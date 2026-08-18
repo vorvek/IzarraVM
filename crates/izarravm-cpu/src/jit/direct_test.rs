@@ -3240,8 +3240,8 @@ fn install_chain_block(cache: &mut JitState, compilation: &Compilation) -> Block
 #[test]
 fn link_mask_admits_class_b_difference_on_a_segment_nobody_pins() {
     let mut cache = BlockCache::default();
-    let source = key(0x4_1000);
-    let target = key(0x4_2000);
+    let source = key(0x4_1010);
+    let target = key(0x4_1020);
 
     let mut source_compilation = chain_mask_compilation(
         BlockSpan::new(source, 1, 1).expect("source span"),
@@ -3276,8 +3276,8 @@ fn link_mask_admits_class_b_difference_on_a_segment_nobody_pins() {
 #[test]
 fn link_mask_chains_the_prince_hot_pair_two_cycle() {
     let mut cache = BlockCache::default();
-    let first = key(0x4_3000);
-    let second = key(0x4_4000);
+    let first = key(0x4_1030);
+    let second = key(0x4_1040);
 
     let mut first_compilation = chain_mask_compilation(
         BlockSpan::new(first, 1, 1).expect("first span"),
@@ -3311,8 +3311,8 @@ fn link_mask_chains_the_prince_hot_pair_two_cycle() {
 #[test]
 fn link_mask_still_refuses_class_d_conflict_on_a_segment_both_pin() {
     let mut cache = BlockCache::default();
-    let source = key(0x4_5000);
-    let target = key(0x4_6000);
+    let source = key(0x4_1050);
+    let target = key(0x4_1060);
 
     let mut source_compilation = chain_mask_compilation(
         BlockSpan::new(source, 1, 1).expect("source span"),
@@ -3353,9 +3353,9 @@ fn link_mask_still_refuses_class_d_conflict_on_a_segment_both_pin() {
 #[test]
 fn link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates() {
     let mut cache = BlockCache::default();
-    let root = key(0x4_7000);
-    let middle = key(0x4_8000);
-    let tail = key(0x4_9000);
+    let root = key(0x4_1070);
+    let middle = key(0x4_1080);
+    let tail = key(0x4_1090);
 
     let mut root_compilation = chain_mask_compilation(
         BlockSpan::new(root, 1, 1).expect("root span"),
@@ -3418,9 +3418,9 @@ fn link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates() {
 #[test]
 fn link_mask_widens_an_inbound_edge_that_can_follow_the_chain() {
     let mut cache = BlockCache::default();
-    let root = key(0x4_a000);
-    let middle = key(0x4_b000);
-    let tail = key(0x4_c000);
+    let root = key(0x4_10a0);
+    let middle = key(0x4_10b0);
+    let tail = key(0x4_10c0);
 
     let mut root_compilation = chain_mask_compilation(
         BlockSpan::new(root, 1, 1).expect("root span"),
@@ -3468,4 +3468,133 @@ fn link_mask_widens_an_inbound_edge_that_can_follow_the_chain() {
         cache.chain_layouts[root_id.index()].data,
         cache.segment_layouts[root_id.index()].data
     );
+}
+
+/// A NEW predecessor arriving at an already-widened block must be judged against that block's
+/// CHAIN requirement, not against its own frozen snapshot. `R` pins only DS, but everything
+/// downstream of it needs ES, so an incoming edge that disagrees about ES has to be refused even
+/// though neither `P` nor `R` reads ES itself.
+///
+/// This is the row that catches a predicate wired to `segment_layouts` instead of
+/// `chain_layouts`: the propagation would leave `P` with a narrower requirement than the target
+/// it links to, which is the invariant the whole design rests on.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_judges_a_new_predecessor_against_the_widened_requirement() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_10d0);
+    let tail = key(0x4_10e0);
+    let newcomer = key(0x4_10f0);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+    assert_eq!(cache.outbound[root_id.index()][0], Some(tail_id));
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "R's requirement must name the ES its successor pins"
+    );
+
+    let mut newcomer_compilation = chain_mask_compilation(
+        BlockSpan::new(newcomer, 1, 1).expect("newcomer span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    newcomer_compilation.successors[0] = Some(link_target_of(root));
+    let newcomer_id = install_chain_block(&mut cache, &newcomer_compilation);
+
+    assert_eq!(
+        cache.outbound[newcomer_id.index()][0],
+        None,
+        "P disagrees about the ES R's chain requires, so the edge must be refused"
+    );
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::SegmentLayout as usize],
+        1
+    );
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        0,
+        "a refusal is not a cut"
+    );
+}
+
+/// A recycled slot must not serve the retired occupant's WIDENED requirement to its successor.
+/// `install` resets the chain layout in the same statement that writes the block's own layout;
+/// without that reset the new block inherits a stale mask AND stale descriptors, and refuses
+/// edges it should admit.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_resets_the_chain_requirement_when_a_slot_is_recycled() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1110);
+    let tail = key(0x4_1120);
+    let newcomer = key(0x4_1130);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    install_chain_block(&mut cache, &tail_compilation);
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0
+    );
+
+    assert_eq!(cache.retire_physical_range_for_test(root.physical, 1), 1);
+    let reborn = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(root, 1, 1).expect("reborn span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x1111)],
+        ),
+    );
+    assert_eq!(
+        reborn.index(),
+        root_id.index(),
+        "the row is vacuous unless the slot really is recycled"
+    );
+    assert_eq!(
+        cache.chain_layouts[reborn.index()],
+        cache.segment_layouts[reborn.index()],
+        "a fresh occupant starts at its own layout"
+    );
+
+    // And the reset is observable through the predicate, not just the field: an edge that agrees
+    // with the NEW occupant must link.
+    let mut newcomer_compilation = chain_mask_compilation(
+        BlockSpan::new(newcomer, 1, 1).expect("newcomer span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    newcomer_compilation.successors[0] = Some(link_target_of(root));
+    let newcomer_id = install_chain_block(&mut cache, &newcomer_compilation);
+    assert_eq!(cache.outbound[newcomer_id.index()][0], Some(reborn));
 }
