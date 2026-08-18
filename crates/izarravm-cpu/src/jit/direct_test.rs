@@ -2647,6 +2647,12 @@ fn segment_write_static_cell_is_registered_as_suppressed_fallthrough() {
         all(target_os = "linux", target_arch = "x86_64")
     )
 ))]
+/// The refusal this row needs is a REAL one. It used to perturb the target's DS descriptor on a
+/// `trivial_compilation` whose `used` mask is 0 (direct_test.rs:64), which was a refusal only
+/// while `link_compatible` compared all six frozen descriptors unconditionally. Under the chain
+/// mask a segment NOBODY in the chain pins is not a reason to refuse, so that edge now links and
+/// the row would have been testing generation history through a path it never takes. Both ends
+/// therefore PIN DS here — a genuine class-D conflict, refused before and after the mask.
 #[test]
 fn link_refusal_census_preserves_generation_history_through_retry_and_source_retire() {
     let mut cache = BlockCache::default();
@@ -2662,6 +2668,7 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
     assert!(matches!(cache.probe(source), BlockProbe::Compile));
     let mut source_compilation =
         trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.segment_layout.used |= segment_bit(SegmentIndex::Ds);
     source_compilation.successors = [Some(target_link), None];
     source_compilation.emitted_static_targets = source_compilation.successors;
     cache.install(&source_compilation).expect("source install");
@@ -2669,6 +2676,7 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
     assert!(matches!(cache.probe(target), BlockProbe::Interpret));
     assert!(matches!(cache.probe(target), BlockProbe::Compile));
     let mut target_g1 = trivial_compilation(BlockSpan::new(target, 1, 1).expect("target span"));
+    target_g1.segment_layout.used |= segment_bit(SegmentIndex::Ds);
     target_g1.segment_layout.data[segment_index(SegmentIndex::Ds)].selector ^= 8;
     let target_g1_id = cache.install(&target_g1).expect("first target install");
     cache.note_direct_link_refusal_exit(1);
@@ -3092,4 +3100,274 @@ fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chain-used link mask (dev_docs/plans/2026-08-18-chain-used-link-mask.md, NON-ADOPTING slice)
+//
+// The contract these rows pin: a static edge is refused over a frozen `data` descriptor only when
+// some block in the CHAIN — the source's requirement or the target's — actually pins that
+// segment. A descriptor nobody pins is not a reason to refuse (class B); a descriptor both ends
+// pin with different values still is (class D). Because the requirement is transitive, a link
+// made downstream can widen a block's requirement and retroactively invalidate an already-live
+// inbound edge, which is then CUT (`LinkClearCause::ChainWiden`).
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn chain_mask_compilation(
+    span: BlockSpan,
+    pinned: &[SegmentIndex],
+    descriptors: &[(SegmentIndex, u16)],
+) -> Compilation {
+    let mut compilation = trivial_compilation(span);
+    let mut used = 0u8;
+    for segment in pinned {
+        used |= segment_bit(*segment);
+    }
+    compilation.segment_layout.used = used;
+    for (segment, selector) in descriptors {
+        let slot = &mut compilation.segment_layout.data[segment_index(*segment)];
+        slot.selector = *selector;
+        slot.base = u32::from(*selector) << 4;
+    }
+    compilation
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn link_target_of(key: BlockKey) -> LinkTarget {
+    LinkTarget {
+        linear: key.linear,
+        mode_key: key.mode_key,
+    }
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn install_chain_block(cache: &mut JitState, compilation: &Compilation) -> BlockId {
+    let key = compilation.span.key;
+    assert!(matches!(cache.probe(key), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(key), BlockProbe::Compile));
+    cache.install(compilation).expect("chain block install")
+}
+
+/// Class B: the two snapshots differ on ES, which NEITHER block pins. Whole-array equality
+/// refuses this edge; it is 68.03% of prince-586's link refusals and the class its hot pair is
+/// in.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_admits_class_b_difference_on_a_segment_nobody_pins() {
+    let mut cache = BlockCache::default();
+    let source = key(0x4_1000);
+    let target = key(0x4_2000);
+
+    let mut source_compilation = chain_mask_compilation(
+        BlockSpan::new(source, 1, 1).expect("source span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    source_compilation.successors[0] = Some(link_target_of(target));
+    let source_id = install_chain_block(&mut cache, &source_compilation);
+
+    let target_compilation = chain_mask_compilation(
+        BlockSpan::new(target, 1, 1).expect("target span"),
+        &[],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let target_id = install_chain_block(&mut cache, &target_compilation);
+
+    assert_eq!(cache.outbound[source_id.index()][0], Some(target_id));
+    assert!(cache.has_linked_successor(source_id));
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::SegmentLayout as usize],
+        0
+    );
+}
+
+/// prince-586's hot pair, modelled as what it is: a 2-CYCLE whose two members differ on an ES
+/// neither of them pins. Both edges must form, because it is the pair being chain-eligible — not
+/// one edge existing — that lifts the quota clamp at run.rs:2294.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_chains_the_prince_hot_pair_two_cycle() {
+    let mut cache = BlockCache::default();
+    let first = key(0x4_3000);
+    let second = key(0x4_4000);
+
+    let mut first_compilation = chain_mask_compilation(
+        BlockSpan::new(first, 1, 1).expect("first span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    first_compilation.successors[0] = Some(link_target_of(second));
+    let first_id = install_chain_block(&mut cache, &first_compilation);
+
+    let mut second_compilation = chain_mask_compilation(
+        BlockSpan::new(second, 1, 1).expect("second span"),
+        &[],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    second_compilation.successors[0] = Some(link_target_of(first));
+    let second_id = install_chain_block(&mut cache, &second_compilation);
+
+    assert_eq!(cache.outbound[first_id.index()][0], Some(second_id));
+    assert_eq!(cache.outbound[second_id.index()][0], Some(first_id));
+    assert!(cache.has_linked_successor(first_id));
+    assert!(cache.has_linked_successor(second_id));
+}
+
+/// Class D: both ends pin ES and disagree about it. This is a REAL conflict — one of the two
+/// blocks would run against a base the other's entry check never validated — and it must stay
+/// refused. The guard against over-admission; it passes before and after the mask lands.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_still_refuses_class_d_conflict_on_a_segment_both_pin() {
+    let mut cache = BlockCache::default();
+    let source = key(0x4_5000);
+    let target = key(0x4_6000);
+
+    let mut source_compilation = chain_mask_compilation(
+        BlockSpan::new(source, 1, 1).expect("source span"),
+        &[SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    source_compilation.successors[0] = Some(link_target_of(target));
+    let source_id = install_chain_block(&mut cache, &source_compilation);
+
+    let target_compilation = chain_mask_compilation(
+        BlockSpan::new(target, 1, 1).expect("target span"),
+        &[SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    install_chain_block(&mut cache, &target_compilation);
+
+    assert_eq!(cache.outbound[source_id.index()][0], None);
+    assert!(!cache.has_linked_successor(source_id));
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::SegmentLayout as usize],
+        1
+    );
+}
+
+/// THE DISCRIMINATING ROW. `R -> S` is class B on ES (neither pins it, and their ES descriptors
+/// DIFFER). `S -> T` is admissible on its own terms because `S` and `T` agree on ES, which `T`
+/// pins. Admitting both and stopping there is the depth-2 miscompile: entering at `R` validates
+/// `R`'s ES, and the chain then runs `T`'s body against `S`'s ES base.
+///
+/// A shallow implementation — one that computes each block's requirement from its own snapshot,
+/// or from its direct successors without walking back to predecessors — leaves `R -> S` live and
+/// FAILS here. The only sound outcomes are widen-`R` (impossible in this row: `R`'s own ES
+/// descriptor disagrees) or CUT `R -> S`.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_7000);
+    let middle = key(0x4_8000);
+    let tail = key(0x4_9000);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(middle));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+
+    let mut middle_compilation = chain_mask_compilation(
+        BlockSpan::new(middle, 1, 1).expect("middle span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    middle_compilation.successors[0] = Some(link_target_of(tail));
+    let middle_id = install_chain_block(&mut cache, &middle_compilation);
+
+    // The ordering hazard this row is most likely to die of: if the edge never formed, every
+    // assertion below passes for the wrong reason.
+    assert_eq!(
+        cache.outbound[root_id.index()][0],
+        Some(middle_id),
+        "class-B edge R -> S must exist before the widen that is supposed to cut it"
+    );
+
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+
+    assert_eq!(cache.outbound[middle_id.index()][0], Some(tail_id));
+    assert_eq!(
+        cache.outbound[root_id.index()][0],
+        None,
+        "R -> S must be CUT: S's requirement now names ES and R disagrees about it"
+    );
+    assert!(!cache.has_linked_successor(root_id));
+}
+
+/// The mirror arm: same shape, but all three blocks hold the SAME ES descriptor. The widen then
+/// SUCCEEDS at `R` instead of cutting, so the chain stays whole. Together with the row above this
+/// pins both arms of the worklist; a "cut on every widen" implementation passes that row and
+/// fails this one.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_widens_an_inbound_edge_that_can_follow_the_chain() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_a000);
+    let middle = key(0x4_b000);
+    let tail = key(0x4_c000);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(middle));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+
+    let mut middle_compilation = chain_mask_compilation(
+        BlockSpan::new(middle, 1, 1).expect("middle span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    middle_compilation.successors[0] = Some(link_target_of(tail));
+    let middle_id = install_chain_block(&mut cache, &middle_compilation);
+    assert_eq!(cache.outbound[root_id.index()][0], Some(middle_id));
+
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+
+    assert_eq!(cache.outbound[middle_id.index()][0], Some(tail_id));
+    assert_eq!(
+        cache.outbound[root_id.index()][0],
+        Some(middle_id),
+        "the widen agrees at R, so the edge must survive"
+    );
 }
