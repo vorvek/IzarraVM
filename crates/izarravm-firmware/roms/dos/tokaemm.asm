@@ -1807,9 +1807,8 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; the no-error frame's CS slot ([esp+36]) == our 0x08 -> the no-error frame
 ; that woke the halt; irq_body's own VM check then parks it in the halt slot.
 ; A ring-0 #GP raised INSIDE the flagged window cannot take this arm: its
-; frame carries the
-; faulting EIP at [esp+36], and offset 8 is the DOS device-driver header
-; (dh_next), never executed code.
+; frame carries the faulting EIP at [esp+36], and offset 8 is the DOS
+; device-driver header (dh_next), never executed code.
 ;
 ; TEST 3 (remaining = error-code frame): bit 17 of [esp+44], the frame's
 ; real EFLAGS. Set -> a genuine V86 #GP -> monitor_body (whose dispatch
@@ -2372,9 +2371,17 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     ; old-vector table with 16, and RETF'd through the garbage pair it found --
     ; E10, the MonikaTT #GP(0) at 0xAF:78A3. Holding WITH the ISR bit set fixed
     ; that and is faithful for a VME or EMM386-class (IOPL-0) manager, which is
-    ; what this monitor used to be. It needed a complete set of drain points,
-    ; and the VCPI DE0C mode switch destroyed the drainer. Running at IOPL 3
-    ; deletes the question instead of completing the drain set.
+    ; what this monitor used to be -- under VME the INTA has already happened
+    ; when the monitor gets control, and the AMD-K5 TRM S3.1.4 (VME) describes
+    ; exactly this: with VIF clear, "the operating system holds the interrupt
+    ; pending", saving the vector and setting VIP. Reference, in
+    ; dev_docs/reference/Pentium-K6/ :
+    ;     AMD-K5_Processor_Technical_Reference_Manual_(November_1996).txt
+    ;
+    ; So the old architecture was a software VME, not an invented state. It
+    ; needed a complete set of drain points, and the VCPI DE0C mode switch
+    ; destroyed the drainer. Running at IOPL 3 deletes the question instead of
+    ; completing the drain set.
     call reflect_vector_v86
     popad
     iretd

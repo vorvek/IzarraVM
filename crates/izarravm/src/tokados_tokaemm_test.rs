@@ -38,8 +38,8 @@ impl TokaEmmScenario {
 }
 
 /// Run the machine in fine bursts, reporting every sample point that lands with
-/// the CPU in V86, and stopping early once `done` is satisfied. Returns
-/// (samples in V86, whether `done` was reached).
+/// the CPU in V86, and stopping early once `done` is satisfied or the guest
+/// exits.
 ///
 /// Sampling `in_v86()` is the only way to observe V86 residency -- nothing
 /// counts it -- and it has two biases that make a coarse sample useless:
@@ -56,7 +56,8 @@ impl TokaEmmScenario {
 /// will never see V86, however healthy the machine is. Sample finely, sample
 /// while the guest is busy, and judge on the accumulated count.
 ///
-/// Returns (samples in V86, whether `done` was reached, the last stop reason).
+/// Returns (samples in V86, whether the loop ended early -- `done` fired, or
+/// the guest exited -- and the last stop reason).
 /// A `TestExit` ends the loop: the guest has signalled its verdict and every
 /// further burst would re-run an already-halted machine, so callers that assert
 /// on an exit code get it from the third element rather than running the
@@ -1037,7 +1038,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 
         // Sampled rather than run straight through, because this is the ONLY
         // row that observes V86 residency on the far side of a DE0C round trip.
-        // `vcpi_pm_to_v86` (tokaemm.asm:3692) is the second of the file's two
+        // `vcpi_pm_to_v86` (tokaemm.asm:3699) is the second of the file's two
         // sites that stamp IOPL into a V86 EFLAGS image, and the boot-sampling
         // rows never reach it -- a plain `LH TOKAMOUS + MEM` boot only ever
         // enters V86 through `pm_init`. Asserting IOPL 3 here is what closes
@@ -1821,7 +1822,7 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
 ///
 /// COVERAGE BOUNDARY, stated because it is not obvious: tokaemm.asm stamps IOPL
 /// into a V86 EFLAGS image at exactly two sites -- `pm_init`'s return-to-V86
-/// IRETD (:1755) and `vcpi_pm_to_v86` (:3692) -- and this row's `LH TOKAMOUS +
+/// IRETD (:1772) and `vcpi_pm_to_v86` (:3699) -- and this row's `LH TOKAMOUS +
 /// MEM` boot only ever enters V86 through the first, so it cannot see a
 /// regression confined to the VCPI re-entry path. That second site is covered
 /// by `tokaemm_vcpi_m3_de0c_switch_round_trip`, which samples the same

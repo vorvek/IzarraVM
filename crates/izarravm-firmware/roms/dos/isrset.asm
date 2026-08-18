@@ -36,7 +36,7 @@ org 0x100
 ;               break each time round, so ~40 cycles/iteration: ~30k iterations
 ;               per tick, and the bound covers ~66 ticks.
 ;   MEM_SPIN -- CMP mem,imm + DEC + JNZ, ~10 cycles/iteration: ~120k iterations
-;               per tick, and the bound covers ~55 ticks.
+;               per tick, and the bound covers ~66 ticks.
 ;
 ; Both are sized so that exhaustion means "the thing waited for never happened",
 ; not "the fixture was impatient" -- which is what makes the 0xDn markers below
