@@ -1883,11 +1883,13 @@ fn run_boot_hdd_folder(
         write_framebuffer_ppm(&mut machine, path)?;
         println!("screenshot: {}", path.display());
     }
-    // Reconcile guest writes back to the host folder. Katea's write engine
-    // buffers guest file changes until a flush; without this, anything the
-    // guest wrote (a `dir > log.txt` capture, a rebound executable) is
-    // silently discarded at exit, which defeats the mounted-folder contract
-    // and the guest-side debug channel it enables.
+    // Final reconcile. Katea projects completed write commands to the host as
+    // they happen, but a write whose FAT, directory or path was still
+    // incomplete at the last command boundary is held in the guest-write store;
+    // without this, anything left there (a `dir > log.txt` capture, a rebound
+    // executable) is silently discarded at exit, which defeats the
+    // mounted-folder contract and the guest-side debug channel it enables. This
+    // also flushes the open host handles.
     machine.flush_hdd_folder();
 
     // Wall time + realtics extraction (for 2+3). Makes A/B runs self-contained.
@@ -1931,7 +1933,7 @@ fn write_hdd_profile_json(
     let margo_display = machine.margo_display();
     #[allow(unused_mut)]
     let mut report = json!({
-        "schema": "izarravm-hdd-profile-v1",
+        "schema": "izarravm-hdd-profile-v2",
         "workload": workload.display().to_string(),
         "mode": mode.canonical_name(),
         "cycle_budget": budget,
@@ -2010,6 +2012,36 @@ fn write_hdd_profile_json(
             "run_scan_steps": k.run_scan_steps,
             "fat_sector_reads": k.fat_sector_reads,
             "dir_or_free_sector_reads": k.dir_or_free_sector_reads,
+            "sector_writes": k.sector_writes,
+            "int13_read_commands": k.int13_read_commands,
+            "int13_read_sectors": k.int13_read_sectors,
+            "int13_read_wait_ticks": k.int13_read_wait_ticks,
+            "int13_write_commands": k.int13_write_commands,
+            "int13_write_sectors": k.int13_write_sectors,
+            "int13_write_wait_ticks": k.int13_write_wait_ticks,
+            "pio_read_commands": k.pio_read_commands,
+            "pio_read_sectors": k.pio_read_sectors,
+            "pio_read_wait_ticks": k.pio_read_wait_ticks,
+            "pio_write_commands": k.pio_write_commands,
+            "pio_write_sectors": k.pio_write_sectors,
+            "pio_write_wait_ticks": k.pio_write_wait_ticks,
+            "dma_read_commands": k.dma_read_commands,
+            "dma_read_sectors": k.dma_read_sectors,
+            "dma_read_wait_ticks": k.dma_read_wait_ticks,
+            "dma_write_commands": k.dma_write_commands,
+            "dma_write_sectors": k.dma_write_sectors,
+            "dma_write_wait_ticks": k.dma_write_wait_ticks,
+            "overlay_resident_sectors": k.overlay_resident_sectors,
+            "overlay_pending_sectors": k.overlay_pending_sectors,
+            "pending_unmapped_sectors": k.pending_unmapped_sectors,
+            "spill_operations": k.spill_operations,
+            "spill_bytes": k.spill_bytes,
+            "spill_wall_ns": k.spill_wall_ns,
+            "projection_operations": k.projection_operations,
+            "projection_bytes": k.projection_bytes,
+            "projection_wall_ns": k.projection_wall_ns,
+            "metadata_projection_passes": k.metadata_projection_passes,
+            "host_write_failures": k.host_write_failures,
         })),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
@@ -2734,6 +2766,36 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 // IZARRAVM_KATEA_REGION_CENSUS=1 armed the volume at mount.
                 "katea_fat_sector_reads": mark.katea.as_ref().map(|k| k.fat_sector_reads),
                 "katea_dir_or_free_sector_reads": mark.katea.as_ref().map(|k| k.dir_or_free_sector_reads),
+                "katea_sector_writes": mark.katea.as_ref().map(|k| k.sector_writes),
+                "katea_int13_read_commands": mark.katea.as_ref().map(|k| k.int13_read_commands),
+                "katea_int13_read_sectors": mark.katea.as_ref().map(|k| k.int13_read_sectors),
+                "katea_int13_read_wait_ticks": mark.katea.as_ref().map(|k| k.int13_read_wait_ticks),
+                "katea_int13_write_commands": mark.katea.as_ref().map(|k| k.int13_write_commands),
+                "katea_int13_write_sectors": mark.katea.as_ref().map(|k| k.int13_write_sectors),
+                "katea_int13_write_wait_ticks": mark.katea.as_ref().map(|k| k.int13_write_wait_ticks),
+                "katea_pio_read_commands": mark.katea.as_ref().map(|k| k.pio_read_commands),
+                "katea_pio_read_sectors": mark.katea.as_ref().map(|k| k.pio_read_sectors),
+                "katea_pio_read_wait_ticks": mark.katea.as_ref().map(|k| k.pio_read_wait_ticks),
+                "katea_pio_write_commands": mark.katea.as_ref().map(|k| k.pio_write_commands),
+                "katea_pio_write_sectors": mark.katea.as_ref().map(|k| k.pio_write_sectors),
+                "katea_pio_write_wait_ticks": mark.katea.as_ref().map(|k| k.pio_write_wait_ticks),
+                "katea_dma_read_commands": mark.katea.as_ref().map(|k| k.dma_read_commands),
+                "katea_dma_read_sectors": mark.katea.as_ref().map(|k| k.dma_read_sectors),
+                "katea_dma_read_wait_ticks": mark.katea.as_ref().map(|k| k.dma_read_wait_ticks),
+                "katea_dma_write_commands": mark.katea.as_ref().map(|k| k.dma_write_commands),
+                "katea_dma_write_sectors": mark.katea.as_ref().map(|k| k.dma_write_sectors),
+                "katea_dma_write_wait_ticks": mark.katea.as_ref().map(|k| k.dma_write_wait_ticks),
+                "katea_overlay_resident_sectors": mark.katea.as_ref().map(|k| k.overlay_resident_sectors),
+                "katea_overlay_pending_sectors": mark.katea.as_ref().map(|k| k.overlay_pending_sectors),
+                "katea_pending_unmapped_sectors": mark.katea.as_ref().map(|k| k.pending_unmapped_sectors),
+                "katea_spill_operations": mark.katea.as_ref().map(|k| k.spill_operations),
+                "katea_spill_bytes": mark.katea.as_ref().map(|k| k.spill_bytes),
+                "katea_spill_wall_ns": mark.katea.as_ref().map(|k| k.spill_wall_ns),
+                "katea_projection_operations": mark.katea.as_ref().map(|k| k.projection_operations),
+                "katea_projection_bytes": mark.katea.as_ref().map(|k| k.projection_bytes),
+                "katea_projection_wall_ns": mark.katea.as_ref().map(|k| k.projection_wall_ns),
+                "katea_metadata_projection_passes": mark.katea.as_ref().map(|k| k.metadata_projection_passes),
+                "katea_host_write_failures": mark.katea.as_ref().map(|k| k.host_write_failures),
                 // The fixed-disk census. All zero unless IZARRAVM_INT13_PROFILE=1.
                 "int13_read_calls": mark.int13.read_calls,
                 "int13_read_sectors": mark.int13.read_sectors,

@@ -58,6 +58,7 @@ const SECTORS_PER_TRACK: u32 = 63;
 /// real geometry would put its seek time.
 const COMMAND_LATENCY_TICKS: u64 = 0;
 const PIO_BYTES_PER_SECOND: u64 = 16_700_000;
+const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 
 fn pio_sector_ticks() -> u64 {
     (SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(PIO_BYTES_PER_SECOND as u128) as u64
@@ -86,6 +87,12 @@ pub(crate) fn pio_transfer_ticks_cached(sectors: u32, hits: u32) -> u64 {
     }
     let charged = u64::from(sectors.saturating_sub(hits.min(sectors)));
     COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(charged))
+}
+
+pub(crate) fn dma_transfer_ticks(request: AtaDmaRequest) -> u64 {
+    let data_ticks = (request.byte_len() as u128 * MASTER_CLOCK_HZ as u128)
+        .div_ceil(request.bytes_per_second as u128);
+    DMA_COMMAND_LATENCY_TICKS.saturating_add(data_ticks.min(u64::MAX as u128) as u64)
 }
 
 /// ATA status register bits.
@@ -139,6 +146,7 @@ enum PendingAction {
     SetFeatures { feature: u8, mode: u8 },
     Diagnostic,
     CheckPower,
+    FlushCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,7 +350,7 @@ impl AtaDisk {
     }
 
     /// Whether this disk is a flat image (vs a lazy host-folder facade). Only an
-    /// image has flushable bytes; a folder is read-only with no backing buffer, so
+    /// image exposes flat bytes; host-folder handles are flushed separately, so
     /// callers that persist `bytes()` must skip it (see `Machine::eject_hdd`).
     pub fn is_image(&self) -> bool {
         matches!(self.backing, Backing::Image(_))
@@ -371,6 +379,44 @@ impl AtaDisk {
     pub fn reconcile_host_folder(&mut self) {
         if let Backing::HostFolder(volume) = &mut self.backing {
             volume.reconcile();
+        }
+    }
+
+    pub(crate) fn commit_guest_write_batch(
+        &mut self,
+        route: crate::katea_tree::GuestWriteRoute,
+    ) -> crate::katea_tree::CommitGuestWriteResult {
+        match &mut self.backing {
+            Backing::Image(_) => crate::katea_tree::CommitGuestWriteResult::Projected,
+            Backing::HostFolder(volume) => volume.commit_guest_write_batch(route),
+        }
+    }
+
+    pub(crate) fn note_guest_read_batch(
+        &self,
+        route: crate::katea_tree::GuestStorageRoute,
+        sectors: u64,
+        wait_ticks: u64,
+    ) {
+        if let Backing::HostFolder(volume) = &self.backing {
+            volume.note_guest_read_batch(route, sectors, wait_ticks);
+        }
+    }
+
+    pub(crate) fn note_guest_write_wait(
+        &self,
+        route: crate::katea_tree::GuestStorageRoute,
+        wait_ticks: u64,
+    ) {
+        if let Backing::HostFolder(volume) = &self.backing {
+            volume.note_guest_write_wait(route, wait_ticks);
+        }
+    }
+
+    fn flush_guest_writes(&mut self) -> crate::katea_tree::CommitGuestWriteResult {
+        match &mut self.backing {
+            Backing::Image(_) => crate::katea_tree::CommitGuestWriteResult::Projected,
+            Backing::HostFolder(volume) => volume.flush_guest_writes(),
         }
     }
 
@@ -692,11 +738,11 @@ impl AtaDisk {
             ),
             // EXECUTE DEVICE DIAGNOSTIC (0x90): report device 0 passed (0x01).
             0x90 => self.schedule(PendingAction::Diagnostic, COMMAND_LATENCY_TICKS),
-            // CHECK POWER MODE reports active. IDLE, STANDBY, and FLUSH CACHE
-            // complete successfully because the HLE backing has no volatile
-            // drive cache or mechanical power state.
+            // CHECK POWER MODE reports active. IDLE and STANDBY have no mechanical
+            // state; FLUSH CACHE projects metadata and flushes host-file handles.
             0xE5 => self.schedule(PendingAction::CheckPower, COMMAND_LATENCY_TICKS),
-            0xE2 | 0xE3 | 0xE7 => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
+            0xE2 | 0xE3 => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
+            0xE7 => self.schedule(PendingAction::FlushCache, COMMAND_LATENCY_TICKS),
             // NOP (0x00) always aborts on hardware, never a silent success.
             _ => self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS),
         }
@@ -762,6 +808,15 @@ impl AtaDisk {
             PendingAction::CheckPower => {
                 self.sector_count = 0xFF;
                 self.complete_ok();
+            }
+            PendingAction::FlushCache => {
+                if self.flush_guest_writes()
+                    == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+                {
+                    self.abort();
+                } else {
+                    self.complete_ok();
+                }
             }
         }
     }
@@ -933,6 +988,11 @@ impl AtaDisk {
             self.abort();
             return;
         }
+        self.note_guest_read_batch(
+            crate::katea_tree::GuestStorageRoute::Dma,
+            u64::from(request.sectors),
+            dma_transfer_ticks(request),
+        );
         self.last_access_bytes = bytes;
         self.advance_dma_task_file(request);
         self.complete_ok();
@@ -953,8 +1013,15 @@ impl AtaDisk {
                 return false;
             }
         }
-        if let Backing::HostFolder(volume) = &mut self.backing {
-            volume.reconcile_after_write();
+        self.note_guest_write_wait(
+            crate::katea_tree::GuestStorageRoute::Dma,
+            dma_transfer_ticks(request),
+        );
+        if self.commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Dma)
+            == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+        {
+            self.abort();
+            return false;
         }
         self.last_access_bytes = data.len();
         self.advance_dma_task_file(request);
@@ -985,6 +1052,12 @@ impl AtaDisk {
             if self.pio_sectors_remaining > 0 {
                 self.schedule(PendingAction::PrepareRead, pio_sector_ticks());
             } else {
+                let sectors = self.last_access_bytes / SECTOR;
+                self.note_guest_read_batch(
+                    crate::katea_tree::GuestStorageRoute::Pio,
+                    sectors as u64,
+                    pio_transfer_ticks(sectors as u32),
+                );
                 self.status = status::DRDY | status::DSC;
             }
         }
@@ -1023,8 +1096,16 @@ impl AtaDisk {
             self.phase = Phase::Idle;
             self.status = status::DRDY | status::DSC;
             self.error = 0;
-            if let Backing::HostFolder(volume) = &mut self.backing {
-                volume.reconcile_after_write();
+            let sectors = self.last_access_bytes / SECTOR;
+            self.note_guest_write_wait(
+                crate::katea_tree::GuestStorageRoute::Pio,
+                pio_transfer_ticks(sectors as u32),
+            );
+            if self.commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Pio)
+                == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+            {
+                self.abort();
+                return;
             }
             self.raise_irq();
         }
@@ -1220,6 +1301,7 @@ impl<'a> CanonicalAtaDisk<'a> {
                     PendingAction::SetFeatures { feature, mode } => (7, feature, mode),
                     PendingAction::Diagnostic => (8, 0, 0),
                     PendingAction::CheckPower => (9, 0, 0),
+                    PendingAction::FlushCache => (10, 0, 0),
                 };
                 (true, ticks_remaining, tag, arg0, arg1)
             }

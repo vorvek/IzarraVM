@@ -67,6 +67,24 @@ pub(crate) fn parse_dir(bytes: &[u8]) -> Vec<DirEntry> {
     out
 }
 
+/// Bytes fatgen103 forbids in a short name, plus the separators and the wildcards.
+/// A directory entry is guest bytes: nothing stops a guest from writing `A\..\..\`
+/// into one, and the reconcile pass turns a short name straight into a host path
+/// under the mounted folder. `Path::join` on such a name walks out of the mount,
+/// so the illegal bytes are rejected here -- at the one point every host path in
+/// this engine is derived from -- rather than at each of the join sites.
+/// Rejecting these can never orphan a name Katea itself synthesized: `fat_name`
+/// builds every mounted short name from a strict allowlist that shares no byte
+/// with this set, so only a name the guest invented can land here.
+const ILLEGAL_83_BYTES: &[u8] = b"\"*+,/:;<=>?[\\]|.";
+
+/// Whether this short name is safe to turn into a host path inside the mount.
+pub(crate) fn name_is_host_safe(name: &[u8; 11]) -> bool {
+    !name
+        .iter()
+        .any(|b| *b < 0x20 || *b == 0x7F || ILLEGAL_83_BYTES.contains(b))
+}
+
 /// Classify an entry. `system` is the set of folded 8.3 names that must never be
 /// materialized (the InMemory boot files). Conservative: anything ambiguous Skips.
 pub(crate) fn classify(e: &DirEntry, system: &HashSet<[u8; 11]>) -> EntryAction {
@@ -75,6 +93,9 @@ pub(crate) fn classify(e: &DirEntry, system: &HashSet<[u8; 11]>) -> EntryAction 
     }
     if e.attr & ATTR_LFN == ATTR_LFN || e.attr & ATTR_VOLUME_LABEL != 0 {
         return EntryAction::Skip; // LFN fragment or volume label
+    }
+    if !name_is_host_safe(&e.name) {
+        return EntryAction::Skip; // would escape the mount or is not a FAT name
     }
     if system.contains(&e.name) {
         return EntryAction::Skip;

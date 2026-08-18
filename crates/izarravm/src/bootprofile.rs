@@ -379,8 +379,7 @@ pub fn run(
     if let Some(path) = profile_json {
         write_json(path, &run, wall, dir)?;
     }
-    // Katea buffers guest writes until a flush. Nothing here should have written
-    // anything, but skipping the flush would leave that unverifiable.
+    // Exercise the same final validation and handle-flush path as normal shutdown.
     machine.flush_hdd_folder();
     if !reached_boot {
         return Err(format!(
@@ -629,6 +628,84 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     dir_or_free_sector_reads: after
                         .dir_or_free_sector_reads
                         .saturating_sub(before.dir_or_free_sector_reads),
+                    sector_writes: after.sector_writes.saturating_sub(before.sector_writes),
+                    int13_read_commands: after
+                        .int13_read_commands
+                        .saturating_sub(before.int13_read_commands),
+                    int13_read_sectors: after
+                        .int13_read_sectors
+                        .saturating_sub(before.int13_read_sectors),
+                    int13_read_wait_ticks: after
+                        .int13_read_wait_ticks
+                        .saturating_sub(before.int13_read_wait_ticks),
+                    int13_write_commands: after
+                        .int13_write_commands
+                        .saturating_sub(before.int13_write_commands),
+                    int13_write_sectors: after
+                        .int13_write_sectors
+                        .saturating_sub(before.int13_write_sectors),
+                    int13_write_wait_ticks: after
+                        .int13_write_wait_ticks
+                        .saturating_sub(before.int13_write_wait_ticks),
+                    pio_read_commands: after
+                        .pio_read_commands
+                        .saturating_sub(before.pio_read_commands),
+                    pio_read_sectors: after
+                        .pio_read_sectors
+                        .saturating_sub(before.pio_read_sectors),
+                    pio_read_wait_ticks: after
+                        .pio_read_wait_ticks
+                        .saturating_sub(before.pio_read_wait_ticks),
+                    pio_write_commands: after
+                        .pio_write_commands
+                        .saturating_sub(before.pio_write_commands),
+                    pio_write_sectors: after
+                        .pio_write_sectors
+                        .saturating_sub(before.pio_write_sectors),
+                    pio_write_wait_ticks: after
+                        .pio_write_wait_ticks
+                        .saturating_sub(before.pio_write_wait_ticks),
+                    dma_read_commands: after
+                        .dma_read_commands
+                        .saturating_sub(before.dma_read_commands),
+                    dma_read_sectors: after
+                        .dma_read_sectors
+                        .saturating_sub(before.dma_read_sectors),
+                    dma_read_wait_ticks: after
+                        .dma_read_wait_ticks
+                        .saturating_sub(before.dma_read_wait_ticks),
+                    dma_write_commands: after
+                        .dma_write_commands
+                        .saturating_sub(before.dma_write_commands),
+                    dma_write_sectors: after
+                        .dma_write_sectors
+                        .saturating_sub(before.dma_write_sectors),
+                    dma_write_wait_ticks: after
+                        .dma_write_wait_ticks
+                        .saturating_sub(before.dma_write_wait_ticks),
+                    overlay_resident_sectors: after.overlay_resident_sectors,
+                    overlay_pending_sectors: after.overlay_pending_sectors,
+                    pending_unmapped_sectors: after.pending_unmapped_sectors,
+                    spill_operations: after
+                        .spill_operations
+                        .saturating_sub(before.spill_operations),
+                    spill_bytes: after.spill_bytes.saturating_sub(before.spill_bytes),
+                    spill_wall_ns: after.spill_wall_ns.saturating_sub(before.spill_wall_ns),
+                    projection_operations: after
+                        .projection_operations
+                        .saturating_sub(before.projection_operations),
+                    projection_bytes: after
+                        .projection_bytes
+                        .saturating_sub(before.projection_bytes),
+                    projection_wall_ns: after
+                        .projection_wall_ns
+                        .saturating_sub(before.projection_wall_ns),
+                    metadata_projection_passes: after
+                        .metadata_projection_passes
+                        .saturating_sub(before.metadata_projection_passes),
+                    host_write_failures: after
+                        .host_write_failures
+                        .saturating_sub(before.host_write_failures),
                 },
                 _ => KateaStorageCounters::default(),
             };
@@ -853,7 +930,7 @@ fn write_json(
     workload: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let report = json!({
-        "schema": "izarravm-boot-phase-profile-v1",
+        "schema": "izarravm-boot-phase-profile-v2",
         "workload": workload.display().to_string(),
         "mode": run.mode.canonical_name(),
         "total_wall_seconds": wall.as_secs_f64(),
@@ -876,6 +953,36 @@ fn write_json(
                 "host_bytes": row.katea.host_bytes,
                 "host_wall_ns": row.katea.host_wall_ns,
                 "run_scan_steps": row.katea.run_scan_steps,
+                "sector_writes": row.katea.sector_writes,
+                "int13_read_commands": row.katea.int13_read_commands,
+                "int13_read_sectors": row.katea.int13_read_sectors,
+                "int13_read_wait_ticks": row.katea.int13_read_wait_ticks,
+                "int13_write_commands": row.katea.int13_write_commands,
+                "int13_write_sectors": row.katea.int13_write_sectors,
+                "int13_write_wait_ticks": row.katea.int13_write_wait_ticks,
+                "pio_read_commands": row.katea.pio_read_commands,
+                "pio_read_sectors": row.katea.pio_read_sectors,
+                "pio_read_wait_ticks": row.katea.pio_read_wait_ticks,
+                "pio_write_commands": row.katea.pio_write_commands,
+                "pio_write_sectors": row.katea.pio_write_sectors,
+                "pio_write_wait_ticks": row.katea.pio_write_wait_ticks,
+                "dma_read_commands": row.katea.dma_read_commands,
+                "dma_read_sectors": row.katea.dma_read_sectors,
+                "dma_read_wait_ticks": row.katea.dma_read_wait_ticks,
+                "dma_write_commands": row.katea.dma_write_commands,
+                "dma_write_sectors": row.katea.dma_write_sectors,
+                "dma_write_wait_ticks": row.katea.dma_write_wait_ticks,
+                "overlay_resident_sectors": row.katea.overlay_resident_sectors,
+                "overlay_pending_sectors": row.katea.overlay_pending_sectors,
+                "pending_unmapped_sectors": row.katea.pending_unmapped_sectors,
+                "spill_operations": row.katea.spill_operations,
+                "spill_bytes": row.katea.spill_bytes,
+                "spill_wall_ns": row.katea.spill_wall_ns,
+                "projection_operations": row.katea.projection_operations,
+                "projection_bytes": row.katea.projection_bytes,
+                "projection_wall_ns": row.katea.projection_wall_ns,
+                "metadata_projection_passes": row.katea.metadata_projection_passes,
+                "host_write_failures": row.katea.host_write_failures,
             },
             "machine_phases": row.machine_phases.iter().map(|(name, wall_ns, count)| json!({
                 "name": name,

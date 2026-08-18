@@ -105,6 +105,40 @@ fn rewrite_single_cluster_file(
     vol.write_sector(dir_lba, &directory);
 }
 
+fn write_fat_link(vol: &mut KateaTreeVolume, cluster: u32, next: u32) {
+    let byte = cluster as usize * 4;
+    let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+    let mut sector = vol.read_sector(lba);
+    let offset = byte % SECTOR;
+    sector[offset..offset + 4].copy_from_slice(&(next & 0x0FFF_FFFF).to_le_bytes());
+    vol.write_sector(lba, &sector);
+}
+
+fn write_cluster_bytes(vol: &mut KateaTreeVolume, first: u32, data: &[u8]) {
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    for (cluster_index, chunk) in data.chunks(cluster_bytes).enumerate() {
+        for (sector_index, bytes) in chunk.chunks(SECTOR).enumerate() {
+            let mut sector = [0u8; SECTOR];
+            sector[..bytes.len()].copy_from_slice(bytes);
+            vol.write_sector(
+                vol.cluster_to_lba(first + cluster_index as u32) + sector_index as u32,
+                &sector,
+            );
+        }
+    }
+}
+
+fn update_file_size(vol: &mut KateaTreeVolume, dir_cluster: u32, name: &[u8; 11], size: u32) {
+    let lba = vol.cluster_to_lba(dir_cluster);
+    let mut directory = vol.read_sector(lba);
+    let slot = (0..16)
+        .map(|index| index * 32)
+        .find(|&offset| &directory[offset..offset + 11] == name)
+        .expect("existing file entry");
+    directory[slot + 28..slot + 32].copy_from_slice(&size.to_le_bytes());
+    vol.write_sector(lba, &directory);
+}
+
 #[cfg(test)]
 fn fresh_vol(tag: &str) -> (KateaTreeVolume, std::path::PathBuf) {
     let root = scratch(tag);
@@ -219,8 +253,8 @@ fn reconcile_grows_a_file() {
 }
 
 #[test]
-fn after_write_defers_a_growing_file_until_the_final_reconcile() {
-    let (mut vol, root) = fresh_vol("rec_grow_deferred");
+fn after_write_streams_a_growing_file_before_the_final_reconcile() {
+    let (mut vol, root) = fresh_vol("rec_grow_live");
     let first = vol.next_free + 1000;
     let initial = vec![0x11; 32];
     stamp_file(&mut vol, 2, "GROW.BIN", 0x20, first, &initial);
@@ -231,8 +265,14 @@ fn after_write_defers_a_growing_file_until_the_final_reconcile() {
     let first_gathered_bytes = vol.gathered_bytes();
     let first_writes = vol.atomic_writes();
     let first_write_bytes = vol.atomic_write_bytes();
-    assert_eq!(first_gathers, 1, "the first shape is mirrored immediately");
-    assert_eq!(first_writes, 1, "the first shape is written immediately");
+    assert_eq!(
+        first_gathers, 0,
+        "the first shape must stream without a whole-file gather"
+    );
+    assert_eq!(
+        first_writes, 0,
+        "the first shape must not use an atomic whole-file rewrite"
+    );
 
     let mut final_payload = Vec::new();
     for step in 1..=6u8 {
@@ -252,6 +292,12 @@ fn after_write_defers_a_growing_file_until_the_final_reconcile() {
     }
 
     assert_eq!(
+        std::fs::read(root.join("GROW.BIN")).unwrap(),
+        final_payload,
+        "every completed growth command must reach the host before flush"
+    );
+
+    assert_eq!(
         vol.gathers(),
         first_gathers,
         "growth must not re-gather prefixes"
@@ -259,36 +305,282 @@ fn after_write_defers_a_growing_file_until_the_final_reconcile() {
     assert_eq!(
         vol.gathered_bytes(),
         first_gathered_bytes,
-        "growth must add no gathered bytes"
+        "growth must add no whole-file gathered bytes"
     );
     assert_eq!(
         vol.atomic_writes(),
         first_writes,
-        "growth must not rewrite prefixes"
+        "growth must not atomically rewrite prefixes"
     );
     assert_eq!(
         vol.atomic_write_bytes(),
         first_write_bytes,
-        "growth must add no materialized bytes"
-    );
-    assert_eq!(
-        std::fs::read(root.join("GROW.BIN")).unwrap(),
-        initial,
-        "the host keeps the last completed shape until flush"
+        "growth must add no atomically materialized prefix bytes"
     );
 
     vol.reconcile();
     assert_eq!(std::fs::read(root.join("GROW.BIN")).unwrap(), final_payload);
-    assert_eq!(vol.gathers(), first_gathers + 1);
+    assert_eq!(vol.gathers(), first_gathers);
+    assert_eq!(vol.gathered_bytes(), first_gathered_bytes);
+    assert_eq!(vol.atomic_writes(), first_writes);
+    assert_eq!(vol.atomic_write_bytes(), first_write_bytes);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn data_and_fat_before_directory_project_when_the_path_appears() {
+    let (mut vol, root) = fresh_vol("data_before_directory");
+    let first = vol.next_free + 1000;
+    let payload = b"payload arrived before its name\r\n";
+
+    write_cluster_bytes(&mut vol, first, payload);
     assert_eq!(
-        vol.gathered_bytes(),
-        first_gathered_bytes + final_payload.len() as u64
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::Deferred
     );
-    assert_eq!(vol.atomic_writes(), first_writes + 1);
+    write_fat_link(&mut vol, first, FAT32_EOC);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(!root.join("LATE.TXT").exists());
+
+    stamp_file_entry_only(&mut vol, 2, "LATE.TXT", 0x20, first, payload.len() as u32);
     assert_eq!(
-        vol.atomic_write_bytes(),
-        first_write_bytes + final_payload.len() as u64
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::Projected
     );
+    assert_eq!(std::fs::read(root.join("LATE.TXT")).unwrap(), payload);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn directory_and_data_before_fat_project_when_the_chain_becomes_valid() {
+    let (mut vol, root) = fresh_vol("directory_before_fat");
+    let first = vol.next_free + 1000;
+    let payload = b"chain arrives last\r\n";
+
+    stamp_file_entry_only(&mut vol, 2, "CHAIN.TXT", 0x20, first, payload.len() as u32);
+    assert_eq!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::Deferred
+    );
+    write_cluster_bytes(&mut vol, first, payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(!root.join("CHAIN.TXT").exists());
+
+    write_fat_link(&mut vol, first, FAT32_EOC);
+    assert_eq!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::Projected
+    );
+    assert_eq!(std::fs::read(root.join("CHAIN.TXT")).unwrap(), payload);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn nested_create_rename_and_delete_are_live_at_command_boundaries() {
+    let (mut vol, root) = fresh_vol("nested_live_lifecycle");
+    let sub = make_subdir(&mut vol, 2, "SUB");
+    let first = sub + 1000;
+    stamp_file(&mut vol, sub, "OLD.TXT", 0x20, first, b"nested\r\n");
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        std::fs::read(root.join("SUB").join("OLD.TXT")).unwrap(),
+        b"nested\r\n"
+    );
+
+    rename_entry(&mut vol, sub, "OLD.TXT", "NEW.TXT");
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(!root.join("SUB").join("OLD.TXT").exists());
+    assert!(root.join("SUB").join("NEW.TXT").exists());
+
+    delete_entry(&mut vol, sub, "NEW.TXT");
+    free_chain(&mut vol, first);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(!root.join("SUB").join("NEW.TXT").exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn truncate_and_fragmented_growth_reach_the_host_at_command_boundaries() {
+    let (mut vol, root) = fresh_vol("truncate_fragmented_live");
+    let first = vol.next_free + 1000;
+    let second = first + 7;
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    let initial = vec![0x21; 1000];
+    stamp_file(&mut vol, 2, "FRAG.BIN", 0x20, first, &initial);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+
+    update_file_size(&mut vol, 2, b"FRAG    BIN", 73);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        std::fs::read(root.join("FRAG.BIN")).unwrap(),
+        &initial[..73]
+    );
+
+    let mut payload = vec![0x31; cluster_bytes];
+    payload.extend(vec![0x42; 37]);
+    write_cluster_bytes(&mut vol, first, &payload[..cluster_bytes]);
+    write_cluster_bytes(&mut vol, second, &payload[cluster_bytes..]);
+    write_fat_link(&mut vol, first, second);
+    write_fat_link(&mut vol, second, FAT32_EOC);
+    update_file_size(&mut vol, 2, b"FRAG    BIN", payload.len() as u32);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(std::fs::read(root.join("FRAG.BIN")).unwrap(), payload);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+#[ignore = "host performance acceptance; run alone with --release"]
+fn sequential_17_3_mib_install_projects_without_spill_at_udma2_rate() {
+    const INSTALL_BYTES: usize = 18_125_725;
+    const COMMAND_SECTORS: usize = 256;
+    const UDMA2_BYTES_PER_SECOND: f64 = 33_300_000.0;
+
+    let (mut vol, root) = fresh_vol("installer_17m");
+    let first = vol.next_free + 1000;
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    let clusters = INSTALL_BYTES.div_ceil(cluster_bytes) as u32;
+    for index in 0..clusters {
+        let cluster = first + index;
+        let next = if index + 1 == clusters {
+            crate::fat32::FAT32_EOC
+        } else {
+            cluster + 1
+        };
+        let byte = cluster as usize * 4;
+        let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let mut sector = vol.read_sector(lba);
+        let offset = byte % SECTOR;
+        sector[offset..offset + 4].copy_from_slice(&(next & 0x0FFF_FFFF).to_le_bytes());
+        vol.write_sector(lba, &sector);
+    }
+    stamp_file_entry_only(&mut vol, 2, "BANANA.DAT", 0x20, first, 0);
+    assert_ne!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::HostIoFailure
+    );
+    assert!(
+        root.join("BANANA.DAT").exists(),
+        "the file appears before data arrives"
+    );
+
+    let sectors = INSTALL_BYTES.div_ceil(SECTOR);
+    for command_start in (0..sectors).step_by(COMMAND_SECTORS) {
+        let command_end = (command_start + COMMAND_SECTORS).min(sectors);
+        for sector_index in command_start..command_end {
+            let mut sector = [0u8; SECTOR];
+            let byte_start = sector_index * SECTOR;
+            let valid = (INSTALL_BYTES - byte_start).min(SECTOR);
+            for (index, byte) in sector[..valid].iter_mut().enumerate() {
+                *byte = ((byte_start + index) % 251) as u8;
+            }
+            let cluster_index = sector_index / usize::from(vol.geo.spc);
+            let sector_in_cluster = sector_index % usize::from(vol.geo.spc);
+            let lba = vol.cluster_to_lba(first + cluster_index as u32) + sector_in_cluster as u32;
+            vol.write_sector(lba, &sector);
+        }
+        assert_ne!(
+            vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+            CommitGuestWriteResult::HostIoFailure
+        );
+    }
+
+    let dir_lba = vol.cluster_to_lba(2);
+    let mut directory = vol.read_sector(dir_lba);
+    let slot = (0..16)
+        .map(|index| index * 32)
+        .find(|&offset| &directory[offset..offset + 11] == b"BANANA  DAT")
+        .unwrap();
+    directory[slot + 28..slot + 32].copy_from_slice(&(INSTALL_BYTES as u32).to_le_bytes());
+    vol.write_sector(dir_lba, &directory);
+    assert_ne!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::HostIoFailure
+    );
+
+    let counters = vol.storage_counters();
+    assert_eq!(
+        counters.spill_operations, 0,
+        "a mapped sequential install must not spill"
+    );
+    assert_eq!(counters.spill_bytes, 0);
+    assert_eq!(counters.pending_unmapped_sectors, 0);
+    let last_sector_index = sectors - 1;
+    let last_cluster_index = last_sector_index / usize::from(vol.geo.spc);
+    let last_sector_in_cluster = last_sector_index % usize::from(vol.geo.spc);
+    let last_lba =
+        vol.cluster_to_lba(first + last_cluster_index as u32) + last_sector_in_cluster as u32;
+    assert!(!vol.store.is_pending(last_lba));
+    let rate =
+        counters.projection_bytes as f64 / (counters.projection_wall_ns as f64 / 1_000_000_000.0);
+    println!(
+        "katea projection throughput: {:.1} MiB/s",
+        rate / 1_048_576.0
+    );
+    assert!(
+        rate >= UDMA2_BYTES_PER_SECOND,
+        "projection rate {rate:.1} B/s is below UDMA2"
+    );
+
+    let host = std::fs::read(root.join("BANANA.DAT")).unwrap();
+    assert_eq!(host.len(), INSTALL_BYTES);
+    assert!(
+        host.iter()
+            .enumerate()
+            .all(|(index, byte)| *byte == (index % 251) as u8),
+        "guest and host payloads differ"
+    );
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn host_write_failure_reports_an_error_and_retains_data_for_retry() {
+    let (mut vol, root) = fresh_vol("host_write_failure");
+    let first = vol.next_free + 1000;
+    let payload = b"retry survives host failure\r\n";
+    stamp_file(&mut vol, 2, "BLOCK.DAT", 0x20, first, payload);
+    std::fs::create_dir(root.join("BLOCK.DAT")).unwrap();
+
+    assert_eq!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::HostIoFailure
+    );
+    let failed = vol.storage_counters();
+    assert!(failed.host_write_failures > 0);
+    assert!(
+        failed.overlay_pending_sectors > 0,
+        "failed payload must remain retryable"
+    );
+
+    std::fs::remove_dir(root.join("BLOCK.DAT")).unwrap();
+    let dir_lba = vol.cluster_to_lba(2);
+    let directory = vol.read_sector(dir_lba);
+    vol.write_sector(dir_lba, &directory);
+    assert_ne!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::HostIoFailure
+    );
+    assert_eq!(std::fs::read(root.join("BLOCK.DAT")).unwrap(), payload);
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn ambiguous_cluster_ownership_is_safely_deferred() {
+    let (mut vol, root) = fresh_vol("ambiguous_owner");
+    let first = vol.next_free + 1000;
+    let payload = b"one chain cannot own two files";
+    stamp_file(&mut vol, 2, "FIRST.DAT", 0x20, first, payload);
+    stamp_file_entry_only(&mut vol, 2, "SECOND.DAT", 0x20, first, payload.len() as u32);
+
+    assert_eq!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::Deferred
+    );
+    assert!(!root.join("FIRST.DAT").exists());
+    assert!(!root.join("SECOND.DAT").exists());
+    assert!(vol.storage_counters().overlay_pending_sectors > 0);
+    drop(vol);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1212,12 +1504,12 @@ fn reconcile_moves_a_host_file_into_a_subdir() {
     let sub_fc = vol.tree().root.subdirs[0].dir.first_cluster;
     let free = vol.next_free;
     stamp_file(&mut vol, 2, "M.TXT", 0x20, free, b"moved\r\n");
-    vol.reconcile();
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
     assert!(root.join("M.TXT").exists());
     // Move M.TXT from root into SUB: 0xE5 in root, fresh entry in SUB, same cluster.
     delete_entry(&mut vol, 2, "M.TXT");
     stamp_file_entry_only(&mut vol, sub_fc, "M.TXT", 0x20, free, 6);
-    vol.reconcile();
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
     assert!(!root.join("M.TXT").exists(), "gone from root");
     assert_eq!(
         std::fs::read(root.join("SUB").join("M.TXT")).unwrap(),
@@ -2052,4 +2344,97 @@ fn the_region_census_is_silent_until_armed_and_counts_after() {
         "the directory read and the free-space read counted"
     );
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_stale_directory_size_must_not_truncate_already_projected_bytes() {
+    // DOS writes the FAT and the payload while the directory entry still carries
+    // the size the file had at create time (0). Any unrelated directory write in
+    // the same pass makes the reconcile stream this file against that stale size.
+    let (mut vol, root) = fresh_vol("stale_dir_size_truncate");
+    let first = vol.next_free + 1000;
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    let payload: Vec<u8> = (0..cluster_bytes).map(|i| (i % 251) as u8).collect();
+
+    write_fat_link(&mut vol, first, FAT32_EOC);
+    stamp_file_entry_only(&mut vol, 2, "STALE.BIN", 0x20, first, 0);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(root.join("STALE.BIN").exists(), "empty file appears first");
+
+    write_cluster_bytes(&mut vol, first, &payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        std::fs::read(root.join("STALE.BIN")).unwrap(),
+        payload,
+        "the payload streamed to the host"
+    );
+
+    // An unrelated directory write: same bytes back, which is what a timestamp or
+    // a sibling entry update looks like to the projection layer.
+    let dir_lba = vol.cluster_to_lba(2);
+    let directory = vol.read_sector(dir_lba);
+    vol.write_sector(dir_lba, &directory);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        std::fs::read(root.join("STALE.BIN")).unwrap(),
+        payload,
+        "a stale directory size must not discard projected payload"
+    );
+
+    // Close: the guest finally publishes the real size.
+    update_file_size(&mut vol, 2, b"STALE   BIN", payload.len() as u32);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    vol.reconcile();
+    assert_eq!(
+        std::fs::read(root.join("STALE.BIN")).unwrap(),
+        payload,
+        "the closed file must hold the guest payload, not zeros"
+    );
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+#[cfg(windows)]
+fn a_guest_file_named_for_a_win32_device_becomes_a_real_host_file() {
+    // Win32 resolves CON in every directory, so a bare decode_83 would open the
+    // console: the payload would go to a terminal and read back as nothing.
+    let (mut vol, root) = fresh_vol("win32_device_name");
+    let first = vol.next_free + 1000;
+    let payload = b"not the console\r\n";
+    stamp_file(&mut vol, 2, "CON", 0x20, first, payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+
+    assert_eq!(
+        std::fs::read(root.join("CON+")).unwrap(),
+        payload,
+        "the guest's CON is a real file under an escaped name"
+    );
+
+    // The rule covers the name followed by any extension: NUL.TXT is NUL.
+    let second = first + 8;
+    stamp_file(&mut vol, 2, "NUL.TXT", 0x20, second, payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(std::fs::read(root.join("NUL+.TXT")).unwrap(), payload);
+
+    // An ordinary name that merely starts with a device name is untouched.
+    let third = second + 8;
+    stamp_file(&mut vol, 2, "CONFIG.SY_", 0x20, third, payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(std::fs::read(root.join("CONFIG.SY_")).unwrap(), payload);
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+#[cfg(windows)]
+fn the_device_name_guard_maps_stems_and_extensions_case_insensitively() {
+    assert_eq!(host_child_name(b"CON        "), "CON+");
+    assert_eq!(host_child_name(b"con        "), "con+");
+    assert_eq!(host_child_name(b"NUL     TXT"), "NUL+.TXT");
+    assert_eq!(host_child_name(b"LPT1    DAT"), "LPT1+.DAT");
+    assert_eq!(host_child_name(b"COM9       "), "COM9+");
+    // Not reserved: a longer stem, and a device name only in the extension.
+    assert_eq!(host_child_name(b"CONS       "), "CONS");
+    assert_eq!(host_child_name(b"README  CON"), "README.CON");
 }

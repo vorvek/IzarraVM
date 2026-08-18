@@ -365,6 +365,27 @@ fn host_folder_disk(tag: &str) -> (AtaDisk, std::path::PathBuf) {
     (AtaDisk::from_host_folder(vol), dir)
 }
 
+fn root_file_lba(disk: &AtaDisk, name: &[u8; 11]) -> u32 {
+    let part_start = crate::katea_volume::PART_START;
+    let vbr = disk.read_lba(part_start).unwrap();
+    let spc = u32::from(vbr[0x0D]);
+    let reserved = u32::from(u16::from_le_bytes([vbr[0x0E], vbr[0x0F]]));
+    let fats = u32::from(vbr[0x10]);
+    let fatsz = u32::from_le_bytes([vbr[0x24], vbr[0x25], vbr[0x26], vbr[0x27]]);
+    let root_cluster = u32::from_le_bytes([vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F]]);
+    let data_start = part_start + reserved + fats * fatsz;
+    let root = disk
+        .read_lba(data_start + (root_cluster - 2) * spc)
+        .unwrap();
+    let slot = (0..16)
+        .map(|index| index * 32)
+        .find(|&offset| &root[offset..offset + 11] == name)
+        .unwrap();
+    let first_cluster = (u32::from(u16::from_le_bytes([root[slot + 20], root[slot + 21]])) << 16)
+        | u32::from(u16::from_le_bytes([root[slot + 26], root[slot + 27]]));
+    data_start + (first_cluster - 2) * spc
+}
+
 #[test]
 fn host_folder_write_lands_in_the_overlay_and_reads_back() {
     let (mut disk, dir) = host_folder_disk("rw");
@@ -378,5 +399,143 @@ fn host_folder_write_lands_in_the_overlay_and_reads_back() {
     let back = disk.read_lba(lba).expect("in range");
     assert_eq!(back[0], 0x77);
     assert_eq!(back[SECTOR - 1], 0x88);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pio_command_projects_to_the_host_before_flush() {
+    let (mut disk, dir) = host_folder_disk("pio_live");
+    let lba = root_file_lba(&disk, b"A       TXT");
+    let mut sector = disk.read_lba(lba).unwrap();
+    sector[..2].copy_from_slice(b"PI");
+
+    program_lba(&mut disk, lba, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x30);
+    advance_to_deadline(&mut disk);
+    for byte in sector {
+        disk.write_port(PRIMARY_CMD_BASE, byte);
+    }
+    advance_to_deadline(&mut disk);
+
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"PI");
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.pio_write_commands, 1);
+    assert_eq!(counters.pio_write_sectors, 1);
+    assert_eq!(counters.pio_write_wait_ticks, pio_transfer_ticks(1));
+    drop(disk);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pio_read_reports_its_guest_visible_wait() {
+    let (mut disk, dir) = host_folder_disk("pio_read_timing");
+    let lba = root_file_lba(&disk, b"A       TXT");
+
+    program_lba(&mut disk, lba, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x20);
+    advance_to_deadline(&mut disk);
+    for _ in 0..SECTOR {
+        disk.read_port(PRIMARY_CMD_BASE).unwrap();
+    }
+
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.pio_read_commands, 1);
+    assert_eq!(counters.pio_read_sectors, 1);
+    assert_eq!(counters.pio_read_wait_ticks, pio_transfer_ticks(1));
+    drop(disk);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dma_command_projects_to_the_host_before_flush() {
+    let (mut disk, dir) = host_folder_disk("dma_live");
+    let lba = root_file_lba(&disk, b"A       TXT");
+    disk.write_port(PRIMARY_CMD_BASE + 1, 0x03);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 0x42);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xEF);
+    advance_to_deadline(&mut disk);
+
+    program_lba(&mut disk, lba, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xCA);
+    let wait_ticks = dma_transfer_ticks(disk.pending_dma().unwrap());
+    let mut sector = disk.read_lba(lba).unwrap();
+    sector[..2].copy_from_slice(b"DM");
+    assert!(disk.complete_dma_write(&sector));
+
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"DM");
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.dma_write_commands, 1);
+    assert_eq!(counters.dma_write_sectors, 1);
+    assert_eq!(counters.dma_write_wait_ticks, wait_ticks);
+    drop(disk);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dma_read_reports_its_guest_visible_wait() {
+    let (mut disk, dir) = host_folder_disk("dma_read_timing");
+    let lba = root_file_lba(&disk, b"A       TXT");
+    disk.write_port(PRIMARY_CMD_BASE + 1, 0x03);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 0x42);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xEF);
+    advance_to_deadline(&mut disk);
+
+    program_lba(&mut disk, lba, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xC8);
+    let wait_ticks = dma_transfer_ticks(disk.pending_dma().unwrap());
+    let payload = disk.read_dma_payload().unwrap();
+    disk.complete_dma_read(payload.len());
+
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.dma_read_commands, 1);
+    assert_eq!(counters.dma_read_sectors, 1);
+    assert_eq!(counters.dma_read_wait_ticks, wait_ticks);
+    drop(disk);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn flush_cache_projects_pending_data_without_counting_a_write_command() {
+    let (mut disk, dir) = host_folder_disk("flush_cache");
+    let lba = root_file_lba(&disk, b"A       TXT");
+    let mut sector = disk.read_lba(lba).unwrap();
+    sector[..2].copy_from_slice(b"FC");
+    assert!(disk.write_lba(lba, &sector));
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"hi");
+
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xE7);
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.status & status::ERR, 0);
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"FC");
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.pio_write_commands, 0);
+    assert!(counters.projection_operations > 0);
+    drop(disk);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pio_host_failure_aborts_the_guest_command_and_retains_the_overlay() {
+    let (mut disk, dir) = host_folder_disk("pio_failure");
+    let lba = root_file_lba(&disk, b"A       TXT");
+    std::fs::remove_file(dir.join("A.TXT")).unwrap();
+    std::fs::create_dir(dir.join("A.TXT")).unwrap();
+
+    program_lba(&mut disk, lba, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x30);
+    advance_to_deadline(&mut disk);
+    for byte in [0x66; SECTOR] {
+        disk.write_port(PRIMARY_CMD_BASE, byte);
+    }
+    advance_to_deadline(&mut disk);
+
+    assert_eq!(disk.status & status::ERR, status::ERR);
+    assert_eq!(disk.error, error::ABRT);
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.pio_write_commands, 1);
+    assert_eq!(counters.pio_write_sectors, 1);
+    assert!(counters.overlay_pending_sectors > 0);
+    assert!(counters.host_write_failures > 0);
+    drop(disk);
     std::fs::remove_dir_all(&dir).ok();
 }
