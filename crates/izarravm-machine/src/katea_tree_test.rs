@@ -2345,3 +2345,51 @@ fn the_region_census_is_silent_until_armed_and_counts_after() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn a_stale_directory_size_must_not_truncate_already_projected_bytes() {
+    // DOS writes the FAT and the payload while the directory entry still carries
+    // the size the file had at create time (0). Any unrelated directory write in
+    // the same pass makes the reconcile stream this file against that stale size.
+    let (mut vol, root) = fresh_vol("stale_dir_size_truncate");
+    let first = vol.next_free + 1000;
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    let payload: Vec<u8> = (0..cluster_bytes).map(|i| (i % 251) as u8).collect();
+
+    write_fat_link(&mut vol, first, FAT32_EOC);
+    stamp_file_entry_only(&mut vol, 2, "STALE.BIN", 0x20, first, 0);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(root.join("STALE.BIN").exists(), "empty file appears first");
+
+    write_cluster_bytes(&mut vol, first, &payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        std::fs::read(root.join("STALE.BIN")).unwrap(),
+        payload,
+        "the payload streamed to the host"
+    );
+
+    // An unrelated directory write: same bytes back, which is what a timestamp or
+    // a sibling entry update looks like to the projection layer.
+    let dir_lba = vol.cluster_to_lba(2);
+    let directory = vol.read_sector(dir_lba);
+    vol.write_sector(dir_lba, &directory);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        std::fs::read(root.join("STALE.BIN")).unwrap(),
+        payload,
+        "a stale directory size must not discard projected payload"
+    );
+
+    // Close: the guest finally publishes the real size.
+    update_file_size(&mut vol, 2, b"STALE   BIN", payload.len() as u32);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    vol.reconcile();
+    assert_eq!(
+        std::fs::read(root.join("STALE.BIN")).unwrap(),
+        payload,
+        "the closed file must hold the guest payload, not zeros"
+    );
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}

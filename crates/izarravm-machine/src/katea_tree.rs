@@ -30,6 +30,10 @@ use std::path::{Path, PathBuf};
 /// also roughly the depth DOS's 64-char path limit allows.
 const MAX_DEPTH: usize = 32;
 
+/// Cap on cached open host write handles. A guest writes one or two files at a
+/// time; this is only large enough that a normal working set never evicts.
+const MAX_HOST_WRITE_HANDLES: usize = 64;
+
 /// Floor on the synthesized partition, in sectors: 532,481, which is exactly one
 /// sector past where fatgen103's `DskTableFAT32` leaves 512-byte clusters behind
 /// for 4 KiB ones. Every derived volume is at least this big, so every derived
@@ -974,6 +978,13 @@ struct ProjectedFile {
     path: PathBuf,
     size: u32,
     chain: Vec<u32>,
+    /// Payload has been projected past the size the guest's directory entry last
+    /// declared. DOS writes clusters long before it publishes the closing size,
+    /// so while this is set the entry's size is stale by construction and must
+    /// never be used to shorten the host file: the bytes past it have already
+    /// been acknowledged out of the store and exist nowhere else. Cleared as
+    /// soon as a directory entry catches up to (or past) the projected extent.
+    extended_past_directory: bool,
 }
 
 struct PendingStream {
@@ -1112,6 +1123,7 @@ impl KateaTreeVolume {
                             path: path.clone(),
                             size: u32::try_from(f.source.len()).unwrap_or(u32::MAX),
                             chain,
+                            extended_past_directory: false,
                         },
                     );
                 }
@@ -1359,6 +1371,7 @@ impl KateaTreeVolume {
         path: PathBuf,
         size: u32,
         chain: Vec<u32>,
+        extended_past_directory: bool,
     ) {
         self.blocked_projection_keys.remove(&key);
         if let Some(old) = self.projected_files.remove(&key) {
@@ -1375,8 +1388,15 @@ impl KateaTreeVolume {
         for (index, &cluster) in chain.iter().enumerate() {
             self.projected_clusters.insert(cluster, (key, index as u32));
         }
-        self.projected_files
-            .insert(key, ProjectedFile { path, size, chain });
+        self.projected_files.insert(
+            key,
+            ProjectedFile {
+                path,
+                size,
+                chain,
+                extended_past_directory,
+            },
+        );
     }
 
     fn remove_projection(&mut self, key: (u32, [u8; 11])) {
@@ -1395,8 +1415,42 @@ impl KateaTreeVolume {
         }
     }
 
-    fn stream_file_overlay(&mut self, pending: PendingStream) -> std::io::Result<()> {
+    fn stream_file_overlay(&mut self, mut pending: PendingStream) -> std::io::Result<()> {
         let spc = u32::from(self.geo.spc);
+        // `set_len` marks a size that came from the guest's directory entry; a
+        // streamed batch carries the extent its own writes reached instead.
+        // Reconcile the two before a byte moves, because the entry can be
+        // arbitrarily stale: DOS publishes the closing size last, so a directory
+        // write for any sibling entry drags this file through reconcile against
+        // a size from before its payload existed. Truncating to that size would
+        // destroy payload already acknowledged out of the store, and a later
+        // size update would then extend the file with zeros -- guest-visible
+        // loss with no way back. Deliberate truncation still lands: it arrives
+        // as a *changed* entry size while the projection is not extended.
+        let existing = self
+            .projected_files
+            .get(&pending.key)
+            .map(|file| (file.size, file.extended_past_directory));
+        let mut set_len = pending.set_len;
+        // Compare at sector granularity. A streamed extent is rounded up to the
+        // sector that carried it, so a closing size inside that last sector is
+        // the entry catching up, not a shrink -- only a size that would drop a
+        // whole acknowledged sector is the stale-entry case.
+        let declared_sectors = u64::from(pending.size).div_ceil(SECTOR as u64) * SECTOR as u64;
+        let extended_past_directory = match existing {
+            Some((existing_size, true))
+                if pending.set_len && declared_sectors < u64::from(existing_size) =>
+            {
+                pending.size = existing_size;
+                set_len = false;
+                true
+            }
+            _ if pending.set_len => false,
+            Some((existing_size, existing_extended)) => {
+                existing_extended || pending.size > existing_size
+            }
+            None => false,
+        };
         let mut spans: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut acknowledged = Vec::new();
         let positions = match pending.sectors.as_ref() {
@@ -1442,6 +1496,17 @@ impl KateaTreeVolume {
             }
         }
 
+        // The handle cache exists to spare a reopen per command on the file
+        // being written, which is one or two files at a time. Without a cap a
+        // session that touches thousands of files holds a descriptor for every
+        // one of them until eject, so drop the whole cache once it grows past
+        // any plausible working set. Closing is the only thing lost: every
+        // handle is unbuffered, so nothing is pending inside one.
+        if self.host_write_handles.len() >= MAX_HOST_WRITE_HANDLES
+            && !self.host_write_handles.contains_key(&pending.path)
+        {
+            self.host_write_handles.clear();
+        }
         let file = match self.host_write_handles.entry(pending.path.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
@@ -1457,7 +1522,7 @@ impl KateaTreeVolume {
             file.seek(SeekFrom::Start(*offset))?;
             file.write_all(bytes)?;
         }
-        if pending.set_len {
+        if set_len {
             file.set_len(u64::from(pending.size))?;
         }
 
@@ -1468,7 +1533,7 @@ impl KateaTreeVolume {
         let mut counters = self.counters.get();
         counters.projection_operations = counters
             .projection_operations
-            .saturating_add(spans.len() as u64 + u64::from(pending.set_len));
+            .saturating_add(spans.len() as u64 + u64::from(set_len));
         counters.projection_bytes = counters.projection_bytes.saturating_add(bytes);
         self.counters.set(counters);
 
@@ -1480,6 +1545,7 @@ impl KateaTreeVolume {
             pending.path.clone(),
             pending.size,
             pending.chain,
+            extended_past_directory,
         );
         self.mirrored.insert(
             pending.key,
@@ -1575,15 +1641,25 @@ impl KateaTreeVolume {
         if self.fat_dirty_clusters.is_empty() {
             return;
         }
-        let affected: Vec<_> = self
-            .projected_files
+        // Ask the reverse index which projections own a dirtied cluster rather
+        // than rescanning every projected chain. The two select the same keys --
+        // `projected_clusters` holds exactly the clusters of every projected
+        // chain -- but scanning cost the total cluster count of the whole mount
+        // on every command that touched the FAT, which is most commands of a
+        // sequential install.
+        let affected_keys: HashSet<(u32, [u8; 11])> = self
+            .fat_dirty_clusters
             .iter()
-            .filter(|(_, file)| {
-                file.chain
-                    .iter()
-                    .any(|cluster| self.fat_dirty_clusters.contains(cluster))
+            .filter_map(|cluster| self.projected_clusters.get(cluster))
+            .map(|(key, _)| *key)
+            .collect();
+        let affected: Vec<_> = affected_keys
+            .into_iter()
+            .filter_map(|key| {
+                self.projected_files
+                    .get(&key)
+                    .map(|file| (key, file.clone()))
             })
-            .map(|(key, file)| (*key, file.clone()))
             .collect();
         for (key, file) in affected {
             let first = file.chain.first().copied().unwrap_or(0);
@@ -1611,7 +1687,13 @@ impl KateaTreeVolume {
                 self.blocked_projection_keys.extend(conflicts);
                 continue;
             }
-            self.install_projection(key, file.path, file.size, chain);
+            self.install_projection(
+                key,
+                file.path,
+                file.size,
+                chain,
+                file.extended_past_directory,
+            );
         }
     }
 
@@ -2088,6 +2170,7 @@ impl KateaTreeVolume {
                     r.new_path.clone(),
                     projected.size,
                     projected.chain,
+                    projected.extended_past_directory,
                 );
             }
             self.mirrored.remove(&r.old_key);
@@ -2445,6 +2528,9 @@ impl KateaTreeVolume {
                             w.path.clone(),
                             w.gather.size,
                             w.chain.clone(),
+                            // A whole-file rewrite from the guest's own declared
+                            // size: the host file now matches the entry exactly.
+                            false,
                         );
                         self.mirrored.insert(
                             w.key,
