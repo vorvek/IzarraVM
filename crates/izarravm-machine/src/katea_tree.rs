@@ -34,6 +34,58 @@ const MAX_DEPTH: usize = 32;
 /// time; this is only large enough that a normal working set never evicts.
 const MAX_HOST_WRITE_HANDLES: usize = 64;
 
+/// DOS device names Win32 still resolves as character devices. Per Microsoft's
+/// "Naming Files, Paths, and Namespaces", these are reserved *in every
+/// directory* -- `C:\mount\CON` is the console, not a file -- and the rule
+/// applies to the name followed by any extension as well, so `NUL.TXT` is also
+/// `NUL`. Matching is case-insensitive. COM0 and LPT0 are on Microsoft's
+/// current list and cost nothing to include.
+#[cfg(windows)]
+const WIN32_RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+    "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// The suffix that lifts a guest name off a Win32 device name. `+` is legal in a
+/// Win32 file name and illegal in an 8.3 short name -- `fat_name::is_legal_83`
+/// excludes it and `katea_write::classify` now rejects it -- so no name the
+/// guest can write ever folds onto a mangled one. That is what keeps a guest
+/// that creates both `CON` and some other name from having them collide on one
+/// host file.
+#[cfg(windows)]
+const DEVICE_NAME_ESCAPE: char = '+';
+
+/// The host file name for one guest 8.3 name. Everywhere a host path is derived
+/// from guest directory bytes goes through here.
+///
+/// On Windows a bare `decode_83` would hand `OpenOptions::open` a device path
+/// for a guest file called CON or NUL: the open succeeds against the console or
+/// the null device, so the guest's bytes go to a terminal or vanish, and its
+/// reads come back as zeros. The guard belongs here rather than in `classify`
+/// because rejecting the *entry* would read as "this file disappeared" and
+/// delete a real host file of that name -- which a non-Windows host can hold
+/// perfectly well. So non-Windows keeps `decode_83` verbatim.
+fn host_child_name(name: &[u8; 11]) -> String {
+    let decoded = crate::katea_volume::decode_83(name);
+    #[cfg(windows)]
+    {
+        let (stem, ext) = match decoded.split_once('.') {
+            Some((stem, ext)) => (stem, Some(ext)),
+            None => (decoded.as_str(), None),
+        };
+        if WIN32_RESERVED_DEVICE_NAMES
+            .iter()
+            .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        {
+            return match ext {
+                Some(ext) => format!("{stem}{DEVICE_NAME_ESCAPE}.{ext}"),
+                None => format!("{stem}{DEVICE_NAME_ESCAPE}"),
+            };
+        }
+    }
+    decoded
+}
+
 /// Floor on the synthesized partition, in sectors: 532,481, which is exactly one
 /// sector past where fatgen103's `DskTableFAT32` leaves 512-byte clusters behind
 /// for 4 KiB ones. Every derived volume is at least this big, so every derived
@@ -2125,7 +2177,7 @@ impl KateaTreeVolume {
                 if fresh.len() == 1 {
                     let &(ndir, nname, _) = fresh[0];
                     if let Some(host_dir) = self.dir_paths.get(&ndir).cloned() {
-                        let new_path = host_dir.join(crate::katea_volume::decode_83(&nname));
+                        let new_path = host_dir.join(host_child_name(&nname));
                         renames.push(PendingRename {
                             old_key: *key,
                             new_key: (ndir, nname),
@@ -2311,7 +2363,7 @@ impl KateaTreeVolume {
                         if handled.contains(&(dir_cluster, name)) {
                             continue; // already renamed in phase 2 (symmetry with MakeFile)
                         }
-                        let path = host_dir.join(crate::katea_volume::decode_83(&name));
+                        let path = host_dir.join(host_child_name(&name));
                         mkdirs.push((dir_cluster, name, first_cluster, path));
                     }
                     crate::katea_write::EntryAction::MakeFile {
@@ -2398,9 +2450,7 @@ impl KateaTreeVolume {
                                 .mirrored
                                 .get(&key)
                                 .map(|m| m.host_path.clone())
-                                .unwrap_or_else(|| {
-                                    host_dir.join(crate::katea_volume::decode_83(&name))
-                                });
+                                .unwrap_or_else(|| host_dir.join(host_child_name(&name)));
                             streams.push(PendingStream {
                                 path,
                                 key,
@@ -2473,9 +2523,7 @@ impl KateaTreeVolume {
                             .mirrored
                             .get(&(dir_cluster, name))
                             .map(|m| m.host_path.clone())
-                            .unwrap_or_else(|| {
-                                host_dir.join(crate::katea_volume::decode_83(&name))
-                            });
+                            .unwrap_or_else(|| host_dir.join(host_child_name(&name)));
                         writes.push(PendingWrite {
                             path: host_path,
                             data,

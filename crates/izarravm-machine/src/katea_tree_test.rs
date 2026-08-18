@@ -2393,3 +2393,48 @@ fn a_stale_directory_size_must_not_truncate_already_projected_bytes() {
     drop(vol);
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+#[cfg(windows)]
+fn a_guest_file_named_for_a_win32_device_becomes_a_real_host_file() {
+    // Win32 resolves CON in every directory, so a bare decode_83 would open the
+    // console: the payload would go to a terminal and read back as nothing.
+    let (mut vol, root) = fresh_vol("win32_device_name");
+    let first = vol.next_free + 1000;
+    let payload = b"not the console\r\n";
+    stamp_file(&mut vol, 2, "CON", 0x20, first, payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+
+    assert_eq!(
+        std::fs::read(root.join("CON+")).unwrap(),
+        payload,
+        "the guest's CON is a real file under an escaped name"
+    );
+
+    // The rule covers the name followed by any extension: NUL.TXT is NUL.
+    let second = first + 8;
+    stamp_file(&mut vol, 2, "NUL.TXT", 0x20, second, payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(std::fs::read(root.join("NUL+.TXT")).unwrap(), payload);
+
+    // An ordinary name that merely starts with a device name is untouched.
+    let third = second + 8;
+    stamp_file(&mut vol, 2, "CONFIG.SY_", 0x20, third, payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(std::fs::read(root.join("CONFIG.SY_")).unwrap(), payload);
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+#[cfg(windows)]
+fn the_device_name_guard_maps_stems_and_extensions_case_insensitively() {
+    assert_eq!(host_child_name(b"CON        "), "CON+");
+    assert_eq!(host_child_name(b"con        "), "con+");
+    assert_eq!(host_child_name(b"NUL     TXT"), "NUL+.TXT");
+    assert_eq!(host_child_name(b"LPT1    DAT"), "LPT1+.DAT");
+    assert_eq!(host_child_name(b"COM9       "), "COM9+");
+    // Not reserved: a longer stem, and a device name only in the extension.
+    assert_eq!(host_child_name(b"CONS       "), "CONS");
+    assert_eq!(host_child_name(b"README  CON"), "README.CON");
+}
