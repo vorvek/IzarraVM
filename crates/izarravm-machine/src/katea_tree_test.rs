@@ -2438,3 +2438,154 @@ fn the_device_name_guard_maps_stems_and_extensions_case_insensitively() {
     assert_eq!(host_child_name(b"CONS       "), "CONS");
     assert_eq!(host_child_name(b"README  CON"), "README.CON");
 }
+
+// --- item 2: the unmapped-sector cluster index ------------------------------
+
+/// Write `sectors` payload sectors starting at `first`, with no FAT chain and no
+/// directory entry, so nothing can project them.
+fn write_unprojectable(vol: &mut KateaTreeVolume, first: u32, sectors: usize, fill: u8) {
+    for index in 0..sectors {
+        let cluster_index = index / usize::from(vol.geo.spc);
+        let sector_in_cluster = index % usize::from(vol.geo.spc);
+        let lba = vol.cluster_to_lba(first + cluster_index as u32) + sector_in_cluster as u32;
+        vol.write_sector(lba, &[fill; SECTOR]);
+    }
+}
+
+#[test]
+fn a_commit_examines_only_the_clusters_it_touched() {
+    let (mut vol, root) = fresh_vol("unmapped_scope");
+    let spc = usize::from(vol.geo.spc);
+    let stale = vol.next_free + 1000;
+    // Four clusters of payload that nothing can map. They stay unmapped.
+    write_unprojectable(&mut vol, stale, spc * 4, 0x11);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        vol.storage_counters().pending_unmapped_sectors,
+        (spc * 4) as u64
+    );
+
+    // A later, unrelated command touches one cluster elsewhere. It must not walk
+    // the four stale clusters again: the whole point of indexing by cluster.
+    let other = stale + 64;
+    vol.reset_candidate_census();
+    write_unprojectable(&mut vol, other, spc, 0x22);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        vol.candidate_lbas_examined(),
+        spc as u64,
+        "a commit must examine its own cluster's sectors, not every unmapped sector ever written"
+    );
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn unmapped_sectors_reach_the_host_once_their_cluster_becomes_projectable() {
+    let (mut vol, root) = fresh_vol("unmapped_then_mapped");
+    let spc = usize::from(vol.geo.spc);
+    let cluster_bytes = spc * SECTOR;
+    let first = vol.next_free + 1000;
+    // Payload lands before the FAT chain and the directory entry exist.
+    let payload: Vec<u8> = (0..cluster_bytes * 2).map(|i| (i % 251) as u8).collect();
+    write_cluster_bytes(&mut vol, first, &payload);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(
+        vol.storage_counters().pending_unmapped_sectors,
+        (spc * 2) as u64,
+        "payload with no owner is held, not projected"
+    );
+
+    // Now the guest publishes the chain and the entry, exactly as DOS closes a file.
+    write_fat_link(&mut vol, first, first + 1);
+    write_fat_link(&mut vol, first + 1, FAT32_EOC);
+    stamp_file_entry_only(&mut vol, 2, "LATE.BIN", 0x20, first, payload.len() as u32);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    // The directory write forces a metadata pass, which streams the whole chain.
+    assert_eq!(std::fs::read(root.join("LATE.BIN")).unwrap(), payload);
+    assert_eq!(
+        vol.storage_counters().pending_unmapped_sectors,
+        0,
+        "projected payload must leave the unmapped index"
+    );
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_reused_cluster_projects_under_its_new_owner() {
+    let (mut vol, root) = fresh_vol("unmapped_cluster_reuse");
+    let spc = usize::from(vol.geo.spc);
+    let cluster_bytes = spc * SECTOR;
+    let first = vol.next_free + 1000;
+
+    // A file is created, then deleted and its chain freed: the cluster is free.
+    let stale = vec![0x41u8; cluster_bytes];
+    stamp_file(&mut vol, 2, "GONE.BIN", 0x20, first, &stale);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(root.join("GONE.BIN").exists());
+    delete_entry(&mut vol, 2, "GONE.BIN");
+    free_chain(&mut vol, first);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(!root.join("GONE.BIN").exists());
+
+    // A new file reuses the very same cluster. Its payload arrives first, with no
+    // owner, and only then the chain and the entry.
+    let fresh: Vec<u8> = (0..cluster_bytes).map(|i| (i % 97) as u8).collect();
+    write_cluster_bytes(&mut vol, first, &fresh);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    write_fat_link(&mut vol, first, FAT32_EOC);
+    stamp_file_entry_only(&mut vol, 2, "REUSE.BIN", 0x20, first, fresh.len() as u32);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+
+    assert_eq!(std::fs::read(root.join("REUSE.BIN")).unwrap(), fresh);
+    assert_eq!(vol.storage_counters().pending_unmapped_sectors, 0);
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The shape the cluster index exists for: guest payload that lands before
+/// anything can map it, command after command. Held sectors used to be swept in
+/// full on every commit, so the work grew with the square of what the session
+/// had written. Asserted on the sweep's own census rather than on wall, because
+/// the census is exactly what the index bounds and it is the same on every host.
+///
+/// Measured on the author's host at a393404e (flat set) against the index, min
+/// of three interleaved runs: 128 commands 102.1 ms -> 33.2 ms, and the sweep
+/// inside it 58.5 ms -> 1.6 ms.
+#[test]
+fn held_sectors_do_not_make_a_write_run_quadratic() {
+    const COMMAND_SECTORS: usize = 256;
+    let mut examined = Vec::new();
+    for commands in [16usize, 32, 64] {
+        let (mut vol, root) = fresh_vol(&format!("unmapped_growth_{commands}"));
+        let first = vol.next_free + 1000;
+        let spc = usize::from(vol.geo.spc);
+        vol.reset_candidate_census();
+        for command in 0..commands {
+            let base = first + (command * COMMAND_SECTORS / spc) as u32;
+            write_unprojectable(&mut vol, base, COMMAND_SECTORS, 0x77);
+            assert_ne!(
+                vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+                CommitGuestWriteResult::HostIoFailure
+            );
+        }
+        assert_eq!(
+            vol.storage_counters().pending_unmapped_sectors,
+            (commands * COMMAND_SECTORS) as u64,
+            "every unprojectable sector stays held, and the index counts it exactly once"
+        );
+        examined.push(vol.candidate_lbas_examined());
+        drop(vol);
+        std::fs::remove_dir_all(&root).ok();
+    }
+    // Linear: each run writes its own sectors once and revisits nobody else's.
+    for (index, commands) in [16usize, 32, 64].iter().enumerate() {
+        assert_eq!(
+            examined[index],
+            (commands * COMMAND_SECTORS) as u64,
+            "a run of {commands} commands examined {} candidate sectors",
+            examined[index]
+        );
+    }
+}
