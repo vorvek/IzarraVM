@@ -1730,6 +1730,14 @@ impl BlockCache {
             self.note_direct_link_cleared(index, slot, LinkClearCause::Flushed, target);
         }
         self.inbound.clear();
+        // Every edge is gone, so every CHAIN requirement those edges justified is gone with it.
+        // Monotonicity is a rule about a LIVE link graph; here there is none left, and the state
+        // written back is exactly what `install` would write, which is the array's only other
+        // writer. Without this a flushed block keeps demanding a segment nothing live reaches --
+        // safe, but permanently over-strict, and it would refuse precisely the class-B edges this
+        // mask exists to admit. Wholesale SMC and paging flushes make that the common case, not a
+        // corner. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
+        self.chain_layouts.copy_from_slice(&self.segment_layouts);
         self.waiting.clear();
         self.linear_blocks.clear();
         self.stats.unlinks += links;
@@ -2617,11 +2625,18 @@ impl BlockCache {
         // the merge it computes here IS the decision: on conflict this refuses with nothing
         // written, and on success the merged requirement is handed to `widen_chain_requirement`
         // AFTER the link is published. The propagation never re-decides this edge.
-        let chain_merge =
-            self.chain_layouts[source_index].link_merge(self.chain_layouts[target_index]);
-        let refusal = if self.block_link_epochs.get(source_index).copied() != Some(self.link_epoch)
-            || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch)
-        {
+        //
+        // Computed BEHIND the epoch test, not beside it. That is the same short-circuit the split
+        // if-chain preserves, and it is load-bearing twice over: a stale index's layout entry is
+        // not meaningful, and the epoch arm is a high-frequency refusal that must not start paying
+        // for a six-segment merge it never consults.
+        let stale_epoch = self.block_link_epochs.get(source_index).copied()
+            != Some(self.link_epoch)
+            || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch);
+        let chain_merge = (!stale_epoch)
+            .then(|| self.chain_layouts[source_index].link_merge(self.chain_layouts[target_index]))
+            .flatten();
+        let refusal = if stale_epoch {
             Some(LinkRefusal::StaleEpoch)
         } else if chain_merge.is_none() {
             Some(LinkRefusal::SegmentLayout)
@@ -2718,6 +2733,14 @@ impl BlockCache {
         let Some(source_index) = self.active_index(source) else {
             return;
         };
+        // ABOVE the no-change return, deliberately. Non-adoption is a property of every merge this
+        // function is ever handed, not only of the ones that widen something -- a merge that
+        // rewrote the block's descriptors while leaving the mask alone is exactly the silent
+        // failure this asserts against, and behind the return it would never be checked.
+        debug_assert_eq!(
+            self.chain_layouts[source_index].data, merged.data,
+            "the non-adopting merge never rewrites a block's own descriptors",
+        );
         if self.chain_layouts[source_index].used == merged.used {
             return;
         }
@@ -2725,10 +2748,6 @@ impl BlockCache {
             self.chain_layouts[source_index].used & merged.used,
             self.chain_layouts[source_index].used,
             "a chain requirement may only ever widen",
-        );
-        debug_assert_eq!(
-            self.chain_layouts[source_index].data, merged.data,
-            "the non-adopting merge never rewrites a block's own descriptors",
         );
         self.chain_layouts[source_index] = merged;
         let mut worklist = vec![source];
@@ -3162,9 +3181,15 @@ pub(crate) enum DirectKind {
     /// `MOV r16, Sreg` (0x8C, register destination). The selector is baked as a compile-time
     /// constant, which is sound because the block's `SegmentLayout` pins the whole descriptor:
     /// `run_direct_block` rejects any entry whose live copy differs (`cs_matches` for CS,
-    /// `data_matches` for the other five) and `SegmentLayout::link_compatible` requires equal
-    /// snapshots on both ends of every link, so no chained path reaches this slot under a
-    /// different selector.
+    /// `data_matches`/`all_data_matches` for the other five).
+    ///
+    /// A CHAINED path reaches this slot without an entry check of its own, and what covers that is
+    /// the `used` mask below, not any rule about equal snapshots -- links stopped requiring those
+    /// in the 2026-08-18 chain-used mask slice. Because `selector_segment` puts the segment in
+    /// `used`, it is in this block's chain requirement, and every edge on the path here had to
+    /// agree with that requirement (`SegmentLayout::link_merge`) or be refused. So no chained path
+    /// reaches this slot under a different selector, and a link made downstream that would break
+    /// the agreement cuts the inbound edge instead.
     ///
     /// For the five DATA segments that pinning is not automatic. `data_matches` SKIPS any
     /// segment outside the block's `used` mask, and that mask is derived from actual memory
@@ -6062,8 +6087,10 @@ fn compile_with_instruction_limit(
     // A block that overwrites a segment register publishes NO successors, static or dynamic.
     //
     // The argument this replaces was that such a block could not link anyway, because it exits
-    // with a different segment than it entered and `link_compatible` demands equal snapshots.
-    // That compares the wrong two things: `link_compatible` compares the two blocks'
+    // with a different segment than it entered and `SegmentLayout::link_compatible` demanded equal
+    // snapshots. (That method no longer exists: the chain-used mask replaced it with `link_merge`
+    // in 2026-08-18. The refutation below did not depend on it and stands unchanged.)
+    // That compares the wrong two things: the predicate compares the two blocks'
     // COMPILE-TIME ENTRY snapshots, and on the pass that compiles them the write is very often a
     // no-op -- `mov ds, ax` where AX already holds DS is the ordinary "reload DS with what it
     // has" case. The edge links, and then a LINKED successor runs no segment check at all: a

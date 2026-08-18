@@ -3423,6 +3423,17 @@ fn link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates() {
         cache.chain_layouts[middle_id.index()].used & segment_bit(SegmentIndex::Es),
         0
     );
+    // R-A's load-bearing claim: `unlink_outbound` does NOT re-park. A cut edge reverts to the zero
+    // portal and reports `StaticUnbound`; it must not join `waiting`, where `resolve_waiting`
+    // would retry it forever against a conflict the monotone widen can never undo.
+    assert!(
+        cache
+            .waiting
+            .values()
+            .flatten()
+            .all(|source| source.block != root_id),
+        "a ChainWiden cut must not re-park the source for an absorbing retry loop"
+    );
 }
 
 /// The mirror arm: same shape, but all three blocks hold the SAME ES descriptor. The widen then
@@ -3550,6 +3561,55 @@ fn link_mask_judges_a_new_predecessor_against_the_widened_requirement() {
         0,
         "a refusal is not a cut"
     );
+}
+
+/// A translation flush drops every edge while the blocks stay compiled, so the requirements those
+/// edges justified must go with them. Leaving a widened mask behind is monotone in the SAFE
+/// direction but permanently over-strict: the class-B edges this slice exists to admit would be
+/// refused for a segment nothing live reaches any more, and nothing ever narrows the mask again.
+///
+/// Sound because a flush leaves NO live edge to violate: the reset restores exactly the state
+/// `install` would have written, which is the only other writer of this array.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_forgets_chain_requirements_a_translation_flush_invalidated() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1210);
+    let tail = key(0x4_1220);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+    assert_eq!(cache.outbound[root_id.index()][0], Some(tail_id));
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "the row is vacuous unless the requirement really widened first"
+    );
+
+    cache.invalidate_translation();
+
+    assert!(cache.inbound.is_empty());
+    assert_eq!(cache.outbound[root_id.index()][0], None);
+    for index in [root_id.index(), tail_id.index()] {
+        assert_eq!(
+            cache.chain_layouts[index], cache.segment_layouts[index],
+            "a flush leaves no live edge, so no block may keep a widened requirement"
+        );
+    }
 }
 
 /// A recycled slot must not serve the retired occupant's WIDENED requirement to its successor.
