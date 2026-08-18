@@ -1410,7 +1410,56 @@ impl Machine {
                                 self.advance_halted_cpu_clocks(wake_step);
                             }
                             None => {
-                                let remaining = deadline_ticks - self.timeline.now_ticks();
+                                // Saturating because a batch can end PAST the
+                                // deadline, so `now > deadline` is a normal state
+                                // here, not a broken invariant. The batch was
+                                // granted `remaining_ticks` worth of clocks at
+                                // loop top, and four separate routes carry the
+                                // timeline beyond that grant:
+                                //   (a) `run_budgeted` always retires at least one
+                                //       instruction, so the last one straddles the
+                                //       budget;
+                                //   (b) the batch-entry `service_pending_interrupt`
+                                //       is charged before any cap test runs;
+                                //   (c) `isa_io_batch_clocks` joins the batch-end
+                                //       `step` without ever having been counted
+                                //       against the cap (`spent` is core plus
+                                //       in-batch bus only);
+                                //   (d) the grant itself rounds UP --
+                                //       `cpu_clocks_for_master_ticks_ceil(..).max(1)`
+                                //       -- so even a batch that spends exactly what
+                                //       it was granted lands up to
+                                //       `ticks_per_cpu_clock - 1` master ticks past
+                                //       the deadline (249 at the 386 quantum), with
+                                //       no instruction-level explanation at all.
+                                // The overshoot is small but NOT bounded by a
+                                // handful of clocks: measured at 3 clocks on the
+                                // 386 fixture (`tokaemm_real_if_never_zero_in_v86_
+                                // across_a_boot` hits it once per boot), while the
+                                // true bound is one instruction's core clocks plus
+                                // the batch's uncounted ISA charge -- `isa_io_clocks`
+                                // is `clock_hz / 1_000_000`, i.e. 166 clocks per ISA
+                                // access at the 586 persona, so an Approximate-class
+                                // batch can overshoot by hundreds.
+                                // `next_timer_wake` already clamps the same quantity
+                                // the same way, and it is exactly what returned None
+                                // here.
+                                //
+                                // Clamping to zero IS the semantic: `remaining`
+                                // exists only to stop the halted fast-forward
+                                // from running past the caller's deadline, and a
+                                // deadline already reached leaves zero halted
+                                // time to grant. `advance_halted_ticks(0)` is the
+                                // same no-op the exact-landing case already takes,
+                                // and the loop condition then ends the run. The
+                                // pending device edge is not lost -- the next run
+                                // call re-derives it.
+                                #[cfg(test)]
+                                if self.timeline.now_ticks() > deadline_ticks {
+                                    self.test_halt_deadline_clamps += 1;
+                                }
+                                let remaining =
+                                    deadline_ticks.saturating_sub(self.timeline.now_ticks());
                                 if let Some(ticks) = self.next_timed_io_deadline() {
                                     self.advance_halted_ticks(ticks.min(remaining));
                                 } else {
