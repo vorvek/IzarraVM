@@ -257,6 +257,60 @@ fn scanout_argb_decodes_32bpp_pixels() {
 }
 
 #[test]
+fn visible_writes_report_only_the_rows_that_changed() {
+    let mut margo = Margo::default();
+    assert!(margo.set_mode(0x101));
+    let settled = margo.content_generation();
+
+    margo.write_vram_u8(3 * 640 + 17, 0x2a);
+
+    assert_eq!(
+        margo.changed_rows_since(settled),
+        std::iter::once(3..4).collect::<Vec<_>>()
+    );
+    let changed = margo.content_generation();
+    margo.write_vram_u8(3 * 640 + 17, 0x2a);
+    assert_eq!(margo.content_generation(), changed);
+    assert!(margo.changed_rows_since(changed).is_empty());
+}
+
+/// A row-scoped scanout converts the named rows and touches nothing else, so a
+/// caller may hand it the frame it already holds. The rows outside the run keep
+/// a value the converter could never produce (`0x2a` maps to `0x0011_2233`, and
+/// every other index in this fixture maps to 0), so a converter that quietly
+/// rewrote the whole frame -- or resized it -- fails here.
+#[test]
+fn scanout_argb_rows_converts_only_the_named_rows() {
+    let mut palette = [0u32; 256];
+    palette[0x2a] = 0x0011_2233;
+    let mut margo = Margo::default();
+    assert!(margo.set_mode(0x101));
+    let mut argb = vec![0x00aa_55aa; 640 * 480];
+
+    margo.write_vram_u8(3 * 640 + 17, 0x2a);
+    let changed = 3..4;
+    margo.scanout_argb_rows(&palette, std::slice::from_ref(&changed), &mut argb);
+
+    assert_eq!(argb.len(), 640 * 480);
+    assert_eq!(argb[3 * 640 + 17], 0x0011_2233);
+    assert_eq!(
+        argb[3 * 640 + 18],
+        0,
+        "the rest of the named row IS converted"
+    );
+    assert_eq!(argb[2 * 640 + 17], 0x00aa_55aa);
+    assert_eq!(argb[4 * 640 + 17], 0x00aa_55aa);
+    assert!(
+        argb[..3 * 640].iter().all(|&word| word == 0x00aa_55aa),
+        "every row above the run is left exactly as the caller had it"
+    );
+    assert!(
+        argb[4 * 640..].iter().all(|&word| word == 0x00aa_55aa),
+        "and every row below it"
+    );
+}
+
+#[test]
 fn cursor_composites_the_four_and_xor_results() {
     let mut margo = Margo::default();
     margo.set_mode_640x480x8();

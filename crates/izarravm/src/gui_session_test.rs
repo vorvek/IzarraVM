@@ -894,6 +894,11 @@ fn runtime_profile_json_has_stable_fields_and_derived_values() {
         max_throttle_ahead_ticks: MASTER_CLOCK_HZ / 4,
         frames_produced: 7,
         frames_skipped: 2,
+        margo_lfb_direct_write_bytes: 123,
+        margo_scanout_rows_converted: 9,
+        presentation_upload_submit_wall_ns: 19,
+        presentation_upload_bytes: 456,
+        presentation_partial_uploads: 3,
         ..RuntimeProfileMetrics::default()
     };
     let audio = AudioDebugSnapshot {
@@ -934,6 +939,11 @@ fn runtime_profile_json_has_stable_fields_and_derived_values() {
     assert_eq!(value["max_catchup_credit_seconds"], 0.5);
     assert_eq!(value["frames_produced"], 7);
     assert_eq!(value["frames_skipped"], 2);
+    assert_eq!(value["margo_lfb_direct_write_bytes"], 123);
+    assert_eq!(value["margo_scanout_rows_converted"], 9);
+    assert_eq!(value["presentation_upload_submit_wall_ns"], 19);
+    assert_eq!(value["presentation_upload_bytes"], 456);
+    assert_eq!(value["presentation_partial_uploads"], 3);
     assert_eq!(value["audio_underruns_after_prefill"], 11);
     assert_eq!(value["audio_overruns"], 13);
     assert_eq!(value["audio_late_callbacks"], 17);

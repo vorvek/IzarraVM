@@ -65,6 +65,15 @@ fn video_facade_preserves_presented_and_headless_scanout_behavior() {
     assert_eq!((presented_width, presented_height), (320, 400));
     assert_eq!(presented[0], 0x00ff_0000);
 
+    let first = machine
+        .presented_frame_update()
+        .expect("first cached frame");
+    let unchanged = machine
+        .presented_frame_update()
+        .expect("unchanged cached frame");
+    assert!(unchanged.changed_rows.is_empty());
+    assert!(std::sync::Arc::ptr_eq(&first.words, &unchanged.words));
+
     let (_, full_width, full_height) = machine.frame_argb();
     assert_eq!(full_width, 320);
     assert!(full_height > presented_height);
@@ -1512,4 +1521,81 @@ fn int10_returns_to_text_mode() {
         machine.video().read_u8(VGA_TEXT_MEMORY_SIZE - 2).unwrap(),
         b' '
     );
+}
+
+/// The delta path and the contract path must present the SAME picture in
+/// canonical Mode 13h.
+///
+/// Mode 13h does not present from the index raster at all: it presents from the
+/// VGA's own incrementally maintained ARGB cache, cropped to the display
+/// height. A delta path that re-derives the frame from `last_presented` and the
+/// DAC would be a second definition of what is on screen, agreeing only by
+/// coincidence. This pins the agreement.
+#[test]
+fn mode13h_presents_identically_through_both_frame_paths() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x13));
+    machine.video_mut().set_dac_entry(1, 63, 0, 0);
+    machine.video_mut().set_dac_entry(2, 0, 63, 0);
+    machine.write_physical_u8(VGA_MODE13H_BASE, 1);
+    machine.write_physical_u8(VGA_MODE13H_BASE + 320 * 7 + 9, 2);
+    machine.advance_devices(600_000);
+
+    let (words, width, height) = machine
+        .presented_frame_argb()
+        .expect("a raster completed during the advance");
+    let update = machine
+        .presented_frame_update()
+        .expect("the delta path answers wherever the contract path does");
+
+    assert_eq!((update.width, update.height), (width, height));
+    assert_eq!(update.words.as_slice(), words.as_slice());
+}
+
+/// A guest may program the vertical display end PAST the vertical total, which
+/// leaves a short raster: `vdisp_end` rows are claimed but only `vtotal` rows
+/// were ever rendered. `recompute_vertical_timing` honours the guest's bytes
+/// without clamping, and register-banging 256-colour titles reach this while
+/// they retune a tweaked mode.
+///
+/// `presented_frame_argb` answers by truncating to what was rendered. The delta
+/// path must present exactly that, and in particular must not answer `None`:
+/// that is the placeholder-frame failure mode from the other side -- a screen
+/// that goes dark for as long as the guest holds the timing, in a moment where
+/// there IS a frame to show.
+#[test]
+fn a_short_raster_presents_identically_through_both_frame_paths() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x13));
+    machine.video_mut().set_dac_entry(1, 63, 0, 0);
+    machine.write_physical_u8(VGA_MODE13H_BASE, 1);
+    // Vertical display end 457 (r12 + the overflow bit already set by Mode 13h,
+    // + 1) against a vertical total that stays at 449: the protect bit in r11
+    // keeps 00h-07h out, so the guest moves the active region past the end of
+    // the raster without moving the raster.
+    assert!(machine.video_mut().write_port(0x3D4, 0x12));
+    assert!(machine.video_mut().write_port(0x3D5, 200));
+    machine.advance_devices(600_000);
+
+    let (words, width, height) = machine
+        .presented_frame_argb()
+        .expect("a raster completed after the retune");
+    assert_eq!((width, height), (320, 457));
+    assert_eq!(
+        words.len(),
+        320 * 449,
+        "the raster is short: fewer words than width * height"
+    );
+
+    let update = machine
+        .presented_frame_update()
+        .expect("the delta path answers wherever the contract path does");
+    assert_eq!((update.width, update.height), (width, height));
+    assert_eq!(update.words.as_slice(), words.as_slice());
+
+    // And a second call must not diff a frame it cannot index row by row.
+    let again = machine
+        .presented_frame_update()
+        .expect("the short raster still presents");
+    assert_eq!(again.words.as_slice(), words.as_slice());
 }

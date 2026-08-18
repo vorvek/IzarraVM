@@ -12,7 +12,65 @@
 //! per-frame data (new framebuffer bytes when the guest advanced, the CRT style
 //! selector, and a time for the Ye Olde grain) and uploads it in `prepare`.
 
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use egui_wgpu::CallbackTrait;
+
+static PACK_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_SUBMIT_WALL_NS: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_ROWS: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_RUNS: AtomicU64 = AtomicU64::new(0);
+static FULL_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static PARTIAL_UPLOADS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PresentationMetricsSnapshot {
+    pub pack_wall_ns: u64,
+    pub upload_submit_wall_ns: u64,
+    pub upload_bytes: u64,
+    pub upload_rows: u64,
+    pub upload_runs: u64,
+    pub full_uploads: u64,
+    pub partial_uploads: u64,
+}
+
+impl PresentationMetricsSnapshot {
+    pub(crate) fn delta_since(self, previous: Self) -> Self {
+        Self {
+            pack_wall_ns: self.pack_wall_ns.saturating_sub(previous.pack_wall_ns),
+            upload_submit_wall_ns: self
+                .upload_submit_wall_ns
+                .saturating_sub(previous.upload_submit_wall_ns),
+            upload_bytes: self.upload_bytes.saturating_sub(previous.upload_bytes),
+            upload_rows: self.upload_rows.saturating_sub(previous.upload_rows),
+            upload_runs: self.upload_runs.saturating_sub(previous.upload_runs),
+            full_uploads: self.full_uploads.saturating_sub(previous.full_uploads),
+            partial_uploads: self
+                .partial_uploads
+                .saturating_sub(previous.partial_uploads),
+        }
+    }
+}
+
+pub(crate) fn presentation_metrics_snapshot() -> PresentationMetricsSnapshot {
+    PresentationMetricsSnapshot {
+        pack_wall_ns: PACK_WALL_NS.load(Ordering::Relaxed),
+        upload_submit_wall_ns: UPLOAD_SUBMIT_WALL_NS.load(Ordering::Relaxed),
+        upload_bytes: UPLOAD_BYTES.load(Ordering::Relaxed),
+        upload_rows: UPLOAD_ROWS.load(Ordering::Relaxed),
+        upload_runs: UPLOAD_RUNS.load(Ordering::Relaxed),
+        full_uploads: FULL_UPLOADS.load(Ordering::Relaxed),
+        partial_uploads: PARTIAL_UPLOADS.load(Ordering::Relaxed),
+    }
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
 
 // CRT look. Two styles selected at runtime by the `style` uniform (0 off,
 // 1 subtle, 2 Ye Olde). Both styles model a high-resolution VGA monitor; Ye
@@ -159,12 +217,32 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// A new guest framebuffer to upload (RGBA8), with its dimensions. Built only
-/// when the guest frame counter advances.
+/// A new guest framebuffer plus the scanline runs that changed.
+///
+/// `changed_rows` is a delta against the frame BEFORE this one, so applying it
+/// to a texture that never received that frame leaves the untouched rows stale
+/// forever -- there is no later frame that repairs them, because every later
+/// frame reports only its own changes. `update_from`/`update_to` carry the
+/// publication numbers the runs span so `prepare` can notice the gap and upload
+/// the frame whole instead. Nothing acknowledges a paint, and nothing needs to:
+/// a dropped frame costs one full upload and corrects itself.
 pub struct CrtFrame {
-    pub rgba: Vec<u8>,
+    pub words: Arc<Vec<u32>>,
+    pub changed_rows: Vec<Range<usize>>,
     pub width: u32,
     pub height: u32,
+    pub update_from: u64,
+    pub update_to: u64,
+}
+
+/// Whether the texture must take the frame whole rather than by its runs.
+///
+/// `last_update` is the publication number this texture last had applied, or
+/// `u64::MAX` for "nothing yet" -- publications start at 1, so the wrap makes
+/// the very first frame answer `true` here on its own merits rather than by
+/// coincidence.
+pub(crate) fn upload_is_full(frame_update_from: u64, last_update: u64, recreated: bool) -> bool {
+    recreated || frame_update_from != last_update.wrapping_add(1)
 }
 
 /// Per-paint callback: the optional new frame, the CRT style selector (0 off,
@@ -185,6 +263,23 @@ pub struct CrtResources {
     bind_group: wgpu::BindGroup,
     dims: (u32, u32),
     srgb: bool,
+    upload_scratch: Vec<u8>,
+    last_update: u64,
+}
+
+pub(crate) fn pack_argb_rows(words: &[u32], width: usize, rows: Range<usize>, out: &mut Vec<u8>) {
+    let start = rows.start.saturating_mul(width).min(words.len());
+    let end = rows.end.saturating_mul(width).min(words.len());
+    out.clear();
+    out.reserve(end.saturating_sub(start).saturating_mul(4));
+    for &color in &words[start..end] {
+        out.extend_from_slice(&[
+            ((color >> 16) & 0xff) as u8,
+            ((color >> 8) & 0xff) as u8,
+            (color & 0xff) as u8,
+            0xff,
+        ]);
+    }
 }
 
 fn source_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
@@ -349,14 +444,16 @@ impl CrtResources {
             bind_group,
             dims: (1, 1),
             srgb: format.is_srgb(),
+            upload_scratch: Vec::new(),
+            last_update: u64::MAX,
         }
     }
 
     /// Recreate the source texture (and its bind group) when the guest mode
     /// changes the framebuffer dimensions.
-    fn ensure_texture(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+    fn ensure_texture(&mut self, device: &wgpu::Device, w: u32, h: u32) -> bool {
         if self.dims == (w, h) {
-            return;
+            return false;
         }
         let texture = source_texture(device, w, h);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -369,6 +466,7 @@ impl CrtResources {
         );
         self.texture = texture;
         self.dims = (w, h);
+        true
     }
 }
 
@@ -385,26 +483,63 @@ impl CallbackTrait for CrtCallback {
             .get_mut::<CrtResources>()
             .expect("CrtResources registered at init");
         if let Some(frame) = &self.frame {
-            res.ensure_texture(device, frame.width, frame.height);
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &res.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &frame.rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * frame.width),
-                    rows_per_image: Some(frame.height),
-                },
-                wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            let recreated = res.ensure_texture(device, frame.width, frame.height);
+            let full = 0..frame.height as usize;
+            let rows = if upload_is_full(frame.update_from, res.last_update, recreated) {
+                std::slice::from_ref(&full)
+            } else {
+                frame.changed_rows.as_slice()
+            };
+            res.last_update = frame.update_to;
+            for rows in rows {
+                let start = rows.start.min(frame.height as usize);
+                let end = rows.end.min(frame.height as usize);
+                if start >= end {
+                    continue;
+                }
+                let pack_started = Instant::now();
+                pack_argb_rows(
+                    &frame.words,
+                    frame.width as usize,
+                    start..end,
+                    &mut res.upload_scratch,
+                );
+                PACK_WALL_NS.fetch_add(duration_ns(pack_started.elapsed()), Ordering::Relaxed);
+                let upload_started = Instant::now();
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &res.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: start as u32,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &res.upload_scratch,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * frame.width),
+                        rows_per_image: Some((end - start) as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: frame.width,
+                        height: (end - start) as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                UPLOAD_SUBMIT_WALL_NS
+                    .fetch_add(duration_ns(upload_started.elapsed()), Ordering::Relaxed);
+                UPLOAD_BYTES.fetch_add(res.upload_scratch.len() as u64, Ordering::Relaxed);
+                UPLOAD_ROWS.fetch_add((end - start) as u64, Ordering::Relaxed);
+                UPLOAD_RUNS.fetch_add(1, Ordering::Relaxed);
+                if start == 0 && end == frame.height as usize {
+                    FULL_UPLOADS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    PARTIAL_UPLOADS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         let (w, h) = res.dims;
         // 8 floats = 32 bytes (std140-safe): src_size.xy, style, srgb, time, pad×3.
