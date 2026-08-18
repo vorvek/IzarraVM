@@ -1791,3 +1791,96 @@ fn v86_sequential_run_off_at_the_64k_boundary_wraps_ip_to_zero() {
         cpu.is_v86_mode()
     );
 }
+
+/// The metal invariant the VIF-gated-INTA design rests on: a V86 task running at
+/// real IOPL 3 owns the real IF, and while the guest holds it clear NOTHING
+/// acknowledges the PIC.
+///
+/// Today's TOKAEMM monitor runs its V86 guest at IOPL 0, so every guest CLI/STI
+/// traps to the monitor and the real IF stays pinned open -- the core then takes
+/// the IRQ (INTA) immediately and the monitor queues the vector in `vip`. The
+/// design deletes that by giving the guest IOPL 3. This fixture certifies the
+/// three CPU-level facts that makes possible, none of which involve tokaemm.asm:
+///
+/// * a guest CLI at IOPL 3 executes rather than faulting, and clears the real IF;
+/// * with IF clear, the boundary check never calls `acknowledge_interrupt`, so
+///   the bus's pending-IRQ slot is still occupied afterwards. An untaken
+///   `Option` IS "no INTA" at this layer: `TestBus::acknowledge_interrupt`
+///   `take()`s it, exactly as the real bus pulses INTA at the 8259A;
+/// * a guest STI re-arms it, honouring the one-instruction shadow, and the NEXT
+///   boundary takes the vector.
+///
+/// The design leans on all three. If this fails, the design is not implementable
+/// as written.
+#[test]
+fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
+    // cli ; nop ; sti ; nop ; nop
+    let guest = [0xfa, 0x90, 0xfb, 0x90, 0x90];
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+    // `enter_v86_direct` leaves IOPL 0 (the monitor's shape today). The design's
+    // shape is IOPL 3, which is what makes CLI/STI the guest's own.
+    cpu.registers.eflags |= 0x3000;
+    cpu.set_flag(FLAG_IF, true);
+
+    // 1. The guest CLI runs and clears the REAL IF; it does not #GP to the monitor.
+    cpu.cycle(&mut bus).unwrap();
+    assert!(
+        cpu.is_v86_mode(),
+        "CLI at IOPL 3 must execute in the V86 task, not fault into the monitor"
+    );
+    assert!(
+        !cpu.flag(FLAG_IF),
+        "the guest's CLI must clear the real IF at IOPL 3"
+    );
+
+    // 2. Raise a PIC line inside the guest's CLI window and step past it. Vector
+    //    0x21 is the one vector v86_world gives a present gate, so a delivery
+    //    that DID happen lands somewhere observable instead of faulting.
+    bus.pending_irq = Some(0x21);
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        cpu.registers.eip, 2,
+        "the NOP after the CLI must have executed"
+    );
+    assert_eq!(
+        bus.pending_irq,
+        Some(0x21),
+        "no INTA may reach the chip while the guest holds IF clear: the request \
+         must still be pending, unacknowledged"
+    );
+    assert!(cpu.is_v86_mode(), "and the guest must still be running");
+
+    // 3. The guest's own STI re-opens the window -- but the one-instruction
+    //    shadow means the instruction AFTER it still runs first.
+    cpu.cycle(&mut bus).unwrap();
+    assert!(cpu.flag(FLAG_IF), "the guest's STI must set the real IF");
+    assert_eq!(
+        bus.pending_irq,
+        Some(0x21),
+        "STI itself must not be the boundary the interrupt is taken at"
+    );
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        cpu.registers.eip, 4,
+        "the shadow instruction after STI must execute"
+    );
+    assert_eq!(
+        bus.pending_irq,
+        Some(0x21),
+        "the STI shadow must still hold the request off"
+    );
+
+    // 4. The next boundary takes it -- and THAT is where the INTA happens.
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        bus.pending_irq, None,
+        "the boundary after the shadow must acknowledge the request"
+    );
+    assert!(
+        !cpu.is_v86_mode(),
+        "delivery out of V86 lands in the ring-0 monitor"
+    );
+    assert_eq!(cpu.registers.eip, MON_CODE);
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+}

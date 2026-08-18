@@ -2209,3 +2209,250 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
          particular story.\n{text}"
     );
 }
+
+/// Run one guest .COM from AUTOEXEC under a bare `DEVICE=C:\DOS\TOKAEMM.SYS`
+/// and return the stop reason and the screen text. Every fixture in the
+/// INTA-invariant block below has the same shape -- one COM, one exit code --
+/// and differs only in which COM it runs and what its codes mean.
+fn run_tokaemm_com(label: &str, name: &str, com: &[u8]) -> (StopReason, String) {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let autoexec = format!("@ECHO OFF\r\nPATH C:\\DOS\r\n{name}\r\n").into_bytes();
+
+    let mut scenario = TokaEmmScenario::new(
+        label,
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (format!("{name}.COM"), com.to_vec()),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    (stop, text)
+}
+
+/// THE INTA INVARIANT: while the V86 guest has interrupts disabled, nothing may
+/// acknowledge the 8259A on its behalf. An INTA is the guest's to issue, through
+/// its own IVT handler, once it re-enables.
+///
+/// There is no crate-external PIC API to read the ISR with (pic.rs is
+/// `pub(crate)` and the ISR has no accessor), and promoting one would be the
+/// wrong seam anyway: the thing under test is what the GUEST sees, and the guest
+/// reads the chip through OCW3 like every DOS program does. So the probe is
+/// guest-side, which is also the exact shape E10 arrived in.
+///
+/// NOINTA.COM is self-proving, which matters more here than usual: a CLI'd guest
+/// that reads the ISR too early reads 00 because nothing has happened yet, not
+/// because the invariant holds. So it first polls the IRR (OCW3 0x0A) until IR0
+/// is REQUESTED and only then reads the ISR (OCW3 0x0B); reaching the ISR read
+/// at all means a timer request demonstrably exists. 0xD1 is the exhausted poll,
+/// kept distinct so it can never be read as either answer.
+///
+/// RED on today's monitor: it pins the real IF open and virtualizes IF as VIF,
+/// so the first tick is INTA'd and parked in `vip` the instant it appears, and
+/// the ISR read returns 01 -> 0xE1.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_pic_isr_is_empty_while_the_v86_guest_has_interrupts_disabled() {
+    let (stop, text) = run_tokaemm_com("tokaemm-nointa", "NOINTA", izarravm_firmware::nointa_com());
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "the master ISR must be empty while the V86 guest holds interrupts \
+         disabled (stop={stop:?}). 0xE1 = something acknowledged the chip on \
+         the guest's behalf; 0xD1 = no request ever became visible in the IRR, \
+         so the fixture proved nothing and needs its bound looked at, not its \
+         assertion.\n{text}"
+    );
+}
+
+/// The other half of the E10 rule, and a REGRESSION GUARD rather than a red
+/// fixture: whatever the monitor does while the guest has interrupts disabled,
+/// once the guest's own IVT[8] handler is running the chip must show IS0 SET --
+/// the state a real 8259A is in between INTA and EOI. DJGPP's shared
+/// hardware-IRQ wrapper probes exactly that (OCW3 0x0B + IN 0x20) to tell a real
+/// IRQ from a spurious entry; the 0 the old early-EOI path left there sent it
+/// down its not-my-line branch, indexed a 16-entry table with 16, and RETF'd
+/// through the pair it found -- MonikaTT's #GP(0) at 0xAF:78A3.
+///
+/// The current `.hold` path already satisfies this, so it passes on main today,
+/// and it is here to keep passing while the monitor is rebuilt around it.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_guest_irq_handler_runs_with_its_own_line_in_service() {
+    let (stop, text) = run_tokaemm_com("tokaemm-isrset", "ISRSET", izarravm_firmware::isrset_com());
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "the guest's own IRQ0 handler must find IS0 set before it EOIs \
+         (stop={stop:?}). 0xE1 = it ran with its line not in service (the E10 \
+         mechanism); 0xD1/0xD2 are setup -- no request appeared, or the handler \
+         never ran.\n{text}"
+    );
+}
+
+/// Routing row 1 (design section 3.5). A guest `INT 0Dh` is a SOFTWARE
+/// interrupt and must reach the guest's IVT[0x0D] whatever the 8259A's vector
+/// bases are. Vector 13 is doubly loaded on this monitor -- it is the #GP a
+/// V86 `INT n` traps through, and, while the master sits at the DOS-default
+/// base 8, it is also IRQ5 -- so a discriminator lives there.
+///
+/// The discriminating half moves the master off base 8 with a VCPI DE0B first
+/// (with the chip masked and the guest CLI'd, so no tick can be reflected at a
+/// vector DOS has not hooked) and requires INT 0Dh to still land on IVT[0x0D].
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_guest_int0d_reflects_vector_13_not_irq5() {
+    let (stop, text) = run_tokaemm_com(
+        "tokaemm-int0drfl",
+        "INT0DRFL",
+        izarravm_firmware::int0drfl_com(),
+    );
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "a guest INT 0Dh must reach IVT[0x0D] at both PIC base settings \
+         (stop={stop:?}). 0xE1 = it missed at the DOS defaults; 0xE2 = it \
+         missed once the master moved off base 8 (reflected as IRQ5 at the new \
+         base); 0xD1/0xD2 are DE0B setup.\n{text}"
+    );
+}
+
+/// Routing row 2 (design section 3.5), written as a PIN of the round-trip
+/// identity rather than as a red fixture. Once a client has moved the master to
+/// 0x88, vector 0x88 means two things: where IRQ0 now arrives, and an ordinary
+/// software-interrupt vector the guest may still call. A guest `INT 88h` must
+/// reach IVT[0x88] as a software interrupt, and nothing may EOI the chip for it.
+///
+/// The monitor's default-gate arm re-derives the line by consulting the chip's
+/// own ISR, so it is self-correcting for the software-INT case, and the software
+/// INT itself is reflected straight out of the #GP body without consulting the
+/// PIC bookkeeping at all -- so this is expected to pass today. It is here to
+/// hold the identity down while the routing around it is rebuilt.
+///
+/// The precondition that makes it non-vacuous is that IRQ0 is genuinely IN
+/// SERVICE when the INT 88h executes (0xD2 if it never got there): that is the
+/// only state in which a line-number derivation could plausibly claim the
+/// vector.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_guest_int88_after_remap_is_not_converted_to_irq0() {
+    let (stop, text) = run_tokaemm_com(
+        "tokaemm-int88rmp",
+        "INT88RMP",
+        izarravm_firmware::int88rmp_com(),
+    );
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "a guest INT 88h with the master remapped to 0x88 must reach IVT[0x88] \
+         as a software interrupt (stop={stop:?}). 0xE1 = it did not; 0xE2 = the \
+         in-service line was EOI'd by something other than the guest; 0xD1/0xD2 \
+         are setup.\n{text}"
+    );
+}
+
+/// Routing row 3 (design section 3.5), the stale-bookkeeping construction and
+/// the red one of the three. The monitor caches the PIC's vector bases in its
+/// own words and reflects a hardware IRQ to `cache_base + line`; the cache is
+/// written only by VCPI DE0Ah/DE0Bh, but the PIC ports are NOT trapped in the
+/// monitor's TSS I/O-permission bitmap (only 0x92 is), so a guest can reprogram
+/// the chip straight through an ICW sequence and leave the cache lying.
+///
+/// PICSTALE.COM: DE0B the master to 0x88 (cache and chip both move), then a
+/// direct `OUT 0x20/0x21` ICW sequence puts the CHIP back to base 8 (cache now
+/// stale), then let a real IRQ0 fire. The right answer is that the ARRIVING
+/// VECTOR decides -- a request that entered through IDT vector 8 is IVT[8]'s.
+/// IVT[0x88] carries a decoy handler so the wrong answer is reported rather
+/// than crashing the guest through whatever was in that slot.
+///
+/// RED on today's monitor: `irq_m0` reflects to `vcpi_pic_master` (0x88) + 0,
+/// so the decoy at IVT[0x88] runs and IVT[8] never does -> 0xE1.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_hardware_irq_after_a_direct_port_remap_reflects_the_arriving_vector() {
+    let (stop, text) = run_tokaemm_com(
+        "tokaemm-picstale",
+        "PICSTALE",
+        izarravm_firmware::picstale_com(),
+    );
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "an IRQ0 arriving on IDT vector 8 must reflect to the guest's IVT[8], \
+         whatever the monitor last recorded as the master base (stop={stop:?}). \
+         0xE1 = it reflected through the stale cache to IVT[0x88]; 0xD2 = no \
+         timer interrupt arrived at all, so the fixture proved nothing.\n{text}"
+    );
+}
+
+/// The VCPI CLI-excursion shape, and the guard that REPLACES the interim
+/// boundary release merged at 203efaae ("release held lines at the VCPI
+/// V86->PM boundary"). A client that CLIs in V86, lets a timer tick arrive
+/// while it is disabled, and then DE0Cs to protected mode must not carry a
+/// wedged master ISR across with it: IS0 is the highest priority level, and a
+/// stuck IS0 inhibits the whole chip, which is how Tomb Raider froze on the
+/// FMV's first frame and Grand Prix 2 froze mid-race at LAP 0.
+///
+/// VCPISW.COM is exactly that client, and its own step codes keep this from
+/// going vacuous: it WAITS until the chip shows IS0 in service before switching
+/// (0xD1 if that never happened, so the switch would have crossed the boundary
+/// with nothing held), requires IS0 clear on the far side (0xED), and then
+/// requires the chip to still be ALIVE by hand-polling it with OCW3 P=1 (0xEE)
+/// -- "clear" alone is also what a dead chip looks like.
+///
+/// This passes on main because of the interim release at 203efaae. The design
+/// deletes that release along with the whole `vip` queue (there is nothing to
+/// release once the guest's CLI drives the real IF), and this is the fixture
+/// that has to stay green across the deletion. Bounded by the same cycle budget
+/// as the rest of the suite.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_vcpi_client_that_clis_in_v86_then_switches_does_not_wedge() {
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        .to_vec();
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-vcpi-cli-excursion",
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![
+            ("CONFIG.SYS".to_string(), config),
+            (
+                "AUTOEXEC.BAT".to_string(),
+                b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec(),
+            ),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+            (
+                "VCPISW.COM".to_string(),
+                izarravm_firmware::vcpisw_com().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+    let stop = machine
+        .run_until_halt_or_cycles(800_000_000)
+        .expect("machine run");
+    let text = machine.screen_text().as_text();
+    assert_eq!(
+        stop,
+        StopReason::TestExit { code: 0xA5 },
+        "a VCPI client that CLIs in V86 and then switches to protected mode \
+         must not leave the master PIC wedged (stop={stop:?}). 0xED = IS0 \
+         survived the switch; 0xEE = IS0 cleared but the chip acknowledges \
+         nothing any more; 0xD1 = no line was ever held, so the fixture proved \
+         nothing.\n{text}"
+    );
+}
