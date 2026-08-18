@@ -312,11 +312,13 @@ arena_svc_count: dw 0             ; granule count, or the wanted logical page
 arena_svc_fail:  db 0             ; 0 = success, 1 = could not be satisfied
 ; ems_page_alloc32 clobbers every register a chain walk would want to keep, so
 ; the EMS sub-functions carry their loop state here instead of in registers.
-; ebp specifically is NOT available: the monitor's INT 67h entry holds
-; &frame.eip in it and the return path still needs it. (That entry is
-; int67_entry, reached through the static IDT; the constraint predates the
-; IOPL-3 switch, when the same call arrived via vec13_entry's .intn arm, and
-; it is unchanged because both paths park &frame.eip in ebp.)
+; ebp was historically reserved too: the IOPL-0 entry path parked &frame.eip
+; in it across the sensitive-op emulation, so the EMS arms could not use it.
+; That is VESTIGIAL now. These arms are reached only from intc0_entry's .arena
+; via arena_svc, and intc0_entry never writes ebp -- it does a bare pushad, and
+; its popad restores ebp whatever happens in between. The memory-carried loop
+; state stays because ems_page_alloc32 genuinely clobbers everything else; only
+; the ebp half of the rationale is dead.
 ems_svc_slot:    dw 0
 ems_svc_tail:    dw 0
 ems_svc_cur:     dw 0
@@ -1600,10 +1602,10 @@ idt:
                                   ;           reflect to the guest's own IVT
 %assign v v+1
 %endrep
-    IDTGATE int67_entry           ; 0x67 EMS/VCPI: reached directly only when
-                                  ;      the guest runs V86 at IOPL=3 (else the
-                                  ;      INT is IOPL-sensitive and arrives via
-                                  ;      vec13_entry). AH=DEh -> the monitor's
+    IDTGATE int67_entry           ; 0x67 EMS/VCPI: THE dispatch route for a
+                                  ;      guest INT 67h -- at real IOPL 3 the
+                                  ;      INT is not IOPL-sensitive and comes
+                                  ;      straight here. AH=DEh -> the monitor's
                                   ;      VCPI server; else reflect like deflt.
 %assign v 0x68
 %rep (0x70 - 0x68)
@@ -1797,8 +1799,7 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; that runs with IF open, and it brackets itself in `r0_hlt`. Flag set AND
 ; the no-error frame's CS slot ([esp+36]) == our 0x08 -> IRQ5 that woke the
 ; halt; irq_body's own VM check then parks it in the halt slot. A ring-0 #GP
-; raised
-; INSIDE the flagged window cannot take this arm: its frame carries the
+; raised INSIDE the flagged window cannot take this arm: its frame carries the
 ; faulting EIP at [esp+36], and offset 8 is the DOS device-driver header
 ; (dh_next), never executed code.
 ;
@@ -2037,9 +2038,9 @@ monitor_body:
     movzx ebx, byte [fs:hlt_vector]
     mov byte [fs:hlt_pending], 0
     call reflect_vector_v86     ; EBX is the vector the waking gate sat on, so
-                                ; it reflects exactly like .go does. EBP is the
-                                ; V86 frame; the origin is proven (we only
-                                ; reach here from a V86 HLT).
+                                ; it reflects exactly like irq_body's V86 arm.
+                                ; EBP is the V86 frame; the origin is proven
+                                ; (we only reach here from a V86 HLT).
     jmp .done_gp
 
 ; ---- Two-byte privileged 0F ops (386MAX QMAX_I0D GP_ESCOD, adapted to the
@@ -2459,16 +2460,18 @@ exc_common:
     iretd
 
 ; ---- Default gates for every vector this driver has no dedicated handler
-; for (1-5, 16, 18-0x6F, 0x78-0xFF -- see the idt: comment above). Before the
-; PRM-correct load_flags IOPL fix these slots were unreachable: IOPL was
-; pinned at 0, so every guest INT/IRET/PUSHF/POPF trapped as a sensitive
-; instruction through vec13_entry into monitor_body's emulation first. A guest that
-; legitimately raises its own IOPL to 3 (Watcom-compiled Toka-DOS kernel/EMM
-; glue, observed during MEM runs) makes these dispatch for real, straight
-; through this IDT. Reflect exactly like exc_de/exc_ud/exc_nm: bounce to the
-; guest's own real-mode IVT handler, the same thing real hardware's IDT-driven
-; INT dispatch would have done. No EOI -- these are software INTs / CPU traps,
-; not PIC lines. ----
+; for (1-5, 16, 18-0x6F, 0x78-0xFF -- see the idt: comment above). These are
+; the UNIVERSAL dispatch route for a guest software INT: the monitor runs its
+; V86 guests at real IOPL 3, so INT n is never IOPL-sensitive and always lands
+; on the IDT slot it names. (Historically these slots were unreachable -- IOPL
+; was pinned at 0 and every guest INT/IRET/PUSHF/POPF trapped through
+; vec13_entry into monitor_body's emulation first; then the PRM-correct
+; load_flags IOPL fix made them reachable for the rare guest that raised its
+; own IOPL to 3, and the IOPL-3 monitor made that the only case there is.)
+; Reflect exactly like exc_de/exc_ud/exc_nm: bounce to the guest's own
+; real-mode IVT handler, the same thing real hardware's IDT-driven INT dispatch
+; would have done. No EOI -- these are software INTs / CPU traps, not PIC
+; lines. ----
 %assign v 1
 %rep 5
 deflt_%[v]:
@@ -3312,8 +3315,16 @@ ems_page_alloc32:
 ; The service itself. Sub-function in [arena_svc_op]; see the block beside
 ; arena_q_type for why everything crosses in memory rather than registers.
 arena_svc:
-    push ebp                      ; intc0_entry keeps &frame.eip here and its
-    movzx eax, byte [fs:arena_svc_op]   ; return path still needs it
+    push ebp                      ; VESTIGIAL, kept deliberately: the only
+    movzx eax, byte [fs:arena_svc_op]   ; caller is intc0_entry's .arena, which
+                                  ; never writes ebp and whose popad restores
+                                  ; it regardless, so this preserves nothing
+                                  ; anyone needs. It dates from the IOPL-0
+                                  ; entry path, which did park &frame.eip in
+                                  ; ebp. Left as calling-convention
+                                  ; conservatism -- the jump table below is
+                                  ; shared, and a future caller that DOES hold
+                                  ; something in ebp gets it back for free.
     cmp eax, ASVC_MAX
     ja .bad
     call dword [fs:.jt + eax*4]   ; call, not jmp: the pop below must run.

@@ -2456,17 +2456,22 @@ fn tokaemm_hardware_irq_after_a_direct_port_remap_reflects_the_arriving_vector()
 /// FMV's first frame and Grand Prix 2 froze mid-race at LAP 0.
 ///
 /// VCPISW.COM is exactly that client, and its own step codes keep this from
-/// going vacuous: it WAITS until the chip shows IS0 in service before switching
-/// (0xD1 if that never happened, so the switch would have crossed the boundary
-/// with nothing held), requires IS0 clear on the far side (0xED), and then
-/// requires the chip to still be ALIVE by hand-polling it with OCW3 P=1 (0xEE)
-/// -- "clear" alone is also what a dead chip looks like.
+/// going vacuous: it WAITS until the chip shows IR0 REQUESTED before switching
+/// (OCW3 0x0A; 0xD1 if that never happened, so the switch would have crossed
+/// the boundary with nothing outstanding), requires IS0 clear on the far side
+/// (0xED), and then requires the chip to still be ALIVE by hand-polling it with
+/// OCW3 P=1 (0xEE) -- "clear" alone is also what a dead chip looks like.
 ///
-/// This passes on main because of the interim release at 203efaae. The design
-/// deletes that release along with the whole `vip` queue (there is nothing to
-/// release once the guest's CLI drives the real IF), and this is the fixture
-/// that has to stay green across the deletion. Bounded by the same cycle budget
-/// as the rest of the suite.
+/// The precondition reads the IRR because under the IOPL-3 monitor the client's
+/// own `CLI` clears the real IF, so nothing acknowledges the chip while it
+/// waits: the tick latches in the IRR and the ISR stays empty. It used to read
+/// the ISR, back when the monitor pinned the real IF open, acknowledged the
+/// line immediately and parked it in `vip` -- that queue is what could strand a
+/// line across DE0C, and the interim release at 203efaae existed to hand it
+/// back. Both the queue and the release are deleted; there is nothing to
+/// release once the guest's CLI drives the real IF, and this fixture is what
+/// holds that claim honest. Bounded by the same cycle budget as the rest of the
+/// suite.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_client_that_clis_in_v86_then_switches_does_not_wedge() {
