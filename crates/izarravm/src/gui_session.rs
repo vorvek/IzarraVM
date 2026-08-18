@@ -285,6 +285,20 @@ impl SessionSnapshot {
     }
 }
 
+/// One published frame: the whole picture, plus the scanline runs that changed
+/// since the PREVIOUS publication.
+///
+/// `changed_rows` is a delta, so it is only meaningful to a consumer that
+/// applied the publication before it. `update_from`/`update_to` are what let one
+/// say so: the worker numbers publications 1, 2, 3, ... and a consumer may apply
+/// the runs only when `update_from` is exactly one past the last publication it
+/// applied. Anything else -- a frame dropped between the poll and the paint, a
+/// consumer that starts late -- and the frame must be taken whole.
+///
+/// The two numbers differ only where a consumer FOLDS an unpainted frame into
+/// the next one (see `GuiApp::poll_session`): the merged frame carries the older
+/// frame's `update_from` and the newer one's `update_to`, and its runs are the
+/// union, so the chain stays unbroken.
 #[derive(Debug, Clone)]
 pub(super) struct SessionFrame {
     pub(super) words: Arc<Vec<u32>>,
@@ -292,6 +306,8 @@ pub(super) struct SessionFrame {
     pub(super) width: usize,
     pub(super) height: usize,
     pub(super) seq: u64,
+    pub(super) update_from: u64,
+    pub(super) update_to: u64,
     pub(super) generation: u64,
 }
 
@@ -1302,6 +1318,10 @@ fn run_worker(
     let mut last_pace = Instant::now();
     let mut last_media = last_pace;
     let mut published_seq = u64::MAX;
+    // Publications are numbered from 1 so that a consumer starting from "I have
+    // applied nothing", which it spells `u64::MAX`, cannot read the first frame
+    // as the one that follows it.
+    let mut published_update = 0u64;
     let mut last_frame_gen: Option<u64> = None;
     let mut keys = ScriptedKeys::from_env(generation.machine.master_ticks());
 
@@ -1463,12 +1483,15 @@ fn run_worker(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(frame) = rendered {
+                published_update += 1;
                 published.frame = Some(SessionFrame {
                     words: frame.words,
                     changed_rows: frame.changed_rows,
                     width: frame.width,
                     height: frame.height,
                     seq,
+                    update_from: published_update,
+                    update_to: published_update,
                     generation: generation.id,
                 });
                 last_frame_gen = frame_gen;

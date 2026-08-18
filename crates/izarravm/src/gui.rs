@@ -1115,7 +1115,15 @@ impl GuiApp {
         let update = self.session.poll();
         self.session_snapshot = update.snapshot;
         if let Some(frame) = update.newest_frame {
-            self.session_frame = Some(frame);
+            // FOLD, do not overwrite. The frame already sitting here was polled
+            // and never painted -- egui may have discarded the pass, or two
+            // polls may fall between two paints -- and its scanline runs are the
+            // only record that those rows moved. Dropping it would leave them
+            // stale on the texture until something happened to repaint them.
+            self.session_frame = Some(match self.session_frame.take() {
+                Some(unpainted) => merge_session_frames(unpainted, frame),
+                None => frame,
+            });
         }
         let mut prefs_changed = false;
         for event in update.events {
@@ -1221,6 +1229,47 @@ impl Drop for GuiApp {
     }
 }
 
+/// Fold an unpainted frame into the one that superseded it.
+///
+/// The newer frame's pixels are already the whole current picture, so only the
+/// damage has to be carried: the result spans both publications and reports the
+/// union of their runs. Frames from different worker generations do not compose
+/// -- a machine reset republishes from a fresh screen -- so those take the newer
+/// frame alone, and the publication gap makes the consumer upload it whole.
+fn merge_session_frames(unpainted: SessionFrame, newer: SessionFrame) -> SessionFrame {
+    if unpainted.generation != newer.generation
+        || unpainted.width != newer.width
+        || unpainted.height != newer.height
+        || unpainted.update_to.wrapping_add(1) != newer.update_from
+    {
+        return newer;
+    }
+    SessionFrame {
+        changed_rows: merge_row_runs(&unpainted.changed_rows, &newer.changed_rows),
+        update_from: unpainted.update_from,
+        ..newer
+    }
+}
+
+/// Union two ascending, non-overlapping run lists into one of the same shape.
+fn merge_row_runs(
+    left: &[std::ops::Range<usize>],
+    right: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut runs: Vec<std::ops::Range<usize>> = left.iter().chain(right).cloned().collect();
+    runs.sort_by_key(|run| run.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match merged.last_mut() {
+            // Touching runs coalesce as well as overlapping ones: two adjacent
+            // runs are one upload, and one upload is cheaper than two.
+            Some(last) if run.start <= last.end => last.end = last.end.max(run.end),
+            _ => merged.push(run),
+        }
+    }
+    merged
+}
+
 /// The largest 4:3 rectangle that fits `area`, centred.
 fn fit_4_3(area: egui::Rect) -> egui::Rect {
     let (width, height) = if area.width() / area.height() > 4.0 / 3.0 {
@@ -1251,6 +1300,8 @@ impl GuiApp {
                 changed_rows: frame.changed_rows,
                 width: frame.width as u32,
                 height: frame.height as u32,
+                update_from: frame.update_from,
+                update_to: frame.update_to,
             })
         });
         // Paint the guest screen through the wgpu shader pass: aspect-fill to the

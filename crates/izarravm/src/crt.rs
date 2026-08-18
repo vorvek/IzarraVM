@@ -218,11 +218,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// A new guest framebuffer plus the scanline runs that changed.
+///
+/// `changed_rows` is a delta against the frame BEFORE this one, so applying it
+/// to a texture that never received that frame leaves the untouched rows stale
+/// forever -- there is no later frame that repairs them, because every later
+/// frame reports only its own changes. `update_from`/`update_to` carry the
+/// publication numbers the runs span so `prepare` can notice the gap and upload
+/// the frame whole instead. Nothing acknowledges a paint, and nothing needs to:
+/// a dropped frame costs one full upload and corrects itself.
 pub struct CrtFrame {
     pub words: Arc<Vec<u32>>,
     pub changed_rows: Vec<Range<usize>>,
     pub width: u32,
     pub height: u32,
+    pub update_from: u64,
+    pub update_to: u64,
+}
+
+/// Whether the texture must take the frame whole rather than by its runs.
+///
+/// `last_update` is the publication number this texture last had applied, or
+/// `u64::MAX` for "nothing yet" -- publications start at 1, so the wrap makes
+/// the very first frame answer `true` here on its own merits rather than by
+/// coincidence.
+pub(crate) fn upload_is_full(frame_update_from: u64, last_update: u64, recreated: bool) -> bool {
+    recreated || frame_update_from != last_update.wrapping_add(1)
 }
 
 /// Per-paint callback: the optional new frame, the CRT style selector (0 off,
@@ -244,6 +264,7 @@ pub struct CrtResources {
     dims: (u32, u32),
     srgb: bool,
     upload_scratch: Vec<u8>,
+    last_update: u64,
 }
 
 pub(crate) fn pack_argb_rows(words: &[u32], width: usize, rows: Range<usize>, out: &mut Vec<u8>) {
@@ -424,6 +445,7 @@ impl CrtResources {
             dims: (1, 1),
             srgb: format.is_srgb(),
             upload_scratch: Vec::new(),
+            last_update: u64::MAX,
         }
     }
 
@@ -463,11 +485,12 @@ impl CallbackTrait for CrtCallback {
         if let Some(frame) = &self.frame {
             let recreated = res.ensure_texture(device, frame.width, frame.height);
             let full = 0..frame.height as usize;
-            let rows = if recreated {
+            let rows = if upload_is_full(frame.update_from, res.last_update, recreated) {
                 std::slice::from_ref(&full)
             } else {
                 frame.changed_rows.as_slice()
             };
+            res.last_update = frame.update_to;
             for rows in rows {
                 let start = rows.start.min(frame.height as usize);
                 let end = rows.end.min(frame.height as usize);

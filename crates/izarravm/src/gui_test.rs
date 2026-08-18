@@ -519,3 +519,57 @@ fn every_rom_failure_says_something_different() {
         seen.push(text);
     }
 }
+
+fn test_session_frame(update: u64, changed_rows: Vec<std::ops::Range<usize>>) -> SessionFrame {
+    SessionFrame {
+        words: std::sync::Arc::new(vec![0u32; 4 * 8]),
+        changed_rows,
+        width: 4,
+        height: 8,
+        seq: update,
+        update_from: update,
+        update_to: update,
+        generation: 1,
+    }
+}
+
+/// Two publications, one paint: the damage of the frame that was never painted
+/// has to survive into the one that replaced it, or its rows stay stale on the
+/// texture with no later frame reporting them again.
+#[test]
+fn an_unpainted_frame_folds_its_damage_into_the_next_one() {
+    let unpainted = test_session_frame(4, [1..2, 6..7].into_iter().collect());
+    let newer = test_session_frame(5, std::iter::once(2..3).collect());
+
+    let merged = merge_session_frames(unpainted, newer);
+
+    assert_eq!(
+        merged.changed_rows,
+        [1..3, 6..7].into_iter().collect::<Vec<_>>()
+    );
+    assert_eq!((merged.update_from, merged.update_to), (4, 5));
+    assert!(
+        !crate::crt::upload_is_full(merged.update_from, 3, false),
+        "the folded frame continues the chain, so it still uploads by runs"
+    );
+}
+
+/// A merge is only sound while the two frames describe the same screen. A
+/// worker generation change republishes from a fresh machine, so the older
+/// frame's rows mean nothing against it -- and the resulting publication gap is
+/// what makes the consumer take the new frame whole.
+#[test]
+fn frames_from_different_generations_do_not_fold() {
+    let unpainted = test_session_frame(4, std::iter::once(1..2).collect());
+    let mut newer = test_session_frame(5, std::iter::once(2..3).collect());
+    newer.generation = 2;
+
+    let merged = merge_session_frames(unpainted, newer);
+
+    assert_eq!(
+        merged.changed_rows,
+        std::iter::once(2..3).collect::<Vec<_>>()
+    );
+    assert_eq!(merged.update_from, 5);
+    assert!(crate::crt::upload_is_full(merged.update_from, 3, false));
+}
