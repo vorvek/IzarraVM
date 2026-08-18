@@ -2041,6 +2041,83 @@ fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A COALESCED HOST READ MUST NOT OVERTAKE THE GUEST'S OWN WRITE.
+///
+/// A batched command reads up to 64 contiguous sectors of one host file in one
+/// operation and answers the rest of the span out of that buffer. The buffer is
+/// filled from the HOST FILE, so it physically contains pre-write bytes for
+/// every sector in the span -- including any sector the guest has overwritten.
+/// This pins that the guest never sees them.
+///
+/// Two layers stand between the window and the guest, and the assertions below
+/// name both: `write_lba` leaves the written sector in the host-side sector
+/// cache, which is consulted above the backing, and `read_sector_checked`
+/// resolves `self.store.get(lba)` before `read_command_window_sector` for a
+/// sector that has since been evicted. The cache capacity is 32,768 sectors, so
+/// driving that eviction is not a unit-test-sized fixture; the ordering inside
+/// `read_sector_checked` is the backstop and is asserted by inspection.
+///
+/// NON-VACUOUS: the third sector's LBA is inside the one coalesced host read
+/// this command issues (`host_read_operations == 1` over a four-sector span),
+/// so the window holds 0x42 for it throughout. Serving the window ahead of both
+/// layers -- deleting the `put` in `AtaDisk::write_lba` and hoisting
+/// `read_command_window_sector` above the store match -- reads back 0x42.
+#[test]
+fn a_batched_read_still_resolves_the_guest_write_overlay_per_sector() {
+    let dir = katea_scratch("batch-overlay");
+    std::fs::write(dir.join("GAME.DAT"), patterned(8)).unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+
+    // Overwrite the third sector of the span BEFORE anything in the span is
+    // read, so the command below fills its window from the untouched host file.
+    for i in 0..512u32 {
+        machine.write_physical_u8(0x20000 + i, if i == 0 { 0x9A } else { 0xC7 });
+    }
+    int13_write_at(&mut machine, lba + 2, 1);
+
+    let ops_before = machine
+        .katea_storage_counters()
+        .unwrap()
+        .host_read_operations;
+    let (_, misses_before) = machine.hdd_sector_cache_counters().unwrap();
+    let read = int13_read_at(&mut machine, lba, 4);
+    assert_eq!(
+        machine.hdd_sector_cache_counters().unwrap().1 - misses_before,
+        3,
+        "the three unwritten sectors reach the backing; the written one is \
+         answered above it, which is the first of the two layers"
+    );
+    assert_eq!(
+        machine
+            .katea_storage_counters()
+            .unwrap()
+            .host_read_operations
+            - ops_before,
+        1,
+        "one physical host read covered the whole four-sector span, so the \
+         window really does hold pre-write bytes for the written sector"
+    );
+    assert_eq!(
+        read,
+        vec![0x40, 0x41, 0x9A, 0x43],
+        "the coalesced span must not serve host bytes for a sector the guest wrote"
+    );
+
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A LIVE HOST FILE THAT SHRINKS TO A SECTOR BOUNDARY KEEPS ITS ONE COMPLETE
+/// SECTOR.
+///
+/// The batched read asks for the whole span in one call and gets a short answer.
+/// The complete leading sector in that answer is real content and must survive;
+/// the sectors past the new end are not.
+///
+/// NON-VACUOUS: discarding the whole short answer (returning `SectorRead`'s zero
+/// fallback whenever `read_bytes < read_len`) fails the leading assertion with
+/// `0x00` instead of `0x40`.
 #[test]
 fn a_short_host_file_preserves_the_complete_sectors_in_a_batched_read() {
     let dir = katea_scratch("short-batch");
@@ -2060,6 +2137,100 @@ fn a_short_host_file_preserves_the_complete_sectors_in_a_batched_read() {
         int13_read_at(&mut machine, lba, 4),
         vec![0x40, 0x00, 0x00, 0x00],
         "coalescing must not discard a complete leading sector when a live host file shrinks"
+    );
+
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A FAILED SINGLE-SECTOR READ IS ALL ZEROS, NOT A HALF-SECTOR.
+///
+/// A one-sector command has a one-sector span, so it takes `read_host_span`'s
+/// unbatched `read_exact` arm. `read_exact` leaves its buffer UNSPECIFIED when
+/// it fails, and it fails only after copying what it did get -- so a host file
+/// truncated mid-sector fills part of the buffer and then errors. The degraded
+/// contract is "no content at all": serving the surviving prefix with a zero
+/// tail hands the guest a sector that is half real and half invented, and does
+/// it without any signal that differs from a clean failure.
+///
+/// NON-VACUOUS: dropping the `out = [0u8; SECTOR]` reset from the `Err` arm of
+/// `read_host_span` reads back `0x42` -- the 476 bytes that survived the
+/// truncation -- instead of `0x00`. Verified by mutation.
+#[test]
+fn a_failed_unbatched_read_does_not_leak_the_bytes_that_arrived_before_the_error() {
+    let dir = katea_scratch("partial-sector");
+    let path = dir.join("GAME.DAT");
+    std::fs::write(&path, patterned(8)).unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+
+    // 1,500 bytes leaves sector 2 (bytes 1024..1536) with a 476-byte prefix.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1500)
+        .unwrap();
+
+    assert_eq!(
+        int13_read_at(&mut machine, lba + 2, 1),
+        vec![0x00],
+        "a torn sector is a failed read, so none of its surviving bytes reach \
+         the guest"
+    );
+
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A PARTIAL TRAILING SECTOR IN A SHORT BATCH IS NOT CONTENT.
+///
+/// The shrink above lands on a sector boundary, so every byte the host returned
+/// belonged to a whole sector. This one does not: the file is cut to 1,500 bytes
+/// while the directory still advertises 4,096, so the single coalesced read
+/// comes back with two whole sectors and a 476-byte remainder.
+///
+/// Those 476 bytes must not be padded out and served. A served sector is a
+/// CACHED sector, and the sector cache would then pin a half-real sector for the
+/// life of the mount even after the host file is restored -- the same failure
+/// `a_failed_host_read_is_served_as_zeros_but_never_cached` exists to prevent.
+/// The remainder is dropped and the sector re-resolves through the degraded
+/// path, which is what makes the restore below observable.
+///
+/// NON-VACUOUS: rounding `batch.truncate(read_bytes / SECTOR * SECTOR)` down to
+/// `batch.truncate(read_bytes)` in `read_host_span` serves the remainder as
+/// content and reads back `0x42` for the third sector. Verified by mutation.
+#[test]
+fn a_partial_trailing_sector_in_a_batched_read_is_never_served_as_content() {
+    let dir = katea_scratch("partial-tail");
+    let path = dir.join("GAME.DAT");
+    let original = patterned(8);
+    std::fs::write(&path, &original).unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1500)
+        .unwrap();
+
+    assert_eq!(
+        int13_read_at(&mut machine, lba, 4),
+        vec![0x40, 0x41, 0x00, 0x00],
+        "the two whole sectors survive; the 476-byte remainder is dropped rather \
+         than padded into a third sector"
+    );
+
+    // Restore the file byte for byte. The dropped sector has to come back, which
+    // is only possible if the remainder was never cached as content.
+    std::fs::write(&path, &original).unwrap();
+    assert_eq!(
+        int13_read_at(&mut machine, lba + 2, 1),
+        vec![0x42],
+        "the partial sector was a failure, not content, so the restored bytes \
+         are readable"
     );
 
     drop(machine);

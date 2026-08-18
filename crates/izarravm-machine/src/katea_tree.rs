@@ -3230,6 +3230,13 @@ fn read_host_span(
                 }
                 Err(e) => {
                     eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
+                    // `read_exact` leaves the buffer UNSPECIFIED when it fails,
+                    // and it fails after filling part of it when the host file
+                    // was truncated mid-sector. Zero the sector rather than hand
+                    // the guest a half-sector of real bytes with a zero tail:
+                    // the degraded contract is "no content", and the pre-batching
+                    // path reset `out` here for exactly this reason.
+                    out = [0u8; SECTOR];
                     degraded = true;
                     *slot = None;
                     context.window.replace(None);

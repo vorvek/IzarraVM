@@ -2258,7 +2258,11 @@ impl Machine {
         let hits_before = self.sector_cache_hits();
         if ah == 0x42 {
             if let Some(disk) = self.ata.as_ref() {
-                disk.begin_read_command(lba as u32, u32::from(count));
+                // Same conversion the per-sector arms use. A silent `as u32`
+                // here would hand the window a wrapped start LBA rather than
+                // trip the dispatch's own validation.
+                let start = u32::try_from(lba).expect("validated EDD LBA fits ATA");
+                disk.begin_read_command(start, u32::from(count));
             }
             let mut index = 0u16;
             while index < count {

@@ -78,6 +78,16 @@ during a batched command, complete leading sectors are preserved. A partial
 following sector is discarded and retried through the existing degraded-read
 path instead of being cached as content.
 
+A read that fails part-way is degraded in full. `read_exact` leaves its buffer
+unspecified on failure, and it fails only after copying whatever did arrive, so
+a sector torn by a truncation would otherwise reach the guest half real and half
+zero with no signal distinguishing it from a clean failure. The sector is zeroed
+before it is returned.
+
+A sector the guest has written resolves through the guest write store before the
+coalesced window is consulted, so a window filled from the host file cannot
+serve pre-write bytes for a sector the guest has since changed.
+
 ### Measurement controls
 
 The storage profile now reports physical host read operations and bytes in
@@ -124,8 +134,18 @@ smaller, more stable cold-load service burst while guest timing stays unchanged.
 
 The implementation was checked with:
 
-- 1,536 passing `izarravm-machine` library tests, with 3 ignored
-- 231 passing `izarravm` tests, with 92 ignored
-- strict Clippy for all `izarravm-machine` targets
-- formatting, release build, file-policy, transient-read, short-file, cached
-  handle, reconciliation, CHS, and EDD regression checks
+- 1,539 passing `izarravm-machine` library tests, with 3 ignored
+- 231 passing `izarravm` tests, and the 92 ignored guest rows under `--release`
+- strict Clippy for all `izarravm-machine` and `izarravm` targets
+- formatting, release build, and the file-policy check
+
+Four regressions are specific to this change. Each names, in its doc comment,
+the mutation that makes it fail:
+
+- a coalesced span does not serve host bytes for a sector the guest wrote
+- a shrink to a sector boundary keeps its one complete leading sector
+- a partial trailing sector in a short batch is dropped, not padded and cached
+- a read torn mid-sector returns zeros, not the prefix that survived
+
+The pre-existing transient-read, cached-handle, reconciliation, CHS, and EDD
+tests were re-run unchanged; this change did not add to them.
