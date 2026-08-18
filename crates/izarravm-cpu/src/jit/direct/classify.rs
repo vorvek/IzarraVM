@@ -109,9 +109,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // in production since its own slice, with a mutation record behind it. The census asked: a
     // 16-bit workload ranks these ten rows near 19% of block-stopping hits.
     //
-    // Three exclusions hold the boundary, and each is enforced in the ARM rather than by this
+    // Two exclusions hold the boundary, and each is enforced in the ARM rather than by this
     // list, because a list is the wrong place for a rule the next reader has to re-derive:
-    // ADC and SBB at Word (no carry-in lane), and both MEMORY shapes at Word (see the arms).
+    // ADC and SBB at Word (no carry-in lane), and form 1's MEMORY shape at Word (see the arms).
+    // Form 3's memory shape used to be the third: it is admitted as of the B2 slice, because it
+    // only READS and so lowers through the relaxed lean read site. See that arm.
     //
     // `0x83` WAS on that list and is now admitted, which is the second half of this slice. Its
     // register form produces `AluImm`, which carries a `width` field as of this commit, and its
@@ -527,16 +529,38 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                             src,
                             width: operand_width,
                         }),
-                        // Refused at Word for form 1's reason, plus one of its own, and `op != 7`
-                        // for form 1's reason too: `0x3b` word memory ships in quake's renderer.
-                        // What is new is the COMBINATION of Word with a write-back after a memory
-                        // read, which nothing exercises today, since `AluMemSource` at Word only
-                        // ever reaches CMP. Both halves are certified separately, the pair is not.
-                        DecodedOperand::Mem(_)
-                            if insn.operand_size == OperandSize::Word && op != 7 =>
-                        {
-                            None
-                        }
+                        // Word memory is ADMITTED here, unlike form 1 above, and the difference
+                        // between the two arms is the SITE rather than the opcode. `AluMemSource`
+                        // only READS guest memory, through `emit_ram_read_pointer`, which
+                        // dispatches to the RELAXED lean one-lookup read site whenever
+                        // `one_lookup_load` is on (the default). So a misaligned page-local operand
+                        // is served natively with the split bus charge instead of side-exiting at
+                        // that slot on every execution — which is exactly the economics that keep
+                        // form 1's read-modify-write shape refused, since site 6 carries the
+                        // unrelaxed guard and would need a read deposit AND a write deposit inside
+                        // one slot. `a_misaligned_word_alu_memory_source_runs_natively` in
+                        // `cpu_jit_misaligned_memory_test.rs` pins that behavior as an exact split
+                        // delta rather than leaving it to this comment.
+                        //
+                        // What this admission newly exercises is the COMBINATION of Word with a
+                        // register write-back after a memory read: `AluMemSource` at Word used to
+                        // reach only CMP, so the read lane (`movzx_r32_word_disp8`) and the
+                        // write-back lane (`emit_alu_preloaded`'s `mov_r16_r16`) were certified
+                        // separately and the pair was not. It is now, by
+                        // `the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op`
+                        // in `cpu_jit_word_memory_test.rs`, which runs all five writing ops plus
+                        // `0x3b` CMP as the non-writing control against a block-free interpreter
+                        // with `0xdead` in every destination's high half.
+                        //
+                        // ADC and SBB are still refused, by the forms-1|3 guard above and by a
+                        // release assert in `emit_alu_preloaded`; nothing here reaches them.
+                        //
+                        // The census asked for this one. `IZARRAVM_DIRECT_BARRIER_CENSUS=1` on
+                        // peachdrm-586 ranks `0x2B` SUB r16,r/m16 word memory at 655,103,963 of
+                        // 661,739,172 barrier runtime_hits — 99.0%, a single shape. The whole
+                        // non-carry set lands together because it is one arm and one emitter path,
+                        // and because the relocation trap predicts `0x03` would simply inherit
+                        // `0x2B`'s exits otherwise.
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemSource {
                             op,
                             dst: m.reg,

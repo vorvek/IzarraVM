@@ -487,6 +487,43 @@ fn a_misaligned_word_read_into_a_sixteen_bit_destination_runs_natively() {
     }
 }
 
+/// The sixteen-bit ALU memory-SOURCE form of the same read: `sub ax, word [odd]`.
+///
+/// `AluMemSource` reads through `emit_ram_read_pointer`, which dispatches to this slice's RELAXED
+/// lean read site whenever `one_lookup_load` is on (the default). So the form-3 word-memory
+/// admission does NOT convert a barrier into a per-execution side exit at misaligned addresses --
+/// it is served natively with the split charge, exactly like the MOVZX rows above. That is the
+/// economics claim the admission rests on, and it belongs here rather than in `word_memory`, whose
+/// `lowered` asserts bus clocks EQUAL to the interpreter.
+///
+/// It is not a duplicate of the loads: this row also WRITES a sixteen-bit register back and
+/// rewrites the lazy descriptor, so a lowering that served the misaligned read but mishandled the
+/// tail still fails here on registers or lazy flags.
+#[test]
+fn a_misaligned_word_alu_memory_source_runs_natively() {
+    for offset in [1u32, 3, 0x11] {
+        let at = OPERAND_PAGE + 0x800 + offset;
+        let mut body = vec![0x66u8];
+        body.extend_from_slice(&disp32(&[0x2b], 0, at));
+        lowered_misaligned(&body, 2, &format!("sub ax, word [{at:#x}]"));
+    }
+
+    // The other half of the split guard, on the same slot: an operand on the page's LAST byte
+    // CROSSES, and the crossing bound refuses it whatever the alignment relaxation does. Without
+    // this row the test above would keep passing if the crossing half were relaxed along with the
+    // alignment half, and the pointer would then be used across a page the FastMap entry does not
+    // cover. `guarded` also asserts the refusal is transactional -- EIP left AT the slot, guest RAM
+    // untouched, and the interpreted re-execution agreeing on both roles.
+    let at = OPERAND_PAGE + 0xfff;
+    let mut body = vec![0x66u8];
+    body.extend_from_slice(&disp32(&[0x2b], 0, at));
+    guarded(
+        &body,
+        alignment_exits,
+        &format!("sub ax, word [{at:#x}] crosses"),
+    );
+}
+
 /// An ALIGNED read that reaches the counting read STUB must charge exactly what the inline fast
 /// arm charges. The read-side twin of `an_aligned_store_through_the_slow_stub_charges_no_split`.
 ///
