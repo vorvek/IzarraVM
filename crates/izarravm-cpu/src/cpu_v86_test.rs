@@ -1183,11 +1183,23 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     // this chain needs is missing, so it walks the whole table and ends in
     // shutdown: #GP (contributory) nests #PF (page fault) from the not-present
     // ESP0 push, which is handled serially; vector 14's gate is zeroed in this
-    // world, so its null selector nests #GP (contributory) on a page fault, which
-    // escalates to #DF; vector 8's gate is zeroed too, so calling the double-fault
-    // handler nests #GP once more and the processor shuts down. The reported
-    // nested vector is therefore that third fault, and `original_vector` is the
-    // one the chain started from.
+    // world, so its clear present bit nests #NP (contributory) on a page fault,
+    // which escalates to #DF; vector 8's gate is zeroed too, so calling the
+    // double-fault handler nests #NP once more and the processor shuts down. The
+    // reported nested vector is therefore that third fault, and `original_vector`
+    // is the one the chain started from.
+    //
+    // The #NP here is NOT the architectural answer -- it pins the emulator's
+    // documented divergence. On metal a zeroed IDT entry is a type-0 descriptor
+    // and the PRM's AR-byte gate-type test, which precedes both the DPL and the
+    // presence test, raises #GP(vector*8+2). This emulator omits that type check
+    // (see the ledger note in `deliver_exception_body`), so with it absent the P
+    // check fires first and reports #NP. These vectors read 13 before the P check
+    // existed, which was the right vector for the wrong reason: it came from the
+    // null-selector load further down, carrying error code 0 rather than
+    // vector*8+2. #NP and #GP are both contributory, so the chain and its
+    // shutdown are unchanged either way -- only the vector each step reports.
+    // Adding the type check later moves these back to 13, correctly this time.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     put32(&mut bus.memory, 0x2000 + 6 * 4, 0x6000 | 0x6);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
@@ -1209,7 +1221,7 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
         result,
         Err(CpuError::TripleFault {
             original_vector: 13,
-            nested_vector: 13,
+            nested_vector: 11,
         }),
         "{result:?}"
     );
@@ -1452,15 +1464,20 @@ fn a_fault_while_calling_the_double_fault_handler_stops_the_machine() {
     // 386 PRM 9.9.8: "If any other exception occurs while attempting to call the
     // double-fault handler, the processor enters shutdown mode." Same layout as
     // the double-fault case above, except vector 8's gate is left zeroed: its
-    // null selector raises #GP while the #DF frame is being built. This is the
-    // one case that still stops the emulator.
+    // P bit is clear, so it raises #NP while the #DF frame is being built. This
+    // is the one case that still stops the emulator.
     //
-    // The nested vector asserted below encodes a separate, pre-existing gap:
-    // `deliver_exception_body` never checks a gate's present bit, so a zeroed gate
-    // surfaces as #GP(0) from the null-selector load rather than the architectural
-    // #NP(vector*8+2). Either way the class is contributory and the escalation
-    // verdict is the same, but this assertion will need the vector changed if that
-    // check is ever added.
+    // The nested vector pins the emulator's documented divergence, not the
+    // architectural answer: metal raises #GP(vector*8+2) for a zeroed entry via
+    // the AR-byte gate-type check the PRM puts ahead of both the DPL and the
+    // presence test, and which this emulator omits (see the ledger note in
+    // `deliver_exception_body`). With that check absent the P check fires first
+    // and reports #NP. This read 13 until `deliver_exception_body` gained the P
+    // check -- the right vector for the wrong reason, since it came from the
+    // null-selector load with error code 0 instead of vector*8+2. #NP and #GP
+    // are both contributory (`fault_class`), so the escalation verdict and the
+    // shutdown are identical either way; only the reported vector moves. Adding
+    // the type check later moves this back to 13, correctly this time.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     cpu.idtr.base = SPLIT_IDT;
     write_gate(&mut bus.memory, SPLIT_IDT + 14 * 8, MON_PF);
@@ -1473,7 +1490,7 @@ fn a_fault_while_calling_the_double_fault_handler_stops_the_machine() {
         result,
         Err(CpuError::TripleFault {
             original_vector: 14,
-            nested_vector: 13,
+            nested_vector: 11,
         }),
         "{result:?}"
     );
@@ -1884,4 +1901,193 @@ fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
     );
     assert_eq!(cpu.registers.eip, MON_CODE);
     assert_eq!(cpu.registers.cs().selector, R0_CS);
+}
+
+// ---------------------------------------------------------------------------
+// IDT gate DPL / P-bit conformance (386 PRM, PROTECTED-MODE arm of the
+// INT n / INT 3 / INTO operation, dev_docs/reference/i386/i386.txt):
+//
+//     IF software interrupt (* i.e. caused by INT n, INT 3, or INTO *)
+//     THEN
+//          IF gate descriptor DPL < CPL
+//          THEN #GP(vector number * 8+2+EXT);
+//          FI;
+//     FI;
+//     Gate must be present, else #NP(vector number * 8+2+EXT);
+//
+// A V86 task is always CPL 3, so it is the sharpest source for the rule: every
+// gate `v86_world` builds is DPL 0 (`int_gate` writes access 0x8e), which is
+// what real silicon refuses an `INT n` through. These call the delivery entry
+// points directly rather than executing `CD 21`, so the gate rule is isolated
+// from the separate V86 IOPL gate on `INT n`.
+// ---------------------------------------------------------------------------
+
+/// Overwrite the access byte of the IDT gate for `vector`. 0x8e/0xee are a
+/// present 32-bit interrupt gate at DPL 0 / DPL 3; clearing bit 7 makes it
+/// not-present.
+fn set_gate_access(m: &mut [u8], vector: u8, access: u8) {
+    m[(IDT + u32::from(vector) * 8 + 5) as usize] = access;
+}
+
+/// The IDT-style error code the PRM's `vector number * 8 + 2 + EXT` names.
+fn idt_error_code(vector: u8, ext: bool) -> u32 {
+    u32::from(vector) * 8 + 2 + u32::from(ext)
+}
+
+#[test]
+fn v86_software_int_through_a_dpl0_gate_general_protection_faults() {
+    // The case found at the 2026-08-18 IOPL-3 final review: a CPL-3 V86 guest's
+    // INT n through a DPL-0 gate must #GP on metal; the emulator dispatched it.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0x21], &[0x00]);
+    enter_v86_direct(&mut cpu, 0x1000, 0x1000);
+    assert_eq!(cpu.current_privilege_level(), 3, "a V86 task is CPL 3");
+
+    let result = cpu.software_interrupt(&mut bus, 0x21);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(code),
+            }) if code == idt_error_code(0x21, false)
+        ),
+        "INT 0x21 from CPL 3 through a DPL-0 gate must #GP(0x21*8+2), got {result:?}"
+    );
+    assert!(
+        cpu.is_v86_mode(),
+        "the refused delivery leaves the guest in V86"
+    );
+    assert_eq!(
+        cpu.registers.cs().selector,
+        0x0A00,
+        "and leaves its CS untouched -- no monitor entry happened"
+    );
+}
+
+#[test]
+fn v86_software_int_through_a_dpl3_gate_dispatches() {
+    // The non-vacuous partner: the SAME delivery through a DPL-3 gate (the
+    // 0xEE posture TOKAEMM's IDT now carries) must still reach the monitor.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0x21], &[0x00]);
+    set_gate_access(&mut bus.memory, 0x21, 0xee);
+    enter_v86_direct(&mut cpu, 0x1000, 0x1000);
+
+    cpu.software_interrupt(&mut bus, 0x21).unwrap();
+
+    assert!(!cpu.is_v86_mode(), "delivery out of V86 enters the monitor");
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    assert_eq!(cpu.registers.eip, MON_CODE);
+}
+
+#[test]
+fn v86_hardware_interrupt_through_a_dpl0_gate_dispatches() {
+    // The EXT exemption, pinned against the identical gate the software test
+    // above is refused by: the PRM guards the DPL comparison with "IF software
+    // interrupt", so an external delivery through a DPL-0 gate is legal at any
+    // CPL. Without this the fix would break every IRQ a V86 guest takes.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    enter_v86_direct(&mut cpu, 0x1000, 0x1000);
+
+    cpu.hardware_interrupt(&mut bus, 0x21).unwrap();
+
+    assert!(!cpu.is_v86_mode(), "the IRQ is delivered into the monitor");
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    assert_eq!(cpu.registers.eip, MON_CODE);
+}
+
+#[test]
+fn v86_software_int_through_a_not_present_gate_raises_np() {
+    // The P-bit check sits OUTSIDE the PRM's "IF software interrupt" guard, so
+    // it applies to every source; the gate here is DPL 3 so the DPL rule cannot
+    // fire and the #NP is isolated.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0x21], &[0x00]);
+    set_gate_access(&mut bus.memory, 0x21, 0x6e); // DPL 3, P = 0
+    enter_v86_direct(&mut cpu, 0x1000, 0x1000);
+
+    let result = cpu.software_interrupt(&mut bus, 0x21);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 11,
+                error_code: Some(code),
+            }) if code == idt_error_code(0x21, false)
+        ),
+        "a not-present gate must #NP(0x21*8+2), got {result:?}"
+    );
+}
+
+#[test]
+fn v86_hardware_interrupt_through_a_not_present_gate_raises_np_with_ext_set() {
+    // Same rule, EXT = 1: the PRM's P-bit line carries the same +EXT term as
+    // the DPL line, and an external delivery is the one source that sets it.
+    // This is the decision the brief asked for: hardware delivery is NOT exempt
+    // from the P bit (only from the DPL comparison), so a not-present gate
+    // faults for an IRQ too -- with error code vector*8+2+1.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    set_gate_access(&mut bus.memory, 0x21, 0x6e); // DPL 3, P = 0
+    enter_v86_direct(&mut cpu, 0x1000, 0x1000);
+
+    let result = cpu.hardware_interrupt(&mut bus, 0x21);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 11,
+                error_code: Some(code),
+            }) if code == idt_error_code(0x21, true)
+        ),
+        "an external delivery through a not-present gate must #NP(0x21*8+2+1), got {result:?}"
+    );
+}
+
+#[test]
+fn v86_software_int_through_a_not_present_dpl0_gate_takes_gp_not_np() {
+    // Exception priority. Both conditions hold at once; the PRM orders the DPL
+    // test BEFORE the presence test, so the guest must see #GP, not #NP. This
+    // is what pins the checks to their position in the body -- after the gate
+    // is read, before any stack switch or target-segment check.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0x21], &[0x00]);
+    set_gate_access(&mut bus.memory, 0x21, 0x0e); // DPL 0, P = 0
+    enter_v86_direct(&mut cpu, 0x1000, 0x1000);
+
+    let result = cpu.software_interrupt(&mut bus, 0x21);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(code),
+            }) if code == idt_error_code(0x21, false)
+        ),
+        "DPL is tested before P, so this is #GP not #NP, got {result:?}"
+    );
+}
+
+#[test]
+fn v86_int3_through_a_dpl0_gate_general_protection_faults() {
+    // "IF software interrupt (* i.e. caused by INT n, INT 3, or INTO *)": the
+    // breakpoint vector takes the same rule as INT n. A guest debugger's DPL-0
+    // vector-3 gate is exactly the "user code cannot single-step into the
+    // kernel handler" case the rule exists for.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcc], &[0x00]);
+    int_gate(&mut bus.memory, 3, MON_CODE); // present, DPL 0
+    enter_v86_direct(&mut cpu, 0x1000, 0x1000);
+
+    let result = cpu.software_interrupt(&mut bus, 3);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(code),
+            }) if code == idt_error_code(3, false)
+        ),
+        "INT3 from CPL 3 through a DPL-0 gate must #GP(3*8+2), got {result:?}"
+    );
 }

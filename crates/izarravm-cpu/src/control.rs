@@ -13,6 +13,47 @@ enum TaskSwitchKind {
     Return,
 }
 
+/// Which of the three interrupt sources the 386 PRM distinguishes drove a
+/// delivery.
+///
+/// This is deliberately NOT the same distinction as the `is_external: bool`
+/// the older delivery signatures carry. That bool separates a
+/// processor-detected exception from everything else -- it decides the
+/// error-code push and the double-fault class -- and so lumps a software
+/// `INT n` in with an external IRQ. The PRM's two gate checks need the finer
+/// split: a software interrupt contributes `EXT = 0` like an exception does,
+/// yet it is the ONLY source the gate-DPL comparison applies to. Threading the
+/// source as a parameter (rather than as a `CpuGsw` field) keeps the hot
+/// struct's measured cache layout untouched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeliverySource {
+    /// A processor-detected fault, trap or abort. `EXT = 0`; pushes an error
+    /// code on the vectors that carry one.
+    Exception,
+    /// `INT n`, `INT 3` or `INTO`. `EXT = 0`; never pushes an error code; the
+    /// only source the gate-DPL check applies to.
+    SoftwareInterrupt,
+    /// An external hardware interrupt. `EXT = 1`; never pushes an error code;
+    /// exempt from the gate-DPL check.
+    External,
+}
+
+impl DeliverySource {
+    /// External hardware interrupts and software `INT n` never push an error
+    /// code, even on a vector that a CPU exception would carry one for (e.g.
+    /// IRQ0 remapped to vector 8, #DF). Only a genuine CPU exception pushes one.
+    /// This is exactly the old `!is_external` predicate.
+    fn pushes_error_code(self) -> bool {
+        matches!(self, Self::Exception)
+    }
+
+    /// The PRM's `EXT` term, set only for an interrupt external to the running
+    /// program. A processor exception and a software `INT n` both contribute 0.
+    fn ext(self) -> u32 {
+        matches!(self, Self::External) as u32
+    }
+}
+
 impl CpuGsw {
     pub(super) fn software_interrupt<B: CpuBus>(
         &mut self,
@@ -21,7 +62,11 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
         if self.is_protected_mode() {
-            self.deliver_exception(bus, vector, None, true)
+            // `SoftwareInterrupt`, not `External`: this is the one source the
+            // gate-DPL check applies to. It used to pass the `is_external =
+            // true` bool, which carries the right error-code behaviour but
+            // cannot express the PRM's software/external split.
+            self.deliver_interrupt(bus, vector, None, DeliverySource::SoftwareInterrupt)
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -56,7 +101,7 @@ impl CpuGsw {
         vector: u8,
     ) -> ExecResult<()> {
         if self.is_protected_mode() {
-            self.deliver_exception(bus, vector, None, true)
+            self.deliver_interrupt(bus, vector, None, DeliverySource::External)
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -304,8 +349,10 @@ impl CpuGsw {
     ///   real #DF handler, which would then get its #DF delivered instead of a
     ///   stop. No DOS-era guest does that, and every other layout ends in a stop
     ///   either way -- with the precise "IDT does not cover vector N" diagnostic
-    ///   instead of a generic triple fault. Revisit together with the missing
-    ///   gate-P-bit check.
+    ///   instead of a generic triple fault. (The gate-P-bit check this note used
+    ///   to be paired with now exists, in `deliver_exception_body`; it raises an
+    ///   ordinary #NP and escalates through the table like any other fault. The
+    ///   IDT-limit stop is deliberately still outside it.)
     ///
     /// One known wart, inherited rather than introduced: in REAL mode
     /// `deliver_exception` routes through `software_interrupt`, which posts
@@ -390,6 +437,10 @@ impl CpuGsw {
         }
     }
 
+    /// Two-way entry kept for the exception and external-interrupt call sites:
+    /// `is_external` distinguishes only those two (see `DeliverySource`, whose
+    /// third variant a software `INT n` needs). Software interrupts come in
+    /// through `software_interrupt`, which names its source directly.
     pub(super) fn deliver_exception<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -400,20 +451,38 @@ impl CpuGsw {
         // to vector 8, #DF). Only a genuine CPU exception pushes one.
         is_external: bool,
     ) -> ExecResult<()> {
-        if vector == 6 && !is_external {
+        let source = if is_external {
+            DeliverySource::External
+        } else {
+            DeliverySource::Exception
+        };
+        self.deliver_interrupt(bus, vector, error_code, source)
+    }
+
+    fn deliver_interrupt<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+        error_code: Option<u32>,
+        source: DeliverySource,
+    ) -> ExecResult<()> {
+        if vector == 6 && source.pushes_error_code() {
             self.trace_ud_if_enabled(bus);
         }
         // #GP deliveries bound for a protected-mode guest handler (the V86 ones
         // are the monitor's routine trap traffic - hundreds of thousands per
         // second - so only trace when the guest is NOT in V86).
-        if (vector == 13 || vector == 11 || vector == 12) && !is_external && !self.is_v86_mode() {
+        if (vector == 13 || vector == 11 || vector == 12)
+            && source.pushes_error_code()
+            && !self.is_v86_mode()
+        {
             self.trace_fault_if_enabled(bus, vector, error_code);
         }
         if !self.is_protected_mode() {
             return self.software_interrupt(bus, vector);
         }
 
-        self.deliver_exception_inner(bus, vector, error_code, is_external)
+        self.deliver_exception_inner(bus, vector, error_code, source)
     }
 
     /// Guard around the delivery body: a fault raised while the frame is being
@@ -428,7 +497,7 @@ impl CpuGsw {
         bus: &mut B,
         vector: u8,
         error_code: Option<u32>,
-        is_external: bool,
+        source: DeliverySource,
     ) -> ExecResult<()> {
         // Snapshot everything the body mutates before its final CS:EIP commit:
         // CPL, EFLAGS (VM drop, NT/TF/IF clears), the inner SS:ESP installed by
@@ -451,7 +520,7 @@ impl CpuGsw {
             SegmentIndex::Gs,
         ]
         .map(|segment| (segment, self.registers.segment(segment)));
-        let result = self.deliver_exception_body(bus, vector, error_code, is_external);
+        let result = self.deliver_exception_body(bus, vector, error_code, source);
         // A committed task switch is the one failure this restore must NOT run
         // for. By then the incoming task's CR3, LDTR, TR, CS:EIP and GPRs are
         // live, and putting five fields of the OUTGOING task back would assemble
@@ -495,7 +564,7 @@ impl CpuGsw {
         bus: &mut B,
         vector: u8,
         error_code: Option<u32>,
-        is_external: bool,
+        source: DeliverySource,
     ) -> ExecResult<()> {
         let gate_address = self.idtr.base + u32::from(vector) * 8;
         if u32::from(self.idtr.limit) < u32::from(vector) * 8 + 7 {
@@ -510,6 +579,72 @@ impl CpuGsw {
         // its whole IDT off type 6) builds a WORD frame, and its high-offset
         // word is reserved: only the low word reaches EIP.
         let gate_type = (gate_high >> 8) & 0x0f;
+        // 386 PRM, PROTECTED-MODE arm of the INT n / INT 3 / INTO operation
+        // (dev_docs/reference/i386/i386.txt):
+        //
+        //     IF software interrupt (* i.e. caused by INT n, INT 3, or INTO *)
+        //     THEN
+        //          IF gate descriptor DPL < CPL
+        //          THEN #GP(vector number * 8+2+EXT);
+        //          FI;
+        //     FI;
+        //     Gate must be present, else #NP(vector number * 8+2+EXT);
+        //
+        // Both run here: after the gate has been read, and BEFORE the task-gate
+        // branch, the target CS descriptor read and every stack switch below.
+        // That position is the observable part -- when a DPL-0 gate is reached
+        // from CPL 3 with no valid inner stack behind it, the guest must see
+        // this #GP with the gate's own selector-style error code, not the
+        // #GP(0) the later stack-switch path would raise.
+        //
+        // The DPL comparison is a SOFTWARE-interrupt rule only. An external
+        // interrupt and a processor exception are both exempt (the PRM guards
+        // it with `IF software interrupt`), which is what lets one DPL-0 gate
+        // serve IRQs and faults while refusing a ring-3 `INT n` -- the ordinary
+        // posture for a kernel that does not want user code forging system
+        // calls. The P-bit line sits OUTSIDE that guard, so it applies to every
+        // source; only the EXT term in its error code varies.
+        //
+        // The personas do not fork here: this is architectural on every 386,
+        // 486 and 586, and nothing in the persona tables touches gate parsing.
+        //
+        // NOT checked here, unchanged by this fix and out of its scope: that
+        // the AR byte names an interrupt, trap or task gate at all. The PRM
+        // puts that test FIRST, ahead of both checks above:
+        //
+        //     Descriptor AR byte must indicate interrupt gate, trap gate, or
+        //     task gate, else #GP(vector number * 8+2+EXT);
+        //
+        // A descriptor of any other type is still decoded as an interrupt gate
+        // here. Adding the P check sharpens that divergence rather than
+        // introducing it, and moves where it shows: a non-gate descriptor with
+        // P = 0 -- a zeroed IDT entry being the common case -- now reports
+        // #NP(vector*8+2) from the check below, where metal reports
+        // #GP(vector*8+2) from the type check this emulator omits. Before this
+        // commit the same entry fell through to the interrupt-gate arm and
+        // surfaced as #GP(0) from the null-selector load: the right vector for
+        // the wrong reason, with the wrong error code. A present non-gate
+        // descriptor still falls through exactly as it always did. Closing this
+        // properly means adding the type check ahead of both, at which point
+        // the zeroed-entry case becomes #GP(vector*8+2) and two escalation
+        // tests move back to vector 13 -- on purpose, and with the error code
+        // right this time.
+        let gate_dpl = ((gate_high >> 13) & 3) as u8;
+        let idt_error_code =
+            selector_error_code(u16::from(vector) << 3, false, true) | source.ext();
+        if source == DeliverySource::SoftwareInterrupt && gate_dpl < self.current_privilege_level()
+        {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(idt_error_code),
+            });
+        }
+        if gate_high & (1 << 15) == 0 {
+            return Err(InternalFault::Exception {
+                vector: 11,
+                error_code: Some(idt_error_code),
+            });
+        }
         let is_interrupt_gate = gate_type & 0x07 == 0x06;
         let gate_is_32 = gate_type & 0x08 != 0;
         // The V86-source frame is ALWAYS dword-sized: the PRM's
@@ -537,7 +672,7 @@ impl CpuGsw {
         // DOS/4GW 1.97 points #PF at one of these.
         if (gate_high >> 8) & 0x1f == 0x05 {
             self.task_switch(bus, selector, TaskSwitchKind::Call)?;
-            if !is_external && vector_pushes_error_code(vector) {
+            if source.pushes_error_code() && vector_pushes_error_code(vector) {
                 // The switch has committed, and this push lands on the NEW task's
                 // stack, so a fault here is terminal for the same reason it is
                 // inside `commit_task_switch`.
@@ -626,7 +761,7 @@ impl CpuGsw {
         // The error code is pushed only for a CPU exception on a vector that carries one
         // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
         // hardware interrupt or software `INT n`, even when it lands on such a vector.
-        if !is_external && vector_pushes_error_code(vector) {
+        if source.pushes_error_code() && vector_pushes_error_code(vector) {
             // TOKAEMM's vec13 discriminator (emulator contract) only ever inspects a
             // V86-ORIGIN vector-13 delivery: a V86 sensitive-instruction #GP (always
             // error code 0 -- there is no selector to blame, the fault is on the
