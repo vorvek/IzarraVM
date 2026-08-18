@@ -530,7 +530,10 @@ pub(crate) enum LinkRefusal {
     Inactive,
     /// One end predates the current link epoch.
     StaleEpoch,
-    /// `SegmentLayout::link_compatible` refused.
+    /// The CHAIN segment requirements of the two ends do not merge: they disagree about `cs`, or
+    /// about a `data` descriptor that some block in one of the two chains actually pins
+    /// (`SegmentLayout::link_merge`). A descriptor no block in either chain pins is not a reason
+    /// to refuse -- that admission is the whole of the 2026-08-18 chain-used mask slice.
     SegmentLayout,
     /// `CompiledBlock::link_compatible` refused.
     BlockShape,
@@ -642,6 +645,7 @@ fn link_clear_bucket_label(cause: LinkClearCause) -> &'static str {
         LinkClearCause::Retired => "cleared_retired",
         LinkClearCause::Flushed => "cleared_flushed",
         LinkClearCause::Reset => "cleared_reset",
+        LinkClearCause::ChainWiden => "cleared_chain_widen",
     }
 }
 
@@ -904,12 +908,23 @@ pub(crate) enum LinkClearCause {
     /// `reset_storage`: the cache-wide drop, code and all. Rare; counted apart so a rise in it
     /// cannot hide inside the flush lane.
     Reset,
+    /// A downstream link widened the target's CHAIN segment requirement past what this source can
+    /// satisfy, so the edge was cut to keep the chain sound. Both blocks stay compiled and the
+    /// cell reverts to the zero portal, so the source's exits report `StaticUnbound`; the edge is
+    /// NOT re-parked in `waiting`, because the widen is monotone and a retry could only re-derive
+    /// the same conflict. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
+    ChainWiden,
 }
 
 impl LinkClearCause {
-    pub(crate) const COUNT: usize = 4;
-    pub(crate) const ALL: [Self; Self::COUNT] =
-        [Self::Replaced, Self::Retired, Self::Flushed, Self::Reset];
+    pub(crate) const COUNT: usize = 5;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Replaced,
+        Self::Retired,
+        Self::Flushed,
+        Self::Reset,
+        Self::ChainWiden,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -917,6 +932,7 @@ impl LinkClearCause {
             Self::Retired => "retired",
             Self::Flushed => "flushed",
             Self::Reset => "reset",
+            Self::ChainWiden => "chain_widen",
         }
     }
 }

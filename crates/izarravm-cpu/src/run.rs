@@ -2235,6 +2235,14 @@ impl CpuGsw {
             }
         }
         let has_link = self.jit_direct.has_linked_successor(block.id());
+        // The STRICT arm stays strict, deliberately. The 2026-08-18 chain-used link mask narrowed
+        // the EDGE predicate to the segments some block in the chain actually pins, and it is
+        // sound precisely because this check still proves all six of the root's own descriptors:
+        // the non-adopting merge never puts a descriptor into a chain requirement that its
+        // holder's own snapshot does not hold. Relaxing this to the block's own `data_matches`
+        // would validate the root's pinned set and not the CHAIN's -- a wrong-base miscompile.
+        // Reading `chain_layout` here instead is the class-C adoption slice, and it must REPLACE
+        // the 116-byte layout fetch above rather than add a second one.
         let data_descriptors_match = if has_link {
             segments.all_data_matches(self)
         } else {

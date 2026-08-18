@@ -2650,3 +2650,177 @@ fn a_dynamic_miss_into_a_rejected_block_is_attributed_to_its_barrier() {
         "a dynamic miss must not be reported in the static column"
     );
 }
+
+/// The chain-used link mask, at the machine rather than at `BlockCache`
+/// (dev_docs/plans/2026-08-18-chain-used-link-mask.md). Two blocks compiled under DIFFERENT ES
+/// descriptors, neither of which touches ES: whole-array snapshot equality refused this edge, the
+/// source exited `StaticUnbound` on every iteration, and prince-586 paid a dispatcher round trip
+/// per 1.58 guest instructions for it.
+///
+/// The edge must now form and the transfer must happen NATIVELY -- and the result must still be
+/// the interpreter's, because a chained successor runs no entry check of its own.
+#[test]
+fn direct_chain_links_across_a_segment_descriptor_neither_block_uses() {
+    const ENTRY: u32 = 0x200;
+    const SECOND: u32 = 0x220;
+    const DONE: u32 = 0x240;
+
+    let mut memory = vec![0; 0x5000];
+    memory[ENTRY as usize..ENTRY as usize + 10].copy_from_slice(&[
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x220
+    ]);
+    memory[SECOND as usize..SECOND as usize + 10].copy_from_slice(&[
+        0xb9, 0x02, 0x00, 0x00, 0x00, // mov ecx,2
+        0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x240
+    ]);
+    memory[DONE as usize] = 0xf4; // hlt, never compiled: the chain must END here
+
+    let mut native = flat_stack_cpu(ENTRY);
+    let mut interp = flat_stack_cpu(ENTRY);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + 5, SECOND, SECOND + 5];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interp, &mut interp_bus, &starts);
+
+    // The compile-time capture is whatever the segment registers hold AT INSTALL, so installing
+    // the two blocks under different ES selectors is exactly the census's class B: a frozen
+    // descriptor that differs and that neither block reads.
+    let entry_es = native.registers.segment(SegmentIndex::Es);
+    let entry_block = install_fixture_block(&mut native, ENTRY);
+    native
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::flat(0x20, 0x93));
+    install_fixture_block(&mut native, SECOND);
+    assert_ne!(entry_es, native.registers.segment(SegmentIndex::Es));
+    // Back to the root's own ES for the run: the root still proves all six of its descriptors.
+    native.registers.set_segment(SegmentIndex::Es, entry_es);
+
+    native.set_eip(ENTRY);
+    interp.set_eip(ENTRY);
+    let before = native.perf_counters().clone();
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, entry_block)
+            .unwrap()
+    );
+    for _ in 0..4 {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+
+    assert_eq!(native.registers.eip, DONE);
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    let after = native.perf_counters().clone();
+    assert_eq!(
+        after.jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        1,
+        "the two blocks must chain natively, not through the dispatcher"
+    );
+    assert_eq!(
+        after.jit_direct_entries - before.jit_direct_entries,
+        1,
+        "one host entry must cover both blocks"
+    );
+    assert_unresolved_reason_deltas(&before, &after, [1, 0, 0, 0]);
+}
+
+/// The other half of the chain mask's soundness, at the machine: the ROOT's entry check has to
+/// prove the descriptors the CHAIN needs, not the ones the root itself happens to use.
+///
+/// The root reads no memory at all. Its successor reads through ES, so the chain requirement
+/// carries ES even though the root's own pinned mask is empty. Enter with a live ES whose BASE
+/// differs from the one the successor baked, and the entry must be REFUSED -- relaxing the linked
+/// arm to the root's own mask would let the chain run and read the wrong address, silently.
+#[test]
+fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
+    const ENTRY: u32 = 0x200;
+    const SECOND: u32 = 0x220;
+    const DONE: u32 = 0x240;
+    const BAKED: u32 = 0x3000;
+    const SHIFT: u32 = 0x100;
+
+    let mut memory = vec![0; 0x5000];
+    memory[ENTRY as usize..ENTRY as usize + 10].copy_from_slice(&[
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x220
+    ]);
+    memory[SECOND as usize..SECOND as usize + 12].copy_from_slice(&[
+        0x26, 0x8b, 0x15, 0x00, 0x30, 0x00, 0x00, // mov edx,[es:0x3000]
+        0xe9, 0x14, 0x00, 0x00, 0x00, // jmp 0x240
+    ]);
+    memory[DONE as usize] = 0xf4;
+    memory[BAKED as usize..BAKED as usize + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    memory[(BAKED + SHIFT) as usize..(BAKED + SHIFT) as usize + 4]
+        .copy_from_slice(&0xcafe_babeu32.to_le_bytes());
+
+    let mut native = flat_stack_cpu(ENTRY);
+    let mut native_bus = TestBus::with_memory(memory);
+    native_bus.direct_pages_enabled = true;
+    native_bus.direct_page_clocks = true;
+    decode_fixture(
+        &mut native,
+        &mut native_bus,
+        &[ENTRY, ENTRY + 5, SECOND, SECOND + 7],
+    );
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        0x3000,
+        0x3000,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        true,
+    );
+
+    let entry_block = install_fixture_block(&mut native, ENTRY);
+    install_fixture_block(&mut native, SECOND);
+
+    // Non-vacuity first: with the live ES the successor baked, the chain forms and runs.
+    native.set_eip(ENTRY);
+    let before = native.perf_counters().clone();
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, entry_block)
+            .unwrap()
+    );
+    assert_eq!(native.registers.eip, DONE);
+    assert_eq!(native.registers.edx(), 0xdead_beef);
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        1,
+        "the successor must be reached natively, or this row proves nothing about chains"
+    );
+
+    // Now move ES's BASE. The root pins nothing, so only the strict six-descriptor check stands
+    // between the chain and a read through the stale base.
+    let baked_es = native.registers.segment(SegmentIndex::Es);
+    let mut shifted_es = baked_es;
+    shifted_es.base = SHIFT;
+    native.registers.set_segment(SegmentIndex::Es, shifted_es);
+    native.set_eip(ENTRY);
+    native.registers.set_edx(0);
+    let before = native.perf_counters().clone();
+    assert!(
+        !native
+            .try_run_direct_block_for_test(&mut native_bus, entry_block)
+            .unwrap(),
+        "the root must refuse: the chain needs an ES the root itself never pinned"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_reject_data_segment
+            - before.jit_direct_reject_data_segment,
+        1
+    );
+    assert_eq!(native.registers.eip, ENTRY);
+    assert_eq!(
+        native.registers.edx(),
+        0,
+        "nothing may have run: a chained read here would have used the baked base"
+    );
+}

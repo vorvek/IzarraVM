@@ -2364,6 +2364,24 @@ fn direct_exit_and_link_cell_layouts_are_pinned() {
     }
 }
 
+/// Bucket lookup by LABEL, not by index. The bucket layout is derived from `LinkRefusal::COUNT`
+/// and `LinkClearCause::COUNT`, so a new cause shifts every index past it and a row that
+/// hard-codes 13 silently starts asserting about its neighbour instead.
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+fn census_bucket(buckets: &[(&'static str, u64)], label: &str) -> u64 {
+    buckets
+        .iter()
+        .find(|(name, _)| *name == label)
+        .map(|(_, count)| *count)
+        .unwrap_or_else(|| panic!("census bucket {label} must exist"))
+}
+
 #[cfg(all(
     feature = "direct-link-refusal-census",
     any(
@@ -2432,6 +2450,7 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
             "cleared_retired",
             "cleared_flushed",
             "cleared_reset",
+            "cleared_chain_widen",
             "unexpected_linked",
             "closed",
         ]
@@ -2647,6 +2666,12 @@ fn segment_write_static_cell_is_registered_as_suppressed_fallthrough() {
         all(target_os = "linux", target_arch = "x86_64")
     )
 ))]
+/// The refusal this row needs is a REAL one. It used to perturb the target's DS descriptor on a
+/// `trivial_compilation` whose `used` mask is 0 (direct_test.rs:64), which was a refusal only
+/// while `link_compatible` compared all six frozen descriptors unconditionally. Under the chain
+/// mask a segment NOBODY in the chain pins is not a reason to refuse, so that edge now links and
+/// the row would have been testing generation history through a path it never takes. Both ends
+/// therefore PIN DS here — a genuine class-D conflict, refused before and after the mask.
 #[test]
 fn link_refusal_census_preserves_generation_history_through_retry_and_source_retire() {
     let mut cache = BlockCache::default();
@@ -2662,6 +2687,7 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
     assert!(matches!(cache.probe(source), BlockProbe::Compile));
     let mut source_compilation =
         trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.segment_layout.used |= segment_bit(SegmentIndex::Ds);
     source_compilation.successors = [Some(target_link), None];
     source_compilation.emitted_static_targets = source_compilation.successors;
     cache.install(&source_compilation).expect("source install");
@@ -2669,6 +2695,7 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
     assert!(matches!(cache.probe(target), BlockProbe::Interpret));
     assert!(matches!(cache.probe(target), BlockProbe::Compile));
     let mut target_g1 = trivial_compilation(BlockSpan::new(target, 1, 1).expect("target span"));
+    target_g1.segment_layout.used |= segment_bit(SegmentIndex::Ds);
     target_g1.segment_layout.data[segment_index(SegmentIndex::Ds)].selector ^= 8;
     let target_g1_id = cache.install(&target_g1).expect("first target install");
     cache.note_direct_link_refusal_exit(1);
@@ -2680,7 +2707,10 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
         refused.rows[0].last_target_generation,
         Some(target_g1_id.generation())
     );
-    assert_eq!(refused.rows[0].buckets[4].1, 1);
+    assert_eq!(
+        census_bucket(&refused.rows[0].buckets, "refused_segment_layout"),
+        1
+    );
 
     assert_eq!(cache.retire_physical_range_for_test(target.physical, 1), 1);
     assert!(matches!(cache.probe(target), BlockProbe::Interpret));
@@ -2698,8 +2728,14 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
         linked.rows[0].last_target_generation,
         Some(target_g2_id.generation())
     );
-    assert_eq!(linked.rows[0].buckets[4].1, 1);
-    assert_eq!(linked.rows[0].buckets[13].1, 1);
+    assert_eq!(
+        census_bucket(&linked.rows[0].buckets, "refused_segment_layout"),
+        1
+    );
+    assert_eq!(
+        census_bucket(&linked.rows[0].buckets, "unexpected_linked"),
+        1
+    );
 
     assert_eq!(cache.retire_physical_range_for_test(source.physical, 1), 1);
     cache.note_direct_link_refusal_exit(1);
@@ -2711,9 +2747,15 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
         closed.rows[0].last_target_generation,
         Some(target_g2_id.generation())
     );
-    assert_eq!(closed.rows[0].buckets[4].1, 1);
-    assert_eq!(closed.rows[0].buckets[13].1, 1);
-    assert_eq!(closed.rows[0].buckets[14].1, 1);
+    assert_eq!(
+        census_bucket(&closed.rows[0].buckets, "refused_segment_layout"),
+        1
+    );
+    assert_eq!(
+        census_bucket(&closed.rows[0].buckets, "unexpected_linked"),
+        1
+    );
+    assert_eq!(census_bucket(&closed.rows[0].buckets, "closed"), 1);
     assert_eq!(closed.rows[0].unbound_exits, 3);
 
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
@@ -2884,7 +2926,7 @@ fn admission_census_rejected_probe_classifier_covers_every_cache_state_and_disab
     assert_eq!(cache.classify_rejected_probe(rejected), None);
 }
 
-/// The three link-clear causes account for every cleared link: their sum equals the aggregate
+/// The five link-clear causes account for every cleared link: their sum equals the aggregate
 /// `BlockCacheStats::unlinks` that feeds `jit_direct_links_cleared`. The aggregate is fed
 /// independently rather than derived, so this is the cross-check that they have not drifted --
 /// a new unlink site that forgets its cause would show up here as a shortfall.
@@ -2951,7 +2993,45 @@ fn link_clear_causes_close_on_the_aggregate() {
         1
     );
 
-    // All FOUR sites, not three: deleting any single increment above must break the sum.
+    // ChainWiden: a link made downstream widens a block's chain segment requirement past what an
+    // already-linked predecessor can satisfy, and that inbound edge is cut. Fresh blocks for the
+    // same reason the reset section below needs them.
+    let widen_root = key(0x1600);
+    let widen_middle = key(0x1700);
+    let widen_tail = key(0x1800);
+    let widen_root_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(widen_root, 1, 1).expect("widen root span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x1111)],
+        ),
+    );
+    let widen_middle_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(widen_middle, 1, 1).expect("widen middle span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    let widen_tail_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(widen_tail, 1, 1).expect("widen tail span"),
+            &[SegmentIndex::Ds, SegmentIndex::Es],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    assert!(cache.try_link(widen_root_id, 0, widen_middle_id));
+    assert!(cache.try_link(widen_middle_id, 0, widen_tail_id));
+    assert_eq!(cache.outbound[widen_root_id.index()][0], None);
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        1
+    );
+
+    // All FIVE sites: deleting any single increment above must break the sum.
     let causes = cache.stalls.links_cleared;
     assert!(
         causes.iter().all(|&n| n > 0),
@@ -3092,4 +3172,507 @@ fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chain-used link mask (dev_docs/plans/2026-08-18-chain-used-link-mask.md, NON-ADOPTING slice)
+//
+// The contract these rows pin: a static edge is refused over a frozen `data` descriptor only when
+// some block in the CHAIN — the source's requirement or the target's — actually pins that
+// segment. A descriptor nobody pins is not a reason to refuse (class B); a descriptor both ends
+// pin with different values still is (class D). Because the requirement is transitive, a link
+// made downstream can widen a block's requirement and retroactively invalidate an already-live
+// inbound edge, which is then CUT (`LinkClearCause::ChainWiden`).
+//
+// MUTATION EVIDENCE (2026-08-18, applied by hand, observed, restored). Each row names the fixture
+// that caught it; a mutation nobody catches is a fixture bug, not a free pass.
+//
+// | mutation | caught by |
+// |---|---|
+// | predicate reads `segment_layouts` instead of `chain_layouts` | `link_mask_judges_a_new_predecessor_against_the_widened_requirement` |
+// | worklist never seeded (propagation made shallow) | `link_mask_cuts_an_inbound_edge_...` AND `link_mask_widens_an_inbound_edge_...` |
+// | the `None` arm's `unlink_outbound` deleted (widen, never cut) | `link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates` |
+// | `merge_chain`'s conflict arm made permissive | `link_mask_still_refuses_class_d_...`, plus both worklist rows |
+// | `chain_layouts` reset dropped from `install`'s recycled arm | `link_mask_resets_the_chain_requirement_when_a_slot_is_recycled` |
+// | run.rs's linked entry arm relaxed to `data_matches` | `direct_chain_entry_validates_a_segment_only_the_successor_uses` (execution level) |
+//
+// Two findings worth keeping. FIRST: the transitive row does NOT catch the `segment_layouts`
+// predicate on its own -- the worklist still cuts the edge behind it -- which is why the
+// new-predecessor row exists. SECOND: the run.rs mutation survived the ENTIRE crate until the
+// execution-level row was written; no BlockCache fixture can see it, because that hole is in what
+// the dispatcher proves, not in which edges form.
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn chain_mask_compilation(
+    span: BlockSpan,
+    pinned: &[SegmentIndex],
+    descriptors: &[(SegmentIndex, u16)],
+) -> Compilation {
+    let mut compilation = trivial_compilation(span);
+    let mut used = 0u8;
+    for segment in pinned {
+        used |= segment_bit(*segment);
+    }
+    compilation.segment_layout.used = used;
+    for (segment, selector) in descriptors {
+        let slot = &mut compilation.segment_layout.data[segment_index(*segment)];
+        slot.selector = *selector;
+        slot.base = u32::from(*selector) << 4;
+    }
+    compilation
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn link_target_of(key: BlockKey) -> LinkTarget {
+    LinkTarget {
+        linear: key.linear,
+        mode_key: key.mode_key,
+    }
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn install_chain_block(cache: &mut JitState, compilation: &Compilation) -> BlockId {
+    let key = compilation.span.key;
+    assert!(matches!(cache.probe(key), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(key), BlockProbe::Compile));
+    cache.install(compilation).expect("chain block install")
+}
+
+/// Class B: the two snapshots differ on ES, which NEITHER block pins. Whole-array equality
+/// refuses this edge; it is 68.03% of prince-586's link refusals and the class its hot pair is
+/// in.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_admits_class_b_difference_on_a_segment_nobody_pins() {
+    let mut cache = BlockCache::default();
+    let source = key(0x4_1010);
+    let target = key(0x4_1020);
+
+    let mut source_compilation = chain_mask_compilation(
+        BlockSpan::new(source, 1, 1).expect("source span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    source_compilation.successors[0] = Some(link_target_of(target));
+    let source_id = install_chain_block(&mut cache, &source_compilation);
+
+    let target_compilation = chain_mask_compilation(
+        BlockSpan::new(target, 1, 1).expect("target span"),
+        &[],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let target_id = install_chain_block(&mut cache, &target_compilation);
+
+    assert_eq!(cache.outbound[source_id.index()][0], Some(target_id));
+    assert!(cache.has_linked_successor(source_id));
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::SegmentLayout as usize],
+        0
+    );
+}
+
+/// prince-586's hot pair, modelled as what it is: a 2-CYCLE whose two members differ on an ES
+/// neither of them pins. Both edges must form, because it is the pair being chain-eligible — not
+/// one edge existing — that lifts the quota clamp at run.rs:2294.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_chains_the_prince_hot_pair_two_cycle() {
+    let mut cache = BlockCache::default();
+    let first = key(0x4_1030);
+    let second = key(0x4_1040);
+
+    let mut first_compilation = chain_mask_compilation(
+        BlockSpan::new(first, 1, 1).expect("first span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    first_compilation.successors[0] = Some(link_target_of(second));
+    let first_id = install_chain_block(&mut cache, &first_compilation);
+
+    let mut second_compilation = chain_mask_compilation(
+        BlockSpan::new(second, 1, 1).expect("second span"),
+        &[],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    second_compilation.successors[0] = Some(link_target_of(first));
+    let second_id = install_chain_block(&mut cache, &second_compilation);
+
+    assert_eq!(cache.outbound[first_id.index()][0], Some(second_id));
+    assert_eq!(cache.outbound[second_id.index()][0], Some(first_id));
+    assert!(cache.has_linked_successor(first_id));
+    assert!(cache.has_linked_successor(second_id));
+}
+
+/// Class D: both ends pin ES and disagree about it. This is a REAL conflict — one of the two
+/// blocks would run against a base the other's entry check never validated — and it must stay
+/// refused. The guard against over-admission; it passes before and after the mask lands.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_still_refuses_class_d_conflict_on_a_segment_both_pin() {
+    let mut cache = BlockCache::default();
+    let source = key(0x4_1050);
+    let target = key(0x4_1060);
+
+    let mut source_compilation = chain_mask_compilation(
+        BlockSpan::new(source, 1, 1).expect("source span"),
+        &[SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    source_compilation.successors[0] = Some(link_target_of(target));
+    let source_id = install_chain_block(&mut cache, &source_compilation);
+
+    let target_compilation = chain_mask_compilation(
+        BlockSpan::new(target, 1, 1).expect("target span"),
+        &[SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    install_chain_block(&mut cache, &target_compilation);
+
+    assert_eq!(cache.outbound[source_id.index()][0], None);
+    assert!(!cache.has_linked_successor(source_id));
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::SegmentLayout as usize],
+        1
+    );
+}
+
+/// THE DISCRIMINATING ROW. `R -> S` is class B on ES (neither pins it, and their ES descriptors
+/// DIFFER). `S -> T` is admissible on its own terms because `S` and `T` agree on ES, which `T`
+/// pins. Admitting both and stopping there is the depth-2 miscompile: entering at `R` validates
+/// `R`'s ES, and the chain then runs `T`'s body against `S`'s ES base.
+///
+/// A shallow implementation — one that computes each block's requirement from its own snapshot,
+/// or from its direct successors without walking back to predecessors — leaves `R -> S` live and
+/// FAILS here. The only sound outcomes are widen-`R` (impossible in this row: `R`'s own ES
+/// descriptor disagrees) or CUT `R -> S`.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1070);
+    let middle = key(0x4_1080);
+    let tail = key(0x4_1090);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(middle));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+
+    let mut middle_compilation = chain_mask_compilation(
+        BlockSpan::new(middle, 1, 1).expect("middle span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    middle_compilation.successors[0] = Some(link_target_of(tail));
+    let middle_id = install_chain_block(&mut cache, &middle_compilation);
+
+    // The ordering hazard this row is most likely to die of: if the edge never formed, every
+    // assertion below passes for the wrong reason.
+    assert_eq!(
+        cache.outbound[root_id.index()][0],
+        Some(middle_id),
+        "class-B edge R -> S must exist before the widen that is supposed to cut it"
+    );
+
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+
+    assert_eq!(cache.outbound[middle_id.index()][0], Some(tail_id));
+    assert_eq!(
+        cache.outbound[root_id.index()][0],
+        None,
+        "R -> S must be CUT: S's requirement now names ES and R disagrees about it"
+    );
+    assert!(!cache.has_linked_successor(root_id));
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        1,
+        "the cut must be attributed to the widen, not to a replace or a retire"
+    );
+    // S absorbed the widen even though R could not.
+    assert_ne!(
+        cache.chain_layouts[middle_id.index()].used & segment_bit(SegmentIndex::Es),
+        0
+    );
+    // R-A's load-bearing claim: `unlink_outbound` does NOT re-park. A cut edge reverts to the zero
+    // portal and reports `StaticUnbound`; it must not join `waiting`, where `resolve_waiting`
+    // would retry it forever against a conflict the monotone widen can never undo.
+    assert!(
+        cache
+            .waiting
+            .values()
+            .flatten()
+            .all(|source| source.block != root_id),
+        "a ChainWiden cut must not re-park the source for an absorbing retry loop"
+    );
+}
+
+/// The mirror arm: same shape, but all three blocks hold the SAME ES descriptor. The widen then
+/// SUCCEEDS at `R` instead of cutting, so the chain stays whole. Together with the row above this
+/// pins both arms of the worklist; a "cut on every widen" implementation passes that row and
+/// fails this one.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_widens_an_inbound_edge_that_can_follow_the_chain() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_10a0);
+    let middle = key(0x4_10b0);
+    let tail = key(0x4_10c0);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(middle));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+
+    let mut middle_compilation = chain_mask_compilation(
+        BlockSpan::new(middle, 1, 1).expect("middle span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    middle_compilation.successors[0] = Some(link_target_of(tail));
+    let middle_id = install_chain_block(&mut cache, &middle_compilation);
+    assert_eq!(cache.outbound[root_id.index()][0], Some(middle_id));
+
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+
+    assert_eq!(cache.outbound[middle_id.index()][0], Some(tail_id));
+    assert_eq!(
+        cache.outbound[root_id.index()][0],
+        Some(middle_id),
+        "the widen agrees at R, so the edge must survive"
+    );
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        0
+    );
+    // And the widen actually REACHED R, two hops from the link that caused it. Without this the
+    // row would pass against an implementation that never propagates at all.
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "R's chain requirement must have absorbed the ES that T pins"
+    );
+    // Non-adoption: only the mask moved. R's own descriptors are still R's.
+    assert_eq!(
+        cache.chain_layouts[root_id.index()].data,
+        cache.segment_layouts[root_id.index()].data
+    );
+}
+
+/// A NEW predecessor arriving at an already-widened block must be judged against that block's
+/// CHAIN requirement, not against its own frozen snapshot. `R` pins only DS, but everything
+/// downstream of it needs ES, so an incoming edge that disagrees about ES has to be refused even
+/// though neither `P` nor `R` reads ES itself.
+///
+/// This is the row that catches a predicate wired to `segment_layouts` instead of
+/// `chain_layouts`: the propagation would leave `P` with a narrower requirement than the target
+/// it links to, which is the invariant the whole design rests on.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_judges_a_new_predecessor_against_the_widened_requirement() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_10d0);
+    let tail = key(0x4_10e0);
+    let newcomer = key(0x4_10f0);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+    assert_eq!(cache.outbound[root_id.index()][0], Some(tail_id));
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "R's requirement must name the ES its successor pins"
+    );
+
+    let mut newcomer_compilation = chain_mask_compilation(
+        BlockSpan::new(newcomer, 1, 1).expect("newcomer span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    newcomer_compilation.successors[0] = Some(link_target_of(root));
+    let newcomer_id = install_chain_block(&mut cache, &newcomer_compilation);
+
+    assert_eq!(
+        cache.outbound[newcomer_id.index()][0],
+        None,
+        "P disagrees about the ES R's chain requires, so the edge must be refused"
+    );
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::SegmentLayout as usize],
+        1
+    );
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        0,
+        "a refusal is not a cut"
+    );
+}
+
+/// A translation flush drops every edge while the blocks stay compiled, so the requirements those
+/// edges justified must go with them. Leaving a widened mask behind is monotone in the SAFE
+/// direction but permanently over-strict: the class-B edges this slice exists to admit would be
+/// refused for a segment nothing live reaches any more, and nothing ever narrows the mask again.
+///
+/// Sound because a flush leaves NO live edge to violate: the reset restores exactly the state
+/// `install` would have written, which is the only other writer of this array.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_forgets_chain_requirements_a_translation_flush_invalidated() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1210);
+    let tail = key(0x4_1220);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    let tail_id = install_chain_block(&mut cache, &tail_compilation);
+    assert_eq!(cache.outbound[root_id.index()][0], Some(tail_id));
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "the row is vacuous unless the requirement really widened first"
+    );
+
+    cache.invalidate_translation();
+
+    assert!(cache.inbound.is_empty());
+    assert_eq!(cache.outbound[root_id.index()][0], None);
+    for index in [root_id.index(), tail_id.index()] {
+        assert_eq!(
+            cache.chain_layouts[index], cache.segment_layouts[index],
+            "a flush leaves no live edge, so no block may keep a widened requirement"
+        );
+    }
+}
+
+/// A recycled slot must not serve the retired occupant's WIDENED requirement to its successor.
+/// `install` resets the chain layout in the same statement that writes the block's own layout;
+/// without that reset the new block inherits a stale mask AND stale descriptors, and refuses
+/// edges it should admit.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn link_mask_resets_the_chain_requirement_when_a_slot_is_recycled() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1110);
+    let tail = key(0x4_1120);
+    let newcomer = key(0x4_1130);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    install_chain_block(&mut cache, &tail_compilation);
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0
+    );
+
+    assert_eq!(cache.retire_physical_range_for_test(root.physical, 1), 1);
+    let reborn = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(root, 1, 1).expect("reborn span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x1111)],
+        ),
+    );
+    assert_eq!(
+        reborn.index(),
+        root_id.index(),
+        "the row is vacuous unless the slot really is recycled"
+    );
+    assert_eq!(
+        cache.chain_layouts[reborn.index()],
+        cache.segment_layouts[reborn.index()],
+        "a fresh occupant starts at its own layout"
+    );
+
+    // And the reset is observable through the predicate, not just the field: an edge that agrees
+    // with the NEW occupant must link.
+    let mut newcomer_compilation = chain_mask_compilation(
+        BlockSpan::new(newcomer, 1, 1).expect("newcomer span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x1111)],
+    );
+    newcomer_compilation.successors[0] = Some(link_target_of(root));
+    let newcomer_id = install_chain_block(&mut cache, &newcomer_compilation);
+    assert_eq!(cache.outbound[newcomer_id.index()][0], Some(reborn));
 }
