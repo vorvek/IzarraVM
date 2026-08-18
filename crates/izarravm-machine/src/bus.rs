@@ -921,6 +921,25 @@ impl CpuBus for MachineBus<'_> {
                 direct: true,
             });
         }
+        if self
+            .direct_margo_lfb_bytes(address, width.bytes() as usize, width)
+            .is_some()
+        {
+            let data = self
+                .vega
+                .margo_lfb_direct_bytes(address, width.bytes() as usize)
+                .expect("the LFB probe and copy must agree");
+            let value = match width {
+                BusWidth::Byte => u32::from(data[0]),
+                BusWidth::Word => u32::from(u16::from_le_bytes([data[0], data[1]])),
+                BusWidth::Dword => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            };
+            self.record_direct_vga_accesses(address, width.bytes() as usize, width, kind);
+            return Ok(DirectMemoryRead {
+                value,
+                direct: true,
+            });
+        }
         // A MISALIGNED but page-local access into plain RAM. Today this falls through to
         // `read_memory`, which declines wide at `vega`, hits `should_split`, and recurses one
         // byte at a time; every byte re-asks `vega` and then reads the same `self.memory` slice.
@@ -1001,6 +1020,18 @@ impl CpuBus for MachineBus<'_> {
             }
             return Ok(DirectMemoryWrite { direct: true });
         }
+        if self
+            .direct_margo_lfb_bytes(address, width.bytes() as usize, width)
+            .is_some()
+        {
+            let data = self
+                .vega
+                .margo_lfb_direct_bytes_mut(address, width.bytes() as usize)
+                .expect("the LFB probe and copy must agree");
+            data.copy_from_slice(&value.to_le_bytes()[..width.bytes() as usize]);
+            self.record_direct_vga_accesses(address, width.bytes() as usize, width, kind);
+            return Ok(DirectMemoryWrite { direct: true });
+        }
         // The write twin of the unaligned admission in `read_memory_direct`; see that comment for
         // the L-RAM per-byte argument. `Memory::write_u16`/`write_u32` take a BYTE offset and have
         // no alignment requirement of their own, so the data path needs no change.
@@ -1052,6 +1083,18 @@ impl CpuBus for MachineBus<'_> {
             out.copy_from_slice(&self.memory.as_slice()[start..end]);
             return Ok(out.len());
         }
+        if self
+            .direct_margo_lfb_bytes(address, out.len(), access_width)
+            .is_some()
+        {
+            out.copy_from_slice(
+                self.vega
+                    .margo_lfb_direct_bytes(address, out.len())
+                    .expect("the LFB probe and copy must agree"),
+            );
+            self.record_direct_vga_accesses(address, out.len(), access_width, kind);
+            return Ok(out.len());
+        }
         let Some((address, page_offset)) =
             self.direct_vga_bytes(address, out.len(), access_width, false)
         else {
@@ -1087,6 +1130,17 @@ impl CpuBus for MachineBus<'_> {
             self.memory.as_mut_slice()[start..end].copy_from_slice(data);
             return Ok(data.len());
         }
+        if self
+            .direct_margo_lfb_bytes(address, data.len(), access_width)
+            .is_some()
+        {
+            self.vega
+                .margo_lfb_direct_bytes_mut(address, data.len())
+                .expect("the LFB probe and copy must agree")
+                .copy_from_slice(data);
+            self.record_direct_vga_accesses(address, data.len(), access_width, kind);
+            return Ok(data.len());
+        }
         let Some((address, page_offset)) =
             self.direct_vga_bytes(address, data.len(), access_width, true)
         else {
@@ -1115,16 +1169,20 @@ impl CpuBus for MachineBus<'_> {
         {
             return 0;
         }
-        let ram = self
-            .direct_page_ram_bytes(address, bytes, access_width)
-            .map_or(0, |(_, start, end)| end - start);
-        let vga = match kind {
+        if let Some((_, start, end)) = self.direct_page_ram_bytes(address, bytes, access_width) {
+            return end - start;
+        }
+        if match kind {
             BusAccessKind::DataRead => self.direct_vga_bytes(address, bytes, access_width, false),
             BusAccessKind::DataWrite => self.direct_vga_bytes(address, bytes, access_width, true),
             _ => None,
         }
-        .map_or(0, |_| bytes);
-        ram.max(vga)
+        .is_some()
+        {
+            return bytes;
+        }
+        self.direct_margo_lfb_bytes(address, bytes, access_width)
+            .map_or(0, |_| bytes)
     }
 
     #[inline]
@@ -1229,6 +1287,8 @@ impl CpuBus for MachineBus<'_> {
                 .checked_add(width.bytes())
                 .is_some_and(|end| end <= video_end)
         {
+            self.vega
+                .record_direct_access(address, width.bytes() as usize, kind);
             if kind == BusAccessKind::DataWrite {
                 self.vega.note_direct_write(address, width.bytes() as usize);
             }
@@ -3005,6 +3065,29 @@ impl MachineBus<'_> {
         available.then_some((gated, gated as usize & RAM_LOOKUP_PAGE_MASK))
     }
 
+    #[inline]
+    fn direct_margo_lfb_bytes(
+        &self,
+        address: u32,
+        bytes: usize,
+        access_width: BusWidth,
+    ) -> Option<(u32, usize)> {
+        let end = address.checked_add(u32::try_from(bytes).ok()?)?;
+        if address < crate::MARGO_LFB_BASE || end > crate::MARGO_MMIO_BASE {
+            return None;
+        }
+        let gated = self.apply_a20(address);
+        if gated != address
+            || bytes == 0
+            || should_split(gated, access_width)
+            || ((gated as usize & RAM_LOOKUP_PAGE_MASK) + bytes > RAM_LOOKUP_PAGE_SIZE)
+            || self.vega.margo_lfb_direct_bytes(gated, bytes).is_none()
+        {
+            return None;
+        }
+        Some((gated, gated as usize & RAM_LOOKUP_PAGE_MASK))
+    }
+
     fn record_direct_vga_accesses(
         &mut self,
         address: u32,
@@ -3012,6 +3095,7 @@ impl MachineBus<'_> {
         width: BusWidth,
         kind: BusAccessKind,
     ) {
+        self.vega.record_direct_access(address, bytes, kind);
         let wait_states = if self.active_mode.uses_approximate_timing() {
             video_wait_states_approx(self.active_mode.persona())
         } else {

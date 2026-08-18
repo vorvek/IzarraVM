@@ -135,19 +135,6 @@ const _: () = assert!(LOGO_RGBA.len() == LOGO_W * LOGO_H * 4);
 /// The source PNG's flat background colour, the unmix origin.
 const LOGO_BG_F32: [f32; 3] = [236.0, 230.0, 223.0];
 
-/// Pack 0x00RRGGBB words into a tightly-packed opaque RGBA8 buffer for upload.
-fn words_to_rgba(words: &[u32], width: usize, height: usize) -> Vec<u8> {
-    let mut rgba = vec![0u8; width * height * 4];
-    for (i, &color) in words.iter().enumerate().take(width * height) {
-        let o = i * 4;
-        rgba[o] = ((color >> 16) & 0xff) as u8;
-        rgba[o + 1] = ((color >> 8) & 0xff) as u8;
-        rgba[o + 2] = (color & 0xff) as u8;
-        rgba[o + 3] = 0xff;
-    }
-    rgba
-}
-
 /// Open the host file manager at `path`. A small portable shim over the platform
 /// "reveal in file manager" command, kept behind a cfg so no extra crate is
 /// pulled in. Failures are logged rather than surfaced; opening a folder is a
@@ -1260,7 +1247,8 @@ impl GuiApp {
             }
             self.frame_seq = frame.seq;
             Some(crate::crt::CrtFrame {
-                rgba: words_to_rgba(&frame.words, frame.width, frame.height),
+                words: frame.words,
+                changed_rows: frame.changed_rows,
                 width: frame.width as u32,
                 height: frame.height as u32,
             })

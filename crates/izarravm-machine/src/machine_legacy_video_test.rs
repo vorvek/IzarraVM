@@ -65,6 +65,15 @@ fn video_facade_preserves_presented_and_headless_scanout_behavior() {
     assert_eq!((presented_width, presented_height), (320, 400));
     assert_eq!(presented[0], 0x00ff_0000);
 
+    let first = machine
+        .presented_frame_update()
+        .expect("first cached frame");
+    let unchanged = machine
+        .presented_frame_update()
+        .expect("unchanged cached frame");
+    assert!(unchanged.changed_rows.is_empty());
+    assert!(std::sync::Arc::ptr_eq(&first.words, &unchanged.words));
+
     let (_, full_width, full_height) = machine.frame_argb();
     assert_eq!(full_width, 320);
     assert!(full_height > presented_height);

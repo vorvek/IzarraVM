@@ -1920,6 +1920,7 @@ fn write_hdd_profile_json(
     let guest_seconds = master_ticks as f64 / MASTER_CLOCK_HZ as f64;
     let perf = machine.cpu().perf_counters();
     let instructions = perf.instructions.max(1);
+    let video = machine.video_host_metrics();
     let machine_profile = machine.host_profile_snapshot();
     let machine_phases = machine_profile.phases;
     let classified_wall_ns = machine_phases
@@ -1927,6 +1928,7 @@ fn write_hdd_profile_json(
         .map(|phase| phase.wall_ns)
         .sum::<u64>();
     let total_wall_ns = wall.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let margo_display = machine.margo_display();
     #[allow(unused_mut)]
     let mut report = json!({
         "schema": "izarravm-hdd-profile-v1",
@@ -1947,6 +1949,28 @@ fn write_hdd_profile_json(
         "cpu_core_clocks_per_host_second": machine.cpu().elapsed_clocks as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "direct_native_coverage": perf.jit_direct_insns as f64 / instructions as f64,
         "direct_slow_exits_per_100_instructions": 100.0 * perf.jit_direct_side_exits as f64 / instructions as f64,
+        "active_display": format!("{:?}", machine.active_display()),
+        "legacy_video_mode": format!("{:?}", machine.active_video_mode()),
+        "margo_display": margo_display.map(|display| json!({
+            "mode": format!("0x{:04x}", display.mode),
+            "width": display.width,
+            "height": display.height,
+            "bpp": display.bpp,
+            "pitch": display.pitch,
+            "start": display.start,
+        })),
+        "video_host": {
+            "margo_lfb_direct_read_bytes": video.margo_lfb_direct_read_bytes,
+            "margo_lfb_direct_write_bytes": video.margo_lfb_direct_write_bytes,
+            "margo_lfb_slow_read_bytes": video.margo_lfb_slow_read_bytes,
+            "margo_lfb_slow_write_bytes": video.margo_lfb_slow_write_bytes,
+            "margo_banked_direct_read_bytes": video.margo_banked_direct_read_bytes,
+            "margo_banked_direct_write_bytes": video.margo_banked_direct_write_bytes,
+            "margo_banked_slow_read_bytes": video.margo_banked_slow_read_bytes,
+            "margo_banked_slow_write_bytes": video.margo_banked_slow_write_bytes,
+            "margo_scanout_rows_converted": video.margo_scanout_rows_converted,
+            "margo_scanout_pixels_converted": video.margo_scanout_pixels_converted,
+        },
         "timedemo": timedemo.map(|(gametics, realtics)| json!({
             "gametics": gametics,
             "realtics": realtics,

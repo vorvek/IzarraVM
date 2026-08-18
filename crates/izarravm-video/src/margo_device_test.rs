@@ -257,6 +257,43 @@ fn scanout_argb_decodes_32bpp_pixels() {
 }
 
 #[test]
+fn visible_writes_report_only_the_rows_that_changed() {
+    let mut margo = Margo::default();
+    assert!(margo.set_mode(0x101));
+    let settled = margo.content_generation();
+
+    margo.write_vram_u8(3 * 640 + 17, 0x2a);
+
+    assert_eq!(
+        margo.changed_rows_since(settled),
+        std::iter::once(3..4).collect::<Vec<_>>()
+    );
+    let changed = margo.content_generation();
+    margo.write_vram_u8(3 * 640 + 17, 0x2a);
+    assert_eq!(margo.content_generation(), changed);
+    assert!(margo.changed_rows_since(changed).is_empty());
+}
+
+#[test]
+fn scanout_argb_rows_reuses_storage_and_leaves_clean_rows_untouched() {
+    let mut palette = [0u32; 256];
+    palette[0x2a] = 0x0011_2233;
+    let mut margo = Margo::default();
+    assert!(margo.set_mode(0x101));
+    let mut argb = vec![0x00aa_55aa; 640 * 480];
+    let capacity = argb.capacity();
+
+    margo.write_vram_u8(3 * 640 + 17, 0x2a);
+    let changed = 3..4;
+    margo.scanout_argb_rows(&palette, std::slice::from_ref(&changed), &mut argb);
+
+    assert_eq!(argb.capacity(), capacity);
+    assert_eq!(argb[3 * 640 + 17], 0x0011_2233);
+    assert_eq!(argb[2 * 640 + 17], 0x00aa_55aa);
+    assert_eq!(argb[4 * 640 + 17], 0x00aa_55aa);
+}
+
+#[test]
 fn cursor_composites_the_four_and_xor_results() {
     let mut margo = Margo::default();
     margo.set_mode_640x480x8();

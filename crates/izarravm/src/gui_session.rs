@@ -5,6 +5,7 @@ use izarravm_audio::{AudioDebugSnapshot, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiConfig, MidiStatus};
 use izarravm_machine::{
     CdAudioState, CdImage, CueSource, JoystickState, Machine, MachineProfile, StopReason,
+    VideoHostMetricsSnapshot,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -286,7 +287,8 @@ impl SessionSnapshot {
 
 #[derive(Debug, Clone)]
 pub(super) struct SessionFrame {
-    pub(super) words: Vec<u32>,
+    pub(super) words: Arc<Vec<u32>>,
+    pub(super) changed_rows: Vec<std::ops::Range<usize>>,
     pub(super) width: usize,
     pub(super) height: usize,
     pub(super) seq: u64,
@@ -926,10 +928,16 @@ impl MachineGeneration {
         self.wavetable = Some(wavetable);
         self.midi_receiver = Some(midi_receiver);
         let now = Instant::now();
-        self.runtime_profile = runtime_profile_enabled().then(|| {
+        let runtime_profile = runtime_profile_enabled();
+        if runtime_profile {
+            self.machine.enable_machine_profiling();
+        }
+        self.runtime_profile = runtime_profile.then(|| {
             RuntimeProfiler::new(
                 now,
                 self.spec.sink.as_ref().and_then(AudioSink::debug_snapshot),
+                self.machine.video_host_metrics(),
+                crate::crt::presentation_metrics_snapshot(),
             )
         });
         Ok(())
@@ -1440,7 +1448,7 @@ fn run_worker(
         // -- before this was an Option it was a single black pixel, which the
         // window stretched to full size -- so the publication waits instead.
         let rendered = new_frame
-            .then(|| generation.machine.presented_frame_argb())
+            .then(|| generation.machine.presented_frame_update())
             .flatten();
         let frame_produced = rendered.is_some();
         let serial = new_frame.then(|| generation.machine.serial_text());
@@ -1454,11 +1462,12 @@ fn run_worker(
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some((words, width, height)) = rendered {
+            if let Some(frame) = rendered {
                 published.frame = Some(SessionFrame {
-                    words,
-                    width,
-                    height,
+                    words: frame.words,
+                    changed_rows: frame.changed_rows,
+                    width: frame.width,
+                    height: frame.height,
                     seq,
                     generation: generation.id,
                 });
@@ -1496,6 +1505,8 @@ fn run_worker(
         if should_sleep {
             std::thread::sleep(EMU_SLICE);
         }
+        let video_metrics = generation.machine.video_host_metrics();
+        let presentation_metrics = crate::crt::presentation_metrics_snapshot();
         if let (Some(profile), Some(audio_finished)) =
             (generation.runtime_profile.as_mut(), audio_finished)
         {
@@ -1521,6 +1532,8 @@ fn run_worker(
                 published_before,
                 frame_produced,
                 backpressured,
+                video_metrics,
+                presentation_metrics,
                 before_sleep,
             );
             profile.maybe_emit(profile_finished, generation.spec.sink.as_ref());
@@ -1744,6 +1757,23 @@ struct RuntimeProfileMetrics {
     max_throttle_ahead_ticks: u64,
     frames_produced: u64,
     frames_skipped: u64,
+    margo_lfb_direct_read_bytes: u64,
+    margo_lfb_direct_write_bytes: u64,
+    margo_lfb_slow_read_bytes: u64,
+    margo_lfb_slow_write_bytes: u64,
+    margo_banked_direct_read_bytes: u64,
+    margo_banked_direct_write_bytes: u64,
+    margo_banked_slow_read_bytes: u64,
+    margo_banked_slow_write_bytes: u64,
+    margo_scanout_rows_converted: u64,
+    margo_scanout_pixels_converted: u64,
+    presentation_pack_wall_ns: u64,
+    presentation_upload_submit_wall_ns: u64,
+    presentation_upload_bytes: u64,
+    presentation_upload_rows: u64,
+    presentation_upload_runs: u64,
+    presentation_full_uploads: u64,
+    presentation_partial_uploads: u64,
 }
 
 impl RuntimeProfileMetrics {
@@ -1798,6 +1828,64 @@ impl RuntimeProfileMetrics {
                 .saturating_add(current_seq - published_seq - 1);
         }
     }
+
+    fn record_video(
+        &mut self,
+        video: VideoHostMetricsSnapshot,
+        presentation: crate::crt::PresentationMetricsSnapshot,
+    ) {
+        self.margo_lfb_direct_read_bytes = self
+            .margo_lfb_direct_read_bytes
+            .saturating_add(video.margo_lfb_direct_read_bytes);
+        self.margo_lfb_direct_write_bytes = self
+            .margo_lfb_direct_write_bytes
+            .saturating_add(video.margo_lfb_direct_write_bytes);
+        self.margo_lfb_slow_read_bytes = self
+            .margo_lfb_slow_read_bytes
+            .saturating_add(video.margo_lfb_slow_read_bytes);
+        self.margo_lfb_slow_write_bytes = self
+            .margo_lfb_slow_write_bytes
+            .saturating_add(video.margo_lfb_slow_write_bytes);
+        self.margo_banked_direct_read_bytes = self
+            .margo_banked_direct_read_bytes
+            .saturating_add(video.margo_banked_direct_read_bytes);
+        self.margo_banked_direct_write_bytes = self
+            .margo_banked_direct_write_bytes
+            .saturating_add(video.margo_banked_direct_write_bytes);
+        self.margo_banked_slow_read_bytes = self
+            .margo_banked_slow_read_bytes
+            .saturating_add(video.margo_banked_slow_read_bytes);
+        self.margo_banked_slow_write_bytes = self
+            .margo_banked_slow_write_bytes
+            .saturating_add(video.margo_banked_slow_write_bytes);
+        self.margo_scanout_rows_converted = self
+            .margo_scanout_rows_converted
+            .saturating_add(video.margo_scanout_rows_converted);
+        self.margo_scanout_pixels_converted = self
+            .margo_scanout_pixels_converted
+            .saturating_add(video.margo_scanout_pixels_converted);
+        self.presentation_pack_wall_ns = self
+            .presentation_pack_wall_ns
+            .saturating_add(presentation.pack_wall_ns);
+        self.presentation_upload_submit_wall_ns = self
+            .presentation_upload_submit_wall_ns
+            .saturating_add(presentation.upload_submit_wall_ns);
+        self.presentation_upload_bytes = self
+            .presentation_upload_bytes
+            .saturating_add(presentation.upload_bytes);
+        self.presentation_upload_rows = self
+            .presentation_upload_rows
+            .saturating_add(presentation.upload_rows);
+        self.presentation_upload_runs = self
+            .presentation_upload_runs
+            .saturating_add(presentation.upload_runs);
+        self.presentation_full_uploads = self
+            .presentation_full_uploads
+            .saturating_add(presentation.full_uploads);
+        self.presentation_partial_uploads = self
+            .presentation_partial_uploads
+            .saturating_add(presentation.partial_uploads);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1839,6 +1927,23 @@ struct RuntimeProfileReport {
     max_throttle_ahead_seconds: f64,
     frames_produced: u64,
     frames_skipped: u64,
+    margo_lfb_direct_read_bytes: u64,
+    margo_lfb_direct_write_bytes: u64,
+    margo_lfb_slow_read_bytes: u64,
+    margo_lfb_slow_write_bytes: u64,
+    margo_banked_direct_read_bytes: u64,
+    margo_banked_direct_write_bytes: u64,
+    margo_banked_slow_read_bytes: u64,
+    margo_banked_slow_write_bytes: u64,
+    margo_scanout_rows_converted: u64,
+    margo_scanout_pixels_converted: u64,
+    presentation_pack_wall_ns: u64,
+    presentation_upload_submit_wall_ns: u64,
+    presentation_upload_bytes: u64,
+    presentation_upload_rows: u64,
+    presentation_upload_runs: u64,
+    presentation_full_uploads: u64,
+    presentation_partial_uploads: u64,
     audio_debug_available: bool,
     audio_frames_produced: u64,
     audio_frames_consumed: u64,
@@ -1927,6 +2032,23 @@ impl RuntimeProfileReport {
             max_throttle_ahead_seconds: metrics.max_throttle_ahead_ticks as f64 / ticks_per_second,
             frames_produced: metrics.frames_produced,
             frames_skipped: metrics.frames_skipped,
+            margo_lfb_direct_read_bytes: metrics.margo_lfb_direct_read_bytes,
+            margo_lfb_direct_write_bytes: metrics.margo_lfb_direct_write_bytes,
+            margo_lfb_slow_read_bytes: metrics.margo_lfb_slow_read_bytes,
+            margo_lfb_slow_write_bytes: metrics.margo_lfb_slow_write_bytes,
+            margo_banked_direct_read_bytes: metrics.margo_banked_direct_read_bytes,
+            margo_banked_direct_write_bytes: metrics.margo_banked_direct_write_bytes,
+            margo_banked_slow_read_bytes: metrics.margo_banked_slow_read_bytes,
+            margo_banked_slow_write_bytes: metrics.margo_banked_slow_write_bytes,
+            margo_scanout_rows_converted: metrics.margo_scanout_rows_converted,
+            margo_scanout_pixels_converted: metrics.margo_scanout_pixels_converted,
+            presentation_pack_wall_ns: metrics.presentation_pack_wall_ns,
+            presentation_upload_submit_wall_ns: metrics.presentation_upload_submit_wall_ns,
+            presentation_upload_bytes: metrics.presentation_upload_bytes,
+            presentation_upload_rows: metrics.presentation_upload_rows,
+            presentation_upload_runs: metrics.presentation_upload_runs,
+            presentation_full_uploads: metrics.presentation_full_uploads,
+            presentation_partial_uploads: metrics.presentation_partial_uploads,
             audio_debug_available,
             audio_frames_produced: audio.frames_produced,
             audio_frames_consumed: audio.frames_consumed,
@@ -2014,11 +2136,18 @@ struct RuntimeProfiler {
     total: RuntimeProfileMetrics,
     initial_audio: Option<AudioDebugSnapshot>,
     last_audio: Option<AudioDebugSnapshot>,
+    last_video: VideoHostMetricsSnapshot,
+    last_presentation: crate::crt::PresentationMetricsSnapshot,
     backpressure_started: Option<Instant>,
 }
 
 impl RuntimeProfiler {
-    fn new(now: Instant, audio: Option<AudioDebugSnapshot>) -> Self {
+    fn new(
+        now: Instant,
+        audio: Option<AudioDebugSnapshot>,
+        video: VideoHostMetricsSnapshot,
+        presentation: crate::crt::PresentationMetricsSnapshot,
+    ) -> Self {
         Self {
             started: now,
             interval_started: now,
@@ -2027,6 +2156,8 @@ impl RuntimeProfiler {
             total: RuntimeProfileMetrics::default(),
             initial_audio: audio,
             last_audio: audio,
+            last_video: video,
+            last_presentation: presentation,
             backpressure_started: None,
         }
     }
@@ -2044,6 +2175,8 @@ impl RuntimeProfiler {
         published_seq: u64,
         frame_produced: bool,
         backpressured: bool,
+        video: VideoHostMetricsSnapshot,
+        presentation: crate::crt::PresentationMetricsSnapshot,
         now: Instant,
     ) {
         self.interval.record_work(emulation, audio, frame);
@@ -2058,6 +2191,12 @@ impl RuntimeProfiler {
             .record_frame(current_seq, published_seq, frame_produced);
         self.total
             .record_frame(current_seq, published_seq, frame_produced);
+        let video_delta = video.delta_since(self.last_video);
+        let presentation_delta = presentation.delta_since(self.last_presentation);
+        self.interval.record_video(video_delta, presentation_delta);
+        self.total.record_video(video_delta, presentation_delta);
+        self.last_video = video;
+        self.last_presentation = presentation;
 
         match (self.backpressure_started, backpressured) {
             (None, true) => self.backpressure_started = Some(now),

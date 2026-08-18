@@ -2415,6 +2415,10 @@ impl Machine {
         self.vega.active_video_mode()
     }
 
+    pub fn margo_display(&self) -> Option<crate::MargoDisplay> {
+        self.vega.margo_active().then(|| self.vega.margo_display())
+    }
+
     /// Monotonic legacy timing sequence used by the host renderer to pace frame
     /// publication without borrowing the VGA implementation.
     pub fn frame_sequence(&self) -> u64 {
@@ -2468,6 +2472,18 @@ impl Machine {
         frame
     }
 
+    pub fn presented_frame_update(&self) -> Option<crate::PresentedFrameUpdate> {
+        let start = self.host_profile.start();
+        let frame = self.vega.presented_frame_update();
+        self.host_profile
+            .record(MachineProfilePhaseKind::VideoConversion, start);
+        frame
+    }
+
+    pub fn video_host_metrics(&self) -> crate::VideoHostMetricsSnapshot {
+        self.vega.host_metrics()
+    }
+
     /// Render the current display state immediately for a headless capture.
     /// Legacy VGA output is cropped to its visible rows; accelerated scanouts
     /// use their current front buffers.
@@ -2493,9 +2509,9 @@ impl Machine {
     /// (so a mode or resolution change always moves the key).
     ///
     /// Returns `None` for text mode (time-based cursor/attribute blink toggles with no
-    /// guest write, so writes alone cannot capture it — text keeps re-rendering), and —
-    /// in v1 — for Margo LFB / Distira (their own scanout; a generation for them is
-    /// deferred to v2). Consumers of [`Self::presented_frame_argb`] should use
+    /// guest write, so writes alone cannot capture it) and Distira. Margo combines
+    /// its row-damage generation with the legacy DAC generation. Consumers of
+    /// [`Self::presented_frame_argb`] should use
     /// [`Self::presented_frame_generation`] so the key and raster are finalized
     /// together. Pure `&self`: no rendering, no timing side effects.
     pub fn frame_generation(&self) -> Option<u64> {

@@ -330,18 +330,6 @@ fn logo_recolor_maps_background_to_beige_and_keeps_ink() {
 }
 
 #[test]
-fn framebuffer_words_pack_into_rgba() {
-    let words = [0, 0x00AB_CDEF, 0, 0x00AB_CDEF];
-    let rgba = words_to_rgba(&words, 2, 2);
-    assert_eq!(rgba.len(), 16);
-    // Pixel 1 is 0x00ABCDEF -> R=AB, G=CD, B=EF, A=FF.
-    assert_eq!(
-        (rgba[4], rgba[5], rgba[6], rgba[7]),
-        (0xAB, 0xCD, 0xEF, 0xFF)
-    );
-}
-
-#[test]
 fn star_icon_is_red_in_the_centre_and_clear_in_the_corner() {
     let size = 64u32;
     let rgba = render_star_icon(size, [0xC7, 0x44, 0x46]);

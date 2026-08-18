@@ -3,6 +3,10 @@
 
 //! VEGA video-card ownership and guest-visible routing.
 
+use std::cell::RefCell;
+use std::ops::Range;
+use std::sync::Arc;
+
 use izarravm_bus::{BusWidth, Memory};
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 use izarravm_video::{
@@ -15,7 +19,10 @@ use crate::video_params::{
     DISTIRA_PCI_BAR_SIZE, DISTIRA_PCI_DEVICE_ID, DISTIRA_PCI_LFB_OFFSET, DISTIRA_PCI_REVISION,
     DISTIRA_PCI_TEX_OFFSET, DISTIRA_PCI_VENDOR_ID,
 };
-use crate::{ActiveDisplay, DISTIRA_MMIO_BASE, MARGO_LFB_BASE, MARGO_MMIO_BASE};
+use crate::{
+    ActiveDisplay, DISTIRA_MMIO_BASE, MARGO_LFB_BASE, MARGO_MMIO_BASE, PresentedFrameUpdate,
+    VideoHostMetricsSnapshot,
+};
 
 /// Margo's legacy extension index/data pair. Both sit in the VGA port block but
 /// are undefined on plain VGA, the same slot real SuperVGA chips took for their
@@ -67,6 +74,31 @@ pub(crate) enum VideoWrite {
 }
 
 #[derive(Debug)]
+struct PresentedArgbCache {
+    words: Arc<Vec<u32>>,
+    palette: [u32; DAC_ENTRIES],
+    width: usize,
+    height: usize,
+    margo_generation: u64,
+    owner: Option<ActiveDisplay>,
+    valid: bool,
+}
+
+impl Default for PresentedArgbCache {
+    fn default() -> Self {
+        Self {
+            words: Arc::new(Vec::new()),
+            palette: [0; DAC_ENTRIES],
+            width: 0,
+            height: 0,
+            margo_generation: 0,
+            owner: None,
+            valid: false,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct Vega {
     vga: Box<Vga>,
     margo: Margo,
@@ -97,6 +129,8 @@ pub(crate) struct Vega {
     // a SHORT run answers the question without waiting for a full schedule.
     vbe_mode_sets_linear: u32,
     vbe_mode_sets_banked: u32,
+    presented_argb_cache: RefCell<PresentedArgbCache>,
+    host_metrics: std::cell::Cell<VideoHostMetricsSnapshot>,
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
@@ -116,6 +150,8 @@ impl Default for Vega {
             margo_ext_disp_y: 0,
             vbe_mode_sets_linear: 0,
             vbe_mode_sets_banked: 0,
+            presented_argb_cache: RefCell::new(PresentedArgbCache::default()),
+            host_metrics: std::cell::Cell::new(VideoHostMetricsSnapshot::default()),
             // Izarra has no PCI BIOS yet, so Distira powers on with its fixed
             // BAR decoded. Guest drivers may still rewrite command and BAR0.
             distira_command: 0x0002,
@@ -329,6 +365,75 @@ impl Vega {
         self.margo_active
     }
 
+    pub(crate) fn host_metrics(&self) -> VideoHostMetricsSnapshot {
+        self.host_metrics.get()
+    }
+
+    #[inline]
+    pub(crate) fn record_direct_access(
+        &self,
+        address: u32,
+        bytes: usize,
+        kind: izarravm_bus::BusAccessKind,
+    ) {
+        let banked = self.margo_banked_window_at(address);
+        let linear =
+            self.margo_active && self.margo_linear && margo_lfb_offset(address, bytes).is_some();
+        if !banked && !linear {
+            return;
+        }
+        let mut metrics = self.host_metrics.get();
+        let count = bytes as u64;
+        if banked {
+            match kind {
+                izarravm_bus::BusAccessKind::DataRead => {
+                    metrics.margo_banked_direct_read_bytes =
+                        metrics.margo_banked_direct_read_bytes.saturating_add(count);
+                }
+                izarravm_bus::BusAccessKind::DataWrite => {
+                    metrics.margo_banked_direct_write_bytes = metrics
+                        .margo_banked_direct_write_bytes
+                        .saturating_add(count);
+                }
+                _ => {}
+            }
+        } else if linear {
+            match kind {
+                izarravm_bus::BusAccessKind::DataRead => {
+                    metrics.margo_lfb_direct_read_bytes =
+                        metrics.margo_lfb_direct_read_bytes.saturating_add(count);
+                }
+                izarravm_bus::BusAccessKind::DataWrite => {
+                    metrics.margo_lfb_direct_write_bytes =
+                        metrics.margo_lfb_direct_write_bytes.saturating_add(count);
+                }
+                _ => {}
+            }
+        }
+        self.host_metrics.set(metrics);
+    }
+
+    pub(crate) fn margo_lfb_direct_bytes(&self, address: u32, bytes: usize) -> Option<&[u8]> {
+        if !self.margo_active || !self.margo_linear {
+            return None;
+        }
+        let start = margo_lfb_offset(address, bytes)?;
+        Some(&self.margo.vram()[start..start + bytes])
+    }
+
+    pub(crate) fn margo_lfb_direct_bytes_mut(
+        &mut self,
+        address: u32,
+        bytes: usize,
+    ) -> Option<&mut [u8]> {
+        if !self.margo_active || !self.margo_linear {
+            return None;
+        }
+        let start = margo_lfb_offset(address, bytes)?;
+        self.margo.note_vram_write(start, bytes);
+        Some(&mut self.margo.vram_mut()[start..start + bytes])
+    }
+
     pub(crate) fn active_video_mode(&self) -> VideoMode {
         self.vga.active_mode()
     }
@@ -427,6 +532,9 @@ impl Vega {
     /// this path.
     pub(crate) fn note_direct_write(&mut self, address: u32, bytes: usize) {
         if self.margo_banked_window_at(address) {
+            if let Some(offset) = self.margo_banked_window_offset(address) {
+                self.margo.note_vram_write(offset, bytes);
+            }
             return;
         }
         let Some(offset) = address.checked_sub(VGA_MODE13H_BASE) else {
@@ -439,6 +547,14 @@ impl Vega {
     /// owner is decided by who owns the window itself.
     pub(crate) fn note_direct_write_pages(&mut self, dirty_pages: u16) {
         if self.margo_banked_window_at(VGA_MODE13H_BASE) {
+            if let Some(base) = self.margo_banked_window_key() {
+                for page in 0..16 {
+                    if dirty_pages & (1 << page) != 0 {
+                        self.margo
+                            .note_vram_write(base as usize + page * 0x1000, 0x1000);
+                    }
+                }
+            }
             return;
         }
         self.vga.note_direct_write_pages(dirty_pages);
@@ -798,6 +914,167 @@ impl Vega {
         Some((words, width, height))
     }
 
+    pub(crate) fn presented_frame_update(&self) -> Option<PresentedFrameUpdate> {
+        match self.active_display() {
+            ActiveDisplay::MargoLfb => return self.margo_frame_update(),
+            ActiveDisplay::VgaRaster => return self.vga_frame_update(),
+            ActiveDisplay::Distira => {}
+        }
+        let owner = self.active_display();
+        let (words, width, height) = self.presented_frame_argb()?;
+        let mut cache = self.presented_argb_cache.borrow_mut();
+        let full = !cache.valid
+            || cache.owner != Some(owner)
+            || cache.width != width
+            || cache.height != height
+            || cache.words.len() != words.len();
+        let changed_rows = if full {
+            std::iter::once(0..height).collect()
+        } else {
+            changed_frame_rows(&cache.words, &words, width, height)
+        };
+        if full {
+            cache.words = Arc::new(words);
+        } else if !changed_rows.is_empty() {
+            let cached = Arc::make_mut(&mut cache.words);
+            for rows in &changed_rows {
+                let start = rows.start * width;
+                let end = rows.end * width;
+                cached[start..end].copy_from_slice(&words[start..end]);
+            }
+        }
+        cache.width = width;
+        cache.height = height;
+        cache.owner = Some(owner);
+        cache.valid = true;
+        Some(PresentedFrameUpdate {
+            words: cache.words.clone(),
+            changed_rows,
+            width,
+            height,
+        })
+    }
+
+    fn vga_frame_update(&self) -> Option<PresentedFrameUpdate> {
+        let raster = self.vga.last_presented()?;
+        let width = raster.width as usize;
+        let height = if raster.display_height == 0 {
+            raster.height as usize
+        } else {
+            raster.display_height as usize
+        };
+        let pixels = &raster.pixels[..width.saturating_mul(height).min(raster.pixels.len())];
+        if pixels.is_empty() || pixels.len() != width.saturating_mul(height) {
+            return None;
+        }
+        let palette = self.palette_argb();
+        let mut cache = self.presented_argb_cache.borrow_mut();
+        let full = !cache.valid
+            || cache.owner != Some(ActiveDisplay::VgaRaster)
+            || cache.width != width
+            || cache.height != height
+            || cache.words.len() != pixels.len()
+            || cache.palette != palette;
+        if full {
+            cache.words = Arc::new(vec![0; pixels.len()]);
+        }
+        let mut changed_rows = Vec::new();
+        let mut first = None;
+        for row in 0..height {
+            let start = row * width;
+            let end = start + width;
+            let dirty = full
+                || pixels[start..end]
+                    .iter()
+                    .zip(&cache.words[start..end])
+                    .any(|(&index, &word)| palette[usize::from(index)] != word);
+            if dirty {
+                if first.is_none() {
+                    first = Some(row);
+                }
+            } else if let Some(start) = first.take() {
+                changed_rows.push(start..row);
+            }
+        }
+        if let Some(start) = first {
+            changed_rows.push(start..height);
+        }
+        if !changed_rows.is_empty() {
+            let words = Arc::make_mut(&mut cache.words);
+            for rows in &changed_rows {
+                let start = rows.start * width;
+                let end = rows.end * width;
+                for (word, &index) in words[start..end].iter_mut().zip(&pixels[start..end]) {
+                    *word = palette[usize::from(index)];
+                }
+            }
+        }
+        cache.palette = palette;
+        cache.width = width;
+        cache.height = height;
+        cache.owner = Some(ActiveDisplay::VgaRaster);
+        cache.valid = true;
+        Some(PresentedFrameUpdate {
+            words: cache.words.clone(),
+            changed_rows,
+            width,
+            height,
+        })
+    }
+
+    fn margo_frame_update(&self) -> Option<PresentedFrameUpdate> {
+        let display = self.margo.display();
+        let width = display.width as usize;
+        let height = display.height as usize;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let palette = self.palette_argb();
+        let generation = self.margo.content_generation();
+        let mut cache = self.presented_argb_cache.borrow_mut();
+        let full = !cache.valid
+            || cache.owner != Some(ActiveDisplay::MargoLfb)
+            || cache.width != width
+            || cache.height != height
+            || cache.words.len() != width.saturating_mul(height)
+            || cache.palette != palette;
+        let changed_rows = if full {
+            std::iter::once(0..height).collect()
+        } else {
+            self.margo.changed_rows_since(cache.margo_generation)
+        };
+        if full {
+            cache.words = Arc::new(vec![0; width.saturating_mul(height)]);
+        }
+        if !changed_rows.is_empty() {
+            self.margo
+                .scanout_argb_rows(&palette, &changed_rows, Arc::make_mut(&mut cache.words));
+            let rows = changed_rows
+                .iter()
+                .map(|range| range.end.saturating_sub(range.start) as u64)
+                .sum::<u64>();
+            let mut metrics = self.host_metrics.get();
+            metrics.margo_scanout_rows_converted =
+                metrics.margo_scanout_rows_converted.saturating_add(rows);
+            metrics.margo_scanout_pixels_converted = metrics
+                .margo_scanout_pixels_converted
+                .saturating_add(rows.saturating_mul(width as u64));
+            self.host_metrics.set(metrics);
+        }
+        cache.palette = palette;
+        cache.width = width;
+        cache.height = height;
+        cache.margo_generation = generation;
+        cache.owner = Some(ActiveDisplay::MargoLfb);
+        cache.valid = true;
+        Some(PresentedFrameUpdate {
+            words: cache.words.clone(),
+            changed_rows,
+            width,
+            height,
+        })
+    }
+
     pub(crate) fn capture_frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
         if self.active_display() != ActiveDisplay::VgaRaster {
             return self.frame_argb();
@@ -815,18 +1092,35 @@ impl Vega {
     }
 
     pub(crate) fn frame_generation(&self) -> Option<u64> {
-        if self.active_display() != ActiveDisplay::VgaRaster || self.vga.is_text_mode() {
-            return None;
+        match self.active_display() {
+            ActiveDisplay::MargoLfb => {
+                let display = self.margo.display();
+                let generation = self
+                    .margo
+                    .content_generation()
+                    .wrapping_mul(0xd6e8_feb8_6659_fd93)
+                    .wrapping_add(self.vga.content_gen());
+                Some(Self::frame_generation_key(
+                    generation,
+                    display.width,
+                    display.height,
+                ))
+            }
+            ActiveDisplay::Distira => None,
+            ActiveDisplay::VgaRaster if self.vga.is_text_mode() => None,
+            ActiveDisplay::VgaRaster => Some(Self::frame_generation_key(
+                self.vga.content_gen(),
+                self.vga.raster_width(),
+                self.vga.raster_height(),
+            )),
         }
-        Some(Self::frame_generation_key(
-            self.vga.content_gen(),
-            self.vga.raster_width(),
-            self.vga.raster_height(),
-        ))
     }
 
     pub(crate) fn presented_frame_generation(&self) -> Option<u64> {
-        if self.active_display() != ActiveDisplay::VgaRaster || self.vga.is_text_mode() {
+        if self.active_display() == ActiveDisplay::MargoLfb {
+            return self.frame_generation();
+        }
+        if self.active_display() == ActiveDisplay::Distira || self.vga.is_text_mode() {
             return None;
         }
         let raster = self.vga.last_presented()?;
@@ -965,6 +1259,11 @@ impl Vega {
                     .map(|offset| self.margo.read_vram_u8(offset))
                     .unwrap_or(0xff);
             }
+            let mut metrics = self.host_metrics.get();
+            metrics.margo_banked_slow_read_bytes = metrics
+                .margo_banked_slow_read_bytes
+                .saturating_add(width as u64);
+            self.host_metrics.set(metrics);
             return true;
         }
 
@@ -1027,6 +1326,11 @@ impl Vega {
             for (index, byte) in out.iter_mut().enumerate() {
                 *byte = self.margo.read_vram_u8(offset + index);
             }
+            let mut metrics = self.host_metrics.get();
+            metrics.margo_lfb_slow_read_bytes = metrics
+                .margo_lfb_slow_read_bytes
+                .saturating_add(width as u64);
+            self.host_metrics.set(metrics);
             return true;
         }
         if let Some(offset) = margo_mmio_offset(address, width) {
@@ -1066,6 +1370,10 @@ impl Vega {
             if let Some(offset) = self.margo_banked_window_offset(address) {
                 self.margo.write_vram_u8(offset, value);
             }
+            let mut metrics = self.host_metrics.get();
+            metrics.margo_banked_slow_write_bytes =
+                metrics.margo_banked_slow_write_bytes.saturating_add(1);
+            self.host_metrics.set(metrics);
             return VideoWrite::Accepted;
         }
         if let Some(offset) = self.legacy_gfx_offset(address, 1) {
@@ -1109,6 +1417,10 @@ impl Vega {
         }
         if let Some(offset) = margo_lfb_offset(address, 1) {
             self.margo.write_vram_u8(offset, value);
+            let mut metrics = self.host_metrics.get();
+            metrics.margo_lfb_slow_write_bytes =
+                metrics.margo_lfb_slow_write_bytes.saturating_add(1);
+            self.host_metrics.set(metrics);
             return VideoWrite::Accepted;
         }
         if let Some(offset) = margo_mmio_offset(address, 1) {
@@ -1429,6 +1741,28 @@ impl Vega {
         let offset = bank + (address - VGA_MODE13H_BASE) as usize;
         (offset < MARGO_VRAM_SIZE).then_some(offset)
     }
+}
+
+fn changed_frame_rows(old: &[u32], new: &[u32], width: usize, height: usize) -> Vec<Range<usize>> {
+    let mut changed = Vec::new();
+    let mut first = None;
+    for row in 0..height {
+        let start = row * width;
+        let end = start + width;
+        let dirty = old[start..end] != new[start..end];
+        match (first, dirty) {
+            (None, true) => first = Some(row),
+            (Some(start), false) => {
+                changed.push(start..row);
+                first = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = first {
+        changed.push(start..height);
+    }
+    changed
 }
 
 /// One line per accepted 4F02 mode set, under `IZARRAVM_VBE_TRACE`.

@@ -701,6 +701,92 @@ fn a_bulk_copy_into_the_banked_window_lands_in_the_named_bank() {
     );
 }
 
+#[test]
+fn a_bulk_copy_into_the_linear_framebuffer_takes_the_direct_path() {
+    const OFFSET: usize = 0x1100;
+    const COUNT: usize = 0x800;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x4101));
+
+    let payload: Vec<u8> = (0..COUNT)
+        .map(|i| (i.wrapping_mul(37) & 0xff) as u8)
+        .collect();
+    let address = MARGO_LFB_BASE + OFFSET as u32;
+    let admitted = with_bus(&mut machine, |bus| {
+        bus.direct_memory_bytes(
+            address,
+            payload.len(),
+            BusWidth::Byte,
+            BusAccessKind::DataWrite,
+        )
+    });
+    assert_eq!(admitted, payload.len());
+
+    let written = with_bus(&mut machine, |bus| {
+        bus.write_memory_bytes_direct(address, &payload, BusWidth::Byte, BusAccessKind::DataWrite)
+    })
+    .unwrap();
+    assert_eq!(written, payload.len());
+    assert_eq!(
+        &machine.vega.margo().vram()[OFFSET..OFFSET + COUNT],
+        payload.as_slice()
+    );
+    let metrics = machine.video_host_metrics();
+    assert_eq!(metrics.margo_lfb_direct_write_bytes, COUNT as u64);
+    assert_eq!(metrics.margo_lfb_slow_write_bytes, 0);
+}
+
+#[test]
+fn margo_frame_publication_reports_stable_generation_and_row_damage() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x4101));
+
+    let generation = machine
+        .presented_frame_generation()
+        .expect("Margo graphics output has a generation");
+    let first = machine.presented_frame_update().expect("Margo frame");
+    assert_eq!(
+        first.changed_rows,
+        std::iter::once(0..480).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        machine.video_host_metrics().margo_scanout_rows_converted,
+        480
+    );
+    assert_eq!(machine.presented_frame_generation(), Some(generation));
+
+    with_bus(&mut machine, |bus| {
+        bus.write_memory(
+            MARGO_LFB_BASE + 3 * 640 + 17,
+            BusWidth::Byte,
+            0x2a,
+            BusAccessKind::DataWrite,
+        )
+    })
+    .unwrap();
+    let second = machine
+        .presented_frame_update()
+        .expect("updated Margo frame");
+    assert_eq!(
+        second.changed_rows,
+        std::iter::once(3..4).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        machine.video_host_metrics().margo_scanout_rows_converted,
+        481
+    );
+    assert_eq!(second.words[3 * 640 + 17], machine.palette_argb()[0x2a]);
+    assert_ne!(machine.presented_frame_generation(), Some(generation));
+}
+
 /// T5b -- and a real REP MOVS must REACH that bulk pair.
 ///
 /// T5a proves the copy lands correctly once someone calls it. This proves the

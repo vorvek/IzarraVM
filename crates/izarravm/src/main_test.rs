@@ -427,6 +427,11 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     assert_eq!(report["stop"]["code"], 0);
     assert_eq!(report["timedemo"]["gametics"], 35);
     assert_eq!(report["machine_phase_timing_enabled"], true);
+    assert_eq!(report["active_display"], "VgaRaster");
+    assert!(report["legacy_video_mode"].as_str().is_some());
+    assert!(report["margo_display"].is_null());
+    assert_eq!(report["video_host"]["margo_lfb_direct_write_bytes"], 0);
+    assert_eq!(report["video_host"]["margo_scanout_rows_converted"], 0);
     assert!(report["guest_seconds"].as_f64().unwrap() > 0.0);
     assert!(report["direct_native_coverage"].as_f64().is_some());
     assert!(

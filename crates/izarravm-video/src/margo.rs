@@ -11,6 +11,8 @@ mod modes;
 mod registers;
 mod scan;
 
+use std::ops::Range;
+
 use modes::{BAYER_4X4, decode_argb, quantize_channel, yuv_to_argb};
 pub use modes::{
     Channel, MARGO_VBE_MODES, MargoDisplay, PixelFormat, VbeMode, bytes_per_pixel, pixel_format,
@@ -495,6 +497,8 @@ fn pattern(vram: &mut [u8], p: &PatternParams) -> u64 {
 pub struct Margo {
     vram: Vec<u8>,
     display: MargoDisplay,
+    content_generation: u64,
+    row_generations: Vec<u64>,
     display_start_latch: u32,
     display_start_pending: bool,
     control: u32,
@@ -546,6 +550,8 @@ impl Default for Margo {
         Self {
             vram: vec![0; MARGO_VRAM_SIZE],
             display: MargoDisplay::default(),
+            content_generation: 0,
+            row_generations: Vec::new(),
             display_start_latch: 0,
             display_start_pending: false,
             control: 0,
@@ -583,6 +589,7 @@ impl Margo {
         };
         self.display_start_latch = 0;
         self.display_start_pending = false;
+        self.mark_full_damage();
         true
     }
 
@@ -611,8 +618,12 @@ impl Margo {
     /// Apply a queued display origin when one or more frame boundaries elapsed.
     pub fn advance_frames(&mut self, frames: u64) {
         if frames > 0 && self.display_start_pending {
+            let changed = self.display.start != self.display_start_latch;
             self.display.start = self.display_start_latch;
             self.display_start_pending = false;
+            if changed {
+                self.mark_full_damage();
+            }
         }
     }
 
@@ -625,8 +636,11 @@ impl Margo {
     }
 
     pub fn write_vram_u8(&mut self, offset: usize, value: u8) {
-        if let Some(slot) = self.vram.get_mut(offset) {
+        if let Some(slot) = self.vram.get_mut(offset)
+            && *slot != value
+        {
             *slot = value;
+            self.note_vram_write(offset, 1);
         }
     }
 
@@ -636,6 +650,89 @@ impl Margo {
 
     pub fn vram_mut(&mut self) -> &mut [u8] {
         &mut self.vram
+    }
+
+    pub fn content_generation(&self) -> u64 {
+        self.content_generation
+    }
+
+    pub fn note_vram_write(&mut self, offset: usize, bytes: usize) {
+        let Some(write_end) = offset.checked_add(bytes) else {
+            return;
+        };
+        if bytes == 0 {
+            return;
+        }
+
+        if self.overlay_reg(REG_OVL_CTRL) & 0x1 != 0 {
+            self.mark_full_damage();
+            return;
+        }
+        if self.cursor_reg(REG_CURSOR_CTRL) & 0x1 != 0 {
+            let cursor_start = self.cursor_reg(REG_CURSOR_ADDR) as usize;
+            let cursor_end = cursor_start.saturating_add(1024);
+            if offset < cursor_end && write_end > cursor_start {
+                self.mark_full_damage();
+                return;
+            }
+        }
+
+        let pitch = self.display.pitch as usize;
+        let height = self.display.height as usize;
+        if pitch == 0 || height == 0 {
+            return;
+        }
+        let visible_start = self.display.start as usize;
+        let visible_end = visible_start.saturating_add(pitch.saturating_mul(height));
+        let start = offset.max(visible_start);
+        let end = write_end.min(visible_end);
+        if start >= end {
+            return;
+        }
+        let first = (start - visible_start) / pitch;
+        let last = (end - 1 - visible_start) / pitch;
+        self.mark_rows(first..last.saturating_add(1));
+    }
+
+    pub fn changed_rows_since(&self, generation: u64) -> Vec<Range<usize>> {
+        let mut ranges = Vec::new();
+        let mut start = None;
+        for (row, &changed) in self.row_generations.iter().enumerate() {
+            let dirty = changed.wrapping_sub(generation) < (1u64 << 63) && changed != generation;
+            match (start, dirty) {
+                (None, true) => start = Some(row),
+                (Some(first), false) => {
+                    ranges.push(first..row);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(first) = start {
+            ranges.push(first..self.row_generations.len());
+        }
+        ranges
+    }
+
+    fn mark_full_damage(&mut self) {
+        let height = self.display.height as usize;
+        self.row_generations.resize(height, 0);
+        if height > 0 {
+            self.content_generation = self.content_generation.wrapping_add(1);
+            self.row_generations.fill(self.content_generation);
+        }
+    }
+
+    fn mark_rows(&mut self, rows: Range<usize>) {
+        let height = self.display.height as usize;
+        let start = rows.start.min(height);
+        let end = rows.end.min(height);
+        if start >= end {
+            return;
+        }
+        self.row_generations.resize(height, 0);
+        self.content_generation = self.content_generation.wrapping_add(1);
+        self.row_generations[start..end].fill(self.content_generation);
     }
 
     /// The visible scanout surface: `pitch * height` bytes starting at `start`.
@@ -652,34 +749,50 @@ impl Margo {
     /// source pixel, `width * height` long. Empty when no mode is set. Reads are
     /// bounds-checked and default to 0, matching `visible_surface`.
     pub fn scanout_argb(&self, palette: &[u32; 256]) -> Vec<u32> {
+        let height = self.display.height as usize;
+        let mut out = Vec::new();
+        let rows = 0..height;
+        self.scanout_argb_rows(palette, std::slice::from_ref(&rows), &mut out);
+        out
+    }
+
+    pub fn scanout_argb_rows(
+        &self,
+        palette: &[u32; 256],
+        rows: &[Range<usize>],
+        out: &mut Vec<u32>,
+    ) {
         let width = self.display.width as usize;
         let height = self.display.height as usize;
+        out.resize(width.saturating_mul(height), 0);
         let pitch = self.display.pitch as u64;
         let bpp = self.display.bpp;
         let depth = bytes_per_pixel(bpp) as u64;
         let start = self.display.start as u64;
         let len = self.vram.len() as u64;
-        let mut out = Vec::with_capacity(width * height);
-        for y in 0..height as u64 {
-            for x in 0..width as u64 {
-                // Saturating like the blit paths, so an extreme DISP_START or
-                // pitch skips past the store rather than overflowing the offset.
-                let off = start
-                    .saturating_add(y.saturating_mul(pitch))
-                    .saturating_add(x.saturating_mul(depth));
-                let mut bytes = [0u8; 4];
-                for (i, slot) in bytes.iter_mut().enumerate().take(depth as usize) {
-                    let addr = off.saturating_add(i as u64);
-                    if addr < len {
-                        *slot = self.vram[addr as usize];
+        for rows in rows {
+            let row_start = rows.start.min(height);
+            let row_end = rows.end.min(height);
+            for y in row_start..row_end {
+                for x in 0..width {
+                    // Saturating like the blit paths, so an extreme DISP_START or
+                    // pitch skips past the store rather than overflowing the offset.
+                    let off = start
+                        .saturating_add((y as u64).saturating_mul(pitch))
+                        .saturating_add((x as u64).saturating_mul(depth));
+                    let mut bytes = [0u8; 4];
+                    for (i, slot) in bytes.iter_mut().enumerate().take(depth as usize) {
+                        let addr = off.saturating_add(i as u64);
+                        if addr < len {
+                            *slot = self.vram[addr as usize];
+                        }
                     }
+                    out[y * width + x] = decode_argb(bpp, u32::from_le_bytes(bytes), palette);
                 }
-                out.push(decode_argb(bpp, u32::from_le_bytes(bytes), palette));
             }
+            self.composite_overlay(out, row_start..row_end);
+            self.composite_cursor(out, palette, row_start..row_end);
         }
-        self.composite_overlay(&mut out);
-        self.composite_cursor(&mut out, palette);
-        out
     }
 
     /// Overlay the 64x64 two-plane hardware cursor onto the decoded scanout `out`
@@ -692,7 +805,7 @@ impl Margo {
     /// `CURSOR_POS` X/Y are signed 16-bit, so the cursor can run off the top/left;
     /// pixels outside the screen are clipped. An off-store plane byte skips that
     /// cursor pixel (transparent), never wraps.
-    fn composite_cursor(&self, out: &mut [u32], palette: &[u32; 256]) {
+    fn composite_cursor(&self, out: &mut [u32], palette: &[u32; 256], rows: Range<usize>) {
         if self.cursor_reg(REG_CURSOR_CTRL) & 0x1 == 0 {
             return;
         }
@@ -710,7 +823,12 @@ impl Margo {
             for cx in 0..64i32 {
                 let sx = pos_x + cx;
                 let sy = pos_y + cy;
-                if sx < 0 || sx >= width || sy < 0 || sy >= height {
+                if sx < 0
+                    || sx >= width
+                    || sy < 0
+                    || sy >= height
+                    || !(rows.start..rows.end).contains(&(sy as usize))
+                {
                     continue;
                 }
                 let byte = (cy as u64) * 8 + (cx as u64) / 8;
@@ -742,7 +860,7 @@ impl Margo {
     /// not wrapped; every source read is bounds-checked against the frame store and
     /// an off-store byte skips that overlay pixel. Zero source or destination
     /// extent is a no-op (guards the scale divide).
-    fn composite_overlay(&self, out: &mut [u32]) {
+    fn composite_overlay(&self, out: &mut [u32], rows: Range<usize>) {
         let ctrl = self.overlay_reg(REG_OVL_CTRL);
         if ctrl & 0x1 == 0 {
             return;
@@ -769,7 +887,7 @@ impl Margo {
 
         for dy in 0..dst_h {
             let screen_y = dst_y + dy;
-            if screen_y >= height {
+            if screen_y >= height || !(rows.start..rows.end).contains(&(screen_y as usize)) {
                 continue;
             }
             for dx in 0..dst_w {
@@ -965,6 +1083,7 @@ impl Margo {
             return;
         }
         if reg == REG_CONTROL {
+            let previous = self.control;
             self.control = (self.control & !(0xff_u32 << shift)) | (u32::from(value) << shift);
             if self.control & 0x1 != 0 {
                 // RESET aborts the operation. It already completed, so this only
@@ -974,6 +1093,9 @@ impl Margo {
                 self.expand = None;
                 self.control &= !0x1;
             }
+            if previous != self.control && self.overlay_reg(REG_OVL_CTRL) & 0x1 != 0 {
+                self.mark_full_damage();
+            }
             return;
         }
         if (BLIT_BASE..BLIT_BASE + BLIT_REGS * 4).contains(&reg) {
@@ -982,13 +1104,21 @@ impl Margo {
             return;
         }
         if (CURSOR_BASE..CURSOR_BASE + CURSOR_REGS * 4).contains(&reg) {
-            let slot = &mut self.cursor[(reg - CURSOR_BASE) / 4];
-            *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            let index = (reg - CURSOR_BASE) / 4;
+            let next = (self.cursor[index] & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            if self.cursor[index] != next {
+                self.cursor[index] = next;
+                self.mark_full_damage();
+            }
             return;
         }
         if (OVL_BASE..OVL_BASE + OVL_REGS * 4).contains(&reg) {
-            let slot = &mut self.overlay[(reg - OVL_BASE) / 4];
-            *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            let index = (reg - OVL_BASE) / 4;
+            let next = (self.overlay[index] & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            if self.overlay[index] != next {
+                self.overlay[index] = next;
+                self.mark_full_damage();
+            }
             return;
         }
         if (PUSH_BASE_REG..PUSH_BASE_REG + PUSH_REGS * 4).contains(&reg) {
@@ -1123,6 +1253,12 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = fill(&mut self.vram, &params);
+        self.note_blit_rect(
+            params.dst_base,
+            params.dst_pitch,
+            params.dst_y,
+            params.height,
+        );
         self.arm_busy_ns(BLIT_SETUP_NS + pixels * FILL_NS_PER_PIXEL);
     }
 
@@ -1149,6 +1285,12 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = copy(&mut self.vram, &params);
+        self.note_blit_rect(
+            params.dst_base,
+            params.dst_pitch,
+            params.dst_y,
+            params.height,
+        );
         self.arm_busy_ns(BLIT_SETUP_NS + pixels * COPY_NS_PER_PIXEL);
     }
 
@@ -1177,6 +1319,12 @@ impl Margo {
             src_y: src_xy >> 16,
         };
         let pixels = color_expand_mem(&mut self.vram, &params);
+        self.note_blit_rect(
+            params.common.dst_base,
+            params.common.dst_pitch,
+            params.common.dst_y,
+            params.common.height,
+        );
         self.arm_busy_ns(BLIT_SETUP_NS + pixels * EXPAND_NS_PER_PIXEL);
     }
 
@@ -1196,6 +1344,9 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = line(&mut self.vram, &params);
+        let first_y = params.y0.min(params.y1);
+        let rows = params.y0.max(params.y1).saturating_sub(first_y) + 1;
+        self.note_blit_rect(params.dst_base, params.dst_pitch, first_y, rows);
         self.arm_busy_ns(BLIT_SETUP_NS + pixels * LINE_NS_PER_PIXEL);
     }
 
@@ -1217,6 +1368,12 @@ impl Margo {
             clip: self.build_clip(),
         };
         let pixels = pattern(&mut self.vram, &params);
+        self.note_blit_rect(
+            params.dst_base,
+            params.dst_pitch,
+            params.dst_y,
+            params.height,
+        );
         self.arm_busy_ns(BLIT_SETUP_NS + pixels * PATTERN_NS_PER_PIXEL);
     }
 
@@ -1268,6 +1425,13 @@ impl Margo {
             state.words_received,
             word,
         );
+        let row = state.words_received / state.words_per_row;
+        self.note_blit_rect(
+            state.params.dst_base,
+            state.params.dst_pitch,
+            state.params.dst_y.saturating_add(row),
+            1,
+        );
         state.words_received += 1;
         state.written += written;
         if u64::from(state.words_received) >= state.total_words {
@@ -1276,6 +1440,18 @@ impl Margo {
         } else {
             self.expand = Some(state);
         }
+    }
+
+    fn note_blit_rect(&mut self, base: u32, pitch: u32, y: u32, height: u32) {
+        if pitch == 0 || height == 0 {
+            return;
+        }
+        let start = u64::from(base).saturating_add(u64::from(y).saturating_mul(u64::from(pitch)));
+        let bytes = u64::from(height).saturating_mul(u64::from(pitch));
+        let (Ok(start), Ok(bytes)) = (usize::try_from(start), usize::try_from(bytes)) else {
+            return;
+        };
+        self.note_vram_write(start, bytes);
     }
 
     /// Drain `ns` nanoseconds of modeled busy time. The machine calls this at

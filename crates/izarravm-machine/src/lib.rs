@@ -23,7 +23,7 @@ use izarravm_video::{
     CGA_FB_SIZE, DAC_ENTRIES, MARGO_VBE_MODES, TextFrame, VGA_PLANAR_WINDOW_SIZE,
     VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, bytes_per_pixel, font, pixel_format, vbe_mode,
 };
-pub use izarravm_video::{MARGO_ID_VALUE, VideoMode};
+pub use izarravm_video::{MARGO_ID_VALUE, MargoDisplay, VideoMode};
 #[cfg(test)]
 use izarravm_video::{Margo, Vga, VgaRaster};
 use std::collections::VecDeque;
@@ -332,6 +332,65 @@ pub enum ActiveDisplay {
     VgaRaster,
     MargoLfb,
     Distira,
+}
+
+#[derive(Debug, Clone)]
+pub struct PresentedFrameUpdate {
+    pub words: std::sync::Arc<Vec<u32>>,
+    pub changed_rows: Vec<std::ops::Range<usize>>,
+    pub width: usize,
+    pub height: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoHostMetricsSnapshot {
+    pub margo_lfb_direct_read_bytes: u64,
+    pub margo_lfb_direct_write_bytes: u64,
+    pub margo_lfb_slow_read_bytes: u64,
+    pub margo_lfb_slow_write_bytes: u64,
+    pub margo_banked_direct_read_bytes: u64,
+    pub margo_banked_direct_write_bytes: u64,
+    pub margo_banked_slow_read_bytes: u64,
+    pub margo_banked_slow_write_bytes: u64,
+    pub margo_scanout_rows_converted: u64,
+    pub margo_scanout_pixels_converted: u64,
+}
+
+impl VideoHostMetricsSnapshot {
+    pub fn delta_since(self, previous: Self) -> Self {
+        Self {
+            margo_lfb_direct_read_bytes: self
+                .margo_lfb_direct_read_bytes
+                .saturating_sub(previous.margo_lfb_direct_read_bytes),
+            margo_lfb_direct_write_bytes: self
+                .margo_lfb_direct_write_bytes
+                .saturating_sub(previous.margo_lfb_direct_write_bytes),
+            margo_lfb_slow_read_bytes: self
+                .margo_lfb_slow_read_bytes
+                .saturating_sub(previous.margo_lfb_slow_read_bytes),
+            margo_lfb_slow_write_bytes: self
+                .margo_lfb_slow_write_bytes
+                .saturating_sub(previous.margo_lfb_slow_write_bytes),
+            margo_banked_direct_read_bytes: self
+                .margo_banked_direct_read_bytes
+                .saturating_sub(previous.margo_banked_direct_read_bytes),
+            margo_banked_direct_write_bytes: self
+                .margo_banked_direct_write_bytes
+                .saturating_sub(previous.margo_banked_direct_write_bytes),
+            margo_banked_slow_read_bytes: self
+                .margo_banked_slow_read_bytes
+                .saturating_sub(previous.margo_banked_slow_read_bytes),
+            margo_banked_slow_write_bytes: self
+                .margo_banked_slow_write_bytes
+                .saturating_sub(previous.margo_banked_slow_write_bytes),
+            margo_scanout_rows_converted: self
+                .margo_scanout_rows_converted
+                .saturating_sub(previous.margo_scanout_rows_converted),
+            margo_scanout_pixels_converted: self
+                .margo_scanout_pixels_converted
+                .saturating_sub(previous.margo_scanout_pixels_converted),
+        }
+    }
 }
 
 /// Execution quantum a wall-pacing caller grants the CPU after
