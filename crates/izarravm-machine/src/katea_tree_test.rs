@@ -2589,3 +2589,66 @@ fn held_sectors_do_not_make_a_write_run_quadratic() {
         );
     }
 }
+
+/// A host write that fails strands its sectors in the held index, and the next
+/// commit must retry them. The cluster is projectable already -- what failed is
+/// the host write, which is not a projection event -- so nothing re-arms the
+/// revisit ticket unless the failure path does it itself.
+///
+/// Deliberately never calls `reconcile`/`flush_guest_writes`: the final full walk
+/// recovers the sector either way, which is exactly why the missing per-commit
+/// retry is invisible from the existing host-write-failure row.
+#[test]
+fn a_failed_host_write_leaves_its_sectors_retryable_on_the_next_commit() {
+    let (mut vol, root) = fresh_vol("failed_write_retry");
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    let first = vol.next_free + 1000;
+    let payload = vec![0x61u8; cluster_bytes];
+    stamp_file(&mut vol, 2, "RETRY.BIN", 0x20, first, &payload);
+    // `reconcile` materializes through `atomic_write`, which drops the host
+    // write handle, so the host file can be replaced below.
+    vol.reconcile();
+    assert_eq!(std::fs::read(root.join("RETRY.BIN")).unwrap(), payload);
+
+    // A directory where the file was: the next open of that path fails.
+    std::fs::remove_file(root.join("RETRY.BIN")).unwrap();
+    std::fs::create_dir(root.join("RETRY.BIN")).unwrap();
+
+    // One data sector inside the projected chain. No FAT write and no directory
+    // write, so this commit takes the streaming path, not the metadata pass.
+    let mut sector = [0x62u8; SECTOR];
+    sector[0] = 0xA5;
+    vol.write_sector(vol.cluster_to_lba(first), &sector);
+    assert_eq!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::HostIoFailure
+    );
+    // The whole cluster is held, not just the sector this commit wrote: the
+    // payload `stamp_file` laid down arrived before any projection owned it, and
+    // `atomic_write` -- how `reconcile` materialized the file -- acknowledges
+    // nothing, so those sectors were still held when this write joined them.
+    assert_eq!(
+        vol.storage_counters().pending_unmapped_sectors,
+        u64::from(vol.geo.spc),
+        "the sectors the host write could not place are held for a retry"
+    );
+
+    // Put the host file back, then commit nothing at all. The retry owes itself
+    // to the held sector alone: this batch is empty and writes no metadata.
+    std::fs::remove_dir(root.join("RETRY.BIN")).unwrap();
+    std::fs::write(root.join("RETRY.BIN"), &payload).unwrap();
+    assert_ne!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::HostIoFailure
+    );
+
+    let host = std::fs::read(root.join("RETRY.BIN")).unwrap();
+    assert_eq!(
+        &host[..SECTOR],
+        &sector[..],
+        "the held sector reached the host"
+    );
+    assert_eq!(vol.storage_counters().pending_unmapped_sectors, 0);
+    drop(vol);
+    std::fs::remove_dir_all(&root).ok();
+}

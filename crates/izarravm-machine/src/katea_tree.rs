@@ -819,10 +819,12 @@ pub(crate) struct KateaTreeVolume {
     /// pending bit (`stream_file_overlay`) drops it from the index in the same
     /// breath.
     unmapped_sectors: u64,
-    /// Clusters holding unmapped sectors that a projection has since claimed.
-    /// `install_projection` is the single event that can turn an unmapped
-    /// sector projectable, so it records the clusters here and the next commit
-    /// revisits exactly those.
+    /// Clusters whose held sectors have earned another look, recorded by the
+    /// three events that can change a held sector's verdict without the next
+    /// commit writing anywhere near it: `install_projection` gives a cluster an
+    /// owner, the live scan drops a key's block, and a failed host write leaves
+    /// sectors held whose cluster was projectable all along. The next commit
+    /// revisits exactly these and nothing else.
     newly_projectable_clusters: HashSet<u32>,
     batch_sector_writes: u64,
     directory_dirty: bool,
@@ -2033,6 +2035,15 @@ impl KateaTreeVolume {
                     for lba in stranded {
                         self.note_unmapped(lba);
                     }
+                    // A held sector's cluster can be projectable already -- what
+                    // failed is the host write, which is not a projection event.
+                    // `stream_projected_batch` drained the revisit tickets at its
+                    // top and then aborted, so re-arm every cluster still holding
+                    // a sector. The keys are precise, not over-broad: anything
+                    // that projected before the abort was already dropped by
+                    // `forget_unmapped`.
+                    let held: Vec<u32> = self.unmapped_by_cluster.keys().copied().collect();
+                    self.newly_projectable_clusters.extend(held);
                     self.note_host_write_failure();
                     eprintln!("katea: projecting a guest write batch failed: {e}");
                 }
