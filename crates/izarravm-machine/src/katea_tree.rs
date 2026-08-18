@@ -2000,6 +2000,19 @@ impl KateaTreeVolume {
             counters.metadata_projection_passes =
                 counters.metadata_projection_passes.saturating_add(1);
             self.counters.set(counters);
+            // Two whole-tree passes: `reconcile_mode` gathers every live entry
+            // and `metadata_projection_pending` gathers them again to decide
+            // whether the next command owes another pass. An incremental
+            // dirty-set was the obvious answer and was measured instead of
+            // taken. On the 17 MiB install row both passes cost 0.000 ms of a
+            // 34.5 ms projection phase -- that install dirties a directory
+            // three times. On an install shaped to dirty one on every command
+            // (64 files, one commit each), the two gathers were 2.4% of the
+            // row's 25.4 ms while the host writes they lead to were 94%. The
+            // walks are cheap because they read synthesized metadata out of
+            // memory; the projection is expensive because it writes files.
+            // Restructuring this would put the projection model's invariants at
+            // risk to buy back a fiftieth of a row, so it was not done.
             self.reconcile_mode(ReconcileMode::AfterWrite);
             self.metadata_reconcile_pending =
                 self.host_io_failed || self.metadata_projection_pending();
@@ -2406,7 +2419,15 @@ impl KateaTreeVolume {
             // held in the store rather than projected, and the file marked
             // ambiguous. Conservative -- nothing is lost, the final reconcile
             // still writes it -- but it is a permanent per-session leak.
-            // Deferred to the measured projection-cost follow-up.
+            //
+            // The projection-cost follow-up measured it and left it. The leak
+            // is bounded by the clusters a directory has ever held, which is
+            // tiny next to a mount's data clusters, and a stranded cluster does
+            // not feed the held-sector index: `write_sector` files a sector
+            // read as metadata under neither the batch's projectable path nor
+            // the held set. So it costs a map entry and an occasional
+            // re-materialize, not a scaling term. The honest fix needs the
+            // dirty-set the paragraph above declined to build.
             self.directory_clusters
                 .extend(dir_chain.iter().map(|cluster| (*cluster, dir_cluster)));
             let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
