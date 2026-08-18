@@ -2341,9 +2341,27 @@ fn tokaemm_guest_int0d_reflects_vector_13_not_irq5() {
 /// hold the identity down while the routing around it is rebuilt.
 ///
 /// The precondition that makes it non-vacuous is that IRQ0 is genuinely IN
-/// SERVICE when the INT 88h executes (0xD2 if it never got there): that is the
-/// only state in which a line-number derivation could plausibly claim the
-/// vector.
+/// SERVICE when the INT 88h executes: that is the only state in which a
+/// line-number derivation could plausibly claim the vector. Two things
+/// constrain how INT88RMP gets there, and both are worth knowing before editing
+/// it.
+///
+/// It must obtain that state THE LEGAL WAY -- from inside the guest's own
+/// interrupt handler, where the chip really has IS0 set because the guest's own
+/// tick was acknowledged for it (0xD3 if the handler looks and it is not). A
+/// fixture that instead CLI'd and spun waiting for IS0 to appear would be
+/// relying on the monitor pinning the real IF open and acknowledging early,
+/// which is exactly what this campaign deletes: it would start failing on its
+/// own setup step the moment the monitor is fixed.
+///
+/// And the remap has to come FIRST. DE0B reprograms the 8259A with a full ICW
+/// sequence, and ICW1 resets the chip, in-service state included -- so there is
+/// no "hold a line in service, then remap". The only reachable form of the
+/// state is "remap, then take a tick at the new base", which is also the shape a
+/// real VCPI client's clock lives in. That leaves IVT[0x88] serving both the
+/// hardware entry and the software one, so a phase byte tells them apart; the
+/// ambiguity cannot bite, because the hardware entry runs with IF clear and with
+/// IS0 inhibiting the chip until the chained DOS handler EOIs on the way out.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_guest_int88_after_remap_is_not_converted_to_irq0() {
@@ -2357,8 +2375,9 @@ fn tokaemm_guest_int88_after_remap_is_not_converted_to_irq0() {
         StopReason::TestExit { code: 0xA5 },
         "a guest INT 88h with the master remapped to 0x88 must reach IVT[0x88] \
          as a software interrupt (stop={stop:?}). 0xE1 = it did not; 0xE2 = the \
-         in-service line was EOI'd by something other than the guest; 0xD1/0xD2 \
-         are setup.\n{text}"
+         in-service line was EOI'd by something other than the guest; \
+         0xD1/0xD2/0xD3 are setup (DE0B refused, the timer handler never ran, \
+         or IS0 was not in service when the handler looked).\n{text}"
     );
 }
 

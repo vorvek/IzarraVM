@@ -26,6 +26,23 @@ cpu 386
 org 0x100
 %define OK 0xA5
 
+; Spin bounds. The gsw_386 profile clocks ~25 MHz, so one 54.9 ms timer tick is
+; ~1.4M emulated cycles. The two loop shapes here cover very different amounts
+; of emulated time per iteration, so they get separate bounds rather than one
+; copied constant:
+;
+;   IO_SPIN  -- OUT + IN + TEST + DEC + JNZ. The port accesses force a step
+;               break each time round, so ~40 cycles/iteration: ~34k iterations
+;               per tick, and the bound covers ~55 ticks.
+;   MEM_SPIN -- CMP mem,imm + DEC + JNZ, ~10 cycles/iteration: ~140k iterations
+;               per tick, and the bound covers ~55 ticks.
+;
+; Both are sized so that exhaustion means "the thing waited for never happened",
+; not "the fixture was impatient" -- which is what makes the 0xDn markers below
+; worth reporting.
+%define IO_SPIN  2000000
+%define MEM_SPIN 8000000
+
 start:
     xor ax, ax
     mov es, ax
@@ -40,7 +57,7 @@ start:
     mov byte [hit], 0
 
     ; ---- wait until IR0 is REQUESTED, so the STI below has something to let in
-    mov ecx, 2000000
+    mov ecx, IO_SPIN
 .wait_irr:
     mov al, 0x0A                  ; OCW3: read-select IRR
     out 0x20, al
@@ -55,7 +72,7 @@ start:
     sti
 
     ; ---- wait for the handler to record what the chip showed it
-    mov ecx, 8000000
+    mov ecx, MEM_SPIN
 .wait_hit:
     cmp byte [hit], 0
     jne .ran

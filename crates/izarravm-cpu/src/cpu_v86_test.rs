@@ -1820,7 +1820,7 @@ fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
     enter_v86_direct(&mut cpu, 0, 0x1000);
     // `enter_v86_direct` leaves IOPL 0 (the monitor's shape today). The design's
     // shape is IOPL 3, which is what makes CLI/STI the guest's own.
-    cpu.registers.eflags |= 0x3000;
+    cpu.registers.eflags |= FLAG_IOPL;
     cpu.set_flag(FLAG_IF, true);
 
     // 1. The guest CLI runs and clears the REAL IF; it does not #GP to the monitor.
@@ -1835,8 +1835,9 @@ fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
     );
 
     // 2. Raise a PIC line inside the guest's CLI window and step past it. Vector
-    //    0x21 is the one vector v86_world gives a present gate, so a delivery
-    //    that DID happen lands somewhere observable instead of faulting.
+    //    0x21 is the one NON-#GP vector v86_world gives a present gate (13 has
+    //    the other), so a delivery that DID happen lands somewhere observable
+    //    instead of faulting, and cannot be confused with a #GP.
     bus.pending_irq = Some(0x21);
     cpu.cycle(&mut bus).unwrap();
     assert_eq!(
