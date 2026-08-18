@@ -2007,6 +2007,8 @@ fn write_hdd_profile_json(
             "sector_reads": k.sector_reads,
             "host_file_reads": k.host_file_reads,
             "host_bytes": k.host_bytes,
+            "host_read_operations": k.host_read_operations,
+            "host_read_bytes": k.host_read_bytes,
             "host_wall_ns": k.host_wall_ns,
             "host_file_opens": k.host_file_opens,
             "run_scan_steps": k.run_scan_steps,
@@ -2760,6 +2762,8 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "katea_sector_reads": mark.katea.as_ref().map(|k| k.sector_reads),
                 "katea_host_bytes": mark.katea.as_ref().map(|k| k.host_bytes),
                 "katea_host_file_reads": mark.katea.as_ref().map(|k| k.host_file_reads),
+                "katea_host_read_operations": mark.katea.as_ref().map(|k| k.host_read_operations),
+                "katea_host_read_bytes": mark.katea.as_ref().map(|k| k.host_read_bytes),
                 "katea_host_file_opens": mark.katea.as_ref().map(|k| k.host_file_opens),
                 "katea_run_scan_steps": mark.katea.as_ref().map(|k| k.run_scan_steps),
                 // The FAT / directory region split. Zero unless

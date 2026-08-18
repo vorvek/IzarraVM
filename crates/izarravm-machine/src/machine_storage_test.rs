@@ -1945,6 +1945,8 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
     assert_eq!(counters.int13_read_commands, 2);
     assert_eq!(counters.int13_read_sectors, 8);
     assert_eq!(counters.int13_read_wait_ticks, first_stall);
+    assert_eq!(counters.host_read_operations, 1);
+    assert_eq!(counters.host_read_bytes, 4 * 512);
 
     drop(machine);
     std::fs::remove_dir_all(&dir).ok();
@@ -2033,6 +2035,31 @@ fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
         machine.hdd_sector_cache_counters().unwrap().0 - hits_before,
         1,
         "the successful re-read filled the cache normally"
+    );
+
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_short_host_file_preserves_the_complete_sectors_in_a_batched_read() {
+    let dir = katea_scratch("short-batch");
+    let path = dir.join("GAME.DAT");
+    std::fs::write(&path, patterned(8)).unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(512)
+        .unwrap();
+
+    assert_eq!(
+        int13_read_at(&mut machine, lba, 4),
+        vec![0x40, 0x00, 0x00, 0x00],
+        "coalescing must not discard a complete leading sector when a live host file shrinks"
     );
 
     drop(machine);

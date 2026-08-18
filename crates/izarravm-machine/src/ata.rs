@@ -467,6 +467,18 @@ impl AtaDisk {
         self.cache.borrow().misses()
     }
 
+    pub(crate) fn begin_read_command(&self, start_lba: u32, sectors: u32) {
+        if let Backing::HostFolder(volume) = &self.backing {
+            volume.begin_read_command(start_lba, sectors);
+        }
+    }
+
+    pub(crate) fn end_read_command(&self) {
+        if let Backing::HostFolder(volume) = &self.backing {
+            volume.end_read_command();
+        }
+    }
+
     /// Read straight from the backing, bypassing the cache. Split out so the
     /// cache has exactly one filler and the backing exactly one reader.
     ///

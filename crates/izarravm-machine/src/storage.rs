@@ -1887,21 +1887,28 @@ impl Machine {
         let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
-        for i in 0..count {
-            let lba = start_lba + u32::from(i);
-            let addr = buffer.wrapping_add(u32::from(i) * 512);
-            if ah == 0x02 {
-                let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
-                match data {
-                    Some(bytes) => {
-                        if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
-                            unreachable_buffer = true;
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            } else {
+        if ah == 0x02 {
+            if let Some(disk) = self.ata.as_ref() {
+                disk.begin_read_command(start_lba, u32::from(count));
+            }
+            let mut payload = Vec::with_capacity(usize::from(count) * ata::SECTOR);
+            for i in 0..count {
+                let lba = start_lba + u32::from(i);
+                let Some(bytes) = self.ata.as_ref().and_then(|disk| disk.read_lba(lba)) else {
+                    break;
+                };
+                payload.extend_from_slice(&bytes);
+            }
+            if let Some(disk) = self.ata.as_ref() {
+                disk.end_read_command();
+            }
+            let delivered = self.write_guest_linear_block(buffer, &payload);
+            done = (delivered / ata::SECTOR) as u8;
+            unreachable_buffer = delivered < payload.len();
+        } else {
+            for i in 0..count {
+                let lba = start_lba + u32::from(i);
+                let addr = buffer.wrapping_add(u32::from(i) * 512);
                 if self.linear_present_prefix(addr, 512) < 512 {
                     unreachable_buffer = true;
                     break;
@@ -1915,8 +1922,8 @@ impl Machine {
                 if !wrote {
                     break;
                 }
+                done += 1;
             }
-            done += 1;
         }
 
         let host_write_failed = ah == 0x03
@@ -1999,6 +2006,11 @@ impl Machine {
         let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
+        if ah == 0x0A
+            && let Some(disk) = self.ata.as_ref()
+        {
+            disk.begin_read_command(start_lba, u32::from(count));
+        }
         for i in 0..count {
             let lba = start_lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * LONG_SECTOR_BYTES);
@@ -2037,6 +2049,11 @@ impl Machine {
                 }
             }
             done += 1;
+        }
+        if ah == 0x0A
+            && let Some(disk) = self.ata.as_ref()
+        {
+            disk.end_read_command();
         }
 
         let host_write_failed = ah == 0x0B
@@ -2239,23 +2256,53 @@ impl Machine {
         let mut unreachable_buffer = false;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
-        for i in 0..count {
-            let l = u32::try_from(lba + u64::from(i)).expect("validated EDD LBA fits ATA");
-            let addr = buffer.wrapping_add(u32::from(i) * 512);
-            match ah {
-                0x42 => {
-                    let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
-                    match data {
-                        Some(bytes) => {
-                            if self.write_guest_linear_block(addr, &bytes) < bytes.len() {
-                                unreachable_buffer = true;
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
+        if ah == 0x42 {
+            if let Some(disk) = self.ata.as_ref() {
+                disk.begin_read_command(lba as u32, u32::from(count));
+            }
+            let mut index = 0u16;
+            while index < count {
+                let chunk = (count - index).min(64);
+                let mut payload = Vec::with_capacity(usize::from(chunk) * ata::SECTOR);
+                for offset in 0..chunk {
+                    let sector = u32::try_from(lba + u64::from(index + offset))
+                        .expect("validated EDD LBA fits ATA");
+                    let Some(bytes) = self.ata.as_ref().and_then(|disk| disk.read_lba(sector))
+                    else {
+                        break;
+                    };
+                    payload.extend_from_slice(&bytes);
                 }
-                0x43 => {
+                let read_sectors = (payload.len() / ata::SECTOR) as u16;
+                if read_sectors == 0 {
+                    break;
+                }
+                let addr = buffer.wrapping_add(u32::from(index) * ata::SECTOR as u32);
+                let delivered = self.write_guest_linear_block(addr, &payload);
+                let delivered_sectors = (delivered / ata::SECTOR) as u16;
+                done += delivered_sectors;
+                index += delivered_sectors;
+                if delivered < payload.len() {
+                    unreachable_buffer = true;
+                    break;
+                }
+                if read_sectors < chunk {
+                    break;
+                }
+            }
+            if let Some(disk) = self.ata.as_ref() {
+                disk.end_read_command();
+            }
+        } else {
+            if ah == 0x44
+                && let Some(disk) = self.ata.as_ref()
+            {
+                disk.begin_read_command(lba as u32, u32::from(count));
+            }
+            for i in 0..count {
+                let l = u32::try_from(lba + u64::from(i)).expect("validated EDD LBA fits ATA");
+                let addr = buffer.wrapping_add(u32::from(i) * 512);
+                if ah == 0x43 {
                     // The source has to be readable in full BEFORE anything is
                     // committed. An untranslatable page reads back as the
                     // walker's 0xFF fill, and a sector is persistent: writing
@@ -2274,15 +2321,20 @@ impl Machine {
                     if !wrote {
                         break;
                     }
-                }
-                0x44 => {
+                } else if ah == 0x44 {
                     if self.ata.as_ref().and_then(|d| d.read_lba(l)).is_none() {
                         break;
                     }
+                } else {
+                    unreachable!("EDD transfer dispatch validates AH");
                 }
-                _ => unreachable!("EDD transfer dispatch validates AH"),
+                done += 1;
             }
-            done += 1;
+            if ah == 0x44
+                && let Some(disk) = self.ata.as_ref()
+            {
+                disk.end_read_command();
+            }
         }
         let host_write_failed = ah == 0x43
             && done > 0
