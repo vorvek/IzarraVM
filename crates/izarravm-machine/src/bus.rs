@@ -1169,7 +1169,27 @@ impl CpuBus for MachineBus<'_> {
         {
             return 0;
         }
+        // First match wins, where this used to take `ram.max(vga)`. The `max`
+        // was never choosing between two live answers: RAM and the video
+        // apertures are disjoint address ranges, so at most one probe can
+        // admit, and the loser contributed 0. The ladder now also asks Margo's
+        // LFB, and evaluating all three to take a maximum would price two
+        // certain misses on every RAM access.
         if let Some((_, start, end)) = self.direct_page_ram_bytes(address, bytes, access_width) {
+            debug_assert!(
+                self.direct_vga_bytes(
+                    address,
+                    bytes,
+                    access_width,
+                    kind == BusAccessKind::DataWrite
+                )
+                .is_none()
+                    && self
+                        .direct_margo_lfb_bytes(address, bytes, access_width)
+                        .is_none(),
+                "RAM and the video apertures must be mutually exclusive; \
+                 taking the first admission would otherwise hide a shorter grant"
+            );
             return end - start;
         }
         if match kind {
@@ -3065,13 +3085,30 @@ impl MachineBus<'_> {
         available.then_some((gated, gated as usize & RAM_LOOKUP_PAGE_MASK))
     }
 
+    /// Whether `bytes` at `address` are one contiguous run inside Margo's linear
+    /// framebuffer, and the gated address to serve them from.
+    ///
+    /// Deliberately WITHOUT the page-crossing clause the RAM and legacy-VGA
+    /// probes above carry. Those two serve out of a host page table where a
+    /// run that leaves the page changes backing store mid-copy; Margo's VRAM is
+    /// one contiguous `Vec` and `margo_lfb_direct_bytes` bounds-checks the
+    /// WHOLE range, so a page crossing changes nothing about the slice. Keeping
+    /// the clause would have declined most real scanline copies: a 640-byte
+    /// mode-101h row crosses a 4 KiB boundary once every seven rows, and a
+    /// full-width REP MOVS of a 1024-byte row crosses on half of them.
+    ///
+    /// The A20 clause is NOT dead here. `A20_MASK` clears bit 20 at every
+    /// address, not only under 1 MiB, and the 4 MiB LFB aperture spans bit 20 --
+    /// so with A20 off the second and fourth megabytes alias down. Declining
+    /// leaves them to the slow path, which applies the same gating one byte at
+    /// a time.
     #[inline]
     fn direct_margo_lfb_bytes(
         &self,
         address: u32,
         bytes: usize,
         access_width: BusWidth,
-    ) -> Option<(u32, usize)> {
+    ) -> Option<u32> {
         let end = address.checked_add(u32::try_from(bytes).ok()?)?;
         if address < crate::MARGO_LFB_BASE || end > crate::MARGO_MMIO_BASE {
             return None;
@@ -3080,12 +3117,11 @@ impl MachineBus<'_> {
         if gated != address
             || bytes == 0
             || should_split(gated, access_width)
-            || ((gated as usize & RAM_LOOKUP_PAGE_MASK) + bytes > RAM_LOOKUP_PAGE_SIZE)
             || self.vega.margo_lfb_direct_bytes(gated, bytes).is_none()
         {
             return None;
         }
-        Some((gated, gated as usize & RAM_LOOKUP_PAGE_MASK))
+        Some(gated)
     }
 
     fn record_direct_vga_accesses(

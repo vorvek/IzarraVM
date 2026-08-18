@@ -2872,6 +2872,18 @@ impl Vga {
         out
     }
 
+    /// Whether [`Self::cached_mode13h_presented_argb`] would answer with a
+    /// frame, without building or cloning one.
+    ///
+    /// Exists so a caller can ASK the question cheaply before deciding which of
+    /// two presentation paths to take. Answering it by calling the cache itself
+    /// costs a full-frame `Vec` clone, which is the opposite of what a chooser
+    /// wants. The two must agree, so both are written against the same pair of
+    /// conditions and nothing else.
+    pub fn presents_cached_mode13h_argb(&self) -> bool {
+        self.canonical_mode13_layout() && self.last_presented().is_some()
+    }
+
     /// Palette-map the latest completed canonical Mode 13h frame. The cache is
     /// full-sized so callers can keep their existing crop behavior.
     pub fn cached_mode13h_presented_argb(&self) -> Option<(Vec<u32>, usize, usize, usize)> {

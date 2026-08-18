@@ -740,6 +740,78 @@ fn a_bulk_copy_into_the_linear_framebuffer_takes_the_direct_path() {
     assert_eq!(metrics.margo_lfb_slow_write_bytes, 0);
 }
 
+/// A scanline copy that CROSSES a 4 KiB boundary must still take the direct
+/// path.
+///
+/// Row 6 of a 640-byte-pitch mode starts at 0xF00 and ends at 0x1180, and one
+/// row in seven lands like this; at 1024 bytes per row it is one in two. Margo's
+/// frame store is a single contiguous allocation and the aperture probe bounds-
+/// checks the whole run against it, so a page boundary inside the run means
+/// nothing here -- the page-crossing clause that guards the RAM and legacy-VGA
+/// probes would have sent the common case back to the per-byte path.
+#[test]
+fn a_page_crossing_scanline_copy_still_takes_the_direct_path() {
+    const PITCH: usize = 640;
+    const OFFSET: usize = 6 * PITCH;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    assert!(machine.vega.set_vbe_mode(0x4101));
+    const _: () = assert!(
+        OFFSET / 0x1000 != (OFFSET + PITCH - 1) / 0x1000,
+        "the fixture is only discriminating while the run crosses a page"
+    );
+
+    let payload: Vec<u8> = (0..PITCH)
+        .map(|i| (i.wrapping_mul(29) & 0xff) as u8)
+        .collect();
+    let address = MARGO_LFB_BASE + OFFSET as u32;
+    let admitted = with_bus(&mut machine, |bus| {
+        bus.direct_memory_bytes(
+            address,
+            payload.len(),
+            BusWidth::Byte,
+            BusAccessKind::DataWrite,
+        )
+    });
+    assert_eq!(
+        admitted,
+        payload.len(),
+        "the whole row, not the page remnant"
+    );
+
+    let written = with_bus(&mut machine, |bus| {
+        bus.write_memory_bytes_direct(address, &payload, BusWidth::Byte, BusAccessKind::DataWrite)
+    })
+    .unwrap();
+    assert_eq!(written, payload.len());
+    assert_eq!(
+        &machine.vega.margo().vram()[OFFSET..OFFSET + PITCH],
+        payload.as_slice()
+    );
+
+    let mut read_back = vec![0u8; PITCH];
+    let read = with_bus(&mut machine, |bus| {
+        bus.read_memory_bytes_direct(
+            address,
+            &mut read_back,
+            BusWidth::Byte,
+            BusAccessKind::DataRead,
+        )
+    })
+    .unwrap();
+    assert_eq!(read, payload.len());
+    assert_eq!(read_back, payload);
+
+    let metrics = machine.video_host_metrics();
+    assert_eq!(metrics.margo_lfb_direct_write_bytes, PITCH as u64);
+    assert_eq!(metrics.margo_lfb_direct_read_bytes, PITCH as u64);
+    assert_eq!(metrics.margo_lfb_slow_write_bytes, 0);
+    assert_eq!(metrics.margo_lfb_slow_read_bytes, 0);
+}
+
 #[test]
 fn margo_frame_publication_reports_stable_generation_and_row_damage() {
     let mut machine = Machine::new(

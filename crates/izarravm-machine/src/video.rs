@@ -2510,7 +2510,18 @@ impl Machine {
     ///
     /// Returns `None` for text mode (time-based cursor/attribute blink toggles with no
     /// guest write, so writes alone cannot capture it) and Distira. Margo combines
-    /// its row-damage generation with the legacy DAC generation. Consumers of
+    /// its row-damage generation with the legacy DAC generation.
+    ///
+    /// Margo answering `Some` here is a SEMANTIC STEP for anything counting
+    /// frames. It used to answer `None`, which the host's publication rule reads
+    /// as "no key, always publish"; now a Margo title with a still screen moves
+    /// no key and publishes nothing, so its `frames_skipped` count steps up from
+    /// roughly zero to roughly every idle frame. That is the same reading the
+    /// VGA raster has always had -- a skipped frame is a frame that would have
+    /// been identical -- so profile numbers from before and after this change
+    /// are not comparable for Margo titles.
+    ///
+    /// Consumers of
     /// [`Self::presented_frame_argb`] should use
     /// [`Self::presented_frame_generation`] so the key and raster are finalized
     /// together. Pure `&self`: no rendering, no timing side effects.

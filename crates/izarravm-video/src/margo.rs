@@ -648,7 +648,23 @@ impl Margo {
         &self.vram
     }
 
+    /// The frame store, writable, with NO damage reported.
+    ///
+    /// Every routine byte a guest writes arrives through `write_vram_u8`, the
+    /// direct-access slice, or a blit, and each of those reports its rows. A
+    /// caller that reaches for the raw store instead is stepping outside that
+    /// and owes the tracker an answer -- otherwise its pixels are converted
+    /// once and then never again, because no row ever looks dirty. Use
+    /// [`Self::vram_mut_noted`] unless the write is provably already covered.
     pub fn vram_mut(&mut self) -> &mut [u8] {
+        &mut self.vram
+    }
+
+    /// [`Self::vram_mut`] for a bulk writer that has no rows to report: marks
+    /// the whole visible surface dirty up front, so anything the caller stores
+    /// is converted on the next scanout no matter where it landed.
+    pub fn vram_mut_noted(&mut self) -> &mut [u8] {
+        self.mark_full_damage();
         &mut self.vram
     }
 
@@ -1442,8 +1458,19 @@ impl Margo {
         }
     }
 
+    /// Report the destination rectangle of a completed blit as row damage.
+    ///
+    /// A zero HEIGHT wrote nothing, so there is nothing to report. A zero PITCH
+    /// is a different thing entirely: the engine still writes, it just writes
+    /// every row on top of the first, and the rectangle this would compute is
+    /// empty for a store that is not. Say "everything" there rather than
+    /// "nothing" -- the alternative silently freezes whatever the guest drew.
     fn note_blit_rect(&mut self, base: u32, pitch: u32, y: u32, height: u32) {
-        if pitch == 0 || height == 0 {
+        if height == 0 {
+            return;
+        }
+        if pitch == 0 {
+            self.mark_full_damage();
             return;
         }
         let start = u64::from(base).saturating_add(u64::from(y).saturating_mul(u64::from(pitch)));
