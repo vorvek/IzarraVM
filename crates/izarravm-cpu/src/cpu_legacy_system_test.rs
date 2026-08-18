@@ -2730,3 +2730,122 @@ fn task_switch_into_protected_mode_still_builds_a_null_data_selector_as_unusable
         "a protected-mode null selector stays the unusable null descriptor"
     );
 }
+
+// ---------------------------------------------------------------------------
+// IDT gate DPL conformance in PROTECTED mode (the V86 companions, with the
+// PRM quote, live in `cpu_v86_test.rs`). Ring 3 here is set the way
+// `call_gate_inter_privilege_switches_stack` sets it: cached CS/SS written
+// directly, with `cpu.cpl` seeded to match.
+// ---------------------------------------------------------------------------
+
+/// A protected-mode CPU whose IDT (base 0x200) holds one 32-bit interrupt gate
+/// for `vector` with access byte `gate_access`, targeting `RING0_CODE:0x40`.
+/// The GDT lives at 0x100 limit 0xff, so the two tables never overlap.
+fn protected_cpu_with_idt_gate(vector: u8, gate_access: u8) -> (CpuGsw, Vec<u8>) {
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(&[0xf4], &[RING0_CODE]);
+    let gate = 0x200 + u32::from(vector) * 8;
+    put16(&mut memory, gate, 0x40); // offset 15..0
+    put16(&mut memory, gate + 2, 0x08); // RING0_CODE selector
+    memory[gate as usize + 4] = 0;
+    memory[gate as usize + 5] = gate_access;
+    put16(&mut memory, gate + 6, 0); // offset 31..16
+    cpu.idtr = DescriptorTable {
+        base: 0x200,
+        limit: 0x1ff,
+    };
+    (cpu, memory)
+}
+
+/// Drop `cpu` to ring 3 with flat ring-3 CS/SS caches.
+fn descend_to_ring3(cpu: &mut CpuGsw) {
+    cpu.registers.set_segment(
+        SegmentIndex::Cs,
+        SegmentRegister {
+            selector: 0x1b,
+            base: 0,
+            limit: 0xf_ffff,
+            access: 0xfb,
+            default_size_32: false,
+        },
+    );
+    cpu.registers.set_segment(
+        SegmentIndex::Ss,
+        SegmentRegister {
+            selector: 0x23,
+            base: 0,
+            limit: 0xf_ffff,
+            access: 0xf3,
+            default_size_32: false,
+        },
+    );
+    cpu.registers.set_esp(0xc0);
+    cpu.cpl = 3;
+}
+
+#[test]
+fn ring3_software_int_through_a_dpl0_gate_general_protection_faults() {
+    // Same rule as the V86 case, reached from an ordinary protected-mode ring 3
+    // instead. Note there is no TSS here at all: the fault must be raised from
+    // the gate alone, before the inner-stack switch that would need one.
+    let (mut cpu, memory) = protected_cpu_with_idt_gate(0x20, 0x8e); // P, DPL 0
+    let mut bus = TestBus::with_memory(memory);
+    descend_to_ring3(&mut cpu);
+
+    let result = cpu.software_interrupt(&mut bus, 0x20);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0x102), // 0x20 * 8 + 2
+            })
+        ),
+        "INT 0x20 from CPL 3 through a DPL-0 gate must #GP(0x20*8+2), got {result:?}"
+    );
+    assert_eq!(
+        cpu.registers.cs().selector,
+        0x1b,
+        "no transfer happened -- CS is still the ring-3 selector"
+    );
+}
+
+#[test]
+fn ring3_into_through_a_dpl0_gate_general_protection_faults() {
+    // "INT n, INT 3, or INTO" -- the overflow trap takes the same rule.
+    let (mut cpu, memory) = protected_cpu_with_idt_gate(4, 0x8e); // P, DPL 0
+    let mut bus = TestBus::with_memory(memory);
+    descend_to_ring3(&mut cpu);
+
+    let result = cpu.software_interrupt(&mut bus, 4);
+
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0x22), // 4 * 8 + 2
+            })
+        ),
+        "INTO from CPL 3 through a DPL-0 gate must #GP(4*8+2), got {result:?}"
+    );
+}
+
+#[test]
+fn ring0_software_int_through_a_dpl0_gate_dispatches() {
+    // Non-vacuity at the other end of the comparison: the rule is DPL < CPL, so
+    // a ring-0 caller through the very same DPL-0 gate is served. Ring 0 to
+    // ring 0 crosses nothing, so this needs no TSS either.
+    let (mut cpu, memory) = protected_cpu_with_idt_gate(0x20, 0x8e); // P, DPL 0
+    let mut bus = TestBus::with_memory(memory);
+    assert_eq!(cpu.current_privilege_level(), 0);
+
+    cpu.software_interrupt(&mut bus, 0x20).unwrap();
+
+    assert_eq!(
+        cpu.registers.cs().selector,
+        0x08,
+        "entered the handler's CS"
+    );
+    assert_eq!(cpu.registers.eip, 0x40);
+}
