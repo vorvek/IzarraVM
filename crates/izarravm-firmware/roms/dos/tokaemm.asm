@@ -1547,9 +1547,30 @@ gdtr:
 ; BOTH #GP and IRQ5 (SB16): vec13_entry disambiguates. The exception overlaps on
 ; 8/10-12/14 (#DF/#TS/#NP/#SS/#PF) have no source here: identity-mapped
 ; always-present pages and no PM selector loads from V86.
+; DPL 3, and that is the OTHER HALF of the IOPL-3 posture, not a relaxation.
+; A V86 task is always CPL 3, and the 386 checks the GATE's DPL against CPL for
+; SOFTWARE interrupts only: "IF software interrupt ... IF gate descriptor
+; DPL < CPL THEN #GP(vector number * 8+2+EXT)" (i386 PRM, INTERRUPT/EXCEPTION
+; pseudocode -- dev_docs/reference/i386/i386.txt:17766-17771). With DPL-0 gates
+; every guest INT 21h on real silicon would #GP into vec13_entry and stop the
+; machine on the 0xD6 tripwire. Hardware IRQs are unaffected either way: the
+; PRM gates that check on `software interrupt`, so an externally delivered
+; vector never consults the gate DPL.
+;
+; The reference monitor pairs the two halves exactly: 386MAX runs its VM
+; clients at @VMIOPL 3 AND builds its IDT with `CPL0_INTR3 or CPL3` -- a 32-bit
+; interrupt gate at DPL 3 (QMAX_IDT.ASM:226, under
+; dev_docs/reference/386max/386MAX/BIGMEM.BOB/).
+;
+; No gate here is deliberately ring-0-only. This monitor exposes no INT-n
+; service that the guest must be kept out of: every vector either reflects to
+; the guest's own IVT or is a service the guest is meant to call (INT 67h VCPI,
+; INT 0xC0 private), and a guest INT 08h reflecting vector 8 is the documented
+; matched-metal residue in the routing rule above irq_body. So all 256 gates
+; are DPL 3, uniformly.
 %macro IDTGATE 1
     dw %1, 0x0008                 ; offset-low, PM code selector (driver < 64K)
-    db 0, 0x8E                    ; present, ring-0 32-bit interrupt gate
+    db 0, 0xEE                    ; present, DPL 3, 32-bit interrupt gate
     dw 0                          ; offset-high
 %endmacro
 align 8
@@ -1877,9 +1898,22 @@ monitor_body:
     ; The IOPL-sensitive set. The guest runs at real IOPL 3 (pm_init,
     ; vcpi_pm_to_v86), where CLI/STI/PUSHF/POPF/INT n/IRET are NOT
     ; IOPL-sensitive: the CPU executes them for real and they never fault here.
-    ; So reaching this arm means the V86 frame's IOPL is not 3 -- a monitor bug
-    ; in whoever built that frame, never a guest one. Emulating it would hide
-    ; the defect behind a monitor that silently half-works, so name it and stop.
+    ;
+    ; For the five FLAG instructions (FA/FB/9C/9D/CF) reaching this arm has one
+    ; cause: the V86 frame's IOPL is not 3.
+    ;
+    ; For INT n (CD) on REAL SILICON there is a second cause -- the IDT gate the
+    ; vector lands on has DPL < CPL, which #GP(vector*8+2)s a CPL-3 guest before
+    ; the handler runs (i386 PRM, dev_docs/reference/i386/i386.txt:17766-17771;
+    ; see the IDTGATE comment for why every gate here is DPL 3). THIS EMULATOR
+    ; DOES NOT RAISE THAT FAULT: control.rs's software_interrupt path never
+    ; compares gate DPL to CPL, so a DPL-0 gate would work here and fail on
+    ; metal. Recorded in the design's S10 and filed as an emulator-side task --
+    ; do not conclude from a green suite that the gate DPLs are right.
+    ;
+    ; Either cause is a monitor bug in whoever built the frame or the gate,
+    ; never a guest one. Emulating it would hide the defect behind a monitor
+    ; that silently half-works, so name it and stop.
     cmp dl, 0xFA                  ; CLI
     je .sensitive_at_iopl0
     cmp dl, 0xFB                  ; STI
