@@ -1780,8 +1780,10 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; ============================================================================
 
 ; ---- vector 13: #GP (error-code frame, from V86 OR from the monitor's own
-; ring 0) OR IRQ5 (the SB16, no error code). V86 trap tax Part 2. The
-; discriminator forks on FRAME ORIGIN, read from the frame's own shape --
+; ring 0) OR any no-error-code delivery on vector 13 (IRQ5 at the default
+; master base, or a guest INT 0Dh -- the fork does not distinguish them, and
+; per the routing rule above irq_body it does not need to). V86 trap tax
+; Part 2. The discriminator forks on FRAME SHAPE, read from the frame itself --
 ; never on the error-code VALUE, and with no opcode peek and no PIC probe:
 ;
 ;   error-code frame:  [esp+32]=EC  [esp+36]=EIP [esp+40]=CS     [esp+44]=EFLAGS
@@ -1790,15 +1792,15 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; TEST 1: bit 17 (VM) of [esp+40]. In an error-code frame that slot holds
 ; CS, a zero-extended 16-bit value in BOTH origins (a V86 segment, or the
 ; monitor's own 0x08), so bit 17 can never be set; in a no-error frame it
-; holds the interrupted EFLAGS. Set -> the V86 IRQ5 frame, at ANY
+; holds the interrupted EFLAGS. Set -> a V86 no-error frame, at ANY
 ; interrupted IP (the IP == 0 ambiguity the old error-code-value scheme
 ; needed an opcode peek and a PIC probe for does not exist in this basis,
 ; and neither does that scheme's documented mis-emulation residual).
 ;
 ; TEST 2 (clear): the ring-0 sti;hlt window below is the only ring-0 code
 ; that runs with IF open, and it brackets itself in `r0_hlt`. Flag set AND
-; the no-error frame's CS slot ([esp+36]) == our 0x08 -> IRQ5 that woke the
-; halt; irq_body's own VM check then parks it in the halt slot. A ring-0 #GP
+; the no-error frame's CS slot ([esp+36]) == our 0x08 -> the no-error frame
+; that woke the halt; irq_body's own VM check then parks it in the halt slot. A ring-0 #GP
 ; raised INSIDE the flagged window cannot take this arm: its frame carries the
 ; faulting EIP at [esp+36], and offset 8 is the DOS device-driver header
 ; (dh_next), never executed code.
@@ -1814,8 +1816,10 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; the frame re-faults the same way; the only correct move is the named
 ; diagnostic exit. The same fork guards the OTHER PIC-base-8 collisions:
 ; irq_body classifies error-code frames on vectors 8/10/11/12/14 (0xD5 for
-; a ring-0 origin), and reflect_vector refuses ring-0 frames outright
-; (0xD4) as the backstop for the exc_*/deflt_* reflect paths. monitor_body
+; a ring-0 origin -- and the deflt_* gates report there too, since
+; deflt_common routes through irq_body), and reflect_vector refuses ring-0
+; frames outright (0xD4) as the backstop for the exc_de/exc_ud/exc_nm reflect
+; paths, which are the only ones left that reflect unconditionally. monitor_body
 ; adds 0xD6: an IOPL-sensitive instruction faulted at all, which means the
 ; V86 frame's IOPL is not 3 -- a monitor bug, not a guest one. irq_body adds
 ; 0xD7 for a doubly-occupied halt-window slot.
@@ -1839,7 +1843,7 @@ vec13_entry:
     cmp byte [fs:r0_hlt], 0       ; TEST 2: the ring-0 halt window is the only
     je .ec_frame                  ; IF-open ring-0 code
     cmp dword [esp+36], 8         ; no-error ring-0 frame: CS slot = our 0x08
-    je .vec13_noerror             ; -> the IRQ5 that woke the hlt
+    je .vec13_noerror             ; -> the no-error frame that woke the hlt
 .ec_frame:
     test dword [esp+44], FLAGS_VM ; TEST 3: error-code frame's EFLAGS.VM
     jnz monitor_body              ; V86 #GP -> emulate/reflect as ever
@@ -2303,6 +2307,7 @@ irq_common:                       ; pushad done, EBX = vector
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
+                                  ; falls through into irq_body
 
 ; ---- THE ROUTING RULE: EVERY GATE REFLECTS THE VECTOR IT SITS ON. ----
 ;
@@ -2634,9 +2639,10 @@ intc0_entry:
 ;   in: ESI = pushad base (guest regs: EDI+0, EBX+16, EDX+20, ECX+24,
 ;       EAX+28), EBP = &frame.eip (V86 frame: ES at +20, past EIP/CS/EFLAGS/
 ;       ESP/SS), DS = flat, FS = driver data.
-;   The CALLER advances the frame IP (the two entry paths differ: vec13's
-;   fault frame points at the INT, the int67_entry gate frame is already
-;   past it). Guest register writes go through the pushad block; live
+;   No IP advance anywhere: int67_entry is the only caller, and its
+;   software-INT gate frame already points PAST the INT. (The IOPL-0 fault
+;   frame that pointed AT it, and the monitor_body arm that compensated, are
+;   both gone.) Guest register writes go through the pushad block; live
 ;   eax/ecx/edx are popad-restored, so only [esi+..] writes are outputs. ----
 vcpi_dispatch:
     movzx eax, byte [esi+28]      ; guest AL = VCPI subfunction
@@ -3714,7 +3720,8 @@ vcpi_pm_to_v86:
 ; at any non-default base, and put a cache that can go stale on the delivery
 ; path. Every gate now carries its own vector; see the routing note above
 ; irq_body. vcpi_pic_master/vcpi_pic_slave survive, but only to answer DE0A
-; and to be written by DE0B -- they no longer participate in delivery.
+; and to be written by DE0B (and read back as its ICW2 source) -- they no
+; longer participate in delivery.
 
 ; Reflect an interrupt into the guest's real-mode IVT handler.
 ;   in: EBX = vector, EBP = &frame.eip, FS = driver data.  clobbers eax,ecx,edx,edi
@@ -3722,8 +3729,9 @@ vcpi_pm_to_v86:
 ; The frame MUST be a V86 one: [ebp+12]/[ebp+16] (guest SS:SP) only exist on
 ; a V86 trap frame, and rewriting a ring-0 frame's EIP/CS to real-mode IVT
 ; values makes the next IRETD re-fault -- one reflected ring-0 frame is what
-; turned the G1 storm self-sustaining. vec13_entry and irq_body classify
-; their own frames and enter at reflect_vector_v86, past the check; the
+; turned the G1 storm self-sustaining. The callers listed at
+; reflect_vector_v86 below classify their own frames and enter past the check
+; (vec13_entry classifies but does not reflect -- it jumps to irq_body); the
 ; exc_de/exc_ud/exc_nm gates reflect unconditionally, so a future
 ; ring-0-origin fault through any of those vectors lands on the VM check and
 ; reports (0xD4) on its first iteration: the bounded-storm backstop.
@@ -3863,7 +3871,8 @@ banner: db 'TOKAEMM XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0
 ; itself on a game run instead of wedging or storming. Codes in use:
 ; the trapped-I/O opcode byte (monitor_body .unhandled_io), 0xD3 (ring-0
 ; #GP, vec13_entry TEST 3), 0xD4 (reflect_vector on a ring-0 frame), 0xD5
-; (a ring-0 CPU exception on an IRQ gate, irq_body .ring0_exc), 0xD6 (an
+; (a ring-0 CPU exception on an IRQ gate, or on a default gate -- deflt_common
+; routes through irq_body -- irq_body .ring0_exc), 0xD6 (an
 ; IOPL-sensitive instruction faulted, so the V86 frame's IOPL is not 3 --
 ; a monitor bug, not a guest one; monitor_body .sensitive_at_iopl0), 0xD7
 ; (the one-slot halt window was already occupied, irq_body .hlt_slot_busy --
