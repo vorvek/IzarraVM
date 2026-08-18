@@ -1,10 +1,10 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Recursive, read-only, lazy host-folder directory tree for the Katea
-//! controller. Generalizes the flat `KateaVolume` into a full FAT32
-//! directory tree whose FAT and directory sectors are computed on demand, so
-//! RAM scales with the entry count rather than the disk or file sizes.
+//! Recursive, lazy host-folder directory tree for the Katea controller.
+//! Generalizes the flat `KateaVolume` into a full FAT32 directory tree whose
+//! FAT and directory sectors are computed on demand and whose guest writes are
+//! projected incrementally to host files.
 
 // `KateaTreeVolume` is consumed by the ATA `HostFolder` backing (`ata.rs`) and
 // `mount_hdd_folder` (`lib.rs`). A few
@@ -22,8 +22,8 @@ use crate::katea_volume::{
     fat_size_sectors, lba_to_chs, sectors_per_cluster, stamp_fat32_bpb,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Cap recursion so a pathological tree (or an undetected loop) can't run away;
@@ -694,7 +694,7 @@ enum Role {
     File(usize),
 }
 
-/// A lazy, read-only, whole-disk FAT32 volume over a recursive host-folder tree.
+/// A lazy whole-disk FAT32 volume over a recursive host-folder tree.
 /// The sibling of the flat `KateaVolume`, generalized to a full directory tree:
 /// FAT and directory sectors are computed on demand and file data is read lazily,
 /// so RAM scales with the entry count rather than the disk or file sizes.
@@ -740,6 +740,21 @@ pub(crate) struct KateaTreeVolume {
     /// `existing_files` (host_path for case-correct overwrite) and `materialized`
     /// (content-fingerprint dedupe). The root dir has no entry (it has no parent).
     mirrored: HashMap<(u32, [u8; 11]), MirrorEntry>,
+    /// Current valid guest file chains. Projected payload sectors can leave the
+    /// overlay because reads resolve these clusters back through the host file.
+    projected_files: HashMap<(u32, [u8; 11]), ProjectedFile>,
+    projected_clusters: HashMap<u32, ((u32, [u8; 11]), u32)>,
+    blocked_projection_keys: HashSet<(u32, [u8; 11])>,
+    /// Open host handles reused by positioned writes until guest flush or eject.
+    host_write_handles: HashMap<PathBuf, File>,
+    directory_clusters: HashMap<u32, u32>,
+    batch_lbas: HashSet<u32>,
+    unmapped_lbas: HashSet<u32>,
+    batch_sector_writes: u64,
+    directory_dirty: bool,
+    metadata_reconcile_pending: bool,
+    fat_dirty_clusters: HashSet<u32>,
+    host_io_failed: bool,
     /// Folded 8.3 names of the InMemory boot files; never materialized to the host.
     system_names: HashSet<[u8; 11]>,
     /// Files whose bytes `reconcile` has re-read from the disk. Counts the work the
@@ -747,7 +762,7 @@ pub(crate) struct KateaTreeVolume {
     gathers: u64,
     /// Exact file states whose most recent gather or host write failed. An inline
     /// reconcile retries only the same state; a later guest write makes it an
-    /// ordinary changing file again and defers it until the final reconcile.
+    /// ordinary changing file again and lets a later pass retry it.
     retry_gathers: HashMap<(u32, [u8; 11]), FileState>,
     #[cfg(test)]
     gathered_bytes: u64,
@@ -828,6 +843,52 @@ pub struct KateaStorageCounters {
     /// them differ: their ratio is what says the cache is working. Before the
     /// cache they were equal by construction.
     pub host_file_opens: u64,
+    pub sector_writes: u64,
+    pub int13_read_commands: u64,
+    pub int13_read_sectors: u64,
+    pub int13_read_wait_ticks: u64,
+    pub int13_write_commands: u64,
+    pub int13_write_sectors: u64,
+    pub int13_write_wait_ticks: u64,
+    pub pio_read_commands: u64,
+    pub pio_read_sectors: u64,
+    pub pio_read_wait_ticks: u64,
+    pub pio_write_commands: u64,
+    pub pio_write_sectors: u64,
+    pub pio_write_wait_ticks: u64,
+    pub dma_read_commands: u64,
+    pub dma_read_sectors: u64,
+    pub dma_read_wait_ticks: u64,
+    pub dma_write_commands: u64,
+    pub dma_write_sectors: u64,
+    pub dma_write_wait_ticks: u64,
+    pub overlay_resident_sectors: u64,
+    pub overlay_pending_sectors: u64,
+    pub pending_unmapped_sectors: u64,
+    pub spill_operations: u64,
+    pub spill_bytes: u64,
+    pub spill_wall_ns: u64,
+    pub projection_operations: u64,
+    pub projection_bytes: u64,
+    pub projection_wall_ns: u64,
+    pub metadata_projection_passes: u64,
+    pub host_write_failures: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuestStorageRoute {
+    Int13,
+    Pio,
+    Dma,
+}
+
+pub(crate) type GuestWriteRoute = GuestStorageRoute;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommitGuestWriteResult {
+    Projected,
+    Deferred,
+    HostIoFailure,
 }
 
 /// Katea's belief about one host-side entry (file or dir): where it lives, the
@@ -904,7 +965,26 @@ struct LiveEntry {
     dir_cluster: u32,
     name: [u8; 11],
     first_cluster: u32,
+    size: u32,
     is_dir: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedFile {
+    path: PathBuf,
+    size: u32,
+    chain: Vec<u32>,
+}
+
+struct PendingStream {
+    path: PathBuf,
+    key: (u32, [u8; 11]),
+    first_cluster: u32,
+    size: u32,
+    chain: Vec<u32>,
+    state: FileState,
+    sectors: Option<Vec<(u32, u64)>>,
+    set_len: bool,
 }
 
 /// One file the reconcile pass has decided to materialize: where to write it, the
@@ -924,6 +1004,7 @@ struct PendingWrite {
     /// lands. A held or failed write leaves the entry's watermark alone, so the
     /// next pass gathers again.
     gather: Gather,
+    chain: Vec<u32>,
 }
 
 /// A disappeared mirrored entry (file or dir) whose clusters are now claimed by
@@ -997,22 +1078,40 @@ impl KateaTreeVolume {
         // --- seed the write maps from the (allocated) tree ----------------------
         let mut dir_paths: HashMap<u32, PathBuf> = HashMap::new();
         let mut mirrored: HashMap<(u32, [u8; 11]), MirrorEntry> = HashMap::new();
+        let mut projected_files = HashMap::new();
+        let mut projected_clusters = HashMap::new();
         fn seed(
             dir: &TreeDir,
             dir_paths: &mut HashMap<u32, PathBuf>,
             mirrored: &mut HashMap<(u32, [u8; 11]), MirrorEntry>,
+            projected_files: &mut HashMap<(u32, [u8; 11]), ProjectedFile>,
+            projected_clusters: &mut HashMap<u32, ((u32, [u8; 11]), u32)>,
         ) {
             dir_paths.insert(dir.first_cluster, dir.host_path.clone());
             for f in &dir.files {
                 if let FileSource::HostFile { path, .. } = &f.source {
+                    let key = (dir.first_cluster, f.name);
                     mirrored.insert(
-                        (dir.first_cluster, f.name),
+                        key,
                         MirrorEntry {
                             host_path: path.clone(),
                             first_cluster: f.first_cluster,
                             is_dir: false,
                             last_fingerprint: None,
                             last_gather: None,
+                        },
+                    );
+                    let chain: Vec<u32> =
+                        (f.first_cluster..f.first_cluster + f.cluster_count).collect();
+                    for (index, &cluster) in chain.iter().enumerate() {
+                        projected_clusters.insert(cluster, (key, index as u32));
+                    }
+                    projected_files.insert(
+                        key,
+                        ProjectedFile {
+                            path: path.clone(),
+                            size: u32::try_from(f.source.len()).unwrap_or(u32::MAX),
+                            chain,
                         },
                     );
                 }
@@ -1028,10 +1127,22 @@ impl KateaTreeVolume {
                         last_gather: None,
                     },
                 );
-                seed(&s.dir, dir_paths, mirrored);
+                seed(
+                    &s.dir,
+                    dir_paths,
+                    mirrored,
+                    projected_files,
+                    projected_clusters,
+                );
             }
         }
-        seed(&tree.root, &mut dir_paths, &mut mirrored);
+        seed(
+            &tree.root,
+            &mut dir_paths,
+            &mut mirrored,
+            &mut projected_files,
+            &mut projected_clusters,
+        );
         let mut system_names: HashSet<[u8; 11]> = system_files
             .iter()
             .map(|(name, _)| fold_literal_83(name))
@@ -1054,6 +1165,11 @@ impl KateaTreeVolume {
         let mut runs = Vec::new();
         flatten(&tree.root, true, &mut dirs, &mut files, &mut runs);
         runs.sort_by_key(|r| r.0);
+        let directory_clusters = runs
+            .iter()
+            .filter(|(_, _, role)| matches!(role, Role::Dir(_)))
+            .flat_map(|(first, last, _)| (*first..=*last).map(|cluster| (cluster, *first)))
+            .collect();
 
         Ok(Self {
             tree,
@@ -1069,6 +1185,18 @@ impl KateaTreeVolume {
             store: crate::katea_store::SectorStore::new(),
             dir_paths,
             mirrored,
+            projected_files,
+            projected_clusters,
+            blocked_projection_keys: HashSet::new(),
+            host_write_handles: HashMap::new(),
+            directory_clusters,
+            batch_lbas: HashSet::new(),
+            unmapped_lbas: HashSet::new(),
+            batch_sector_writes: 0,
+            directory_dirty: false,
+            metadata_reconcile_pending: false,
+            fat_dirty_clusters: HashSet::new(),
+            host_io_failed: false,
             system_names,
             gathers: 0,
             retry_gathers: HashMap::new(),
@@ -1106,7 +1234,19 @@ impl KateaTreeVolume {
 
     /// What the read path has done since mount. See [`KateaStorageCounters`].
     pub(crate) fn storage_counters(&self) -> KateaStorageCounters {
-        self.counters.get()
+        let mut counters = self.counters.get();
+        let store = self.store.counters();
+        counters.overlay_resident_sectors = store.resident_sectors;
+        counters.overlay_pending_sectors = store.pending_sectors;
+        counters.pending_unmapped_sectors = self
+            .unmapped_lbas
+            .iter()
+            .filter(|lba| self.store.is_pending(**lba))
+            .count() as u64;
+        counters.spill_operations = store.spill_operations;
+        counters.spill_bytes = store.spill_bytes;
+        counters.spill_wall_ns = store.spill_wall_ns;
+        counters
     }
 
     /// How many file bodies `reconcile` has re-read. Test-only: the live path only
@@ -1179,6 +1319,361 @@ impl KateaTreeVolume {
         (ROOT_CLUSTER..=self.geo.count_of_clusters + 1).contains(&c)
     }
 
+    fn is_metadata_sector(&self, lba: u32) -> bool {
+        if lba < self.geo.part_start + self.geo.first_data_sector {
+            return true;
+        }
+        let rel = lba - self.geo.part_start - self.geo.first_data_sector;
+        let cluster = ROOT_CLUSTER + rel / u32::from(self.geo.spc);
+        self.directory_clusters.contains_key(&cluster)
+    }
+
+    fn note_metadata_write(&mut self, lba: u32) -> bool {
+        if lba < self.geo.part_start {
+            return true;
+        }
+        let rel = lba - self.geo.part_start;
+        let reserved = u32::from(RESERVED_SECTORS);
+        let fat_end = reserved + u32::from(NUM_FATS) * self.geo.fatsz;
+        if (reserved..fat_end).contains(&rel) {
+            let within = (rel - reserved) % self.geo.fatsz;
+            let first_cluster = within.saturating_mul((SECTOR / 4) as u32);
+            self.fat_dirty_clusters
+                .extend(first_cluster..first_cluster + (SECTOR / 4) as u32);
+            return true;
+        }
+        if rel < self.geo.first_data_sector {
+            return true;
+        }
+        let cluster = ROOT_CLUSTER + (rel - self.geo.first_data_sector) / u32::from(self.geo.spc);
+        if self.directory_clusters.contains_key(&cluster) {
+            self.directory_dirty = true;
+            return true;
+        }
+        false
+    }
+
+    fn install_projection(
+        &mut self,
+        key: (u32, [u8; 11]),
+        path: PathBuf,
+        size: u32,
+        chain: Vec<u32>,
+    ) {
+        self.blocked_projection_keys.remove(&key);
+        if let Some(old) = self.projected_files.remove(&key) {
+            for cluster in old.chain {
+                if self
+                    .projected_clusters
+                    .get(&cluster)
+                    .is_some_and(|(owner, _)| *owner == key)
+                {
+                    self.projected_clusters.remove(&cluster);
+                }
+            }
+        }
+        for (index, &cluster) in chain.iter().enumerate() {
+            self.projected_clusters.insert(cluster, (key, index as u32));
+        }
+        self.projected_files
+            .insert(key, ProjectedFile { path, size, chain });
+    }
+
+    fn remove_projection(&mut self, key: (u32, [u8; 11])) {
+        self.blocked_projection_keys.remove(&key);
+        if let Some(old) = self.projected_files.remove(&key) {
+            self.host_write_handles.remove(&old.path);
+            for cluster in old.chain {
+                if self
+                    .projected_clusters
+                    .get(&cluster)
+                    .is_some_and(|(owner, _)| *owner == key)
+                {
+                    self.projected_clusters.remove(&cluster);
+                }
+            }
+        }
+    }
+
+    fn stream_file_overlay(&mut self, pending: PendingStream) -> std::io::Result<()> {
+        let spc = u32::from(self.geo.spc);
+        let mut spans: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut acknowledged = Vec::new();
+        let positions = match pending.sectors.as_ref() {
+            Some(sectors) => sectors.clone(),
+            None => {
+                let mut sectors = Vec::new();
+                for (cluster_index, cluster) in pending.chain.iter().copied().enumerate() {
+                    let base = self.cluster_to_lba(cluster);
+                    for sector_in_cluster in 0..spc {
+                        sectors.push((
+                            base + sector_in_cluster,
+                            (cluster_index as u64 * u64::from(spc) + u64::from(sector_in_cluster))
+                                * SECTOR as u64,
+                        ));
+                    }
+                }
+                sectors
+            }
+        };
+        let mut positions = positions;
+        positions.sort_unstable_by_key(|(_, offset)| *offset);
+        for (lba, offset) in positions {
+            if !self.store.is_pending(lba) {
+                continue;
+            }
+            let Some(sector) = self.store.get(lba)? else {
+                continue;
+            };
+            let valid = u64::from(pending.size)
+                .saturating_sub(offset)
+                .min(SECTOR as u64) as usize;
+            if valid == 0 {
+                continue;
+            }
+            match spans.last_mut() {
+                Some((span_offset, bytes)) if *span_offset + bytes.len() as u64 == offset => {
+                    bytes.extend_from_slice(&sector[..valid]);
+                }
+                _ => spans.push((offset, sector[..valid].to_vec())),
+            }
+            if valid == SECTOR {
+                acknowledged.push(lba);
+            }
+        }
+
+        let file = match self.host_write_handles.entry(pending.path.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&pending.path)?,
+            ),
+        };
+        for (offset, bytes) in &spans {
+            file.seek(SeekFrom::Start(*offset))?;
+            file.write_all(bytes)?;
+        }
+        if pending.set_len {
+            file.set_len(u64::from(pending.size))?;
+        }
+
+        let bytes = spans
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        let mut counters = self.counters.get();
+        counters.projection_operations = counters
+            .projection_operations
+            .saturating_add(spans.len() as u64 + u64::from(pending.set_len));
+        counters.projection_bytes = counters.projection_bytes.saturating_add(bytes);
+        self.counters.set(counters);
+
+        for lba in acknowledged {
+            self.store.acknowledge(lba);
+        }
+        self.install_projection(
+            pending.key,
+            pending.path.clone(),
+            pending.size,
+            pending.chain,
+        );
+        self.mirrored.insert(
+            pending.key,
+            MirrorEntry {
+                host_path: pending.path,
+                first_cluster: pending.first_cluster,
+                is_dir: false,
+                last_fingerprint: None,
+                last_gather: Some(Gather {
+                    size: pending.state.size,
+                    chain_id: pending.state.chain_id,
+                    seq: self.store.seq(),
+                    all_present: true,
+                }),
+            },
+        );
+        self.retry_gathers.remove(&pending.key);
+        Ok(())
+    }
+
+    fn stream_projected_batch(&mut self) -> std::io::Result<bool> {
+        type ProjectedBatch = HashMap<(u32, [u8; 11]), (u32, Vec<(u32, u64)>)>;
+
+        let spc = u32::from(self.geo.spc);
+        let mut files = ProjectedBatch::new();
+        let candidates: HashSet<u32> = self
+            .batch_lbas
+            .union(&self.unmapped_lbas)
+            .copied()
+            .collect();
+        for lba in candidates {
+            if !self.store.is_pending(lba) || self.is_metadata_sector(lba) {
+                continue;
+            }
+            let rel = lba - self.geo.part_start - self.geo.first_data_sector;
+            let cluster = ROOT_CLUSTER + rel / spc;
+            let sector_in_cluster = rel % spc;
+            let Some((key, cluster_index)) = self.projected_clusters.get(&cluster).copied() else {
+                self.unmapped_lbas.insert(lba);
+                continue;
+            };
+            if self.blocked_projection_keys.contains(&key) {
+                self.unmapped_lbas.insert(lba);
+                continue;
+            }
+            let offset = (u64::from(cluster_index) * u64::from(spc) + u64::from(sector_in_cluster))
+                * SECTOR as u64;
+            let current_size = self.projected_files.get(&key).map_or(0, |file| file.size);
+            let end = if offset < u64::from(current_size) {
+                current_size
+            } else {
+                u32::try_from(offset + SECTOR as u64).unwrap_or(u32::MAX)
+            };
+            let entry = files.entry(key).or_insert_with(|| (end, Vec::new()));
+            entry.0 = entry.0.max(end);
+            entry.1.push((lba, offset));
+        }
+
+        let mut projected = false;
+        for (key, (end, sectors)) in files {
+            let Some(file) = self.projected_files.get(&key).cloned() else {
+                continue;
+            };
+            let size = file.size.max(end);
+            let state = FileState {
+                first_cluster: file.chain.first().copied().unwrap_or(0),
+                size,
+                chain_id: chain_id(&file.chain),
+                chain_seq: file
+                    .chain
+                    .iter()
+                    .map(|cluster| self.store.max_seq_in(self.cluster_to_lba(*cluster), spc))
+                    .max()
+                    .unwrap_or(0),
+            };
+            self.stream_file_overlay(PendingStream {
+                path: file.path,
+                key,
+                first_cluster: state.first_cluster,
+                size,
+                chain: file.chain,
+                state,
+                sectors: Some(sectors),
+                set_len: false,
+            })?;
+            projected = true;
+        }
+        self.unmapped_lbas.retain(|lba| self.store.is_pending(*lba));
+        Ok(projected)
+    }
+
+    fn refresh_changed_fat_projections(&mut self) {
+        if self.fat_dirty_clusters.is_empty() {
+            return;
+        }
+        let affected: Vec<_> = self
+            .projected_files
+            .iter()
+            .filter(|(_, file)| {
+                file.chain
+                    .iter()
+                    .any(|cluster| self.fat_dirty_clusters.contains(cluster))
+            })
+            .map(|(key, file)| (*key, file.clone()))
+            .collect();
+        for (key, file) in affected {
+            let first = file.chain.first().copied().unwrap_or(0);
+            let Some(chain) = crate::katea_write::chain(first, self.max_chain(), |cluster| {
+                self.fat_entry(cluster)
+            }) else {
+                self.blocked_projection_keys.insert(key);
+                continue;
+            };
+            if chain.iter().any(|cluster| !self.cluster_in_range(*cluster)) {
+                self.blocked_projection_keys.insert(key);
+                continue;
+            }
+            let conflicts: Vec<_> = chain
+                .iter()
+                .filter_map(|cluster| {
+                    self.projected_clusters
+                        .get(cluster)
+                        .map(|(owner, _)| *owner)
+                })
+                .filter(|owner| *owner != key)
+                .collect();
+            if !conflicts.is_empty() {
+                self.blocked_projection_keys.insert(key);
+                self.blocked_projection_keys.extend(conflicts);
+                continue;
+            }
+            self.install_projection(key, file.path, file.size, chain);
+        }
+    }
+
+    fn flush_write_handles(&mut self) -> std::io::Result<()> {
+        let mut operations = 0u64;
+        for file in self.host_write_handles.values_mut() {
+            file.flush()?;
+            operations = operations.saturating_add(1);
+        }
+        if operations > 0 {
+            let mut counters = self.counters.get();
+            counters.projection_operations =
+                counters.projection_operations.saturating_add(operations);
+            self.counters.set(counters);
+        }
+        Ok(())
+    }
+
+    fn metadata_projection_pending(&self) -> bool {
+        if !self.blocked_projection_keys.is_empty() {
+            return true;
+        }
+        let errors_before = self.store.read_errors();
+        let live = self.gather_live();
+        if self.store.read_errors() != errors_before {
+            return true;
+        }
+        let live_keys: HashSet<_> = live
+            .iter()
+            .map(|entry| (entry.dir_cluster, entry.name))
+            .collect();
+        if self.mirrored.keys().any(|key| !live_keys.contains(key)) {
+            return true;
+        }
+        live.into_iter().any(|entry| {
+            let key = (entry.dir_cluster, entry.name);
+            let Some(mirror) = self.mirrored.get(&key) else {
+                return true;
+            };
+            if mirror.first_cluster != entry.first_cluster || mirror.is_dir != entry.is_dir {
+                return true;
+            }
+            if entry.is_dir {
+                return false;
+            }
+            let Some(projected) = self.projected_files.get(&key) else {
+                return true;
+            };
+            if projected.size != entry.size {
+                return true;
+            }
+            let Some(chain) =
+                crate::katea_write::chain(entry.first_cluster, self.max_chain(), |cluster| {
+                    self.fat_entry(cluster)
+                })
+            else {
+                return true;
+            };
+            chain != projected.chain
+        })
+    }
+
     /// Read-only walk of every known directory, collecting its live entries (files
     /// and subdirs, skipping dots/LFN/volume-label/system names). The basis for
     /// detecting disappearances (delete/rename) in `reconcile`.
@@ -1219,6 +1714,7 @@ impl KateaTreeVolume {
                             dir_cluster,
                             name,
                             first_cluster,
+                            size: 0,
                             is_dir: true,
                         });
                         // Only descend into dirs Katea already knows; a just-MKDIR'd
@@ -1231,12 +1727,13 @@ impl KateaTreeVolume {
                     crate::katea_write::EntryAction::MakeFile {
                         name,
                         first_cluster,
-                        ..
+                        size,
                     } => {
                         out.push(LiveEntry {
                             dir_cluster,
                             name,
                             first_cluster,
+                            size,
                             is_dir: false,
                         });
                     }
@@ -1252,15 +1749,181 @@ impl KateaTreeVolume {
     /// incomplete or ambiguous entry is held in the overlay and retried next pass.
     /// This entry point is the forced final pass used by explicit flush/eject.
     pub(crate) fn reconcile(&mut self) {
-        self.reconcile_mode(ReconcileMode::Final);
+        let _ = self.flush_guest_writes();
     }
 
-    /// Reconcile after a successful ATA write command. A file is materialized on
-    /// its first completed shape, then later changing shapes are left in the guest
-    /// write store until an explicit flush/eject. This keeps a growing file from
-    /// re-reading and re-writing its whole prefix after every command.
-    pub(crate) fn reconcile_after_write(&mut self) {
-        self.reconcile_mode(ReconcileMode::AfterWrite);
+    /// Reconcile after a successful ATA write command.
+    #[cfg(test)]
+    pub(crate) fn reconcile_after_write(&mut self) -> CommitGuestWriteResult {
+        self.commit_guest_write_batch(GuestWriteRoute::Pio)
+    }
+
+    pub(crate) fn commit_guest_write_batch(
+        &mut self,
+        route: GuestWriteRoute,
+    ) -> CommitGuestWriteResult {
+        let projection_started = std::time::Instant::now();
+        let sectors = self.batch_sector_writes;
+        let mut counters = self.counters.get();
+        let projection_operations_before = counters.projection_operations;
+        match route {
+            GuestWriteRoute::Int13 => {
+                counters.int13_write_commands = counters.int13_write_commands.saturating_add(1);
+                counters.int13_write_sectors = counters.int13_write_sectors.saturating_add(sectors);
+            }
+            GuestWriteRoute::Pio => {
+                counters.pio_write_commands = counters.pio_write_commands.saturating_add(1);
+                counters.pio_write_sectors = counters.pio_write_sectors.saturating_add(sectors);
+            }
+            GuestWriteRoute::Dma => {
+                counters.dma_write_commands = counters.dma_write_commands.saturating_add(1);
+                counters.dma_write_sectors = counters.dma_write_sectors.saturating_add(sectors);
+            }
+        }
+        self.counters.set(counters);
+        self.host_io_failed = false;
+
+        if self.directory_dirty
+            || (self.metadata_reconcile_pending && !self.fat_dirty_clusters.is_empty())
+        {
+            let mut counters = self.counters.get();
+            counters.metadata_projection_passes =
+                counters.metadata_projection_passes.saturating_add(1);
+            self.counters.set(counters);
+            self.reconcile_mode(ReconcileMode::AfterWrite);
+            self.metadata_reconcile_pending =
+                self.host_io_failed || self.metadata_projection_pending();
+        } else {
+            self.refresh_changed_fat_projections();
+            match self.stream_projected_batch() {
+                Ok(_) => {}
+                Err(e) => {
+                    self.unmapped_lbas.extend(
+                        self.batch_lbas
+                            .iter()
+                            .copied()
+                            .filter(|lba| self.store.is_pending(*lba)),
+                    );
+                    self.note_host_write_failure();
+                    eprintln!("katea: projecting a guest write batch failed: {e}");
+                }
+            }
+        }
+
+        self.batch_lbas.clear();
+        self.batch_sector_writes = 0;
+        self.directory_dirty = false;
+        self.fat_dirty_clusters.clear();
+        let projected = self.counters.get().projection_operations > projection_operations_before;
+        let result = if self.host_io_failed {
+            CommitGuestWriteResult::HostIoFailure
+        } else if projected {
+            CommitGuestWriteResult::Projected
+        } else {
+            CommitGuestWriteResult::Deferred
+        };
+        self.note_projection_wall(projection_started);
+        result
+    }
+
+    pub(crate) fn note_guest_read_batch(
+        &self,
+        route: GuestStorageRoute,
+        sectors: u64,
+        wait_ticks: u64,
+    ) {
+        let mut counters = self.counters.get();
+        match route {
+            GuestStorageRoute::Int13 => {
+                counters.int13_read_commands = counters.int13_read_commands.saturating_add(1);
+                counters.int13_read_sectors = counters.int13_read_sectors.saturating_add(sectors);
+                counters.int13_read_wait_ticks =
+                    counters.int13_read_wait_ticks.saturating_add(wait_ticks);
+            }
+            GuestStorageRoute::Pio => {
+                counters.pio_read_commands = counters.pio_read_commands.saturating_add(1);
+                counters.pio_read_sectors = counters.pio_read_sectors.saturating_add(sectors);
+                counters.pio_read_wait_ticks =
+                    counters.pio_read_wait_ticks.saturating_add(wait_ticks);
+            }
+            GuestStorageRoute::Dma => {
+                counters.dma_read_commands = counters.dma_read_commands.saturating_add(1);
+                counters.dma_read_sectors = counters.dma_read_sectors.saturating_add(sectors);
+                counters.dma_read_wait_ticks =
+                    counters.dma_read_wait_ticks.saturating_add(wait_ticks);
+            }
+        }
+        self.counters.set(counters);
+    }
+
+    pub(crate) fn note_guest_write_wait(&self, route: GuestStorageRoute, wait_ticks: u64) {
+        let mut counters = self.counters.get();
+        match route {
+            GuestStorageRoute::Int13 => {
+                counters.int13_write_wait_ticks =
+                    counters.int13_write_wait_ticks.saturating_add(wait_ticks);
+            }
+            GuestStorageRoute::Pio => {
+                counters.pio_write_wait_ticks =
+                    counters.pio_write_wait_ticks.saturating_add(wait_ticks);
+            }
+            GuestStorageRoute::Dma => {
+                counters.dma_write_wait_ticks =
+                    counters.dma_write_wait_ticks.saturating_add(wait_ticks);
+            }
+        }
+        self.counters.set(counters);
+    }
+
+    pub(crate) fn flush_guest_writes(&mut self) -> CommitGuestWriteResult {
+        let projection_started = std::time::Instant::now();
+        let projection_operations_before = self.counters.get().projection_operations;
+        self.host_io_failed = false;
+        let mut counters = self.counters.get();
+        counters.metadata_projection_passes = counters.metadata_projection_passes.saturating_add(1);
+        self.counters.set(counters);
+        self.reconcile_mode(ReconcileMode::Final);
+        self.metadata_reconcile_pending = self.host_io_failed || self.metadata_projection_pending();
+        if let Err(e) = self.flush_write_handles() {
+            self.note_host_write_failure();
+            eprintln!("katea: flushing host files failed: {e}");
+        }
+        self.batch_lbas.clear();
+        self.batch_sector_writes = 0;
+        self.directory_dirty = false;
+        self.fat_dirty_clusters.clear();
+        let projected = self.counters.get().projection_operations > projection_operations_before;
+        let result = if self.host_io_failed {
+            CommitGuestWriteResult::HostIoFailure
+        } else if projected {
+            CommitGuestWriteResult::Projected
+        } else {
+            CommitGuestWriteResult::Deferred
+        };
+        self.note_projection_wall(projection_started);
+        result
+    }
+
+    fn note_host_write_failure(&mut self) {
+        self.host_io_failed = true;
+        let mut counters = self.counters.get();
+        counters.host_write_failures = counters.host_write_failures.saturating_add(1);
+        self.counters.set(counters);
+    }
+
+    fn note_projection_operation(&self, bytes: u64) {
+        let mut counters = self.counters.get();
+        counters.projection_operations = counters.projection_operations.saturating_add(1);
+        counters.projection_bytes = counters.projection_bytes.saturating_add(bytes);
+        self.counters.set(counters);
+    }
+
+    fn note_projection_wall(&self, started: std::time::Instant) {
+        let mut counters = self.counters.get();
+        counters.projection_wall_ns = counters
+            .projection_wall_ns
+            .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        self.counters.set(counters);
     }
 
     fn reconcile_mode(&mut self, mode: ReconcileMode) {
@@ -1289,12 +1952,44 @@ impl KateaTreeVolume {
             eprintln!("katea: skipping reconcile after a failed read of guest-written data");
             return;
         }
+        let mut cluster_claims: HashMap<u32, (u32, [u8; 11])> = HashMap::new();
+        let mut ambiguous_files = HashSet::new();
+        for entry in live
+            .iter()
+            .filter(|entry| !entry.is_dir && entry.first_cluster >= 2)
+        {
+            let key = (entry.dir_cluster, entry.name);
+            let Some(chain) =
+                crate::katea_write::chain(entry.first_cluster, self.max_chain(), |c| {
+                    self.fat_entry(c)
+                })
+            else {
+                continue;
+            };
+            for cluster in chain {
+                if self.directory_clusters.contains_key(&cluster) {
+                    ambiguous_files.insert(key);
+                }
+                if let Some(other) = cluster_claims.insert(cluster, key)
+                    && other != key
+                {
+                    ambiguous_files.insert(other);
+                    ambiguous_files.insert(key);
+                }
+            }
+        }
+        if self.store.read_errors() != errors_at_entry {
+            eprintln!("katea: skipping reconcile after a failed FAT ownership read");
+            return;
+        }
         let live_keys: HashSet<(u32, [u8; 11])> =
             live.iter().map(|l| (l.dir_cluster, l.name)).collect();
         // The live scan is complete and trustworthy here. Drop retry markers for
         // entries that disappeared; doing this before the read-error check above
         // could let an incomplete scan discard the only immediate retry state.
         self.retry_gathers.retain(|key, _| live_keys.contains(key));
+        self.blocked_projection_keys
+            .retain(|key| live_keys.contains(key));
         // first_cluster -> the live entries claiming it (for rename matching in phase 2).
         let mut live_by_cluster: HashMap<u32, Vec<(u32, [u8; 11], bool)>> = HashMap::new();
         for l in &live {
@@ -1374,13 +2069,26 @@ impl KateaTreeVolume {
         }
         // Apply renames first (so a move's source path still exists), then deletes.
         for r in renames {
+            self.host_write_handles.remove(&r.old_path);
             if let Err(e) = std::fs::rename(&r.old_path, &r.new_path) {
+                self.note_host_write_failure();
                 eprintln!(
                     "katea: rename {} -> {} failed: {e}",
                     r.old_path.display(),
                     r.new_path.display()
                 );
                 continue;
+            }
+            self.note_projection_operation(0);
+            let projected = self.projected_files.get(&r.old_key).cloned();
+            self.remove_projection(r.old_key);
+            if let Some(projected) = projected {
+                self.install_projection(
+                    r.new_key,
+                    r.new_path.clone(),
+                    projected.size,
+                    projected.chain,
+                );
             }
             self.mirrored.remove(&r.old_key);
             self.mirrored.insert(
@@ -1404,6 +2112,7 @@ impl KateaTreeVolume {
         // try to remove the (now-empty) host dir. (bool Ord: false(file) < true(dir).)
         deletes.sort_by_key(|d| d.is_dir);
         for d in deletes {
+            self.host_write_handles.remove(&d.path);
             let res = if d.is_dir {
                 std::fs::remove_dir(&d.path) // fails (held) if the host dir is non-empty
             } else {
@@ -1412,12 +2121,17 @@ impl KateaTreeVolume {
             if let Err(e) = res
                 && d.path.exists()
             {
+                self.note_host_write_failure();
                 eprintln!("katea: delete {} failed: {e}", d.path.display());
                 continue; // hold
             }
+            self.note_projection_operation(0);
             self.mirrored.remove(&d.key);
+            self.remove_projection(d.key);
             if d.is_dir {
                 self.dir_paths.remove(&d.first_cluster);
+                self.directory_clusters
+                    .retain(|_, owner| *owner != d.first_cluster);
             }
         }
 
@@ -1451,6 +2165,8 @@ impl KateaTreeVolume {
             if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
                 continue; // a chain link outside the data region: hold this dir
             }
+            self.directory_clusters
+                .extend(dir_chain.iter().map(|cluster| (*cluster, dir_cluster)));
             let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
             for c in &dir_chain {
                 let base = self.cluster_to_lba(*c);
@@ -1472,6 +2188,7 @@ impl KateaTreeVolume {
             // Decide every entry (read-only); collect actions, then apply.
             let mut mkdirs: Vec<(u32, [u8; 11], u32, std::path::PathBuf)> = Vec::new();
             let mut writes: Vec<PendingWrite> = Vec::new();
+            let mut streams: Vec<PendingStream> = Vec::new();
             // Entries whose bytes matched what the host already holds: nothing to
             // write, but the decision is complete, so date them.
             let mut watermarks: Vec<((u32, [u8; 11]), Gather)> = Vec::new();
@@ -1520,8 +2237,8 @@ impl KateaTreeVolume {
                         // Touched this session? Non-empty files must have written
                         // data; a brand-new name in a written directory counts even
                         // when empty. Untouched tree/system files are skipped. This
-                        // asks the store's presence bits, which never clear, so an
-                        // evicted sector still reads as touched.
+                        // asks the store's historical bits, which remain after a
+                        // projected sector is acknowledged.
                         let data_written = fchain.iter().any(|c| {
                             let base = self.cluster_to_lba(*c);
                             (0..spc).any(|s| self.store.was_written(base + s))
@@ -1551,6 +2268,10 @@ impl KateaTreeVolume {
                             .max()
                             .unwrap_or(0);
                         let key = (dir_cluster, name);
+                        if ambiguous_files.contains(&key) {
+                            self.blocked_projection_keys.insert(key);
+                            continue;
+                        }
                         let last_gather = self.mirrored.get(&key).and_then(|m| m.last_gather);
                         if let Some(g) = last_gather
                             && g.all_present
@@ -1568,19 +2289,25 @@ impl KateaTreeVolume {
                             chain_id: chain_now,
                             chain_seq,
                         };
-                        let changed_since_completed = last_gather.is_some_and(|g| {
-                            g.size != size || g.chain_id != chain_now || chain_seq > g.seq
-                        });
                         let retry_exact = self.retry_gathers.get(&key) == Some(&state);
-                        if mode == ReconcileMode::AfterWrite
-                            && changed_since_completed
-                            && !retry_exact
-                        {
-                            // Every invocation of this mode follows some successful
-                            // guest write command. An unchanged per-file snapshot can
-                            // therefore be only an interleaved FAT, directory, FSInfo,
-                            // or unrelated write, not proof that this file is done.
-                            self.retry_gathers.remove(&key);
+                        if mode == ReconcileMode::AfterWrite && !retry_exact {
+                            let path = self
+                                .mirrored
+                                .get(&key)
+                                .map(|m| m.host_path.clone())
+                                .unwrap_or_else(|| {
+                                    host_dir.join(crate::katea_volume::decode_83(&name))
+                                });
+                            streams.push(PendingStream {
+                                path,
+                                key,
+                                first_cluster,
+                                size,
+                                chain: fchain,
+                                state,
+                                sectors: None,
+                                set_len: true,
+                            });
                             continue;
                         }
 
@@ -1654,6 +2381,7 @@ impl KateaTreeVolume {
                             first_cluster,
                             state,
                             gather,
+                            chain: fchain,
                         });
                     }
                 }
@@ -1673,9 +2401,11 @@ impl KateaTreeVolume {
             }
             for (parent, name, first_cluster, path) in mkdirs {
                 if let Err(e) = std::fs::create_dir_all(&path) {
+                    self.note_host_write_failure();
                     eprintln!("katea: mkdir {} failed: {e}", path.display());
                     continue;
                 }
+                self.note_projection_operation(0);
                 self.dir_paths.entry(first_cluster).or_insert(path.clone());
                 self.mirrored.entry((parent, name)).or_insert(MirrorEntry {
                     host_path: path,
@@ -1688,14 +2418,34 @@ impl KateaTreeVolume {
                     work.push(first_cluster);
                 }
             }
+            for stream in streams {
+                let key = stream.key;
+                let state = stream.state;
+                if let Err(e) = self.stream_file_overlay(stream) {
+                    self.note_host_write_failure();
+                    eprintln!(
+                        "katea: streaming {} failed: {e}",
+                        crate::katea_volume::decode_83(&key.1)
+                    );
+                    self.retry_gathers.insert(key, state);
+                }
+            }
             for w in writes {
                 #[cfg(test)]
                 {
                     self.atomic_writes += 1;
                     self.atomic_write_bytes += w.data.len() as u64;
                 }
+                self.host_write_handles.remove(&w.path);
                 match crate::katea_write::atomic_write(&w.path, &w.data) {
                     Ok(()) => {
+                        self.note_projection_operation(w.data.len() as u64);
+                        self.install_projection(
+                            w.key,
+                            w.path.clone(),
+                            w.gather.size,
+                            w.chain.clone(),
+                        );
                         self.mirrored.insert(
                             w.key,
                             MirrorEntry {
@@ -1712,6 +2462,7 @@ impl KateaTreeVolume {
                         self.retry_gathers.remove(&w.key);
                     }
                     Err(e) => {
+                        self.note_host_write_failure();
                         // Hold on failure: the real host file is untouched; retry
                         // next pass. atomic_write guarantees no torn file.
                         eprintln!("katea: materialize {} failed: {e}", w.path.display());
@@ -1722,12 +2473,28 @@ impl KateaTreeVolume {
         }
     }
 
-    /// Store one guest-written sector. Reads of this LBA now return `data` until
-    /// eject. The interpreter (`reconcile`) reads it back to mirror finished files
-    /// to the host folder. The payload may be spilled to disk, which is invisible
-    /// here and to every reader.
+    /// Store one guest-written sector. Reads return it until projection can safely
+    /// acknowledge it or the volume is dropped. Pending payload may spill to disk.
     pub(crate) fn write_sector(&mut self, lba: u32, data: &[u8; SECTOR]) {
+        let metadata = self.note_metadata_write(lba);
         self.store.insert(lba, data);
+        self.batch_lbas.insert(lba);
+        self.batch_sector_writes = self.batch_sector_writes.saturating_add(1);
+        if !metadata && !self.batch_lba_is_projected(lba) {
+            self.unmapped_lbas.insert(lba);
+        }
+        let mut counters = self.counters.get();
+        counters.sector_writes = counters.sector_writes.saturating_add(1);
+        self.counters.set(counters);
+    }
+
+    fn batch_lba_is_projected(&self, lba: u32) -> bool {
+        if lba < self.geo.part_start + self.geo.first_data_sector {
+            return false;
+        }
+        let rel = lba - self.geo.part_start - self.geo.first_data_sector;
+        let cluster = ROOT_CLUSTER + rel / u32::from(self.geo.spc);
+        self.projected_clusters.contains_key(&cluster)
     }
 
     /// Read one whole-disk sector by absolute LBA. Resolves entirely from
@@ -1806,6 +2573,25 @@ impl KateaTreeVolume {
     /// serving directory entries or lazy file bytes. A cluster in no run is free
     /// space (zeros).
     fn data_sector(&self, cluster: u32, sector_in_cluster: u32) -> SectorRead {
+        if let Some((key, cluster_index)) = self.projected_clusters.get(&cluster)
+            && let Some(projected) = self.projected_files.get(key)
+        {
+            let spc = u32::from(self.geo.spc);
+            let byte_off = (u64::from(*cluster_index) * u64::from(spc)
+                + u64::from(sector_in_cluster))
+                * SECTOR as u64;
+            let source = FileSource::HostFile {
+                path: projected.path.clone(),
+                len: u64::from(projected.size),
+            };
+            return read_source_span(
+                &source,
+                byte_off,
+                projected.size,
+                &self.counters,
+                &self.host_read_cache,
+            );
+        }
         // `runs` is sorted by `first_cluster` (the constructor sorts it after
         // `flatten`) and its ranges are disjoint and non-empty: `assign_dir` hands
         // out clusters from one monotonically increasing counter, and

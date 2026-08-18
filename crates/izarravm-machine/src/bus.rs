@@ -2236,7 +2236,13 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(self.wss.read_port(offset)));
         }
         if ide::IdeChannel::owns_port(port) {
-            return Ok(u32::from(self.ide.read_port(port).unwrap_or(0xff)));
+            let value = self.ide.read_port(port).unwrap_or(0xff);
+            // Alternate status is non-destructive, and the IDE completion edge
+            // already bounds the batch through `event_batch_cap`.
+            if self.lazy_port_reads && port == ide::SECONDARY_CTRL && !io_touched_before_read {
+                *self.io_touched = false;
+            }
+            return Ok(u32::from(value));
         }
         if ata::AtaDisk::owns_port(port) {
             // The primary channel: a mounted disk drives the task file; an empty

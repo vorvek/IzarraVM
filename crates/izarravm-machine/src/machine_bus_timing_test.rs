@@ -667,6 +667,44 @@ fn lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accura
 }
 
 #[test]
+fn secondary_ide_alt_status_is_lazy_only_in_the_approximate_class() {
+    let mut accurate = test_machine();
+    with_bus(&mut accurate, |bus| {
+        let _ = bus
+            .read_io(ide::SECONDARY_CTRL, BusWidth::Byte, 0, false)
+            .unwrap();
+        assert!(*bus.io_touched);
+    });
+
+    let mut approximate = test_machine();
+    approximate.set_mode(GswMode::Gsw586);
+    with_bus(&mut approximate, |bus| {
+        let _ = bus
+            .read_io(ide::SECONDARY_CTRL, BusWidth::Byte, 0, false)
+            .unwrap();
+        assert!(!*bus.io_touched);
+
+        let _ = bus
+            .read_io(ide::SECONDARY_CMD_BASE + 7, BusWidth::Byte, 0, false)
+            .unwrap();
+        assert!(*bus.io_touched);
+    });
+}
+
+#[test]
+fn secondary_ide_alt_status_does_not_clear_an_earlier_batch_break() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        *bus.io_touched = true;
+        let _ = bus
+            .read_io(ide::SECONDARY_CTRL, BusWidth::Byte, 0, false)
+            .unwrap();
+        assert!(*bus.io_touched);
+    });
+}
+
+#[test]
 fn ring0_monitor_port_access_does_not_set_io_touched_in_approximate_class() {
     // V86 trap tax, Part 1: a port access made by the ring-0 monitor
     // (cpu_is_ring0_pm = true, the TOKAEMM monitor's remapped_pic_line PIC OCW3

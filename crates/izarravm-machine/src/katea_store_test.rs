@@ -76,7 +76,7 @@ fn ram_stays_bounded_under_a_large_write_volume() {
     // 20000 sectors written is 10 MiB of payload. The old overlay would hold all
     // of it; the bound here is the cache plus one Chunk per 128 KiB touched.
     let written = 20_000 * SECTOR;
-    let bound = 64 * (SECTOR + 16) + 64 * 24 + (20_000 / 256 + 2) * 56;
+    let bound = 64 * (SECTOR + 16) + 64 * 24 + (20_000 / 256 + 2) * 88;
     assert!(
         store.ram_bytes() <= bound,
         "ram {} exceeds bound {bound} after writing {written} bytes",

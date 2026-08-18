@@ -1911,6 +1911,13 @@ impl Machine {
             }
             done += 1;
         }
+
+        let host_write_failed = ah == 0x03
+            && done > 0
+            && self.ata.as_mut().is_some_and(|disk| {
+                disk.commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Int13)
+                    == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+            });
         // A CHS read of LBA 0 (the MBR) to 0000:7C00 is a fixed-disk boot. Mirror
         // the INT 19h ATA branch: only a sector carrying the 55AA boot signature is
         // a real OS, so stand the HLE Toka-DOS and IZEMM down (the booted OS then
@@ -1933,9 +1940,25 @@ impl Machine {
             };
             self.note_int13_data(kind, u32::from(done), cache_hits);
         }
+        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
+        if let Some(disk) = self.ata.as_ref() {
+            if ah == 0x02 {
+                disk.note_guest_read_batch(
+                    crate::katea_tree::GuestStorageRoute::Int13,
+                    u64::from(done),
+                    wait_ticks,
+                );
+            } else {
+                disk.note_guest_write_wait(crate::katea_tree::GuestStorageRoute::Int13, wait_ticks);
+            }
+        }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
-        let status = transfer_status(done == count, unreachable_buffer);
+        let status = if host_write_failed {
+            0x20
+        } else {
+            transfer_status(done == count, unreachable_buffer)
+        };
         self.set_eax_ah(status);
         self.set_fixed_disk_status(status);
         self.set_int_frame_carry(status != 0);
@@ -2009,6 +2032,13 @@ impl Machine {
             done += 1;
         }
 
+        let host_write_failed = ah == 0x0B
+            && done > 0
+            && self.ata.as_mut().is_some_and(|disk| {
+                disk.commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Int13)
+                    == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+            });
+
         let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
             let kind = if ah == 0x0A {
@@ -2018,9 +2048,25 @@ impl Machine {
             };
             self.note_int13_data(kind, u32::from(done), cache_hits);
         }
+        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
+        if let Some(disk) = self.ata.as_ref() {
+            if ah == 0x0A {
+                disk.note_guest_read_batch(
+                    crate::katea_tree::GuestStorageRoute::Int13,
+                    u64::from(done),
+                    wait_ticks,
+                );
+            } else {
+                disk.note_guest_write_wait(crate::katea_tree::GuestStorageRoute::Int13, wait_ticks);
+            }
+        }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
-        match transfer_status(done == count, unreachable_buffer) {
+        match if host_write_failed {
+            0x20
+        } else {
+            transfer_status(done == count, unreachable_buffer)
+        } {
             0 => self.int13_hdd_ok(),
             status => self.int13_hdd_error(status),
         }
@@ -2231,6 +2277,12 @@ impl Machine {
             }
             done += 1;
         }
+        let host_write_failed = ah == 0x43
+            && done > 0
+            && self.ata.as_mut().is_some_and(|disk| {
+                disk.commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Int13)
+                    == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+            });
         let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
             let kind = match ah {
@@ -2240,10 +2292,27 @@ impl Machine {
             };
             self.note_int13_data(kind, u32::from(done), cache_hits);
         }
+        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
+        if let Some(disk) = self.ata.as_ref() {
+            match ah {
+                0x42 => disk.note_guest_read_batch(
+                    crate::katea_tree::GuestStorageRoute::Int13,
+                    u64::from(done),
+                    wait_ticks,
+                ),
+                0x43 => disk
+                    .note_guest_write_wait(crate::katea_tree::GuestStorageRoute::Int13, wait_ticks),
+                _ => {}
+            }
+        }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
-        let status = transfer_status(done == count, unreachable_buffer);
+        let status = if host_write_failed {
+            0x20
+        } else {
+            transfer_status(done == count, unreachable_buffer)
+        };
         self.set_eax_ah(status);
         self.set_fixed_disk_status(status);
         self.set_int_frame_carry(status != 0);

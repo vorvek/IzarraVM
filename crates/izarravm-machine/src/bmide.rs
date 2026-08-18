@@ -4,10 +4,9 @@
 //! Intel PIIX4-compatible PCI bus-master IDE registers and PRD engine.
 
 use izarravm_bus::{BusWidth, Memory};
-use izarravm_core::MASTER_CLOCK_HZ;
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
-use crate::ata::{AtaDisk, AtaDmaDirection, AtaDmaRequest};
+use crate::ata::{AtaDisk, AtaDmaDirection};
 
 const COMMAND_START: u8 = 0x01;
 const COMMAND_READ_FROM_DISK: u8 = 0x08;
@@ -18,7 +17,6 @@ const STATUS_DRIVE0_DMA: u8 = 0x20;
 const STATUS_DRIVE1_DMA: u8 = 0x40;
 const PRD_EOT: u32 = 0x8000_0000;
 const PRD_RESERVED: u32 = 0x7fff_0000;
-const COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000; // 100 us
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrdSpan {
@@ -163,7 +161,7 @@ impl BusMasterIde {
         self.primary.transfer = Some(Transfer {
             direction: request.direction,
             spans: plan.spans,
-            ticks_remaining: transfer_ticks(request),
+            ticks_remaining: crate::ata::dma_transfer_ticks(request),
             byte_len: request.byte_len(),
             retires_eot: plan.retires_eot,
         });
@@ -305,12 +303,6 @@ impl BusMasterIde {
             _ => {}
         }
     }
-}
-
-fn transfer_ticks(request: AtaDmaRequest) -> u64 {
-    let data_ticks = (request.byte_len() as u128 * MASTER_CLOCK_HZ as u128)
-        .div_ceil(request.bytes_per_second as u128);
-    COMMAND_LATENCY_TICKS.saturating_add(data_ticks.min(u64::MAX as u128) as u64)
 }
 
 fn parse_prds(

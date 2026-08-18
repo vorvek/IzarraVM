@@ -605,8 +605,8 @@ fn flush_hdd_folder_runs_a_final_reconcile() {
 }
 
 #[test]
-fn flush_hdd_folder_forces_a_changed_direct_write_past_the_inline_debounce() {
-    let dir = std::env::temp_dir().join(format!("katea_flush_direct_{}", std::process::id()));
+fn completed_int13_batches_survive_a_drop_without_finalization() {
+    let dir = std::env::temp_dir().join(format!("katea_int13_live_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("A.TXT"), b"before!!").unwrap();
@@ -617,9 +617,8 @@ fn flush_hdd_folder_forces_a_changed_direct_write_past_the_inline_debounce() {
     .unwrap();
     machine.mount_hdd_folder(&dir).unwrap();
 
-    // Resolve A.TXT through the synthesized BPB and root directory, then write its
-    // data sector through AtaDisk::write_lba. The BIOS/INT 13 paths use this direct
-    // route and deliberately do not run the inline ATA-command reconcile.
+    // Resolve A.TXT through the synthesized BPB and root directory, then use the
+    // same write + command-batch boundary as the BIOS/INT 13 paths.
     let part_start = crate::katea_volume::PART_START;
     let disk = machine.ata.as_ref().unwrap();
     let vbr = disk.read_lba(part_start).unwrap();
@@ -641,18 +640,37 @@ fn flush_hdd_folder_forces_a_changed_direct_write_past_the_inline_debounce() {
     let mut sector = disk.read_lba(file_lba).unwrap();
     sector[..8].copy_from_slice(b"FIRST!!!");
     assert!(machine.ata.as_mut().unwrap().write_lba(file_lba, &sector));
-    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"before!!");
-    machine.flush_hdd_folder();
+    assert_ne!(
+        machine
+            .ata
+            .as_mut()
+            .unwrap()
+            .commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Int13),
+        crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+    );
     assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"FIRST!!!");
 
-    // With a completed gather now recorded, an inline reconcile would debounce
-    // this second direct change. One explicit flush must bypass that debounce.
     sector[..8].copy_from_slice(b"AFTER!!!");
     assert!(machine.ata.as_mut().unwrap().write_lba(file_lba, &sector));
-    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"FIRST!!!");
-    machine.flush_hdd_folder();
+    assert_ne!(
+        machine
+            .ata
+            .as_mut()
+            .unwrap()
+            .commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Int13),
+        crate::katea_tree::CommitGuestWriteResult::HostIoFailure
+    );
     assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"AFTER!!!");
+    let counters = machine.katea_storage_counters().unwrap();
+    assert_eq!(counters.int13_write_commands, 2);
+    assert_eq!(counters.int13_write_sectors, 2);
+    assert_eq!(counters.pio_write_commands, 0);
+    assert_eq!(counters.dma_write_commands, 0);
+    assert_eq!(counters.spill_operations, 0);
+    // No flush_hdd_folder: dropping the active machine models an abnormal exit
+    // after the command boundary completed.
     drop(machine);
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"AFTER!!!");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1923,6 +1941,10 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
         4,
         "all four sectors came out of the cache"
     );
+    let counters = machine.katea_storage_counters().unwrap();
+    assert_eq!(counters.int13_read_commands, 2);
+    assert_eq!(counters.int13_read_sectors, 8);
+    assert_eq!(counters.int13_read_wait_ticks, first_stall);
 
     drop(machine);
     std::fs::remove_dir_all(&dir).ok();

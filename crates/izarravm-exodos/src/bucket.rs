@@ -4,7 +4,7 @@
 //! Structural-bucket classification of one archived sweep row.
 //!
 //! The orchestrator (`scripts/sweep-exodos.ps1`) collects; this decides. It
-//! turns an `izarravm-hdd-profile-v1` JSON, its phase-mark series, its screen
+//! turns an IzarraVM HDD profile JSON, its phase-mark series, its screen
 //! index and the frames that index kept into an outcome, a set of bucket flags
 //! with the measured metric behind each one, and reported-only columns.
 //!

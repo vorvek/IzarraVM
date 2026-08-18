@@ -3,19 +3,16 @@
 
 //! The bounded guest-write store behind `katea_tree`'s host-folder disk.
 //!
-//! Guest writes to a Katea host-folder volume have no home in the host tree: a
-//! guest-created file's clusters are outside the mounted folder's `runs`, a
-//! cluster tail past the file's declared size is never written to the host file
-//! at all, and FAT and directory sectors have no host-side representation. So
-//! every written sector must be kept verbatim until eject. Keeping all of them in
-//! RAM makes memory grow with the bytes the guest writes, which is what this
-//! module exists to stop.
+//! Guest writes initially land outside the mounted folder's static run table.
+//! The projection layer acknowledges payload sectors after writing them to host
+//! files, but FAT, directory, incomplete, and ambiguous writes remain here.
+//! Keeping all pending payload in RAM would make memory grow with an unmapped
+//! write burst, which is what this module exists to stop.
 //!
 //! The store keeps a bounded RAM cache of recently written sectors and spills the
 //! rest to a scratch file, so RAM tracks the cache size rather than the write
-//! volume. What stays in RAM per written region is presence and placement
-//! metadata only: one 48-byte [`Chunk`] per 128 KiB of touched disk, which is
-//! about a thousandth of the payload it describes.
+//! volume. What stays in RAM per written region is pending, historical-touch,
+//! and placement metadata only.
 //!
 //! The contract is byte-for-byte the one a plain `HashMap<u32, [u8; 512]>` would
 //! give: [`SectorStore::get`] returns exactly what [`SectorStore::insert`] last
@@ -72,9 +69,11 @@ struct Chunk {
     /// Byte offset of this chunk's slab in the spill file, or [`UNALLOCATED`]
     /// until the first sector of the chunk is evicted.
     slab: u64,
-    /// One bit per sector: was it ever written this session. Never cleared, so it
-    /// is exactly the key set of the `HashMap` this store replaces.
+    /// One bit per sector whose latest guest bytes still live in this store.
     present: [u8; (CHUNK_SECTORS / 8) as usize],
+    /// One bit per sector ever written this session. Reconcile uses this history
+    /// after a projected payload has been acknowledged and removed.
+    written: [u8; (CHUNK_SECTORS / 8) as usize],
     /// The store's write counter as of the last write anywhere in this chunk.
     /// Reconcile uses it to skip re-reading files that cannot have changed.
     last_seq: u64,
@@ -85,6 +84,7 @@ impl Chunk {
         Self {
             slab: UNALLOCATED,
             present: [0; (CHUNK_SECTORS / 8) as usize],
+            written: [0; (CHUNK_SECTORS / 8) as usize],
             last_seq: 0,
         }
     }
@@ -97,7 +97,27 @@ impl Chunk {
     fn set_present(&mut self, lba: u32) {
         let i = chunk_offset(lba);
         self.present[(i / 8) as usize] |= 1 << (i % 8);
+        self.written[(i / 8) as usize] |= 1 << (i % 8);
     }
+
+    fn clear_present(&mut self, lba: u32) {
+        let i = chunk_offset(lba);
+        self.present[(i / 8) as usize] &= !(1 << (i % 8));
+    }
+
+    fn was_written(&self, lba: u32) -> bool {
+        let i = chunk_offset(lba);
+        self.written[(i / 8) as usize] & (1 << (i % 8)) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SectorStoreCounters {
+    pub resident_sectors: u64,
+    pub pending_sectors: u64,
+    pub spill_operations: u64,
+    pub spill_bytes: u64,
+    pub spill_wall_ns: u64,
 }
 
 /// Read exactly `buf.len()` bytes at `off`. Positioned reads take `&File`, which
@@ -199,6 +219,9 @@ pub(crate) struct SectorStore {
     /// decision so a failed read holds that chain instead of feeding zeros into a
     /// delete or an overwrite. `Atomic` only because reads take `&self`.
     read_errors: AtomicU64,
+    spill_operations: u64,
+    spill_bytes: u64,
+    spill_wall_ns: u64,
     /// Test-only fault injection: make every spill read fail. Breaking the file on
     /// disk is not a usable fault model, because the next eviction extends the file
     /// again and the lost range comes back as a hole full of zeroes rather than as
@@ -228,6 +251,9 @@ impl SectorStore {
             #[cfg(test)]
             fail_reads: false,
             read_errors: AtomicU64::new(0),
+            spill_operations: 0,
+            spill_bytes: 0,
+            spill_wall_ns: 0,
         }
     }
 
@@ -318,7 +344,44 @@ impl SectorStore {
     pub(crate) fn was_written(&self, lba: u32) -> bool {
         self.chunks
             .get(&chunk_id(lba))
+            .is_some_and(|c| c.was_written(lba))
+    }
+
+    pub(crate) fn is_pending(&self, lba: u32) -> bool {
+        self.chunks
+            .get(&chunk_id(lba))
             .is_some_and(|c| c.is_present(lba))
+    }
+
+    pub(crate) fn acknowledge(&mut self, lba: u32) {
+        let old_seq = self.cache.remove(&lba).map(|(seq, _)| seq);
+        if let Some(seq) = old_seq {
+            self.order.remove(&seq);
+        }
+        if let Some(chunk) = self.chunks.get_mut(&chunk_id(lba)) {
+            chunk.clear_present(lba);
+        }
+    }
+
+    pub(crate) fn counters(&self) -> SectorStoreCounters {
+        let pending_sectors = self
+            .chunks
+            .values()
+            .map(|chunk| {
+                chunk
+                    .present
+                    .iter()
+                    .map(|byte| u64::from(byte.count_ones()))
+                    .sum::<u64>()
+            })
+            .sum();
+        SectorStoreCounters {
+            resident_sectors: self.cache.len() as u64,
+            pending_sectors,
+            spill_operations: self.spill_operations,
+            spill_bytes: self.spill_bytes,
+            spill_wall_ns: self.spill_wall_ns,
+        }
     }
 
     /// The write counter as of the last write to any sector in `[first, first +
@@ -354,7 +417,7 @@ impl SectorStore {
     /// metadata actually stored, not of table slack.
     #[cfg(test)]
     pub(crate) fn ram_bytes(&self) -> usize {
-        self.cache.len() * (SECTOR + 16) + self.order.len() * 24 + self.chunks.len() * 56
+        self.cache.len() * (SECTOR + 16) + self.order.len() * 24 + self.chunks.len() * 88
     }
 
     /// Resident sector count, for the bound tests.
@@ -418,15 +481,21 @@ impl SectorStore {
     /// Place one sector in the spill file, creating the file and the chunk's slab
     /// on demand. The sector stays in the cache unless this returns `Ok`.
     fn spill_sector(&mut self, lba: u32, data: &[u8; SECTOR]) -> io::Result<()> {
+        let started = std::time::Instant::now();
         if self.spill.is_none() {
             // Truncate rather than create_new: the name carries our pid, so an
             // existing file is an orphan from a dead process, never a live one.
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&self.path)?;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(true);
+            #[cfg(all(windows, not(test)))]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+                options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+            }
+            let file = options.open(&self.path)?;
+            #[cfg(all(unix, not(test)))]
+            let _ = std::fs::remove_file(&self.path);
             self.spill = Some(file);
             self.spill_len = 0;
         }
@@ -455,11 +524,17 @@ impl SectorStore {
         let Some(file) = self.spill.as_ref() else {
             return Err(io::Error::other("katea spill: file vanished"));
         };
-        write_all_at(
+        let result = write_all_at(
             file,
             data,
             slab + u64::from(chunk_offset(lba)) * SECTOR as u64,
-        )
+        );
+        self.spill_operations = self.spill_operations.saturating_add(1);
+        self.spill_bytes = self.spill_bytes.saturating_add(SECTOR as u64);
+        self.spill_wall_ns = self
+            .spill_wall_ns
+            .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        result
     }
 }
 
