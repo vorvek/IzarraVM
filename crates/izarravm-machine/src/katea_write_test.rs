@@ -141,3 +141,46 @@ fn atomic_write_replaces_and_leaves_no_temp() {
     assert!(leftovers.is_empty(), "no .kattmp left behind");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_guest_name_that_would_escape_the_mount_is_skipped() {
+    let system = HashSet::new();
+    // `A\..\..\` + `BAT` joins to a path two levels above the mounted folder.
+    let escape = DirEntry {
+        name: *b"A\\..\\..\\BAT",
+        attr: 0x20,
+        first_cluster: 5,
+        size: 8,
+    };
+    assert_eq!(classify(&escape, &system), EntryAction::Skip);
+    // Forward slashes escape just as well, and a directory is no different.
+    let escape_dir = DirEntry {
+        name: *b"../../..   ",
+        attr: 0x10,
+        first_cluster: 5,
+        size: 0,
+    };
+    assert_eq!(classify(&escape_dir, &system), EntryAction::Skip);
+    let embedded_dot = DirEntry {
+        name: *b"A.B     TXT",
+        attr: 0x20,
+        first_cluster: 5,
+        size: 8,
+    };
+    assert_eq!(classify(&embedded_dot, &system), EntryAction::Skip);
+    // Every byte fat_name can synthesize still classifies normally.
+    let ordinary = DirEntry {
+        name: *b"A-_~{}!#TXT",
+        attr: 0x20,
+        first_cluster: 5,
+        size: 8,
+    };
+    assert_eq!(
+        classify(&ordinary, &system),
+        EntryAction::MakeFile {
+            name: *b"A-_~{}!#TXT",
+            first_cluster: 5,
+            size: 8,
+        }
+    );
+}
