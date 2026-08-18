@@ -1339,6 +1339,16 @@ pub struct Machine {
     // within the total that later fed advance_devices.
     #[cfg(test)]
     test_batch_core_totals: Vec<u64>,
+    // Test-only: how many times the halt fast-forward's remaining-ticks clamp
+    // actually clamped, i.e. a batch ended on a HLT with `now_ticks()` already
+    // PAST `deadline_ticks`. Its only job is to keep
+    // `halt_fast_forward_survives_a_batch_that_overshot_the_run_deadline`
+    // non-vacuous: that test can only assert "did not panic", which the fix
+    // satisfies trivially if the batch grant arithmetic ever stops overshooting.
+    // Compiled out of release builds entirely, and the site it lives on is the
+    // cold HLT arm, so the run loop pays nothing either way.
+    #[cfg(test)]
+    test_halt_deadline_clamps: u64,
     /// Windowed IPE trace (see `arm_ipe_window_trace`). Read-only observer, off by default.
     /// `next_ipe_window_entries` is `u64::MAX` when disarmed, the same sentinel discipline
     /// `next_phase_mark_ticks` uses, so the run loop's disabled path is one compare.
@@ -1661,6 +1671,8 @@ impl Machine {
             test_prior_core_pushes: Vec::new(),
             #[cfg(test)]
             test_batch_core_totals: Vec::new(),
+            #[cfg(test)]
+            test_halt_deadline_clamps: 0,
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
