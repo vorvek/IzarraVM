@@ -31,7 +31,8 @@ org 0x100
 %define OK 0xA5
 
 ; Spin bound. gsw_386 is the project's 386DX-at-22-MHz reference
-; (bench_reference.rs:93), so one 54.9 ms timer tick is 22e6 * 0.0549 = ~1.2M
+; (bench_reference.rs, "Project reference: 386DX at 22 MHz"), so one 54.9 ms
+; timer tick is 22e6 * 0.0549 = ~1.2M
 ; emulated cycles. This loop is two CMP mem,imm plus DEC + JNZ, ~12 cycles per
 ; iteration, so a tick is ~100k iterations and the bound covers ~80 of them:
 ; exhaustion means no timer interrupt arrived at all, not that the fixture was

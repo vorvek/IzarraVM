@@ -27,7 +27,8 @@ org 0x100
 %define OK 0xA5
 
 ; Spin bounds. gsw_386 is the project's 386DX-at-22-MHz reference
-; (bench_reference.rs:93), so one 54.9 ms timer tick is 22e6 * 0.0549 = ~1.2M
+; (bench_reference.rs, "Project reference: 386DX at 22 MHz"), so one 54.9 ms
+; timer tick is 22e6 * 0.0549 = ~1.2M
 ; emulated cycles. The two loop shapes here cover very different amounts of
 ; emulated time per iteration, so they get separate bounds rather than one
 ; copied constant:

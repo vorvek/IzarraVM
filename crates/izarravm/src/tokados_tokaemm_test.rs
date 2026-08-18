@@ -56,8 +56,8 @@ impl TokaEmmScenario {
 /// will never see V86, however healthy the machine is. Sample finely, sample
 /// while the guest is busy, and judge on the accumulated count.
 ///
-/// Returns (samples in V86, whether the loop ended early -- `done` fired, or
-/// the guest exited -- and the last stop reason).
+/// Returns (samples in V86, whether the loop ended because `done` fired or the
+/// guest exited, and the last stop reason).
 /// A `TestExit` ends the loop: the guest has signalled its verdict and every
 /// further burst would re-run an already-halted machine, so callers that assert
 /// on an exit code get it from the third element rather than running the
@@ -69,6 +69,7 @@ fn sample_v86_while_busy(
     mut done: impl FnMut(&Machine) -> bool,
 ) -> (u32, bool, StopReason) {
     const BURST: u64 = 200_000;
+    debug_assert!(max_samples > 0, "a zero sample budget samples nothing");
     let mut in_v86_samples = 0;
     let mut last_stop = StopReason::CycleLimit { requested: 0 };
     for _ in 0..max_samples {
@@ -102,6 +103,13 @@ fn sample_v86_while_busy(
 /// clears this by an order of magnitude, and a machine that stopped entering
 /// V86 at all fails loudly rather than passing an invariant vacuously.
 const MIN_V86_SAMPLES: u32 = 5;
+
+/// Sample budget for a whole-boot row. At `sample_v86_while_busy`'s 200k-cycle
+/// burst this is ~800M emulated cycles, which is the same ceiling the
+/// non-sampled boot rows pass to `run_until_halt_or_cycles` — enough for
+/// `LH TOKAMOUS + MEM` (or a VCPISW round trip) to reach its verdict with room
+/// to spare, and bounded so a wedged machine fails instead of hanging.
+const SAMPLE_BUDGET: u32 = 4_000;
 
 #[test]
 #[should_panic(expected = "expected exactly one TOKAEMM.SYS override")]
@@ -1038,7 +1046,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 
         // Sampled rather than run straight through, because this is the ONLY
         // row that observes V86 residency on the far side of a DE0C round trip.
-        // `vcpi_pm_to_v86` (tokaemm.asm:3699) is the second of the file's two
+        // `vcpi_pm_to_v86`'s `mov dword [esp+0x10], 0x00023002` is the second
+        // of tokaemm.asm's two
         // sites that stamp IOPL into a V86 EFLAGS image, and the boot-sampling
         // rows never reach it -- a plain `LH TOKAMOUS + MEM` boot only ever
         // enters V86 through `pm_init`. Asserting IOPL 3 here is what closes
@@ -1046,7 +1055,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         // path would leave every other row in the suite green.
         let (in_v86_samples, _, stop) = sample_v86_while_busy(
             machine,
-            4_000,
+            SAMPLE_BUDGET,
             |machine| {
                 let eflags = machine.cpu().registers.eflags;
                 assert_eq!(
@@ -1242,7 +1251,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
     // machine is. See sample_v86_while_busy.
     let (in_v86_samples, reached, _) = sample_v86_while_busy(
         &mut machine,
-        4_000,
+        SAMPLE_BUDGET,
         |_| {},
         |machine| {
             current_root_prompt(machine)
@@ -1821,8 +1830,11 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
 /// the guest happens to run a CLI there.
 ///
 /// COVERAGE BOUNDARY, stated because it is not obvious: tokaemm.asm stamps IOPL
-/// into a V86 EFLAGS image at exactly two sites -- `pm_init`'s return-to-V86
-/// IRETD (:1772) and `vcpi_pm_to_v86` (:3699) -- and this row's `LH TOKAMOUS +
+/// into a V86 EFLAGS image at exactly two sites -- `pm_init`'s
+/// `push dword 0x00023202` and `vcpi_pm_to_v86`'s
+/// `mov dword [esp+0x10], 0x00023002` (both unique on grep, which is how to
+/// find them; line numbers here have gone stale twice) -- and this row's
+/// `LH TOKAMOUS +
 /// MEM` boot only ever enters V86 through the first, so it cannot see a
 /// regression confined to the VCPI re-entry path. That second site is covered
 /// by `tokaemm_vcpi_m3_de0c_switch_round_trip`, which samples the same
@@ -1857,7 +1869,7 @@ fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
     // run, when they got one at all.
     let (in_v86_samples, _, _) = sample_v86_while_busy(
         machine,
-        4_000,
+        SAMPLE_BUDGET,
         |machine| {
             let eflags = machine.cpu().registers.eflags;
             assert_eq!(
@@ -1921,7 +1933,7 @@ fn tokaemm_real_if_tracks_the_guest_across_a_boot() {
     let mut saw_if_set = 0u32;
     let (in_v86_samples, _, _) = sample_v86_while_busy(
         machine,
-        4_000,
+        SAMPLE_BUDGET,
         |machine| {
             if machine.cpu().registers.eflags & FLAG_IF == 0 {
                 saw_if_clear += 1;

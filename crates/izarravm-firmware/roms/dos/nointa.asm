@@ -32,7 +32,8 @@ org 0x100
 %define OK 0xA5
 
 ; Spin bound for the IRR poll. gsw_386 is the project's 386DX-at-22-MHz
-; reference (bench_reference.rs:93), so one 54.9 ms timer tick is
+; reference (bench_reference.rs, "Project reference: 386DX at 22 MHz"), so
+; one 54.9 ms timer tick is
 ; 22e6 * 0.0549 = ~1.2M emulated cycles. This loop is OUT + IN + TEST +
 ; DEC + JNZ and the port accesses force a step break each time round, so
 ; ~40 cycles/iteration: ~30k iterations per tick, and the bound covers
