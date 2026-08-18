@@ -43,21 +43,48 @@ Katea filesystem, or alter guest-visible controller timing.
 
 ### Command-local host range reads
 
-The BIOS read paths declare the starting LBA and sector count to `AtaDisk`.
-Host-folder disks use that boundary to read contiguous bytes from one host file
-in a single operation, capped at 64 sectors. The cap matches the useful scale of
-86Box's default IDE window without reading beyond the active guest request or the
-file's contiguous allocation.
+A read path declares the starting LBA and sector count of the run it is about to
+walk to `AtaDisk`. Host-folder disks use that boundary to read contiguous bytes
+from one host file in a single operation, capped at 64 sectors. The cap matches
+the useful scale of 86Box's default IDE window without reading beyond the active
+guest request or the file's contiguous allocation.
 
-The extra bytes live only until the BIOS command ends. They are discarded before
-the next command, so an unrequested sector cannot stay stale if a host file is
-changed between two guest reads. The guest overlay is still checked first, and
-the ordinary sector cache still observes each requested sector as the guest asks
-for it.
+The extra bytes live only until the command ends. They are discarded before the
+next one, so an unrequested sector cannot stay stale if a host file is changed
+between two guest reads. This is why a declared range must open and close inside
+a single host-side call, and why the one path that cannot do that is excluded
+below. The guest overlay is still checked first, and the ordinary sector cache
+still observes each requested sector as the guest asks for it.
 
 The existing one-file open-handle cache remains in place. Projected host files
 now reach the range reader directly instead of constructing a temporary
 `PathBuf`-backed source for each sector.
+
+### Which callers declare a range
+
+Every read path that walks a contiguous run inside a single host-side call
+declares that run:
+
+| Caller | Path |
+| --- | --- |
+| `AH=02` / `AH=0A` | INT 13h CHS read, and long-sector read |
+| `AH=04` | INT 13h CHS verify |
+| `AH=42` / `AH=44` | EDD read, and EDD verify |
+| `read_dma_payload` | bus-master DMA, device to memory |
+
+Native PIO reads (`prepare_read_sector`) are deliberately left unbatched. A PIO
+command serves one sector per DRQ and the guest drains each through the data
+port before the next is scheduled, so a window would have to survive an interval
+bounded by guest execution rather than by a host-side call. That breaks the
+property the whole design rests on -- a host folder cannot change underneath a
+declared range -- and the command has no single exit to close the range at: it
+ends in `read_data_byte`, in `abort`, in `soft_reset`, or nowhere at all if the
+guest simply stops draining. Lifting this means giving a PIO command one owned
+lifetime, which is a separate change.
+
+DMA and PIO both schedule their deadlines at command time, before any sector is
+looked up, and price with the uncached formula. Their guest-visible timing is
+therefore structurally independent of how the host performs the reads.
 
 ### Batched guest-buffer delivery
 
@@ -134,18 +161,32 @@ smaller, more stable cold-load service burst while guest timing stays unchanged.
 
 The implementation was checked with:
 
-- 1,539 passing `izarravm-machine` library tests, with 3 ignored
+- 1,542 passing `izarravm-machine` library tests, with 3 ignored
 - 231 passing `izarravm` tests, and the 92 ignored guest rows under `--release`
 - strict Clippy for all `izarravm-machine` and `izarravm` targets
 - formatting, release build, and the file-policy check
 
-Four regressions are specific to this change. Each names, in its doc comment,
-the mutation that makes it fail:
+Seven regressions are specific to this change. Each names, in its doc comment,
+the mutation that makes it fail, and each mutation was applied and observed:
 
 - a coalesced span does not serve host bytes for a sector the guest wrote
 - a shrink to a sector boundary keeps its one complete leading sector
 - a partial trailing sector in a short batch is dropped, not padded and cached
 - a read torn mid-sector returns zeros, not the prefix that survived
+- a DMA read coalesces its whole contiguous request into one host read
+- a DMA span that fails part-way reports what the per-sector path reported
+- a CHS verify coalesces its run the way its EDD twin already did
 
 The pre-existing transient-read, cached-handle, reconciliation, CHS, and EDD
 tests were re-run unchanged; this change did not add to them.
+
+### Guest timing, measured rather than argued
+
+The whole library suite was run in both control legs. With
+`IZARRAVM_HDD_COMMAND_READ_BATCH=0`, exactly four tests change result, and all
+four are `host_read_operations` assertions. The other 1,538 -- every timing,
+charge, tick, status-register, content and determinism test in the machine --
+pass identically with batching on and off.
+
+That is the fidelity claim in its strongest available form: batching moves the
+physical-operation counters and nothing else the guest can observe.

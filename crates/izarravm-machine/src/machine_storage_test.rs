@@ -2143,6 +2143,66 @@ fn a_short_host_file_preserves_the_complete_sectors_in_a_batched_read() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// One INT 13h CHS verify (AH=04) of `count` sectors at `lba`. Returns
+/// (AL, AH): sectors verified and status.
+fn int13_verify_at(machine: &mut Machine, lba: u32, count: u8) -> (u8, u8) {
+    let sectors_per_track = 63u32;
+    let cyl = lba / (16 * sectors_per_track);
+    let rem = lba % (16 * sectors_per_track);
+    let head = rem / sectors_per_track;
+    let sector = rem % sectors_per_track + 1;
+    let cx = ((cyl & 0xFF) << 8) | ((cyl & 0x300) >> 2) | sector;
+    machine
+        .cpu
+        .registers
+        .set_eax((0x04 << 8) | u32::from(count));
+    machine.cpu.registers.set_ecx(cx);
+    machine.cpu.registers.set_edx((head << 8) | 0x80);
+    machine.handle_int13();
+    let eax = machine.cpu.registers.eax();
+    (eax as u8, (eax >> 8) as u8)
+}
+
+/// CHS VERIFY COALESCES THE SAME WAY ITS EDD TWIN DOES.
+///
+/// AH=04 walks a contiguous run and throws the bytes away, which is the same
+/// shape as a read and was the one member of the INT 13h read family left
+/// issuing a host read per sector while AH=02, AH=0A, AH=42 and AH=44 all
+/// coalesced. It reports AL = sectors verified and AH = 0 exactly as before.
+///
+/// NON-VACUOUS: removing the `begin_read_command` call from `int13_hdd_verify`
+/// makes this four-sector verify cost 4 physical host reads instead of 1.
+/// Verified by mutation.
+#[test]
+fn a_chs_verify_coalesces_its_run_like_the_edd_form() {
+    let dir = katea_scratch("verify-batch");
+    std::fs::write(dir.join("GAME.DAT"), patterned(8)).unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+
+    let before = machine
+        .katea_storage_counters()
+        .unwrap()
+        .host_read_operations;
+    assert_eq!(
+        int13_verify_at(&mut machine, lba, 4),
+        (4, 0x00),
+        "all four verify, with success status"
+    );
+    assert_eq!(
+        machine
+            .katea_storage_counters()
+            .unwrap()
+            .host_read_operations
+            - before,
+        1,
+        "one physical host read covered the whole verified run"
+    );
+
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A FAILED SINGLE-SECTOR READ IS ALL ZEROS, NOT A HALF-SECTOR.
 ///
 /// A one-sector command has a one-sector span, so it takes `read_host_span`'s

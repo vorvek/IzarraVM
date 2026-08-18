@@ -2116,6 +2116,12 @@ impl Machine {
         let mut done: u8 = 0;
         // Sector-cache hits this transfer collects, for the charge below.
         let hits_before = self.sector_cache_hits();
+        // Verify walks the same contiguous run a read does and discards the
+        // bytes, so it coalesces identically. EDD verify (AH=44) already did;
+        // this is the CHS half of the same pair.
+        if let Some(disk) = self.ata.as_ref() {
+            disk.begin_read_command(start_lba, u32::from(count));
+        }
         for i in 0..count {
             let readable = self
                 .ata
@@ -2126,6 +2132,9 @@ impl Machine {
                 break;
             }
             done += 1;
+        }
+        if let Some(disk) = self.ata.as_ref() {
+            disk.end_read_command();
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
