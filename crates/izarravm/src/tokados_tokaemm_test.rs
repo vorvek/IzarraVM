@@ -1755,26 +1755,99 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
     );
 }
 
-/// Regression for the V86 IRET/IOPL gate (vorvek/v86-iret-iopl): TOKAEMM
-/// virtualizes IF by trapping CLI/STI/PUSHF/POPF/INT n/IRET to the monitor
-/// and stamping the guest IRET frame's image-IF from its own VIF (often 0 in
-/// ISR context). If IRET is not IOPL-gated like its siblings, a V86 guest's
-/// own IRET pops that monitor-stamped image straight into REAL EFLAGS via
-/// load_flags (no IOPL gating) -- killing real IF inside V86 so interrupts
-/// never deliver again (this was the Prince of Persia livelock root cause).
-/// This test samples real IF at several points across a real TOKAEMM boot
-/// and asserts it is never 0 while the guest is in V86 mode -- the invariant
-/// that would have caught this whole class of bug. Cheap: reuses the MEM
-/// harness's boot (LH TOKAMOUS + MEM reaches a prompt in ~200-350M cycles),
-/// split into small bursts so the sample points fall throughout the run
-/// rather than only at the very end.
+/// THE V86 ENTRY INVARIANT: every EFLAGS image the monitor IRETDs into V86
+/// carries IOPL 3. This replaces `tokaemm_real_if_never_zero_in_v86_across_a_boot`
+/// (vorvek/v86-iret-iopl), and the swap is deliberate rather than a deletion.
+///
+/// What the original guarded: the Prince of Persia livelock. The pre-IOPL-3
+/// monitor virtualized IF by trapping CLI/STI/PUSHF/POPF/INT n/IRET and
+/// stamping the guest IRET frame's image-IF from its own VIF (often 0 in ISR
+/// context). If IRET were not IOPL-gated like its siblings, a V86 guest's own
+/// IRET popped that monitor-stamped image straight into REAL EFLAGS via
+/// load_flags, killing real IF inside V86 so interrupts never delivered again.
+///
+/// Why that class is now impossible: there is no monitor-stamped image. The
+/// guest runs at real IOPL 3, its CLI/STI/PUSHF/POPF/IRET execute for real, and
+/// real IF simply IS the guest's IF -- so IF=0 in V86 is the CORRECT state
+/// whenever the guest has disabled interrupts, and the old assertion would now
+/// fire on healthy behaviour. Deleting it outright is how the PoP class comes
+/// back, though, so it is replaced rather than removed.
+///
+/// What THIS guards: any V86 entry point that forgets to put IOPL 3 in the
+/// frame. If one does, the sensitive set silently starts trapping again and the
+/// monitor quietly reverts to emulating what it no longer has code to emulate.
+/// `signal32 0xD6` catches that loudly -- but only on a path the guest actually
+/// executes; this catches it on every path the sampler observes, whether or not
+/// the guest happens to run a CLI there.
+///
+/// Cheap: reuses the MEM harness's boot (LH TOKAMOUS + MEM reaches a prompt in
+/// ~200-350M cycles), split into small bursts so the sample points fall
+/// throughout the run rather than only at the very end.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
-fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
+fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut scenario = TokaEmmScenario::new(
-        "tokaemm-ifinvariant",
+        "tokaemm-iopl3invariant",
+        profile,
+        vec![
+            ("AUTOEXEC.BAT".to_string(), autoexec),
+            (
+                "TOKAEMM.SYS".to_string(),
+                izarravm_firmware::tokaemm_sys().to_vec(),
+            ),
+        ],
+    );
+    let machine = &mut scenario.machine;
+
+    // Every sample point that lands in V86 is one check of the invariant, so
+    // the fine sampling is not only what makes the test reliable -- it is what
+    // gives it teeth. The old 20M-cycle bursts got roughly one V86 sample per
+    // run, when they got one at all.
+    let (saw_v86_samples, _) = sample_v86_while_busy(
+        machine,
+        4_000,
+        |machine| {
+            let eflags = machine.cpu().registers.eflags;
+            assert_eq!(
+                (eflags >> 12) & 3,
+                3,
+                "V86 IOPL was not 3 (eflags={eflags:#010x}); some entry point \
+                 built a frame without it, and the sensitive set is trapping \
+                 again"
+            );
+        },
+        |_| false,
+    );
+    let text = machine.screen_text().as_text();
+
+    assert!(
+        saw_v86_samples >= MIN_V86_SAMPLES,
+        "the boot never entered V86 mode; the invariant was never exercised \
+         ({saw_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
+    );
+}
+
+/// The non-vacuity partner to `tokaemm_v86_iopl_is_always_three_across_a_boot`,
+/// and the row that makes the IOPL-3 claim mean something. IOPL 3 is only
+/// interesting because it hands the guest the REAL interrupt flag: assert that
+/// real IF actually moves with the guest, by requiring at least one V86 sample
+/// with IF=0 and at least one with IF=1 across a boot.
+///
+/// Without this, a monitor that regressed to pinning real IF open forever --
+/// exactly the pre-IOPL-3 behaviour this design removed -- would still satisfy
+/// every other row in the suite, including the IOPL-3 invariant above. DOS
+/// brackets its IRQ-sensitive regions with CLI/STI constantly, so both states
+/// are reached many times over during a normal boot; seeing only one of them is
+/// evidence the flag is stuck, not evidence of a quiet boot.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_real_if_tracks_the_guest_across_a_boot() {
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut scenario = TokaEmmScenario::new(
+        "tokaemm-iftracks",
         profile,
         vec![
             ("AUTOEXEC.BAT".to_string(), autoexec),
@@ -1788,19 +1861,17 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
 
     const FLAG_IF: u32 = 0x0000_0200;
 
-    // Every sample point that lands in V86 is one check of the invariant, so
-    // the fine sampling is not only what makes the test reliable -- it is what
-    // gives it teeth. The old 20M-cycle bursts got roughly one V86 sample per
-    // run, when they got one at all.
+    let mut saw_if_clear = 0u32;
+    let mut saw_if_set = 0u32;
     let (saw_v86_samples, _) = sample_v86_while_busy(
         machine,
         4_000,
         |machine| {
-            assert_ne!(
-                machine.cpu().registers.eflags & FLAG_IF,
-                0,
-                "real IF was 0 while the guest was in V86 mode"
-            );
+            if machine.cpu().registers.eflags & FLAG_IF == 0 {
+                saw_if_clear += 1;
+            } else {
+                saw_if_set += 1;
+            }
         },
         |_| false,
     );
@@ -1810,6 +1881,18 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
         saw_v86_samples >= MIN_V86_SAMPLES,
         "the boot never entered V86 mode; the invariant was never exercised \
          ({saw_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
+    );
+    assert!(
+        saw_if_clear > 0,
+        "real IF was never 0 in V86 across {saw_v86_samples} samples: the \
+         guest's CLI is not reaching the real flag, so the monitor is pinning \
+         IF open again.\n{text}"
+    );
+    assert!(
+        saw_if_set > 0,
+        "real IF was never 1 in V86 across {saw_v86_samples} samples: the \
+         guest never runs with interrupts enabled, which a booting DOS must \
+         do.\n{text}"
     );
 }
 

@@ -1434,7 +1434,7 @@ impl Machine {
                                 //       no instruction-level explanation at all.
                                 // The overshoot is small but NOT bounded by a
                                 // handful of clocks: measured at 3 clocks on the
-                                // 386 fixture (`tokaemm_real_if_never_zero_in_v86_
+                                // 386 fixture (`tokaemm_v86_iopl_is_always_three_
                                 // across_a_boot` hits it once per boot), while the
                                 // true bound is one instruction's core clocks plus
                                 // the batch's uncounted ISA charge -- `isa_io_clocks`
