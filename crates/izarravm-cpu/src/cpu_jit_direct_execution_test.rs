@@ -2729,3 +2729,98 @@ fn direct_chain_links_across_a_segment_descriptor_neither_block_uses() {
     );
     assert_unresolved_reason_deltas(&before, &after, [1, 0, 0, 0]);
 }
+
+/// The other half of the chain mask's soundness, at the machine: the ROOT's entry check has to
+/// prove the descriptors the CHAIN needs, not the ones the root itself happens to use.
+///
+/// The root reads no memory at all. Its successor reads through ES, so the chain requirement
+/// carries ES even though the root's own pinned mask is empty. Enter with a live ES whose BASE
+/// differs from the one the successor baked, and the entry must be REFUSED -- relaxing the linked
+/// arm to the root's own mask would let the chain run and read the wrong address, silently.
+#[test]
+fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
+    const ENTRY: u32 = 0x200;
+    const SECOND: u32 = 0x220;
+    const DONE: u32 = 0x240;
+    const BAKED: u32 = 0x3000;
+    const SHIFT: u32 = 0x100;
+
+    let mut memory = vec![0; 0x5000];
+    memory[ENTRY as usize..ENTRY as usize + 10].copy_from_slice(&[
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x220
+    ]);
+    memory[SECOND as usize..SECOND as usize + 12].copy_from_slice(&[
+        0x26, 0x8b, 0x15, 0x00, 0x30, 0x00, 0x00, // mov edx,[es:0x3000]
+        0xe9, 0x14, 0x00, 0x00, 0x00, // jmp 0x240
+    ]);
+    memory[DONE as usize] = 0xf4;
+    memory[BAKED as usize..BAKED as usize + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    memory[(BAKED + SHIFT) as usize..(BAKED + SHIFT) as usize + 4]
+        .copy_from_slice(&0xcafe_babeu32.to_le_bytes());
+
+    let mut native = flat_stack_cpu(ENTRY);
+    let mut native_bus = TestBus::with_memory(memory);
+    native_bus.direct_pages_enabled = true;
+    native_bus.direct_page_clocks = true;
+    decode_fixture(
+        &mut native,
+        &mut native_bus,
+        &[ENTRY, ENTRY + 5, SECOND, SECOND + 7],
+    );
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        0x3000,
+        0x3000,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        true,
+    );
+
+    let entry_block = install_fixture_block(&mut native, ENTRY);
+    install_fixture_block(&mut native, SECOND);
+
+    // Non-vacuity first: with the live ES the successor baked, the chain forms and runs.
+    native.set_eip(ENTRY);
+    let before = native.perf_counters().clone();
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, entry_block)
+            .unwrap()
+    );
+    assert_eq!(native.registers.eip, DONE);
+    assert_eq!(native.registers.edx(), 0xdead_beef);
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        1,
+        "the successor must be reached natively, or this row proves nothing about chains"
+    );
+
+    // Now move ES's BASE. The root pins nothing, so only the strict six-descriptor check stands
+    // between the chain and a read through the stale base.
+    let baked_es = native.registers.segment(SegmentIndex::Es);
+    let mut shifted_es = baked_es;
+    shifted_es.base = SHIFT;
+    native.registers.set_segment(SegmentIndex::Es, shifted_es);
+    native.set_eip(ENTRY);
+    native.registers.set_edx(0);
+    let before = native.perf_counters().clone();
+    assert!(
+        !native
+            .try_run_direct_block_for_test(&mut native_bus, entry_block)
+            .unwrap(),
+        "the root must refuse: the chain needs an ES the root itself never pinned"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_reject_data_segment
+            - before.jit_direct_reject_data_segment,
+        1
+    );
+    assert_eq!(native.registers.eip, ENTRY);
+    assert_eq!(
+        native.registers.edx(),
+        0,
+        "nothing may have run: a chained read here would have used the baked base"
+    );
+}

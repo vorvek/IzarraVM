@@ -3183,6 +3183,24 @@ fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
 // pin with different values still is (class D). Because the requirement is transitive, a link
 // made downstream can widen a block's requirement and retroactively invalidate an already-live
 // inbound edge, which is then CUT (`LinkClearCause::ChainWiden`).
+//
+// MUTATION EVIDENCE (2026-08-18, applied by hand, observed, restored). Each row names the fixture
+// that caught it; a mutation nobody catches is a fixture bug, not a free pass.
+//
+// | mutation | caught by |
+// |---|---|
+// | predicate reads `segment_layouts` instead of `chain_layouts` | `link_mask_judges_a_new_predecessor_against_the_widened_requirement` |
+// | worklist never seeded (propagation made shallow) | `link_mask_cuts_an_inbound_edge_...` AND `link_mask_widens_an_inbound_edge_...` |
+// | the `None` arm's `unlink_outbound` deleted (widen, never cut) | `link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates` |
+// | `merge_chain`'s conflict arm made permissive | `link_mask_still_refuses_class_d_...`, plus both worklist rows |
+// | `chain_layouts` reset dropped from `install`'s recycled arm | `link_mask_resets_the_chain_requirement_when_a_slot_is_recycled` |
+// | run.rs's linked entry arm relaxed to `data_matches` | `direct_chain_entry_validates_a_segment_only_the_successor_uses` (execution level) |
+//
+// Two findings worth keeping. FIRST: the transitive row does NOT catch the `segment_layouts`
+// predicate on its own -- the worklist still cuts the edge behind it -- which is why the
+// new-predecessor row exists. SECOND: the run.rs mutation survived the ENTIRE crate until the
+// execution-level row was written; no BlockCache fixture can see it, because that hole is in what
+// the dispatcher proves, not in which edges form.
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(any(
