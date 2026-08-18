@@ -481,6 +481,37 @@ fn sti_busy_loop_takes_irq0_despite_intervening_instructions() {
 }
 
 #[test]
+fn halt_fast_forward_survives_a_batch_that_overshot_the_run_deadline() {
+    // A batch is granted a budget derived from the ticks LEFT to the caller's
+    // deadline, but it can spend more than it was granted: `run_budgeted`
+    // always retires at least one instruction, the batch-entry interrupt
+    // service is charged before any cap test, and the ISA I/O charge is added
+    // to the batch-end step without ever having been counted against the cap.
+    // So `now_ticks()` can sit PAST `deadline_ticks` when the batch ends -- and
+    // when that same batch ended on a HLT with IF clear, `next_timer_wake`
+    // returns None and the halt fast-forward computes the ticks it may still
+    // consume. That subtraction used to be plain and panicked in debug
+    // ("attempt to subtract with overflow"); in release it wrapped to ~u64::MAX
+    // and let the fast-forward run all the way to the next timed-I/O edge,
+    // ignoring the caller's deadline entirely.
+    //
+    // `cli; hlt` in a raw program is the smallest guest that reaches that
+    // branch. The burst sweep is what makes it deterministic: some burst size
+    // in this range always ends its final batch on the HLT with the deadline
+    // already a clock or two behind.
+    for burst in 1u64..=64 {
+        let mut machine =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xfa, 0xf4])
+                .expect("raw cli; hlt machine");
+        for _ in 0..8 {
+            let _ = machine
+                .run_until_halt_or_cycles(burst)
+                .unwrap_or_else(|e| panic!("burst {burst}: {e}"));
+        }
+    }
+}
+
+#[test]
 fn machine_accepts_256k_flash_and_shadows_top_64k() {
     // A 256 KiB flash whose top 64 KiB carries a recognizable reset far-jump
     // boots: the machine maps the top 64 KiB at 0xF0000, so the reset vector at

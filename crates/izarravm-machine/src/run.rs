@@ -1410,7 +1410,34 @@ impl Machine {
                                 self.advance_halted_cpu_clocks(wake_step);
                             }
                             None => {
-                                let remaining = deadline_ticks - self.timeline.now_ticks();
+                                // Saturating because a batch can end PAST the
+                                // deadline, so `now > deadline` is a normal
+                                // state here, not a broken invariant. The batch
+                                // was granted `remaining_ticks` worth of clocks
+                                // at loop top, but it may spend more than it was
+                                // granted: `run_budgeted` always retires at least
+                                // one instruction, the batch-entry
+                                // `service_pending_interrupt` is charged before
+                                // any cap test, and `isa_io_batch_clocks` joins
+                                // the batch-end `step` without ever having been
+                                // counted against the cap. Measured overshoot at
+                                // the HLT is 1-4 CPU clocks (`tokaemm_real_if_
+                                // never_zero_in_v86_across_a_boot` hits it once
+                                // per boot, at 3). `next_timer_wake` already
+                                // clamps the same quantity the same way, and it
+                                // is exactly what returned None here.
+                                //
+                                // Clamping to zero IS the semantic: `remaining`
+                                // exists only to stop the halted fast-forward
+                                // from running past the caller's deadline, and a
+                                // deadline already reached leaves zero halted
+                                // time to grant. `advance_halted_ticks(0)` is the
+                                // same no-op the exact-landing case already takes,
+                                // and the loop condition then ends the run. The
+                                // pending device edge is not lost -- the next run
+                                // call re-derives it.
+                                let remaining =
+                                    deadline_ticks.saturating_sub(self.timeline.now_ticks());
                                 if let Some(ticks) = self.next_timed_io_deadline() {
                                     self.advance_halted_ticks(ticks.min(remaining));
                                 } else {
