@@ -192,26 +192,41 @@ start:
     ; descriptor to available and make the second trip prove nothing.
 do_switch:
     mov ebp, 0x1BADB002           ; marker: must survive BOTH switches
-    cli                           ; virtualized: VIF := 0, real IF stays 1
-    ; ---- 4a. force a HELD line across the switch (the E10 regression) ----
-    ; With VIF clear the monitor's irq_body takes its `.hold` path: the INTA has
-    ; already happened (this monitor keeps the real IF open and virtualizes IF
-    ; as VIF), so the 8259A's IS bit is set, and the line is parked in `vip` for
-    ; a later `maybe_deliver`. Wait here until the chip actually shows IS0 set,
-    ; so the switch below is guaranteed to cross the boundary with a line held
-    ; -- a fixture that switched before the tick landed would prove nothing.
+    cli                           ; real CLI: the guest runs at IOPL 3, so this
+                                  ; clears the REAL IF and the CPU stops
+                                  ; accepting interrupts here and now
+    ; ---- 4a. force an UNDELIVERED REQUEST across the switch ----
+    ; The precondition this fixture needs is an interrupt the guest has not
+    ; taken yet, still outstanding when DE0C hands the machine to the client.
+    ; Under the IOPL-3 monitor the CLI above shuts the real IF, so the 8259A is
+    ; never acknowledged while we sit here: the timer's request latches in the
+    ; IRR and stays there, unacknowledged, with the ISR untouched. Wait until
+    ; the chip actually shows IR0 set, so the switch below is guaranteed to
+    ; cross the boundary with a request outstanding -- a fixture that switched
+    ; before the tick landed would prove nothing.
+    ;
+    ; This probe used to read the ISR (OCW3 0x0B) because the pre-IOPL-3
+    ; monitor kept the real IF open and virtualized IF as VIF: it acknowledged
+    ; the line immediately and parked it in `vip`, so IS0 was the observable.
+    ; That monitor could then be left holding a line it could never deliver
+    ; across DE0C -- the wedge this fixture exists to catch. With no early
+    ; INTA there is no held line to observe, and the IRR is where an
+    ; undelivered request now lives. The wedge assertions after the switch are
+    ; unchanged; only the way the precondition is established moved.
+    ;
     ; The PIC ports are not in the monitor's TSS I/O bitmap (only 0x92 is), so
     ; this reads the real chip.
     mov ecx, 8000000              ; bound: ~one 54.9 ms tick with room to spare
 .wait_hold:
-    mov al, 0x0B                  ; OCW3: select ISR for the next read
+    mov al, 0x0A                  ; OCW3: select IRR for the next read
     out 0x20, al
     in al, 0x20
-    test al, 0x01                 ; IS0: the timer line, acknowledged and held
-    jnz .held
+    test al, 0x01                 ; IR0: the timer line, REQUESTED but not
+    jnz .held                     ; acknowledged (the ISR stays empty)
     dec ecx
     jnz .wait_hold
-    jmp f_nohold                  ; never held: the precondition never happened
+    jmp f_nohold                  ; no request ever appeared: the precondition
+                                  ; never happened
 .held:
     mov esi, [lin_base]
     add esi, swst                 ; ESI = switch-structure linear
@@ -422,8 +437,10 @@ f_busy:   mov al, 0xD0        ; trip 1 left the client TSS descriptor available,
           jmp sig               ; so the monitor's busy-bit clear is untested
 f_xms:    mov al, 0xE7
           jmp sig
-f_nohold: mov al, 0xD1        ; no line was ever held with VIF clear, so the
-                              ; switch below would not have tested anything
+f_nohold: mov al, 0xD1        ; no timer request ever became visible in the IRR
+                              ; under the CLI, so the switch below would not
+                              ; have carried anything across the boundary and
+                              ; the wedge assertions would prove nothing
 
 sig:
     mov ah, al

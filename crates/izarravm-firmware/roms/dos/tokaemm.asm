@@ -54,7 +54,22 @@ k_gs: dw 0
 k_cs: dw 0                        ; EXECRH far-return CS
 k_ip: dw 0                        ; EXECRH far-return IP
 
-vif: db 1                         ; virtual IF (guest's view; DOS boots with IF=1)
+; `vif` (virtual IF) lived here and is gone: the guest runs at real IOPL 3, so
+; the REAL EFLAGS.IF is the guest's IF and there is nothing left to proxy.
+hlt_pending: db 0                 ; 1 = hlt_vector holds a line taken by the
+                                  ; ring-0 sti;hlt wake and not yet reflected.
+                                  ; OUT OF BAND on purpose: there is no byte
+                                  ; value that is not a legal vector (a guest
+                                  ; may DE0B the master base to 0xF8, putting
+                                  ; IRQ7 on vector 0xFF), so an in-band
+                                  ; sentinel would silently drop that line and
+                                  ; leave its ISR bit set forever -- the exact
+                                  ; wedge this design exists to remove.
+hlt_vector: db 0                  ; EBX as it arrived at the gate. Today that
+                                  ; is a LINE, which equals the vector only at
+                                  ; the default PIC bases; Task 4A makes every
+                                  ; gate carry its own vector and this becomes
+                                  ; a vector unconditionally.
 r0_hlt: db 0                      ; 1 only inside monitor_body .hlt's sti;hlt
                                   ; window -- the sole ring-0 stretch with IF
                                   ; open. vec13_entry and irq_body read it to
@@ -71,9 +86,11 @@ va20: db 1                        ; virtual A20 (guest's view). The REAL gate is
                                   ; approach. (INT 15h AH=24xx / 8042 A20 paths
                                   ; are not virtualized; XMS+port 0x92 is what
                                   ; FreeDOS and period software use.)
+; `vip` (lines held while VIF=0) lived here and is gone with `.hold`. Under
+; IOPL 3 the chip is never acknowledged while the guest has interrupts off, so
+; there is nothing to queue: an undelivered request simply stays latched in the
+; 8259A's own IRR, which is what a 386 with a real EMM does.
 align 2
-vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
-                                  ; line N, master 0-7 + slave 8-15)
 
 ; ---- XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
@@ -1719,7 +1736,22 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     movzx eax, word [fs:k_sp]
     add eax, 4
     push eax
-    push dword 0x00020202         ; EFLAGS: VM | IF(real) | bit1, IOPL 0
+    ; The frame carries REAL IOPL 3, which is the whole mechanism: at IOPL 3 in
+    ; V86 the CPU stops treating CLI/STI/PUSHF/POPF/INT n/IRET as sensitive, so
+    ; they execute for real and the guest's IF *is* the real IF. That is what
+    ; the reference monitors do (386MAX `@VMIOPL equ 3`, QMAX_DTE.INC; JEMM runs
+    ; its clients at real IOPL 3), and it is what the VCPI spec S4.0 requires
+    ; when it says the IOPL-sensitive instructions must be "available".
+    ;
+    ; Extenders PROBE for it. DOS16M (the DOS4G loader) reads the flags image to
+    ; classify real-mode vs V86-under-a-monitor, and an IOPL-0 image sent it
+    ; down its raw LGDT mode-switch path, which is fatal under any monitor.
+    ; The old monitor forged IOPL 3 into every PUSHF/PUSHFD image while real
+    ; IOPL stayed 0; now the image is simply correct and the forgery is gone.
+    ; Nothing at CPL 3 can architecturally change IOPL (load_flags preserves it
+    ; on any CPL != 0 load), so a guest POPF/IRET cannot lower it back to 0 and
+    ; escape.
+    push dword 0x00023202         ; EFLAGS: VM | IOPL 3 | IF(real) | bit1
     movzx eax, word [fs:k_cs]
     push eax
     movzx eax, word [fs:k_ip]
@@ -1770,7 +1802,10 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; diagnostic exit. The same fork guards the OTHER PIC-base-8 collisions:
 ; irq_body classifies error-code frames on vectors 8/10/11/12/14 (0xD5 for
 ; a ring-0 origin), and reflect_vector refuses ring-0 frames outright
-; (0xD4) as the backstop for the exc_*/deflt_* reflect paths.
+; (0xD4) as the backstop for the exc_*/deflt_* reflect paths. monitor_body
+; adds 0xD6: an IOPL-sensitive instruction faulted at all, which means the
+; V86 frame's IOPL is not 3 -- a monitor bug, not a guest one. irq_body adds
+; 0xD7 for a doubly-occupied halt-window slot.
 ;
 ; EMULATOR-CONTRACT NOTE: TEST 1 is airtight because deliver_exception
 ; pushes CS zero-extended and never pushes an error code for an external
@@ -1810,18 +1845,24 @@ monitor_body:
     movzx ebx, word [ebp]         ; guest IP
     add eax, ebx                  ; eax = linear addr of the faulting opcode
     movzx edx, byte [eax]
-    cmp dl, 0xFA
-    je .cli
-    cmp dl, 0xFB
-    je .sti
-    cmp dl, 0x9C
-    je .pushf
-    cmp dl, 0x9D
-    je .popf
-    cmp dl, 0xCD
-    je .intn
-    cmp dl, 0xCF
-    je .iret_op
+    ; The IOPL-sensitive set. The guest runs at real IOPL 3 (pm_init,
+    ; vcpi_pm_to_v86), where CLI/STI/PUSHF/POPF/INT n/IRET are NOT
+    ; IOPL-sensitive: the CPU executes them for real and they never fault here.
+    ; So reaching this arm means the V86 frame's IOPL is not 3 -- a monitor bug
+    ; in whoever built that frame, never a guest one. Emulating it would hide
+    ; the defect behind a monitor that silently half-works, so name it and stop.
+    cmp dl, 0xFA                  ; CLI
+    je .sensitive_at_iopl0
+    cmp dl, 0xFB                  ; STI
+    je .sensitive_at_iopl0
+    cmp dl, 0x9C                  ; PUSHF
+    je .sensitive_at_iopl0
+    cmp dl, 0x9D                  ; POPF
+    je .sensitive_at_iopl0
+    cmp dl, 0xCD                  ; INT n (dispatches through the static IDT
+    je .sensitive_at_iopl0        ; now: deflt_*/int67_entry/intc0_entry)
+    cmp dl, 0xCF                  ; IRET
+    je .sensitive_at_iopl0
     cmp dl, 0xE6                  ; OUT imm8, AL — the trapped port 0x92 (A20)
     je .out92_imm
     cmp dl, 0xEE                  ; OUT DX, AL
@@ -1850,84 +1891,29 @@ monitor_body:
     call reflect_vector
     jmp .done_gp
 
-; ---- 66-prefixed sensitive forms. PUSHFD/POPFD/IRETD are IOPL-sensitive in
-; V86 exactly like their 16-bit forms; CWSDPMI's V86 mode-switch path uses
-; them. The prefix byte is at [eax], the opcode at [eax+1]. Anything else
+; ---- 66-prefixed forms. PUSHFD/POPFD/IRETD are IOPL-sensitive in V86 exactly
+; like their 16-bit forms, so at IOPL 3 they too execute for real and cannot
+; fault here; reaching one is the same monitor bug the unprefixed set reports
+; (0xD6). The prefix byte is at [eax], the opcode at [eax+1]. Anything else
 ; 66-prefixed stays a diagnostic exit, with AL = the second byte (not 0x66)
 ; so the next gap names itself. ----
 .prefix66:
     mov dl, [eax+1]
-    cmp dl, 0x9C
-    je .pushfd
-    cmp dl, 0x9D
-    je .popfd
-    cmp dl, 0xCF
-    je .iretd_op
+    cmp dl, 0x9C                  ; PUSHFD
+    je .sensitive_at_iopl0
+    cmp dl, 0x9D                  ; POPFD
+    je .sensitive_at_iopl0
+    cmp dl, 0xCF                  ; IRETD
+    je .sensitive_at_iopl0
     mov ebx, 13                   ; unhandled 66-prefixed op: reflect INT 0Dh
     call reflect_vector           ; like the unprefixed catch-all (DOS16M's
     jmp .done_gp                  ; o32 LGDT prep lands here); frame IP still
                                   ; points at the 66 byte, fault semantics
-.pushfd:
-    ; 32-bit image: frame EFLAGS with IF := VIF and, per the PRM, VM and RF
-    ; cleared in the STORED image (the frame's own VM bit stays set). The
-    ; image carries VIRTUAL IOPL = 3: the reference monitors expose IOPL 3
-    ; to their V86 tenants (JEMM runs clients at real IOPL 3; 386MAX
-    ; virtualizes the sensitive set the same way), and the VCPI spec S4.0
-    ; requires the IOPL-sensitive instructions be "available". Extenders
-    ; PROBE this: DOS16M reads the flags image to classify real-mode vs
-    ; V86-under-a-monitor, and an IOPL-0 image sent it down its raw
-    ; LGDT mode-switch path (fatal under any monitor). The real IOPL
-    ; stays 0 -- vif virtualization is unchanged; nothing at CPL 3 can
-    ; architecturally change IOPL, so the constant image is faithful.
-    mov eax, [ebp+8]
-    and eax, 0xFFFCFDFF           ; clear IF + VM(17) + RF(16) in the image
-    or eax, 0x3000                ; virtual IOPL = 3
-    cmp byte [fs:vif], 0
-    je .pfd_store
-    or eax, 0x0200
-.pfd_store:
-    mov ebx, [ebp+16]             ; guest SS
-    shl ebx, 4
-    sub word [ebp+12], 4          ; guest SP -= 4
-    movzx ecx, word [ebp+12]
-    mov [ebx+ecx], eax
-    add word [ebp], 2             ; skip 66 9C
-    jmp .done_gp
-.popfd:
-    mov ebx, [ebp+16]             ; guest SS
-    shl ebx, 4
-    movzx ecx, word [ebp+12]
-    mov eax, [ebx+ecx]            ; popped EFLAGS dword
-    add word [ebp+12], 4
-    test ax, 0x0200               ; popped IF -> VIF
-    setnz cl
-    mov [fs:vif], cl
-    and ax, 0xCFFF                ; monitor frame stays IOPL 0 (same as .popf)
-    or ax, 0x0200                 ; frame keeps real IF = 1
-    mov word [ebp+8], ax          ; low word only: the frame's high word (VM=1)
-                                  ; is preserved, matching hardware POPFD in V86
-                                  ; (VM/RF/IOPL-class bits unchanged)
-    add word [ebp], 2             ; skip 66 9D
-    call maybe_deliver
-    jmp .done_gp
-.iretd_op:
-    mov ebx, [ebp+16]             ; guest SS
-    shl ebx, 4
-    movzx ecx, word [ebp+12]
-    mov eax, [ebx+ecx]            ; pop EIP (V86 IP is 16-bit; high half dropped)
-    mov word [ebp], ax
-    mov eax, [ebx+ecx+4]          ; pop CS
-    mov word [ebp+4], ax
-    mov eax, [ebx+ecx+8]          ; pop EFLAGS
-    add word [ebp+12], 12
-    test ax, 0x0200               ; popped IF -> VIF
-    setnz cl
-    mov [fs:vif], cl
-    and ax, 0xCFFF                ; monitor frame stays IOPL 0 (same as .iret_op)
-    or ax, 0x0200                 ; frame keeps real IF = 1
-    mov word [ebp+8], ax          ; low word only; frame VM=1 preserved
-    call maybe_deliver
-    jmp .done_gp
+; The 66-prefixed .pushfd/.popfd/.iretd_op bodies lived here and are gone for
+; the same reason as the unprefixed six. The DOS16M rationale that justified
+; .pushfd's forged IOPL-3 image now lives at pm_init's IRETD, where it explains
+; why the frame carries REAL IOPL 3 -- the forgery it used to describe is
+; deleted because the image is simply true.
 
 ; ---- virtualized port 0x92: the guest's A20 gate. Only 0x92 is set in the
 ; I/O bitmap, so any other port reaching here is a monitor bug -> signal. The
@@ -1967,117 +1953,20 @@ monitor_body:
 .unhandled_io:
     mov al, dl
     jmp signal32
-.cli:
-    mov byte [fs:vif], 0
-    inc word [ebp]
-    jmp .done_gp
-.sti:
-    mov byte [fs:vif], 1
-    inc word [ebp]
-    call maybe_deliver            ; STI may release a pending IRQ
-    jmp .done_gp
-.pushf:
-    mov ax, [ebp+8]               ; frame EFLAGS
-    and ax, 0xFDFF                ; IF := VIF for the pushed image
-    or ax, 0x3000                 ; virtual IOPL = 3 (see .pushfd: extenders
-    cmp byte [fs:vif], 0          ; probe the image to classify the machine)
-    je .pf_store
-    or ax, 0x0200
-.pf_store:
-    mov ebx, [ebp+16]            ; guest SS
-    shl ebx, 4
-    sub word [ebp+12], 2         ; guest SP -= 2
-    movzx ecx, word [ebp+12]
-    mov [ebx+ecx], ax
-    inc word [ebp]               ; PUSHF is 1 byte
-    jmp .done_gp
-.popf:
-    mov ebx, [ebp+16]           ; guest SS
-    shl ebx, 4
-    movzx ecx, word [ebp+12]    ; guest SP
-    mov ax, [ebx+ecx]           ; popped flags
-    add word [ebp+12], 2
-    test ax, 0x0200             ; popped IF -> VIF
-    setnz cl
-    mov [fs:vif], cl
-    and ax, 0xCFFF               ; keep the monitor's frame at IOPL 0 (bits 12-13):
-                                  ; the ring-0 IRETD back into V86 restores IOPL
-                                  ; from this frame verbatim (CPL 0, full PRM
-                                  ; restore), so a guest-popped IOPL=3 here would
-                                  ; escape vif virtualization for good
-    or ax, 0x0200               ; frame keeps real IF = 1
-    mov word [ebp+8], ax        ; update guest flags (VM in high word preserved)
-    inc word [ebp]              ; POPF is 1 byte
-    call maybe_deliver          ; POPF may re-enable interrupts
-    jmp .done_gp
-.intn:
-    movzx ebx, byte [eax+1]      ; INT vector operand
-    cmp bl, 0x67                 ; INT 67h: EMS and VCPI share the vector.
-    jne .intn_not67              ; AH=DEh is the monitor-side VCPI server;
-    cmp byte [esp+29], 0xDE      ; anything else reflects to the guest EMS
-    jne .intn_reflect            ; driver as before. Guest AH = pushad EAX+1.
-    add word [ebp], 2            ; return IP = past INT 67h (fault frame
-    mov esi, esp                 ; points AT the instruction on this path)
-    call vcpi_dispatch           ; ESI = pushad base, EBP = &frame.eip
-    jmp .done_gp
-.intn_not67:
-    cmp bl, 0xC0                 ; TOKAEMM-private monitor call?
-    jne .intn_reflect
-    cmp word [esp+20], 0x544D    ; guest DX == 'TM' (XMS-move memcpy)?
-    je .intn_memcpy
-    cmp word [esp+20], 0x4D50    ; guest DX == 'PM' (EMS frame remap)?
-    je .intn_remap
-    cmp word [esp+20], 0x5154    ; guest DX == 'TQ' (arena free query)?
-    je .intn_query
-    cmp word [esp+20], 0x4154    ; guest DX == 'TA' (arena allocator)?
-    je .intn_arena
-    jmp .intn_reflect            ; foreign INT 0xC0: reflect like any other
-.intn_memcpy:
-    add word [ebp], 2            ; skip past INT 0xC0
-    call flat_memcpy
-    jmp .done_gp
-.intn_remap:
-    add word [ebp], 2
-    call frame_remap
-    jmp .done_gp
-.intn_query:
-    add word [ebp], 2
-    mov bl, [fs:arena_q_type]
-    call arena_query32
-    mov [fs:arena_q_largest], ax
-    mov [fs:arena_q_total], dx
-    jmp .done_gp
-.intn_arena:
-    add word [ebp], 2
-    call arena_svc
-    jmp .done_gp
-.intn_reflect:
-    add word [ebp], 2            ; return IP = past INT n
-    call reflect_vector
-    jmp .done_gp
-.iret_op:
-    mov ebx, [ebp+16]           ; guest SS
-    shl ebx, 4
-    movzx ecx, word [ebp+12]    ; guest SP
-    mov ax, [ebx+ecx]           ; pop IP
-    mov word [ebp], ax
-    add word [ebp+12], 2
-    movzx ecx, word [ebp+12]
-    mov ax, [ebx+ecx]           ; pop CS
-    mov word [ebp+4], ax
-    add word [ebp+12], 2
-    movzx ecx, word [ebp+12]
-    mov ax, [ebx+ecx]           ; pop FLAGS
-    add word [ebp+12], 2
-    test ax, 0x0200            ; popped IF -> VIF
-    setnz cl
-    mov [fs:vif], cl
-    and ax, 0xCFFF              ; keep the monitor's frame at IOPL 0, same reason
-                                 ; as .popf above
-    or ax, 0x0200             ; frame keeps real IF = 1
-    mov word [ebp+8], ax
-    call maybe_deliver         ; IRET may re-enable interrupts
-    jmp .done_gp
+; ---- The IOPL-3 tripwire. See the dispatch comment above: an IOPL-sensitive
+; opcode can only fault into this monitor if the V86 frame it came from does
+; not carry IOPL 3. Nothing the guest can do produces that -- load_flags
+; preserves IOPL on every CPL != 0 load, so a guest POPF/IRET cannot lower it.
+; It is therefore a defect in a monitor-built frame, and the machine stops. ----
+.sensitive_at_iopl0:
+    mov al, 0xD6
+    jmp signal32
+; The six single-byte IOPL-sensitive arms (.cli/.sti/.pushf/.popf/.intn/
+; .iret_op) lived here. They are gone with the IOPL-3 switch: the CPU executes
+; all six for real now. INT 67h and INT 0xC0 -- the two the monitor SERVES --
+; arrive through their own static-IDT gates instead (int67_entry, intc0_entry),
+; which perform the same AH=DEh and DX-cookie splits against a software-INT
+; frame that is already past the instruction.
 .hlt:
     inc word [ebp]             ; return IP = past the F4 byte (HLT is 1 byte)
     ; Real HLT is CPL-gated (a V86 task is always CPL 3), so the CPU now #GP(0)s
@@ -2086,48 +1975,54 @@ monitor_body:
     ; machine, then IRET back to the guest just past the F4 byte. The IDT is the
     ; same table in both V86 and ring 0 (idt/idtr above), so any interrupt that
     ; fires during this real HLT vectors straight into irq_m*/irq_s*/vec13_entry
-    ; exactly as it would have for the guest -- VIF=0 holds the line in vip (the
-    ; existing irq_body hold path) and VIF=1 reflects it into the guest's IVT
-    ; (irq_reflect_line), same as any other interrupt arriving mid-V86.
+    ; exactly as it would have for the guest -- irq_body's .hlt_wake arm parks
+    ; it in the bounded halt slot (it arrives on a ring-0 frame reflect_vector
+    ; must refuse) and the drain below reflects it into the guest's IVT.
     ;
-    ; Guest VIF=0 (interrupts virtually disabled): a real 386 hangs forever on
-    ; `HLT` with IF=0, woken only by NMI or reset -- NMI is not virtualized here,
-    ; so a literal mirror would wedge the whole VM on a guest bug (or on a
+    ; Guest IF=0 (interrupts disabled): a real 386 hangs forever on `HLT` with
+    ; IF=0, woken only by NMI or reset -- NMI is not virtualized here, so a
+    ; literal mirror would wedge the whole VM on a guest bug (or on a
     ; legitimate but IF=0 halt-until-NMI idiom this emulator doesn't model).
-    ; Decision (documented, not a silent divergence): run the real `hlt` with
-    ; real IF left clear, matching the guest's request bit-for-bit; the run
-    ; loop's own interrupt-pending wake (service_pending_interrupt) still can't
-    ; fire with IF=0, so this blocks until something forces IF, which nothing
-    ; here does for a VIF=0 halt. To avoid a permanent guest-visible wedge on
-    ; ordinary FreeDOS idle loops (which always halt with IF=1 -- DOS brackets
-    ; IRQ-sensitive code with CLI/STI, never idles under CLI), only the VIF=1
-    ; path executes a real hlt; a VIF=0 HLT resumes the guest immediately
-    ; (equivalent to an instantaneous NMI/no-op wake), since no real game or
-    ; DOS idle loop halts with interrupts masked and this monitor has nothing
-    ; that will ever clear that state for it otherwise.
-    cmp byte [fs:vif], 0
-    je .done_gp
+    ; Decision (documented, not a silent divergence): the run loop's own
+    ; interrupt-pending wake (service_pending_interrupt) cannot fire with IF=0,
+    ; so a faithful halt would block until something forces IF, which nothing
+    ; here does. To avoid a permanent guest-visible wedge on ordinary FreeDOS
+    ; idle loops (which always halt with IF=1 -- DOS brackets IRQ-sensitive
+    ; code with CLI/STI, never idles under CLI), only the IF=1 path executes a
+    ; real hlt; an IF=0 HLT resumes the guest immediately (equivalent to an
+    ; instantaneous NMI/no-op wake), since no real game or DOS idle loop halts
+    ; with interrupts masked and this monitor has nothing that will ever clear
+    ; that state for it otherwise. The test is now against the guest's REAL
+    ; flag in the frame rather than the deleted `vif` proxy; the divergence
+    ; itself is unchanged.
+    test dword [ebp+8], 0x200   ; frame EFLAGS.IF = the guest's own IF
+    jz .done_gp
     mov byte [fs:r0_hlt], 1     ; vec13_entry's TEST 2: IRQ5 landing in this
                                 ; window is the wake, not a #GP
     sti
     hlt                         ; wakes when service_pending_interrupt admits a
                                 ; real IRQ. This hlt runs at ring 0 (VM=0), so
-                                ; irq_body's real-frame check (below) cannot
-                                ; treat the waking IRQ's 3-dword IRETD frame as
-                                ; a V86 frame; it holds the line in vip,
-                                ; leaving it in service, same as the VIF=0
-                                ; path, then IRETDs straight back here. Drain
-                                ; it into the guest now that we're about to
-                                ; return to V86:
-                                ; maybe_deliver reflects the highest-priority
-                                ; held line through EBP's real V86 frame.
-    cli                         ; close the window BEFORE dropping the flag:
-                                ; IF stays open across the waking IRETD, so
-                                ; without this a second IRQ could land between
-                                ; the flag clear and .done_gp's IRETD as an
-                                ; unclassifiable ring-0 frame
+                                ; irq_body's frame-origin check cannot treat the
+                                ; waking IRQ's 3-dword IRETD frame as a V86
+                                ; frame; .hlt_wake stores it, leaves it in
+                                ; service, clears IF in the frame it returns
+                                ; through, and IRETDs straight back here.
+    cli                         ; belt-and-braces: .hlt_wake already cleared bit
+                                ; 9 in the waking frame, so IF is shut on
+                                ; arrival. Kept because the fall-through from a
+                                ; spurious wake (HLT can resume without a
+                                ; delivered vector) is not covered by that.
     mov byte [fs:r0_hlt], 0
-    call maybe_deliver
+    cmp byte [fs:hlt_pending], 0 ; drain the slot into the guest's real V86
+    je .done_gp                  ; frame, now that we are about to return
+    movzx ebx, byte [fs:hlt_vector]
+    mov byte [fs:hlt_pending], 0
+    call irq_reflect_line       ; EBX is what the gate handed us, which today is
+                                ; a LINE -- so it converts exactly like .go
+                                ; does. Task 4A makes both sides carry vectors
+                                ; and turns this into `call reflect_vector_v86`.
+                                ; EBP is the V86 frame; the origin is proven (we
+                                ; only reach here from a V86 HLT).
     jmp .done_gp
 
 ; ---- Two-byte privileged 0F ops (386MAX QMAX_I0D GP_ESCOD, adapted to the
@@ -2364,10 +2259,10 @@ monitor_body:
     iretd
 
 ; ---- Hardware IRQs (no error code). Per-line stubs load the 8259 line number
-; and share one body: reflect to the guest IVT when VIF is set, else hold the
-; line in the vip mask, leaving it in service, and deliver it on the next
-; STI/POPF/IRET. Master lines 0-7 (vectors 8-15, 5 via vec13_entry), slave
-; lines 8-15 (vectors 0x70-0x77). ----
+; and share one body, which reflects to the guest IVT unconditionally: the
+; guest runs at real IOPL 3, so a line the guest has not enabled is never
+; acknowledged in the first place and never reaches a gate. Master lines 0-7
+; (vectors 8-15, 5 via vec13_entry), slave lines 8-15 (vectors 0x70-0x77). ----
 %assign line 0
 %rep 8
 irq_m%[line]:
@@ -2396,42 +2291,34 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     jz .not_v86_irq               ; frame holds a 16-bit CS here (bit 17
                                   ; never set), so set can only be the V86
                                   ; IRQ frame
-    cmp byte [fs:vif], 0
-    jne .go
-.hold:
-    ; Hold the line in vip and RETURN WITH THE ISR BIT STILL SET. The EOI
-    ; belongs to whoever services the interrupt, and under this monitor that
-    ; is always the guest's own IVT handler -- the .go path below already
-    ; relies on exactly that. EOIing here instead handed the guest handler a
-    ; state the 8259A cannot produce: its own line no longer in service while
-    ; its handler runs. DJGPP's shared hardware-IRQ wrapper probes that
-    ; (OCW3 0x0B + IN 0x20) to tell a real IRQ from a spurious entry, read
-    ; the 0 this path left behind, took its not-my-line branch, indexed its
-    ; 16-entry per-IRQ old-vector table with 16, and RETF'd through the
-    ; garbage pair it found there -- E10, the MonikaTT #GP(0) at 0xAF:78A3.
+    ; A V86 IRQ frame can only EXIST when the guest had IF=1: at IOPL 3 the
+    ; guest's own CLI clears the real flag, and service_pending_interrupt gates
+    ; the INTA on it, so an interrupt taken under a guest CLI never happens --
+    ; the request stays latched in the 8259A's IRR and is taken after the STI.
+    ; So there is nothing to hold and `.go` is the only V86 outcome.
     ;
-    ; Cost of the honest behaviour: while the guest sits with VIF clear, the
-    ; held line stays highest-in-service, so the 8259A blocks equal- and
-    ; lower-priority lines until the guest's handler EOIs. Requests are not
-    ; lost (they sit in the IRR and are taken by priority once the EOI
-    ; lands), and that IS what a 386 with a real EMM sees: the PIC does not
-    ; move on until the interrupt is acknowledged. The one behaviour this
-    ; gives up is masking a guest whose IVT handler never EOIs at all; on
-    ; real hardware that guest wedges its PIC too.
-    mov ecx, ebx
-    mov ax, 1
-    shl ax, cl
-    or [fs:vip], ax
-    popad
-    iretd
+    ; What the deleted `.hold` was protecting, kept because it is expensive to
+    ; re-derive: the EOI belongs to whoever services the interrupt, which under
+    ; this monitor is always the guest's own IVT handler, and the handler must
+    ; find its OWN LINE STILL IN SERVICE. An earlier revision EOI'd on the
+    ; monitor's behalf and handed the guest a state the 8259A cannot produce;
+    ; DJGPP's shared hardware-IRQ wrapper probes exactly that (OCW3 0x0B +
+    ; IN 0x20) to tell a real IRQ from a spurious entry, read the 0 that path
+    ; left behind, took its not-my-line branch, indexed its 16-entry per-IRQ
+    ; old-vector table with 16, and RETF'd through the garbage pair it found --
+    ; E10, the MonikaTT #GP(0) at 0xAF:78A3. Holding WITH the ISR bit set fixed
+    ; that and is faithful for a VME or EMM386-class (IOPL-0) manager, which is
+    ; what this monitor used to be. It needed a complete set of drain points,
+    ; and the VCPI DE0C mode switch destroyed the drainer. Running at IOPL 3
+    ; deletes the question instead of completing the drain set.
 .go:
     call irq_reflect_line
     popad
     iretd
 ; Bit 17 clear: either the IRQ that woke the ring-0 sti;hlt window (a
 ; no-error frame, CS slot = our 0x08, only under the r0_hlt bracket --
-; reflect_vector must never run against that 3-dword frame, so hold the
-; line like the VIF=0 coalesce path and let .hlt drain it), or an
+; reflect_vector must never run against that 3-dword frame, so park it in
+; the bounded halt slot and let .hlt drain it), or an
 ; ERROR-CODE frame: vectors 8/10/11/12/14 on the master gates are also
 ; #DF/#TS/#NP/#SS/#PF, the same PIC-base-8 collision vector 13 has with
 ; IRQ5, and the same frame-shape fork decides it. The old code fell into
@@ -2442,7 +2329,7 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     cmp byte [fs:r0_hlt], 0
     je .ec_frame
     cmp dword [ebp+4], 8          ; no-error ring-0 frame: CS slot = monitor CS
-    je .hold                      ; -> the hlt wake
+    je .hlt_wake                  ; -> the hlt wake
 .ec_frame:
     test dword [ebp+12], FLAGS_VM ; error-code frame's EFLAGS.VM
     jz .ring0_exc
@@ -2460,6 +2347,37 @@ irq_body:                         ; vec13_entry joins here (segs already set)
 .ring0_exc:
     mov al, 0xD5                  ; a ring-0 CPU exception landed on an IRQ
     jmp signal32                  ; gate: the monitor faulted on itself
+; ---- The bounded halt-window slot. `.hlt` runs a real `sti; hlt` at ring 0,
+; so the waking IRQ lands on a 3-dword ring-0 frame that reflect_vector must
+; refuse. Park it here and let `.hlt` drain it into the guest's real V86 frame
+; on the way out. This is NOT the old `vip`: its lifetime is a monitor-internal
+; window the guest cannot extend, and it is drained unconditionally before the
+; next V86 entry.
+;
+; ONE SLOT IS PROVABLY SUFFICIENT, and 0xD7 is the contract assert on the proof
+; rather than the reason it is safe:
+;   1. service_pending_interrupt takes at most ONE vector per call and returns
+;      immediately after delivery;
+;   2. delivery is through an interrupt gate, so this arm runs with IF already
+;      0 -- no second interrupt can arrive while the slot is being written;
+;   3. the only boundary at which a second interrupt could be accepted is the
+;      one AFTER the wake's IRETD returns into the halt window, and the frame-IF
+;      clear below shuts exactly that boundary.
+; No interleaving can occupy the slot twice. If 0xD7 ever fires one of those
+; three premises is false and the machine must stop, not improvise.
+.hlt_wake:
+    cmp byte [fs:hlt_pending], 0
+    jne .hlt_slot_busy
+    mov [fs:hlt_vector], bl       ; EBX as it arrived (see hlt_vector)
+    mov byte [fs:hlt_pending], 1
+    and dword [ebp+8], ~0x200     ; clear bit 9 in the frame we IRETD through,
+                                  ; so IF is already shut when control lands
+                                  ; back in the halt window (premise 3)
+    popad
+    iretd
+.hlt_slot_busy:
+    mov al, 0xD7
+    jmp signal32
 
 ; ---- CPU exceptions raised by V86 guest code (#DE 0, #UD 6, #NM 7 — the
 ; no-error-code faults a real-mode program can produce). Reflect to the guest
@@ -2935,14 +2853,14 @@ vcpi_dispatch:
 ; spec relies on exactly this), so the monitor stack and flat reads keep
 ; working until the far jump hands the client its own world.
 .de0c:
-    ; The monitor is about to stop being reachable: from the far jump below the
-    ; client owns the IDT and the PIC, and its V86 excursions come back through
-    ; vcpi_pm_to_v86 with VIF forced 0, so `maybe_deliver` will never drain
-    ; `vip` again. Disclaim any line held there before handing over -- see
-    ; vip_release_to_chip for the invariant and why metal never reaches here.
-    ; Safe this early: the spec contract lets DE0C destroy EAX, and ECX/EDX are
-    ; reloaded for the client from the pushad block after the switch.
-    call vip_release_to_chip
+    ; No boundary release is needed here any more. The interim fix disclaimed
+    ; lines held in `vip` with specific EOIs before handing the machine to the
+    ; client, because a line held across this switch was held forever (the
+    ; drainer only ran from a V86 sensitive-op trap, and the client never
+    ; returns to that world) and a stuck IS0 inhibits the whole chip. At IOPL 3
+    ; the monitor never acknowledges a line it cannot deliver, so there is
+    ; nothing held at this boundary and nothing to give back -- which is also
+    ; why metal never needed this site.
     mov eax, [esi+4]              ; guest ESI = switch-structure linear
     mov ecx, [eax]
     mov cr3, ecx                  ; client paging context
@@ -3678,9 +3596,10 @@ vcpi_pm_entry:
 ; identical in both contexts). Spec register contract: only EAX destroyed;
 ; every segment register is reloaded by the IRETD itself. The monitor's
 ; TSS-busy bit is cleared through the freshly-reloaded flat DS before LTR,
-; and vif is forced 0 so the resumed V86 side stays virtually masked until
-; it STIs (the spec's IF-cleared intent through the vif layer; the frame's
-; real IF stays 1, the monitor convention). ----
+; and the EFLAGS slot is stamped with IF=0 so the resumed V86 side really is
+; masked until it STIs. That is the spec's interrupts-off intent expressed in
+; the REAL flag: the guest runs at IOPL 3, so its own STI clears the mask for
+; it and no monitor-side proxy bit is involved. ----
 vcpi_pm_to_v86:
     cli                           ; enforce the spec's interrupts-off rule
     mov eax, [cs:pd_lin]
@@ -3695,92 +3614,29 @@ vcpi_pm_to_v86:
     ltr ax
     xor ax, ax
     lldt ax                       ; the monitor uses no LDT
-    mov eax, [cs:base_lin]
-    mov byte [eax + vif], 0       ; V86 resumes virtually masked
-    mov dword [esp+0x10], 0x00020202 ; EFLAGS slot: VM=1, real IF=1,
-                                  ; IOPL=0, reserved bit 1
+    mov dword [esp+0x10], 0x00023002 ; EFLAGS slot: VM=1, IOPL=3, real IF=0
+                                  ; (masked per the spec), reserved bit 1
     add esp, 8                    ; drop the far-call return address
     iretd                         ; EIP,CS,EFLAGS,ESP,SS,ES,DS,FS,GS -> V86
 
-; The monitor issues no EOI of its own IN THE COURSE OF SERVICING A LINE:
-; every hardware line it takes is reflected to a guest IVT handler,
-; immediately (.go) or once VIF is set (.hold -> maybe_deliver), and that
-; handler owns the EOI exactly as it does on bare hardware. `irq_eoi` used to
-; serve the .hold path and is gone with it; see the note there. The one EOI
-; the monitor does issue is `vip_release_to_chip` below, and it is not a
-; service EOI -- it is the monitor DISCLAIMING lines it can no longer deliver.
-
-; Release every line held in `vip` back to the 8259A and empty `vip`.
-;   in: FS = driver data.  clobbers eax, ecx, edx.
+; THE MONITOR ISSUES NO EOI OF ITS OWN, ANYWHERE. Every hardware line it
+; takes is reflected to a guest IVT handler, and that handler owns the EOI
+; exactly as it does on bare hardware. Two earlier revisions broke this and
+; both are recorded so neither comes back:
 ;
-; THE OWNERSHIP INVARIANT: the monitor must not hold an in-service line across
-; a boundary it cannot be re-entered through. `.hold` acknowledges a line (the
-; INTA has happened, the ISR bit is set) and parks it in `vip` for delivery by
-; `maybe_deliver` -- but `maybe_deliver` runs only from a V86 sensitive-op trap
-; with VIF set. A VCPI client that switches to protected mode leaves that world
-; entirely: it owns the IDT and the PIC from then on, and its V86 excursions
-; come back through `vcpi_pm_to_v86`, which forces VIF=0. So a line held across
-; a DE0C switch is held FOREVER, and per the 8259A's fully nested rule
-; ("While the IS bit is set all further interrupts of the same or lower
-; priority are inhibited", 8259A datasheet, Fully Nested Mode) a stuck IS0
-; inhibits the whole chip: the client's own timer handler never fires again and
-; the guest wedges with its clock stopped. That is E10's regression -- Tomb
-; Raider froze on the FMV's first frame, Grand Prix 2 mid-race at LAP 0.
+;   * EOI-then-hold: the guest's handler ran with its own line NOT in
+;     service, a state the 8259A cannot produce. DJGPP's shared IRQ wrapper
+;     probes it (OCW3 0x0B + IN 0x20) -- E10, MonikaTT #GP(0) at 0xAF:78A3.
+;   * `vip_release_to_chip`: specific EOIs at the VCPI DE0C boundary to
+;     disclaim lines the monitor could no longer deliver (Tomb Raider froze
+;     on the FMV's first frame, Grand Prix 2 at LAP 0, both from a stuck IS0
+;     inhibiting the chip under the fully-nested rule). Correct as far as it
+;     went, but it cleared an in-service bit with no handler having run, at
+;     a boundary metal never reaches.
 ;
-; ON METAL THIS SITE IS UNREACHABLE. A period V86 manager runs its client at
-; IOPL=3 -- 386MAX states it outright (QMAX_DTE.INC: "@VMIOPL equ 3 ; Use this
-; IOPL for VM clients to avoid GP Faults on CLI/STI/HLT/INT/IRET/PUSHF/POPF")
-; -- so a guest CLI clears the REAL IF and no INTA happens at all while the
-; guest has interrupts off. The request stays latched in the IRR and is taken
-; later, by the V86 guest after its STI or by the PM client after the switch.
-; This monitor instead keeps the real IF open and virtualizes IF as VIF, so it
-; acknowledges lines at moments metal would not have, and must hand back what
-; it cannot deliver. Dropping the delivery is the pre-E10 behaviour and costs
-; nothing a periodic source does not re-raise: the released line's request
-; re-latches in the IRR and the client's handler takes it right after the
-; switch, which is the metal outcome.
-;
-; SPECIFIC EOIs, not non-specific: with more than one line held, or with a
-; rotation the guest set through OCW2, a non-specific EOI clears the highest
-; in-service level rather than the one being disclaimed. Slave lines first,
-; then ONE cascade EOI to the master (its IS2 is a single bit however many
-; slave INTAs stacked behind it), then the master's own lines.
-vip_release_to_chip:
-    movzx edx, word [fs:vip]
-    test dx, dx
-    jz .done
-    mov ecx, 8                    ; slave lines 8..15 -> specific EOI to 0xA0
-.slave:
-    bt edx, ecx
-    jnc .slave_next
-    lea eax, [ecx-8]
-    or al, 0x60                   ; OCW2: specific EOI, level = line-8
-    out 0xA0, al
-.slave_next:
-    inc ecx
-    cmp ecx, 16
-    jb .slave
-    test dx, 0xFF00               ; any slave line at all -> one cascade EOI
-    jz .master_lines
-    mov al, 0x62                  ; OCW2: specific EOI, level 2 (the cascade)
-    out 0x20, al
-.master_lines:
-    xor ecx, ecx                  ; master lines 0..7; 2 is the cascade pin and
-.master:                          ; can never be held as a line of its own
-    cmp ecx, 2
-    je .master_next
-    bt edx, ecx
-    jnc .master_next
-    mov eax, ecx
-    or al, 0x60                   ; OCW2: specific EOI, level = line
-    out 0x20, al
-.master_next:
-    inc ecx
-    cmp ecx, 8
-    jb .master
-    mov word [fs:vip], 0          ; last: nothing above may see a stale hold
-.done:
-    ret
+; Both existed only to clean up after an early INTA. Running the guest at
+; real IOPL 3 means the acknowledge never happens while the guest has
+; interrupts off, so there is nothing to clean up and no EOI to fabricate.
 
 ; A default-gate vector can be a software INT or a hardware IRQ after a VCPI
 ; client remaps the PIC away from the DOS defaults. If EBX is inside the current
@@ -3869,16 +3725,16 @@ reflect_vector:
     jz reflect_ring0_frame
 reflect_vector_v86:               ; entry for callers that already proved the
                                   ; frame's origin (monitor_body via TEST 3,
-                                  ; irq_body/maybe_deliver via their VM tests)
+                                  ; irq_body via its VM test, .hlt via the V86
+                                  ; HLT that opened the window)
     mov edx, [ebp+16]            ; guest SS
     shl edx, 4                   ; edx = guest stack base (linear)
-    mov ax, [ebp+8]             ; guest flags, IF := VIF, virtual IOPL = 3
-    and ax, 0xFDFF              ; (the image convention; see .pushfd)
-    or ax, 0x3000
-    cmp byte [fs:vif], 0
-    je .rf
-    or ax, 0x0200
-.rf:
+    mov ax, [ebp+8]             ; guest flags, pushed VERBATIM: real IF is the
+                                ; guest's IF and IOPL really is 3, so there is
+                                ; nothing left to forge. The old image
+                                ; substituted VIF for IF and OR'd in a virtual
+                                ; IOPL 3 over a real IOPL 0; both are now true
+                                ; of the frame itself.
     sub word [ebp+12], 2         ; push FLAGS
     movzx ecx, word [ebp+12]
     mov [edx+ecx], ax
@@ -3896,60 +3752,23 @@ reflect_vector_v86:               ; entry for callers that already proved the
     mov word [ebp], ax          ; guest IP = IVT[vec] offset
     movzx eax, word [edi+2]
     mov word [ebp+4], ax        ; guest CS = IVT[vec] segment
-    mov byte [fs:vif], 0        ; entering the ISR clears VIF
+    and word [ebp+8], 0xFDFF    ; clear IF in the FRAME: real-mode INT
+                                ; semantics. The gate already cleared the live
+                                ; flag; this is the image the guest's ISR
+                                ; returns through, and its IRET restores IF for
+                                ; real because the guest runs at IOPL 3. The
+                                ; flags pushed onto the guest stack above still
+                                ; carry the pre-interrupt IF, which is what the
+                                ; ISR's IRET must put back.
     ret
 reflect_ring0_frame:
     mov al, 0xD4                ; reflection asked against a ring-0 frame:
     jmp signal32                ; a storm's first bounced iteration -- report
 
-; If VIF is set and lines are pending, deliver the highest-priority one per
-; call (the reflect clears VIF; the guest ISR's IRET re-runs us, draining the
-; queue). Priority = 8259 fully-nested with the slave cascaded at IR2:
-; 0, 1, 8..15, then 2..7 (a raw line 2 cannot occur — cascade INTA resolves to
-; the slave vectors — but the walk covers it so a held bit can never stick).
-;   in: EBP = &frame.eip, FS = driver data.  clobbers eax,ebx,ecx,edx,edi
-maybe_deliver:
-    cmp byte [fs:vif], 0
-    je .none
-    movzx edx, word [fs:vip]
-    test dx, dx
-    jz .none
-    xor ebx, ebx                  ; line 0
-    test dl, 1
-    jnz .hit
-    mov ebx, 1                    ; line 1
-    test dl, 2
-    jnz .hit
-    mov ebx, 8                    ; slave lines 8..15 (the cascade slot)
-.slave:
-    mov ecx, ebx
-    mov ax, 1
-    shl ax, cl
-    test dx, ax
-    jnz .hit
-    inc ebx
-    cmp ebx, 16
-    jb .slave
-    mov ebx, 2                    ; remaining master lines 2..7
-.low:
-    mov ecx, ebx
-    mov ax, 1
-    shl ax, cl
-    test dx, ax
-    jnz .hit
-    inc ebx
-    cmp ebx, 8
-    jb .low
-    ret                           ; unreachable: dx was nonzero
-.hit:
-    mov ecx, ebx
-    mov ax, 1
-    shl ax, cl
-    not ax
-    and [fs:vip], ax              ; claim the line
-    jmp irq_reflect_line          ; tail: ret returns to maybe_deliver's caller
-.none:
-    ret
+; `maybe_deliver` -- the vip drain, run from every sensitive-op trap that
+; could raise VIF -- lived here. With no early INTA there is no queue to
+; drain: an interrupt the guest has not enabled simply stays latched in the
+; 8259A's IRR and the chip delivers it in priority order once the guest STIs.
 
 ; Ring-0 flat memcpy for the XMS block MOVE (INT 0xC0 monitor service). The guest
 ; driver staged src/dst linear + byte count in its resident [xms_mv_*] dwords
@@ -4037,7 +3856,11 @@ banner: db 'TOKAEMM XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0
 ; itself on a game run instead of wedging or storming. Codes in use:
 ; the trapped-I/O opcode byte (monitor_body .unhandled_io), 0xD3 (ring-0
 ; #GP, vec13_entry TEST 3), 0xD4 (reflect_vector on a ring-0 frame), 0xD5
-; (a ring-0 CPU exception on an IRQ gate, irq_body .ring0_exc).
+; (a ring-0 CPU exception on an IRQ gate, irq_body .ring0_exc), 0xD6 (an
+; IOPL-sensitive instruction faulted, so the V86 frame's IOPL is not 3 --
+; a monitor bug, not a guest one; monitor_body .sensitive_at_iopl0), 0xD7
+; (the one-slot halt window was already occupied, irq_body .hlt_slot_busy --
+; a contract assert on the single-slot proof, and unreachable if it holds).
 signal32:
     mov ah, al
     mov al, 12

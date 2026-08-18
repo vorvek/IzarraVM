@@ -1497,13 +1497,17 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("598K"),
+        Some("599K"),
         "all three RAM-scaled tables -- the arena bitmap, the VCPI ownership \
          bitmap and the EMS chain table -- moved out of the resident core into \
          the system window at SYS_LIN_BASE, which took conventional free from \
          582 KiB to 598 KiB (past the 593 KiB the machine had before it grew to \
          64 MB). In the core they cost ~18 KiB AND grew at ~288 bytes per \
-         megabyte of arena; in extended memory they cost neither.\n{text}"
+         megabyte of arena; in extended memory they cost neither. The last \
+         KiB, 598 -> 599, came from the IOPL-3 rewrite: deleting the \
+         sensitive-op emulation, the vif/vip hold machinery, maybe_deliver \
+         and the VCPI boundary EOI release shrank the driver by 800 \
+         bytes.\n{text}"
     );
     assert_extended_category(&screen, "23,552K", "23,141K");
 
@@ -1692,12 +1696,16 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(24K)"),
-        "TokaEMM should retain only its ~24 KiB low core: code, state, the \
-         8,304-byte TSS and the monitor stack (EMS function 50h pushed the \
-         rounded figure from 23K to 24K). Nothing left in the core scales \
-         with installed RAM -- all three tables that did are in the system \
-         window -- so this figure is now the same on a 64 MB machine and a \
+        tokaemm.contains("(23K)"),
+        "TokaEMM should retain only its ~23 KiB low core: code, state, the \
+         8,304-byte TSS and the monitor stack. EMS function 50h once pushed \
+         the rounded figure from 23K to 24K; the IOPL-3 rewrite took it back \
+         down, because deleting the sensitive-op emulation arms, the vif/vip \
+         hold machinery, maybe_deliver and the VCPI boundary EOI release \
+         shrank the driver by 800 bytes (24,288 -> 23,488). Nothing left in \
+         the core scales with installed RAM -- all three tables that did are \
+         in the system window -- so this figure is now the same on a 64 MB \
+         machine and a \
          256 MB one.\n{}",
         screen.text
     );
@@ -1708,8 +1716,9 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(598K)"),
-        "MEM /CLASSIFY should report about 598 KiB conventional free.\n{}",
+        Some("(599K)"),
+        "MEM /CLASSIFY should report about 599 KiB conventional free (598 KiB \
+         before the IOPL-3 rewrite shrank the resident core by 800 bytes).\n{}",
         screen.text
     );
 }
