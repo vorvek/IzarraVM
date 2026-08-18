@@ -1697,10 +1697,23 @@ impl KateaTreeVolume {
         }
     }
 
+    /// Commit every open host handle to the media.
+    ///
+    /// `sync_all`, not `flush`: `File::flush` is a documented no-op, because a
+    /// `File` has no userspace buffer to push. The guest reaches this through
+    /// ATA FLUSH CACHE (0xE7), which on real hardware promises the write cache
+    /// has reached the platter -- reporting success after a no-op would be a
+    /// durability claim this disk never made good on.
+    ///
+    /// The cost is scoped to the explicit-flush path by its callers: only
+    /// `flush_guest_writes` calls this, and only 0xE7 and the final
+    /// reconcile at flush/eject call that. The per-command commit path
+    /// (`commit_guest_write_batch`) never syncs, so a sequential install still
+    /// pays one write per span and nothing else.
     fn flush_write_handles(&mut self) -> std::io::Result<()> {
         let mut operations = 0u64;
         for file in self.host_write_handles.values_mut() {
-            file.flush()?;
+            file.sync_all()?;
             operations = operations.saturating_add(1);
         }
         if operations > 0 {
@@ -2248,6 +2261,13 @@ impl KateaTreeVolume {
             if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
                 continue; // a chain link outside the data region: hold this dir
             }
+            // Grows here and is pruned only when a directory is deleted, so a
+            // directory whose chain SHRINKS leaves its freed clusters behind. A
+            // file that later reuses one has those sectors read as metadata:
+            // held in the store rather than projected, and the file marked
+            // ambiguous. Conservative -- nothing is lost, the final reconcile
+            // still writes it -- but it is a permanent per-session leak.
+            // Deferred to the measured projection-cost follow-up.
             self.directory_clusters
                 .extend(dir_chain.iter().map(|cluster| (*cluster, dir_cluster)));
             let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
