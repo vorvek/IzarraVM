@@ -805,7 +805,27 @@ pub(crate) struct KateaTreeVolume {
     host_write_handles: HashMap<PathBuf, File>,
     directory_clusters: HashMap<u32, u32>,
     batch_lbas: HashSet<u32>,
-    unmapped_lbas: HashSet<u32>,
+    /// Guest data sectors no projection could map, indexed by the data cluster
+    /// that holds them. Flat, this was one set of every such sector ever
+    /// written, rebuilt and re-examined on every commit: a sequential install
+    /// whose payload outruns its FAT paid a sweep proportional to everything
+    /// written so far, so the session cost grew with the square of its size.
+    /// A sector only stops being unmapped when its own cluster becomes
+    /// projectable, so a commit needs the clusters it touched and the clusters
+    /// a projection just claimed -- never the whole set.
+    unmapped_by_cluster: HashMap<u32, HashSet<u32>>,
+    /// `unmapped_by_cluster`'s total, maintained rather than recounted. Every
+    /// entry is pending by construction: the only path that clears a sector's
+    /// pending bit (`stream_file_overlay`) drops it from the index in the same
+    /// breath.
+    unmapped_sectors: u64,
+    /// Clusters whose held sectors have earned another look, recorded by the
+    /// three events that can change a held sector's verdict without the next
+    /// commit writing anywhere near it: `install_projection` gives a cluster an
+    /// owner, the live scan drops a key's block, and a failed host write leaves
+    /// sectors held whose cluster was projectable all along. The next commit
+    /// revisits exactly these and nothing else.
+    newly_projectable_clusters: HashSet<u32>,
     batch_sector_writes: u64,
     directory_dirty: bool,
     metadata_reconcile_pending: bool,
@@ -813,6 +833,11 @@ pub(crate) struct KateaTreeVolume {
     host_io_failed: bool,
     /// Folded 8.3 names of the InMemory boot files; never materialized to the host.
     system_names: HashSet<[u8; 11]>,
+    /// How many candidate sectors `stream_projected_batch` has examined. The
+    /// unmapped index exists to keep this proportional to the commit rather
+    /// than to the session, and a test reads it to prove that.
+    #[cfg(test)]
+    candidate_lbas_examined: u64,
     /// Files whose bytes `reconcile` has re-read from the disk. Counts the work the
     /// `last_gather` skip exists to avoid, so a test can prove the skip fires.
     gathers: u64,
@@ -1255,7 +1280,9 @@ impl KateaTreeVolume {
             host_write_handles: HashMap::new(),
             directory_clusters,
             batch_lbas: HashSet::new(),
-            unmapped_lbas: HashSet::new(),
+            unmapped_by_cluster: HashMap::new(),
+            unmapped_sectors: 0,
+            newly_projectable_clusters: HashSet::new(),
             batch_sector_writes: 0,
             directory_dirty: false,
             metadata_reconcile_pending: false,
@@ -1264,6 +1291,8 @@ impl KateaTreeVolume {
             system_names,
             gathers: 0,
             retry_gathers: HashMap::new(),
+            #[cfg(test)]
+            candidate_lbas_examined: 0,
             #[cfg(test)]
             gathered_bytes: 0,
             #[cfg(test)]
@@ -1302,15 +1331,21 @@ impl KateaTreeVolume {
         let store = self.store.counters();
         counters.overlay_resident_sectors = store.resident_sectors;
         counters.overlay_pending_sectors = store.pending_sectors;
-        counters.pending_unmapped_sectors = self
-            .unmapped_lbas
-            .iter()
-            .filter(|lba| self.store.is_pending(**lba))
-            .count() as u64;
+        counters.pending_unmapped_sectors = self.unmapped_sectors;
         counters.spill_operations = store.spill_operations;
         counters.spill_bytes = store.spill_bytes;
         counters.spill_wall_ns = store.spill_wall_ns;
         counters
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_lbas_examined(&self) -> u64 {
+        self.candidate_lbas_examined
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_candidate_census(&mut self) {
+        self.candidate_lbas_examined = 0;
     }
 
     /// How many file bodies `reconcile` has re-read. Test-only: the live path only
@@ -1439,6 +1474,11 @@ impl KateaTreeVolume {
         }
         for (index, &cluster) in chain.iter().enumerate() {
             self.projected_clusters.insert(cluster, (key, index as u32));
+            // This cluster's held sectors have an owner now, so the next commit
+            // owes them a second look even if it writes nowhere near them.
+            if self.unmapped_by_cluster.contains_key(&cluster) {
+                self.newly_projectable_clusters.insert(cluster);
+            }
         }
         self.projected_files.insert(
             key,
@@ -1591,6 +1631,7 @@ impl KateaTreeVolume {
 
         for lba in acknowledged {
             self.store.acknowledge(lba);
+            self.forget_unmapped(lba);
         }
         self.install_projection(
             pending.key,
@@ -1623,12 +1664,36 @@ impl KateaTreeVolume {
 
         let spc = u32::from(self.geo.spc);
         let mut files = ProjectedBatch::new();
-        let candidates: HashSet<u32> = self
-            .batch_lbas
-            .union(&self.unmapped_lbas)
-            .copied()
-            .collect();
-        for lba in candidates {
+        // The candidate set is this command's own writes plus the held sectors
+        // that could have changed status since the last commit -- the ones in a
+        // cluster this command touched, and the ones in a cluster a projection
+        // has claimed. Every other held sector is in a cluster nothing has
+        // touched and no projection owns, so it would reach the same verdict it
+        // reached last time. Sweeping them anyway is what made the held set's
+        // cost quadratic in a session that keeps writing unprojectable payload.
+        // Borrowed out and put back rather than cloned: with nothing held, this
+        // path is the whole of a sequential install's per-command work, and a
+        // set copy per command is a real share of it.
+        let batch = std::mem::take(&mut self.batch_lbas);
+        let mut held_candidates: Vec<u32> = Vec::new();
+        if self.unmapped_by_cluster.is_empty() {
+            self.newly_projectable_clusters.clear();
+        } else {
+            let mut clusters: HashSet<u32> = self.newly_projectable_clusters.drain().collect();
+            clusters.extend(batch.iter().filter_map(|lba| self.data_cluster_of(*lba)));
+            for cluster in &clusters {
+                if let Some(held) = self.unmapped_by_cluster.get(cluster) {
+                    held_candidates.extend(held.iter().copied().filter(|lba| !batch.contains(lba)));
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.candidate_lbas_examined = self
+                .candidate_lbas_examined
+                .saturating_add((batch.len() + held_candidates.len()) as u64);
+        }
+        for lba in batch.iter().copied().chain(held_candidates.iter().copied()) {
             if !self.store.is_pending(lba) || self.is_metadata_sector(lba) {
                 continue;
             }
@@ -1636,11 +1701,11 @@ impl KateaTreeVolume {
             let cluster = ROOT_CLUSTER + rel / spc;
             let sector_in_cluster = rel % spc;
             let Some((key, cluster_index)) = self.projected_clusters.get(&cluster).copied() else {
-                self.unmapped_lbas.insert(lba);
+                self.note_unmapped(lba);
                 continue;
             };
             if self.blocked_projection_keys.contains(&key) {
-                self.unmapped_lbas.insert(lba);
+                self.note_unmapped(lba);
                 continue;
             }
             let offset = (u64::from(cluster_index) * u64::from(spc) + u64::from(sector_in_cluster))
@@ -1656,6 +1721,7 @@ impl KateaTreeVolume {
             entry.1.push((lba, offset));
         }
 
+        self.batch_lbas = batch;
         let mut projected = false;
         for (key, (end, sectors)) in files {
             let Some(file) = self.projected_files.get(&key).cloned() else {
@@ -1685,7 +1751,6 @@ impl KateaTreeVolume {
             })?;
             projected = true;
         }
-        self.unmapped_lbas.retain(|lba| self.store.is_pending(*lba));
         Ok(projected)
     }
 
@@ -1937,6 +2002,19 @@ impl KateaTreeVolume {
             counters.metadata_projection_passes =
                 counters.metadata_projection_passes.saturating_add(1);
             self.counters.set(counters);
+            // Two whole-tree passes: `reconcile_mode` gathers every live entry
+            // and `metadata_projection_pending` gathers them again to decide
+            // whether the next command owes another pass. An incremental
+            // dirty-set was the obvious answer and was measured instead of
+            // taken. On the 17 MiB install row both passes cost 0.000 ms of a
+            // 34.5 ms projection phase -- that install dirties a directory
+            // three times. On an install shaped to dirty one on every command
+            // (64 files, one commit each), the two gathers were 2.4% of the
+            // row's 25.4 ms while the host writes they lead to were 94%. The
+            // walks are cheap because they read synthesized metadata out of
+            // memory; the projection is expensive because it writes files.
+            // Restructuring this would put the projection model's invariants at
+            // risk to buy back a fiftieth of a row, so it was not done.
             self.reconcile_mode(ReconcileMode::AfterWrite);
             self.metadata_reconcile_pending =
                 self.host_io_failed || self.metadata_projection_pending();
@@ -1945,12 +2023,27 @@ impl KateaTreeVolume {
             match self.stream_projected_batch() {
                 Ok(_) => {}
                 Err(e) => {
-                    self.unmapped_lbas.extend(
-                        self.batch_lbas
-                            .iter()
-                            .copied()
-                            .filter(|lba| self.store.is_pending(*lba)),
-                    );
+                    // Metadata sectors are excluded: `stream_projected_batch`
+                    // has always skipped them, and the index is keyed by data
+                    // cluster, which a FAT or directory sector does not have.
+                    let stranded: Vec<u32> = self
+                        .batch_lbas
+                        .iter()
+                        .copied()
+                        .filter(|lba| self.store.is_pending(*lba) && !self.is_metadata_sector(*lba))
+                        .collect();
+                    for lba in stranded {
+                        self.note_unmapped(lba);
+                    }
+                    // A held sector's cluster can be projectable already -- what
+                    // failed is the host write, which is not a projection event.
+                    // `stream_projected_batch` drained the revisit tickets at its
+                    // top and then aborted, so re-arm every cluster still holding
+                    // a sector. The keys are precise, not over-broad: anything
+                    // that projected before the abort was already dropped by
+                    // `forget_unmapped`.
+                    let held: Vec<u32> = self.unmapped_by_cluster.keys().copied().collect();
+                    self.newly_projectable_clusters.extend(held);
                     self.note_host_write_failure();
                     eprintln!("katea: projecting a guest write batch failed: {e}");
                 }
@@ -2135,8 +2228,26 @@ impl KateaTreeVolume {
         // entries that disappeared; doing this before the read-error check above
         // could let an incomplete scan discard the only immediate retry state.
         self.retry_gathers.retain(|key, _| live_keys.contains(key));
-        self.blocked_projection_keys
-            .retain(|key| live_keys.contains(key));
+        let unblocked: Vec<(u32, [u8; 11])> = self
+            .blocked_projection_keys
+            .iter()
+            .filter(|key| !live_keys.contains(*key))
+            .copied()
+            .collect();
+        for key in unblocked {
+            self.blocked_projection_keys.remove(&key);
+            // Dropping the block is the other way a held sector can become
+            // projectable, so the clusters it frees owe the next commit a look.
+            if let Some(file) = self.projected_files.get(&key) {
+                let claimed: Vec<u32> = file
+                    .chain
+                    .iter()
+                    .copied()
+                    .filter(|cluster| self.unmapped_by_cluster.contains_key(cluster))
+                    .collect();
+                self.newly_projectable_clusters.extend(claimed);
+            }
+        }
         // first_cluster -> the live entries claiming it (for rename matching in phase 2).
         let mut live_by_cluster: HashMap<u32, Vec<(u32, [u8; 11], bool)>> = HashMap::new();
         for l in &live {
@@ -2319,7 +2430,15 @@ impl KateaTreeVolume {
             // held in the store rather than projected, and the file marked
             // ambiguous. Conservative -- nothing is lost, the final reconcile
             // still writes it -- but it is a permanent per-session leak.
-            // Deferred to the measured projection-cost follow-up.
+            //
+            // The projection-cost follow-up measured it and left it. The leak
+            // is bounded by the clusters a directory has ever held, which is
+            // tiny next to a mount's data clusters, and a stranded cluster does
+            // not feed the held-sector index: `write_sector` files a sector
+            // read as metadata under neither the batch's projectable path nor
+            // the held set. So it costs a map entry and an occasional
+            // re-materialize, not a scaling term. The honest fix needs the
+            // dirty-set the paragraph above declined to build.
             self.directory_clusters
                 .extend(dir_chain.iter().map(|cluster| (*cluster, dir_cluster)));
             let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
@@ -2635,11 +2754,58 @@ impl KateaTreeVolume {
         self.batch_lbas.insert(lba);
         self.batch_sector_writes = self.batch_sector_writes.saturating_add(1);
         if !metadata && !self.batch_lba_is_projected(lba) {
-            self.unmapped_lbas.insert(lba);
+            self.note_unmapped(lba);
         }
         let mut counters = self.counters.get();
         counters.sector_writes = counters.sector_writes.saturating_add(1);
         self.counters.set(counters);
+    }
+
+    /// The data cluster holding `lba`, or `None` for a sector below the data
+    /// region (the MBR, the VBR, the FATs). The unmapped index is keyed by this,
+    /// so a sector without one never enters it.
+    fn data_cluster_of(&self, lba: u32) -> Option<u32> {
+        let first_data = self.geo.part_start + self.geo.first_data_sector;
+        if lba < first_data {
+            return None;
+        }
+        Some(ROOT_CLUSTER + (lba - first_data) / u32::from(self.geo.spc))
+    }
+
+    /// Hold `lba` in the unmapped index. Idempotent: a sector re-examined by a
+    /// later commit and still unprojectable is already there.
+    fn note_unmapped(&mut self, lba: u32) {
+        let Some(cluster) = self.data_cluster_of(lba) else {
+            return;
+        };
+        if self
+            .unmapped_by_cluster
+            .entry(cluster)
+            .or_default()
+            .insert(lba)
+        {
+            self.unmapped_sectors = self.unmapped_sectors.saturating_add(1);
+        }
+    }
+
+    /// Drop `lba` from the unmapped index, because its payload has reached the
+    /// host and the store no longer holds it. Called from the one site that
+    /// acknowledges a sector, so the index never outlives what it describes.
+    fn forget_unmapped(&mut self, lba: u32) {
+        let Some(cluster) = self.data_cluster_of(lba) else {
+            return;
+        };
+        let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.unmapped_by_cluster.entry(cluster)
+        else {
+            return;
+        };
+        if entry.get_mut().remove(&lba) {
+            self.unmapped_sectors = self.unmapped_sectors.saturating_sub(1);
+        }
+        if entry.get().is_empty() {
+            entry.remove();
+        }
     }
 
     fn batch_lba_is_projected(&self, lba: u32) -> bool {
