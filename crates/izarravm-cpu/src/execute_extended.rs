@@ -905,9 +905,10 @@ impl CpuGsw {
                 }
             }
             0xcf => {
-                // IRET is IOPL-sensitive in V86 (386 PRM): #GP(0) below IOPL 3, so the
-                // V86 monitor's .iret_op performs the virtualized pop (VIF from the
-                // image, real IF stays 1). Mirrors CLI/STI/PUSHF/POPF.
+                // IRET is IOPL-sensitive in V86 (386 PRM): #GP(0) below IOPL 3.
+                // TOKAEMM runs its guests at real IOPL 3, so this waves them through
+                // and the pop reaches real EFLAGS; the gate still serves any IOPL-0
+                // V86 configuration. Mirrors CLI/STI/PUSHF/POPF.
                 self.check_v86_iopl()?;
                 self.iret(bus, operand_size)?;
                 Ok(clocks(22))

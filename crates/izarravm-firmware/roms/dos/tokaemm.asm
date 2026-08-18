@@ -7,17 +7,19 @@
 ; ring-0 monitor environment in its OWN resident memory, then instead of a
 ; signal stub it IRETDs the *running kernel* into V86 at the SYSINIT return
 ; point (the EXECRH post-INIT code), so real FreeDOS keeps booting virtualized
-; under the monitor. The monitor emulates the V86 sensitive instructions
-; (CLI/STI/PUSHF/POPF/INT/IRET via a virtual IF) and reflects the timer (IRQ0
-; -> INT 08h) and keyboard (IRQ1 -> INT 09h) hardware interrupts to the guest's
-; real-mode IVT, holding them pending while VIF is clear (real DOS brackets
-; IRQ-sensitive code with CLI/STI).
+; under the monitor. The guest runs at real IOPL 3, so the V86 sensitive
+; instructions (CLI/STI/PUSHF/POPF/INT/IRET) execute for real and the guest's
+; IF IS the real IF -- nothing is emulated or virtualized. The monitor reflects
+; the timer (IRQ0 -> INT 08h) and keyboard (IRQ1 -> INT 09h) hardware
+; interrupts to the guest's real-mode IVT; one the guest has disabled is never
+; acknowledged at all and simply stays latched in the 8259A's IRR (real DOS
+; brackets IRQ-sensitive code with CLI/STI).
 ;
 ; Addressing model (all load-segment relative):
 ;   * PM CODE selector 0x08  base = CS<<4    (monitor runs at driver offsets)
 ;   * PM DATA selector 0x10  base = 0 flat   (builds page tables at linear addrs)
-;   * PM DATA selector 0x20  base = CS<<4    (monitor reaches its own VIF + the
-;                                             saved kernel context, via FS)
+;   * PM DATA selector 0x20  base = CS<<4    (monitor reaches its own state +
+;                                             the saved kernel context, via FS)
 ; On a V86 fault the CPU nulls DS/ES/FS/GS; the monitor reads guest memory + the
 ; real-mode IVT through the null DS (base 0 == flat) and its own data through FS.
 ;
@@ -56,20 +58,19 @@ k_ip: dw 0                        ; EXECRH far-return IP
 
 ; `vif` (virtual IF) lived here and is gone: the guest runs at real IOPL 3, so
 ; the REAL EFLAGS.IF is the guest's IF and there is nothing left to proxy.
-hlt_pending: db 0                 ; 1 = hlt_vector holds a line taken by the
+hlt_pending: db 0                 ; 1 = hlt_vector holds a vector taken by the
                                   ; ring-0 sti;hlt wake and not yet reflected.
-                                  ; OUT OF BAND on purpose: there is no byte
-                                  ; value that is not a legal vector (a guest
-                                  ; may DE0B the master base to 0xF8, putting
-                                  ; IRQ7 on vector 0xFF), so an in-band
-                                  ; sentinel would silently drop that line and
-                                  ; leave its ISR bit set forever -- the exact
-                                  ; wedge this design exists to remove.
-hlt_vector: db 0                  ; EBX as it arrived at the gate. Today that
-                                  ; is a LINE, which equals the vector only at
-                                  ; the default PIC bases; Task 4A makes every
-                                  ; gate carry its own vector and this becomes
-                                  ; a vector unconditionally.
+                                  ; OUT OF BAND on purpose: every byte value is
+                                  ; a legal vector -- a guest may DE0B the
+                                  ; master base to 0xF8, putting IRQ7 on vector
+                                  ; 0xFF -- so an in-band sentinel would
+                                  ; silently drop that line and leave its ISR
+                                  ; bit set forever, the exact wedge this
+                                  ; design exists to remove.
+hlt_vector: db 0                  ; the vector the waking gate sits on, stored
+                                  ; as EBX arrived. Every gate carries its own
+                                  ; vector (see the routing rule above
+                                  ; irq_body), so no conversion is involved.
 r0_hlt: db 0                      ; 1 only inside monitor_body .hlt's sti;hlt
                                   ; window -- the sole ring-0 stretch with IF
                                   ; open. vec13_entry and irq_body read it to
@@ -89,8 +90,8 @@ va20: db 1                        ; virtual A20 (guest's view). The REAL gate is
 ; `vip` (lines held while VIF=0) lived here and is gone with `.hold`. Under
 ; IOPL 3 the chip is never acknowledged while the guest has interrupts off, so
 ; there is nothing to queue: an undelivered request simply stays latched in the
-; 8259A's own IRR, which is what a 386 with a real EMM does.
-align 2
+; 8259A's own IRR, which is what a 386 with a real EMM does. (Its `align 2`
+; went with it -- the word it was aligning no longer exists.)
 
 ; ---- XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
@@ -284,11 +285,11 @@ arena_q_total:   dw 0
 ; the cs:-readable memo in V86 and never enters the monitor at all.
 ;
 ; Everything crosses in these words -- nothing in registers, nothing in flags.
-; The two monitor entry paths put the guest's EFLAGS at different stack offsets
-; (vec13_entry's fault frame vs intc0_entry's gate frame), so a CF return would
-; have to know which path it came in on; the other services dodge that the same
-; way. ONE cookie with a sub-function byte, not four cookies, because every
-; cookie has to be added at BOTH dispatch sites.
+; A CF return was avoided because the guest's EFLAGS sat at different stack
+; offsets depending on the entry path; intc0_entry's gate frame is the only
+; path now, but the memo convention stays -- it costs nothing and the other
+; services already share it. ONE cookie with a sub-function byte, not four,
+; because every cookie costs a compare at the dispatch site.
 ; The EMS sub-functions (4-7) are here rather than behind a cookie of their own
 ; because every cookie costs a compare at BOTH dispatch sites; a sub-function
 ; byte costs one table entry. They work in whole GUEST OPERATIONS -- build a
@@ -311,8 +312,11 @@ arena_svc_count: dw 0             ; granule count, or the wanted logical page
 arena_svc_fail:  db 0             ; 0 = success, 1 = could not be satisfied
 ; ems_page_alloc32 clobbers every register a chain walk would want to keep, so
 ; the EMS sub-functions carry their loop state here instead of in registers.
-; ebp specifically is NOT available: vec13_entry's .intn path holds
-; &frame.eip in it and .done_gp still needs it.
+; ebp specifically is NOT available: the monitor's INT 67h entry holds
+; &frame.eip in it and the return path still needs it. (That entry is
+; int67_entry, reached through the static IDT; the constraint predates the
+; IOPL-3 switch, when the same call arrived via vec13_entry's .intn arm, and
+; it is unchanged because both paths park &frame.eip in ebp.)
 ems_svc_slot:    dw 0
 ems_svc_tail:    dw 0
 ems_svc_cur:     dw 0
@@ -323,9 +327,9 @@ ems_svc_left:    dw 0
 ;
 ; An earlier version of this comment justified the memo with a tick-loss
 ; story: a walk this long, held under an interrupt guard, could outlast one
-; 54.9 ms IRQ0 tick and lose it to `vip`'s one-bit coalescing. That does not
+; 54.9 ms IRQ0 tick and lose it to one-bit coalescing. That does not
 ; hold up under a second look. Each AH=42h/DE03/etc. call closes its own
-; VIF=0 window with its own iret, so polling never accumulates one long
+; interrupts-off window with its own iret, so polling never accumulates one long
 ; window out of many short ones, and a single ~140k-instruction walk of
 ; bt/inc/cmp/jmp would need each instruction to average roughly 104 cycles at
 ; 266 MHz to fill 54.9 ms -- about 60x more than those instructions actually
@@ -867,8 +871,10 @@ ef_frame:                         ; 41h get page-frame segment -> BX
     iret
 ; 42h get page counts: BX=free, DX=total. Free is DERIVED from the shared
 ; arena every call; total was fixed at INIT. No interrupt guard: INT 67h
-; delivery already clears VIF before any handler runs (including this one),
-; so no guest ISR can interleave with the arena_query call below the way one
+; delivery already clears the real IF before any handler runs (including this
+; one) -- the interrupt gate does it in hardware, and reflect_vector_v86
+; clears bit 9 in the frame for a reflected entry -- so no guest ISR can
+; interleave with the arena_query call below the way one
 ; could interleave with a far-called XMS entry point -- xf_query_free's cli
 ; guards against that case specifically, and does not apply here. A cache HIT
 ; in arena_query costs a handful of compares and never enters the monitor at
@@ -1545,16 +1551,21 @@ align 8
 ; EMM glue does this during MEM runs) stops trapping CLI/STI/PUSHF/POPF/INT/
 ; IRET as sensitive ops (check_v86_iopl correctly waves them through, matching
 ; real silicon) -- so a bare `INT n` now dispatches through THIS static IDT
-; directly, at ring 0, instead of through vec13_entry and monitor_body's
-; sensitive-instruction emulation.
+; directly, at ring 0. That is now the ONLY route: the monitor runs every V86
+; guest at real IOPL 3, so `INT n` is never IOPL-sensitive and monitor_body's
+; sensitive-instruction emulation is gone (an INT that faults there today is
+; the 0xD6 tripwire, not a dispatch path).
 ; Every previously-null slot below was safe only because IOPL was pinned at 0;
 ; it no longer is. A null gate's selector field is 0x0000: deliver_exception's
 ; final `load_segment(bus, Cs, 0)` raises a fatal CpuError::GeneralProtection
 ; that unwinds out of the emulator entirely, not a re-entrant #GP the monitor
 ; can catch. So every slot must hold a real gate now. deflt_N/deflt_common give
-; every currently-null vector the same reflect_vector treatment exc_de/exc_ud/
-; exc_nm already use: bounce it to the guest's own real-mode IVT handler,
-; matching how real hardware would have serviced a software INT anyway.
+; every currently-null vector the same treatment exc_de/exc_ud/exc_nm already
+; use: bounce it to the guest's own real-mode IVT handler, matching how real
+; hardware would have serviced a software INT anyway. deflt_common routes
+; through irq_body rather than reflecting directly, so a hardware IRQ remapped
+; onto one of these vectors is classified by frame origin first -- see the
+; routing rule above irq_body.
 idt:
     IDTGATE exc_de                ; 0    #DE divide error -> reflect to IVT[0]
     IDTGATE deflt_1               ; 1    #DB/INT1 (debug; no resident debugger)
@@ -1785,7 +1796,8 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; TEST 2 (clear): the ring-0 sti;hlt window below is the only ring-0 code
 ; that runs with IF open, and it brackets itself in `r0_hlt`. Flag set AND
 ; the no-error frame's CS slot ([esp+36]) == our 0x08 -> IRQ5 that woke the
-; halt; irq_body's own VM check then holds the line. A ring-0 #GP raised
+; halt; irq_body's own VM check then parks it in the halt slot. A ring-0 #GP
+; raised
 ; INSIDE the flagged window cannot take this arm: its frame carries the
 ; faulting EIP at [esp+36], and offset 8 is the DOS device-driver header
 ; (dh_next), never executed code.
@@ -1822,18 +1834,25 @@ vec13_entry:
     mov ax, 0x20
     mov fs, ax
     test dword [esp+40], FLAGS_VM ; TEST 1: no-error frame's EFLAGS.VM
-    jnz .irq5                     ; (an error-code frame holds 16-bit CS here)
+    jnz .vec13_noerror            ; (an error-code frame holds 16-bit CS here)
     cmp byte [fs:r0_hlt], 0       ; TEST 2: the ring-0 halt window is the only
     je .ec_frame                  ; IF-open ring-0 code
     cmp dword [esp+36], 8         ; no-error ring-0 frame: CS slot = our 0x08
-    je .irq5                      ; -> the IRQ5 that woke the hlt
+    je .vec13_noerror             ; -> the IRQ5 that woke the hlt
 .ec_frame:
     test dword [esp+44], FLAGS_VM ; TEST 3: error-code frame's EFLAGS.VM
     jnz monitor_body              ; V86 #GP -> emulate/reflect as ever
     mov al, 0xD3                  ; ring-0 #GP: the monitor faulted on itself
     jmp signal32                  ; (G1 storm iteration 0) -- report, stop
-.irq5:
-    mov ebx, 5
+; TEST 1 decides FRAME SHAPE (no-error vs error-code), never origin -- hence
+; the name. Calling this arm ".irq5" or ".vec13_external" would re-assert the
+; software-vs-hardware claim the routing note above irq_body shows is neither
+; knowable nor needed: at IOPL 3 a guest `INT 0Dh` and a hardware IRQ5 both
+; arrive here as byte-identical no-error frames. EBX is the vector this gate
+; sits on, 13, for both -- which is the vector the guest should see in both
+; cases, so the question never has to be answered.
+.vec13_noerror:
+    mov ebx, 13
     jmp irq_body                  ; no-error-code frame path
 
 ; ---- #GP monitor body: a sensitive instruction faulted. Error-code frame;
@@ -2017,12 +2036,10 @@ monitor_body:
     je .done_gp                  ; frame, now that we are about to return
     movzx ebx, byte [fs:hlt_vector]
     mov byte [fs:hlt_pending], 0
-    call irq_reflect_line       ; EBX is what the gate handed us, which today is
-                                ; a LINE -- so it converts exactly like .go
-                                ; does. Task 4A makes both sides carry vectors
-                                ; and turns this into `call reflect_vector_v86`.
-                                ; EBP is the V86 frame; the origin is proven (we
-                                ; only reach here from a V86 HLT).
+    call reflect_vector_v86     ; EBX is the vector the waking gate sat on, so
+                                ; it reflects exactly like .go does. EBP is the
+                                ; V86 frame; the origin is proven (we only
+                                ; reach here from a V86 HLT).
     jmp .done_gp
 
 ; ---- Two-byte privileged 0F ops (386MAX QMAX_I0D GP_ESCOD, adapted to the
@@ -2258,16 +2275,16 @@ monitor_body:
     add esp, 4                   ; discard the #GP error code
     iretd
 
-; ---- Hardware IRQs (no error code). Per-line stubs load the 8259 line number
-; and share one body, which reflects to the guest IVT unconditionally: the
-; guest runs at real IOPL 3, so a line the guest has not enabled is never
+; ---- Hardware IRQs (no error code). Per-line stubs load THE VECTOR THEY SIT
+; ON and share one body, which reflects it to the guest IVT unconditionally:
+; the guest runs at real IOPL 3, so a line the guest has not enabled is never
 ; acknowledged in the first place and never reaches a gate. Master lines 0-7
 ; (vectors 8-15, 5 via vec13_entry), slave lines 8-15 (vectors 0x70-0x77). ----
 %assign line 0
 %rep 8
 irq_m%[line]:
     pushad
-    mov ebx, line
+    mov ebx, 8 + line             ; the vector this gate occupies
     jmp irq_common
 %assign line line+1
 %endrep
@@ -2275,16 +2292,50 @@ irq_m%[line]:
 %rep 8
 irq_s%[line]:
     pushad
-    mov ebx, line
+    mov ebx, 0x70 + (line - 8)    ; the vector this gate occupies
     jmp irq_common
 %assign line line+1
 %endrep
 
-irq_common:                       ; pushad done, EBX = IRQ line
+irq_common:                       ; pushad done, EBX = vector
     mov ax, 0x10
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
+
+; ---- THE ROUTING RULE: EVERY GATE REFLECTS THE VECTOR IT SITS ON. ----
+;
+; The correctness argument is one sentence: the arriving vector IS the vector
+; the guest should see, because the monitor's IDT and the guest's IVT are
+; indexed by the same 256-entry vector space. That holds whether the entry was
+; produced by the PIC's INTA or by a `CD nn` byte pair, so **no gate ever has
+; to answer the software-INT-vs-hardware-IRQ question** -- which is fortunate,
+; because on a 386 it is not answerable: both deliveries produce byte-identical
+; no-error V86 frames, the ISR bit is necessary-but-not-sufficient for a
+; hardware IRQ, and a frame-IF test only separates the IF=0 case. The one
+; remaining signal is an opcode peek at CS:IP-2, and that scheme is recorded
+; just above vec13_entry as ABANDONED, with a documented mis-emulation
+; residual. Do not re-introduce a discriminator here.
+;
+; What this replaced: the gates used to discard the arriving vector and
+; RECOMPUTE one as `vcpi_pic_master + line`. At the DOS default bases that is
+; the identity and the bug was invisible; away from them it was wrong, and
+; worse, `vcpi_pic_master`/`vcpi_pic_slave` are a CACHE of the chip's state
+; that the chip can outrun -- the PIC ports are not in the TSS I/O bitmap (only
+; 0x92 is), so a guest `OUT 0x20`/`OUT 0x21` reprograms the 8259 without the
+; monitor seeing it. DE0B the master to 0x88, then direct-OUT it back to 8, and
+; a real IRQ0 arriving at vector 8 was reflected to 0x88. Reflecting the
+; arriving vector deletes that whole class rather than patching the arms that
+; read the cache.
+;
+; MATCHED-METAL RESIDUE, deliberate: a guest that executes `INT 08h` while IRQ0
+; genuinely is in service reflects to vector 8, and its handler EOIs a line
+; that is in service, prematurely ending IRQ0's service. Real hardware does
+; exactly this, for exactly the same reason -- the 8259 has no idea a `CD 08`
+; ran. It is matched behaviour, not residue to be fixed later.
+;
+; irq_body is now purely a FRAME-ORIGIN classifier: it decides frame shape
+; (V86 / ring-0 halt wake / error-code), never vector.
 irq_body:                         ; vec13_entry joins here (segs already set)
     lea ebp, [esp + 32]
     test dword [ebp+8], FLAGS_VM  ; no-error frame's EFLAGS.VM; an ERROR-CODE
@@ -2295,7 +2346,8 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     ; guest's own CLI clears the real flag, and service_pending_interrupt gates
     ; the INTA on it, so an interrupt taken under a guest CLI never happens --
     ; the request stays latched in the 8259A's IRR and is taken after the STI.
-    ; So there is nothing to hold and `.go` is the only V86 outcome.
+    ; So there is nothing to hold: reflecting is the only V86 outcome, and the
+    ; `.go` label that used to name it is gone with the branch that chose it.
     ;
     ; What the deleted `.hold` was protecting, kept because it is expensive to
     ; re-derive: the EOI belongs to whoever services the interrupt, which under
@@ -2311,8 +2363,7 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     ; what this monitor used to be. It needed a complete set of drain points,
     ; and the VCPI DE0C mode switch destroyed the drainer. Running at IOPL 3
     ; deletes the question instead of completing the drain set.
-.go:
-    call irq_reflect_line
+    call reflect_vector_v86
     popad
     iretd
 ; Bit 17 clear: either the IRQ that woke the ring-0 sti;hlt window (a
@@ -2334,12 +2385,13 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     test dword [ebp+12], FLAGS_VM ; error-code frame's EFLAGS.VM
     jz .ring0_exc
     ; A V86-origin CPU exception collided onto this IRQ gate: reflect it to
-    ; the guest IVT entry for the EXCEPTION vector (master line N sits on
-    ; vector N+8), fault semantics, and no EOI -- no PIC line is in service.
-    ; Only master lines can carry one (the slave gates at 0x70-0x77 and
-    ; remapped deflt bases are not CPU-exception vectors).
+    ; the guest IVT entry for the EXCEPTION vector, fault semantics, and no EOI
+    ; -- no PIC line is in service. EBX is ALREADY that vector: every gate
+    ; carries the vector it sits on, and a colliding exception is by definition
+    ; the one whose vector equals this gate's. (This used to read `add ebx, 8`,
+    ; converting a master line to its default-base vector -- the same number,
+    ; arrived at by arithmetic that only held at the default base.)
     lea ebp, [ebp+4]              ; &frame.eip of the error-code frame
-    add ebx, 8
     call reflect_vector
     popad
     add esp, 4                    ; discard the error code
@@ -2466,19 +2518,25 @@ deflt_common:
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
-    lea ebp, [esp + 32]
-    call remapped_pic_line
-    jc .irq
-    call reflect_vector
-    popad
-    iretd
-.irq:
-    jmp irq_body                  ; the remapped-PIC lines get the same
-                                  ; frame-origin classification, VIF hold,
-                                  ; and ring-0-wake hold the fixed gates get
-                                  ; (a remapped IRQ waking the .hlt window
-                                  ; used to reflect against the 3-dword
-                                  ; ring-0 frame here)
+    ; Every gate now hands irq_body a vector and a frame, and irq_body is
+    ; purely a frame-origin classifier -- so this is an unconditional jump, not
+    ; a reflect. It must NOT be a bare reflect_vector: a hardware IRQ remapped
+    ; onto a deflt_* vector can still wake the ring-0 sti;hlt, and
+    ; reflect_vector would refuse that 3-dword ring-0 frame with signal32 0xD4.
+    ;
+    ; Two consequences that look like side effects and are not:
+    ;   * deflt_ac improves. Vector 17 is the one default-covered vector whose
+    ;     CPU-exception form carries an error code. The old path called
+    ;     reflect_vector against a frame it assumed was 3 dwords; irq_body's
+    ;     .ec_frame arm classifies by frame SHAPE first, so a genuine #AC is no
+    ;     longer at risk of being mis-popped. The emulator never sets CR0.AM, so
+    ;     this is latent-only -- but it is a strict improvement.
+    ;   * The 0xD4 backstop narrows, deliberately. reflect_vector's ring-0
+    ;     refusal used to guard these reflects too; they now report 0xD5 through
+    ;     irq_body's .ring0_exc arm instead, leaving 0xD4 guarding only
+    ;     exc_de/exc_ud/exc_nm. Same stop-the-machine semantics, different code
+    ;     -- a reader chasing a 0xD5 must know the default gates land there.
+    jmp irq_body
 
 ; ---- Vector 17 (#AC alignment check): the ONLY newly-covered vector whose
 ; CPU-exception form carries an error code. This emulator never sets CR0.AM
@@ -2494,14 +2552,14 @@ deflt_ac:
     mov ebx, 17
     jmp deflt_common
 
-; ---- Vector 0x67 (EMS + VCPI, which share the INT). Reached through the
-; static IDT only when the guest's live IOPL is 3 (otherwise INT n is
-; IOPL-sensitive in V86 and the call arrives through vec13_entry's .intn
-; path, which performs the same AH=DEh split). AH=DEh -> the monitor-side
-; VCPI server; anything else reflects to the guest's own IVT handler (the
-; V86 EMS driver) exactly like a deflt_ gate. The frame's saved CS:IP
-; already points past the INT instruction on this path (software-INT gate
-; dispatch), so no IP advance -- unlike .intn's fault frame. ----
+; ---- Vector 0x67 (EMS + VCPI, which share the INT). THE dispatch route for
+; a guest INT 67h: the guest runs at real IOPL 3, so the INT is not
+; IOPL-sensitive and goes straight through this static IDT gate. AH=DEh -> the
+; monitor-side VCPI server; anything else reflects to the guest's own IVT
+; handler (the V86 EMS driver) exactly like a deflt_ gate. The frame's saved
+; CS:IP already points PAST the INT instruction (software-INT gate dispatch),
+; so no IP advance -- the IOPL-0 fault frame that pointed AT it, and the
+; monitor_body arm that compensated, are both gone. ----
 int67_entry:
     pushad
     mov ax, 0x10
@@ -2519,12 +2577,12 @@ int67_entry:
     mov ebx, 0x67
     jmp deflt_common              ; re-loads DS/FS: harmless
 
-; ---- Vector 0xC0 (TOKAEMM-private monitor calls). Reached through the static
-; IDT only when the guest's live IOPL is 3; below that, INT n is IOPL-sensitive
-; in V86 and the call arrives through vec13_entry's .intn path, which performs
-; the same cookie split. The frame's saved CS:IP is already past the INT on this
-; path (software-INT gate dispatch), so no IP advance -- unlike .intn's fault
-; frame. A foreign INT 0xC0 reflects to the guest's own handler. ----
+; ---- Vector 0xC0 (TOKAEMM-private monitor calls). THE dispatch route for a
+; guest INT 0xC0: at real IOPL 3 the INT is not IOPL-sensitive and arrives
+; straight through this static IDT gate. The frame's saved CS:IP is already
+; PAST the INT (software-INT gate dispatch), so no IP advance -- the IOPL-0
+; fault frame that pointed AT it, and the monitor_body arm that compensated,
+; are both gone. A foreign INT 0xC0 reflects to the guest's own handler. ----
 intc0_entry:
     pushad
     mov ax, 0x10
@@ -3207,8 +3265,8 @@ ems_page_free32:
 ; The ems_cursor next-fit is not decoration (D6): without it, taking N pages one
 ; at a time rescans every already-taken low page each call, so a single AH=43h
 ; asking for most of the pool -- a RAM disk claiming all of EMS does exactly
-; this -- cost O(N^2) bit tests and could hold VIF=0 across multiple 54.9 ms
-; IRQ0 ticks. And no EMS-private free chain: it would have to stay in step with
+; this -- cost O(N^2) bit tests and could hold interrupts off across multiple
+; 54.9 ms IRQ0 ticks. And no EMS-private free chain: it would have to stay in step with
 ; grabs XMS or VCPI make out of the SAME bitmap.
 ems_page_alloc32:
     movzx ecx, word [fs:arena_granules]
@@ -3254,8 +3312,8 @@ ems_page_alloc32:
 ; The service itself. Sub-function in [arena_svc_op]; see the block beside
 ; arena_q_type for why everything crosses in memory rather than registers.
 arena_svc:
-    push ebp                      ; vec13_entry's .intn path keeps &frame.eip
-    movzx eax, byte [fs:arena_svc_op]   ; here and .done_gp still needs it
+    push ebp                      ; intc0_entry keeps &frame.eip here and its
+    movzx eax, byte [fs:arena_svc_op]   ; return path still needs it
     cmp eax, ASVC_MAX
     ja .bad
     call dword [fs:.jt + eax*4]   ; call, not jmp: the pop below must run.
@@ -3638,76 +3696,14 @@ vcpi_pm_to_v86:
 ; real IOPL 3 means the acknowledge never happens while the guest has
 ; interrupts off, so there is nothing to clean up and no EOI to fabricate.
 
-; A default-gate vector can be a software INT or a hardware IRQ after a VCPI
-; client remaps the PIC away from the DOS defaults. If EBX is inside the current
-; master/slave base range and the corresponding PIC ISR bit is set, return CF=1
-; with EBX rewritten to the IRQ line. Otherwise CF=0 and EBX remains a vector.
-remapped_pic_line:
-    push eax
-    push ecx
-    push edx
-    movzx ecx, word [fs:vcpi_pic_master]
-    mov eax, ebx
-    sub eax, ecx
-    cmp eax, 8
-    jb .master
-    movzx ecx, word [fs:vcpi_pic_slave]
-    mov eax, ebx
-    sub eax, ecx
-    cmp eax, 8
-    jb .slave
-.no:
-    clc
-    pop edx
-    pop ecx
-    pop eax
-    ret
-.master:
-    mov ecx, eax                  ; candidate line 0..7
-    mov al, 0x0B                  ; OCW3: read ISR
-    out 0x20, al
-    in al, 0x20
-    movzx edx, al
-    mov eax, 1
-    shl eax, cl
-    test edx, eax
-    jz .no
-    mov ebx, ecx
-    stc
-    pop edx
-    pop ecx
-    pop eax
-    ret
-.slave:
-    mov ecx, eax                  ; candidate slave sub-line 0..7
-    mov al, 0x0B
-    out 0xA0, al
-    in al, 0xA0
-    movzx edx, al
-    mov eax, 1
-    shl eax, cl
-    test edx, eax
-    jz .no
-    lea ebx, [ecx + 8]
-    stc
-    pop edx
-    pop ecx
-    pop eax
-    ret
-
-; Reflect line EBX to its guest IVT vector using the current VCPI/PIC mapping.
-; Tail-jumps reflect_vector.
-irq_reflect_line:
-    cmp ebx, 8
-    jb .master
-    movzx eax, word [fs:vcpi_pic_slave]
-    add ebx, eax
-    sub ebx, 8
-    jmp reflect_vector_v86        ; every caller sits behind a VM test
-.master:
-    movzx eax, word [fs:vcpi_pic_master]
-    add ebx, eax
-    jmp reflect_vector_v86
+; `remapped_pic_line` (vector -> line, by subtracting the cached PIC base and
+; probing the ISR) and `irq_reflect_line` (line -> vector, by adding it back)
+; lived here. They were inverses, so the round trip through them was the
+; identity and never added information -- it only made the fixed gates wrong
+; at any non-default base, and put a cache that can go stale on the delivery
+; path. Every gate now carries its own vector; see the routing note above
+; irq_body. vcpi_pic_master/vcpi_pic_slave survive, but only to answer DE0A
+; and to be written by DE0B -- they no longer participate in delivery.
 
 ; Reflect an interrupt into the guest's real-mode IVT handler.
 ;   in: EBX = vector, EBP = &frame.eip, FS = driver data.  clobbers eax,ecx,edx,edi

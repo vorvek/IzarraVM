@@ -2274,9 +2274,9 @@ fn cli_runs_in_v86_at_iopl3() {
 #[test]
 fn iret_faults_in_v86_below_iopl3() {
     // IRET (0xCF) in a V86 task with IOPL 0 traps to the monitor with #GP(0), exactly
-    // like CLI/STI/PUSHF/POPF. This is the TOKAEMM root-cause fix: a V86 guest's IRET
-    // must be IOPL-gated so the monitor can virtualize the flags pop (VIF), instead of
-    // popping a monitor-stamped IF=0 image straight into real EFLAGS.
+    // like CLI/STI/PUSHF/POPF. The IOPL gate itself is the architectural rule; TOKAEMM
+    // now runs at IOPL 3 and takes the other side of it (see the IOPL-3 rows below),
+    // but this row pins that the gate still fires for an IOPL-0 V86 task.
     let (mut cpu, memory) = real_mode_cpu(&[0xcf], 0x40);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.eflags = 0x2 | FLAG_VM; // IOPL 0
