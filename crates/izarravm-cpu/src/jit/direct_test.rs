@@ -2364,6 +2364,24 @@ fn direct_exit_and_link_cell_layouts_are_pinned() {
     }
 }
 
+/// Bucket lookup by LABEL, not by index. The bucket layout is derived from `LinkRefusal::COUNT`
+/// and `LinkClearCause::COUNT`, so a new cause shifts every index past it and a row that
+/// hard-codes 13 silently starts asserting about its neighbour instead.
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+fn census_bucket(buckets: &[(&'static str, u64)], label: &str) -> u64 {
+    buckets
+        .iter()
+        .find(|(name, _)| *name == label)
+        .map(|(_, count)| *count)
+        .unwrap_or_else(|| panic!("census bucket {label} must exist"))
+}
+
 #[cfg(all(
     feature = "direct-link-refusal-census",
     any(
@@ -2432,6 +2450,7 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
             "cleared_retired",
             "cleared_flushed",
             "cleared_reset",
+            "cleared_chain_widen",
             "unexpected_linked",
             "closed",
         ]
@@ -2688,7 +2707,10 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
         refused.rows[0].last_target_generation,
         Some(target_g1_id.generation())
     );
-    assert_eq!(refused.rows[0].buckets[4].1, 1);
+    assert_eq!(
+        census_bucket(&refused.rows[0].buckets, "refused_segment_layout"),
+        1
+    );
 
     assert_eq!(cache.retire_physical_range_for_test(target.physical, 1), 1);
     assert!(matches!(cache.probe(target), BlockProbe::Interpret));
@@ -2706,8 +2728,14 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
         linked.rows[0].last_target_generation,
         Some(target_g2_id.generation())
     );
-    assert_eq!(linked.rows[0].buckets[4].1, 1);
-    assert_eq!(linked.rows[0].buckets[13].1, 1);
+    assert_eq!(
+        census_bucket(&linked.rows[0].buckets, "refused_segment_layout"),
+        1
+    );
+    assert_eq!(
+        census_bucket(&linked.rows[0].buckets, "unexpected_linked"),
+        1
+    );
 
     assert_eq!(cache.retire_physical_range_for_test(source.physical, 1), 1);
     cache.note_direct_link_refusal_exit(1);
@@ -2719,9 +2747,15 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
         closed.rows[0].last_target_generation,
         Some(target_g2_id.generation())
     );
-    assert_eq!(closed.rows[0].buckets[4].1, 1);
-    assert_eq!(closed.rows[0].buckets[13].1, 1);
-    assert_eq!(closed.rows[0].buckets[14].1, 1);
+    assert_eq!(
+        census_bucket(&closed.rows[0].buckets, "refused_segment_layout"),
+        1
+    );
+    assert_eq!(
+        census_bucket(&closed.rows[0].buckets, "unexpected_linked"),
+        1
+    );
+    assert_eq!(census_bucket(&closed.rows[0].buckets, "closed"), 1);
     assert_eq!(closed.rows[0].unbound_exits, 3);
 
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
@@ -2892,7 +2926,7 @@ fn admission_census_rejected_probe_classifier_covers_every_cache_state_and_disab
     assert_eq!(cache.classify_rejected_probe(rejected), None);
 }
 
-/// The three link-clear causes account for every cleared link: their sum equals the aggregate
+/// The five link-clear causes account for every cleared link: their sum equals the aggregate
 /// `BlockCacheStats::unlinks` that feeds `jit_direct_links_cleared`. The aggregate is fed
 /// independently rather than derived, so this is the cross-check that they have not drifted --
 /// a new unlink site that forgets its cause would show up here as a shortfall.
@@ -2959,7 +2993,45 @@ fn link_clear_causes_close_on_the_aggregate() {
         1
     );
 
-    // All FOUR sites, not three: deleting any single increment above must break the sum.
+    // ChainWiden: a link made downstream widens a block's chain segment requirement past what an
+    // already-linked predecessor can satisfy, and that inbound edge is cut. Fresh blocks for the
+    // same reason the reset section below needs them.
+    let widen_root = key(0x1600);
+    let widen_middle = key(0x1700);
+    let widen_tail = key(0x1800);
+    let widen_root_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(widen_root, 1, 1).expect("widen root span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x1111)],
+        ),
+    );
+    let widen_middle_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(widen_middle, 1, 1).expect("widen middle span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    let widen_tail_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(widen_tail, 1, 1).expect("widen tail span"),
+            &[SegmentIndex::Ds, SegmentIndex::Es],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    assert!(cache.try_link(widen_root_id, 0, widen_middle_id));
+    assert!(cache.try_link(widen_middle_id, 0, widen_tail_id));
+    assert_eq!(cache.outbound[widen_root_id.index()][0], None);
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        1
+    );
+
+    // All FIVE sites: deleting any single increment above must break the sum.
     let causes = cache.stalls.links_cleared;
     assert!(
         causes.iter().all(|&n| n > 0),
@@ -3323,6 +3395,16 @@ fn link_mask_cuts_an_inbound_edge_a_downstream_widen_invalidates() {
         "R -> S must be CUT: S's requirement now names ES and R disagrees about it"
     );
     assert!(!cache.has_linked_successor(root_id));
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        1,
+        "the cut must be attributed to the widen, not to a replace or a retire"
+    );
+    // S absorbed the widen even though R could not.
+    assert_ne!(
+        cache.chain_layouts[middle_id.index()].used & segment_bit(SegmentIndex::Es),
+        0
+    );
 }
 
 /// The mirror arm: same shape, but all three blocks hold the SAME ES descriptor. The widen then
@@ -3369,5 +3451,21 @@ fn link_mask_widens_an_inbound_edge_that_can_follow_the_chain() {
         cache.outbound[root_id.index()][0],
         Some(middle_id),
         "the widen agrees at R, so the edge must survive"
+    );
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ChainWiden as usize],
+        0
+    );
+    // And the widen actually REACHED R, two hops from the link that caused it. Without this the
+    // row would pass against an implementation that never propagates at all.
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "R's chain requirement must have absorbed the ES that T pins"
+    );
+    // Non-adoption: only the mask moved. R's own descriptors are still R's.
+    assert_eq!(
+        cache.chain_layouts[root_id.index()].data,
+        cache.segment_layouts[root_id.index()].data
     );
 }

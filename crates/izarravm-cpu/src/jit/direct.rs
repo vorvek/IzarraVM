@@ -278,9 +278,19 @@ const SEGMENT_ORDER: [SegmentIndex; 6] = [
     SegmentIndex::Gs,
 ];
 
-/// Segment state baked into one direct translation. Only data segments actually used by the
-/// block are retained. A linked target must have the identical snapshot, so validating the root
-/// block also validates every body reached through its successor cells.
+/// Segment state baked into one direct translation, frozen at compile time. `used` is the PINNED
+/// set: the segments this block's emitted code depends on, whether through a baked base or a
+/// baked selector.
+///
+/// A linked target does NOT have to carry an identical snapshot -- it used to, and that rule cost
+/// prince-586 its whole wall. What it must do is AGREE on every segment that some block in the
+/// chain pins. `BlockCache::chain_layouts` carries that transitive requirement per block (own
+/// `used`, plus the union of the masks of everything reachable through live links), and
+/// `link_merge` below is the edge predicate over it. Because the merge is NON-ADOPTING -- a bit
+/// set on either side demands descriptor EQUALITY -- a chain requirement never names a descriptor
+/// its holder's own snapshot does not have, so validating the root's six descriptors
+/// (`all_data_matches`, run.rs) still validates every body reached through its successor cells.
+/// dev_docs/plans/2026-08-18-chain-used-link-mask.md has the invariant and its proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentLayout {
     cs: SegmentRegister,
@@ -349,8 +359,47 @@ impl SegmentLayout {
             .all(|segment| self.data[segment_index(segment)] == cpu.registers.segment(segment))
     }
 
-    pub(crate) fn link_compatible(&self, target: &Self) -> bool {
-        self.cs == target.cs && self.data == target.data
+    /// Merge two CHAIN requirements, NON-ADOPTING: the result requires the UNION of the two
+    /// masks, and every segment in that union must carry the SAME descriptor on both sides.
+    /// `None` is a conflict -- no requirement satisfies both ends at once.
+    ///
+    /// Non-adoption is what makes the result's descriptors identical to `self`'s: the two agree
+    /// wherever the result's mask can ever be read, so the merge only ever moves `used`. The
+    /// adopting variant (take the pinning side's descriptor for a bit only one side sets) admits
+    /// another 25.9% of prince's refusals but is unsound until the dispatcher entry check reads
+    /// the chain requirement instead of the block's own; it is a separate slice.
+    ///
+    /// Why the mask has to be TRANSITIVE, and not just this edge's two ends: a chained transfer
+    /// jumps into the successor's body without returning to the dispatcher, so no block except
+    /// the chain root ever runs a segment check. With `R -> S` admitted on a differing ES that
+    /// neither pins, and `S -> T` admitted because `S` and `T` agree on the ES that `T` pins,
+    /// entering at `R` validates `R`'s ES and then runs `T`'s body against `S`'s ES base. That
+    /// is why `BlockCache` propagates the requirement backwards on every widen and cuts the edges
+    /// that cannot follow.
+    pub(crate) fn merge_chain(self, target: Self) -> Option<Self> {
+        let used = self.used | target.used;
+        for segment in SEGMENT_ORDER {
+            let index = segment_index(segment);
+            if used & segment_bit(segment) != 0 && self.data[index] != target.data[index] {
+                return None;
+            }
+        }
+        Some(Self {
+            cs: self.cs,
+            data: self.data,
+            used,
+        })
+    }
+
+    /// The static-edge predicate and its product in one call: `None` refuses the edge, `Some` is
+    /// the source's widened chain requirement. `cs` is compared plain and stays out of the merge
+    /// (0 of prince-586's 107,088 refusals differed on CS, and `cs_matches` at the entry check is
+    /// a separate gate).
+    pub(crate) fn link_merge(self, target: Self) -> Option<Self> {
+        if self.cs != target.cs {
+            return None;
+        }
+        self.merge_chain(target)
     }
 
     /// The pinned selector for `segment`, from whichever of the two snapshots holds it. CS lives
@@ -780,6 +829,18 @@ pub(crate) struct BlockCache {
     /// was 116 of that struct's 240 bytes while every hot-path read goes through a `&self`
     /// method that never needed the copy. Entry reads it exactly once.
     segment_layouts: Vec<SegmentLayout>,
+    /// Parallel to `blocks`, same `BlockId::index()`: this block's CHAIN segment requirement --
+    /// its own `SegmentLayout` merged with the requirement of every block reachable from it
+    /// through currently live links. Only `used` ever differs from `segment_layouts[i]`, because
+    /// the merge is non-adopting (`SegmentLayout::merge_chain`).
+    ///
+    /// MONOTONE for the whole life of the block in slot `i`: written by `install` (reset to the
+    /// block's own layout, in the same statement that writes `segment_layouts[i]`, so the two can
+    /// never come apart) and by `widen_chain_requirement`, which only ever adds bits. Nothing
+    /// else -- not unlink, not retire, not the link-epoch bump -- touches it. A stale-too-WIDE
+    /// requirement costs an over-strict edge refusal; a stale-too-NARROW one is a wrong-base
+    /// miscompile, so narrowing is made unrepresentable rather than merely unlikely.
+    chain_layouts: Vec<SegmentLayout>,
     /// Parallel to `blocks`, same `BlockId::index()`: the physical start of each mutable imm32
     /// lane the block's emitted code reads through, `NO_IMM_LANE` for an unused slot. Out of
     /// `CompiledBlock` for the reason its size pin states — nothing here is read on a block entry,
@@ -952,6 +1013,7 @@ impl BlockCache {
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
             segment_layouts: Vec::new(),
+            chain_layouts: Vec::new(),
             block_imm_lanes: Vec::new(),
             lane_trial_epochs: HashMap::default(),
             top_mismatch_retires: HashMap::default(),
@@ -1198,6 +1260,7 @@ impl BlockCache {
         if index == self.blocks.len() {
             self.blocks.push(block);
             self.segment_layouts.push(compilation.segment_layout);
+            self.chain_layouts.push(compilation.segment_layout);
             self.block_imm_lanes.push(compilation.imm_lanes);
             if index == self.block_portals.len() {
                 self.block_portals.push(Arc::new(BlockPortal::new()));
@@ -1224,6 +1287,9 @@ impl BlockCache {
             debug_assert!(self.block_decode_slots[index].is_empty());
             self.blocks[index] = block;
             self.segment_layouts[index] = compilation.segment_layout;
+            // A recycled slot must never inherit the retired occupant's WIDENED chain
+            // requirement: the new block reaches a different successor set entirely.
+            self.chain_layouts[index] = compilation.segment_layout;
             self.block_imm_lanes[index] = compilation.imm_lanes;
             self.link_cells[index] = compilation.link_cells.clone();
             self.outbound[index] = [None, None];
@@ -2446,6 +2512,7 @@ impl BlockCache {
         self.physical_keys.clear();
         self.blocks.clear();
         self.segment_layouts.clear();
+        self.chain_layouts.clear();
         self.block_imm_lanes.clear();
         self.lane_trial_epochs.clear();
         self.top_mismatch_retires.clear();
@@ -2545,13 +2612,18 @@ impl BlockCache {
         // names itself. The ORDER is the original chain's order and the short-circuit is
         // preserved, which matters: a stale epoch must be reported before the layout compare,
         // because a stale index's `segment_layouts` entry is not meaningful.
+        //
+        // The segment arm compares the two ends' CHAIN requirements, not their own snapshots, and
+        // the merge it computes here IS the decision: on conflict this refuses with nothing
+        // written, and on success the merged requirement is handed to `widen_chain_requirement`
+        // AFTER the link is published. The propagation never re-decides this edge.
+        let chain_merge =
+            self.chain_layouts[source_index].link_merge(self.chain_layouts[target_index]);
         let refusal = if self.block_link_epochs.get(source_index).copied() != Some(self.link_epoch)
             || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch)
         {
             Some(LinkRefusal::StaleEpoch)
-        } else if !self.segment_layouts[source_index]
-            .link_compatible(&self.segment_layouts[target_index])
-        {
+        } else if chain_merge.is_none() {
             Some(LinkRefusal::SegmentLayout)
         } else if !source_block.link_compatible(&target_block) {
             Some(LinkRefusal::BlockShape)
@@ -2615,7 +2687,80 @@ impl BlockCache {
         self.stats.links += 1;
         #[cfg(feature = "direct-link-refusal-census")]
         self.note_direct_link_linked(source_index, slot_index, target);
+        // AFTER the edge is visible: the propagation walks `inbound`, and this edge's own source
+        // may itself be someone's target. `chain_merge` was proved `Some` by the refusal chain
+        // above.
+        if let Some(merged) = chain_merge {
+            self.widen_chain_requirement(source, merged);
+        }
         true
+    }
+
+    /// Absorb `merged` as `source`'s chain requirement and push the widening backwards until it
+    /// settles. Called only from `try_link_inner`, only after the edge is published.
+    ///
+    /// The obligation being restored is: for every live edge `P -> Q`, `chain(Q).used` is a
+    /// subset of `chain(P).used` and the two agree on every descriptor in `chain(Q).used`. A
+    /// widen at `Q` can break that for `Q`'s PREDECESSORS, so the walk is inbound-only; it cannot
+    /// break it for `Q`'s successors, because their obligation ranges over their own (unchanged)
+    /// masks, and a bit new to `Q` cannot already be in a successor's mask -- if it were, `Q`
+    /// would have had it before this widen.
+    ///
+    /// A predecessor that cannot absorb the widen -- its own frozen descriptor for one of the new
+    /// segments disagrees -- has its edge CUT. That arm is reachable and load-bearing even under
+    /// the non-adopting merge: equality is demanded at link time over a mask that later GROWS,
+    /// so an edge admitted because nobody pinned ES becomes unsound the moment a block downstream
+    /// of the target pins ES with a different descriptor.
+    ///
+    /// Termination: a requirement bit, once set, is never cleared while the block lives, and
+    /// there are six of them, so each block is pushed at most six times per generation.
+    fn widen_chain_requirement(&mut self, source: BlockId, merged: SegmentLayout) {
+        let Some(source_index) = self.active_index(source) else {
+            return;
+        };
+        if self.chain_layouts[source_index].used == merged.used {
+            return;
+        }
+        debug_assert_eq!(
+            self.chain_layouts[source_index].used & merged.used,
+            self.chain_layouts[source_index].used,
+            "a chain requirement may only ever widen",
+        );
+        debug_assert_eq!(
+            self.chain_layouts[source_index].data, merged.data,
+            "the non-adopting merge never rewrites a block's own descriptors",
+        );
+        self.chain_layouts[source_index] = merged;
+        let mut worklist = vec![source];
+        while let Some(widened) = worklist.pop() {
+            let Some(widened_index) = self.active_index(widened) else {
+                continue;
+            };
+            let requirement = self.chain_layouts[widened_index];
+            // Snapshot: `unlink_outbound` below edits this very vector.
+            let Some(inbound) = self.inbound.get(&widened).cloned() else {
+                continue;
+            };
+            for link in inbound {
+                // An `inbound` entry can name a block whose slot has since been recycled. Widening
+                // or cutting on that index would touch a DIFFERENT block's edges; the retirement
+                // walk in `unlink_block` guards the same way.
+                let Some(predecessor_index) = self.active_index(link.block) else {
+                    continue;
+                };
+                match self.chain_layouts[predecessor_index].merge_chain(requirement) {
+                    Some(predecessor_merged) => {
+                        if predecessor_merged.used != self.chain_layouts[predecessor_index].used {
+                            self.chain_layouts[predecessor_index] = predecessor_merged;
+                            worklist.push(link.block);
+                        }
+                    }
+                    None => {
+                        self.unlink_outbound(link.block, link.slot, LinkClearCause::ChainWiden);
+                    }
+                }
+            }
+        }
     }
 
     /// `cause` is passed by the caller rather than inferred: the same helper serves the
@@ -5926,8 +6071,13 @@ fn compile_with_instruction_limit(
     // so its `data_matches` never executes. A later entry with a different AX writes DS and jumps
     // straight into a body baked against the old base.
     //
-    // Barring both edges makes the property true by construction. Inbound links stay safe: the
-    // source's snapshot equality plus the root's `all_data_matches` still pin the entry state.
+    // Barring both edges makes the property true by construction, and it is what keeps INBOUND
+    // links safe as well -- not any argument about snapshots. A block that publishes no
+    // successors is where the chain ENDS: its segment write is the last thing that happens before
+    // control returns to `run_direct_block`, so there is no downstream body to enter against the
+    // base the write just invalidated. That argument survives the chain-used mask
+    // (dev_docs/plans/2026-08-18-chain-used-link-mask.md), which is about frozen compile-time
+    // capture and says nothing about a value the block is about to overwrite at run time.
     let segment_write_block = segment_writes != 0;
     let dynamic_successor = !segment_write_block
         && matches!(
