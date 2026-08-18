@@ -499,6 +499,14 @@ fn halt_fast_forward_survives_a_batch_that_overshot_the_run_deadline() {
     // branch. The burst sweep is what makes it deterministic: some burst size
     // in this range always ends its final batch on the HLT with the deadline
     // already a clock or two behind.
+    //
+    // "Did not panic" is all this test can assert directly, and under the fix
+    // that would pass even if nothing overshot -- so count the clamps that
+    // actually fired and require at least one. Without that, a future change to
+    // the batch grant or cap arithmetic could stop reaching the branch and
+    // hollow this test out silently. Bursts 1..=7 all overshoot today, so the
+    // assert has margin.
+    let mut clamps = 0u64;
     for burst in 1u64..=64 {
         let mut machine =
             Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xfa, 0xf4])
@@ -508,7 +516,13 @@ fn halt_fast_forward_survives_a_batch_that_overshot_the_run_deadline() {
                 .run_until_halt_or_cycles(burst)
                 .unwrap_or_else(|e| panic!("burst {burst}: {e}"));
         }
+        clamps += machine.test_halt_deadline_clamps;
     }
+    assert!(
+        clamps > 0,
+        "no burst ended a HLT batch past the deadline, so this test no longer \
+         exercises the halt fast-forward's remaining-ticks clamp at all"
+    );
 }
 
 #[test]
