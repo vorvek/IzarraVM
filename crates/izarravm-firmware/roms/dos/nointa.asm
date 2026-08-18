@@ -31,12 +31,22 @@ cpu 386
 org 0x100
 %define OK 0xA5
 
+; Spin bound for the IRR poll. gsw_386 is the project's 386DX-at-22-MHz
+; reference (bench_reference.rs:93), so one 54.9 ms timer tick is
+; 22e6 * 0.0549 = ~1.2M emulated cycles. This loop is OUT + IN + TEST +
+; DEC + JNZ and the port accesses force a step break each time round, so
+; ~40 cycles/iteration: ~30k iterations per tick, and the bound covers
+; ~66 ticks. Exhaustion means no timer request ever appeared at all --
+; reported as its own code, never confused with the ISR answer.
+%define IRR_SPIN 2000000
+
 start:
-    cli                           ; on the virtual-IF monitor this is a #GP that
-                                  ; only clears VIF; the real IF stays open
+    cli                           ; the guest runs at real IOPL 3, so this is
+                                  ; not a #GP: it clears the REAL IF, which is
+                                  ; the whole point of the invariant below
 
     ; ---- 1. wait until IR0 is REQUESTED (the proof the ISR read is not early)
-    mov ecx, 2000000              ; bound: many 54.9 ms ticks of guest time
+    mov ecx, IRR_SPIN
 .wait_irr:
     mov al, 0x0A                  ; OCW3: read-select IRR
     out 0x20, al

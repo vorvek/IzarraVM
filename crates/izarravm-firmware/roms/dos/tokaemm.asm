@@ -7,9 +7,12 @@
 ; ring-0 monitor environment in its OWN resident memory, then instead of a
 ; signal stub it IRETDs the *running kernel* into V86 at the SYSINIT return
 ; point (the EXECRH post-INIT code), so real FreeDOS keeps booting virtualized
-; under the monitor. The guest runs at real IOPL 3, so the V86 sensitive
-; instructions (CLI/STI/PUSHF/POPF/INT/IRET) execute for real and the guest's
-; IF IS the real IF -- nothing is emulated or virtualized. The monitor reflects
+; under the monitor. The guest runs at real IOPL 3 -- the reference posture,
+; stated outright by 386MAX (QMAX_DTE.INC: `@VMIOPL equ 3 ; Use this IOPL for
+; VM clients to avoid GP Faults on CLI/STI/HLT/INT/IRET/PUSHF/POPF`), and what
+; JEMM does with its clients too. So the V86 sensitive instructions
+; (CLI/STI/PUSHF/POPF/INT/IRET) execute for real and the guest's IF IS the real
+; IF -- nothing is emulated or virtualized. The monitor reflects
 ; the timer (IRQ0 -> INT 08h) and keyboard (IRQ1 -> INT 09h) hardware
 ; interrupts to the guest's real-mode IVT; one the guest has disabled is never
 ; acknowledged at all and simply stays latched in the 8259A's IRR (real DOS
@@ -107,7 +110,8 @@ xms_mv_len: dd 0                  ; 0Bh move: byte count / src linear / dst line
 xms_mv_src: dd 0                  ; (the INT 0xC0 'TM' memcpy reads these three
 xms_mv_dst: dd 0                  ;  via FS; the 16-bit V86 ABI has no
                                   ;  32-bit registers to pass them in)
-xms_slot_save: dw 0               ; 0Fh resize: keep the slot across find_gap (clobbers SI)
+xms_slot_save: dw 0               ; 0Fh resize: keep the slot across
+                                  ; find_gap (which clobbers SI)
 xms_rv_off: dd 0                  ; resolve input: the endpoint's 32-bit offset
 xms_need_kb: dw 0                 ; arena_alloc input: KB wanted
 xms_need_gran: dw 0               ; 1 KB granules reserved for that request
@@ -528,7 +532,8 @@ init:
 .p_done:
     pop ds
 
-    ; Signon banner. INT 29h works during device INIT, when INT 21h AH=09h is unreliable.
+    ; Signon banner. INT 29h works during device INIT, when INT 21h
+    ; AH=09h is unreliable.
     cmp byte [tree_mode], 0
     je .bplain
     mov si, banner_tree
@@ -1800,8 +1805,9 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; TEST 2 (clear): the ring-0 sti;hlt window below is the only ring-0 code
 ; that runs with IF open, and it brackets itself in `r0_hlt`. Flag set AND
 ; the no-error frame's CS slot ([esp+36]) == our 0x08 -> the no-error frame
-; that woke the halt; irq_body's own VM check then parks it in the halt slot. A ring-0 #GP
-; raised INSIDE the flagged window cannot take this arm: its frame carries the
+; that woke the halt; irq_body's own VM check then parks it in the halt slot.
+; A ring-0 #GP raised INSIDE the flagged window cannot take this arm: its
+; frame carries the
 ; faulting EIP at [esp+36], and offset 8 is the DOS device-driver header
 ; (dh_next), never executed code.
 ;
@@ -3389,7 +3395,8 @@ arena_svc:
     call ems_page_alloc32         ; -> AX = page index, or CF. Clobbers every
     jc .tk_unwind                 ; register a loop would want; hence the
     movzx edi, ax                 ; memory-held loop state
-    mov word [SYS_LIN_BASE + SYS_EMS_LINK + edi*2], 0xFFFF   ; new tail terminates the chain
+    ; new tail terminates the chain
+    mov word [SYS_LIN_BASE + SYS_EMS_LINK + edi*2], 0xFFFF
     movzx edx, word [fs:ems_svc_tail]
     cmp dx, 0xFFFF
     je .tk_head
@@ -3869,14 +3876,22 @@ banner: db 'TOKAEMM XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0
 ; Failure signal via the unit-tester exit port (AL = code). Stops the
 ; machine with the code as the exit status, so a monitor defect names
 ; itself on a game run instead of wedging or storming. Codes in use:
-; the trapped-I/O opcode byte (monitor_body .unhandled_io), 0xD3 (ring-0
-; #GP, vec13_entry TEST 3), 0xD4 (reflect_vector on a ring-0 frame), 0xD5
-; (a ring-0 CPU exception on an IRQ gate, or on a default gate -- deflt_common
-; routes through irq_body -- irq_body .ring0_exc), 0xD6 (an
-; IOPL-sensitive instruction faulted, so the V86 frame's IOPL is not 3 --
-; a monitor bug, not a guest one; monitor_body .sensitive_at_iopl0), 0xD7
-; (the one-slot halt window was already occupied, irq_body .hlt_slot_busy --
-; a contract assert on the single-slot proof, and unreachable if it holds).
+;   <opcode byte>  a trapped I/O port that is not 0x92
+;                  (monitor_body .unhandled_io)
+;   0xD3           ring-0 #GP: the monitor faulted on itself
+;                  (vec13_entry TEST 3)
+;   0xD4           reflect asked against a ring-0 frame (reflect_vector).
+;                  Backstops exc_de/exc_ud/exc_nm only -- the default gates
+;                  moved to 0xD5 when deflt_common started routing through
+;                  irq_body
+;   0xD5           a ring-0 CPU exception on an IRQ gate, or on a default gate
+;                  (irq_body .ring0_exc)
+;   0xD6           an IOPL-sensitive instruction faulted at all, so the V86
+;                  frame's IOPL is not 3 -- a monitor bug, not a guest one
+;                  (monitor_body .sensitive_at_iopl0)
+;   0xD7           the one-slot halt window was already occupied
+;                  (irq_body .hlt_slot_busy) -- a contract assert on the
+;                  single-slot proof, and unreachable if it holds
 signal32:
     mov ah, al
     mov al, 12
@@ -3958,7 +3973,7 @@ tables            equ $$ + TABLES_OFF
 ; is paragraph-aligned only by accident of the tail layout, and the next queued
 ; item rearranges exactly that tail.
 %if (resident_core_end - $$) > 0xFFF0
-    %error "TOKAEMM resident core is past 0xFFF0; the kernel's (offset+15)/16 break rounding wraps"
+    %error "TOKAEMM resident core is past 0xFFF0; the kernel break rounding wraps"
 %endif
 
 ; The fallback break is reported as a paragraph count, `IMAGE_END_OFF >> 4`, and
@@ -3967,7 +3982,7 @@ tables            equ $$ + TABLES_OFF
 ; comment on TABLES_OFF warns about, would under-reserve by 15 bytes with no
 ; diagnostic anywhere.
 %if IMAGE_END_OFF % 16
-    %error "TOKAEMM IMAGE_END_OFF must be a whole number of paragraphs; INIT reports it shifted"
+    %error "TOKAEMM IMAGE_END_OFF must be whole paragraphs; INIT reports a shift"
 %endif
 
 ; pm_init lays the chain terminators down with a dword store, two link words at

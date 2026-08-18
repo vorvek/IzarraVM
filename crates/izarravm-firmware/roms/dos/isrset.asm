@@ -26,15 +26,16 @@ cpu 386
 org 0x100
 %define OK 0xA5
 
-; Spin bounds. The gsw_386 profile clocks ~25 MHz, so one 54.9 ms timer tick is
-; ~1.4M emulated cycles. The two loop shapes here cover very different amounts
-; of emulated time per iteration, so they get separate bounds rather than one
+; Spin bounds. gsw_386 is the project's 386DX-at-22-MHz reference
+; (bench_reference.rs:93), so one 54.9 ms timer tick is 22e6 * 0.0549 = ~1.2M
+; emulated cycles. The two loop shapes here cover very different amounts of
+; emulated time per iteration, so they get separate bounds rather than one
 ; copied constant:
 ;
 ;   IO_SPIN  -- OUT + IN + TEST + DEC + JNZ. The port accesses force a step
-;               break each time round, so ~40 cycles/iteration: ~34k iterations
-;               per tick, and the bound covers ~55 ticks.
-;   MEM_SPIN -- CMP mem,imm + DEC + JNZ, ~10 cycles/iteration: ~140k iterations
+;               break each time round, so ~40 cycles/iteration: ~30k iterations
+;               per tick, and the bound covers ~66 ticks.
+;   MEM_SPIN -- CMP mem,imm + DEC + JNZ, ~10 cycles/iteration: ~120k iterations
 ;               per tick, and the bound covers ~55 ticks.
 ;
 ; Both are sized so that exhaustion means "the thing waited for never happened",

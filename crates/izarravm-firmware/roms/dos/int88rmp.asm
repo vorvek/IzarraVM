@@ -51,9 +51,10 @@ cpu 386
 org 0x100
 %define OK 0xA5
 
-; Spin bound. The gsw_386 profile clocks ~25 MHz, so one 54.9 ms timer tick is
-; ~1.4M emulated cycles. This loop is CMP mem,imm + DEC + JNZ, ~10 cycles per
-; iteration, so a tick is ~140k iterations and the bound covers ~55 of them:
+; Spin bound. gsw_386 is the project's 386DX-at-22-MHz reference
+; (bench_reference.rs:93), so one 54.9 ms timer tick is 22e6 * 0.0549 = ~1.2M
+; emulated cycles. This loop is CMP mem,imm + DEC + JNZ, ~10 cycles per
+; iteration, so a tick is ~120k iterations and the bound covers ~66 of them:
 ; exhaustion means no tick ever reached the remapped vector, not that the
 ; fixture was impatient.
 %define MEM_SPIN 8000000
@@ -73,6 +74,10 @@ start:
     mov word [es:0x88*4], h88
     mov [es:0x88*4+2], cs
 
+    ; Unlike picstale, this fixture never saves or restores the master IMR
+    ; itself: it remaps through DE0B, and the monitor's .de0b already brackets
+    ; its ICW sequence with the masks (in al,0x21 ... out 0x21,al). picstale
+    ; remaps by direct OUT, so it has to do that bracketing by hand.
     ; ---- 1. master to 0x88, BEFORE anything is in service (the ICW sequence
     ;         DE0B runs would clear the ISR anyway)
     mov byte [moved], 1           ; set before the call that can leave it moved
@@ -153,7 +158,8 @@ h88:
     mov byte [cs:sw_hit], 0
     mov byte [cs:phase], 3
     int 0x88
-    mov byte [cs:phase], 4
+    mov byte [cs:phase], 4        ; past the software INT: a vector-0x88 entry
+                                  ; from here on is NOT the one under test
     cmp byte [cs:sw_hit], 1
     je .routed
     mov byte [cs:code], 0xE1

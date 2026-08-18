@@ -55,14 +55,21 @@ impl TokaEmmScenario {
 /// Together those mean a handful of samples taken after the boot has settled
 /// will never see V86, however healthy the machine is. Sample finely, sample
 /// while the guest is busy, and judge on the accumulated count.
+///
+/// Returns (samples in V86, whether `done` was reached, the last stop reason).
+/// A `TestExit` ends the loop: the guest has signalled its verdict and every
+/// further burst would re-run an already-halted machine, so callers that assert
+/// on an exit code get it from the third element rather than running the
+/// machine again afterwards.
 fn sample_v86_while_busy(
     machine: &mut Machine,
     max_samples: u32,
     mut on_v86_sample: impl FnMut(&Machine),
     mut done: impl FnMut(&Machine) -> bool,
-) -> (u32, bool) {
+) -> (u32, bool, StopReason) {
     const BURST: u64 = 200_000;
     let mut in_v86_samples = 0;
+    let mut last_stop = StopReason::CycleLimit { requested: 0 };
     for _ in 0..max_samples {
         let stop = machine
             .run_until_halt_or_cycles(BURST)
@@ -73,15 +80,20 @@ fn sample_v86_while_busy(
                 machine.screen_text().as_text()
             );
         }
+        let exited = matches!(stop, StopReason::TestExit { .. });
+        last_stop = stop;
         if machine.in_v86() {
             in_v86_samples += 1;
             on_v86_sample(machine);
         }
+        if exited {
+            return (in_v86_samples, true, last_stop);
+        }
         if done(machine) {
-            return (in_v86_samples, true);
+            return (in_v86_samples, true, last_stop);
         }
     }
-    (in_v86_samples, false)
+    (in_v86_samples, false, last_stop)
 }
 
 /// Enough V86 sample points to prove the guest really ran there, with room for
@@ -1022,15 +1034,42 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             ],
         );
         let machine = &mut scenario.machine;
-        let stop = machine
-            .run_until_halt_or_cycles(800_000_000)
-            .expect("machine run");
+
+        // Sampled rather than run straight through, because this is the ONLY
+        // row that observes V86 residency on the far side of a DE0C round trip.
+        // `vcpi_pm_to_v86` (tokaemm.asm:3692) is the second of the file's two
+        // sites that stamp IOPL into a V86 EFLAGS image, and the boot-sampling
+        // rows never reach it -- a plain `LH TOKAMOUS + MEM` boot only ever
+        // enters V86 through `pm_init`. Asserting IOPL 3 here is what closes
+        // that gap: a regression that dropped IOPL only on the VCPI re-entry
+        // path would leave every other row in the suite green.
+        let (in_v86_samples, _, stop) = sample_v86_while_busy(
+            machine,
+            4_000,
+            |machine| {
+                let eflags = machine.cpu().registers.eflags;
+                assert_eq!(
+                    (eflags >> 12) & 3,
+                    3,
+                    "V86 IOPL was not 3 (eflags={eflags:#010x}) with \
+                     {memory_mib} MiB {emm_arg}; a V86 entry point built a \
+                     frame without it"
+                );
+            },
+            |_| false,
+        );
         let text = machine.screen_text().as_text();
         assert_eq!(
             stop,
             StopReason::TestExit { code: 0xA5 },
             "VCPI switch round-trip failed with {memory_mib} MiB {emm_arg} \
              (stop={stop:?}); a 0xEn code names the failed step.\n{text}"
+        );
+        assert!(
+            in_v86_samples >= MIN_V86_SAMPLES,
+            "the VCPI client never ran in V86 with {memory_mib} MiB {emm_arg}, \
+             so the IOPL check above was vacuous ({in_v86_samples} samples, \
+             needed {MIN_V86_SAMPLES}).\n{text}"
         );
     }
 }
@@ -1200,7 +1239,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
     // work; once the prompt is up the guest halts and the CPU parks in the
     // monitor, so a sample taken then reads false no matter how healthy the
     // machine is. See sample_v86_while_busy.
-    let (in_v86_samples, reached) = sample_v86_while_busy(
+    let (in_v86_samples, reached, _) = sample_v86_while_busy(
         &mut machine,
         4_000,
         |_| {},
@@ -1780,6 +1819,16 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
 /// executes; this catches it on every path the sampler observes, whether or not
 /// the guest happens to run a CLI there.
 ///
+/// COVERAGE BOUNDARY, stated because it is not obvious: tokaemm.asm stamps IOPL
+/// into a V86 EFLAGS image at exactly two sites -- `pm_init`'s return-to-V86
+/// IRETD (:1755) and `vcpi_pm_to_v86` (:3692) -- and this row's `LH TOKAMOUS +
+/// MEM` boot only ever enters V86 through the first, so it cannot see a
+/// regression confined to the VCPI re-entry path. That second site is covered
+/// by `tokaemm_vcpi_m3_de0c_switch_round_trip`, which samples the same
+/// assertion across a real DE0C round trip; between them both sites are
+/// sampled. Keep it that way -- dropping the sampling from either row reopens
+/// half the invariant.
+///
 /// Cheap: reuses the MEM harness's boot (LH TOKAMOUS + MEM reaches a prompt in
 /// ~200-350M cycles), split into small bursts so the sample points fall
 /// throughout the run rather than only at the very end.
@@ -1805,7 +1854,7 @@ fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
     // the fine sampling is not only what makes the test reliable -- it is what
     // gives it teeth. The old 20M-cycle bursts got roughly one V86 sample per
     // run, when they got one at all.
-    let (saw_v86_samples, _) = sample_v86_while_busy(
+    let (in_v86_samples, _, _) = sample_v86_while_busy(
         machine,
         4_000,
         |machine| {
@@ -1823,9 +1872,9 @@ fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
     let text = machine.screen_text().as_text();
 
     assert!(
-        saw_v86_samples >= MIN_V86_SAMPLES,
+        in_v86_samples >= MIN_V86_SAMPLES,
         "the boot never entered V86 mode; the invariant was never exercised \
-         ({saw_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
+         ({in_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
     );
 }
 
@@ -1841,6 +1890,12 @@ fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
 /// brackets its IRQ-sensitive regions with CLI/STI constantly, so both states
 /// are reached many times over during a normal boot; seeing only one of them is
 /// evidence the flag is stuck, not evidence of a quiet boot.
+///
+/// This boots a second time rather than folding into the IOPL row above, and
+/// the duplication is deliberate: the two assertions fail for entirely
+/// different reasons (a frame built without IOPL 3, versus a flag that stopped
+/// tracking the guest), and keeping them in separate rows means the failing
+/// row names the cause on its own.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_real_if_tracks_the_guest_across_a_boot() {
@@ -1863,7 +1918,7 @@ fn tokaemm_real_if_tracks_the_guest_across_a_boot() {
 
     let mut saw_if_clear = 0u32;
     let mut saw_if_set = 0u32;
-    let (saw_v86_samples, _) = sample_v86_while_busy(
+    let (in_v86_samples, _, _) = sample_v86_while_busy(
         machine,
         4_000,
         |machine| {
@@ -1878,21 +1933,21 @@ fn tokaemm_real_if_tracks_the_guest_across_a_boot() {
     let text = machine.screen_text().as_text();
 
     assert!(
-        saw_v86_samples >= MIN_V86_SAMPLES,
+        in_v86_samples >= MIN_V86_SAMPLES,
         "the boot never entered V86 mode; the invariant was never exercised \
-         ({saw_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
+         ({in_v86_samples} samples, needed {MIN_V86_SAMPLES}).\n{text}"
     );
     assert!(
         saw_if_clear > 0,
-        "real IF was never 0 in V86 across {saw_v86_samples} samples: the \
-         guest's CLI is not reaching the real flag, so the monitor is pinning \
-         IF open again.\n{text}"
+        "real IF was never 0 in V86 across {in_v86_samples} samples \
+         (0 clear, {saw_if_set} set): the guest's CLI is not reaching the real \
+         flag, so the monitor is pinning IF open again.\n{text}"
     );
     assert!(
         saw_if_set > 0,
-        "real IF was never 1 in V86 across {saw_v86_samples} samples: the \
-         guest never runs with interrupts enabled, which a booting DOS must \
-         do.\n{text}"
+        "real IF was never 1 in V86 across {in_v86_samples} samples \
+         ({saw_if_clear} clear, 0 set): the guest never runs with interrupts \
+         enabled, which a booting DOS must do.\n{text}"
     );
 }
 
