@@ -3190,7 +3190,7 @@ fn wait_retires_natively_when_no_exception_is_pending() {
         1.5
     );
     assert_eq!(cpu.fpu.status & 0x3f, 0);
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 /// WAIT's ARCHITECTURAL JOB: with an unmasked exception pending and CR0.NE set it must trap, and
@@ -3246,7 +3246,7 @@ fn wait_delivers_the_pending_exception_and_the_task_switch_fault() {
         assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
         assert_eq!(direct.fp_rem, interpreter.fp_rem);
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 /// `fld dword [0x200]` / `frndint` / `fstp dword [0x204]`.
@@ -3310,7 +3310,7 @@ fn frndint_matches_the_interpreter_under_every_rounding_mode() {
             }
         }
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 /// FRNDINT's operand guard: an EMPTY ST(0) must side exit rather than round whatever the resident
@@ -3339,5 +3339,5 @@ fn frndint_side_exits_on_an_empty_stack_slot() {
         "the empty-slot guard must have exited: {:?}",
         cpu.perf_counters()
     );
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }

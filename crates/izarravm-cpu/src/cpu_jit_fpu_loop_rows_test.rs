@@ -308,7 +308,7 @@ fn every_fpu_loop_row_flips_with_the_gate() {
             "{name} must be admitted with IZARRAVM_FPU_LOOP_ROWS on"
         );
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -374,7 +374,7 @@ fn every_fpu_loop_row_stays_a_barrier_at_word_operand_size() {
             "{name} decodes at Word in a 32-bit segment and must stay a barrier"
         );
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 /// The neighbours this slice must NOT have swept in.
@@ -422,7 +422,7 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
             "{name} was admitted before this slice and must still be"
         );
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -635,7 +635,7 @@ fn sahf_matches_the_interpreter_across_ah_descriptor_and_overflow_state() {
             }
         }
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -692,7 +692,7 @@ fn setcc_memory_matches_the_interpreter_for_every_condition() {
             }
         }
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 /// The SETcc byte must survive a MEMORY GUARD on the store, and the guard must fire before it.
@@ -709,7 +709,7 @@ fn setcc_memory_exits_before_the_store_when_the_page_guard_fires() {
         base_arm(cpu, 0x2 | crate::FLAG_ZF, false)
     });
     finish(fixture, 1, "SETcc into an unmapped page");
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -805,7 +805,7 @@ fn div_and_idiv_memory_match_the_interpreter_across_the_guard_classes() {
             run_div_mem(true, target, eax, edx, divisor, retired, &context);
         }
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 /// THE DEFERRED MODE-13 COMPLETION, which is the one thing this row's emitter exists to get right.
@@ -829,7 +829,7 @@ fn a_mode13_divide_guard_exit_deposits_no_read() {
         let context = format!("divide by zero out of the Mode-13 aperture, signed={signed}");
         run_div_mem(signed, MODE13_TARGET, 17, 0, 0, 1, &context);
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }
 
 /// The read's OWN guard must fire before anything else in the slot.
@@ -854,5 +854,5 @@ fn div_memory_exits_on_the_read_guard_before_the_divide() {
             &format!("unmapped divisor page, signed={signed}"),
         );
     }
-    select_fpu_loop_rows(false);
+    jit::direct::set_fpu_loop_rows_for_test(None);
 }

@@ -3,7 +3,8 @@
 
 //! The one-lookup load path (`dev_docs/2026-08-07-one-lookup-load-design.md`): the lean read
 //! site (D3a) replacing `emit_ram_read_pointer`'s classic pair for its ten callers, the parking
-//! probe (D3b) for the Ret/Ret16/JmpMem trio, the x87 read-pointer probe (D5), and the shared
+//! probe (D3b) for the deferred-completion callers (the Ret/Ret16/JmpMem trio, and DivMem since
+//! the FPU-loop-rows slice), the x87 read-pointer probe (D5), and the shared
 //! read-resolve stub pad (D4) — the store pad's sibling: six counting stubs (GPR width x cpl,
 //! the only width dependence being the mode13 lane they move), two park-only trio stubs and
 //! two x87 pack stubs, ten against the store pad's seventeen because reads have no code-watch
@@ -196,11 +197,13 @@ fn gpr_read_width_index(width: MemoryWidth) -> usize {
     }
 }
 
-/// The D3b parking probe for the Ret/Ret16/JmpMem trio, emitted by
+/// The D3b parking probe for the deferred-completion callers (Ret/Ret16/JmpMem, and DivMem
+/// since the FPU-loop-rows slice), emitted by
 /// `emit_ram_read_pointer_inner` in place of its classic front (after the segmented address and
-/// the wide guard). Parks the page KIND in `STACK_READ_KIND` and moves NO counter: the trio's
-/// own `emit_mode13_read_completion` call runs after their CS-limit side exit, preserving the
-/// deferred-increment ordering those sites were built around.
+/// the wide guard). Parks the page KIND in `STACK_READ_KIND` and moves NO counter: each
+/// caller's own `emit_mode13_read_completion` call runs after its side exits (the trio's
+/// CS-limit check; DivMem's divide guards), preserving the deferred-increment ordering those
+/// sites were built around.
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -226,7 +229,8 @@ pub(super) fn emit_read_probe_parking(
     // Review F1, the domination rule: the RAM-kind park lives HERE, where the untagged arm and
     // the cpl0 supervisor strip-rejoin both pass — under a ring-0 flat-model extender the
     // supervisor arm is the COMMON case, and the prologue does not zero this chain-surviving
-    // slot. RDX is dead at every trio site (each reloads it from RDI after the completion).
+    // slot. RDX is dead at every caller site (the trio reloads it from RDI after the
+    // completion; DivMem reloads it from home(2) before the divide).
     // Hoisting this park above `fast_join` is the F1 miscompile: the chain cell in the battery
     // reads a 4-clock phantom video charge on a supervisor RET when it happens.
     e.mov_r32_imm32(Reg::RDX, u32::from(NATIVE_RAM_KIND));
