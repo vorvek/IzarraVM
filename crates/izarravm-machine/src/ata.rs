@@ -467,6 +467,18 @@ impl AtaDisk {
         self.cache.borrow().misses()
     }
 
+    pub(crate) fn begin_read_command(&self, start_lba: u32, sectors: u32) {
+        if let Backing::HostFolder(volume) = &self.backing {
+            volume.begin_read_command(start_lba, sectors);
+        }
+    }
+
+    pub(crate) fn end_read_command(&self) {
+        if let Backing::HostFolder(volume) = &self.backing {
+            volume.end_read_command();
+        }
+    }
+
     /// Read straight from the backing, bypassing the cache. Split out so the
     /// cache has exactly one filler and the backing exactly one reader.
     ///
@@ -878,6 +890,28 @@ impl AtaDisk {
         self.schedule(PendingAction::PrepareRead, pio_transfer_ticks(1));
     }
 
+    /// DELIBERATELY UNBATCHED. The other read paths declare their whole range
+    /// and let a host-folder backing coalesce it; this one must not.
+    ///
+    /// A PIO command serves one sector per DRQ, and the guest drains each one
+    /// through the data port before the next is scheduled. A coalesced window
+    /// would therefore have to survive from this sector's read until the guest
+    /// has drained every sector it covers -- an interval bounded by GUEST
+    /// execution, not by a host-side call. Two things follow, and either alone
+    /// disqualifies it:
+    ///
+    /// - The window's whole safety argument is that a host folder cannot change
+    ///   underneath it, which holds only because every other declared range is
+    ///   opened and closed inside a single host-side function. Across a PIO
+    ///   drain the folder is live for as long as the guest takes.
+    /// - The command has no single exit. It ends in `read_data_byte` when the
+    ///   last sector drains, in `abort`, or in `soft_reset`, and a guest that
+    ///   simply stops draining ends it nowhere at all. A range left open there
+    ///   would serve stale bytes to whatever read next.
+    ///
+    /// The win was also the smallest of the three: PIO is the path DOS does not
+    /// take. Lifting this means giving the command a single owned lifetime, not
+    /// adding a call here.
     fn prepare_read_sector(&mut self) {
         let Some(sector) = self.read_lba(self.pio_lba) else {
             self.abort();
@@ -968,16 +1002,37 @@ impl AtaDisk {
         self.dma_request
     }
 
+    /// Assemble the whole device-to-memory payload.
+    ///
+    /// The sectors are contiguous and their count is known before the first one
+    /// is looked up, and the entire loop runs inside one host-side call with no
+    /// guest-visible step between sectors, so it declares its range and lets a
+    /// host-folder backing coalesce the reads. Unlike PIO (see
+    /// `prepare_read_sector`), there is no window here for the guest to observe
+    /// or interrupt.
+    ///
+    /// The declared range is closed on every exit, including the short-read
+    /// path, so a partially built payload cannot leave a window behind for the
+    /// next command to read stale bytes out of.
     pub(crate) fn read_dma_payload(&self) -> Option<Vec<u8>> {
         let request = self.dma_request?;
         if request.direction != AtaDmaDirection::DeviceToMemory {
             return None;
         }
+        self.begin_read_command(request.lba, request.sectors);
         let mut payload = Vec::with_capacity(request.byte_len());
+        let mut complete = true;
         for lba in request.lba..request.lba + request.sectors {
-            payload.extend_from_slice(&self.read_lba(lba)?);
+            match self.read_lba(lba) {
+                Some(bytes) => payload.extend_from_slice(&bytes),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
         }
-        Some(payload)
+        self.end_read_command();
+        complete.then_some(payload)
     }
 
     pub(crate) fn complete_dma_read(&mut self, bytes: usize) {

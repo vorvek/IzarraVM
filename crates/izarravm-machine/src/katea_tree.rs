@@ -34,6 +34,24 @@ const MAX_DEPTH: usize = 32;
 /// time; this is only large enough that a normal working set never evicts.
 const MAX_HOST_WRITE_HANDLES: usize = 64;
 
+/// One host range read is bounded to the default 86Box IDE cache window.
+const HOST_READ_COMMAND_WINDOW_SECTORS: u32 = 64;
+
+#[derive(Debug)]
+struct HostReadWindow {
+    start_lba: u32,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct HostReadContext<'a> {
+    lba: u32,
+    command_sectors: u32,
+    counters: &'a std::cell::Cell<KateaStorageCounters>,
+    cache: &'a std::cell::RefCell<Option<(PathBuf, File)>>,
+    window: &'a std::cell::RefCell<Option<HostReadWindow>>,
+}
+
 /// DOS device names Win32 still resolves as character devices. Per Microsoft's
 /// "Naming Files, Paths, and Namespaces", these are reserved *in every
 /// directory* -- `C:\mount\CON` is the console, not a file -- and the rule
@@ -868,6 +886,12 @@ pub(crate) struct KateaTreeVolume {
     /// a stale handle matters because `File::open` shares delete and rename, so a
     /// replaced file would otherwise keep reading its pre-write contents.
     host_read_cache: std::cell::RefCell<Option<(PathBuf, File)>>,
+    /// Bytes coalesced only within the active guest read command. The window is
+    /// discarded at command completion, so it cannot make an unrequested sector
+    /// stale across two INT 13h calls.
+    host_read_window: std::cell::RefCell<Option<HostReadWindow>>,
+    read_command_end_lba: std::cell::Cell<Option<u32>>,
+    command_read_batch_enabled: bool,
     /// Arms the FAT / directory / free-space region census. Read once at mount
     /// from `IZARRAVM_KATEA_REGION_CENSUS=1`, and OFF by default: those two
     /// counters were investigation residue, and each increment is a
@@ -883,6 +907,11 @@ fn region_census_enabled() -> bool {
     std::env::var("IZARRAVM_KATEA_REGION_CENSUS").as_deref() == Ok("1")
 }
 
+/// Enabled by default; `=0` provides a same-binary benchmark control.
+fn command_read_batch_enabled() -> bool {
+    std::env::var("IZARRAVM_HDD_COMMAND_READ_BATCH").as_deref() != Ok("0")
+}
+
 /// What the Katea host-folder read path did, for the boot profiler's disk phases.
 ///
 /// Deliberately counters rather than a `MachineProfilePhaseKind`: the host reads
@@ -894,11 +923,13 @@ pub struct KateaStorageCounters {
     pub sector_reads: u64,
     /// Sectors whose bytes came out of a host file.
     pub host_file_reads: u64,
-    /// Bytes read out of host files.
+    /// Logical host-file bytes served to the guest.
     pub host_bytes: u64,
-    /// Wall nanoseconds spent inside host file reads. Timed per sector, which is
-    /// four orders of magnitude cooler than the instruction stream, so the two
-    /// `Instant::now` calls are not a hot-path tax.
+    /// Physical host read calls and bytes after command-local coalescing.
+    pub host_read_operations: u64,
+    pub host_read_bytes: u64,
+    /// Wall nanoseconds spent in physical host reads. Command-window hits do
+    /// not enter this counter.
     pub host_wall_ns: u64,
     /// Cluster-run table entries scanned to resolve data sectors. `data_sector`
     /// binary-searches the sorted `runs`, so this is now `log2(runs)` per sector
@@ -1301,6 +1332,9 @@ impl KateaTreeVolume {
             atomic_write_bytes: 0,
             counters: std::cell::Cell::new(KateaStorageCounters::default()),
             host_read_cache: std::cell::RefCell::new(None),
+            host_read_window: std::cell::RefCell::new(None),
+            read_command_end_lba: std::cell::Cell::new(None),
+            command_read_batch_enabled: command_read_batch_enabled(),
             region_census: region_census_enabled(),
         })
     }
@@ -1346,6 +1380,66 @@ impl KateaTreeVolume {
     #[cfg(test)]
     pub(crate) fn reset_candidate_census(&mut self) {
         self.candidate_lbas_examined = 0;
+    }
+
+    pub(crate) fn begin_read_command(&self, start_lba: u32, sectors: u32) {
+        self.host_read_window.replace(None);
+        if !self.command_read_batch_enabled {
+            self.read_command_end_lba.set(None);
+            return;
+        }
+        self.read_command_end_lba.set(Some(
+            start_lba
+                .saturating_add(sectors)
+                .min(self.geo.total_sectors),
+        ));
+    }
+
+    pub(crate) fn end_read_command(&self) {
+        self.read_command_end_lba.set(None);
+        self.host_read_window.replace(None);
+    }
+
+    fn command_span_sectors(&self, lba: u32, contiguous: u32) -> u32 {
+        self.read_command_end_lba
+            .get()
+            .filter(|end| lba < *end)
+            .map(|end| {
+                (end - lba)
+                    .min(contiguous)
+                    .clamp(1, HOST_READ_COMMAND_WINDOW_SECTORS)
+            })
+            .unwrap_or(1)
+    }
+
+    fn host_read_context(&self, lba: u32, command_sectors: u32) -> HostReadContext<'_> {
+        HostReadContext {
+            lba,
+            command_sectors,
+            counters: &self.counters,
+            cache: &self.host_read_cache,
+            window: &self.host_read_window,
+        }
+    }
+
+    fn read_command_window_sector(&self, lba: u32) -> Option<SectorRead> {
+        let slot = self.host_read_window.borrow();
+        let cached = slot.as_ref()?;
+        let offset = usize::try_from(lba.checked_sub(cached.start_lba)?)
+            .ok()?
+            .checked_mul(SECTOR)?;
+        let available = cached.bytes.len().checked_sub(offset)?.min(SECTOR);
+        if available == 0 {
+            return None;
+        }
+        let mut bytes = [0u8; SECTOR];
+        bytes[..available].copy_from_slice(&cached.bytes[offset..offset + available]);
+        drop(slot);
+        let mut counters = self.counters.get();
+        counters.host_file_reads += 1;
+        counters.host_bytes = counters.host_bytes.saturating_add(available as u64);
+        self.counters.set(counters);
+        Some(SectorRead::ok(bytes))
     }
 
     /// How many file bodies `reconcile` has re-read. Test-only: the live path only
@@ -2173,6 +2267,8 @@ impl KateaTreeVolume {
         // would otherwise keep serving its pre-write contents through a handle
         // that is still perfectly valid and now points at the wrong bytes.
         self.host_read_cache.replace(None);
+        self.host_read_window.replace(None);
+        self.read_command_end_lba.set(None);
         // A guest-written sector that cannot be read back reads as zeros, and zeros
         // are not a safe input here: phase 2 reads a zeroed FAT entry as "chain
         // freed" and deletes the host file, `parse_dir` stops at the first zero
@@ -2846,6 +2942,9 @@ impl KateaTreeVolume {
                 return SectorRead::degraded();
             }
         }
+        if let Some(served) = self.read_command_window_sector(lba) {
+            return served;
+        }
         if lba == 0 {
             return SectorRead::ok(self.mbr);
         }
@@ -2900,16 +2999,13 @@ impl KateaTreeVolume {
             let byte_off = (u64::from(*cluster_index) * u64::from(spc)
                 + u64::from(sector_in_cluster))
                 * SECTOR as u64;
-            let source = FileSource::HostFile {
-                path: projected.path.clone(),
-                len: u64::from(projected.size),
-            };
-            return read_source_span(
-                &source,
+            let lba = self.cluster_to_lba(cluster) + sector_in_cluster;
+            let span = self.command_span_sectors(lba, spc - sector_in_cluster);
+            return read_host_span(
+                &projected.path,
                 byte_off,
                 projected.size,
-                &self.counters,
-                &self.host_read_cache,
+                self.host_read_context(lba, span),
             );
         }
         // `runs` is sorted by `first_cluster` (the constructor sorts it after
@@ -2972,12 +3068,14 @@ impl KateaTreeVolume {
                 let f = &self.files[*id];
                 let byte_off = u64::from(cluster_off) * u64::from(spc) * SECTOR as u64
                     + u64::from(sector_in_cluster) * SECTOR as u64;
+                let lba = self.cluster_to_lba(cluster) + sector_in_cluster;
+                let contiguous = (run.1 - cluster) * spc + spc - sector_in_cluster;
+                let span = self.command_span_sectors(lba, contiguous);
                 read_source_span(
                     &f.source,
                     byte_off,
                     f.size,
-                    &self.counters,
-                    &self.host_read_cache,
+                    self.host_read_context(lba, span),
                 )
             }
         }
@@ -3040,11 +3138,9 @@ fn read_source_span(
     source: &FileSource,
     byte_off: u64,
     size: u32,
-    counters: &std::cell::Cell<KateaStorageCounters>,
-    cache: &std::cell::RefCell<Option<(PathBuf, File)>>,
+    context: HostReadContext<'_>,
 ) -> SectorRead {
     let mut out = [0u8; SECTOR];
-    let mut degraded = false;
     let valid = u64::from(size).saturating_sub(byte_off).min(SECTOR as u64) as usize;
     if valid == 0 {
         return SectorRead::ok(out);
@@ -3059,62 +3155,107 @@ fn read_source_span(
             out[..avail].copy_from_slice(&v[start..start + avail]);
         }
         FileSource::HostFile { path, .. } => {
-            // Seek + read on a cached handle, opening only when the path changes.
-            // This used to open the file afresh for every 512-byte sector: 36,503
-            // opens at ~41 us each, 1.50 s of pure host I/O, to load one 18 MB PAK.
-            //
-            // Timed and counted because the open-to-sector ratio, not the byte
-            // count, is what the boot profiler needs in order to price a
-            // guest-visible disk read.
-            let started = std::time::Instant::now();
-            let mut opened = 0u64;
-            let mut slot = cache.borrow_mut();
-            let reusable = slot.as_ref().is_some_and(|(cached, _)| cached == path);
-            if !reusable {
-                // Drop the old handle before opening the new one, so at most one
-                // host file is held open at a time.
-                *slot = None;
-                match File::open(path) {
-                    Ok(file) => {
-                        opened = 1;
-                        *slot = Some((path.clone(), file));
-                    }
-                    Err(e) => eprintln!("katea: open {}: {e}", path.display()),
-                }
-            }
-            match slot.as_mut() {
-                Some((_, file)) => {
-                    if let Err(e) = file
-                        .seek(SeekFrom::Start(byte_off))
-                        .and_then(|_| file.read_exact(&mut out[..valid]))
-                    {
-                        eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
-                        out = [0u8; SECTOR];
-                        degraded = true;
-                        // A failed read can leave the handle at an unknown offset,
-                        // and the file may have been truncated underneath us. Drop
-                        // it so the next sector re-opens rather than compounding.
-                        *slot = None;
-                    }
-                }
-                // The open failed and already logged; read back as zeros, exactly
-                // as the pre-cache path did for a vanished host file.
-                None => {
-                    out = [0u8; SECTOR];
-                    degraded = true;
-                }
-            }
-            drop(slot);
-            let mut tally = counters.get();
-            tally.host_file_reads += 1;
-            tally.host_file_opens = tally.host_file_opens.saturating_add(opened);
-            tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
-            tally.host_wall_ns = tally
-                .host_wall_ns
-                .saturating_add(crate::duration_ns_u64(started.elapsed()));
-            counters.set(tally);
+            return read_host_span(path, byte_off, size, context);
         }
     }
+    SectorRead::ok(out)
+}
+
+fn read_host_span(
+    path: &Path,
+    byte_off: u64,
+    size: u32,
+    context: HostReadContext<'_>,
+) -> SectorRead {
+    let mut out = [0u8; SECTOR];
+    let valid = u64::from(size).saturating_sub(byte_off).min(SECTOR as u64) as usize;
+    if valid == 0 {
+        return SectorRead::ok(out);
+    }
+    let started = std::time::Instant::now();
+    let mut opened = 0u64;
+    let mut operations = 0u64;
+    let mut physical_bytes = 0u64;
+    let mut degraded = false;
+    let requested = u64::from(context.command_sectors.max(1)) * SECTOR as u64;
+    let read_len = u64::from(size).saturating_sub(byte_off).min(requested) as usize;
+    let mut batch = (read_len > valid).then(|| Vec::with_capacity(read_len));
+    let mut slot = context.cache.borrow_mut();
+    let reusable = slot.as_ref().is_some_and(|(cached, _)| cached == path);
+    if !reusable {
+        *slot = None;
+        match File::open(path) {
+            Ok(file) => {
+                opened = 1;
+                *slot = Some((path.to_path_buf(), file));
+            }
+            Err(e) => eprintln!("katea: open {}: {e}", path.display()),
+        }
+    }
+    match slot.as_mut() {
+        Some((_, file)) => {
+            operations = 1;
+            let read = file.seek(SeekFrom::Start(byte_off)).and_then(|_| {
+                if let Some(batch) = &mut batch {
+                    file.take(read_len as u64).read_to_end(batch)
+                } else {
+                    file.read_exact(&mut out[..valid]).map(|_| valid)
+                }
+            });
+            match read {
+                Ok(read_bytes) if read_bytes >= valid => {
+                    physical_bytes = read_bytes as u64;
+                    if let Some(mut batch) = batch {
+                        if read_bytes < read_len {
+                            batch.truncate(read_bytes / SECTOR * SECTOR);
+                        }
+                        out[..valid].copy_from_slice(&batch[..valid]);
+                        if batch.len() > valid {
+                            context.window.replace(Some(HostReadWindow {
+                                start_lba: context.lba,
+                                bytes: batch,
+                            }));
+                        }
+                    }
+                }
+                Ok(read_bytes) => {
+                    physical_bytes = read_bytes as u64;
+                    eprintln!(
+                        "katea: read {} @ {byte_off}: unexpected EOF",
+                        path.display()
+                    );
+                    degraded = true;
+                    *slot = None;
+                    context.window.replace(None);
+                }
+                Err(e) => {
+                    eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
+                    // `read_exact` leaves the buffer UNSPECIFIED when it fails,
+                    // and it fails after filling part of it when the host file
+                    // was truncated mid-sector. Zero the sector rather than hand
+                    // the guest a half-sector of real bytes with a zero tail:
+                    // the degraded contract is "no content", and the pre-batching
+                    // path reset `out` here for exactly this reason.
+                    out = [0u8; SECTOR];
+                    degraded = true;
+                    *slot = None;
+                    context.window.replace(None);
+                }
+            }
+        }
+        None => degraded = true,
+    }
+    drop(slot);
+    let mut tally = context.counters.get();
+    tally.host_file_reads += 1;
+    tally.host_file_opens = tally.host_file_opens.saturating_add(opened);
+    tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
+    tally.host_read_operations = tally.host_read_operations.saturating_add(operations);
+    tally.host_read_bytes = tally.host_read_bytes.saturating_add(physical_bytes);
+    tally.host_wall_ns = tally
+        .host_wall_ns
+        .saturating_add(crate::duration_ns_u64(started.elapsed()));
+    context.counters.set(tally);
     SectorRead {
         bytes: out,
         degraded,

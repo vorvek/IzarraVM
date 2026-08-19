@@ -620,6 +620,10 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     host_file_reads: after.host_file_reads.saturating_sub(before.host_file_reads),
                     host_file_opens: after.host_file_opens.saturating_sub(before.host_file_opens),
                     host_bytes: after.host_bytes.saturating_sub(before.host_bytes),
+                    host_read_operations: after
+                        .host_read_operations
+                        .saturating_sub(before.host_read_operations),
+                    host_read_bytes: after.host_read_bytes.saturating_sub(before.host_read_bytes),
                     host_wall_ns: after.host_wall_ns.saturating_sub(before.host_wall_ns),
                     run_scan_steps: after.run_scan_steps.saturating_sub(before.run_scan_steps),
                     fat_sector_reads: after
@@ -951,6 +955,8 @@ fn write_json(
                 "host_file_reads": row.katea.host_file_reads,
                 "host_file_opens": row.katea.host_file_opens,
                 "host_bytes": row.katea.host_bytes,
+                "host_read_operations": row.katea.host_read_operations,
+                "host_read_bytes": row.katea.host_read_bytes,
                 "host_wall_ns": row.katea.host_wall_ns,
                 "run_scan_steps": row.katea.run_scan_steps,
                 "sector_writes": row.katea.sector_writes,

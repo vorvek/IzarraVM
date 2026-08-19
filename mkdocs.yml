@@ -24,6 +24,7 @@ nav:
       - Nuked-SC55 for Sound Canvas playback: recipes/nuked-sc55.md
       - MT-32 ROMs with the P330 receiver: recipes/mt32-roms.md
   - Troubleshooting and FAQ: troubleshooting.md
+  - Host-folder read batching: host-folder-read-batching.md
   - VGA core: vga-core/README.md
   - VEGA (Margo / Distira):
       - Programmer's guide: vega/vega-programmers-guide.md

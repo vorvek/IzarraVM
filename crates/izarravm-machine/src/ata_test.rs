@@ -350,11 +350,28 @@ fn initialized_geometry_translates_task_file_chs() {
 }
 
 /// A tiny host-folder-backed disk: a real KateaTreeVolume over a temp folder.
+/// `host_folder_disk` plus one extra file, for the multi-sector ranges the
+/// coalescing tests need. `A.TXT` stays exactly where it was so every existing
+/// caller keeps its LBAs.
+fn host_folder_disk_with(tag: &str, extra: (&str, &[u8])) -> (AtaDisk, std::path::PathBuf) {
+    host_folder_disk_inner(tag, Some(extra))
+}
+
 fn host_folder_disk(tag: &str) -> (AtaDisk, std::path::PathBuf) {
+    host_folder_disk_inner(tag, None)
+}
+
+fn host_folder_disk_inner(
+    tag: &str,
+    extra: Option<(&str, &[u8])>,
+) -> (AtaDisk, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("katea_ata_{}_{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("A.TXT"), b"hi").unwrap();
+    if let Some((name, bytes)) = extra {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
     let img = izarravm_firmware::tokados_hdd_img();
     let mut mbr = [0u8; 512];
     mbr.copy_from_slice(&img[0..512]);
@@ -489,6 +506,131 @@ fn dma_read_reports_its_guest_visible_wait() {
     let counters = disk.katea_storage_counters().unwrap();
     assert_eq!(counters.dma_read_commands, 1);
     assert_eq!(counters.dma_read_sectors, 1);
+    assert_eq!(counters.dma_read_wait_ticks, wait_ticks);
+    drop(disk);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `sectors` sectors whose every byte is the sector index or'd with 0x40, so a
+/// sector served from the wrong offset is visible in its first byte alone.
+fn patterned_ata(sectors: usize) -> Vec<u8> {
+    (0..sectors * SECTOR)
+        .map(|i| (i / SECTOR) as u8 | 0x40)
+        .collect()
+}
+
+/// Arm a device-to-memory DMA request for `count` sectors at `lba`.
+fn arm_dma_read(disk: &mut AtaDisk, lba: u32, count: u8) {
+    disk.write_port(PRIMARY_CMD_BASE + 1, 0x03);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 0x42);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xEF);
+    advance_to_deadline(disk);
+    program_lba(disk, lba, count);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xC8);
+}
+
+/// The first byte of each sector of a DMA payload.
+fn payload_sector_heads(payload: &[u8]) -> Vec<u8> {
+    payload.chunks(SECTOR).map(|s| s[0]).collect()
+}
+
+/// A BUS-MASTER DMA READ COALESCES ITS WHOLE CONTIGUOUS REQUEST.
+///
+/// `read_dma_payload` assembles every sector of the request inside one
+/// host-side call, so unlike PIO it can declare the whole range. Four sectors
+/// must cost one physical host read and still deliver each sector's own bytes.
+///
+/// NON-VACUOUS: deleting the `begin_read_command` call from `read_dma_payload`
+/// makes the range undeclared, every sector falls back to a one-sector span,
+/// and `host_read_operations` is 4 instead of 1.
+#[test]
+fn a_dma_read_coalesces_its_contiguous_request_into_one_host_read() {
+    let (mut disk, dir) = host_folder_disk_with("dma_batch", ("BIG.DAT", &patterned_ata(4)));
+    let lba = root_file_lba(&disk, b"BIG     DAT");
+    arm_dma_read(&mut disk, lba, 4);
+
+    let before = disk.katea_storage_counters().unwrap().host_read_operations;
+    let payload = disk.read_dma_payload().unwrap();
+    disk.complete_dma_read(payload.len());
+    let after = disk.katea_storage_counters().unwrap().host_read_operations;
+
+    assert_eq!(
+        payload_sector_heads(&payload),
+        vec![0x40, 0x41, 0x42, 0x43],
+        "each sector still delivers its own bytes"
+    );
+    assert_eq!(
+        after - before,
+        1,
+        "the whole four-sector request cost one physical host read"
+    );
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.dma_read_commands, 1);
+    assert_eq!(counters.dma_read_sectors, 4);
+    drop(disk);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A HOST FAILURE PART-WAY THROUGH A DMA SPAN LOOKS THE SAME AS IT ALWAYS DID.
+///
+/// Batching changes how many host reads a span costs; it must not change what
+/// the guest sees when one of them comes up short. The host file is cut to two
+/// sectors while the directory still advertises four, so the back half of the
+/// span fails inside a coalesced read rather than on its own.
+///
+/// The contract this pins: the transfer still COMPLETES (a short host file is
+/// served as zeros, not an ABRT), the surviving sectors keep their real bytes,
+/// the failed ones are zeros, and the reported sector count and wait are the
+/// full request -- the same registers the per-sector path produced.
+///
+/// NON-VACUOUS, both directions, each applied and observed:
+///
+/// - Removing `begin_read_command`/`end_read_command` from `read_dma_payload`
+///   leaves every assertion here passing and moves only `host_read_operations`.
+///   That IS the claim: batching is invisible to the guest on the failure path.
+/// - Discarding a short coalesced answer wholesale instead of keeping its
+///   complete leading sectors (guarding `read_host_span`'s success arm with
+///   `read_bytes >= read_len`) reads back `[0, 0, 0, 0]` instead of
+///   `[64, 65, 0, 0]` -- the surviving sectors are lost.
+#[test]
+fn a_dma_span_that_fails_part_way_reports_what_the_per_sector_path_did() {
+    let (mut disk, dir) = host_folder_disk_with("dma_short", ("BIG.DAT", &patterned_ata(4)));
+    let lba = root_file_lba(&disk, b"BIG     DAT");
+
+    // Two whole sectors survive; the directory still says four.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("BIG.DAT"))
+        .unwrap()
+        .set_len(2 * 512)
+        .unwrap();
+
+    arm_dma_read(&mut disk, lba, 4);
+    let wait_ticks = dma_transfer_ticks(disk.pending_dma().unwrap());
+    let payload = disk.read_dma_payload().expect(
+        "a short host file is served as zeros, so the transfer completes rather \
+         than aborting",
+    );
+    assert_eq!(
+        payload.len(),
+        4 * SECTOR,
+        "the payload is still the full requested length"
+    );
+    assert_eq!(
+        payload_sector_heads(&payload),
+        vec![0x40, 0x41, 0x00, 0x00],
+        "the sectors that survived the truncation keep their bytes; the rest \
+         are the degraded zero fill"
+    );
+    disk.complete_dma_read(payload.len());
+
+    let counters = disk.katea_storage_counters().unwrap();
+    assert_eq!(counters.dma_read_commands, 1);
+    assert_eq!(
+        counters.dma_read_sectors, 4,
+        "the guest asked for four and is charged for four; a host-side shortfall \
+         is not a guest-visible short transfer"
+    );
     assert_eq!(counters.dma_read_wait_ticks, wait_ticks);
     drop(disk);
     std::fs::remove_dir_all(&dir).ok();
