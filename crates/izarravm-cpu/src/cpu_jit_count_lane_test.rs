@@ -613,7 +613,7 @@ fn the_baked_arm_matches_the_interpreter_for_every_form_and_count() {
                 assert_eq!(
                     native.perf_counters().smc_lane_registrations,
                     0,
-                    "{} on the {}: the off arm must bake the count, or this sweep is a second copy                      of the lane sweep",
+                    "{} on the {}: the off arm must bake the count, or this sweep is a second copy of the lane sweep",
                     shape.label(),
                     frame.label()
                 );

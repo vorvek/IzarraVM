@@ -5057,7 +5057,9 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// no full re-attribution this time, and `rejected` flat.
 ///
 /// **TWO COUNTERS MOVE AGAINST THE GRAIN and a future reader should not be surprised by them:
-/// static-unbound rose +9.6% and narrow kills +4.4% on the count arm.** Both are the expected
+/// static-unbound rose +9.6% and narrow kills +4.4% on the count arm of the LONG WALL ROW (the
+/// short row and the census leg both read static-unbound -4.3%, so the sign is row-specific).**
+/// Both are the expected
 /// shape of the win rather than a contradiction of it: absorbing the count patches keeps blocks
 /// alive, so spans that used to end at a patched byte now extend past it and reach NEW seams, and
 /// the newly admitted spans bring their own decode lines for the interpreter to kill. The wall
