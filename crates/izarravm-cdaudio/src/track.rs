@@ -174,6 +174,15 @@ impl DecodedTrack {
             .name("cd-audio-decode".to_string())
             .spawn(move || decode_worker(&path, info, &shared, registry.as_ref()));
         if spawned.is_err() {
+            // KNOWN GAP, deliberately left alone here rather than widened into
+            // this change: the track was admitted above, before the spawn, and
+            // nothing takes it back out. `finished` stays false for a worker
+            // that never existed, so the registry holds a full-size buffer it
+            // can never evict, for the life of the mount. The residency guard
+            // in `evict_excess` raises the price of it -- two such zombies pin
+            // three residents where they used to pin two -- but it is not the
+            // cause and reverting the guard would not fix it. The fix is to
+            // withdraw the admission on this path; filed as a follow-up.
             self.shared.workers.fetch_sub(1, Ordering::Relaxed);
             // The thread could not be created, so nothing will ever fill this
             // track. Clearing the flag lets the next `frame()` try again rather
@@ -278,7 +287,8 @@ impl Registry {
     }
 
     /// Take the buffer back from the oldest tracks until no more than
-    /// [`MAX_RESIDENT`] hold one, skipping any a worker is still writing into.
+    /// [`MAX_RESIDENT`] hold one, skipping any a worker is still writing into
+    /// and never taking the last buffer that is left.
     fn evict_excess(&self) {
         let mut resident = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         while resident.len() > MAX_RESIDENT {
@@ -286,6 +296,38 @@ impl Registry {
             // buffer from a live worker is safe in itself -- it copies under the
             // same lock and checks the length -- but clearing `started`
             // underneath one would let a second worker begin on the same track.
+            let evictable = resident
+                .iter()
+                .filter(|s| s.finished.load(Ordering::SeqCst))
+                .count();
+            // Never take the last one. `last_touch` orders the candidates
+            // against each other, but it cannot say which track the mixer is
+            // drawing from right now -- and when only one candidate is left, it
+            // is the track being played that gets taken, because a track being
+            // read is by definition finished while the ones still decoding are
+            // not. That is the exact shape: an idle track decoded far enough to
+            // read but whose worker has not yet stored `finished` is not a
+            // candidate, so the song under the play head becomes the only one,
+            // and evicting it restarts that song from sector 0 mid-play. It is
+            // an audible dropout in a Quake or Tomb Raider track, and the price
+            // of refusing is one extra decoded track -- a few megabytes, held
+            // for as long as it takes the older worker to store its flag, after
+            // which its own tail call clears the backlog. The bound is a memory
+            // ceiling; the music is the product.
+            //
+            // Under the same reasoning as the arm below: a third buffer is a
+            // better answer than a stall, and here also than a skip.
+            //
+            // The hand-built fixtures lean on this too, which is worth knowing
+            // before anyone weakens it. They install a residency directly and
+            // then assert on what eviction does with it; a worker still on its
+            // way out can reach `evict_excess` from its tail call in the middle
+            // of that. With this guard the stray call finds fewer than two
+            // candidates and breaks, so it cannot disturb the state under test.
+            // Weaken the guard and those tests go back to flaking.
+            if evictable < 2 {
+                break;
+            }
             let Some(index) = resident
                 .iter()
                 .enumerate()
