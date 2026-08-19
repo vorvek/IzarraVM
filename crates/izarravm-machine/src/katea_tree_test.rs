@@ -2145,10 +2145,16 @@ fn cached_host_handle_serves_identical_bytes_with_one_open_per_file() {
     let served = after.host_file_reads - before.host_file_reads;
     let opened = after.host_file_opens - before.host_file_opens;
     assert_eq!(served as usize, sectors * 3, "every sector still counted");
-    // Three sequential whole-file passes over two distinct paths: one open each.
-    assert_eq!(opened, 3, "want one open per file pass, got {opened}");
+    // Zero, not three. The `find` probe above already opened both files, and the
+    // handle cache is an LRU deep enough to hold both, so all three passes --
+    // including the return to BIG.BIN after OTHER.BIN displaced it as most
+    // recent -- reuse a handle that is already open. A single-entry cache
+    // reopened on every change of file, which is the shape an asset load
+    // produces whenever two files interleave.
+    assert_eq!(opened, 0, "want no reopen at all, got {opened}");
+    assert_eq!(vol.host_read_handles(), 2, "both paths stay cached");
     assert!(
-        served > opened * 20,
+        served > 20,
         "the cache must collapse opens: {served} sectors over {opened} opens"
     );
 
@@ -2186,15 +2192,23 @@ fn reconcile_invalidates_the_cached_host_handle() {
 
     // Prime the cache on the original contents.
     assert_eq!(vol.read_sector(lba)[0], 0xAA);
-    assert!(vol.host_read_cache.borrow().is_some(), "cache is primed");
+    assert!(
+        vol.host_read_handle_cached(&root.join("VICTIM.BIN")),
+        "cache is primed"
+    );
 
     // Rewrite the host file behind Katea's back, then run the reconcile that is
     // the documented invalidation point.
     fs::write(root.join("VICTIM.BIN"), vec![0x5Cu8; 600]).unwrap();
     vol.reconcile();
-    assert!(
-        vol.host_read_cache.borrow().is_none(),
+    assert_eq!(
+        vol.host_read_handles(),
+        0,
         "reconcile must drop the cached handle"
+    );
+    assert!(
+        !vol.readahead_holds(&root.join("VICTIM.BIN")),
+        "reconcile must drop the read-ahead buffer with it"
     );
     assert_eq!(
         vol.read_sector(lba)[0],
@@ -2651,4 +2665,399 @@ fn a_failed_host_write_leaves_its_sectors_retryable_on_the_next_commit() {
     assert_eq!(vol.storage_counters().pending_unmapped_sectors, 0);
     drop(vol);
     std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Cross-command read-ahead, the read-handle LRU, and the projection's scaling.
+// ---------------------------------------------------------------------------
+
+/// Mount `root` and return the volume. Same boot sectors and system files as
+/// `fresh_vol`, but over a folder the caller has already populated.
+fn mount(root: &std::path::Path) -> KateaTreeVolume {
+    let sys = vec![
+        ("KERNEL.SYS".to_string(), vec![0xEBu8; 100]),
+        ("COMMAND.COM".to_string(), vec![0u8; 50]),
+    ];
+    let img = izarravm_firmware::tokados_hdd_img();
+    let mut mbr = [0u8; 512];
+    mbr.copy_from_slice(&img[0..512]);
+    let mut vbr = [0u8; 512];
+    vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+    KateaTreeVolume::new(&mbr, &vbr, root, &sys).unwrap()
+}
+
+/// The guest cluster a mounted host file starts at, found by its host path.
+fn first_cluster_of(vol: &KateaTreeVolume, path: &std::path::Path) -> u32 {
+    fn walk(dir: &TreeDir, path: &std::path::Path) -> Option<u32> {
+        for f in &dir.files {
+            if let FileSource::HostFile { path: p, .. } = &f.source
+                && p == path
+            {
+                return Some(f.first_cluster);
+            }
+        }
+        dir.subdirs.iter().find_map(|s| walk(&s.dir, path))
+    }
+    walk(&vol.tree().root, path).expect("the file is in the tree")
+}
+
+/// Read `sectors` sectors starting at `lba` as one guest read command.
+fn read_command(vol: &KateaTreeVolume, lba: u32, sectors: u32) -> Vec<u8> {
+    vol.begin_read_command(lba, sectors);
+    let mut out = Vec::with_capacity(sectors as usize * SECTOR);
+    for s in 0..sectors {
+        out.extend_from_slice(&vol.read_sector(lba + s));
+    }
+    vol.end_read_command();
+    out
+}
+
+/// THE READ WINDOW MUST SURVIVE THE COMMAND THAT FILLED IT.
+///
+/// A DOS asset load is not one big command: it is a long run of separate 8-sector
+/// (one 4 KiB cluster) INT 13h commands over one file. The PR 726 window is
+/// discarded at every command boundary, so each of those commands paid its own
+/// synchronous host `seek`+`read` -- which is what the 0.5-8 ms read tail in the
+/// duke3d-486 hitch profile was made of. The read-ahead buffer is keyed by host
+/// path and byte range rather than by LBA, so it can outlive the command.
+///
+/// NON-VACUOUS: dropping the read-ahead in `end_read_command` (i.e. giving it the
+/// window's lifetime) makes the second and third commands physical reads again
+/// and fails the `host_read_operations` assertion.
+#[test]
+fn readahead_serves_later_commands_out_of_one_host_read() {
+    let root = scratch("readahead_span");
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let path = root.join("BIG.BIN");
+    fs::write(&path, &data).unwrap();
+    let vol = mount(&root);
+    let lba = vol.cluster_to_lba(first_cluster_of(&vol, &path));
+
+    let before = vol.storage_counters();
+    for command in 0..3u32 {
+        let got = read_command(&vol, lba + command * 8, 8);
+        let start = command as usize * 8 * SECTOR;
+        assert_eq!(
+            &got[..],
+            &data[start..start + 8 * SECTOR],
+            "command {command} served the wrong bytes"
+        );
+    }
+    let after = vol.storage_counters();
+
+    assert_eq!(
+        after.host_read_operations - before.host_read_operations,
+        1,
+        "three commands, one host read"
+    );
+    assert_eq!(
+        after.host_readahead_fills - before.host_readahead_fills,
+        1,
+        "one fill"
+    );
+    assert!(
+        after.host_readahead_hits - before.host_readahead_hits >= 16,
+        "the second and third commands must be served from RAM, got {} hits",
+        after.host_readahead_hits - before.host_readahead_hits
+    );
+    // Logical bytes served are unchanged by any of this: 24 sectors asked for,
+    // 24 sectors' worth counted.
+    assert_eq!(
+        after.host_bytes - before.host_bytes,
+        24 * SECTOR as u64,
+        "the guest was served exactly what it asked for"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The kill switch has to put the read path back on the PR 726 behaviour exactly,
+/// so an A/B is same-binary.
+#[test]
+fn the_readahead_kill_switch_restores_a_host_read_per_command() {
+    let root = scratch("readahead_off");
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let path = root.join("BIG.BIN");
+    fs::write(&path, &data).unwrap();
+    let mut vol = mount(&root);
+    vol.disarm_readahead();
+    // Pin the OTHER switch, so this test measures one mechanism whichever leg of
+    // `IZARRAVM_HDD_COMMAND_READ_BATCH` the suite is being run under.
+    vol.command_read_batch_enabled = true;
+    let lba = vol.cluster_to_lba(first_cluster_of(&vol, &path));
+
+    let before = vol.storage_counters();
+    for command in 0..3u32 {
+        let got = read_command(&vol, lba + command * 8, 8);
+        let start = command as usize * 8 * SECTOR;
+        assert_eq!(
+            &got[..],
+            &data[start..start + 8 * SECTOR],
+            "the bytes must not depend on the switch"
+        );
+    }
+    let after = vol.storage_counters();
+
+    assert_eq!(
+        after.host_read_operations - before.host_read_operations,
+        3,
+        "disarmed: one host read per command, as before"
+    );
+    assert_eq!(
+        after.host_readahead_hits - before.host_readahead_hits,
+        0,
+        "and no read-ahead at all"
+    );
+    // The command window is a separate mechanism and must still be doing its job:
+    // 8 sectors per command, 3 physical reads, not 24.
+    assert_eq!(
+        after.host_read_bytes - before.host_read_bytes,
+        3 * 8 * SECTOR as u64,
+        "the per-command window still coalesces"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// THE WRITE-THROUGH PATH IS ITS OWN INVALIDATION POINT.
+///
+/// `stream_projected_batch` -> `stream_file_overlay` writes a guest sector
+/// straight into the host file and then acknowledges it out of the overlay, so
+/// the next read of that sector resolves through the host file again. It runs
+/// with no reconcile around it, so the blanket drop in `reconcile_mode` never
+/// sees it. A read-ahead buffer filled before the write holds the file's old
+/// bytes for exactly that sector.
+///
+/// NON-VACUOUS: deleting the `invalidate_host_reads` call from
+/// `stream_file_overlay` fails the final assertion with the pre-write byte.
+#[test]
+fn a_write_through_drops_the_readahead_for_that_file() {
+    let root = scratch("readahead_writethrough");
+    let data: Vec<u8> = vec![0xA1u8; 200_000];
+    let path = root.join("BIG.BIN");
+    fs::write(&path, &data).unwrap();
+    let mut vol = mount(&root);
+    let lba = vol.cluster_to_lba(first_cluster_of(&vol, &path));
+
+    // Prime the read-ahead over the file's opening bytes.
+    assert_eq!(read_command(&vol, lba, 8)[0], 0xA1);
+    assert!(
+        vol.readahead_holds(&path),
+        "the buffer is primed on this file"
+    );
+
+    // The guest overwrites one sector; the commit streams it through to the host
+    // file and acknowledges it, so reads fall back to the host from here on.
+    let sector = [0x5Cu8; SECTOR];
+    vol.write_sector(lba, &sector);
+    assert_eq!(
+        vol.reconcile_after_write(),
+        CommitGuestWriteResult::Projected,
+        "the write must reach the host file"
+    );
+    assert!(
+        !vol.store.is_pending(lba),
+        "and be acknowledged out of the overlay, or this proves nothing"
+    );
+    assert!(
+        !vol.readahead_holds(&path),
+        "the write-through must drop the buffer it just invalidated"
+    );
+
+    assert_eq!(
+        vol.read_sector(lba)[0],
+        0x5C,
+        "the next read must see the written bytes, not the buffered ones"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The handle cache is an LRU with a bound: a session that touches many files
+/// must not hold a descriptor for each, and the most recently used must survive.
+#[test]
+fn the_read_handle_cache_is_a_bounded_lru() {
+    let root = scratch("handle_lru");
+    let count = MAX_HOST_READ_HANDLES + 3;
+    let paths: Vec<std::path::PathBuf> = (0..count)
+        .map(|i| {
+            let path = root.join(format!("F{i:02}.BIN"));
+            fs::write(&path, vec![i as u8; 4096]).unwrap();
+            path
+        })
+        .collect();
+    let vol = mount(&root);
+
+    for (i, path) in paths.iter().enumerate() {
+        let lba = vol.cluster_to_lba(first_cluster_of(&vol, path));
+        assert_eq!(vol.read_sector(lba)[0], i as u8, "file {i} served wrong");
+    }
+
+    assert_eq!(
+        vol.host_read_handles(),
+        MAX_HOST_READ_HANDLES,
+        "the cache must stay bounded"
+    );
+    for (i, path) in paths.iter().enumerate() {
+        assert_eq!(
+            vol.host_read_handle_cached(path),
+            i >= count - MAX_HOST_READ_HANDLES,
+            "wrong eviction verdict for file {i}"
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A ONE-FILE WRITE MUST NOT COST THE WHOLE VOLUME.
+///
+/// A projection pass walks the cluster chain of every live file three times over
+/// (the ownership scan, the materialize scan, and the pending re-check), and each
+/// step of a walk asks `fat_entry` for one cluster. `fat_entry` reads a whole FAT
+/// sector, and synthesizing one costs 128 hashed set probes -- so the pass paid
+/// ~128 probes per cluster ON THE VOLUME for a write that touched one file.
+/// Measured on a 47 MB duke3d-486 folder: single passes of 290, 196 and 125 ms,
+/// each synchronous on the emulation thread.
+///
+/// The memo makes the FAT synthesis proportional to the FAT REGION the pass
+/// touches (one build per 128 clusters at worst) instead of to the clusters it
+/// walks. This asserts that ratio directly.
+///
+/// NON-VACUOUS: returning `self.fat.fat_sector(within, &self.geo)` from
+/// `base_fat_sector` without consulting or filling the memo makes builds exceed
+/// the walked-cluster count and fails the ratio assertion by two orders of
+/// magnitude.
+#[test]
+fn a_one_file_write_does_not_resynthesize_the_fat_per_cluster() {
+    let root = scratch("projection_scaling");
+    // Enough clusters that "proportional to the volume" and "proportional to the
+    // write" are far apart, in few enough root entries that `stamp_file` still
+    // finds a free slot in the root directory's first sector.
+    for i in 0..8u32 {
+        fs::write(root.join(format!("A{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    let allocated = vol.fat.next_free() - ROOT_CLUSTER;
+    assert!(
+        allocated > 400,
+        "want a volume worth walking, got {allocated} clusters"
+    );
+
+    // One small new file, exactly the measured case: a guest creating a file in a
+    // directory it dirties. This is the write that used to project the volume.
+    let first = vol.fat.next_free();
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "NEW.TXT",
+        ATTR_ARCHIVE,
+        first,
+        b"hi",
+    );
+    vol.reset_fat_sector_builds();
+    let before = vol.storage_counters();
+    vol.reconcile_after_write();
+    let after = vol.storage_counters();
+
+    assert!(
+        after.metadata_projection_passes > before.metadata_projection_passes,
+        "this must be the metadata-projection path, or the test is vacuous"
+    );
+    assert_eq!(
+        fs::read(root.join("NEW.TXT")).unwrap(),
+        b"hi",
+        "and it must actually project the file"
+    );
+    let builds = vol.fat_sector_builds();
+    assert!(
+        builds * 8 < u64::from(allocated),
+        "a one-file write synthesized {builds} FAT sectors over {allocated} \
+         allocated clusters: the pass is still paying per cluster"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The memo may only change WHETHER the bytes are recomputed, never WHAT they
+/// are. Every FAT sector of the volume must read back byte for byte what an
+/// uncached synthesis produces, in a read order that alternates between two
+/// sectors so the single memo slot misses on every request.
+#[test]
+fn the_fat_memo_is_byte_identical_to_an_uncached_synthesis() {
+    let (vol, root) = fresh_vol("fat_memo_identity");
+    let reserved = u32::from(RESERVED_SECTORS);
+    let fat_sectors = vol.geo.fatsz.min(64);
+
+    for within in 0..fat_sectors {
+        let uncached = vol.fat.fat_sector(within, &vol.geo);
+        let lba = vol.geo.part_start + reserved + within;
+        assert_eq!(vol.read_sector(lba), uncached, "FAT sector {within}");
+        // Alternate to a different sector and back, so the next iteration and the
+        // re-read below both come off a missed memo.
+        let other = (within + 1) % fat_sectors;
+        let _ = vol.read_sector(vol.geo.part_start + reserved + other);
+        assert_eq!(
+            vol.read_sector(lba),
+            uncached,
+            "FAT sector {within} re-read"
+        );
+    }
+    // The second FAT copy is the same bytes at a different LBA.
+    for within in 0..fat_sectors.min(4) {
+        let lba = vol.geo.part_start + reserved + vol.geo.fatsz + within;
+        assert_eq!(
+            vol.read_sector(lba),
+            vol.fat.fat_sector(within, &vol.geo),
+            "FAT copy 2, sector {within}"
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The max counters must report the longest SINGLE operation, which is the only
+/// figure that can tell a visible freeze from time spread thin.
+#[test]
+fn the_max_counters_track_the_longest_single_operation() {
+    let root = scratch("max_counters");
+    fs::write(root.join("BIG.BIN"), vec![0x33u8; 200_000]).unwrap();
+    let mut vol = mount(&root);
+    let lba = vol.cluster_to_lba(first_cluster_of(&vol, &root.join("BIG.BIN")));
+
+    assert_eq!(
+        vol.storage_counters().host_read_max_ns,
+        0,
+        "nothing has been read yet"
+    );
+    assert_eq!(vol.storage_counters().projection_max_ns, 0);
+
+    read_command(&vol, lba, 8);
+    let counters = vol.storage_counters();
+    assert!(counters.host_read_max_ns > 0, "a host read was timed");
+    assert!(
+        counters.host_read_max_ns <= counters.host_wall_ns,
+        "one operation cannot exceed the sum of all of them"
+    );
+
+    let first = vol.fat.next_free();
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "NEW.TXT",
+        ATTR_ARCHIVE,
+        first,
+        b"hi",
+    );
+    vol.reconcile_after_write();
+    let counters = vol.storage_counters();
+    assert!(
+        counters.projection_max_ns > 0,
+        "a projection pass was timed"
+    );
+    assert!(
+        counters.projection_max_ns <= counters.projection_wall_ns,
+        "one pass cannot exceed the sum of all of them"
+    );
+
+    fs::remove_dir_all(&root).ok();
 }

@@ -56,9 +56,79 @@ a single host-side call, and why the one path that cannot do that is excluded
 below. The guest overlay is still checked first, and the ordinary sector cache
 still observes each requested sector as the guest asks for it.
 
-The existing one-file open-handle cache remains in place. Projected host files
-now reach the range reader directly instead of constructing a temporary
-`PathBuf`-backed source for each sector.
+The window is addressed by LBA, so it can only ever cover sectors that are both
+inside the declared command and contiguous in the host file. The read-ahead
+buffer described below has neither limit, because it is addressed by file byte
+offset instead.
+
+Projected host files reach the range reader directly instead of constructing a
+temporary `PathBuf`-backed source for each sector.
+
+### Cross-command read-ahead
+
+A game's asset load is not one large command. It arrives as a long run of
+separate eight-sector requests, one per 4 KiB cluster, and the command window is
+discarded between every pair of them. Each of those requests therefore still paid
+its own synchronous host seek and read.
+
+A read-ahead buffer sits under the window and survives command boundaries. On a
+physical read it pulls up to 256 KiB from the host file, and a later sector whose
+whole range lies inside the buffered bytes is served as a memory copy with no
+host call at all. The buffer holds one file's bytes at a time, which is the shape
+DOS produces: one file is read at a time, front to back.
+
+It is keyed by host path and byte offset rather than by LBA, so it stays correct
+however the guest's clusters are laid out, and it is used only when the requested
+sector lies wholly inside the range it holds.
+
+Because the buffer outlives the command, it needs an invalidation rule of its
+own. Four operations mutate a host file this disk reads: the atomic whole-file
+write, the rename, the delete, and the write-through path that streams guest
+sectors into a projected file. The first three run inside the reconcile pass,
+which drops every cached read view on entry and again, scoped to the affected
+path, at each mutation. The scoped drops are load-bearing: the pass reads file
+bytes between its entry and its writes. The write-through path is reachable with
+no reconcile around it, so it invalidates its own path before writing.
+
+The buffer does not track changes made to the mounted folder by another program
+while the machine is running. That was already outside the mount's contract; the
+buffer widens the window in which such a change goes unnoticed.
+
+### Read-handle LRU
+
+The open read handle was a single entry. That is right for one sequential file
+and degrades to one `File::open` per sector as soon as two files interleave,
+which is what an asset load does whenever a read lands between two projections.
+It is now an LRU of eight handles, keyed by path, invalidated through the same
+funnel as the read-ahead buffer, and symmetric with the write-handle cache.
+
+### Metadata projection scaling
+
+The same profile that showed the read tail showed a larger cost on the write
+side: every interval stall of 19 ms or more was entirely metadata projection,
+fired by a guest write command, with single passes measured at 290, 196 and
+125 ms on a 47 MB folder. The passes are synchronous on the emulation thread.
+
+A projection pass walks the cluster chain of every live file three times over --
+the ownership scan, the materialize scan, and the pending re-check. Each step of
+a walk asks for one FAT entry, each FAT entry read synthesizes a whole 512-byte
+FAT sector, and synthesizing one evaluates 128 entries against a hash set. A
+write that touched one small file therefore paid roughly 128 hashed lookups for
+every cluster on the volume.
+
+The synthesized FAT sector is now memoized, one entry deep. A chain walk asks for
+clusters in ascending order, so 128 consecutive requests land in the same FAT
+sector and the single slot captures the whole win.
+
+The memo cannot change what the guest reads. The cluster index and the geometry
+are built at mount and never mutated, so the synthesis is a pure function of the
+sector index and any two evaluations agree byte for byte. The memo also sits
+strictly below the guest write overlay: the overlay is still consulted first and
+still reports its read failures, so a guest-written FAT sector never reaches the
+memo at all.
+
+Measured by unit test, on a folder of 772 allocated clusters, a one-file write
+went from 1,531 FAT sector syntheses to 13.
 
 ### Which callers declare a range
 
@@ -122,6 +192,35 @@ addition to logical host-file sectors. Command batching is enabled by default;
 setting `IZARRAVM_HDD_COMMAND_READ_BATCH=0` disables it for a same-binary A/B
 comparison.
 
+The read-ahead is enabled by default and has the same kind of control:
+`IZARRAVM_HDD_READAHEAD=0` disarms it, restoring one physical read per command.
+Both switches are read once at mount.
+
+The two switches are not independent. The read-ahead reads at least as far as
+the command window would have, so with the read-ahead armed, setting
+`IZARRAVM_HDD_COMMAND_READ_BATCH=0` no longer changes any physical-read counter:
+the library suite passes identically with it on and off. To isolate the window's
+own contribution, disarm both.
+
+The profile also reports the longest single operation of each kind, beside the
+sums it already reported:
+
+| Counter | Meaning |
+| --- | --- |
+| `host_read_max_ns` | longest single host read this session |
+| `projection_max_ns` | longest single projection pass this session |
+| `host_readahead_hits` | sectors served from the read-ahead buffer |
+| `host_readahead_fills` | physical reads that filled the buffer |
+
+A sum cannot see a hitch. Time spread thin over a minute and the same time spent
+in one synchronous pass are the same number of nanoseconds and a completely
+different experience, and only the maximum separates them. Both maxima are read
+off the `Instant` pair their sums already computed, so neither costs a clock
+read. In the phase-mark series they are cumulative running maxima like every
+other counter in that series; the boot profiler carries them through as levels
+rather than differencing them, because the difference of two maxima means
+nothing.
+
 ## DukeMark results
 
 The measured fixture used the 486 persona, 64 MiB RAM, VEGA video, and a
@@ -179,6 +278,59 @@ the mutation that makes it fail, and each mutation was applied and observed:
 
 The pre-existing transient-read, cached-handle, reconciliation, CHS, and EDD
 tests were re-run unchanged; this change did not add to them.
+
+## Follow-up: read-ahead, handle LRU, projection scaling
+
+The three sections added above were validated the same way. Six further
+regressions are specific to them, each naming its mutation:
+
+- three commands over one file cost one physical host read, not three
+- `IZARRAVM_HDD_READAHEAD=0` puts it back to one physical read per command
+- a write-through drops the read-ahead buffer for the file it wrote
+- the handle cache stays bounded at eight and evicts least-recently-used
+- a one-file write does not resynthesize the FAT once per cluster walked
+- every FAT sector reads back byte-identical to an uncached synthesis, under a
+  read order that misses the one-entry memo on every request
+
+Three pre-existing assertions moved, all of them host-side counters:
+
+- `the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder` read
+  `host_read_bytes == 4 * 512` and now reads `8 * 512`. The command asked for
+  four sectors of an eight-sector file and the read-ahead pulled the rest.
+  `host_bytes`, the logical figure, is unchanged, as are the cache hit and miss
+  counts, the charged stall, and the bytes served.
+- `cached_host_handle_serves_identical_bytes_with_one_open_per_file` read
+  `host_file_opens == 3` and now reads `0`. The probe that identifies the two
+  files already opened both, and the LRU is deep enough to keep them; the
+  single-entry cache reopened on every change of file. Sectors served are
+  unchanged.
+- `a_failed_host_read_is_served_as_zeros_but_never_cached` truncated the file it
+  had just read and expected the next sector of it to fail. With a read-ahead
+  buffer that sector is already in RAM. The test now puts its failing sector in
+  a second file this run has never opened, so the read genuinely reaches the
+  host. What it asserts -- that a degraded read is served as zeros and never
+  cached, and that the restored bytes come back -- is unchanged.
+
+No timing, charge, tick, status-register, content or determinism test changed.
+The whole workspace passes: 1,549 `izarravm-machine` library tests with 3
+ignored, 231 `izarravm` tests with 92 ignored, and every other crate.
+
+### Guest timing, measured again
+
+The library suite was run in both legs of the new switch. With
+`IZARRAVM_HDD_READAHEAD=0`, exactly three tests change result: the two new ones
+that assert the read-ahead is doing something, and the `host_read_bytes`
+assertion described above. The other 1,546 pass identically armed and disarmed.
+
+The read-ahead moves physical-read counters and nothing else the guest can
+observe. The handle LRU and the FAT memo have no switch because neither has a
+guest-visible degree of freedom: the LRU only decides whether a file is reopened,
+and the memo only decides whether identical bytes are recomputed.
+
+The wall-clock effect on the duke3d-486 hitch has NOT been measured. The
+acceptance instrument is in place -- `projection_max_ns` and `host_read_max_ns`
+in the profile and the phase-mark series -- and the fixture run belongs to
+whoever grades this.
 
 ### Guest timing, measured rather than argued
 

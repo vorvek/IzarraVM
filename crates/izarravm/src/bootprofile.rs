@@ -625,6 +625,17 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                         .saturating_sub(before.host_read_operations),
                     host_read_bytes: after.host_read_bytes.saturating_sub(before.host_read_bytes),
                     host_wall_ns: after.host_wall_ns.saturating_sub(before.host_wall_ns),
+                    // A running max is a level, not an accumulator: subtracting
+                    // two of them means nothing. Carried through as the
+                    // session-to-date maximum, the same way the overlay
+                    // occupancy levels below are.
+                    host_read_max_ns: after.host_read_max_ns,
+                    host_readahead_hits: after
+                        .host_readahead_hits
+                        .saturating_sub(before.host_readahead_hits),
+                    host_readahead_fills: after
+                        .host_readahead_fills
+                        .saturating_sub(before.host_readahead_fills),
                     run_scan_steps: after.run_scan_steps.saturating_sub(before.run_scan_steps),
                     fat_sector_reads: after
                         .fat_sector_reads
@@ -704,6 +715,8 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     projection_wall_ns: after
                         .projection_wall_ns
                         .saturating_sub(before.projection_wall_ns),
+                    // A level, like `host_read_max_ns` above.
+                    projection_max_ns: after.projection_max_ns,
                     metadata_projection_passes: after
                         .metadata_projection_passes
                         .saturating_sub(before.metadata_projection_passes),
@@ -984,6 +997,10 @@ fn write_json(
                 "spill_operations": row.katea.spill_operations,
                 "spill_bytes": row.katea.spill_bytes,
                 "spill_wall_ns": row.katea.spill_wall_ns,
+                "host_read_max_ns": row.katea.host_read_max_ns,
+                "host_readahead_hits": row.katea.host_readahead_hits,
+                "host_readahead_fills": row.katea.host_readahead_fills,
+                "projection_max_ns": row.katea.projection_max_ns,
                 "projection_operations": row.katea.projection_operations,
                 "projection_bytes": row.katea.projection_bytes,
                 "projection_wall_ns": row.katea.projection_wall_ns,

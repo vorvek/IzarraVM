@@ -1946,7 +1946,12 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
     assert_eq!(counters.int13_read_sectors, 8);
     assert_eq!(counters.int13_read_wait_ticks, first_stall);
     assert_eq!(counters.host_read_operations, 1);
-    assert_eq!(counters.host_read_bytes, 4 * 512);
+    // The one physical read pulls the whole 8-sector file, not just the four
+    // sectors this command asked for: the read-ahead fills up to 256 KiB so the
+    // NEXT command over the same file is a memcpy. The command asked for four
+    // sectors and was served four sectors -- `host_bytes`, the logical figure,
+    // is unchanged; `host_read_bytes` is the physical one and is what moved.
+    assert_eq!(counters.host_read_bytes, 8 * 512);
 
     drop(machine);
     std::fs::remove_dir_all(&dir).ok();
@@ -1974,12 +1979,19 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
 #[test]
 fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
     let dir = katea_scratch("degraded");
-    let path = dir.join("GAME.DAT");
+    let path = dir.join("OTHER.DAT");
     let original = patterned(8);
+    std::fs::write(dir.join("GAME.DAT"), patterned(8)).unwrap();
     std::fs::write(&path, &original).unwrap();
     let mut machine = machine_with_hdd_folder(&dir);
-    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
-    let (sector_a, sector_b) = (lba, lba + 1);
+    // Two files, because the failure has to reach the host. A read fills a
+    // cross-command read-ahead buffer of up to 256 KiB from the file it touched,
+    // so a sector of the file sector A lives in would afterwards be served out of
+    // RAM and never notice the truncation below. Sector B is in a file this run
+    // has never opened, so its first read is genuinely a host read that fails.
+    let (a_lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+    let (b_lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"OTHER   DAT");
+    let (sector_a, sector_b) = (a_lba, b_lba + 1);
 
     // A: a healthy read, then proof the cache really is answering in this run.
     assert_eq!(int13_read_at(&mut machine, sector_a, 1), vec![0x40]);
