@@ -403,19 +403,35 @@ fn imm8_lane_absorbs_a_patch_on_the_slow_byte_write_path() {
 /// remove — `lane_only` at `core.rs`'s heat block is the suppression, and it is keyed on the
 /// accept COUNT rather than on any lane's width, so the new class is covered by construction.
 /// This fixture is what turns "by construction" into a measurement.
+///
+/// **THE DECODE LINE IS RE-FETCHED BETWEEN PATCHES, and without that this test cannot fail.**
+/// `heat_hit` is set by a narrow decode kill as well as by a block kill, and the first patch kills
+/// the line — so a fixture that just stores 64 times charges heat at most once, never reaches the
+/// threshold of 4, and passes with the suppression deleted. Re-decoding restores the line each
+/// round, so every round produces a narrow kill and `smc_narrow_kills` climbs with the loop; the
+/// assertion below pins that, which is what makes the zero-heat assertion beside it mean
+/// "suppressed" rather than "never charged".
 #[test]
 fn imm8_lane_writes_contribute_no_smc_heat() {
     // The compiled immediate is deliberately outside the patch sequence below: a repatch to the
     // value already in memory is elided by G2 before it reaches the choke, so a colliding first
     // round would silently cost one accept.
     let (mut cpu, mut bus, id) = lane_fixture(Shape { op: 0, dst: 0 }, 0xee);
-    for round in 0..64u32 {
+    const ROUNDS: u32 = 64;
+    for round in 0..ROUNDS {
+        cpu.set_eip(ENTRY + ALU_OFFSET);
+        cpu.fetch_decoded(&mut bus, ENTRY + ALU_OFFSET).unwrap();
         // Every value distinct from the last: G2 same-value elision never reaches the choke, so
         // an identical repatch would not count.
         guest_store_byte(&mut cpu, &mut bus, LANE, (round + 1) as u8);
     }
     let perf = cpu.perf_counters();
-    assert_eq!(perf.smc_lane_accepts, 64);
+    assert_eq!(perf.smc_lane_accepts, u64::from(ROUNDS));
+    assert!(
+        perf.smc_narrow_kills >= u64::from(ROUNDS),
+        "every round must produce a decode-line kill, or the heat assertion below is vacuous:          narrow kills {}",
+        perf.smc_narrow_kills
+    );
     assert_eq!(
         perf.smc_heat_chunks_hot, 0,
         "lane patches must not heat the chunk"
@@ -425,7 +441,6 @@ fn imm8_lane_writes_contribute_no_smc_heat() {
         cpu.jit_direct.block(id).is_some(),
         "the block must survive all of them"
     );
-    let _ = &mut bus;
 }
 
 /// The width check, fail-closed, from the wide side: a FOUR-byte store starting at the one-byte
@@ -657,6 +672,60 @@ fn a_page_the_fetch_cache_cannot_see_gets_no_imm8_lane() {
         105,
         "the baked immediate still applies"
     );
+}
+
+/// Compile `middle` in the fixture frame under a forced arm and hand back the emitted code's
+/// LENGTH.
+///
+/// The length rather than the bytes, and that is a limitation of the fixture rather than a
+/// weakening of the claim: two compilations bake different host pointers (link-cell and portal
+/// addresses, and a lane's own host pointer), so a byte comparison across them fails on
+/// allocation noise whatever the arm. The length is stable, and it is exactly the quantity a
+/// stray lane moves — the lane arm emits `mov r64, imm64` plus `movzx r32, byte [r64]` where the
+/// baked arm emits one `mov r32, imm32`.
+fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
+    jit::direct::set_imm8_lanes_for_test(Some(arm));
+    let mut cpu = flat_cpu();
+    let mut bus = test_bus(image_from(middle));
+    decode_at(&mut cpu, &mut bus, &block_starts(middle.len() as u32));
+    match jit::direct::compile(&mut cpu, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(c) => c.code.len(),
+        jit::direct::CompileOutcome::Retry => panic!("fixture block did not compile: Retry"),
+        jit::direct::CompileOutcome::StructuralReject(r) => {
+            panic!("fixture block did not compile: reject {r:?}")
+        }
+    }
+}
+
+/// THE OFF ARM PAYS NOTHING, stated as emitted code rather than as an argument.
+///
+/// The admitted shape's two arms must differ — otherwise the knob is decorative — and every OTHER
+/// shape must emit the same code under both arms, which is what says the arm is a lane admission
+/// and not a second code path that a non-`0x80` block also walks through.
+#[test]
+fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
+    let admitted = &[0x80, 0xc0, 0x11];
+    assert_ne!(
+        emitted_len_under_arm(admitted, false),
+        emitted_len_under_arm(admitted, true),
+        "the admitted shape must lower differently under the two arms, or the knob does nothing"
+    );
+    for middle in [
+        // The AL short form, an `AluByteImm` the arm must not touch.
+        &[0x04, 0x11][..],
+        // The dword immediate family, which has its own lane and its own knob.
+        &[0x81, 0xc0, 0x78, 0x56, 0x34, 0x12][..],
+        // A byte ALU with a register source: the emitter the lane arm shares its tail with.
+        &[0x00, 0xc4][..],
+        // A plain register move, the frame's own instruction repeated.
+        &[0x89, 0xd8][..],
+    ] {
+        assert_eq!(
+            emitted_len_under_arm(middle, false),
+            emitted_len_under_arm(middle, true),
+            "{middle:02x?} must emit the same code under both arms"
+        );
+    }
 }
 
 /// The `IZARRAVM_IMM8_LANES` spelling table. `imm8_lanes_enabled` caches its env reading in a
