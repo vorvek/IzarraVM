@@ -256,6 +256,49 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xfe
                 | 0xff
         )
+        // THE V86 LOOP-A ROWS (`IZARRAVM_V86_LOOP_ROWS`, default off) are a SECOND allowlist,
+        // written as its own term rather than folded into the list above so that the gate-off arm
+        // is byte-identical to the pre-slice tree by inspection rather than by reading a
+        // hundred-line `matches!`.
+        //
+        // `0x05..=0x3d` step 8 are ALU form 5, the accumulator with a full-width immediate, and
+        // `0x3d` CMP AX,imm16 is the census row (96,182,170 interpreted hits). The whole form is
+        // admitted for the closure rule at the top of this file: all eight members reach ONE arm,
+        // which produces `AluImm { dst: 0, width: operand_width }` -- a kind that has carried a
+        // width field since the `0x81` slice and whose Word lane (`emit_alu`'s `mov ecx, imm32`
+        // then a 66-prefixed `alu_r16_r16` with both operands masked, then `emit_write_gpr16`) has
+        // been in production on `0x81`/`0x83` since then. `decode` fetches this immediate with
+        // `fetch_immediate(operand_size)`, which at Word is a zero-extended `fetch_u16`, so the
+        // emitter's `imm & 0xffff` is exact rather than a truncation. ADC (`0x15`) and SBB
+        // (`0x1d`) are refused at Word by the forms-1|3|5 guard below, for the reason forms 1 and
+        // 3 already refuse them: no carry-in lane.
+        //
+        // `0xa1` / `0xa3` are the moffs word forms, and they are the pair the long note above
+        // names as the COUNTEREXAMPLE that must not be swept in by proximity. That note was right
+        // about the hazard and is now the statement of the fix: both arms carried a hard-coded
+        // `MemoryWidth::Dword`, and both now carry `operand_width`, exactly as MOVZX/MOVSX grew
+        // `dst_width` rather than being kept off the list. `0xa0` / `0xa2` keep their literal
+        // `MemoryWidth::Byte`, because THEIR width is a property of the form.
+        //
+        // `0x07` / `0x1f` POP ES / POP DS and `0xf8` / `0xf9` CLC / STC have arms of their own
+        // below, both gated there as well; the entries here are what lets a 16-bit segment reach
+        // them at all.
+        //
+        // `0xfc` / `0xfd` CLD / STD are deliberately NOT here even though the same census measures
+        // a `0xfc` word row at 1,642,514 hits. They are a different arm from CLC/STC (a DF write
+        // with no lazy-descriptor interaction), so admitting them would put a second mechanism
+        // behind one knob and make this slice's A/B unattributable. A follow-on, not an omission.
+        && !(v86_loop_rows_enabled()
+            && matches!(
+                insn.opcode,
+                0x05 | 0x0d | 0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d
+                    | 0x07
+                    | 0x1f
+                    | 0xa1
+                    | 0xa3
+                    | 0xf8
+                    | 0xf9
+            ))
         // Group 3's `/0` (TEST r/m16, imm16) is the ONE width-safe member of `0xf7`, so it is
         // admitted by sub-opcode here rather than by adding `0xf7` to the list above: every other
         // member's arm (NEG, MUL, IMUL, DIV) deliberately carries no width field and documents
@@ -443,13 +486,21 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // members of two shared arms. Without a guard here the next reader applying that rule
             // lands the bug above in one line. `0x81 | 0x83` states the same refusal the same way.
             //
-            // Forms 1 and 3 ONLY. The other forms in this group are byte-width by encoding and
+            // Forms 1, 3 and 5 ONLY. The other forms in this group are byte-width by encoding and
             // reach lanes that carry no `operand_width` at all, so their ADC and SBB members are
             // correct at Word and are admitted: `0x10`/`0x18`/`0x12`/`0x1a` produce `AluRegByte`
             // and `0x14`/`0x1c` produce `AluByteImm`. Widening this guard to the whole group
             // refuses those six as collateral, which is a regression rather than a fix.
+            //
+            // Form 5 (the accumulator with a full-width immediate) joined the guard with the
+            // V86 loop-A slice, which is what first lets a form-5 opcode reach here at Word. It
+            // produces `AluImm { width: operand_width }` and routes through the same
+            // `emit_alu_preloaded` Word lane forms 1 and 3 do, so `0x15` ADC AX,imm16 and `0x1d`
+            // SBB AX,imm16 have exactly the failure this guard already describes. The guard is
+            // UNGATED on purpose: it can only fire on a form the gate admits, and stating the
+            // refusal unconditionally is what stops the next reader re-deriving it.
             if insn.operand_size == OperandSize::Word
-                && matches!(form, 1 | 3)
+                && matches!(form, 1 | 3 | 5)
                 && matches!(op, 2 | 3)
             {
                 return None;
@@ -823,6 +874,26 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     set: opcode == 0xfd,
                 });
             }
+            // CLC (0xf8) and STC (0xf9). Behind `IZARRAVM_V86_LOOP_ROWS`; `0xf8` is the tombraid
+            // loop-A census's fourth row at 95,090,745 interpreted hits, and it is the loop's LAST
+            // instruction before the `ret`, so nothing after it retires natively while it stays a
+            // barrier.
+            //
+            // STC rides the arm with it by the closure rule at the top of this file: the emitter
+            // is one `or`/`and` on the flag shadow selected by this bool, and refusing one
+            // polarity of a two-polarity arm would be arbitrary. CMC (0xf5) is NOT here: it reads
+            // the incoming CF and complements it, which is a different operation needing the
+            // current value rather than a constant, and no census row measures it.
+            //
+            // Unlike CLD/STD above these ARE on the Word allowlist (under the gate), because the
+            // measured row is a 16-bit one. Neither instruction consults `operand_size` in the
+            // interpreter -- both are one `set_flag(FLAG_CF, ..)` -- so the two widths are the
+            // same operation and the kind carries no width to get wrong.
+            0xf8 | 0xf9 if v86_loop_rows_enabled() => {
+                return Some(DirectKind::CarryFlag {
+                    set: opcode == 0xf9,
+                });
+            }
             0xc9 => {
                 return Some(DirectKind::Leave);
             }
@@ -873,6 +944,36 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         0x1e => SegmentIndex::Ds,
                         _ => SegmentIndex::Es,
                     }),
+                });
+            }
+            // POP ES (0x07) and POP DS (0x1f), the read half's mirror: a word off the stack loaded
+            // into a segment register. Behind `IZARRAVM_V86_LOOP_ROWS`; `0x07` is the tombraid
+            // loop-A census's largest row at 97,347,816 interpreted hits and 95,057,524 static
+            // unbound exits, and `0x1f` rides the same arm with 6,016,460 of its own.
+            //
+            // POP SS (0x17) is left off both this arm and the gated allowlist above, and the reason
+            // is exactly the one `0x8e /2` states in its own arm: loading SS arms a one-instruction
+            // interrupt shadow (`load_segment_arming_ss_shadow`) that the interpreter consumes at
+            // the start of the NEXT instruction. A native block never passes through that point,
+            // so a block that continued after it would hold the shadow open across every remaining
+            // slot, which moves where an interrupt is delivered. FS and GS have no `POP` encoding
+            // in the one-byte map at all, so the DS/ES pair is the whole family here.
+            //
+            // WORD ONLY, and the refusal is in this arm rather than downstream. At `Dword` the
+            // interpreter pops FOUR bytes and loads the low 16 (386 PRM), which is a different
+            // stack movement and a different bus charge; no fixture measures that form, and
+            // `stack_width_kind`'s `(kind, true, Dword)` arm would otherwise wave it straight
+            // through to an emitter that only knows the 16-bit shape.
+            0x07 | 0x1f if v86_loop_rows_enabled() => {
+                if insn.operand_size != OperandSize::Word {
+                    return None;
+                }
+                return Some(DirectKind::PopSegReal {
+                    segment: if opcode == 0x07 {
+                        SegmentIndex::Es
+                    } else {
+                        SegmentIndex::Ds
+                    },
                 });
             }
             0x68 => {
@@ -1155,10 +1256,26 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     raw_clocks: 4,
                 });
             }
+            // MOV AX/EAX, moffs. `width` is `operand_width` as of the V86 loop-A slice; it was a
+            // hard-coded `MemoryWidth::Dword`, which is why `0xa1` had to be kept off the Word
+            // allowlist and why the note at the top of this file names it as the counterexample
+            // that proximity would sweep in. The kind is `Load`, which has carried a width end to
+            // end since `0x8b`: at Word `emit_load` reads two bytes through
+            // `movzx_r32_word_disp8` and writes the destination with `emit_write_gpr16`, merging
+            // into AX and leaving EAX's high half exactly as `write_gpr_sized(0, Word, ..)` does.
+            // `raw_clocks: 4` is right at both widths -- the interpreter's arm returns `clocks(4)`
+            // without consulting `operand_size`.
+            //
+            // The moffs displacement is fetched at ADDRESS size and zero-extended (`decode`), so a
+            // 16-bit address mode cannot produce a displacement the block's `AddressWrap::Word`
+            // would have to mask.
+            //
+            // The segment comes from the override when there is one, which is what the tombraid
+            // row needs: its form is `mov ax, es:[0x6c]`, prefix mask 32.
             0xa1 => {
                 return Some(DirectKind::Load {
                     dst: 0,
-                    width: MemoryWidth::Dword,
+                    width: operand_width,
                     addr: DirectAddr {
                         segment: insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
                         base: None,
@@ -1185,10 +1302,22 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     raw_clocks: 4,
                 });
             }
+            // MOV moffs, AX/EAX. `width` is `operand_width` for `0xa1`'s reason above, and the
+            // store side of the argument is `0x89`'s: `emit_store`'s Word arm is
+            // `store_r16_disp8` plus `emit_dynamic_word_increment`, guarded by
+            // `emit_wide_page_guard` at 2-byte alignment and by `emit_watched_store_guard`. So a
+            // two-byte store writes exactly two bytes and cannot straddle a page. A MISALIGNED one
+            // is served rather than refused: `emit_store` dispatches to the relaxed lean store
+            // site, which splits the charge instead of side-exiting.
+            //
+            // Its census row is small (`0x00A3` word, 593,213 hits) but real, and it is in the
+            // slice because it sits in the SAME compile unit as the rows that are not: the
+            // `0xc8fe7` neighbourhood is `mov ax, es:[0x6c]` / `mov cs:[0xf5], ax`, so admitting
+            // the load and refusing the store would relocate the stop one instruction along.
             0xa3 => {
                 return Some(DirectKind::Store {
                     source: StoreSource::Reg(0),
-                    width: MemoryWidth::Dword,
+                    width: operand_width,
                     addr: DirectAddr {
                         segment: insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
                         base: None,

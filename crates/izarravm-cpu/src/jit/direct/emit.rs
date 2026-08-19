@@ -429,6 +429,25 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
             // its EIP advance, all of which the loop tail below charges from the slot list.
             DirectKind::Nop => {}
             DirectKind::DirectionFlag { set } => emit_direction_flag(&mut e, set),
+            // CLC / STC. The flag shadow gets the constant bit, then `emit_set_cf_only` publishes
+            // it exactly as `set_flag(FLAG_CF, ..)` would -- through the pending descriptor's CF
+            // override when one is live, straight into EFLAGS when none is, and with the trailing
+            // `eflags |= 0x2` on both paths.
+            //
+            // This is NOT `emit_direction_flag`'s shape and must not be simplified into it. DF
+            // sits outside `ARITH_FLAGS`, so no lazy descriptor can ever recompute it and a plain
+            // RBP-plus-EFLAGS write is complete (which is also why that arm can skip the
+            // `eflags |= 0x2` this one reproduces). CF is inside it: a live descriptor that
+            // survived this instruction would recompute CF from the pre-CLC operand pair at the
+            // next reader and silently overwrite what the guest just set.
+            DirectKind::CarryFlag { set } => {
+                if set {
+                    e.or_r32_imm32(Reg::RBP, crate::FLAG_CF);
+                } else {
+                    e.and_r32_imm32(Reg::RBP, !crate::FLAG_CF);
+                }
+                emit_set_cf_only(&mut e);
+            }
             DirectKind::ShiftCl { op, dst } => emit_shift_cl(&mut e, op, dst),
             DirectKind::Bt { rm, index } => {
                 emit_bt_reg(&mut e, rm, index);
@@ -1074,6 +1093,70 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
                 e.alu_r16_imm16(0, home(4), 2);
                 emit_write_gpr16(&mut e, dst, Reg::RDX);
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
+            // POP Sreg on a 16-bit stack (0x07 ES, 0x1F DS) in real mode or V86. `Pop16`'s read
+            // followed by `LoadSegReal`'s write, both unchanged from the arms above.
+            //
+            // The ORDER is the interpreter's: `pop` advances SP and only then does `load_segment`
+            // write the register (execute.rs, the 0x07 / 0x1f arms). Nothing between the two is
+            // observable here -- there is no fault path left once the read's guards have passed,
+            // and the destination is a segment register, so it can never alias the stack pointer
+            // the way `Pop16`'s POP SP case can.
+            //
+            // The selector is read with `movzx`, so RDX holds it zero-extended and the copy into
+            // RAX is exact rather than a truncation. `LoadSegReal` starts from `home(src)` and
+            // cannot be shared literally; RDX is then free to stage the access constant, and the
+            // read completion has already run (and clobbered RDX) inside `emit_ram_read_pointer`,
+            // before the `movzx`, so `Ret16`'s reload hazard does not apply here.
+            //
+            // Every write below is AFTER `emit_ram_read_pointer`'s guards, which jump to `side`,
+            // so a memory exit leaves the instruction un-started: SP has not moved and the
+            // segment register still holds its old descriptor.
+            //
+            // There is deliberately NO limit store, for the reason `LoadSegReal`'s arm gives at
+            // length: a real-mode load leaves the cached limit alone (unreal mode) and a V86 entry
+            // has already canonicalized all six segments to 0xFFFF. That argument is about the
+            // FIELD rather than about where the selector came from, so a selector popped off the
+            // stack changes nothing in it.
+            DirectKind::PopSegReal { segment } => {
+                const REAL: SegmentRegister = SegmentRegister::real(0);
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    stack_addr(0),
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                e.alu_r16_imm16(0, home(4), 2);
+                let base = segment_field_base(segment);
+                e.mov_r32_r32(Reg::RAX, Reg::RDX);
+                // The selector is stored BEFORE the shift turns RAX into the base.
+                e.store_r16_disp32(Reg::R15, base + selector_offset(), Reg::RAX);
+                // One 16-bit store covers `access` and `default_size_32`, which are adjacent.
+                e.mov_r32_imm32(
+                    Reg::RDX,
+                    u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
+                );
+                e.store_r16_disp32(Reg::R15, base + access_offset(), Reg::RDX);
+                e.shift_r32_imm8(4, Reg::RAX, 4);
+                e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((
                     side,
