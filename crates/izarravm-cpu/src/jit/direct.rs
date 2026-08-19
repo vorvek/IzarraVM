@@ -5174,6 +5174,18 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 /// and are still blocked on THE DESIGN COST below, which is untouched by that slice — the plumbing
 /// is no longer the obstacle, the flag-capture split is.
 ///
+/// **STATUS 2026-08-20: THE TRIGGER HAS FIRED for `0xC1`/`0xC0`, so THIS A/B IS DUE A RE-RUN.**
+/// `count_lane_for` admits the group-2 COUNT byte as a second `IMM8_LANE_WIDTH` class behind
+/// `IZARRAVM_COUNT_LANES` (default off), and THE DESIGN COST below is paid rather than avoided:
+/// `emit_rotate_reg_lane` and `emit_shift_lane` carry the compile-time three-way split as a runtime
+/// three-way branch over the masked loaded byte. Concretely, **with `IZARRAVM_COUNT_LANES=1` the
+/// 2026-08-19/20 numbers above measure something else**: the -6.3% long-row delta was read against
+/// a world where every count-byte patch killed a block (`smc_lane_accepts` 109.0 M -> 91.8 M was
+/// the cost side of that trade), and on the count-lane arm those same patches are `lane_accepts`
+/// that retire nothing. So an `on`-vs-`off` rotate-rows leg run with the count arm live is not
+/// comparable with the legs recorded here, and the four-leg 2x2 caution below applies to this pair
+/// too: `0x0FA4` SHLD remains the one unlaned third of the trigger.
+///
 /// **THE 2x2 HAS A CROSS TERM, and a combined ladder leg must be read knowing it.** With
 /// `IZARRAVM_IMM8_LANES=1`, a `0x80` patch that a lane absorbs no longer stamps SMC heat on its
 /// 16-byte chunk (`lane_only` at core.rs suppresses the bump). The `heat_gated` arm below admits a
@@ -5890,8 +5902,13 @@ fn imm8_lane_for(
 ///   already runtime data out of guest CL and it has no immediate byte to lane.
 /// - `insn.opcode == 0xC1 || insn.opcode == 0xC0`: `0xD1` produces the SAME two kinds but carries
 ///   no immediate at all — its count is the literal 1 baked into the opcode — so `physical + 2`
-///   would name the next instruction's first byte. Testing the opcode is what makes the lane
-///   address a fact about the encoding rather than an assumption.
+///   would name the next instruction's first byte. **This bar is REDUNDANT today and kept anyway,
+///   which is worth stating plainly rather than leaving a reader to discover by mutation:** every
+///   opcode that produces `RotateReg` or `Shift` other than these two (`0xD0`..`0xD3`) has
+///   `imm_len == 0`, so the length bars below already refuse them, and no fixture in
+///   `cpu_jit_count_lane_test` can isolate this test's removal. It stays because it is the bar that
+///   makes `physical + 2` a fact about the ENCODING rather than an inference from three other
+///   fields, on `imm_lane_for`'s over-determined-checks principle.
 /// - `insn.prefixes == Prefixes::default()`: no segment override, no address-size override, no
 ///   operand-size override, no REP and no LOCK. Any prefix byte moves the immediate off offset 2,
 ///   and a LOCK'd patch is refused rather than argued impossible — `imm_lane_for`'s bar exactly.

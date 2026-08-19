@@ -204,6 +204,12 @@ pub(super) fn record_structural_barrier(
 ///   whole non-vacuity argument reads. The gate is mirrored below, immediately after `classify`,
 ///   and it is arm-gated so the `off` and `on` arms see no change at all.
 ///
+/// * NOT A DIVERGENCE, the 2026-08-20 L2 arm-2 count lane (`IZARRAVM_COUNT_LANES`), recorded here
+///   because it is the first place a reader will look for it. That slice attaches a lane to a kind
+///   `classify` has ALREADY admitted; every one of `count_lane_for`'s bars narrows which admitted
+///   slots take a lane and none can turn a Native classification into a boundary. So unlike the L1
+///   heat gate above -- the one admission rule that was not a `classify` answer -- it needs no
+///   mirror, and this scan stops exactly where the compile walk stops on both of its arms.
 /// * CLOSED, the memory-ALU BLOCK cap. `compile_with_instruction_limit` breaks at its LOOP TOP on
 ///   `memory_alu_slots != 0 && slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, regardless of
 ///   what the next instruction turns out to be. This scan applied the same bound only when the
