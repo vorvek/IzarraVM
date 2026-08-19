@@ -13,9 +13,11 @@
 //! `emit_shift_lane` for the runtime three-way branch that is this slice's whole correctness cost.
 //!
 //! **The arm is default OFF.** Every positive fixture here forces it on through
-//! `set_count_lanes_for_test`, which is thread-local, so a fixture that forgot would test the
-//! refusal and call it a lowering. `count_lane_is_refused_on_the_default_arm` is the fixture that
-//! proves the forcing is doing something.
+//! `force_count_lanes`, whose `ArmOverride` guard restores the ambient reading on the way out even
+//! if the fixture panics; a fixture that forgot to force would test the refusal and call it a
+//! lowering, and one that forgot to restore would hand the next test on the same thread an arm it
+//! never asked for. `count_lane_is_refused_on_the_default_arm` is the fixture that proves the
+//! forcing is doing something.
 //!
 //! **THE FRAME CARRIES A LIVE LAZY-FLAGS DESCRIPTOR into the laned instruction**, and that is not
 //! decoration. The three count shapes differ mostly in what they do to the DESCRIPTOR: count 0 must
@@ -24,6 +26,21 @@
 //! and every assertion below would pass with the branch deleted. So slot 1 of every fixture block
 //! is `add ebx, ebx`, whose emitted form leaves a descriptor, and the group-2 instruction is slot
 //! 2. `a_zero_count_preserves_the_live_descriptor` is the fixture that pins the frame itself.
+//!
+//! **AND THE FRAME CONSUMES THE FLAG SHADOW AFTERWARDS, at slot 3, which is a second thing the
+//! first version of this file got wrong.** The 2..31 rotate arm's contract is that it captures CF
+//! and FREEZES every other bit of RBP, because a rotate architecturally preserves SF, ZF, PF and
+//! AF and the live descriptor still owns them. With nothing downstream reading the shadow, that
+//! freeze is unobservable: an adversarial review widened the capture mask to `CF|ZF|SF` and the
+//! whole suite stayed green, because RBP is never published wholesale at block exit.
+//!
+//! Slot 3 is therefore `ror edi, 1` — the `0xD1 /1` two-byte form, which takes NO lane (no
+//! immediate byte) and is outside the `IZARRAVM_ROTATE_ROWS` gate, so it adds no dependency on
+//! either arm. As a count-1 rotate it PUBLISHES RBP WHOLESALE to `eflags` with only `CF|OF`
+//! redefined, so every other bit of the architectural result comes straight out of the shadow the
+//! laned instruction left behind. A widened capture mask lands the lane preamble's own
+//! `cmp ecx, 1` flags in RBP's SF and ZF, and they reach guest EFLAGS from here. That is what
+//! turns the freeze into a measurement.
 //!
 //! The group-2 instruction is never at the block's entry, for `cpu_jit_imm_lane_test`'s reason: an
 //! opcode at the entry position is not reached by the emitted body on this fixture path, so an
@@ -39,9 +56,9 @@ const SEED_OFFSET: u32 = 2;
 const OP_OFFSET: u32 = 4;
 /// The lane: the group-2 count byte, two bytes into a three-byte instruction.
 const LANE: u32 = ENTRY + OP_OFFSET + 2;
-/// Instructions in a fixture block: the two frame slots, the group-2 slot, and the trailing
-/// `mov edi, edi` before the HLT boundary.
-const BLOCK_INSNS: u8 = 4;
+/// Instructions in a fixture block: the two leading frame slots, the group-2 slot, the shadow
+/// consumer, and the trailing `mov edi, edi` before the HLT boundary.
+const BLOCK_INSNS: u8 = 5;
 
 /// The count shapes every emitter fixture sweeps. `0x20` masks to 0 and `0x21` masks to 1, which is
 /// what turns "the mask is applied to the loaded byte before the shape test" into a measurement:
@@ -129,6 +146,44 @@ const ROL: Shape = Shape {
     dst: 0,
 };
 
+/// Force both one-byte lane arms for the length of one fixture and restore the AMBIENT reading
+/// when it ends -- normally or by panic.
+///
+/// A plain `set_*_for_test(Some(..))` at the top of a test LEAKS: the overrides are thread-local
+/// and the harness reuses threads, so the next fixture on that thread inherits an arm it never
+/// asked for. That was tolerable while the knob only selected lane admission. It is not tolerable
+/// now: `count_lanes_enabled()` also selects which door `note_code_byte_write_hit` takes, so a
+/// leaked ON override changes the SMC write path and the lane-rejection counters of every later
+/// test on the thread -- including the fixtures whose whole point is that those counters stay at
+/// zero on the shipped arm.
+///
+/// `Drop` rather than a trailing statement, because a `panic!` inside a fixture (an assertion
+/// failure, which is the normal way these end when something is wrong) skips trailing statements
+/// and would leak exactly when the state is least expected.
+struct ArmOverride;
+
+impl Drop for ArmOverride {
+    fn drop(&mut self) {
+        jit::direct::set_count_lanes_for_test(None);
+        jit::direct::set_imm8_lanes_for_test(None);
+    }
+}
+
+/// Force the count arm and leave the imm8 arm ambient. Bind the result for the fixture's lifetime.
+#[must_use]
+fn force_count_lanes(on: bool) -> ArmOverride {
+    jit::direct::set_count_lanes_for_test(Some(on));
+    ArmOverride
+}
+
+/// Force BOTH one-byte arms, for the fixtures whose claim is about their interaction.
+#[must_use]
+fn force_both_lane_arms(count: bool, imm8: bool) -> ArmOverride {
+    jit::direct::set_count_lanes_for_test(Some(count));
+    jit::direct::set_imm8_lanes_for_test(Some(imm8));
+    ArmOverride
+}
+
 fn flat_cpu() -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_fast_map_enabled_for_test(true);
@@ -150,8 +205,8 @@ fn flat_cpu() -> CpuGsw {
     cpu
 }
 
-/// `mov esi, esi` / `add ebx, ebx` / `<group-2>` / `mov edi, edi` / `hlt`. The HLT is a hard
-/// boundary, so the block is exactly the four instructions before it.
+/// `mov esi, esi` / `add ebx, ebx` / `<group-2>` / `ror edi, 1` / `mov edi, edi` / `hlt`. The HLT
+/// is a hard boundary, so the block is exactly the five instructions before it.
 fn image(shape: Shape, count: u8) -> Vec<u8> {
     image_from(&[shape.opcode, 0xc0 | (shape.op << 3) | shape.dst, count])
 }
@@ -160,14 +215,96 @@ fn image(shape: Shape, count: u8) -> Vec<u8> {
 /// near-miss shape in the admitted slot's place.
 fn image_from(middle: &[u8]) -> Vec<u8> {
     let mut memory = vec![0u8; 0x5000];
-    // `add ebx, ebx` is the descriptor seed; see the module comment for why every fixture needs
-    // one live across the laned instruction.
+    // `add ebx, ebx` is the descriptor seed and `ror edi, 1` (the `0xD1 /1` form, which takes no
+    // lane and is outside the rotate-rows gate) is the shadow consumer; see the module comment for
+    // why every fixture needs both around the laned instruction.
     let mut code = vec![0x89, 0xf6, 0x01, 0xdb];
     code.extend_from_slice(middle);
+    code.extend_from_slice(&[0xd1, 0xcf, 0x89, 0xff, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory
+}
+
+/// The frame WITHOUT the shadow consumer: `mov esi, esi` / `add ebx, ebx` / `<group-2>` /
+/// `mov edi, edi` / `hlt`, four instructions.
+///
+/// **BOTH FRAMES ARE NEEDED AND EACH HIDES EXACTLY WHAT THE OTHER EXPOSES.** This is not
+/// belt-and-braces; it was measured, one mutation at a time, and neither frame alone is sufficient:
+///
+/// * The CONSUMER frame publishes the shadow wholesale at slot 3, which is the only way the 2..31
+///   arm's RBP freeze becomes observable at all. But that publish also OVERWRITES the descriptor
+///   and re-defines CF and OF, so on this frame alone two real defects survive: deleting the
+///   count-0 branch (the seed's CF happens to match what a zero-count rotate captures, and the
+///   consumer overwrites the override anyway) and giving the count-1 arm the 2..31 flag path (the
+///   consumer publishes and clears a moment later either way).
+/// * The CONSUMER-FREE frame ends with whatever the group-2 slot left, so the raw descriptor and
+///   the un-republished EFLAGS are both directly comparable — which catches those two. But nothing
+///   reads RBP after the laned slot, so on this frame alone the RBP freeze is unobservable and a
+///   widened capture mask survives.
+///
+/// So the interpreter sweeps run over both, and the mutation record in the commit message lists
+/// which frame catches which defect.
+fn image_without_consumer(shape: Shape, count: u8) -> Vec<u8> {
+    let mut memory = vec![0u8; 0x5000];
+    let mut code = vec![0x89, 0xf6, 0x01, 0xdb];
+    code.extend_from_slice(&[shape.opcode, 0xc0 | (shape.op << 3) | shape.dst, count]);
     code.extend_from_slice(&[0x89, 0xff, 0xf4]);
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
     memory
 }
+
+/// Instruction starts for the consumer-free frame, whose group-2 slot is always three bytes.
+fn block_starts_without_consumer() -> [u32; 4] {
+    [
+        ENTRY,
+        ENTRY + SEED_OFFSET,
+        ENTRY + OP_OFFSET,
+        ENTRY + OP_OFFSET + 3,
+    ]
+}
+
+/// Which of the two frames a sweep round is running on. See `image_without_consumer` for why every
+/// interpreter comparison runs on both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Frame {
+    /// `.. / <group-2> / ror edi, 1 / mov edi, edi / hlt` — the shadow is published downstream.
+    WithConsumer,
+    /// `.. / <group-2> / mov edi, edi / hlt` — the descriptor the slot left survives to block exit.
+    WithoutConsumer,
+}
+
+impl Frame {
+    fn image(self, shape: Shape, count: u8) -> Vec<u8> {
+        match self {
+            Frame::WithConsumer => image(shape, count),
+            Frame::WithoutConsumer => image_without_consumer(shape, count),
+        }
+    }
+
+    /// Decode starts, for a group-2 slot that is always three bytes long.
+    fn starts(self) -> Vec<u32> {
+        match self {
+            Frame::WithConsumer => block_starts(3).to_vec(),
+            Frame::WithoutConsumer => block_starts_without_consumer().to_vec(),
+        }
+    }
+
+    fn instructions(self) -> u8 {
+        match self {
+            Frame::WithConsumer => BLOCK_INSNS,
+            Frame::WithoutConsumer => BLOCK_INSNS - 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Frame::WithConsumer => "consumer frame",
+            Frame::WithoutConsumer => "consumer-free frame",
+        }
+    }
+}
+
+const FRAMES: [Frame; 2] = [Frame::WithConsumer, Frame::WithoutConsumer];
 
 fn decode_at(cpu: &mut CpuGsw, bus: &mut TestBus, starts: &[u32]) {
     for &linear in starts {
@@ -182,12 +319,13 @@ fn decode_at(cpu: &mut CpuGsw, bus: &mut TestBus, starts: &[u32]) {
 }
 
 /// Instruction starts for a block whose middle instruction is `middle_len` bytes long.
-fn block_starts(middle_len: u32) -> [u32; 4] {
+fn block_starts(middle_len: u32) -> [u32; 5] {
     [
         ENTRY,
         ENTRY + SEED_OFFSET,
         ENTRY + OP_OFFSET,
         ENTRY + OP_OFFSET + middle_len,
+        ENTRY + OP_OFFSET + middle_len + 2,
     ]
 }
 
@@ -283,8 +421,8 @@ fn guest_store_dword(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, value: u3
 
 /// Compile and install a count-lane block for `shape`, with the arm forced ON, and hand back
 /// everything a patch-then-run needs.
-fn lane_fixture(shape: Shape, count: u8) -> (CpuGsw, TestBus, jit::direct::BlockId) {
-    jit::direct::set_count_lanes_for_test(Some(true));
+fn lane_fixture(shape: Shape, count: u8) -> (CpuGsw, TestBus, jit::direct::BlockId, ArmOverride) {
+    let arm_override = force_count_lanes(true);
     let mut cpu = flat_cpu();
     let mut bus = test_bus(image(shape, count));
     decode_at(&mut cpu, &mut bus, &block_starts(3));
@@ -299,7 +437,7 @@ fn lane_fixture(shape: Shape, count: u8) -> (CpuGsw, TestBus, jit::direct::Block
         1,
         "the lane must be counted as a COUNT lane, not folded into another class"
     );
-    (cpu, bus, id)
+    (cpu, bus, id, arm_override)
 }
 
 /// Compile the fixture block for `middle` on the AMBIENT arm and report how many lanes it took.
@@ -337,6 +475,7 @@ fn lanes_registered_for(middle: &[u8], instructions: u8) -> usize {
 
 /// Run the fixture block natively and the same bytes interpreted, and assert they agree on
 /// everything the campaign compares.
+#[allow(clippy::too_many_arguments)]
 fn assert_agrees(
     native: &mut CpuGsw,
     native_bus: &mut TestBus,
@@ -344,6 +483,7 @@ fn assert_agrees(
     interpreter_bus: &mut TestBus,
     id: jit::direct::BlockId,
     eax: u32,
+    frame: Frame,
     label: &str,
 ) {
     arm(native, eax);
@@ -358,7 +498,7 @@ fn assert_agrees(
             .unwrap(),
         "{label}: native block did not run"
     );
-    for _ in 0..BLOCK_INSNS {
+    for _ in 0..frame.instructions() {
         interpreter.cycle(interpreter_bus).unwrap();
     }
     assert_eq!(
@@ -392,66 +532,136 @@ fn assert_agrees(
 /// width, and this tree matches its own interpreter across the whole range.
 #[test]
 fn count_lane_matches_the_interpreter_for_every_form_and_count() {
-    jit::direct::set_count_lanes_for_test(Some(true));
-    for shape in SHAPES {
-        for (round, &count) in COUNTS.iter().enumerate() {
-            // Compiled at a count that is NOT the one under test, so a lane that quietly re-used
-            // its compile-time immediate fails instead of agreeing.
-            let mut native = flat_cpu();
-            let mut native_bus = test_bus(image(shape, 0x11));
-            decode_at(&mut native, &mut native_bus, &block_starts(3));
-            let id = install(&mut native, ENTRY, BLOCK_INSNS);
-            assert_eq!(
-                native.perf_counters().smc_lane_registrations,
-                1,
-                "{}: no lane, so this round would be vacuous",
-                shape.label()
-            );
+    let _arm = force_count_lanes(true);
+    for frame in FRAMES {
+        for shape in SHAPES {
+            for (round, &count) in COUNTS.iter().enumerate() {
+                // Compiled at a count that is NOT the one under test, so a lane that quietly
+                // re-used its compile-time immediate fails instead of agreeing.
+                let mut native = flat_cpu();
+                let mut native_bus = test_bus(frame.image(shape, 0x11));
+                decode_at(&mut native, &mut native_bus, &frame.starts());
+                let id = install(&mut native, ENTRY, frame.instructions());
+                assert_eq!(
+                    native.perf_counters().smc_lane_registrations,
+                    1,
+                    "{} on the {}: no lane, so this round would be vacuous",
+                    shape.label(),
+                    frame.label()
+                );
 
-            let mut interpreter = flat_cpu();
-            let mut interpreter_bus = test_bus(image(shape, 0x11));
-            decode_at(&mut interpreter, &mut interpreter_bus, &block_starts(3));
+                let mut interpreter = flat_cpu();
+                let mut interpreter_bus = test_bus(frame.image(shape, 0x11));
+                decode_at(&mut interpreter, &mut interpreter_bus, &frame.starts());
 
-            guest_store_byte(&mut native, &mut native_bus, LANE, count);
-            guest_store_byte(&mut interpreter, &mut interpreter_bus, LANE, count);
+                guest_store_byte(&mut native, &mut native_bus, LANE, count);
+                guest_store_byte(&mut interpreter, &mut interpreter_bus, LANE, count);
 
-            let label = format!("{} count {count:#04x}", shape.label());
-            assert_agrees(
-                &mut native,
-                &mut native_bus,
-                &mut interpreter,
-                &mut interpreter_bus,
-                id,
-                0x1234_5678u32.wrapping_mul(round as u32 + 1) | 1,
-                &label,
-            );
+                let label = format!(
+                    "{} count {count:#04x} on the {}",
+                    shape.label(),
+                    frame.label()
+                );
+                assert_agrees(
+                    &mut native,
+                    &mut native_bus,
+                    &mut interpreter,
+                    &mut interpreter_bus,
+                    id,
+                    0x1234_5678u32.wrapping_mul(round as u32 + 1) | 1,
+                    frame,
+                    &label,
+                );
+            }
         }
     }
 }
 
-/// THE FRAME IS NON-VACUOUS. A descriptor really is live when the group-2 slot runs, and a masked
-/// count of zero really does leave it exactly as it found it.
+/// THE COUNT-0 CONTRACT, ON THE CONSUMER-FREE FRAME: a masked count of zero moves no flag, creates
+/// no descriptor and destroys none, and the block ends carrying exactly the descriptor the seed ALU
+/// left.
 ///
-/// Without this the whole count-0 contract is unobservable: with no descriptor live, "publish RBP
-/// and clear the descriptor" and "touch nothing" settle to the same architectural state, and the
-/// count-0 arm of the runtime branch could be deleted with every other fixture still passing.
+/// **This fixture runs on `image_without_consumer` and that is load-bearing.** On the main frame
+/// slot 3 publishes the shadow and clears the descriptor, which overwrites the evidence: with only
+/// that frame, deleting the count-0 branch outright leaves the entire suite green, because a
+/// zero-count rotate captures the `cmp` flags' CF, which for this seed matches the descriptor's,
+/// and the consumer then overwrites the override anyway. Comparing the RAW descriptor at the end
+/// of a block that has nothing after the group-2 slot is what makes the count-0 arm's deletion
+/// visible.
+///
+/// The liveness half is asserted from the interpreter two instructions in, which is where the
+/// claim is actually made: a descriptor is live ENTERING the group-2 slot. Without that, "leave it
+/// untouched" and "there was nothing to touch" are the same assertion.
 #[test]
 fn a_zero_count_preserves_the_live_descriptor() {
+    let _arm = force_count_lanes(true);
     for count in [0u8, 0x20] {
-        let (mut cpu, mut bus, id) = lane_fixture(ROL, 3);
-        guest_store_byte(&mut cpu, &mut bus, LANE, count);
-        arm(&mut cpu, 0x8000_0001);
-        let before = cpu.registers.eax();
-        let block = cpu.jit_direct.block(id).expect("the block survives");
-        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        let mut native = flat_cpu();
+        let mut native_bus = test_bus(image_without_consumer(ROL, 3));
+        decode_at(
+            &mut native,
+            &mut native_bus,
+            &block_starts_without_consumer(),
+        );
+        let id = install(&mut native, ENTRY, 4);
+        assert_eq!(
+            native.perf_counters().smc_lane_registrations,
+            1,
+            "count {count:#04x}: no lane, so this round would be vacuous"
+        );
+
+        let mut interpreter = flat_cpu();
+        let mut interpreter_bus = test_bus(image_without_consumer(ROL, 3));
+        decode_at(
+            &mut interpreter,
+            &mut interpreter_bus,
+            &block_starts_without_consumer(),
+        );
+
+        guest_store_byte(&mut native, &mut native_bus, LANE, count);
+        guest_store_byte(&mut interpreter, &mut interpreter_bus, LANE, count);
+
+        arm(&mut native, 0x8000_0001);
+        arm(&mut interpreter, 0x8000_0001);
+        let before = native.registers.eax();
+
+        let block = native.jit_direct.block(id).expect("the block survives");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap()
+        );
+        // Two instructions in is the group-2 slot's entry: the descriptor must be live THERE, or
+        // "preserved" is a statement about nothing.
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+        interpreter.cycle(&mut interpreter_bus).unwrap();
         assert_ne!(
-            cpu.pending_flags,
+            interpreter.pending_flags,
             PendingFlags::default(),
-            "count {count:#04x}: the seed ALU must leave a live descriptor, or the count-0 \
-             contract is unobservable"
+            "count {count:#04x}: the seed ALU must leave a live descriptor entering the group-2 \
+             slot, or the count-0 contract is unobservable"
+        );
+        let entering = interpreter.pending_flags;
+        for _ in 0..2 {
+            interpreter.cycle(&mut interpreter_bus).unwrap();
+        }
+
+        assert_eq!(
+            interpreter.pending_flags, entering,
+            "count {count:#04x}: the INTERPRETER must carry the seed's descriptor through a \
+             zero-count rotate untouched; if it does not, the oracle moved and not the emitter"
         );
         assert_eq!(
-            cpu.registers.eax(),
+            native.pending_flags, interpreter.pending_flags,
+            "count {count:#04x}: a zero count must create no descriptor and destroy none"
+        );
+        assert_eq!(native.eflags(), interpreter.eflags(), "count {count:#04x}");
+        assert_eq!(
+            native.registers, interpreter.registers,
+            "count {count:#04x}"
+        );
+        assert_eq!(
+            native.registers.eax(),
             before,
             "count {count:#04x}: a masked count of zero must not touch the destination"
         );
@@ -465,7 +675,7 @@ fn a_zero_count_preserves_the_live_descriptor() {
 /// count and the interpreter comparison above re-decoded the same stale line".
 #[test]
 fn count_lane_uses_the_current_count_not_the_compiled_one() {
-    let (mut cpu, mut bus, id) = lane_fixture(ROL, 3);
+    let (mut cpu, mut bus, id, _arm) = lane_fixture(ROL, 3);
     guest_store_byte(&mut cpu, &mut bus, LANE, 8);
     arm(&mut cpu, 0x0000_00ff);
     let block = cpu.jit_direct.block(id).expect("the block survives");
@@ -484,54 +694,62 @@ fn count_lane_uses_the_current_count_not_the_compiled_one() {
 /// passes every "does it rotate by the right amount" assertion and fails here.
 #[test]
 fn a_patched_count_re_executes_without_recompiling() {
-    for shape in SHAPES {
-        jit::direct::set_count_lanes_for_test(Some(true));
-        let mut native = flat_cpu();
-        let mut native_bus = test_bus(image(shape, 3));
-        decode_at(&mut native, &mut native_bus, &block_starts(3));
-        let id = install(&mut native, ENTRY, BLOCK_INSNS);
-        assert_eq!(native.perf_counters().smc_lane_registrations, 1);
+    let _arm = force_count_lanes(true);
+    for frame in FRAMES {
+        for shape in SHAPES {
+            let mut native = flat_cpu();
+            let mut native_bus = test_bus(frame.image(shape, 3));
+            decode_at(&mut native, &mut native_bus, &frame.starts());
+            let id = install(&mut native, ENTRY, frame.instructions());
+            assert_eq!(native.perf_counters().smc_lane_registrations, 1);
 
-        let mut interpreter = flat_cpu();
-        let mut interpreter_bus = test_bus(image(shape, 3));
-        decode_at(&mut interpreter, &mut interpreter_bus, &block_starts(3));
+            let mut interpreter = flat_cpu();
+            let mut interpreter_bus = test_bus(frame.image(shape, 3));
+            decode_at(&mut interpreter, &mut interpreter_bus, &frame.starts());
 
-        let before_kills = native.perf_counters().smc_narrow_kills;
-        // Every value distinct from the last: G2 same-value elision never reaches the choke, so an
-        // identical repatch would not count as an accept.
-        let patches = [1u8, 0, 2, 1, 31, 0, 0x21, 0x20, 7];
-        for (round, &count) in patches.iter().enumerate() {
-            guest_store_byte(&mut native, &mut native_bus, LANE, count);
-            guest_store_byte(&mut interpreter, &mut interpreter_bus, LANE, count);
-            assert_eq!(
-                native.perf_counters().smc_lane_accepts,
-                round as u64 + 1,
-                "{}: patch {count:#04x} must be absorbed as a lane accept",
+            let before_kills = native.perf_counters().smc_narrow_kills;
+            // Every value distinct from the last: G2 same-value elision never reaches the choke,
+            // so an identical repatch would not count as an accept.
+            let patches = [1u8, 0, 2, 1, 31, 0, 0x21, 0x20, 7];
+            for (round, &count) in patches.iter().enumerate() {
+                guest_store_byte(&mut native, &mut native_bus, LANE, count);
+                guest_store_byte(&mut interpreter, &mut interpreter_bus, LANE, count);
+                assert_eq!(
+                    native.perf_counters().smc_lane_accepts,
+                    round as u64 + 1,
+                    "{} on the {}: patch {count:#04x} must be absorbed as a lane accept",
+                    shape.label(),
+                    frame.label()
+                );
+                assert_agrees(
+                    &mut native,
+                    &mut native_bus,
+                    &mut interpreter,
+                    &mut interpreter_bus,
+                    id,
+                    0x89ab_cdefu32.wrapping_mul(round as u32 + 1) | 1,
+                    frame,
+                    &format!(
+                        "{} patch {count:#04x} on the {}",
+                        shape.label(),
+                        frame.label()
+                    ),
+                );
+            }
+            let after = native.perf_counters();
+            assert_eq!(after.smc_lane_reject_width, 0);
+            assert_eq!(after.smc_lane_reject_address, 0);
+            assert!(
+                after.smc_narrow_kills > before_kills,
+                "{}: the interpreter's decode line must still be killed",
                 shape.label()
             );
-            assert_agrees(
-                &mut native,
-                &mut native_bus,
-                &mut interpreter,
-                &mut interpreter_bus,
-                id,
-                0x89ab_cdefu32.wrapping_mul(round as u32 + 1) | 1,
-                &format!("{} patch {count:#04x}", shape.label()),
+            assert!(
+                native.jit_direct.block(id).is_some(),
+                "{}: the block must survive every patch",
+                shape.label()
             );
         }
-        let after = native.perf_counters();
-        assert_eq!(after.smc_lane_reject_width, 0);
-        assert_eq!(after.smc_lane_reject_address, 0);
-        assert!(
-            after.smc_narrow_kills > before_kills,
-            "{}: the interpreter's decode line must still be killed",
-            shape.label()
-        );
-        assert!(
-            native.jit_direct.block(id).is_some(),
-            "{}: the block must survive every patch",
-            shape.label()
-        );
     }
 }
 
@@ -542,8 +760,7 @@ fn a_patched_count_re_executes_without_recompiling() {
 /// counter and on block liveness together.
 #[test]
 fn the_count_arm_alone_opens_the_slow_byte_door() {
-    jit::direct::set_count_lanes_for_test(Some(true));
-    jit::direct::set_imm8_lanes_for_test(Some(false));
+    let _arm = force_both_lane_arms(true, false);
     let mut cpu = flat_cpu();
     cpu.set_fast_map_enabled_for_test(false);
     let mut bus = test_bus(image(ROL, 3));
@@ -565,7 +782,6 @@ fn the_count_arm_alone_opens_the_slow_byte_door() {
     arm(&mut cpu, 0x0000_00ff);
     assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
     assert_eq!(cpu.registers.eax(), 0x0000_ff00);
-    jit::direct::set_imm8_lanes_for_test(None);
 }
 
 /// A lane write is not code churn. Enough patches to cross the heat threshold several times over
@@ -583,7 +799,7 @@ fn count_lane_writes_contribute_no_smc_heat() {
     // The compiled count is deliberately outside the patch sequence below: a repatch to the value
     // already in memory is elided by G2 before it reaches the choke, so a colliding first round
     // would silently cost one accept.
-    let (mut cpu, mut bus, id) = lane_fixture(ROL, 0xee);
+    let (mut cpu, mut bus, id, _arm) = lane_fixture(ROL, 0xee);
     const ROUNDS: u32 = 64;
     for round in 0..ROUNDS {
         cpu.set_eip(ENTRY + OP_OFFSET);
@@ -614,7 +830,7 @@ fn count_lane_writes_contribute_no_smc_heat() {
 /// and takes the normal invalidation path.
 #[test]
 fn dword_write_at_the_count_lane_start_retires_the_block() {
-    let (mut cpu, mut bus, id) = lane_fixture(ROL, 3);
+    let (mut cpu, mut bus, id, _arm) = lane_fixture(ROL, 3);
     guest_store_dword(&mut cpu, &mut bus, LANE, 0x1122_3344);
 
     let perf = cpu.perf_counters();
@@ -632,7 +848,7 @@ fn dword_write_at_the_count_lane_start_retires_the_block() {
 /// width one, because it does not start at the lane.
 #[test]
 fn straddling_write_over_the_count_lane_retires_the_block() {
-    let (mut cpu, mut bus, id) = lane_fixture(ROL, 3);
+    let (mut cpu, mut bus, id, _arm) = lane_fixture(ROL, 3);
     guest_store_word(&mut cpu, &mut bus, LANE - 1, 0x1122);
 
     let perf = cpu.perf_counters();
@@ -649,7 +865,7 @@ fn straddling_write_over_the_count_lane_retires_the_block() {
 #[test]
 fn structural_write_to_the_same_instruction_retires_the_block() {
     for offset in [0u32, 1] {
-        let (mut cpu, mut bus, id) = lane_fixture(ROL, 3);
+        let (mut cpu, mut bus, id, _arm) = lane_fixture(ROL, 3);
         guest_store_byte(&mut cpu, &mut bus, ENTRY + OP_OFFSET + offset, 0xd1);
 
         let perf = cpu.perf_counters();
@@ -667,7 +883,7 @@ fn structural_write_to_the_same_instruction_retires_the_block() {
 /// lane. They arrive through the value-less choke with no store path behind them.
 #[test]
 fn device_write_at_the_count_lane_retires_the_block() {
-    let (mut cpu, mut bus, id) = lane_fixture(ROL, 3);
+    let (mut cpu, mut bus, id, _arm) = lane_fixture(ROL, 3);
     cpu.note_device_memory_write_range(LANE, 1);
 
     assert_eq!(cpu.perf_counters().smc_lane_accepts, 0);
@@ -688,8 +904,7 @@ fn device_write_at_the_count_lane_retires_the_block() {
 /// counters included. FastMap is off here because that is the path the door selects on.
 #[test]
 fn count_lane_is_refused_on_the_default_arm() {
-    jit::direct::set_count_lanes_for_test(Some(false));
-    jit::direct::set_imm8_lanes_for_test(Some(false));
+    let _arm = force_both_lane_arms(false, false);
     let mut cpu = flat_cpu();
     cpu.set_fast_map_enabled_for_test(false);
     let mut bus = test_bus(image(ROL, 4));
@@ -724,7 +939,6 @@ fn count_lane_is_refused_on_the_default_arm() {
         cpu.jit_direct.block(id).is_none(),
         "with no lane, the patch a lane would have absorbed retires the block"
     );
-    jit::direct::set_imm8_lanes_for_test(None);
 }
 
 /// The admission bars, one fixture per bar, each a near-miss of the admitted shape. Every one of
@@ -732,27 +946,38 @@ fn count_lane_is_refused_on_the_default_arm() {
 /// count is a REFUSAL and not a truncated walk.
 #[test]
 fn near_miss_shapes_take_no_count_lane() {
-    jit::direct::set_count_lanes_for_test(Some(true));
+    let _arm = force_count_lanes(true);
     // `0xD1 /0` ROL r32, 1: the SAME `RotateReg` kind, but its count is the literal 1 baked into
     // the opcode and it carries no immediate at all, so `physical + 2` would name the NEXT
     // instruction's first byte. TWO bars refuse it -- the opcode test and `imm_len == 1` -- and
     // this fixture cannot tell them apart; see `count_lane_for`, which says outright that the
     // opcode bar is redundant today and kept as defence in depth.
-    assert_eq!(lanes_registered_for(&[0xd1, 0xc0], 4), 0, "0xD1 /0 ROL");
+    assert_eq!(
+        lanes_registered_for(&[0xd1, 0xc0], BLOCK_INSNS),
+        0,
+        "0xD1 /0 ROL"
+    );
     // `0xD3 /4` SHL r32, CL: a `ShiftCl` kind, whose count is already runtime data out of guest CL
     // and which has no immediate byte to lane. Excluded by kind.
-    assert_eq!(lanes_registered_for(&[0xd3, 0xe0], 4), 0, "0xD3 /4 SHL CL");
+    assert_eq!(
+        lanes_registered_for(&[0xd3, 0xe0], BLOCK_INSNS),
+        0,
+        "0xD3 /4 SHL CL"
+    );
     // A segment override moves the count byte off offset 2. Refused rather than re-derived.
     assert_eq!(
-        lanes_registered_for(&[0x26, 0xc1, 0xc0, 0x03], 4),
+        lanes_registered_for(&[0x26, 0xc1, 0xc0, 0x03], BLOCK_INSNS),
         0,
         "prefixed 0xC1"
     );
     // An operand-size override makes this a WORD shift, whose emitter has no CL-form lane at all.
-    // The prefix bar and the `len == 3` bar both refuse it, which is what makes `shift_r16_cl` a
-    // helper this tree does not owe.
+    // THREE bars refuse it here -- the prefix bar, `len == 3`, and the kind's own width -- and only
+    // the last of those is load-bearing: in a 16-bit code segment the same instruction needs no
+    // prefix at all and satisfies the first two. See
+    // `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` in
+    // cpu_jit_sixteen_bit_test, which is the fixture for the case this one cannot reach.
     assert_eq!(
-        lanes_registered_for(&[0x66, 0xc1, 0xe0, 0x03], 4),
+        lanes_registered_for(&[0x66, 0xc1, 0xe0, 0x03], BLOCK_INSNS),
         0,
         "0x66-prefixed 0xC1 shift"
     );
@@ -776,7 +1001,7 @@ fn near_miss_shapes_take_no_count_lane() {
     // admitted shape, but its kind is `AluByteImm` and its lane belongs to the OTHER arm, which is
     // off here. A count lane that matched on encoding shape instead of on kind would take it.
     assert_eq!(
-        lanes_registered_for(&[0x80, 0xc0, 0x11], 4),
+        lanes_registered_for(&[0x80, 0xc0, 0x11], BLOCK_INSNS),
         0,
         "0x80 belongs to the imm8 arm"
     );
@@ -789,7 +1014,7 @@ fn near_miss_shapes_take_no_count_lane() {
 /// parameterized.
 #[test]
 fn a_page_the_fetch_cache_cannot_see_gets_no_count_lane() {
-    jit::direct::set_count_lanes_for_test(Some(true));
+    let _arm = force_count_lanes(true);
     let mut cpu = flat_cpu();
     let mut bus = test_bus(image(ROL, 4));
     decode_at(&mut cpu, &mut bus, &block_starts(3));
@@ -839,8 +1064,8 @@ fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
     let mut bus = test_bus(image_from(middle));
     decode_at(&mut cpu, &mut bus, &block_starts(middle.len() as u32));
     let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
-    // Restored before the match, so a `panic!` below cannot leave this thread's override forced.
-    // The override is per-thread and the harness reuses threads across tests.
+    // Restored before the match rather than through `ArmOverride`, because this helper is called
+    // TWICE per comparison and must not hold an override across its own second call.
     jit::direct::set_count_lanes_for_test(None);
     match outcome {
         jit::direct::CompileOutcome::Compiled(c) => c.code.len(),
@@ -946,15 +1171,21 @@ fn the_count_arm_and_the_imm8_arm_are_separate_levers() {
 /// width, shows up here and nowhere else.
 #[test]
 fn a_count_lane_and_an_imm8_lane_coexist_in_one_block() {
-    jit::direct::set_count_lanes_for_test(Some(true));
-    jit::direct::set_imm8_lanes_for_test(Some(true));
+    let _arm = force_both_lane_arms(true, true);
     let mut cpu = flat_cpu();
     // `80 c0 11` ADD AL, 0x11 then `c1 c0 03` ROL EAX, 3, both in the frame.
     let mut bus = test_bus(image_from(&[0x80, 0xc0, 0x11, 0xc1, 0xc0, 0x03]));
     decode_at(
         &mut cpu,
         &mut bus,
-        &[ENTRY, ENTRY + 2, ENTRY + 4, ENTRY + 7, ENTRY + 10],
+        &[
+            ENTRY,
+            ENTRY + 2,
+            ENTRY + 4,
+            ENTRY + 7,
+            ENTRY + 10,
+            ENTRY + 12,
+        ],
     );
     let key = jit::direct::key_for(&cpu, ENTRY, true).unwrap();
     assert!(matches!(
@@ -962,7 +1193,11 @@ fn a_count_lane_and_an_imm8_lane_coexist_in_one_block() {
         jit::direct::BlockProbe::Interpret
     ));
     let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("the block compiles");
-    assert_eq!(compilation.span.instructions, 5);
+    assert_eq!(
+        compilation.span.instructions,
+        BLOCK_INSNS + 1,
+        "the frame plus BOTH laned slots; a truncated walk would make the lane counts vacuous"
+    );
     assert_eq!(compilation.imm_lane_count(), 2, "both lanes must register");
     assert_eq!(compilation.imm8_lane_count(), 1);
     assert_eq!(compilation.count_lane_count(), 1);
@@ -985,5 +1220,4 @@ fn a_count_lane_and_an_imm8_lane_coexist_in_one_block() {
     assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
     // AL = 1 + 0x20 = 0x21, then ROL EAX, 8.
     assert_eq!(cpu.registers.eax(), 0x0000_2100);
-    jit::direct::set_imm8_lanes_for_test(None);
 }

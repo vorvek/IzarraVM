@@ -3663,10 +3663,17 @@ pub(crate) enum DirectKind {
         /// See `RotateReg::lane` for why a runtime count costs a three-way branch, and
         /// `emit_shift_lane` for the branch itself.
         ///
-        /// **Word can never carry one**, and that falls out of the admission bars rather than
-        /// being asserted on top of them: a Word `0xC1` needs a `0x66` prefix, which fails both
-        /// `prefixes == Prefixes::default()` and `len == 3`. So no `shift_r16_cl` is owed and the
-        /// emitter's Word arm stays the compile-time-count one it has always been.
+        /// **Word can never carry one, and `count_lane_for` bars it EXPLICITLY on this field.**
+        /// The first version of this slice barred it by inference instead — "a Word `0xC1` needs a
+        /// `0x66`, which fails both the prefix bar and `len == 3`" — and that inference is FALSE in
+        /// a 16-bit code segment, where the operand size follows CS.D and not a prefix. An
+        /// unprefixed `c1 e0 03` in a CS.D=0 segment is `shl ax, 3`: `Prefixes::default()`,
+        /// `disp_len 0`, `imm_len 1`, `len 3`, `width: Word`. `0xC1` is on classify's Word
+        /// allowlist, so it reached the emitter, which has no CL-form Word lane and panicked the
+        /// compiler. The width test is the bar and
+        /// `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
+        /// fixture. (`RotateReg` needs no such field: classify refuses both rotates at Word
+        /// outright.)
         lane: Option<ImmLane>,
     },
     /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
@@ -5897,9 +5904,22 @@ fn imm8_lane_for(
 /// - `count_lanes_enabled()`: the A/B arm. Default OFF, so the shipped binary is the pre-slice
 ///   world and the ladder can measure both arms out of one executable. Independent of
 ///   `IZARRAVM_IMM8_LANES` on purpose — see `count_lanes_enabled`.
-/// - `DirectKind::RotateReg { lane: None, .. }` / `DirectKind::Shift { lane: None, .. }`: the only
-///   two kinds whose emitters have a lane arm. `ShiftCl` (`0xD3`) is excluded by kind: its count is
-///   already runtime data out of guest CL and it has no immediate byte to lane.
+/// - `DirectKind::RotateReg { lane: None, .. }` / `DirectKind::Shift { lane: None, width: Byte |
+///   Dword, .. }`: the only two kinds whose emitters have a lane arm, at the only two widths whose
+///   emitters have one. `ShiftCl` (`0xD3`) is excluded by kind: its count is already runtime data
+///   out of guest CL and it has no immediate byte to lane.
+///
+///   **THE WIDTH HALF OF THAT TEST IS LOAD-BEARING AND WAS ONCE ABSENT.** The first version of
+///   this function argued Word away instead of testing it: "a Word `0xC1` needs a `0x66` prefix,
+///   so the prefix bar and `len == 3` already refuse it". That is true in a 32-bit code segment
+///   and FALSE in a 16-bit one, where the operand size follows CS.D. An unprefixed `c1 e0 03` in a
+///   CS.D=0 segment decodes as `shl ax, 3` at `OperandSize::Word` and satisfies every other bar
+///   here; `0xC1` is on classify's Word allowlist, so the lane attached and `emit_shift_lane`
+///   reached its `unreachable!` and PANICKED THE COMPILER on ordinary DOS code. Barring on the
+///   kind's own width is what makes the refusal a fact rather than an inference about encodings.
+///   `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
+///   fixture; the Word form keeps compiling with a baked count, exactly as before this slice.
+///   `RotateReg` needs no width test: classify refuses both rotates at Word outright.
 /// - `insn.opcode == 0xC1 || insn.opcode == 0xC0`: `0xD1` produces the SAME two kinds but carries
 ///   no immediate at all — its count is the literal 1 baked into the opcode — so `physical + 2`
 ///   would name the next instruction's first byte. **This bar is REDUNDANT today and kept anyway,
@@ -5912,8 +5932,8 @@ fn imm8_lane_for(
 /// - `insn.prefixes == Prefixes::default()`: no segment override, no address-size override, no
 ///   operand-size override, no REP and no LOCK. Any prefix byte moves the immediate off offset 2,
 ///   and a LOCK'd patch is refused rather than argued impossible — `imm_lane_for`'s bar exactly.
-///   This bar is ALSO what keeps Word out of the emitter: a Word `0xC1` needs a `0x66`, so
-///   `emit_shift_lane` never sees one and owes no `shift_r16_cl`.
+///   This bar does NOT keep Word out — the width test above is what does that, and reading this
+///   bar as if it did is the exact mistake that shipped a compiler panic.
 /// - `insn.disp_len == 0`, `insn.imm_len == 1`, `insn.len == 3`: the decoder's own record of what
 ///   it consumed. Together they pin the count byte at instruction offset 2 and nowhere else. The
 ///   register destination is implied by the kinds (`classify` produces both only from
@@ -5951,7 +5971,12 @@ fn count_lane_for(
     }
     if !matches!(
         kind,
-        DirectKind::RotateReg { lane: None, .. } | DirectKind::Shift { lane: None, .. }
+        DirectKind::RotateReg { lane: None, .. }
+            | DirectKind::Shift {
+                lane: None,
+                width: MemoryWidth::Byte | MemoryWidth::Dword,
+                ..
+            }
     ) {
         return None;
     }

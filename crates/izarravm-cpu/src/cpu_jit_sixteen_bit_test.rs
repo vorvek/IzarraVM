@@ -856,3 +856,88 @@ fn tier_zero_byte_forms_and_near_jmp_form_a_sixteen_bit_block() {
         "a side exit would let the interpreter produce the right answer anyway"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9. The count lane (L2 arm 2) must not reach a 16-bit code segment.
+// ---------------------------------------------------------------------------
+
+/// THE WORD GROUP-2 SHIFT IN A 16-BIT CODE SEGMENT, and it is a REGRESSION FIXTURE for a crash.
+///
+/// `count_lane_for`'s first form barred the Word shifts with the argument "a Word `0xC1` needs a
+/// `0x66`, so the prefix and length bars already refuse it". **That argument is false in a 16-bit
+/// code segment**, where the operand size follows CS.D rather than a prefix: an unprefixed
+/// `c1 e0 03` decodes as `shl ax, 3` at `OperandSize::Word` with default prefixes, `disp_len 0`,
+/// `imm_len 1` and `len 3` — every bar satisfied. `0xC1` is on classify's Word allowlist, so
+/// `classify` produced `Shift { width: Word }`, the lane attached, and `emit_shift_lane` reached
+/// its `unreachable!` and PANICKED THE COMPILER. The fix bars the kind's own width; this fixture
+/// is what keeps it barred.
+///
+/// The assertion is threefold and each third would have been enough to catch the crash: the
+/// compile does not panic, it takes NO lane, and the emitted block still computes the Word shift
+/// the interpreter computes. The last one is what says the fix is a lane refusal rather than a
+/// lowering refusal — the Word form must keep compiling with a baked count, exactly as it did
+/// before this slice existed.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
+    jit::direct::set_count_lanes_for_test(Some(true));
+    let mut memory = vec![0u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + 8].copy_from_slice(&[
+        0x40, // inc ax
+        0xc1, 0xe0, 0x03, // shl ax, 3   -- Word by CS.D, no prefix, three bytes
+        0xc1, 0xe8, 0x01, // shr ax, 1   -- the count-1 shape, likewise Word
+        0xf4, // hlt
+    ]);
+    let mut bus = sixteen_bit_bus(memory.clone());
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000]);
+    warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 4]);
+
+    // The compile itself is the crash site. `install_sixteen_bit_block` panics on a reject, so
+    // reaching past it says the walk completed.
+    let compilation = match jit::direct::compile(&mut cpu, ENTRY, false) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("the Word group-2 block must still compile: structural reject")
+        }
+        jit::direct::CompileOutcome::Retry => {
+            panic!("the Word group-2 block must still compile: retry")
+        }
+    };
+    assert_eq!(
+        compilation.count_lane_count(),
+        0,
+        "a Word group-2 shift must take no count lane; its emitter has no CL-form Word lane"
+    );
+    assert_eq!(compilation.imm_lane_count(), 0);
+
+    let block = install_sixteen_bit_block(&mut cpu, ENTRY, 3);
+    cpu.registers.gpr = [0; 8];
+    cpu.registers.set_eax(0xdead_1234);
+    cpu.set_eip(ENTRY);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+        "the baked-count Word block must still run natively"
+    );
+
+    // The oracle: the same bytes interpreted, with no block at all.
+    let mut interpreter_bus = sixteen_bit_bus(memory);
+    let mut interpreter = sixteen_bit_code_cpu(ENTRY);
+    interpreter.registers.gpr = [0; 8];
+    interpreter.registers.set_eax(0xdead_1234);
+    interpreter.set_eip(ENTRY);
+    for _ in 0..3 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+    assert_eq!(
+        cpu.registers, interpreter.registers,
+        "the baked Word lowering must still match the interpreter"
+    );
+    assert_eq!(cpu.eflags(), interpreter.eflags());
+    assert_eq!(cpu.pending_flags, interpreter.pending_flags);
+    jit::direct::set_count_lanes_for_test(None);
+}

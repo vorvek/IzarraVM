@@ -4817,7 +4817,9 @@ fn emit_shift_reg8(e: &mut Encoder, op: u8, dst: u8, count: u8) {
 ///
 /// This is the licence a ROTATE does not have, which is why `emit_rotate_reg` does not call it.
 fn emit_commit_shift_flags(e: &mut Encoder, count: u8) {
-    let mut defined = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
+    // The same const the lane form merges under its runtime branch, so the two cannot drift into
+    // defining different flag sets for the same instruction at the same count.
+    let mut defined = SHIFT_DEFINED;
     if count == 1 {
         defined |= crate::FLAG_OF;
     }
@@ -4933,9 +4935,13 @@ fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
     emit_set_cf_only(e);
 }
 
-/// The flags a group-2 SHIFT always defines. `emit_commit_shift_flags` owns the same set for the
-/// baked forms; it is spelled out here because the lane form has to merge it under a runtime
-/// branch rather than pass a precomputed mask.
+/// The flags a group-2 SHIFT always defines, at every width and every non-zero count. OF joins
+/// them at a masked count of exactly 1 and nowhere else.
+///
+/// Shared by the baked path (`emit_commit_shift_flags`, which adds OF from a compile-time count)
+/// and the lane path (`emit_shift_lane`, which adds it under a runtime branch), because the two
+/// must define the same set for the same instruction at the same count — the lane form's whole
+/// claim is that it changes where the count comes from and nothing else.
 const SHIFT_DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
 
 /// The COUNT-LANE form of ROL/ROR r32 (`0xC1 /0`, `/1`): the count byte is read out of guest RAM
@@ -5020,9 +5026,14 @@ fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, lane: ImmLane) {
 /// place and rewrites the destination's lane, so running it over a value the count-0 path never
 /// read would write scratch into a guest register.
 ///
-/// **Word is unreachable**, and by construction rather than by assertion elsewhere:
-/// `count_lane_for` requires `prefixes == Prefixes::default()` and `len == 3`, and a Word `0xC1`
-/// needs a `0x66`. That is what makes `shift_r16_cl` a helper this tree does not owe.
+/// **Word is unreachable because `count_lane_for` BARS IT ON THE KIND'S WIDTH**, and that sentence
+/// is written this way because the first version of this slice made the weaker claim — that the
+/// prefix bar and `len == 3` refused Word already, since a Word `0xC1` needs a `0x66`. In a
+/// 16-bit code segment the operand size follows CS.D, so `c1 e0 03` is an unprefixed three-byte
+/// `shl ax, 3` at Word, and the arm below was reached and PANICKED THE COMPILER on ordinary DOS
+/// code. The width bar is now explicit at the admission site, and
+/// `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
+/// fixture. That is what makes `shift_r16_cl` a helper this tree does not owe.
 fn emit_shift_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, lane: ImmLane) {
     debug_assert!(
         matches!(op, 4..=7),
