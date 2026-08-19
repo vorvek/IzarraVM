@@ -1020,6 +1020,32 @@ impl Encoder {
         self.bytes.push(count);
     }
 
+    /// An 8-bit group-2 shift/rotate by CL (`D2 /op`) -- the CL-count twin of `shift_r8_imm8`, and
+    /// it exists for the count-lane emitter, whose count is runtime data and cannot be encoded as
+    /// an immediate at all.
+    ///
+    /// Restricted to AL through BL for `shift_r8_imm8`'s reason: without a REX prefix, ModRM
+    /// register numbers 4 through 7 name AH/CH/DH/BH, and the emitter's byte lane works in scratch
+    /// registers rather than encoding a guest byte lane directly.
+    ///
+    /// The 8-bit width is the point, exactly as it is for the imm8 form: the host computes every
+    /// flag against the 8-bit operand -- CF from bit 7 for a left shift and bit 0 for a right one,
+    /// SF from bit 7, ZF and PF from the 8-bit result -- so it does the narrowing the interpreter's
+    /// `BusWidth::Byte` does instead of the emitter reconstructing it.
+    ///
+    /// The host applies the architectural five-bit count mask to CL itself, exactly as it does for
+    /// the imm8 form. The count-lane emitter masks anyway, because it must SELECT on the masked
+    /// value; the two masks agree, so the extra one is a shape test and never a semantic change.
+    pub(crate) fn shift_r8_cl(&mut self, op: u8, dst: Reg) {
+        assert!(op < 8, "shift group must fit three bits");
+        assert!(
+            dst.0 < 4,
+            "byte shift scratch registers must be AL through BL"
+        );
+        self.bytes.push(0xD2);
+        self.modrm(0b11, op, dst.low3());
+    }
+
     /// A 16-bit group-2 immediate shift (`66 [REX] C1 /op ib`).
     ///
     /// The 16-bit width is the whole point, exactly as it is for `alu_r16_imm16`: an x86-64 16-bit
