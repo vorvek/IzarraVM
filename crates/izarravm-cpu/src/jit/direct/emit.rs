@@ -614,13 +614,30 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
             }
+            // The count-lane forms differ from the baked forms in exactly one thing: where the
+            // COUNT comes from. That one thing costs more here than it does for `AluByteImm`,
+            // because the baked emitters select their whole flag shape from the count's value at
+            // emission — see `emit_shift_lane` and `emit_rotate_reg_lane` for the runtime three-way
+            // branch that reproduces the selection.
             DirectKind::Shift {
                 op,
                 dst,
                 count,
                 width,
-            } => emit_shift(&mut e, op, dst, count, width),
-            DirectKind::RotateReg { op, dst, count } => emit_rotate_reg(&mut e, op, dst, count),
+                lane,
+            } => match lane {
+                Some(lane) => emit_shift_lane(&mut e, op, dst, width, lane),
+                None => emit_shift(&mut e, op, dst, count, width),
+            },
+            DirectKind::RotateReg {
+                op,
+                dst,
+                count,
+                lane,
+            } => match lane {
+                Some(lane) => emit_rotate_reg_lane(&mut e, op, dst, lane),
+                None => emit_rotate_reg(&mut e, op, dst, count),
+            },
             DirectKind::DoubleShiftReg {
                 left,
                 dst,
@@ -4800,7 +4817,9 @@ fn emit_shift_reg8(e: &mut Encoder, op: u8, dst: u8, count: u8) {
 ///
 /// This is the licence a ROTATE does not have, which is why `emit_rotate_reg` does not call it.
 fn emit_commit_shift_flags(e: &mut Encoder, count: u8) {
-    let mut defined = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
+    // The same const the lane form merges under its runtime branch, so the two cannot drift into
+    // defining different flag sets for the same instruction at the same count.
+    let mut defined = SHIFT_DEFINED;
     if count == 1 {
         defined |= crate::FLAG_OF;
     }
@@ -4914,6 +4933,161 @@ fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
     // the guest's OF is still owned by the descriptor.
     emit_capture_flags(e, crate::FLAG_CF);
     emit_set_cf_only(e);
+}
+
+/// The flags a group-2 SHIFT always defines, at every width and every non-zero count. OF joins
+/// them at a masked count of exactly 1 and nowhere else.
+///
+/// Shared by the baked path (`emit_commit_shift_flags`, which adds OF from a compile-time count)
+/// and the lane path (`emit_shift_lane`, which adds it under a runtime branch), because the two
+/// must define the same set for the same instruction at the same count — the lane form's whole
+/// claim is that it changes where the count comes from and nothing else.
+const SHIFT_DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
+
+/// The COUNT-LANE form of ROL/ROR r32 (`0xC1 /0`, `/1`): the count byte is read out of guest RAM
+/// on every execution instead of being baked, so a guest patch of it keeps the block.
+///
+/// # Why this is a branch and not a swapped operand
+///
+/// `emit_rotate_reg`'s correctness argument is a COMPILE-TIME split on the masked count, and the
+/// three shapes are not variations on one flag update — they are three different contracts:
+///
+/// * **0**: `shift_rotate` returns before touching the value or a flag. No flag moves, no
+///   descriptor is created, and no live descriptor is destroyed. This is the shape a "conservative"
+///   publish gets WRONG rather than approximately right: publishing RBP here would commit whatever
+///   the last deferred op left in the shadow AND clear a descriptor the guest still owns.
+/// * **1**: capture `CF|OF`, publish RBP to `eflags`, clear the descriptor. See `emit_rotate_reg`'s
+///   two-`set_flag`-calls paragraph for why that is exactly what the interpreter settles to.
+/// * **2..31**: capture CF alone and route it through `emit_set_cf_only`, because a rotate
+///   architecturally PRESERVES SF, ZF, PF and AF and must not publish the shadow wholesale.
+///
+/// So the lane form carries the split as a RUNTIME three-way branch over the loaded byte. This is
+/// the cost `rotate_rows_enabled`'s "THE DESIGN COST" paragraph priced, and it is why this family
+/// was not in L2 arm 1 beside the flag-neutral `0x80` byte ALU.
+///
+/// # The ordering rules, each of which is a silent divergence if broken
+///
+/// * **The mask comes first.** `& 0x1f` is applied to the LOADED byte before any shape test, for
+///   the reason `emit_rotate_reg` masks `raw_count`: the guest count is architecturally five bits,
+///   so a patched `0x20` is the no-op shape and a patched `0x21` is the count-1 shape. Selecting on
+///   the raw byte would misread both.
+/// * **The test comes BEFORE the rotate, and each arm carries its own rotate.** A `cmp` placed
+///   after the host rotate would destroy the very flags the capture is about to read. Duplicating
+///   the rotate is what buys a flag capture that is still the host's own answer.
+/// * **The count-0 arm jumps clear of everything**, including both flag paths. It emits no rotate,
+///   which is right in its own terms too: the interpreter's write-back at count 0 is the identity.
+///
+/// # Registers
+///
+/// RDX stages the lane's host pointer and RCX the masked count, both emitter scratch (`GUEST_HOMES`
+/// is R8-R14 plus RBX), so neither can alias `home(dst)` — not even when `dst` is guest ECX or EDX.
+/// Nothing between the mask and the last read of RCX writes it: `rol r32, cl` only READS CL, and
+/// `emit_capture_flags`/`emit_set_cf_only`/`emit_clear_pending` work in RAX, RDI and RBP.
+fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, lane: ImmLane) {
+    debug_assert!(matches!(op, 0 | 1), "only ROL and ROR reach this emitter");
+    debug_assert_eq!(u32::from(lane.width), IMM8_LANE_WIDTH);
+    let one = e.label();
+    let done = e.label();
+    e.mov_r64_imm64(Reg::RDX, lane.host as u64);
+    e.movzx_r32_byte_disp32(Reg::RCX, Reg::RDX, 0);
+    e.and_r32_imm32(Reg::RCX, 0x1f);
+    e.jz(done);
+    e.cmp_r32_imm32(Reg::RCX, 1);
+    e.jz(one);
+    // Counts 2 through 31: CF only, in place, exactly as `emit_rotate_reg`'s tail does it. The
+    // host rotate's OF is deliberately NOT captured — above count 1 it is undefined on x86 and the
+    // guest's OF is still owned by the descriptor.
+    e.shift_r32_cl(op, home(dst));
+    emit_capture_flags(e, crate::FLAG_CF);
+    emit_set_cf_only(e);
+    e.jmp(done);
+    e.place(one);
+    // Count 1: the imm-form host rotate, byte-identical to what the baked emitter picks at this
+    // count, then the `CF|OF` capture and the eager publish.
+    e.shift_r32_imm8(op, home(dst), 1);
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+    e.place(done);
+}
+
+/// The COUNT-LANE form of the group-2 SHIFTS: `0xC1 /4..=7` at Dword and `0xC0 /4` at Byte.
+///
+/// The same runtime three-way branch `emit_rotate_reg_lane` carries, over the same masked loaded
+/// byte, and for the same reason — but the two upper arms differ only in ONE bit of the `defined`
+/// mask rather than in which flag path they take, because `emit_commit_shift_flags` is shared by
+/// every count above zero and adds `FLAG_OF` at exactly count 1. So the tail (the publish, the
+/// descriptor clear, and at Byte the write-back) is emitted once and both arms fall into it, which
+/// is `emit_shift_cl`'s compactness argument applied here: that slice was reverted once for
+/// inlining a full merge into both arms.
+///
+/// **Count 0 still jumps clear of everything**, and at Byte that includes the WRITE-BACK. Skipping
+/// it is not an optimisation of an identity store: `emit_write_gpr8` shifts its value register in
+/// place and rewrites the destination's lane, so running it over a value the count-0 path never
+/// read would write scratch into a guest register.
+///
+/// **Word is unreachable because `count_lane_for` BARS IT ON THE KIND'S WIDTH**, and that sentence
+/// is written this way because the first version of this slice made the weaker claim — that the
+/// prefix bar and `len == 3` refused Word already, since a Word `0xC1` needs a `0x66`. In a
+/// 16-bit code segment the operand size follows CS.D, so `c1 e0 03` is an unprefixed three-byte
+/// `shl ax, 3` at Word, and the arm below was reached and PANICKED THE COMPILER on ordinary DOS
+/// code. The width bar is now explicit at the admission site, and
+/// `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
+/// fixture. That is what makes `shift_r16_cl` a helper this tree does not owe.
+fn emit_shift_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, lane: ImmLane) {
+    debug_assert!(
+        matches!(op, 4..=7),
+        "emit_shift_lane is the SHIFT lane; rotates route to emit_rotate_reg_lane"
+    );
+    debug_assert_eq!(u32::from(lane.width), IMM8_LANE_WIDTH);
+    let one = e.label();
+    let merge = e.label();
+    let done = e.label();
+    e.mov_r64_imm64(Reg::RDX, lane.host as u64);
+    e.movzx_r32_byte_disp32(Reg::RCX, Reg::RDX, 0);
+    e.and_r32_imm32(Reg::RCX, 0x1f);
+    e.jz(done);
+    match width {
+        // The byte lane's read/modify/write-back through `emit_read_store_value` and
+        // `emit_write_gpr8` is `emit_shift_reg8`'s verbatim, and so is the ordering it enforces:
+        // the flag publish runs BEFORE the write-back, because that helper's `shl`, `and` and `or`
+        // clobber the host flags the capture reads. RDX is re-used as the value register once the
+        // count is safely in RCX; `dst` is a BYTE-register index, so `home(dst)` would reach the
+        // wrong register for indices 4..7 and the helpers exist precisely to avoid it.
+        MemoryWidth::Byte => {
+            debug_assert_eq!(op, 4, "only SHL r8 (0xC0 /4) has a byte lane");
+            emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RDX);
+            e.cmp_r32_imm32(Reg::RCX, 1);
+            e.jz(one);
+            e.shift_r8_cl(op, Reg::RDX);
+            emit_capture_flags(e, SHIFT_DEFINED);
+            e.jmp(merge);
+            e.place(one);
+            e.shift_r8_imm8(op, Reg::RDX, 1);
+            emit_capture_flags(e, SHIFT_DEFINED | crate::FLAG_OF);
+            e.place(merge);
+            e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+            emit_clear_pending(e);
+            emit_write_gpr8(e, dst, Reg::RDX);
+        }
+        MemoryWidth::Dword => {
+            e.cmp_r32_imm32(Reg::RCX, 1);
+            e.jz(one);
+            e.shift_r32_cl(op, home(dst));
+            emit_capture_flags(e, SHIFT_DEFINED);
+            e.jmp(merge);
+            e.place(one);
+            e.shift_r32_imm8(op, home(dst), 1);
+            emit_capture_flags(e, SHIFT_DEFINED | crate::FLAG_OF);
+            e.place(merge);
+            e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+            emit_clear_pending(e);
+        }
+        MemoryWidth::Word | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("count lanes are admitted only at the unprefixed Byte and Dword forms")
+        }
+    }
+    e.place(done);
 }
 
 fn emit_double_shift_reg(e: &mut Encoder, left: bool, dst: u8, src: u8, count: ShiftCount) {

@@ -204,6 +204,12 @@ pub(super) fn record_structural_barrier(
 ///   whole non-vacuity argument reads. The gate is mirrored below, immediately after `classify`,
 ///   and it is arm-gated so the `off` and `on` arms see no change at all.
 ///
+/// * NOT A DIVERGENCE, the 2026-08-20 L2 arm-2 count lane (`IZARRAVM_COUNT_LANES`), recorded here
+///   because it is the first place a reader will look for it. That slice attaches a lane to a kind
+///   `classify` has ALREADY admitted; every one of `count_lane_for`'s bars narrows which admitted
+///   slots take a lane and none can turn a Native classification into a boundary. So unlike the L1
+///   heat gate above -- the one admission rule that was not a `classify` answer -- it needs no
+///   mirror, and this scan stops exactly where the compile walk stops on both of its arms.
 /// * CLOSED, the memory-ALU BLOCK cap. `compile_with_instruction_limit` breaks at its LOOP TOP on
 ///   `memory_alu_slots != 0 && slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, regardless of
 ///   what the next instruction turns out to be. This scan applied the same bound only when the
@@ -453,6 +459,12 @@ pub(crate) struct DirectStallTally {
     /// over: `smc_lane_accepts` moving with this counter flat would say the L2 arm-1 lanes were
     /// not the cause.
     pub imm8_lane_registrations: u64,
+    /// Group-2 COUNT lanes registered at install (the `0xC1`/`0xC0` count byte behind
+    /// `IZARRAVM_COUNT_LANES`), the L2 arm-2 share of the aggregate
+    /// `PerfCounters::smc_lane_registrations`. Kept apart from `imm8_lane_registrations` even
+    /// though both register at `IMM8_LANE_WIDTH`: the two arms are independent knobs, so a
+    /// combined leg has to be able to attribute an accepts movement to one of them.
+    pub count_lane_registrations: u64,
     /// Interpreted continuations whose decode line had died between the packed first touch and
     /// the deferred full-view fetch (`IZARRAVM_DECODE_PACK`). The staleness argument in
     /// `run_budgeted_inner` says admission cannot invalidate the slot it screened, so this is the
@@ -1722,6 +1734,7 @@ impl crate::jit::JitState {
             lane_trial_installs: self.stalls.lane_trial_installs,
             disp_lane_registrations: self.stalls.disp_lane_registrations,
             imm8_lane_registrations: self.stalls.imm8_lane_registrations,
+            count_lane_registrations: self.stalls.count_lane_registrations,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,

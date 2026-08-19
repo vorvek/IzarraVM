@@ -1258,6 +1258,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     dst,
                     count: insn.imm as u8,
                     width: MemoryWidth::Byte,
+                    // `classify` never attaches a lane: it has neither the physical address nor
+                    // the cpu in scope. `count_lane_for` fills this in from the compile walk, at
+                    // the last point before the slot is committed.
+                    lane: None,
                 });
             }
             0xc1 | 0xd1 => {
@@ -1319,6 +1323,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         op: m.reg,
                         dst,
                         count,
+                        lane: None,
                     });
                 }
                 return Some(DirectKind::Shift {
@@ -1326,6 +1331,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     dst,
                     count,
                     width: operand_width,
+                    lane: None,
                 });
             }
             // Group 2 by CL. Sixth in the runtime-weighted reject audit: /7 alone is 807,607

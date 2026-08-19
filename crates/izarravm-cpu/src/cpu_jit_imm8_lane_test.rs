@@ -529,9 +529,19 @@ fn byte_write_at_a_dword_lane_start_still_rejects_on_width() {
 /// So: same block, same store, same dword lane as
 /// `byte_write_at_a_dword_lane_start_still_rejects_on_width` — but with the arm OFF, both
 /// rejection counters must stay at zero while the block still dies.
+///
+/// **BOTH one-byte arms are forced off, and the second one had to be added when
+/// `IZARRAVM_COUNT_LANES` flipped to default ON on 2026-08-20.** The door's test is an OR over the
+/// two arms (`note_code_byte_write_hit`), so this fixture's claim was never about the imm8 arm
+/// alone — it is about the state in which NEITHER one-byte class is live. While the count arm was
+/// default-off, forcing the imm8 arm was enough to reach that state by accident; it no longer is,
+/// and reading the ambient count arm here would test the permitting door while claiming to test
+/// the refusing one. The lesson generalises: a fixture that means "no lane class is live" has to
+/// say so for every class, not for the one its file is named after.
 #[test]
 fn the_off_arm_moves_no_rejection_counter_on_a_byte_write() {
     jit::direct::set_imm8_lanes_for_test(Some(false));
+    jit::direct::set_count_lanes_for_test(Some(false));
     let mut cpu = flat_cpu();
     cpu.set_fast_map_enabled_for_test(false);
     // `81 c0 ii ii ii ii` — ADD EAX, imm32, which takes a four-byte lane on every arm.
@@ -560,6 +570,7 @@ fn the_off_arm_moves_no_rejection_counter_on_a_byte_write() {
         cpu.jit_direct.block(id).is_none(),
         "the block still dies; only the counters differ between the arms"
     );
+    jit::direct::set_count_lanes_for_test(None);
 }
 
 /// A write to the instruction's OTHER bytes — its opcode and ModRM — is structural and retires the

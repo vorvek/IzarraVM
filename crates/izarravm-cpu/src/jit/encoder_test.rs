@@ -822,6 +822,28 @@ fn shift_r8_imm8_known_bytes() {
 }
 
 #[test]
+fn shift_r8_cl_known_bytes() {
+    // shl dl, cl -- no REX, D2 /4. ModRM 11_100_010 = 0xE2. The absence of a 0x66 and of a REX is
+    // the same assertion `shift_r8_imm8_known_bytes` makes: the operand is eight bits wide, so the
+    // host computes CF from bit 7, SF from bit 7 and ZF/PF from the 8-bit result, which is what
+    // lets the count-lane emitter take the flags rather than reconstruct them.
+    let mut e = Encoder::new();
+    e.shift_r8_cl(4, Reg::RDX);
+    assert_eq!(e.finish(), vec![0xD2, 0xE2]);
+    // A different sub-opcode reaches a different /op slot and nothing else moves.
+    let mut e = Encoder::new();
+    e.shift_r8_cl(5, Reg::RBX);
+    assert_eq!(e.finish(), vec![0xD2, 0xEB]);
+}
+
+#[test]
+#[should_panic(expected = "byte shift scratch registers must be AL through BL")]
+fn shift_r8_cl_refuses_a_high_register() {
+    // Same trap as the imm8 form: without a REX prefix, ModRM register 4 is AH, not SPL.
+    Encoder::new().shift_r8_cl(4, Reg::RSP);
+}
+
+#[test]
 #[should_panic(expected = "byte shift scratch registers must be AL through BL")]
 fn shift_r8_imm8_refuses_a_high_register() {
     // Without a REX prefix, ModRM register 4 is AH, not SPL. The assert is what stops a caller

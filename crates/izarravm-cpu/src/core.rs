@@ -430,12 +430,19 @@ impl CpuGsw {
     /// bit for bit, counters included, so it keeps the value-less door it always had.
     /// `the_off_arm_moves_no_rejection_counter_on_a_byte_write` is that pin.
     ///
-    /// The knob is a process-wide `OnceLock` read (a thread-local `Cell` under `cfg(test)`), so
+    /// **TWO ARMS OPEN THE SAME DOOR SINCE L2 ARM 2.** `IZARRAVM_COUNT_LANES=1` puts one-byte
+    /// GROUP-2 COUNT lanes in blocks (`count_lane_for`), which need the value-aware door for
+    /// exactly the reason the `0x80` immediate lanes do, so the test is an OR rather than a second
+    /// knob replacing the first. The shipped world — both knobs off — is unchanged, and each arm
+    /// alone still opens the door on its own: the two lane classes are independent levers and
+    /// neither may require the other to be measurable.
+    ///
+    /// The knobs are process-wide `OnceLock` reads (thread-local `Cell`s under `cfg(test)`), so
     /// this is a predictable load and branch, not an env lookup.
     #[inline]
     pub(super) fn note_code_byte_write_hit(&mut self, physical: u32) -> bool {
         #[cfg(feature = "jit")]
-        if crate::jit::direct::imm8_lanes_enabled() {
+        if crate::jit::direct::imm8_lanes_enabled() || crate::jit::direct::count_lanes_enabled() {
             return self.note_code_write_hit(physical, 1);
         }
         self.note_code_write(physical, 1)
