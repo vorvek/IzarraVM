@@ -413,9 +413,38 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 }
                 None => emit_alu(&mut e, op, dst, None, Some(imm), width),
             },
-            DirectKind::AluByteImm { op, dst, imm } => {
-                emit_alu_byte_imm(&mut e, op, dst, imm);
-            }
+            // The one-byte lane form, and it differs from the baked form in exactly one
+            // instruction for `AluImm`'s reason: where the source operand comes from.
+            // `emit_alu_byte_imm` would `mov ecx, imm32` with the compile-time byte
+            // zero-extended; this zero-extends the byte out of guest RAM instead, so a guest
+            // patch of that one byte takes effect on the next entry with no recompile.
+            // `emit_alu_byte_preloaded` reads only CL, so the zero-extension is a convenience
+            // and not a correctness term -- but it keeps RCX's upper bits defined, which is what
+            // the baked form's `mov r32, imm32` also does.
+            //
+            // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, and
+            // `emit_alu_byte_preloaded`'s FIRST instruction is `mov edx, eax`, so nothing reads
+            // RDX on entry. The destination byte is read into RAX BEFORE the address is staged,
+            // which matters if `dst` ever aliased the scratch -- it cannot (it is a guest home),
+            // but the ordering costs nothing and removes the question.
+            DirectKind::AluByteImm { op, dst, imm, lane } => match lane {
+                Some(lane) => {
+                    debug_assert_eq!(u32::from(lane.width), IMM8_LANE_WIDTH);
+                    emit_read_store_value(
+                        &mut e,
+                        StoreSource::Reg(dst),
+                        MemoryWidth::Byte,
+                        Reg::RAX,
+                    );
+                    e.mov_r64_imm64(Reg::RDX, lane.host as u64);
+                    e.movzx_r32_byte_disp32(Reg::RCX, Reg::RDX, 0);
+                    emit_alu_byte_preloaded(&mut e, op);
+                    if op != 7 {
+                        emit_write_gpr8(&mut e, dst, Reg::RDX);
+                    }
+                }
+                None => emit_alu_byte_imm(&mut e, op, dst, imm),
+            },
             DirectKind::AluRegByte { op, dst, src } => {
                 emit_alu_reg_byte(&mut e, op, dst, src);
             }

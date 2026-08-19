@@ -1535,6 +1535,11 @@ impl CpuGsw {
                         .direct
                         .note_disp_lane_registrations(compilation.disp_lane_count() as u64);
                 }
+                if compilation.imm8_lane_count() != 0 {
+                    self.jit_direct
+                        .direct
+                        .note_imm8_lane_registrations(compilation.imm8_lane_count() as u64);
+                }
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the
                 // block-entry site are written branchlessly.

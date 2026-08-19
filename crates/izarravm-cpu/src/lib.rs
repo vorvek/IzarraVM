@@ -1940,6 +1940,9 @@ pub struct DirectStallSnapshot {
     /// Displacement lanes registered at install — the disp share of
     /// `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
     pub disp_lane_registrations: u64,
+    /// One-byte imm lanes (`0x80 /r`) registered at install, the imm8 share of the aggregate
+    /// `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
+    pub imm8_lane_registrations: u64,
     /// Continuations the packed decode first touch screened and then could not materialise a line
     /// for. Expected identically zero; see `DirectStallTally`.
     pub decode_pack_late_view_miss: u64,

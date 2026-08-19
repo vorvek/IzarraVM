@@ -323,7 +323,9 @@ fn prime_direct(cpu: &mut CpuGsw, bus: &mut TestBus, pristine: &[u8], case: &Gen
     );
 }
 
-fn run_generated_mode(mode: GswMode, mode_offset: u32) {
+/// Runs the sweep and returns the ONE-BYTE immediate lanes the direct role registered across it,
+/// so the arm-on caller can prove its sweep actually exercised the lane emitter.
+fn run_generated_mode(mode: GswMode, mode_offset: u32) -> u64 {
     let cases: Vec<_> = (0..CASES_PER_MODE)
         .map(|index| generated_case(index, mode_offset))
         .collect();
@@ -405,12 +407,57 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) {
             direct.perf_counters()
         );
     }
+    direct.jit_direct.stall_snapshot().imm8_lane_registrations
 }
 
 #[test]
 fn generated_direct_blocks_match_interpreter_in_486_and_586_modes() {
-    run_generated_mode(GswMode::Gsw486, 0);
-    run_generated_mode(GswMode::Gsw586, CASES_PER_MODE);
+    assert_eq!(
+        run_generated_mode(GswMode::Gsw486, 0),
+        0,
+        "the default arm must register no one-byte lane"
+    );
+    assert_eq!(
+        run_generated_mode(GswMode::Gsw586, CASES_PER_MODE),
+        0,
+        "the default arm must register no one-byte lane"
+    );
+}
+
+/// The same sweep with the L2 arm-1 one-byte immediate lane class ADMITTED, so the generator's
+/// `0x80 /r` slot compiles to the lane form instead of the baked one.
+///
+/// This is the arm's whole-block differential. `cpu_jit_imm8_lane_test` compares one instruction
+/// against the interpreter in a three-slot fixture; this runs the lane emission inside a
+/// thirty-two-instruction block whose neighbours consume the flags it produces, against randomized
+/// operands, at every one of the eight sub-opcodes (the slot's op is `(op + 1) & 7` over the case
+/// index) and at every byte-register destination including AH/CH/DH/BH. A lane form that got the
+/// flag capture, the lazy descriptor, the write-back suppression on CMP or the high-lane staging
+/// wrong diverges here even where the isolated fixture agreed.
+///
+/// `GENERATED_BLOCK_NATIVE_INSTRUCTIONS` is unchanged and asserted unchanged inside
+/// `run_generated_mode`: a lane changes which host instructions a slot emits, never whether the
+/// slot is classified. A lane arm that accidentally refused the slot would show up as a lost
+/// retirement, not as quiet agreement.
+#[test]
+fn generated_direct_blocks_match_interpreter_with_imm8_lanes_admitted() {
+    // Thread-local, and this test owns its thread; `run_generated_mode` builds and runs everything
+    // it needs before returning, so the arm is live for every compile in the sweep.
+    jit::direct::set_imm8_lanes_for_test(Some(true));
+    assert!(
+        jit::direct::imm8_lanes_enabled(),
+        "the sweep needs the one-byte lane arm forced on"
+    );
+    // NON-VACUITY. Without this the sweep degrades silently into a second copy of the baked one
+    // the moment an admission bar tightens (or the generator's `0x80` slot changes shape), and it
+    // would keep passing while testing nothing this arm added.
+    let lanes_486 = run_generated_mode(GswMode::Gsw486, 0);
+    let lanes_586 = run_generated_mode(GswMode::Gsw586, CASES_PER_MODE);
+    jit::direct::set_imm8_lanes_for_test(None);
+    assert!(
+        lanes_486 > 0 && lanes_586 > 0,
+        "the sweep compiled no one-byte lane, so it tested the baked form twice:          486 {lanes_486}, 586 {lanes_586}"
+    );
 }
 
 fn single_case_memory(case: &GeneratedCase) -> Vec<u8> {

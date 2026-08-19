@@ -416,6 +416,31 @@ impl CpuGsw {
         self.note_code_write_inner(physical, width, true)
     }
 
+    /// A CHANGED one-byte guest store onto a direct RAM page, routed to whichever of the two doors
+    /// the one-byte lane arm selects. The slow byte path's entry point (`write_linear_u8`).
+    ///
+    /// **The arm test is the whole point of this function existing.** A one-byte lane can only be
+    /// absorbed through the value-aware door, so `IZARRAVM_IMM8_LANES=1` needs it; but the door
+    /// also decides whether a byte write that lands on a DWORD lane is counted in
+    /// `smc_lane_reject_width` / `smc_lane_reject_address`, and it makes the choke walk the lane
+    /// arrays for every block a byte store touches. Taking it unconditionally would move both
+    /// counters and add that walk on the SHIPPED arm, which
+    /// `dev_docs/duke-reprofile-2026-08-19.md` reads as a baseline (`smc_lane_reject_width` "reads
+    /// 0 today") and compares against the 08-16 census. The off arm must be the pre-slice world
+    /// bit for bit, counters included, so it keeps the value-less door it always had.
+    /// `the_off_arm_moves_no_rejection_counter_on_a_byte_write` is that pin.
+    ///
+    /// The knob is a process-wide `OnceLock` read (a thread-local `Cell` under `cfg(test)`), so
+    /// this is a predictable load and branch, not an env lookup.
+    #[inline]
+    pub(super) fn note_code_byte_write_hit(&mut self, physical: u32) -> bool {
+        #[cfg(feature = "jit")]
+        if crate::jit::direct::imm8_lanes_enabled() {
+            return self.note_code_write_hit(physical, 1);
+        }
+        self.note_code_write(physical, 1)
+    }
+
     /// In-flight SMC needs no check here, and that is a proof rather than an omission. A store
     /// from native code into watched code never commits inside the block: the emitted store's
     /// code-watch guard side-exits (`SideExitReason::CodeWatch`) before the write, and the

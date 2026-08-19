@@ -590,16 +590,25 @@ impl CpuGsw {
     ///
     /// The invalidation gate is width-sensitive, because the two slow paths this replaces are NOT
     /// symmetric: `write_linear_fragment` (sized) pre-gates on `code_write_watched` before calling
-    /// `note_code_write_hit` at all, but `write_linear_u8` (byte) calls `note_code_write` on every
-    /// `changed` write, with no watched pre-check. Those two are separate DOORS onto the same body
-    /// (`note_code_write_inner`) and are no longer interchangeable: `note_code_write_hit` allows
-    /// the mutable imm32 lane exemption, `note_code_write` refuses it. Nothing here depends on the
-    /// difference — a lane accepts width 4 only, so no byte write is ever accepted through either
-    /// door, and this function calls `note_code_write_hit` for both widths. The one visible
-    /// consequence is diagnostic and lives on the SLOW byte path: a byte write landing inside a
-    /// lane goes through `write_linear_u8`'s value-less door, so it retires the block exactly as
-    /// it should but is not counted in `smc_lane_reject_width`, while the same write served here
-    /// would be. `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
+    /// `note_code_write_hit` at all, but `write_linear_u8` (byte) calls its door on every `changed`
+    /// write, with no watched pre-check.
+    ///
+    /// THE TWO DOORS. `note_code_write_hit` and `note_code_write` are separate entrances onto one
+    /// body (`note_code_write_inner`), and they are not interchangeable: the first permits the
+    /// mutable-lane exemption, the second refuses it. This function takes the permitting door at
+    /// both widths, and since the L2 arm-1 slice that choice is load-bearing at width one rather
+    /// than merely uniform — a one-byte `0x80` immediate lane accepts a one-byte store, so a byte
+    /// write served here can be absorbed instead of killing the block. Before that slice no lane
+    /// accepted width 1 at all, so the door made no difference at this width.
+    ///
+    /// The slow byte path's door is ARM-SELECTED rather than fixed, which this function's is not.
+    /// `write_linear_u8` routes through `note_code_byte_write_hit` (core.rs), which takes the
+    /// permitting door only when `IZARRAVM_IMM8_LANES` is on — see that function for why the off
+    /// arm must keep the refusing one, counters included. This function is unaffected: it has
+    /// taken the permitting door at both widths since long before the arm existed, so its
+    /// behaviour is the same on either.
+    ///
+    /// `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
     /// unconditional unit-sim feed (`core.rs`) -- diagnostic only, but the one place
     /// `IZARRAVM_UNIT_SIM` observes SMC. An earlier version of this function used `watched &&
     /// changed` for every width, which silently dropped that sim feed for a changed byte write
@@ -1378,7 +1387,17 @@ impl CpuGsw {
             self.write_direct_byte_page_cached(bus, linear, physical, value, kind)?
         {
             if changed {
-                self.note_code_write(physical, 1);
+                // ARM-SELECTED, and `note_code_byte_write_hit` (core.rs) is where the selection and
+                // its argument live. With `IZARRAVM_IMM8_LANES=1` this takes the value-aware door,
+                // which is the only door that permits the lane exemption and so the only way a
+                // 386-persona guest (no FastMap) can have its own `0x80` immediate patch absorbed.
+                // With the arm off it keeps the value-less `note_code_write` it always had, so the
+                // shipped arm is the pre-slice world down to the rejection counters.
+                //
+                // The bus-path caller below stays value-less unconditionally: a device or unmapped
+                // target can never be a lane, because `direct_host_bytes` only ever hands out
+                // fetch-cache pages.
+                self.note_code_byte_write_hit(physical);
             }
             return Ok(());
         }

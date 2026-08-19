@@ -599,6 +599,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         op,
                         dst: 0,
                         imm: insn.imm as u8,
+                        // The accumulator short form's immediate sits at offset ONE, not two, so
+                        // it is out of `imm8_lane_for`'s admitted shape by its opcode test. Baked,
+                        // as it always was.
+                        lane: None,
                     });
                 }
                 // ALU accumulator forms with a full-width immediate (0x05/0x0d/.../0x3d). NOT in
@@ -868,10 +872,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x80 => {
                 let m = insn.modrm?;
                 return match insn.operand? {
+                    // `lane: None` here for `imm_lane_for`'s reason on the `0x81` arm below:
+                    // `classify` has no `&CpuGsw` and no physical address, and a lane needs both.
+                    // The compile loop attaches one through `imm8_lane_for` for exactly this
+                    // shape when `IZARRAVM_IMM8_LANES` admits it.
                     DecodedOperand::Reg(dst) => Some(DirectKind::AluByteImm {
                         op: m.reg,
                         dst,
                         imm: insn.imm as u8,
+                        lane: None,
                     }),
                     DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
                         op: m.reg,

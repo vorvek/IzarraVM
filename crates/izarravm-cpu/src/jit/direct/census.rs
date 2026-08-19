@@ -447,6 +447,12 @@ pub(crate) struct DirectStallTally {
     /// aggregate `PerfCounters::smc_lane_registrations`. The split is what the A/B needs:
     /// `smc_lane_accepts` moving with this counter flat would say the imm lanes did the work.
     pub disp_lane_registrations: u64,
+    /// One-byte immediate lanes registered at install (the `0x80 /r` family behind
+    /// `IZARRAVM_IMM8_LANES`), the imm8 share of the aggregate
+    /// `PerfCounters::smc_lane_registrations`. Same job as `disp_lane_registrations` one class
+    /// over: `smc_lane_accepts` moving with this counter flat would say the L2 arm-1 lanes were
+    /// not the cause.
+    pub imm8_lane_registrations: u64,
     /// Interpreted continuations whose decode line had died between the packed first touch and
     /// the deferred full-view fetch (`IZARRAVM_DECODE_PACK`). The staleness argument in
     /// `run_budgeted_inner` says admission cannot invalidate the slot it screened, so this is the
@@ -1715,6 +1721,7 @@ impl crate::jit::JitState {
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
             disp_lane_registrations: self.stalls.disp_lane_registrations,
+            imm8_lane_registrations: self.stalls.imm8_lane_registrations,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,

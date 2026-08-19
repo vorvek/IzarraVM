@@ -3883,6 +3883,14 @@ mod jit_imm_lane;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_imm8_lane_test.rs"]
+mod jit_imm8_lane;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_disp_lane_test.rs"]
 mod jit_disp_lane;
 
