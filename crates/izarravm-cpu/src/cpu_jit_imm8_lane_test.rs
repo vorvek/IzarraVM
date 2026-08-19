@@ -515,6 +515,53 @@ fn byte_write_at_a_dword_lane_start_still_rejects_on_width() {
     );
 }
 
+/// THE OFF ARM'S COUNTERS DO NOT MOVE, and this is the fixture the adversarial review demanded.
+///
+/// The slow byte path's door is arm-selected (`note_code_byte_write_hit`, core.rs). Taking the
+/// value-aware door unconditionally is the obvious simplification and it is WRONG: the permitting
+/// door also runs the lane-rejection accounting, so a byte store landing on a DWORD lane would
+/// start counting in `smc_lane_reject_width` on the SHIPPED arm — a counter
+/// `dev_docs/duke-reprofile-2026-08-19.md` reads as a baseline ("reads 0 today") and compares the
+/// 08-16 census against. The kill is identical either way; only the counters and the choke's
+/// per-block lane walk differ, which is exactly what makes the mistake invisible without this
+/// fixture.
+///
+/// So: same block, same store, same dword lane as
+/// `byte_write_at_a_dword_lane_start_still_rejects_on_width` — but with the arm OFF, both
+/// rejection counters must stay at zero while the block still dies.
+#[test]
+fn the_off_arm_moves_no_rejection_counter_on_a_byte_write() {
+    jit::direct::set_imm8_lanes_for_test(Some(false));
+    let mut cpu = flat_cpu();
+    cpu.set_fast_map_enabled_for_test(false);
+    // `81 c0 ii ii ii ii` — ADD EAX, imm32, which takes a four-byte lane on every arm.
+    let mut bus = test_bus(image_from(&[0x81, 0xc0, 0x78, 0x56, 0x34, 0x12]));
+    decode_at(&mut cpu, &mut bus, &block_starts(6));
+    let id = install(&mut cpu, ENTRY, 3);
+    assert_eq!(
+        cpu.perf_counters().smc_lane_registrations,
+        1,
+        "the dword lane must exist, or the counters below are zero for the wrong reason"
+    );
+
+    guest_store_byte(&mut cpu, &mut bus, ENTRY + ALU_OFFSET + 2, 0x99);
+
+    let perf = cpu.perf_counters();
+    assert_eq!(perf.smc_lane_accepts, 0);
+    assert_eq!(
+        perf.smc_lane_reject_width, 0,
+        "the shipped arm must not start counting byte writes as lane rejections"
+    );
+    assert_eq!(
+        perf.smc_lane_reject_address, 0,
+        "the shipped arm must not start counting byte writes as lane rejections"
+    );
+    assert!(
+        cpu.jit_direct.block(id).is_none(),
+        "the block still dies; only the counters differ between the arms"
+    );
+}
+
 /// A write to the instruction's OTHER bytes — its opcode and ModRM — is structural and retires the
 /// block. It overlaps no lane byte, so it is not even a lane rejection.
 #[test]
@@ -688,7 +735,11 @@ fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
     let mut cpu = flat_cpu();
     let mut bus = test_bus(image_from(middle));
     decode_at(&mut cpu, &mut bus, &block_starts(middle.len() as u32));
-    match jit::direct::compile(&mut cpu, ENTRY, true) {
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    // Restored before the match, so a `panic!` below cannot leave this thread's override forced.
+    // The override is per-thread and the harness reuses threads across tests.
+    jit::direct::set_imm8_lanes_for_test(None);
+    match outcome {
         jit::direct::CompileOutcome::Compiled(c) => c.code.len(),
         jit::direct::CompileOutcome::Retry => panic!("fixture block did not compile: Retry"),
         jit::direct::CompileOutcome::StructuralReject(r) => {

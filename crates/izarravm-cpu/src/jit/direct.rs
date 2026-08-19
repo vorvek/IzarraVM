@@ -5009,10 +5009,26 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// every flag; the ADMISSION is net-negative on the only fixture that carries the runtime mass.
 ///
 /// **RE-TEST TRIGGER: a one-byte mutable-imm lane class covering the `imm_len=1` patch shapes
-/// (`0xC1`, `0xC0`, `0x80`).** `IMM_LANE_WIDTH` is four and `imm_lane_for`'s accept rule is written
-/// against that width, so a 1-byte lane is its own width class rather than a widened match. Once
-/// duke's count-byte patches become `lane_accepts` instead of narrow kills, this A/B is measuring
-/// something different and must be run again.
+/// (`0xC1`, `0xC0`, `0x80`).** `IMM_LANE_WIDTH` is four and `imm_lane_for`'s accept rule was
+/// written against that width, so a 1-byte lane is its own width class rather than a widened
+/// match. Once duke's count-byte patches become `lane_accepts` instead of narrow kills, this A/B is
+/// measuring something different and must be run again.
+///
+/// **STATUS 2026-08-19: the width class EXISTS and its first user shipped.** `IMM8_LANE_WIDTH` is
+/// one, every lane carries its own width, and `imm8_lane_for` admits the `0x80 /r` third of the
+/// trigger behind `IZARRAVM_IMM8_LANES` (default off). `0xC1`/`0xC0` and `0x0FA4` are NOT admitted
+/// and are still blocked on THE DESIGN COST below, which is untouched by that slice — the plumbing
+/// is no longer the obstacle, the flag-capture split is.
+///
+/// **THE 2x2 HAS A CROSS TERM, and a combined ladder leg must be read knowing it.** With
+/// `IZARRAVM_IMM8_LANES=1`, a `0x80` patch that a lane absorbs no longer stamps SMC heat on its
+/// 16-byte chunk (`lane_only` at core.rs suppresses the bump). The `heat_gated` arm below admits a
+/// `0xC1 /0` site exactly when its count byte carries NO heat record — and heat records are
+/// per-chunk, so a `0xC1` whose chunk was being kept hot by a neighbouring `0x80` patch becomes
+/// admissible once that `0x80` is laned. **So `ROTATE_ROWS=heat_gated` with `IMM8_LANES=1` admits
+/// a SUPERSET of the sites it admits with `IMM8_LANES=0`, and the combined leg's delta is not the
+/// sum of the two single-lever deltas.** Measure the four legs if the interaction matters; do not
+/// subtract one arm's number from the combined one and call the remainder the other arm's.
 ///
 /// THE DESIGN COST THE NEXT SLICE MUST BUDGET FOR, because it is not a lane-plumbing detail. A
 /// laned count is loaded at RUNTIME, and `emit_rotate_reg`'s whole correctness argument is a
