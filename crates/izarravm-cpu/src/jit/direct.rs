@@ -192,9 +192,23 @@ pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
 /// families), so a block spanning such a region needs the larger budget for its lanes to absorb
 /// the whole burst — one uncovered patched slot is enough to keep killing the block.
 pub(crate) const MAX_BLOCK_IMM_LANES: usize = 12;
-/// The only store width a lane accepts. The dword field is patched whole or not at all; a byte
+/// The store width a DWORD lane accepts. The dword field is patched whole or not at all; a byte
 /// or word patch of it takes the normal invalidation path.
+///
+/// Since the 2026-08-19 L2 arm-1 slice this is one of TWO widths a lane can carry, not the only
+/// one — see `IMM8_LANE_WIDTH`. Each lane records its own width and the write choke accepts a
+/// patch only at that lane's exact width, so the two classes cannot absorb each other's writes.
 pub(crate) const IMM_LANE_WIDTH: u32 = 4;
+/// The store width a ONE-BYTE lane accepts (`imm8_lane_for`, the `0x80 /r` ALU r/m8 imm8 family).
+///
+/// Its own width class rather than a widened match on `IMM_LANE_WIDTH`, and the distinction is
+/// load-bearing in both directions: a one-byte patch landing on a DWORD lane must still reject on
+/// width (it changes one byte of a field the emitted code reads whole, so the block's baked shape
+/// is wrong), and a four-byte patch landing on a one-byte lane must still reject on width (it
+/// rewrites the three instruction bytes after the immediate as well). `smc_lane_reject_width`
+/// counts both, and its meaning — "a write started exactly at a lane and was refused for its
+/// size" — is unchanged by the second class existing.
+pub(crate) const IMM8_LANE_WIDTH: u32 = 1;
 /// Empty slot in a block's lane array. Physical address 0 is a real address (the real-mode IVT),
 /// so the sentinel has to be an address no six-byte instruction's immediate can start at.
 const NO_IMM_LANE: u32 = u32::MAX;
@@ -847,6 +861,15 @@ pub(crate) struct BlockCache {
     /// only at the SMC write choke. A recycled slot is refilled by `install`, so a retired
     /// occupant's lanes can never answer for its successor.
     block_imm_lanes: Vec<[u32; MAX_BLOCK_IMM_LANES]>,
+    /// The WIDTH CLASS of each entry in `block_imm_lanes`, same index, `0` for an unused slot.
+    /// Either `IMM_LANE_WIDTH` (4) or `IMM8_LANE_WIDTH` (1).
+    ///
+    /// A parallel array rather than a field packed into the lane address, because the address array
+    /// is what the write choke scans and it is scanned on every SMC write to a compiled span: the
+    /// common case is "no lane matches", and that comparison stays a bare `u32` equality against a
+    /// value that needs no unmasking. The width is read only on the slots that already matched or
+    /// already overlap.
+    block_imm_lane_widths: Vec<[u8; MAX_BLOCK_IMM_LANES]>,
     /// G1 lane trial spend marks: the heat epoch in which `lane_trial_spend` last granted this
     /// key its one compile-through-heat attempt (see `lane_trial_enabled` for the mechanism).
     /// Stale epochs are simply overwritten on the next grant, so the map only ever holds one
@@ -1015,6 +1038,7 @@ impl BlockCache {
             segment_layouts: Vec::new(),
             chain_layouts: Vec::new(),
             block_imm_lanes: Vec::new(),
+            block_imm_lane_widths: Vec::new(),
             lane_trial_epochs: HashMap::default(),
             top_mismatch_retires: HashMap::default(),
             lane_trial_override: None,
@@ -1262,6 +1286,7 @@ impl BlockCache {
             self.segment_layouts.push(compilation.segment_layout);
             self.chain_layouts.push(compilation.segment_layout);
             self.block_imm_lanes.push(compilation.imm_lanes);
+            self.block_imm_lane_widths.push(compilation.imm_lane_widths);
             if index == self.block_portals.len() {
                 self.block_portals.push(Arc::new(BlockPortal::new()));
             } else {
@@ -1291,6 +1316,7 @@ impl BlockCache {
             // requirement: the new block reaches a different successor set entirely.
             self.chain_layouts[index] = compilation.segment_layout;
             self.block_imm_lanes[index] = compilation.imm_lanes;
+            self.block_imm_lane_widths[index] = compilation.imm_lane_widths;
             self.link_cells[index] = compilation.link_cells.clone();
             self.outbound[index] = [None, None];
             self.dynamic_next_slots[index] = 0;
@@ -1538,6 +1564,12 @@ impl BlockCache {
     /// `smc_lane_registrations` the same install site feeds.
     pub(crate) fn note_disp_lane_registrations(&mut self, lanes: u64) {
         self.stalls.disp_lane_registrations += lanes;
+    }
+
+    /// One-byte immediate lanes registered by an install — the imm8 share of the aggregate
+    /// `smc_lane_registrations` the same install site feeds.
+    pub(crate) fn note_imm8_lane_registrations(&mut self, lanes: u64) {
+        self.stalls.imm8_lane_registrations += lanes;
     }
 
     /// The packed first touch screened a slot that no longer had a line by the time the
@@ -1929,14 +1961,25 @@ impl BlockCache {
                     // partial patch), a write that misses this block's lanes entirely, a block
                     // with no lanes at all, and every write from a caller that cannot pass
                     // `lanes`.
+                    //
+                    // The width test is PER LANE since the L2 arm-1 slice, not against the one
+                    // global `IMM_LANE_WIDTH`. It is still an exact-width test at an exact lane
+                    // start, so nothing about the fail-closed argument changes: a lane accepts the
+                    // store that rewrites its field WHOLE and no other. What the second class buys
+                    // is that a one-byte `0x80` immediate patch is now such a store, where before
+                    // no store of width 1 could ever be one.
                     if let BlockState::Compiled(id) = state
                         && lanes
                         && let Some(index) = self.active_index(id)
                     {
                         let block_lanes = self.block_imm_lanes[index];
+                        let block_lane_widths = self.block_imm_lane_widths[index];
                         if physical != NO_IMM_LANE
-                            && width == IMM_LANE_WIDTH
-                            && block_lanes.contains(&physical)
+                            && block_lanes.iter().zip(block_lane_widths.iter()).any(
+                                |(lane, lane_width)| {
+                                    *lane == physical && width == u32::from(*lane_width)
+                                },
+                            )
                         {
                             result.lane_accepts += 1;
                             #[cfg(feature = "smc-census")]
@@ -1948,10 +1991,20 @@ impl BlockCache {
                             survivor_count += 1;
                             continue;
                         }
-                        for lane in block_lanes.iter().copied().filter(|lane| {
-                            *lane != NO_IMM_LANE
-                                && physical_ranges_overlap(physical, width, *lane, IMM_LANE_WIDTH)
-                        }) {
+                        for (lane, _) in block_lanes
+                            .iter()
+                            .copied()
+                            .zip(block_lane_widths.iter().copied())
+                            .filter(|(lane, lane_width)| {
+                                *lane != NO_IMM_LANE
+                                    && physical_ranges_overlap(
+                                        physical,
+                                        width,
+                                        *lane,
+                                        u32::from(*lane_width),
+                                    )
+                            })
+                        {
                             if physical == lane {
                                 result.lane_reject_width += 1;
                             } else {
@@ -2522,6 +2575,7 @@ impl BlockCache {
         self.segment_layouts.clear();
         self.chain_layouts.clear();
         self.block_imm_lanes.clear();
+        self.block_imm_lane_widths.clear();
         self.lane_trial_epochs.clear();
         self.top_mismatch_retires.clear();
         self.link_cells.clear();
@@ -2911,6 +2965,7 @@ impl BlockCache {
         self.blocks[index].entry = 0;
         self.blocks[index].body_entry = 0;
         self.block_imm_lanes[index] = [NO_IMM_LANE; MAX_BLOCK_IMM_LANES];
+        self.block_imm_lane_widths[index] = [0; MAX_BLOCK_IMM_LANES];
         self.free_block_slots
             .push(u16::try_from(index).expect("block slot index must fit its ID"));
         self.live_blocks -= 1;
@@ -3108,11 +3163,19 @@ pub(crate) struct Compilation {
     /// `NO_IMM_LANE` for an unused slot. `install` copies these into the cache's per-block lane
     /// array, which is what the SMC write choke matches a patch against.
     imm_lanes: [u32; MAX_BLOCK_IMM_LANES],
+    /// The width class of each `imm_lanes` entry, `0` for an unused slot. Copied into the cache's
+    /// `block_imm_lane_widths` beside the addresses; see that field for why the two are parallel
+    /// arrays rather than one array of pairs.
+    imm_lane_widths: [u8; MAX_BLOCK_IMM_LANES],
     /// How many of `imm_lanes` are DISPLACEMENT lanes (`disp_lane_for`). The write choke never
     /// needs the distinction — a lane is a lane there — but the install site does: the split
     /// between `smc_lane_registrations` and `disp_lane_registrations` is what says which lane
     /// kind an A/B's `smc_lane_accepts` movement belongs to.
     disp_lanes: u8,
+    /// How many of `imm_lanes` are ONE-BYTE lanes (`imm8_lane_for`), for the same reason
+    /// `disp_lanes` exists: the L2 arm-1 A/B has to be able to say that a `smc_lane_accepts`
+    /// movement came from the new class rather than from the `0x81` family shifting under it.
+    imm8_lanes: u8,
     pub code: Vec<u8>,
 }
 
@@ -3126,6 +3189,10 @@ impl Compilation {
 
     pub(crate) fn disp_lane_count(&self) -> usize {
         usize::from(self.disp_lanes)
+    }
+
+    pub(crate) fn imm8_lane_count(&self) -> usize {
+        usize::from(self.imm8_lanes)
     }
 }
 
@@ -3141,10 +3208,16 @@ impl Compilation {
 /// (see `note_direct_data_map_changed`), and every event that could change which host bytes back a
 /// physical address — an A20 toggle, a direct-map change, a bus mapping-epoch change that is not
 /// data-only — routes through `invalidate_code_caches`, which clears this cache.
+///
+/// `width` is the lane's WIDTH CLASS in bytes — `IMM_LANE_WIDTH` for the `0x81` dword family and
+/// `disp_lane_for`'s disp32 field, `IMM8_LANE_WIDTH` for the `0x80` imm8 family. It travels with
+/// the lane all the way to the cache's `block_imm_lane_widths` so the write choke can test a patch
+/// against the width of the lane it landed on rather than against a single global width.
 #[derive(Clone, Copy)]
 pub(crate) struct ImmLane {
     pub(crate) physical: u32,
     pub(crate) host: usize,
+    pub(crate) width: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -3284,6 +3357,19 @@ pub(crate) enum DirectKind {
         op: u8,
         dst: u8,
         imm: u8,
+        /// Present only for the shapes `imm8_lane_for` admits (the reg-destination `0x80 /r`
+        /// byte family, no prefixes). When present the emitted form IGNORES `imm` and loads the
+        /// one immediate byte out of guest RAM on every execution, so a guest patch of that byte
+        /// needs no recompile. `imm` still carries the value decoded at compile time and is what
+        /// the non-lane form bakes.
+        ///
+        /// A runtime immediate is FLAG-NEUTRAL here, and that is why this family shipped as L2's
+        /// first arm while the group-2 count byte did not: `emit_alu_byte_preloaded` computes the
+        /// flags from the host operation's own result at run time whatever the source operand is
+        /// (`emit_alu_reg_byte` already feeds it a register), so there is no compile-time split on
+        /// the immediate's VALUE to preserve. `emit_rotate_reg`, by contrast, picks its capture
+        /// mask at emission from the count — see `rotate_rows_enabled`'s "THE DESIGN COST".
+        lane: Option<ImmLane>,
     },
     /// The BYTE-LANE register ALU: `op r8, r8` for the whole eight-operation set, both operand
     /// orders (0x00/0x08/../0x38 with a register r/m, and 0x02/0x0A/../0x3A likewise).
@@ -4811,6 +4897,88 @@ pub(crate) fn disp_lanes_enabled() -> bool {
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_DISP_LANES").as_deref(), Ok("0")))
 }
 
+/// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class
+/// (`IZARRAVM_IMM8_LANES`). See `imm8_lane_for` for what qualifies and why this family alone.
+///
+/// **DEFAULT OFF**, on the `IZARRAVM_ROTATE_ROWS` contract rather than the `IZARRAVM_LANE_FAMILY`
+/// one: both arms ship in the one executable, because this box has measured 6% wall variance
+/// between builds of identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a
+/// cross-build comparison would not be evidence. Off is the base and it is byte-for-byte the
+/// pre-slice world — no lane is registered, every `0x80` slot bakes its immediate exactly as it
+/// did, and the write choke's per-lane width test degenerates to the old global one because every
+/// registered lane is then four bytes wide.
+///
+/// **THE SPELLING TABLE.** Trimmed and case-folded on the way in, because a knob set from a shell
+/// script picks up whitespace and one set from a PowerShell ladder picks up capitalisation.
+///
+/// * unset, `` (empty), `0` or `off` -> OFF. The shipped base.
+/// * `1` or `on` -> ON. The slice.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason restated in this slice's terms:
+///   a mistyped ladder leg (`IZARRAVM_IMM8_LANES=yes`, `=imm8`, `=true`) that fell through to OFF
+///   would run the BASE and be read as "the one-byte lane class did nothing", which is the one
+///   wrong conclusion this slice exists to avoid. Failing at the first compile is cheaper than a
+///   plausible number.
+pub(crate) fn imm8_lanes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = IMM8_LANES_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_imm8_lanes_arm(std::env::var("IZARRAVM_IMM8_LANES")))
+}
+
+/// The `IZARRAVM_IMM8_LANES` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `imm8_lanes_enabled` for the contract.
+fn parse_imm8_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_IMM8_LANES is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset, `0` or `off` (the shipped base), and `1` or `on` (the \
+                 one-byte `0x80` immediate lane class)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_IMM8_LANES={other:?} names no arm; accepted spellings are unset, `0` or \
+             `off` (the shipped base) and `1` or `on` (the one-byte `0x80` immediate lane class). \
+             Refusing to guess: a mistyped ladder leg that silently ran the base would be read as \
+             the slice failing"
+        ),
+    }
+}
+
+// Per-THREAD, for `ROTATE_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run both arms in one process, so one test's arm selection must not
+// reach another's compile. Since the arm is default-OFF, every positive fixture for this class
+// MUST force it on through here or it would test the refusal and call it a lowering.
+#[cfg(test)]
+thread_local! {
+    static IMM8_LANES_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the one-byte lane arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_IMM8_LANES` reading.
+#[cfg(test)]
+pub(crate) fn set_imm8_lanes_for_test(forced: Option<bool>) {
+    IMM8_LANES_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `imm8_lanes_enabled` caches its env reading in
+/// a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
+/// never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_imm8_lanes_arm(value)
+}
+
 /// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and
 /// **`0xC0 /4` SHL r8**, both register forms.
 ///
@@ -5394,6 +5562,7 @@ fn imm_lane_for(
     let lane = ImmLane {
         physical: lane,
         host,
+        width: IMM_LANE_WIDTH as u8,
     };
     Some((
         DirectKind::AluImm {
@@ -5402,6 +5571,101 @@ fn imm_lane_for(
             imm,
             lane: Some(lane),
             width: MemoryWidth::Dword,
+        },
+        lane,
+    ))
+}
+
+/// The ONE-BYTE twin of `imm_lane_for`: `0x80 /r`, ALU r/m8 with an imm8, REGISTER destination,
+/// no prefixes — the first user of the `IMM8_LANE_WIDTH` class, behind `IZARRAVM_IMM8_LANES`.
+///
+/// # Why this family and not the other two
+///
+/// The duke3d-586 SMC shape trace (`.bench/results/duke-smc-trace-20260819/README.md`) measures
+/// three `imm_len == 1` patch shapes carrying 79% of all block kills and 62% of newly-hot chunk
+/// events: `0x80` at 4.73 M events, `0xC1` at 1.97 M and `0x0FA4` (SHLD) at 0.21 M. Only `0x80`
+/// ships here, and the cut is a CORRECTNESS one rather than a ranking one. `emit_rotate_reg` and
+/// the SHLD emitter both pick their flag-capture behaviour at EMISSION from the immediate's value
+/// (`rotate_rows_enabled`'s "THE DESIGN COST" paragraph states the three-way split: count 0 moves
+/// no flag at all, count 1 captures `CF|OF`, 2..31 captures CF alone), so a runtime immediate would
+/// have to be paired with a runtime-conditional flag path that does not exist. The byte ALU has no
+/// such split: `emit_alu_byte_preloaded` derives every flag from the host operation it just ran,
+/// which is why `emit_alu_reg_byte` can already feed it a register operand. Swapping a baked
+/// `mov ecx, imm32` for a `movzx ecx, byte [lane]` therefore changes the SOURCE of the operand and
+/// nothing else — same operation, same lazy-flag descriptor, same truncation, same write-back
+/// suppression on CMP.
+///
+/// # The admission bars, and each one's job
+///
+/// - `imm8_lanes_enabled()`: the A/B arm. Default OFF, so the shipped binary is the pre-slice
+///   world and the ladder can measure both arms out of one executable.
+/// - `DirectKind::AluByteImm { lane: None, .. }`: the only kind whose emitter has a lane arm.
+/// - `insn.opcode == 0x80`: `classify` also produces `AluByteImm` for the AL-accumulator short
+///   forms (`0x04`/`0x0C`/…/`0x3C`), whose immediate sits at offset ONE, not two. Testing the
+///   opcode is what makes `physical + 2` a fact about the encoding rather than an assumption.
+///   A `0x82` alias, if the decoder ever produced one, is likewise out.
+/// - `insn.prefixes == Prefixes::default()`: no segment override, no address-size override, no
+///   operand-size override, no REP and no LOCK. Any prefix byte moves the immediate off offset 2,
+///   and a LOCK'd patch is refused rather than argued impossible — the same bar `imm_lane_for`
+///   sets.
+/// - `insn.disp_len == 0`, `insn.imm_len == 1`, `insn.len == 3`: the decoder's own record of what
+///   it consumed. Together they pin the immediate at instruction offset 2 and nowhere else. The
+///   register destination is implied by the kind (`classify` produces `AluByteImm` only from
+///   `DecodedOperand::Reg`) and re-implied by `len == 3`, which no memory form can reach.
+/// - `direct_host_bytes(lane, IMM8_LANE_WIDTH)`: the page-kind guard, verbatim from
+///   `imm_lane_for` — only a page the fetch cache hands out may back a lane, so device apertures
+///   and unmapped pages never produce one. The instruction is already page-local in physical
+///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
+/// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
+///   baked immediate, which is a missed optimisation and never a correctness question.
+///
+/// NO HEAT GATE, unlike `disp_lane_for`. The two are not the same trade: a disp lane costs two
+/// host instructions on every EXECUTION of a load that may never be patched, which is what made
+/// doom's unpatched texture loads regress; this lane replaces a `mov r32, imm32` with a
+/// `mov r64, imm64` + `movzx r32, byte [r64]`, on a row duke measures at 4.73 M actual patch
+/// events. If the ladder shows the untaxed sites dominating, the disp gate
+/// (`has_record_range(lane, IMM8_LANE_WIDTH)`) is the ready-made second arm — but gating on
+/// unmeasured suspicion would ship two mechanisms as one A/B.
+fn imm8_lane_for(
+    cpu: &CpuGsw,
+    insn: &DecodedInsn,
+    kind: DirectKind,
+    physical: u32,
+    lanes_used: usize,
+) -> Option<(DirectKind, ImmLane)> {
+    if lanes_used >= MAX_BLOCK_IMM_LANES || !imm8_lanes_enabled() {
+        return None;
+    }
+    let DirectKind::AluByteImm {
+        op,
+        dst,
+        imm,
+        lane: None,
+    } = kind
+    else {
+        return None;
+    };
+    if insn.opcode != 0x80
+        || insn.prefixes != Prefixes::default()
+        || insn.disp_len != 0
+        || insn.imm_len != 1
+        || insn.len != 3
+    {
+        return None;
+    }
+    let lane = physical.checked_add(2)?;
+    let host = cpu.direct_host_bytes(lane, IMM8_LANE_WIDTH)?;
+    let lane = ImmLane {
+        physical: lane,
+        host,
+        width: IMM8_LANE_WIDTH as u8,
+    };
+    Some((
+        DirectKind::AluByteImm {
+            op,
+            dst,
+            imm,
+            lane: Some(lane),
         },
         lane,
     ))
@@ -5484,6 +5748,7 @@ fn disp_lane_for(
     let lane = ImmLane {
         physical: lane,
         host,
+        width: IMM_LANE_WIDTH as u8,
     };
     Some((
         DirectKind::Load {
@@ -5634,8 +5899,10 @@ fn compile_with_instruction_limit(
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
     let mut imm_lanes = [NO_IMM_LANE; MAX_BLOCK_IMM_LANES];
+    let mut imm_lane_widths = [0u8; MAX_BLOCK_IMM_LANES];
     let mut imm_lane_count = 0usize;
     let mut disp_lane_count = 0u8;
+    let mut imm8_lane_count = 0u8;
     let mut stop = CompileStop::Boundary;
 
     while slots.len() < instruction_limit.min(MAX_BLOCK_INSTRUCTIONS) {
@@ -6061,13 +6328,17 @@ fn compile_with_instruction_limit(
         // Every `break` above abandons the slot, and a lane recorded for an instruction that never
         // joined the block would name bytes outside the block's span -- an address the write choke
         // could never match, but also a lane the block does not actually read through.
-        // The two lane matchers are mutually exclusive by kind (`AluImm` vs `Load`), so at most
-        // one fires per slot and both draw on the one `MAX_BLOCK_IMM_LANES` budget.
+        // The three lane matchers are mutually exclusive by kind (`AluImm` vs `AluByteImm` vs
+        // `Load`), so at most one fires per slot and all three draw on the one
+        // `MAX_BLOCK_IMM_LANES` budget. Each records its lane's WIDTH CLASS beside the address;
+        // the write choke tests a patch against that per-lane width, so a one-byte lane and a
+        // dword lane in the same block cannot absorb each other's stores.
         #[cfg(feature = "barrier-census-closure")]
         let mut lane_probe_bits = 0u8;
         let kind = match imm_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
             Some((kind, lane)) => {
                 imm_lanes[imm_lane_count] = lane.physical;
+                imm_lane_widths[imm_lane_count] = lane.width;
                 imm_lane_count += 1;
                 #[cfg(feature = "barrier-census-closure")]
                 {
@@ -6075,18 +6346,37 @@ fn compile_with_instruction_limit(
                 }
                 kind
             }
-            None => match disp_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+            None => match imm8_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
                 Some((kind, lane)) => {
                     imm_lanes[imm_lane_count] = lane.physical;
+                    imm_lane_widths[imm_lane_count] = lane.width;
                     imm_lane_count += 1;
-                    disp_lane_count += 1;
+                    imm8_lane_count += 1;
+                    // The IMM bit, deliberately shared with the `0x81` family rather than given a
+                    // third: B.3's export answers "did a mutable-IMMEDIATE lane attach on a walk
+                    // from this entry", and both classes are that. The census split that says WHICH
+                    // class did the work is `imm8_lane_registrations`, which is a counter rather
+                    // than a per-site bit.
                     #[cfg(feature = "barrier-census-closure")]
                     {
-                        lane_probe_bits |= census::lane_probe::DISP;
+                        lane_probe_bits |= census::lane_probe::IMM;
                     }
                     kind
                 }
-                None => kind,
+                None => match disp_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+                    Some((kind, lane)) => {
+                        imm_lanes[imm_lane_count] = lane.physical;
+                        imm_lane_widths[imm_lane_count] = lane.width;
+                        imm_lane_count += 1;
+                        disp_lane_count += 1;
+                        #[cfg(feature = "barrier-census-closure")]
+                        {
+                            lane_probe_bits |= census::lane_probe::DISP;
+                        }
+                        kind
+                    }
+                    None => kind,
+                },
             },
         };
         // B.3's lane-match export. Gated at the CALL SITE per the census contract, and only when a
@@ -6500,7 +6790,9 @@ fn compile_with_instruction_limit(
         link_cells,
         body_offset: emitted.body_offset,
         imm_lanes,
+        imm_lane_widths,
         disp_lanes: disp_lane_count,
+        imm8_lanes: imm8_lane_count,
         code: emitted.code,
     })
 }

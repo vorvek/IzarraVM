@@ -590,16 +590,19 @@ impl CpuGsw {
     ///
     /// The invalidation gate is width-sensitive, because the two slow paths this replaces are NOT
     /// symmetric: `write_linear_fragment` (sized) pre-gates on `code_write_watched` before calling
-    /// `note_code_write_hit` at all, but `write_linear_u8` (byte) calls `note_code_write` on every
-    /// `changed` write, with no watched pre-check. Those two are separate DOORS onto the same body
-    /// (`note_code_write_inner`) and are no longer interchangeable: `note_code_write_hit` allows
-    /// the mutable imm32 lane exemption, `note_code_write` refuses it. Nothing here depends on the
-    /// difference — a lane accepts width 4 only, so no byte write is ever accepted through either
-    /// door, and this function calls `note_code_write_hit` for both widths. The one visible
-    /// consequence is diagnostic and lives on the SLOW byte path: a byte write landing inside a
-    /// lane goes through `write_linear_u8`'s value-less door, so it retires the block exactly as
-    /// it should but is not counted in `smc_lane_reject_width`, while the same write served here
-    /// would be. `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
+    /// `note_code_write_hit` at all, but `write_linear_u8` (byte) calls it on every `changed`
+    /// write, with no watched pre-check. Those two are separate DOORS onto the same body
+    /// (`note_code_write_inner`) and are not interchangeable: `note_code_write_hit` allows the
+    /// mutable-lane exemption, `note_code_write` refuses it. This function calls
+    /// `note_code_write_hit` for both widths, and since the L2 arm-1 slice that MATTERS at width
+    /// one rather than being merely uniform: a one-byte `0x80` immediate lane accepts a one-byte
+    /// store, so a byte write served here can now be absorbed instead of killing the block. Until
+    /// that slice no lane accepted width 1 at all, and the asymmetry this paragraph used to
+    /// describe — the slow byte path taking a value-less door and so missing
+    /// `smc_lane_reject_width` — was diagnostic only. It is not any more, so `write_linear_u8`'s
+    /// direct-page arm was moved onto this same door; its bus-path callers stay value-less, being
+    /// device or unmapped targets that `direct_host_bytes` can never make a lane out of.
+    /// `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
     /// unconditional unit-sim feed (`core.rs`) -- diagnostic only, but the one place
     /// `IZARRAVM_UNIT_SIM` observes SMC. An earlier version of this function used `watched &&
     /// changed` for every width, which silently dropped that sim feed for a changed byte write
@@ -1378,7 +1381,20 @@ impl CpuGsw {
             self.write_direct_byte_page_cached(bus, linear, physical, value, kind)?
         {
             if changed {
-                self.note_code_write(physical, 1);
+                // The VALUE-AWARE door, `note_code_write_hit`, and this is the byte twin of what
+                // `write_linear_fragment_after_probe` has always done for sized stores on a direct
+                // page. It was the value-LESS `note_code_write` until the L2 arm-1 slice, which is
+                // what `finish_fast_map_write`'s doc comment records as the one visible asymmetry
+                // between the fast and slow byte paths -- and it is load-bearing now rather than
+                // diagnostic: a one-byte lane can only absorb a one-byte patch through a door that
+                // permits the lane exemption, and this is the door a 386-persona guest (no FastMap)
+                // patching its own `0x80` immediate arrives at.
+                //
+                // The other two callers below stay value-less on purpose. They are the bus path
+                // (a device or unmapped target, never a lane by construction -- `direct_host_bytes`
+                // only ever hands out fetch-cache pages) and they carry no `changed` bit, so they
+                // are exactly the population `note_code_write`'s doc names as ineligible.
+                self.note_code_write_hit(physical, 1);
             }
             return Ok(());
         }

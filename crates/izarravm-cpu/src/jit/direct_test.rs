@@ -79,7 +79,9 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
         body_offset: 0,
         imm_lanes: [NO_IMM_LANE; MAX_BLOCK_IMM_LANES],
+        imm_lane_widths: [0; MAX_BLOCK_IMM_LANES],
         disp_lanes: 0,
+        imm8_lanes: 0,
         code: vec![0xc3],
     }
 }
