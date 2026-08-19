@@ -85,9 +85,9 @@ chime_note:
     pop ax
     ret
 
-; chime_delay: block for about 120 ms by polling two PIT channel-0 reloads
-; (~54.9 ms each). Self-contained so the chime does not depend on the RAM test
-; having run. Preserves all registers.
+; chime_delay: block for about 120 ms by waiting out two PIT channel-0 reloads
+; (~54.9 ms each) as BIOS timer ticks. Self-contained so the chime does not
+; depend on the RAM test having run. Preserves all registers.
 chime_delay:
     push cx
     mov cx, 2
@@ -97,35 +97,28 @@ chime_delay:
     pop cx
     ret
 
-; chime_pit_wait: block until PIT channel 0 reloads once. The counter falls; a
-; wrap shows when a fresh read reads higher than the previous one. The busy poll
-; also advances emulated time so the counter actually moves. Preserves registers.
+; chime_pit_wait: sleep until IRQ0 advances the BIOS tick count. HLT lets the
+; machine jump straight to the next device deadline instead of interpreting a
+; clock-speed-dependent PIT poll loop. The wait needs IF set (a halt with
+; interrupts masked never wakes), so it enables them itself and restores the
+; caller's flags on the way out. Only the low word of the tick dword is
+; compared, and only for inequality: the midnight rollover to zero changes it
+; like any other tick. Preserves registers and flags.
 chime_pit_wait:
+    pushf
     push ax
     push bx
-    push cx
-    call chime_pit_read             ; BX = initial count
-    mov cx, bx
-.spin:
-    call chime_pit_read             ; BX = current count
-    cmp bx, cx                      ; counter wrapped (count rose) -> done
-    ja .done
-    mov cx, bx                      ; track the falling count
-    jmp .spin
-.done:
-    pop cx
+    push ds
+    mov ax, BDA_SEG
+    mov ds, ax
+    mov bx, [BDA_TICKS]
+.wait:
+    sti
+    hlt
+    cmp bx, [BDA_TICKS]
+    je .wait                        ; another IRQ woke us before timer 0
+    pop ds
     pop bx
     pop ax
-    ret
-
-; chime_pit_read: latch and read PIT counter 0 -> BX = 16-bit count. Preserves AX.
-chime_pit_read:
-    push ax
-    xor al, al                      ; latch counter 0
-    out PORT_PIT_CTRL, al
-    in al, PORT_PIT_CH0             ; LSB
-    mov bl, al
-    in al, PORT_PIT_CH0             ; MSB
-    mov bh, al
-    pop ax
+    popf
     ret
