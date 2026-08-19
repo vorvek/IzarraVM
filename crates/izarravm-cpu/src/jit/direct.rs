@@ -4879,15 +4879,48 @@ pub(crate) fn disp_lanes_enabled() -> bool {
 /// Both arms ship in one executable, the `IZARRAVM_LANE_FAMILY` and `IZARRAVM_DISP_LANES` contract:
 /// this box has measured 6% wall variance between builds of identical source, which is larger than
 /// the effect, so a cross-build comparison would not be evidence.
+///
+/// **THREE ARMS SINCE THE 2026-08-19 L1 SLICE**, selected by the same variable and all shipping in
+/// the one executable for the same reason (`dev_docs/duke-reprofile-2026-08-19.md` §6.2):
+///
+/// * `IZARRAVM_ROTATE_ROWS` unset, or `0` -> `Off`: the shipped refusal. THE BASE, and it is
+///   byte-for-byte the pre-slice world.
+/// * `heat` or `heat_gated` -> `HeatGated`: admit ONLY where the count byte carries no SMC heat
+///   record. THE SLICE.
+/// * any other value -> `On`: the 2026-08-09 unconditional admission. THE NEGATIVE CONTROL, and it
+///   is expected to reproduce that day's -3.44%.
+///
+/// The `Ok(value) if value != "0"` reading that shipped before this is preserved exactly for every
+/// value except the two new spellings, so `IZARRAVM_ROTATE_ROWS=1` still names the arm it always
+/// named and the historical A/B legs stay comparable.
 pub(crate) fn rotate_rows_enabled() -> bool {
+    rotate_rows_arm() != RotateRowsArm::Off
+}
+
+/// The three-way selection behind `rotate_rows_enabled`. See its doc comment for the contract.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RotateRowsArm {
+    /// Today's shipped refusal: `classify` returns None for both rows.
+    Off,
+    /// L1: admit the rows only at sites whose count byte carries no SMC heat record.
+    HeatGated,
+    /// The 2026-08-09 unconditional admission, kept as the negative control.
+    On,
+}
+
+pub(crate) fn rotate_rows_arm() -> RotateRowsArm {
     #[cfg(test)]
     if let Some(forced) = ROTATE_ROWS_OVERRIDE.with(std::cell::Cell::get) {
         return forced;
     }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(
-        || matches!(std::env::var("IZARRAVM_ROTATE_ROWS").as_deref(), Ok(value) if value != "0"),
-    )
+    static ARM: std::sync::OnceLock<RotateRowsArm> = std::sync::OnceLock::new();
+    *ARM.get_or_init(|| match std::env::var("IZARRAVM_ROTATE_ROWS").as_deref() {
+        // `Err` covers both "unset" and "not UTF-8"; the latter is not a spelling of any arm and
+        // falling back to the shipped base is the only safe reading of it.
+        Err(_) | Ok("0") => RotateRowsArm::Off,
+        Ok("heat" | "heat_gated") => RotateRowsArm::HeatGated,
+        Ok(_) => RotateRowsArm::On,
+    })
 }
 
 // Per-THREAD, because the shipped knob is a process-wide `OnceLock` and the fixtures have to run
@@ -4898,13 +4931,26 @@ pub(crate) fn rotate_rows_enabled() -> bool {
 // rows MUST force the on arm through it, or it would test the refusal and call it a lowering.
 #[cfg(test)]
 thread_local! {
-    static ROTATE_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static ROTATE_ROWS_OVERRIDE: std::cell::Cell<Option<RotateRowsArm>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Force the group-2 admission arm on this thread for the length of a fixture; `None` restores the
-/// ambient `IZARRAVM_ROTATE_ROWS` reading.
+/// ambient `IZARRAVM_ROTATE_ROWS` reading. The `bool` spelling is the pre-L1 one and keeps naming
+/// the two arms it always named; `set_rotate_rows_arm_for_test` reaches the third.
 #[cfg(test)]
 pub(crate) fn set_rotate_rows_for_test(forced: Option<bool>) {
+    set_rotate_rows_arm_for_test(forced.map(|on| {
+        if on {
+            RotateRowsArm::On
+        } else {
+            RotateRowsArm::Off
+        }
+    }));
+}
+
+#[cfg(test)]
+pub(crate) fn set_rotate_rows_arm_for_test(forced: Option<RotateRowsArm>) {
     ROTATE_ROWS_OVERRIDE.with(|cell| cell.set(forced));
 }
 
@@ -5397,6 +5443,74 @@ fn disp_lane_for(
     ))
 }
 
+/// The physical address of the byte that encodes the COUNT for the two rows `IZARRAVM_ROTATE_ROWS`
+/// gates -- `0xC1`/`0xD1` `/0` ROL and `0xC0 /4` SHL r8 -- or `None` for anything else, including
+/// the rows that were lowered before the 2026-08-09 slice (`/1` ROR, `/4..=7` at Dword) and which
+/// the knob deliberately does not cover.
+///
+/// `physical` is the instruction's start and the instruction is already known page-local in
+/// physical (`physical_page_local` in the compile loop), so start-relative arithmetic over its own
+/// bytes is contiguous.
+///
+/// Two byte positions, because the count lives in two different places:
+///
+/// * `0xC0`/`0xC1` carry an `imm8` and it is the instruction's LAST byte (`physical + len - 1`).
+///   That is the byte duke patches: the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows.
+/// * `0xD1` has no immediate at all -- its count is the literal 1 baked into the OPCODE, so the
+///   only byte that can change the count is the opcode byte itself. Register form only (classify
+///   admits nothing else), so the encoding is prefixes + opcode + modrm and the opcode sits at
+///   `physical + len - 2`. Gating a `0xD1` on its opcode byte is the faithful inversion rather
+///   than a widening: a `D1 -> C1` patch is exactly the write that would kill a block spanning it.
+fn rotate_row_count_byte(insn: &DecodedInsn, physical: u32) -> Option<u32> {
+    let reg = insn.modrm?.reg;
+    match insn.opcode {
+        0xc0 if reg == 4 => {}
+        0xc1 if reg == 0 => {}
+        0xd1 if reg == 0 => {
+            // No immediate and no displacement is what makes `len - 2` the opcode byte. Both hold
+            // for every form classify admits; asserting them here rather than assuming them means
+            // a future widening of the admitted shape degrades to "no gate site, refuse" instead
+            // of probing an unrelated byte.
+            if insn.imm_len != 0 || insn.disp_len != 0 {
+                return None;
+            }
+            return physical.checked_add(u32::from(insn.len).checked_sub(2)?);
+        }
+        _ => return None,
+    }
+    if insn.imm_len != 1 {
+        return None;
+    }
+    physical.checked_add(u32::from(insn.len).checked_sub(1)?)
+}
+
+/// The L1 heat gate: `true` when this instruction is one of the gated group-2 rows AND its count
+/// byte carries an SMC heat record, i.e. the byte has measured patch history and a block spanning
+/// it would be at risk of the 2026-08-09 kill amplification.
+///
+/// This is `disp_lane_for`'s `has_record_range` probe INVERTED. There a record ADMITS the lane
+/// form (the field is known to be patched, so pay two host instructions per execution to survive
+/// the patch); here a record REFUSES the whole row (the count byte is known to be patched, so
+/// leave it the hard boundary it has always been and let the block end before it). Sites with no
+/// record convert; sites with one keep the shipped refusal exactly, which is what makes the
+/// 2026-08-09 regression unreproducible by construction.
+///
+/// The probe reads the heat accelerator WITHOUT `sync_smc_heat`, exactly as `disp_lane_for` does
+/// and for the same reason (this is a `&CpuGsw` path). A stale read can at worst admit one site
+/// that a later kill will refuse on recompile, or refuse one that could have converted --
+/// admission tuning, never correctness, because the lowering itself is correct at every count.
+///
+/// One byte, not `IMM_LANE_WIDTH`: the design phrase is `has_record_range(count_lane, 1)`. The
+/// heat map's resolution is a 16-byte chunk, so this is not as narrow as it reads -- it asks "has
+/// anything in this instruction's chunk ever taken a heat-charged kill", which is the conservative
+/// direction for a refusal gate.
+fn rotate_row_count_byte_is_patched(cpu: &CpuGsw, insn: &DecodedInsn, physical: u32) -> bool {
+    let Some(count_byte) = rotate_row_count_byte(insn, physical) else {
+        return false;
+    };
+    cpu.jit_direct.smc_heat.has_record_range(count_byte, 1)
+}
+
 fn compile_with_instruction_limit(
     cpu: &mut CpuGsw,
     entry_lin: u32,
@@ -5579,7 +5693,36 @@ fn compile_with_instruction_limit(
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         }
-        let kind = match DirectUnitPlanner::classify(&insn, lin, entry_lin) {
+        let planned = DirectUnitPlanner::classify(&insn, lin, entry_lin);
+        // L1, the third `IZARRAVM_ROTATE_ROWS` arm (dev_docs/duke-reprofile-2026-08-19.md §6.1).
+        //
+        // WHY HERE AND NOT IN `classify`. `classify` takes a `&DecodedInsn` and two LINEAR
+        // addresses; the heat map is keyed by PHYSICAL and lives behind `cpu`, and neither is in
+        // scope there. `disp_lane_for` -- the gate this one inverts -- is called from this same
+        // loop for exactly that reason, and mirroring its access path is what keeps the two probes
+        // reading the one structure through the one accessor.
+        //
+        // WHY IT DOWNGRADES TO `HardBoundary` RATHER THAN INVENTING A REFUSAL KIND. The off arm's
+        // refusal is a `classify` None, which lands in the census as an ordinary `hard_boundary`
+        // unbound exit. A heat-gated refusal has to be the SAME row or the arms are not comparable
+        // against the census this slice was ranked on. Falling into the existing
+        // `PlannedInsn::HardBoundary` arm below gets that for free, barrier-census record and all.
+        //
+        // COST ON THE OTHER TWO ARMS. The arm compare is a `OnceLock` read against a cached enum
+        // and short-circuits before any instruction inspection, so `Off` and `On` pay one
+        // perfectly-predicted branch per NATIVE slot on the COMPILE walk -- never on the execution
+        // path, which this function does not sit on
+        // ([[default-off-instruments-tax-hot-path]]).
+        let planned = match planned {
+            PlannedInsn::Native(_)
+                if rotate_rows_arm() == RotateRowsArm::HeatGated
+                    && rotate_row_count_byte_is_patched(cpu, &insn, expected_phys) =>
+            {
+                PlannedInsn::HardBoundary
+            }
+            planned => planned,
+        };
+        let kind = match planned {
             PlannedInsn::Native(kind) => kind,
             PlannedInsn::HardBoundary => {
                 if instruction_limit >= MAX_BLOCK_INSTRUCTIONS

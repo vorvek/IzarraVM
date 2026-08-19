@@ -2302,6 +2302,195 @@ fn the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions() {
     jit::direct::set_rotate_rows_for_test(None);
 }
 
+/// L1, the heat-gated arm, from the REFUSING side: a site whose count byte carries an SMC heat
+/// record keeps the shipped refusal, arm or no arm.
+///
+/// This is the whole safety argument of the slice. The 2026-08-09 regression was block-kill
+/// amplification -- duke patches the group-2 COUNT byte, blocks that span it die, and they take
+/// their live `0x81` immediate and `0x8A` displacement lanes down with them (-3.44% wall, coverage
+/// 0.7480 -> 0.7264; see `rotate_rows_enabled`). The gate says a patched site is left as the hard
+/// boundary it has always been, so no block ever spans it and the mechanism cannot recur. If the
+/// `has_record_range` term in `rotate_row_count_byte_is_patched` is deleted, every assertion here
+/// flips to `Some(3)`.
+///
+/// The heat record is seeded at the count byte the way one real patch leaves one -- the same
+/// `bump` the disp-lane fixtures use, which is what `note_code_write_inner` does on a
+/// heat-charged kill.
+#[test]
+fn the_heat_gated_arm_refuses_a_patched_count_byte() {
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+    for (code, count_byte) in [
+        (vec![0xc1u8, 0xc3, 0x10], ENTRY + 2), // rol ebx, 16: imm8, the last byte
+        (vec![0xc1, 0xc3, 0x01], ENTRY + 2),
+        (vec![0xc1, 0xc3, 0x00], ENTRY + 2),
+        (vec![0xd1, 0xc3], ENTRY), // rol ebx, 1: the count is IN the opcode byte
+        (vec![0xc0, 0xe3, 0x05], ENTRY + 2), // shl bl, 5
+        (vec![0xc0, 0xe7, 0x05], ENTRY + 2), // shl bh, 5, the high-lane index
+    ] {
+        assert!(
+            compile_leading_block_with_heat(&code, Some(count_byte)).is_none(),
+            "heat_gated: {code:02x?} has a patched count byte and must stay refused"
+        );
+    }
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// L1 from the ADMITTING side: the identical rows convert when their count byte has never been
+/// patched. Paired with the test above this is the slice in two assertions -- the gate splits one
+/// census row by measured patch history and nothing else.
+///
+/// The unpatched share of the `0xC1 /0` row is the number the whole slice exists to measure
+/// (`u`, dev_docs/duke-reprofile-2026-08-19.md §5 L1); this fixture pins that the share is
+/// reachable at all.
+#[test]
+fn the_heat_gated_arm_admits_an_unpatched_count_byte() {
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+    for code in [
+        vec![0xc1u8, 0xc3, 0x10],
+        vec![0xc1, 0xc3, 0x01],
+        vec![0xc1, 0xc3, 0x00],
+        vec![0xd1, 0xc3],
+        vec![0xc0, 0xe3, 0x05],
+        vec![0xc0, 0xe7, 0x05],
+    ] {
+        assert_eq!(
+            compile_leading_block_with_heat(&code, None),
+            Some(3),
+            "heat_gated: {code:02x?} has a never-patched count byte and must admit"
+        );
+    }
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// The gate is SCOPED to the two rows the knob covers, and this is the test that would catch it
+/// widening. `0xC1 /1` ROR and `0xC1 /4..=7` were lowered by earlier slices and are deliberately
+/// outside `IZARRAVM_ROTATE_ROWS`; if the heat probe matched them too, the heat-gated arm would
+/// silently REMOVE admissions that ship today and every A/B against it would price two changes as
+/// one in the wrong direction.
+#[test]
+fn the_heat_gate_does_not_reach_rows_outside_the_knob() {
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+    for (code, patched_byte) in [
+        (vec![0xc1u8, 0xcb, 0x10], ENTRY + 2), // ror ebx, 16: the 2026-07-26 slice
+        (vec![0xc1, 0xcb, 0x01], ENTRY + 2),
+        (vec![0xd1, 0xcb], ENTRY),           // ror ebx, 1 via 0xD1
+        (vec![0xc1, 0xe3, 0x05], ENTRY + 2), // shl ebx, 5: older still, a dword operand
+    ] {
+        assert_eq!(
+            compile_leading_block_with_heat(&code, Some(patched_byte)),
+            Some(3),
+            "heat_gated: {code:02x?} predates this slice and must stay lowered even when hot"
+        );
+    }
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// The other two arms are HEAT-BLIND, and that is what makes them the base and the negative
+/// control rather than two more flavours of the slice.
+///
+/// * `Off` must refuse a never-patched site as well as a patched one. This is the hard
+///   requirement that the shipped default is bit-identical to the pre-L1 world: if the heat probe
+///   leaked into the off arm, the base leg of every A/B would already carry the slice.
+/// * `On` must admit a PATCHED site -- that is precisely the 2026-08-09 admission whose -3.44% the
+///   control leg is supposed to reproduce. An `On` that quietly gained the gate would make the
+///   control agree with the slice and the ladder would be unfalsifiable.
+#[test]
+fn the_off_and_on_arms_ignore_heat_entirely() {
+    let rows = [
+        (vec![0xc1u8, 0xc3, 0x10], ENTRY + 2),
+        (vec![0xd1, 0xc3], ENTRY),
+        (vec![0xc0, 0xe3, 0x05], ENTRY + 2),
+    ];
+
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::Off);
+    for (code, count_byte) in &rows {
+        assert!(
+            compile_leading_block_with_heat(code, None).is_none(),
+            "off arm: {code:02x?} must refuse even with a cold count byte"
+        );
+        assert!(
+            compile_leading_block_with_heat(code, Some(*count_byte)).is_none(),
+            "off arm: {code:02x?} must refuse with a hot count byte too"
+        );
+    }
+
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::On);
+    for (code, count_byte) in &rows {
+        assert_eq!(
+            compile_leading_block_with_heat(code, None),
+            Some(3),
+            "on arm: {code:02x?} must admit a cold count byte"
+        );
+        assert_eq!(
+            compile_leading_block_with_heat(code, Some(*count_byte)),
+            Some(3),
+            "on arm: {code:02x?} must admit a HOT count byte; that is the 2026-08-09 control"
+        );
+    }
+
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// The env contract itself, asserted on the SHIPPED reading path with the override cleared: unset
+/// must mean `Off`. Everything above runs on the thread-local override, so without this nothing
+/// would notice the default flipping.
+#[test]
+fn the_shipped_rotate_rows_default_is_the_off_arm() {
+    jit::direct::set_rotate_rows_arm_for_test(None);
+    assert_eq!(
+        jit::direct::rotate_rows_arm(),
+        jit::direct::RotateRowsArm::Off,
+        "the shipped default is the OFF arm; IZARRAVM_ROTATE_ROWS is exported in this \
+         environment, unset it"
+    );
+    assert!(
+        !jit::direct::rotate_rows_enabled(),
+        "`rotate_rows_enabled` must keep agreeing with the arm it now wraps"
+    );
+}
+
+/// Select one of the three group-2 admission arms for this thread and PROVE the selection took,
+/// the arm-shaped twin of `select_rotate_rows`.
+fn select_rotate_rows_arm(arm: jit::direct::RotateRowsArm) {
+    jit::direct::set_rotate_rows_arm_for_test(Some(arm));
+    assert_eq!(
+        jit::direct::rotate_rows_arm(),
+        arm,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_ROTATE_ROWS"
+    );
+}
+
+/// `compile_leading_block` with an optional SMC heat record seeded at one physical byte first.
+///
+/// The fixture CPU is flat and unpaged, so linear and physical agree and the caller can name the
+/// count byte as an offset from `ENTRY` directly. The seed is one `bump`, which is exactly what
+/// `note_code_write_inner` leaves behind after one heat-charged kill -- the same seeding the
+/// disp-lane fixtures use, on the other side of the same probe.
+fn compile_leading_block_with_heat(code: &[u8], heat_at: Option<u32>) -> Option<u8> {
+    let mut memory = vec![0; 0x5000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    let mut block = code.to_vec();
+    block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
+    let mut cpu = flat_cpu(GswMode::Gsw586);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [
+        ENTRY,
+        ENTRY + code.len() as u32,
+        ENTRY + code.len() as u32 + 2,
+    ];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    if let Some(physical) = heat_at {
+        cpu.sync_smc_heat();
+        cpu.jit_direct.smc_heat.bump(physical, 1, 0);
+    }
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions)
+}
+
 /// Compile an instruction as slot 0 of a three-slot block, with every slot's decode line
 /// warmed. The three-slot shape matters: warming only the entry line makes slot 1 miss, the walk
 /// stops at Retry, and the fewer-than-three-slots gate reports the same `is_none()` as a genuine
