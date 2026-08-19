@@ -1927,8 +1927,8 @@ fn prepare_shl_reg8(
     ];
     decode_fixture(&mut native, &mut native_bus, &starts);
     decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
-    // Same reason as the rotate fixture: 0xC0 has no arm at all on the shipped default, so this
-    // whole battery would fail inside `install_block` without forcing the on arm here.
+    // Same framing as the rotate fixture: the arm is STATED rather than inherited, so this
+    // battery keeps testing the lowering whichever arm ships as the default.
     select_rotate_rows(true);
     let block = install_block(&mut native);
     // `dst & 3` is the HOME the byte lane lives in, so the seed reaches the operand whichever half
