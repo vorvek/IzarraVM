@@ -8,7 +8,7 @@
 //! the HDD probe FAILs on a bare machine because C: is HLE-backed rather than a
 //! real ATA disk, while CPU/floppy/optical PASS (those controllers are present).
 
-use izarravm_core::{GswMode, VideoCard};
+use izarravm_core::{GswMode, MASTER_CLOCK_HZ, VideoCard};
 use izarravm_firmware::{SuiteRecordStatus, izarra_bios, parse_result_block};
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
@@ -41,6 +41,69 @@ fn status(results: &izarravm_firmware::SuiteResults, name: &str) -> SuiteRecordS
         .find(|record| record.name == name)
         .unwrap_or_else(|| panic!("expected a record named {name}"))
         .status
+}
+
+fn full_post_timing(mode: GswMode) -> (std::time::Duration, u64, u64) {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = mode;
+    let mut machine = Machine::new(profile, izarra_bios()).unwrap();
+    machine.set_fast_post(false);
+    machine.enable_phase_marks();
+
+    let started = std::time::Instant::now();
+    for _ in 0..15_000 {
+        machine.run_master_ticks(MASTER_CLOCK_HZ / 1_000).unwrap();
+        if let Some(mark) = machine
+            .phase_marks()
+            .iter()
+            .find(|mark| mark.id == izarravm_machine::phase_mark::POST_END)
+        {
+            return (
+                mark.wall.duration_since(started),
+                mark.master_ticks,
+                mark.perf.instructions,
+            );
+        }
+    }
+    panic!("full POST did not finish in {mode} mode");
+}
+
+#[test]
+fn full_post_work_does_not_scale_with_cpu_frequency() {
+    let samples = [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ]
+    .map(|mode| (mode, full_post_timing(mode)));
+    for (mode, (wall, ticks, instructions)) in samples {
+        eprintln!(
+            "{mode}: wall={:.3}s guest={:.3}s instructions={instructions}",
+            wall.as_secs_f64(),
+            ticks as f64 / MASTER_CLOCK_HZ as f64
+        );
+        assert!(
+            ticks >= MASTER_CLOCK_HZ,
+            "full POST must retain its visible guest-time cadence in {mode} mode"
+        );
+    }
+
+    for pair in samples.windows(2) {
+        let (slower_mode, (_, slower_ticks, slower_instructions)) = pair[0];
+        let (faster_mode, (_, faster_ticks, faster_instructions)) = pair[1];
+        assert!(
+            faster_ticks <= slower_ticks,
+            "full POST got longer from {slower_mode} ({:.3}s) to {faster_mode} ({:.3}s)",
+            slower_ticks as f64 / MASTER_CLOCK_HZ as f64,
+            faster_ticks as f64 / MASTER_CLOCK_HZ as f64
+        );
+        assert!(
+            faster_instructions <= slower_instructions.saturating_mul(5) / 4,
+            "full POST work grew from {slower_mode} ({slower_instructions} instructions) to \
+             {faster_mode} ({faster_instructions} instructions)"
+        );
+    }
 }
 
 #[test]
