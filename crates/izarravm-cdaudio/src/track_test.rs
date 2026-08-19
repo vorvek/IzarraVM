@@ -278,7 +278,12 @@ fn a_live_track_is_never_the_one_evicted() {
     let newer = registry.track(fixture("tone.flac")).unwrap();
     for track in [&live, &older, &newer] {
         track.frame(0);
-        assert!(wait_for(|| track.frame(track.sectors() - 1).is_some()));
+        // On `finished`, not on the last frame being readable: a worker
+        // publishes its final sectors and only then stores the flag, so a
+        // readable track can still have a worker about to write `true` over the
+        // `false` this test is about to install -- which hands the registry a
+        // fourth candidate and evicts whatever it likes.
+        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
     }
     {
         let mut resident = registry.inner.lock().unwrap();
@@ -320,7 +325,9 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
     let c = registry.track(fixture("tone.flac")).unwrap();
     for track in [&a, &b, &c] {
         track.frame(0);
-        assert!(wait_for(|| track.frame(track.sectors() - 1).is_some()));
+        // On `finished` for the same reason as above: a worker still on its way
+        // out would store `true` after the `false` installed below.
+        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
     }
     // Three resident with none evictable, and `a` ready to be decoded afresh --
     // exactly what an admission during two live decodes leaves behind.
@@ -339,12 +346,97 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
     assert_eq!(resident(&registry), 3);
 
     // Touching `a` admits it, which cannot evict anything -- nothing is
-    // finished. Only the worker reaching its end can clear the backlog.
+    // finished. Only a worker reaching its end can clear the backlog.
     a.frame(0);
+    assert!(
+        wait_for(|| a.shared.finished.load(Ordering::SeqCst)),
+        "the worker for the admitted track never reached its end"
+    );
+
+    // `a`'s own worker is not the one that can do it: it leaves exactly one
+    // evictable track behind, and the registry never takes the last one -- from
+    // here that track is indistinguishable from the one under the play head.
+    registry.evict_excess();
+    assert_eq!(
+        resident(&registry),
+        3,
+        "the only decoded track was taken while two others were still decoding"
+    );
+
+    // The next worker out is. `b` was touched before `c`, so it is the one that
+    // goes.
+    b.shared.finished.store(true, Ordering::SeqCst);
+    registry.evict_excess();
 
     assert!(
-        wait_for(|| resident(&registry) <= MAX_RESIDENT),
+        resident(&registry) <= MAX_RESIDENT,
         "the backlog outlived the worker that could have cleared it"
+    );
+    assert_eq!(
+        b.resident_bytes(),
+        0,
+        "the backlog was cleared from the wrong end"
+    );
+}
+
+#[test]
+fn the_track_under_the_play_head_survives_an_older_one_that_has_not_flagged_itself() {
+    // The state a two-core runner reaches on its own: one track fully decoded
+    // and being read frame by frame, an older idle one whose worker has
+    // published its last sector but not yet stored `finished`, and a third
+    // arriving from boundary prefetch. Only the played track is a candidate,
+    // and taking it sends the mixer back to a decode from sector 0 in the middle
+    // of a song. Built by hand because reaching it live is a race lost a few
+    // times in a hundred.
+    let registry = Registry::new();
+    let played = registry.track(fixture("tone.wav")).unwrap();
+    let idle = registry.track(fixture("tone.ogg")).unwrap();
+    let arriving = registry.track(fixture("tone.flac")).unwrap();
+    for track in [&played, &idle, &arriving] {
+        track.frame(0);
+        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
+    }
+    {
+        let mut resident = registry.inner.lock().unwrap();
+        resident.clear();
+        for track in [&idle, &played, &arriving] {
+            let mut filled = track.shared.filled.lock().unwrap();
+            filled.pcm = vec![0u8; AUDIO_FRAME_BYTES];
+            track.shared.finished.store(true, Ordering::SeqCst);
+            resident.push(Arc::clone(&track.shared));
+        }
+        // `idle` was touched first and is the one whose flag is late; `arriving`
+        // has only just missed, so it is the newest and still decoding.
+        idle.shared.finished.store(false, Ordering::SeqCst);
+        arriving.shared.finished.store(false, Ordering::SeqCst);
+    }
+    // The mixer reads `played`, which is what makes it the most recent.
+    played.shared.last_touch.store(
+        TOUCH_CLOCK.fetch_add(1, Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+
+    registry.evict_excess();
+
+    assert!(
+        played.resident_bytes() > 0,
+        "the track being played was evicted out from under the mixer"
+    );
+    assert!(idle.resident_bytes() > 0, "an unfinished track was evicted");
+
+    // And the backlog is not permanent: the late flag lands and the older track
+    // goes, which is what a worker's tail call does.
+    idle.shared.finished.store(true, Ordering::SeqCst);
+    registry.evict_excess();
+
+    assert_eq!(
+        idle.resident_bytes(),
+        0,
+        "the older track survived its own worker's tail call"
+    );
+    assert!(
+        played.resident_bytes() > 0,
+        "the played track went on the second pass instead"
     );
 }
 
@@ -360,8 +452,21 @@ fn a_track_being_replayed_is_not_the_one_evicted() {
     let other = registry.track(fixture("tone.ogg")).unwrap();
     played.frame(0);
     other.frame(0);
-    assert!(wait_for(|| played.frame(played.sectors() - 1).is_some()));
-    assert!(wait_for(|| other.frame(other.sectors() - 1).is_some()));
+    // Waited on `finished`, not on the last frame being readable. Those are not
+    // the same instant: a worker publishes its last run of sectors and only then
+    // stores the flag, so a track can read to its end while the registry still
+    // sees it as one a worker is writing into. Waiting on the readable frame
+    // leaves this test's stated precondition -- both tracks decoded and idle --
+    // unestablished, and which side of that window `other` was on decided
+    // whether the test found the eviction bug or a passing run.
+    for track in [&played, &other] {
+        assert!(
+            wait_for(|| track.shared.finished.load(Ordering::SeqCst)),
+            "a worker never reached its end"
+        );
+    }
+    assert!(played.frame(played.sectors() - 1).is_some());
+    assert!(other.frame(other.sectors() - 1).is_some());
 
     // `played` was admitted first, so it is the oldest by admission order. Now
     // read it the way the mixer would -- every one of these is a hit.
@@ -406,3 +511,16 @@ fn formatting_a_track_does_not_print_its_audio() {
         rendered.len()
     );
 }
+
+// MUTATION EVIDENCE for residency eviction (2026-08-19, applied by hand, run, restored). Each row
+// names the fixture that caught it; a mutation nobody catches is a fixture bug, not a free pass.
+//
+// | mutation | caught by |
+// |---|---|
+// | `evict_excess`: the last-candidate guard weakened from `evictable < 2` to `evictable < 1`, which is the pre-fix behaviour exactly | `the_track_under_the_play_head_survives_an_older_one_that_has_not_flagged_itself` AND `a_backlog_is_cleared_by_the_next_worker_to_finish` |
+// | `frame`: the `last_touch` store deleted, so recency counts decode starts and not reads | `a_track_being_replayed_is_not_the_one_evicted` |
+//
+// The second row is why the first fixture is not the whole net: with the precondition of
+// `a_track_being_replayed_is_not_the_one_evicted` finally established (it now waits on `finished`,
+// not on the last frame being readable) that test no longer races into the eviction bug, so the
+// deterministic fixture above carries it and the replay test keeps the recency rule honest.
