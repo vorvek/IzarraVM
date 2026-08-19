@@ -82,6 +82,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         imm_lane_widths: [0; MAX_BLOCK_IMM_LANES],
         disp_lanes: 0,
         imm8_lanes: 0,
+        count_lanes: 0,
         code: vec![0xc3],
     }
 }

@@ -1572,6 +1572,15 @@ impl BlockCache {
         self.stalls.imm8_lane_registrations += lanes;
     }
 
+    /// Group-2 count lanes registered by an install — the L2 arm-2 share of the aggregate
+    /// `smc_lane_registrations` the same install site feeds. Separate from
+    /// `imm8_lane_registrations` even though both classes register at `IMM8_LANE_WIDTH`, because
+    /// the two arms are independent knobs and a combined ladder leg has to be able to say which
+    /// class moved.
+    pub(crate) fn note_count_lane_registrations(&mut self, lanes: u64) {
+        self.stalls.count_lane_registrations += lanes;
+    }
+
     /// The packed first touch screened a slot that no longer had a line by the time the
     /// interpreted arm asked for it. See the field.
     pub(crate) fn note_decode_pack_late_view_miss(&mut self) {
@@ -3176,6 +3185,11 @@ pub(crate) struct Compilation {
     /// `disp_lanes` exists: the L2 arm-1 A/B has to be able to say that a `smc_lane_accepts`
     /// movement came from the new class rather than from the `0x81` family shifting under it.
     imm8_lanes: u8,
+    /// How many of `imm_lanes` are GROUP-2 COUNT lanes (`count_lane_for`), for the same reason
+    /// `imm8_lanes` exists and NOT folded into it even though both are `IMM8_LANE_WIDTH`: the two
+    /// classes are selected by independent knobs, so a `smc_lane_accepts` movement on a combined
+    /// ladder leg has to be attributable to one of them.
+    count_lanes: u8,
     pub code: Vec<u8>,
 }
 
@@ -3193,6 +3207,10 @@ impl Compilation {
 
     pub(crate) fn imm8_lane_count(&self) -> usize {
         usize::from(self.imm8_lanes)
+    }
+
+    pub(crate) fn count_lane_count(&self) -> usize {
+        usize::from(self.count_lanes)
     }
 }
 
@@ -3532,6 +3550,19 @@ pub(crate) enum DirectKind {
         op: u8,
         dst: u8,
         count: u8,
+        /// Present only for the shapes `count_lane_for` admits (the register-destination `0xC1`
+        /// form, no prefixes, `imm_len == 1`, `len == 3`). When present the emitted form IGNORES
+        /// `count` and loads the count byte out of guest RAM on every execution, so a guest patch
+        /// of that byte needs no recompile. `count` still carries the value decoded at compile time
+        /// and is what the non-lane form bakes.
+        ///
+        /// **A runtime count is NOT flag-neutral here, and that is this lane's whole cost.**
+        /// `emit_rotate_reg` picks its capture mask at EMISSION from the masked count -- 0 emits
+        /// nothing at all, 1 captures `CF|OF` and publishes the shadow, 2..31 captures CF and goes
+        /// through `emit_set_cf_only`. The lane form has to reproduce that split as a RUNTIME
+        /// three-way branch (`emit_rotate_reg_lane`), which is what `rotate_rows_enabled`'s "THE
+        /// DESIGN COST" paragraph priced and what kept this family out of L2 arm 1.
+        lane: Option<ImmLane>,
     },
     /// MUL r/m32, register form (0xF7 /4). Unsigned, and the only DirectKind whose destination is
     /// implicit: it writes guest EAX and EDX regardless of `src`. No width field, for the same
@@ -3627,6 +3658,16 @@ pub(crate) enum DirectKind {
         dst: u8,
         count: u8,
         width: MemoryWidth,
+        /// Present only for the shapes `count_lane_for` admits: the register-destination `0xC1
+        /// /4..=7` (Dword) and `0xC0 /4` (Byte) forms, no prefixes, `imm_len == 1`, `len == 3`.
+        /// See `RotateReg::lane` for why a runtime count costs a three-way branch, and
+        /// `emit_shift_lane` for the branch itself.
+        ///
+        /// **Word can never carry one**, and that falls out of the admission bars rather than
+        /// being asserted on top of them: a Word `0xC1` needs a `0x66` prefix, which fails both
+        /// `prefixes == Prefixes::default()` and `len == 3`. So no `shift_r16_cl` is owed and the
+        /// emitter's Word arm stays the compile-time-count one it has always been.
+        lane: Option<ImmLane>,
     },
     /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
     /// admits ROL (/0) and ROR (/1) but routes them to `RotateReg`, because rotates do not define
@@ -5819,6 +5860,127 @@ fn imm8_lane_for(
     ))
 }
 
+/// The GROUP-2 COUNT twin of `imm8_lane_for`: the count byte of `0xC1 /0` ROL, `0xC1 /1` ROR,
+/// `0xC1 /4..=7` (SHL/SHR/SAL/SAR at Dword) and `0xC0 /4` SHL r8 — register destinations, no
+/// prefixes. The second user of the `IMM8_LANE_WIDTH` class, behind `IZARRAVM_COUNT_LANES`.
+///
+/// # Why this family, and why it comes second
+///
+/// This is the RE-TEST TRIGGER `rotate_rows_enabled` names. duke3d patches the COUNT BYTE of its
+/// group-2 shifts and rotates (the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows, ~1.97 M
+/// events on the duke3d-586 long row), and since the 2026-08-19/20 `IZARRAVM_ROTATE_ROWS` default
+/// flip those sites are ADMITTED — so each patch now kills a compiled block that may also carry
+/// live `0x81` imm lanes and `0x8A` displacement lanes, taking their accepts down with it.
+/// `smc_lane_accepts` fell 109.0 M -> 91.8 M (-16%) on that row when the rows were admitted, and
+/// this class is what turns those kills back into accepts.
+///
+/// It comes second because a laned count is not flag-neutral the way a laned `0x80` immediate is:
+/// the emitters pick their whole flag shape from the count's VALUE at emission. That is the design
+/// cost, it is paid in `emit_rotate_reg_lane` and `emit_shift_lane` as a runtime three-way branch,
+/// and it is the reason this is a separate slice with a separate knob rather than a widening of
+/// `imm8_lane_for`'s opcode test.
+///
+/// # The admission bars, and each one's job
+///
+/// - `count_lanes_enabled()`: the A/B arm. Default OFF, so the shipped binary is the pre-slice
+///   world and the ladder can measure both arms out of one executable. Independent of
+///   `IZARRAVM_IMM8_LANES` on purpose — see `count_lanes_enabled`.
+/// - `DirectKind::RotateReg { lane: None, .. }` / `DirectKind::Shift { lane: None, .. }`: the only
+///   two kinds whose emitters have a lane arm. `ShiftCl` (`0xD3`) is excluded by kind: its count is
+///   already runtime data out of guest CL and it has no immediate byte to lane.
+/// - `insn.opcode == 0xC1 || insn.opcode == 0xC0`: `0xD1` produces the SAME two kinds but carries
+///   no immediate at all — its count is the literal 1 baked into the opcode — so `physical + 2`
+///   would name the next instruction's first byte. Testing the opcode is what makes the lane
+///   address a fact about the encoding rather than an assumption.
+/// - `insn.prefixes == Prefixes::default()`: no segment override, no address-size override, no
+///   operand-size override, no REP and no LOCK. Any prefix byte moves the immediate off offset 2,
+///   and a LOCK'd patch is refused rather than argued impossible — `imm_lane_for`'s bar exactly.
+///   This bar is ALSO what keeps Word out of the emitter: a Word `0xC1` needs a `0x66`, so
+///   `emit_shift_lane` never sees one and owes no `shift_r16_cl`.
+/// - `insn.disp_len == 0`, `insn.imm_len == 1`, `insn.len == 3`: the decoder's own record of what
+///   it consumed. Together they pin the count byte at instruction offset 2 and nowhere else. The
+///   register destination is implied by the kinds (`classify` produces both only from
+///   `DecodedOperand::Reg`) and re-implied by `len == 3`, which no memory form can reach.
+/// - `direct_host_bytes(lane, IMM8_LANE_WIDTH)`: the page-kind guard, verbatim from
+///   `imm_lane_for` — only a page the fetch cache hands out may back a lane, so device apertures
+///   and unmapped pages never produce one. The instruction is already page-local in physical
+///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
+/// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
+///   baked count, which is a missed optimisation and never a correctness question.
+///
+/// NO HEAT GATE, for `imm8_lane_for`'s reason and with one measurement on top of it: the L1
+/// `heat_gated` arm gated this very row on heat and LOST (+1.6% wall), because only 11.4% of the
+/// ROL row's runtime hits sit on unheated chunks. Gating the LANE by heat would be the same bet
+/// from the other side. If the ladder shows the untaxed sites dominating, `has_record_range(lane,
+/// IMM8_LANE_WIDTH)` is the ready-made second arm.
+///
+/// # What does NOT change, stated where a reviewer will look for it
+///
+/// **Admission is untouched, so `census_native_suffix` owes no new mirror.** This lane attaches to
+/// a kind `classify` has already admitted — every bar above narrows which admitted slots take a
+/// lane, and none of them can turn a Native classification into a boundary. The L1 heat gate needed
+/// a census mirror precisely because it was the one admission rule that was not a `classify`
+/// answer; this is not an admission rule at all. The suffix scan therefore stops exactly where the
+/// compile walk stops on both arms of this knob.
+fn count_lane_for(
+    cpu: &CpuGsw,
+    insn: &DecodedInsn,
+    kind: DirectKind,
+    physical: u32,
+    lanes_used: usize,
+) -> Option<(DirectKind, ImmLane)> {
+    if lanes_used >= MAX_BLOCK_IMM_LANES || !count_lanes_enabled() {
+        return None;
+    }
+    if !matches!(
+        kind,
+        DirectKind::RotateReg { lane: None, .. } | DirectKind::Shift { lane: None, .. }
+    ) {
+        return None;
+    }
+    if !matches!(insn.opcode, 0xc0 | 0xc1)
+        || insn.prefixes != Prefixes::default()
+        || insn.disp_len != 0
+        || insn.imm_len != 1
+        || insn.len != 3
+    {
+        return None;
+    }
+    let lane = physical.checked_add(2)?;
+    let host = cpu.direct_host_bytes(lane, IMM8_LANE_WIDTH)?;
+    let lane = ImmLane {
+        physical: lane,
+        host,
+        width: IMM8_LANE_WIDTH as u8,
+    };
+    let kind = match kind {
+        DirectKind::RotateReg { op, dst, count, .. } => DirectKind::RotateReg {
+            op,
+            dst,
+            count,
+            lane: Some(lane),
+        },
+        DirectKind::Shift {
+            op,
+            dst,
+            count,
+            width,
+            ..
+        } => DirectKind::Shift {
+            op,
+            dst,
+            count,
+            width,
+            lane: Some(lane),
+        },
+        // Unreachable past the kind test above; spelled as a refusal rather than an
+        // `unreachable!` so a future widening of that test degrades to "no lane" instead of
+        // panicking a compile.
+        _ => return None,
+    };
+    Some((kind, lane))
+}
+
 /// The displacement twin of `imm_lane_for`: `0x8A MOV r8, [..disp32..]`, every ModRM memory
 /// form, no prefixes — GATED ON MEASURED PATCH HISTORY. The admitted field is the
 /// instruction's disp32, which duke3d-586's SMC trace measured at 17M of its 19.3M disp-patch
@@ -6051,6 +6213,7 @@ fn compile_with_instruction_limit(
     let mut imm_lane_count = 0usize;
     let mut disp_lane_count = 0u8;
     let mut imm8_lane_count = 0u8;
+    let mut count_lane_count = 0u8;
     let mut stop = CompileStop::Boundary;
 
     while slots.len() < instruction_limit.min(MAX_BLOCK_INSTRUCTIONS) {
@@ -6511,19 +6674,41 @@ fn compile_with_instruction_limit(
                     }
                     kind
                 }
-                None => match disp_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+                // The group-2 COUNT lane (L2 arm 2). Placed after the two immediate matchers and
+                // before the displacement one purely to keep the reading order "widest immediate
+                // first"; the four are mutually exclusive by KIND (`AluImm` vs `AluByteImm` vs
+                // `RotateReg`/`Shift` vs `Load`), so at most one can fire per slot whatever the
+                // order, and all four draw on the one `MAX_BLOCK_IMM_LANES` budget.
+                None => match count_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
                     Some((kind, lane)) => {
                         imm_lanes[imm_lane_count] = lane.physical;
                         imm_lane_widths[imm_lane_count] = lane.width;
                         imm_lane_count += 1;
-                        disp_lane_count += 1;
+                        count_lane_count += 1;
+                        // The IMM bit, shared with both immediate classes for `imm8_lane_for`'s
+                        // reason: B.3's export answers "did a mutable-IMMEDIATE lane attach on a
+                        // walk from this entry", and a count byte is an immediate. The census
+                        // split that says WHICH class did the work is `count_lane_registrations`.
                         #[cfg(feature = "barrier-census-closure")]
                         {
-                            lane_probe_bits |= census::lane_probe::DISP;
+                            lane_probe_bits |= census::lane_probe::IMM;
                         }
                         kind
                     }
-                    None => kind,
+                    None => match disp_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+                        Some((kind, lane)) => {
+                            imm_lanes[imm_lane_count] = lane.physical;
+                            imm_lane_widths[imm_lane_count] = lane.width;
+                            imm_lane_count += 1;
+                            disp_lane_count += 1;
+                            #[cfg(feature = "barrier-census-closure")]
+                            {
+                                lane_probe_bits |= census::lane_probe::DISP;
+                            }
+                            kind
+                        }
+                        None => kind,
+                    },
                 },
             },
         };
@@ -6941,6 +7126,7 @@ fn compile_with_instruction_limit(
         imm_lane_widths,
         disp_lanes: disp_lane_count,
         imm8_lanes: imm8_lane_count,
+        count_lanes: count_lane_count,
         code: emitted.code,
     })
 }
