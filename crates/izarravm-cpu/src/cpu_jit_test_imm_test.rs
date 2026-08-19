@@ -2308,14 +2308,20 @@ fn the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions() {
 /// This is the whole safety argument of the slice. The 2026-08-09 regression was block-kill
 /// amplification -- duke patches the group-2 COUNT byte, blocks that span it die, and they take
 /// their live `0x81` immediate and `0x8A` displacement lanes down with them (-3.44% wall, coverage
-/// 0.7480 -> 0.7264; see `rotate_rows_enabled`). The gate says a patched site is left as the hard
-/// boundary it has always been, so no block ever spans it and the mechanism cannot recur. If the
-/// `has_record_range` term in `rotate_row_count_byte_is_patched` is deleted, every assertion here
-/// flips to `Some(3)`.
+/// 0.7480 -> 0.7264; see `rotate_rows_enabled`). The gate says a site with a record is left as the
+/// hard boundary it has always been, so no block spans it for as long as the record stands. (Not
+/// forever: records are erasable, and `rotate_row_count_byte_is_patched` documents the bound and
+/// the self-correction. This fixture pins the gate, not the bound.) If the `has_record_range` term
+/// is deleted, every assertion here flips to `Some(3)`.
 ///
 /// The heat record is seeded at the count byte the way one real patch leaves one -- the same
 /// `bump` the disp-lane fixtures use, which is what `note_code_write_inner` does on a
 /// heat-charged kill.
+///
+/// EVERY BYTE OF THESE INSTRUCTIONS SHARES ONE 16-BYTE HEAT CHUNK at `ENTRY`, so this test cannot
+/// tell a right count-byte address from a wrong one. That is what
+/// `the_heat_gate_reads_the_count_bytes_own_chunk` is for; do not add address-sensitivity claims
+/// here.
 #[test]
 fn the_heat_gated_arm_refuses_a_patched_count_byte() {
     select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
@@ -2359,6 +2365,71 @@ fn the_heat_gated_arm_admits_an_unpatched_count_byte() {
             "heat_gated: {code:02x?} has a never-patched count byte and must admit"
         );
     }
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// THE ADDRESS TEST. Every other fixture in this group sits at `ENTRY = 0x501`, where the whole
+/// instruction lives inside one 16-byte heat chunk, so all of them pass just as happily against a
+/// gate that probed the wrong byte of the instruction -- or any byte of it. This one places the
+/// gated instruction ACROSS a chunk boundary and seeds heat in one chunk only, which is the only
+/// shape that can see the count byte's address at all.
+///
+/// Two encodings, and they straddle in opposite directions on purpose, so a single off-by-one in
+/// either direction fails one of them:
+///
+/// * `c1 c3 10` (rol ebx, 16) at `0x50e`: opcode `0x50e` and modrm `0x50f` in chunk `0x500`, imm8
+///   `0x510` alone in chunk `0x510`. The count byte is the IMM8, so heat on `0x510` refuses and
+///   heat on `0x500` alone admits. Changing `checked_sub(1)` to `checked_sub(2)` in
+///   `rotate_row_count_byte` moves the probe into the opcode's chunk and flips both halves.
+/// * `d1 c3` (rol ebx, 1) at `0x50f`: opcode `0x50f` in chunk `0x500`, modrm `0x510` in chunk
+///   `0x510`. `0xD1` has NO immediate -- its count is the literal 1 in the opcode -- so the
+///   polarity is reversed: heat on `0x500` refuses and heat on `0x510` alone admits. Changing that
+///   arm's `checked_sub(2)` to `checked_sub(1)` flips both halves of this pair.
+///
+/// The last case is the collapsed-chunk pin: a record ANYWHERE in the count byte's 16-byte chunk
+/// refuses, because `has_record_range` resolves to chunks and not to bytes. That is deliberate and
+/// conservative for a refusal gate, but it is a real widening of the design's per-byte phrasing
+/// and it deserves to be written down as behaviour rather than discovered from a census.
+#[test]
+fn the_heat_gate_reads_the_count_bytes_own_chunk() {
+    const ROL_IMM8: u32 = 0x50e; // opcode 0x50e, modrm 0x50f, imm8 0x510
+    const ROL_D1: u32 = 0x50f; // opcode 0x50f, modrm 0x510
+    const LOW_CHUNK: u32 = 0x500;
+    const HIGH_CHUNK: u32 = 0x510;
+    let rol_imm8 = vec![0xc1u8, 0xc3, 0x10];
+    let rol_d1 = vec![0xd1u8, 0xc3];
+
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+
+    // `0xC1`: the count byte is the imm8, in the HIGH chunk.
+    assert!(
+        compile_leading_block_at_with_heat(ROL_IMM8, &rol_imm8, Some(HIGH_CHUNK)).is_none(),
+        "c1 c3 10 at 0x50e: heat on the imm8's chunk must refuse"
+    );
+    assert_eq!(
+        compile_leading_block_at_with_heat(ROL_IMM8, &rol_imm8, Some(LOW_CHUNK)),
+        Some(3),
+        "c1 c3 10 at 0x50e: heat on the OPCODE's chunk alone must admit; the gate reads the imm8"
+    );
+
+    // `0xD1`: the count is the opcode, in the LOW chunk. Opposite polarity.
+    assert!(
+        compile_leading_block_at_with_heat(ROL_D1, &rol_d1, Some(LOW_CHUNK)).is_none(),
+        "d1 c3 at 0x50f: heat on the opcode's chunk must refuse"
+    );
+    assert_eq!(
+        compile_leading_block_at_with_heat(ROL_D1, &rol_d1, Some(HIGH_CHUNK)),
+        Some(3),
+        "d1 c3 at 0x50f: heat on the MODRM's chunk alone must admit; the gate reads the opcode"
+    );
+
+    // The collapsed case, stated as behaviour: chunk resolution, not byte resolution.
+    assert!(
+        compile_leading_block_at_with_heat(ROL_IMM8, &rol_imm8, Some(HIGH_CHUNK + 0x0f)).is_none(),
+        "a record anywhere in the count byte's 16-byte chunk must refuse; the probe is \
+         chunk-resolved"
+    );
+
     jit::direct::set_rotate_rows_arm_for_test(None);
 }
 
@@ -2449,6 +2520,58 @@ fn the_shipped_rotate_rows_default_is_the_off_arm() {
     );
 }
 
+/// The spelling table, tested without touching the process environment. `rotate_rows_arm` caches
+/// its reading in a `OnceLock`, so the env itself is testable exactly once per process and never
+/// in a way the harness could order; lifting the table into `parse_rotate_rows_arm` is what makes
+/// the contract assertable at all.
+#[test]
+fn the_rotate_rows_spelling_table_is_exact() {
+    use jit::direct::{RotateRowsArm, parse_rotate_rows_arm_for_test as parse};
+    assert_eq!(
+        parse(Err(std::env::VarError::NotPresent)),
+        RotateRowsArm::Off
+    );
+    for spelling in ["0", "", "  0  "] {
+        assert_eq!(
+            parse(Ok(spelling.to_string())),
+            RotateRowsArm::Off,
+            "{spelling:?} must name the base arm"
+        );
+    }
+    // Case-folded and trimmed: a knob set from a shell script picks up whitespace and one set from
+    // a PowerShell ladder picks up capitalisation. Neither is a different arm.
+    for spelling in ["heat", "heat_gated", "HEAT", "Heat_Gated", " heat \n"] {
+        assert_eq!(
+            parse(Ok(spelling.to_string())),
+            RotateRowsArm::HeatGated,
+            "{spelling:?} must name the L1 arm"
+        );
+    }
+    // `1` and only `1`. Pinned rather than merely accepted: every historical A/B leg spelled the
+    // 2026-08-09 admission this way and the legs have to stay comparable.
+    assert_eq!(parse(Ok("1".to_string())), RotateRowsArm::On);
+}
+
+/// A MISSPELLED LADDER LEG MUST FAIL LOUDLY. The pre-L1 reading was "any value but 0 means on",
+/// which would quietly turn `IZARRAVM_ROTATE_ROWS=heat-gated` into the NEGATIVE CONTROL -- whose
+/// expected result is the 2026-08-09 -3.44%. That leg would then be read as "the heat gate did not
+/// help", which is the single wrong conclusion this slice exists to avoid. So the parser panics
+/// instead of guessing, and this is the test that stops a future edit from restoring the
+/// convenience.
+#[test]
+fn an_unrecognised_rotate_rows_spelling_refuses_to_guess() {
+    for spelling in ["heat-gated", "heatgated", "gated", "on", "2", "true", "yes"] {
+        let panicked = std::panic::catch_unwind(|| {
+            jit::direct::parse_rotate_rows_arm_for_test(Ok(spelling.to_string()))
+        });
+        assert!(
+            panicked.is_err(),
+            "IZARRAVM_ROTATE_ROWS={spelling:?} names no arm and must panic rather than silently \
+             select the negative control"
+        );
+    }
+}
+
 /// Select one of the three group-2 admission arms for this thread and PROVE the selection took,
 /// the arm-shaped twin of `select_rotate_rows`.
 fn select_rotate_rows_arm(arm: jit::direct::RotateRowsArm) {
@@ -2467,25 +2590,33 @@ fn select_rotate_rows_arm(arm: jit::direct::RotateRowsArm) {
 /// `note_code_write_inner` leaves behind after one heat-charged kill -- the same seeding the
 /// disp-lane fixtures use, on the other side of the same probe.
 fn compile_leading_block_with_heat(code: &[u8], heat_at: Option<u32>) -> Option<u8> {
+    compile_leading_block_at_with_heat(ENTRY, code, heat_at)
+}
+
+/// The same, at a caller-chosen entry address. The address is a parameter for exactly one reason:
+/// the heat map resolves to 16-byte chunks, so a fixture pinned to `ENTRY` cannot distinguish the
+/// count byte from any other byte of the instruction. See
+/// `the_heat_gate_reads_the_count_bytes_own_chunk`.
+fn compile_leading_block_at_with_heat(entry: u32, code: &[u8], heat_at: Option<u32>) -> Option<u8> {
     let mut memory = vec![0; 0x5000];
-    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[(entry - 1) as usize] = 0x90;
     let mut block = code.to_vec();
     block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
-    memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
+    memory[entry as usize..entry as usize + block.len()].copy_from_slice(&block);
     let mut cpu = flat_cpu(GswMode::Gsw586);
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     let starts = [
-        ENTRY,
-        ENTRY + code.len() as u32,
-        ENTRY + code.len() as u32 + 2,
+        entry,
+        entry + code.len() as u32,
+        entry + code.len() as u32 + 2,
     ];
     decode_fixture(&mut cpu, &mut bus, &starts);
     if let Some(physical) = heat_at {
         cpu.sync_smc_heat();
         cpu.jit_direct.smc_heat.bump(physical, 1, 0);
     }
-    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    let outcome = jit::direct::compile(&mut cpu, entry, true);
     outcome
         .is_some()
         .then(|| outcome.unwrap().span.instructions)

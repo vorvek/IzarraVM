@@ -191,7 +191,18 @@ pub(super) fn record_structural_barrier(
 /// direction the reader cannot see.
 ///
 /// The audit that produced the current form found SIX divergences. Three are closed here, one is
-/// deliberately left open, and two belong to the dirty-segment slice:
+/// deliberately left open, and two belong to the dirty-segment slice. A seventh arrived with the
+/// 2026-08-19 L1 arm and is closed below:
+///
+/// * CLOSED, the L1 heat gate (`IZARRAVM_ROTATE_ROWS=heat`). That arm's refusal is NOT a
+///   `classify` None -- `classify` admits the group-2 row and the compile walk downgrades it to
+///   `HardBoundary` afterwards, where the physical address and the heat map are in scope. This
+///   scan calls `classify` directly, so before the mirror below it walked straight through a
+///   heat-gated ROL that the compile walk stops at. The resulting over-report is the worst
+///   possible shape for this particular slice: it is correlated with `(1 - u)`, the PATCHED
+///   share, so it would move the suffix columns in the heat-vs-off difference that the arm's
+///   whole non-vacuity argument reads. The gate is mirrored below, immediately after `classify`,
+///   and it is arm-gated so the `off` and `on` arms see no change at all.
 ///
 /// * CLOSED, the memory-ALU BLOCK cap. `compile_with_instruction_limit` breaks at its LOOP TOP on
 ///   `memory_alu_slots != 0 && slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, regardless of
@@ -291,6 +302,18 @@ fn census_native_suffix(
         let PlannedInsn::Native(kind) = DirectUnitPlanner::classify(&insn, lin, entry_lin) else {
             break;
         };
+        // The L1 heat gate, mirrored from the compile walk. `classify` alone is NOT the compile
+        // walk's admission on the `heat_gated` arm: a group-2 row whose count byte carries a heat
+        // record classifies Native and is then downgraded to `HardBoundary` one step later. A scan
+        // that took the bare `classify` answer would walk straight through the very instruction
+        // the compile walk stops at, and the over-report would be correlated with the unpatched
+        // share `u` -- i.e. it would corrupt exactly the heat-vs-off census difference the arm
+        // exists to measure. See the ledger entry above and `rotate_row_count_byte_is_patched`.
+        if rotate_rows_arm() == RotateRowsArm::HeatGated
+            && rotate_row_count_byte_is_patched(cpu, &insn, expected_phys)
+        {
+            break;
+        }
         let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
             break;
         };
