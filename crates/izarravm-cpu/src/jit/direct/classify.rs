@@ -1228,6 +1228,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // emitter so the off arm is the pre-slice refusal byte for byte: this whole
                 // opcode had no arm before the slice, so returning None from the top of it puts
                 // the row back in the census as the same `hard_boundary` it was ranked as.
+                //
+                // `rotate_rows_enabled` is true on BOTH admitting arms (`on` and `heat_gated`).
+                // The heat gate cannot live here -- it needs the physical address and the heat
+                // map, neither of which is in this function's signature -- so it runs one step
+                // later, in the compile loop, and downgrades this admission to the very same
+                // `HardBoundary` the `!enabled` return produces. See `rotate_rows_arm`.
                 if !rotate_rows_enabled() {
                     return None;
                 }
@@ -1271,6 +1277,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // one. `/4..=7` are older still. Read here, above the shared `let-else` and the
                 // Word guard, so the off arm reproduces the pre-slice refusal exactly -- ROL had
                 // no arm at all then, so the row goes back to being an ordinary `hard_boundary`.
+                //
+                // The `heat_gated` arm reads as ADMITTING here and is narrowed one step later, in
+                // the compile loop, where the physical address and the heat map are in scope; see
+                // `rotate_rows_arm` and `rotate_row_count_byte_is_patched`. `/1` ROR is outside
+                // that gate too, exactly as it is outside this one.
                 if m.reg == 0 && !rotate_rows_enabled() {
                     return None;
                 }

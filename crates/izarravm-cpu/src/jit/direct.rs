@@ -4858,36 +4858,115 @@ pub(crate) fn disp_lanes_enabled() -> bool {
 /// only when the patched count byte's value range excludes 0 and 1. Price that before pricing the
 /// lane.
 ///
-/// THE ALTERNATIVE WORTH PRICING FIRST, because it may not need the lane work at all: admit
-/// `0xC1 /0` **only at sites whose count byte has no heat record** -- the disp-lane heat gate
-/// INVERTED, admitting never-patched sites instead of hot ones. See `disp_lane_for` for the
-/// pattern and for how a heat record is probed at classify time. Duke's ~1.9M count-byte patch
-/// events are concentrated on a small number of sites; the 260M runtime hits are not necessarily
-/// on the same ones, and the unpatched share is exactly the part of the row that carries no
-/// block-kill risk. If that share is most of the mass, this is a much smaller slice than the lane.
-///
-/// **Read at the CLASSIFY admission point, not at emission**, so the off arm reproduces the
-/// pre-slice refusal exactly: `classify` returns None, the compile walk breaks, and the row lands
-/// back in the census as an ordinary `hard_boundary` unbound exit rather than as some new refusal
-/// kind that would not be comparable with the census this slice was ranked against. That is also
-/// what makes the shipped default a true pre-slice world and not merely a quiet one.
+/// THE ALTERNATIVE PRICED FIRST, because it may not need the lane work at all, and **BUILT on
+/// 2026-08-19 as the `heat_gated` arm below**: admit `0xC1 /0` **only at sites whose count byte
+/// has no heat record** -- the disp-lane heat gate INVERTED, admitting never-patched sites instead
+/// of hot ones. Duke's ~1.9M count-byte patch events are concentrated on a small number of sites;
+/// the 260M runtime hits are not necessarily on the same ones, and the unpatched share `u` is
+/// exactly the part of the row that carries no block-kill risk. Measuring `u` is the arm's
+/// deliverable and it is what prices the lane slice above.
 ///
 /// **The knob covers THIS SLICE ONLY.** `0xC1 /1` and `0xD1 /1` ROR at Dword were lowered by the
 /// 2026-07-26 slice and are deliberately outside it; so are `/4..=7`. Sweeping them in would make
-/// every future A/B price two slices as one.
+/// every future A/B price two slices as one. The heat gate is scoped to the same two rows.
 ///
-/// Both arms ship in one executable, the `IZARRAVM_LANE_FAMILY` and `IZARRAVM_DISP_LANES` contract:
-/// this box has measured 6% wall variance between builds of identical source, which is larger than
-/// the effect, so a cross-build comparison would not be evidence.
+/// **THREE ARMS SINCE THE 2026-08-19 L1 SLICE**, all shipping in the one executable on the
+/// `IZARRAVM_LANE_FAMILY` / `IZARRAVM_DISP_LANES` contract -- this box has measured 6% wall
+/// variance between builds of identical source, which is larger than the effect, so a cross-build
+/// comparison would not be evidence (`dev_docs/duke-reprofile-2026-08-19.md` §6.2):
+///
+/// * `IZARRAVM_ROTATE_ROWS` unset, `0` or `off` -> `Off`: the shipped refusal. THE BASE, and it is
+///   byte-for-byte the pre-slice world.
+/// * `heat` or `heat_gated` -> `HeatGated`: admit ONLY where the count byte carries no SMC heat
+///   record. THE SLICE.
+/// * `1` or `on` -> `On`: the 2026-08-09 unconditional admission. THE NEGATIVE CONTROL, and it is
+///   expected to reproduce that day's -3.44%. `1` is pinned to this arm rather than merely
+///   accepted by it, because `1` is the spelling every historical A/B leg used and keeping it
+///   stable is what makes those legs comparable with a leg run on this binary.
+/// * **anything else PANICS.** See `parse_rotate_rows_arm` for why guessing is worse than failing.
+///
+/// **WHERE EACH ARM IS READ.** `Off` is read at the CLASSIFY admission point, so it reproduces the
+/// pre-slice refusal exactly: `classify` returns None, the compile walk breaks, and the row lands
+/// back in the census as an ordinary `hard_boundary` unbound exit rather than as some new refusal
+/// kind that would not be comparable with the census this slice was ranked against. That is what
+/// makes the shipped default a true pre-slice world and not merely a quiet one. `HeatGated`
+/// classifies as `On` does and is narrowed one step later, in the compile walk, where the physical
+/// address and the heat map are in scope; it downgrades to the SAME `HardBoundary`, so its
+/// refusals are the same census row as the off arm's. `census_native_suffix` mirrors that
+/// downgrade -- see the divergence ledger there, which is the only other place `classify` is
+/// consulted as if it were the admission.
 pub(crate) fn rotate_rows_enabled() -> bool {
+    rotate_rows_arm() != RotateRowsArm::Off
+}
+
+/// The three-way selection behind `rotate_rows_enabled`. See its doc comment for the contract.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RotateRowsArm {
+    /// Today's shipped refusal: `classify` returns None for both rows.
+    Off,
+    /// L1: admit the rows only at sites whose count byte carries no SMC heat record.
+    HeatGated,
+    /// The 2026-08-09 unconditional admission, kept as the negative control.
+    On,
+}
+
+pub(crate) fn rotate_rows_arm() -> RotateRowsArm {
     #[cfg(test)]
     if let Some(forced) = ROTATE_ROWS_OVERRIDE.with(std::cell::Cell::get) {
         return forced;
     }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(
-        || matches!(std::env::var("IZARRAVM_ROTATE_ROWS").as_deref(), Ok(value) if value != "0"),
-    )
+    static ARM: std::sync::OnceLock<RotateRowsArm> = std::sync::OnceLock::new();
+    *ARM.get_or_init(|| parse_rotate_rows_arm(std::env::var("IZARRAVM_ROTATE_ROWS")))
+}
+
+/// The `IZARRAVM_ROTATE_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `rotate_rows_enabled` for the contract.
+///
+/// **AN UNRECOGNISED VALUE PANICS, and that is the load-bearing choice here.** The obvious
+/// alternative -- fall through to `On` the way the pre-L1 `value != "0"` reading did -- silently
+/// turns a mistyped ladder leg (`IZARRAVM_ROTATE_ROWS=heat-gated`, `=heatgated`, `=gated`) into
+/// the NEGATIVE CONTROL, whose expected result is the 2026-08-09 -3.44%. A leg that quietly ran
+/// the control instead of the slice would be read as "the heat gate did not help", which is the
+/// one wrong conclusion this whole slice exists to avoid. So a typo fails loudly at the first
+/// compile rather than producing a plausible number.
+///
+/// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
+/// whitespace and a knob set from a PowerShell ladder picks up capitalisation; neither is a
+/// different arm and neither should reach the panic.
+fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRowsArm {
+    let raw = match value {
+        // Unset is the shipped base and the overwhelmingly common case.
+        Err(std::env::VarError::NotPresent) => return RotateRowsArm::Off,
+        // Not-UTF-8 is not a spelling of any arm. It reaches the same panic as a typo rather than
+        // the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_ROTATE_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `0` (off, the shipped base), `heat` / `heat_gated` (the \
+                 L1 heat-gated arm), or `1` (the 2026-08-09 unconditional admission)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    // Each arm answers to its DESIGN NAME (`off` / `heat_gated` / `on`, the spellings
+    // dev_docs/duke-reprofile-2026-08-19.md §6.2 uses to describe the ladder) as well as to its
+    // numeric one. A ladder leg written from the design doc and a leg written from the shell
+    // history must reach the same arm, or the accepted-spelling set is itself a trap.
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => RotateRowsArm::Off,
+        "heat" | "heat_gated" => RotateRowsArm::HeatGated,
+        // `1` is pinned here rather than merely accepted: the pre-L1 reading was "any value but
+        // 0", `1` is the spelling every historical A/B leg used, and keeping it on this arm is
+        // what makes those legs comparable with a leg run on this binary.
+        "1" | "on" => RotateRowsArm::On,
+        other => panic!(
+            "IZARRAVM_ROTATE_ROWS={other:?} names no arm; accepted spellings are unset, `0` or \
+             `off` (the shipped base), `heat` / `heat_gated` (the L1 heat-gated arm), or `1` / \
+             `on` (the 2026-08-09 unconditional admission, the negative control). Refusing to \
+             guess: a mistyped ladder leg that silently ran the negative control would be read as \
+             the slice failing"
+        ),
+    }
 }
 
 // Per-THREAD, because the shipped knob is a process-wide `OnceLock` and the fixtures have to run
@@ -4898,14 +4977,37 @@ pub(crate) fn rotate_rows_enabled() -> bool {
 // rows MUST force the on arm through it, or it would test the refusal and call it a lowering.
 #[cfg(test)]
 thread_local! {
-    static ROTATE_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static ROTATE_ROWS_OVERRIDE: std::cell::Cell<Option<RotateRowsArm>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Force the group-2 admission arm on this thread for the length of a fixture; `None` restores the
-/// ambient `IZARRAVM_ROTATE_ROWS` reading.
+/// ambient `IZARRAVM_ROTATE_ROWS` reading. The `bool` spelling is the pre-L1 one and keeps naming
+/// the two arms it always named; `set_rotate_rows_arm_for_test` reaches the third.
 #[cfg(test)]
 pub(crate) fn set_rotate_rows_for_test(forced: Option<bool>) {
+    set_rotate_rows_arm_for_test(forced.map(|on| {
+        if on {
+            RotateRowsArm::On
+        } else {
+            RotateRowsArm::Off
+        }
+    }));
+}
+
+#[cfg(test)]
+pub(crate) fn set_rotate_rows_arm_for_test(forced: Option<RotateRowsArm>) {
     ROTATE_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `rotate_rows_arm` caches its env reading in a
+/// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
+/// never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_rotate_rows_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> RotateRowsArm {
+    parse_rotate_rows_arm(value)
 }
 
 /// Seed for `JitState::word_at_486`, read once per process from `IZARRAVM_JIT16_486`.
@@ -5397,6 +5499,92 @@ fn disp_lane_for(
     ))
 }
 
+/// The physical address of the byte that encodes the COUNT for the two rows `IZARRAVM_ROTATE_ROWS`
+/// gates -- `0xC1`/`0xD1` `/0` ROL and `0xC0 /4` SHL r8 -- or `None` for anything else, including
+/// the rows that were lowered before the 2026-08-09 slice (`/1` ROR, `/4..=7` at Dword) and which
+/// the knob deliberately does not cover.
+///
+/// `physical` is the instruction's start and the instruction is already known page-local in
+/// physical (`physical_page_local` in the compile loop), so start-relative arithmetic over its own
+/// bytes is contiguous.
+///
+/// Two byte positions, because the count lives in two different places:
+///
+/// * `0xC0`/`0xC1` carry an `imm8` and it is the instruction's LAST byte (`physical + len - 1`).
+///   That is the byte duke patches: the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows.
+/// * `0xD1` has no immediate at all -- its count is the literal 1 baked into the OPCODE, so the
+///   only byte that can change the count is the opcode byte itself. Register form only (classify
+///   admits nothing else), so the encoding is prefixes + opcode + modrm and the opcode sits at
+///   `physical + len - 2`. Gating a `0xD1` on its opcode byte is the faithful inversion rather
+///   than a widening: a `D1 -> C1` patch is exactly the write that would kill a block spanning it.
+fn rotate_row_count_byte(insn: &DecodedInsn, physical: u32) -> Option<u32> {
+    let reg = insn.modrm?.reg;
+    match insn.opcode {
+        0xc0 if reg == 4 => {}
+        0xc1 if reg == 0 => {}
+        0xd1 if reg == 0 => {
+            // No immediate and no displacement is what makes `len - 2` the opcode byte. Both hold
+            // for every form classify admits; asserting them here rather than assuming them means
+            // a future widening of the admitted shape degrades to "no gate site, refuse" instead
+            // of probing an unrelated byte.
+            if insn.imm_len != 0 || insn.disp_len != 0 {
+                return None;
+            }
+            return physical.checked_add(u32::from(insn.len).checked_sub(2)?);
+        }
+        _ => return None,
+    }
+    if insn.imm_len != 1 {
+        return None;
+    }
+    physical.checked_add(u32::from(insn.len).checked_sub(1)?)
+}
+
+/// The L1 heat gate: `true` when this instruction is one of the gated group-2 rows AND its count
+/// byte carries an SMC heat record, i.e. the byte has measured patch history and a block spanning
+/// it would be at risk of the 2026-08-09 kill amplification.
+///
+/// This is `disp_lane_for`'s `has_record_range` probe INVERTED. There a record ADMITS the lane
+/// form (the field is known to be patched, so pay two host instructions per execution to survive
+/// the patch); here a record REFUSES the whole row (the count byte is known to be patched, so
+/// leave it the hard boundary it has always been and let the block end before it). Sites with no
+/// record convert; sites with one keep the shipped refusal exactly.
+///
+/// **WHAT THAT BOUNDS, AND WHAT IT DOES NOT.** It would be wrong to call the 2026-08-09
+/// amplification structurally impossible on this arm, because a heat record is ERASABLE and this
+/// gate reads only the record that exists right now:
+///
+/// * `SmcHeatMap::sync_resets` clears the whole map on a `BlockCache` clear or `reset_storage`, so
+///   after every cache reset the arm behaves like `on` at every site until the records are
+///   re-earned;
+/// * `take_stale_stamp` CONSUMES an aged-out record as part of `lift_cold_smc_dormant` recovery,
+///   which is the same erasure at one site.
+///
+/// What the gate actually gives is a BOUND with self-correction. In a window where the record is
+/// missing, a patched site admits and the next patch kills the block exactly as it did on
+/// 2026-08-09 -- but that kill is precisely what writes the record back
+/// (`note_code_write_inner`), so the site refuses from its next recompile onward and the cost is
+/// one kill per site per erasure rather than the steady-state churn the unconditional arm paid.
+/// That convergence is the same shape as `disp_lane_for`'s, one kill behind the truth in the other
+/// direction, and it is why the ladder's K1 guard (`smc_lane_accepts` must not fall,
+/// `smc_heat_demotions` must not rise) is a real kill criterion rather than a formality.
+///
+/// The probe reads the heat accelerator WITHOUT `sync_smc_heat`, exactly as `disp_lane_for` does
+/// and for the same reason (this is a `&CpuGsw` path). A stale read can at worst admit one site
+/// that a later kill will refuse on recompile, or refuse one that could have converted --
+/// admission tuning, never correctness, because the lowering itself is correct at every count.
+///
+/// One byte, not `IMM_LANE_WIDTH`: the design phrase is `has_record_range(count_lane, 1)`. The
+/// heat map's resolution is a 16-byte chunk, so this is not as narrow as it reads -- it asks "has
+/// anything in this instruction's chunk ever taken a heat-charged kill", which is the conservative
+/// direction for a refusal gate.
+fn rotate_row_count_byte_is_patched(cpu: &CpuGsw, insn: &DecodedInsn, physical: u32) -> bool {
+    let Some(count_byte) = rotate_row_count_byte(insn, physical) else {
+        return false;
+    };
+    cpu.jit_direct.smc_heat.has_record_range(count_byte, 1)
+}
+
 fn compile_with_instruction_limit(
     cpu: &mut CpuGsw,
     entry_lin: u32,
@@ -5579,7 +5767,36 @@ fn compile_with_instruction_limit(
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;
         }
-        let kind = match DirectUnitPlanner::classify(&insn, lin, entry_lin) {
+        let planned = DirectUnitPlanner::classify(&insn, lin, entry_lin);
+        // L1, the third `IZARRAVM_ROTATE_ROWS` arm (dev_docs/duke-reprofile-2026-08-19.md §6.1).
+        //
+        // WHY HERE AND NOT IN `classify`. `classify` takes a `&DecodedInsn` and two LINEAR
+        // addresses; the heat map is keyed by PHYSICAL and lives behind `cpu`, and neither is in
+        // scope there. `disp_lane_for` -- the gate this one inverts -- is called from this same
+        // loop for exactly that reason, and mirroring its access path is what keeps the two probes
+        // reading the one structure through the one accessor.
+        //
+        // WHY IT DOWNGRADES TO `HardBoundary` RATHER THAN INVENTING A REFUSAL KIND. The off arm's
+        // refusal is a `classify` None, which lands in the census as an ordinary `hard_boundary`
+        // unbound exit. A heat-gated refusal has to be the SAME row or the arms are not comparable
+        // against the census this slice was ranked on. Falling into the existing
+        // `PlannedInsn::HardBoundary` arm below gets that for free, barrier-census record and all.
+        //
+        // COST ON THE OTHER TWO ARMS. The arm compare is a `OnceLock` read against a cached enum
+        // and short-circuits before any instruction inspection, so `Off` and `On` pay one
+        // perfectly-predicted branch per NATIVE slot on the COMPILE walk -- never on the execution
+        // path, which this function does not sit on
+        // ([[default-off-instruments-tax-hot-path]]).
+        let planned = match planned {
+            PlannedInsn::Native(_)
+                if rotate_rows_arm() == RotateRowsArm::HeatGated
+                    && rotate_row_count_byte_is_patched(cpu, &insn, expected_phys) =>
+            {
+                PlannedInsn::HardBoundary
+            }
+            planned => planned,
+        };
+        let kind = match planned {
             PlannedInsn::Native(kind) => kind,
             PlannedInsn::HardBoundary => {
                 if instruction_limit >= MAX_BLOCK_INSTRUCTIONS

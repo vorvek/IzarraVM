@@ -2302,6 +2302,362 @@ fn the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions() {
     jit::direct::set_rotate_rows_for_test(None);
 }
 
+/// L1, the heat-gated arm, from the REFUSING side: a site whose count byte carries an SMC heat
+/// record keeps the shipped refusal, arm or no arm.
+///
+/// This is the whole safety argument of the slice. The 2026-08-09 regression was block-kill
+/// amplification -- duke patches the group-2 COUNT byte, blocks that span it die, and they take
+/// their live `0x81` immediate and `0x8A` displacement lanes down with them (-3.44% wall, coverage
+/// 0.7480 -> 0.7264; see `rotate_rows_enabled`). The gate says a site with a record is left as the
+/// hard boundary it has always been, so no block spans it for as long as the record stands. (Not
+/// forever: records are erasable, and `rotate_row_count_byte_is_patched` documents the bound and
+/// the self-correction. This fixture pins the gate, not the bound.) If the `has_record_range` term
+/// is deleted, every assertion here flips to `Some(3)`.
+///
+/// The heat record is seeded at the count byte the way one real patch leaves one -- the same
+/// `bump` the disp-lane fixtures use, which is what `note_code_write_inner` does on a
+/// heat-charged kill.
+///
+/// EVERY BYTE OF THESE INSTRUCTIONS SHARES ONE 16-BYTE HEAT CHUNK at `ENTRY`, so this test cannot
+/// tell a right count-byte address from a wrong one. That is what
+/// `the_heat_gate_reads_the_count_bytes_own_chunk` is for; do not add address-sensitivity claims
+/// here.
+#[test]
+fn the_heat_gated_arm_refuses_a_patched_count_byte() {
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+    for (code, count_byte) in [
+        (vec![0xc1u8, 0xc3, 0x10], ENTRY + 2), // rol ebx, 16: imm8, the last byte
+        (vec![0xc1, 0xc3, 0x01], ENTRY + 2),
+        (vec![0xc1, 0xc3, 0x00], ENTRY + 2),
+        (vec![0xd1, 0xc3], ENTRY), // rol ebx, 1: the count is IN the opcode byte
+        (vec![0xc0, 0xe3, 0x05], ENTRY + 2), // shl bl, 5
+        (vec![0xc0, 0xe7, 0x05], ENTRY + 2), // shl bh, 5, the high-lane index
+    ] {
+        assert!(
+            compile_leading_block_with_heat(&code, Some(count_byte)).is_none(),
+            "heat_gated: {code:02x?} has a patched count byte and must stay refused"
+        );
+    }
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// L1 from the ADMITTING side: the identical rows convert when their count byte has never been
+/// patched. Paired with the test above this is the slice in two assertions -- the gate splits one
+/// census row by measured patch history and nothing else.
+///
+/// The unpatched share of the `0xC1 /0` row is the number the whole slice exists to measure
+/// (`u`, dev_docs/duke-reprofile-2026-08-19.md §5 L1); this fixture pins that the share is
+/// reachable at all.
+#[test]
+fn the_heat_gated_arm_admits_an_unpatched_count_byte() {
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+    for code in [
+        vec![0xc1u8, 0xc3, 0x10],
+        vec![0xc1, 0xc3, 0x01],
+        vec![0xc1, 0xc3, 0x00],
+        vec![0xd1, 0xc3],
+        vec![0xc0, 0xe3, 0x05],
+        vec![0xc0, 0xe7, 0x05],
+    ] {
+        assert_eq!(
+            compile_leading_block_with_heat(&code, None),
+            Some(3),
+            "heat_gated: {code:02x?} has a never-patched count byte and must admit"
+        );
+    }
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// THE ADDRESS TEST. Every other fixture in this group sits at `ENTRY = 0x501`, where the whole
+/// instruction lives inside one 16-byte heat chunk, so all of them pass just as happily against a
+/// gate that probed the wrong byte of the instruction -- or any byte of it. This one places the
+/// gated instruction ACROSS a chunk boundary and seeds heat in one chunk only, which is the only
+/// shape that can see the count byte's address at all.
+///
+/// Two encodings, and they straddle in opposite directions on purpose, so a single off-by-one in
+/// either direction fails one of them:
+///
+/// * `c1 c3 10` (rol ebx, 16) at `0x50e`: opcode `0x50e` and modrm `0x50f` in chunk `0x500`, imm8
+///   `0x510` alone in chunk `0x510`. The count byte is the IMM8, so heat on `0x510` refuses and
+///   heat on `0x500` alone admits. Changing `checked_sub(1)` to `checked_sub(2)` in
+///   `rotate_row_count_byte` moves the probe into the opcode's chunk and flips both halves.
+/// * `d1 c3` (rol ebx, 1) at `0x50f`: opcode `0x50f` in chunk `0x500`, modrm `0x510` in chunk
+///   `0x510`. `0xD1` has NO immediate -- its count is the literal 1 in the opcode -- so the
+///   polarity is reversed: heat on `0x500` refuses and heat on `0x510` alone admits. Changing that
+///   arm's `checked_sub(2)` to `checked_sub(1)` flips both halves of this pair.
+///
+/// The last case is the collapsed-chunk pin: a record ANYWHERE in the count byte's 16-byte chunk
+/// refuses, because `has_record_range` resolves to chunks and not to bytes. That is deliberate and
+/// conservative for a refusal gate, but it is a real widening of the design's per-byte phrasing
+/// and it deserves to be written down as behaviour rather than discovered from a census.
+#[test]
+fn the_heat_gate_reads_the_count_bytes_own_chunk() {
+    const ROL_IMM8: u32 = 0x50e; // opcode 0x50e, modrm 0x50f, imm8 0x510
+    const ROL_D1: u32 = 0x50f; // opcode 0x50f, modrm 0x510
+    const LOW_CHUNK: u32 = 0x500;
+    const HIGH_CHUNK: u32 = 0x510;
+    let rol_imm8 = vec![0xc1u8, 0xc3, 0x10];
+    let rol_d1 = vec![0xd1u8, 0xc3];
+
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+
+    // `0xC1`: the count byte is the imm8, in the HIGH chunk.
+    assert!(
+        compile_leading_block_at_with_heat(ROL_IMM8, &rol_imm8, Some(HIGH_CHUNK)).is_none(),
+        "c1 c3 10 at 0x50e: heat on the imm8's chunk must refuse"
+    );
+    assert_eq!(
+        compile_leading_block_at_with_heat(ROL_IMM8, &rol_imm8, Some(LOW_CHUNK)),
+        Some(3),
+        "c1 c3 10 at 0x50e: heat on the OPCODE's chunk alone must admit; the gate reads the imm8"
+    );
+
+    // `0xD1`: the count is the opcode, in the LOW chunk. Opposite polarity.
+    assert!(
+        compile_leading_block_at_with_heat(ROL_D1, &rol_d1, Some(LOW_CHUNK)).is_none(),
+        "d1 c3 at 0x50f: heat on the opcode's chunk must refuse"
+    );
+    assert_eq!(
+        compile_leading_block_at_with_heat(ROL_D1, &rol_d1, Some(HIGH_CHUNK)),
+        Some(3),
+        "d1 c3 at 0x50f: heat on the MODRM's chunk alone must admit; the gate reads the opcode"
+    );
+
+    // The collapsed case, stated as behaviour: chunk resolution, not byte resolution.
+    assert!(
+        compile_leading_block_at_with_heat(ROL_IMM8, &rol_imm8, Some(HIGH_CHUNK + 0x0f)).is_none(),
+        "a record anywhere in the count byte's 16-byte chunk must refuse; the probe is \
+         chunk-resolved"
+    );
+
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// The gate is SCOPED to the two rows the knob covers, and this is the test that would catch it
+/// widening. `0xC1 /1` ROR and `0xC1 /4..=7` were lowered by earlier slices and are deliberately
+/// outside `IZARRAVM_ROTATE_ROWS`; if the heat probe matched them too, the heat-gated arm would
+/// silently REMOVE admissions that ship today and every A/B against it would price two changes as
+/// one in the wrong direction.
+#[test]
+fn the_heat_gate_does_not_reach_rows_outside_the_knob() {
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::HeatGated);
+    for (code, patched_byte) in [
+        (vec![0xc1u8, 0xcb, 0x10], ENTRY + 2), // ror ebx, 16: the 2026-07-26 slice
+        (vec![0xc1, 0xcb, 0x01], ENTRY + 2),
+        (vec![0xd1, 0xcb], ENTRY),           // ror ebx, 1 via 0xD1
+        (vec![0xc1, 0xe3, 0x05], ENTRY + 2), // shl ebx, 5: older still, a dword operand
+    ] {
+        assert_eq!(
+            compile_leading_block_with_heat(&code, Some(patched_byte)),
+            Some(3),
+            "heat_gated: {code:02x?} predates this slice and must stay lowered even when hot"
+        );
+    }
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// The other two arms are HEAT-BLIND, and that is what makes them the base and the negative
+/// control rather than two more flavours of the slice.
+///
+/// * `Off` must refuse a never-patched site as well as a patched one. This is the hard
+///   requirement that the shipped default is bit-identical to the pre-L1 world: if the heat probe
+///   leaked into the off arm, the base leg of every A/B would already carry the slice.
+/// * `On` must admit a PATCHED site -- that is precisely the 2026-08-09 admission whose -3.44% the
+///   control leg is supposed to reproduce. An `On` that quietly gained the gate would make the
+///   control agree with the slice and the ladder would be unfalsifiable.
+#[test]
+fn the_off_and_on_arms_ignore_heat_entirely() {
+    let rows = [
+        (vec![0xc1u8, 0xc3, 0x10], ENTRY + 2),
+        (vec![0xd1, 0xc3], ENTRY),
+        (vec![0xc0, 0xe3, 0x05], ENTRY + 2),
+    ];
+
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::Off);
+    for (code, count_byte) in &rows {
+        assert!(
+            compile_leading_block_with_heat(code, None).is_none(),
+            "off arm: {code:02x?} must refuse even with a cold count byte"
+        );
+        assert!(
+            compile_leading_block_with_heat(code, Some(*count_byte)).is_none(),
+            "off arm: {code:02x?} must refuse with a hot count byte too"
+        );
+    }
+
+    select_rotate_rows_arm(jit::direct::RotateRowsArm::On);
+    for (code, count_byte) in &rows {
+        assert_eq!(
+            compile_leading_block_with_heat(code, None),
+            Some(3),
+            "on arm: {code:02x?} must admit a cold count byte"
+        );
+        assert_eq!(
+            compile_leading_block_with_heat(code, Some(*count_byte)),
+            Some(3),
+            "on arm: {code:02x?} must admit a HOT count byte; that is the 2026-08-09 control"
+        );
+    }
+
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+/// The env contract itself, asserted on the SHIPPED reading path with the override cleared: unset
+/// must mean `Off`. Everything above runs on the thread-local override, so without this nothing
+/// would notice the default flipping.
+#[test]
+fn the_shipped_rotate_rows_default_is_the_off_arm() {
+    jit::direct::set_rotate_rows_arm_for_test(None);
+    assert_eq!(
+        jit::direct::rotate_rows_arm(),
+        jit::direct::RotateRowsArm::Off,
+        "the shipped default is the OFF arm; IZARRAVM_ROTATE_ROWS is exported in this \
+         environment, unset it"
+    );
+    assert!(
+        !jit::direct::rotate_rows_enabled(),
+        "`rotate_rows_enabled` must keep agreeing with the arm it now wraps"
+    );
+}
+
+/// The spelling table, tested without touching the process environment. `rotate_rows_arm` caches
+/// its reading in a `OnceLock`, so the env itself is testable exactly once per process and never
+/// in a way the harness could order; lifting the table into `parse_rotate_rows_arm` is what makes
+/// the contract assertable at all.
+#[test]
+fn the_rotate_rows_spelling_table_is_exact() {
+    use jit::direct::{RotateRowsArm, parse_rotate_rows_arm_for_test as parse};
+    assert_eq!(
+        parse(Err(std::env::VarError::NotPresent)),
+        RotateRowsArm::Off
+    );
+    // Each arm answers to its DESIGN NAME as well as its numeric one: §6.2 of the re-profile calls
+    // the ladder legs off / heat_gated / on, so a leg written from the doc has to reach the same
+    // arm as a leg written from the shell history.
+    for spelling in ["0", "", "  0  ", "off", "OFF"] {
+        assert_eq!(
+            parse(Ok(spelling.to_string())),
+            RotateRowsArm::Off,
+            "{spelling:?} must name the base arm"
+        );
+    }
+    // Case-folded and trimmed: a knob set from a shell script picks up whitespace and one set from
+    // a PowerShell ladder picks up capitalisation. Neither is a different arm.
+    for spelling in ["heat", "heat_gated", "HEAT", "Heat_Gated", " heat \n"] {
+        assert_eq!(
+            parse(Ok(spelling.to_string())),
+            RotateRowsArm::HeatGated,
+            "{spelling:?} must name the L1 arm"
+        );
+    }
+    // `1` is PINNED rather than merely accepted: every historical A/B leg spelled the 2026-08-09
+    // admission this way and the legs have to stay comparable with a leg run on this binary. `on`
+    // rides alongside it as the design name.
+    for spelling in ["1", "on", "ON", " on "] {
+        assert_eq!(
+            parse(Ok(spelling.to_string())),
+            RotateRowsArm::On,
+            "{spelling:?} must name the negative control"
+        );
+    }
+}
+
+/// A MISSPELLED LADDER LEG MUST FAIL LOUDLY. The pre-L1 reading was "any value but 0 means on",
+/// which would quietly turn `IZARRAVM_ROTATE_ROWS=heat-gated` into the NEGATIVE CONTROL -- whose
+/// expected result is the 2026-08-09 -3.44%. That leg would then be read as "the heat gate did not
+/// help", which is the single wrong conclusion this slice exists to avoid. So the parser panics
+/// instead of guessing, and this is the test that stops a future edit from restoring the
+/// convenience.
+///
+/// `heat-gated` and `heatgated` are the near-misses that matter: both are one keystroke from the
+/// real spelling and both would previously have selected the control. `off`/`on` are NOT in this
+/// list -- they are accepted design names, pinned by the table test above.
+#[test]
+fn an_unrecognised_rotate_rows_spelling_refuses_to_guess() {
+    // The default hook prints a backtrace banner per panic, and this test raises seven on purpose.
+    // Silencing them for the length of the loop keeps a passing suite readable; restored straight
+    // after, because a hook left installed would swallow a LATER test's genuine failure output.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcomes: Vec<_> = [
+        "heat-gated",
+        "heatgated",
+        "gated",
+        "heat gated",
+        "2",
+        "true",
+        "yes",
+    ]
+    .into_iter()
+    .map(|spelling| {
+        let panicked = std::panic::catch_unwind(|| {
+            jit::direct::parse_rotate_rows_arm_for_test(Ok(spelling.to_string()))
+        })
+        .is_err();
+        (spelling, panicked)
+    })
+    .collect();
+    std::panic::set_hook(previous);
+
+    for (spelling, panicked) in outcomes {
+        assert!(
+            panicked,
+            "IZARRAVM_ROTATE_ROWS={spelling:?} names no arm and must panic rather than silently \
+             select the negative control"
+        );
+    }
+}
+
+/// Select one of the three group-2 admission arms for this thread and PROVE the selection took,
+/// the arm-shaped twin of `select_rotate_rows`.
+fn select_rotate_rows_arm(arm: jit::direct::RotateRowsArm) {
+    jit::direct::set_rotate_rows_arm_for_test(Some(arm));
+    assert_eq!(
+        jit::direct::rotate_rows_arm(),
+        arm,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_ROTATE_ROWS"
+    );
+}
+
+/// `compile_leading_block` with an optional SMC heat record seeded at one physical byte first.
+///
+/// The fixture CPU is flat and unpaged, so linear and physical agree and the caller can name the
+/// count byte as an offset from `ENTRY` directly. The seed is one `bump`, which is exactly what
+/// `note_code_write_inner` leaves behind after one heat-charged kill -- the same seeding the
+/// disp-lane fixtures use, on the other side of the same probe.
+fn compile_leading_block_with_heat(code: &[u8], heat_at: Option<u32>) -> Option<u8> {
+    compile_leading_block_at_with_heat(ENTRY, code, heat_at)
+}
+
+/// The same, at a caller-chosen entry address. The address is a parameter for exactly one reason:
+/// the heat map resolves to 16-byte chunks, so a fixture pinned to `ENTRY` cannot distinguish the
+/// count byte from any other byte of the instruction. See
+/// `the_heat_gate_reads_the_count_bytes_own_chunk`.
+fn compile_leading_block_at_with_heat(entry: u32, code: &[u8], heat_at: Option<u32>) -> Option<u8> {
+    let mut memory = vec![0; 0x5000];
+    memory[(entry - 1) as usize] = 0x90;
+    let mut block = code.to_vec();
+    block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    memory[entry as usize..entry as usize + block.len()].copy_from_slice(&block);
+    let mut cpu = flat_cpu(GswMode::Gsw586);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [
+        entry,
+        entry + code.len() as u32,
+        entry + code.len() as u32 + 2,
+    ];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    if let Some(physical) = heat_at {
+        cpu.sync_smc_heat();
+        cpu.jit_direct.smc_heat.bump(physical, 1, 0);
+    }
+    let outcome = jit::direct::compile(&mut cpu, entry, true);
+    outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions)
+}
+
 /// Compile an instruction as slot 0 of a three-slot block, with every slot's decode line
 /// warmed. The three-slot shape matters: warming only the entry line makes slot 1 miss, the walk
 /// stops at Retry, and the fewer-than-three-slots gate reports the same `is_none()` as a genuine
