@@ -85,9 +85,9 @@ chime_note:
     pop ax
     ret
 
-; chime_delay: block for about 120 ms by polling two PIT channel-0 reloads
-; (~54.9 ms each). Self-contained so the chime does not depend on the RAM test
-; having run. Preserves all registers.
+; chime_delay: block for about 120 ms by waiting out two PIT channel-0 reloads
+; (~54.9 ms each) as BIOS timer ticks. Self-contained so the chime does not
+; depend on the RAM test having run. Preserves all registers.
 chime_delay:
     push cx
     mov cx, 2
@@ -99,8 +99,13 @@ chime_delay:
 
 ; chime_pit_wait: sleep until IRQ0 advances the BIOS tick count. HLT lets the
 ; machine jump straight to the next device deadline instead of interpreting a
-; clock-speed-dependent PIT poll loop. Preserves registers.
+; clock-speed-dependent PIT poll loop. The wait needs IF set (a halt with
+; interrupts masked never wakes), so it enables them itself and restores the
+; caller's flags on the way out. Only the low word of the tick dword is
+; compared, and only for inequality: the midnight rollover to zero changes it
+; like any other tick. Preserves registers and flags.
 chime_pit_wait:
+    pushf
     push ax
     push bx
     push ds
@@ -115,4 +120,5 @@ chime_pit_wait:
     pop ds
     pop bx
     pop ax
+    popf
     ret

@@ -98,6 +98,11 @@ fn full_post_work_does_not_scale_with_cpu_frequency() {
             slower_ticks as f64 / MASTER_CLOCK_HZ as f64,
             faster_ticks as f64 / MASTER_CLOCK_HZ as f64
         );
+        // The band, not a pinned count: POST work must not track the CPU clock.
+        // Measured spread across the four modes is 4.021M/4.021M/4.021M/4.059M,
+        // so the worst adjacent ratio is 1.010; 1.25 leaves room for a probe or a
+        // POST step to grow without a re-pin. The regression this catches is the
+        // PIT busy poll, whose 386 -> 586 ratio was about 22x.
         assert!(
             faster_instructions <= slower_instructions.saturating_mul(5) / 4,
             "full POST work grew from {slower_mode} ({slower_instructions} instructions) to \
