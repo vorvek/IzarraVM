@@ -4900,8 +4900,9 @@ pub(crate) fn disp_lanes_enabled() -> bool {
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class
 /// (`IZARRAVM_IMM8_LANES`). See `imm8_lane_for` for what qualifies and why this family alone.
 ///
-/// **DEFAULT OFF**, on the `IZARRAVM_ROTATE_ROWS` contract rather than the `IZARRAVM_LANE_FAMILY`
-/// one: both arms ship in the one executable, because this box has measured 6% wall variance
+/// **DEFAULT OFF** -- an unset knob is the base here, which is the OPPOSITE of `IZARRAVM_JIT16_486`
+/// and of `IZARRAVM_ROTATE_ROWS` since its 2026-08-19/20 flip, where an unset knob is the slice.
+/// Either way both arms ship in the one executable, because this box has measured 6% wall variance
 /// between builds of identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a
 /// cross-build comparison would not be evidence. Off is the base and it is byte-for-byte the
 /// pre-slice world — no lane is registered, every `0x80` slot bakes its immediate exactly as it
@@ -4982,31 +4983,55 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and
 /// **`0xC0 /4` SHL r8**, both register forms.
 ///
-/// **DEFAULT OFF, MEASURED NET-NEGATIVE.** `IZARRAVM_ROTATE_ROWS` must be SET, to anything other
-/// than exactly "0", to admit them. The pre-flip `IZARRAVM_SMC_LANE_TRIAL` contract: the mechanism,
-/// its tests and its mutation record all ship, switched off, because the thing that refuted it is
-/// a property of one fixture's SMC behaviour rather than of the lowering.
+/// **DEFAULT ON SINCE THE 2026-08-19/20 RE-MEASUREMENT.** `IZARRAVM_ROTATE_ROWS` unset admits both
+/// rows unconditionally; `0` or `off` is the escape back to the pre-slice refusal, which still
+/// ships whole -- its classify path, its fixtures and its mutation record -- because it is the base
+/// every A/B on these rows is read against.
 ///
 /// WHY IT EXISTS. The duke3d-586 re-census (`.bench/results/duke586-census-20260809.json`) ranks
 /// `0xC1 /0` first by BOTH currencies -- 260,659,304 runtime hits, the hottest interpreted
 /// instruction in the trace, and 111,123,374 static unbound exits, the largest refused-row seam --
 /// with `0xC0 /4` second at 32,839,852 and 31,743,121. On paper this is the top of the list.
 ///
-/// WHY IT IS OFF. Interleaved A/B/B/A on duke3d-586, one binary, quiet box. Off arm rt 0.3298
-/// (legs 0.3283, 0.3313); on arm rt 0.3184 (legs 0.3111, 0.3257). **Delta -3.44%**, and native
-/// coverage DROPPED on the admitting arm, 0.7480 -> 0.7264. Admitting the hottest row made the
-/// backend cover LESS.
+/// WHY IT WAS OFF (2026-08-09). Interleaved A/B/B/A on duke3d-586, one binary, quiet box. Off arm
+/// rt 0.3298 (legs 0.3283, 0.3313); on arm rt 0.3184 (legs 0.3111, 0.3257). **Delta -3.44%**, and
+/// native coverage DROPPED on the admitting arm, 0.7480 -> 0.7264. Admitting the hottest row made
+/// the backend cover LESS, so the row shipped refused.
 ///
-/// THE MECHANISM, which the counters name outright: `smc_lane_accepts` collapsed 55.57M -> 25.45M,
-/// narrow kills rose 45.25M -> 49.55M, `heat_hot` 357k -> 373k. Duke patches the COUNT BYTE of its
-/// group-2 shifts (the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows, ~1.9M events). Before
-/// the slice those ROLs were hard boundaries, so no compiled block ever spanned the patched byte
-/// and the patch cost nothing. After it, blocks span the byte -- and each 1-byte count patch now
-/// kills a block that ALSO carries live `0x81` imm lanes and `0x8A` displacement lanes, taking
-/// their accepts down with it. That is the lane-trial iteration-1 mixing failure reborn one level
-/// up: not lane-shaped writes mixed with unlaned ones inside a chunk, but a lane-shaped BLOCK
-/// extended across a patch shape no lane class covers. The lowering is correct at every count and
-/// every flag; the ADMISSION is net-negative on the only fixture that carries the runtime mass.
+/// THE MECHANISM THAT DAY, which the counters named outright: `smc_lane_accepts` collapsed
+/// 55.57M -> 25.45M, narrow kills rose 45.25M -> 49.55M, `heat_hot` 357k -> 373k. Duke patches the
+/// COUNT BYTE of its group-2 shifts (the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows, ~1.9M
+/// events). Before the slice those ROLs were hard boundaries, so no compiled block ever spanned the
+/// patched byte and the patch cost nothing. After it, blocks span the byte -- and each 1-byte count
+/// patch now kills a block that ALSO carries live `0x81` imm lanes and `0x8A` displacement lanes,
+/// taking their accepts down with it. That is the lane-trial iteration-1 mixing failure reborn one
+/// level up: not lane-shaped writes mixed with unlaned ones inside a chunk, but a lane-shaped BLOCK
+/// extended across a patch shape no lane class covers. The lowering was correct at every count and
+/// every flag then as now; what was net-negative was the ADMISSION, and only because of what the
+/// killed blocks fell back onto.
+///
+/// **WHY IT IS ON (2026-08-19/20). THE REFUTATION INVERTED, and the reason is that the fallback got
+/// cheap.** `.bench/results/duke-l1-heatgate-20260819/README.md` plus `long/ladder-summary.json`,
+/// same binary at main `4bf7a4c8`, all arms selected through this knob, pinned CPU 8, quiet host,
+/// DUKEMARK stop `test_exit:81` on every leg and per-arm counters deterministic across legs:
+///
+/// * duke3d-586-**short**: off floor min 147.27 s over EIGHT legs (spread 2.7%); `on` min 139.05 s
+///   over three interleaved legs. **-5.6%.** For scale, the two arms that lost on the same ladder:
+///   `heat_gated` +1.6% and `imm8` lanes -1.0%.
+/// * duke3d-586 **long merge-gate row**: off 336.82 / 343.80 s, on 315.60 / 315.79 s. **-6.3%
+///   min-wall**, rt 0.41 -> 0.44, insns/entry 11.18 -> 14.02, static-unbound -335 M (-23%),
+///   coverage -0.7 pp.
+///
+/// The 08-09 kill-amplification signature is STILL THERE and is no longer wall-dominant:
+/// `smc_lane_accepts` 109.0 M -> 91.8 M on the long row (-16%), while `smc_heat_demotions` actually
+/// FELL, 147,518 -> 144,136. What changed between the two measurements is the decline path those
+/// killed blocks land on -- the sticky-decline memo, the chain-used link mask, warm-fetch-inline
+/// and the one-lookup pair all repriced it -- so the same number of kills now costs a fraction of
+/// what it cost in August's first week. The short row's census says the same thing from the other
+/// side: `rejected` static-unbound target 231.8 M -> 89.6 M (-142 M), entries -20%, insns/entry
+/// 11.08 -> 13.69. **The lesson to carry, not just the number: a refutation whose mechanism is
+/// "the fallback is expensive" expires when the fallback is optimised, and it does not announce
+/// that it has expired.**
 ///
 /// **RE-TEST TRIGGER: a one-byte mutable-imm lane class covering the `imm_len=1` patch shapes
 /// (`0xC1`, `0xC0`, `0x80`).** `IMM_LANE_WIDTH` is four and `imm_lane_for`'s accept rule was
@@ -5042,13 +5067,16 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// only when the patched count byte's value range excludes 0 and 1. Price that before pricing the
 /// lane.
 ///
-/// THE ALTERNATIVE PRICED FIRST, because it may not need the lane work at all, and **BUILT on
-/// 2026-08-19 as the `heat_gated` arm below**: admit `0xC1 /0` **only at sites whose count byte
-/// has no heat record** -- the disp-lane heat gate INVERTED, admitting never-patched sites instead
-/// of hot ones. Duke's ~1.9M count-byte patch events are concentrated on a small number of sites;
-/// the 260M runtime hits are not necessarily on the same ones, and the unpatched share `u` is
-/// exactly the part of the row that carries no block-kill risk. Measuring `u` is the arm's
-/// deliverable and it is what prices the lane slice above.
+/// THE ALTERNATIVE PRICED FIRST, because it might not have needed the lane work at all: **BUILT on
+/// 2026-08-19 as the `heat_gated` arm below and MEASURED THE SAME NIGHT, where it LOST.** It admits
+/// `0xC1 /0` only at sites whose count byte has no heat record -- the disp-lane heat gate INVERTED,
+/// admitting never-patched sites instead of hot ones -- on the theory that duke's ~1.9M count-byte
+/// patch events sit on a small number of sites while the 260M runtime hits do not. The unpatched
+/// share `u` came out at only **11.4%** of the row's runtime hits (ROL `runtime_hits` 170,902,770 ->
+/// 151,490,740, chunk-granular so a lower bound), and the arm cost **+1.6%** wall against the eight-
+/// leg off floor. The row's mass sits on HEATED chunks, so gating by heat gives up almost all of the
+/// prize to protect against a cost that -- as the `on` arm then showed -- is no longer the dominant
+/// term anyway. `heat_gated` stays as a measured arm, not as a candidate default.
 ///
 /// **The knob covers THIS SLICE ONLY.** `0xC1 /1` and `0xD1 /1` ROR at Dword were lowered by the
 /// 2026-07-26 slice and are deliberately outside it; so are `/4..=7`. Sweeping them in would make
@@ -5059,21 +5087,22 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// variance between builds of identical source, which is larger than the effect, so a cross-build
 /// comparison would not be evidence (`dev_docs/duke-reprofile-2026-08-19.md` §6.2):
 ///
-/// * `IZARRAVM_ROTATE_ROWS` unset, `0` or `off` -> `Off`: the shipped refusal. THE BASE, and it is
-///   byte-for-byte the pre-slice world.
+/// * `IZARRAVM_ROTATE_ROWS` **unset**, or `1` / `on` -> `On`: unconditional admission of both rows.
+///   **THE SHIPPED DEFAULT since 2026-08-19/20**, on -5.6% short / -6.3% long. `1` is pinned to
+///   this arm rather than merely accepted by it, because `1` is the spelling every historical A/B
+///   leg used and keeping it stable is what makes those legs comparable with a leg run on this
+///   binary -- including the 2026-08-09 legs it has now contradicted.
+/// * `0` or `off` (or an empty value) -> `Off`: the pre-slice refusal. **THE ESCAPE, and THE BASE
+///   every A/B on these rows is read against**, because it is byte-for-byte the pre-slice world.
 /// * `heat` or `heat_gated` -> `HeatGated`: admit ONLY where the count byte carries no SMC heat
-///   record. THE SLICE.
-/// * `1` or `on` -> `On`: the 2026-08-09 unconditional admission. THE NEGATIVE CONTROL, and it is
-///   expected to reproduce that day's -3.44%. `1` is pinned to this arm rather than merely
-///   accepted by it, because `1` is the spelling every historical A/B leg used and keeping it
-///   stable is what makes those legs comparable with a leg run on this binary.
+///   record. The L1 slice, measured and beaten by both other arms (+1.6%).
 /// * **anything else PANICS.** See `parse_rotate_rows_arm` for why guessing is worse than failing.
 ///
 /// **WHERE EACH ARM IS READ.** `Off` is read at the CLASSIFY admission point, so it reproduces the
 /// pre-slice refusal exactly: `classify` returns None, the compile walk breaks, and the row lands
 /// back in the census as an ordinary `hard_boundary` unbound exit rather than as some new refusal
 /// kind that would not be comparable with the census this slice was ranked against. That is what
-/// makes the shipped default a true pre-slice world and not merely a quiet one. `HeatGated`
+/// makes the `off` arm a true pre-slice world and not merely a quiet one. `HeatGated`
 /// classifies as `On` does and is narrowed one step later, in the compile walk, where the physical
 /// address and the heat map are in scope; it downgrades to the SAME `HardBoundary`, so its
 /// refusals are the same census row as the off arm's. `census_native_suffix` mirrors that
@@ -5086,11 +5115,12 @@ pub(crate) fn rotate_rows_enabled() -> bool {
 /// The three-way selection behind `rotate_rows_enabled`. See its doc comment for the contract.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RotateRowsArm {
-    /// Today's shipped refusal: `classify` returns None for both rows.
+    /// The pre-slice refusal: `classify` returns None for both rows. Shipped default until
+    /// 2026-08-19; now the escape and the A/B base.
     Off,
     /// L1: admit the rows only at sites whose count byte carries no SMC heat record.
     HeatGated,
-    /// The 2026-08-09 unconditional admission, kept as the negative control.
+    /// Unconditional admission. **Today's shipped default**, on the 2026-08-19/20 re-measurement.
     On,
 }
 
@@ -5109,25 +5139,30 @@ pub(crate) fn rotate_rows_arm() -> RotateRowsArm {
 /// **AN UNRECOGNISED VALUE PANICS, and that is the load-bearing choice here.** The obvious
 /// alternative -- fall through to `On` the way the pre-L1 `value != "0"` reading did -- silently
 /// turns a mistyped ladder leg (`IZARRAVM_ROTATE_ROWS=heat-gated`, `=heatgated`, `=gated`) into
-/// the NEGATIVE CONTROL, whose expected result is the 2026-08-09 -3.44%. A leg that quietly ran
-/// the control instead of the slice would be read as "the heat gate did not help", which is the
-/// one wrong conclusion this whole slice exists to avoid. So a typo fails loudly at the first
-/// compile rather than producing a plausible number.
+/// whatever arm the fallthrough names, and the reading of the leg is then a statement about an arm
+/// nobody selected. That was worth failing loudly for when the fallthrough was the negative
+/// control, and it is worth it MORE now that `On` is the shipped default: a typo would run the
+/// default and be read as "the arm I asked for changed nothing", which is the one wrong conclusion
+/// an arm ladder exists to avoid. A typo fails at the first compile rather than producing a
+/// plausible number.
 ///
 /// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
 /// whitespace and a knob set from a PowerShell ladder picks up capitalisation; neither is a
 /// different arm and neither should reach the panic.
 fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRowsArm {
     let raw = match value {
-        // Unset is the shipped base and the overwhelmingly common case.
-        Err(std::env::VarError::NotPresent) => return RotateRowsArm::Off,
+        // Unset is the shipped default and the overwhelmingly common case. Since the 2026-08-19/20
+        // re-measurement that default is `On`: see `rotate_rows_enabled` for both A/Bs. `0` / `off`
+        // is the escape back to the pre-slice refusal.
+        Err(std::env::VarError::NotPresent) => return RotateRowsArm::On,
         // Not-UTF-8 is not a spelling of any arm. It reaches the same panic as a typo rather than
         // the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_ROTATE_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `0` (off, the shipped base), `heat` / `heat_gated` (the \
-                 L1 heat-gated arm), or `1` (the 2026-08-09 unconditional admission)"
+                 spellings are unset or `1` / `on` (the shipped default, unconditional \
+                 admission), `0` / `off` (the pre-slice refusal), or `heat` / `heat_gated` (the \
+                 L1 heat-gated arm)"
             )
         }
         Ok(raw) => raw,
@@ -5137,18 +5172,23 @@ fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRow
     // numeric one. A ladder leg written from the design doc and a leg written from the shell
     // history must reach the same arm, or the accepted-spelling set is itself a trap.
     match raw.trim().to_ascii_lowercase().as_str() {
+        // The escape from the shipped default back to the pre-slice refusal. Empty stays here with
+        // `0` and `off` rather than following "unset" to `On`: a ladder or wrapper script that
+        // computes the value and produces "" meant something falsy, and `IZARRAVM_ROTATE_ROWS=`
+        // is the shell's shortest way to say off.
         "" | "0" | "off" => RotateRowsArm::Off,
         "heat" | "heat_gated" => RotateRowsArm::HeatGated,
         // `1` is pinned here rather than merely accepted: the pre-L1 reading was "any value but
         // 0", `1` is the spelling every historical A/B leg used, and keeping it on this arm is
-        // what makes those legs comparable with a leg run on this binary.
+        // what makes those legs comparable with a leg run on this binary. It is now also the
+        // explicit spelling of the shipped default, so a ladder that names it stays honest.
         "1" | "on" => RotateRowsArm::On,
         other => panic!(
-            "IZARRAVM_ROTATE_ROWS={other:?} names no arm; accepted spellings are unset, `0` or \
-             `off` (the shipped base), `heat` / `heat_gated` (the L1 heat-gated arm), or `1` / \
-             `on` (the 2026-08-09 unconditional admission, the negative control). Refusing to \
-             guess: a mistyped ladder leg that silently ran the negative control would be read as \
-             the slice failing"
+            "IZARRAVM_ROTATE_ROWS={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default, the 2026-08-19/20 unconditional admission), `0` / `off` \
+             (the pre-slice refusal, the escape), or `heat` / `heat_gated` (the L1 heat-gated \
+             arm). Refusing to guess: a mistyped ladder leg that silently ran a different arm \
+             would be read as the slice under test doing nothing"
         ),
     }
 }
@@ -5157,8 +5197,12 @@ fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRow
 // both arms in one process. Thread-local rather than a global is what keeps the parallel test
 // harness honest: one test's arm selection cannot reach another's compile.
 //
-// Since the flip to default-OFF this is not a convenience: every positive fixture for these two
-// rows MUST force the on arm through it, or it would test the refusal and call it a lowering.
+// Not a convenience, in EITHER direction, and the direction that matters flipped on 2026-08-19.
+// While the default was OFF, every positive fixture for these two rows had to force the on arm
+// through here or it would test the refusal and call it a lowering. Now that the default is ON, it
+// is the REFUSAL fixtures that must force `Off` explicitly -- a fixture that means to pin the
+// pre-slice boundary and reads the ambient arm would silently compile the rows and pass for the
+// wrong reason. Both kinds state their arm; neither leans on the default.
 #[cfg(test)]
 thread_local! {
     static ROTATE_ROWS_OVERRIDE: std::cell::Cell<Option<RotateRowsArm>> =

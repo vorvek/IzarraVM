@@ -1511,10 +1511,11 @@ fn prepare_rotate_reg(
     ];
     decode_fixture(&mut native, &mut native_bus, &starts);
     decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
-    // The shipped default is OFF (`rotate_rows_enabled` carries the A/B that made it so), so the
-    // ROL half of this battery has to FORCE the on arm rather than read the ambient one. Without
-    // this the `op == 0` cases would fail inside `install_block`'s three-slot assertion and the
-    // `op == 1` half would keep passing, which reads as a ROL-specific emitter bug.
+    // FORCED ON rather than left to the ambient reading. The shipped default is now ON too
+    // (`rotate_rows_enabled` carries both A/Bs), so this is no longer what makes the ROL half run
+    // — it is what keeps it running if the default ever moves again. Off, the `op == 0` cases fail
+    // inside `install_block`'s three-slot assertion while the `op == 1` half keeps passing, which
+    // reads as a ROL-specific emitter bug rather than as an arm selection.
     select_rotate_rows(true);
     let block = install_block(&mut native);
     arm_group2_reg(&mut native, dst, seed, eflags, pending);
@@ -2104,12 +2105,14 @@ fn byte_shl_register_form_matches_the_interpreter_in_486_mode() {
 #[test]
 fn group2_non_lowered_rotates_remain_interpreter_only() {
     // FORCED ON, and this is the subtle one. Every row here is refused by a GUARD -- the `m.reg`
-    // tests, the register-only `let-else`, the Word check inside the rotate branch. On the shipped
-    // default arm the knob would refuse `0xC1 /0` and the whole of `0xC0` before any of those
-    // guards ran, so the rows would still pass while certifying nothing about the guards, and a
-    // widening of `m.reg != 4` to `4..=7` would survive. The knob is pinned by
-    // `the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions`; the guards are
-    // pinned here, and the two must not be allowed to stand in for each other.
+    // tests, the register-only `let-else`, the Word check inside the rotate branch. On the OFF arm
+    // the knob refuses `0xC1 /0` and the whole of `0xC0` before any of those guards runs, so the
+    // rows would still pass while certifying nothing about the guards, and a widening of
+    // `m.reg != 4` to `4..=7` would survive. That the default arm happens to be ON since
+    // 2026-08-19 does not make the force redundant: it is what keeps this test meaningful if the
+    // default moves again. The knob itself is pinned by
+    // `the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admissions`; the
+    // guards are pinned here, and the two must not be allowed to stand in for each other.
     select_rotate_rows(true);
     for code in [
         vec![0xc1, 0xd3, 0x05], // /2 RCL: takes the incoming CF as a rotate input
@@ -2166,9 +2169,10 @@ fn group2_dword_rotate_register_form_is_lowered() {
     // it dead code, and every negative assertion above would still pass.
     //
     // ROL (/0) is the 2026-08-09 admission: 260,659,304 runtime hits and 111,123,374 static
-    // unbound exits on duke3d-586, the top row of the re-census by both currencies. It ships
-    // DEFAULT OFF (the A/B measured -3.44% and a coverage drop; see `rotate_rows_enabled`), so the
-    // arm is forced here. The ROR and 0xD1 /1 rows below are outside the knob and would pass
+    // unbound exits on duke3d-586, the top row of the re-census by both currencies. It shipped
+    // default OFF on that day's -3.44% and ships default ON since the 2026-08-19/20 re-measurement
+    // (see `rotate_rows_enabled` for both), and the arm is forced here either way so this test does
+    // not depend on which. The ROR and 0xD1 /1 rows below are outside the knob and would pass
     // either way -- forcing is what stops this test from silently becoming a ROR-only pin.
     select_rotate_rows(true);
     for code in [
@@ -2195,8 +2199,10 @@ fn group2_byte_shl_register_form_is_lowered() {
     // unbound exits. Every byte-register index, because 4..7 name AH/CH/DH/BH and reach a
     // different lane of `emit_read_store_value` and `emit_write_gpr8` than 0..3 do.
     //
-    // Default OFF, so the arm is forced; without this every assertion below would fail rather than
-    // go vacuous, but the failure would name the wrong cause.
+    // The arm is stated rather than inherited: on the off arm every assertion below fails rather
+    // than going vacuous, but the failure names the wrong cause. That the shipped default has been
+    // ON since 2026-08-19/20 is not a reason to drop the force — it is what keeps this test tied to
+    // the emitter instead of to whichever arm ships.
     select_rotate_rows(true);
     for dst in 0..8u8 {
         for count in [0u8, 1, 5, 32] {
@@ -2226,47 +2232,65 @@ fn select_rotate_rows(enabled: bool) {
 
 /// The SHIPPED DEFAULT world, and the boundary of what the knob covers.
 ///
-/// After the 2026-08-09 A/B (-3.44% wall and native coverage 0.7480 -> 0.7264 on the admitting
-/// arm; see `rotate_rows_enabled` for the lane-accept-collapse mechanism) the two rows this slice
-/// added ship OFF. That makes the default arm the one every other consumer of this backend sees,
-/// so it is the arm that needs a test of its own rather than the exotic one.
+/// **The default INVERTED on 2026-08-19/20 and this fixture inverted with it.** The 2026-08-09 A/B
+/// shipped these two rows OFF (-3.44% wall, coverage 0.7480 -> 0.7264 on the admitting arm); the
+/// re-measurement on the same fixture found the unconditional arm FASTEST, -5.6% on the short row
+/// and -6.3% on the long merge-gate row, because the decline path the killed blocks fall onto has
+/// been repriced since. See `rotate_rows_enabled` for both measurements. The default arm is the one
+/// every other consumer of this backend sees, so it is the arm that needs a test of its own.
 ///
-/// Three claims, and the last two are each the sort of regression that produces a wrong NUMBER
+/// Four claims, and the middle two are each the sort of regression that produces a wrong NUMBER
 /// rather than a broken build, so nothing else in the suite would notice:
 ///
-/// * the default really is off. Asserted with the override CLEARED, so it reads the shipped
+/// * the default really is ON. Asserted with the override CLEARED, so it reads the shipped
 ///   `OnceLock` path and fails if `IZARRAVM_ROTATE_ROWS` is exported in this environment;
-/// * on that default arm the two rows are refused exactly as they were before the slice, which is
-///   what makes an A/B run against it a measurement of THIS slice;
-/// * the rows that were already lowered STAY lowered on it. `0xC1 /1` and `0xD1 /1` ROR at Dword
-///   landed in the 2026-07-26 slice, and `0xC1 /4..=7` earlier still; both are deliberately
+/// * on that default arm the two rows ADMIT and carry their whole block;
+/// * on the `0` / `off` escape they are refused exactly as they were before the slice, which is
+///   what makes an A/B run against that arm a measurement of THIS slice. The escape is not a
+///   legacy spelling: it is the base every future ladder leg on these rows is read against, so it
+///   has to keep reproducing the pre-slice world or the base stops being one;
+/// * the rows that were already lowered STAY lowered on the escape. `0xC1 /1` and `0xD1 /1` ROR at
+///   Dword landed in the 2026-07-26 slice, and `0xC1 /4..=7` earlier still; both are deliberately
 ///   outside the knob. If a later edit swept them behind it, every A/B from then on would price
 ///   two slices as one.
 ///
-/// The forced-on half at the end is what stops the whole test passing against a compiler that
-/// refused everything. Restores the ambient arm before returning: the harness gives each test its
-/// own thread and the override is thread-local, so that is hygiene rather than load-bearing, but a
-/// fixture that left a process-visible knob flipped is the shape of trap this file has been bitten
-/// by before.
+/// The two halves make the test non-vacuous in both directions: a compiler that refused everything
+/// fails the default half, and one that admitted everything fails the escape half. Restores the
+/// ambient arm before returning: the harness gives each test its own thread and the override is
+/// thread-local, so that is hygiene rather than load-bearing, but a fixture that left a
+/// process-visible knob flipped is the shape of trap this file has been bitten by before.
 #[test]
-fn the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions() {
+fn the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admissions() {
+    let slice_rows = || {
+        [
+            vec![0xc1u8, 0xc3, 0x10], // rol ebx, 16
+            vec![0xc1, 0xc3, 0x01],   // rol ebx, 1
+            vec![0xd1, 0xc3],         // rol ebx, 1 via the 0xD1 encoding
+            vec![0xc0, 0xe3, 0x05],   // shl bl, 5
+            vec![0xc0, 0xe7, 0x05],   // shl bh, 5, the high-lane index
+        ]
+    };
+
     jit::direct::set_rotate_rows_for_test(None);
     assert!(
-        !jit::direct::rotate_rows_enabled(),
-        "the shipped default is OFF after the 2026-08-09 A/B; IZARRAVM_ROTATE_ROWS is exported in \
-         this environment, unset it"
+        jit::direct::rotate_rows_enabled(),
+        "the shipped default is ON after the 2026-08-19/20 re-measurement; IZARRAVM_ROTATE_ROWS is \
+         exported in this environment, unset it"
     );
+    for code in slice_rows() {
+        assert_eq!(
+            compile_leading_block(&code),
+            Some(3),
+            "default arm: {code:02x?} must admit and carry the whole three-slot block"
+        );
+    }
 
-    for code in [
-        vec![0xc1u8, 0xc3, 0x10], // rol ebx, 16
-        vec![0xc1, 0xc3, 0x01],   // rol ebx, 1
-        vec![0xd1, 0xc3],         // rol ebx, 1 via the 0xD1 encoding
-        vec![0xc0, 0xe3, 0x05],   // shl bl, 5
-        vec![0xc0, 0xe7, 0x05],   // shl bh, 5, the high-lane index
-    ] {
+    // The `0` / `off` escape, in the same process and on the same thread.
+    select_rotate_rows(false);
+    for code in slice_rows() {
         assert!(
             compile_leading_block(&code).is_none(),
-            "default arm: {code:02x?} must refuse exactly as it did before the slice"
+            "off arm: {code:02x?} must refuse exactly as it did before the slice"
         );
     }
 
@@ -2279,23 +2303,7 @@ fn the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions() {
         assert_eq!(
             compile_leading_block(&code),
             Some(3),
-            "default arm: {code:02x?} predates this slice and must stay lowered"
-        );
-    }
-
-    // The same five rows on the FORCED-ON arm, in the same process and on the same thread.
-    select_rotate_rows(true);
-    for code in [
-        vec![0xc1u8, 0xc3, 0x10],
-        vec![0xc1, 0xc3, 0x01],
-        vec![0xd1, 0xc3],
-        vec![0xc0, 0xe3, 0x05],
-        vec![0xc0, 0xe7, 0x05],
-    ] {
-        assert_eq!(
-            compile_leading_block(&code),
-            Some(3),
-            "on arm: {code:02x?} must admit"
+            "off arm: {code:02x?} predates this slice and must stay lowered"
         );
     }
 
@@ -2456,15 +2464,16 @@ fn the_heat_gate_does_not_reach_rows_outside_the_knob() {
     jit::direct::set_rotate_rows_arm_for_test(None);
 }
 
-/// The other two arms are HEAT-BLIND, and that is what makes them the base and the negative
-/// control rather than two more flavours of the slice.
+/// The other two arms are HEAT-BLIND, and that is what makes them the base and the unconditional
+/// admission rather than two more flavours of the slice.
 ///
 /// * `Off` must refuse a never-patched site as well as a patched one. This is the hard
-///   requirement that the shipped default is bit-identical to the pre-L1 world: if the heat probe
-///   leaked into the off arm, the base leg of every A/B would already carry the slice.
-/// * `On` must admit a PATCHED site -- that is precisely the 2026-08-09 admission whose -3.44% the
-///   control leg is supposed to reproduce. An `On` that quietly gained the gate would make the
-///   control agree with the slice and the ladder would be unfalsifiable.
+///   requirement that the ESCAPE arm is bit-identical to the pre-L1 world: if the heat probe leaked
+///   into the off arm, the base leg of every A/B would already carry the slice.
+/// * `On` must admit a PATCHED site -- that is precisely the admission the 2026-08-09 A/B measured
+///   at -3.44% and the 2026-08-19/20 re-measurement measured at -5.6% / -6.3%, and it is now the
+///   SHIPPED DEFAULT. An `On` that quietly gained the gate would make the default agree with the
+///   heat arm, so neither the historical legs nor the ladder would mean what they say.
 #[test]
 fn the_off_and_on_arms_ignore_heat_entirely() {
     let rows = [
@@ -2503,19 +2512,21 @@ fn the_off_and_on_arms_ignore_heat_entirely() {
 }
 
 /// The env contract itself, asserted on the SHIPPED reading path with the override cleared: unset
-/// must mean `Off`. Everything above runs on the thread-local override, so without this nothing
-/// would notice the default flipping.
+/// must mean `On`, as it has since the 2026-08-19/20 re-measurement (-5.6% short, -6.3% long; see
+/// `rotate_rows_enabled`). Everything above runs on the thread-local override, so without this
+/// nothing would notice the default flipping — which it now has, once, and this is the test that
+/// makes the next flip a deliberate edit rather than a side effect.
 #[test]
-fn the_shipped_rotate_rows_default_is_the_off_arm() {
+fn the_shipped_rotate_rows_default_is_the_on_arm() {
     jit::direct::set_rotate_rows_arm_for_test(None);
     assert_eq!(
         jit::direct::rotate_rows_arm(),
-        jit::direct::RotateRowsArm::Off,
-        "the shipped default is the OFF arm; IZARRAVM_ROTATE_ROWS is exported in this \
+        jit::direct::RotateRowsArm::On,
+        "the shipped default is the ON arm; IZARRAVM_ROTATE_ROWS is exported in this \
          environment, unset it"
     );
     assert!(
-        !jit::direct::rotate_rows_enabled(),
+        jit::direct::rotate_rows_enabled(),
         "`rotate_rows_enabled` must keep agreeing with the arm it now wraps"
     );
 }
@@ -2527,9 +2538,13 @@ fn the_shipped_rotate_rows_default_is_the_off_arm() {
 #[test]
 fn the_rotate_rows_spelling_table_is_exact() {
     use jit::direct::{RotateRowsArm, parse_rotate_rows_arm_for_test as parse};
+    // UNSET is the shipped default and it is the ON arm since 2026-08-19/20. Note that `""` is NOT
+    // unset and does NOT follow it: an empty value keeps naming `Off` below, so a wrapper script
+    // that computes the value and produces "" still means something falsy.
     assert_eq!(
         parse(Err(std::env::VarError::NotPresent)),
-        RotateRowsArm::Off
+        RotateRowsArm::On,
+        "unset must name the shipped default, which is the ON arm"
     );
     // Each arm answers to its DESIGN NAME as well as its numeric one: §6.2 of the re-profile calls
     // the ladder legs off / heat_gated / on, so a leg written from the doc has to reach the same
@@ -2538,7 +2553,7 @@ fn the_rotate_rows_spelling_table_is_exact() {
         assert_eq!(
             parse(Ok(spelling.to_string())),
             RotateRowsArm::Off,
-            "{spelling:?} must name the base arm"
+            "{spelling:?} must name the base arm, the escape from the shipped default"
         );
     }
     // Case-folded and trimmed: a knob set from a shell script picks up whitespace and one set from
@@ -2552,26 +2567,26 @@ fn the_rotate_rows_spelling_table_is_exact() {
     }
     // `1` is PINNED rather than merely accepted: every historical A/B leg spelled the 2026-08-09
     // admission this way and the legs have to stay comparable with a leg run on this binary. `on`
-    // rides alongside it as the design name.
+    // rides alongside it as the design name. Both now spell the SHIPPED DEFAULT explicitly.
     for spelling in ["1", "on", "ON", " on "] {
         assert_eq!(
             parse(Ok(spelling.to_string())),
             RotateRowsArm::On,
-            "{spelling:?} must name the negative control"
+            "{spelling:?} must name the unconditional admission, the shipped default"
         );
     }
 }
 
 /// A MISSPELLED LADDER LEG MUST FAIL LOUDLY. The pre-L1 reading was "any value but 0 means on",
-/// which would quietly turn `IZARRAVM_ROTATE_ROWS=heat-gated` into the NEGATIVE CONTROL -- whose
-/// expected result is the 2026-08-09 -3.44%. That leg would then be read as "the heat gate did not
-/// help", which is the single wrong conclusion this slice exists to avoid. So the parser panics
-/// instead of guessing, and this is the test that stops a future edit from restoring the
-/// convenience.
+/// which would quietly turn `IZARRAVM_ROTATE_ROWS=heat-gated` into the unconditional arm -- and
+/// since 2026-08-19/20 that arm is also the SHIPPED DEFAULT, so the leg would run exactly what an
+/// unset environment runs and be read as "the arm I asked for changed nothing". That is the single
+/// wrong conclusion an arm ladder exists to avoid. So the parser panics instead of guessing, and
+/// this is the test that stops a future edit from restoring the convenience.
 ///
 /// `heat-gated` and `heatgated` are the near-misses that matter: both are one keystroke from the
-/// real spelling and both would previously have selected the control. `off`/`on` are NOT in this
-/// list -- they are accepted design names, pinned by the table test above.
+/// real spelling and both would previously have fallen through to the default arm. `off`/`on` are
+/// NOT in this list -- they are accepted design names, pinned by the table test above.
 #[test]
 fn an_unrecognised_rotate_rows_spelling_refuses_to_guess() {
     // The default hook prints a backtrace banner per panic, and this test raises seven on purpose.
@@ -2603,7 +2618,7 @@ fn an_unrecognised_rotate_rows_spelling_refuses_to_guess() {
         assert!(
             panicked,
             "IZARRAVM_ROTATE_ROWS={spelling:?} names no arm and must panic rather than silently \
-             select the negative control"
+             falling through to the default arm"
         );
     }
 }
