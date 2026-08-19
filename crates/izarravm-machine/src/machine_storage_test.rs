@@ -1946,6 +1946,18 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
     assert_eq!(counters.int13_read_sectors, 8);
     assert_eq!(counters.int13_read_wait_ticks, first_stall);
     assert_eq!(counters.host_read_operations, 1);
+    // Four sectors asked for, four sectors read. A first touch of a file gets
+    // the command extent and nothing more: the read-ahead only fills past the
+    // command once a path has proved it is being read sequentially.
+    //
+    // LOAD-BEARING FOR THE READ-AHEAD RAMP, not just for this cache. This is the
+    // only EXACT statement of the ramp's first-touch rule anywhere: the ratio
+    // bounds in `katea_tree_test.rs`
+    // (`readahead_serves_later_commands_out_of_one_host_read`,
+    // `interleaved_single_sector_reads_do_not_amplify`) bound amplification but
+    // cannot tell an earned fill from a small unearned one. A first touch that
+    // read some fixed multiple of the command would pass both of them and fail
+    // here. Weaken this line and that rule loses its only pin.
     assert_eq!(counters.host_read_bytes, 4 * 512);
 
     drop(machine);
@@ -1974,12 +1986,19 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
 #[test]
 fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
     let dir = katea_scratch("degraded");
-    let path = dir.join("GAME.DAT");
+    let path = dir.join("OTHER.DAT");
     let original = patterned(8);
+    std::fs::write(dir.join("GAME.DAT"), patterned(8)).unwrap();
     std::fs::write(&path, &original).unwrap();
     let mut machine = machine_with_hdd_folder(&dir);
-    let (lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
-    let (sector_a, sector_b) = (lba, lba + 1);
+    // Two files, because the failure has to reach the host. A read fills a
+    // cross-command read-ahead buffer of up to 256 KiB from the file it touched,
+    // so a sector of the file sector A lives in would afterwards be served out of
+    // RAM and never notice the truncation below. Sector B is in a file this run
+    // has never opened, so its first read is genuinely a host read that fails.
+    let (a_lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"GAME    DAT");
+    let (b_lba, _) = katea_file_lba(machine.ata.as_ref().unwrap(), b"OTHER   DAT");
+    let (sector_a, sector_b) = (a_lba, b_lba + 1);
 
     // A: a healthy read, then proof the cache really is answering in this run.
     assert_eq!(int13_read_at(&mut machine, sector_a, 1), vec![0x40]);

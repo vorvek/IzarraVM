@@ -37,10 +37,69 @@ const MAX_HOST_WRITE_HANDLES: usize = 64;
 /// One host range read is bounded to the default 86Box IDE cache window.
 const HOST_READ_COMMAND_WINDOW_SECTORS: u32 = 64;
 
+/// Ceiling on one read-ahead fill. 86Box's IDE path reads a whole ATA command
+/// (up to 256 sectors) into a persistent per-drive 128 KiB buffer; this is the
+/// same shape, one notch larger, because a DOS game's asset load arrives as a
+/// long run of separate 8-sector (one 4 KiB cluster) INT 13h commands rather
+/// than as one big command, so the buffer has to span *commands* to pay off.
+///
+/// A FILL NEVER STARTS THIS BIG. It starts at the extent the command actually
+/// asked for -- one sector when nothing declared a command at all, which is what
+/// a reconcile gather looks like -- and doubles only when the previous fill for
+/// that same path was consumed to its exact end. Any other offset (a backward
+/// seek, a jump, a first touch) resets it to the command extent.
+///
+/// That is the whole amplification argument. A fill larger than the command is
+/// only ever granted to a path that has already been read sequentially that far,
+/// so the bytes read ahead are paid for by bytes already served: physical bytes
+/// stay within roughly twice logical bytes, the overshoot being the last fill of
+/// a stream that stops early. A flat fill has no such bound -- a single-sector
+/// probe outside any command would pull 256 KiB for 512 bytes, and an
+/// alternating or backward pattern would do it on every read.
+///
+/// The ramp is per path (see [`HostReadAhead::next_fill`]) and there are several
+/// slots, so two interleaved files each keep their own place and their own ramp.
+const HOST_READAHEAD_MAX_BYTES: u64 = 256 * 1024;
+
+/// Read-ahead slots. Four, for the reason the handle cache holds eight: an asset
+/// load interleaves a handful of files (the executable, an overlay, a PAK), and
+/// a single slot would miss on every alternation -- the worst case for a ramp,
+/// because a miss is also what resets it.
+const HOST_READAHEAD_SLOTS: usize = 4;
+
+/// Cap on cached open host READ handles. Symmetric with
+/// [`MAX_HOST_WRITE_HANDLES`], but far smaller: DOS reads a handful of files at a
+/// time (the executable, its overlay, a PAK), so eight entries cover a real
+/// working set while keeping the linear scan below trivially short.
+const MAX_HOST_READ_HANDLES: usize = 8;
+
 #[derive(Debug)]
 struct HostReadWindow {
     start_lba: u32,
     bytes: Vec<u8>,
+}
+
+/// Bytes read ahead of the guest out of one host file, surviving command
+/// boundaries. Keyed by path plus the byte range it covers, so a hit is exact:
+/// a sector is served from here only when this buffer holds the very bytes that
+/// a fresh `seek`+`read` of `path` at that offset would return.
+///
+/// INVALIDATION: every host mutation funnels through
+/// [`KateaTreeVolume::invalidate_host_reads`], which drops this buffer (scoped
+/// to a path where the mutation is scoped to one). See that method for why the
+/// funnel is complete.
+#[derive(Debug)]
+struct HostReadAhead {
+    path: PathBuf,
+    /// Byte offset in `path` that `bytes[0]` came from.
+    start: u64,
+    bytes: Vec<u8>,
+    /// What the next fill for this path is allowed to reach, if that fill starts
+    /// at exactly `start + bytes.len()`. Twice the fill that produced this
+    /// buffer, capped at [`HOST_READAHEAD_MAX_BYTES`]. A fill at any other offset
+    /// ignores it and takes the command extent instead. See
+    /// [`HOST_READAHEAD_MAX_BYTES`] for the amplification argument this carries.
+    next_fill: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -48,8 +107,12 @@ struct HostReadContext<'a> {
     lba: u32,
     command_sectors: u32,
     counters: &'a std::cell::Cell<KateaStorageCounters>,
-    cache: &'a std::cell::RefCell<Option<(PathBuf, File)>>,
+    cache: &'a std::cell::RefCell<Vec<(PathBuf, File)>>,
     window: &'a std::cell::RefCell<Option<HostReadWindow>>,
+    /// Read-ahead slots, MRU last. Empty when the read-ahead is disarmed.
+    readahead: &'a std::cell::RefCell<Vec<HostReadAhead>>,
+    /// Ceiling on one fill, or 0 when `IZARRAVM_HDD_READAHEAD=0` disarmed it.
+    readahead_max: u64,
 }
 
 /// DOS device names Win32 still resolves as character devices. Per Microsoft's
@@ -881,17 +944,53 @@ pub(crate) struct KateaTreeVolume {
     /// `RefCell` for the same reason `counters` is a `Cell`: `read_sector` is
     /// `&self` and the emulation thread owns the volume.
     ///
-    /// INVALIDATION: `reconcile_mode` clears this on entry. It is the single
-    /// funnel for every host mutation (`atomic_write`, `fs::rename`, deletes), and
-    /// a stale handle matters because `File::open` shares delete and rename, so a
-    /// replaced file would otherwise keep reading its pre-write contents.
-    host_read_cache: std::cell::RefCell<Option<(PathBuf, File)>>,
+    /// INVALIDATION: `invalidate_host_reads` clears this, and every host mutation
+    /// calls it. A stale handle matters because `File::open` shares delete and
+    /// rename, so a replaced file would otherwise keep reading its pre-write
+    /// contents.
+    ///
+    /// A small LRU rather than the single entry it started as: one entry is right
+    /// for a pure sequential load but degrades to an open-per-sector as soon as
+    /// two files interleave (a program reading its own overlay, or a read landing
+    /// between two projections), which is exactly the pattern an asset load
+    /// produces. MRU is the last element; the scan is over at most
+    /// [`MAX_HOST_READ_HANDLES`] paths.
+    host_read_cache: std::cell::RefCell<Vec<(PathBuf, File)>>,
     /// Bytes coalesced only within the active guest read command. The window is
     /// discarded at command completion, so it cannot make an unrequested sector
     /// stale across two INT 13h calls.
     host_read_window: std::cell::RefCell<Option<HostReadWindow>>,
+    /// Bytes read ahead of the guest, surviving command boundaries. An LRU of
+    /// [`HOST_READAHEAD_SLOTS`] slots, MRU last. See [`HostReadAhead`].
+    host_readahead: std::cell::RefCell<Vec<HostReadAhead>>,
     read_command_end_lba: std::cell::Cell<Option<u32>>,
     command_read_batch_enabled: bool,
+    /// The read-ahead's fill ceiling, or 0 when `IZARRAVM_HDD_READAHEAD=0`
+    /// disarmed it. Read once at mount so an A/B is same-binary.
+    readahead_max_bytes: u64,
+    /// Memo of the base-view FAT sector most recently synthesized, keyed by its
+    /// FAT-relative sector index.
+    ///
+    /// `ClusterIndex::fat_sector` builds a 512-byte sector by evaluating 128
+    /// `fat_entry` values, each a `HashSet<u32>` probe under SipHash, so one
+    /// `KateaTreeVolume::fat_entry` call costs ~128 hashed lookups. A cluster
+    /// chain walk calls it once per cluster, in ascending cluster order, so 128
+    /// consecutive calls land in the same FAT sector: one entry captures the whole
+    /// win and a second would never be used. The projection pass walks chains for
+    /// every file on the volume three times over, which is what made a one-file
+    /// write cost hundreds of milliseconds on a 47 MB folder.
+    ///
+    /// SOUND BY CONSTRUCTION: `fat` and `geo` are built in `new` and never
+    /// mutated, so `fat.fat_sector(within, &geo)` is a pure function of `within`.
+    /// The memo sits strictly *below* the overlay: `read_sector_checked` still
+    /// consults `store` first and still reports its read errors, so a guest-written
+    /// FAT sector never reaches this cache and the bytes served are identical.
+    fat_sector_cache: std::cell::RefCell<Option<(u32, [u8; SECTOR])>>,
+    /// How many base-view FAT sectors have actually been synthesized. The memo
+    /// exists to keep this proportional to the FAT region a pass touches rather
+    /// than to the clusters it walks, and a test reads it to prove that.
+    #[cfg(test)]
+    fat_sector_builds: std::cell::Cell<u64>,
     /// Arms the FAT / directory / free-space region census. Read once at mount
     /// from `IZARRAVM_KATEA_REGION_CENSUS=1`, and OFF by default: those two
     /// counters were investigation residue, and each increment is a
@@ -910,6 +1009,16 @@ fn region_census_enabled() -> bool {
 /// Enabled by default; `=0` provides a same-binary benchmark control.
 fn command_read_batch_enabled() -> bool {
     std::env::var("IZARRAVM_HDD_COMMAND_READ_BATCH").as_deref() != Ok("0")
+}
+
+/// The read-ahead's fill ceiling, or 0 when it is disarmed. Enabled by default;
+/// `IZARRAVM_HDD_READAHEAD=0` provides a same-binary control.
+fn readahead_max_bytes() -> u64 {
+    if std::env::var("IZARRAVM_HDD_READAHEAD").as_deref() == Ok("0") {
+        0
+    } else {
+        HOST_READAHEAD_MAX_BYTES
+    }
 }
 
 /// What the Katea host-folder read path did, for the boot profiler's disk phases.
@@ -931,6 +1040,22 @@ pub struct KateaStorageCounters {
     /// Wall nanoseconds spent in physical host reads. Command-window hits do
     /// not enter this counter.
     pub host_wall_ns: u64,
+    /// The longest SINGLE `read_host_span` this session, in nanoseconds.
+    ///
+    /// A sum cannot see a hitch: 784 ms of projection spread over a minute is
+    /// invisible, and 784 ms in one synchronous pass is a visible freeze. The max
+    /// is what separates the two, and it is what the read-ahead and the projection
+    /// scaling are graded against. Zero new syscalls: this reads the `Instant`
+    /// pair the sum already computes.
+    pub host_read_max_ns: u64,
+    /// Sectors served out of the cross-command read-ahead buffer (a memcpy, no
+    /// host I/O). Derivable from `host_file_reads - host_read_operations` only
+    /// while the command window is also in play; counted directly so a test can
+    /// name the mechanism it is asserting on.
+    pub host_readahead_hits: u64,
+    /// Read-ahead fills: physical host reads that pulled more than the command
+    /// asked for, so a later command could be served from RAM.
+    pub host_readahead_fills: u64,
     /// Cluster-run table entries scanned to resolve data sectors. `data_sector`
     /// binary-searches the sorted `runs`, so this is now `log2(runs)` per sector
     /// rather than the tree-size-dependent linear walk it was built to expose.
@@ -983,6 +1108,11 @@ pub struct KateaStorageCounters {
     pub projection_operations: u64,
     pub projection_bytes: u64,
     pub projection_wall_ns: u64,
+    /// The longest SINGLE projection operation this session, in nanoseconds --
+    /// one `commit_guest_write_batch` or one `flush_guest_writes`, each of which
+    /// runs synchronously on the emulation thread. See [`Self::host_read_max_ns`]
+    /// for why the sum is not enough.
+    pub projection_max_ns: u64,
     pub metadata_projection_passes: u64,
     pub host_write_failures: u64,
 }
@@ -1331,10 +1461,15 @@ impl KateaTreeVolume {
             #[cfg(test)]
             atomic_write_bytes: 0,
             counters: std::cell::Cell::new(KateaStorageCounters::default()),
-            host_read_cache: std::cell::RefCell::new(None),
+            host_read_cache: std::cell::RefCell::new(Vec::new()),
             host_read_window: std::cell::RefCell::new(None),
+            host_readahead: std::cell::RefCell::new(Vec::new()),
             read_command_end_lba: std::cell::Cell::new(None),
             command_read_batch_enabled: command_read_batch_enabled(),
+            readahead_max_bytes: readahead_max_bytes(),
+            fat_sector_cache: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            fat_sector_builds: std::cell::Cell::new(0),
             region_census: region_census_enabled(),
         })
     }
@@ -1382,6 +1517,50 @@ impl KateaTreeVolume {
         self.candidate_lbas_examined = 0;
     }
 
+    /// Base-view FAT sectors actually synthesized since mount. See
+    /// [`Self::fat_sector_cache`].
+    #[cfg(test)]
+    pub(crate) fn fat_sector_builds(&self) -> u64 {
+        self.fat_sector_builds.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_fat_sector_builds(&self) {
+        self.fat_sector_builds.set(0);
+    }
+
+    /// How many host read handles are cached, for the LRU bound test.
+    #[cfg(test)]
+    pub(crate) fn host_read_handles(&self) -> usize {
+        self.host_read_cache.borrow().len()
+    }
+
+    /// Whether a read handle for `path` is cached.
+    #[cfg(test)]
+    pub(crate) fn host_read_handle_cached(&self, path: &Path) -> bool {
+        self.host_read_cache
+            .borrow()
+            .iter()
+            .any(|(cached, _)| cached == path)
+    }
+
+    /// Whether a read-ahead slot currently holds bytes of `path`.
+    #[cfg(test)]
+    pub(crate) fn readahead_holds(&self, path: &Path) -> bool {
+        self.host_readahead
+            .borrow()
+            .iter()
+            .any(|ahead| ahead.path == path)
+    }
+
+    /// Disarm the read-ahead without going through the environment, so a test can
+    /// drive both legs of the `IZARRAVM_HDD_READAHEAD` gate in one process.
+    #[cfg(test)]
+    pub(crate) fn disarm_readahead(&mut self) {
+        self.readahead_max_bytes = 0;
+        self.host_readahead.borrow_mut().clear();
+    }
+
     pub(crate) fn begin_read_command(&self, start_lba: u32, sectors: u32) {
         self.host_read_window.replace(None);
         if !self.command_read_batch_enabled {
@@ -1419,6 +1598,58 @@ impl KateaTreeVolume {
             counters: &self.counters,
             cache: &self.host_read_cache,
             window: &self.host_read_window,
+            readahead: &self.host_readahead,
+            readahead_max: self.readahead_max_bytes,
+        }
+    }
+
+    /// Drop every cached view of the host filesystem that a mutation could have
+    /// invalidated: open read handles, the command window, and the read-ahead
+    /// buffer. `path` scopes the drop to one host file; `None` drops everything.
+    ///
+    /// COMPLETENESS. Five things mutate a host file this volume reads.
+    ///
+    /// Four are inside this module: `katea_write::atomic_write`,
+    /// `std::fs::rename`, the deletes, and `stream_file_overlay`'s positioned
+    /// write / `set_len`. The first three all run inside `reconcile_mode`, which
+    /// calls this unscoped on entry (as it always has) and again, scoped, at each
+    /// mutation -- the scoped calls matter because phase 3 *reads* file bytes and
+    /// then rewrites them within the same pass, so an entry-only drop would let a
+    /// handle opened by the gather serve pre-write bytes afterwards.
+    /// `stream_file_overlay` is the fourth and is also reachable from
+    /// `stream_projected_batch`, outside any reconcile, so it calls this itself.
+    ///
+    /// The fifth is outside: `Dos::katea_repair` rewrites CONFIG.SYS and
+    /// AUTOEXEC.BAT in the mounted folder and renames the originals aside. It
+    /// does not call this and does not need to -- it finishes by calling
+    /// `mount_hdd_folder`, which builds a whole new volume, so every cache here
+    /// is dropped with the old one. That is the only safe way to reach a mounted
+    /// folder from outside this module, and it is worth naming because a future
+    /// caller that skipped the re-mount would be serving stale bytes with nothing
+    /// in this file to tell it so.
+    ///
+    /// `create_dir_all` is deliberately not on the list: a directory is never a
+    /// read source here, and its *contents* are synthesized from the guest's own
+    /// FAT and directory sectors, never read back off the host.
+    fn invalidate_host_reads(&self, path: Option<&Path>) {
+        match path {
+            Some(path) => {
+                self.host_read_cache
+                    .borrow_mut()
+                    .retain(|(cached, _)| cached != path);
+                self.host_readahead
+                    .borrow_mut()
+                    .retain(|ahead| ahead.path != path);
+                // The command window is LBA-keyed, not path-keyed, so it cannot
+                // be scoped; it is at most one command's worth of bytes and the
+                // next physical read refills it.
+                self.host_read_window.replace(None);
+            }
+            None => {
+                self.host_read_cache.borrow_mut().clear();
+                self.host_readahead.borrow_mut().clear();
+                self.host_read_window.replace(None);
+            }
         }
     }
 
@@ -1681,6 +1912,16 @@ impl KateaTreeVolume {
                 acknowledged.push(lba);
             }
         }
+
+        // The write-through path is reachable from `stream_projected_batch` with
+        // no reconcile around it, so it is its own invalidation point: anything
+        // cached for this path is about to describe the file as it was before
+        // these spans land. Scoped, so a read-ahead over another file survives.
+        //
+        // Before the write, not after: a `?` on any step below returns early with
+        // the file possibly part-written, and a cache left standing across that
+        // return would serve pre-write bytes for the rest of the session.
+        self.invalidate_host_reads(Some(&pending.path));
 
         // The handle cache exists to spare a reopen per command on the file
         // being written, which is one or two files at a time. Without a cap a
@@ -2253,21 +2494,25 @@ impl KateaTreeVolume {
     }
 
     fn note_projection_wall(&self, started: std::time::Instant) {
+        let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         let mut counters = self.counters.get();
-        counters.projection_wall_ns = counters
-            .projection_wall_ns
-            .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        counters.projection_wall_ns = counters.projection_wall_ns.saturating_add(elapsed);
+        // The sum says how much of the session went into projection; the max says
+        // whether any single pass was long enough for the user to see it as a
+        // freeze. Same `Instant` pair, no extra clock read.
+        counters.projection_max_ns = counters.projection_max_ns.max(elapsed);
         self.counters.set(counters);
     }
 
     fn reconcile_mode(&mut self, mode: ReconcileMode) {
-        // Drop the cached read handle before touching the host. This is the only
-        // funnel for host mutation -- `atomic_write`, `fs::rename`, deletes -- and
+        // Drop every cached read view before touching the host. This pass is the
+        // funnel for `atomic_write`, `fs::rename` and the deletes, and
         // `File::open` shares delete and rename on Windows, so a rewritten file
         // would otherwise keep serving its pre-write contents through a handle
-        // that is still perfectly valid and now points at the wrong bytes.
-        self.host_read_cache.replace(None);
-        self.host_read_window.replace(None);
+        // that is still perfectly valid and now points at the wrong bytes. Each
+        // individual mutation below invalidates its own path again, because this
+        // pass reads file bytes between here and there.
+        self.invalidate_host_reads(None);
         self.read_command_end_lba.set(None);
         // A guest-written sector that cannot be read back reads as zeros, and zeros
         // are not a safe input here: phase 2 reads a zeroed FAT entry as "chain
@@ -2424,6 +2669,8 @@ impl KateaTreeVolume {
         // Apply renames first (so a move's source path still exists), then deletes.
         for r in renames {
             self.host_write_handles.remove(&r.old_path);
+            self.invalidate_host_reads(Some(&r.old_path));
+            self.invalidate_host_reads(Some(&r.new_path));
             if let Err(e) = std::fs::rename(&r.old_path, &r.new_path) {
                 self.note_host_write_failure();
                 eprintln!(
@@ -2468,6 +2715,7 @@ impl KateaTreeVolume {
         deletes.sort_by_key(|d| d.is_dir);
         for d in deletes {
             self.host_write_handles.remove(&d.path);
+            self.invalidate_host_reads(Some(&d.path));
             let res = if d.is_dir {
                 std::fs::remove_dir(&d.path) // fails (held) if the host dir is non-empty
             } else {
@@ -2803,6 +3051,7 @@ impl KateaTreeVolume {
                     self.atomic_write_bytes += w.data.len() as u64;
                 }
                 self.host_write_handles.remove(&w.path);
+                self.invalidate_host_reads(Some(&w.path));
                 match crate::katea_write::atomic_write(&w.path, &w.data) {
                     Ok(()) => {
                         self.note_projection_operation(w.data.len() as u64);
@@ -2973,7 +3222,7 @@ impl KateaTreeVolume {
                 self.counters.set(counters);
             }
             let within = (rel - reserved) % self.geo.fatsz;
-            return SectorRead::ok(self.fat.fat_sector(within, &self.geo));
+            return SectorRead::ok(self.base_fat_sector(within));
         }
 
         // Data region: cluster 2 begins at `first_data_sector`.
@@ -2986,6 +3235,27 @@ impl KateaTreeVolume {
         }
 
         SectorRead::ok([0u8; SECTOR])
+    }
+
+    /// The base-view FAT sector `within` sectors into a FAT copy, memoized.
+    ///
+    /// Byte-identical to `self.fat.fat_sector(within, &self.geo)` by construction:
+    /// `fat` and `geo` are immutable after `new`, so that call is a pure function
+    /// of `within` and any two evaluations agree. The memo therefore cannot change
+    /// what any read ordering observes -- it only decides whether the same bytes
+    /// are recomputed or copied. See [`Self::fat_sector_cache`] for why it pays.
+    fn base_fat_sector(&self, within: u32) -> [u8; SECTOR] {
+        if let Some((cached_within, bytes)) = self.fat_sector_cache.borrow().as_ref()
+            && *cached_within == within
+        {
+            return *bytes;
+        }
+        let bytes = self.fat.fat_sector(within, &self.geo);
+        #[cfg(test)]
+        self.fat_sector_builds
+            .set(self.fat_sector_builds.get().saturating_add(1));
+        self.fat_sector_cache.replace(Some((within, bytes)));
+        bytes
     }
 
     /// Resolve one data-region sector by finding the run owning `cluster`, then
@@ -3173,26 +3443,84 @@ fn read_host_span(
         return SectorRead::ok(out);
     }
     let started = std::time::Instant::now();
+
+    // A read-ahead hit is a memcpy out of RAM and nothing else: no open, no seek,
+    // no read, and no entry in the wall counters -- the same accounting the
+    // command window already gets, for the same reason. The range test is exact
+    // (same path, and the whole sector inside the buffered byte range), so the
+    // bytes are the bytes a fresh positioned read would have returned, provided
+    // the buffer has not gone stale. `invalidate_host_reads` is what provides
+    // that; see it for why the funnel is complete.
+    // A read-ahead hit, and the ramp the next miss will use, both come out of the
+    // slot for this path. `slot` is its index, MRU-promoted on use.
+    let armed = context.readahead_max > 0;
+    let mut ramp = 0u64;
+    if armed {
+        let mut slots = context.readahead.borrow_mut();
+        if let Some(index) = slots.iter().position(|ahead| ahead.path == path) {
+            let ahead = &slots[index];
+            let offset = byte_off.checked_sub(ahead.start);
+            if let Some(off) = offset
+                && let Ok(off) = usize::try_from(off)
+                && off.saturating_add(valid) <= ahead.bytes.len()
+            {
+                out[..valid].copy_from_slice(&ahead.bytes[off..off + valid]);
+                let ahead = slots.remove(index);
+                slots.push(ahead);
+                drop(slots);
+                let mut tally = context.counters.get();
+                tally.host_file_reads += 1;
+                tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
+                tally.host_readahead_hits = tally.host_readahead_hits.saturating_add(1);
+                context.counters.set(tally);
+                return SectorRead::ok(out);
+            }
+            // A miss. Only a miss that starts at exactly the end of this path's
+            // buffer is a continuing sequential stream and earns a bigger fill;
+            // anything else is a seek and takes the command extent.
+            if offset == Some(ahead.bytes.len() as u64) {
+                ramp = ahead.next_fill;
+            }
+        }
+    }
+
     let mut opened = 0u64;
     let mut operations = 0u64;
     let mut physical_bytes = 0u64;
+    let mut filled = 0u64;
     let mut degraded = false;
+    // The command window may only ever cover sectors this command asked for AND
+    // that are LBA-contiguous in this file, which is what `command_sectors`
+    // encodes. The read-ahead is under no such limit: it is keyed by file byte
+    // offset, so it stays correct however the guest's clusters are laid out --
+    // which is why it, and not the window, is allowed to run past the command.
     let requested = u64::from(context.command_sectors.max(1)) * SECTOR as u64;
-    let read_len = u64::from(size).saturating_sub(byte_off).min(requested) as usize;
-    let mut batch = (read_len > valid).then(|| Vec::with_capacity(read_len));
-    let mut slot = context.cache.borrow_mut();
-    let reusable = slot.as_ref().is_some_and(|(cached, _)| cached == path);
-    if !reusable {
-        *slot = None;
-        match File::open(path) {
+    let fill = requested.max(ramp.min(context.readahead_max));
+    let read_len = u64::from(size).saturating_sub(byte_off).min(fill) as usize;
+    // Armed, everything read is buffered, even a lone sector: that is what gives
+    // the next sequential read something to ramp off. Disarmed, the buffer is
+    // allocated only when the command window will use it, exactly as before.
+    let mut batch = (armed || read_len > valid).then(|| Vec::with_capacity(read_len));
+
+    let mut cache = context.cache.borrow_mut();
+    match cache.iter().position(|(cached, _)| cached == path) {
+        Some(index) => {
+            // Promote to MRU so the eviction below takes the coldest path.
+            let entry = cache.remove(index);
+            cache.push(entry);
+        }
+        None => match File::open(path) {
             Ok(file) => {
                 opened = 1;
-                *slot = Some((path.to_path_buf(), file));
+                if cache.len() >= MAX_HOST_READ_HANDLES {
+                    cache.remove(0);
+                }
+                cache.push((path.to_path_buf(), file));
             }
             Err(e) => eprintln!("katea: open {}: {e}", path.display()),
-        }
+        },
     }
-    match slot.as_mut() {
+    match cache.last_mut().filter(|(cached, _)| cached == path) {
         Some((_, file)) => {
             operations = 1;
             let read = file.seek(SeekFrom::Start(byte_off)).and_then(|_| {
@@ -3210,7 +3538,36 @@ fn read_host_span(
                             batch.truncate(read_bytes / SECTOR * SECTOR);
                         }
                         out[..valid].copy_from_slice(&batch[..valid]);
-                        if batch.len() > valid {
+                        if armed {
+                            // The read-ahead owns the buffer, by move. It covers
+                            // everything the LBA-keyed window would have (same
+                            // starting offset, never shorter than the command
+                            // extent) and is keyed more precisely, so filling
+                            // both would be a copy for a redundant lookup.
+                            // A FILL is a read that went past what the command
+                            // asked for. Counting anything longer than the
+                            // single served sector would count an ordinary
+                            // command-extent read as read-ahead and flatter the
+                            // hits-per-fill ratio, and this counter is an
+                            // acceptance instrument.
+                            if batch.len() as u64 > requested {
+                                filled = 1;
+                            }
+                            let next_fill = (batch.len() as u64)
+                                .saturating_mul(2)
+                                .min(context.readahead_max);
+                            let mut slots = context.readahead.borrow_mut();
+                            slots.retain(|ahead| ahead.path != path);
+                            if slots.len() >= HOST_READAHEAD_SLOTS {
+                                slots.remove(0);
+                            }
+                            slots.push(HostReadAhead {
+                                path: path.to_path_buf(),
+                                start: byte_off,
+                                bytes: batch,
+                                next_fill,
+                            });
+                        } else if batch.len() > valid {
                             context.window.replace(Some(HostReadWindow {
                                 start_lba: context.lba,
                                 bytes: batch,
@@ -3225,8 +3582,9 @@ fn read_host_span(
                         path.display()
                     );
                     degraded = true;
-                    *slot = None;
+                    cache.pop();
                     context.window.replace(None);
+                    context.readahead.borrow_mut().retain(|a| a.path != path);
                 }
                 Err(e) => {
                     eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
@@ -3238,23 +3596,25 @@ fn read_host_span(
                     // path reset `out` here for exactly this reason.
                     out = [0u8; SECTOR];
                     degraded = true;
-                    *slot = None;
+                    cache.pop();
                     context.window.replace(None);
+                    context.readahead.borrow_mut().retain(|a| a.path != path);
                 }
             }
         }
         None => degraded = true,
     }
-    drop(slot);
+    drop(cache);
+    let elapsed = crate::duration_ns_u64(started.elapsed());
     let mut tally = context.counters.get();
     tally.host_file_reads += 1;
     tally.host_file_opens = tally.host_file_opens.saturating_add(opened);
     tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
     tally.host_read_operations = tally.host_read_operations.saturating_add(operations);
     tally.host_read_bytes = tally.host_read_bytes.saturating_add(physical_bytes);
-    tally.host_wall_ns = tally
-        .host_wall_ns
-        .saturating_add(crate::duration_ns_u64(started.elapsed()));
+    tally.host_readahead_fills = tally.host_readahead_fills.saturating_add(filled);
+    tally.host_wall_ns = tally.host_wall_ns.saturating_add(elapsed);
+    tally.host_read_max_ns = tally.host_read_max_ns.max(elapsed);
     context.counters.set(tally);
     SectorRead {
         bytes: out,
