@@ -215,23 +215,23 @@ fn fpu_loop_row_encodings() -> [(&'static str, Vec<u8>); 5] {
 // The gate itself
 // ---------------------------------------------------------------------------------------------
 
-/// THE DEFAULT PIN, and it is the one assertion that decides whether this slice is inert.
+/// THE DEFAULT PIN, and it is the one assertion that decides what a shipped binary admits.
 ///
-/// Catches: a flip of `parse_fpu_loop_rows_arm`'s `NotPresent` arm. The slice ships OFF and the ON
-/// arm is a separate decision priced by a wall ladder; a default that moved without that ladder
-/// would change every shipped binary's admission silently.
+/// Catches: a flip of `parse_fpu_loop_rows_arm`'s `NotPresent` arm. The default is ON since the
+/// 2026-08-20 tombraid-586 ladder (-17.2% min-wall, full non-overlap); a default that moved back
+/// without a ladder would change every shipped binary's admission silently.
 ///
 /// It reads the AMBIENT knob deliberately -- no override -- so it also fails if
-/// `IZARRAVM_FPU_LOOP_ROWS=1` is exported in the environment running the suite, which is the
+/// `IZARRAVM_FPU_LOOP_ROWS=0` is exported in the environment running the suite, which is the
 /// correct outcome: the rest of this file states its arm, and a fixture that means to pin the
 /// shipped default has nowhere else to read it from.
 #[test]
-fn fpu_loop_rows_ships_off_by_default() {
+fn fpu_loop_rows_ships_on_by_default() {
     jit::direct::set_fpu_loop_rows_for_test(None);
     assert!(
-        !jit::direct::fpu_loop_rows_enabled(),
-        "IZARRAVM_FPU_LOOP_ROWS must default OFF in this slice; see fpu_loop_rows_enabled for \
-         why the flip is a separate, ladder-priced decision"
+        jit::direct::fpu_loop_rows_enabled(),
+        "IZARRAVM_FPU_LOOP_ROWS must default ON since the 2026-08-20 flip; see \
+         fpu_loop_rows_enabled for the ladder that priced it"
     );
 }
 
@@ -244,9 +244,10 @@ fn fpu_loop_rows_ships_off_by_default() {
 #[test]
 fn fpu_loop_rows_spelling_table_names_both_arms() {
     use std::env::VarError;
-    assert!(!jit::direct::parse_fpu_loop_rows_arm_for_test(Err(
-        VarError::NotPresent
-    )));
+    assert!(
+        jit::direct::parse_fpu_loop_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the ON arm since the 2026-08-20 flip"
+    );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
         assert!(
             !jit::direct::parse_fpu_loop_rows_arm_for_test(Ok(off.to_string())),

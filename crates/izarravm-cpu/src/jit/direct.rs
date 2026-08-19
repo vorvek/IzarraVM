@@ -5262,8 +5262,9 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 }
 
 /// Whether `classify` admits the FIVE dword rows the 32-bit FPU-loop census names
-/// (`IZARRAVM_FPU_LOOP_ROWS`). **DEFAULT OFF in this slice**; the flip is a separate decision
-/// priced by a wall ladder, exactly as `IZARRAVM_ROTATE_ROWS` and `IZARRAVM_COUNT_LANES` were.
+/// (`IZARRAVM_FPU_LOOP_ROWS`). **DEFAULT ON since 2026-08-20** (the slice shipped OFF for one
+/// commit; the flip was priced by the tombraid-586 wall ladder exactly as `IZARRAVM_ROTATE_ROWS`
+/// and `IZARRAVM_COUNT_LANES` were -- the numbers are in the spelling table below).
 ///
 /// The rows, and each one's home:
 ///
@@ -5299,10 +5300,13 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 /// FSIN/FCOS/FPTAN are not expressible in SSE at all, so the row's identity decides whether the
 /// slice is buildable.
 ///
-/// THE SPELLING TABLE, trimmed and case-folded on the way in, matching `IZARRAVM_IMM8_LANES`:
+/// THE SPELLING TABLE, trimmed and case-folded on the way in, matching `IZARRAVM_COUNT_LANES`:
 ///
-/// * **unset**, `` (empty), `0` or `off` -> OFF. The shipped default and the A/B base.
-/// * `1` or `on` -> ON.
+/// * **unset** or `1` / `on` -> ON. The shipped default since 2026-08-20: the tombraid-586
+///   ladder read -17.2% min-wall (211.5 vs 255.4 s, three legs per arm, full non-overlap,
+///   `.bench/results/tomb-fmv-admission-20260819/wall-ladder/`), guest counters byte-identical
+///   per arm. Recorded before that date, an "on" leg is the non-default arm.
+/// * `` (empty), `0` or `off` -> OFF. The escape, the pre-slice refusal and the A/B base.
 /// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
 ///   fell through to the default would be read as "the arm I asked for changed nothing".
 pub(crate) fn fpu_loop_rows_enabled() -> bool {
@@ -5318,14 +5322,16 @@ pub(crate) fn fpu_loop_rows_enabled() -> bool {
 /// unit-tested without a process-global env write. See `fpu_loop_rows_enabled` for the contract.
 fn parse_fpu_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset = ON since the 2026-08-20 flip; `0` / `off` is the escape. Same shape (and same
+        // trap) as `IZARRAVM_COUNT_LANES`: an off leg must EXPORT `0`, not unset the variable.
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
         // than the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_FPU_LOOP_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `0` / `off` (the shipped default, the pre-slice refusal), \
-                 and `1` / `on` (the five 32-bit FPU-loop rows)"
+                 spellings are unset or `1` / `on` (the shipped default: the five 32-bit \
+                 FPU-loop rows), and `0` / `off` (the escape, the pre-slice refusal)"
             )
         }
         Ok(raw) => raw,
@@ -5334,19 +5340,20 @@ fn parse_fpu_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
         "" | "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_FPU_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `0` / \
-             `off` (the shipped default, the pre-slice refusal and the A/B base), and `1` / `on` \
-             (the five 32-bit FPU-loop rows: WAIT, SAHF, FRNDINT, DIV/IDIV memory and SETcc \
-             memory). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and \
-             be read as the arm it named doing nothing"
+            "IZARRAVM_FPU_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default: the five 32-bit FPU-loop rows: WAIT, SAHF, FRNDINT, \
+             DIV/IDIV memory and SETcc memory), and `0` / `off` (the escape, the pre-slice \
+             refusal and the A/B base). Refusing to guess: a mistyped ladder leg would silently \
+             run the DEFAULT and be read as the arm it named doing nothing"
         ),
     }
 }
 
 // Per-THREAD, for `IMM8_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
 // and the fixtures have to run both arms in one process, so one test's arm selection must not
-// reach another's compile. While the default is OFF every POSITIVE fixture for these five rows
-// must force it on through here, or it tests the refusal and calls it a lowering.
+// reach another's compile. Every fixture for these five rows states its arm through here in
+// BOTH directions -- a positive fixture that rode the ambient default would go vacuous the day
+// the default moved, and the negative (refusal) fixtures need the off arm now that ON ships.
 #[cfg(test)]
 thread_local! {
     static FPU_LOOP_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
