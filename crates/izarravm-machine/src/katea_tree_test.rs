@@ -2738,7 +2738,12 @@ fn readahead_serves_later_commands_out_of_one_host_read() {
         .collect();
     let path = root.join("BIG.BIN");
     fs::write(&path, &data).unwrap();
-    let vol = mount(&root);
+    let mut vol = mount(&root);
+    // Pin the OTHER switch, so this measures one mechanism whichever leg of
+    // `IZARRAVM_HDD_COMMAND_READ_BATCH` the suite is being run under. The two are
+    // independent axes: with the command batch off, the first fill collapses to
+    // a single sector and the ramp has to climb the whole way from there.
+    vol.command_read_batch_enabled = true;
     let lba = vol.cluster_to_lba(first_cluster_of(&vol, &path));
 
     let before = vol.storage_counters();
@@ -2777,7 +2782,7 @@ fn readahead_serves_later_commands_out_of_one_host_read() {
     // The ramp's bound, asserted rather than argued.
     let physical = after.host_read_bytes - before.host_read_bytes;
     assert!(
-        physical <= 4 * served,
+        physical <= 3 * served,
         "read {physical} physical bytes to serve {served}"
     );
 
@@ -2832,8 +2837,14 @@ fn interleaved_single_sector_reads_do_not_amplify() {
     let served = after.host_bytes - before.host_bytes;
     let physical = after.host_read_bytes - before.host_read_bytes;
     assert_eq!(served, 128 * SECTOR as u64, "128 sectors were asked for");
+    // Three, not four: a first-touch fill that ignored the command extent and
+    // took a fixed multiple of it would still slip under a looser bound. Measured
+    // at 1.98x, so this leaves half again as much room as the ramp actually uses.
+    // The other half of that invariant -- that a first touch reads the command
+    // extent and NOTHING more -- is pinned exactly, one file over, by
+    // `the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder`.
     assert!(
-        physical <= 4 * served,
+        physical <= 3 * served,
         "alternating single-sector reads pulled {physical} physical bytes to \
          serve {served}"
     );

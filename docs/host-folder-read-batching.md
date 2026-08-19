@@ -233,11 +233,12 @@ The read-ahead is enabled by default and has the same kind of control:
 `IZARRAVM_HDD_READAHEAD=0` disarms it, restoring one physical read per command.
 Both switches are read once at mount.
 
-The two switches are not independent. The read-ahead reads at least as far as
-the command window would have, so with the read-ahead armed, setting
-`IZARRAVM_HDD_COMMAND_READ_BATCH=0` no longer changes any physical-read counter:
-the library suite passes identically with it on and off. To isolate the window's
-own contribution, disarm both.
+The two are independent axes, and both remain worth turning. Because a fill is
+earned rather than granted, it starts at whatever extent the command declared,
+and `IZARRAVM_HDD_COMMAND_READ_BATCH=0` collapses that extent to a single sector.
+The ramp then has to climb the whole way from 512 bytes instead of starting at
+the command's own size, so the two switches move different quantities and the
+same four tests change on the batch leg as before this change.
 
 The profile also reports the longest single operation of each kind, beside the
 sums it already reported:

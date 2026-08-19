@@ -3544,7 +3544,13 @@ fn read_host_span(
                             // starting offset, never shorter than the command
                             // extent) and is keyed more precisely, so filling
                             // both would be a copy for a redundant lookup.
-                            if batch.len() > valid {
+                            // A FILL is a read that went past what the command
+                            // asked for. Counting anything longer than the
+                            // single served sector would count an ordinary
+                            // command-extent read as read-ahead and flatter the
+                            // hits-per-fill ratio, and this counter is an
+                            // acceptance instrument.
+                            if batch.len() as u64 > requested {
                                 filled = 1;
                             }
                             let next_fill = (batch.len() as u64)

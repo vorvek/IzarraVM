@@ -1949,6 +1949,15 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
     // Four sectors asked for, four sectors read. A first touch of a file gets
     // the command extent and nothing more: the read-ahead only fills past the
     // command once a path has proved it is being read sequentially.
+    //
+    // LOAD-BEARING FOR THE READ-AHEAD RAMP, not just for this cache. This is the
+    // only EXACT statement of the ramp's first-touch rule anywhere: the ratio
+    // bounds in `katea_tree_test.rs`
+    // (`readahead_serves_later_commands_out_of_one_host_read`,
+    // `interleaved_single_sector_reads_do_not_amplify`) bound amplification but
+    // cannot tell an earned fill from a small unearned one. A first touch that
+    // read some fixed multiple of the command would pass both of them and fail
+    // here. Weaken this line and that rule loses its only pin.
     assert_eq!(counters.host_read_bytes, 4 * 512);
 
     drop(machine);
