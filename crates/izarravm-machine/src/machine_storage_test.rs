@@ -1946,12 +1946,10 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
     assert_eq!(counters.int13_read_sectors, 8);
     assert_eq!(counters.int13_read_wait_ticks, first_stall);
     assert_eq!(counters.host_read_operations, 1);
-    // The one physical read pulls the whole 8-sector file, not just the four
-    // sectors this command asked for: the read-ahead fills up to 256 KiB so the
-    // NEXT command over the same file is a memcpy. The command asked for four
-    // sectors and was served four sectors -- `host_bytes`, the logical figure,
-    // is unchanged; `host_read_bytes` is the physical one and is what moved.
-    assert_eq!(counters.host_read_bytes, 8 * 512);
+    // Four sectors asked for, four sectors read. A first touch of a file gets
+    // the command extent and nothing more: the read-ahead only fills past the
+    // command once a path has proved it is being read sequentially.
+    assert_eq!(counters.host_read_bytes, 4 * 512);
 
     drop(machine);
     std::fs::remove_dir_all(&dir).ok();

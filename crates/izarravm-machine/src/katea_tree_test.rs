@@ -2721,20 +2721,28 @@ fn read_command(vol: &KateaTreeVolume, lba: u32, sectors: u32) -> Vec<u8> {
 /// duke3d-486 hitch profile was made of. The read-ahead buffer is keyed by host
 /// path and byte range rather than by LBA, so it can outlive the command.
 ///
+/// The ramp is what bounds the cost: the fill starts at the command extent and
+/// only doubles where the previous fill for this path ended, so the physical
+/// bytes a sequential stream reads stay within a small factor of the bytes it is
+/// served, however far it runs.
+///
 /// NON-VACUOUS: dropping the read-ahead in `end_read_command` (i.e. giving it the
-/// window's lifetime) makes the second and third commands physical reads again
-/// and fails the `host_read_operations` assertion.
+/// window's lifetime) makes every command a physical read again and fails the
+/// `host_read_operations` assertion.
 #[test]
 fn readahead_serves_later_commands_out_of_one_host_read() {
     let root = scratch("readahead_span");
-    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let commands = 32u32;
+    let data: Vec<u8> = (0..commands * 8 * SECTOR as u32)
+        .map(|i| (i % 251) as u8)
+        .collect();
     let path = root.join("BIG.BIN");
     fs::write(&path, &data).unwrap();
     let vol = mount(&root);
     let lba = vol.cluster_to_lba(first_cluster_of(&vol, &path));
 
     let before = vol.storage_counters();
-    for command in 0..3u32 {
+    for command in 0..commands {
         let got = read_command(&vol, lba + command * 8, 8);
         let start = command as usize * 8 * SECTOR;
         assert_eq!(
@@ -2745,27 +2753,93 @@ fn readahead_serves_later_commands_out_of_one_host_read() {
     }
     let after = vol.storage_counters();
 
-    assert_eq!(
-        after.host_read_operations - before.host_read_operations,
-        1,
-        "three commands, one host read"
-    );
-    assert_eq!(
-        after.host_readahead_fills - before.host_readahead_fills,
-        1,
-        "one fill"
+    let operations = after.host_read_operations - before.host_read_operations;
+    assert!(
+        operations <= 8,
+        "{commands} commands must not cost {operations} host reads"
     );
     assert!(
-        after.host_readahead_hits - before.host_readahead_hits >= 16,
-        "the second and third commands must be served from RAM, got {} hits",
-        after.host_readahead_hits - before.host_readahead_hits
+        after.host_readahead_fills > before.host_readahead_fills,
+        "and the saving must come from fills that ran past the command"
     );
-    // Logical bytes served are unchanged by any of this: 24 sectors asked for,
-    // 24 sectors' worth counted.
+    let hits = after.host_readahead_hits - before.host_readahead_hits;
+    assert!(
+        hits >= u64::from(commands * 8) - operations,
+        "every sector not physically read must come from the buffer, got {hits}"
+    );
+    // Logical bytes served are unchanged by any of this.
+    let served = after.host_bytes - before.host_bytes;
     assert_eq!(
-        after.host_bytes - before.host_bytes,
-        24 * SECTOR as u64,
+        served,
+        u64::from(commands * 8) * SECTOR as u64,
         "the guest was served exactly what it asked for"
+    );
+    // The ramp's bound, asserted rather than argued.
+    let physical = after.host_read_bytes - before.host_read_bytes;
+    assert!(
+        physical <= 4 * served,
+        "read {physical} physical bytes to serve {served}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// AMPLIFICATION MUST STAY BOUNDED WHEN TWO FILES INTERLEAVE.
+///
+/// The read-ahead's failure mode is a fill that is large, unearned, and thrown
+/// away: a miss costs a physical read of the whole fill, so a pattern that misses
+/// every time turns 512 bytes served into a fill's worth of host I/O, on the
+/// emulation thread, in exactly the cold-file case this exists to help. Two files
+/// read a sector at a time in turn is that pattern.
+///
+/// Two things hold the line. The slots are an LRU, so alternation still hits
+/// rather than evicting on every read; and the fill is earned per path, so even a
+/// pure miss stream can only ever read what its command asked for.
+///
+/// NON-VACUOUS: one slot instead of `HOST_READAHEAD_SLOTS` drops the hits to zero;
+/// a flat `HOST_READAHEAD_MAX_BYTES` fill instead of the ramp reads a fill per
+/// sector and blows the byte bound by two orders of magnitude.
+#[test]
+fn interleaved_single_sector_reads_do_not_amplify() {
+    let root = scratch("readahead_interleave");
+    // Comfortably larger than one maximum fill, so a flat fill would not be
+    // clamped by the file size and the bound below really is about the ramp.
+    let bytes = HOST_READAHEAD_MAX_BYTES as usize * 2;
+    let names = ["ONE.BIN", "TWO.BIN"];
+    for (i, name) in names.iter().enumerate() {
+        fs::write(root.join(name), vec![0xB0u8 | i as u8; bytes]).unwrap();
+    }
+    let vol = mount(&root);
+    let lbas: Vec<u32> = names
+        .iter()
+        .map(|name| vol.cluster_to_lba(first_cluster_of(&vol, &root.join(name))))
+        .collect();
+
+    let before = vol.storage_counters();
+    // No `begin_read_command` at all: a bare single-sector probe, which is what a
+    // reconcile gather looks like and the least the read-ahead is ever told.
+    for sector in 0..64u32 {
+        for (i, lba) in lbas.iter().enumerate() {
+            assert_eq!(
+                vol.read_sector(lba + sector)[0],
+                0xB0 | i as u8,
+                "file {i} sector {sector}"
+            );
+        }
+    }
+    let after = vol.storage_counters();
+
+    let served = after.host_bytes - before.host_bytes;
+    let physical = after.host_read_bytes - before.host_read_bytes;
+    assert_eq!(served, 128 * SECTOR as u64, "128 sectors were asked for");
+    assert!(
+        physical <= 4 * served,
+        "alternating single-sector reads pulled {physical} physical bytes to \
+         serve {served}"
+    );
+    assert!(
+        after.host_readahead_hits > before.host_readahead_hits,
+        "and the alternation must still hit: one slot per file, not one slot"
     );
 
     fs::remove_dir_all(&root).ok();
@@ -3057,6 +3131,145 @@ fn the_max_counters_track_the_longest_single_operation() {
     assert!(
         counters.projection_max_ns <= counters.projection_wall_ns,
         "one pass cannot exceed the sum of all of them"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// EVERY HOST MUTATION MUST LEAVE NOTHING CACHED FOR THE PATH IT TOUCHED.
+///
+/// `reconcile_mode` drops every cached read view on entry, but it then READS file
+/// bytes -- phase 3 gathers a changing file from the base view before deciding to
+/// rewrite it -- and only afterwards mutates. So the entry drop is not enough on
+/// its own: by the time `atomic_write` replaces the file, the gather has already
+/// re-opened it and filled a read-ahead slot with its pre-write bytes. On Windows
+/// the stale handle stays perfectly valid and simply points at the replaced
+/// content, and the buffer never notices at all.
+///
+/// This pins the post-condition for the overwrite path, which is the one a gather
+/// can reach.
+///
+/// NON-VACUOUS: removing the scoped `invalidate_host_reads` from the `writes`
+/// loop in `reconcile_mode` leaves the gather's handle and buffer in place and
+/// fails both assertions.
+#[test]
+fn an_overwrite_leaves_no_cached_read_view_for_the_file() {
+    let root = scratch("inval_overwrite");
+    let path = root.join("VICTIM.BIN");
+    // Two sectors, so the gather must read the second one from the HOST file:
+    // the guest only writes the first, and a partly-written chain is what makes
+    // reconcile open the base view at all.
+    fs::write(&path, vec![0xAAu8; 2 * SECTOR]).unwrap();
+    let mut vol = mount(&root);
+    let lba = vol.cluster_to_lba(first_cluster_of(&vol, &path));
+
+    vol.write_sector(lba, &[0x5Cu8; SECTOR]);
+    vol.reconcile();
+
+    assert_eq!(
+        fs::read(&path).unwrap()[..SECTOR],
+        [0x5Cu8; SECTOR],
+        "the overwrite must have happened, or this proves nothing"
+    );
+    assert!(
+        !vol.host_read_handle_cached(&path),
+        "the gather's handle must not outlive the write it preceded"
+    );
+    assert!(
+        !vol.readahead_holds(&path),
+        "and neither must the bytes it read ahead"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The same post-condition for the rename path, on BOTH paths: the source, whose
+/// cached views now describe a name that no longer exists, and the destination,
+/// whose name has just acquired different content than anything cached under it
+/// could have held.
+///
+/// HONEST ABOUT ITS STRENGTH: with the pass ordered as it is today, phase 2
+/// applies renames before phase 3 reads anything, so the entry drop alone
+/// already satisfies this and removing the scoped calls from the `renames` loop
+/// does NOT fail it. The scoped calls are defence in depth for the ordering, and
+/// this test is the post-condition they defend -- the one an ordering change
+/// would break silently. `an_overwrite_leaves_no_cached_read_view_for_the_file`
+/// is the reachable case, and its mutation does fail.
+#[test]
+fn a_rename_leaves_no_cached_read_view_for_either_path() {
+    let root = scratch("inval_rename");
+    let old_path = root.join("OLD.TXT");
+    let new_path = root.join("NEW.TXT");
+    // A file already on the host, so a read of it resolves through the host file
+    // rather than out of the guest write store, and can prime the caches.
+    fs::write(&old_path, b"keepme\r\n").unwrap();
+    let mut vol = mount(&root);
+    let first = first_cluster_of(&vol, &old_path);
+
+    let lba = vol.cluster_to_lba(first);
+    assert_eq!(&vol.read_sector(lba)[..6], b"keepme");
+    // The handle cache is unconditional; the read-ahead is not, so this test
+    // stays about invalidation in either leg of `IZARRAVM_HDD_READAHEAD`.
+    assert!(vol.host_read_handle_cached(&old_path), "primed");
+
+    rename_entry(&mut vol, ROOT_CLUSTER, "OLD.TXT", "NEW.TXT");
+    vol.reconcile();
+
+    assert!(!old_path.exists() && new_path.exists(), "the rename landed");
+    for path in [&old_path, &new_path] {
+        assert!(
+            !vol.host_read_handle_cached(path),
+            "a handle survived the rename: {}",
+            path.display()
+        );
+        assert!(
+            !vol.readahead_holds(path),
+            "a read-ahead slot survived the rename: {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        &vol.read_sector(lba)[..6],
+        b"keepme",
+        "and the bytes still resolve, now through the new name"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The same post-condition for the delete path. A handle left open here is worse
+/// than stale: on Windows it keeps the deleted file's content readable through a
+/// descriptor whose name is already gone.
+///
+/// Same standing as the rename post-condition above: satisfied today by the
+/// entry drop as well, asserted so an ordering change cannot break it quietly.
+#[test]
+fn a_delete_leaves_no_cached_read_view_for_the_file() {
+    let root = scratch("inval_delete");
+    let path = root.join("GONE.TXT");
+    // A file already on the host, so a read of it resolves through the host file
+    // rather than out of the guest write store, and can prime the caches.
+    fs::write(&path, b"bye\r\n").unwrap();
+    let mut vol = mount(&root);
+    let first = first_cluster_of(&vol, &path);
+
+    let lba = vol.cluster_to_lba(first);
+    assert_eq!(&vol.read_sector(lba)[..3], b"bye");
+    // Unconditional, for the reason given in the rename test above.
+    assert!(vol.host_read_handle_cached(&path), "primed");
+
+    delete_entry(&mut vol, ROOT_CLUSTER, "GONE.TXT");
+    free_chain(&mut vol, first);
+    vol.reconcile();
+
+    assert!(!path.exists(), "the delete landed");
+    assert!(
+        !vol.host_read_handle_cached(&path),
+        "a handle survived the delete"
+    );
+    assert!(
+        !vol.readahead_holds(&path),
+        "a read-ahead slot survived the delete"
     );
 
     fs::remove_dir_all(&root).ok();

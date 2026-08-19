@@ -2763,7 +2763,12 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "io_stall_ticks": mark.io_stall_ticks,
                 "halted_ticks": mark.halted_ticks,
                 "katea_host_wall_ns": mark.katea.as_ref().map(|k| k.host_wall_ns),
-                "katea_host_read_max_ns": mark.katea.as_ref().map(|k| k.host_read_max_ns),
+                // `_max_level_ns`, not `_max_ns`: this series is cumulative and
+                // consumers difference it column by column, and the difference of
+                // two running maxima is not the maximum over the interval. The
+                // suffix says "read me as a level" so a uniform differencer
+                // cannot quietly produce a meaningless number.
+                "katea_host_read_max_level_ns": mark.katea.as_ref().map(|k| k.host_read_max_ns),
                 "katea_host_readahead_hits": mark.katea.as_ref().map(|k| k.host_readahead_hits),
                 "katea_host_readahead_fills": mark.katea.as_ref().map(|k| k.host_readahead_fills),
                 "katea_sector_reads": mark.katea.as_ref().map(|k| k.sector_reads),
@@ -2805,7 +2810,7 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "katea_projection_operations": mark.katea.as_ref().map(|k| k.projection_operations),
                 "katea_projection_bytes": mark.katea.as_ref().map(|k| k.projection_bytes),
                 "katea_projection_wall_ns": mark.katea.as_ref().map(|k| k.projection_wall_ns),
-                "katea_projection_max_ns": mark.katea.as_ref().map(|k| k.projection_max_ns),
+                "katea_projection_max_level_ns": mark.katea.as_ref().map(|k| k.projection_max_ns),
                 "katea_metadata_projection_passes": mark.katea.as_ref().map(|k| k.metadata_projection_passes),
                 "katea_host_write_failures": mark.katea.as_ref().map(|k| k.host_write_failures),
                 // The fixed-disk census. All zero unless IZARRAVM_INT13_PROFILE=1.

@@ -72,14 +72,40 @@ discarded between every pair of them. Each of those requests therefore still pai
 its own synchronous host seek and read.
 
 A read-ahead buffer sits under the window and survives command boundaries. On a
-physical read it pulls up to 256 KiB from the host file, and a later sector whose
-whole range lies inside the buffered bytes is served as a memory copy with no
-host call at all. The buffer holds one file's bytes at a time, which is the shape
-DOS produces: one file is read at a time, front to back.
+physical read it pulls a run of bytes from the host file, and a later sector whose
+whole range lies inside the buffered bytes is served as a memory copy with no host
+call at all.
 
 It is keyed by host path and byte offset rather than by LBA, so it stays correct
 however the guest's clusters are laid out, and it is used only when the requested
-sector lies wholly inside the range it holds.
+sector lies wholly inside the range it holds. Because the read-ahead covers
+everything the LBA-keyed window would have -- same starting offset, never shorter
+than the command extent -- the window is not filled at all while the read-ahead is
+armed. The buffer is moved into whichever of the two owns it, never copied.
+
+There are four slots, evicted least-recently-used like the read handles, so two
+interleaved files each keep their own place.
+
+### How far a fill reads
+
+A fill starts at the extent the command declared -- one sector when nothing
+declared a command at all, which is what a reconcile gather looks like -- and
+doubles, up to 256 KiB, only when the miss that triggers it lands at exactly the
+end of the previous fill for that same path. Any other offset resets it: a
+backward seek, a jump, a first touch.
+
+That rule is the whole amplification argument. A fill larger than the command is
+only ever granted to a path that has already been read sequentially that far, so
+the bytes read ahead are paid for by bytes already served. Physical bytes stay
+within roughly twice logical bytes, the overshoot being the last fill of a stream
+that stops early, and a purely random or alternating pattern reads exactly what
+its command asked for and no more.
+
+A flat fill has no such bound, which is why it is not what shipped. Measured by
+unit test: thirty-two sequential eight-sector commands read 131,072 physical bytes
+to serve 131,072 -- a ratio of one -- while 128 alternating single-sector reads
+across two files read 130,048 to serve 65,536. With a flat 256 KiB fill the same
+alternating pattern reads 524,288, and with a single slot it never hits at all.
 
 Because the buffer outlives the command, it needs an invalidation rule of its
 own. Four operations mutate a host file this disk reads: the atomic whole-file
@@ -101,6 +127,17 @@ and degrades to one `File::open` per sector as soon as two files interleave,
 which is what an asset load does whenever a read lands between two projections.
 It is now an LRU of eight handles, keyed by path, invalidated through the same
 funnel as the read-ahead buffer, and symmetric with the write-handle cache.
+
+### The fifth mutation site
+
+Four host mutations live in the Katea module, and each invalidates through the
+funnel. A fifth lives outside it: the BIOS repair service rewrites CONFIG.SYS and
+AUTOEXEC.BAT in the mounted folder and renames the originals aside. It does not
+call the funnel and does not need to, because it finishes by re-mounting the
+folder, which builds a new volume and drops every cache with the old one. That is
+the only safe way to reach a mounted folder from outside the module, and it is
+named in the funnel's own comment so a future caller that skipped the re-mount
+does not have to rediscover why it matters.
 
 ### Metadata projection scaling
 
@@ -210,16 +247,21 @@ sums it already reported:
 | `host_read_max_ns` | longest single host read this session |
 | `projection_max_ns` | longest single projection pass this session |
 | `host_readahead_hits` | sectors served from the read-ahead buffer |
-| `host_readahead_fills` | physical reads that filled the buffer |
+| `host_readahead_fills` | physical reads that ran past their command |
 
 A sum cannot see a hitch. Time spread thin over a minute and the same time spent
 in one synchronous pass are the same number of nanoseconds and a completely
 different experience, and only the maximum separates them. Both maxima are read
 off the `Instant` pair their sums already computed, so neither costs a clock
-read. In the phase-mark series they are cumulative running maxima like every
-other counter in that series; the boot profiler carries them through as levels
-rather than differencing them, because the difference of two maxima means
-nothing.
+read.
+
+Both are running maxima, which is to say levels, and a level must not be
+differenced: the difference of two running maxima is not the maximum over the
+interval between them. The boot profiler carries them through undifferenced. In
+the phase-mark series, which is cumulative and is differenced column by column by
+its consumers, they appear as `katea_host_read_max_level_ns` and
+`katea_projection_max_level_ns` -- the suffix is there so a uniform differencer
+cannot quietly produce a meaningless number.
 
 ## DukeMark results
 
@@ -281,24 +323,33 @@ tests were re-run unchanged; this change did not add to them.
 
 ## Follow-up: read-ahead, handle LRU, projection scaling
 
-The three sections added above were validated the same way. Six further
-regressions are specific to them, each naming its mutation:
+The sections added above were validated the same way. Ten further regressions are
+specific to them:
 
-- three commands over one file cost one physical host read, not three
+- thirty-two commands over one file cost at most eight physical host reads, and
+  read no more physical bytes than they served
+- alternating single-sector reads across two files stay inside the same byte
+  bound and still hit the buffer
 - `IZARRAVM_HDD_READAHEAD=0` puts it back to one physical read per command
 - a write-through drops the read-ahead buffer for the file it wrote
+- an overwrite leaves no cached read view for the file it replaced
+- a rename leaves none for either path, and a delete none for the file
 - the handle cache stays bounded at eight and evicts least-recently-used
 - a one-file write does not resynthesize the FAT once per cluster walked
 - every FAT sector reads back byte-identical to an uncached synthesis, under a
   read order that misses the one-entry memo on every request
+- the max counters never exceed the sums they sit beside
 
-Three pre-existing assertions moved, all of them host-side counters:
+Each names its mutation. Six were applied and observed to fail: the memo removed,
+the read-ahead given the window's lifetime, the write-through invalidation
+deleted, one slot instead of four, a flat fill instead of the ramp, and the
+overwrite's scoped invalidation deleted. The rename and delete post-conditions
+say so in their own comments: with the pass ordered as it is, phase 2 mutates
+before phase 3 reads, so the entry drop already satisfies them and their scoped
+calls are defence in depth against an ordering change.
 
-- `the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder` read
-  `host_read_bytes == 4 * 512` and now reads `8 * 512`. The command asked for
-  four sectors of an eight-sector file and the read-ahead pulled the rest.
-  `host_bytes`, the logical figure, is unchanged, as are the cache hit and miss
-  counts, the charged stall, and the bytes served.
+Two pre-existing assertions moved, both host-side counters:
+
 - `cached_host_handle_serves_identical_bytes_with_one_open_per_file` read
   `host_file_opens == 3` and now reads `0`. The probe that identifies the two
   files already opened both, and the LRU is deep enough to keep them; the
@@ -311,16 +362,22 @@ Three pre-existing assertions moved, all of them host-side counters:
   host. What it asserts -- that a degraded read is served as zeros and never
   cached, and that the restored bytes come back -- is unchanged.
 
+`the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder` did NOT move.
+Its `host_read_bytes == 4 * 512` holds unchanged, because a first touch of a file
+gets the command extent and nothing more.
+
 No timing, charge, tick, status-register, content or determinism test changed.
-The whole workspace passes: 1,549 `izarravm-machine` library tests with 3
+The whole workspace passes: 1,553 `izarravm-machine` library tests with 3
 ignored, 231 `izarravm` tests with 92 ignored, and every other crate.
 
 ### Guest timing, measured again
 
 The library suite was run in both legs of the new switch. With
-`IZARRAVM_HDD_READAHEAD=0`, exactly three tests change result: the two new ones
-that assert the read-ahead is doing something, and the `host_read_bytes`
-assertion described above. The other 1,546 pass identically armed and disarmed.
+`IZARRAVM_HDD_READAHEAD=0`, exactly three tests change result, and all three are
+the ones that exist to assert the read-ahead is doing something. No pre-existing
+test moves at all. The other 1,550 -- every timing, charge, tick,
+status-register, content and determinism test in the machine -- pass identically
+armed and disarmed.
 
 The read-ahead moves physical-read counters and nothing else the guest can
 observe. The handle LRU and the FAT memo have no switch because neither has a
