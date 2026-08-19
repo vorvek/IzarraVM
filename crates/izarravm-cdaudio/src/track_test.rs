@@ -363,8 +363,9 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
         "the only decoded track was taken while two others were still decoding"
     );
 
-    // The next worker out is. `b` was touched before `c`, so it is the one that
-    // goes.
+    // The next worker out is. `c` is not a candidate at this point and never
+    // becomes one here; the live comparison is `b` against `a`, and `b` was
+    // touched first, so `b` is the one that goes.
     b.shared.finished.store(true, Ordering::SeqCst);
     registry.evict_excess();
 
@@ -376,6 +377,79 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
         b.resident_bytes(),
         0,
         "the backlog was cleared from the wrong end"
+    );
+}
+
+#[test]
+fn a_real_workers_tail_call_is_what_clears_the_backlog() {
+    // The test above hand-drives the flag and calls `evict_excess` itself, which
+    // pins the ORDER a backlog is cleared in but proves nothing about who calls
+    // it. Deleting the body of the worker's tail call leaves that test green.
+    // This one leaves the call in the worker's hands: nothing else here can
+    // reach `evict_excess` after the flag lands.
+    //
+    // Three residents: one finished and idle, one that never finishes, and one
+    // that takes a real worker.
+    let registry = Registry::new();
+    let played = registry.track(fixture("tone.wav")).unwrap();
+    let stuck = registry.track(fixture("tone.ogg")).unwrap();
+    let arriving = registry.track(fixture("tone.flac")).unwrap();
+    for track in [&played, &stuck, &arriving] {
+        track.frame(0);
+        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
+    }
+    {
+        let mut resident = registry.inner.lock().unwrap();
+        resident.clear();
+        for track in [&played, &stuck, &arriving] {
+            let mut filled = track.shared.filled.lock().unwrap();
+            filled.pcm = vec![0u8; AUDIO_FRAME_BYTES];
+            track.shared.finished.store(true, Ordering::SeqCst);
+            resident.push(Arc::clone(&track.shared));
+        }
+        // `stuck` stands in for a worker that has not reached its end -- the
+        // reason a backlog exists at all.
+        stuck.shared.finished.store(false, Ordering::SeqCst);
+        // `arriving` is asked for afresh: no readable sector and nothing
+        // started, so its `frame` misses and a real worker is spawned.
+        let mut filled = arriving.shared.filled.lock().unwrap();
+        filled.ready = 0;
+        arriving.shared.finished.store(false, Ordering::SeqCst);
+        arriving.shared.started.store(false, Ordering::SeqCst);
+    }
+    let resident = |registry: &Registry| registry.inner.lock().unwrap().len();
+
+    // The decline, checked with no worker alive so the count cannot be a race:
+    // one evictable track and the registry leaves it alone.
+    registry.evict_excess();
+    assert_eq!(
+        resident(&registry),
+        3,
+        "the last evictable track was taken at admission"
+    );
+    assert!(played.resident_bytes() > 0);
+
+    // Now the real worker. Admission declines again for the same reason -- it
+    // still sees only `played` -- so the count can only come down once
+    // `arriving` stores its flag, and the tail call is what asks afterwards.
+    arriving.frame(0);
+
+    assert!(
+        wait_for(|| resident(&registry) <= MAX_RESIDENT),
+        "no worker asked again on its way out, so the backlog is permanent"
+    );
+    assert_eq!(
+        played.resident_bytes(),
+        0,
+        "the backlog was cleared from the wrong end"
+    );
+    assert!(
+        stuck.resident_bytes() > 0,
+        "a track still being written into was evicted"
+    );
+    assert!(
+        arriving.resident_bytes() > 0,
+        "the worker evicted the track it had just filled"
     );
 }
 
@@ -519,8 +593,18 @@ fn formatting_a_track_does_not_print_its_audio() {
 // |---|---|
 // | `evict_excess`: the last-candidate guard weakened from `evictable < 2` to `evictable < 1`, which is the pre-fix behaviour exactly | `the_track_under_the_play_head_survives_an_older_one_that_has_not_flagged_itself` AND `a_backlog_is_cleared_by_the_next_worker_to_finish` |
 // | `frame`: the `last_touch` store deleted, so recency counts decode starts and not reads | `a_track_being_replayed_is_not_the_one_evicted` |
+// | `decode_worker`: the tail call to `evict_excess` replaced with `let _ = registry;`, so a backlog is never asked about again | `a_real_workers_tail_call_is_what_clears_the_backlog` |
 //
 // The second row is why the first fixture is not the whole net: with the precondition of
 // `a_track_being_replayed_is_not_the_one_evicted` finally established (it now waits on `finished`,
 // not on the last frame being readable) that test no longer races into the eviction bug, so the
 // deterministic fixture above carries it and the replay test keeps the recency rule honest.
+//
+// The third row was a hole this change opened and then closed, which is worth the ledger space.
+// `a_backlog_is_cleared_by_the_next_worker_to_finish` caught that mutation before this change,
+// when it drove the backlog with a real worker. Restructuring it for the guard meant hand-driving
+// the flag and calling `evict_excess` from the test, and a fixture that makes the call itself
+// cannot notice that the worker stopped making it: the mutation ran green, 47 of 47, until
+// `a_real_workers_tail_call_is_what_clears_the_backlog` was written to leave that one call in the
+// worker's hands. Both were run against the mutation in that order, and the second one fails on
+// the full ten-second wait rather than on an assertion, because the backlog simply never clears.
