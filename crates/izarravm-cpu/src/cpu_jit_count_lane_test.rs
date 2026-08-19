@@ -12,12 +12,22 @@
 //! compiled block. See `count_lane_for` for the admission argument and `emit_rotate_reg_lane` /
 //! `emit_shift_lane` for the runtime three-way branch that is this slice's whole correctness cost.
 //!
-//! **The arm is default OFF.** Every positive fixture here forces it on through
-//! `force_count_lanes`, whose `ArmOverride` guard restores the ambient reading on the way out even
-//! if the fixture panics; a fixture that forgot to force would test the refusal and call it a
-//! lowering, and one that forgot to restore would hand the next test on the same thread an arm it
-//! never asked for. `count_lane_is_refused_on_the_default_arm` is the fixture that proves the
-//! forcing is doing something.
+//! **The arm is DEFAULT ON since the 2026-08-20 ladder** (-5.73% short, -4.94% long; see
+//! `count_lanes_enabled`). Every fixture here states its arm through `force_count_lanes` /
+//! `force_both_lane_arms` anyway, whose `ArmOverride` guard restores the ambient reading on the way
+//! out even if the fixture panics. Stating it is not ceremony and the direction that matters
+//! flipped with the default: it is now the REFUSAL fixtures that must force `Some(false)`, because
+//! one that read the ambient arm would compile a lane and pass for the wrong reason.
+//! `count_lane_is_refused_on_the_off_arm` is that fixture, and
+//! `the_shipped_count_lanes_default_is_the_on_arm` is the one test here that deliberately reads the
+//! ambient arm.
+//!
+//! **THE BAKED EMITTERS KEEP THEIR OWN SWEEP, and the flip is why.** Before 2026-08-20 every
+//! unforced group-2 fixture in the tree exercised `emit_rotate_reg` and `emit_shift`; on today's
+//! default those same fixtures take a lane, so the baked path would have quietly lost its coverage
+//! at the moment the default moved. `the_baked_arm_matches_the_interpreter_for_every_form_and_count`
+//! is that coverage, forced off and held here rather than left to the ambient arm of some other
+//! file.
 //!
 //! **THE FRAME CARRIES A LIVE LAZY-FLAGS DESCRIPTOR into the laned instruction**, and that is not
 //! decoration. The three count shapes differ mostly in what they do to the DESCRIPTOR: count 0 must
@@ -577,6 +587,60 @@ fn count_lane_matches_the_interpreter_for_every_form_and_count() {
     }
 }
 
+/// THE BAKED EMITTERS, swept exactly as the lane emitters are, with the arm forced OFF.
+///
+/// **This test exists because of the 2026-08-20 default flip and would have been redundant before
+/// it.** While the arm was default-off, every unforced group-2 fixture in the tree -- the
+/// rotate-rows admission fixtures, the lowering sweeps, the timing cases -- ran `emit_rotate_reg`
+/// and `emit_shift`. On today's default those same fixtures attach a lane and run
+/// `emit_rotate_reg_lane` / `emit_shift_lane` instead. Nothing failed when the default moved,
+/// because the two paths agree; what changed silently is WHICH path the tree covers. A future edit
+/// to the baked compile-time three-way split would then be caught by nothing.
+///
+/// So the baked path gets its own sweep, over the same forms, the same counts and both frames, and
+/// the count is BAKED into the image rather than patched in -- on this arm a patch retires the
+/// block instead of being absorbed, which is the whole point of the arm.
+#[test]
+fn the_baked_arm_matches_the_interpreter_for_every_form_and_count() {
+    let _arm = force_count_lanes(false);
+    for frame in FRAMES {
+        for shape in SHAPES {
+            for (round, &count) in COUNTS.iter().enumerate() {
+                let mut native = flat_cpu();
+                let mut native_bus = test_bus(frame.image(shape, count));
+                decode_at(&mut native, &mut native_bus, &frame.starts());
+                let id = install(&mut native, ENTRY, frame.instructions());
+                assert_eq!(
+                    native.perf_counters().smc_lane_registrations,
+                    0,
+                    "{} on the {}: the off arm must bake the count, or this sweep is a second copy                      of the lane sweep",
+                    shape.label(),
+                    frame.label()
+                );
+
+                let mut interpreter = flat_cpu();
+                let mut interpreter_bus = test_bus(frame.image(shape, count));
+                decode_at(&mut interpreter, &mut interpreter_bus, &frame.starts());
+
+                assert_agrees(
+                    &mut native,
+                    &mut native_bus,
+                    &mut interpreter,
+                    &mut interpreter_bus,
+                    id,
+                    0x1234_5678u32.wrapping_mul(round as u32 + 1) | 1,
+                    frame,
+                    &format!(
+                        "BAKED {} count {count:#04x} on the {}",
+                        shape.label(),
+                        frame.label()
+                    ),
+                );
+            }
+        }
+    }
+}
+
 /// THE COUNT-0 CONTRACT, ON THE CONSUMER-FREE FRAME: a masked count of zero moves no flag, creates
 /// no descriptor and destroys none, and the block ends carrying exactly the descriptor the seed ALU
 /// left.
@@ -894,16 +958,18 @@ fn device_write_at_the_count_lane_retires_the_block() {
     let _ = &mut bus;
 }
 
-/// THE OFF ARM. Without the thread-local forcing, the very same block registers no lane, the baked
-/// count still applies, and the very same patch retires the block -- which is what makes every
-/// fixture above a statement about the slice rather than about the backend it was already.
+/// THE OFF ARM, which since the 2026-08-20 default flip must be FORCED rather than inherited. On
+/// this arm the very same block registers no lane, the baked count still applies, and the very same
+/// patch retires the block -- which is what makes every fixture above a statement about the slice
+/// rather than about the backend it was already, and what keeps the escape a true pre-slice world
+/// for the next A/B to be read against.
 ///
 /// The two rejection counters are pinned at zero on this arm for
 /// `the_off_arm_moves_no_rejection_counter_on_a_byte_write`'s reason (cpu_jit_imm8_lane_test): with
 /// both one-byte arms off, `note_code_byte_write_hit` must keep the value-less door it always had,
 /// counters included. FastMap is off here because that is the path the door selects on.
 #[test]
-fn count_lane_is_refused_on_the_default_arm() {
+fn count_lane_is_refused_on_the_off_arm() {
     let _arm = force_both_lane_arms(false, false);
     let mut cpu = flat_cpu();
     cpu.set_fast_map_enabled_for_test(false);
@@ -1117,27 +1183,72 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
     }
 }
 
-/// The `IZARRAVM_COUNT_LANES` spelling table. `count_lanes_enabled` caches its env reading in a
-/// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
-/// never in an order the harness controls -- hence the parse function is exercised directly.
+/// The `IZARRAVM_COUNT_LANES` spelling table, and THE DEFAULT PIN, TWO-SIDED.
 ///
-/// The `unset -> false` assertion is the OTHER half of the default pin: flipping the default to on
-/// fails here, and hard-wiring the arm off fails the emitted-code fixture above.
+/// `count_lanes_enabled` caches its env reading in a process-wide `OnceLock`, so the contract is
+/// otherwise assertable exactly once per process and never in an order the harness controls --
+/// hence the parse function is exercised directly.
+///
+/// **Both directions are pinned here and each fails a different mutation**, which is what makes
+/// this a pin rather than a restatement of the code:
+///
+/// * `unset -> ON` is the 2026-08-20 flip. Restoring `unset -> false` (the pre-flip mapping) fails
+///   the first assertion. Without it, a default that silently reverted would leave the whole class
+///   dormant in the shipped binary while every forced fixture in this file kept passing.
+/// * `0` / `off` / empty `-> OFF` is the escape. Making the off spellings select ON -- the obvious
+///   "simplify the table now that on is the default" edit -- fails the second loop. That escape is
+///   the base every future A/B on this class is read against, so it has to keep reproducing the
+///   pre-slice world or the base stops being one.
+///
+/// `1` / `on` stays pinned to ON rather than merely accepted, because that is the spelling every
+/// leg in `.bench/results/duke-l2-count-lane-20260820/` used.
 #[test]
 fn count_lanes_spelling_table() {
     use std::env::VarError;
     let parse = jit::direct::parse_count_lanes_arm_for_test;
-    assert!(!parse(Err(VarError::NotPresent)), "unset is the base");
+    assert!(
+        parse(Err(VarError::NotPresent)),
+        "unset must select ON -- the shipped default since the 2026-08-20 ladder"
+    );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
-        assert!(!parse(Ok(off.to_string())), "{off:?} must be the base");
+        assert!(
+            !parse(Ok(off.to_string())),
+            "{off:?} must select the pre-slice world; it is the escape and the A/B base"
+        );
     }
     for on in ["1", "on", "ON", " On "] {
-        assert!(parse(Ok(on.to_string())), "{on:?} must be the slice");
+        assert!(
+            parse(Ok(on.to_string())),
+            "{on:?} must select the lane class"
+        );
     }
 }
 
-/// A typo must not silently run the base. See `parse_count_lanes_arm` for why guessing is worse
-/// than failing: a leg that quietly ran the base would be read as the slice doing nothing.
+/// THE SHIPPED DEFAULT, asserted through the live reader rather than the parse table.
+///
+/// Everything else in this file runs on the thread-local override, so without this nothing would
+/// notice `count_lanes_enabled` growing a different default from the one `parse_count_lanes_arm`
+/// spells -- a `#[cfg]`, a stray `OnceLock` seed, an override that failed to clear. It also makes
+/// the NEXT flip a deliberate edit rather than a side effect, which is exactly the job this test
+/// did for `IZARRAVM_ROTATE_ROWS`.
+///
+/// Reads the AMBIENT arm, with the override explicitly cleared first. That is the one place in
+/// this file that depends on the process environment: a developer running the suite with
+/// `IZARRAVM_COUNT_LANES=0` exported is asking for the escape and will see this fail, which is the
+/// correct and legible outcome for a deliberate default pin.
+#[test]
+fn the_shipped_count_lanes_default_is_the_on_arm() {
+    jit::direct::set_count_lanes_for_test(None);
+    assert!(
+        jit::direct::count_lanes_enabled(),
+        "the shipped default must be ON since the 2026-08-20 ladder (-5.73% short, -4.94% long); \
+         see count_lanes_enabled for the evidence"
+    );
+}
+
+/// A typo must not silently run the default. See `parse_count_lanes_arm` for why guessing is worse
+/// than failing -- and why the argument is STRONGER since the flip: a leg that quietly fell through
+/// would run exactly what an unset environment runs, and be read as the arm it named doing nothing.
 #[test]
 #[should_panic(expected = "names no arm")]
 fn an_unrecognised_count_lanes_spelling_panics() {

@@ -5032,11 +5032,37 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// (`IZARRAVM_COUNT_LANES`). See `count_lane_for` for what qualifies, and `emit_rotate_reg_lane` /
 /// `emit_shift_lane` for the runtime three-way branch that is the whole cost of the class.
 ///
-/// **DEFAULT OFF**, on `imm8_lanes_enabled`'s contract exactly: off is the base, both arms ship in
-/// one executable because this box has measured 6% wall variance between builds of identical
-/// source, and off is byte-for-byte the pre-slice world -- no lane is registered, every `0xC1`
-/// and `0xC0` slot bakes its count exactly as it did, and the emitted code is the compile-time
-/// three-way split it has always been.
+/// **DEFAULT ON SINCE THE 2026-08-20 LADDER.** An unset knob registers count lanes; `0` or `off`
+/// is the escape back to the pre-slice world, which still ships whole -- its baked emitters, its
+/// fixtures and its mutation record -- because it is the base every A/B on this class is read
+/// against. On the escape no lane is registered, every `0xC1` and `0xC0` slot bakes its count
+/// exactly as it did, and the emitted code is the compile-time three-way split it has always been.
+/// Both arms ship in one executable because this box has measured 6% wall variance between builds
+/// of identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a cross-build comparison
+/// would not be evidence.
+///
+/// **WHY IT IS ON (2026-08-20).** `.bench/results/duke-l2-count-lane-20260820/`, one binary at
+/// `a0912841`, both arms selected through this knob, pinned CPU 8, quiet host, DUKEMARK stop
+/// `test_exit:81` on every leg, per-arm counters deterministic across legs:
+///
+/// * duke3d-586-**short**: base min 142.64 s, count arm min 134.47 s over three interleaved legs
+///   each. **-5.73%**, and the C1 invariants held on every leg.
+/// * duke3d-586 **long merge-gate row**: base min 314.62 s, count arm min 299.07 s. **-4.94%
+///   min-wall**, rt 0.44 -> 0.46, native coverage 0.78 -> 0.83.
+///
+/// THE MECHANISM IS THE ONE THE SLICE WAS BUILT FOR, and the counters say so directly:
+/// `smc_lane_accepts` 91.8 M -> 113.4 M on the long row, i.e. the count-byte patches that used to
+/// kill blocks are now absorbed, and `smc_heat_demotions` fell 52%. The census legs close exactly:
+/// `dormant_probe` declines -16.7%, `dormant_heat` -18.4% (66 -> 47 sites), dormant SUM -5.8% with
+/// no full re-attribution this time, and `rejected` flat.
+///
+/// **TWO COUNTERS MOVE AGAINST THE GRAIN and a future reader should not be surprised by them:
+/// static-unbound rose +9.6% and narrow kills +4.4% on the count arm.** Both are the expected
+/// shape of the win rather than a contradiction of it: absorbing the count patches keeps blocks
+/// alive, so spans that used to end at a patched byte now extend past it and reach NEW seams, and
+/// the newly admitted spans bring their own decode lines for the interpreter to kill. The wall
+/// wins anyway, on both rows, which is the currency this ladder is read in. If a later slice moves
+/// these two counters the other way, that is not automatically progress -- check the wall.
 ///
 /// **A SEPARATE KNOB FROM `IZARRAVM_IMM8_LANES`, deliberately, and NOT because the two classes are
 /// unrelated.** They are both one-byte lanes and they share the width class, the budget and the
@@ -5048,12 +5074,20 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// **THE SPELLING TABLE.** Trimmed and case-folded on the way in, because a knob set from a shell
 /// script picks up whitespace and one set from a PowerShell ladder picks up capitalisation.
 ///
-/// * unset, `` (empty), `0` or `off` -> OFF. The shipped base.
-/// * `1` or `on` -> ON. The slice.
-/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg
-///   (`IZARRAVM_COUNT_LANES=yes`, `=count`, `=true`) that fell through to OFF would run the BASE
-///   and be read as "the count lane class did nothing", which is the one wrong conclusion this
-///   slice exists to avoid.
+/// * **unset**, `1` or `on` -> ON. **The shipped default since 2026-08-20.** `1` is pinned to this
+///   arm rather than merely accepted by it, because `1` is the spelling every ladder leg in
+///   `.bench/results/duke-l2-count-lane-20260820/` used, and keeping it stable is what makes those
+///   legs comparable with a leg run on a later binary.
+/// * `` (empty), `0` or `off` -> OFF. The pre-slice world, and **the escape and the base** every
+///   A/B on this class is read against. Empty stays here with `0` and `off` rather than following
+///   "unset" to ON, for `parse_rotate_rows_arm`'s reason: a wrapper script that computes the value
+///   and produces "" meant something falsy, and `IZARRAVM_COUNT_LANES=` is the shell's shortest
+///   way to say off.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason, and the reason is STRONGER
+///   now that the fallthrough arm would be the default: a mistyped leg (`IZARRAVM_COUNT_LANES=yes`,
+///   `=count`, `=true`) that fell through would run exactly what an unset environment runs and be
+///   read as "the arm I asked for changed nothing", which is the one wrong conclusion an arm ladder
+///   exists to avoid.
 pub(crate) fn count_lanes_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = COUNT_LANES_OVERRIDE.with(std::cell::Cell::get) {
@@ -5067,14 +5101,17 @@ pub(crate) fn count_lanes_enabled() -> bool {
 /// unit-tested without a process-global env write. See `count_lanes_enabled` for the contract.
 fn parse_count_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the shipped default and the overwhelmingly common case. Since the 2026-08-20
+        // ladder that default is ON (-5.73% short, -4.94% long; see `count_lanes_enabled`).
+        // `0` / `off` is the escape back to the pre-slice world.
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
         // than the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_COUNT_LANES is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset, `0` or `off` (the shipped base), and `1` or `on` (the \
-                 group-2 count-byte lane class)"
+                 spellings are unset or `1` / `on` (the shipped default, the group-2 count-byte \
+                 lane class), and `0` or `off` (the pre-slice world, the escape)"
             )
         }
         Ok(raw) => raw,
@@ -5083,18 +5120,24 @@ fn parse_count_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
         "" | "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_COUNT_LANES={other:?} names no arm; accepted spellings are unset, `0` or \
-             `off` (the shipped base) and `1` or `on` (the group-2 count-byte lane class). \
-             Refusing to guess: a mistyped ladder leg that silently ran the base would be read as \
-             the slice failing"
+            "IZARRAVM_COUNT_LANES={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default since 2026-08-20, the group-2 count-byte lane class), and \
+             `0` or `off` (the pre-slice world, the escape). Refusing to guess: a mistyped ladder \
+             leg would silently run the DEFAULT and be read as the arm it named doing nothing"
         ),
     }
 }
 
 // Per-THREAD, for `IMM8_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
 // and the fixtures have to run both arms in one process, so one test's arm selection must not
-// reach another's compile. Since the arm is default-OFF, every positive fixture for this class
-// MUST force it on through here or it would test the refusal and call it a lowering.
+// reach another's compile.
+//
+// Not a convenience, in EITHER direction, and the direction that matters flipped on 2026-08-20.
+// While the arm was default-OFF, every positive fixture for this class had to force it on through
+// here or it would test the refusal and call it a lowering. Now that the default is ON, it is the
+// REFUSAL fixtures that must force `Some(false)` explicitly -- a fixture that means to pin the
+// baked-count world and reads the ambient arm would silently compile a lane and pass for the wrong
+// reason. Both kinds state their arm; neither leans on the default.
 #[cfg(test)]
 thread_local! {
     static COUNT_LANES_OVERRIDE: std::cell::Cell<Option<bool>> =
@@ -5181,17 +5224,23 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 /// and are still blocked on THE DESIGN COST below, which is untouched by that slice — the plumbing
 /// is no longer the obstacle, the flag-capture split is.
 ///
-/// **STATUS 2026-08-20: THE TRIGGER HAS FIRED for `0xC1`/`0xC0`, so THIS A/B IS DUE A RE-RUN.**
-/// `count_lane_for` admits the group-2 COUNT byte as a second `IMM8_LANE_WIDTH` class behind
-/// `IZARRAVM_COUNT_LANES` (default off), and THE DESIGN COST below is paid rather than avoided:
-/// `emit_rotate_reg_lane` and `emit_shift_lane` carry the compile-time three-way split as a runtime
-/// three-way branch over the masked loaded byte. Concretely, **with `IZARRAVM_COUNT_LANES=1` the
-/// 2026-08-19/20 numbers above measure something else**: the -6.3% long-row delta was read against
-/// a world where every count-byte patch killed a block (`smc_lane_accepts` 109.0 M -> 91.8 M was
-/// the cost side of that trade), and on the count-lane arm those same patches are `lane_accepts`
-/// that retire nothing. So an `on`-vs-`off` rotate-rows leg run with the count arm live is not
-/// comparable with the legs recorded here, and the four-leg 2x2 caution below applies to this pair
-/// too: `0x0FA4` SHLD remains the one unlaned third of the trigger.
+/// **STATUS 2026-08-20: THE TRIGGER HAS FIRED for `0xC1`/`0xC0`, AND ITS SLICE IS NOW THE SHIPPED
+/// DEFAULT, so EVERY NUMBER ABOVE IS HISTORICAL ON DEFAULTS.** `count_lane_for` admits the group-2
+/// COUNT byte as a second `IMM8_LANE_WIDTH` class behind `IZARRAVM_COUNT_LANES`, and THE DESIGN
+/// COST below is paid rather than avoided: `emit_rotate_reg_lane` and `emit_shift_lane` carry the
+/// compile-time three-way split as a runtime three-way branch over the masked loaded byte. That
+/// knob flipped to default ON on the 2026-08-20 ladder (-5.73% short, -4.94% long;
+/// `.bench/results/duke-l2-count-lane-20260820/`).
+///
+/// What that means for the legs recorded above, stated plainly because it is easy to miss: the
+/// -5.6% / -6.3% deltas were measured in a world where every count-byte patch KILLED a block, and
+/// `smc_lane_accepts` 109.0 M -> 91.8 M was the cost side of that trade. On today's defaults those
+/// same patches are absorbed (91.8 M -> 113.4 M) and retire nothing, so **the cost this A/B was
+/// trading against no longer exists at the size it had.** An `on`-vs-`off` rotate-rows leg run on
+/// current defaults is NOT comparable with the legs above; it is a different measurement of a
+/// differently-priced admission, and it should be re-run rather than compared. The four-leg 2x2
+/// caution below applies to this pair too. `0x0FA4` SHLD remains the one unlaned third of the
+/// trigger.
 ///
 /// **THE 2x2 HAS A CROSS TERM, and a combined ladder leg must be read knowing it.** With
 /// `IZARRAVM_IMM8_LANES=1`, a `0x80` patch that a lane absorbs no longer stamps SMC heat on its
@@ -5901,9 +5950,10 @@ fn imm8_lane_for(
 ///
 /// # The admission bars, and each one's job
 ///
-/// - `count_lanes_enabled()`: the A/B arm. Default OFF, so the shipped binary is the pre-slice
-///   world and the ladder can measure both arms out of one executable. Independent of
-///   `IZARRAVM_IMM8_LANES` on purpose — see `count_lanes_enabled`.
+/// - `count_lanes_enabled()`: the A/B arm. **Default ON since the 2026-08-20 ladder** (-5.73%
+///   short, -4.94% long), with `0` / `off` the escape to the pre-slice world; both arms ship in one
+///   executable so a later ladder can still measure them. Independent of `IZARRAVM_IMM8_LANES` on
+///   purpose — see `count_lanes_enabled`.
 /// - `DirectKind::RotateReg { lane: None, .. }` / `DirectKind::Shift { lane: None, width: Byte |
 ///   Dword, .. }`: the only two kinds whose emitters have a lane arm, at the only two widths whose
 ///   emitters have one. `ShiftCl` (`0xD3`) is excluded by kind: its count is already runtime data
