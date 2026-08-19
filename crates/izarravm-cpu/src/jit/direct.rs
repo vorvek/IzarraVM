@@ -4875,14 +4875,14 @@ pub(crate) fn disp_lanes_enabled() -> bool {
 /// variance between builds of identical source, which is larger than the effect, so a cross-build
 /// comparison would not be evidence (`dev_docs/duke-reprofile-2026-08-19.md` §6.2):
 ///
-/// * `IZARRAVM_ROTATE_ROWS` unset, or `0` -> `Off`: the shipped refusal. THE BASE, and it is
+/// * `IZARRAVM_ROTATE_ROWS` unset, `0` or `off` -> `Off`: the shipped refusal. THE BASE, and it is
 ///   byte-for-byte the pre-slice world.
 /// * `heat` or `heat_gated` -> `HeatGated`: admit ONLY where the count byte carries no SMC heat
 ///   record. THE SLICE.
-/// * `1` -> `On`: the 2026-08-09 unconditional admission. THE NEGATIVE CONTROL, and it is expected
-///   to reproduce that day's -3.44%. `1` is pinned to this arm rather than merely accepted by it,
-///   because `1` is the spelling every historical A/B leg used and keeping it stable is what makes
-///   those legs comparable with a leg run on this binary.
+/// * `1` or `on` -> `On`: the 2026-08-09 unconditional admission. THE NEGATIVE CONTROL, and it is
+///   expected to reproduce that day's -3.44%. `1` is pinned to this arm rather than merely
+///   accepted by it, because `1` is the spelling every historical A/B leg used and keeping it
+///   stable is what makes those legs comparable with a leg run on this binary.
 /// * **anything else PANICS.** See `parse_rotate_rows_arm` for why guessing is worse than failing.
 ///
 /// **WHERE EACH ARM IS READ.** `Off` is read at the CLASSIFY admission point, so it reproduces the
@@ -4948,19 +4948,23 @@ fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRow
         }
         Ok(raw) => raw,
     };
+    // Each arm answers to its DESIGN NAME (`off` / `heat_gated` / `on`, the spellings
+    // dev_docs/duke-reprofile-2026-08-19.md §6.2 uses to describe the ladder) as well as to its
+    // numeric one. A ladder leg written from the design doc and a leg written from the shell
+    // history must reach the same arm, or the accepted-spelling set is itself a trap.
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" => RotateRowsArm::Off,
+        "" | "0" | "off" => RotateRowsArm::Off,
         "heat" | "heat_gated" => RotateRowsArm::HeatGated,
-        // `1` and nothing else. The pre-L1 reading was "any value but 0", and `1` is the spelling
-        // every historical A/B leg used, so keeping it pinned to `On` is what makes those legs
-        // comparable with a leg run on this binary.
-        "1" => RotateRowsArm::On,
+        // `1` is pinned here rather than merely accepted: the pre-L1 reading was "any value but
+        // 0", `1` is the spelling every historical A/B leg used, and keeping it on this arm is
+        // what makes those legs comparable with a leg run on this binary.
+        "1" | "on" => RotateRowsArm::On,
         other => panic!(
-            "IZARRAVM_ROTATE_ROWS={other:?} names no arm; accepted spellings are unset or `0` \
-             (off, the shipped base), `heat` / `heat_gated` (the L1 heat-gated arm), or `1` (the \
-             2026-08-09 unconditional admission, the negative control). Refusing to guess: a \
-             mistyped ladder leg that silently ran the negative control would be read as the \
-             slice failing"
+            "IZARRAVM_ROTATE_ROWS={other:?} names no arm; accepted spellings are unset, `0` or \
+             `off` (the shipped base), `heat` / `heat_gated` (the L1 heat-gated arm), or `1` / \
+             `on` (the 2026-08-09 unconditional admission, the negative control). Refusing to \
+             guess: a mistyped ladder leg that silently ran the negative control would be read as \
+             the slice failing"
         ),
     }
 }

@@ -430,6 +430,10 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
 //  * restoring the bare `!insn.continuable` makes
 //    `census_suffix_admits_the_non_continuable_imul_forms` read 0 where it must read 3.
 //
+//  * deleting the L1 heat-gate mirror makes `census_suffix_mirrors_the_l1_heat_gate` read 4 on its
+//    hot leg where it must read 2. That is the seventh divergence, and it is the only one whose
+//    over-report is CORRELATED with the quantity the arm measures rather than merely bounded.
+//
 // The x87 divergence has NO test here, deliberately and not by omission: the forward scan refuses
 // every x87 kind outright, so the compile walk's x87 caps are unreachable from it and any mirror
 // of them would be dead code no fixture could make fire. It is left as a conservative floor and
@@ -482,6 +486,80 @@ fn census_row_for(code: &[u8], warm_offsets: &[u32], opcode: u16) -> crate::Dire
         .unwrap_or_else(|| panic!("no census row for opcode {opcode:#x}"));
     assert_eq!(row.hits, 1, "fixture must record exactly one barrier hit");
     row.clone()
+}
+
+/// The L1 heat gate's suffix mirror, and it is the seventh divergence in the scan's ledger.
+///
+/// The gate is the ONLY admission rule in the backend that is not a `classify` answer: on the
+/// `heat_gated` arm a group-2 row whose count byte carries a heat record classifies Native and is
+/// downgraded to `HardBoundary` afterwards, in the compile walk, where the physical address and
+/// the heat map are in scope. `census_native_suffix` calls `classify` directly, so without the
+/// mirror it walks straight through the instruction the compile walk stops at.
+///
+/// That over-report is the worst possible shape for this particular slice rather than a generic
+/// inaccuracy: it appears only at PATCHED sites, so its size is proportional to `(1 - u)` — and
+/// `u`, the unpatched share, is the single number the arm exists to measure. A suffix column that
+/// moved with `(1 - u)` would corrupt the heat-vs-off census difference the ladder's non-vacuity
+/// check reads (dev_docs/duke-reprofile-2026-08-19.md §6.2).
+///
+/// One fixture, two legs, differing ONLY in whether the count byte carries a record:
+///
+/// * cold count byte — the ROL is admitted by both the compile walk and the scan, so the scan
+///   reaches every warmed instruction after the barrier: 4;
+/// * hot count byte — the compile walk stops at the ROL, so the scan must too: 2, the two `inc`s
+///   between the barrier and the ROL.
+///
+/// Deleting the mirror in `census_native_suffix` makes the second leg read 4, which is exactly the
+/// silent over-report described above.
+#[test]
+fn census_suffix_mirrors_the_l1_heat_gate() {
+    // ENTRY+0 barrier, +1 inc eax, +2 inc ecx, +3..+5 rol ebx,16, +6 inc edx. The ROL's count byte
+    // is its imm8 at ENTRY + 5. ENTRY+7 is deliberately left unwarmed so the cold leg's expected
+    // value is an exact number rather than a floor, the same discipline as `barrier_suffix`.
+    let code = [DIRECT_BARRIER, 0x40, 0x41, 0xc1, 0xc3, 0x10, 0x42];
+    let offsets = [0, 1, 2, 3, 6];
+
+    assert_eq!(
+        heat_gated_barrier_suffix(&code, &offsets, None),
+        4,
+        "control: with no record on the count byte the heat gate admits the ROL and the scan \
+         reaches every warmed instruction after the barrier"
+    );
+    assert_eq!(
+        heat_gated_barrier_suffix(&code, &offsets, Some(ENTRY + 5)),
+        2,
+        "a record on the count byte stops the COMPILE WALK at the ROL, so the suffix scan must \
+         stop there too; without the mirror this reads 4 and the over-report tracks (1 - u)"
+    );
+}
+
+/// `barrier_suffix` on the `heat_gated` arm, with an optional SMC heat record seeded at one
+/// physical byte first. The arm is forced through the thread-local override rather than the
+/// process-wide `OnceLock`, and restored before returning.
+fn heat_gated_barrier_suffix(code: &[u8], warm_offsets: &[u32], heat_at: Option<u32>) -> u64 {
+    let (mut cpu, mut bus) = fixture(code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = warm_offsets.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    // One `bump` is what `note_code_write_inner` leaves after one heat-charged kill, the same
+    // seeding the disp-lane and classify-side fixtures use on the other sides of this probe.
+    if let Some(physical) = heat_at {
+        cpu.sync_smc_heat();
+        cpu.jit_direct.smc_heat.bump(physical, 1, 0);
+    }
+    jit::direct::set_rotate_rows_arm_for_test(Some(jit::direct::RotateRowsArm::HeatGated));
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+    jit::direct::set_rotate_rows_arm_for_test(None);
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+        .expect("no census row for the barrier");
+    assert_eq!(row.hits, 1, "fixture must record exactly one barrier hit");
+    row.native_suffix_instructions
 }
 
 /// The memory-ALU BLOCK cap, and it is the largest of the six divergences the suffix audit found.

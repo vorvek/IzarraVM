@@ -2531,7 +2531,10 @@ fn the_rotate_rows_spelling_table_is_exact() {
         parse(Err(std::env::VarError::NotPresent)),
         RotateRowsArm::Off
     );
-    for spelling in ["0", "", "  0  "] {
+    // Each arm answers to its DESIGN NAME as well as its numeric one: §6.2 of the re-profile calls
+    // the ladder legs off / heat_gated / on, so a leg written from the doc has to reach the same
+    // arm as a leg written from the shell history.
+    for spelling in ["0", "", "  0  ", "off", "OFF"] {
         assert_eq!(
             parse(Ok(spelling.to_string())),
             RotateRowsArm::Off,
@@ -2547,9 +2550,16 @@ fn the_rotate_rows_spelling_table_is_exact() {
             "{spelling:?} must name the L1 arm"
         );
     }
-    // `1` and only `1`. Pinned rather than merely accepted: every historical A/B leg spelled the
-    // 2026-08-09 admission this way and the legs have to stay comparable.
-    assert_eq!(parse(Ok("1".to_string())), RotateRowsArm::On);
+    // `1` is PINNED rather than merely accepted: every historical A/B leg spelled the 2026-08-09
+    // admission this way and the legs have to stay comparable with a leg run on this binary. `on`
+    // rides alongside it as the design name.
+    for spelling in ["1", "on", "ON", " on "] {
+        assert_eq!(
+            parse(Ok(spelling.to_string())),
+            RotateRowsArm::On,
+            "{spelling:?} must name the negative control"
+        );
+    }
 }
 
 /// A MISSPELLED LADDER LEG MUST FAIL LOUDLY. The pre-L1 reading was "any value but 0 means on",
@@ -2558,14 +2568,40 @@ fn the_rotate_rows_spelling_table_is_exact() {
 /// help", which is the single wrong conclusion this slice exists to avoid. So the parser panics
 /// instead of guessing, and this is the test that stops a future edit from restoring the
 /// convenience.
+///
+/// `heat-gated` and `heatgated` are the near-misses that matter: both are one keystroke from the
+/// real spelling and both would previously have selected the control. `off`/`on` are NOT in this
+/// list -- they are accepted design names, pinned by the table test above.
 #[test]
 fn an_unrecognised_rotate_rows_spelling_refuses_to_guess() {
-    for spelling in ["heat-gated", "heatgated", "gated", "on", "2", "true", "yes"] {
+    // The default hook prints a backtrace banner per panic, and this test raises seven on purpose.
+    // Silencing them for the length of the loop keeps a passing suite readable; restored straight
+    // after, because a hook left installed would swallow a LATER test's genuine failure output.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcomes: Vec<_> = [
+        "heat-gated",
+        "heatgated",
+        "gated",
+        "heat gated",
+        "2",
+        "true",
+        "yes",
+    ]
+    .into_iter()
+    .map(|spelling| {
         let panicked = std::panic::catch_unwind(|| {
             jit::direct::parse_rotate_rows_arm_for_test(Ok(spelling.to_string()))
-        });
+        })
+        .is_err();
+        (spelling, panicked)
+    })
+    .collect();
+    std::panic::set_hook(previous);
+
+    for (spelling, panicked) in outcomes {
         assert!(
-            panicked.is_err(),
+            panicked,
             "IZARRAVM_ROTATE_ROWS={spelling:?} names no arm and must panic rather than silently \
              select the negative control"
         );
