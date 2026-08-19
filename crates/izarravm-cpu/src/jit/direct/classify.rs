@@ -9,6 +9,21 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             return None;
         }
         let native = NativeX87Insn::classify(insn)?;
+        // The two FPU-loop rows are gated HERE rather than inside `NativeX87Insn::classify`,
+        // which is a pure encoding table -- `native_x87_test.rs` asserts it opcode by opcode with
+        // no CPU and no environment in scope, and threading a policy knob through it would make
+        // every one of those rows read the ambient arm. This is the same seam `classify` already
+        // uses for `rotate_rows_enabled` and `count_lanes_enabled`.
+        //
+        // The Word bar for both rows is the `operand_size != Dword` early return above, which is
+        // the FPU branch's blanket bar and predates this slice: in a CS.D = 0 segment every
+        // unprefixed instruction decodes at `Word`, WAIT and FRNDINT included, so neither is
+        // admitted there whether or not a prefix is present.
+        if matches!(native, NativeX87Insn::Wait | NativeX87Insn::RoundToInt)
+            && !fpu_loop_rows_enabled()
+        {
+            return None;
+        }
         let addr = match native {
             NativeX87Insn::BinaryMemory { addr, .. }
             | NativeX87Insn::IntBinaryMemory { addr, .. }
@@ -252,19 +267,39 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     {
         return None;
     }
-    // SETcc r/m8, register destination. Byte-wide whatever the operand-size prefix says (the
+    // SETcc r/m8, BOTH operand forms. Byte-wide whatever the operand-size prefix says (the
     // interpreter's arm calls `write_operand_u8` without consulting `operand_size`), but 0x0f9x
     // is NOT in the Word-size allowlist above, so a 66-prefixed encoding never reaches here and
     // the point is moot rather than relied on. Keyed on the full u16 for the reason 0x0faf below
     // documents: the `u8::try_from` truncation further down cannot see a two-byte opcode.
+    //
+    // That Word gate is ALSO the memory form's width bar, and it is a bar on the FORM rather than
+    // on the prefix: an unprefixed `0F 94 /0 mem` in a CS.D = 0 segment decodes at
+    // `OperandSize::Word` with prefix mask 0 and is refused by the same line that refuses the
+    // 66-prefixed one in a 32-bit segment. `setcc_word_segment_memory_form_stays_a_barrier` pins
+    // both directions.
+    //
+    // The memory form is the tombraid FMV census's `0x0F94 /0 memory dword` row at 27,602,402
+    // interpreted hits, one per iteration of the 32-bit FPU loop, and it sits behind
+    // `IZARRAVM_FPU_LOOP_ROWS`. All sixteen conditions ride the gate together, for the closure
+    // rule stated at the top of this file: the condition is a raw four-bit code handed to
+    // `Encoder::setcc` exactly as the register form already hands it, so refusing fifteen
+    // siblings of one measured row would be arbitrary rather than conservative.
     if let 0x0f90..=0x0f9f = insn.opcode {
+        let condition = (insn.opcode & 0x0f) as u8;
         let DecodedOperand::Reg(dst) = insn.operand? else {
-            return None;
+            let DecodedOperand::Mem(addr) = insn.operand? else {
+                return None;
+            };
+            if !fpu_loop_rows_enabled() {
+                return None;
+            }
+            return Some(DirectKind::SetCcMem {
+                condition,
+                addr: direct_addr(addr)?,
+            });
         };
-        return Some(DirectKind::SetCc {
-            condition: (insn.opcode & 0x0f) as u8,
-            dst,
-        });
+        return Some(DirectKind::SetCc { condition, dst });
     }
     // IMUL r32, r/m32, both operand forms. Must stay below the Word-size gate above: a
     // 66-prefixed IMUL decodes with OperandSize::Word and is not in that gate's allowlist, so it
@@ -799,6 +834,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 return Some(DirectKind::Push {
                     source: StoreSource::Flags { mask: u32::MAX },
                 });
+            }
+            // SAHF. Behind `IZARRAVM_FPU_LOOP_ROWS` (default off); the tombraid FMV census ranks
+            // the dword row at 55,203,044 interpreted hits, two per iteration of the 32-bit FPU
+            // loop, second only to WAIT.
+            //
+            // Deliberately NOT added to the `OperandSize::Word` allowlist above, and the reason is
+            // the NOP/CLD one rather than a hazard: SAHF's interpreter arm never consults
+            // `operand_size` (it reads AH and rewrites five EFLAGS bits, both width-invariant), so
+            // a Word admission would be CORRECT and simply unmeasured -- no census row, 16-bit or
+            // otherwise, and this campaign does not ship admissions with no counter to gate them.
+            // `sahf_word_segment_form_stays_a_barrier` pins that the unprefixed form in a
+            // CS.D = 0 segment is refused rather than lowered or panicking, which is the shape the
+            // count-lane slice got wrong in the other direction by barring on the PREFIX.
+            //
+            // LAHF (0x9f) is the sibling and stays out: it writes AH from the flag byte, needs its
+            // own emitter, and the census measures no row for it at all.
+            0x9e if fpu_loop_rows_enabled() => {
+                return Some(DirectKind::Sahf);
             }
             // PUSH DS (0x1e) and PUSH ES (0x06), the read half of the segment family. Both are
             // ordinary word stack stores of a value the block already pins: the selector is baked
@@ -1417,28 +1470,49 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         }),
                     };
                 }
-                // DIV (/6) and IDIV (/7) r/m32, REGISTER form. The two are ONE arm because the
-                // emitter's two bodies are selected by `signed` and both are separately tested;
-                // what must not be widened is the pair of ENCODER primitives behind them.
+                // DIV (/6) and IDIV (/7) r/m32, BOTH operand forms. The sub-opcode pair is ONE arm
+                // because the emitter's two bodies are selected by `signed` and both are
+                // separately tested; what must not be widened is the pair of ENCODER primitives
+                // behind them.
                 //
-                // MEMORY is deliberately absent, and the reason is the fault rather than the
-                // address. A memory DIV can side-exit for two independent reasons -- the read's
-                // own guards and the divide guard -- at the same slot, and the second must not be
-                // reachable before the first has been proved not to fire. Both fixtures' memory
-                // rows are under the campaign's 100k floor (doom 28,078; quake 95,839 + 57,491),
-                // so the shape is left unbuilt rather than built untested.
+                // The MEMORY form is the tombraid FMV census's `0xF7 /7 memory dword` row at
+                // 27,602,949 interpreted hits, one per iteration of the 32-bit FPU loop, and it
+                // sits behind `IZARRAVM_FPU_LOOP_ROWS`. `/6` rides the gate with it by the closure
+                // rule at the top of this file rather than by a second measurement: the two
+                // sub-opcodes have shared this arm since it was written, and splitting them at the
+                // memory form alone would be the arbitrary half-admission that rule exists to stop.
+                //
+                // What this arm used to say, and what the emitter now has to answer:
+                //
+                // > MEMORY is deliberately absent, and the reason is the fault rather than the
+                // > address. A memory DIV can side-exit for two independent reasons -- the read's
+                // > own guards and the divide guard -- at the same slot, and the second must not
+                // > be reachable before the first has been proved not to fire.
+                //
+                // `emit_div_mem` answers it with the DEFERRED mode-13 completion `Ret`/`JmpMem`
+                // already use; see the `DirectKind::DivMem` doc comment for why the ordering
+                // hazard is the read COUNTER rather than the exits themselves.
                 //
                 // No `raw_clocks`: group 3 charges `clocks(2)` for every sub-opcode and both
-                // operand forms, which is the `_ => 2` default. No `width`: the `OperandSize::Word`
-                // gate at the top of `classify` excludes 0xf7, exactly as for `MulReg`.
+                // operand forms, which is the `_ => 2` default. No `width` on either kind: the
+                // `OperandSize::Word` gate at the top of `classify` excludes 0xf7, exactly as for
+                // `MulReg`, so both forms are dword-only by construction rather than by the
+                // absence of a 0x66 prefix.
                 if opcode == 0xf7 && matches!(m.reg, 6 | 7) {
+                    let signed = m.reg == 7;
                     let DecodedOperand::Reg(src) = insn.operand? else {
-                        return None;
+                        let DecodedOperand::Mem(addr) = insn.operand? else {
+                            return None;
+                        };
+                        if !fpu_loop_rows_enabled() {
+                            return None;
+                        }
+                        return Some(DirectKind::DivMem {
+                            addr: direct_addr(addr)?,
+                            signed,
+                        });
                     };
-                    return Some(DirectKind::DivReg {
-                        src,
-                        signed: m.reg == 7,
-                    });
+                    return Some(DirectKind::DivReg { src, signed });
                 }
                 if m.reg != 0 {
                     return None;

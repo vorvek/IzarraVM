@@ -313,6 +313,65 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.setcc(condition, Reg::RDX);
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
             }
+            // SETcc m8. The condition byte is produced FIRST -- before `emit_store` touches the
+            // address, the page kind or the write pointer -- and parked in the frame, because
+            // `emit_store` materialises its source last and this source needs `emit_load_host_
+            // flags`, whose `push`/`popfq` pair and RAX use cannot run inside a store's live
+            // scratch. See `StoreSource::ParkedByte`.
+            //
+            // The park must also precede `MemorySideExits::new`'s guards in EFFECT even though it
+            // precedes them in emission: it writes only a frame scratch slot and no guest state,
+            // so a memory side exit after it leaves the instruction un-started exactly as a plain
+            // `Store`'s does. The flag READ is likewise harmless to repeat -- RBP is not consumed.
+            DirectKind::SetCcMem { condition, addr } => {
+                let side = e.label();
+                e.xor_r64_self(Reg::RDX);
+                emit_load_host_flags(&mut e);
+                e.setcc(condition, Reg::RDX);
+                e.store_r64_disp32(Reg::RSP, STACK_PUSH_MEM_VALUE, Reg::RDX);
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_store(
+                    &mut e,
+                    StoreSource::ParkedByte,
+                    MemoryWidth::Byte,
+                    addr,
+                    memory,
+                    reasons,
+                    memory.address_wrap,
+                );
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    MemoryWidth::Byte.needs_alignment_guard(),
+                    memory.cpl3,
+                    true,
+                );
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
+            // SAHF. RBP is the running materialized-EFLAGS shadow, so it is already what the
+            // interpreter's `materialize_flags()` would settle to; the three lines below are the
+            // interpreter's own `eflags = (eflags & !0xd5) | (ah & 0xd5) | 0x02` applied to it,
+            // then the publish and the descriptor teardown that `materialize_flags` owes.
+            //
+            // Read AH the way `emit_read_store_value`'s byte arm reads a high lane: guest AH is
+            // bits 8..15 of `home(0)`.
+            //
+            // `emit_clear_pending` is MANDATORY and is the whole reason this cannot be an RBP
+            // write alone: SAHF's five bits are all inside `ARITH_FLAGS`, so a live descriptor
+            // that survived this instruction would recompute them from a pre-SAHF operand pair at
+            // the next reader and silently overwrite what the guest just loaded.
+            DirectKind::Sahf => emit_sahf(&mut e),
             // CBW / CWDE. Dword widens AX to EAX in one step: `movsx_r32_r16` reads the source's
             // low 16 bits and defines all 32, so `home(0)` as both source and destination is
             // safe -- the instruction reads before it writes, same as `emit_mov_extend_reg`'s
@@ -574,6 +633,35 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let guard = e.label();
                 emit_div_reg(&mut e, src, signed, guard);
                 side_exit_reason_stubs.push((guard, side, SideExitReason::DivideGuard));
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
+            // TWO side-exit families through ONE `side` label: the read's memory reasons and the
+            // divide guard. That is the pairing `DivReg`'s comment said had to be ordered before
+            // the memory form could exist, and `emit_div_mem` is where the ordering lives.
+            DirectKind::DivMem { addr, signed } => {
+                let side = e.label();
+                let guard = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_div_mem(&mut e, addr, signed, memory, reasons, guard);
+                side_exit_reason_stubs.push((guard, side, SideExitReason::DivideGuard));
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    MemoryWidth::Dword.needs_alignment_guard(),
+                    memory.cpl3,
+                    false,
+                );
                 side_exits.push((
                     side,
                     slot.lin.wrapping_sub(span.key.linear),
@@ -3851,6 +3939,14 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
         StoreSource::Selector(segment) => {
             unreachable!("PUSH {segment:?} must be resolved to an immediate in emit_store")
         }
+        // The byte `SetCcMem` computed at the top of its slot. Byte width only: the parker is the
+        // only producer and it stores a `setcc` result, so a wider read here would pick up the
+        // upper bytes of a frame slot nothing defined. The `debug_assert` is the whole check --
+        // there is no correct wider behaviour to fall back to.
+        StoreSource::ParkedByte => {
+            debug_assert!(matches!(width, MemoryWidth::Byte));
+            e.load_r64_disp32(value, Reg::RSP, STACK_PUSH_MEM_VALUE);
+        }
         StoreSource::EipDelta(delta) => {
             // Word as well as Dword: a 16-bit CALL pushes the return IP as two bytes. The value
             // is computed the same way either width, from the LIVE eip plus the delta, and the
@@ -4620,13 +4716,36 @@ fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
 /// never bind differently, arbitrarily often. That makes the liveness argument worth stating
 /// where the guard is rather than leaving it implicit in the run loop.
 fn emit_div_reg(e: &mut Encoder, src: u8, signed: bool, guard: Label) {
+    if signed {
+        // The divisor first and SIGN-extended: it is the one operand whose width changes.
+        e.movsxd_r64_r32(Reg::RCX, home(src));
+    } else {
+        e.mov_r32_r32(Reg::RCX, home(src));
+    }
+    emit_div_preloaded(e, signed, guard);
+    emit_div_write_back(e);
+}
+
+/// The divide itself, with the divisor already staged in RCX -- sign-extended to 64 bits for the
+/// signed form, zero-extended (a plain `mov r32, r32`) for the unsigned one.
+///
+/// Split out of `emit_div_reg` so the MEMORY form shares one body rather than a transcription of
+/// it, and split at the DIVISOR because that is the only thing the two operand forms disagree
+/// about: the dividend is EDX:EAX either way, the guards are the same three (or one) tests, and
+/// the quotient/remainder land in the same two registers. The split is byte-neutral for the
+/// register form -- the instructions below are emitted in exactly the order they were when this
+/// was one function, which is what keeps the gate-off build identical to main.
+///
+/// Leaves the quotient in RAX and the remainder in RDX. It does NOT write them back to the guest
+/// homes: `emit_div_mem` has one more thing to do (the deferred mode-13 read completion) between
+/// the last guard and the point where the frame may be disturbed, so the write-back is the
+/// caller's, through `emit_div_write_back`.
+fn emit_div_preloaded(e: &mut Encoder, signed: bool, guard: Label) {
     // 0x3 is the x86 above-or-equal / not-carry condition, 0x4 is zero, 0x5 is not-zero.
     const JAE: u8 = 0x3;
     const JE: u8 = 0x4;
     const JNE: u8 = 0x5;
     if signed {
-        // The divisor first and SIGN-extended: it is the one operand whose width changes.
-        e.movsxd_r64_r32(Reg::RCX, home(src));
         // EDX:EAX assembled into RAX as one 64-bit dividend. `mov r32, r32` zero-extends, so the
         // two halves compose with a shift and an OR rather than needing a mask.
         e.mov_r32_r32(Reg::RAX, home(0));
@@ -4650,7 +4769,6 @@ fn emit_div_reg(e: &mut Encoder, src: u8, signed: bool, guard: Label) {
         e.cmp_r64_r64(Reg::RAX, Reg::RCX);
         e.jcc(JNE, guard);
     } else {
-        e.mov_r32_r32(Reg::RCX, home(src));
         e.mov_r32_r32(Reg::RAX, home(0));
         e.mov_r32_r32(Reg::RDX, home(2));
         // The whole unsigned guard, both fault conditions: see the derivation above.
@@ -4658,11 +4776,125 @@ fn emit_div_reg(e: &mut Encoder, src: u8, signed: bool, guard: Label) {
         e.jcc(JAE, guard);
         e.div_r32(Reg::RCX);
     }
-    // Quotient to EAX, remainder to EDX, exactly as `CpuGsw::div`'s Dword arms write them. The
-    // signed form's `edx` is the low half of a 64-bit remainder whose magnitude is below the
-    // divisor's, so the truncation is the interpreter's own `remainder as u32`.
+}
+
+/// Quotient to EAX, remainder to EDX, exactly as `CpuGsw::div`'s Dword arms write them. The
+/// signed form's `edx` is the low half of a 64-bit remainder whose magnitude is below the
+/// divisor's, so the truncation is the interpreter's own `remainder as u32`.
+///
+/// Separate from `emit_div_preloaded` so the memory form can put the deferred mode-13 read
+/// completion AFTER this and still have every guard exit land before both. This is the point of no
+/// return for the slot: past it the instruction has committed guest state and no exit may be taken.
+fn emit_div_write_back(e: &mut Encoder) {
     e.mov_r32_r32(home(0), Reg::RAX);
     e.mov_r32_r32(home(2), Reg::RDX);
+}
+
+/// DIV / IDIV r/m32, MEMORY form (`0xF7 /6`, `/7`), behind `IZARRAVM_FPU_LOOP_ROWS`.
+///
+/// # The ordering, which is the whole of this function
+///
+/// `DivReg`'s comment named the hazard as "two independent side-exit reasons at the same slot".
+/// The reason the second one cannot simply follow the first is NOT the exits, it is the mode-13
+/// read counter between them. `emit_ram_read_pointer` deposits `mode13_dword_reads` into the frame
+/// before it returns, `emit_return` copies that lane out on EVERY exit including a side exit, and
+/// a side exit re-runs the whole instruction in the interpreter -- so a divide-guard exit taken
+/// after the deposit charges one guest read twice. That is a guest-visible bus-accounting error,
+/// the same class `dynamic_counter_fields` refuses to make maskable.
+///
+/// So this uses the DEFERRED completion shape `Ret` and `JmpMem` already use for their CS-limit
+/// exit: `emit_ram_read_pointer_inner`, which parks the page kind and moves no counter, then every
+/// guard, then the commit, then `emit_mode13_read_completion` last. In order:
+///
+/// 1. the address, alignment and page-kind guards (`_inner`) -- exit, nothing deposited;
+/// 2. the divisor load out of RDI, and its sign extension for IDIV;
+/// 3. the divide guards, including IDIV's post-divide quotient-range one -- exit, still nothing
+///    deposited, and still pre-effect because the divide has written only RAX and RDX;
+/// 4. `emit_div_write_back`, the commit;
+/// 5. `emit_mode13_read_completion`, which clobbers RCX and RDX and is why 4 comes before it.
+///
+/// # Why the divisor is re-extended rather than loaded sign-extended
+///
+/// Two instructions (`load_r32_disp8` then `movsxd_r64_r32` on the same register) instead of one
+/// `movsxd r64, m32` the encoder does not have. Adding that primitive for one call site would be a
+/// second thing to test for no saving that any counter can see.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_div_mem(
+    e: &mut Encoder,
+    addr: DirectAddr,
+    signed: bool,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+    guard: Label,
+) {
+    emit_ram_read_pointer_inner(
+        e,
+        MemoryWidth::Dword,
+        addr,
+        memory,
+        sides,
+        memory.address_wrap,
+    );
+    e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
+    if signed {
+        e.movsxd_r64_r32(Reg::RCX, Reg::RCX);
+    }
+    emit_div_preloaded(e, signed, guard);
+    emit_div_write_back(e);
+    emit_mode13_read_completion(e, MemoryWidth::Dword);
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_div_mem(
+    _: &mut Encoder,
+    _: DirectAddr,
+    _: bool,
+    _: MemoryEmitContext,
+    _: MemorySideExits,
+    _: Label,
+) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+/// SAHF (0x9E), behind `IZARRAVM_FPU_LOOP_ROWS`.
+///
+/// The interpreter is `materialize_flags()` then
+/// `eflags = (eflags & !0xd5) | (ah & 0xd5) | 0x02`, and RBP is the running materialized shadow --
+/// so the settle is already done and what is left is the mask-merge, the publish and the
+/// descriptor teardown. That is the same three-step tail `emit_rotate_reg`'s count-1 branch runs,
+/// for the same stated reason: with a live descriptor the net eflags is the materialized word with
+/// this instruction's bits replaced, which is exactly RBP after the merge; with no descriptor live
+/// `materialize_flags` is a no-op and RBP already equals eflags.
+///
+/// `0xd5` is CF|PF|AF|ZF|SF and is a strict subset of `ARITH_FLAGS`. **OF is the sixth member and
+/// is deliberately NOT in the mask**: SAHF preserves it, and widening the mask to `ARITH_FLAGS`
+/// would clear it whenever AH's bit 11 happened to be clear -- silently, because AH's bit 11 does
+/// not exist.
+///
+/// AH is bits 8..15 of `home(0)`, read the way `emit_read_store_value`'s byte arm reads any high
+/// lane. RAX and RDX are emitter scratch and no guest home is either, so `home(0)` cannot alias
+/// them even when the guest is using EAX.
+fn emit_sahf(e: &mut Encoder) {
+    const SAHF_MASK: u32 =
+        crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_AF | crate::FLAG_ZF | crate::FLAG_SF;
+    // AH into RDX, zero-extended.
+    e.mov_r32_r32(Reg::RDX, home(0));
+    e.shift_r32_imm8(5, Reg::RDX, 8);
+    e.and_r32_imm32(Reg::RDX, SAHF_MASK);
+    e.and_r32_imm32(Reg::RBP, !SAHF_MASK);
+    e.or_r32_r32(Reg::RBP, Reg::RDX);
+    // The interpreter's trailing `| 0x02`. Bit 1 is expected to be set on every path that writes
+    // eflags already, but it is reproduced rather than relied on for `emit_set_cf_only`'s reason:
+    // `Registers` derives `PartialEq` and the campaign compares the raw eflags field.
+    e.or_r32_imm32(Reg::RBP, 0x2);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
 }
 
 fn emit_test_imm_reg(e: &mut Encoder, dst: u8, imm: u32, width: MemoryWidth) {

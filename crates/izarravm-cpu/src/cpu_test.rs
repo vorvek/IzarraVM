@@ -3899,6 +3899,14 @@ mod jit_count_lane;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_fpu_loop_rows_test.rs"]
+mod jit_fpu_loop_rows;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_disp_lane_test.rs"]
 mod jit_disp_lane;
 
