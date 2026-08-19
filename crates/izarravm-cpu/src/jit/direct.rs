@@ -4980,6 +4980,94 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
     parse_imm8_lanes_arm(value)
 }
 
+/// Whether `count_lane_for` admits the one-byte GROUP-2 COUNT lane class
+/// (`IZARRAVM_COUNT_LANES`). See `count_lane_for` for what qualifies, and `emit_rotate_reg_lane` /
+/// `emit_shift_lane` for the runtime three-way branch that is the whole cost of the class.
+///
+/// **DEFAULT OFF**, on `imm8_lanes_enabled`'s contract exactly: off is the base, both arms ship in
+/// one executable because this box has measured 6% wall variance between builds of identical
+/// source, and off is byte-for-byte the pre-slice world -- no lane is registered, every `0xC1`
+/// and `0xC0` slot bakes its count exactly as it did, and the emitted code is the compile-time
+/// three-way split it has always been.
+///
+/// **A SEPARATE KNOB FROM `IZARRAVM_IMM8_LANES`, deliberately, and NOT because the two classes are
+/// unrelated.** They are both one-byte lanes and they share the width class, the budget and the
+/// write choke. What forces them apart is the LADDER: `rotate_rows_enabled`'s cross-term paragraph
+/// shows that one-byte lanes interact with group-2 admission through the per-chunk heat map, so a
+/// combined knob would make the arm-1 and arm-2 deltas unrecoverable from each other. Two knobs
+/// give the 2x2 four legs that can actually be measured.
+///
+/// **THE SPELLING TABLE.** Trimmed and case-folded on the way in, because a knob set from a shell
+/// script picks up whitespace and one set from a PowerShell ladder picks up capitalisation.
+///
+/// * unset, `` (empty), `0` or `off` -> OFF. The shipped base.
+/// * `1` or `on` -> ON. The slice.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg
+///   (`IZARRAVM_COUNT_LANES=yes`, `=count`, `=true`) that fell through to OFF would run the BASE
+///   and be read as "the count lane class did nothing", which is the one wrong conclusion this
+///   slice exists to avoid.
+pub(crate) fn count_lanes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = COUNT_LANES_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_count_lanes_arm(std::env::var("IZARRAVM_COUNT_LANES")))
+}
+
+/// The `IZARRAVM_COUNT_LANES` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `count_lanes_enabled` for the contract.
+fn parse_count_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_COUNT_LANES is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset, `0` or `off` (the shipped base), and `1` or `on` (the \
+                 group-2 count-byte lane class)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_COUNT_LANES={other:?} names no arm; accepted spellings are unset, `0` or \
+             `off` (the shipped base) and `1` or `on` (the group-2 count-byte lane class). \
+             Refusing to guess: a mistyped ladder leg that silently ran the base would be read as \
+             the slice failing"
+        ),
+    }
+}
+
+// Per-THREAD, for `IMM8_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run both arms in one process, so one test's arm selection must not
+// reach another's compile. Since the arm is default-OFF, every positive fixture for this class
+// MUST force it on through here or it would test the refusal and call it a lowering.
+#[cfg(test)]
+thread_local! {
+    static COUNT_LANES_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the count-lane arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_COUNT_LANES` reading.
+#[cfg(test)]
+pub(crate) fn set_count_lanes_for_test(forced: Option<bool>) {
+    COUNT_LANES_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `count_lanes_enabled` caches its env reading in
+/// a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
+/// never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_count_lanes_arm(value)
+}
+
 /// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and
 /// **`0xC0 /4` SHL r8**, both register forms.
 ///
