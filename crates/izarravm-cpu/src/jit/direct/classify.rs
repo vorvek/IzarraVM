@@ -1233,7 +1233,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // in this file refuses it, and it is a separate census row this slice does not claim.
             0xc0 => {
                 let m = insn.modrm?;
-                // The A/B off arm (`IZARRAVM_ROTATE_ROWS=0`). Read HERE rather than in the
+                // The off arm (`IZARRAVM_ROTATE_ROWS=0`, the opt-out from the shipped default since
+                // the 2026-08-19/20 flip). Read HERE rather than in the
                 // emitter so the off arm is the pre-slice refusal byte for byte: this whole
                 // opcode had no arm before the slice, so returning None from the top of it puts
                 // the row back in the census as the same `hard_boundary` it was ranked as.
@@ -1280,7 +1281,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 if !matches!(m.reg, 0 | 1 | 4..=7) {
                     return None;
                 }
-                // The A/B off arm (`IZARRAVM_ROTATE_ROWS=0`), and it covers `/0` ALONE. `/1` ROR
+                // The off arm (`IZARRAVM_ROTATE_ROWS=0`, the opt-out since the 2026-08-19/20 flip),
+                // and it covers `/0` ALONE. `/1` ROR
                 // was lowered before this slice and stays ungated: the off arm has to restore the
                 // pre-slice world, not a no-rotates world, or an A/B would price two slices as
                 // one. `/4..=7` are older still. Read here, above the shared `let-else` and the

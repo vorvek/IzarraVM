@@ -925,16 +925,18 @@ fn word_size_shift_forms_are_lowered() {
 #[test]
 fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
     // The group-2 admission knob is FORCED ON for this table, and it is the ROL rows that need it.
-    // Those two ship default-off (`jit::direct::rotate_rows_enabled` carries the A/B), and on the
-    // default arm the knob refuses them BEFORE the Word guard runs -- they would still pass while
-    // certifying nothing about the guard this test exists to pin, and a Word admission slipped
-    // into the rotate branch would survive. The knob's own arms are pinned in
-    // `the_rotate_rows_knob_defaults_off_and_restores_the_pre_slice_admissions`; the Word guard is
-    // pinned here, and neither may stand in for the other.
+    // On the OFF arm the knob refuses them BEFORE the Word guard runs -- they would still pass
+    // while certifying nothing about the guard this test exists to pin, and a Word admission
+    // slipped into the rotate branch would survive. The shipped default has been ON since the
+    // 2026-08-19/20 re-measurement (`jit::direct::rotate_rows_enabled` carries both A/Bs), so the
+    // force is now insurance against the default moving rather than the thing that makes these rows
+    // reachable. The knob's own arms are pinned in
+    // `the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admissions`; the
+    // Word guard is pinned here, and neither may stand in for the other.
     jit::direct::set_rotate_rows_for_test(Some(true));
     assert!(
         jit::direct::rotate_rows_enabled(),
-        "the ROL rows below pin the Word guard, which the default arm never reaches"
+        "the ROL rows below pin the Word guard, which the off arm never reaches"
     );
     let cases: &[(&str, &[u8])] = &[
         ("0xc1 /0 rol cx,imm8", &[0x66, 0xc1, 0xc1, 0x03]),

@@ -74,13 +74,14 @@ fn push_u32(code: &mut Vec<u8>, value: u32) {
 }
 
 fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
-    // The generated block carries two slots that are DEFAULT OFF in the shipped backend: the
+    // The generated block carries two slots that live behind the group-2 admission knob: the
     // `0xC1 /0` half of the rotate slot and the `0xC0 /4` SHL r8 slot beside it
-    // (`jit::direct::rotate_rows_enabled` carries the A/B that turned them off). Forced on here,
-    // in the builder, because it is the block's CONTENT that needs the arm -- every test that
-    // builds one of these blocks needs it, and `GENERATED_BLOCK_NATIVE_INSTRUCTIONS` is counted
-    // with both slots admitted. Without this the walk would stop at the SHL and the pin would
-    // fail rather than the differential going quiet, but it would name the wrong cause.
+    // (`jit::direct::rotate_rows_enabled` carries both A/Bs -- default off from 2026-08-09, default
+    // ON since the 2026-08-19/20 re-measurement). Forced on here, in the builder, because it is the
+    // block's CONTENT that needs the arm: every test that builds one of these blocks needs it, and
+    // `GENERATED_BLOCK_NATIVE_INSTRUCTIONS` is counted with both slots admitted. On the off arm the
+    // walk stops at the SHL and the pin fails rather than the differential going quiet, but it
+    // names the wrong cause -- which is why the arm is stated here instead of inherited.
     jit::direct::set_rotate_rows_for_test(Some(true));
     assert!(
         jit::direct::rotate_rows_enabled(),
