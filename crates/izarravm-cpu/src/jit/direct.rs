@@ -3313,12 +3313,52 @@ pub(crate) enum DirectKind {
     },
     /// `SETcc r8` (0F 90..9F, register destination). The guest condition encoding is x86's own,
     /// so the emitted `setcc` takes it unchanged; `condition()` in the interpreter is the same
-    /// truth table the host flags implement. Register form only: a memory destination is a byte
-    /// store and has no census row.
+    /// truth table the host flags implement.
     SetCc {
         condition: u8,
         dst: u8,
     },
+    /// `SETcc m8` (0F 90..9F, MEMORY destination) -- the tombraid FMV census's `0x0F94 /0` row at
+    /// 27,602,402 interpreted hits, behind `IZARRAVM_FPU_LOOP_ROWS`.
+    ///
+    /// A separate kind from `SetCc` rather than a `StoreSource` on `Store`, because of WHERE the
+    /// value has to be computed. `emit_store` materialises its source LAST, inside the page-kind
+    /// arm, after the address, the permission check and the write-pointer resolve have all
+    /// clobbered RAX/RCX/RDX/RDI -- and the value here is `popfq`-derived from RBP, which cannot
+    /// run there without disturbing the store's own live scratch. So the byte is computed FIRST,
+    /// parked in the frame, and the store reads it back: see `StoreSource::ParkedByte` and
+    /// `emit_set_cc_mem`.
+    ///
+    /// ALL SIXTEEN conditions, not just `/4` SETE. The condition is a raw four-bit code handed
+    /// straight to `Encoder::setcc`, identical to what the register form above already does with
+    /// it, so there is no per-condition correctness question to measure separately -- and the
+    /// closure rule stated at the top of `classify` ("admitting one member of a shared arm while
+    /// refusing its sibling would be arbitrary") applies to this arm exactly as it does there.
+    ///
+    /// Byte-wide by FORM, whatever the operand-size prefix says: the interpreter's arm calls
+    /// `write_operand_u8` without consulting `operand_size`. `0x0f9x` is absent from classify's
+    /// Word-size allowlist, so a 66-prefixed encoding never reaches the arm and an unprefixed one
+    /// in a CS.D = 0 segment does not either -- which is the width bar for this row, and it is the
+    /// SAME bar the register form has always had.
+    SetCcMem {
+        condition: u8,
+        addr: DirectAddr,
+    },
+    /// `SAHF` (0x9E) -- the tombraid FMV census's second-largest loop-B row at 55,203,044
+    /// interpreted hits, behind `IZARRAVM_FPU_LOOP_ROWS`.
+    ///
+    /// The interpreter is three lines: `materialize_flags()`, then
+    /// `eflags = (eflags & !0xd5) | (ah & 0xd5) | 0x02`. Every bit in `0xd5` (CF, PF, AF, ZF, SF)
+    /// is inside `ARITH_FLAGS`, so this touches nothing the lazy descriptor does not already own,
+    /// and OF -- the sixth `ARITH_FLAGS` member -- is deliberately PRESERVED.
+    ///
+    /// No width field and no width bar of its own: SAHF has identical semantics at either operand
+    /// size (it reads AH and writes five EFLAGS bits, neither of which is width-dependent), and
+    /// `0x9e` is absent from classify's Word-size allowlist so the Word form stays a barrier. That
+    /// absence is a MEASUREMENT boundary, not a correctness one -- the census row is dword and no
+    /// fixture measures a 16-bit SAHF -- and it is stated here because the kind carries no width to
+    /// bar on.
+    Sahf,
     /// CBW/CWDE (0x98): widen the accumulator's sign into the next width. `width` is the
     /// interpreter's `operand_size` (the DESTINATION width): Word writes AX from AL (CBW),
     /// Dword writes EAX from AX (CWDE). No flags touched. Accumulator-implicit, so the kind
@@ -3605,6 +3645,39 @@ pub(crate) enum DirectKind {
     /// tested; there, it would have been one character inside a shared body.
     DivReg {
         src: u8,
+        signed: bool,
+    },
+    /// DIV (0xF7 /6) and IDIV (0xF7 /7) r/m32, MEMORY form; `signed` selects IDIV. Behind
+    /// `IZARRAVM_FPU_LOOP_ROWS`. The tombraid FMV census's `0xF7 /7 memory dword` row is
+    /// 27,602,949 interpreted hits; `/6` rides the same shared classifier arm by the closure rule
+    /// (`DivReg`'s arm is `matches!(m.reg, 6 | 7)`, and splitting the pair at the memory form
+    /// would be exactly the arbitrary split the top of `classify` warns against).
+    ///
+    /// `DivReg`'s comment used to say the memory form was "deliberately absent, and the reason is
+    /// the fault rather than the address: a memory DIV can side-exit for two independent reasons --
+    /// the read's own guards and the divide guard -- at the same slot, and the second must not be
+    /// reachable before the first has been proved not to fire." **That ordering requirement is
+    /// what this kind's emitter is built around** and it is stricter than it first sounds, because
+    /// the hazard is not the ORDER of the exits, it is the mode-13 read COUNTER that sits between
+    /// them. `emit_ram_read_pointer` deposits `mode13_*_reads` into the frame before it returns,
+    /// and those lanes are copied out on EVERY exit -- so a divide-guard exit taken after the
+    /// deposit would charge the read once natively and once more when the interpreter re-executes
+    /// the instruction whole.
+    ///
+    /// `emit_div_mem` therefore uses the DEFERRED-completion shape that `Ret` and `JmpMem` already
+    /// use for their CS-limit exit: `emit_ram_read_pointer_inner` (which moves no counter), then
+    /// every divide guard including the post-divide quotient-range one, then the home write-back,
+    /// and only then `emit_mode13_read_completion`. Every exit out of this slot is therefore
+    /// pre-deposit and pre-effect.
+    ///
+    /// No `width` field, for `DivReg`'s reason exactly: classify's `OperandSize::Word` gate
+    /// excludes `0xf7` (bar `/0` TEST), so the arm is unreachable at Word, and a `width` field
+    /// would invite a future edit to pass `operand_width` and lower a 16-bit divide as a 32-bit
+    /// one. The bar is on the KIND -- this kind is dword-only by construction -- rather than on
+    /// the absence of a 0x66 prefix, which is why an UNPREFIXED `F7 /7 mem` in a CS.D = 0 segment
+    /// (`OperandSize::Word`, prefix mask 0) is refused too.
+    DivMem {
+        addr: DirectAddr,
         signed: bool,
     },
     TestImmReg {
@@ -4174,6 +4247,20 @@ pub(crate) enum StoreSource {
     /// throw away the segment identity that `selector_segment` needs to pin the descriptor.
     Selector(SegmentIndex),
     EipDelta(u32),
+    /// A byte the SLOT computed before the store's address work started, parked in the native
+    /// frame at `STACK_PUSH_MEM_VALUE` and read back here. Today's only producer is `SetCcMem`.
+    ///
+    /// It exists because `emit_store` materialises its source LAST -- inside the page-kind arm,
+    /// after the address, the permission check and the write-pointer resolve have consumed every
+    /// one of RAX/RCX/RDX/RDI -- and a SETcc byte cannot be produced there: it needs
+    /// `emit_load_host_flags`, which works in RAX and moves RSP with a `push`/`popfq` pair.
+    ///
+    /// The frame slot is the one `emit_push_mem` already uses for the same shape (a value read
+    /// before a store whose own path clobbers all four scratch registers), and the aliasing
+    /// argument recorded on `STACK_PUSH_MEM_VALUE` carries over unchanged: the write and the read
+    /// happen inside a single slot's emission, and `SetCcMem` is not an ALU kind, so it can never
+    /// be live at the same time as `STACK_ALU_OLD_RESULT`'s own user.
+    ParkedByte,
 }
 
 #[derive(Clone, Copy)]
@@ -4250,7 +4337,15 @@ impl DirectKind {
             Self::MovExtendReg { .. } => 3,
             // The interpreter's 0x0f90..=0x0f9f arm returns clocks(4) for both operand forms
             // against a default of 2, so this cannot ride the `_ => 2` arm below.
-            Self::SetCc { .. } => 4,
+            // ... and the SAME arm covers the memory form: `execute_condmove_decoded` returns one
+            // `clocks(4)` for the whole `0x0f90..=0x0f9f` range without looking at the operand
+            // shape, so the two kinds share this line rather than each guessing.
+            Self::SetCc { .. } | Self::SetCcMem { .. } => 4,
+            // SAHF's interpreter arm (execute.rs, 0x9e) returns clocks(3) -- one more than the
+            // `_ => 2` default, which is exactly the size of gap the campaign has shipped twice
+            // and that no emitter assertion can see (`completed_raw` sums this same accessor).
+            // LAHF's arm returns clocks(2) and is not lowered at all.
+            Self::Sahf => 3,
             // 0x98 (CBW/CWDE) returns clocks(3) for both operand forms (execute.rs); 0x99
             // (CWD/CDQ) returns clocks(2) for both, which is what the `_ => 2` default already
             // gives, so Cdq deliberately has no arm here.
@@ -4373,6 +4468,9 @@ impl DirectKind {
                 } | Self::DoubleShiftMem { .. }
                     | Self::ImulMem { .. }
                     | Self::ImulMemAcc { .. }
+                    // The divisor. ONE dword read, the same one `ImulMemAcc` registers: the
+                    // dividend is EDX:EAX and never touches memory.
+                    | Self::DivMem { .. }
                     | Self::TestImmMem {
                         width: MemoryWidth::Dword,
                         ..
@@ -4398,7 +4496,7 @@ impl DirectKind {
                 Self::Store {
                     width: MemoryWidth::Byte,
                     ..
-                }
+                } | Self::SetCcMem { .. }
             ) || matches!(
                 self,
                 Self::AluMemDest {
@@ -4487,6 +4585,7 @@ impl DirectKind {
             | Self::AluMemDest { addr, .. }
             | Self::DoubleShiftMem { addr, .. }
             | Self::TestImmMem { addr, .. }
+            | Self::DivMem { addr, .. }
             | Self::RmwIncDec { addr, .. }
             | Self::PushMem { addr, .. }
             | Self::JmpMem { addr, .. }
@@ -4581,6 +4680,7 @@ impl DirectKind {
         match self {
             Self::Store { addr, .. }
             | Self::RmwIncDec { addr, .. }
+            | Self::SetCcMem { addr, .. }
             | Self::DoubleShiftMem { addr, .. } => Some(addr.segment),
             Self::AluMemDest {
                 op: 0..=6, addr, ..
@@ -5159,6 +5259,120 @@ pub(crate) fn set_count_lanes_for_test(forced: Option<bool>) {
 #[cfg(test)]
 pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
     parse_count_lanes_arm(value)
+}
+
+/// Whether `classify` admits the FIVE dword rows the 32-bit FPU-loop census names
+/// (`IZARRAVM_FPU_LOOP_ROWS`). **DEFAULT ON since 2026-08-20** (the slice shipped OFF for one
+/// commit; the flip was priced by the tombraid-586 wall ladder exactly as `IZARRAVM_ROTATE_ROWS`
+/// and `IZARRAVM_COUNT_LANES` were -- the numbers are in the spelling table below).
+///
+/// The rows, and each one's home:
+///
+/// | row | form | where it lowers |
+/// |---|---|---|
+/// | `0x9B` WAIT/FWAIT | no operand | `NativeX87Insn::Wait`, an x87 slot whose whole body is the gate |
+/// | `0x9E` SAHF | no operand | `DirectKind::Sahf` |
+/// | `0xD9 /7` mod=3 rm=4 FRNDINT | register | `NativeX87Insn::RoundToInt` |
+/// | `0xF7 /6`,`/7` DIV/IDIV r/m32 | MEMORY | `DirectKind::DivMem` |
+/// | `0x0F90..=0x0F9F` SETcc r/m8 | MEMORY | `DirectKind::SetCcMem` |
+///
+/// WHY IT EXISTS. `dev_docs/tombraid-reprofile-2026-08-20.md` §4: on tombraid-586 the FMV phase is
+/// 77% of the row's wall at rt 0.609, 93.6% of its JIT entries end on a `static_unbound` exit, and
+/// 72.0% of that mass (643.5 M of 893.3 M) is class `rejected` -- the successor block is REFUSED
+/// compilation. `.bench/results/tombraid-reprofile-20260820/census-fmv-summary.json` splits the
+/// rejected table into two loops, and this knob is the whole of loop B, the game's 32-bit FPU loop
+/// at linear `0x49ACF3-0x4CB300` (mode key `0x31B`, ~27.6 M iterations). Its five rows, by
+/// interpreted runtime hits over the 20e9 census prefix:
+///
+/// * `0x9B` **165,587,061** -- three sites, six per iteration, the single largest row in the table;
+/// * `0x9E` 55,203,044 and `0xD9 /7` 55,195,911 -- two per iteration each;
+/// * `0xF7 /7` memory 27,602,949 and `0x0F94 /0` memory 27,602,402 -- one per iteration each.
+///
+/// **THE DOC'S NAME FOR THE THIRD ROW IS WRONG, and the census says so on its face.** Both
+/// `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1 and the handoff call `0xD9 /7` "FNSTCW". The
+/// row's `operand_form` is `"none"`, and `decode`'s FPU arm sets `insn.operand` for `mod != 3`
+/// ONLY -- so the row is a REGISTER form, and FNSTCW m16 (which is `mod != 3`, and which
+/// `NativeX87Insn::StoreControlWord` has lowered since before this slice) cannot be it. The eight
+/// `mod = 3` encodings are FPREM/FYL2XP1/FSQRT/FSINCOS/FRNDINT/FSCALE/FSIN/FCOS. Which one was
+/// settled by measurement rather than by inference: a temporary probe in `execute_fpu_register`,
+/// run on the tombraid fixture at 4e9 cycles, saw ModRM byte `0xFC` and nothing else, i.e.
+/// **FRNDINT**. That matters beyond bookkeeping -- FNSTCW would have been a two-byte store and
+/// FSIN/FCOS/FPTAN are not expressible in SSE at all, so the row's identity decides whether the
+/// slice is buildable.
+///
+/// THE SPELLING TABLE, trimmed and case-folded on the way in, matching `IZARRAVM_COUNT_LANES`:
+///
+/// * **unset** or `1` / `on` -> ON. The shipped default since 2026-08-20: the tombraid-586
+///   ladder read -17.2% min-wall (211.5 vs 255.4 s, three legs per arm, full non-overlap,
+///   `.bench/results/tomb-fmv-admission-20260819/wall-ladder/`), guest counters byte-identical
+///   per arm. Recorded before that date, an "on" leg is the non-default arm.
+/// * `` (empty), `0` or `off` -> OFF. The escape, the pre-slice refusal and the A/B base.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
+///   fell through to the default would be read as "the arm I asked for changed nothing".
+pub(crate) fn fpu_loop_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FPU_LOOP_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_fpu_loop_rows_arm(std::env::var("IZARRAVM_FPU_LOOP_ROWS")))
+}
+
+/// The `IZARRAVM_FPU_LOOP_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `fpu_loop_rows_enabled` for the contract.
+fn parse_fpu_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset = ON since the 2026-08-20 flip; `0` / `off` is the escape. Same shape (and same
+        // trap) as `IZARRAVM_COUNT_LANES`: an off leg must EXPORT `0`, not unset the variable.
+        Err(std::env::VarError::NotPresent) => return true,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_FPU_LOOP_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `1` / `on` (the shipped default: the five 32-bit \
+                 FPU-loop rows), and `0` / `off` (the escape, the pre-slice refusal)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_FPU_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default: the five 32-bit FPU-loop rows: WAIT, SAHF, FRNDINT, \
+             DIV/IDIV memory and SETcc memory), and `0` / `off` (the escape, the pre-slice \
+             refusal and the A/B base). Refusing to guess: a mistyped ladder leg would silently \
+             run the DEFAULT and be read as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `IMM8_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run both arms in one process, so one test's arm selection must not
+// reach another's compile. Every fixture for these five rows states its arm through here in
+// BOTH directions -- a positive fixture that rode the ambient default would go vacuous the day
+// the default moved, and the negative (refusal) fixtures need the off arm now that ON ships.
+#[cfg(test)]
+thread_local! {
+    static FPU_LOOP_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the FPU-loop-row arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_FPU_LOOP_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_fpu_loop_rows_for_test(forced: Option<bool>) {
+    FPU_LOOP_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `fpu_loop_rows_enabled` caches its env reading
+/// in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process
+/// and never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_fpu_loop_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_fpu_loop_rows_arm(value)
 }
 
 /// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and

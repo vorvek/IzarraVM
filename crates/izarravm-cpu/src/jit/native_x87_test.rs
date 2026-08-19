@@ -46,9 +46,11 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             // 0xD9 /4: FCHS, FABS, FTST, FXAM. rm 2, 3, 6 and 7 are undefined in the interpreter
             // and must stay rejected, so this is an explicit rm list, not a range.
             | (0xd9, 3, 4, 0 | 1 | 4 | 5)
-            // 0xD9 /7 rm=2 is FSQRT, the only member of that group with a single-instruction
-            // host equivalent. The other seven encodings stay rejected.
-            | (0xd9, 3, 7, 2)
+            // 0xD9 /7 rm=2 is FSQRT and rm=4 is FRNDINT (the FPU-loop slice's census row), the
+            // two members of that group with a host equivalent -- a `vsqrtsd` and a `vroundsd`
+            // under a runtime branch on the control word's RC field. The other six encodings
+            // (FPREM, FYL2XP1, FSINCOS, FSCALE, FSIN, FCOS) stay rejected.
+            | (0xd9, 3, 7, 2 | 4)
             // 0xDA memory forms: integer m32 arithmetic, all 8 sub-opcodes (`IntBinaryMemory`).
             // The register row keeps only `(0xda, 3, 5, 1)`, FUCOMPP; every other 0xDA mod=3
             // encoding is FCMOVcc and unrepresentable here, so it stays rejected.
@@ -111,8 +113,13 @@ fn classifier_selects_exact_traced_slice() {
     // (FIST m32) adds 3 modes x 1 sub-opcode x 8 rm values = 24, landing at 1077. 0xD9 mod=3 /4
     // (FCHS/FABS/FTST/FXAM) adds 4 rm values, landing at 1081. FSQRT (0xD9 /7 rm=2) adds one,
     // landing at 1082. 0xDF /7 memory (FISTP m64) adds 3 modes x 8 rm values = 24, landing at
-    // 1106. 0xDB /7 memory (FSTP m80) adds another 24, landing at 1130.
-    assert_eq!(accepted, 1130);
+    // 1106. 0xDB /7 memory (FSTP m80) adds another 24, landing at 1130. FRNDINT (0xD9 /7 rm=4,
+    // the FPU-loop slice) adds one, landing at 1131.
+    //
+    // WAIT (0x9B) is deliberately NOT in this total: it is not an escape opcode and the sweep
+    // above runs 0xD8..=0xDF only. `classifier_rejects_bad_prefixes_and_malformed_decodes` is
+    // where its ModRM-free shape is pinned.
+    assert_eq!(accepted, 1131);
 }
 
 #[test]
@@ -292,15 +299,23 @@ fn classifier_preserves_operations_indices_and_addresses() {
             "0xd9 mod=3 /4 rm={rm} is undefined and must stay unclassifiable"
         );
     }
-    // FSQRT, and the seven 0xD9 /7 encodings around it that must NOT come with it. FPREM,
-    // FYL2XP1, FSINCOS, FRNDINT, FSCALE, FSIN and FCOS are either transcendental or
-    // rounding-control dependent, and admitting any of them by widening the rm match is the
-    // realistic mistake this loop exists to catch.
+    // FSQRT and FRNDINT, and the six 0xD9 /7 encodings around them that must NOT come with them.
+    // FPREM, FYL2XP1, FSINCOS, FSCALE, FSIN and FCOS are transcendentals or partial remainders
+    // that the interpreter computes through Rust `f64` library calls, and admitting any of them
+    // by widening the rm match is the realistic mistake this loop exists to catch.
+    //
+    // FRNDINT joined on the FPU-loop slice and is rounding-control dependent, which is exactly
+    // what the earlier version of this comment gave as the reason it could not join: the answer
+    // is the runtime four-way branch in `emit_native_x87`, not a baked mode.
     assert_eq!(
         NativeX87Insn::classify(&insn(0xd9, 3, 7, 2)),
         Some(NativeX87Insn::SquareRoot)
     );
-    for rm in [0u8, 1, 3, 4, 5, 6, 7] {
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 7, 4)),
+        Some(NativeX87Insn::RoundToInt)
+    );
+    for rm in [0u8, 1, 3, 5, 6, 7] {
         assert!(
             NativeX87Insn::classify(&insn(0xd9, 3, 7, rm)).is_none(),
             "0xd9 mod=3 /7 rm={rm} must stay unclassifiable"
@@ -448,7 +463,21 @@ fn classifier_rejects_bad_prefixes_and_malformed_decodes() {
     candidate = insn(0xd8, 0, 0, 0);
     candidate.modrm = None;
     assert!(NativeX87Insn::classify(&candidate).is_none());
+    // WAIT/FWAIT. `decode`'s FPU arm fetches a ModRM for every opcode EXCEPT 0x9b, so the ONLY
+    // shape that classifies is the one with neither a ModRM nor an operand -- and it classifies
+    // as `Wait` since the FPU-loop slice, where it previously fell through the `insn.modrm?`
+    // below it. Both halves are pinned: a 0x9b that arrives carrying either field is a decode
+    // that did not happen, and admitting it would emit a slot whose `metadata().memory` says None
+    // while an operand exists.
     candidate = insn(0x9b, 3, 0, 0);
+    candidate.modrm = None;
+    assert_eq!(
+        NativeX87Insn::classify(&candidate),
+        Some(NativeX87Insn::Wait)
+    );
+    candidate = insn(0x9b, 3, 0, 0);
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+    candidate = insn(0x9b, 0, 0, 5);
     candidate.modrm = None;
     assert!(NativeX87Insn::classify(&candidate).is_none());
     candidate = insn(0x1d8, 0, 0, 0);
@@ -1150,6 +1179,8 @@ fn every_x87_shape() -> Vec<NativeX87Insn> {
         NativeX87Insn::TestZero,
         NativeX87Insn::Examine,
         NativeX87Insn::SquareRoot,
+        NativeX87Insn::Wait,
+        NativeX87Insn::RoundToInt,
         NativeX87Insn::LoadF32 { addr: addr() },
         NativeX87Insn::LoadI32 { addr: addr() },
         NativeX87Insn::LoadControlWord { addr: addr() },
@@ -1220,7 +1251,9 @@ fn shape_is_enumerated(insn: NativeX87Insn) -> bool {
         | NativeX87Insn::SignOp { .. }
         | NativeX87Insn::TestZero
         | NativeX87Insn::Examine
-        | NativeX87Insn::SquareRoot => true,
+        | NativeX87Insn::SquareRoot
+        | NativeX87Insn::Wait
+        | NativeX87Insn::RoundToInt => true,
     }
 }
 

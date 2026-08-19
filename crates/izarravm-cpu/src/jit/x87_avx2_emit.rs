@@ -282,6 +282,48 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             emit_finite_guard(e, VALUE0, context.side_exit);
             emit_store_physical(e, top, VALUE0);
         }
+        // WAIT/FWAIT. The body is EMPTY on purpose: the whole instruction is the gate above, and
+        // when `check_gate` is false the gate has already run earlier in this block and still
+        // holds (see `NativeX87Insn::Wait` for why that is exact rather than optimistic). No
+        // register, no status bit, no TOP movement -- an emitted WAIT that touched any of them
+        // would be wrong, because the interpreter's 0x9b arm returns straight out of
+        // `execute_fpu_decoded` without reaching `execute_fpu_register` or the FPU state at all.
+        NativeX87Insn::Wait => {}
+        // FRNDINT. The four-way branch on the control word's RC field IS the instruction: RC is a
+        // runtime value and `vroundsd` takes its mode as an immediate, so the four modes are four
+        // emitted instructions with three compares in front of them.
+        //
+        // The immediates are `fpu_round_rc`'s four arms in `fpu_round_rc`'s order --
+        // 0 round-to-nearest-even, 1 floor, 2 ceil, 3 truncate -- which is also the RC encoding's
+        // own order, so the mapping is the identity and there is no translation to get wrong.
+        // Bit 3 (0x08) suppresses the precision exception, matching an interpreter that does not
+        // model one; without it a host MXCSR flag would move where no guest state does.
+        //
+        // Scratch: RDX only, which `emit_load_physical` has just finished with (it is that
+        // helper's tag scratch), and which nothing below `emit_store_physical` reads.
+        NativeX87Insn::RoundToInt => {
+            emit_load_physical(e, top, VALUE0, context.side_exit);
+            e.movzx_r32_word_disp32(Reg::RDX, context.cpu, control_offset());
+            e.shr_r32_imm8(Reg::RDX, 10);
+            e.and_r32_imm32(Reg::RDX, 3);
+            let done = e.label();
+            let arms = [e.label(), e.label(), e.label()];
+            for (mode, arm) in arms.iter().enumerate() {
+                e.cmp_r32_imm32(Reg::RDX, mode as u32 + 1);
+                e.jz(*arm);
+            }
+            e.vroundsd(VALUE0, VALUE0, VALUE0, 0x08);
+            e.jmp(done);
+            for (mode, arm) in arms.iter().enumerate() {
+                e.place(*arm);
+                e.vroundsd(VALUE0, VALUE0, VALUE0, (mode as u8 + 1) | 0x08);
+                if mode + 1 < arms.len() {
+                    e.jmp(done);
+                }
+            }
+            e.place(done);
+            emit_store_physical(e, top, VALUE0);
+        }
         // FTST. The only compare shape that loads ONE physical register: its right-hand side is
         // the literal +0.0, not a stack slot, so there is no second tag or finite guard.
         NativeX87Insn::TestZero => {

@@ -3131,3 +3131,213 @@ fn x87_top_retire_budget_is_fresh_after_the_page_is_rewritten() {
         "the rewritten key spends a fresh budget"
     );
 }
+
+// =============================================================================================
+// The two x87 rows of the tombraid FMV census's loop B, behind `IZARRAVM_FPU_LOOP_ROWS`.
+//
+// The other three rows of that slice (SAHF, DIV/IDIV memory, SETcc memory) are integer kinds and
+// live in `cpu_jit_fpu_loop_rows_test.rs`, together with the gate's own spelling and default
+// pins. These two are here because they are `NativeX87Insn` variants emitted by
+// `x87_avx2_emit.rs`, and only this file's harness compares `CpuGsw.fpu`, the TOP and `fp_rem`.
+//
+// EVERY fixture below forces the arm: the shipped default is OFF, so one that read the ambient
+// knob would compile a block that stops at the row and compare the interpreter against itself.
+// =============================================================================================
+
+/// Force the FPU-loop-row arm for this thread and prove the selection took.
+fn select_fpu_loop_rows(enabled: bool) {
+    jit::direct::set_fpu_loop_rows_for_test(Some(enabled));
+    assert_eq!(
+        jit::direct::fpu_loop_rows_enabled(),
+        enabled,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_FPU_LOOP_ROWS"
+    );
+}
+
+/// `fld dword [0x200]` / `fwait` / `fstp dword [0x204]` / `fwait`, the FMV loop's shape for the
+/// WAIT row: the SECOND WAIT is not the block's first x87 slot, so it emits no gate of its own and
+/// exercises the inherited-gate argument in `NativeX87Insn::Wait`.
+fn wait_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]
+        0x9b, // fwait
+        0xd9, 0x1d, 0x04, 0x02, 0x00, 0x00, // fstp dword [0x204]
+        0x9b, // fwait
+        0x89, 0xc0, // mov eax,eax
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&1.5f32.to_bits().to_le_bytes());
+    memory
+}
+
+/// WAIT retires NATIVELY when nothing is pending, in both the gate-emitting and the
+/// gate-inherited position.
+///
+/// Catches: a `Wait` that never reached `emit_native_x87` at all -- the block would stop short and
+/// `Exact(5)` fails. It also catches a `raw_clocks`/`fp_class` mistake, because
+/// `assert_program_matches_impl` compares `elapsed_clocks`, `fp_rem` and the per-run `core_clocks`
+/// vector, and WAIT is the only user of `FpOpClass::Wait`: copying `Register` there moves the
+/// total.
+#[test]
+fn wait_retires_natively_when_no_exception_is_pending() {
+    select_fpu_loop_rows(true);
+    let (cpu, bus) = assert_program_matches_exact_insns(GswMode::Gsw586, wait_program(), 0x037f, 5);
+    assert_eq!(
+        f32::from_le_bytes(bus.memory[DATA + 4..DATA + 8].try_into().unwrap()),
+        1.5
+    );
+    assert_eq!(cpu.fpu.status & 0x3f, 0);
+    jit::direct::set_fpu_loop_rows_for_test(None);
+}
+
+/// WAIT's ARCHITECTURAL JOB: with an unmasked exception pending and CR0.NE set it must trap, and
+/// with CR0.MP + CR0.TS it must raise #NM. Neither may be swallowed by the native form.
+///
+/// Catches an emit arm that is empty AND unguarded. The comparison is `run_straight_line`'s whole
+/// result, so a native run that retired the WAIT where the interpreter faulted differs in the
+/// returned fault, in EIP and in the x87 state.
+///
+/// This is the fixture the `NativeX87Insn::Wait` doc's "conservative but never permissive"
+/// paragraph is written against: the native side may side-exit where the interpreter retires, but
+/// never the reverse. CR0.MP | CR0.TS is WAIT's OWN #NM pair and is a different pair from the
+/// CR0.EM | CR0.TS the shared gate tests, which is why it is exercised here rather than left to
+/// `nm_and_mf_gates_match_interpreter_without_touching_x87_or_memory`.
+#[test]
+fn wait_delivers_the_pending_exception_and_the_task_switch_fault() {
+    select_fpu_loop_rows(true);
+    let memory = wait_program();
+    let (mut direct, mut direct_bus) =
+        assert_program_matches(GswMode::Gsw586, memory.clone(), 0x037f);
+
+    for pending_mf in [false, true] {
+        let mut interpreter = x87_cpu(GswMode::Gsw586);
+        let mut interpreter_bus = direct_memory(memory.clone());
+        arm(&mut interpreter, 0x037f);
+        run_to_halt(&mut interpreter, &mut interpreter_bus);
+        arm(&mut direct, 0x037f);
+        arm(&mut interpreter, 0x037f);
+        direct_bus.memory.copy_from_slice(&memory);
+        direct_bus.trace = BusTrace::default();
+        interpreter_bus.memory.copy_from_slice(&memory);
+        interpreter_bus.trace = BusTrace::default();
+        if pending_mf {
+            for cpu in [&mut direct, &mut interpreter] {
+                cpu.control.cr0 = CR0_NE;
+                cpu.fpu.control &= !1;
+                cpu.fpu.raise_exception(1);
+            }
+        } else {
+            direct.control.cr0 = CR0_MP | CR0_TS;
+            interpreter.control.cr0 = CR0_MP | CR0_TS;
+        }
+        let fpu_before = direct.fpu.clone();
+        let memory_before = direct_bus.memory.clone();
+        let direct_result = direct.run_straight_line(&mut direct_bus, u64::MAX);
+        let interpreter_result = interpreter.run_straight_line(&mut interpreter_bus, u64::MAX);
+        assert_eq!(direct_result, interpreter_result, "pending_mf={pending_mf}");
+        assert_eq!(direct.registers, interpreter.registers);
+        assert_eq!(direct.fpu, interpreter.fpu);
+        assert_eq!(direct.fpu, fpu_before, "the trap left x87 state moved");
+        assert_eq!(direct_bus.memory, interpreter_bus.memory);
+        assert_eq!(direct_bus.memory, memory_before);
+        assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
+        assert_eq!(direct.fp_rem, interpreter.fp_rem);
+    }
+    jit::direct::set_fpu_loop_rows_for_test(None);
+}
+
+/// `fld dword [0x200]` / `frndint` / `fstp dword [0x204]`.
+fn frndint_program(value: f32) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]
+        0xd9, 0xfc, // frndint
+        0xd9, 0x1d, 0x04, 0x02, 0x00, 0x00, // fstp dword [0x204]
+        0x89, 0xc0, // mov eax,eax
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+    memory
+}
+
+/// FRNDINT under ALL FOUR rounding-control modes, over the values that separate them.
+///
+/// Catches, and each is a real mutation of `emit_native_x87`'s `RoundToInt` arm:
+///
+/// * a BAKED immediate instead of the runtime branch -- three of the four RC arms then round the
+///   wrong way, and `+/-2.5`, `+/-0.5` and `+/-1.5` each separate a different pair of modes;
+/// * the RC field read from the wrong bits. `>> 10 & 3` is the only correct extraction; a `>> 8`
+///   picks up the PRECISION-control field instead, which is why the `precision` loop varies it;
+/// * the four immediates permuted -- `fpu_round_rc`'s arms are nearest/floor/ceil/trunc in that
+///   order and `vroundsd`'s encoding agrees, so any permutation shows on a negative value;
+/// * a missing `emit_store_physical`, which leaves ST(0) unrounded.
+///
+/// `assert_program_matches_exact_insns` pins FOUR native retirements, so a slot that quietly fell
+/// back to the interpreter -- which would compare EQUAL on every value -- fails instead.
+#[test]
+fn frndint_matches_the_interpreter_under_every_rounding_mode() {
+    select_fpu_loop_rows(true);
+    for rc in 0..4u16 {
+        for precision in [0x0000u16, 0x0300] {
+            let control = 0x007f | precision | (rc << 10);
+            for value in [
+                2.5f32, -2.5, 1.5, -1.5, 0.5, -0.5, 0.0, -0.0, 3.7, -3.7, 4.0, -0.25,
+            ] {
+                let (_, bus) = assert_program_matches_exact_insns(
+                    GswMode::Gsw586,
+                    frndint_program(value),
+                    control,
+                    4,
+                );
+                let rounded =
+                    f32::from_le_bytes(bus.memory[DATA + 4..DATA + 8].try_into().unwrap());
+                let expected = match rc {
+                    0 => f64::from(value).round_ties_even(),
+                    1 => f64::from(value).floor(),
+                    2 => f64::from(value).ceil(),
+                    _ => f64::from(value).trunc(),
+                } as f32;
+                assert_eq!(
+                    rounded.to_bits(),
+                    expected.to_bits(),
+                    "rc={rc} precision={precision:#06x} value={value}"
+                );
+            }
+        }
+    }
+    jit::direct::set_fpu_loop_rows_for_test(None);
+}
+
+/// FRNDINT's operand guard: an EMPTY ST(0) must side exit rather than round whatever the resident
+/// cache happened to hold.
+///
+/// Catches an arm that skipped `emit_load_physical` and read the physical XMM directly. The
+/// program pops the stack empty first, so the tag word says Empty and only the interpreter's own
+/// `fpu.get(0)` path may run.
+#[test]
+fn frndint_side_exits_on_an_empty_stack_slot() {
+    select_fpu_loop_rows(true);
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]
+        0xdd, 0xd8, // fstp st(0) -- pops, leaving ST(0) empty
+        0xd9, 0xfc, // frndint
+        0x89, 0xc0, // mov eax,eax
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&2.5f32.to_bits().to_le_bytes());
+    let (cpu, _) = assert_program_matches(GswMode::Gsw586, memory, 0x037f);
+    assert!(
+        cpu.perf_counters().jit_direct_side_exits > 0,
+        "the empty-slot guard must have exited: {:?}",
+        cpu.perf_counters()
+    );
+    jit::direct::set_fpu_loop_rows_for_test(None);
+}

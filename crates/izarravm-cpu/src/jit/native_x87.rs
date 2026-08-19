@@ -206,9 +206,49 @@ pub(crate) enum NativeX87Insn {
     SignOp {
         negate: bool,
     },
-    /// FSQRT (0xD9 FA). The one member of the 0xD9 /7 register group that lowers: every other
-    /// encoding there is a transcendental, a partial remainder or an RC-dependent rounding, none
-    /// of which has a single-instruction host equivalent.
+    /// WAIT / FWAIT (0x9B). The one member of this enum that is not an escape opcode at all, and
+    /// the one whose emitted body is EMPTY: its entire architectural job is the pending-exception
+    /// trap that `emit_gate` already performs, so a lowered WAIT is the gate plus a fall-through.
+    ///
+    /// The interpreter (fpu_exec.rs, the `opcode == 0x9b` head of `execute_fpu_decoded`) is three
+    /// tests: `#NM` when `CR0.MP & CR0.TS` are BOTH set, `#MF` when `CR0.NE` is set and the x87
+    /// has a pending unmasked exception, otherwise `clocks(6)` and nothing else. `emit_gate`'s
+    /// first test is `CR0.EM | CR0.TS`, which is a SUPERSET of the first -- it side exits on
+    /// `TS` alone and on `EM` alone, where WAIT would have retired -- and its second test is
+    /// `CR0.NE != 0 && status & 0x3f & !(control & 0x3f) != 0`, which is
+    /// `X87::pending_unmasked_exception` transcribed. Conservative-but-never-permissive is the
+    /// same contract every other guard in this file has: a side exit re-runs the instruction in
+    /// the interpreter, which faults or retires by its own rules.
+    ///
+    /// **The gate is emitted ONCE per block, and this variant depends on that being sound rather
+    /// than on it being re-armed.** `emit`'s `check_gate: !x87_gate_emitted` skips the gate for
+    /// every x87 slot after the first (re-arming only after FLDCW, which changes the MASK). A WAIT
+    /// in the second or later x87 slot therefore emits NOTHING AT ALL, and that is exact for the
+    /// reason recorded at that call site: no native x87 arm can set status bits 0..5, every
+    /// exceptional result side exits before changing x87 state, and `CR0` cannot move mid-block
+    /// because `MOV CR0` is not lowered. So if the gate passed at the block's first x87 slot it
+    /// still passes here.
+    Wait,
+    /// FRNDINT (0xD9 FC): round ST(0) to an integer under the control word's RC field.
+    ///
+    /// The tombraid FMV census's third loop-B row (55,195,911 interpreted hits, two per iteration).
+    /// The re-profile document calls that row "FNSTCW" and is wrong; see
+    /// `direct::fpu_loop_rows_enabled` for the census evidence and the probe that settled it.
+    ///
+    /// The interpreter is `fpu_round_rc(control, ST(0))` (lib.rs), whose four RC arms are
+    /// `round_ties_even` / `floor` / `ceil` / `trunc` -- which is `vroundsd`'s immediate encoding
+    /// 0/1/2/3 exactly, in the same order. RC is a RUNTIME value, so the emitted form is a
+    /// four-way branch on `(control >> 10) & 3` rather than a baked immediate; `emit_fistp_chop_
+    /// guard`'s alternative (refuse every RC but chop) would leave the row uncollapsed on any
+    /// guest that rounds, which is most of them.
+    ///
+    /// No result guard, unlike `SquareRoot`: rounding a finite double yields a finite double at
+    /// every RC (the magnitude grows by at most one ULP-of-integer and `f64::MAX` is an integer),
+    /// so the operand guard `emit_load_physical` already applies is the whole requirement.
+    RoundToInt,
+    /// FSQRT (0xD9 FA). The one member of the 0xD9 /7 register group that lowered before the
+    /// FPU-loop slice added FRNDINT above: the remaining six encodings there are transcendentals
+    /// or partial remainders, none of which has a single-instruction host equivalent.
     ///
     /// The interpreter STORES a NaN result and raises IE (fpu_exec.rs:483-491), so the native
     /// form must not: `emit_finite_guard` on the result catches the negative operand and side
@@ -347,6 +387,10 @@ impl NativeX87Insn {
             | Self::TestZero
             | Self::Examine
             | Self::SquareRoot
+            // FRNDINT rewrites ST(0) in place and WAIT touches nothing at all, so both are
+            // TOP-insensitive in the 0xD9 /4 group's sense.
+            | Self::RoundToInt
+            | Self::Wait
             // Neither control-word form touches the register stack, the status word or the tag
             // word, so both are TOP-insensitive. That is what makes them safe to admit, and it is
             // also why they pin a block to its compile-time TOP for no architectural reason; see
@@ -380,6 +424,13 @@ impl NativeX87Insn {
         }
 
         let opcode = u8::try_from(insn.opcode).ok()?;
+        // WAIT/FWAIT is in `DecodeGroup::Fpu` but is not an escape opcode: `decode`'s FPU arm
+        // fetches a ModRM for every opcode EXCEPT 0x9b, so this must answer above the
+        // `insn.modrm?` below or the row can never classify. `insn.operand` is None for the same
+        // reason, which is what the census reports as `operand_form: "none"`.
+        if opcode == 0x9b {
+            return (insn.modrm.is_none() && insn.operand.is_none()).then_some(Self::Wait);
+        }
         let modrm = insn.modrm?;
         if modrm.mode > 3 || modrm.reg > 7 || modrm.rm > 7 {
             return None;
@@ -448,9 +499,12 @@ impl NativeX87Insn {
             (0xd9, 4, 1) => Some(Self::SignOp { negate: false }),
             (0xd9, 4, 4) => Some(Self::TestZero),
             (0xd9, 4, 5) => Some(Self::Examine),
-            // FSQRT alone out of the eight 0xD9 /7 encodings. The other seven (FPREM, FYL2XP1,
-            // FSINCOS, FRNDINT, FSCALE, FSIN, FCOS) stay rejected.
+            // FSQRT and FRNDINT out of the eight 0xD9 /7 encodings. The other six (FPREM,
+            // FYL2XP1, FSINCOS, FSCALE, FSIN, FCOS) stay rejected: each is a transcendental or a
+            // partial remainder with no host equivalent, and the interpreter computes them in
+            // Rust `f64` library calls that no emitted sequence reproduces bit for bit.
             (0xd9, 7, 2) => Some(Self::SquareRoot),
+            (0xd9, 7, 4) => Some(Self::RoundToInt),
             (0xd9, 5, 0) => Some(Self::LoadOne),
             (0xd9, 5, 6) => Some(Self::LoadZero),
             (0xda, 5, 1) | (0xde, 3, 1) => Some(Self::ComparePopPop),
@@ -624,6 +678,28 @@ impl NativeX87Insn {
             Self::SquareRoot => NativeX87Metadata {
                 raw_clocks: 70,
                 fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+            // `clocks(20)`, the 0xFC arm of `fpu_d9_register`. It shares the 0xD9 /7 opcode with
+            // FSQRT above and charges a quarter of it, which is the reason the group cannot ride
+            // one arm.
+            Self::RoundToInt => NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+            // WAIT's OWN class, `FpOpClass::Wait`, and it is the only user of it. Copying
+            // `Register` here is the realistic mistake and it would be a guest-visible timing
+            // divergence rather than a rounding one: `execute_fpu_decoded`'s 0x9b head returns
+            // `clocks(6)` and then scales it through `scale_fp_clocks(.., FpOpClass::Wait)`, a
+            // different `fp_timing_class` entry from every other shape in this table.
+            Self::Wait => NativeX87Metadata {
+                raw_clocks: 6,
+                fp_class: FpOpClass::Wait,
                 memory: None,
                 pops: false,
                 terminates_block: false,
