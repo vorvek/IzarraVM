@@ -121,7 +121,69 @@ struct FatWalk {
     /// `ClusterIndex::fat_entry` is a single `HashSet` probe. Boxed so the cursor
     /// itself stays pointer-sized on the walk's stack frame.
     overlay: Option<Box<[u8; SECTOR]>>,
+    /// Every FAT sector this walk resolved, in resolve order. This is the walk's
+    /// COMPLETE dependency set -- see [`ChainMemo`], which keeps it so a later
+    /// pass can prove the chain cannot have changed.
+    sectors: Vec<u32>,
+    /// Set when a resolve failed to read a guest-written FAT sector back and the
+    /// walk therefore ran on substituted zeros. Such a walk is never memoized:
+    /// its answer is a function of an I/O failure rather than of the volume.
+    degraded: bool,
 }
+
+/// A memoized cluster chain, and exactly what would have to change to make it
+/// wrong.
+///
+/// WHY. Even with the per-sector walk cursor, the projection pass still stepped
+/// every cluster of every live file's chain three to four times over, and did it
+/// again on the next pass whether or not anything had changed. Measured: a worst
+/// pass of 0.96 ms on a 47 MB folder against 9.68 ms on a 498 MB one -- the same
+/// tenfold ratio as the allocated cluster count, for a write that touched one
+/// file.
+///
+/// WHEN IT IS STILL VALID. A chain from `first` is fully determined by the FAT
+/// entries at its own clusters. Each of those comes from one of exactly two
+/// places: the store's overlay for the FAT sector holding it, or the base view.
+///
+/// * The base view never changes. `fat` and `geo` are built in `new` and never
+///   mutated.
+/// * The overlay changes only through `SectorStore::insert`, whose sole caller is
+///   `write_sector`, which routes every FAT-region LBA through
+///   `note_metadata_write` -- the site that stamps `fat_sector_epoch`. It can
+///   also change through `SectorStore::acknowledge`, whose sole caller
+///   acknowledges a projected file's DATA sectors and never a metadata one
+///   (asserted there).
+///
+/// So if no sector in `sectors` has been stamped since `epoch`, every entry the
+/// walk read still reads the same, and the walk would produce the same chain.
+/// The dependency set is complete because it records EVERY resolve, including
+/// the ones the base view answered: a sector that held no guest bytes then and
+/// holds some now is stamped, and stamping is what expires the memo.
+///
+/// EXTENSION IS COVERED. A chain that has grown had its old last cluster's FAT
+/// entry rewritten from EOC to a link, and that entry is in a sector the walk
+/// read, so the memo expires. A chain that has been freed or re-pointed is the
+/// same argument.
+#[derive(Debug)]
+struct ChainMemo {
+    /// `katea_write::chain`'s answer, `None` included: a held chain is as worth
+    /// memoizing as a good one, and for the same reason.
+    result: Option<Vec<u32>>,
+    /// The FAT sectors the walk read, FAT-copy-relative.
+    sectors: Vec<u32>,
+    /// `fat_epoch` when the walk ran.
+    epoch: u64,
+}
+
+/// Chain memo entries kept before the whole map is dropped.
+///
+/// The map is keyed by first cluster, so a well-behaved mount holds one entry
+/// per live file and the total of their chains is bounded by the volume's
+/// cluster count. What is NOT bounded by that is a guest that keeps creating
+/// files at fresh clusters: each leaves an entry behind that nothing prunes.
+/// Clearing wholesale at a ceiling costs one cold pass and cannot be wrong --
+/// the memo is only ever an optimization over walking.
+const CHAIN_MEMO_MAX_ENTRIES: usize = 65_536;
 
 #[derive(Clone, Copy)]
 struct HostReadContext<'a> {
@@ -1026,6 +1088,25 @@ pub(crate) struct KateaTreeVolume {
     /// test reads it to prove that.
     #[cfg(test)]
     fat_walk_resolves: std::cell::Cell<u64>,
+    /// Cluster chains already walked, keyed by first cluster. See [`ChainMemo`]
+    /// for the validity argument and [`CHAIN_MEMO_MAX_ENTRIES`] for the bound.
+    /// `RefCell` because `chain_of` is `&self`.
+    chain_memo: std::cell::RefCell<HashMap<u32, ChainMemo>>,
+    /// Monotone counter of guest writes to the FAT region. Also the "nothing at
+    /// all has changed" fast path: a memo taken at the current epoch needs no
+    /// per-sector check.
+    fat_epoch: u64,
+    /// The epoch at which each FAT sector was last written by the guest,
+    /// FAT-copy-relative (so a write to either copy expires both, which is the
+    /// conservative direction). Absent means never.
+    fat_sector_epoch: HashMap<u32, u64>,
+    /// Chain walks actually performed, and memo hits, since mount. The memo
+    /// exists to keep the first proportional to what CHANGED rather than to the
+    /// mounted folder, and a test reads both to prove it.
+    #[cfg(test)]
+    chain_walks: std::cell::Cell<u64>,
+    #[cfg(test)]
+    chain_memo_hits: std::cell::Cell<u64>,
     /// Arms the FAT / directory / free-space region census. Read once at mount
     /// from `IZARRAVM_KATEA_REGION_CENSUS=1`, and OFF by default: those two
     /// counters were investigation residue, and an increment is still a branch
@@ -1555,6 +1636,13 @@ impl KateaTreeVolume {
             fat_sector_builds: std::cell::Cell::new(0),
             #[cfg(test)]
             fat_walk_resolves: std::cell::Cell::new(0),
+            chain_memo: std::cell::RefCell::new(HashMap::new()),
+            fat_epoch: 0,
+            fat_sector_epoch: HashMap::new(),
+            #[cfg(test)]
+            chain_walks: std::cell::Cell::new(0),
+            #[cfg(test)]
+            chain_memo_hits: std::cell::Cell::new(0),
             region_census: region_census_enabled(),
         })
     }
@@ -1638,6 +1726,19 @@ impl KateaTreeVolume {
     #[cfg(test)]
     pub(crate) fn chain_via_walk(&self, first: u32) -> Option<Vec<u32>> {
         self.chain_of(first)
+    }
+
+    /// Chain walks actually performed and memo hits, since mount. See
+    /// [`ChainMemo`].
+    #[cfg(test)]
+    pub(crate) fn chain_walk_counts(&self) -> (u64, u64) {
+        (self.chain_walks.get(), self.chain_memo_hits.get())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_chain_walk_counts(&self) {
+        self.chain_walks.set(0);
+        self.chain_memo_hits.set(0);
     }
 
     /// How many host read handles are cached, for the LRU bound test.
@@ -1881,6 +1982,10 @@ impl KateaTreeVolume {
         let byte = c as usize * 4;
         let within = (byte / SECTOR) as u32;
         if within >= self.geo.fatsz {
+            // Outside FAT copy 0 entirely: a corrupt or guest-crafted link. The
+            // old path answers it, and the walk records nothing -- so a memo
+            // built from it must not be trusted, which `degraded` enforces.
+            walk.degraded = true;
             return self.fat_entry(c);
         }
         let off = byte % SECTOR;
@@ -1889,6 +1994,7 @@ impl KateaTreeVolume {
             #[cfg(test)]
             self.fat_walk_resolves
                 .set(self.fat_walk_resolves.get().saturating_add(1));
+            walk.sectors.push(within);
             let lba = self.geo.part_start + u32::from(RESERVED_SECTORS) + within;
             walk.overlay = match self.store.get(lba) {
                 Ok(Some(bytes)) => Some(Box::new(bytes)),
@@ -1898,6 +2004,7 @@ impl KateaTreeVolume {
                     // store has already counted the error and `read_sector`
                     // dropped the degraded flag and served zeros.
                     eprintln!("katea: guest-written sector {lba} could not be read back: {e}");
+                    walk.degraded = true;
                     Some(Box::new([0u8; SECTOR]))
                 }
             };
@@ -1924,16 +2031,61 @@ impl KateaTreeVolume {
         }
     }
 
-    /// Follow the cluster chain starting at `first`, with a fresh walk cursor.
+    /// Follow the cluster chain starting at `first`, memoized.
     ///
     /// Every chain walk in the reconcile path goes through here, so none of them
-    /// pays `fat_entry`'s per-cluster sector copy. The result is
-    /// `katea_write::chain`'s, unchanged.
+    /// pays `fat_entry`'s per-cluster sector copy -- and none of them re-walks a
+    /// chain whose FAT sectors nothing has written since the last walk. The
+    /// result is `katea_write::chain`'s, unchanged, in both cases; see
+    /// [`ChainMemo`] for why the second one is the same answer and not merely a
+    /// plausible one.
     fn chain_of(&self, first: u32) -> Option<Vec<u32>> {
+        if let Some(memo) = self.chain_memo.borrow().get(&first)
+            && self.chain_memo_is_current(memo)
+        {
+            #[cfg(test)]
+            self.chain_memo_hits
+                .set(self.chain_memo_hits.get().saturating_add(1));
+            return memo.result.clone();
+        }
+        #[cfg(test)]
+        self.chain_walks
+            .set(self.chain_walks.get().saturating_add(1));
         let mut walk = FatWalk::default();
-        crate::katea_write::chain(first, self.max_chain(), |c| {
+        let result = crate::katea_write::chain(first, self.max_chain(), |c| {
             self.fat_entry_walked(c, &mut walk)
-        })
+        });
+        if !walk.degraded {
+            let mut memo = self.chain_memo.borrow_mut();
+            if memo.len() >= CHAIN_MEMO_MAX_ENTRIES && !memo.contains_key(&first) {
+                memo.clear();
+            }
+            memo.insert(
+                first,
+                ChainMemo {
+                    result: result.clone(),
+                    sectors: walk.sectors,
+                    epoch: self.fat_epoch,
+                },
+            );
+        }
+        result
+    }
+
+    /// Would re-walking this memo's chain read the same FAT entries it did?
+    ///
+    /// The whole-volume test first: with no FAT write at all since the memo was
+    /// taken, nothing needs checking. Otherwise every sector the walk read is
+    /// compared against the epoch at which it was last written -- a handful of
+    /// probes for a chain of any length, because a FAT sector covers 128
+    /// clusters.
+    fn chain_memo_is_current(&self, memo: &ChainMemo) -> bool {
+        if self.fat_epoch == memo.epoch {
+            return true;
+        }
+        memo.sectors
+            .iter()
+            .all(|within| self.fat_sector_epoch.get(within).copied().unwrap_or(0) <= memo.epoch)
     }
 
     /// Absolute LBA of a data cluster's first sector. The reconcile pass and the
@@ -1982,6 +2134,14 @@ impl KateaTreeVolume {
             let first_cluster = within.saturating_mul((SECTOR / 4) as u32);
             self.fat_dirty_clusters
                 .extend(first_cluster..first_cluster + (SECTOR / 4) as u32);
+            // THE CHAIN MEMO'S ONLY INVALIDATION SITE. `write_sector` is the sole
+            // caller of `SectorStore::insert` and routes every FAT-region LBA
+            // through here, so stamping the sector here is what makes
+            // [`ChainMemo`]'s dependency test sound. Taken modulo `fatsz`, so a
+            // write to either FAT copy expires memos that read the first -- the
+            // conservative direction, and free.
+            self.fat_epoch += 1;
+            self.fat_sector_epoch.insert(within, self.fat_epoch);
             return true;
         }
         if rel < self.geo.first_data_sector {
@@ -2182,6 +2342,15 @@ impl KateaTreeVolume {
         bump(&self.counters.projection_bytes, bytes);
 
         for lba in acknowledged {
+            // `acknowledge` is the other way the store's answer for an LBA can
+            // change, and this is its only caller. [`ChainMemo`] is sound only
+            // because what it drops is always a projected file's DATA sectors,
+            // never a FAT one -- the memo has no hook here and needs none.
+            debug_assert!(
+                lba >= self.geo.part_start + self.geo.first_data_sector,
+                "acknowledged a metadata sector ({lba}): the chain memo has no \
+                 invalidation hook for that"
+            );
             self.store.acknowledge(lba);
             self.forget_unmapped(lba);
         }

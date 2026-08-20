@@ -3272,6 +3272,143 @@ fn a_chain_walk_resolves_one_fat_sector_per_128_clusters() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// THE CHAIN MEMO MUST NEVER SERVE A CHAIN THE FAT NO LONGER SAYS.
+///
+/// This is the safety test for `ChainMemo`'s invalidation, and the dangerous
+/// direction is obvious: a stale chain fed to reconcile writes the wrong bytes
+/// into a real host file, or deletes one. So rather than assert the invalidation
+/// rule, the test replays a deterministic pseudo-random sequence of guest FAT
+/// writes -- links, EOCs, frees, and rewrites of sectors already written -- and
+/// after EVERY ONE of them compares `chain_of` against `katea_write::chain`
+/// driven by the untouched `fat_entry`, over every seeded first cluster.
+///
+/// The sequence deliberately mixes clusters that share a FAT sector with ones
+/// that do not, so both arms of `chain_memo_is_current` are exercised: the
+/// whole-volume epoch equality and the per-sector comparison.
+///
+/// NON-VACUOUS: deleting the `fat_sector_epoch.insert` in `note_metadata_write`
+/// (so nothing ever expires) fails on the first write that changes a chain;
+/// so does stamping the epoch but comparing it with `>=` instead of `<=`.
+#[test]
+fn the_chain_memo_never_outlives_a_fat_write_that_changes_its_chain() {
+    let (mut vol, root) = seeded_volume("chain_memo_invalidation");
+    let max = vol.max_chain();
+    let base = vol.fat.next_free();
+    // The clusters whose chains are checked after every mutation: mount-time
+    // ones, guest-written ones, and free space past both.
+    let watched: Vec<u32> = (2..12)
+        .chain(base - 4..base + 320)
+        .chain([base + 900, base + 1500])
+        .collect();
+
+    let mut seed = 0x1234_5678u32;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let mut changed_something = 0;
+
+    for step in 0..250 {
+        // Rewrite one FAT entry through the guest's own path.
+        let cluster = base + (rng() % 340);
+        let value = match rng() % 4 {
+            0 => 0u32,                    // free it: chains through it end
+            1 => crate::fat32::FAT32_EOC, // terminate here
+            2 => cluster + 1,             // link forward
+            _ => base + (rng() % 340),    // link anywhere, possibly a cycle
+        };
+        let byte = cluster as usize * 4;
+        let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let mut sec = vol.read_sector(lba);
+        let off = byte % SECTOR;
+        let old = sec[off..off + 4].to_vec();
+        sec[off..off + 4].copy_from_slice(&(value & 0x0FFF_FFFF).to_le_bytes());
+        if old != sec[off..off + 4] {
+            changed_something += 1;
+        }
+        vol.write_sector(lba, &sec);
+
+        for &first in &watched {
+            let want = crate::katea_write::chain(first, max, |c| vol.fat_entry(c));
+            assert_eq!(
+                vol.chain_via_walk(first),
+                want,
+                "step {step}: memo served a stale chain from cluster {first} \
+                 after writing FAT[{cluster}] = {value:#x}"
+            );
+        }
+    }
+    assert!(
+        changed_something > 100,
+        "the sweep rewrote the same bytes every time ({changed_something} real \
+         changes), so it proves nothing"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A PASS OVER AN UNCHANGED VOLUME MUST NOT WALK A SINGLE CHAIN.
+///
+/// This is the O(folder) fix's second half. `chain_of` is called three to four
+/// times per live file per projection pass, and before the memo every one of
+/// those stepped every cluster of the file. With nothing written to the FAT
+/// since the last pass, none of them may walk at all.
+///
+/// NON-VACUOUS: returning early from `chain_of` before the memo lookup makes the
+/// walk count equal the call count and fails the first assertion.
+#[test]
+fn a_second_pass_over_an_unchanged_volume_walks_no_chains() {
+    let root = scratch("chain_memo_steady_state");
+    for i in 0..8u32 {
+        fs::write(root.join(format!("A{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    let allocated = vol.fat.next_free() - ROOT_CLUSTER;
+    assert!(allocated > 400, "want a volume worth walking");
+
+    let first = vol.fat.next_free();
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "NEW.TXT",
+        ATTR_ARCHIVE,
+        first,
+        b"hi",
+    );
+    vol.reconcile();
+    assert_eq!(fs::read(root.join("NEW.TXT")).unwrap(), b"hi");
+
+    // A second FULL pass with NO guest write in between: every chain the pass
+    // asks for is one it already has, and none of the FAT has moved.
+    vol.reset_chain_walk_counts();
+    let before = vol.storage_counters();
+    vol.reconcile();
+    let after = vol.storage_counters();
+    let (walks, hits) = vol.chain_walk_counts();
+
+    assert!(
+        hits > 0,
+        "the second pass asked for no chains at all, so it proves nothing"
+    );
+    assert_eq!(
+        walks, 0,
+        "an unchanged volume re-walked {walks} chains ({hits} served from the \
+         memo): the pass is still proportional to the folder"
+    );
+    // What the pass still reads is its DIRECTORY bytes, which is proportional to
+    // the directory count, not to the data. Nothing near the cluster count.
+    let reads = after.sector_reads - before.sector_reads;
+    assert!(
+        reads * 8 < u64::from(allocated),
+        "the pass read {reads} sectors over {allocated} allocated clusters, so \
+         something is still walking the FAT"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// The counter block is now one `Cell` per field rather than one `Cell` over the
 /// whole struct. The behaviour that has to survive is that a bump touches ITS
 /// field and nothing else -- the old whole-block read-modify-write made that true
