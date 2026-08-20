@@ -400,7 +400,15 @@ impl IdeChannel {
             .ticks_until_completion()
             .is_some_and(|ticks| ticks >= self.poll_floor_ticks);
         if armed {
+            // Zeroed on the arm as well, and it is a no-op behaviourally: the
+            // arm suppresses the lazy clear, so `io_touched` stays true and no
+            // later read in this batch can satisfy `!io_touched_before_read` to
+            // resume counting, and batch entry would zero it regardless. It is
+            // done anyway so the diagnostic histogram records each run ONCE --
+            // without it the arm and the batch-entry reset both bucket the same
+            // run and the 9-16 bucket reads twice the arm count.
             self.record_poll_run_length();
+            self.alt_status_run = 0;
         }
         armed
     }
