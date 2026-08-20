@@ -1081,7 +1081,10 @@ fn wss_dma_position_advances_with_the_frames_the_guest_hears() {
     }
 
     let start = guest_dma_count(&mut machine);
-    assert_eq!(start, 255, "the channel starts at the count the guest wrote");
+    assert_eq!(
+        start, 255,
+        "the channel starts at the count the guest wrote"
+    );
 
     // Advance a fraction of the buffer and watch the counter move with it. At
     // 8000 Hz, 10 guest ms is 80 frames -- well short of the 256-frame buffer,
@@ -1118,7 +1121,11 @@ fn wss_device_default_matches_the_profile_default() {
     let profile = izarravm_core::WssConfig::default();
     let device = izarravm_audio::Ad1848Config::default();
     assert_eq!(device.irq, profile.irq.line(), "IRQ default");
-    assert_eq!(usize::from(device.dma), profile.dma.channel(), "DMA default");
+    assert_eq!(
+        usize::from(device.dma),
+        profile.dma.channel(),
+        "DMA default"
+    );
 }
 
 #[test]

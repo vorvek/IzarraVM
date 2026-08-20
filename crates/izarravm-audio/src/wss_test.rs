@@ -295,7 +295,11 @@ fn config_register_bit6_reads_back_and_the_rest_does_not() {
         );
     }
     dev.write_port(3, 0x21);
-    assert_eq!(dev.read_port(1), 0x04, "bit 6 cleared through a mirror port");
+    assert_eq!(
+        dev.read_port(1),
+        0x04,
+        "bit 6 cleared through a mirror port"
+    );
 }
 
 #[test]

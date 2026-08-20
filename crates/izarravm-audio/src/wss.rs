@@ -307,7 +307,11 @@ impl Ad1848 {
             eprintln!(
                 "[WSS] IN  base+{offset} -> {value:#04x} (index={:#04x} mce={} irq={} dma={} \
                  playing={} count={})",
-                self.index, self.mce, self.config.irq, self.config.dma, self.playing,
+                self.index,
+                self.mce,
+                self.config.irq,
+                self.config.dma,
+                self.playing,
                 self.current_count,
             );
         }
