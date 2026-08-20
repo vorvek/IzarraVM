@@ -669,6 +669,28 @@ pub struct PhaseMark {
     /// FastMap / direct-map whole-map wipe counters at this boundary. `Copy` and
     /// always-on in the CPU, so sampling it per mark costs a struct move.
     pub fast_map_audit: izarravm_cpu::FastMapAuditCounters,
+    /// Bytes moved through the ATAPI data phases at this boundary.
+    ///
+    /// THE CD COLUMN THE SERIES WAS MISSING. Before this, a CD-streaming
+    /// interval's throughput had to be inferred from `brk_step` (the disk-read
+    /// audit of 2026-08-20 did exactly that, and had to argue the identity
+    /// "736,626 word reads x 2 B = the modelled 12x rate" to make the inference
+    /// stand up). This is split-invariant: it is a byte sum out of
+    /// `IdeChannel::take_access_bytes`, so it reads the same however the host
+    /// slices its batches, which is what makes it a fidelity falsifier.
+    pub cd_pio_bytes: u64,
+    /// Device advances that carried ATAPI bytes, at this boundary.
+    ///
+    /// **BATCH-SHAPED. DO NOT GRADE ON IT.** It increments once per device
+    /// advance that moved bytes (`timing.rs`, next to `cd_pio_bytes`), so it
+    /// collapses as batches lengthen and rises as they shorten. Any lever that
+    /// changes batch geometry moves this without moving one byte of delivered
+    /// data. It is emitted because the ratio `cd_pio_bytes / cd_accesses` is a
+    /// useful read of batch shape, never because the level means anything.
+    pub cd_accesses: u64,
+    /// ATAPI CDBs executed at this boundary. One per 2048-byte sector under
+    /// TOKACD, and unlike `cd_accesses` it is invariant to batch geometry.
+    pub atapi_packet_commands: u64,
     /// The sampled CPU census at this boundary, when `IZARRAVM_CPU_PROFILE`
     /// armed it; `None` otherwise, so an unprofiled run pays nothing and reports
     /// no empty tables. Differencing consecutive marks gives the per-phase
@@ -2078,6 +2100,9 @@ impl Machine {
             halted_ticks: self.halted_ticks,
             int13: self.int13_profile,
             fast_map_audit: self.cpu.fast_map_audit_counters(),
+            cd_pio_bytes: self.cd_pio_bytes,
+            cd_accesses: self.cd_accesses,
+            atapi_packet_commands: self.ide.packet_command_count(),
             cpu_profile: self
                 .cpu
                 .profiling_enabled()
@@ -2157,6 +2182,9 @@ impl Machine {
             halted_ticks: self.halted_ticks,
             int13: self.int13_profile,
             fast_map_audit: self.cpu.fast_map_audit_counters(),
+            cd_pio_bytes: self.cd_pio_bytes,
+            cd_accesses: self.cd_accesses,
+            atapi_packet_commands: self.ide.packet_command_count(),
             cpu_profile: None,
         });
     }

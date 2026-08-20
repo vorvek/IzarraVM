@@ -413,6 +413,15 @@ impl Machine {
         self.cd_pio_bytes
     }
 
+    /// ATAPI CDBs the guest has executed through the register handshake.
+    ///
+    /// The batch-invariant partner of `cd_access_count`. TOKACD issues one
+    /// PACKET per 2048-byte sector, so on a CD-streaming row this is the sector
+    /// count, and it does not move when the host lengthens or shortens a batch.
+    pub fn atapi_packet_command_count(&self) -> u64 {
+        self.ide.packet_command_count()
+    }
+
     /// Leave ATAPI PACKET commands unanswered. This is a guest-driver timeout
     /// test seam; normal machines never enable it.
     #[doc(hidden)]

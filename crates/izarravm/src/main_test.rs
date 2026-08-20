@@ -2397,6 +2397,9 @@ fn phase_mark_series_carries_the_break_and_smc_scan_columns() {
         halted_ticks: 0,
         int13: Default::default(),
         fast_map_audit: Default::default(),
+        cd_pio_bytes: 0,
+        cd_accesses: 0,
+        atapi_packet_commands: 0,
         cpu_profile: None,
     };
 
@@ -2425,6 +2428,50 @@ fn phase_mark_series_carries_the_break_and_smc_scan_columns() {
         ("direct_page_misses", 19),
         ("jit_direct_arena_compactions", 20),
         ("jit_direct_arena_compaction_ns", 21),
+    ] {
+        assert_eq!(
+            row.get(key).and_then(|v| v.as_u64()),
+            Some(expected),
+            "{key} must be serialised into the phase-mark series"
+        );
+    }
+}
+
+/// The three CD columns the 2026-08-20 disk-read audit had to do without.
+///
+/// The audit inferred load-window CD throughput from `brk_step` and had to
+/// argue an identity ("736,626 word reads x 2 B equals the modelled 12x rate")
+/// to make the inference stand up, because the series carried 45 Katea fields
+/// and not one CD field. This pins the columns into the series so no later
+/// reader repeats that work -- and so a lever that changes ATAPI batch geometry
+/// can be graded on `cd_pio_bytes` (split-invariant) rather than on
+/// `cd_accesses` (batch-shaped, emitted for its ratio only).
+#[test]
+fn phase_mark_series_carries_the_cd_columns() {
+    let mark = izarravm_machine::PhaseMark {
+        id: izarravm_machine::phase_mark::PERIODIC,
+        wall: std::time::Instant::now(),
+        master_ticks: 0,
+        elapsed_clocks: 0,
+        perf: Default::default(),
+        machine_phases: Default::default(),
+        katea: None,
+        io_stall_ticks: 0,
+        halted_ticks: 0,
+        int13: Default::default(),
+        fast_map_audit: Default::default(),
+        cd_pio_bytes: 1_474_560,
+        cd_accesses: 719,
+        atapi_packet_commands: 720,
+        cpu_profile: None,
+    };
+
+    let rows = phase_mark_series_json(std::slice::from_ref(&mark));
+    let row = &rows[0];
+    for (key, expected) in [
+        ("cd_pio_bytes", 1_474_560),
+        ("cd_accesses", 719),
+        ("atapi_packet_commands", 720),
     ] {
         assert_eq!(
             row.get(key).and_then(|v| v.as_u64()),

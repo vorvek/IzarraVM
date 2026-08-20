@@ -2003,6 +2003,16 @@ fn write_hdd_profile_json(
         })),
         "io_stall_ticks": machine.io_stall_ticks(),
         "halted_ticks": machine.halted_ticks(),
+        // The CD columns. `cd_pio_bytes` is the byte sum out of the ATAPI data
+        // phases and is invariant to batch geometry, so it is the fidelity
+        // falsifier for anything that changes how the host slices a CD read.
+        // `cd_accesses` is NOT: it counts device advances that carried bytes and
+        // collapses as batches lengthen. `atapi_packet_commands` is the
+        // batch-invariant per-command currency (one per 2048-byte sector under
+        // TOKACD).
+        "cd_pio_bytes": machine.cd_pio_byte_count(),
+        "cd_accesses": machine.cd_access_count(),
+        "atapi_packet_commands": machine.atapi_packet_command_count(),
         "katea": machine.katea_storage_counters().map(|k| json!({
             "sector_reads": k.sector_reads,
             "host_file_reads": k.host_file_reads,
@@ -2762,6 +2772,20 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "jit_direct_entries": mark.perf.jit_direct_entries,
                 "io_stall_ticks": mark.io_stall_ticks,
                 "halted_ticks": mark.halted_ticks,
+                // THE CD COLUMNS. Read `cd_pio_bytes` for throughput: it is a
+                // byte sum and is split-invariant, so a lever that changes batch
+                // geometry cannot move it without changing what the drive
+                // delivered. `cd_accesses` is batch-shaped by construction (one
+                // per device advance that carried bytes) and must never be
+                // graded on; it is here so the ratio against `cd_pio_bytes` can
+                // be read as batch shape. `atapi_packet_commands` is the
+                // batch-invariant command count -- one per 2048-byte sector
+                // under TOKACD, i.e. the sector rate, which is what a per-sector
+                // assertion needs and what the 2026-08-20 disk-read audit had to
+                // infer from `brk_step` for want of this column.
+                "cd_pio_bytes": mark.cd_pio_bytes,
+                "cd_accesses": mark.cd_accesses,
+                "atapi_packet_commands": mark.atapi_packet_commands,
                 "katea_host_wall_ns": mark.katea.as_ref().map(|k| k.host_wall_ns),
                 // `_max_level_ns`, not `_max_ns`: this series is cumulative and
                 // consumers difference it column by column, and the difference of

@@ -153,6 +153,55 @@ fn read_deadlines_keep_master_ticks_across_a_live_cpu_switch() {
     assert_eq!(input(&mut machine, ide::SECONDARY_CMD_BASE), 0x62);
 }
 
+/// The batch-invariant CD currency: one count per CDB the guest executed.
+///
+/// `cd_accesses` cannot answer "how many sectors did the guest ask for" -- it
+/// increments once per device advance that carried bytes, so lengthening a
+/// batch collapses it. This counter is fed at `execute_packet`, i.e. once per
+/// command, so a per-sector assertion (TOKACD issues one PACKET per 2048-byte
+/// sector) has a currency that survives any change in batch geometry.
+#[test]
+fn atapi_packet_commands_count_one_per_executed_cdb() {
+    let mut machine = cd_machine(8);
+    machine.set_mode(GswMode::Gsw586);
+    let start = machine.atapi_packet_command_count();
+
+    // TEST UNIT READY clears the power-on unit attention; both are CDBs.
+    clear_unit_attention(&mut machine);
+    assert_eq!(
+        machine.atapi_packet_command_count() - start,
+        1,
+        "the unit-attention probe is one executed CDB"
+    );
+
+    // Three more non-data CDBs. Split the SAME work across different advance
+    // shapes -- one in a single advance, one in two halves -- so the counter is
+    // shown to be a property of the command, not of the batching.
+    for split in [false, true, false] {
+        send_cdb(&mut machine, [0u8; 12]);
+        let ticks = machine.ide.ticks_until_completion().unwrap();
+        if split {
+            machine.advance_devices_ticks(ticks / 2);
+            machine.advance_devices_ticks(ticks - ticks / 2);
+        } else {
+            machine.advance_devices_ticks(ticks);
+        }
+        let _ = input(&mut machine, ide::SECONDARY_CMD_BASE + 7);
+    }
+
+    assert_eq!(
+        machine.atapi_packet_command_count() - start,
+        4,
+        "one count per CDB executed, independent of how the advance was split"
+    );
+    assert_eq!(
+        machine.cd_pio_byte_count(),
+        0,
+        "no data phase ran -- the command count and the byte count are different \
+         currencies and neither substitutes for the other"
+    );
+}
+
 #[test]
 fn halted_cpu_uses_the_secondary_ide_deadline_in_every_mode() {
     for mode in [

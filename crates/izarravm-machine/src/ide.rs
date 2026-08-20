@@ -128,6 +128,12 @@ pub struct IdeChannel {
     /// Test seam that leaves PACKET commands unanswered so guest timeout paths
     /// can run against a present drive.
     test_stall_packet: bool,
+    /// ATAPI CDBs executed since power-on. Always counted: it is the only cheap
+    /// per-command currency the phase series can carry, and every CD-throughput
+    /// question the disk-read audit had to infer from `brk_step` is really a
+    /// question about commands per guest second. One `u64` add per CDB, on a
+    /// path that is already doing a device dispatch.
+    packet_commands: u64,
 }
 
 impl Default for IdeChannel {
@@ -160,6 +166,7 @@ impl Default for IdeChannel {
             read_lba: 0,
             last_access_bytes: 0,
             test_stall_packet: false,
+            packet_commands: 0,
         }
     }
 }
@@ -274,6 +281,17 @@ impl IdeChannel {
                 return;
             }
         }
+    }
+
+    /// ATAPI CDBs executed since power-on. Monotonic, never cleared, and
+    /// deliberately NOT part of the canonical payload: it is host bookkeeping.
+    ///
+    /// This is the per-command currency `cd_accesses` is not. `cd_accesses`
+    /// increments once per *device advance that carried bytes*, so it collapses
+    /// as batches lengthen; this one counts commands the guest issued, which is
+    /// invariant to how the host slices its batches.
+    pub fn packet_command_count(&self) -> u64 {
+        self.packet_commands
     }
 
     /// Take and clear the access-byte count for the GUI LED.
@@ -555,6 +573,7 @@ impl IdeChannel {
     /// Execute an assembled CDB after command latency. Short replies become
     /// visible now; reads and seeks schedule their mechanical boundary.
     fn execute_packet(&mut self, cdb: [u8; 12]) {
+        self.packet_commands = self.packet_commands.saturating_add(1);
         if let Some(length) = data_out_length(&cdb).filter(|&length| length > 0) {
             self.begin_data_out(length);
             return;
