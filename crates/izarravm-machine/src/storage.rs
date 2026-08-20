@@ -415,9 +415,15 @@ impl Machine {
 
     /// ATAPI CDBs the guest has executed through the register handshake.
     ///
-    /// The batch-invariant partner of `cd_access_count`. TOKACD issues one
-    /// PACKET per 2048-byte sector, so on a CD-streaming row this is the sector
-    /// count, and it does not move when the host lengthens or shortens a batch.
+    /// The batch-invariant partner of `cd_access_count`: one count per CDB the
+    /// device executed, which does not move when the host lengthens or shortens
+    /// a batch.
+    ///
+    /// **It equals the SECTOR count only under a driver that requests one sector
+    /// per PACKET**, which TOKACD does (`tokacd.asm` sets transfer length 1 in
+    /// every READ(10)). A multi-sector READ(10) is ONE count and N
+    /// `PresentReadSector` boundaries, so a different driver breaks the
+    /// identity while leaving the counter itself correct.
     pub fn atapi_packet_command_count(&self) -> u64 {
         self.ide.packet_command_count()
     }

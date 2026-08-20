@@ -1163,6 +1163,31 @@ fn ata_poll_skip_env_spelling_table_and_default() {
     }
 }
 
+/// The SWEEP knobs panic on a typo too, and this is not symmetry for its own
+/// sake: their first real use will be a sweep, which is exactly the run a silent
+/// fallback poisons. `IZARRAVM_ATA_POLL_RUN=sixteen` used to run 16 without a
+/// word, and a mistyped sweep leg would have read as "that threshold changed
+/// nothing" -- the same trap the main gate already refuses.
+#[test]
+fn ata_poll_skip_sweep_knobs_panic_on_a_typo() {
+    use std::env::VarError;
+    assert_eq!(
+        run::sweep_knob_for_test("X", Err(VarError::NotPresent)),
+        None,
+        "unset is the ONLY silent path -- it is a spelling of 'the default'"
+    );
+    assert_eq!(
+        run::sweep_knob_for_test("X", Ok("  24  ".to_string())),
+        Some(24),
+        "a number still parses, trimmed"
+    );
+    for typo in ["sixteen", "20us", "", "-1", "1.5"] {
+        let result =
+            std::panic::catch_unwind(|| run::sweep_knob_for_test("X", Ok(typo.to_string())));
+        assert!(result.is_err(), "sweep knob {typo:?} must panic");
+    }
+}
+
 /// A typo must PANIC rather than silently run the default: a mistyped ladder leg
 /// that fell through would be read as "the arm I asked for changed nothing".
 #[test]

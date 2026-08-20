@@ -96,32 +96,98 @@ fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
     }
 }
 
+/// A sweep knob's value, or a PANIC.
+///
+/// **THE KNOBS' FIRST REAL USE WILL BE A SWEEP, WHICH IS EXACTLY THE RUN A
+/// SILENT FALLBACK POISONS.** These two started life as
+/// `.ok().and_then(|r| r.parse().ok())`, so `IZARRAVM_ATA_POLL_RUN=sixteen` ran
+/// 16 without a word -- while the main gate one screen up panics on
+/// `IZARRAVM_ATA_POLL_SKIP=yes` for the stated reason that "a mistyped ladder
+/// leg that fell through to the default would be read as 'the arm I asked for
+/// changed nothing'". A mistyped sweep leg is the same trap wearing the same
+/// clothes: it reads as "that threshold changed nothing".
+///
+/// Unset is the only silent path, because unset is a spelling of "the default".
+fn sweep_knob(name: &str, value: Result<String, std::env::VarError>, what: &str) -> Option<u64> {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("{name} is set to a value that is not valid UTF-8; it takes {what}")
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(parsed) => Some(parsed),
+        Err(_) => panic!(
+            "{name}={raw:?} is not a number; it takes {what}. \
+             Refusing to guess: a mistyped sweep leg would silently run the DEFAULT and be \
+             read as the value it named changing nothing"
+        ),
+    }
+}
+
 /// `IZARRAVM_ATA_POLL_RUN`, default 16. A sweep override, not a supported knob.
 pub(super) fn ata_poll_run_default() -> u32 {
-    std::env::var("IZARRAVM_ATA_POLL_RUN")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|run| *run > 0)
-        .unwrap_or(ide::ATA_POLL_RUN)
+    match sweep_knob(
+        "IZARRAVM_ATA_POLL_RUN",
+        std::env::var("IZARRAVM_ATA_POLL_RUN"),
+        "a positive alt-status read count",
+    ) {
+        None => ide::ATA_POLL_RUN,
+        // Zero would arm on every read and is never what a sweep means; it is
+        // refused rather than clamped, for the same reason a typo is.
+        Some(0) => panic!(
+            "IZARRAVM_ATA_POLL_RUN=0 would arm the skip on every alt-status read; \
+             it takes a positive alt-status read count"
+        ),
+        Some(run) => u32::try_from(run).unwrap_or(u32::MAX),
+    }
 }
 
 /// `IZARRAVM_ATA_POLL_FLOOR_US`, default 20 us. A sweep override.
 pub(super) fn ata_poll_floor_ticks_default() -> u64 {
-    match std::env::var("IZARRAVM_ATA_POLL_FLOOR_US")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-    {
+    match sweep_knob(
+        "IZARRAVM_ATA_POLL_FLOOR_US",
+        std::env::var("IZARRAVM_ATA_POLL_FLOOR_US"),
+        "a minimum-skip floor in microseconds",
+    ) {
+        None => ide::ATA_POLL_FLOOR_TICKS,
         Some(micros) => (u128::from(micros) * u128::from(izarravm_core::MASTER_CLOCK_HZ)
             / 1_000_000)
             .min(u128::from(u64::MAX)) as u64,
-        None => ide::ATA_POLL_FLOOR_TICKS,
     }
 }
 
+/// `IZARRAVM_ATA_POLL_SKIP_DIAG`. Same spelling table as the main gate, and for
+/// the same reason: the mirror-image wart of a silent fallback is a knob that
+/// reads `=off` as ON, which is what an "anything but empty or 0 is on" test
+/// does.
 pub(super) fn ata_poll_skip_diag_default() -> bool {
-    std::env::var("IZARRAVM_ATA_POLL_SKIP_DIAG")
-        .ok()
-        .is_some_and(|value| !matches!(value.trim(), "" | "0"))
+    let raw = match std::env::var("IZARRAVM_ATA_POLL_SKIP_DIAG") {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_ATA_POLL_SKIP_DIAG is set to a value that is not valid UTF-8; \
+             accepted spellings are unset or `0` / `off`, and `1` / `on`"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_ATA_POLL_SKIP_DIAG={other:?} names no arm; accepted spellings are \
+             unset or `0` / `off`, and `1` / `on`. Refusing to guess: the previous test \
+             accepted anything but empty or `0` as ON, so `=off` turned it ON"
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sweep_knob_for_test(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+) -> Option<u64> {
+    sweep_knob(name, value, "a number")
 }
 
 /// The spelling table, reachable from the fixtures. The shipped reading happens
@@ -628,6 +694,26 @@ impl Machine {
                 Some(ata_ticks) => {
                     // The DEVICE-bounded target. The block decision
                     // is made on THIS and nothing else.
+                    //
+                    // THE `min` IS PROVABLY REDUNDANT TODAY, and the
+                    // line is kept anyway. `next_cacheable_edge_ticks`
+                    // chains `next_ata_deadline()` unconditionally,
+                    // which chains this very
+                    // `ide.ticks_until_completion()`, so for the
+                    // secondary channel the edge set SUBSUMES the
+                    // direct read and `ata_ticks` can never bind
+                    // tighter than the `min` it is duplicating. (The
+                    // design's "neither subsumes the other" is wrong
+                    // about this half; it is right about the `None`
+                    // arm above, which is not redundant at all and is
+                    // the load-bearing part of the precondition.)
+                    //
+                    // Kept as defence in depth because it is free and
+                    // because it makes the precondition and the bound
+                    // the SAME fact rather than two facts that happen
+                    // to agree -- so a future change that gates the
+                    // ATA term inside the edge set cannot silently
+                    // unbound this.
                     let device_target = self
                         .next_device_edge_ticks()
                         .map_or(ata_ticks, |edge| ata_ticks.min(edge));
