@@ -3781,6 +3781,36 @@ mod jit_general;
 /// of vacuous assertions, so do not delete it when you change the byte. It must be run on EVERY
 /// arm of every admission knob, not only the shipped default: the 0xF8 breakage above was
 /// invisible on the OFF arm and total on the ON one.
+///
+/// # THE GENERAL RULE, learned three times now: STATE THE ARM, NEVER INHERIT IT
+///
+/// A fixture whose assertion depends on a gate must select that gate's arm explicitly through the
+/// gate's `set_*_for_test` hook. A fixture that reads the ambient arm instead is wrong in one of
+/// two directions and there is no third:
+///
+/// * on the arm it silently assumes, it passes while asserting nothing (vacuous);
+/// * on the other arm, it fails while having found no defect (a false red).
+///
+/// The three occasions, so the next reader can see it is a pattern and not an accident:
+///
+/// 1. **2026-08-20, `DIRECT_BARRIER` = `0xF8`.** The V86 loop-A slice lowered CLC. 30 tests red on
+///    the ON arm, 23 of them pure collateral from this one constant.
+/// 2. **2026-08-21, `word_size_dword_siblings_stay_refused`.** It listed `0x85` as an
+///    unconditionally-refused Word sibling; the TEST-word slice made that gate-dependent, and the
+///    ON arm went red. Fixed by stating `IZARRAVM_TEST_WORD_ROWS=off` in the table and asserting
+///    the flip separately — that table is the worked example to copy.
+/// 3. **2026-08-21, the `IZARRAVM_IMM8_LANES` flip.** Two fixtures asserted "the default arm
+///    registers no one-byte lane" while reading the ambient knob
+///    (`generated_direct_blocks_match_interpreter_in_486_and_586_modes` and
+///    `near_miss_shapes_take_no_count_lane`). Both went red on the new default having found
+///    nothing. Note the second one's extra trap: it stated ONE arm and needed TWO, because
+///    `smc_lane_registrations` counts every lane class rather than the one the fixture is about.
+///
+/// The corollary for a DEFAULT PIN — the one fixture per gate that is *supposed* to read the
+/// ambient arm — is that it must apply the gate's own spelling table to the real environment
+/// rather than hard-asserting a constant, or the suite cannot be green on both arms by
+/// construction. `imm8_lanes_ship_on_by_default` and `test_word_rows_ship_off_by_default` are the
+/// two shapes of that.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",

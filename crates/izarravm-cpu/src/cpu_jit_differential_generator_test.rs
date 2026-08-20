@@ -1,6 +1,18 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
+//! Randomized whole-block differentials: generated blocks run natively and interpreted from
+//! identical state, compared on registers, EIP, EFLAGS, x87, the whole CPU struct, guest RAM, core
+//! clocks and bus clocks.
+//!
+//! **EVERY FIXTURE HERE STATES ITS GATE ARM AND NONE INHERITS THE AMBIENT DEFAULT.** This file has
+//! two sweeps of the same generator — the BAKED form and the one-byte-LANE form — and which one you
+//! get is decided by `IZARRAVM_IMM8_LANES`. The baked sweep used to read the ambient knob and
+//! assert "the default arm registers no one-byte lane"; that assertion was true only while the knob
+//! was default-OFF, and it went red the moment the knob flipped default-ON on 2026-08-21 without
+//! having found any defect. See `crates/izarravm-cpu/src/cpu_test.rs`, the `DIRECT_BARRIER` doc
+//! block, for the general rule and the three times it has now been learned.
+
 use super::*;
 
 const CASES_PER_MODE: u32 = 32;
@@ -413,16 +425,29 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) -> u64 {
 
 #[test]
 fn generated_direct_blocks_match_interpreter_in_486_and_586_modes() {
+    // THE ARM IS STATED, NOT INHERITED, and that is the whole point of these two lines. This test
+    // used to read the ambient `IZARRAVM_IMM8_LANES` and assert the lane count was zero "on the
+    // default arm" — which stopped being true the moment that knob flipped default-ON on
+    // 2026-08-21, and turned a BAKED-form differential into a red test that had found no defect.
+    // The sweep below is the baked form's differential; `..._with_imm8_lanes_admitted` is the
+    // lane form's. Each states its own arm so that neither depends on what the default happens to
+    // be this week. See the note at the top of this file.
+    jit::direct::set_imm8_lanes_for_test(Some(false));
+    assert!(
+        !jit::direct::imm8_lanes_enabled(),
+        "this sweep is the BAKED form's differential and needs the one-byte lane arm forced off"
+    );
     assert_eq!(
         run_generated_mode(GswMode::Gsw486, 0),
         0,
-        "the default arm must register no one-byte lane"
+        "the OFF arm must register no one-byte lane"
     );
     assert_eq!(
         run_generated_mode(GswMode::Gsw586, CASES_PER_MODE),
         0,
-        "the default arm must register no one-byte lane"
+        "the OFF arm must register no one-byte lane"
     );
+    jit::direct::set_imm8_lanes_for_test(None);
 }
 
 /// The same sweep with the L2 arm-1 one-byte immediate lane class ADMITTED, so the generator's

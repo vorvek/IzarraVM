@@ -11,10 +11,18 @@
 //! compile-time flag split, so it ships first. See `imm8_lane_for` for the full admission argument
 //! and `rotate_rows_enabled` for why `0xC1`/`0xC0` and `0x0FA4` are NOT in this arm.
 //!
-//! **The arm is default OFF.** Every positive fixture here forces it on through
-//! `set_imm8_lanes_for_test`, which is thread-local, so a fixture that forgot would test the
-//! refusal and call it a lowering. `imm8_lane_is_refused_on_the_default_arm` is the fixture that
-//! proves the forcing is doing something.
+//! **The arm is DEFAULT ON since the 2026-08-21 re-price** (`duke3d-586` long row −6.774%
+//! min-wall, arms non-overlapping; short row −7.623%; see `imm8_lanes_enabled` for the full
+//! pricing and for why the −1.0% it originally shipped OFF on was a measurement against a baseline
+//! that no longer exists). Every fixture here still states its arm through the thread-local
+//! `set_imm8_lanes_for_test`, and the direction that matters flipped with the default: it used to
+//! be the positive fixtures that had to force it on, and it is now the REFUSAL fixture that must
+//! force `Some(false)` — `imm8_lane_is_refused_on_the_off_arm` — because one that read the ambient
+//! arm would register a lane and pass for the wrong reason.
+//! `imm8_lanes_ship_on_by_default` is the one test here that deliberately reads the ambient arm,
+//! and it applies the spelling table to the real environment rather than hard-asserting a
+//! constant, so this suite is green on BOTH arms by construction. See `cpu_test.rs`'s
+//! `DIRECT_BARRIER` doc block for the general rule and the three times it has been learned.
 //!
 //! The ALU sits at slot 1, never at the block's entry, for `cpu_jit_imm_lane_test`'s reason: an
 //! opcode at the entry position is not reached by the emitted body on this fixture path, so an
@@ -620,11 +628,15 @@ fn device_write_at_the_imm8_lane_retires_the_block() {
     let _ = &mut bus;
 }
 
-/// THE DEFAULT ARM. Without the thread-local forcing, the very same block registers no lane and
-/// the very same patch retires it — which is what makes every fixture above a statement about the
-/// slice rather than about the backend it was already.
+/// THE OFF ARM — the escape, and since the 2026-08-21 flip it is no longer the default. Without
+/// the thread-local forcing the very same block registers a lane and the very same patch is
+/// absorbed, which is what makes every fixture above a statement about the slice rather than about
+/// the backend it was already. **Renamed from `imm8_lane_is_refused_on_the_default_arm` in the
+/// flip commit**: it already stated its arm correctly, but the name asserted something about the
+/// default that stopped being true, and a fixture whose name lies is the thing that misleads the
+/// next reader.
 #[test]
-fn imm8_lane_is_refused_on_the_default_arm() {
+fn imm8_lane_is_refused_on_the_off_arm() {
     jit::direct::set_imm8_lanes_for_test(Some(false));
     let mut cpu = flat_cpu();
     let mut bus = test_bus(image(Shape { op: 0, dst: 0 }, 5));
@@ -633,7 +645,7 @@ fn imm8_lane_is_refused_on_the_default_arm() {
     assert_eq!(
         cpu.perf_counters().smc_lane_registrations,
         0,
-        "the default arm registers no one-byte lane"
+        "the OFF arm registers no one-byte lane"
     );
 
     // The baked immediate still applies, so the off arm is a real lowering and not a refusal to
@@ -797,12 +809,56 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
 fn imm8_lanes_spelling_table() {
     use std::env::VarError;
     let parse = jit::direct::parse_imm8_lanes_arm_for_test;
-    assert!(!parse(Err(VarError::NotPresent)), "unset is the base");
+    assert!(
+        parse(Err(VarError::NotPresent)),
+        "unset must name the ON arm since the 2026-08-21 flip"
+    );
+    // THE EMPTY STRING IS OFF WHILE UNSET IS ON, and the two must not be confused for one another.
+    // That is not a hypothetical distinction: nulling an environment variable in PowerShell leaves
+    // it PRESENT and EMPTY, so three earlier evidence directories ran their default-ON knobs off
+    // believing they had left them at the default. `Remove-Item Env:` is the only true unset.
+    assert!(
+        !parse(Ok(String::new())),
+        "the empty string is the OFF arm even though unset is the ON arm"
+    );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
-        assert!(!parse(Ok(off.to_string())), "{off:?} must be the base");
+        assert!(!parse(Ok(off.to_string())), "{off:?} must name the off arm");
     }
     for on in ["1", "on", "ON", " On "] {
-        assert!(parse(Ok(on.to_string())), "{on:?} must be the slice");
+        assert!(parse(Ok(on.to_string())), "{on:?} must name the on arm");
+    }
+}
+
+/// THE DEFAULT PIN, and it is the one assertion that decides what a shipped binary does with the
+/// `0x80` one-byte lane class.
+///
+/// Catches a flip of `parse_imm8_lanes_arm`'s `NotPresent` arm. The default is ON since the
+/// 2026-08-21 re-price, which the `duke3d-586` long row priced at −6.774% min-wall with the arms
+/// fully non-overlapping and the short row corroborated at −7.623%; a default that moved back
+/// without a ladder would change every shipped binary's lane registration silently.
+///
+/// It reads the AMBIENT knob deliberately — no override — and it therefore agrees with the
+/// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: a fixture that
+/// hard-asserted "on" would make the OFF-arm suite run impossible by construction, which is
+/// exactly the failure this flip had to fix in two other files. With the variable unset the
+/// assertion reduces to "the default is ON", which is the claim it exists for.
+#[test]
+fn imm8_lanes_ship_on_by_default() {
+    jit::direct::set_imm8_lanes_for_test(None);
+    let ambient = std::env::var("IZARRAVM_IMM8_LANES");
+    let expected = jit::direct::parse_imm8_lanes_arm_for_test(ambient.clone());
+    assert_eq!(
+        jit::direct::imm8_lanes_enabled(),
+        expected,
+        "the process-wide reading must agree with the spelling table applied to \
+         IZARRAVM_IMM8_LANES={ambient:?}"
+    );
+    if ambient.is_err() {
+        assert!(
+            expected,
+            "IZARRAVM_IMM8_LANES must default ON since the 2026-08-21 flip; see \
+             imm8_lanes_enabled for the two ladders that priced it"
+        );
     }
 }
 
