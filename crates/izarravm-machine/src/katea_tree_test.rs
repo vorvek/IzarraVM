@@ -1172,6 +1172,19 @@ fn fat_entry_reads_overlay_then_tree() {
         0x0FFF_FFFF,
         "overlay FAT write is visible"
     );
+    // The walked path resolves the same two sources in the same order: an
+    // overlay HIT here (the guest wrote this FAT sector) and an overlay MISS
+    // for cluster 2, whose FAT sector nothing has written.
+    assert_eq!(
+        vol.fat_entry_via_walk(free),
+        0x0FFF_FFFF,
+        "the walk missed the overlay it must read"
+    );
+    assert_eq!(
+        vol.fat_entry_via_walk(2),
+        0x0FFF_FFFF,
+        "the walk's base-view arm disagreed with the tree's own FAT"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -3063,6 +3076,630 @@ fn a_one_file_write_does_not_resynthesize_the_fat_per_cluster() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// Build a volume with a mixture of MOUNT-TIME chains and GUEST-WRITTEN ones,
+/// so a FAT differential has both an overlay-served region and a base-view one,
+/// plus a chain the guest fragmented backwards through the FAT.
+fn seeded_volume(name: &str) -> (KateaTreeVolume, std::path::PathBuf) {
+    let root = scratch(name);
+    for i in 0..6u32 {
+        fs::write(root.join(format!("H{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    // Three guest-written files, one of them long enough to span several FAT
+    // sectors (128 clusters is one FAT sector at 4 bytes an entry).
+    let mut next = vol.fat.next_free();
+    next = stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "G0.BIN",
+        ATTR_ARCHIVE,
+        next,
+        &[1u8; 4096],
+    );
+    let long_first = next;
+    next = stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "G1.BIN",
+        ATTR_ARCHIVE,
+        next,
+        &vec![2u8; 300 * 4096],
+    );
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "G2.BIN",
+        ATTR_ARCHIVE,
+        next,
+        &[3u8; 8192],
+    );
+    // Fragment G1: point its first cluster's FAT entry backwards, at a cluster
+    // in a LOWER FAT sector, so a walk crosses sector boundaries in both
+    // directions and a cursor that only ever moves forward would be caught.
+    let byte = long_first as usize * 4;
+    let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+    let mut sec = vol.read_sector(lba);
+    let off = byte % SECTOR;
+    sec[off..off + 4].copy_from_slice(&(long_first + 200).to_le_bytes());
+    vol.write_sector(lba, &sec);
+    (vol, root)
+}
+
+/// THE WALKED FAT MUST ANSWER EXACTLY WHAT `fat_entry` ANSWERS.
+///
+/// `fat_entry_walked` reaches the base-view FAT through `ClusterIndex::fat_entry`
+/// instead of through a synthesized 512-byte sector, and it hoists the overlay
+/// lookup to once per FAT sector. Both are claims about COST. This is the claim
+/// about VALUE: over every cluster of a volume that has an overlay-shadowed FAT
+/// region, a base-view region, and entries past the end of the FAT, the two paths
+/// agree.
+///
+/// Swept three ways -- fresh cursor per cluster, one cursor ascending, one cursor
+/// descending -- because the cursor is the only state either path carries, and a
+/// stale-cursor bug shows up only when consecutive calls land in different FAT
+/// sectors.
+///
+/// NON-VACUOUS: dropping the `walk.within != Some(within)` guard (so the cursor
+/// never refreshes) fails the ascending sweep on the first sector boundary.
+#[test]
+fn the_walked_fat_agrees_with_fat_entry_over_every_cluster() {
+    let (vol, root) = seeded_volume("fat_walk_identity");
+    let last = vol.geo.count_of_clusters + 3;
+    let mut overlay_served = 0;
+    let mut base_served = 0;
+
+    for c in 0..last {
+        let want = vol.fat_entry(c);
+        assert_eq!(vol.fat_entry_via_walk(c), want, "cluster {c}, fresh cursor");
+        if c < vol.fat.next_free() {
+            base_served += 1;
+        }
+    }
+    // One cursor, ascending: the shape a real chain walk takes.
+    {
+        let mut walk = FatWalk::default();
+        for c in 0..last {
+            assert_eq!(
+                vol.fat_entry_walked(c, &mut walk),
+                vol.fat_entry(c),
+                "cluster {c}, shared cursor ascending"
+            );
+            if walk.overlay.is_some() {
+                overlay_served += 1;
+            }
+        }
+    }
+    // One cursor, descending: crosses every sector boundary the other way.
+    {
+        let mut walk = FatWalk::default();
+        for c in (0..last).rev() {
+            assert_eq!(
+                vol.fat_entry_walked(c, &mut walk),
+                vol.fat_entry(c),
+                "cluster {c}, shared cursor descending"
+            );
+        }
+    }
+    assert!(
+        overlay_served > 0,
+        "the sweep never hit an overlay-written FAT sector, so it proves nothing \
+         about the overlay arm"
+    );
+    assert!(base_served > 500, "want a volume worth sweeping");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// THE CHAIN THE RECONCILE PASS WALKS MUST BE THE CHAIN THE OLD PATH WALKED.
+///
+/// `chain_of` is what every reconcile-path walk now calls. Its result is compared
+/// here, chain for chain, against `katea_write::chain` driven by the untouched
+/// `fat_entry` -- including the deliberately fragmented and the deliberately
+/// corrupt cases, where the answer is `None` and the pass HOLDS the file. A
+/// disagreement on `None` would be the dangerous direction: it would let
+/// reconcile act on a chain it should have held.
+#[test]
+fn chain_of_agrees_with_the_old_per_cluster_walk() {
+    let (vol, root) = seeded_volume("chain_walk_identity");
+    let max = vol.max_chain();
+    let mut some = 0;
+    let mut none = 0;
+
+    // Past the mount's own clusters AND past everything the guest stamped above
+    // them, so the sweep ends in free space where a chain must come back `None`.
+    for first in 0..vol.fat.next_free() + 400 {
+        let old = crate::katea_write::chain(first, max, |c| vol.fat_entry(c));
+        let new = vol.chain_via_walk(first);
+        assert_eq!(new, old, "chain from cluster {first}");
+        match old {
+            Some(_) => some += 1,
+            None => none += 1,
+        }
+    }
+    assert!(some > 100, "want real chains in the sweep, got {some}");
+    assert!(
+        none > 0,
+        "the sweep never hit a held chain, so it proves nothing about the \
+         hold path"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A CHAIN WALK MUST ASK THE STORE ONCE PER FAT SECTOR, NOT ONCE PER CLUSTER.
+///
+/// This is the O(folder) fix itself. Before the walk cursor, every cluster of
+/// every chain paid a `SectorStore` lookup, a `RefCell` borrow and three
+/// 512-byte copies to read four bytes; a 47 MB folder cost a 1.71 ms worst
+/// projection pass and a 498 MB folder cost 18.47 ms, which is the visible-freeze
+/// class. A FAT32 sector holds 128 entries, so a contiguous chain may resolve at
+/// most `ceil(len / 128) + 1` sectors -- the `+ 1` covers a chain that starts
+/// mid-sector.
+///
+/// Counter parity is asserted alongside, because the walk deliberately keeps
+/// bumping `sector_reads` once per cluster: the profile field must not move.
+///
+/// NON-VACUOUS: routing `chain_of` back through `fat_entry` makes the resolve
+/// count equal the cluster count and fails the ratio by two orders of magnitude.
+#[test]
+fn a_chain_walk_resolves_one_fat_sector_per_128_clusters() {
+    let root = scratch("fat_walk_scaling");
+    // One host file long enough that its chain crosses several FAT sectors.
+    fs::write(root.join("BIG.BIN"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+    let vol = mount(&root);
+    let first = first_cluster_of(&vol, &root.join("BIG.BIN"));
+
+    // Mount primes the claim index, which warms the memo for every live chain.
+    // Clear it: this fixture is about what a WALK costs.
+    vol.clear_chain_memo();
+    vol.reset_fat_walk_resolves();
+    let before = vol.storage_counters();
+    let chain = vol.chain_via_walk(first).expect("a contiguous mount chain");
+    let after = vol.storage_counters();
+
+    let clusters = chain.len() as u64;
+    assert!(clusters > 512, "want a long chain, got {clusters} clusters");
+    let resolves = vol.fat_walk_resolves();
+    assert!(
+        resolves <= clusters.div_ceil(128) + 1,
+        "{clusters} clusters resolved {resolves} FAT sectors: the walk is still \
+         asking per cluster"
+    );
+    assert_eq!(
+        after.sector_reads - before.sector_reads,
+        clusters,
+        "sector_reads must still count one served sector per cluster, or the \
+         profile field moved under the fix"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The anti-clobber guard's definition, re-derived in the test from the live set
+/// and the volume's own FAT, with no reference to how `ambiguous_by_full_scan`
+/// is written:
+///
+/// > ambiguous = { k : ∃ c ∈ chain(k) with c a directory cluster, or c ∈ chain(k′)
+/// >               for some live file k′ ≠ k }
+fn ambiguous_by_definition(vol: &KateaTreeVolume) -> HashSet<(u32, [u8; 11])> {
+    let max = vol.max_chain();
+    // Union the chains of every live entry sharing a key -- a guest can write two
+    // directory entries with the same 8.3 name, and the definition treats them as
+    // one file, not as two files colliding.
+    let mut chains: HashMap<(u32, [u8; 11]), HashSet<u32>> = HashMap::new();
+    for (dir_cluster, name, first_cluster, is_dir) in vol.live_entries_for_test() {
+        if is_dir || first_cluster < 2 {
+            continue;
+        }
+        let Some(chain) = crate::katea_write::chain(first_cluster, max, |c| vol.fat_entry(c))
+        else {
+            continue;
+        };
+        chains.entry((dir_cluster, name)).or_default().extend(chain);
+    }
+    let mut out = HashSet::new();
+    for (key, clusters) in &chains {
+        let bad = clusters.iter().any(|c| {
+            vol.is_directory_cluster(*c)
+                || chains
+                    .iter()
+                    .any(|(other, theirs)| other != key && theirs.contains(c))
+        });
+        if bad {
+            out.insert(*key);
+        }
+    }
+    out
+}
+
+/// THE REFERENCE IS THE DEFINITION.
+///
+/// `ambiguous_by_full_scan` is the reference every faster implementation of the
+/// anti-clobber guard is graded against, so it needs its own grading against
+/// something that is not itself. `ambiguous_by_definition` above re-derives the
+/// set from the live entries and the raw `fat_entry`, quadratically and without
+/// looking at how the reference is written.
+///
+/// Driven over a mutation sequence that manufactures every shape the definition
+/// distinguishes: two entries on one chain, a chain crossing a directory
+/// cluster, a duplicate 8.3 name (which must NOT self-collide), and held chains.
+///
+/// NON-VACUOUS: the sweep asserts it produced both empty and non-empty answers,
+/// and that at least one duplicate-name step occurred; dropping `other != key`
+/// from the reference fails it on those steps.
+#[test]
+fn the_full_scan_reference_matches_the_declarative_definition() {
+    let (mut vol, root) = seeded_volume("ambiguity_reference");
+    let base = vol.fat.next_free();
+    let mut seed = 0x0BAD_F00Du32;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+
+    // SELF-COLLISION: two directory entries with the SAME 8.3 name AND the same
+    // first cluster. Their chains are identical, so a definition that did not
+    // exempt a key from colliding with itself would flag this key -- and phase 3
+    // would hold a perfectly ordinary file forever.
+    let self_key = {
+        let before = vol.ambiguous_reference();
+        stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "SELF.BIN", ATTR_ARCHIVE, base, 4096);
+        let one = vol.ambiguous_reference();
+        stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "SELF.BIN", ATTR_ARCHIVE, base, 4096);
+        let two = vol.ambiguous_reference();
+        assert_eq!(
+            one, two,
+            "a second entry with the same key and chain flagged it"
+        );
+        assert_eq!(one, ambiguous_by_definition(&vol));
+        let mut name = [b' '; 11];
+        name[..4].copy_from_slice(b"SELF");
+        name[8..11].copy_from_slice(b"BIN");
+        let _ = before;
+        (ROOT_CLUSTER, name)
+    };
+
+    let mut nonempty = 0;
+    let mut empty = 0;
+    // Now a genuine two-key alias onto one chain, which MUST flag both.
+    stamp_file_entry_only(
+        &mut vol,
+        ROOT_CLUSTER,
+        "ALIAS.BIN",
+        ATTR_ARCHIVE,
+        base,
+        4096,
+    );
+    let aliased = vol.ambiguous_reference();
+    assert!(
+        aliased.contains(&self_key),
+        "two DIFFERENT keys on one chain must flag both, or the sweep below is \
+         not testing the collision arm at all"
+    );
+
+    for step in 0..120 {
+        let cluster = base + (rng() % 300);
+        let value = match rng() % 4 {
+            0 => 0u32,
+            1 => crate::fat32::FAT32_EOC,
+            2 => cluster + 1,
+            _ => base + (rng() % 300),
+        };
+        let byte = cluster as usize * 4;
+        let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let mut sec = vol.read_sector(lba);
+        let off = byte % SECTOR;
+        sec[off..off + 4].copy_from_slice(&(value & 0x0FFF_FFFF).to_le_bytes());
+        vol.write_sector(lba, &sec);
+
+        let reference = vol.ambiguous_reference();
+        assert_eq!(
+            reference,
+            ambiguous_by_definition(&vol),
+            "step {step}: the reference and the definition disagree"
+        );
+        if reference.is_empty() {
+            empty += 1;
+        } else {
+            nonempty += 1;
+        }
+    }
+    assert!(
+        nonempty > 10,
+        "the sweep never produced a flagged file, so it proves nothing ({empty} empty)"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A LINK PAST FAT COPY 0 MUST NOT BE MEMOIZED — THE ADVERSARIAL-GUEST CASE.
+///
+/// `fat_entry_walked` delegates a cluster whose entry falls outside FAT copy 0
+/// to `fat_entry`, which resolves it through an LBA in FAT COPY 1. That is an
+/// overlay sector the cursor never resolved, so it never lands in
+/// `walk.sectors` — and a memo whose dependency set is missing a sector it
+/// actually depends on would survive a guest write to that sector and serve a
+/// chain the FAT no longer says. `walk.degraded = true` on that arm is what
+/// stops the memo existing at all.
+///
+/// A guest can reach this deliberately: the FAT entry it writes is 28 bits wide
+/// and nothing stops it naming a cluster past the synthesized FAT.
+///
+/// NON-VACUOUS, and this is the mutant the review found survivable: deleting the
+/// `walk.degraded = true` line at the `within >= self.geo.fatsz` arm leaves the
+/// whole katea suite green. It fails BOTH assertions here — the memo appears,
+/// and the second walk then serves the pre-write chain.
+#[test]
+fn a_link_past_fat_copy_0_is_never_memoized() {
+    let (mut vol, root) = seeded_volume("fat_copy0_escape");
+    let fatsz = vol.geo.fatsz;
+    let max = vol.max_chain();
+    // The first cluster past what FAT copy 0 can address: 128 entries per sector.
+    let past_copy0 = fatsz * 128;
+    // A chain head deliberately NOT in FAT sector 0, so the copy-1 write below
+    // cannot expire the memo through the head's own sector. 200 / 128 = 1.
+    let head = 200u32;
+    assert_ne!(head / 128, 0, "the head must not share sector 0");
+
+    // The guest points `head` straight at a cluster past FAT copy 0.
+    let byte = head as usize * 4;
+    let head_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+    let mut sec = vol.read_sector(head_lba);
+    let off = byte % SECTOR;
+    sec[off..off + 4].copy_from_slice(&(past_copy0 & 0x0FFF_FFFF).to_le_bytes());
+    vol.write_sector(head_lba, &sec);
+
+    let reference = |v: &KateaTreeVolume| crate::katea_write::chain(head, max, |c| v.fat_entry(c));
+    let before = reference(&vol);
+    assert_eq!(vol.chain_via_walk(head), before, "the walk must be exact");
+    assert!(
+        before.as_ref().is_some_and(|c| c.contains(&past_copy0)),
+        "the fixture must actually reach a cluster past FAT copy 0, got {before:?}"
+    );
+    assert!(
+        !vol.chain_memo_holds(head),
+        "a walk that escaped FAT copy 0 was memoized: its dependency set cannot \
+         name the copy-1 sector it actually read"
+    );
+
+    // Now write the FAT COPY 1 sector that `past_copy0` resolves through. It is
+    // the sector at partition-relative `reserved + fatsz`, whose `within` is
+    // 0 -- NOT the head's sector, so a memo of the walk above would still look
+    // current.
+    let copy1_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + fatsz;
+    let mut sec = vol.read_sector(copy1_lba);
+    sec[0..4].copy_from_slice(&5u32.to_le_bytes());
+    vol.write_sector(copy1_lba, &sec);
+
+    let after = reference(&vol);
+    assert_ne!(
+        after, before,
+        "the copy-1 write must change the chain, or the second assertion is vacuous"
+    );
+    assert_eq!(
+        vol.chain_via_walk(head),
+        after,
+        "a stale memo served the pre-write chain across a FAT copy 1 write"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// THE CHAIN MEMO MUST NEVER SERVE A CHAIN THE FAT NO LONGER SAYS.
+///
+/// This is the safety test for `ChainMemo`'s invalidation, and the dangerous
+/// direction is obvious: a stale chain fed to reconcile writes the wrong bytes
+/// into a real host file, or deletes one. So rather than assert the invalidation
+/// rule, the test replays a deterministic pseudo-random sequence of guest FAT
+/// writes -- links, EOCs, frees, and rewrites of sectors already written -- and
+/// after EVERY ONE of them compares `chain_of` against `katea_write::chain`
+/// driven by the untouched `fat_entry`, over every seeded first cluster.
+///
+/// The sequence deliberately mixes clusters that share a FAT sector with ones
+/// that do not, so both arms of `chain_memo_is_current` are exercised: the
+/// whole-volume epoch equality and the per-sector comparison.
+///
+/// NON-VACUOUS: deleting the `fat_sector_epoch.insert` in `note_metadata_write`
+/// (so nothing ever expires) fails on the first write that changes a chain;
+/// so does stamping the epoch but comparing it with `>=` instead of `<=`.
+#[test]
+fn the_chain_memo_never_outlives_a_fat_write_that_changes_its_chain() {
+    let (mut vol, root) = seeded_volume("chain_memo_invalidation");
+    let max = vol.max_chain();
+    let base = vol.fat.next_free();
+    // The clusters whose chains are checked after every mutation: mount-time
+    // ones, guest-written ones, and free space past both.
+    let watched: Vec<u32> = (2..12)
+        .chain(base - 4..base + 320)
+        .chain([base + 900, base + 1500])
+        .collect();
+
+    let mut seed = 0x1234_5678u32;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let mut changed_something = 0;
+
+    for step in 0..250 {
+        // Rewrite one FAT entry through the guest's own path.
+        let cluster = base + (rng() % 340);
+        let value = match rng() % 4 {
+            0 => 0u32,                    // free it: chains through it end
+            1 => crate::fat32::FAT32_EOC, // terminate here
+            2 => cluster + 1,             // link forward
+            _ => base + (rng() % 340),    // link anywhere, possibly a cycle
+        };
+        let byte = cluster as usize * 4;
+        let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let mut sec = vol.read_sector(lba);
+        let off = byte % SECTOR;
+        let old = sec[off..off + 4].to_vec();
+        sec[off..off + 4].copy_from_slice(&(value & 0x0FFF_FFFF).to_le_bytes());
+        if old != sec[off..off + 4] {
+            changed_something += 1;
+        }
+        vol.write_sector(lba, &sec);
+
+        for &first in &watched {
+            let want = crate::katea_write::chain(first, max, |c| vol.fat_entry(c));
+            assert_eq!(
+                vol.chain_via_walk(first),
+                want,
+                "step {step}: memo served a stale chain from cluster {first} \
+                 after writing FAT[{cluster}] = {value:#x}"
+            );
+        }
+    }
+    assert!(
+        changed_something > 100,
+        "the sweep rewrote the same bytes every time ({changed_something} real \
+         changes), so it proves nothing"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A PASS OVER AN UNCHANGED VOLUME MUST NOT WALK A SINGLE CHAIN.
+///
+/// This is the O(folder) fix's second half. `chain_of` is called three to four
+/// times per live file per projection pass, and before the memo every one of
+/// those stepped every cluster of the file. With nothing written to the FAT
+/// since the last pass, none of them may walk at all.
+///
+/// NON-VACUOUS: returning early from `chain_of` before the memo lookup makes the
+/// walk count equal the call count and fails the first assertion.
+#[test]
+fn a_second_pass_over_an_unchanged_volume_walks_no_chains() {
+    let root = scratch("chain_memo_steady_state");
+    for i in 0..8u32 {
+        fs::write(root.join(format!("A{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    let allocated = vol.fat.next_free() - ROOT_CLUSTER;
+    assert!(allocated > 400, "want a volume worth walking");
+
+    let first = vol.fat.next_free();
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "NEW.TXT",
+        ATTR_ARCHIVE,
+        first,
+        b"hi",
+    );
+    vol.reconcile();
+    assert_eq!(fs::read(root.join("NEW.TXT")).unwrap(), b"hi");
+
+    // A second FULL pass with NO guest write in between: every chain the pass
+    // asks for is one it already has, and none of the FAT has moved.
+    vol.reset_chain_walk_counts();
+    let before = vol.storage_counters();
+    vol.reconcile();
+    let after = vol.storage_counters();
+    let (walks, hits) = vol.chain_walk_counts();
+
+    assert!(
+        hits > 0,
+        "the second pass asked for no chains at all, so it proves nothing"
+    );
+    assert_eq!(
+        walks, 0,
+        "an unchanged volume re-walked {walks} chains ({hits} served from the \
+         memo): the pass is still proportional to the folder"
+    );
+    // What the pass still reads is its DIRECTORY bytes, which is proportional to
+    // the directory count, not to the data. Nothing near the cluster count.
+    let reads = after.sector_reads - before.sector_reads;
+    assert!(
+        reads * 8 < u64::from(allocated),
+        "the pass read {reads} sectors over {allocated} allocated clusters, so \
+         something is still walking the FAT"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The counter block is now one `Cell` per field rather than one `Cell` over the
+/// whole struct. The behaviour that has to survive is that a bump touches ITS
+/// field and nothing else -- the old whole-block read-modify-write made that true
+/// by construction, and per-field cells make it true by construction in a
+/// different way, so it is worth pinning.
+#[test]
+fn a_counter_bump_moves_exactly_one_field() {
+    let cells = KateaCounterCells::default();
+    assert_eq!(
+        cells.snapshot(),
+        KateaStorageCounters::default(),
+        "a fresh block must snapshot as the default report"
+    );
+    bump(&cells.host_read_operations, 3);
+    let mut want = KateaStorageCounters {
+        host_read_operations: 3,
+        ..Default::default()
+    };
+    assert_eq!(cells.snapshot(), want, "one bump, one field");
+    bump(&cells.projection_bytes, 512);
+    want.projection_bytes = 512;
+    assert_eq!(cells.snapshot(), want, "a second bump left the first alone");
+    // Saturation, so an accumulating counter cannot wrap back through zero.
+    bump(&cells.host_bytes, u64::MAX);
+    bump(&cells.host_bytes, 1);
+    want.host_bytes = u64::MAX;
+    assert_eq!(cells.snapshot(), want);
+}
+
+/// A read-ahead HIT does no host I/O, so it must not enter the wall counters --
+/// and, since it never uses one, must not pay for a clock read either. The
+/// counters are what a test can see: `host_wall_ns` and `host_read_max_ns` are
+/// frozen across a run of pure hits, which is only true while the `Instant` sits
+/// BELOW the hit test.
+#[test]
+fn a_readahead_hit_does_not_enter_the_wall_counters() {
+    let root = scratch("readahead_hit_wall");
+    fs::write(root.join("SEQ.BIN"), vec![9u8; 512 * 1024]).unwrap();
+    let vol = mount(&root);
+    let first = first_cluster_of(&vol, &root.join("SEQ.BIN"));
+    let base = vol.cluster_to_lba(first);
+
+    // One physical read puts this sector's bytes in the read-ahead slot, keyed by
+    // path and byte offset. Re-reading the SAME sector is then a guaranteed hit:
+    // same path, offset 0, whole sector inside the buffer.
+    let _ = vol.read_sector(base);
+    let primed = vol.storage_counters();
+    assert!(
+        primed.host_read_operations > 0,
+        "the priming read did no host I/O, so nothing was buffered"
+    );
+    for _ in 0..32 {
+        let _ = vol.read_sector(base);
+    }
+    let after = vol.storage_counters();
+
+    assert!(
+        after.host_readahead_hits > primed.host_readahead_hits,
+        "the sweep produced no read-ahead hits, so it proves nothing"
+    );
+    assert_eq!(
+        after.host_read_operations, primed.host_read_operations,
+        "a read-ahead hit performed a physical read"
+    );
+    assert_eq!(
+        after.host_wall_ns, primed.host_wall_ns,
+        "a read-ahead hit charged host wall time"
+    );
+    assert_eq!(
+        after.host_read_max_ns, primed.host_read_max_ns,
+        "a read-ahead hit moved the worst-single-read max"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// The memo may only change WHETHER the bytes are recomputed, never WHAT they
 /// are. Every FAT sector of the volume must read back byte for byte what an
 /// uncached synthesis produces, in a read order that alternates between two
@@ -3281,6 +3918,1118 @@ fn a_delete_leaves_no_cached_read_view_for_the_file() {
     assert!(
         !vol.readahead_holds(&path),
         "a read-ahead slot survived the delete"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 term A: the incremental anti-clobber claim index.
+// ---------------------------------------------------------------------------
+
+/// Set one FAT entry through the guest's own write path.
+#[cfg(test)]
+fn set_fat(vol: &mut KateaTreeVolume, cluster: u32, value: u32) {
+    let byte = cluster as usize * 4;
+    let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+    let mut sec = vol.read_sector(lba);
+    let off = byte % SECTOR;
+    sec[off..off + 4].copy_from_slice(&(value & 0x0FFF_FFFF).to_le_bytes());
+    vol.write_sector(lba, &sec);
+}
+
+/// Rewrite an existing directory entry's declared size in place.
+#[cfg(test)]
+fn set_entry_size(vol: &mut KateaTreeVolume, dir_cluster: u32, name: &str, size: u32) {
+    let dir_lba = vol.cluster_to_lba(dir_cluster);
+    let mut dsec = vol.read_sector(dir_lba);
+    let mut n = [b' '; 11];
+    let (b, x) = name.split_once('.').unwrap_or((name, ""));
+    n[..b.len()].copy_from_slice(b.as_bytes());
+    n[8..8 + x.len()].copy_from_slice(x.as_bytes());
+    let mut found = false;
+    for slot in (0..16).map(|i| i * 32) {
+        if dsec[slot..slot + 11] == n {
+            dsec[slot + 28..slot + 32].copy_from_slice(&size.to_le_bytes());
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "set_entry_size: {name} not found");
+    vol.write_sector(dir_lba, &dsec);
+}
+
+/// F1 -- THE DIFFERENTIAL. The incremental claim index must produce EXACTLY the
+/// full scan's set, not a superset of it.
+///
+/// Exactness is not fussiness. A spurious flag holds a file in
+/// `blocked_projection_keys`, and a non-empty `blocked_projection_keys` makes
+/// `metadata_projection_pending` return `true` for the rest of the session,
+/// which pins a metadata reconcile on every subsequent write command and moves
+/// `metadata_projection_passes` -- a counter stages 1-2 held identical.
+///
+/// The sequence mixes every shape the index has a hook for: chain growth,
+/// truncation (which RELEASES clusters), freeing, re-pointing one entry's chain
+/// onto another's, MKDIR (which grows `directory_clusters` under live claims),
+/// deletes, and real reconcile passes in between so phase 3's hooks fire.
+///
+/// NON-VACUOUS: the sweep asserts it produced flagged files, that it both
+/// inserted and skipped claims, and that at least one pass really did retract.
+/// Removing any one invalidation hook fails it -- verified for the directory
+/// hook by `a_directory_cluster_taken_over_a_live_claim_flags_it`, which isolates
+/// the one this sweep would otherwise catch only intermittently.
+#[test]
+fn the_incremental_claim_set_matches_a_full_scan_under_random_mutation() {
+    let (mut vol, root) = seeded_volume("claims_differential");
+    vol.arm_claims_verify();
+    let base = vol.fat.next_free();
+    let mut seed = 0x5EED_1234u32;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+
+    // Two entries deliberately aliased onto one chain, so the collision arm is
+    // live from the start.
+    stamp_file_entry_only(
+        &mut vol,
+        ROOT_CLUSTER,
+        "ALIAS.BIN",
+        ATTR_ARCHIVE,
+        base,
+        4096,
+    );
+    let mut flagged_steps = 0;
+
+    for step in 0..400 {
+        match rng() % 6 {
+            0 => set_fat(&mut vol, base + (rng() % 300), 0),
+            1 => set_fat(&mut vol, base + (rng() % 300), crate::fat32::FAT32_EOC),
+            2 => {
+                let c = base + (rng() % 300);
+                set_fat(&mut vol, c, c + 1);
+            }
+            3 => set_fat(&mut vol, base + (rng() % 300), base + (rng() % 300)),
+            4 => {
+                let size = rng() % 300_000;
+                set_entry_size(&mut vol, ROOT_CLUSTER, "G1.BIN", size);
+            }
+            _ => {
+                // A real pass, so phase 3's directory-cluster registration and
+                // phase 2's deletes run against the index.
+                vol.reconcile();
+            }
+        }
+        if step % 37 == 0 {
+            make_subdir(&mut vol, ROOT_CLUSTER, "SUB");
+            vol.reconcile();
+            delete_entry(&mut vol, ROOT_CLUSTER, "SUB");
+        }
+
+        let reference = vol.ambiguous_reference();
+        let (incremental, _complete) = vol.ambiguous_incremental_for_test();
+        assert_eq!(
+            incremental, reference,
+            "step {step}: the incremental claim index disagreed with the full scan"
+        );
+        if !reference.is_empty() {
+            flagged_steps += 1;
+        }
+    }
+
+    assert_eq!(
+        vol.claim_divergences(),
+        0,
+        "the in-process verify harness saw a divergence during a real reconcile"
+    );
+    assert!(
+        flagged_steps > 20,
+        "the sweep flagged nothing worth checking ({flagged_steps} steps)"
+    );
+    let (inserts, skips) = vol.claim_counts();
+    assert!(
+        inserts > 0 && skips > 0,
+        "the sweep must both refresh and skip claims, got {inserts} inserts / {skips} skips"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F2/F3 -- RELEASE THEN RECLAIM, the failure the guard exists to prevent.
+///
+/// A truncated file RELEASES clusters. If the index went on crediting them to
+/// the old owner, the next file to take one would collide with a ghost and be
+/// held forever; if instead the index forgot clusters the old owner still holds,
+/// a genuine collision would go unflagged and one file's bytes would be written
+/// into the other's host path. This drives the whole cycle across two passes and
+/// asserts both files end up with THEIR OWN bytes on the host.
+///
+/// NON-VACUOUS: the assertion that B exists with B's bytes fails if a stale
+/// claim holds it; the assertion on A's bytes fails if the release under-flags
+/// and A is rewritten from clusters B now owns.
+#[test]
+fn release_then_reclaim_across_two_passes() {
+    let (mut vol, root) = fresh_vol("claims_release_reclaim");
+    vol.arm_claims_verify();
+    let a_first = next_free_for_test(&vol);
+    // A: four clusters of its own bytes.
+    let a_bytes = vec![0xAAu8; 4 * 4096];
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "A.BIN",
+        ATTR_ARCHIVE,
+        a_first,
+        &a_bytes,
+    );
+    vol.reconcile();
+    assert_eq!(fs::read(root.join("A.BIN")).unwrap().len(), a_bytes.len());
+
+    // Truncate A to one cluster: EOC at the head, the tail freed.
+    set_fat(&mut vol, a_first, crate::fat32::FAT32_EOC);
+    for i in 1..4 {
+        set_fat(&mut vol, a_first + i, 0);
+    }
+    set_entry_size(&mut vol, ROOT_CLUSTER, "A.BIN", 4096);
+    vol.reconcile();
+    assert_eq!(
+        fs::read(root.join("A.BIN")).unwrap().len(),
+        4096,
+        "the truncate did not reach the host"
+    );
+
+    // B takes a cluster A just released.
+    let b_first = a_first + 1;
+    let b_bytes = vec![0xBBu8; 4096];
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "B.BIN",
+        ATTR_ARCHIVE,
+        b_first,
+        &b_bytes,
+    );
+    vol.reconcile();
+
+    assert_eq!(
+        fs::read(root.join("B.BIN")).unwrap(),
+        b_bytes,
+        "B was held or written from the wrong clusters: a released cluster was \
+         still credited to A"
+    );
+    assert_eq!(
+        fs::read(root.join("A.BIN")).unwrap(),
+        vec![0xAAu8; 4096],
+        "A's host file was rewritten from clusters it no longer owns"
+    );
+    assert_eq!(vol.claim_divergences(), 0);
+    assert_eq!(
+        vol.storage_counters().blocked_projection_keys,
+        0,
+        "a file was left held after the reclaim settled"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F4 -- the same release and reclaim with NO pass between them.
+///
+/// This is the ordering an installer actually produces: the truncate and the new
+/// file's allocation land in one write batch, so "the index was refreshed
+/// between them" is not available. A design that only ever gets this right
+/// because a pass happened in the middle passes F3 and fails here.
+#[test]
+fn release_then_reclaim_in_one_batch() {
+    let (mut vol, root) = fresh_vol("claims_release_reclaim_batch");
+    vol.arm_claims_verify();
+    let a_first = next_free_for_test(&vol);
+    let a_bytes = vec![0xAAu8; 4 * 4096];
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "A.BIN",
+        ATTR_ARCHIVE,
+        a_first,
+        &a_bytes,
+    );
+    vol.reconcile();
+
+    // One batch: truncate A AND create B on a cluster A is releasing.
+    set_fat(&mut vol, a_first, crate::fat32::FAT32_EOC);
+    for i in 1..4 {
+        set_fat(&mut vol, a_first + i, 0);
+    }
+    set_entry_size(&mut vol, ROOT_CLUSTER, "A.BIN", 4096);
+    let b_bytes = vec![0xBBu8; 4096];
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "B.BIN",
+        ATTR_ARCHIVE,
+        a_first + 2,
+        &b_bytes,
+    );
+    vol.reconcile();
+
+    assert_eq!(fs::read(root.join("B.BIN")).unwrap(), b_bytes, "B's bytes");
+    assert_eq!(
+        fs::read(root.join("A.BIN")).unwrap(),
+        vec![0xAAu8; 4096],
+        "A's bytes"
+    );
+    assert_eq!(vol.claim_divergences(), 0);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F5 -- THE FAILURE DIRECTION. A stale claim must hold, never clobber.
+///
+/// The index is made stale on purpose: `suppress_fat_epoch_stamps` stops the one
+/// hook that expires a claim, which is the strongest form of the bug class the
+/// whole design is guarding against. The requirement is not that the outcome is
+/// right -- it cannot be -- but that it errs by HOLDING. A held file's bytes stay
+/// in the overlay and the final flush still writes them; a clobbered file's host
+/// bytes are gone.
+///
+/// NON-VACUOUS: the suppression is asserted to have actually changed the
+/// outcome (the index goes on flagging a key the reference does not), so the
+/// test cannot pass by the hook quietly still working.
+#[test]
+fn a_stale_claim_holds_and_never_clobbers() {
+    let (mut vol, root) = fresh_vol("claims_stale_holds");
+    let a_first = next_free_for_test(&vol);
+    let a_bytes = vec![0xAAu8; 4 * 4096];
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "A.BIN",
+        ATTR_ARCHIVE,
+        a_first,
+        &a_bytes,
+    );
+    vol.reconcile();
+    let a_on_host = fs::read(root.join("A.BIN")).unwrap();
+
+    // From here the index can no longer learn that anything changed.
+    vol.suppress_fat_epoch_stamps();
+    set_fat(&mut vol, a_first, crate::fat32::FAT32_EOC);
+    for i in 1..4 {
+        set_fat(&mut vol, a_first + i, 0);
+    }
+    set_entry_size(&mut vol, ROOT_CLUSTER, "A.BIN", 4096);
+    let b_bytes = vec![0xBBu8; 4096];
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "B.BIN",
+        ATTR_ARCHIVE,
+        a_first + 2,
+        &b_bytes,
+    );
+
+    // The TRUTH here is `ambiguous_by_definition`, which reads the FAT through
+    // `fat_entry` and so bypasses the chain memo. `ambiguous_reference` cannot
+    // serve: suppressing the stamp makes the memo stale too, so the "reference"
+    // is stale in exactly the same way as the thing under test.
+    let truth = ambiguous_by_definition(&vol);
+    let (incremental, _) = vol.ambiguous_incremental_for_test();
+    assert!(
+        incremental.len() > truth.len(),
+        "suppressing the stamp did not make the index stale, so this proves \
+         nothing (incremental {incremental:?}, truth {truth:?})"
+    );
+    assert!(
+        incremental.is_superset(&truth),
+        "a stale index must OVER-flag; it dropped a flag the FAT actually says"
+    );
+
+    vol.reconcile();
+    // B is held, not written from the wrong place. A keeps its bytes.
+    assert!(
+        !root.join("B.BIN").exists() || fs::read(root.join("B.BIN")).unwrap() == b_bytes,
+        "B's host file exists with bytes that are not B's"
+    );
+    assert!(
+        fs::read(root.join("A.BIN"))
+            .unwrap()
+            .starts_with(&[0xAAu8; 4096]),
+        "A's host file was clobbered under a stale index"
+    );
+    assert_eq!(a_on_host.len(), 4 * 4096);
+    assert!(
+        vol.storage_counters().blocked_projection_keys > 0,
+        "the stale index did not hold anything, so it did not err conservatively"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F6 -- a cluster BECOMING a directory cluster must flag a claim that never
+/// changed.
+///
+/// This is the one under-flag the FAT epoch cannot see: the file's chain is
+/// untouched, so its token stays current and the index never revisits it, while
+/// `directory_clusters` grows underneath it during phase 3.
+///
+/// NON-VACUOUS: with `register_directory_cluster`'s flagging removed (a plain
+/// `directory_clusters.insert`), the incremental answer loses the key and the
+/// equality assertion fails.
+#[test]
+fn a_directory_cluster_taken_over_a_live_claim_flags_it() {
+    let (mut vol, root) = fresh_vol("claims_dir_takeover");
+    vol.arm_claims_verify();
+    // The insurance would re-derive this claim anyway on a volume this small, and
+    // the point is the HOOK. Verified: with the refresh left on, deleting the
+    // flagging in `register_directory_cluster` survives this fixture.
+    vol.disable_amortised_refresh();
+    let f_first = next_free_for_test(&vol);
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "F.BIN",
+        ATTR_ARCHIVE,
+        f_first,
+        &[1u8; 4096],
+    );
+    vol.reconcile();
+    let before = vol.ambiguous_reference();
+    assert!(before.is_empty(), "nothing should be ambiguous yet");
+
+    // A subdirectory whose data cluster is the one F already claims. The guest
+    // can write exactly this; DOS would not, which is the point.
+    let mut name = [b' '; 11];
+    name[..3].copy_from_slice(b"SUB");
+    let dlba = vol.cluster_to_lba(f_first);
+    let mut dsec = [0u8; SECTOR];
+    let dot = *b".          ";
+    let dotdot = *b"..         ";
+    dsec[0..32].copy_from_slice(&crate::fat32::fat32_dir_entry(&dot, 0x10, f_first, 0, 0, 0));
+    dsec[32..64].copy_from_slice(&crate::fat32::fat32_dir_entry(&dotdot, 0x10, 0, 0, 0, 0));
+    vol.write_sector(dlba, &dsec);
+    // Zero the REST of the cluster too. It still holds F.BIN's data bytes, and a
+    // directory image with non-zero entries behind its terminator is a TORN
+    // directory -- which would make the pass fall back to the full scan and this
+    // fixture would prove nothing about the hook. (It did exactly that in its
+    // first draft; the mutation run is what surfaced it.)
+    for s in 1..u32::from(vol.geo.spc) {
+        vol.write_sector(dlba + s, &[0u8; SECTOR]);
+    }
+    stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "SUB", 0x10, f_first, 0);
+    vol.reconcile();
+
+    let reference = vol.ambiguous_reference();
+    let (incremental, _) = vol.ambiguous_incremental_for_test();
+    assert!(
+        vol.claims_valid(),
+        "the pass fell back to a full scan, so the directory-growth hook is not          what produced this answer"
+    );
+    assert!(
+        vol.is_directory_cluster(f_first),
+        "the takeover did not register"
+    );
+    assert!(
+        !reference.is_empty(),
+        "the takeover did not make anything ambiguous, so this proves nothing"
+    );
+    assert_eq!(
+        incremental, reference,
+        "the index missed a cluster that became a directory cluster under a \
+         claim it never revisited"
+    );
+    assert_eq!(vol.claim_divergences(), 0);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F7 -- a DEGRADED walk must poison the index, not narrow it.
+///
+/// A walk that read substituted zeros for an unreadable spilled FAT sector does
+/// not know what the FAT says, and the design's rule is that an unknowable input
+/// invalidates the whole index rather than one key: the definition quantifies
+/// over every live file, so if one of them is unknowable the honest answer for
+/// all of them is "re-derive".
+#[test]
+fn a_degraded_walk_poisons_the_claim_index() {
+    // A volume big enough that a FILE's FAT entries live in a different FAT
+    // sector from the DIRECTORIES'. Without that separation the same broken read
+    // also tears `gather_live`, the pass poisons through the incomplete-directory
+    // path instead, and the degraded-walk path is never exercised at all -- the
+    // mutation run caught exactly that.
+    let root = scratch("claims_degraded");
+    for i in 0..8u32 {
+        fs::write(root.join(format!("H{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    // Before the first write: `shrink_cache` replaces the store wholesale, and a
+    // full-size store never evicts on a fixture, so nothing would reach the spill
+    // and nothing could fail to be read back.
+    shrink_cache(&mut vol, 30);
+    vol.arm_claims_verify();
+    vol.disable_amortised_refresh();
+    let first = vol.fat.next_free() + 400; // well past cluster 128: FAT sector >= 1
+    assert!(
+        first / 128 > 0,
+        "the file's FAT sector must not be the root's"
+    );
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "D.BIN",
+        ATTR_ARCHIVE,
+        first,
+        &[3u8; 4096],
+    );
+    vol.reconcile();
+    let (_, _) = vol.ambiguous_incremental_for_test();
+    assert!(
+        vol.claims_valid(),
+        "the index should be live before the fault"
+    );
+
+    // Rewrite the file's FAT sector, which expires its memo AND puts the sector
+    // in the store; then evict it to the spill and break spill reads. The next
+    // walk has to re-read a sector it cannot get back, which is a degraded walk.
+    // (Without the rewrite the memo answers and nothing reads the store at all --
+    // the first draft of this fixture failed for exactly that reason.)
+    // Keep a copy of the root directory sector: the eviction below is
+    // indiscriminate, and if the DIRECTORY's bytes are the ones that cannot be
+    // read back then `gather_live` sees an empty volume, no claim is ever
+    // walked, and the fixture proves nothing. Re-writing it after the flush puts
+    // it back in RAM so only the FAT sector is on the broken spill.
+    let dir_lba = vol.cluster_to_lba(ROOT_CLUSTER);
+    let dsec = vol.read_sector(dir_lba);
+    set_fat(&mut vol, first, crate::fat32::FAT32_EOC);
+    flush_cache(&mut vol, 40);
+    vol.write_sector(dir_lba, &dsec);
+    vol.store.fail_spill_reads();
+    let errors_before = vol.store.read_errors();
+    let (_incremental, complete) = vol.ambiguous_incremental_for_test();
+    assert!(
+        vol.store.read_errors() > errors_before,
+        "no spill read failed, so no walk degraded and this proves nothing"
+    );
+    assert!(
+        complete,
+        "the directories tore too, so this fixture is testing the torn-directory \
+         path rather than the degraded-walk one"
+    );
+    assert!(
+        !vol.claims_valid(),
+        "a degraded walk left the index trusted"
+    );
+
+    vol.store.restore_spill_reads();
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F13 -- a TORN DIRECTORY must not be read as a set of deletions.
+///
+/// `parse_dir` stops at the first zeroed entry, so a directory whose middle
+/// sector the guest has zeroed but not yet rewritten hides every entry behind
+/// the hole -- with `store.read_errors()` never moving. Retracting those keys
+/// would be a retraction on unreliable evidence. The pass must notice and fall
+/// back.
+///
+/// NON-VACUOUS: `directory_image_is_whole` returning `true` unconditionally
+/// makes the pass trust the truncated live set and fails the `claims_valid`
+/// assertion.
+#[test]
+fn a_torn_directory_does_not_retract_the_hidden_keys() {
+    let (mut vol, root) = fresh_vol("claims_torn_dir");
+    vol.arm_claims_verify();
+    // Enough entries that some live past the hole we punch.
+    let mut next = next_free_for_test(&vol);
+    for i in 0..6u32 {
+        next = stamp_file(
+            &mut vol,
+            ROOT_CLUSTER,
+            &format!("T{i}.BIN"),
+            ATTR_ARCHIVE,
+            next,
+            &[i as u8; 4096],
+        );
+    }
+    vol.reconcile();
+    let whole = vol.live_entries_for_test().len();
+    assert!(whole >= 6, "want a directory worth tearing, got {whole}");
+    let (_, complete) = vol.ambiguous_incremental_for_test();
+    assert!(complete, "the directory should be whole before the tear");
+
+    // Zero one entry in the middle: parse_dir now stops there and hides the rest.
+    let dir_lba = vol.cluster_to_lba(ROOT_CLUSTER);
+    let mut dsec = vol.read_sector(dir_lba);
+    let hole = 32 * 2;
+    dsec[hole..hole + 32].copy_from_slice(&[0u8; 32]);
+    vol.write_sector(dir_lba, &dsec);
+
+    let torn = vol.live_entries_for_test().len();
+    assert!(
+        torn < whole,
+        "the tear hid nothing ({torn} vs {whole}), so this proves nothing"
+    );
+    let (incremental, complete) = vol.ambiguous_incremental_for_test();
+    assert!(!complete, "the torn directory was reported as whole");
+    assert_eq!(incremental, vol.ambiguous_reference());
+    assert!(
+        !vol.claims_valid(),
+        "a torn directory left the index trusted, so the next pass would retract \
+         the hidden keys off an incomplete live set"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F9 -- the cost claim. A pass over a volume nothing has written must insert no
+/// claims at all.
+///
+/// NON-VACUOUS: skipping the currency test (always refreshing) makes the insert
+/// count equal the live-file count and fails the first assertion.
+#[test]
+fn a_second_pass_over_an_unchanged_volume_inserts_no_claims() {
+    let root = scratch("claims_steady_state");
+    for i in 0..8u32 {
+        fs::write(root.join(format!("A{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    let allocated = vol.fat.next_free() - ROOT_CLUSTER;
+    assert!(allocated > 400, "want a volume worth walking");
+
+    let first = vol.fat.next_free();
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "NEW.TXT",
+        ATTR_ARCHIVE,
+        first,
+        b"hi",
+    );
+    vol.reconcile();
+    vol.reconcile();
+
+    vol.reset_claim_counts();
+    vol.reconcile();
+    let (inserts, skips) = vol.claim_counts();
+    assert!(
+        skips > 0,
+        "the pass asked for no claims, so it proves nothing"
+    );
+    // The amortised forced refresh touches 1/CLAIM_REFRESH_PERIOD of the keys, so
+    // "no work" is a small constant, not literally zero.
+    assert!(
+        inserts * 4 < skips,
+        "an unchanged volume re-inserted {inserts} claims against {skips} skips: \
+         the pass is still proportional to the folder"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F12 -- the amortised forced refresh must reach every key, and must not spike.
+///
+/// It is insurance against a hook nobody anticipated, so its value is entirely in
+/// its period: every live key is re-derived within `CLAIM_REFRESH_PERIOD` passes.
+/// Asserted by counting, not by trusting the modulus arithmetic.
+#[test]
+fn the_amortised_refresh_reaches_every_key_within_its_period() {
+    let root = scratch("claims_amortised");
+    for i in 0..8u32 {
+        fs::write(root.join(format!("R{i:02}.BIN")), vec![i as u8; 64 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    let first = vol.fat.next_free();
+    stamp_file(&mut vol, ROOT_CLUSTER, "R.TXT", ATTR_ARCHIVE, first, b"hi");
+    vol.reconcile();
+    let keys = vol
+        .live_entries_for_test()
+        .iter()
+        .filter(|(_, _, fc, is_dir)| !*is_dir && *fc >= 2)
+        .count() as u64;
+    assert!(keys > 4, "want several keys, got {keys}");
+
+    vol.reset_claim_counts();
+    for _ in 0..64 {
+        vol.reconcile();
+    }
+    let (inserts, _) = vol.claim_counts();
+    assert!(
+        inserts >= keys,
+        "{inserts} forced refreshes over 64 passes for {keys} keys: some key was \
+         never re-derived inside the period"
+    );
+    // ... and it is amortised, not a periodic rebuild: no single pass may do them
+    // all. One period's worth of passes does roughly one key-set's worth of work.
+    assert!(
+        inserts < keys * 4,
+        "{inserts} refreshes for {keys} keys over 64 passes is not amortisation"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// F11 -- the kill switch. `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` must reproduce
+/// the outcome, which is what makes it a usable A/B control and field bisect
+/// rather than a decoration.
+#[test]
+fn the_incremental_claims_kill_switch_reproduces_the_outcome() {
+    for disarm in [false, true] {
+        let (mut vol, root) = fresh_vol(if disarm {
+            "claims_switch_off"
+        } else {
+            "claims_switch_on"
+        });
+        if disarm {
+            vol.disarm_incremental_claims();
+        }
+        let a_first = next_free_for_test(&vol);
+        let a_bytes = vec![0xAAu8; 4 * 4096];
+        stamp_file(
+            &mut vol,
+            ROOT_CLUSTER,
+            "A.BIN",
+            ATTR_ARCHIVE,
+            a_first,
+            &a_bytes,
+        );
+        vol.reconcile();
+        set_fat(&mut vol, a_first, crate::fat32::FAT32_EOC);
+        for i in 1..4 {
+            set_fat(&mut vol, a_first + i, 0);
+        }
+        set_entry_size(&mut vol, ROOT_CLUSTER, "A.BIN", 4096);
+        let b_bytes = vec![0xBBu8; 4096];
+        stamp_file(
+            &mut vol,
+            ROOT_CLUSTER,
+            "B.BIN",
+            ATTR_ARCHIVE,
+            a_first + 1,
+            &b_bytes,
+        );
+        vol.reconcile();
+
+        assert_eq!(
+            fs::read(root.join("A.BIN")).unwrap(),
+            vec![0xAAu8; 4096],
+            "A's bytes with the index {}",
+            if disarm { "OFF" } else { "ON" }
+        );
+        assert_eq!(
+            fs::read(root.join("B.BIN")).unwrap(),
+            b_bytes,
+            "B's bytes with the index {}",
+            if disarm { "OFF" } else { "ON" }
+        );
+        assert_eq!(
+            vol.storage_counters().blocked_projection_keys,
+            0,
+            "held keys with the index {}",
+            if disarm { "OFF" } else { "ON" }
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// A torn directory image is exactly "a non-free entry behind the first free
+/// one". Pinned directly, because `directory_image_is_whole` is what decides
+/// whether a whole pass trusts its own live set.
+#[test]
+fn directory_image_wholeness_detects_a_hole_and_nothing_else() {
+    let mut bytes = vec![0u8; 32 * 8];
+    // Empty directory: all free.
+    assert!(directory_image_is_whole(&bytes));
+    // Two live entries then free space: normal.
+    bytes[0] = b'A';
+    bytes[32] = b'B';
+    assert!(directory_image_is_whole(&bytes));
+    // A deleted entry among them is still normal.
+    bytes[64] = 0xE5;
+    assert!(directory_image_is_whole(&bytes));
+    // A live entry BEHIND the terminator is a hole.
+    bytes[32 * 5] = b'C';
+    assert!(!directory_image_is_whole(&bytes));
+    // So is a deleted one: DOS never writes 0xE5 past a 0x00.
+    bytes[32 * 5] = 0x00;
+    bytes[32 * 6] = 0xE5;
+    assert!(!directory_image_is_whole(&bytes));
+}
+
+/// M2's fixture -- A RETRACTION MUST CLEAR THE FLAG IT CAUSED.
+///
+/// Two entries alias one chain, so both are flagged. Remove one; the other must
+/// go back to clean. If a retraction only ever removed its own claims and never
+/// decremented the key it stops contesting, the survivor would stay flagged for
+/// the rest of the session -- and a permanently flagged key sits in
+/// `blocked_projection_keys`, which makes `metadata_projection_pending` return
+/// `true` forever, pinning a reconcile on every write command.
+///
+/// This is the "not cost-only" case, and it is why `KeyClaim::bad` is a count
+/// rather than a sticky flag.
+///
+/// NON-VACUOUS with the amortised refresh OFF: disabling the decrement in
+/// `retract_claim` leaves the survivor flagged and fails the second assertion.
+/// With the refresh on, the insurance re-derives the survivor and the mutant
+/// lives -- which is exactly why it is switched off here.
+#[test]
+fn retracting_a_claim_clears_the_flag_it_caused() {
+    let (mut vol, root) = fresh_vol("claims_retract_clears");
+    vol.arm_claims_verify();
+    vol.disable_amortised_refresh();
+    let first = next_free_for_test(&vol);
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "REAL.BIN",
+        ATTR_ARCHIVE,
+        first,
+        &[1u8; 4096],
+    );
+    stamp_file_entry_only(
+        &mut vol,
+        ROOT_CLUSTER,
+        "ALIAS.BIN",
+        ATTR_ARCHIVE,
+        first,
+        4096,
+    );
+
+    let (flagged, _) = vol.ambiguous_incremental_for_test();
+    assert_eq!(
+        flagged.len(),
+        2,
+        "both aliases must be flagged: {flagged:?}"
+    );
+    assert_eq!(flagged, vol.ambiguous_reference());
+
+    // Drop the alias. Its chain is untouched, so nothing expires REAL's claim --
+    // only the retraction can clear REAL's flag.
+    delete_entry(&mut vol, ROOT_CLUSTER, "ALIAS.BIN");
+    let (after, _) = vol.ambiguous_incremental_for_test();
+    assert!(
+        after.is_empty(),
+        "the survivor stayed flagged after the collision went away: {after:?}"
+    );
+    assert_eq!(after, vol.ambiguous_reference());
+    assert_eq!(vol.claim_divergences(), 0);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// M6's fixture -- A DIRECTORY ENTRY RE-POINTED AT ANOTHER CHAIN, WITH NO FAT
+/// WRITE AT ALL.
+///
+/// The FAT token cannot see this: the guest rewrote 4 bytes of a DIRECTORY
+/// sector, and every FAT sector is exactly as it was. The claim is stale unless
+/// the currency test also compares the recorded first cluster against the live
+/// entry's.
+///
+/// NON-VACUOUS with the amortised refresh OFF: dropping `unit.first_cluster ==
+/// *first` from the currency test leaves the old chain claimed and the
+/// incremental answer diverges from the reference.
+#[test]
+fn re_pointing_a_directory_entry_expires_its_claim() {
+    let (mut vol, root) = fresh_vol("claims_repoint");
+    vol.arm_claims_verify();
+    vol.disable_amortised_refresh();
+    let a = next_free_for_test(&vol);
+    let next = stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "A.BIN",
+        ATTR_ARCHIVE,
+        a,
+        &[1u8; 4096],
+    );
+    let b = next;
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "B.BIN",
+        ATTR_ARCHIVE,
+        b,
+        &[2u8; 4096],
+    );
+    let (before, _) = vol.ambiguous_incremental_for_test();
+    assert!(before.is_empty(), "nothing ambiguous yet: {before:?}");
+
+    // Re-point A's directory entry at B's chain. No FAT sector is touched.
+    let dir_lba = vol.cluster_to_lba(ROOT_CLUSTER);
+    let mut dsec = vol.read_sector(dir_lba);
+    let mut name = [b' '; 11];
+    name[..1].copy_from_slice(b"A");
+    name[8..11].copy_from_slice(b"BIN");
+    let mut found = false;
+    for slot in (0..16).map(|i| i * 32) {
+        if dsec[slot..slot + 11] == name {
+            dsec[slot + 20..slot + 22].copy_from_slice(&((b >> 16) as u16).to_le_bytes());
+            dsec[slot + 26..slot + 28].copy_from_slice(&(b as u16).to_le_bytes());
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "A.BIN's directory entry");
+    vol.write_sector(dir_lba, &dsec);
+
+    let reference = vol.ambiguous_reference();
+    assert_eq!(reference.len(), 2, "both entries now share B's chain");
+    let (incremental, _) = vol.ambiguous_incremental_for_test();
+    assert_eq!(
+        incremental, reference,
+        "a directory entry re-pointed at another chain left a stale claim: the \
+         currency test is not comparing the recorded first cluster"
+    );
+    assert_eq!(vol.claim_divergences(), 0);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 term B: the per-chain facts (`all_in_range`, `data_written`) cached
+// on the chain token.
+// ---------------------------------------------------------------------------
+
+/// F10 -- `data_written` MUST FLIP THE MOMENT THE GUEST WRITES THE CHAIN, and
+/// must not be re-derived while it cannot have changed.
+///
+/// This is term B's whole soundness argument in one fixture. The cached `false`
+/// is only allowed to stand while no chunk the chain's data spans has been
+/// written since it was taken; the cached `true` is allowed to stand forever,
+/// because the store's `written` bits are monotone.
+///
+/// The consequence of getting it wrong is not subtle: `data_written` is the gate
+/// at phase 3 that decides whether a file is materialized at all, so a stale
+/// `false` means a file the guest wrote never reaches the host folder.
+///
+/// NON-VACUOUS: making the revalidation unconditional (`data_chunks.iter().all(
+/// |_| true)`) leaves the cached `false` standing and the assertion that
+/// `LATE.BIN` reaches the host fails.
+#[test]
+fn a_cached_data_written_flips_on_the_first_write_to_its_chain() {
+    let root = scratch("chain_facts_data_written");
+    // A mount-time file: never written by the guest, so `data_written` is false
+    // and gets cached on the very first pass.
+    fs::write(root.join("COLD.BIN"), vec![0xC0u8; 64 * 1024]).unwrap();
+    let mut vol = mount(&root);
+    let cold_first = first_cluster_of(&vol, &root.join("COLD.BIN"));
+    vol.reconcile();
+    assert_eq!(
+        fs::read(root.join("COLD.BIN")).unwrap()[0],
+        0xC0,
+        "the untouched mount file must be left alone"
+    );
+
+    // Writes elsewhere on the volume: the cached `false` must survive these, or
+    // the cache is worthless.
+    let other = next_free_for_test(&vol);
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "LATE.BIN",
+        ATTR_ARCHIVE,
+        other,
+        &[0x11u8; 4096],
+    );
+    vol.reconcile();
+    assert_eq!(
+        fs::read(root.join("LATE.BIN")).unwrap(),
+        vec![0x11u8; 4096],
+        "the newly written file must reach the host"
+    );
+
+    // Now write INTO the cold file's own chain. The cached `false` must expire.
+    let base = vol.cluster_to_lba(cold_first);
+    vol.write_sector(base, &[0xEEu8; SECTOR]);
+    vol.reconcile();
+    let after = fs::read(root.join("COLD.BIN")).unwrap();
+    assert_eq!(
+        after[0], 0xEE,
+        "a write into a chain whose `data_written` was cached false never \
+         reached the host: the cache did not expire"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The cached `all_in_range` must be the `any()` it replaces, over both a chain
+/// that is entirely valid and one the guest has pointed outside the data region.
+///
+/// It rides the FAT token with no argument of its own -- it is a pure function
+/// of the chain and of the immutable geometry -- so what this pins is that the
+/// value is the same one, and that it moves when the chain does.
+///
+/// NON-VACUOUS: returning `true` unconditionally from `chain_facts` fails the
+/// second half, where the out-of-range chain must be HELD rather than
+/// materialized from an address that is not on the volume.
+#[test]
+fn the_cached_in_range_flag_matches_a_fresh_scan_of_the_chain() {
+    let (mut vol, root) = fresh_vol("chain_facts_in_range");
+    let first = next_free_for_test(&vol);
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "OK.BIN",
+        ATTR_ARCHIVE,
+        first,
+        &[7u8; 4096],
+    );
+    vol.reconcile();
+    assert!(root.join("OK.BIN").exists(), "the valid chain projects");
+
+    // Point the chain's tail past the end of the volume. Every caller must hold.
+    // Just past `count_of_clusters + 1` (the last valid data cluster) but still
+    // inside FAT copy 0, so this exercises the RANGE check rather than the
+    // out-of-FAT arm, which is a different mechanism with its own fixture.
+    let outside = vol.geo.count_of_clusters + 5;
+    assert!(
+        outside / 128 < vol.geo.fatsz,
+        "the out-of-range cluster must still have a FAT entry in copy 0"
+    );
+    set_fat(&mut vol, first, outside);
+    set_fat(&mut vol, outside, crate::fat32::FAT32_EOC);
+    set_entry_size(&mut vol, ROOT_CLUSTER, "OK.BIN", 8192);
+    let before = fs::read(root.join("OK.BIN")).unwrap();
+    vol.reconcile();
+    assert_eq!(
+        fs::read(root.join("OK.BIN")).unwrap(),
+        before,
+        "a chain reaching outside the data region was materialized anyway"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The cost claim for term B: a pass over a volume nothing has written must not
+/// walk any chain's clusters to re-derive facts it already has.
+///
+/// Measured through `sector_reads`, which the walk still bumps once per cluster:
+/// a pass that re-derived would have to re-walk, and a pass that re-walks shows
+/// up there. The directory reads it still does are proportional to the directory
+/// count, not to the data.
+#[test]
+fn a_steady_state_pass_re_derives_no_chain_facts() {
+    let root = scratch("chain_facts_steady");
+    for i in 0..8u32 {
+        fs::write(root.join(format!("S{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    let allocated = vol.fat.next_free() - ROOT_CLUSTER;
+    assert!(allocated > 400, "want a volume worth walking");
+    let first = vol.fat.next_free();
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "NEW.TXT",
+        ATTR_ARCHIVE,
+        first,
+        b"hi",
+    );
+    vol.reconcile();
+    vol.reconcile();
+
+    vol.reset_chain_walk_counts();
+    let before = vol.storage_counters();
+    vol.reconcile();
+    let after = vol.storage_counters();
+    let (walks, hits) = vol.chain_walk_counts();
+    assert!(
+        hits > 0,
+        "the pass asked for no chains, so it proves nothing"
+    );
+    assert_eq!(walks, 0, "an unchanged volume re-walked {walks} chains");
+    let reads = after.sector_reads - before.sector_reads;
+    assert!(
+        reads * 8 < u64::from(allocated),
+        "the pass resolved {reads} sectors over {allocated} allocated clusters"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// R-1 -- A RETRACTION MUST NOT UN-FLAG A CLUSTER THAT IS STILL A DIRECTORY
+/// CLUSTER.
+///
+/// `retract_claim` decrements the survivor's `bad` only on the 2 -> 1 transition
+/// AND only when the cluster is not a directory cluster. The `!dir` half is
+/// load-bearing and the mutant runs in the DANGEROUS direction: with it deleted,
+/// a cluster that is both directory-owned and doubly claimed loses the
+/// survivor's flag when the other claimant is retracted, so `bad` reaches zero,
+/// phase 3 stops holding the file, and Katea materialises it over clusters a
+/// directory owns. That is precisely the clobber `ambiguous_files` exists to
+/// prevent.
+///
+/// The two ingredients are each covered already --
+/// `a_directory_cluster_taken_over_a_live_claim_flags_it` for the directory
+/// overlap, `retracting_a_claim_clears_the_flag_it_caused` for the two-claimant
+/// retraction -- but their CONJUNCTION followed by a retraction was not, and the
+/// random differential cannot reach it: its menu mutates FAT entries in a range
+/// that does not include the subdirectory, and a directory delete poisons the
+/// index, so the joint state never survives to an assertion.
+///
+/// NON-VACUOUS: deleting `!dir` from the guard at `retract_claim` leaves the
+/// whole katea suite green today; it fails the final assertion here, because the
+/// incremental answer drops B while the full scan keeps it.
+#[test]
+fn retracting_one_claim_leaves_a_directory_cluster_still_flagged() {
+    let (mut vol, root) = fresh_vol("claims_retract_dir_overlap");
+    // Not armed for verify: this fixture has to see the INCREMENTAL answer, and
+    // the verify harness would hand back the reference and hide the defect.
+    vol.disable_amortised_refresh();
+
+    // X is a real directory cluster, registered by a real pass.
+    let x = make_subdir(&mut vol, ROOT_CLUSTER, "SUB");
+    vol.reconcile();
+    assert!(
+        vol.is_directory_cluster(x),
+        "the subdirectory's cluster must be registered before the overlap"
+    );
+
+    // A and B are two files whose chains both run through X.
+    let a_first = next_free_for_test(&vol);
+    set_fat(&mut vol, a_first, x);
+    stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "A.BIN", ATTR_ARCHIVE, a_first, 4096);
+    let b_first = next_free_for_test(&vol);
+    set_fat(&mut vol, b_first, x);
+    stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "B.BIN", ATTR_ARCHIVE, b_first, 4096);
+
+    let mut a_key = [b' '; 11];
+    a_key[..1].copy_from_slice(b"A");
+    a_key[8..11].copy_from_slice(b"BIN");
+    let mut b_key = [b' '; 11];
+    b_key[..1].copy_from_slice(b"B");
+    b_key[8..11].copy_from_slice(b"BIN");
+
+    let reference = vol.ambiguous_reference();
+    let (incremental, complete) = vol.ambiguous_incremental_for_test();
+    assert!(complete, "no torn directory here");
+    assert_eq!(incremental, reference, "both claims present");
+    assert!(
+        incremental.contains(&(ROOT_CLUSTER, a_key))
+            && incremental.contains(&(ROOT_CLUSTER, b_key)),
+        "both files share X AND X is a directory cluster, so both must be \
+         flagged: {incremental:?}"
+    );
+
+    // Retract A by removing its directory entry. Nothing touches a FAT sector, so
+    // B's claim token stays current and B is SKIPPED -- only the retraction can
+    // change B's flag.
+    delete_entry(&mut vol, ROOT_CLUSTER, "A.BIN");
+
+    let reference = vol.ambiguous_reference();
+    assert!(
+        reference.contains(&(ROOT_CLUSTER, b_key)),
+        "the full scan must still flag B: X is still a directory cluster"
+    );
+    let (incremental, _) = vol.ambiguous_incremental_for_test();
+    assert!(
+        incremental.contains(&(ROOT_CLUSTER, b_key)),
+        "retracting A un-flagged B on a cluster a DIRECTORY still owns. Phase 3 \
+         would now materialise B over the subdirectory's clusters -- the exact \
+         clobber the guard exists to prevent"
+    );
+    assert_eq!(
+        incremental, reference,
+        "and the answer must be the reference's"
     );
 
     fs::remove_dir_all(&root).ok();

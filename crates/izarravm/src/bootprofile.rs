@@ -701,6 +701,10 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     overlay_resident_sectors: after.overlay_resident_sectors,
                     overlay_pending_sectors: after.overlay_pending_sectors,
                     pending_unmapped_sectors: after.pending_unmapped_sectors,
+                    // A gauge, like the occupancy levels above: how many entries
+                    // the anti-clobber guard is holding right now, not how many
+                    // it held during this phase.
+                    blocked_projection_keys: after.blocked_projection_keys,
                     spill_operations: after
                         .spill_operations
                         .saturating_sub(before.spill_operations),
@@ -891,6 +895,15 @@ fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: b
     // The run scan is only meaningful next to the sector count it multiplies, and
     // the host opens only next to the sectors they serve: both are ratios, and
     // both were one-per-sector before the read path was fixed.
+    //
+    // READ THE DENOMINATOR CAREFULLY. `sector_reads` counts sectors the facade
+    // RESOLVES, and since the reconcile pass gained its cluster-chain memo a
+    // chain walk served from that memo resolves none. `run_scan_steps` is bumped
+    // only in `data_sector`, which a chain walk never reaches, so this ratio has
+    // always been "run-table steps per DATA sector" over a denominator that also
+    // counted FAT sectors -- and the memo shrank the denominator by 78-96% on the
+    // measured rows without touching the numerator. It is a directional
+    // diagnostic, not a quantity to compare across builds.
     for row in &run.rows {
         if row.reached && row.katea.sector_reads > 0 {
             println!(
@@ -1006,6 +1019,7 @@ fn write_json(
                 "projection_wall_ns": row.katea.projection_wall_ns,
                 "metadata_projection_passes": row.katea.metadata_projection_passes,
                 "host_write_failures": row.katea.host_write_failures,
+                "blocked_projection_keys": row.katea.blocked_projection_keys,
             },
             "machine_phases": row.machine_phases.iter().map(|(name, wall_ns, count)| json!({
                 "name": name,

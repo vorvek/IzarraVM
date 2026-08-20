@@ -347,6 +347,49 @@ impl SectorStore {
             .is_some_and(|c| c.was_written(lba))
     }
 
+    /// Was ANY sector in `[first, first + count)` ever written this session?
+    ///
+    /// Exactly `(first..first + count).any(|lba| self.was_written(lba))`, but
+    /// hashed once per 128 KiB chunk the span touches instead of once per sector.
+    /// The reconcile pass asks this per cluster of every live file's chain, so on
+    /// a `spc = 8` volume it was eight SipHash probes per cluster ON THE WHOLE
+    /// MOUNT for a write that touched one file -- the same
+    /// scales-with-the-folder shape `KateaTreeVolume::fat_entry_walked` was
+    /// built to remove, and what would be left holding the record once that one
+    /// was gone. A cluster normally sits inside one chunk, so this is one probe.
+    ///
+    /// The chunk walk computes one-past-the-end of each chunk, so a span reaching
+    /// the last chunk of the LBA space would overflow that product. It is
+    /// saturated rather than left to a debug panic: every caller today passes a
+    /// `cluster_in_range`-checked cluster through `cluster_to_lba`, so the bound
+    /// is unreachable, but this is a general `pub(crate)` helper and an
+    /// unreachable bound that is not stated is one the next caller inherits
+    /// silently. Saturating is also the correct answer -- the clamp against
+    /// `last + 1` below already ends the walk at the span.
+    pub(crate) fn was_written_span(&self, first: u32, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let last = first.saturating_add(count - 1);
+        let mut lba = first;
+        for id in chunk_id(first)..=chunk_id(last) {
+            let end = id
+                .saturating_add(1)
+                .saturating_mul(CHUNK_SECTORS)
+                .min(last.saturating_add(1));
+            if let Some(chunk) = self.chunks.get(&id) {
+                while lba < end {
+                    if chunk.was_written(lba) {
+                        return true;
+                    }
+                    lba += 1;
+                }
+            }
+            lba = end;
+        }
+        false
+    }
+
     pub(crate) fn is_pending(&self, lba: u32) -> bool {
         self.chunks
             .get(&chunk_id(lba))
@@ -405,6 +448,22 @@ impl SectorStore {
     /// The current write counter, for dating a decision made now.
     pub(crate) fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// The chunk covering `lba`. Callers cache a span's chunk ids once and then
+    /// revalidate through [`Self::chunk_last_seq`] instead of walking the span
+    /// again -- one probe per 128 KiB rather than one per sector.
+    pub(crate) fn chunk_of(lba: u32) -> u32 {
+        chunk_id(lba)
+    }
+
+    /// The write counter as of the last write anywhere in chunk `id`, or 0 if it
+    /// has never been written. The same chunk-granular over-approximation
+    /// [`Self::max_seq_in`] documents: a write to a neighbour in the same 128 KiB
+    /// makes an untouched range look newer than it is, which costs an
+    /// unnecessary re-check and never the opposite.
+    pub(crate) fn chunk_last_seq(&self, id: u32) -> u64 {
+        self.chunks.get(&id).map_or(0, |c| c.last_seq)
     }
 
     /// Spill reads that have failed so far. Reconcile snapshots this around each

@@ -228,3 +228,54 @@ fn no_spill_file_without_eviction() {
     );
     assert!(store.spill.is_none());
 }
+
+/// `was_written_span` MUST BE the per-sector loop it replaces.
+///
+/// The reconcile pass asks "did the guest touch this cluster?" once per cluster
+/// of every live file's chain, and it used to do that with `spc` separate hashed
+/// probes. The span form hashes once per 128 KiB chunk instead. It is only
+/// allowed to be faster, never different: a `false` where the loop says `true`
+/// would make reconcile skip a file the guest actually wrote, and a host file
+/// would silently keep its stale bytes.
+///
+/// NON-VACUOUS: the sweep covers spans that straddle chunk boundaries, start and
+/// end inside untouched chunks, and cross chunks that exist but hold no written
+/// bit in range -- the three shapes a chunk-granular short-circuit gets wrong.
+/// Returning `self.chunks.contains_key(&chunk_id(first))` fails it immediately.
+#[test]
+fn was_written_span_agrees_with_the_per_sector_loop() {
+    let mut store = SectorStore::with_capacity(256);
+    // Writes clustered around two chunk boundaries, plus a scattered tail.
+    for lba in [0u32, 1, 255, 256, 257, 511, 512, 1000, 1023, 1024, 4096] {
+        store.insert(lba, &sector(lba as u8));
+    }
+    for i in 0..64u32 {
+        store.insert(scatter(i), &sector(i as u8));
+    }
+
+    let mut saw_true = 0;
+    let mut saw_false = 0;
+    for first in 0..2_100u32 {
+        for count in [0u32, 1, 2, 7, 8, 9, 255, 256, 257, 512] {
+            let want = (first..first + count).any(|l| store.was_written(l));
+            assert_eq!(
+                store.was_written_span(first, count),
+                want,
+                "span [{first}, {}) disagreed",
+                first + count
+            );
+            if want {
+                saw_true += 1;
+            } else {
+                saw_false += 1;
+            }
+        }
+    }
+    assert!(
+        saw_true > 100 && saw_false > 100,
+        "the sweep must exercise both answers, got {saw_true} true / {saw_false} false"
+    );
+    assert!(!store.was_written_span(4_096, 0), "an empty span is clean");
+    assert!(!store.was_written_span(900_000, 4_096), "past every write");
+    assert!(store.was_written_span(4_000, 200), "reaches the last write");
+}

@@ -2059,6 +2059,10 @@ fn write_hdd_profile_json(
             "projection_max_ns": k.projection_max_ns,
             "metadata_projection_passes": k.metadata_projection_passes,
             "host_write_failures": k.host_write_failures,
+            // A gauge: entries the anti-clobber guard is holding right now. A
+            // non-zero reading at the end of a run means a file never reached
+            // the host folder, which is a criterion that has to be readable.
+            "blocked_projection_keys": k.blocked_projection_keys,
         })),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
@@ -2869,6 +2873,7 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "katea_projection_max_level_ns": mark.katea.as_ref().map(|k| k.projection_max_ns),
                 "katea_metadata_projection_passes": mark.katea.as_ref().map(|k| k.metadata_projection_passes),
                 "katea_host_write_failures": mark.katea.as_ref().map(|k| k.host_write_failures),
+                "katea_blocked_projection_keys": mark.katea.as_ref().map(|k| k.blocked_projection_keys),
                 // The fixed-disk census. All zero unless IZARRAVM_INT13_PROFILE=1.
                 "int13_read_calls": mark.int13.read_calls,
                 "int13_read_sectors": mark.int13.read_sectors,
