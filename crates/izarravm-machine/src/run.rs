@@ -590,19 +590,11 @@ impl Machine {
     /// instead of a re-implementation of it. A fixture that re-derives the
     /// branch it is testing is a fixture that cannot fail.
     pub(crate) fn actuate_ata_poll_skip(&mut self, deadline_ticks: u64, halted: bool) {
-        // THE DEVICE-ARMED ATA/ATAPI CLOCK SKIP, actuation half.
-        //
-        // Position: after `advance_cpu_work`, after every pending
-        // service arm, and BEFORE the device-edge cache
-        // invalidation below -- where `io_touched` is already true
-        // (the arm let the lazy clear stand), so the cache is
-        // dropped for free.
-        //
-        // A STANDALONE `if`, not an `else if` on the halt arm: the
-        // flag is taken unconditionally so it can never be stranded
-        // into the next batch, and the halt case is excluded
-        // explicitly because the halt fast-forward has already
-        // advanced the timeline above.
+        // The flag is TAKEN unconditionally, not tested under a
+        // condition, so it can never be stranded into the next batch.
+        // The halt case is excluded explicitly because by the time
+        // `run_until_tick` calls this, the halt fast-forward has
+        // already advanced the timeline for that batch.
         let armed = std::mem::take(&mut self.ata_poll_skip_armed);
         if armed && !halted {
             // THE MANDATORY ATA TERM. `next_device_edge_ticks`'s own

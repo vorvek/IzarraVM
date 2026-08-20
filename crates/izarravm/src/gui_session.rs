@@ -1557,6 +1557,7 @@ fn run_worker(
                 backpressured,
                 video_metrics,
                 presentation_metrics,
+                generation.machine.ata_poll_skip_counters(),
                 before_sleep,
             );
             profile.maybe_emit(profile_finished, generation.spec.sink.as_ref());
@@ -1797,6 +1798,26 @@ struct RuntimeProfileMetrics {
     presentation_upload_runs: u64,
     presentation_full_uploads: u64,
     presentation_partial_uploads: u64,
+    /// The ATA/ATAPI poll-skip counters, sampled at the end of the last slice.
+    ///
+    /// **AN ABSOLUTE LEVEL, NOT AN INTERVAL DELTA** -- unlike every other field
+    /// here, which accumulates per slice and is reset at each interval
+    /// boundary. Differencing consecutive reports gives the interval.
+    ///
+    /// It exists because the interactive path is the ONE place where the
+    /// deadline-clamped decline can fire: the GUI slice is
+    /// `FAST_EMU_QUANTUM_TICKS` = 1 ms against a 1.111 ms ATAPI sector wait, so
+    /// the slice boundary lands inside the wait, while every headless leg on the
+    /// board runs one `run_until_halt_or_cycles` where `deadline_ticks` spans the
+    /// whole run and never clamps. That branch is dead on every automated run,
+    /// which is exactly why the counters have to be readable from a window.
+    ata_poll_skip: izarravm_machine::AtaPollSkipCounters,
+}
+
+impl RuntimeProfileMetrics {
+    fn observe_ata_poll_skip(&mut self, counters: izarravm_machine::AtaPollSkipCounters) {
+        self.ata_poll_skip = counters;
+    }
 }
 
 impl RuntimeProfileMetrics {
@@ -1977,6 +1998,21 @@ struct RuntimeProfileReport {
     audio_late_callbacks: u64,
     audio_callback_lateness_us: u64,
     audio_lifetime_max_callback_lateness_us: u64,
+    // ATA/ATAPI poll skip. ABSOLUTE LEVELS -- difference two reports for an
+    // interval. `_deadline_clamped` is the interactive-path counter no headless
+    // leg can move: it must be non-zero here only as the sub-floor tail of a
+    // slice, and `ata_poll_skip_blocks` must NOT track it. If blocks tracks
+    // clamped, the split separating a device-edge truncation (which latches)
+    // from a run-deadline truncation (which must not) has regressed.
+    ata_poll_skip_arms_level: u64,
+    ata_poll_skip_spans_level: u64,
+    ata_poll_skip_ticks_level: u64,
+    ata_poll_skip_blocks_level: u64,
+    ata_poll_skip_declines_not_pending_level: u64,
+    ata_poll_skip_declines_below_floor_level: u64,
+    ata_poll_skip_declines_deadline_clamped_level: u64,
+    ata_poll_skip_declines_halted_level: u64,
+    ata_poll_skip_monitor_exempt_level: u64,
 }
 
 impl RuntimeProfileReport {
@@ -2082,6 +2118,17 @@ impl RuntimeProfileReport {
             audio_late_callbacks: audio.late_callbacks,
             audio_callback_lateness_us: audio.callback_lateness_us,
             audio_lifetime_max_callback_lateness_us: audio.max_callback_lateness_us,
+            ata_poll_skip_arms_level: metrics.ata_poll_skip.arms,
+            ata_poll_skip_spans_level: metrics.ata_poll_skip.spans,
+            ata_poll_skip_ticks_level: metrics.ata_poll_skip.ticks,
+            ata_poll_skip_blocks_level: metrics.ata_poll_skip.blocks,
+            ata_poll_skip_declines_not_pending_level: metrics.ata_poll_skip.declines_not_pending,
+            ata_poll_skip_declines_below_floor_level: metrics.ata_poll_skip.declines_below_floor,
+            ata_poll_skip_declines_deadline_clamped_level: metrics
+                .ata_poll_skip
+                .declines_deadline_clamped,
+            ata_poll_skip_declines_halted_level: metrics.ata_poll_skip.declines_halted,
+            ata_poll_skip_monitor_exempt_level: metrics.ata_poll_skip.monitor_exempt,
         }
     }
 }
@@ -2200,8 +2247,11 @@ impl RuntimeProfiler {
         backpressured: bool,
         video: VideoHostMetricsSnapshot,
         presentation: crate::crt::PresentationMetricsSnapshot,
+        ata_poll_skip: izarravm_machine::AtaPollSkipCounters,
         now: Instant,
     ) {
+        self.interval.observe_ata_poll_skip(ata_poll_skip);
+        self.total.observe_ata_poll_skip(ata_poll_skip);
         self.interval.record_work(emulation, audio, frame);
         self.total.record_work(emulation, audio, frame);
         self.interval.record_sleep(sleep);
