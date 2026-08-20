@@ -159,6 +159,18 @@ impl Default for Ad1848Config {
     }
 }
 
+/// Whether `IZARRAVM_WSS_TRACE` asked for a port-level trace of the codec.
+///
+/// Patterned on `DmaChip::trace_dma_mode`: the check is a single relaxed load of
+/// a `OnceLock` at the call site, and every formatting cost sits behind it, so a
+/// plain run pays nothing beyond that load on a path that is already a guest
+/// port access. Turn it on to see a driver's whole init sequence in order --
+/// which register it programmed, what it selected, and what it read back.
+pub fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_WSS_TRACE").is_some())
+}
+
 /// Audio sample format decoded from I8 (FMT + L/C bits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -290,6 +302,19 @@ impl Ad1848 {
     ///   are static reset-value stubs in this DMA-only playback scope.
     /// - 7: R3 PIO Data (stub).
     pub fn read_port(&mut self, offset: u16) -> u8 {
+        let value = self.read_port_inner(offset);
+        if trace_enabled() {
+            eprintln!(
+                "[WSS] IN  base+{offset} -> {value:#04x} (index={:#04x} mce={} irq={} dma={} \
+                 playing={} count={})",
+                self.index, self.mce, self.config.irq, self.config.dma, self.playing,
+                self.current_count,
+            );
+        }
+        value
+    }
+
+    fn read_port_inner(&mut self, offset: u16) -> u8 {
         match offset {
             0..=3 => self.read_board_config(),
             4 => self.read_index(),
@@ -307,6 +332,32 @@ impl Ad1848 {
 
     /// Write one of the 8 device ports by `offset` (see `read_port`).
     pub fn write_port(&mut self, offset: u16, value: u8) {
+        if trace_enabled() {
+            let target = match offset {
+                0..=3 => "board-config".to_string(),
+                4 => "R0-index".to_string(),
+                5 => format!("R1-data(I{})", self.index),
+                6 => "R2-status".to_string(),
+                _ => "R3-pio".to_string(),
+            };
+            eprintln!("[WSS] OUT base+{offset} = {value:#04x} {target}");
+        }
+        self.write_port_inner(offset, value);
+        if trace_enabled() {
+            eprintln!(
+                "[WSS]     -> irq={} dma={} playing={} rate={} count={} stereo={} bpf={}",
+                self.config.irq,
+                self.config.dma,
+                self.playing,
+                self.rate_hz(),
+                self.current_count,
+                self.is_stereo(),
+                self.bytes_per_frame(),
+            );
+        }
+    }
+
+    fn write_port_inner(&mut self, offset: u16, value: u8) {
         match offset {
             0..=3 => self.write_board_config(value),
             4 => self.write_index(value),

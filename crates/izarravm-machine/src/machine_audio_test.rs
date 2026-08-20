@@ -1026,6 +1026,90 @@ fn wss_detect_probe_finds_the_card_at_0x530() {
     });
 }
 
+/// The 8237's current count is a guest-visible register, and a WSS sound engine
+/// reads it to follow the play position. Tomb Raider's HMI engine polls
+/// channel 0's count exactly this way.
+///
+/// The HLE block prefetch used to pull the codec's whole remaining count in one
+/// gulp, which ran the 8237 all the way around inside a single advance: the
+/// guest saw the reloaded value on every poll, the position never moved, and
+/// the game hung at its first FMV while the codec was playing and interrupting
+/// perfectly. The prefetch is now bounded by the frames the advance actually
+/// plays, so the counter the guest reads tracks what it hears.
+#[test]
+fn wss_dma_position_advances_with_the_frames_the_guest_hears() {
+    let mut machine = test_machine();
+    for i in 0..256u32 {
+        machine.write_physical_u8(0x1_0000 + i, 0x80);
+    }
+    with_bus(&mut machine, |bus| {
+        // 8-bit mono, 8000 Hz (I8 CFS0/CSS0), base count 255 -> 256 frames.
+        bus.write_io(0x0B, BusWidth::Byte, 0x58, false).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0C, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x0C, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0xFF, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
+
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x48, false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap();
+        wss_write_indirect(bus, 10, 0x02);
+        wss_write_indirect(bus, 15, 0xFF);
+        wss_write_indirect(bus, 14, 0x00);
+        wss_write_indirect(bus, 9, 0x09);
+        wss_write_indirect(bus, 6, 0x00);
+        wss_write_indirect(bus, 7, 0x00);
+    });
+
+    // Read the channel-0 current count the way a guest does: clear the
+    // flip-flop, then two byte reads.
+    fn guest_dma_count(machine: &mut Machine) -> u16 {
+        let mut count = 0;
+        with_bus(machine, |bus| {
+            bus.write_io(0x0C, BusWidth::Byte, 0x00, false).unwrap();
+            let lo = bus.read_io(0x01, BusWidth::Byte, 0, false).unwrap();
+            let hi = bus.read_io(0x01, BusWidth::Byte, 0, false).unwrap();
+            count = (hi as u16) << 8 | lo as u16;
+        });
+        count
+    }
+
+    let start = guest_dma_count(&mut machine);
+    assert_eq!(start, 255, "the channel starts at the count the guest wrote");
+
+    // Advance a fraction of the buffer and watch the counter move with it. At
+    // 8000 Hz, 10 guest ms is 80 frames -- well short of the 256-frame buffer,
+    // so the count must land strictly inside it rather than back at the reload.
+    let clocks = GswMode::Gsw386
+        .clock_rate()
+        .clocks_for_fraction_floor(10, 1_000);
+    machine.advance_devices_clocks(clocks);
+    let mid = guest_dma_count(&mut machine);
+    assert!(
+        mid < start,
+        "the guest-visible DMA position must advance as frames play (start {start}, now {mid})"
+    );
+    assert!(
+        mid > 8,
+        "and it must NOT have run the whole buffer around inside one advance \
+         (start {start}, now {mid})"
+    );
+
+    // A second advance moves it again, monotonically within the buffer.
+    machine.advance_devices_clocks(clocks);
+    let later = guest_dma_count(&mut machine);
+    assert!(
+        later < mid,
+        "the position keeps advancing (was {mid}, now {later})"
+    );
+}
+
 /// One answer to "what IRQ is the codec on". The audio crate's device-level
 /// default and the core profile default used to disagree (7 vs 11), so every
 /// unit test in the audio crate asserted a line the shipped machine never used.

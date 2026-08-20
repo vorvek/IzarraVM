@@ -22,4 +22,4 @@ pub use opl::OplChip;
 pub use output::{AudioDebugSnapshot, AudioPlayer, AudioSink};
 pub use resample::Resampler;
 pub use soundfont::{EMBEDDED_SOUNDFONT_SHA256, embedded_soundfont_path};
-pub use wss::{Ad1848, Ad1848Config};
+pub use wss::{Ad1848, Ad1848Config, trace_enabled as wss_trace_enabled};

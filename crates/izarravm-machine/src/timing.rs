@@ -256,7 +256,24 @@ impl Machine {
                     while remaining > 0 && playing_at_valid_rate {
                         let bytes_per_frame = self.wss.bytes_per_frame();
                         if self.wss.block_buffer().is_none() {
-                            let frames = self.wss.current_dma_count() as usize + 1;
+                            // Fetch only as many frames as this advance will
+                            // actually PLAY, capped at the codec's remaining
+                            // count so a prefetch never crosses the auto-reload
+                            // boundary.
+                            //
+                            // Reading the whole remaining block instead would
+                            // run the 8237 all the way around inside a single
+                            // advance -- and the 8237's current address and
+                            // count are guest-visible registers. Tomb Raider's
+                            // HMI sound engine polls the channel-0 current
+                            // count to follow the play position: with the
+                            // buffer drained in one gulp it read the same
+                            // reloaded value forever and the game hung at its
+                            // first FMV, even though the codec was playing and
+                            // interrupting correctly. Batching is still worth
+                            // having, so it is kept -- bounded by the work the
+                            // advance is paying for.
+                            let frames = remaining.min(self.wss.current_dma_count() as usize + 1);
                             let count = frames * bytes_per_frame;
                             let mut buf = Vec::with_capacity(count);
                             {
@@ -267,6 +284,12 @@ impl Machine {
                                     };
                                     buf.push(byte);
                                 }
+                            }
+                            if izarravm_audio::wss_trace_enabled() && buf.len() < count {
+                                eprintln!(
+                                    "[WSS] DMA ch{wss_dma} dry: wanted {count} bytes, got {}",
+                                    buf.len()
+                                );
                             }
                             let complete_bytes = buf.len() / bytes_per_frame * bytes_per_frame;
                             buf.truncate(complete_bytes);
@@ -313,6 +336,12 @@ impl Machine {
                     // request after N frames follows the multi-edge coalescing
                     // contract; see DSP path).
                     if self.wss.take_irq() {
+                        if izarravm_audio::wss_trace_enabled() {
+                            eprintln!(
+                                "[WSS] terminal count -> PIC line {wss_irq} (deliverable={})",
+                                self.pic.deliverable(wss_irq)
+                            );
+                        }
                         self.pic.request(wss_irq);
                     }
                 }
