@@ -1230,6 +1230,40 @@ impl Machine {
             // than the much weaker "N reads eventually".
             self.ata_poll_skip_armed = false;
             self.ide.reset_alt_status_run();
+            // DO NOT ARM INTO A SLICE THAT CANNOT PAY FOR A SKIP.
+            //
+            // Measured on the interactive confirmation run, not modelled: the
+            // GUI's real slice is ~13 us, not the 1 ms
+            // `FAST_EMU_QUANTUM_TICKS` the design assumed.
+            // `execution_budget` is `min(credit, quantum)`, and in a paced
+            // window the CREDIT binds -- a machine running on time refills it
+            // in tiny wall-clock increments and spends it immediately. So the
+            // typical interactive slice is BELOW the 20 us floor, a skip armed
+            // in it can never commit, and it declines as `_deadline_clamped`:
+            // 364,753 of them in one 328 s window, 2.14 per committed span,
+            // each costing a forced batch break plus a device-edge-cache
+            // invalidation and its pull-scan.
+            //
+            // Harmless to guest state -- the latch correctly never fired, which
+            // is the R2-B split holding under real load -- but pure waste, and
+            // a paced run at rt 1.0 has no observable margin in which to see
+            // its cost. On a slower host that margin is what runs out first.
+            //
+            // MONOTONE WITHIN A RUN CALL, which is what makes one test at batch
+            // entry sound: `deadline_ticks` is fixed for the call and `now`
+            // only advances, so a slice that cannot pay stays unable to pay for
+            // every later batch in the same call.
+            //
+            // INERT HEADLESS except in the run tail, where the arm already
+            // declines: one `run_until_halt_or_cycles` spans the whole run, so
+            // `remaining` is astronomically above the floor until the very end.
+            //
+            // A MITIGATION, NOT AN ELIMINATION: a batch entered with 25 us
+            // remaining still arms and still clamps. `_deadline_clamped` is to
+            // be re-read on the confirmation run, never assumed to reach zero.
+            self.ata_poll_skip_slice_too_short = deadline_ticks
+                .saturating_sub(self.timeline.now_ticks())
+                < self.ata_poll_floor_ticks;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
             // Capture live timing state before the fields move into MachineBus.
@@ -1275,6 +1309,7 @@ impl Machine {
             // Read before the destructure below, the same way `poll_skip_enabled`
             // is: a `Copy` policy bool, resolved once per machine.
             let ata_poll_skip_enabled = self.ata_poll_skip_enabled;
+            let ata_poll_skip_slice_too_short = self.ata_poll_skip_slice_too_short;
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
@@ -1395,6 +1430,7 @@ impl Machine {
                     exempt_io_touched,
                     ata_poll_skip_enabled,
                     ata_poll_skip_armed,
+                    ata_poll_skip_slice_too_short,
                     ata_poll_skip,
                     isa_io_clocks: isa_io_batch_clocks,
                     pit_observer_fine_until,

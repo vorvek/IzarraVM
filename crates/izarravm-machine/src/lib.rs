@@ -1252,6 +1252,10 @@ pub struct Machine {
     // Reset at batch ENTRY next to `io_touched`, so no arm can survive into a
     // batch that did not raise it; taken at batch end by the actuation.
     ata_poll_skip_armed: bool,
+    // Set at batch entry when the caller's remaining deadline is already
+    // under the floor, so no skip armed in this batch could commit. See the
+    // site in `run_until_tick` for the measurement that produced it.
+    ata_poll_skip_slice_too_short: bool,
     ata_poll_skip: AtaPollSkipDiagnostics,
     // The minimum skip, in master ticks. A copy of the channel's own floor so
     // the batch-end check does not have to reach through the device for it.
@@ -1733,6 +1737,7 @@ impl Machine {
             exempt_io_touched: false,
             ata_poll_skip_enabled: run::ata_poll_skip_default(),
             ata_poll_skip_armed: false,
+            ata_poll_skip_slice_too_short: false,
             ata_poll_skip: AtaPollSkipDiagnostics::new(run::ata_poll_skip_diag_default()),
             ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
             isa_io_batch_clocks: 0,
@@ -3381,6 +3386,11 @@ struct MachineBus<'a> {
     // above the floor. Points at `Machine::ata_poll_skip_armed`, which the run
     // loop clears at batch ENTRY (next to `io_touched`) and takes at batch end.
     ata_poll_skip_armed: &'a mut bool,
+    // A copy of `Machine::ata_poll_skip_slice_too_short`, resolved once per
+    // batch. When true the arm predicate declines before it counts anything:
+    // a skip armed in this slice could not commit, and the arm would cost a
+    // forced batch break for nothing.
+    ata_poll_skip_slice_too_short: bool,
     // Points at `Machine::ata_poll_skip`. The bus half owns `arms` and
     // `monitor_exempt`; every other field is written by the batch-end actuation.
     ata_poll_skip: &'a mut AtaPollSkipDiagnostics,

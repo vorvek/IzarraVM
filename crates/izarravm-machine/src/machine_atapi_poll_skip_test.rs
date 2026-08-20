@@ -941,12 +941,25 @@ fn ata_poll_skip_run_does_not_accumulate_across_a_batch_boundary() {
 
     // One batch through the real run loop, by a route that touches no channel
     // port: the guest's HLT. This is the batch boundary the certificate is about.
+    //
+    // The slice is deliberately ABOVE the floor. A sub-floor slice would leave
+    // `ata_poll_skip_slice_too_short` set, the arm predicate would decline
+    // before counting, and the final read below would not increment the run --
+    // which would make this fixture pass against the very mutant it exists to
+    // kill. The two vacuity guards after the run call are what keep that honest.
     machine.cpu.registers.eip = 0x108;
-    let _ = machine.run_master_ticks(TICKS_PER_US).unwrap();
+    let _ = machine
+        .run_master_ticks(machine.ata_poll_floor_ticks * 4)
+        .unwrap();
     assert!(
         machine.ide.ticks_until_completion().is_some(),
         "VACUOUS if the command completed across the boundary: the run would then reset on \
          the no-pending arm instead of on the batch-entry one. deadline was {deadline}"
+    );
+    assert!(
+        !machine.ata_poll_skip_slice_too_short,
+        "VACUOUS if the last batch entered a sub-floor slice: the read below would then be \
+         refused by the slice test rather than counted into a fresh run"
     );
 
     // The read that would have been the sixteenth of an unbroken run.
@@ -1040,42 +1053,41 @@ fn ata_poll_skip_does_not_block_when_the_run_deadline_truncates() {
         "the wait is still running, so the following phase is not vacuous"
     );
 
-    // PHASE B -- the SUB-FLOOR TAIL, the branch that only exists because of the
-    // clamp. A slice shorter than the floor cannot leave a committable residue,
-    // so the arm declines. It must decline WITHOUT latching.
+    // PHASE B -- THE SUB-FLOOR SLICE, after the interactive mitigation.
+    //
+    // This phase used to build a clamped decline deliberately and assert that it
+    // did not latch. Since the mitigation, a batch entered with less than the
+    // floor remaining does not arm AT ALL, so there is no decline to count: the
+    // waste is removed rather than merely made harmless. What is asserted here
+    // is that stronger property.
+    //
+    // The clamped decline's own disposition -- declines, does NOT latch -- is
+    // still pinned, twice: at the actuation by
+    // `ata_poll_skip_blocks_when_a_device_edge_truncates_but_not_when_the_deadline_does`,
+    // which arms outside the run loop and calls `actuate_ata_poll_skip` with a
+    // sub-floor deadline directly; and at scale by the interactive confirmation
+    // run, where 364,753 real clamped declines moved `blocks` by exactly zero.
+    // The mitigation is not an elimination -- a batch entered just above the
+    // floor can still arm and clamp -- so that disposition still matters.
     let short_slice = machine.ata_poll_floor_ticks / 2;
     let _ = machine.run_master_ticks(short_slice).unwrap();
     let after_b = counters(&machine);
-    assert!(
-        after_b.declines_deadline_clamped >= 1,
-        "the sub-floor tail declined, benignly: {after_b:?}"
+    assert_eq!(
+        after_b.arms, after_a.arms,
+        "a sub-floor slice must not arm: {after_b:?}"
+    );
+    assert_eq!(
+        after_b.declines_deadline_clamped, 0,
+        "and so must not produce a clamped decline either -- one counted here would mean          the arm fired and then declined, which is the forced batch break the mitigation          removes: {after_b:?}"
     );
     assert_eq!(
         after_b.declines_below_floor, 0,
-        "the DEVICE cause did not fire -- same remainder, different cause: {after_b:?}"
+        "the DEVICE cause did not fire: {after_b:?}"
     );
     assert_eq!(after_b.blocks, 0, "and nothing latched: {after_b:?}");
     assert!(
         !machine.ide.poll_skip_blocked(),
-        "THE REGRESSION THIS FIXTURE EXISTS FOR: had this latched, nothing would clear it \
-         until the command completed and the guest would spin out the remainder at full \
-         interpreted cost -- in the GUI only, invisible to every headless leg on the board"
-    );
-    // WHAT BOUNDS THE CLAMPED DECLINE, since nothing latches it, MEASURED
-    // rather than assumed: inside one sub-floor run call the guest re-arms every
-    // ATA_POLL_RUN reads and declines again, so the count is a function of the
-    // TAIL's length, not of the wait's. This 10 us tail produces tens of them.
-    // Each costs 16 iterations of real guest progress plus one batch break -- a
-    // bounded, self-limiting waste, and the alternative (latching) is the
-    // pathology this fixture exists to forbid.
-    //
-    // The consequence for the acceptance bar: `_deadline_clamped` is graded on
-    // whether it SCALES WITH SECTORS, never on whether it exceeds 1. On the
-    // headless path there is a single run call, so its whole tail is one
-    // sub-floor window at the very end of the run.
-    assert!(
-        after_b.declines_deadline_clamped * 2 > after_a.declines_deadline_clamped,
-        "the clamps belong to the sub-floor tail, which is where phase B put them"
+        "THE REGRESSION THIS FIXTURE EXISTS FOR: had a run-deadline truncation ever latched,          nothing would clear it until the command completed and the guest would spin out the          remainder at full interpreted cost -- in the GUI only, invisible to every headless          leg on the board"
     );
     let _ = slices_run;
 
@@ -1127,6 +1139,67 @@ fn ata_poll_skip_blocks_when_a_device_edge_truncates_but_not_when_the_deadline_d
     assert!(
         by_edge.ide.poll_skip_blocked(),
         "the latch IS the point here"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. A slice that cannot pay for a skip does not arm at all.
+// ---------------------------------------------------------------------------
+
+/// **THE INTERACTIVE MITIGATION, and it was measured rather than modelled.**
+///
+/// The design assumed the GUI slice is `FAST_EMU_QUANTUM_TICKS` = 1 ms. The
+/// interactive confirmation run says the real median is ~13 µs, because
+/// `execution_budget` is `min(credit, quantum)` and in a paced window the
+/// CREDIT binds: a machine on time refills it in tiny wall-clock increments and
+/// spends it immediately. Most interactive slices are therefore BELOW the 20 µs
+/// floor, so a skip armed in one can never commit — 364,753 `_deadline_clamped`
+/// declines in a single 328 s window, each costing a forced batch break and a
+/// device-edge-cache invalidation for nothing.
+///
+/// So a batch whose remaining deadline is already sub-floor must not arm. The
+/// discriminator is that `_deadline_clamped` does **not** move: a decline that
+/// counted there would mean the arm fired and then declined, which is the waste
+/// this exists to remove.
+#[test]
+fn ata_poll_skip_does_not_arm_into_a_sub_floor_slice() {
+    let mut machine = poll_machine(true);
+    let deadline = schedule_far_read(&mut machine);
+    assert!(deadline > machine.ata_poll_floor_ticks * 100);
+
+    // A slice far shorter than the floor: the interactive regime, at its median.
+    let short = machine.ata_poll_floor_ticks / 2;
+    for _ in 0..8 {
+        let _ = machine.run_master_ticks(short).unwrap();
+    }
+
+    let c = counters(&machine);
+    assert_eq!(
+        c.arms, 0,
+        "a sub-floor slice cannot pay for a skip, so it must not arm: {c:?}"
+    );
+    assert_eq!(
+        c.declines_deadline_clamped, 0,
+        "AND THIS IS THE DISCRIMINATOR: a decline counted here would mean the arm fired \
+         and then declined -- the forced batch break this mitigation exists to remove. \
+         Zero means it never armed. {c:?}"
+    );
+    assert_eq!(c.spans, 0);
+    assert_eq!(c.blocks, 0, "and nothing latched: {c:?}");
+    assert!(!machine.ide.poll_skip_blocked());
+    assert!(
+        machine.ide.ticks_until_completion().is_some(),
+        "VACUOUS if the command completed: the arm would have declined on the no-pending \
+         arm instead of on the slice test"
+    );
+
+    // A slice that CAN pay still arms and still commits, so the mitigation is
+    // scoped to the case it names and has not disarmed the mechanism.
+    let _ = machine.run_master_ticks(GUI_SLICE_TICKS).unwrap();
+    let c = counters(&machine);
+    assert!(
+        c.spans >= 1,
+        "a slice above the floor arms and commits as before: {c:?}"
     );
 }
 

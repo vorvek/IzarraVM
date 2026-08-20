@@ -124,6 +124,7 @@ impl Machine {
             exempt_io_touched: &mut self.exempt_io_touched,
             ata_poll_skip_enabled: self.ata_poll_skip_enabled,
             ata_poll_skip_armed: &mut self.ata_poll_skip_armed,
+            ata_poll_skip_slice_too_short: self.ata_poll_skip_slice_too_short,
             ata_poll_skip: &mut self.ata_poll_skip,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
@@ -2269,6 +2270,7 @@ impl CpuBus for MachineBus<'_> {
                     self.ata_poll_skip.counters.monitor_exempt.saturating_add(1);
             }
             let arm = self.ata_poll_skip_enabled
+                && !self.ata_poll_skip_slice_too_short
                 && lazy_alt_status
                 && !skip_io_touched
                 && self.ide.note_alt_status_read();

@@ -418,6 +418,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         exempt_io_touched: &mut machine.exempt_io_touched,
         ata_poll_skip_enabled: machine.ata_poll_skip_enabled,
         ata_poll_skip_armed: &mut machine.ata_poll_skip_armed,
+        ata_poll_skip_slice_too_short: machine.ata_poll_skip_slice_too_short,
         ata_poll_skip: &mut machine.ata_poll_skip,
         isa_io_clocks: &mut machine.isa_io_batch_clocks,
         pit_observer_fine_until: &mut machine.pit_observer_fine_until,
