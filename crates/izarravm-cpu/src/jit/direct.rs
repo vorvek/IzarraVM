@@ -5220,25 +5220,79 @@ pub(crate) fn disp_lanes_enabled() -> bool {
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class
 /// (`IZARRAVM_IMM8_LANES`). See `imm8_lane_for` for what qualifies and why this family alone.
 ///
-/// **DEFAULT OFF** -- an unset knob is the base here, which is the OPPOSITE of `IZARRAVM_JIT16_486`
-/// and of `IZARRAVM_ROTATE_ROWS` since its 2026-08-19/20 flip, where an unset knob is the slice.
-/// Either way both arms ship in the one executable, because this box has measured 6% wall variance
-/// between builds of identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a
-/// cross-build comparison would not be evidence. Off is the base and it is byte-for-byte the
-/// pre-slice world — no lane is registered, every `0x80` slot bakes its immediate exactly as it
-/// did, and the write choke's per-lane width test degenerates to the old global one because every
-/// registered lane is then four bytes wide.
+/// **DEFAULT ON SINCE THE 2026-08-21 RE-PRICE.** An unset knob registers one-byte `0x80` lanes;
+/// `0` or `off` is the escape back to the pre-slice world, which still ships whole — its baked
+/// emitter, its fixtures and its differential sweep — because it is the base every A/B on this
+/// class is read against. On the escape no `0x80` lane is registered, every such slot bakes its
+/// immediate exactly as it did, and the write choke's per-lane width test degenerates to the old
+/// global one because every registered lane is then four bytes wide. Both arms ship in one
+/// executable because this box has measured 6% wall variance between builds of identical source
+/// (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a cross-build comparison would not be
+/// evidence.
 ///
-/// **THE SPELLING TABLE.** Trimmed and case-folded on the way in, because a knob set from a shell
-/// script picks up whitespace and one set from a PowerShell ladder picks up capitalisation.
+/// # THE REFUTATION INVERTED, exactly as `IZARRAVM_ROTATE_ROWS`'s did before it
 ///
-/// * unset, `` (empty), `0` or `off` -> OFF. The shipped base.
-/// * `1` or `on` -> ON. The slice.
-/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason restated in this slice's terms:
-///   a mistyped ladder leg (`IZARRAVM_IMM8_LANES=yes`, `=imm8`, `=true`) that fell through to OFF
-///   would run the BASE and be read as "the one-byte lane class did nothing", which is the one
-///   wrong conclusion this slice exists to avoid. Failing at the first compile is cheaper than a
-///   plausible number.
+/// This arm shipped default-OFF on **−1.0%**, a `duke3d-586-short` number taken at `4bf7a4c8` on
+/// 2026-08-19. **That number was measured against `IZARRAVM_ROTATE_ROWS=off`, a baseline that
+/// stopped existing the same night**, and the same session's nearer pair (`on` -> `on_imm8`, i.e.
+/// rotate-rows ON) read **+1.89%** with entries +2.30% — which is why it shipped off. Re-priced
+/// against today's full defaults on 2026-08-21 the sign inverted again and hard. This is the second
+/// time a duke lane's refutation has reversed once the baseline under it moved; `rotate_rows_enabled`
+/// records the first, and the lesson both times is that a lane's value is a property of the
+/// baseline, not of the lane.
+///
+/// **WHAT PRICED THE FLIP** (`.bench/results/imm8-reprice-20260821/`, main `5bec0596`, ONE plain
+/// release binary, both arms selected through this knob, `A B B A A B`, pinned CPU 8, every other
+/// lane knob exported at its shipped value):
+///
+/// | row | A (off) min | B (on) min | min-wall | arms |
+/// |---|---:|---:|---:|---|
+/// | **`duke3d-586` LONG — decides** | 287.423 s | **267.952 s** | **−6.774%** | non-overlapping, 10.1 s clear |
+/// | `duke3d-586-short` — corroborates | 127.320 s | **117.615 s** | **−7.623%** | non-overlapping |
+///
+/// rt on the deciding row **0.4806 -> 0.5155**, the first time duke3d-586 has been above 0.5.
+/// DUKEMARK `test_exit:81` with 1027 / 403 samples on every one of the twelve legs, and ONE
+/// distinct counter tuple per arm across all twelve, so the wall spread inside an arm is host noise
+/// by construction.
+///
+/// **THE TWO ROWS DISAGREE ON ENTRIES, and that is stated rather than smoothed over.**
+/// `jit_direct_entries` is **−7.05% on the long row and +1.99% on the short one**
+/// (`jit_direct_blocks_installed` −7.36% against +4.56%: the two rows settle on different block
+/// populations). The 2026-08-21 `0x85` adjudication named entries as duke's acceptance metric in
+/// place of coverage, and on this slice the deciding row honours that and the corroborating row
+/// does not. **The metric that IS consistent across both rows, and with the wall, is total
+/// dispatcher asks — `entries + declines`, −18.8% long and −17.0% short** — with declines alone
+/// −22.66% / −22.46%, coverage +3.78 pp / +4.16 pp, `jit_direct_insns` +4.68% / +5.29%, and
+/// block-killing `code_invalidations` −19.67% / −22.12%. Price asks in the next duke
+/// pre-registration.
+///
+/// **THE PRE-REGISTERED ENGAGEMENT FALSIFIER WAS MIS-SPECIFIED and is recorded as such, not as
+/// evidence.** It said `smc_lane_registrations` must RISE on the ON arm. It fell 13.57% on the long
+/// row and rose 1.91% on the short one — because it is not `0x80`-specific (it counts every lane
+/// class) and it is a PER-COMPILE event counter, so it tracked `blocks_installed` in both
+/// directions rather than tracking the lane. Engagement is established instead by counters the gate
+/// is the only possible cause of, the arms being one binary differing in one environment variable:
+/// `smc_lane_accepts` +19.9% per registration, and ~9.8 M block-killing invalidations that stop
+/// happening (`code_invalidations` and `smc_narrow_kills` both ~−20%), which is what a laned write
+/// not killing a block looks like. **There is no `0x80`-specific lane counter in a plain build at
+/// all** (`smc_imm8_lane_registrations` is census-only); closing that is an owed follow-up.
+///
+/// # THE SPELLING TABLE
+///
+/// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
+/// whitespace and one set from a PowerShell ladder picks up capitalisation.
+///
+/// * **unset** or `1` / `on` -> ON. The shipped default since the 2026-08-21 flip. Every "defaults"
+///   leg recorded BEFORE that date is the OFF arm and is not comparable with one recorded after.
+/// * `` (empty), `0` or `off` -> OFF. The escape, the pre-slice base and the A/B base.
+///   **The empty string is OFF while unset is ON, and the two must not be confused**: nulling a
+///   variable in PowerShell leaves it PRESENT and EMPTY, which is how three earlier evidence
+///   directories came to run their default-ON knobs off. `Remove-Item Env:` is the only true unset.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason restated in this arm's terms: a
+///   mistyped ladder leg (`IZARRAVM_IMM8_LANES=yes`, `=imm8`, `=true`) that fell through would now
+///   silently run the DEFAULT and be read as "the arm I asked for changed nothing", which is the
+///   one wrong conclusion an arm ladder exists to avoid. Failing at the first compile is cheaper
+///   than a plausible number.
 pub(crate) fn imm8_lanes_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = IMM8_LANES_OVERRIDE.with(std::cell::Cell::get) {
@@ -5252,14 +5306,20 @@ pub(crate) fn imm8_lanes_enabled() -> bool {
 /// unit-tested without a process-global env write. See `imm8_lanes_enabled` for the contract.
 fn parse_imm8_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset = ON since the 2026-08-21 flip; `0` / `off` is the escape. Same shape and the same
+        // trap as `IZARRAVM_ROTATE_ROWS`, `IZARRAVM_COUNT_LANES`, `IZARRAVM_FPU_LOOP_ROWS` and
+        // `IZARRAVM_V86_LOOP_ROWS`: an off leg must EXPORT `0`, and every "defaults" leg recorded
+        // before that date is the OFF arm. NULLING the variable is not unsetting it -- PowerShell
+        // leaves it present and empty, and the empty string is spelled OFF one arm down.
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
         // than the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_IMM8_LANES is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset, `0` or `off` (the shipped base), and `1` or `on` (the \
-                 one-byte `0x80` immediate lane class)"
+                 spellings are unset or `1` / `on` (the shipped default: the one-byte `0x80` \
+                 immediate lane class), and `0` / `off` (the escape, under which every `0x80` \
+                 slot bakes its immediate)"
             )
         }
         Ok(raw) => raw,
@@ -5268,18 +5328,23 @@ fn parse_imm8_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
         "" | "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_IMM8_LANES={other:?} names no arm; accepted spellings are unset, `0` or \
-             `off` (the shipped base) and `1` or `on` (the one-byte `0x80` immediate lane class). \
-             Refusing to guess: a mistyped ladder leg that silently ran the base would be read as \
-             the slice failing"
+            "IZARRAVM_IMM8_LANES={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default: the one-byte `0x80` immediate lane class is registered), \
+             and `0` / `off` (the escape, under which every `0x80` slot bakes its immediate). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
         ),
     }
 }
 
 // Per-THREAD, for `ROTATE_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
 // and the fixtures have to run both arms in one process, so one test's arm selection must not
-// reach another's compile. Since the arm is default-OFF, every positive fixture for this class
-// MUST force it on through here or it would test the refusal and call it a lowering.
+// reach another's compile. THE DIRECTION THAT MATTERS FLIPPED WITH THE DEFAULT ON 2026-08-21: it
+// used to be the positive fixtures that had to force this on, and it is now the REFUSAL fixtures
+// that must force `Some(false)`, because one that read the ambient arm would register a lane and
+// pass for the wrong reason. Two fixtures outside this file learned that the hard way on the flip
+// (`generated_direct_blocks_match_interpreter_in_486_and_586_modes` and
+// `near_miss_shapes_take_no_count_lane`); see `cpu_test.rs`'s `DIRECT_BARRIER` doc for the rule.
 #[cfg(test)]
 thread_local! {
     static IMM8_LANES_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
