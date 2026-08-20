@@ -44,6 +44,33 @@
 //! linear address, so a lowering that dropped the override, or took the wrong one, would agree
 //! with the interpreter byte for byte and every assertion would pass.
 
+// MUTATION EVIDENCE (2026-08-20, applied by hand, run, restored). Each row names the fixture that
+// caught it; a mutation nobody catches is a fixture bug, not a free pass.
+//
+// | mutation | caught by | assertion |
+// |---|---|---|
+// | `0xa1` width back to `MemoryWidth::Dword`, i.e. the pre-slice emitter | `the_moffs_pair_*`, `the_cs_override_*`, `the_tombraid_loop_body_*` | registers: EAX `0x1af9_1234` against the interpreter's `0xdead_1234` |
+// | the CERTAIN-EXIT rule disabled | `a_statically_misaligned_*`, `the_loop_compiles_into_the_units_*` | span length: `Some(3)` where `None` is required |
+// | `CarryFlag` drops `emit_set_cf_only` and writes only the flag shadow | `clc_and_stc_*`, `the_carry_*_adc` | raw lazy-flags descriptor, then registers on the ADC read-back |
+// | the ADC/SBB guard narrowed back to `matches!(form, 1 \| 3)` | `the_gate_does_not_sweep_in_*` | `0x15` ADC AX,imm16 compiles where it must be a barrier |
+// | `PopSegReal`'s `alu_r16_imm16(0, home(4), 2)` widened to `add_r32_imm32` | `pop_segment_preserves_the_high_half_of_esp_across_the_sixteen_bit_wrap` | registers: ESP `0xdeae_0000` against `0xdead_0000` |
+// | `PopSegReal` drops the access / `default_size_32` store | `pop_segment_matches_*`, the stale-descriptor row | registers: the segment's access byte |
+// | `PopSegReal`'s `shift_r32_imm8(4, RAX, 4)` -> shift by 3 | three POP fixtures | registers: the segment base |
+//
+// TWO OF THESE SURVIVED THE FIRST VERSION OF THIS FILE, and both survivals were the same kind of
+// mistake: a seed that already held the value the emitter was failing to write.
+//
+// * The widened pointer advance survived a poisoned ESP high half, because `add r32, 2` and
+//   `add r16, 2` agree on every value that does not carry out of bit 15. `STACK_ESP` alone was not
+//   enough; the WRAP row is what discriminates.
+// * The dropped segment-field store survived because both roles started from a descriptor
+//   `load_segment_real` had already made real, so "write the real-mode access byte" and "write
+//   nothing" produced the same bytes. `Seed::stale_segments` is what closed it.
+//
+// Neither was caught by adding an assertion. Both were caught by changing the STATE the assertion
+// runs against, which is the general shape worth remembering: a differential compares two machines,
+// and it can only see a field the two machines were ever going to disagree about.
+
 use super::*;
 
 /// EIP of the block entry. CS base is 0 in the 16-bit fixture, so this is also its linear address.
@@ -56,12 +83,21 @@ const DS_BASE: u32 = 0x0400;
 const ES_BASE: u32 = 0x0300;
 /// SS is base 0 with SP here, clear of every operand above.
 const STACK_SP: u32 = 0x0700;
+/// The same stack pointer with a POISONED high half, which is what every role is seeded with.
+///
+/// SS.B is 0 in this fixture, so the guest's stack pointer is SP and bits 31..16 of ESP are
+/// architecturally untouched by a push or a pop: `alu_r16_imm16` preserves them where an `add r32`
+/// clears them, and with a ZERO high half the two are indistinguishable. A mutation that widened
+/// `PopSegReal`'s pointer advance to 32 bits SURVIVED the first version of this file for exactly
+/// that reason, and this constant is what closed it.
+const STACK_ESP: u32 = 0xdead_0000 | STACK_SP;
 
 /// A distinct byte at every address, so a store of the wrong WIDTH or through the wrong SEGMENT
 /// changes guest RAM even when it writes the right value. A constant fill would make a four-byte
 /// store indistinguishable from a two-byte one whenever the upper half happened to match.
 fn memory_fill() -> Vec<u8> {
-    let mut memory = vec![0u8; 0x2000];
+    // A full 64K, so a stack pointer at the top of the 16-bit wrap has real memory under it.
+    let mut memory = vec![0u8; 0x1_0000];
     for (i, byte) in memory.iter_mut().enumerate() {
         *byte = (i.wrapping_mul(37).wrapping_add(11) & 0xff) as u8;
     }
@@ -87,7 +123,7 @@ fn sixteen_bit_cpu() -> CpuGsw {
     cpu.load_segment_real(SegmentIndex::Ds, (DS_BASE >> 4) as u16);
     cpu.load_segment_real(SegmentIndex::Es, (ES_BASE >> 4) as u16);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
-    cpu.registers.set_esp(STACK_SP);
+    cpu.registers.set_esp(STACK_ESP);
     cpu.set_eip(ENTRY);
     cpu
 }
@@ -195,7 +231,7 @@ fn compile_leading_block_on(builder: fn() -> CpuGsw, d: bool, body: &[u8]) -> Op
     // Unconditional, and not only for the memory rows: with the operand pages absent from the fast
     // map EVERY memory kind is refused, so a negative assertion made without it would pass for the
     // harness's reason rather than the row's.
-    for page in [0x0000u32, 0x1000] {
+    for page in (0..0x1_0000u32).step_by(0x1000) {
         map_direct_page(&mut cpu, &mut bus, page);
     }
     cpu.set_eip(ENTRY);
@@ -524,10 +560,24 @@ struct Seed {
     operand: u16,
     /// Pushed at SS:SP before the run, for the POP rows.
     stacked: u16,
-    /// When set, ES is given this limit before the run instead of 0xFFFF. A real-mode segment load
-    /// leaves the cached limit ALONE (unreal mode), and the emitted form stores no limit; this is
-    /// what makes that observable.
-    es_limit: Option<u32>,
+    /// The stack pointer at run time. Its LOW half decides where `stacked` is written (SS is base 0
+    /// here), and its HIGH half is poisoned so a 32-bit pointer advance is distinguishable.
+    esp: u32,
+    /// When set, ES and DS are given a STALE descriptor before the run: an unreal-mode limit, a
+    /// code-segment access byte and `default_size_32` true, none of which a fresh real-mode segment
+    /// carries.
+    ///
+    /// This is what makes each field of the segment write observable, and it is not decoration:
+    /// with both roles starting from an already-real descriptor, an emitter that dropped the
+    /// access/`default_size_32` store entirely would agree with the interpreter on every byte,
+    /// because the value it failed to write was already there. That mutation SURVIVED the first
+    /// version of this file.
+    ///
+    /// The limit is the opposite assertion: a real-mode load leaves the cached limit ALONE (that is
+    /// what unreal mode IS), and the emitted form stores none, so the stale limit must SURVIVE the
+    /// pop in real mode. In V86 the entry has already canonicalized every segment, so the fixture's
+    /// V86 rows run without it.
+    stale_segments: bool,
 }
 
 impl Seed {
@@ -540,7 +590,8 @@ impl Seed {
             live_pending: false,
             operand: 0x1234,
             stacked: 0x0050,
-            es_limit: None,
+            esp: STACK_ESP,
+            stale_segments: false,
         }
     }
 
@@ -564,13 +615,18 @@ impl Seed {
         self
     }
 
+    fn esp(mut self, esp: u32) -> Self {
+        self.esp = esp;
+        self
+    }
+
     fn stacked(mut self, stacked: u16) -> Self {
         self.stacked = stacked;
         self
     }
 
-    fn es_limit(mut self, limit: u32) -> Self {
-        self.es_limit = Some(limit);
+    fn stale_segments(mut self) -> Self {
+        self.stale_segments = true;
         self
     }
 }
@@ -601,7 +657,7 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
         let at = (base + u32::from(OPERAND)) as usize;
         memory[at..at + 2].copy_from_slice(&seed.operand.to_le_bytes());
     }
-    let stack_at = STACK_SP as usize;
+    let stack_at = (seed.esp & 0xffff) as usize;
     memory[stack_at..stack_at + 2].copy_from_slice(&seed.stacked.to_le_bytes());
 
     let mut native = builder();
@@ -622,7 +678,7 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
             cpu.begin_instruction();
             cpu.fetch_decoded(bus, linear).expect("fixture decode");
         }
-        for page in [0x0000u32, 0x1000] {
+        for page in (0..0x1_0000u32).step_by(0x1000) {
             map_direct_page(cpu, bus, page);
         }
     }
@@ -653,7 +709,7 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
         cpu.halted = false;
         cpu.interrupt_shadow = false;
         cpu.registers.gpr = seed.gpr;
-        cpu.registers.set_esp(STACK_SP);
+        cpu.registers.set_esp(seed.esp);
         let saved_eflags = cpu.registers.eflags & (FLAG_VM | (3 << 12));
         cpu.registers.eflags = seed.eflags | saved_eflags;
         cpu.pending_flags = PendingFlags::default();
@@ -663,10 +719,14 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
             // branches split on.
             let _ = cpu.alu(0, 0x7fff_ffff, 1, BusWidth::Dword);
         }
-        if let Some(limit) = seed.es_limit {
-            let mut es = cpu.registers.segment(SegmentIndex::Es);
-            es.limit = limit;
-            cpu.registers.set_segment(SegmentIndex::Es, es);
+        if seed.stale_segments {
+            for segment in [SegmentIndex::Es, SegmentIndex::Ds] {
+                let mut stale = cpu.registers.segment(segment);
+                stale.limit = 0xffff_ffff;
+                stale.access = 0x9b;
+                stale.default_size_32 = true;
+                cpu.registers.set_segment(segment, stale);
+            }
         }
         cpu.set_eip(ENTRY);
         cpu.elapsed_clocks = 0;
@@ -978,7 +1038,7 @@ fn the_carry_clc_and_stc_write_is_read_back_by_a_later_adc() {
                     }
                     map_direct_page(cpu, bus, 0x0000);
                     cpu.registers.gpr = std::array::from_fn(|i| 0xdead_0000 | (0xa0 + i as u32));
-                    cpu.registers.set_esp(STACK_SP);
+                    cpu.registers.set_esp(STACK_ESP);
                     cpu.registers.eflags = 0x202 | incoming;
                     cpu.pending_flags = PendingFlags::default();
                     if live_pending {
@@ -1052,9 +1112,13 @@ fn the_carry_clc_and_stc_write_is_read_back_by_a_later_adc() {
 /// * a segment register written before the stack read's guards, which would show as a state
 ///   difference on the guarded row below.
 ///
-/// The `es_limit` row is the unreal-mode property: a real-mode segment load leaves the cached limit
-/// ALONE, and the emitted form stores none. A lowering that helpfully wrote 0xFFFF would disagree
-/// with the interpreter on a segment whose limit is not 0xFFFF.
+/// The `stale_segments` row is what makes each stored FIELD observable, and it carries two
+/// assertions at once. The access byte and `default_size_32` must be OVERWRITTEN with the real-mode
+/// values, which an emitter that dropped that store would fail (that mutation survived the first
+/// version of this file, because both roles already held a real-mode descriptor and the value it
+/// failed to write was already there). The LIMIT must SURVIVE, because a real-mode segment load
+/// leaves the cached limit alone -- that is what unreal mode is -- and a lowering that helpfully
+/// wrote 0xFFFF would disagree with the interpreter.
 #[test]
 fn pop_segment_matches_the_interpreter_in_real_mode_and_v86() {
     select_v86_loop_rows(true);
@@ -1075,10 +1139,48 @@ fn pop_segment_matches_the_interpreter_in_real_mode_and_v86() {
         }
         lowered16(
             &[opcode],
-            Seed::new().stacked(0x0040).es_limit(0xffff_ffff),
-            &format!("{name} with an unreal-mode ES limit"),
+            Seed::new().stacked(0x0040).stale_segments(),
+            &format!("{name} over a stale unreal-mode descriptor"),
         );
     }
+    jit::direct::set_v86_loop_rows_for_test(None);
+}
+
+/// POP Sreg across the SIXTEEN-BIT STACK WRAP, which is the only state that separates a 16-bit
+/// pointer advance from a 32-bit one.
+///
+/// Catches `alu_r16_imm16(0, home(4), 2)` widened to `add_r32_imm32(home(4), 2)`. THIS MUTATION
+/// SURVIVED the first version of this file, and the reason is worth keeping: with SP anywhere below
+/// 0xFFFE the two instructions produce the same 32-bit value, because the add never carries out of
+/// bit 15. Poisoning ESP's high half was not enough on its own; the wrap is what makes the carry
+/// happen, and only then does the widened form clobber bits 31..16.
+///
+/// The interpreter's 16-bit stack pointer wraps within SP (`memory.rs`'s `pop` advances at the
+/// operand size), so the correct answer here is `0xdead_0000` and the mutation's is `0xdeae_0000`.
+#[test]
+fn pop_segment_preserves_the_high_half_of_esp_across_the_sixteen_bit_wrap() {
+    select_v86_loop_rows(true);
+    for (name, opcode) in [("pop es", 0x07u8), ("pop ds", 0x1f)] {
+        for builder in [
+            (sixteen_bit_cpu as fn() -> CpuGsw, "real"),
+            (v86_cpu as fn() -> CpuGsw, "v86"),
+        ] {
+            lowered_on(
+                builder.0,
+                false,
+                &[opcode],
+                Seed::new().esp(0xdead_fffe).stacked(0x0040),
+                &format!("{name} at SP=0xfffe mode={}", builder.1),
+            );
+        }
+    }
+    // The register pops share the same advance and the same wrap, so they are the control that says
+    // the assertion is about the POINTER rather than about this one kind.
+    lowered16(
+        &[0x58],
+        Seed::new().esp(0xdead_fffe).stacked(0x1234),
+        "pop ax at SP=0xfffe",
+    );
     jit::direct::set_v86_loop_rows_for_test(None);
 }
 
@@ -1277,7 +1379,7 @@ fn compile_unit(code: &[u8]) -> Option<u8> {
         cpu.begin_instruction();
         let _ = cpu.fetch_decoded(&mut bus, linear);
     }
-    for page in [0x0000u32, 0x1000] {
+    for page in (0..0x1_0000u32).step_by(0x1000) {
         map_direct_page(&mut cpu, &mut bus, page);
     }
     cpu.set_eip(ENTRY);
@@ -1363,11 +1465,11 @@ fn the_tombraid_loop_body_compiles_as_one_block_and_matches_the_interpreter() {
             cpu.begin_instruction();
             cpu.fetch_decoded(bus, linear).expect("fixture decode");
         }
-        for page in [0x0000u32, 0x1000] {
+        for page in (0..0x1_0000u32).step_by(0x1000) {
             map_direct_page(cpu, bus, page);
         }
         cpu.registers.gpr = std::array::from_fn(|i| 0xdead_0000 | (0xa0 + i as u32));
-        cpu.registers.set_esp(STACK_SP);
+        cpu.registers.set_esp(STACK_ESP);
         cpu.set_eip(ENTRY);
         cpu.elapsed_clocks = 0;
         cpu.timing_rem = 0;
