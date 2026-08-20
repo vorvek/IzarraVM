@@ -148,6 +148,20 @@ fn poll_alt_status(machine: &mut Machine, count: u32) {
     }
 }
 
+/// Arm PIT channel 0 at the DOS default reload, mode 2: an OUT rise 54.8 ms out.
+///
+/// **This is what makes a no-pending-command fixture non-vacuous.** The hazard
+/// the mandatory ATA precondition exists for is the target FALLING THROUGH to an
+/// unrelated edge, and a machine with no unrelated edge armed has nothing to
+/// fall through to -- its `next_device_edge_ticks()` is `None`, so a mutant that
+/// drops the precondition stalls for zero ticks and the fixture passes anyway.
+/// `18.2 Hz` is exactly the "up to 54.9 ms away" the design's B1 names.
+fn arm_far_pit_edge(machine: &mut Machine) {
+    out(machine, 0x43, 0x34); // channel 0, lobyte/hibyte, mode 2
+    out(machine, 0x40, 0); // reload 65536 -> 18.2 Hz
+    out(machine, 0x40, 0);
+}
+
 fn counters(machine: &Machine) -> AtaPollSkipCounters {
     machine.ata_poll_skip_counters()
 }
@@ -617,6 +631,63 @@ fn ata_poll_skip_declines_when_the_command_completed_in_the_same_batch() {
     );
 }
 
+/// **THE FIXTURE THAT ACTUALLY KILLS THE MUTANT.** Same route as the one above,
+/// but on a machine with a far unrelated edge armed.
+///
+/// The fixture above asserts the right thing and still cannot fail against a
+/// mutant that deletes the precondition: `bus_machine` arms no device, so its
+/// `next_device_edge_ticks()` is `None` and there is nothing to fall through TO.
+/// Its `master_ticks() == before` is then satisfied by the ABSENCE of the hazard
+/// rather than by the guard -- the `fixtures-that-cannot-fail` class.
+///
+/// With PIT channel 0 running at the DOS default the fall-through target exists
+/// and is 54.8 ms away. A machine that granted the guest that span with the
+/// drive READY would charge it as `io_stall_clocks`: invisible to
+/// `cd_pio_bytes`, invisible to the frame anchor because guest time still
+/// advances, and visible only as wall no ladder could attribute. That is the
+/// sharpest failure mode in the design, and this is the only fixture in the file
+/// that would see it.
+#[test]
+fn ata_poll_skip_declines_with_a_far_unrelated_edge_and_no_pending_command() {
+    let mut machine = bus_machine(true);
+    arm_far_pit_edge(&mut machine);
+
+    let deadline = schedule_identify(&mut machine);
+    poll_alt_status(&mut machine, ide::ATA_POLL_RUN);
+    assert!(machine.ata_poll_skip_armed, "the arm fired");
+
+    // Route 1 to the no-pending state: the batch's own advance crosses it.
+    machine.advance_devices_ticks(deadline);
+    assert!(machine.ide.ticks_until_completion().is_none());
+
+    let far = machine
+        .next_device_edge_ticks()
+        .expect("a far PIT edge is armed");
+    assert!(
+        far > machine.ata_poll_floor_ticks * 100,
+        "VACUOUS unless the fall-through edge is far: {far} ticks"
+    );
+
+    let before = machine.master_ticks();
+    let stalls_before = machine.io_stall_ticks();
+    machine.actuate_ata_poll_skip(before + far * 8, false);
+
+    let c = counters(&machine);
+    assert_eq!(c.declines_not_pending, 1, "{c:?}");
+    assert_eq!(c.spans, 0);
+    assert_eq!(
+        machine.master_ticks(),
+        before,
+        "with no pending command the machine must not grant the guest the unrelated PIT \
+         edge's whole span with the drive READY"
+    );
+    assert_eq!(
+        machine.io_stall_ticks(),
+        stalls_before,
+        "and must charge nothing as I/O stall, which is where such a grant would hide"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 8. The mandatory ATA precondition, ring-0 SRST route.
 // ---------------------------------------------------------------------------
@@ -633,6 +704,10 @@ fn ata_poll_skip_declines_when_the_command_completed_in_the_same_batch() {
 #[test]
 fn ata_poll_skip_declines_after_a_ring0_soft_reset_inside_the_batch() {
     let mut machine = bus_machine(true);
+    // The far edge for the same reason as route 1: without something to fall
+    // through TO, the assertion below cannot fail against a mutant that drops
+    // the precondition.
+    arm_far_pit_edge(&mut machine);
     schedule_identify(&mut machine);
     poll_alt_status(&mut machine, ide::ATA_POLL_RUN);
     assert!(machine.ata_poll_skip_armed);
@@ -657,8 +732,16 @@ fn ata_poll_skip_declines_after_a_ring0_soft_reset_inside_the_batch() {
         "soft_reset cleared the pending command mid-batch"
     );
 
+    let far = machine
+        .next_device_edge_ticks()
+        .expect("a far PIT edge is armed");
+    assert!(
+        far > machine.ata_poll_floor_ticks * 100,
+        "VACUOUS unless the fall-through edge is far: {far} ticks"
+    );
+
     let before = machine.master_ticks();
-    machine.actuate_ata_poll_skip(before + 1_000 * TICKS_PER_US, false);
+    machine.actuate_ata_poll_skip(before + far * 8, false);
 
     let c = counters(&machine);
     assert_eq!(c.declines_not_pending, 1, "guard 2 declines it: {c:?}");
@@ -666,7 +749,7 @@ fn ata_poll_skip_declines_after_a_ring0_soft_reset_inside_the_batch() {
     assert_eq!(
         machine.master_ticks(),
         before,
-        "the armed flag produced no stall"
+        "the armed flag produced no stall -- not even the far PIT edge's span"
     );
     assert!(machine.ide.poll_skip_blocked(), "guard 1 latched as well");
 }
@@ -814,6 +897,12 @@ fn ata_poll_skip_armed_flag_does_not_survive_a_batch() {
     assert_eq!(c.declines_below_floor, 0);
     assert_eq!(c.declines_deadline_clamped, 0);
     assert_eq!(c.arms, arms_before, "and no new arm was manufactured");
+    assert_eq!(
+        c.declines_halted, 0,
+        "the stale arm was cleared at batch ENTRY, so the halt arm never saw it either -- \
+         stated rather than left to the incidental fact that a halted slice returns before \
+         the actuation: {c:?}"
+    );
     assert!(!machine.ata_poll_skip_armed);
     assert_eq!(
         machine.io_stall_ticks(),
@@ -821,6 +910,60 @@ fn ata_poll_skip_armed_flag_does_not_survive_a_batch() {
         "nothing was stalled: master_ticks moved only by the batch's own work"
     );
     assert!(machine.master_ticks() >= before);
+}
+
+/// **THE CERTIFICATE, pinned.** An arm must mean "N alt-status reads inside ONE
+/// CPU batch with no other I/O to the channel", not the much weaker "N reads
+/// eventually".
+///
+/// The batch-entry `reset_alt_status_run()` is the sole mitigation for design
+/// §7 risk 2 -- "a guest that polls while doing useful work would be robbed of
+/// it" -- and it is the one architectural hazard the design accepts rather than
+/// eliminates. Nothing on the board can see it, because under TOKACD the run
+/// reaches the threshold inside the first batch anyway; without a fixture, the
+/// line is deletable with every other test green.
+///
+/// So: get one read short of the threshold, cross a batch boundary by a route
+/// that touches no channel port, and take one more read. It must NOT arm, and
+/// the run must read 1 -- the reads on either side of the boundary must not
+/// accumulate.
+#[test]
+fn ata_poll_skip_run_does_not_accumulate_across_a_batch_boundary() {
+    let mut machine = poll_machine(true);
+    let deadline = schedule_identify(&mut machine);
+    poll_alt_status(&mut machine, ide::ATA_POLL_RUN - 1);
+    assert_eq!(
+        machine.ide.alt_status_run_for_test(),
+        ide::ATA_POLL_RUN - 1,
+        "one read short of the threshold"
+    );
+    assert!(!machine.ata_poll_skip_armed);
+
+    // One batch through the real run loop, by a route that touches no channel
+    // port: the guest's HLT. This is the batch boundary the certificate is about.
+    machine.cpu.registers.eip = 0x108;
+    let _ = machine.run_master_ticks(TICKS_PER_US).unwrap();
+    assert!(
+        machine.ide.ticks_until_completion().is_some(),
+        "VACUOUS if the command completed across the boundary: the run would then reset on \
+         the no-pending arm instead of on the batch-entry one. deadline was {deadline}"
+    );
+
+    // The read that would have been the sixteenth of an unbroken run.
+    poll_alt_status(&mut machine, 1);
+
+    let c = counters(&machine);
+    assert_eq!(
+        c.arms, 0,
+        "reads in different batches must not accumulate into an arm: {c:?}"
+    );
+    assert_eq!(
+        machine.ide.alt_status_run_for_test(),
+        1,
+        "the run restarted at the batch boundary and this read is its first"
+    );
+    assert!(!machine.ata_poll_skip_armed);
+    assert_eq!(c.spans, 0);
 }
 
 // ---------------------------------------------------------------------------
