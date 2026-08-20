@@ -1782,6 +1782,31 @@ impl KateaTreeVolume {
         self.chain_memo.borrow().contains_key(&first)
     }
 
+    /// The reference ambiguity set over the volume's CURRENT live entries, for
+    /// the fixtures that grade any faster implementation against it.
+    #[cfg(test)]
+    pub(crate) fn ambiguous_reference(&self) -> HashSet<(u32, [u8; 11])> {
+        let live = self.gather_live();
+        self.ambiguous_by_full_scan(&live)
+    }
+
+    /// The same live set the reference was computed over, as
+    /// `(dir_cluster, name, first_cluster, is_dir)`, so a test can re-derive the
+    /// definition independently instead of re-running the implementation.
+    #[cfg(test)]
+    pub(crate) fn live_entries_for_test(&self) -> Vec<(u32, [u8; 11], u32, bool)> {
+        self.gather_live()
+            .into_iter()
+            .map(|e| (e.dir_cluster, e.name, e.first_cluster, e.is_dir))
+            .collect()
+    }
+
+    /// Whether `cluster` is currently registered as a directory cluster.
+    #[cfg(test)]
+    pub(crate) fn is_directory_cluster(&self, cluster: u32) -> bool {
+        self.directory_clusters.contains_key(&cluster)
+    }
+
     /// How many host read handles are cached, for the LRU bound test.
     #[cfg(test)]
     pub(crate) fn host_read_handles(&self) -> usize {
@@ -2902,6 +2927,66 @@ impl KateaTreeVolume {
             .set(self.counters.projection_max_ns.get().max(elapsed));
     }
 
+    /// THE ANTI-CLOBBER GUARD, AS A DEFINITION.
+    ///
+    /// A file is ambiguous when some cluster of its chain is not unambiguously
+    /// its own. Phase 3 holds such a file (`blocked_projection_keys`) instead of
+    /// materializing it, which is what stops Katea writing one guest file's bytes
+    /// into another guest file's host path when the guest's FAT has two directory
+    /// entries pointing into the same clusters. Writing `chain(k)` for this
+    /// entry's chain when the walk returns `Some`:
+    ///
+    /// > **ambiguous = { k ∈ LiveFiles : ∃ c ∈ chain(k) with
+    /// > c ∈ directory_clusters, or ∃ k′ ∈ LiveFiles, k′ ≠ k, c ∈ chain(k′) }**
+    ///
+    /// Three properties of the loop below that the definition captures and that
+    /// any faster implementation has to reproduce:
+    ///
+    /// 1. **Order-independence.** `HashMap::insert` keeps the last writer, so
+    ///    three files claiming one cluster flag pairwise on each insert and all
+    ///    three end up in the set, whatever order `live` is in.
+    /// 2. **A file does not collide with itself.** `other != key` — so two
+    ///    directory entries with the SAME key (a guest can write duplicate 8.3
+    ///    names) union their chains rather than flagging each other, and a chain
+    ///    that revisits a cluster is impossible anyway (it would not terminate,
+    ///    and `katea_write::chain` returns `None`).
+    /// 3. **A held chain contributes nothing.** A `None` walk is skipped here and
+    ///    held at the `MakeFile` arm instead.
+    ///
+    /// This is deliberately a named function rather than an inline loop: it is
+    /// the REFERENCE the incremental claim index is graded against, both by
+    /// fixtures and, on a live row, by `IZARRAVM_KATEA_CLAIMS_VERIFY=1`. If the
+    /// two ever disagree, this one is right.
+    ///
+    /// Cost: O(clusters in the mounted folder), every pass, for a write that
+    /// touched one file. Measured at 4.92 ms per pass on a 498 MB folder — 77% of
+    /// the projection wall.
+    fn ambiguous_by_full_scan(&self, live: &[LiveEntry]) -> HashSet<(u32, [u8; 11])> {
+        let mut cluster_claims: HashMap<u32, (u32, [u8; 11])> = HashMap::new();
+        let mut ambiguous_files = HashSet::new();
+        for entry in live
+            .iter()
+            .filter(|entry| !entry.is_dir && entry.first_cluster >= 2)
+        {
+            let key = (entry.dir_cluster, entry.name);
+            let Some(chain) = self.chain_of(entry.first_cluster) else {
+                continue;
+            };
+            for cluster in chain {
+                if self.directory_clusters.contains_key(&cluster) {
+                    ambiguous_files.insert(key);
+                }
+                if let Some(other) = cluster_claims.insert(cluster, key)
+                    && other != key
+                {
+                    ambiguous_files.insert(other);
+                    ambiguous_files.insert(key);
+                }
+            }
+        }
+        ambiguous_files
+    }
+
     fn reconcile_mode(&mut self, mode: ReconcileMode) {
         // Drop every cached read view before touching the host. This pass is the
         // funnel for `atomic_write`, `fs::rename` and the deletes, and
@@ -2931,28 +3016,7 @@ impl KateaTreeVolume {
             eprintln!("katea: skipping reconcile after a failed read of guest-written data");
             return;
         }
-        let mut cluster_claims: HashMap<u32, (u32, [u8; 11])> = HashMap::new();
-        let mut ambiguous_files = HashSet::new();
-        for entry in live
-            .iter()
-            .filter(|entry| !entry.is_dir && entry.first_cluster >= 2)
-        {
-            let key = (entry.dir_cluster, entry.name);
-            let Some(chain) = self.chain_of(entry.first_cluster) else {
-                continue;
-            };
-            for cluster in chain {
-                if self.directory_clusters.contains_key(&cluster) {
-                    ambiguous_files.insert(key);
-                }
-                if let Some(other) = cluster_claims.insert(cluster, key)
-                    && other != key
-                {
-                    ambiguous_files.insert(other);
-                    ambiguous_files.insert(key);
-                }
-            }
-        }
+        let ambiguous_files = self.ambiguous_by_full_scan(&live);
         if self.store.read_errors() != errors_at_entry {
             eprintln!("katea: skipping reconcile after a failed FAT ownership read");
             return;

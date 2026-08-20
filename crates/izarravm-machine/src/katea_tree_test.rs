@@ -3272,6 +3272,145 @@ fn a_chain_walk_resolves_one_fat_sector_per_128_clusters() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// The anti-clobber guard's definition, re-derived in the test from the live set
+/// and the volume's own FAT, with no reference to how `ambiguous_by_full_scan`
+/// is written:
+///
+/// > ambiguous = { k : ∃ c ∈ chain(k) with c a directory cluster, or c ∈ chain(k′)
+/// >               for some live file k′ ≠ k }
+fn ambiguous_by_definition(vol: &KateaTreeVolume) -> HashSet<(u32, [u8; 11])> {
+    let max = vol.max_chain();
+    // Union the chains of every live entry sharing a key -- a guest can write two
+    // directory entries with the same 8.3 name, and the definition treats them as
+    // one file, not as two files colliding.
+    let mut chains: HashMap<(u32, [u8; 11]), HashSet<u32>> = HashMap::new();
+    for (dir_cluster, name, first_cluster, is_dir) in vol.live_entries_for_test() {
+        if is_dir || first_cluster < 2 {
+            continue;
+        }
+        let Some(chain) = crate::katea_write::chain(first_cluster, max, |c| vol.fat_entry(c))
+        else {
+            continue;
+        };
+        chains.entry((dir_cluster, name)).or_default().extend(chain);
+    }
+    let mut out = HashSet::new();
+    for (key, clusters) in &chains {
+        let bad = clusters.iter().any(|c| {
+            vol.is_directory_cluster(*c)
+                || chains
+                    .iter()
+                    .any(|(other, theirs)| other != key && theirs.contains(c))
+        });
+        if bad {
+            out.insert(*key);
+        }
+    }
+    out
+}
+
+/// THE REFERENCE IS THE DEFINITION.
+///
+/// `ambiguous_by_full_scan` is the reference every faster implementation of the
+/// anti-clobber guard is graded against, so it needs its own grading against
+/// something that is not itself. `ambiguous_by_definition` above re-derives the
+/// set from the live entries and the raw `fat_entry`, quadratically and without
+/// looking at how the reference is written.
+///
+/// Driven over a mutation sequence that manufactures every shape the definition
+/// distinguishes: two entries on one chain, a chain crossing a directory
+/// cluster, a duplicate 8.3 name (which must NOT self-collide), and held chains.
+///
+/// NON-VACUOUS: the sweep asserts it produced both empty and non-empty answers,
+/// and that at least one duplicate-name step occurred; dropping `other != key`
+/// from the reference fails it on those steps.
+#[test]
+fn the_full_scan_reference_matches_the_declarative_definition() {
+    let (mut vol, root) = seeded_volume("ambiguity_reference");
+    let base = vol.fat.next_free();
+    let mut seed = 0x0BAD_F00Du32;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+
+    // SELF-COLLISION: two directory entries with the SAME 8.3 name AND the same
+    // first cluster. Their chains are identical, so a definition that did not
+    // exempt a key from colliding with itself would flag this key -- and phase 3
+    // would hold a perfectly ordinary file forever.
+    let self_key = {
+        let before = vol.ambiguous_reference();
+        stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "SELF.BIN", ATTR_ARCHIVE, base, 4096);
+        let one = vol.ambiguous_reference();
+        stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "SELF.BIN", ATTR_ARCHIVE, base, 4096);
+        let two = vol.ambiguous_reference();
+        assert_eq!(
+            one, two,
+            "a second entry with the same key and chain flagged it"
+        );
+        assert_eq!(one, ambiguous_by_definition(&vol));
+        let mut name = [b' '; 11];
+        name[..4].copy_from_slice(b"SELF");
+        name[8..11].copy_from_slice(b"BIN");
+        let _ = before;
+        (ROOT_CLUSTER, name)
+    };
+
+    let mut nonempty = 0;
+    let mut empty = 0;
+    // Now a genuine two-key alias onto one chain, which MUST flag both.
+    stamp_file_entry_only(
+        &mut vol,
+        ROOT_CLUSTER,
+        "ALIAS.BIN",
+        ATTR_ARCHIVE,
+        base,
+        4096,
+    );
+    let aliased = vol.ambiguous_reference();
+    assert!(
+        aliased.contains(&self_key),
+        "two DIFFERENT keys on one chain must flag both, or the sweep below is \
+         not testing the collision arm at all"
+    );
+
+    for step in 0..120 {
+        let cluster = base + (rng() % 300);
+        let value = match rng() % 4 {
+            0 => 0u32,
+            1 => crate::fat32::FAT32_EOC,
+            2 => cluster + 1,
+            _ => base + (rng() % 300),
+        };
+        let byte = cluster as usize * 4;
+        let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let mut sec = vol.read_sector(lba);
+        let off = byte % SECTOR;
+        sec[off..off + 4].copy_from_slice(&(value & 0x0FFF_FFFF).to_le_bytes());
+        vol.write_sector(lba, &sec);
+
+        let reference = vol.ambiguous_reference();
+        assert_eq!(
+            reference,
+            ambiguous_by_definition(&vol),
+            "step {step}: the reference and the definition disagree"
+        );
+        if reference.is_empty() {
+            empty += 1;
+        } else {
+            nonempty += 1;
+        }
+    }
+    assert!(
+        nonempty > 10,
+        "the sweep never produced a flagged file, so it proves nothing ({empty} empty)"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// A LINK PAST FAT COPY 0 MUST NOT BE MEMOIZED — THE ADVERSARIAL-GUEST CASE.
 ///
 /// `fat_entry_walked` delegates a cluster whose entry falls outside FAT copy 0
