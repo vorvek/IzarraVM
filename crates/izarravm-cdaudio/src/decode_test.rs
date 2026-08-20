@@ -21,7 +21,9 @@ fn decode_all(name: &str) -> (TrackInfo, Vec<u8>, u64) {
 
 /// Peak absolute sample over the first `frames` output frames.
 fn peak(pcm: &[u8], frames: usize) -> u16 {
-    pcm.chunks_exact(4)
+    pcm.as_chunks::<4>()
+        .0
+        .iter()
         .take(frames)
         .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
         .max()
@@ -114,7 +116,7 @@ fn a_mono_22k_source_is_resampled_and_duplicated() {
     let (_info, pcm, _produced) = decode_all("tone-22k-mono.wav");
     // Both channels carry the same signal.
     let mut compared = 0;
-    for sample in pcm.chunks_exact(4).take(2000).skip(200) {
+    for sample in pcm.as_chunks::<4>().0.iter().take(2000).skip(200) {
         let l = i16::from_le_bytes([sample[0], sample[1]]);
         let r = i16::from_le_bytes([sample[2], sample[3]]);
         assert_eq!(l, r);

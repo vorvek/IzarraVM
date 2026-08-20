@@ -2003,7 +2003,7 @@ fn image_dos_folder_names() -> Vec<String> {
 
     // Find the DOS subdirectory entry in the root, then list its files.
     let mut dos_cluster = None;
-    for entry in read_chain(root_clus).chunks_exact(32) {
+    for entry in read_chain(root_clus).as_chunks::<32>().0 {
         if entry[0] == 0x00 {
             break;
         }
@@ -2017,7 +2017,7 @@ fn image_dos_folder_names() -> Vec<String> {
     let dos_cluster = dos_cluster.expect("committed image has no C:\\DOS directory");
 
     let mut names = Vec::new();
-    for entry in read_chain(dos_cluster).chunks_exact(32) {
+    for entry in read_chain(dos_cluster).as_chunks::<32>().0 {
         if entry[0] == 0x00 {
             break;
         }
@@ -2313,7 +2313,7 @@ fn image_root_file(name: &str) -> Vec<u8> {
         panic!("katea: cluster chain from {first} exceeds the disk; corrupt FAT")
     };
 
-    for entry in read_chain(root_clus, usize::MAX).chunks_exact(32) {
+    for entry in read_chain(root_clus, usize::MAX).as_chunks::<32>().0 {
         if entry[0] == 0x00 {
             break;
         }

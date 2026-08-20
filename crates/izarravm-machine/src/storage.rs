@@ -302,9 +302,13 @@ fn parse_el_torito(image: &CdImage) -> Option<ElToritoBoot> {
     if catalog[0] != 1 || catalog[1] != 0 || catalog[30] != 0x55 || catalog[31] != 0xAA {
         return None;
     }
-    let checksum = catalog[..32].chunks_exact(2).fold(0u16, |sum, word| {
-        sum.wrapping_add(u16::from_le_bytes([word[0], word[1]]))
-    });
+    let checksum = catalog[..32]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .fold(0u16, |sum, word| {
+            sum.wrapping_add(u16::from_le_bytes(*word))
+        });
     if checksum != 0 || catalog[32] != 0x88 {
         return None;
     }

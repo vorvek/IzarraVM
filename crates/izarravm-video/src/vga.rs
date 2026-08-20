@@ -170,7 +170,7 @@ pub struct Vga {
 impl Default for Vga {
     fn default() -> Self {
         let mut text_memory = [0; VGA_TEXT_MEMORY_SIZE];
-        for cell in text_memory.chunks_exact_mut(2) {
+        for cell in text_memory.as_chunks_mut::<2>().0 {
             cell[0] = b' ';
             cell[1] = 0x07;
         }
@@ -2146,12 +2146,12 @@ impl Vga {
         self.cursor_offset = 0;
         if clear {
             if self.crtc.char_width == 8 {
-                for cell in self.cga.fb.chunks_exact_mut(2) {
+                for cell in self.cga.fb.as_chunks_mut::<2>().0 {
                     cell[0] = b' ';
                     cell[1] = 0x07;
                 }
             } else {
-                for cell in self.text_memory.chunks_exact_mut(2) {
+                for cell in self.text_memory.as_chunks_mut::<2>().0 {
                     cell[0] = b' ';
                     cell[1] = 0x07;
                 }

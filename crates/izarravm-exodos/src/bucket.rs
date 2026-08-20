@@ -443,8 +443,10 @@ impl FrameImage {
         }
         Some(
             self.rgb
-                .chunks_exact(3)
-                .zip(other.rgb.chunks_exact(3))
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(other.rgb.as_chunks::<3>().0)
                 .filter(|(a, b)| a != b)
                 .count(),
         )
@@ -459,7 +461,7 @@ impl FrameImage {
     /// blank screen while 29.2 billion instructions spin on port reads, and no
     /// counter says so.
     pub fn blank(&self) -> bool {
-        let mut pixels = self.rgb.chunks_exact(3);
+        let mut pixels = self.rgb.as_chunks::<3>().0.iter();
         let Some(first) = pixels.next() else {
             return false;
         };

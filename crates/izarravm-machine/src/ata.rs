@@ -1062,7 +1062,7 @@ impl AtaDisk {
             self.abort();
             return false;
         }
-        for (index, sector) in data.chunks_exact(SECTOR).enumerate() {
+        for (index, sector) in data.as_chunks::<SECTOR>().0.iter().enumerate() {
             if !self.write_lba(request.lba + index as u32, sector) {
                 self.abort();
                 return false;

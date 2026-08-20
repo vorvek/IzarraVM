@@ -24,10 +24,10 @@ fn el_torito_iso(media: u8) -> CdImage {
     iso[catalog + 30] = 0x55;
     iso[catalog + 31] = 0xAA;
     let sum = iso[catalog..catalog + 32]
-        .chunks_exact(2)
-        .fold(0u16, |sum, w| {
-            sum.wrapping_add(u16::from_le_bytes([w[0], w[1]]))
-        });
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .fold(0u16, |sum, w| sum.wrapping_add(u16::from_le_bytes(*w)));
     iso[catalog + 28..catalog + 30].copy_from_slice(&0u16.wrapping_sub(sum).to_le_bytes());
     iso[catalog + 32] = 0x88;
     iso[catalog + 33] = media;

@@ -778,7 +778,7 @@ impl CdImage {
             // each sample's own byte order changes. A Red Book frame is 588
             // stereo pairs of two 16-bit samples, so 2352 bytes divide into
             // exactly 1176 whole samples and no partial one can be left over.
-            for sample in out.chunks_exact_mut(2) {
+            for sample in out.as_chunks_mut::<2>().0 {
                 sample.swap(0, 1);
             }
         }

@@ -31,8 +31,10 @@ fn wait_for(mut f: impl FnMut() -> bool) -> bool {
 /// Peak absolute sample in a frame.
 fn peak(frame: &[u8; AUDIO_FRAME_BYTES]) -> u16 {
     frame
-        .chunks_exact(2)
-        .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|s| i16::from_le_bytes(*s).unsigned_abs())
         .max()
         .unwrap_or(0)
 }

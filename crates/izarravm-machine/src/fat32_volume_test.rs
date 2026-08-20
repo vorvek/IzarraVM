@@ -30,8 +30,8 @@ fn read_dir_entries(vol: &Fat32Volume, first_cluster: u32) -> Vec<[u8; DIR_ENTRY
         for s in 0..spc {
             let lba = geo.first_data_sector + (cl - 2) * spc + s;
             let sec = vol.read_sector(lba);
-            for chunk in sec.chunks_exact(DIR_ENTRY_SIZE) {
-                out.push(chunk.try_into().unwrap());
+            for chunk in sec.as_chunks::<DIR_ENTRY_SIZE>().0 {
+                out.push(*chunk);
             }
         }
         let i = cl as usize * 4;

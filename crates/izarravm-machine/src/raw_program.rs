@@ -248,7 +248,7 @@ fn apply_relocs(
     relocs: &[u8],
     addend: u16,
 ) -> Result<(), ProgramLoadError> {
-    for entry in relocs.chunks_exact(4) {
+    for entry in relocs.as_chunks::<4>().0 {
         let off = u16::from_le_bytes([entry[0], entry[1]]);
         let seg = u16::from_le_bytes([entry[2], entry[3]]);
         let module_offset = usize::from(seg) * 16 + usize::from(off);

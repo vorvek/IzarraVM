@@ -379,7 +379,7 @@ const CLAIM_REFRESH_PERIOD: usize = 64;
 /// truncated parse exactly as they always have.
 fn directory_image_is_whole(bytes: &[u8]) -> bool {
     let mut terminated = false;
-    for entry in bytes.chunks_exact(32) {
+    for entry in bytes.as_chunks::<32>().0 {
         match (terminated, entry[0]) {
             (false, 0x00) => terminated = true,
             (true, 0x00) => {}
@@ -2968,7 +2968,7 @@ impl KateaTreeVolume {
         if self.unmapped_by_cluster.is_empty() {
             self.newly_projectable_clusters.clear();
         } else {
-            let mut clusters: HashSet<u32> = self.newly_projectable_clusters.drain().collect();
+            let mut clusters: HashSet<u32> = std::mem::take(&mut self.newly_projectable_clusters);
             clusters.extend(batch.iter().filter_map(|lba| self.data_cluster_of(*lba)));
             for cluster in &clusters {
                 if let Some(held) = self.unmapped_by_cluster.get(cluster) {

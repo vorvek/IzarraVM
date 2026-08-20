@@ -610,8 +610,8 @@ impl Distira {
         let start = self.display.back_base as usize;
         let len = (self.display.pitch as usize).saturating_mul(self.display.height as usize);
         let end = start.saturating_add(len).min(self.fb.len());
-        for chunk in self.fb[start..end].chunks_exact_mut(2) {
-            chunk.copy_from_slice(&pixel);
+        for chunk in self.fb[start..end].as_chunks_mut::<2>().0 {
+            *chunk = pixel;
         }
     }
 

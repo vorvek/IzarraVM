@@ -226,7 +226,7 @@ impl MidiEngine {
             return;
         }
 
-        for samples in self.scratch.chunks_exact(2) {
+        for samples in self.scratch.as_chunks::<2>().0 {
             self.staged.push_back((samples[0], samples[1]));
         }
         self.guest_frame_cursor = end;

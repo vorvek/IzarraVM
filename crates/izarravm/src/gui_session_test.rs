@@ -1362,8 +1362,10 @@ fn load_cd_image_from_path_mounts_a_cue_naming_an_ogg() {
     }
     let frame = frame.expect("the ogg never decoded through the mounted image");
     let peak = frame
-        .chunks_exact(2)
-        .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|s| i16::from_le_bytes(*s).unsigned_abs())
         .max()
         .unwrap_or(0);
     assert!(peak > 1000, "the mounted ogg played back as near-silence");

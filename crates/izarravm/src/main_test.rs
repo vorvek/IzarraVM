@@ -1942,7 +1942,9 @@ fn the_audio_wav_capture_writes_distinct_left_and_right_channels() {
     );
 
     let frames: Vec<(i16, i16)> = bytes[44..]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|f| {
             (
                 i16::from_le_bytes([f[0], f[1]]),

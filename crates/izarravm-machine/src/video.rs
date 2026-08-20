@@ -1701,8 +1701,7 @@ impl Machine {
             // AL=12: set a block of DAC registers. BX=start, CX=count, ES:DX -> RGB triples.
             0x12 => {
                 let bytes = self.read_guest_linear_block(es_dx, cx as usize * 3);
-                let entries: Vec<[u8; 3]> =
-                    bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                let entries: Vec<[u8; 3]> = bytes.as_chunks::<3>().0.to_vec();
                 self.vega.legacy_mut().set_dac_block(bx as u8, &entries);
             }
             // AL=13: select DAC colour-page mode/page. BL=0 picks four 64-colour
@@ -2310,7 +2309,7 @@ impl Machine {
                 if self.cpu.registers.ebx() as u8 == 0x80 {
                     self.stall_until_margo_frame();
                 }
-                for (offset, entry) in entries.chunks_exact(4).enumerate() {
+                for (offset, entry) in entries.as_chunks::<4>().0.iter().enumerate() {
                     self.vega.legacy_mut().set_dac_entry(
                         (usize::from(start) + offset) as u8,
                         entry[2],

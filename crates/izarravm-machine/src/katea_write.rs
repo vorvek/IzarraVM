@@ -46,7 +46,7 @@ pub(crate) enum EntryAction {
 /// Deleted (`0xE5`) entries are dropped here.
 pub(crate) fn parse_dir(bytes: &[u8]) -> Vec<DirEntry> {
     let mut out = Vec::new();
-    for e in bytes.chunks_exact(32) {
+    for e in bytes.as_chunks::<32>().0 {
         match e[0] {
             0x00 => break,
             0xE5 => continue,

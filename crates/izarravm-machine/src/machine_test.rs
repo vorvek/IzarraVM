@@ -489,7 +489,7 @@ fn audio_cd(frames: u32) -> CdImage {
     let mut bin = vec![0u8; cdimage::DATA_SECTOR + frames as usize * cdimage::RAW_SECTOR];
     // Fill the audio region with signed stereo constants so channel scaling is
     // visible in the mix.
-    for frame in bin[cdimage::DATA_SECTOR..].chunks_exact_mut(4) {
+    for frame in bin[cdimage::DATA_SECTOR..].as_chunks_mut::<4>().0 {
         frame[..2].copy_from_slice(&8000i16.to_le_bytes());
         frame[2..].copy_from_slice(&(-8000i16).to_le_bytes());
     }

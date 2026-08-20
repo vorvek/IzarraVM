@@ -532,7 +532,12 @@ fn volume_icon(ui: &mut egui::Ui) {
 fn recolor_logo(raw: &[u8], beige: [f32; 3]) -> Vec<u8> {
     let bg = LOGO_BG_F32;
     let mut out = vec![0u8; raw.len()];
-    for (src, dst) in raw.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+    for (src, dst) in raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0)
+    {
         let p = [src[0] as f32, src[1] as f32, src[2] as f32];
         let w = (p[0] / bg[0])
             .min(p[1] / bg[1])

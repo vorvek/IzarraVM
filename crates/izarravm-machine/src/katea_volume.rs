@@ -229,7 +229,7 @@ pub fn extract_system_payload(image: &[u8]) -> SystemPayload {
             continue;
         }
         let dir_bytes = read_chain(dir_clus);
-        for entry in dir_bytes.chunks_exact(32) {
+        for entry in dir_bytes.as_chunks::<32>().0 {
             match entry[0] {
                 0x00 => break,    // no further entries in this directory
                 0xE5 => continue, // deleted
