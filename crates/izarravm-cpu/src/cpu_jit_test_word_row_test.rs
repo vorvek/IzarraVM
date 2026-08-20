@@ -39,17 +39,26 @@
 //! SF whenever bit 15 and bit 31 differ, and about PF never -- PF is the low byte at both widths,
 //! which is why ZF and SF are the columns the operand table is chosen to exercise.
 
-// MUTATION EVIDENCE (2026-08-21, applied by hand, run, restored). Each row names the fixture that
-// caught it; a mutation nobody catches is a fixture bug, not a free pass.
+// MUTATION EVIDENCE (2026-08-21). Each mutation below was applied BY HAND to the committed tree,
+// the fixtures were run, the failure text was read, and the tree was restored with
+// `git checkout -- <file>` (which is why the slice was committed first: that command discards
+// every uncommitted change to the file, not only the mutation). A mutation nobody catches is a
+// fixture bug, not a free pass, so the failing ASSERTION is quoted rather than the test name alone.
 //
-// | mutation | caught by | assertion |
-// |---|---|---|
-// | the Word arm routed to `emit_test` (the Dword emitter), i.e. the pre-slice behaviour reached through the new gate | `test_word_register_form_matches_the_interpreter_*` | materialized EFLAGS: ZF 0 against the interpreter's 1 on `test ax,ax` with AX = 0 |
-// | `emit_test_preloaded` called with `MemoryWidth::Dword` from the Word arm | the same | raw lazy-flags descriptor `0x8000_0202` against `0x8000_0102` |
-// | the classify arm's `width: operand_width` reverted to `MemoryWidth::Dword` | the same | as above, both columns |
-// | the allowlist term widened from `insn.opcode == 0x85` to the whole TEST family | `the_gate_does_not_sweep_in_its_neighbours` | `0xA9` TEST AX,imm16 compiles where it must stay a barrier |
-// | the allowlist term's `test_word_rows_enabled()` guard dropped | `the_word_test_row_flips_with_the_gate` | the row compiles on the OFF arm, which would destroy the A/B base |
-// | the arm's `DecodedOperand::Reg` bind relaxed to accept memory | `the_gate_does_not_sweep_in_its_neighbours` | `85 /r` memory form compiles where it must stay a barrier on both arms |
+// | # | mutation | caught by | the assertion that fired |
+// |---|---|---|---|
+// | M1 | the Word emit arm routed to `emit_test`, i.e. the Dword emitter reached through the new gate | `test_word_register_form_matches_the_interpreter_*` (both) | raw lazy-flags descriptor: `tag 0x8000_0202, result 0xbeef_0000` against `tag 0x8000_0102, result 0` |
+// | M2 | the classify arm's `width: operand_width` reverted to `MemoryWidth::Dword` | the same two | the same descriptor pair, from the other end of the same path |
+// | M3 | the allowlist term widened from `insn.opcode == 0x85` to `matches!(.., 0x85 \| 0xa9)` | `the_gate_does_not_sweep_in_its_neighbours` | "0xA9 TEST AX,imm16 must stay a barrier at Word on the true arm": `Some(3)` against `None` |
+// | M4 | the allowlist term's `test_word_rows_enabled()` guard dropped | `the_word_test_row_flips_with_the_gate` | "unprefixed 85 /r ... must stay a barrier with the gate off": `Some(3)` against `None` -- the mutation that would destroy the A/B base |
+// | M5 | the arm's `DecodedOperand::Reg` bind relaxed to fall back to register 0 on memory | `the_gate_does_not_sweep_in_its_neighbours` | "85 /r MEMORY form must stay a barrier at Dword on the false arm": `Some(3)` against `None` |
+//
+// M1 and M2 are the same defect entered from the two ends of the width field, and BOTH were run
+// because the emitter and the classifier are separately editable; the shared failure text is the
+// point rather than a duplication. Note what killed them: not the materialized EFLAGS but the RAW
+// pending descriptor, which is the earlier and stricter of the two. A Word TEST publishes a
+// descriptor a later reader materializes, so a wrong width tag is a defect that outlives the
+// instruction, and `compare_state` reads it directly for that reason.
 
 use super::*;
 
@@ -656,9 +665,7 @@ fn test_word_register_form_matches_the_interpreter_in_a_sixteen_bit_segment() {
                         false,
                         &test_reg(reg, rm),
                         seed,
-                        &format!(
-                            "test r{rm},r{reg} a={a:#06x} b={b:#06x} pending={live_pending}"
-                        ),
+                        &format!("test r{rm},r{reg} a={a:#06x} b={b:#06x} pending={live_pending}"),
                     );
                 }
             }
