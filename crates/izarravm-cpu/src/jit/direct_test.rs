@@ -2075,18 +2075,28 @@ fn the_prefix_gate_admits_the_five_data_segment_overrides_and_refuses_cs() {
                     "{segment:?} override plus LOCK must refuse"
                 );
             }
-            assert!(
-                !prefixes_supported_for(
-                    Prefixes {
-                        operand_size_override: expected_override,
-                        segment_override: Some(SegmentIndex::Cs),
-                        ..Prefixes::default()
-                    },
-                    size,
-                    d,
-                ),
-                "a CS override is refused explicitly, not by omission"
-            );
+            // CS follows `IZARRAVM_V86_LOOP_ROWS` as of 2026-08-20 and is the ONLY clause of this
+            // gate that does. Both arms are asserted here, in the same loop as the five data
+            // segments, so a future edit that gated the whole segment admission behind that knob
+            // instead of only its CS clause fails on the rows above rather than passing quietly.
+            for arm in [false, true] {
+                set_v86_loop_rows_for_test(Some(arm));
+                assert_eq!(
+                    prefixes_supported_for(
+                        Prefixes {
+                            operand_size_override: expected_override,
+                            segment_override: Some(SegmentIndex::Cs),
+                            ..Prefixes::default()
+                        },
+                        size,
+                        d,
+                    ),
+                    arm,
+                    "a CS override is refused explicitly on the off arm and admitted on the on \
+                     arm; it is never refused by omission"
+                );
+            }
+            set_v86_loop_rows_for_test(None);
         }
     }
 }

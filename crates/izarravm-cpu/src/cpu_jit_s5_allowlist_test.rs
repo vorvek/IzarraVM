@@ -107,39 +107,77 @@ fn word_size_byte_forms_are_lowered() {
 /// slice this list guards no `MovImm` producer at all: `0xc7`'s register form is the other one and
 /// it is refused inside the classifier arm, so it has `the_word_size_0xc7_register_form_stays_refused`
 /// rather than a row here.
+/// `0x05` carries a THIRD column because it moved on 2026-08-20: the V86 loop-A slice put ALU
+/// form 5 on the Word allowlist behind `IZARRAVM_V86_LOOP_ROWS`, so it is an allowlist refusal on
+/// the OFF arm and a lowering on the ON one. Running the table on both arms is what keeps the
+/// other seven rows covered on both while pinning `0x05`'s flip in the place that owns it.
 #[test]
 fn word_size_dword_siblings_stay_refused() {
     // `0x81` and `0xf7 /0` left this table on 2026-08-08 (the wolf3d demo-workload census ranked
     // them at 634M block-stopping hits each); their admissions are pinned by
     // `word_size_0x81_register_forms_are_lowered` and
     // `word_size_group3_test_forms_follow_the_slice` below.
-    let cases: &[(&str, &[u8])] = &[
-        ("0x05 add eax,imm", &[0x66, 0x05, 0x34, 0x12]),
-        ("0x85 test r/m,r", &[0x66, 0x85, 0xc0]),
-        ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10]),
-        ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12]),
-        ("0xf7 /2 not r/m", &[0x66, 0xf7, 0xd1]),
-        ("0xf7 /3 neg r/m", &[0x66, 0xf7, 0xd9]),
-        ("0xf7 /4 mul r/m", &[0x66, 0xf7, 0xe1]),
-        ("0xf7 /6 div r/m", &[0x66, 0xf7, 0xf1]),
+    //
+    // The `bool` is "refused on the ON arm too". `0x05` is the one row that is not: its whole
+    // form (ADD/OR/AND/SUB/XOR/CMP with a full-width immediate) joins the allowlist under the
+    // gate, which `cpu_jit_v86_loop_rows_test.rs` pins from the other side.
+    let cases: &[(&str, &[u8], bool)] = &[
+        ("0x05 add eax,imm", &[0x66, 0x05, 0x34, 0x12], false),
+        ("0x85 test r/m,r", &[0x66, 0x85, 0xc0], true),
+        ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10], true),
+        ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12], true),
+        ("0xf7 /2 not r/m", &[0x66, 0xf7, 0xd1], true),
+        ("0xf7 /3 neg r/m", &[0x66, 0xf7, 0xd9], true),
+        ("0xf7 /4 mul r/m", &[0x66, 0xf7, 0xe1], true),
+        ("0xf7 /6 div r/m", &[0x66, 0xf7, 0xf1], true),
     ];
 
-    for &(label, form) in cases {
-        let mut code = vec![0x40, 0x41, 0x42];
-        code.extend_from_slice(form);
-        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
-        warm(
-            &mut cpu,
-            &mut bus,
-            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
-        );
-
-        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-        assert_eq!(
-            compilation.span.instructions, 3,
-            "{label}: must stay refused at Word size, so the block is the three fillers"
-        );
+    for arm in [false, true] {
+        jit::direct::set_v86_loop_rows_for_test(Some(arm));
+        for &(label, form, refused_on_the_on_arm) in cases {
+            if arm && !refused_on_the_on_arm {
+                continue;
+            }
+            word_size_sibling_stays_refused(label, form, arm);
+        }
     }
+    // ...and the row that FLIPS, asserted rather than skipped, so the `continue` above cannot
+    // quietly become the whole test.
+    jit::direct::set_v86_loop_rows_for_test(Some(true));
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&[0x66, 0x05, 0x34, 0x12]);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "0x05 add ax,imm16 must JOIN the block once IZARRAVM_V86_LOOP_ROWS admits ALU form 5"
+    );
+    jit::direct::set_v86_loop_rows_for_test(None);
+}
+
+/// One row of the table above: three filler INCs, the form under test, and the block must stop at
+/// the fillers because the form is off the Word allowlist.
+fn word_size_sibling_stays_refused(label: &str, form: &[u8], arm: bool) {
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(form);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "{label}: must stay refused at Word size on the V86-loop-rows={arm} arm, so the block is \
+         the three fillers"
+    );
 }
 
 /// `0x83` at Word size: the six non-carry sub-ops of the REGISTER form are lowered, and nothing
@@ -346,35 +384,58 @@ fn word_size_push_segment_forms_are_lowered() {
 /// refusals ATTRIBUTABLE. Leave either alone and every row comes back at three instructions
 /// because no push can compile in that cell at all, and the table passes while proving nothing
 /// about the allowlist.
+/// `0x07` and `0x1f` moved on 2026-08-20: the V86 loop-A slice lowers POP ES and POP DS behind
+/// `IZARRAVM_V86_LOOP_ROWS`, so both are allowlist refusals on the OFF arm and lowerings on the ON
+/// one. `0x16` PUSH SS and `0x17` POP SS stay refused on BOTH arms, and that is the pairing this
+/// table exists to hold: the two segments this backend can load in real mode and V86 flip, and the
+/// stack segment does not, because loading SS arms a one-instruction interrupt shadow that a
+/// native block never passes through.
+///
+/// `flat_fixture` builds a REAL-mode CPU (`fresh()` with CS.D forced on), and the rows above force
+/// SS.B off, which is exactly the cell `PopSegReal` is admitted in: real mode, 16-bit stack, Word
+/// operand size. So on the ON arm the two flipping rows really do join the block here, and this
+/// table asserts the flip in both directions rather than describing it.
 #[test]
 fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
-    let cases: &[(&str, &[u8])] = &[
-        ("0x16 push ss", &[0x66, 0x16]),
-        ("0x1f pop ds", &[0x66, 0x1f]),
-        ("0x07 pop es", &[0x66, 0x07]),
-        ("0x17 pop ss", &[0x66, 0x17]),
+    // The `bool` is "refused on the ON arm too".
+    let cases: &[(&str, &[u8], bool)] = &[
+        ("0x16 push ss", &[0x66, 0x16], true),
+        ("0x1f pop ds", &[0x66, 0x1f], false),
+        ("0x07 pop es", &[0x66, 0x07], false),
+        ("0x17 pop ss", &[0x66, 0x17], true),
     ];
 
-    for &(label, form) in cases {
-        let mut code = vec![0x40, 0x41, 0x42];
-        code.extend_from_slice(form);
-        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
-        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
-        ss.default_size_32 = false;
-        cpu.registers.set_segment(SegmentIndex::Ss, ss);
-        cpu.registers.set_esp(0x1000);
-        warm(
-            &mut cpu,
-            &mut bus,
-            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
-        );
+    for arm in [false, true] {
+        jit::direct::set_v86_loop_rows_for_test(Some(arm));
+        for &(label, form, refused_on_the_on_arm) in cases {
+            let mut code = vec![0x40, 0x41, 0x42];
+            code.extend_from_slice(form);
+            let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+            let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+            ss.default_size_32 = false;
+            cpu.registers.set_segment(SegmentIndex::Ss, ss);
+            cpu.registers.set_esp(0x1000);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
 
-        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-        assert_eq!(
-            compilation.span.instructions, 3,
-            "{label}: must stay refused at Word size, so the block is the three fillers"
-        );
+            let refused = !arm || refused_on_the_on_arm;
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(
+                compilation.span.instructions,
+                if refused { 3 } else { 4 },
+                "{label}: on the V86-loop-rows={arm} arm this must {} at Word size",
+                if refused {
+                    "stay refused, leaving the block at the three fillers"
+                } else {
+                    "JOIN the block as a fourth slot"
+                }
+            );
+        }
     }
+    jit::direct::set_v86_loop_rows_for_test(None);
 }
 
 /// `MOV DS, r16` and `MOV ES, r16` at Word size, the write half of the segment family.

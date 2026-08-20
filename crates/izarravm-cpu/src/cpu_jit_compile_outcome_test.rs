@@ -1198,6 +1198,11 @@ fn the_suffix_seed_carries_a_barred_segment_write() {
 ///    half.
 #[test]
 fn barrier_census_attributes_the_prefix_refusal_arm() {
+    // The CS half is an OFF-ARM statement as of 2026-08-20: `IZARRAVM_V86_LOOP_ROWS` admits the CS
+    // override, so the arm is stated rather than inherited and the ON arm is asserted at the end
+    // of this test rather than left to chance. The slice-6 decision this fixture was written for
+    // is unchanged on the shipped default, which is what the OFF arm here pins.
+    jit::direct::set_v86_loop_rows_for_test(Some(false));
     // `mov eax, [eax]`, behind a CS override, behind an SS override, and bare.
     let prefixed = [0x40, 0x41, 0x42, 0x43, 0x2e, 0x8b, 0x00, 0x44, 0x45];
     let ss_override = [0x40, 0x41, 0x42, 0x43, 0x36, 0x8b, 0x00, 0x44, 0x45];
@@ -1254,6 +1259,31 @@ fn barrier_census_attributes_the_prefix_refusal_arm() {
     assert_eq!(row.native_prefix_instructions, 4);
     assert_eq!(row.unbound_exits, 0, "no exit has happened yet");
     assert_eq!(row.dynamic_unbound_exits, 0);
+
+    // The ON arm: the same CS-prefixed load is LOWERED, so it produces no census row at all and the
+    // walk runs past it exactly as the SS control above does. Without this half the test would keep
+    // passing if the gate stopped moving the CS clause, which is the thing it now describes.
+    jit::direct::set_v86_loop_rows_for_test(Some(true));
+    let (mut on_cpu, mut on_bus) = fixture(&prefixed);
+    on_cpu.enable_direct_barrier_census(true);
+    warm(&mut on_cpu, &mut on_bus, &addresses);
+    let on = compiled(jit::direct::compile(&mut on_cpu, ENTRY, true));
+    assert!(
+        on.span.instructions > 5,
+        "with IZARRAVM_V86_LOOP_ROWS on, the CS-prefixed load must be lowered and the walk must \
+         run past it, got {} slots",
+        on.span.instructions
+    );
+    assert!(
+        on_cpu
+            .direct_barrier_census_snapshot()
+            .expect("enabled census snapshot")
+            .rows
+            .iter()
+            .all(|row| row.opcode != 0x8b),
+        "with the gate on the load must not be a barrier at all"
+    );
+    jit::direct::set_v86_loop_rows_for_test(None);
 }
 
 /// The non-continuable arm, same shape of claim. HLT is the durable choice: `block_continuable`

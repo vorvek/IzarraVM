@@ -3311,6 +3311,53 @@ pub(crate) enum DirectKind {
         segment: SegmentIndex,
         src: u8,
     },
+    /// `POP Sreg` (0x07 ES, 0x1F DS) on a SIXTEEN-BIT stack at Word operand size, in REAL MODE or
+    /// V86 -- the tombraid loop-A census's largest row, behind `IZARRAVM_V86_LOOP_ROWS`.
+    ///
+    /// One kind, not two, because only one width exists. `classify` refuses the Dword form in its
+    /// own arm (there the interpreter pops FOUR bytes and loads the low 16), so `stack_width_kind`
+    /// only ever sees this at Word and maps it through unchanged on a 16-bit stack; a 32-bit stack
+    /// falls to that matrix's `_ => None` and the row stays a barrier there. That is deliberately
+    /// the opposite shape from `Pop`/`Pop16`, which have both widths because both are measured.
+    ///
+    /// It is `Pop16`'s read followed by `LoadSegReal`'s write, and both halves are unchanged from
+    /// the arms that already ship them, including the two things about each that are easy to get
+    /// wrong: the pointer advance is a 16-bit register op (`alu_r16_imm16` on the SP home), so
+    /// ESP's high half survives; and there is deliberately NO limit store on the segment write,
+    /// because a real-mode segment load leaves the cached limit alone -- see `LoadSegReal`'s emit
+    /// arm for the full argument, which holds here for the same reason. The one thing it does NOT
+    /// inherit is `Pop16`'s POP SP ordering note: the destination is a segment register, so it can
+    /// never alias the stack pointer this instruction is advancing.
+    ///
+    /// Every guest-visible write sits after every side-exit guard, so a memory exit leaves the
+    /// instruction un-started exactly as `Pop16`'s does.
+    ///
+    /// `written_segment` reports the segment, which makes any block holding this slot a
+    /// SEGMENT-WRITE block: the compile walk's dirty-segment rule ends the block at the first
+    /// later slot that bakes anything from that segment, the self-loop shape is barred, and no
+    /// static link is attempted. All three are inherited from `LoadSegReal` rather than added
+    /// here.
+    PopSegReal {
+        segment: SegmentIndex,
+    },
+    /// `CLC` (0xF8) and `STC` (0xF9) -- the tombraid loop-A census's `0xf8` row at 95,090,745
+    /// interpreted hits, behind `IZARRAVM_V86_LOOP_ROWS`.
+    ///
+    /// The interpreter is one line, `set_flag(FLAG_CF, set)`, and `emit_set_cf_only` is already a
+    /// transcription of exactly that function's CF path -- both of its branches, the live-descriptor
+    /// one that reproduces `PendingFlags::with_cf_override` in place and the bare one that writes
+    /// EFLAGS directly, plus the trailing `eflags |= 0x2` that `set_flag` does on both. The rotate
+    /// rows have been driving it from a CAPTURED carry since 2026-08-09; the only difference here
+    /// is that the bit put into the flag shadow is a compile-time constant.
+    ///
+    /// No width field and no width bar of its own: neither instruction consults `operand_size`,
+    /// so the Word and Dword forms are the same operation. `0xf8`/`0xf9` reach the Word allowlist
+    /// only under the gate, which is a MEASUREMENT boundary rather than a correctness one.
+    ///
+    /// Raw clocks ride the `_ => 2` default, which is what the interpreter charges.
+    CarryFlag {
+        set: bool,
+    },
     /// `SETcc r8` (0F 90..9F, register destination). The guest condition encoding is x86's own,
     /// so the emitted `setcc` takes it unchanged; `condition()` in the interpreter is the same
     /// truth table the host flags implement.
@@ -4371,7 +4418,10 @@ impl DirectKind {
             // emitter: `completed_raw` sums this same function, so the end-of-emit assertion
             // agrees with itself whatever this returns. Only an interpreter differential that
             // ACCUMULATES across slot counts separates a wrong arm from a right one.
-            Self::LoadSegReal { .. } => 7,
+            // `PopSegReal` joins it at the same 7: the interpreter's 0x07 / 0x1f arms return
+            // clocks(7) too, and the stack read is charged separately through `word_reads` the
+            // way `Pop16`'s is.
+            Self::LoadSegReal { .. } | Self::PopSegReal { .. } => 7,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
             // forms share the arm because the interpreter charges them from one `Ok(clocks(9))`.
@@ -4435,6 +4485,7 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::Pop16 { .. }
+                    | Self::PopSegReal { .. }
                     | Self::Ret16 { .. }
                     | Self::TestImmMem {
                         width: MemoryWidth::Word,
@@ -4571,6 +4622,64 @@ impl DirectKind {
         )
     }
 
+    /// The operand address and access width of a slot whose emitter reaches the UNRELAXED wide
+    /// guard -- `emit_wide_page_guard`, whose alignment half SIDE-EXITS rather than falling into a
+    /// split-charge slow path. `None` for every other kind.
+    ///
+    /// THIS IS AN ENUMERATION OF EMITTER SITES, not of opcodes, and it is written against them one
+    /// for one. An earlier version of the certain-exit rule listed `RmwIncDec` alone and justified
+    /// the narrowness with "it is the only unrelaxed site this slice can reach"; that was FALSE,
+    /// and the review that caught it named the counterexample the tree already asserts 30 lines
+    /// from the claim (`the_non_relaxed_sites_still_refuse_a_misaligned_access` uses
+    /// `add dword [odd], imm8`, an `AluMemDest`). The list below is the whole of it:
+    ///
+    /// | kind | site |
+    /// |---|---|
+    /// | `RmwIncDec` | `emit_rmw_inc_dec` / `_dword` (`emit/mem.rs`) |
+    /// | `AluMemDest` with `op != 7` | `emit_alu_mem_dest`'s writing branch |
+    /// | `DoubleShiftMem` | `emit_double_shift_mem` |
+    /// | `PushMem` | `emit_push_mem`, the SOURCE read |
+    /// | `CallMem` | `emit_call_mem`, the SOURCE read |
+    /// | `JmpMem` | its emit arm, which calls `emit_ram_read_pointer_inner` directly |
+    /// | `DivMem` | `emit_div_mem`, likewise |
+    /// | `X87 { addr: Some(..) }` | `emit_x87_memory_pointer`, guard before either fast arm |
+    ///
+    /// `AluMemDest`'s CMP (`op == 7`) is excluded because that branch alone reads through
+    /// `emit_ram_read_pointer`, which dispatches to the relaxed lean site. `PushMem` and `CallMem`
+    /// guard their STACK access too, but that address is ESP-relative and so is never decidable by
+    /// the caller; only the source address is reported here.
+    ///
+    /// **Stated at the shipped one-lookup defaults.** `Load`, `LoadExtend`, `AluMemSource`,
+    /// `ImulMem`, `ImulMemAcc`, `TestImmMem`, `Store`, `SetCcMem` and CMP's read all dispatch to a
+    /// relaxed site through `emit_ram_read_pointer` / `emit_store`, and they do so only while
+    /// `one_lookup_load` and `one_lookup_store` are on. With either turned off they become
+    /// unrelaxed too and this list under-covers -- which costs a missed refusal, never a
+    /// miscompile, on an arm no fixture benches.
+    fn unrelaxed_wide_guard_access(self) -> Option<(DirectAddr, MemoryWidth)> {
+        match self {
+            Self::RmwIncDec { width, addr, .. } => Some((addr, width)),
+            Self::AluMemDest {
+                op: 0..=6,
+                width,
+                addr,
+                ..
+            } => Some((addr, width)),
+            Self::DoubleShiftMem { addr, .. }
+            | Self::PushMem { addr }
+            | Self::CallMem { addr, .. }
+            | Self::JmpMem { addr }
+            | Self::DivMem { addr, .. } => Some((addr, MemoryWidth::Dword)),
+            Self::X87 {
+                insn,
+                addr: Some(addr),
+            } => insn
+                .metadata()
+                .memory
+                .map(|access| (addr, x87_memory_width(access))),
+            _ => None,
+        }
+    }
+
     /// A correctness site, not bookkeeping. Defaulting a memory kind to `None` here makes
     /// `kind_segment_access_supported` trivially true AND keeps the segment out of the block's
     /// `SegmentLayout` mask, and `data_matches` SKIPS unused segments, so a cached block would
@@ -4602,6 +4711,11 @@ impl DirectKind {
             }
             Self::Pop { .. }
             | Self::Pop16 { .. }
+            // The STACK segment, not the one being written. `PopSegReal`'s destination is reported
+            // through `written_segment`, which is a different question and must not be folded in
+            // here: doing so would pin the destination in `used` and retire the block every time
+            // an unrelated ES reload moved a value the slot never reads.
+            | Self::PopSegReal { .. }
             | Self::Leave
             | Self::Ret { .. }
             | Self::Ret16 { .. } => Some(SegmentIndex::Ss),
@@ -4671,7 +4785,7 @@ impl DirectKind {
     /// Consumed only by the compile walk's dirty-segment rule.
     fn written_segment(self) -> Option<SegmentIndex> {
         match self {
-            Self::LoadSegReal { segment, .. } => Some(segment),
+            Self::LoadSegReal { segment, .. } | Self::PopSegReal { segment } => Some(segment),
             _ => None,
         }
     }
@@ -4735,6 +4849,11 @@ impl DirectKind {
                 | Self::Push16 { .. }
                 | Self::Pop { .. }
                 | Self::Pop16 { .. }
+                // `PopSegReal` is here for the same load-bearing reason `PushMem` is, one width
+                // over: it exists only in the 16-bit-stack shape, and the stack-width matrix is
+                // what refuses it on a 32-bit stack. Leaving it out of this predicate would skip
+                // the matrix entirely and emit a 16-bit stack read against a 32-bit ESP.
+                | Self::PopSegReal { .. }
                 | Self::Leave
                 | Self::Call { .. }
                 | Self::Call16 { .. }
@@ -4851,18 +4970,53 @@ use emit_input::*;
 /// `segment_bit`, `SegmentLayout.data` and `segment_access_supported`, with no per-segment arm
 /// anywhere, so splitting them would be a distinction the code does not make.
 ///
-/// **CS is refused, explicitly rather than by omission**, and it is the only refusal here that
-/// costs measured exits (12,674 doom, on `0xFF /4` `jmp dword [cs:m]`; zero on quake). Two reasons,
-/// neither of which applies to the data segments. First, a CS-override WRITE is already
-/// unreachable — `segment_access_supported` refuses `write` to a code segment — so admitting CS
-/// would admit reads only, which is a narrower mechanism than the one this gate now expresses.
-/// Second, CS is the one segment this backend homes TWICE: `SegmentLayout` keeps it in the `cs`
-/// field pinned unconditionally by `cs_matches` AND at index 1 of `data`, and
-/// `DirectKind::selector_segment` already excludes it deliberately on the strength of that split.
-/// A CS-override memory kind would be the first thing to read `data[1]` through `descriptor`, i.e.
-/// to depend on the two homes agreeing, for 0.06% of the class. It stays a barrier.
+/// ## The CS override (V86 loop-A slice, `IZARRAVM_V86_LOOP_ROWS`, default ON since 2026-08-20)
+///
+/// CS was refused here explicitly rather than by omission, on two stated grounds, and the tombraid
+/// loop-A census answers both. It is admitted only behind the gate, so the off arm is the refusal
+/// byte for byte.
+///
+/// The refusal cost 12,674 doom exits when it was written (on `0xFF /4` `jmp dword [cs:m]`; zero on
+/// quake). On tombraid-586 it costs the whole of loop A: the driver keeps its counters in its own
+/// code segment, so `0xff /1` `dec word cs:[m]` (95,055,642 interpreted hits), `0x2b /0`
+/// `sub ax, cs:[m]` (95,055,326), `0xc7 /0` `mov word cs:[m], imm16` and `0xa3`
+/// `mov cs:[m], ax` all stop their walks HERE while `classify` would lower every one of them
+/// unchanged. See `v86_loop_rows_enabled` for the disassembly and for why the re-profile's
+/// "prefix mask 64" reads as a data segment and is not one.
+///
+/// The first stated reason was that **a CS-override WRITE is already unreachable**, because
+/// `segment_access_supported` refuses `write` to a code segment, so admitting CS would admit reads
+/// only. That is true in PROTECTED mode and only there: `segment_access_supported`'s first line
+/// returns `true` unconditionally in real mode and V86, where a segment load has no descriptor to
+/// have a type. Loop A is V86. So the mechanism this gate admits is exactly "reads wherever CS is
+/// readable, writes only where a segment load has no descriptor" -- a split the existing function
+/// already expresses, rather than a new gate this one has to add. A block admitted under one of
+/// those modes can never later be entered under the other: CR0.PE and EFLAGS.VM are bits 1 and 2 of
+/// `jit_mode_key`, which `BlockKey` carries and the entry check compares, the same argument
+/// `stack_width_kind` makes for `LoadSegReal`.
+///
+/// One thing the reversal DOES change for the refused half, worth stating because it moves a census
+/// row rather than a behaviour: a protected-mode CS-override WRITE used to stop at this function,
+/// i.e. as a `CompileStop::Structural` with an attributed rejected span. With the gate on it gets
+/// past here and is refused one step later by `kind_segment_access_supported`, which is a
+/// `CompileStop::Retry` and lands in the census as a DORMANT key rather than a rejected span. Same
+/// outcome for the guest, different class in the tables, and a retry rather than a memoized
+/// decline.
+///
+/// The second was that **CS is the one segment this backend homes TWICE**, in `SegmentLayout.cs`
+/// and at index 1 of `data`, so a CS-override memory kind would be the first thing to depend on
+/// the two homes agreeing. They cannot disagree. `Registers::cs()` is literally
+/// `self.segment(SegmentIndex::Cs)` (`lib.rs`), and `SegmentLayout::capture` fills `cs` and
+/// `data[1]` from that one array element in the same call, so `cs_matches` and the `data[1]` half
+/// of `data_matches` are the same predicate -- and `all_data_matches`, which the dispatcher entry
+/// check runs, already compares `data[1]` on every block today. What the admission newly does is
+/// put the CS bit in `used`, which makes `SegmentLayout::descriptor(Cs)` legal (its `debug_assert`
+/// is on `used`) and adds CS to `merge_chain`'s comparison; the latter can refuse no edge that
+/// `link_merge`'s own `self.cs != target.cs` test does not refuse first.
+/// `SegmentLayout::selector` keeps its CS special case and is still reached only from
+/// `MovSegToReg` and `Push { Selector }`, both of which exclude CS by their own guards.
 fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool) -> bool {
-    if prefixes.segment_override == Some(SegmentIndex::Cs) {
+    if prefixes.segment_override == Some(SegmentIndex::Cs) && !v86_loop_rows_enabled() {
         return false;
     }
     prefixes
@@ -5373,6 +5527,189 @@ pub(crate) fn set_fpu_loop_rows_for_test(forced: Option<bool>) {
 #[cfg(test)]
 pub(crate) fn parse_fpu_loop_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
     parse_fpu_loop_rows_arm(value)
+}
+
+/// Whether the backend admits the SIX rows the tombraid FMV census's loop A names, plus the two
+/// collateral forms the same code path needs (`IZARRAVM_V86_LOOP_ROWS`). **DEFAULT ON since
+/// 2026-08-20** (the slice shipped OFF for three commits; the flip is priced in the spelling table
+/// below).
+///
+/// The rows, and each one's home:
+///
+/// | row | form | where it lowers |
+/// |---|---|---|
+/// | `0x07` POP ES (97.3M hits) and `0x1f` POP DS (6.0M) | no operand | `DirectKind::PopSegReal` |
+/// | `0x3d` CMP AX,imm16 (ALU form 5 at Word) | no operand | `DirectKind::AluImm` |
+/// | `0xa1` MOV AX,moffs16 | no operand | `DirectKind::Load` at `MemoryWidth::Word` |
+/// | `0xf8` CLC, `0xf9` STC | no operand | `DirectKind::CarryFlag` |
+/// | `0xff /1` DEC m16 with a CS override | memory | `DirectKind::RmwIncDec`, already lowered |
+/// | `0x2b /0` SUB r16,m16 with a CS override | memory | `DirectKind::AluMemSource`, already lowered |
+///
+/// plus `0xa3` MOV moffs16,AX and `0xc7 /0` MOV m16,imm16 with a CS override, which the same
+/// straight-line run passes through and which the census measures as rows of their own.
+///
+/// WHY IT EXISTS. `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1: after the FPU-loop slice
+/// (`IZARRAVM_FPU_LOOP_ROWS`) closed loop B, the tombraid-586 FMV window's remaining `rejected`
+/// mass is loop A, a V86 16-bit driver loop at linear `0xC8FDE-0xC9035` (UMB, mode key `0x316`,
+/// ~93M iterations). A decoder probe over the fixture disassembles it as a BIOS-tick watchdog that
+/// keeps its counters in its OWN code segment:
+///
+/// ```text
+/// 0xc9008 06                    push es
+/// 0xc9009 b8 40 00              mov ax, 0x40
+/// 0xc900c 8e c0                 mov es, ax
+/// 0xc900e 26 a1 6c 00           mov ax, es:[0x6c]   ; BIOS tick 0040:006C
+/// 0xc9012 2e 2b 06 f5 00        sub ax, cs:[0xf5]   ; -> linear 0xc8115
+/// 0xc9017 3d b6 00              cmp ax, 0xb6
+/// 0xc901a 73 1b                 jnb
+/// 0xc901c 2e ff 0e f3 00        dec word cs:[0xf3]  ; -> linear 0xc8113
+/// 0xc9021 75 0e                 jne
+/// 0xc9023 2e c7 06 f3 00 ff ff  mov word cs:[0xf3], 0xffff
+/// 0xc902a 2e ff 0e f1 00        dec word cs:[0xf1]  ; -> linear 0xc8111
+/// 0xc902f 74 06                 je
+/// 0xc9031 07                    pop es
+/// 0xc9032 59 5b 58              pop cx / pop bx / pop ax
+/// 0xc9035 f8                    clc
+/// 0xc9036 c3                    ret
+/// ```
+///
+/// **THE RE-PROFILE MISNAMED THE TWO `prefix_unsupported` ROWS' SEGMENT.** §4.1 and the evening
+/// handoff both call them "word-memory forms (both prefix mask 64)" and the queue item calls the
+/// refusal "the segment-override prefix", which reads as one of the five DATA segments -- the class
+/// `prefixes_supported_for` has admitted since the rejected-row campaign's slice 6. Mask 64 is
+/// **CS**: `BarrierShape::from_insn` writes `(segment_index(seg) + 1) << 5`, and
+/// `segment_index(Cs)` is 1. ES would be 32, SS 96, DS 128. That was settled by measurement rather
+/// than by arithmetic -- a temporary probe printed the decoder's own
+/// `insn.prefixes.segment_override` for every instruction in the window, and every mask-64 row came
+/// back `Cs`. It matters because CS was refused DELIBERATELY, with a written justification on
+/// `prefixes_supported_for`, so this is a reversal rather than a widening.
+///
+/// The rows' interpreted runtime hits over the 20e9 census prefix, and their static unbound exits:
+///
+/// * `0x07` 97,347,816 hits / 95,057,524 exits;
+/// * `0x3d` 96,182,170 / 587,085;
+/// * `0xa1` 95,614,884 / 95,502,528;
+/// * `0xf8` 95,090,745 / 94,883,220;
+/// * `0xff /1` cs: 95,055,642 / 95,020,029;
+/// * `0x2b /0` cs: 95,055,326 / 0.
+///
+/// THE ROWS LAND TOGETHER OR NOT AT ALL, and the mechanism is per BLOCK rather than one long walk.
+/// `DirectKind::Jcc` is terminal, so the loop is four compile units, and the barrier census records
+/// the FIRST instruction that stops each one:
+///
+/// * `0xc900e`: `0xa1` -> `0x2b cs:` -> `0x3d` -> `jnb`. It stops at `0xa1` today, and each
+///   admission moves the stop one instruction along, so all three are needed for the unit to exist.
+/// * `0xc901c`: `0xff /1 cs:` -> `jne`, two slots with a terminal last, which the walk's
+///   fewer-than-three rule admits. See the CERTAIN-EXIT rule in the compile walk for why this one
+///   stays a barrier anyway.
+/// * `0xc9023`: `0xc7 /0 cs:` -> `0xff /1 cs:` -> `je`, the same.
+/// * `0xc9031`: `0x07` -> three `Pop16` -> `0xf8`, stopping before the `ret` on
+///   `MAX_BLOCK_STACK_ACCESSES`.
+///
+/// The census numbers say the same thing: `0x2b cs:` carries ZERO unbound exits and `0x3d` carries
+/// 587,085, because both are interior to the `0xc900e` unit, while `0x07`, `0xa1`, `0xf8` and
+/// `0xff /1` each carry ~95M because each is its own entry target. A proper subset relocates the
+/// stop onto the next member and buys nothing, which is the census relocation trap in its exact
+/// local form.
+///
+/// THE SPELLING TABLE, trimmed and case-folded on the way in, matching `IZARRAVM_FPU_LOOP_ROWS`
+/// exactly, default included since the 2026-08-20 flip:
+///
+/// * **unset** or `1` / `on` -> ON. The shipped default. Recorded before that date, an "on" leg is
+///   the non-default arm.
+/// * `` (empty), `0` or `off` -> OFF. The escape, the pre-slice refusal and the A/B base.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
+///   fell through to the default would be read as "the arm I asked for changed nothing".
+///
+/// WHAT PRICED THE FLIP, in the order the evidence was taken
+/// (`.bench/results/tomb-v86-loop-20260820/`):
+///
+/// * **tombraid-586 wall ladder**, one binary, A B B A A B, full 28e9 row: **-13.43% min-wall**
+///   (180.500 s against 208.498 s), arms fully non-overlapping, row rt 0.8100 -> 0.9349, 16-bit
+///   insns/entry 3.568 -> 5.607.
+/// * **Census closure**, 20e9 boot+FMV prefix: the gate-OFF arm is byte-identical to MAIN's own
+///   rebuilt binary on twelve counters, and the ON arm's `rejected` class falls 299,371,338 with
+///   the rows' own mass reconciling to a residual of **exactly zero**.
+/// * **doom-486**, the protected-mode CS-override READ half the tombraid ladder cannot price:
+///   `0xFF /4 jmp dword [cs:m]` is lowered, `jit_direct_exit_cross_page_or_alignment` moves by
+///   **0**, and the guest oracle is unchanged at 2134 gametics in 2883 realtics.
+/// * **Board leg, gate ON**: 12 of 12 fixtures pass against main's own pins.
+/// * **wolf3d-586**, the one fixture whose mechanism counters moved hard: **NEUTRAL** over twelve
+///   legs across two ladders of opposite order (median +0.008%), and its row-level census shows
+///   every departing shape inside this gate's named population with a zero reconciliation
+///   residual. Its inertness is RELOCATION, not inaction: the admitted rows convert and the blocks
+///   stop one or two instructions later on `0x01 /0` ADD word memory, `0x8E /0`, `0x61` POPA and
+///   `0xF7 /7` word, every one a documented refusal. That is the next slice for wolf3d, not a
+///   defect in this one.
+pub(crate) fn v86_loop_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = V86_LOOP_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_v86_loop_rows_arm(std::env::var("IZARRAVM_V86_LOOP_ROWS")))
+}
+
+/// The `IZARRAVM_V86_LOOP_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `v86_loop_rows_enabled` for the contract.
+fn parse_v86_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset = ON since the 2026-08-20 flip; `0` / `off` is the escape. Same shape and the
+        // same trap as `IZARRAVM_FPU_LOOP_ROWS`, `IZARRAVM_ROTATE_ROWS` and `IZARRAVM_COUNT_LANES`:
+        // an off leg must EXPORT `0`, and every "defaults" leg recorded BEFORE this flip is the
+        // OFF arm. NULLING the variable is not unsetting it -- PowerShell leaves it present and
+        // empty, and the empty string is spelled OFF two arms down, which is how three earlier
+        // evidence directories came to measure their default-ON knobs off.
+        Err(std::env::VarError::NotPresent) => return true,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_V86_LOOP_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `1` / `on` (the shipped default: the six 16-bit \
+                 V86-loop rows and the CS-override clause), and `0` / `off` (the escape, under \
+                 which every one of them stays a barrier)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_V86_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default: POP ES/DS, CMP AX imm16, MOV AX moffs16, CLC/STC and the \
+             CS-override word-memory forms are all lowered), and `0` / `off` (the escape, under \
+             which every one of them stays a barrier). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `FPU_LOOP_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run both arms in one process. Every fixture for these rows states its
+// arm through here in BOTH directions -- the refusal fixtures need the off arm stated rather than
+// inherited, so that they keep meaning what they say the day the default moves.
+#[cfg(test)]
+thread_local! {
+    static V86_LOOP_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the V86-loop-row arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_V86_LOOP_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_v86_loop_rows_for_test(forced: Option<bool>) {
+    V86_LOOP_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `v86_loop_rows_enabled` caches its env reading
+/// in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process
+/// and never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_v86_loop_rows_arm(value)
 }
 
 /// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and
@@ -5918,13 +6255,30 @@ fn stack_width_kind(
         // V86 is admitted deliberately -- `.bench/prince_c` runs V86 under JEMMEX, and V86 takes
         // the real-mode path in `load_segment_checked` before the protected-mode branch is even
         // considered.
-        DirectKind::LoadSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
+        //
+        // `PopSegReal` rides the same refusal, and it must: its emit arm is `LoadSegReal`'s three
+        // stores with the selector coming off the stack instead of out of a register, so the
+        // descriptor question is identical and the source of the selector changes nothing about
+        // it. The mode-key argument above carries across unchanged -- V86 is bit 2 of
+        // `jit_mode_key`, so a block admitted here under real mode or V86 can never later be
+        // entered under protected mode.
+        DirectKind::LoadSegReal { .. } | DirectKind::PopSegReal { .. }
+            if cpu.is_protected_mode() && !cpu.is_v86_mode() =>
+        {
             return None;
         }
         other => other,
     };
     match (kind, cpu.stack_is_32bit(), operand_size) {
         (kind, _, _) if !kind.uses_stack() => Some(kind),
+        // `PopSegReal` is matched BEFORE the blanket 32-bit-stack arm below, because it is the one
+        // stack kind with no 32-bit shape at all: `classify` refuses it at Dword, so the arm below
+        // could never wave it through, but a future edit that admitted the Dword form would
+        // otherwise reach an emitter that only knows the 16-bit one. Refusing here says so.
+        (DirectKind::PopSegReal { segment }, false, OperandSize::Word) => {
+            Some(DirectKind::PopSegReal { segment })
+        }
+        (DirectKind::PopSegReal { .. }, _, _) => None,
         (kind, true, OperandSize::Dword) => Some(kind),
         (DirectKind::Push { source }, false, OperandSize::Word) => {
             Some(DirectKind::Push16 { source })
@@ -6677,6 +7031,77 @@ fn compile_with_instruction_limit(
             PlannedInsn::Native(_)
                 if rotate_rows_arm() == RotateRowsArm::HeatGated
                     && rotate_row_count_byte_is_patched(cpu, &insn, expected_phys) =>
+            {
+                PlannedInsn::HardBoundary
+            }
+            // The CERTAIN-EXIT rule (V86 loop-A slice), the same downgrade for a different reason.
+            //
+            // `emit_rmw_inc_dec` is one of the memory sites the one-lookup relaxation never
+            // reached: it guards with `emit_wide_page_guard`, which ends in an alignment test that
+            // side-exits rather than falling into a split-charge slow path. `classify` has said so
+            // in prose for a long time, on the form-1 memory shape it refuses -- "admitted today,
+            // an odd operand would sit INSIDE the block and side-exit at that slot on every
+            // execution, so nothing after it retires natively".
+            //
+            // That prose was a reason to refuse a whole FORM. It is the wrong currency for an
+            // operand whose address is a compile-time CONSTANT, which is what a `disp`-only
+            // addressing mode is: there the alignment is decidable at compile time, so the slot is
+            // either always fine or always an exit, and admitting the second is strictly worse than
+            // the barrier it replaces. A rejected span short-circuits to the interpreter through
+            // the decline memo; a certain-exit slot pays a dispatcher lookup, a segment check, a
+            // native entry, the address, the page-cross bound, the alignment test and an exit stub,
+            // and THEN the interpreter runs the instruction anyway.
+            //
+            // The tombraid loop is where it bites: `dec word cs:[0xf3]` at `0xc901c` resolves to
+            // linear `0xc8113`, and a real-mode segment base is a multiple of 16, so the operand's
+            // parity is the displacement's. Its block is `RmwIncDec` plus a terminal `Jcc`, which
+            // the two-slot rule admits, and it is the target of 95,020,029 unbound exits per census
+            // prefix. Without this rule the slice would compile that block and exit from slot ZERO
+            // on all of them.
+            //
+            // SCOPE, and the first version of this comment got it wrong in a way worth recording.
+            // It said "only `RmwIncDec`, because it is the only unrelaxed site this slice can
+            // reach", and that was false: `emit_alu_mem_dest` takes the same unrelaxed guard for
+            // every op but CMP, `classify` lowers `0x81`/`0x83` memory forms at `operand_width`,
+            // and the CS clause of `prefixes_supported_for` is a PREFIX gate -- it unlocks every
+            // memory kind at once, not the two the tombraid loop happens to use. The census says
+            // so on its face: `0x83 /5 cs:` leaves the rejected table on the ON arm carrying
+            // 9,464,397 unbound exits. Tombraid's own instance is aligned, so nothing was measured
+            // wrong, but the argument was not sound and the next fixture would have found the hole.
+            //
+            // `DirectKind::unrelaxed_wide_guard_access` is the enumeration now, written against the
+            // emitter sites one for one.
+            //
+            // COMPLETENESS, argued rather than asserted this time. A certain-exit slot needs an
+            // unrelaxed site AND a statically decidable misaligned address, so the question is
+            // which of this slice's admissions can produce one. Taken one at a time:
+            //
+            //  * `PopSegReal` reads the stack, whose address is ESP-relative and therefore never
+            //    decidable here;
+            //  * `CarryFlag` and the ALU form-5 arm touch no memory at all;
+            //  * `0xa1` / `0xa3` produce `Load` and `Store`, which dispatch to the RELAXED lean
+            //    sites and are SERVED misaligned rather than exiting;
+            //  * the CS clause of `prefixes_supported_for` unlocks every memory kind at once,
+            //    including all eight unrelaxed ones.
+            //
+            // So the CS clause is the ONLY admission here that can create a certain-exit slot, and
+            // the rule is scoped to it. That is why the predicate tests `addr.segment == Cs`.
+            //
+            // Not scoping it that way was tried and is worse. An unconditional version refuses
+            // seven pre-existing fixtures that deliberately build a statically misaligned disp-only
+            // operand to exercise the RUNTIME guard (`the_non_relaxed_sites_still_refuse_a_
+            // misaligned_access`, `a_misaligned_x87_access_still_exits`, the double-shift and
+            // memory-ALU transactional rows, and two x87 alignment rows) -- and it would be
+            // changing a hazard that PRE-DATES this slice, on a knob whose A/B cannot price it.
+            // A statically misaligned `add dword [odd], imm8` through DS has certain-exited since
+            // long before this branch; turning that into a barrier is a real and separate slice,
+            // with its own measurement, and it is NOT this one.
+            //
+            // Still narrow one more way: only a base-less, index-less, lane-less address, because
+            // anything else is not decidable here. A register-relative CS operand keeps its runtime
+            // guard and is served or refused at run time exactly as before.
+            PlannedInsn::Native(kind)
+                if v86_loop_rows_enabled() && certainly_exits_on_alignment(cpu, kind, d) =>
             {
                 PlannedInsn::HardBoundary
             }
@@ -7493,6 +7918,52 @@ fn static_control_target(kind: DirectKind) -> Option<u32> {
 
 fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u32) -> bool {
     static_control_target(kind).is_none_or(|delta| entry_eip.wrapping_add(delta) <= limit)
+}
+
+/// Whether this slot's operand address is decidable at compile time and FAILS the alignment guard
+/// its emitter will produce, i.e. a slot that would side-exit on every single execution. See the
+/// call site in the compile walk for why that is worse than the barrier it would replace.
+///
+/// `base`, `index` and `disp_lane` must all be absent: with a register in the address the operand
+/// moves at run time, and with a lane the displacement itself is patchable, so neither is decidable
+/// here. What is left is the `disp`-only mode (`mod = 00, rm = 110` at Word address size, `rm = 101`
+/// at Dword), which is exactly the shape the tombraid driver uses.
+///
+/// The offset is masked the way `emit_effective_address` masks it -- to sixteen bits in a 16-bit
+/// code segment -- BEFORE the segment base is added, because that is the order the emitted address
+/// is computed in and a mask applied afterwards would name an address the guest never forms.
+/// `emit_alignment_test` runs on RAX, i.e. on the LINEAR address after the base add, so the base
+/// belongs in this arithmetic. It is inert in real mode and V86, where a base is a multiple of 16
+/// and cannot move bit 0 or bit 1, and load-bearing in protected mode, where a data segment's base
+/// is arbitrary; `a_protected_mode_segment_base_decides_the_alignment` is the row that makes it so.
+fn certainly_exits_on_alignment(cpu: &CpuGsw, kind: DirectKind, d: bool) -> bool {
+    let Some((addr, width)) = kind.unrelaxed_wide_guard_access() else {
+        return false;
+    };
+    // A CS-OVERRIDE OPERAND, which is exactly and only what this gate newly admits. `decode` folds
+    // an explicit override into `AddrMode.segment` and no addressing mode DEFAULTS to CS (the
+    // defaults are DS, and SS for the BP forms), so `segment == Cs` is equivalent to "the
+    // instruction carried a `2E` prefix" and needs no separate flag to test.
+    //
+    // See the call site for why the rule stops here rather than covering every statically
+    // misaligned unrelaxed access: a non-CS one has certain-exited since long before this slice,
+    // and fixing that is a separate change with its own A/B.
+    if addr.segment != SegmentIndex::Cs {
+        return false;
+    }
+    if !width.needs_alignment_guard() {
+        return false;
+    }
+    if addr.base.is_some() || addr.index.is_some() || addr.disp_lane.is_some() {
+        return false;
+    }
+    let offset = if d { addr.disp } else { addr.disp & 0xffff };
+    let linear = cpu
+        .registers
+        .segment(addr.segment)
+        .base
+        .wrapping_add(offset);
+    linear & width.alignment_mask() != 0
 }
 
 fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
