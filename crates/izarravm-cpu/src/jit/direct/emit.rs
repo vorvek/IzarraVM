@@ -584,7 +584,40 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
             }
-            DirectKind::Test { a, b } => emit_test(&mut e, a, b),
+            // The Dword arm is the ORIGINAL `emit_test`, called with the original arguments, so
+            // the gate-OFF binary emits byte-identical code for every TEST it has ever emitted.
+            // Routing Dword through the width-parameterised helper instead would have been tidier
+            // and would have changed three host instructions on a path this slice is not measuring.
+            DirectKind::Test {
+                a,
+                b,
+                width: MemoryWidth::Dword,
+            } => emit_test(&mut e, a, b),
+            // Word (`IZARRAVM_TEST_WORD_ROWS`). `emit_test_byte`'s shape at the other narrow
+            // width: read both register operands through `emit_read_store_value`, which masks to
+            // the width, then hand them to the same `emit_test_preloaded` that has been emitting
+            // the Byte form in production. That helper already carries the 16-bit `alu_r16_r16`
+            // and the Word lazy-flag descriptor `0x8000_0102`; neither is new code.
+            //
+            // TEST writes no register, so the usual Word hazard -- preserving the destination's
+            // high half -- does not arise here at all. What has to be right is the FLAGS, and the
+            // helper gets them from a genuine 16-bit host AND, which is what the interpreter's
+            // `self.alu(4, value, reg, BusWidth::Word)` computes: CF/OF cleared, SF from bit 15,
+            // ZF over sixteen bits, PF over the low byte, AF left live by `emit_logic_live_af`.
+            DirectKind::Test {
+                a,
+                b,
+                width: MemoryWidth::Word,
+            } => {
+                emit_read_store_value(&mut e, StoreSource::Reg(a), MemoryWidth::Word, Reg::RAX);
+                emit_read_store_value(&mut e, StoreSource::Reg(b), MemoryWidth::Word, Reg::RCX);
+                emit_test_preloaded(&mut e, MemoryWidth::Word);
+            }
+            // `classify` builds this kind from `operand_width`, which is Word or Dword and nothing
+            // else, so the remaining widths are unreachable rather than unhandled.
+            DirectKind::Test { .. } => {
+                unreachable!("TEST r/m,r is only ever Word- or Dword-wide")
+            }
             DirectKind::TestByte { a, b } => emit_test_byte(&mut e, a, b),
             DirectKind::Imul { dst, src } => emit_imul(&mut e, dst, src),
             DirectKind::ImulImm { dst, src, imm } => emit_imul_imm(&mut e, dst, src, imm),

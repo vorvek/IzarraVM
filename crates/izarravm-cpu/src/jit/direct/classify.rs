@@ -306,6 +306,25 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     | 0xf8
                     | 0xf9
             ))
+        // THE WORD TEST ROW (`IZARRAVM_TEST_WORD_ROWS`, default OFF) is a THIRD allowlist, written
+        // as its own term for the reason the V86 term above is: the gate-off arm stays byte-
+        // identical to the pre-slice tree by inspection rather than by reading a hundred-line
+        // `matches!`.
+        //
+        // `0x85` is named in this file's header as a Dword sibling whose kind hard-codes Dword,
+        // and that WAS the whole reason it was refused at Word. `DirectKind::Test` carries a
+        // `width` as of this slice, exactly as `0xC7`, `0x81`, `0xB8..=0xBF` and `0xA1`/`0xA3`
+        // each grew one before it, so the header entry is discharged rather than excepted -- see
+        // the arm below and `test_word_rows_enabled` for the census that ranked it (duke3d-586,
+        // 53,583,389 runtime hits, 42.2% of the whole rejected table) and for the suffix
+        // measurement that prices its extension exposure at ONE instruction.
+        //
+        // ONLY `0x85`, and only the REGISTER form, which the arm enforces. `0xA9` (TEST eAX, imm)
+        // is the other Word-shaped member of the family and its emitter is already fully
+        // width-parameterised, so it is one entry away -- it stays out because the census measures
+        // ZERO `0xA9` rows at any width, and an unmeasured admission is the campaign's standing
+        // refusal rather than a free ride. `0x84`/`0xA8` are byte forms and were never at issue.
+        && !(test_word_rows_enabled() && insn.opcode == 0x85)
         // Group 3's `/0` (TEST r/m16, imm16) is the ONE width-safe member of `0xf7`, so it is
         // admitted by sub-opcode here rather than by adding `0xf7` to the list above: every other
         // member's arm (NEG, MUL, IMUL, DIV) deliberately carries no width field and documents
@@ -1108,12 +1127,31 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 };
                 return Some(DirectKind::TestByte { a, b: m.reg });
             }
+            // TEST r/m16|32, r16|32, REGISTER form. `width` is `operand_width` as of the
+            // 2026-08-21 duke slice; it was a hard-coded Dword, which is why the header's
+            // "deliberately NOT here" list named this opcode. The Word arm is reached only when
+            // `test_word_rows_enabled()` opened the gate above, so the Dword behaviour is
+            // unchanged in both arms and the Word one exists only under the knob.
+            //
+            // The MEMORY form falls to `return None` at both widths, exactly as it did before this
+            // slice. It has no kind, no emitter and no census row on any measured fixture.
+            //
+            // No `raw_clocks` field is needed and none is added: the interpreter's 0x85 arm ends
+            // in `Ok(clocks(2))` without consulting `operand_size`, and `DirectKind::raw_clocks`
+            // has no `Test` arm, so both widths ride the `_ => 2` default and charge exactly what
+            // the interpreter charges. This is the field `Load`, `Store` and `MovExtendReg` each
+            // had to add; TEST is the case where the default is already right, and saying so here
+            // is what keeps the next reader from adding a wrong one.
             0x85 => {
                 let m = insn.modrm?;
                 let DecodedOperand::Reg(a) = insn.operand? else {
                     return None;
                 };
-                return Some(DirectKind::Test { a, b: m.reg });
+                return Some(DirectKind::Test {
+                    a,
+                    b: m.reg,
+                    width: operand_width,
+                });
             }
             0xa8 => {
                 return Some(DirectKind::TestImmReg {

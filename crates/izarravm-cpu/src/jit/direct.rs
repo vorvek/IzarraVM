@@ -3538,9 +3538,27 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
         addr: DirectAddr,
     },
+    /// `TEST r/m16|32, r16|32` (0x85), REGISTER form -- AND for flags with no write-back.
+    ///
+    /// `width` arrived with the 2026-08-21 duke slice and is the whole of that slice on this kind.
+    /// It is the same move `MovImm`, `AluImm`, `Load` and `Store` each made in their own slice:
+    /// the kind used to hard-code Dword, which is why `0x85` is named in the classify header's
+    /// "deliberately NOT here" list as a Dword sibling with no width field. Now that it carries
+    /// one, the entry on that list is discharged rather than excepted, and the Word admission is a
+    /// GATED allowlist term (`test_word_rows_enabled`) rather than an unconditional one.
+    ///
+    /// **The Dword emission is untouched, deliberately.** `emit` keeps the original `emit_test`
+    /// for `MemoryWidth::Dword` and routes only Word to `emit_test_preloaded`, so the gate-OFF arm
+    /// is byte-identical to the pre-slice tree by inspection: with the gate off no Word `Test` is
+    /// ever constructed, and every Dword one reaches the emitter it always did.
+    ///
+    /// The MEMORY form is still refused in the arm, at both widths, and the census says nothing
+    /// asks for it: duke3d-586's whole `0x85` population is register-form (twelve rows,
+    /// 53,583,389 runtime hits) with **zero** memory rows.
     Test {
         a: u8,
         b: u8,
+        width: MemoryWidth,
     },
     TestByte {
         a: u8,
@@ -5710,6 +5728,152 @@ pub(crate) fn set_v86_loop_rows_for_test(forced: Option<bool>) {
 #[cfg(test)]
 pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
     parse_v86_loop_rows_arm(value)
+}
+
+/// Whether `classify` admits **`0x85` TEST r/m16, r16, REGISTER form, at Word operand size**
+/// (`IZARRAVM_TEST_WORD_ROWS`).
+///
+/// **DEFAULT OFF.** An unset knob is the pre-slice refusal and the A/B base, the same contract
+/// `IZARRAVM_IMM8_LANES` ships under and the OPPOSITE of `IZARRAVM_V86_LOOP_ROWS` /
+/// `IZARRAVM_ROTATE_ROWS` / `IZARRAVM_COUNT_LANES` / `IZARRAVM_FPU_LOOP_ROWS`, whose unset arm is
+/// the slice. Both arms ship in one executable because this box has measured 6% wall variance
+/// between builds of byte-identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a
+/// cross-build comparison would not be evidence.
+///
+/// # The row, from the census that ranked it
+///
+/// `.bench/results/duke-census-slice-20260821/`, duke3d-586 LONG row at main `49c7ad97` — the
+/// first duke census taken after `IZARRAVM_ROTATE_ROWS`, `IZARRAVM_COUNT_LANES`,
+/// `IZARRAVM_FPU_LOOP_ROWS` and `IZARRAVM_V86_LOOP_ROWS` all became the shipped default. Ranked by
+/// `runtime_hits` per [[barrier-census-mispredicts-both-ways]], the whole rejected table is
+/// 126,933,336 runtime hits over 287 rows, and **`0x85` register-form Word is 53,583,389 of them
+/// -- 42.2%, over twelve rows, 2.4x the next single row.** It is the head either way you count:
+/// the largest of the twelve is 25,275,365 on its own, which is still the table's #1 against
+/// `0x8E /0`'s 22,638,814.
+///
+/// | `/reg` | asize | pfx | `runtime_hits` | `unbound_exits` | mean suffix | max suffix |
+/// |---|---|---|---:|---:|---:|---:|
+/// | 1 | dword | 0x66 | 25,275,365 | 25,201,852 | 0.94 | 1 |
+/// | 1 | word | — | 8,520,955 | 8,430,959 | 1.00 | 1 |
+/// | 2 | word | — | 7,053,194 | 11,527 | 1.00 | 1 |
+/// | 6 | dword | 0x66 | 4,685,484 | 4,381,759 | 1.00 | 1 |
+/// | 0 | dword | 0x66 | 4,203,893 | 1,452,445 | 0.99 | 3 |
+/// | 3 | dword | 0x66 | 1,778,127 | 1,666,320 | 1.00 | 1 |
+/// | 7 | dword | 0x66 | 1,251,170 | 981,894 | 1.00 | 1 |
+/// | 2 | dword | 0x66 | 646,191 | 493,959 | 1.00 | 1 |
+/// | 0/7/6/3 | word | — | 169,010 | 22,059 | 1.00 | 1 |
+///
+/// `modrm_reg` is a register NUMBER on this opcode and not a group extension, which is why the row
+/// is twelve rows rather than one: TEST r/m, r has no `/digit` form. All twelve are one shape.
+///
+/// # Why it clears the standing bar on further Word lowering, which is the only reason it ships
+///
+/// The re-profile's "NOT levers on this row" section closes further Track-A Word lowering behind a
+/// rule rather than a verdict: **S1 was implemented and REFUTED on wall (-3.0%) by extension
+/// exposure into patched spans, and extension exposure must be PRICED before any further Word
+/// row is admitted.** This row is priced by the census's own suffix columns and it is the
+/// cheapest possible answer: **`max_native_suffix` is 1 on eleven of the twelve rows and 3 on the
+/// twelfth**, with a mean of ~1.00. The counterfactual block grows by the TEST plus exactly one
+/// instruction and then stops, so the span this admission exposes is bounded at one instruction by
+/// measurement rather than by hope. Compare the rows this reasoning REFUSES in the same table:
+/// `0xD3 /4` memory dword carries a mean suffix of 26.88 (max 31) and `0xF6 /3` register 10.49.
+/// Those are extension-exposure rows; this one is not.
+///
+/// The one instruction is almost always the paired `Jcc`, which is terminal, so what the admission
+/// buys is not a longer block so much as a block that ENDS AT A BRANCH instead of at an unbound
+/// exit. Predict `jit_direct_linked_transfers` up and `jit_direct_unresolved_static_unbound` down
+/// by roughly the row's own 42.6M exits.
+///
+/// # What is deliberately NOT in this gate
+///
+/// * **The MEMORY form of `0x85`, at either width.** It has no arm today and the duke census
+///   measures **zero** memory rows for this opcode, so admitting it would be a formation change
+///   with no row to attribute it to.
+/// * **`0xA9` TEST eAX, imm at Word.** Its kind (`TestImmReg`) has carried a width since it was
+///   written and `emit_test_imm_reg` is fully width-parameterised, so it is one allowlist entry
+///   away — and it stays out anyway, because the duke census measures **zero** `0xA9` rows at any
+///   width. Riding it along would be an unmeasured admission, which is the campaign's standing
+///   refusal. It is a one-line follow-up for whichever census first ranks it.
+/// * **`0x8E /0` MOV Sreg, m16, the table's #2 row at 22,638,814 hits (17.8%).** Refused on duke's
+///   own law rather than on difficulty: its mean suffix is **0.31**. It TERMINATES rather than
+///   EXTENDS — and it must, because a segment write makes its block a segment-write block, which
+///   bars the self-loop shape and attempts no static link. Converting it would move ~1.3
+///   instructions per hit into native code and buy nothing on the link axis.
+///
+/// # The spelling table
+///
+/// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
+/// whitespace and one set from a PowerShell ladder picks up capitalisation.
+///
+/// * unset, `` (empty), `0` or `off` -> OFF. The shipped base.
+/// * `1` or `on` -> ON. The slice.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason in this slice's terms: a
+///   mistyped ladder leg (`=yes`, `=test`, `=true`) that fell through to OFF would run the BASE
+///   and be read as "the TEST word row did nothing", which is the one wrong conclusion this slice
+///   exists to avoid.
+pub(crate) fn test_word_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = TEST_WORD_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_test_word_rows_arm(std::env::var("IZARRAVM_TEST_WORD_ROWS")))
+}
+
+/// The `IZARRAVM_TEST_WORD_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `test_word_rows_enabled` for the contract.
+fn parse_test_word_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_TEST_WORD_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset, `0` or `off` (the shipped base, under which `0x85` at Word \
+                 stays a barrier), and `1` or `on` (the Word register-form TEST admission)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_TEST_WORD_ROWS={other:?} names no arm; accepted spellings are unset, `0` or \
+             `off` (the shipped base) and `1` or `on` (the `0x85` TEST r/m16,r16 register-form \
+             admission at Word operand size). \
+             Refusing to guess: a mistyped ladder leg that silently ran the base would be read as \
+             the slice failing"
+        ),
+    }
+}
+
+// Per-THREAD, for `ROTATE_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run both arms in one process, so one test's arm selection must not
+// reach another's compile. Since the arm is default-OFF, every positive fixture for this row MUST
+// force it on through here or it would test the refusal and call it a lowering; and every refusal
+// fixture states the off arm rather than inheriting it, so that it keeps meaning what it says the
+// day the default moves.
+#[cfg(test)]
+thread_local! {
+    static TEST_WORD_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the Word-TEST arm on this thread for the length of a fixture; `None` restores the ambient
+/// `IZARRAVM_TEST_WORD_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_test_word_rows_for_test(forced: Option<bool>) {
+    TEST_WORD_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `test_word_rows_enabled` caches its env
+/// reading in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per
+/// process and never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_test_word_rows_arm(value)
 }
 
 /// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and

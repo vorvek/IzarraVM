@@ -111,18 +111,44 @@ fn word_size_byte_forms_are_lowered() {
 /// form 5 on the Word allowlist behind `IZARRAVM_V86_LOOP_ROWS`, so it is an allowlist refusal on
 /// the OFF arm and a lowering on the ON one. Running the table on both arms is what keeps the
 /// other seven rows covered on both while pinning `0x05`'s flip in the place that owns it.
+///
+/// **`0x85` moved the same way on 2026-08-21, behind `IZARRAVM_TEST_WORD_ROWS`** (the duke census
+/// slice: twelve rows, 42.2% of duke3d-586's whole rejected table). Its `DirectKind` grew a width
+/// field, which is the very property this table's header names as the reason the opcode was
+/// refused, so the row is now GATE-DEPENDENT rather than unconditionally refused. It is handled
+/// the way `0x05` is: the refusal table states `IZARRAVM_TEST_WORD_ROWS=off` explicitly rather
+/// than inheriting the ambient knob -- this suite is run on BOTH arms of every admission gate, and
+/// a row that leaned on the default would go red on the ON arm while certifying nothing on the OFF
+/// one -- and the flip itself is asserted at the end so the explicit `off` cannot quietly become
+/// the whole test. `cpu_jit_test_word_row_test.rs` pins it from the other side.
+///
+/// `0xa9` stays in the table unconditionally, and that is deliberate rather than incidental: it is
+/// the one member of the TEST family the duke slice measured at ZERO census rows and therefore
+/// left refused, so this row is what keeps it out.
 #[test]
 fn word_size_dword_siblings_stay_refused() {
+    // Stated, not inherited. See the header: with the ambient knob on, every `0x85` row below
+    // would fail while asserting nothing about the allowlist.
+    jit::direct::set_test_word_rows_for_test(Some(false));
     // `0x81` and `0xf7 /0` left this table on 2026-08-08 (the wolf3d demo-workload census ranked
     // them at 634M block-stopping hits each); their admissions are pinned by
     // `word_size_0x81_register_forms_are_lowered` and
     // `word_size_group3_test_forms_follow_the_slice` below.
     //
-    // The `bool` is "refused on the ON arm too". `0x05` is the one row that is not: its whole
-    // form (ADD/OR/AND/SUB/XOR/CMP with a full-width immediate) joins the allowlist under the
-    // gate, which `cpu_jit_v86_loop_rows_test.rs` pins from the other side.
+    // The `bool` is `refused_on_the_v86_on_arm` and it names ONE gate: `IZARRAVM_V86_LOOP_ROWS`,
+    // the arm the loop below sweeps. It was written when that was the only gate in play; two are
+    // now, so the name is spelled out rather than left as "refused on the ON arm too", which at the
+    // `0x85` row would read as a claim about `IZARRAVM_TEST_WORD_ROWS` and be FALSE — that row is
+    // refused here only because the test states `TEST_WORD_ROWS=off` above, and it is asserted
+    // admitted under `=on` at the end of this test. (2026-08-21 review, N5.)
+    //
+    // `0x05` is the one row whose value is `false`: its whole form (ADD/OR/AND/SUB/XOR/CMP with a
+    // full-width immediate) joins the allowlist under the V86 gate, which
+    // `cpu_jit_v86_loop_rows_test.rs` pins from the other side.
     let cases: &[(&str, &[u8], bool)] = &[
         ("0x05 add eax,imm", &[0x66, 0x05, 0x34, 0x12], false),
+        // Refused on both V86 arms, but only while TEST_WORD_ROWS is off — stated at the top of
+        // this test and flipped at the bottom.
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0], true),
         ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10], true),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12], true),
@@ -134,8 +160,8 @@ fn word_size_dword_siblings_stay_refused() {
 
     for arm in [false, true] {
         jit::direct::set_v86_loop_rows_for_test(Some(arm));
-        for &(label, form, refused_on_the_on_arm) in cases {
-            if arm && !refused_on_the_on_arm {
+        for &(label, form, refused_on_the_v86_on_arm) in cases {
+            if arm && !refused_on_the_v86_on_arm {
                 continue;
             }
             word_size_sibling_stays_refused(label, form, arm);
@@ -158,6 +184,26 @@ fn word_size_dword_siblings_stay_refused() {
         "0x05 add ax,imm16 must JOIN the block once IZARRAVM_V86_LOOP_ROWS admits ALU form 5"
     );
     jit::direct::set_v86_loop_rows_for_test(None);
+
+    // ...and the SECOND row that flips, for the same reason and in the same shape. Without this
+    // the `set_test_word_rows_for_test(Some(false))` at the top of the test would be a way of
+    // making the `0x85` row pass rather than a way of making it mean something.
+    jit::direct::set_test_word_rows_for_test(Some(true));
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&[0x66, 0x85, 0xc0]);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "0x85 test ax,ax must JOIN the block once IZARRAVM_TEST_WORD_ROWS admits the Word \
+         register form"
+    );
+    jit::direct::set_test_word_rows_for_test(None);
 }
 
 /// One row of the table above: three filler INCs, the form under test, and the block must stop at
