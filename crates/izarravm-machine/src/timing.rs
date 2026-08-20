@@ -1101,12 +1101,43 @@ impl Machine {
     /// Timeline phase is included in every conversion, so splitting execution
     /// into different batches does not move an event deadline.
     pub(super) fn event_batch_cap(&self, remaining: u64) -> u64 {
-        let edge_ticks = self
-            .vega_edge_ticks()
+        let edge_ticks = self.next_device_edge_ticks();
+        self.compose_batch_cap(edge_ticks, remaining)
+    }
+
+    /// Master ticks until the FIRST device edge of any kind: the full uncached
+    /// scan, `min(vega_edge_ticks(), next_cacheable_edge_ticks())`.
+    ///
+    /// FACTORED OUT OF `event_batch_cap` SO THE SKIP AND THE CAP PROVABLY READ
+    /// THE SAME SET. The ATA/ATAPI poll skip bounds its jump by this, and a new
+    /// device term must not be addable to one without the other.
+    ///
+    /// Three properties the skip depends on, all of them properties of this set
+    /// rather than of the skip:
+    ///
+    /// * It contains `next_ata_deadline()` UNGATED, which chains `ata`, `bmide`
+    ///   and `ide` together -- so a skip armed by the secondary channel cannot
+    ///   outrun the primary's boundary or a DMA transfer's.
+    /// * It contains every PIT / DSP / WSS / RTC / timed-I/O edge, so NO DEVICE
+    ///   EDGE IS EVER CROSSED INSIDE A SKIP. Nothing can coalesce, nothing can
+    ///   reorder, no IRQ is delivered late: the skip lands *on* the first edge
+    ///   and the ordinary batch-end fan-out runs there as it always does.
+    /// * It contains the two Margo terms, which the deadline cache deliberately
+    ///   excludes; reading them fresh costs a bool and a `u64`.
+    ///
+    /// **DO NOT SUBSTITUTE `next_timer_wake`**, even though the halt
+    /// fast-forward uses it. Its ATA and ATAPI terms are gated on IRQ
+    /// deliverability -- `atapi_wake` requires `self.ide.irq_enabled()` -- and
+    /// TOKACD sets nIEN on the channel before every single command
+    /// (`tokacd.asm:1464-1466`). So on the exact workload the skip exists for,
+    /// `atapi_wake` is `None` and `next_timer_wake` would skip STRAIGHT PAST THE
+    /// COMPLETION. That is the sharpest hazard in the mechanism and the reason
+    /// the skip target is a separate function from the halt target.
+    pub(super) fn next_device_edge_ticks(&self) -> Option<u64> {
+        self.vega_edge_ticks()
             .into_iter()
             .chain(self.next_cacheable_edge_ticks())
-            .min();
-        self.compose_batch_cap(edge_ticks, remaining)
+            .min()
     }
 
     /// The device-free half of the cap: the mode-class fallback grain.

@@ -122,6 +122,9 @@ impl Machine {
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
+            ata_poll_skip_enabled: self.ata_poll_skip_enabled,
+            ata_poll_skip_armed: &mut self.ata_poll_skip_armed,
+            ata_poll_skip: &mut self.ata_poll_skip,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
@@ -2236,11 +2239,58 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(self.wss.read_port(offset)));
         }
         if ide::IdeChannel::owns_port(port) {
-            let value = self.ide.read_port(port).unwrap_or(0xff);
             // Alternate status is non-destructive, and the IDE completion edge
-            // already bounds the batch through `event_batch_cap`.
-            if self.lazy_port_reads && port == ide::SECONDARY_CTRL && !io_touched_before_read {
+            // already bounds the batch through `event_batch_cap`. That is the
+            // exemption; the poll-skip arm below is the one thing that overrides
+            // it, and only for the single read that arms.
+            let lazy_alt_status =
+                self.lazy_port_reads && port == ide::SECONDARY_CTRL && !io_touched_before_read;
+            // THE ARM SITE for the device-armed ATA/ATAPI clock skip. This is
+            // the seam BOTH backends share: the interpreter's `IN AL,DX` and the
+            // native V86 port call-out (`jit/direct/callout.rs`, which passes
+            // `ring0 = cpu.is_ring0_protected()`, false in V86) both land here,
+            // which is what makes the lever backend-independent by construction
+            // rather than by porting.
+            //
+            // `skip_io_touched` AND `io_touched_before_read` ARE NOT
+            // INTERCHANGEABLE, and conflating them was a blocking review finding.
+            // `io_touched_before_read` is snapshotted well above, BEFORE the
+            // general set, and records whether an EARLIER access in this batch
+            // already ended the batch. Under the ring-0-monitor exemption
+            // nothing set the flag either, so it stays false -- meaning
+            // `!io_touched_before_read` is satisfied in exactly the case it was
+            // once claimed to exclude. The exclusion has to come from
+            // `skip_io_touched` itself. Both terms are kept: the first declines
+            // the monitor's own reads, the second declines a read that follows
+            // an access which already ended the batch.
+            let monitor_exempt = self.ata_poll_skip_enabled && lazy_alt_status && skip_io_touched;
+            if monitor_exempt {
+                self.ata_poll_skip.counters.monitor_exempt =
+                    self.ata_poll_skip.counters.monitor_exempt.saturating_add(1);
+            }
+            let arm = self.ata_poll_skip_enabled
+                && lazy_alt_status
+                && !skip_io_touched
+                && self.ide.note_alt_status_read();
+            let value = self.ide.read_port(port).unwrap_or(0xff);
+            // SUPPRESS THE CLEAR, never force the set. `io_touched` is already
+            // true by the time this arm runs UNLESS `skip_io_touched` suppressed
+            // it, and that suppression is the documented "V86 trap tax, Part 1"
+            // contract above: the TOKAEMM monitor's own chipset pokes must not
+            // end the batch and signal through `exempt_io_touched` instead.
+            // Writing `true` here would break that contract silently for any
+            // alt-status read reaching the bus with `cpu_is_ring0_pm` set --
+            // changing the monitor's batch geometry on the one fixture that runs
+            // the monitor. Suppressing the clear is exactly "end the batch on
+            // the arming read, and only where the exemption would otherwise have
+            // fired", and it cannot write `io_touched` at all.
+            if lazy_alt_status && !arm {
                 *self.io_touched = false;
+            }
+            if arm {
+                *self.ata_poll_skip_armed = true;
+                self.ata_poll_skip.counters.arms =
+                    self.ata_poll_skip.counters.arms.saturating_add(1);
             }
             return Ok(u32::from(value));
         }

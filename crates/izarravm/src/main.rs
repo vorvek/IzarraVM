@@ -2013,6 +2013,7 @@ fn write_hdd_profile_json(
         "cd_pio_bytes": machine.cd_pio_byte_count(),
         "cd_accesses": machine.cd_access_count(),
         "atapi_packet_commands": machine.atapi_packet_command_count(),
+        "ata_poll_skip": ata_poll_skip_json(machine),
         "katea": machine.katea_storage_counters().map(|k| json!({
             "sector_reads": k.sector_reads,
             "host_file_reads": k.host_file_reads,
@@ -2725,6 +2726,37 @@ fn assert_callout_counts_closed(counts: izarravm_cpu::DirectCallOutOutcomeCounts
 /// so the histogram no longer predicts a rate — read it as the call-size shape of
 /// the workload, and read `stall_ticks` against `read_sectors - cache_hits` for
 /// the charge.
+/// The device-armed ATA/ATAPI clock-skip mechanism counters.
+///
+/// READ THESE BEFORE READING THE WALL. The wall number alone cannot separate
+/// "the arm never fired" from "the arm fired and the target was wrong", and the
+/// two have completely different fixes. `spans` against the sector count and
+/// `ticks` against `master_ticks` are what falsify the second.
+///
+/// `enabled` is emitted alongside because unset does not mean the same thing on
+/// both sides of the default flip; a leg that recorded zeros without recording
+/// its arm is not evidence.
+fn ata_poll_skip_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
+    let c = machine.ata_poll_skip_counters();
+    json!({
+        "enabled": machine.ata_poll_skip_enabled(),
+        "arms": c.arms,
+        "spans": c.spans,
+        "ticks": c.ticks,
+        "blocks": c.blocks,
+        "declines_not_pending": c.declines_not_pending,
+        "declines_below_floor": c.declines_below_floor,
+        "declines_deadline_clamped": c.declines_deadline_clamped,
+        "declines_halted": c.declines_halted,
+        "monitor_exempt": c.monitor_exempt,
+        // Terminal alt-status run lengths, bucketed 1, 2, 3-4, 5-8, 9-16,
+        // 17-32, 33-64, 65+. All zero unless IZARRAVM_ATA_POLL_SKIP_DIAG armed
+        // it; it exists so ATA_POLL_RUN can be re-derived from a run rather than
+        // a rebuild.
+        "run_histogram": machine.ata_poll_run_histogram().to_vec(),
+    })
+}
+
 fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
     json!({
         "read_calls": p.read_calls,

@@ -41,6 +41,97 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
     poll_skip_policy(value.as_deref(), backend)
 }
 
+/// Whether the device-armed ATA/ATAPI clock skip is engaged.
+///
+/// **DEFAULT OFF FOR THIS LANDING**, flipped in a separate commit after the
+/// ladder, exactly as `IZARRAVM_FPU_LOOP_ROWS` (`bc55e87b` then `a0d2123f`) and
+/// `IZARRAVM_COUNT_LANES` did.
+///
+/// Deliberately NOT named `IZARRAVM_POLL_SKIP_ATA`: this is a different
+/// mechanism from `IZARRAVM_POLL_SKIP` (a device-armed clock skip, not an
+/// instruction-eliding shape skip) and must not read as a sub-flag of it.
+///
+/// THE SPELLING TABLE, trimmed and case-folded on the way in, matching the lane
+/// family exactly:
+///
+/// * **unset** -> OFF, *today*. THE DAY THE DEFAULT FLIPS THIS BECOMES ON, and
+///   every off leg must then EXPORT `0` -- the same trap `ROTATE_ROWS`,
+///   `COUNT_LANES`, `FPU_LOOP_ROWS` and `V86_LOOP_ROWS` all carry. Nulling the
+///   variable is not unsetting it: PowerShell leaves it present and empty, and
+///   the empty string is spelled OFF one arm down, which is how three earlier
+///   evidence directories came to measure their default-on knobs off.
+/// * `` (empty), `0` or `off` -> OFF. The escape and the A/B base.
+/// * `1` / `on` -> ON.
+/// * **anything else PANICS.** A mistyped ladder leg that fell through to the
+///   default would be read as "the arm I asked for changed nothing".
+pub(super) fn ata_poll_skip_default() -> bool {
+    parse_ata_poll_skip_arm(std::env::var("IZARRAVM_ATA_POLL_SKIP"))
+}
+
+fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic
+        // as a typo rather than the same silence as "unset": someone set the
+        // variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_ATA_POLL_SKIP is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `0` / `off` (the shipped default: the ATA/ATAPI poll \
+                 skip stays disarmed) and `1` / `on` (the device-armed clock skip)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_ATA_POLL_SKIP={other:?} names no arm; accepted spellings are unset or \
+             `0` / `off` (the shipped default: the ATA/ATAPI poll skip stays disarmed) and \
+             `1` / `on` (the device-armed clock skip). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be \
+             read as the arm it named doing nothing"
+        ),
+    }
+}
+
+/// `IZARRAVM_ATA_POLL_RUN`, default 16. A sweep override, not a supported knob.
+pub(super) fn ata_poll_run_default() -> u32 {
+    std::env::var("IZARRAVM_ATA_POLL_RUN")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|run| *run > 0)
+        .unwrap_or(ide::ATA_POLL_RUN)
+}
+
+/// `IZARRAVM_ATA_POLL_FLOOR_US`, default 20 us. A sweep override.
+pub(super) fn ata_poll_floor_ticks_default() -> u64 {
+    match std::env::var("IZARRAVM_ATA_POLL_FLOOR_US")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        Some(micros) => (u128::from(micros) * u128::from(izarravm_core::MASTER_CLOCK_HZ)
+            / 1_000_000)
+            .min(u128::from(u64::MAX)) as u64,
+        None => ide::ATA_POLL_FLOOR_TICKS,
+    }
+}
+
+pub(super) fn ata_poll_skip_diag_default() -> bool {
+    std::env::var("IZARRAVM_ATA_POLL_SKIP_DIAG")
+        .ok()
+        .is_some_and(|value| !matches!(value.trim(), "" | "0"))
+}
+
+/// The spelling table, reachable from the fixtures. The shipped reading happens
+/// once per machine at construction, so the contract is otherwise assertable
+/// only by mutating the process environment.
+#[cfg(test)]
+pub(crate) fn parse_ata_poll_skip_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_ata_poll_skip_arm(value)
+}
+
 #[cfg(feature = "jit")]
 #[derive(Debug, Default)]
 pub(super) struct PollSkipDiagnostics {
@@ -486,6 +577,144 @@ fn try_poll_skip_memory(
 }
 
 impl Machine {
+    /// The device-armed ATA/ATAPI clock skip, ACTUATION HALF.
+    ///
+    /// Called once per batch from `run_until_tick`, from the halt
+    /// fast-forward's position: after `advance_cpu_work`, after every pending
+    /// service arm, and BEFORE the device-edge cache invalidation -- where
+    /// `io_touched` is already true (the arm let the lazy clear stand), so the
+    /// cache is dropped for free.
+    ///
+    /// A NAMED METHOD rather than an inline block, and not only for tidiness:
+    /// the fixtures call THIS, so they exercise the production decision tree
+    /// instead of a re-implementation of it. A fixture that re-derives the
+    /// branch it is testing is a fixture that cannot fail.
+    pub(crate) fn actuate_ata_poll_skip(&mut self, deadline_ticks: u64, halted: bool) {
+        // THE DEVICE-ARMED ATA/ATAPI CLOCK SKIP, actuation half.
+        //
+        // Position: after `advance_cpu_work`, after every pending
+        // service arm, and BEFORE the device-edge cache
+        // invalidation below -- where `io_touched` is already true
+        // (the arm let the lazy clear stand), so the cache is
+        // dropped for free.
+        //
+        // A STANDALONE `if`, not an `else if` on the halt arm: the
+        // flag is taken unconditionally so it can never be stranded
+        // into the next batch, and the halt case is excluded
+        // explicitly because the halt fast-forward has already
+        // advanced the timeline above.
+        let armed = std::mem::take(&mut self.ata_poll_skip_armed);
+        if armed && !halted {
+            // THE MANDATORY ATA TERM. `next_device_edge_ticks`'s own
+            // ATA term is OPTIONAL -- it chains `next_ata_deadline`
+            // alongside PIT ch0/ch2, DSP, WSS, RTC and timed I/O and
+            // takes the `min` over whatever is present -- so with no
+            // pending command the `min` falls through to an
+            // unrelated edge, and PIT channel 0 at the default
+            // 18.2 Hz is up to 54.9 ms away. Stalling there would
+            // grant the guest that whole span with the drive READY,
+            // charged as `io_stall_clocks`: invisible to
+            // `cd_pio_bytes`, invisible to the frame anchor (guest
+            // time still advances), and visible only as wall no
+            // ladder could attribute.
+            //
+            // Two independent routes reach the no-pending state --
+            // this batch's own end-of-batch advance crossing the
+            // completion, and a ring-0 SRST landing mid-batch (the
+            // write-side `skip_io_touched` carve-out does not name
+            // 0x376, so such a write does not end the batch) -- so
+            // the guard is explicit, read straight off the channel,
+            // never inferred from the `min`.
+            match self.ide.ticks_until_completion() {
+                None => {
+                    self.ata_poll_skip.counters.declines_not_pending = self
+                        .ata_poll_skip
+                        .counters
+                        .declines_not_pending
+                        .saturating_add(1);
+                }
+                Some(ata_ticks) => {
+                    // The DEVICE-bounded target. The block decision
+                    // is made on THIS and nothing else.
+                    let device_target = self
+                        .next_device_edge_ticks()
+                        .map_or(ata_ticks, |edge| ata_ticks.min(edge));
+                    if device_target < self.ata_poll_floor_ticks {
+                        // A device edge truncated it: the pathology
+                        // the latch exists for. Bound it to one
+                        // wasted break per pending command.
+                        self.ata_poll_skip.counters.declines_below_floor = self
+                            .ata_poll_skip
+                            .counters
+                            .declines_below_floor
+                            .saturating_add(1);
+                        self.ata_poll_skip.counters.blocks =
+                            self.ata_poll_skip.counters.blocks.saturating_add(1);
+                        self.ide.block_poll_skip();
+                    } else {
+                        // Only NOW clamp to the caller's run
+                        // deadline. THE TWO TRUNCATION CAUSES ARE
+                        // KEPT APART, and that is load-bearing on
+                        // the interactive path: the GUI slice is
+                        // FAST_EMU_QUANTUM_TICKS = 1 ms against a
+                        // 1.111 ms `sector_transfer_ticks`, so the
+                        // slice boundary lands inside the wait
+                        // essentially every time. The latch is
+                        // cleared only by `schedule` or a committed
+                        // skip, neither of which happens until the
+                        // sector completes, so blocking on this
+                        // cause would make the guest spin out the
+                        // rest of every sector at full interpreted
+                        // cost -- in the GUI only, invisible to
+                        // every headless leg on the board.
+                        let remaining = deadline_ticks.saturating_sub(self.timeline.now_ticks());
+                        let ticks = device_target.min(remaining);
+                        if ticks < self.ata_poll_floor_ticks {
+                            // The CALLER's slice ran out, not a
+                            // device edge. Different cause,
+                            // different disposition: decline and DO
+                            // NOT block, so the next slice re-arms
+                            // after another run of reads.
+                            let clamped =
+                                &mut self.ata_poll_skip.counters.declines_deadline_clamped;
+                            *clamped = clamped.saturating_add(1);
+                        } else {
+                            // The same primitive `stall_for_hdd_sectors_cached`
+                            // uses for the INT 13h path: it advances
+                            // the master timeline with the full
+                            // device fan-out, charges
+                            // `elapsed_clocks` and `io_stall_clocks`,
+                            // and advances the TSC.
+                            //
+                            // I/O STALL, NOT HALTED TIME. A spinning
+                            // guest is not idle; `halted_ticks` is
+                            // the "guest asked to be parked" metric
+                            // and must stay that.
+                            //
+                            // A clamped target still COMMITS
+                            // whenever it clears the floor -- a
+                            // 500 us residue of a 1.11 ms wait is a
+                            // 500 us skip, the latch is cleared, and
+                            // the following slice takes the rest.
+                            self.stall_for_master_ticks(ticks);
+                            self.ata_poll_skip.counters.spans =
+                                self.ata_poll_skip.counters.spans.saturating_add(1);
+                            self.ata_poll_skip.counters.ticks =
+                                self.ata_poll_skip.counters.ticks.saturating_add(ticks);
+                            self.ide.clear_poll_skip_block();
+                        }
+                    }
+                }
+            }
+        } else if armed {
+            self.ata_poll_skip.counters.declines_halted = self
+                .ata_poll_skip
+                .counters
+                .declines_halted
+                .saturating_add(1);
+        }
+    }
+
     /// Enable or disable the trace-driven unit-growth simulator on the CPU (feature `jit`,
     /// diagnostic). A no-op without feature `jit`. See `CpuGsw::set_unit_sim_enabled`.
     pub fn set_unit_sim_enabled(&mut self, on: bool) {
@@ -916,6 +1145,13 @@ impl Machine {
             }
             self.io_touched = false;
             self.exempt_io_touched = false;
+            // Cleared HERE, at batch entry, so no arm can ever survive into a
+            // batch that did not raise it; and the channel's run counter is
+            // zeroed alongside, which is what makes "armed" mean "N alt-status
+            // reads inside ONE batch with no other I/O to the channel" rather
+            // than the much weaker "N reads eventually".
+            self.ata_poll_skip_armed = false;
+            self.ide.reset_alt_status_run();
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
             // Capture live timing state before the fields move into MachineBus.
@@ -958,6 +1194,9 @@ impl Machine {
             let cap = self.event_batch_cap_cached(remaining);
             #[cfg(feature = "jit")]
             let poll_skip_enabled = self.poll_skip_enabled;
+            // Read before the destructure below, the same way `poll_skip_enabled`
+            // is: a `Copy` policy bool, resolved once per machine.
+            let ata_poll_skip_enabled = self.ata_poll_skip_enabled;
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
@@ -1007,6 +1246,8 @@ impl Machine {
                     pci,
                     io_touched,
                     exempt_io_touched,
+                    ata_poll_skip_armed,
+                    ata_poll_skip,
                     isa_io_batch_clocks,
                     pit_observer_fine_until,
                     opl_probe,
@@ -1074,6 +1315,9 @@ impl Machine {
                     lazy_ports_386: crate::bus::lazy_ports_386_for(*active_mode),
                     io_touched,
                     exempt_io_touched,
+                    ata_poll_skip_enabled,
+                    ata_poll_skip_armed,
+                    ata_poll_skip,
                     isa_io_clocks: isa_io_batch_clocks,
                     pit_observer_fine_until,
                     opl_probe,
@@ -1474,6 +1718,7 @@ impl Machine {
                         self.host_profile
                             .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
                     }
+                    self.actuate_ata_poll_skip(deadline_ticks, outcome.halted);
                     // Keep the cached device edge across this batch only if the batch
                     // was provably quiet. Anything else could have rearmed a device:
                     // a guest port access (io_touched -- NOT a Margo blit arm, which
