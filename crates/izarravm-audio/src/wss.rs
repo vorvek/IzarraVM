@@ -100,11 +100,46 @@ const DAC_MUTE: u8 = 0x80;
 /// AD1848K K-grade revision ID (I12 ID3:0 = "1010").
 const REVISION_K_GRADE: u8 = 0b1010;
 
-/// Config/ID region board/version ID byte (offset 0). A board-integration value,
-/// not codec-defined: the WSS standard has no single canonical board ID, so this
-/// is a plausible static stand-in. Codec-aware detection keys off the I12
-/// revision, so this region just needs to be present.
-const WSS_BOARD_ID: u8 = 0x04;
+/// Presence signature returned in bits 5:0 of every read of the board config
+/// region. This is a *board* property, not a codec one: a Windows Sound System
+/// card answers its four low ports with this constant, and MSS detection code
+/// keys off exactly that -- e.g. the HMI Sound Operating System's `ms8md`
+/// detect probe (shipped with Tomb Raider) reads `base+3` and requires
+/// `(value & 0x3f) == 0x04` before it will even look at the codec. Returning
+/// anything else makes the card undetectable.
+const WSS_CONFIG_SIGNATURE: u8 = 0x04;
+
+/// Board config register bit 6: the IRQ-verify strobe, and the one bit of the
+/// register that reads back.
+///
+/// It is not scratch. Writing it 0->1 drives the interrupt line the low bits
+/// just selected; writing it 1->0 releases that line. That is how an MSS
+/// install routine proves it picked a line that actually reaches the CPU --
+/// write the config byte, strobe, check the handler ran, release -- and it is
+/// why a write-mostly register has a readable bit at all.
+///
+/// The AD1848 is not involved: this is the board latch driving the ISA INT pin
+/// directly, so the strobe fires with the codec idle, unprogrammed, or in the
+/// middle of a transfer, and it fires whether or not I10 IEN is set. The line
+/// it drives is the *currently selected* one, so re-selecting while the strobe
+/// is held moves the assertion with it.
+///
+/// Prior art: `dev_docs/reference/86box/src/sound/snd_azt2316a.c:303-331`, a
+/// board whose own header (`:80-86`) records that "the WSS was completely
+/// cloned here". Plain `snd_wss.c` returns the bit on read and never uses it,
+/// which is what left it looking like scratch.
+const WSS_CONFIG_IRQ_STROBE: u8 = 0x40;
+
+/// 8237 channel selected by bits 1:0 of the board config register. Index 0 and
+/// index 1 both name channel 0; MSS drivers use index 1 for DMA 0 (the HMI
+/// driver's encoder emits `|= 1` for channel 0). A closed 4-entry table is what
+/// makes an out-of-range channel unrepresentable.
+const WSS_DMA_SELECT: [u8; 4] = [0, 0, 1, 3];
+
+/// PIC line selected by bits 5:3 of the board config register. Closed 8-entry
+/// table, so every one of the 8 codes names a real AT interrupt line and the
+/// selection can never land on 0 (the PIT) or an out-of-range value.
+const WSS_IRQ_SELECT: [u8; 8] = [5, 7, 9, 10, 11, 12, 14, 15];
 
 /// Length of the post-MCE autocalibrate window, in output sample periods. The
 /// datasheet specifies "approximately 128 sample cycles" during which ACI is
@@ -112,21 +147,59 @@ const WSS_BOARD_ID: u8 = 0x04;
 // Limit: fixed ~128-sample autocal window
 const AUTOCAL_SAMPLES: u32 = 128;
 
-/// AD1848 board config/ID region (4 ports at the card base, codec sits at base+4).
-/// Carries the IRQ/DMA jumper readback so codec-aware detection can confirm the
-/// resources. Defaults match the design (IRQ7, DMA0). This is the device-init
-/// config; the user-facing `WssConfig` lives in `izarravm-core`.
+/// The codec's currently selected resources: the PIC line its terminal-count
+/// interrupt drives, and the 8237 channel it pulls playback bytes from. Set at
+/// device build time from the machine profile, re-applied from CMOS, and moved
+/// at runtime by a guest write to the board config register (see `write_port`).
+///
+/// This is the device-init config; the user-facing `WssConfig` lives in
+/// `izarravm-core` and is the single authority for what a machine powers on
+/// with. The `Default` here exists only so `Ad1848::default()` works in tests
+/// and MUST agree with `WssConfig::default()` -- two "defaults" that disagree
+/// meant the shipped machine ran on one line while every unit test asserted
+/// another. `izarravm-machine`'s `wss_device_default_matches_the_profile_default`
+/// pins the two together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ad1848Config {
     pub irq: u8,
     pub dma: u8,
 }
 
+/// One change the board's IRQ-verify strobe (config register bit 6) owes the
+/// interrupt controller.
+///
+/// The codec core has no interrupt controller of its own, so a config write
+/// records the delta here and the machine's bus write path applies it -- the
+/// same shape `Mpu401` uses for its own line (`MachineBus::sync_mpu_irq`).
+/// `released` names a line the board has stopped driving, `asserted` a line it
+/// has started driving; a re-selection while the strobe is held carries both.
+/// Only lines the board itself drove are ever released, so a strobe never
+/// clears another device's level off a shared line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardIrqStrobe {
+    pub released: Option<u8>,
+    pub asserted: Option<u8>,
+}
+
 impl Default for Ad1848Config {
     fn default() -> Self {
-        // base 0x530, IRQ7, DMA0 -- chosen to avoid the SB16 defaults (IRQ5/DMA1).
-        Self { irq: 7, dma: 0 }
+        // base 0x530, IRQ11, DMA0 -- mirrors `WssConfig::default()`: IRQ 11
+        // rather than the WSS standard IRQ 7 so the Sound Blaster keeps 7,
+        // which far more DOS titles hardwire; DMA 0 avoids the SB16's DMA 1.
+        Self { irq: 11, dma: 0 }
     }
+}
+
+/// Whether `IZARRAVM_WSS_TRACE` asked for a port-level trace of the codec.
+///
+/// Patterned on `DmaChip::trace_dma_mode`: the check is a single relaxed load of
+/// a `OnceLock` at the call site, and every formatting cost sits behind it, so a
+/// plain run pays nothing beyond that load on a path that is already a guest
+/// port access. Turn it on to see a driver's whole init sequence in order --
+/// which register it programmed, what it selected, and what it read back.
+pub fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_WSS_TRACE").is_some())
 }
 
 /// Audio sample format decoded from I8 (FMT + L/C bits).
@@ -155,8 +228,18 @@ pub struct Ad1848 {
     /// Autocalibrate-in-progress countdown, in output sample periods. `Some(n)`
     /// means ACI is asserted with `n` ticks remaining; `None` means settled.
     aci_remaining: Option<u32>,
-    /// IRQ/DMA jumper readback for the config region.
+    /// Resources (PIC line + 8237 channel) the codec is currently pointed at.
     config: Ad1848Config,
+    /// Last byte written to the board config register. Only bit 6 is readable;
+    /// the rest is kept so a write/read round trip of that bit is exact.
+    board_config: u8,
+    /// The interrupt line the board's IRQ-verify strobe is currently holding, if
+    /// any. Tracked so a release only ever lowers a line the board itself
+    /// raised.
+    board_irq_driven: Option<u8>,
+    /// Strobe change the machine has not applied to the interrupt controller
+    /// yet; taken by `take_board_irq_strobe` at the port write site.
+    board_irq_strobe: Option<BoardIrqStrobe>,
     /// Pending IRQ edge from a terminal-count underflow; taken by `take_irq`.
     irq_pending: bool,
     /// Current DMA count, in sample periods (decrements by one per output frame,
@@ -168,9 +251,6 @@ pub struct Ad1848 {
     /// Rendered stereo frames, drained by the host audio path; capped by
     /// `pcm::push_frame_capped` (drop-oldest rate-match buffer).
     rendered: VecDeque<(i16, i16)>,
-    // HLE block data prefetched for batched WSS DMA.
-    block_buffer: Option<Vec<u8>>,
-    block_buffer_pos: usize,
 }
 
 impl Default for Ad1848 {
@@ -201,12 +281,15 @@ impl Ad1848 {
             status: R2_RESET,
             aci_remaining: None,
             config,
+            // Nothing has written the board register yet; its one readable bit
+            // (6) comes up clear, which is what a powered-on board reports.
+            board_config: 0,
+            board_irq_driven: None,
+            board_irq_strobe: None,
             irq_pending: false,
             current_count: 0,
             playing: false,
             rendered: VecDeque::new(),
-            block_buffer: None,
-            block_buffer_pos: 0,
         }
     }
 
@@ -245,7 +328,8 @@ impl Ad1848 {
     // ---- Direct register (port) interface ---------------------------------
 
     /// Read one of the 8 device ports by `offset`:
-    /// - 0..=3: WSS config/ID region (board ID/version + IRQ/DMA jumper readback).
+    /// - 0..=3: the MSS board configuration register (one register, aliased
+    ///   across all four ports); reads the presence signature plus bit 6.
     /// - 4: R0 Index Address (INIT/MCE/TRD/index).
     /// - 5: R1 Indexed Data (the selected indirect register, with read-only
     ///   bits resolved -- e.g. I11 ACI, I12 revision).
@@ -253,8 +337,25 @@ impl Ad1848 {
     ///   are static reset-value stubs in this DMA-only playback scope.
     /// - 7: R3 PIO Data (stub).
     pub fn read_port(&mut self, offset: u16) -> u8 {
+        let value = self.read_port_inner(offset);
+        if trace_enabled() {
+            eprintln!(
+                "[WSS] IN  base+{offset} -> {value:#04x} (index={:#04x} mce={} irq={} dma={} \
+                 playing={} count={})",
+                self.index,
+                self.mce,
+                self.config.irq,
+                self.config.dma,
+                self.playing,
+                self.current_count,
+            );
+        }
+        value
+    }
+
+    fn read_port_inner(&mut self, offset: u16) -> u8 {
         match offset {
-            0..=3 => self.read_config(offset),
+            0..=3 => self.read_board_config(),
             4 => self.read_index(),
             5 => self.read_indexed_data(),
             6 => self.status,
@@ -270,40 +371,34 @@ impl Ad1848 {
 
     /// Write one of the 8 device ports by `offset` (see `read_port`).
     pub fn write_port(&mut self, offset: u16, value: u8) {
+        if trace_enabled() {
+            let target = match offset {
+                0..=3 => "board-config".to_string(),
+                4 => "R0-index".to_string(),
+                5 => format!("R1-data(I{})", self.index),
+                6 => "R2-status".to_string(),
+                _ => "R3-pio".to_string(),
+            };
+            eprintln!("[WSS] OUT base+{offset} = {value:#04x} {target}");
+        }
+        self.write_port_inner(offset, value);
+        if trace_enabled() {
+            eprintln!(
+                "[WSS]     -> irq={} dma={} playing={} rate={} count={} stereo={} bpf={}",
+                self.config.irq,
+                self.config.dma,
+                self.playing,
+                self.rate_hz(),
+                self.current_count,
+                self.is_stereo(),
+                self.bytes_per_frame(),
+            );
+        }
+    }
+
+    fn write_port_inner(&mut self, offset: u16, value: u8) {
         match offset {
-            // Config/ID region. Offset 1 SELECTS the codec's resources, in the
-            // same nibble encoding `read_config` reports them: high nibble IRQ,
-            // low nibble DMA. ReSonique II is the writable-config-register
-            // variant of the WSS board glue, which is how real WSS/SB combo
-            // chips behaved -- the OPTi 82C930 pairs WSS with SB Pro and lets a
-            // driver move between them at runtime, no power cycle.
-            //
-            // This used to drop the write and expose jumper-only resources, on
-            // the grounds that the region has no datasheet and a writable model
-            // would mean inventing an encoding. That reasoning does not survive
-            // contact with the read side: the readback encoding is already
-            // invented, so honouring the identical encoding on write invents
-            // nothing further -- and without it the codec is the one device on
-            // the card that cannot be re-pointed without restarting the machine,
-            // which is what SNDCTRL.COM would otherwise have to tell the user.
-            //
-            // Selecting resources RE-INITIALISES the codec, because a transfer
-            // left running would keep driving the channel the board no longer
-            // owns: playback stops, the count disarms, and the sticky INT and
-            // pending edge are cleared, exactly as a driver re-programming the
-            // board expects before it re-arms.
-            1 => {
-                self.config.irq = (value >> 4) & 0x0F;
-                self.config.dma = value & 0x0F;
-                self.playing = false;
-                self.current_count = 0;
-                self.irq_pending = false;
-                self.status &= !R2_INT;
-                self.regs[IDX_IFACE_CONFIG] &= !(I9_PEN | I9_CEN);
-            }
-            0 | 2 | 3 => {
-                // Board ID and the mirror offsets stay read-only.
-            }
+            0..=3 => self.write_board_config(value),
             4 => self.write_index(value),
             5 => self.write_indexed_data(value),
             6 => {
@@ -317,17 +412,85 @@ impl Ad1848 {
         }
     }
 
-    /// Config/ID region read. Offset 0 returns a board ID/version byte; offset 1
-    /// returns the IRQ/DMA jumper readback (high nibble IRQ, low nibble DMA);
-    /// the rest mirror them. The exact ID byte is a plausible static value (the
-    /// WSS standard has no single canonical board ID; codec-aware detection
-    /// keys off the I12 revision, this region just needs to be present).
-    fn read_config(&self, offset: u16) -> u8 {
-        match offset {
-            0 => WSS_BOARD_ID, // board/version ID
-            1 => ((self.config.irq & 0x0F) << 4) | (self.config.dma & 0x0F),
-            _ => 0x00,
+    /// Board configuration register read (all four ports of the config region
+    /// decode to this one register).
+    ///
+    /// The selection is NOT readable: bits 5:0 always report the presence
+    /// signature, and only bit 6 comes back as written. Detection code relies
+    /// on precisely this -- HMI's MSS probe masks with `0x3f` and compares
+    /// against `0x04` -- so a card that reported its own IRQ/DMA here would be
+    /// undetectable. Host code that needs the live routing calls
+    /// [`Ad1848::irq`] / [`Ad1848::dma`]; guest code that needs to remember it
+    /// keeps its own copy (SNDCTRL.COM keeps it in CMOS).
+    ///
+    /// Bit 6 reads back because it is the IRQ-verify strobe (see
+    /// [`WSS_CONFIG_IRQ_STROBE`]): software that raised the line reads the
+    /// register to confirm the board is still holding it.
+    fn read_board_config(&self) -> u8 {
+        WSS_CONFIG_SIGNATURE | (self.board_config & WSS_CONFIG_IRQ_STROBE)
+    }
+
+    /// Board configuration register write. This is the only channel through
+    /// which an MSS driver can point the codec at an interrupt line or a DMA
+    /// channel, and it is the *first* port a WSS driver writes: HMI's start
+    /// routine emits the config byte, then derives its own PIC vector and mask
+    /// from the same IRQ number it just encoded. Dropping this write leaves the
+    /// codec interrupting a line nobody hooked, which is exactly the Tomb Raider
+    /// setup hang.
+    ///
+    /// Encoding (bits 5:3 = IRQ code, bits 1:0 = DMA code) is decoded through
+    /// two closed tables, so every one of the 256 possible bytes names a real
+    /// interrupt line and a real 8237 channel. That is what makes the DMA index
+    /// range-safe by construction: the previous unchecked path could produce
+    /// `dma = 11` and panic the machine's channel lookup.
+    ///
+    /// This register RE-STEERS and does nothing else. It is board glue -- an
+    /// ISA-side latch that points the codec's DRQ/DACK/INT pins at the selected
+    /// lines -- with no wire into the AD1848 at base+4, so it cannot touch I9
+    /// PEN, the Current Count, or the R2 INT status, and a transfer in flight
+    /// keeps running across a re-point on the new resources. Both prior-art
+    /// models agree (`snd_wss.c:67-75`, `snd_azt2316a.c:316-320`: set the DMA,
+    /// set the IRQ, stop).
+    ///
+    /// An earlier revision quiesced the codec here and skipped the work when the
+    /// selection was unchanged. Both were inventions: the quiesce forged
+    /// guest-readable codec state (a driver that re-points and reads I9 back
+    /// would see PEN clear where hardware shows it set), and the skip made one
+    /// identical `OUT` behave two different ways depending on hidden prior
+    /// state, which no board does because no board compares -- and it swallowed
+    /// the bit-6 strobe, whose assert and release name the same resources by
+    /// construction.
+    ///
+    /// Bit 6 is the IRQ-verify strobe; the selection is updated first so the
+    /// strobe drives the line the same write just chose.
+    fn write_board_config(&mut self, value: u8) {
+        self.board_config = value;
+        self.config.dma = WSS_DMA_SELECT[usize::from(value & 0x03)];
+        self.config.irq = WSS_IRQ_SELECT[usize::from((value >> 3) & 0x07)];
+
+        let held = if value & WSS_CONFIG_IRQ_STROBE != 0 {
+            Some(self.config.irq)
+        } else {
+            None
+        };
+        if held != self.board_irq_driven {
+            self.board_irq_strobe = Some(BoardIrqStrobe {
+                // Release only a line this board actually raised, and only when
+                // the strobe has left it -- lines are shared, so lowering one
+                // the board never drove would clear another device's level.
+                released: self.board_irq_driven.filter(|line| Some(*line) != held),
+                asserted: held,
+            });
+            self.board_irq_driven = held;
         }
+    }
+
+    /// Take the interrupt-line change the board's IRQ-verify strobe owes the
+    /// interrupt controller, if any. The bus write path drains this immediately
+    /// after every config-region write, so the strobe lands on the guest's `OUT`
+    /// rather than at the next device advance.
+    pub fn take_board_irq_strobe(&mut self) -> Option<BoardIrqStrobe> {
+        self.board_irq_strobe.take()
     }
 
     /// R0 Index Address read. INIT reflects ongoing initialization (we never
@@ -363,6 +526,19 @@ impl Ad1848 {
 
     /// R1 Indexed Data read. Most registers return their stored byte; the
     /// read-only status bits are injected live: I11 ACI and I12 revision.
+    ///
+    /// I11 ACI reports the real state of the modeled autocalibrate window, and
+    /// deliberately does NOT adopt 86Box's read-toggle (`ret ^= 0x20` on every
+    /// read of I11). That toggle exists because 86Box models no autocal window
+    /// at all -- its I11 would otherwise be a constant, so a driver polling for
+    /// either polarity would spin forever, and flipping the bit terminates both
+    /// polls at the cost of never reporting the truth. We do model the window:
+    /// ACI asserts on the MCE 1->0 edge and retires over ~128 output sample
+    /// periods, which the machine clocks whether or not playback is armed (and
+    /// under a fallback rate when the programmed rate is invalid), so a poll for
+    /// ACI set succeeds immediately and a poll for ACI clear terminates in about
+    /// 16 ms of guest time. Both polarities already terminate; toggling would
+    /// only make the bit lie.
     fn read_indexed_data(&self) -> u8 {
         let idx = self.index as usize;
         match idx {
@@ -423,14 +599,10 @@ impl Ad1848 {
         if pen && self.base_count() > 0 {
             if !self.playing {
                 self.current_count = self.base_count();
-                self.block_buffer = None;
-                self.block_buffer_pos = 0;
             }
             self.playing = true;
         } else {
             self.playing = false;
-            self.block_buffer = None;
-            self.block_buffer_pos = 0;
         }
     }
 
@@ -511,11 +683,6 @@ impl Ad1848 {
     /// Whether playback is armed (PEN set + non-zero base count).
     pub fn is_playing(&self) -> bool {
         self.playing
-    }
-
-    /// Current DMA count used to size the next HLE block.
-    pub fn current_dma_count(&self) -> u32 {
-        self.current_count
     }
 
     /// Whether the post-MCE autocalibrate (ACI) window is still retiring. The
@@ -650,32 +817,6 @@ impl Ad1848 {
         self.rendered.pop_front()
     }
 
-    // HLE block-buffer accessors.
-    pub fn take_block_buffer(&mut self) -> Option<Vec<u8>> {
-        self.block_buffer.take()
-    }
-
-    pub fn set_block_buffer(&mut self, buf: Vec<u8>) {
-        self.block_buffer = Some(buf);
-        self.block_buffer_pos = 0;
-    }
-
-    pub fn block_buffer_pos(&self) -> usize {
-        self.block_buffer_pos
-    }
-
-    pub fn advance_block_buffer(&mut self, bytes: usize) {
-        self.block_buffer_pos += bytes;
-    }
-
-    pub fn block_buffer_len(&self) -> usize {
-        self.block_buffer.as_ref().map_or(0, |b| b.len())
-    }
-
-    pub fn block_buffer(&self) -> Option<&Vec<u8>> {
-        self.block_buffer.as_ref()
-    }
-
     /// Advance the Current Count by one sample period. Per the datasheet, the
     /// counter decrements each sample period until zero is reached; the *next*
     /// sample period after zero underflows, which is when the sticky Status INT
@@ -753,11 +894,14 @@ impl Ad1848 {
     /// output frame (alongside `tick_sample`) to retire the ACI window. When the
     /// countdown elapses, ACI clears.
     ///
-    /// ACI-window retiring is coupled to a valid programmed sample rate (the
-    /// integration loop ticks at `rate_hz`): a guest that clears MCE while an
-    /// unsupported (rate-0) format is selected is non-physical -- real drivers
-    /// select a valid rate before clearing MCE -- so that corner is intentionally
-    /// not special-cased here.
+    /// Retiring is NOT coupled to a valid programmed sample rate. The converter
+    /// clock runs regardless of what I8 selects, so when a guest clears MCE
+    /// under one of the two unsupported XTAL1 divides (`rate_hz() == 0`) the
+    /// machine clocks this countdown at `WSS_AUTOCAL_FALLBACK_HZ` instead of
+    /// stalling it (`timing.rs`, the `autocal_active` arms of the advance gate
+    /// and of `device_rates`). That is what makes an ACI poll terminate for
+    /// every format, which in turn is why this model can report the bit
+    /// truthfully instead of toggling it -- see `read_indexed_data`.
     pub fn advance_autocal(&mut self) {
         if let Some(n) = self.aci_remaining {
             if n <= 1 {

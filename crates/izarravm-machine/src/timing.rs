@@ -250,61 +250,37 @@ impl Machine {
             if wss_rate > 0 && (playing_at_valid_rate || autocal_active) {
                 let n = advance.wss_frames as usize;
                 if n > 0 {
-                    // Pre-fetch WSS data into the HLE block buffer. Large batches
-                    // can span multiple blocks, so refill after auto-reload.
-                    let mut remaining = n;
-                    while remaining > 0 && playing_at_valid_rate {
-                        let bytes_per_frame = self.wss.bytes_per_frame();
-                        if self.wss.block_buffer().is_none() {
-                            let frames = self.wss.current_dma_count() as usize + 1;
-                            let count = frames * bytes_per_frame;
-                            let mut buf = Vec::with_capacity(count);
-                            {
-                                let Machine { dma, memory, .. } = self;
-                                for _ in 0..count {
-                                    let Some(byte) = dma.read_byte(wss_dma, memory) else {
-                                        break;
-                                    };
-                                    buf.push(byte);
-                                }
-                            }
-                            let complete_bytes = buf.len() / bytes_per_frame * bytes_per_frame;
-                            buf.truncate(complete_bytes);
-                            if !buf.is_empty() {
-                                self.wss.set_block_buffer(buf);
-                            }
+                    // One 8237 read per byte the codec actually plays, in
+                    // playback order.
+                    //
+                    // This used to pre-fetch a whole HLE block first. That block
+                    // was sized at the codec's entire remaining count, so a
+                    // single advance ran the 8237 all the way around -- and the
+                    // 8237's current address and count are guest-visible
+                    // registers. Tomb Raider's HMI sound engine polls channel
+                    // 0's current count to follow the play position: with the
+                    // buffer drained in one gulp it read the same reloaded value
+                    // forever and the game hung at its first FMV, while the
+                    // codec played and interrupted perfectly.
+                    //
+                    // Bounding the fetch to the frames of this advance fixed the
+                    // position, and left the buffer with nothing to do: it was
+                    // then always filled and fully consumed inside one loop
+                    // iteration, never surviving an advance, while still issuing
+                    // the same one `read_byte` per byte plus a `Vec` allocation
+                    // and a full clone per iteration. So the buffer is gone and
+                    // the fetch closure reads straight through -- fewer moving
+                    // parts for the same guest-visible behaviour.
+                    if playing_at_valid_rate {
+                        let Machine {
+                            wss, dma, memory, ..
+                        } = self;
+                        let played = wss.tick_n_samples(n, || dma.read_byte(wss_dma, memory));
+                        if izarravm_audio::wss_trace_enabled() && played < n {
+                            eprintln!(
+                                "[WSS] DMA ch{wss_dma} dry: wanted {n} frames, played {played}"
+                            );
                         }
-                        let mut consumed_from_buf: usize = 0;
-                        let processed_frames = if let Some(buf) = self.wss.block_buffer().cloned() {
-                            let start_pos = self.wss.block_buffer_pos();
-                            let bytes_avail = buf.len().saturating_sub(start_pos);
-                            let frames_this = (bytes_avail / bytes_per_frame).min(remaining);
-                            self.wss.tick_n_samples(frames_this, || {
-                                let p = start_pos + consumed_from_buf;
-                                if p < buf.len() {
-                                    let b = buf[p];
-                                    consumed_from_buf += 1;
-                                    Some(b)
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            let Machine {
-                                wss, dma, memory, ..
-                            } = self;
-                            wss.tick_n_samples(remaining, || dma.read_byte(wss_dma, memory))
-                        };
-                        if consumed_from_buf > 0 {
-                            self.wss.advance_block_buffer(consumed_from_buf);
-                        }
-                        if self.wss.block_buffer_pos() >= self.wss.block_buffer_len() {
-                            self.wss.take_block_buffer();
-                        }
-                        if processed_frames == 0 {
-                            break;
-                        }
-                        remaining -= processed_frames;
                     }
                     for _ in 0..n {
                         self.wss.advance_autocal();
@@ -313,6 +289,12 @@ impl Machine {
                     // request after N frames follows the multi-edge coalescing
                     // contract; see DSP path).
                     if self.wss.take_irq() {
+                        if izarravm_audio::wss_trace_enabled() {
+                            eprintln!(
+                                "[WSS] terminal count -> PIC line {wss_irq} (deliverable={})",
+                                self.pic.deliverable(wss_irq)
+                            );
+                        }
                         self.pic.request(wss_irq);
                     }
                 }

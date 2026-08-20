@@ -10,8 +10,9 @@
 ;
 ; What it changes, and when it takes effect:
 ;   * The live hardware, immediately. The SB16 mixer's Interrupt/DMA Setup
-;     registers (0x80/0x81) and the WSS config register (0x531) are both
-;     writable, so neither device needs a reboot to move.
+;     registers (0x80/0x81) and the WSS board configuration register (0x530,
+;     decoded at all four of 0x530-0x533) are both writable, so neither device
+;     needs a reboot to move.
 ;   * CMOS NVRAM 0x1B-0x21, so the assignment survives a power cycle. Those
 ;     bytes sit inside the 0x10..0x2D checksum window, so 0x2E/0x2F are
 ;     refreshed too -- without that the next POST discards the whole NVRAM as
@@ -49,8 +50,24 @@ SB_MIXER_DAT   equ SB_BASE + 5         ; 0x225
 MIX_IRQ_SETUP  equ 0x80
 MIX_DMA_SETUP  equ 0x81
 WSS_BASE       equ 0x530
-WSS_ID         equ WSS_BASE            ; board/version ID; 0xFF means absent
-WSS_CONFIG     equ WSS_BASE + 1        ; (irq << 4) | dma, readable AND writable
+; The Microsoft Sound System board configuration register. One register, decoded
+; at all four of base+0..3, and the only way to point the codec at an interrupt
+; line or a DMA channel.
+;
+; WRITE:  bits 5:3 select the IRQ, bits 1:0 the DMA channel, by the two fixed
+;         board tables (see wss_config_byte). Bit 6 is the IRQ-verify strobe:
+;         raising it drives the selected interrupt line, lowering it releases
+;         the line. This tool never raises it -- it moves the routing and leaves
+;         the verifying to whoever wants it -- so every byte it writes has bit 6
+;         clear, which is also what keeps the write free of side effects.
+; READ:   the presence signature plus the strobe -- bits 5:0 read 0x04 on a card
+;         that is there, bit 6 reads back the last strobe, and the SELECTION is
+;         not readable at all. So this tool cannot ask the card what routing it
+;         is on; CMOS is the record, the same way the MPU port is. Open bus
+;         (0xFF) means no card.
+WSS_CONFIG     equ WSS_BASE
+WSS_SIG_MASK   equ 0x3F
+WSS_SIG_VALUE  equ 0x04
 
 ; ---- CMOS -------------------------------------------------------------------
 ; Mirrors `address::CMOS_*` in crates/izarravm-machine/src/firmware_contract.rs.
@@ -194,12 +211,19 @@ start:
 ; =============================================================================
 ; Hardware probe and current-value read.
 ;
-; The CARD is the authority for its own routing, not the CMOS copy: reading the
-; mixer and the config register back means the screen always opens on what the
-; hardware is really doing, even if something moved it since boot. Only the MPU
-; port has no hardware register to read -- both MPU ports stay decoded either
-; way, and the setting only decides which one BLASTER advertises -- so that one
-; comes from CMOS.
+; Where each value comes from is decided by whether the hardware can be asked.
+; The SB16 mixer holds its IRQ/DMA selection in readable registers, so the CARD
+; is the authority there: the screen opens on what the mixer is really doing,
+; even if something moved it since boot.
+;
+; The codec cannot be asked. A Microsoft Sound System board's configuration
+; register reads back a presence signature, not the selection that was written
+; into it -- that is a property of the real hardware, and detection code depends
+; on it -- so the WSS IRQ and DMA come from CMOS, along with the MPU port (which
+; has no hardware register at all; both MPU ports stay decoded either way and the
+; setting only decides which one BLASTER advertises). A game that re-points the
+; codec for itself therefore will not show up here, which is correct: it moved
+; the card for the duration of its own run, not the machine's configuration.
 ; =============================================================================
 read_hardware:
     call probe_sb
@@ -255,21 +279,27 @@ read_hardware:
 .dma16_done:
     mov [FVAL(F_SBD16)], bl
 .no_sb:
+    ; Everything below comes from CMOS, so one magic check covers all of it. A
+    ; bad magic means the block has never been written (or the host is about to
+    ; reseed it), and the field defaults in `fields` already hold the machine's
+    ; power-on assignment -- so leaving them alone is the right answer.
+    mov al, CM_MAGIC
+    call cmos_read
+    cmp al, CM_MAGIC_VALUE
+    jne .cmos_absent
     cmp byte [wss_present], 0
     je .no_wss
-    mov dx, WSS_CONFIG
-    in al, dx
-    mov ah, al
-    shr al, 4
+    mov al, CM_WSS_IRQ
+    call cmos_read
     mov bl, al
     mov si, opt_wssirq
     call in_options
     jc .wss_irq_ok
-    mov bl, 11                  ; unreadable selection: fall back to the default
+    mov bl, 11                  ; unusable record: fall back to the default
 .wss_irq_ok:
     mov [FVAL(F_WSIRQ)], bl
-    mov al, ah
-    and al, 0x0F
+    mov al, CM_WSS_DMA
+    call cmos_read
     mov bl, al
     mov si, opt_dma8
     call in_options
@@ -278,15 +308,11 @@ read_hardware:
 .wss_dma_ok:
     mov [FVAL(F_WSDMA)], bl
 .no_wss:
-    mov al, CM_MAGIC
-    call cmos_read
-    cmp al, CM_MAGIC_VALUE
-    jne .mpu_default
     mov al, CM_MPU_PORT
     call cmos_read
     and al, 1
     mov [FVAL(F_MPU)], al
-.mpu_default:
+.cmos_absent:
     call build_blaster
     ret
 
@@ -337,12 +363,17 @@ probe_sb:
     pop es
     ret
 
-; The codec's board/version ID. An absent card leaves the port on open bus.
+; The board's presence signature, the same check every MSS driver makes: bits
+; 5:0 of the configuration register read 0x04 on a card that is there. Bit 6 is
+; the IRQ-verify strobe -- it reads back whatever the last write left there, so
+; it is masked off here along with undefined bit 7. An absent card leaves the
+; port on open bus (0xFF), which fails the compare.
 probe_wss:
-    mov dx, WSS_ID
+    mov dx, WSS_CONFIG
     in al, dx
-    cmp al, 0xFF
-    je .absent
+    and al, WSS_SIG_MASK
+    cmp al, WSS_SIG_VALUE
+    jne .absent
     mov byte [wss_present], 1
 .absent:
     ret
@@ -1590,12 +1621,59 @@ apply_hw:
 .wss:
     cmp byte [wss_present], 0
     je .done
-    mov al, [FVAL(F_WSIRQ)]
-    shl al, 4
-    or al, [FVAL(F_WSDMA)]
+    call wss_config_byte
     mov dx, WSS_CONFIG
     out dx, al
 .done:
+    ret
+
+; Encode F_WSIRQ / F_WSDMA into the board configuration byte: AL = (irq code
+; << 3) | dma code. Clobbers AX only.
+;
+; The two board tables are fixed by the hardware, not by us:
+;   IRQ  bits 5:3 -> 5, 7, 9, 10, 11, 12, 14, 15   (codes 0..7)
+;   DMA  bits 1:0 -> 0, 0, 1, 3                    (codes 0..3)
+; Only the lines and channels this tool offers are encoded here -- opt_wssirq is
+; {7, 9, 10, 11} and opt_dma8 is {0, 1, 3}, both proper subsets -- so every
+; selection the menus and the command line can produce has an exact encoding.
+; Channel 0 uses code 1 rather than code 0; the two are equivalent on the board,
+; and code 1 is what real MSS drivers emit. Bit 6 (the IRQ-verify strobe) is left
+; clear, so applying a routing never drives an interrupt line.
+;
+; COUPLED TO opt_wssirq: the fall-through below encodes IRQ 11. Adding a line to
+; that list without adding a case here would silently encode it as 11 -- the
+; menu would show one line and the board would be on another.
+wss_config_byte:
+    mov ah, 0x20                ; IRQ 11 (code 4), the fall-through default
+    mov al, [FVAL(F_WSIRQ)]
+    cmp al, 7
+    jne .not_i7
+    mov ah, 0x08                ; code 1
+    jmp .irq_done
+.not_i7:
+    cmp al, 9
+    jne .not_i9
+    mov ah, 0x10                ; code 2
+    jmp .irq_done
+.not_i9:
+    cmp al, 10
+    jne .irq_done
+    mov ah, 0x18                ; code 3
+.irq_done:
+    mov al, [FVAL(F_WSDMA)]
+    cmp al, 0
+    jne .not_d0
+    or ah, 0x01                 ; channel 0 -> code 1
+    jmp .dma_done
+.not_d0:
+    cmp al, 1
+    jne .dma3
+    or ah, 0x02                 ; channel 1 -> code 2
+    jmp .dma_done
+.dma3:
+    or ah, 0x03                 ; channel 3 -> code 3
+.dma_done:
+    mov al, ah
     ret
 
 ; =============================================================================

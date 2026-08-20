@@ -428,6 +428,20 @@ impl Pic8259Pair {
         }
     }
 
+    /// True when the input pin for IRQ `irq` (0..15) is currently being driven
+    /// by a device. Distinct from [`Pic8259Pair::irr_bit`]: on the AT's
+    /// edge-triggered 8259 the IRR latches a rising edge and stays set after the
+    /// line falls, so only this tells a test whether a device is still holding
+    /// the line. Test-only inspector.
+    #[cfg(test)]
+    pub(crate) fn input_asserted(&self, irq: u8) -> bool {
+        if irq < 8 {
+            self.master.asserted & (1 << irq) != 0
+        } else {
+            self.slave.asserted & (1 << (irq - 8)) != 0
+        }
+    }
+
     /// True when IRQ `irq` (0..15) has a latched request in the IRR. IRQ 0..7 are
     /// on the master, IRQ 8..15 on the slave. Test-only inspector.
     #[cfg(test)]
