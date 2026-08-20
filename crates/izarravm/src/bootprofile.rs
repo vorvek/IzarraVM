@@ -701,6 +701,10 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                     overlay_resident_sectors: after.overlay_resident_sectors,
                     overlay_pending_sectors: after.overlay_pending_sectors,
                     pending_unmapped_sectors: after.pending_unmapped_sectors,
+                    // A gauge, like the occupancy levels above: how many entries
+                    // the anti-clobber guard is holding right now, not how many
+                    // it held during this phase.
+                    blocked_projection_keys: after.blocked_projection_keys,
                     spill_operations: after
                         .spill_operations
                         .saturating_sub(before.spill_operations),
@@ -1015,6 +1019,7 @@ fn write_json(
                 "projection_wall_ns": row.katea.projection_wall_ns,
                 "metadata_projection_passes": row.katea.metadata_projection_passes,
                 "host_write_failures": row.katea.host_write_failures,
+                "blocked_projection_keys": row.katea.blocked_projection_keys,
             },
             "machine_phases": row.machine_phases.iter().map(|(name, wall_ns, count)| json!({
                 "name": name,

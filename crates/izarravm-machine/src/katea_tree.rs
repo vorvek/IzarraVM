@@ -196,6 +196,157 @@ struct ChainMemo {
     epoch: u64,
 }
 
+/// The keys claiming one cluster.
+///
+/// A `Vec` per cluster would be one heap allocation per cluster of the mounted
+/// folder -- 128,000 of them on a 498 MB fixture -- for a list that is almost
+/// always exactly one key long. The full scan it replaces stored a bare key in
+/// its `HashMap` and allocated nothing, and the index has to be able to build
+/// itself at least as cheaply as the scan it removes: the first measurement of
+/// term A had the cold build at 1.7x the scan, and this was most of the
+/// difference.
+///
+/// `Many` is reached only when a guest points two directory entries into one
+/// cluster, which is exactly the case the guard exists for and is rare.
+#[derive(Debug)]
+enum Claimants {
+    One((u32, [u8; 11])),
+    Many(Vec<(u32, [u8; 11])>),
+}
+
+impl Claimants {
+    fn len(&self) -> usize {
+        match self {
+            Claimants::One(_) => 1,
+            Claimants::Many(v) => v.len(),
+        }
+    }
+
+    /// The sole claimant, when there is exactly one.
+    fn only(&self) -> Option<(u32, [u8; 11])> {
+        match self {
+            Claimants::One(k) => Some(*k),
+            Claimants::Many(v) if v.len() == 1 => Some(v[0]),
+            Claimants::Many(_) => None,
+        }
+    }
+
+    fn push(&mut self, key: (u32, [u8; 11])) {
+        match self {
+            Claimants::One(existing) => *self = Claimants::Many(vec![*existing, key]),
+            Claimants::Many(v) => v.push(key),
+        }
+    }
+
+    /// Remove one occurrence of `key`; returns the new length.
+    fn remove(&mut self, key: (u32, [u8; 11])) -> usize {
+        match self {
+            Claimants::One(existing) => {
+                if *existing == key {
+                    *self = Claimants::Many(Vec::new());
+                    0
+                } else {
+                    1
+                }
+            }
+            Claimants::Many(v) => {
+                if let Some(at) = v.iter().position(|k| *k == key) {
+                    v.swap_remove(at);
+                }
+                v.len()
+            }
+        }
+    }
+}
+
+/// What dates a chain walk: `fat_epoch` when it ran, and the FAT sectors it
+/// read. See [`ChainMemo`] for why those two are exactly the walk's dependency
+/// set, and [`KateaTreeVolume::chain_token_is_current`] for the test.
+type ChainToken = (u64, Vec<u32>);
+
+/// One live directory entry's contribution to the claim index, and the token
+/// that says the contribution is still what a fresh walk would produce.
+///
+/// The token is exactly [`ChainMemo`]'s: `epoch` is `fat_epoch` at the walk and
+/// `sectors` the walk's FAT dependency set. Held here rather than looked up in
+/// the memo because the memo is keyed by first cluster and is evictable at
+/// [`CHAIN_MEMO_MAX_ENTRIES`], while a claim is keyed by directory ENTRY and must
+/// outlive that -- a claim that vanished when a memo was evicted would be a
+/// RETRACTION, which is the one direction the guard cannot afford (see
+/// [`KateaTreeVolume::insert_claim`]).
+#[derive(Debug)]
+struct ClaimUnit {
+    first_cluster: u32,
+    epoch: u64,
+    sectors: Vec<u32>,
+}
+
+/// What one directory entry KEY currently claims.
+///
+/// `units` is one per live entry with this key -- normally exactly one, but a
+/// guest can write two directory entries with the same 8.3 name and the guard's
+/// definition treats them as one file whose clusters are the UNION of theirs
+/// (see `ambiguous_by_full_scan`'s property 2). `clusters` is that union, sorted
+/// and deduplicated, so the key appears at most once in each `claimants` list.
+#[derive(Debug)]
+struct KeyClaim {
+    units: Vec<ClaimUnit>,
+    clusters: Vec<u32>,
+    /// How many of `clusters` are contested -- claimed by another live key, or
+    /// registered as a directory cluster. The key is ambiguous exactly when this
+    /// is non-zero.
+    ///
+    /// A COUNT, not a sticky flag. A flag set by one pass and never cleared
+    /// would be order-dependent and would not be cost-only: one permanent
+    /// over-flag keeps a key in `blocked_projection_keys`, which makes
+    /// `metadata_projection_pending` return `true` for the rest of the session,
+    /// which pins a reconcile on every command and moves
+    /// `metadata_projection_passes`. Reference counting is what makes the
+    /// incremental answer EQUAL to the full scan's rather than a superset of it.
+    bad: u32,
+}
+
+/// Passes between forced refreshes of any one key.
+///
+/// Insurance, not correctness: the invalidation hooks are what make the index
+/// right, and this bounds how long an unanticipated miss could persist. It is
+/// AMORTISED -- each pass forcibly refreshes `1/N` of the live keys in rotation
+/// rather than rebuilding everything every Nth pass. A periodic full rebuild
+/// would land in `projection_max_ns`, which is the metric the whole slice is
+/// graded on, and would make the worst pass a property of the rebuild rather
+/// than of the work; and at any N large enough to be cheap it would never fire
+/// at all on a 14-pass row.
+const CLAIM_REFRESH_PERIOD: usize = 64;
+
+/// Whether a directory's byte image ends where FAT says it should.
+///
+/// `katea_write::parse_dir` stops at the first entry whose first byte is 0x00,
+/// which in a well-formed FAT directory means "this slot and every slot after it
+/// is free". A TORN directory -- one whose middle sector the guest has zeroed but
+/// not yet rewritten, which is what an installer growing a directory produces --
+/// looks identical from `parse_dir`'s side: it stops early and silently hides
+/// every entry behind the hole.
+///
+/// The signature is detectable, and it is the only one there is: a live or
+/// deleted entry (first byte anything but 0x00) sitting AFTER the first 0x00.
+/// DOS never writes that; a half-written directory does.
+///
+/// Used only to decide whether the incremental claim index may trust this pass's
+/// live set. The reconcile phases themselves are unchanged and still treat the
+/// truncated parse exactly as they always have.
+fn directory_image_is_whole(bytes: &[u8]) -> bool {
+    let mut terminated = false;
+    for entry in bytes.chunks_exact(32) {
+        match (terminated, entry[0]) {
+            (false, 0x00) => terminated = true,
+            (true, 0x00) => {}
+            (true, _) => return false,
+            (false, _) => {}
+        }
+    }
+    true
+}
+
 /// Chain memo entries kept before the whole map is dropped.
 ///
 /// The map is keyed by first cluster, so a well-behaved mount holds one entry
@@ -1121,6 +1272,25 @@ pub(crate) struct KateaTreeVolume {
     /// FAT-copy-relative (so a write to either copy expires both, which is the
     /// conservative direction). Absent means never.
     fat_sector_epoch: HashMap<u32, u64>,
+    /// The incremental claim index: what each live directory entry claims, and
+    /// the reverse map. See [`KeyClaim`] and
+    /// [`KateaTreeVolume::ambiguous_incrementally`].
+    claim_by_key: HashMap<(u32, [u8; 11]), KeyClaim>,
+    claimants: HashMap<u32, Claimants>,
+    /// False when the index cannot be trusted and the next pass must rebuild it
+    /// from a full scan. Set by every case in which we do not know what changed.
+    claims_valid: bool,
+    /// Pass counter, so the amortised forced refresh rotates deterministically
+    /// rather than depending on `HashMap` iteration order.
+    claims_pass: usize,
+    /// `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` forces the full scan every pass:
+    /// the same-binary A/B control leg, and the field bisect if a mounted folder
+    /// ever comes back wrong. Read once at mount.
+    incremental_claims: bool,
+    /// `IZARRAVM_KATEA_CLAIMS_VERIFY=1` computes BOTH and prefers the full scan
+    /// on any disagreement, saying so loudly. Slower by construction; it is what
+    /// lets a real fixture row grade the index, which no unit test can.
+    claims_verify: bool,
     /// Chain walks actually performed, and memo hits, since mount. The memo
     /// exists to keep the first proportional to what CHANGED rather than to the
     /// mounted folder, and a test reads both to prove it.
@@ -1128,6 +1298,32 @@ pub(crate) struct KateaTreeVolume {
     chain_walks: std::cell::Cell<u64>,
     #[cfg(test)]
     chain_memo_hits: std::cell::Cell<u64>,
+    /// Claim insertions performed, and live keys skipped because their claim was
+    /// still current. The whole point of the index is that the first is
+    /// proportional to what CHANGED; a test reads both.
+    #[cfg(test)]
+    claim_inserts: std::cell::Cell<u64>,
+    #[cfg(test)]
+    claim_skips: std::cell::Cell<u64>,
+    /// Disagreements the verify harness has seen. Behaviourally invisible (the
+    /// harness prefers the reference), so only a test can observe one.
+    #[cfg(test)]
+    claim_divergences: std::cell::Cell<u64>,
+    /// Test-only fault injection: stop stamping `fat_sector_epoch`, so the claim
+    /// index goes stale on purpose. There is no production path that does this;
+    /// it exists to prove the FAILURE DIRECTION is a hold and not a clobber.
+    #[cfg(test)]
+    suppress_epoch_stamps: bool,
+    /// Test-only: turn OFF the amortised forced refresh. It exists as insurance
+    /// against a hook nobody anticipated, and that is exactly what makes it a
+    /// hazard in a fixture: on a volume with a handful of keys the rotation
+    /// reaches every one of them within a few passes, so a fixture aimed at ONE
+    /// invalidation hook silently passes when that hook is deleted, because the
+    /// insurance re-derived the claim anyway. Four such mutants survived before
+    /// this switch existed. Every hook-isolating fixture turns it off; the
+    /// fixture for the refresh itself leaves it on.
+    #[cfg(test)]
+    amortised_refresh: bool,
     /// Arms the FAT / directory / free-space region census. Read once at mount
     /// from `IZARRAVM_KATEA_REGION_CENSUS=1`, and OFF by default: those two
     /// counters were investigation residue, and an increment is still a branch
@@ -1141,6 +1337,19 @@ pub(crate) struct KateaTreeVolume {
 /// [`KateaTreeVolume::region_census`].
 fn region_census_enabled() -> bool {
     std::env::var("IZARRAVM_KATEA_REGION_CENSUS").as_deref() == Ok("1")
+}
+
+/// Enabled by default; `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` forces the full
+/// anti-clobber scan every pass. Same-binary control leg and field bisect.
+fn incremental_claims_enabled() -> bool {
+    std::env::var("IZARRAVM_KATEA_INCREMENTAL_CLAIMS").as_deref() != Ok("0")
+}
+
+/// Off by default; `IZARRAVM_KATEA_CLAIMS_VERIFY=1` computes the incremental
+/// answer AND the full scan every pass and prefers the full scan on any
+/// disagreement. Deliberately slow.
+fn claims_verify_enabled() -> bool {
+    std::env::var("IZARRAVM_KATEA_CLAIMS_VERIFY").as_deref() == Ok("1")
 }
 
 /// Enabled by default; `=0` provides a same-binary benchmark control.
@@ -1312,6 +1521,12 @@ katea_counter_block! {
     projection_max_ns,
     metadata_projection_passes,
     host_write_failures,
+    /// Directory entries currently HELD by the anti-clobber guard, as a gauge
+    /// rather than a total: the set they live in (`blocked_projection_keys`) is
+    /// meant to drain, and a non-zero reading at the end of a run means some file
+    /// was never projected. Exported because a criterion that cannot be read is
+    /// not a criterion.
+    blocked_projection_keys,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1618,7 +1833,7 @@ impl KateaTreeVolume {
             .flat_map(|(first, last, _)| (*first..=*last).map(|cluster| (cluster, *first)))
             .collect();
 
-        Ok(Self {
+        let mut volume = Self {
             tree,
             geo,
             mbr: mbr_out,
@@ -1676,8 +1891,57 @@ impl KateaTreeVolume {
             chain_walks: std::cell::Cell::new(0),
             #[cfg(test)]
             chain_memo_hits: std::cell::Cell::new(0),
+            claim_by_key: HashMap::new(),
+            claimants: HashMap::new(),
+            claims_valid: false,
+            claims_pass: 0,
+            incremental_claims: incremental_claims_enabled(),
+            claims_verify: claims_verify_enabled(),
+            #[cfg(test)]
+            claim_inserts: std::cell::Cell::new(0),
+            #[cfg(test)]
+            claim_skips: std::cell::Cell::new(0),
+            #[cfg(test)]
+            claim_divergences: std::cell::Cell::new(0),
+            #[cfg(test)]
+            suppress_epoch_stamps: false,
+            #[cfg(test)]
+            amortised_refresh: true,
             region_census: region_census_enabled(),
-        })
+        };
+        volume.prime_claim_index();
+        Ok(volume)
+    }
+
+    /// Build the anti-clobber claim index once, HERE, at mount.
+    ///
+    /// The index cannot make the FIRST derivation cheap -- pass one has to decide
+    /// ambiguity over every live file, and that is O(clusters in the folder)
+    /// however it is written. What it can decide is WHERE that cost lands. Left
+    /// to the first projection pass it lands in `projection_max_ns`, which is the
+    /// synchronous-freeze metric this whole slice exists to move: measured, the
+    /// cold build made the worst pass on a 498 MB folder 14.4 ms, WORSE than the
+    /// 8.5 ms it was replacing, while every other pass fell to under 2 ms.
+    ///
+    /// Mount is where that cost belongs. It is already O(folder) -- `walk_into`
+    /// recurses the host tree and `seed` inserts one `projected_clusters` entry
+    /// per cluster -- it happens once, and it happens while the user is waiting
+    /// for a drive to appear rather than mid-game.
+    ///
+    /// No new derivation: this runs the same `gather_live` +
+    /// `ambiguous_incrementally` the passes run, so there is nothing extra to
+    /// prove correct. The set it computes is discarded; only the index is kept.
+    /// A folder that arrives with an incomplete directory simply leaves the index
+    /// cold, and the first pass rebuilds it exactly as it would have.
+    fn prime_claim_index(&mut self) {
+        if !self.incremental_claims {
+            return;
+        }
+        let (live, complete) = self.gather_live();
+        if !complete {
+            return;
+        }
+        let _ = self.ambiguous_incrementally(&live);
     }
 
     /// The synthesized geometry, for the profile report. Derived at mount from
@@ -1710,6 +1974,7 @@ impl KateaTreeVolume {
         counters.spill_operations = store.spill_operations;
         counters.spill_bytes = store.spill_bytes;
         counters.spill_wall_ns = store.spill_wall_ns;
+        counters.blocked_projection_keys = self.blocked_projection_keys.len() as u64;
         counters
     }
 
@@ -1745,6 +2010,15 @@ impl KateaTreeVolume {
     #[cfg(test)]
     pub(crate) fn reset_fat_walk_resolves(&self) {
         self.fat_walk_resolves.set(0);
+    }
+
+    /// Drop every memoized chain, so a fixture measuring what a WALK costs
+    /// measures a walk. `prime_claim_index` warms the memo at mount, which is the
+    /// point of it, and a fixture that did not clear it would be timing a
+    /// `HashMap` lookup.
+    #[cfg(test)]
+    pub(crate) fn clear_chain_memo(&self) {
+        self.chain_memo.borrow_mut().clear();
     }
 
     /// One FAT entry through a fresh walk cursor, so a differential test can
@@ -1786,8 +2060,72 @@ impl KateaTreeVolume {
     /// the fixtures that grade any faster implementation against it.
     #[cfg(test)]
     pub(crate) fn ambiguous_reference(&self) -> HashSet<(u32, [u8; 11])> {
-        let live = self.gather_live();
+        let (live, _) = self.gather_live();
         self.ambiguous_by_full_scan(&live)
+    }
+
+    /// The incremental answer over the volume's CURRENT live entries, plus
+    /// `gather_live`'s completeness verdict, for the differential fixtures.
+    #[cfg(test)]
+    pub(crate) fn ambiguous_incremental_for_test(&mut self) -> (HashSet<(u32, [u8; 11])>, bool) {
+        let (live, complete) = self.gather_live();
+        (self.ambiguous_files(&live, complete), complete)
+    }
+
+    /// Claim insertions performed and live keys skipped since the last reset.
+    #[cfg(test)]
+    pub(crate) fn claim_counts(&self) -> (u64, u64) {
+        (self.claim_inserts.get(), self.claim_skips.get())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_claim_counts(&self) {
+        self.claim_inserts.set(0);
+        self.claim_skips.set(0);
+    }
+
+    /// Whether the claim index is currently trusted.
+    #[cfg(test)]
+    pub(crate) fn claims_valid(&self) -> bool {
+        self.claims_valid
+    }
+
+    /// Force the full anti-clobber scan without going through the environment,
+    /// so a test can drive both arms of the gate in one process.
+    #[cfg(test)]
+    pub(crate) fn disarm_incremental_claims(&mut self) {
+        self.incremental_claims = false;
+    }
+
+    /// Arm the verify harness in-process: every internal `ambiguous_files` call
+    /// computes both answers and counts any disagreement.
+    #[cfg(test)]
+    pub(crate) fn arm_claims_verify(&mut self) {
+        self.claims_verify = true;
+    }
+
+    /// Disagreements between the incremental index and the full scan since mount.
+    /// The verify harness prefers the reference and rebuilds, so a divergence is
+    /// invisible to behaviour; a test has to read the count to see it.
+    #[cfg(test)]
+    pub(crate) fn claim_divergences(&self) -> u64 {
+        self.claim_divergences.get()
+    }
+
+    /// Turn off the amortised forced refresh, so a fixture measures the hook it
+    /// is aiming at rather than the insurance. See
+    /// [`Self::amortised_refresh`].
+    #[cfg(test)]
+    pub(crate) fn disable_amortised_refresh(&mut self) {
+        self.amortised_refresh = false;
+    }
+
+    /// Stop stamping `fat_sector_epoch`, simulating an invalidation hook that
+    /// missed. The failure-direction fixture uses it to make the index stale ON
+    /// PURPOSE and assert the outcome is a hold rather than a clobber.
+    #[cfg(test)]
+    pub(crate) fn suppress_fat_epoch_stamps(&mut self) {
+        self.suppress_epoch_stamps = true;
     }
 
     /// The same live set the reference was computed over, as
@@ -1796,6 +2134,7 @@ impl KateaTreeVolume {
     #[cfg(test)]
     pub(crate) fn live_entries_for_test(&self) -> Vec<(u32, [u8; 11], u32, bool)> {
         self.gather_live()
+            .0
             .into_iter()
             .map(|e| (e.dir_cluster, e.name, e.first_cluster, e.is_dir))
             .collect()
@@ -2156,12 +2495,62 @@ impl KateaTreeVolume {
     /// probes for a chain of any length, because a FAT sector covers 128
     /// clusters.
     fn chain_memo_is_current(&self, memo: &ChainMemo) -> bool {
-        if self.fat_epoch == memo.epoch {
+        self.chain_token_is_current(memo.epoch, &memo.sectors)
+    }
+
+    /// The same currency test over a token held somewhere other than the memo.
+    fn chain_token_is_current(&self, epoch: u64, sectors: &[u32]) -> bool {
+        if self.fat_epoch == epoch {
             return true;
         }
-        memo.sectors
+        sectors
             .iter()
-            .all(|within| self.fat_sector_epoch.get(within).copied().unwrap_or(0) <= memo.epoch)
+            .all(|within| self.fat_sector_epoch.get(within).copied().unwrap_or(0) <= epoch)
+    }
+
+    /// A chain walk plus the token that dates it, for the claim index.
+    ///
+    /// `None` for the token means the walk was DEGRADED -- it read substituted
+    /// zeros for an unreadable spilled FAT sector, or followed a link past FAT
+    /// copy 0 through a sector it never recorded. Such a walk is not memoized and
+    /// must not be claimed either: its answer is a function of an I/O failure or
+    /// of a dependency outside its own set.
+    fn chain_with_token(&self, first: u32) -> (Option<Vec<u32>>, Option<ChainToken>) {
+        if let Some(memo) = self.chain_memo.borrow().get(&first)
+            && self.chain_memo_is_current(memo)
+        {
+            #[cfg(test)]
+            self.chain_memo_hits
+                .set(self.chain_memo_hits.get().saturating_add(1));
+            return (
+                memo.result.clone(),
+                Some((memo.epoch, memo.sectors.clone())),
+            );
+        }
+        #[cfg(test)]
+        self.chain_walks
+            .set(self.chain_walks.get().saturating_add(1));
+        let mut walk = FatWalk::default();
+        let result = crate::katea_write::chain(first, self.max_chain(), |c| {
+            self.fat_entry_walked(c, &mut walk)
+        });
+        if walk.degraded {
+            return (result, None);
+        }
+        let token = (self.fat_epoch, walk.sectors.clone());
+        let mut memo = self.chain_memo.borrow_mut();
+        if memo.len() >= CHAIN_MEMO_MAX_ENTRIES && !memo.contains_key(&first) {
+            memo.clear();
+        }
+        memo.insert(
+            first,
+            ChainMemo {
+                result: result.clone(),
+                sectors: walk.sectors,
+                epoch: self.fat_epoch,
+            },
+        );
+        (result, Some(token))
     }
 
     /// Absolute LBA of a data cluster's first sector. The reconcile pass and the
@@ -2216,6 +2605,10 @@ impl KateaTreeVolume {
             // [`ChainMemo`]'s dependency test sound. Taken modulo `fatsz`, so a
             // write to either FAT copy expires memos that read the first -- the
             // conservative direction, and free.
+            #[cfg(test)]
+            if self.suppress_epoch_stamps {
+                return true;
+            }
             self.fat_epoch += 1;
             self.fat_sector_epoch.insert(within, self.fat_epoch);
             return true;
@@ -2639,7 +3032,7 @@ impl KateaTreeVolume {
             return true;
         }
         let errors_before = self.store.read_errors();
-        let live = self.gather_live();
+        let (live, _complete) = self.gather_live();
         if self.store.read_errors() != errors_before {
             return true;
         }
@@ -2677,20 +3070,45 @@ impl KateaTreeVolume {
     /// Read-only walk of every known directory, collecting its live entries (files
     /// and subdirs, skipping dots/LFN/volume-label/system names). The basis for
     /// detecting disappearances (delete/rename) in `reconcile`.
-    fn gather_live(&self) -> Vec<LiveEntry> {
+    ///
+    /// The `bool` is whether every directory it visited was gathered TO
+    /// COMPLETION. Three paths drop a whole directory's entries without
+    /// `store.read_errors()` moving:
+    ///
+    /// * its chain will not resolve (`chain_of` returns `None`);
+    /// * a chain link is outside the data region;
+    /// * `parse_dir` stops at a zeroed entry with live entries behind it -- the
+    ///   hazard `reconcile_mode`'s own entry comment names, and exactly what an
+    ///   installer zeroing a directory cluster mid-write produces.
+    ///
+    /// None of those is an error to this function: an absent entry reads as a
+    /// deletion, which is what phase 2 is for and is guarded there by the "chain
+    /// freed and unclaimed" test. But the incremental claim index would read it
+    /// as a RETRACTION, and a retraction on unreliable evidence is the one
+    /// direction the anti-clobber guard cannot afford. So the verdict is reported
+    /// and `ambiguous_files` falls back to the full scan when it is false.
+    ///
+    /// A directory that exists but is not in `dir_paths` is not "incomplete" --
+    /// it is not visited at all, by design (a just-MKDIR'd subdir is registered
+    /// by the materialize phase and gathered on the next pass), and the full scan
+    /// does not see it either.
+    fn gather_live(&self) -> (Vec<LiveEntry>, bool) {
         let spc = u32::from(self.geo.spc);
         let cluster_bytes = spc as usize * SECTOR;
         let mut work: Vec<u32> = self.dir_paths.keys().copied().collect();
         let mut seen: HashSet<u32> = HashSet::new();
         let mut out = Vec::new();
+        let mut complete = true;
         while let Some(dir_cluster) = work.pop() {
             if !seen.insert(dir_cluster) {
                 continue;
             }
             let Some(dir_chain) = self.chain_of(dir_cluster) else {
+                complete = false;
                 continue;
             };
             if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
+                complete = false;
                 continue;
             }
             let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
@@ -2699,6 +3117,9 @@ impl KateaTreeVolume {
                 for s in 0..spc {
                     dir_bytes.extend_from_slice(&self.read_sector(base + s));
                 }
+            }
+            if !directory_image_is_whole(&dir_bytes) {
+                complete = false;
             }
             for e in crate::katea_write::parse_dir(&dir_bytes) {
                 match crate::katea_write::classify(&e, &self.system_names) {
@@ -2737,7 +3158,7 @@ impl KateaTreeVolume {
                 }
             }
         }
-        out
+        (out, complete)
     }
 
     /// Reconcile the overlay to the host folder: walk every known directory and
@@ -2987,6 +3408,286 @@ impl KateaTreeVolume {
         ambiguous_files
     }
 
+    /// Abandon the incremental claim index. The next pass rebuilds it from a full
+    /// scan.
+    ///
+    /// Called from every place where we do not know WHAT changed, which is the
+    /// only safe reading of "something changed": a degraded walk, a directory
+    /// cluster being un-registered, and a `gather_live` that dropped a directory.
+    /// Cannot be wrong, only cold.
+    fn poison_claims(&mut self) {
+        self.claims_valid = false;
+        self.claim_by_key.clear();
+        self.claimants.clear();
+    }
+
+    /// Register `cluster` as belonging to directory `owner`, flagging any live
+    /// claimant if that makes the cluster contested for the first time.
+    ///
+    /// THE UNDER-FLAG HAZARD THIS CLOSES. A file's chain can be perfectly
+    /// unchanged -- its FAT token still current, so the index never revisits it
+    /// -- while a cluster it holds BECOMES a directory cluster underneath it.
+    /// Nothing in the FAT epoch sees that, so the growth side of
+    /// `directory_clusters` needs its own hook. It is O(clusters added), which is
+    /// one directory chain, not the mount.
+    ///
+    /// The shrink side (a directory deleted, `retain` in phase 2) removes
+    /// ambiguity, and removing a flag is the dangerous direction, so it poisons
+    /// instead. Directory deletes are rare; one cold pass is the right price.
+    fn register_directory_cluster(&mut self, cluster: u32, owner: u32) {
+        if self.directory_clusters.insert(cluster, owner).is_some() {
+            return; // already a directory cluster; contested-ness unchanged
+        }
+        let Some(list) = self.claimants.get(&cluster) else {
+            return;
+        };
+        if list.len() >= 2 {
+            return; // already contested by the multi-claimant rule
+        }
+        let Some(key) = list.only() else {
+            return; // no live claimant: nothing to flag
+        };
+        if let Some(claim) = self.claim_by_key.get_mut(&key) {
+            claim.bad += 1;
+        }
+    }
+
+    /// Drop `key`'s claims, decrementing any other key that stops being contested
+    /// as a result.
+    fn retract_claim(&mut self, key: (u32, [u8; 11])) {
+        let Some(claim) = self.claim_by_key.remove(&key) else {
+            return;
+        };
+        for cluster in claim.clusters {
+            let dir = self.directory_clusters.contains_key(&cluster);
+            let Some(list) = self.claimants.get_mut(&cluster) else {
+                continue;
+            };
+            let old_len = list.len();
+            let new_len = list.remove(key);
+            // Contested is `>= 2 claimants OR a directory cluster`. The only
+            // transition a retraction can make is 2 -> 1 with no directory
+            // overlap, and then exactly one key stops being contested here.
+            if !dir
+                && old_len == 2
+                && new_len == 1
+                && let Some(other) = list.only()
+                && let Some(c) = self.claim_by_key.get_mut(&other)
+            {
+                c.bad = c.bad.saturating_sub(1);
+            }
+            if new_len == 0 {
+                self.claimants.remove(&cluster);
+            }
+        }
+    }
+
+    /// Walk every live entry with this key, union their chains, and record the
+    /// claim. Returns false if any walk was degraded, in which case the caller
+    /// must poison: a claim whose dependency set is incomplete is exactly the
+    /// stale claim the guard cannot afford.
+    fn insert_claim(&mut self, key: (u32, [u8; 11]), firsts: &[u32]) -> bool {
+        #[cfg(test)]
+        self.claim_inserts
+            .set(self.claim_inserts.get().saturating_add(1));
+        let mut units = Vec::with_capacity(firsts.len());
+        let mut clusters: Vec<u32> = Vec::new();
+        for first in firsts {
+            let (result, token) = self.chain_with_token(*first);
+            let Some((epoch, sectors)) = token else {
+                return false;
+            };
+            units.push(ClaimUnit {
+                first_cluster: *first,
+                epoch,
+                sectors,
+            });
+            if let Some(chain) = result {
+                clusters.extend(chain);
+            }
+        }
+        // One entry per cluster per KEY, so the key appears at most once in each
+        // `claimants` list -- which is what makes the 2 -> 1 transition in
+        // `retract_claim` exact. A single chain cannot repeat a cluster (that
+        // would not terminate and `katea_write::chain` returns `None`), so the
+        // sort is needed ONLY to collapse an overlap between two entries sharing
+        // a name, which is the rare duplicate-8.3-name case. Skipping it in the
+        // single-entry case is what keeps the cold build to one pass over the
+        // chain rather than a sort of it.
+        if units.len() > 1 {
+            clusters.sort_unstable();
+            clusters.dedup();
+        }
+
+        let mut bad = 0u32;
+        let mut newly_contested: Vec<(u32, [u8; 11])> = Vec::new();
+        for cluster in &clusters {
+            let dir = self.directory_clusters.contains_key(cluster);
+            match self.claimants.get_mut(cluster) {
+                None => {
+                    self.claimants.insert(*cluster, Claimants::One(key));
+                    if dir {
+                        bad += 1;
+                    }
+                }
+                Some(list) => {
+                    let old_len = list.len();
+                    let old_contested = old_len >= 2 || dir;
+                    // The one key that was here alone becomes contested now.
+                    if !old_contested
+                        && old_len == 1
+                        && let Some(other) = list.only()
+                    {
+                        newly_contested.push(other);
+                    }
+                    list.push(key);
+                    if list.len() >= 2 || dir {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+        for other in newly_contested {
+            if let Some(c) = self.claim_by_key.get_mut(&other) {
+                c.bad += 1;
+            }
+        }
+        self.claim_by_key.insert(
+            key,
+            KeyClaim {
+                units,
+                clusters,
+                bad,
+            },
+        );
+        true
+    }
+
+    /// The anti-clobber guard, evaluated incrementally.
+    ///
+    /// Same set as [`Self::ambiguous_by_full_scan`], which is the definition;
+    /// this reaches it by touching only the keys whose contribution can have
+    /// changed. See [`KeyClaim::bad`] for why it is reference-counted rather than
+    /// flagged, and [`Self::register_directory_cluster`] /
+    /// [`Self::poison_claims`] for the two invalidation sources the FAT epoch
+    /// does not cover.
+    ///
+    /// `dirs_complete` is `gather_live`'s verdict on its own output. It is not a
+    /// nicety: `gather_live` has three paths that drop a whole directory without
+    /// `store.read_errors()` moving -- a chain that will not resolve, a chain
+    /// link out of range, and `parse_dir` stopping at a zeroed entry with live
+    /// entries behind it, which is precisely what an installer zeroing a
+    /// directory cluster mid-write produces. Retracting keys off such a live set
+    /// would be a retraction on unreliable evidence, so instead the pass falls
+    /// back to the full scan (which sees the same incomplete `live`, so the
+    /// answer stays exactly the reference's) and rebuilds next pass.
+    fn ambiguous_files(
+        &mut self,
+        live: &[LiveEntry],
+        dirs_complete: bool,
+    ) -> HashSet<(u32, [u8; 11])> {
+        if !self.incremental_claims || !dirs_complete {
+            if !dirs_complete {
+                self.poison_claims();
+            }
+            return self.ambiguous_by_full_scan(live);
+        }
+        let incremental = self.ambiguous_incrementally(live);
+        if !self.claims_verify {
+            return incremental;
+        }
+        let reference = self.ambiguous_by_full_scan(live);
+        if incremental != reference {
+            eprintln!(
+                "katea: INCREMENTAL CLAIM INDEX DIVERGED -- incremental {} keys, reference {} \
+                 keys; using the reference and rebuilding. This is a bug; re-run with \
+                 IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0 to bypass the index entirely.",
+                incremental.len(),
+                reference.len()
+            );
+            #[cfg(test)]
+            self.claim_divergences
+                .set(self.claim_divergences.get().saturating_add(1));
+            self.poison_claims();
+        }
+        reference
+    }
+
+    fn ambiguous_incrementally(&mut self, live: &[LiveEntry]) -> HashSet<(u32, [u8; 11])> {
+        // The live entries the guard reasons about, keyed, in `live` order so the
+        // amortised refresh rotation is deterministic.
+        let mut order: Vec<(u32, [u8; 11])> = Vec::new();
+        let mut units: HashMap<(u32, [u8; 11]), Vec<u32>> = HashMap::new();
+        for entry in live.iter().filter(|e| !e.is_dir && e.first_cluster >= 2) {
+            let key = (entry.dir_cluster, entry.name);
+            let slot = units.entry(key).or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            });
+            slot.push(entry.first_cluster);
+        }
+
+        if !self.claims_valid {
+            self.claim_by_key.clear();
+            self.claimants.clear();
+            self.claims_valid = true;
+        }
+
+        // Retract keys that are no longer live. Sound because `dirs_complete`
+        // held: every directory was gathered to completion, so a key missing from
+        // `units` really is gone.
+        let stale: Vec<(u32, [u8; 11])> = self
+            .claim_by_key
+            .keys()
+            .filter(|key| !units.contains_key(*key))
+            .copied()
+            .collect();
+        for key in stale {
+            self.retract_claim(key);
+        }
+
+        self.claims_pass = self.claims_pass.wrapping_add(1);
+        let rotation = self.claims_pass % CLAIM_REFRESH_PERIOD;
+        let mut poisoned = false;
+        for (index, key) in order.iter().enumerate() {
+            let firsts = &units[key];
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut forced = index % CLAIM_REFRESH_PERIOD == rotation;
+            #[cfg(test)]
+            if !self.amortised_refresh {
+                forced = false;
+            }
+            let current = !forced
+                && self.claim_by_key.get(key).is_some_and(|claim| {
+                    claim.units.len() == firsts.len()
+                        && claim.units.iter().zip(firsts.iter()).all(|(unit, first)| {
+                            unit.first_cluster == *first
+                                && self.chain_token_is_current(unit.epoch, &unit.sectors)
+                        })
+                });
+            if current {
+                #[cfg(test)]
+                self.claim_skips
+                    .set(self.claim_skips.get().saturating_add(1));
+                continue;
+            }
+            self.retract_claim(*key);
+            if !self.insert_claim(*key, firsts) {
+                poisoned = true;
+                break;
+            }
+        }
+        if poisoned {
+            self.poison_claims();
+            return self.ambiguous_by_full_scan(live);
+        }
+
+        order
+            .into_iter()
+            .filter(|key| self.claim_by_key.get(key).is_some_and(|c| c.bad > 0))
+            .collect()
+    }
+
     fn reconcile_mode(&mut self, mode: ReconcileMode) {
         // Drop every cached read view before touching the host. This pass is the
         // funnel for `atomic_write`, `fs::rename` and the deletes, and
@@ -3009,14 +3710,14 @@ impl KateaTreeVolume {
         let errors_at_entry = self.store.read_errors();
 
         // PHASE 1: gather all live entries (read-only).
-        let live = self.gather_live();
+        let (live, dirs_complete) = self.gather_live();
         if self.store.read_errors() != errors_at_entry {
             // The live set is what every later phase reasons against, so a hole in
             // it cannot be scoped to one chain. Do nothing at all this pass.
             eprintln!("katea: skipping reconcile after a failed read of guest-written data");
             return;
         }
-        let ambiguous_files = self.ambiguous_by_full_scan(&live);
+        let ambiguous_files = self.ambiguous_files(&live, dirs_complete);
         if self.store.read_errors() != errors_at_entry {
             eprintln!("katea: skipping reconcile after a failed FAT ownership read");
             return;
@@ -3193,6 +3894,10 @@ impl KateaTreeVolume {
                 self.dir_paths.remove(&d.first_cluster);
                 self.directory_clusters
                     .retain(|_, owner| *owner != d.first_cluster);
+                // A cluster leaving `directory_clusters` REMOVES ambiguity, and
+                // removing a flag is the direction the guard cannot take on
+                // trust. Rare (a directory delete), so pay one cold pass.
+                self.poison_claims();
             }
         }
 
@@ -3238,8 +3943,9 @@ impl KateaTreeVolume {
             // the held set. So it costs a map entry and an occasional
             // re-materialize, not a scaling term. The honest fix needs the
             // dirty-set the paragraph above declined to build.
-            self.directory_clusters
-                .extend(dir_chain.iter().map(|cluster| (*cluster, dir_cluster)));
+            for cluster in &dir_chain {
+                self.register_directory_cluster(*cluster, dir_cluster);
+            }
             let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
             for c in &dir_chain {
                 let base = self.cluster_to_lba(*c);
