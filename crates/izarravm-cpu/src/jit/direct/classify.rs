@@ -262,7 +262,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xfe
                 | 0xff
         )
-        // THE V86 LOOP-A ROWS (`IZARRAVM_V86_LOOP_ROWS`, default off) are a SECOND allowlist,
+        // THE V86 LOOP-A ROWS (`IZARRAVM_V86_LOOP_ROWS`, default ON since 2026-08-20) are a
+        // SECOND allowlist,
         // written as its own term rather than folded into the list above so that the gate-off arm
         // is byte-identical to the pre-slice tree by inspection rather than by reading a
         // hundred-line `matches!`.

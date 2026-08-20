@@ -4970,7 +4970,7 @@ use emit_input::*;
 /// `segment_bit`, `SegmentLayout.data` and `segment_access_supported`, with no per-segment arm
 /// anywhere, so splitting them would be a distinction the code does not make.
 ///
-/// ## The CS override (V86 loop-A slice, `IZARRAVM_V86_LOOP_ROWS`, default off)
+/// ## The CS override (V86 loop-A slice, `IZARRAVM_V86_LOOP_ROWS`, default ON since 2026-08-20)
 ///
 /// CS was refused here explicitly rather than by omission, on two stated grounds, and the tombraid
 /// loop-A census answers both. It is admitted only behind the gate, so the off arm is the refusal
@@ -5530,7 +5530,9 @@ pub(crate) fn parse_fpu_loop_rows_arm_for_test(value: Result<String, std::env::V
 }
 
 /// Whether the backend admits the SIX rows the tombraid FMV census's loop A names, plus the two
-/// collateral forms the same code path needs (`IZARRAVM_V86_LOOP_ROWS`). **DEFAULT OFF.**
+/// collateral forms the same code path needs (`IZARRAVM_V86_LOOP_ROWS`). **DEFAULT ON since
+/// 2026-08-20** (the slice shipped OFF for three commits; the flip is priced in the spelling table
+/// below).
 ///
 /// The rows, and each one's home:
 ///
@@ -5611,12 +5613,34 @@ pub(crate) fn parse_fpu_loop_rows_arm_for_test(value: Result<String, std::env::V
 /// local form.
 ///
 /// THE SPELLING TABLE, trimmed and case-folded on the way in, matching `IZARRAVM_FPU_LOOP_ROWS`
-/// except in which arm is the default:
+/// exactly, default included since the 2026-08-20 flip:
 ///
-/// * **unset**, `` (empty), `0` or `off` -> OFF. The shipped default and the pre-slice refusal.
-/// * `1` / `on` -> ON, the slice.
+/// * **unset** or `1` / `on` -> ON. The shipped default. Recorded before that date, an "on" leg is
+///   the non-default arm.
+/// * `` (empty), `0` or `off` -> OFF. The escape, the pre-slice refusal and the A/B base.
 /// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
 ///   fell through to the default would be read as "the arm I asked for changed nothing".
+///
+/// WHAT PRICED THE FLIP, in the order the evidence was taken
+/// (`.bench/results/tomb-v86-loop-20260820/`):
+///
+/// * **tombraid-586 wall ladder**, one binary, A B B A A B, full 28e9 row: **-13.43% min-wall**
+///   (180.500 s against 208.498 s), arms fully non-overlapping, row rt 0.8100 -> 0.9349, 16-bit
+///   insns/entry 3.568 -> 5.607.
+/// * **Census closure**, 20e9 boot+FMV prefix: the gate-OFF arm is byte-identical to MAIN's own
+///   rebuilt binary on twelve counters, and the ON arm's `rejected` class falls 299,371,338 with
+///   the rows' own mass reconciling to a residual of **exactly zero**.
+/// * **doom-486**, the protected-mode CS-override READ half the tombraid ladder cannot price:
+///   `0xFF /4 jmp dword [cs:m]` is lowered, `jit_direct_exit_cross_page_or_alignment` moves by
+///   **0**, and the guest oracle is unchanged at 2134 gametics in 2883 realtics.
+/// * **Board leg, gate ON**: 12 of 12 fixtures pass against main's own pins.
+/// * **wolf3d-586**, the one fixture whose mechanism counters moved hard: **NEUTRAL** over twelve
+///   legs across two ladders of opposite order (median +0.008%), and its row-level census shows
+///   every departing shape inside this gate's named population with a zero reconciliation
+///   residual. Its inertness is RELOCATION, not inaction: the admitted rows convert and the blocks
+///   stop one or two instructions later on `0x01 /0` ADD word memory, `0x8E /0`, `0x61` POPA and
+///   `0xF7 /7` word, every one a documented refusal. That is the next slice for wolf3d, not a
+///   defect in this one.
 pub(crate) fn v86_loop_rows_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = V86_LOOP_ROWS_OVERRIDE.with(std::cell::Cell::get) {
@@ -5630,17 +5654,21 @@ pub(crate) fn v86_loop_rows_enabled() -> bool {
 /// unit-tested without a process-global env write. See `v86_loop_rows_enabled` for the contract.
 fn parse_v86_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        // Unset = OFF while the slice is unpriced. An ON leg must EXPORT `1`; the day a ladder
-        // flips this default, every recorded "defaults" leg before the flip becomes the OFF arm,
-        // which is the trap `IZARRAVM_FPU_LOOP_ROWS` and `IZARRAVM_COUNT_LANES` both carry.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset = ON since the 2026-08-20 flip; `0` / `off` is the escape. Same shape and the
+        // same trap as `IZARRAVM_FPU_LOOP_ROWS`, `IZARRAVM_ROTATE_ROWS` and `IZARRAVM_COUNT_LANES`:
+        // an off leg must EXPORT `0`, and every "defaults" leg recorded BEFORE this flip is the
+        // OFF arm. NULLING the variable is not unsetting it -- PowerShell leaves it present and
+        // empty, and the empty string is spelled OFF two arms down, which is how three earlier
+        // evidence directories came to measure their default-ON knobs off.
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
         // than the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_V86_LOOP_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `0` / `off` (the shipped default: the six 16-bit \
-                 V86-loop rows stay barriers), and `1` / `on` (the slice)"
+                 spellings are unset or `1` / `on` (the shipped default: the six 16-bit \
+                 V86-loop rows and the CS-override clause), and `0` / `off` (the escape, under \
+                 which every one of them stays a barrier)"
             )
         }
         Ok(raw) => raw,
@@ -5649,9 +5677,10 @@ fn parse_v86_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
         "" | "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_V86_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `0` / \
-             `off` (the shipped default: POP ES/DS, CMP AX imm16, MOV AX moffs16, CLC/STC and the \
-             CS-override word-memory forms all stay barriers), and `1` / `on` (the slice). \
+            "IZARRAVM_V86_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default: POP ES/DS, CMP AX imm16, MOV AX moffs16, CLC/STC and the \
+             CS-override word-memory forms are all lowered), and `0` / `off` (the escape, under \
+             which every one of them stays a barrier). \
              Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
              as the arm it named doing nothing"
         ),

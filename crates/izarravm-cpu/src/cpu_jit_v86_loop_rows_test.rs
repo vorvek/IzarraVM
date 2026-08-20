@@ -29,9 +29,11 @@
 //! `mov cs:[m], ax` and `0xc7 /0` `mov word cs:[m], imm16`.
 //!
 //! **Every fixture here states its arm through `set_v86_loop_rows_for_test`, in both directions.**
-//! The shipped default is OFF, so a positive fixture that read the ambient knob would be testing
-//! the refusal and calling it a lowering; the refusal fixtures force `Some(false)` rather than
-//! leaning on the default, so they keep meaning what they say after a flip.
+//! That was written while the default was OFF, when a positive fixture reading the ambient knob
+//! would have been testing the refusal and calling it a lowering. The default is ON since
+//! 2026-08-20 and the discipline is unchanged and now pays the other way: the REFUSAL fixtures
+//! would be the vacuous ones if they leaned on it. Nothing in this file reads the ambient arm
+//! except the default pin itself, which is the one assertion that is supposed to.
 //!
 //! The differential rows run the same guest bytes natively and through a BLOCK-FREE interpreter
 //! from identical state, and compare registers (segment registers and EIP included), the raw lazy
@@ -298,9 +300,11 @@ fn loop_a_collateral() -> Vec<(&'static str, Vec<u8>)> {
 
 /// THE DEFAULT PIN, and it is the one assertion that decides what a shipped binary admits.
 ///
-/// Catches: a flip of `parse_v86_loop_rows_arm`'s `NotPresent` arm. The slice ships OFF and is
-/// unpriced; a default that moved without a ladder would change every shipped binary's admission
-/// silently, and the CS-override reversal in particular would ride along unmeasured.
+/// Catches: a flip of `parse_v86_loop_rows_arm`'s `NotPresent` arm. The default is ON since the
+/// 2026-08-20 flip, which the tombraid-586 ladder priced at -13.43% min-wall with the doom
+/// CS-READ row, a 12/12 board leg and a NEUTRAL twelve-leg wolf3d-586 result behind it; a default
+/// that moved back without a ladder would change every shipped binary's admission silently, and
+/// the CS-override reversal in particular would ride along unmeasured.
 ///
 /// It reads the AMBIENT knob deliberately -- no override -- and it must therefore agree with the
 /// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: the whole point
@@ -312,7 +316,7 @@ fn loop_a_collateral() -> Vec<(&'static str, Vec<u8>)> {
 /// it checks that the process-wide `OnceLock` reading agrees with the exported value, which is the
 /// same claim one level up and is exactly what a ladder leg depends on.
 #[test]
-fn v86_loop_rows_ship_off_by_default() {
+fn v86_loop_rows_ship_on_by_default() {
     jit::direct::set_v86_loop_rows_for_test(None);
     let ambient = std::env::var("IZARRAVM_V86_LOOP_ROWS");
     let expected = jit::direct::parse_v86_loop_rows_arm_for_test(ambient.clone());
@@ -324,8 +328,8 @@ fn v86_loop_rows_ship_off_by_default() {
     );
     if ambient.is_err() {
         assert!(
-            !expected,
-            "IZARRAVM_V86_LOOP_ROWS must default OFF until a tombraid-586 ladder prices it"
+            expected,
+            "IZARRAVM_V86_LOOP_ROWS must default ON since the 2026-08-20 flip; see              v86_loop_rows_enabled for the evidence that priced it"
         );
     }
 }
@@ -340,8 +344,16 @@ fn v86_loop_rows_ship_off_by_default() {
 fn v86_loop_rows_spelling_table_names_both_arms() {
     use std::env::VarError;
     assert!(
-        !jit::direct::parse_v86_loop_rows_arm_for_test(Err(VarError::NotPresent)),
-        "unset must name the OFF arm while the slice is unpriced"
+        jit::direct::parse_v86_loop_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the ON arm since the 2026-08-20 flip"
+    );
+    // The EMPTY string is a spelling of OFF and unset is a spelling of ON, and the two must not be
+    // confused for one another. That is not a hypothetical distinction: nulling an environment
+    // variable in PowerShell leaves it PRESENT and EMPTY, so three earlier evidence directories
+    // ran their default-ON knobs off believing they had left them at the default.
+    assert!(
+        !jit::direct::parse_v86_loop_rows_arm_for_test(Ok(String::new())),
+        "the empty string is the OFF arm even though unset is the ON arm"
     );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
         assert!(
