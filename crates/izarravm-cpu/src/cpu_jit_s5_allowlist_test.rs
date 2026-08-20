@@ -135,11 +135,20 @@ fn word_size_dword_siblings_stay_refused() {
     // `word_size_0x81_register_forms_are_lowered` and
     // `word_size_group3_test_forms_follow_the_slice` below.
     //
-    // The `bool` is "refused on the ON arm too". `0x05` is the one row that is not: its whole
-    // form (ADD/OR/AND/SUB/XOR/CMP with a full-width immediate) joins the allowlist under the
-    // gate, which `cpu_jit_v86_loop_rows_test.rs` pins from the other side.
+    // The `bool` is `refused_on_the_v86_on_arm` and it names ONE gate: `IZARRAVM_V86_LOOP_ROWS`,
+    // the arm the loop below sweeps. It was written when that was the only gate in play; two are
+    // now, so the name is spelled out rather than left as "refused on the ON arm too", which at the
+    // `0x85` row would read as a claim about `IZARRAVM_TEST_WORD_ROWS` and be FALSE — that row is
+    // refused here only because the test states `TEST_WORD_ROWS=off` above, and it is asserted
+    // admitted under `=on` at the end of this test. (2026-08-21 review, N5.)
+    //
+    // `0x05` is the one row whose value is `false`: its whole form (ADD/OR/AND/SUB/XOR/CMP with a
+    // full-width immediate) joins the allowlist under the V86 gate, which
+    // `cpu_jit_v86_loop_rows_test.rs` pins from the other side.
     let cases: &[(&str, &[u8], bool)] = &[
         ("0x05 add eax,imm", &[0x66, 0x05, 0x34, 0x12], false),
+        // Refused on both V86 arms, but only while TEST_WORD_ROWS is off — stated at the top of
+        // this test and flipped at the bottom.
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0], true),
         ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10], true),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12], true),
@@ -151,8 +160,8 @@ fn word_size_dword_siblings_stay_refused() {
 
     for arm in [false, true] {
         jit::direct::set_v86_loop_rows_for_test(Some(arm));
-        for &(label, form, refused_on_the_on_arm) in cases {
-            if arm && !refused_on_the_on_arm {
+        for &(label, form, refused_on_the_v86_on_arm) in cases {
+            if arm && !refused_on_the_v86_on_arm {
                 continue;
             }
             word_size_sibling_stays_refused(label, form, arm);

@@ -635,6 +635,40 @@ fn lowered_on(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed, context
 /// saturation. Each is written into the LOW half only, so the seed's `0xdead` high half survives.
 const OPERANDS: [u32; 6] = [0x0000, 0x0001, 0x00ff, 0x7fff, 0x8000, 0xffff];
 
+/// Seed the two guest operands of `TEST rm, reg`, or `None` when the iteration is redundant.
+///
+/// **When `reg == rm` there is only ONE guest register.** The first version of this file wrote
+/// both values into it —
+///
+/// ```ignore
+/// Seed::new().gpr(rm, 0xdead_0000 | a).gpr(reg, 0xbeef_0000 | b)
+/// ```
+///
+/// — so on every aliasing pair the second call overwrote the first, `a` was discarded, and the
+/// advertised 6 x 36 sweep quietly collapsed to 6 distinct machine states. The assertions still
+/// fired (the surviving high half is nonzero, so the ZF discriminator survived) which is exactly
+/// why nothing caught it: it was coverage loss, not a hole. Found by the 2026-08-21 adversarial
+/// review (N1).
+///
+/// The fix sweeps the aliased pairs over `a` alone and skips the thirty duplicate iterations,
+/// rather than pretending to a second operand that does not exist.
+fn operand_seed(reg: u8, rm: u8, a: u32, b: u32) -> Option<Seed> {
+    if reg == rm {
+        // `test ax,ax`: the guest ANDs the register with itself, so `b` is architecturally
+        // meaningless here. One state per `a`, and the 0xdead high half is what makes a Dword
+        // lowering of `test ax,ax` with AX = 0 disagree about ZF.
+        if a != b {
+            return None;
+        }
+        return Some(Seed::new().gpr(usize::from(rm), 0xdead_0000 | a));
+    }
+    Some(
+        Seed::new()
+            .gpr(usize::from(rm), 0xdead_0000 | a)
+            .gpr(usize::from(reg), 0xbeef_0000 | b),
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // 0x85 TEST r/m16, r16 at Word
 // ---------------------------------------------------------------------------------------------
@@ -650,17 +684,22 @@ const OPERANDS: [u32; 6] = [0x0000, 0x0001, 0x00ff, 0x7fff, 0x8000, 0xffff];
 /// shape the census's largest row is: `emit_read_store_value` is called twice into two different
 /// host registers, and an aliasing bug there would only show when the two guest operands are the
 /// same register.
+///
+/// **The sweep is 36 operand pairs on the four DISTINCT-register pairs and 6 on the two aliased
+/// ones**, because an aliased pair has one register and therefore one value; `operand_seed` says so
+/// and skips the redundant iterations rather than overwriting one value with the other. Do not
+/// restore the "6 x 36" reading — it was never true for `(0,0)` and `(6,6)`.
 #[test]
 fn test_word_register_form_matches_the_interpreter_in_a_sixteen_bit_segment() {
     select_test_word_rows(true);
     for &(reg, rm) in &[(0u8, 0u8), (0, 1), (1, 0), (2, 3), (6, 6), (7, 4)] {
         for a in OPERANDS {
             for b in OPERANDS {
+                let Some(base) = operand_seed(reg, rm, a, b) else {
+                    continue;
+                };
                 for live_pending in [false, true] {
-                    let seed = Seed::new()
-                        .gpr(usize::from(rm), 0xdead_0000 | a)
-                        .gpr(usize::from(reg), 0xbeef_0000 | b);
-                    let seed = if live_pending { seed.pending() } else { seed };
+                    let seed = if live_pending { base.pending() } else { base };
                     lowered_on(
                         sixteen_bit_cpu,
                         false,
@@ -683,11 +722,11 @@ fn test_word_register_form_matches_the_interpreter_in_a_thirty_two_bit_segment()
     for &(reg, rm) in &[(0u8, 0u8), (1, 1), (0, 6), (3, 2), (6, 0), (7, 7)] {
         for a in OPERANDS {
             for b in OPERANDS {
+                let Some(base) = operand_seed(reg, rm, a, b) else {
+                    continue;
+                };
                 for live_pending in [false, true] {
-                    let seed = Seed::new()
-                        .gpr(usize::from(rm), 0xdead_0000 | a)
-                        .gpr(usize::from(reg), 0xbeef_0000 | b);
-                    let seed = if live_pending { seed.pending() } else { seed };
+                    let seed = if live_pending { base.pending() } else { base };
                     lowered_on(
                         flat_protected_cpu,
                         true,
@@ -718,9 +757,9 @@ fn test_dword_register_form_is_unchanged_on_both_arms() {
         for &(reg, rm) in &[(0u8, 0u8), (1, 2), (5, 3)] {
             for a in OPERANDS {
                 for b in OPERANDS {
-                    let seed = Seed::new()
-                        .gpr(usize::from(rm), 0xdead_0000 | a)
-                        .gpr(usize::from(reg), 0xbeef_0000 | b);
+                    let Some(seed) = operand_seed(reg, rm, a, b) else {
+                        continue;
+                    };
                     lowered_on(
                         flat_protected_cpu,
                         true,
