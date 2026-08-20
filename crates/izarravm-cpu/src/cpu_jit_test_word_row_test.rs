@@ -47,11 +47,16 @@
 //
 // | # | mutation | caught by | the assertion that fired |
 // |---|---|---|---|
-// | M1 | the Word emit arm routed to `emit_test`, i.e. the Dword emitter reached through the new gate | `test_word_register_form_matches_the_interpreter_*` (both) | raw lazy-flags descriptor: `tag 0x8000_0202, result 0xbeef_0000` against `tag 0x8000_0102, result 0` |
+// | M1 | the Word emit arm routed to `emit_test`, i.e. the Dword emitter reached through the new gate | `test_word_register_form_matches_the_interpreter_*` (both) | raw lazy-flags descriptor: `tag 0x8000_0202, result 0xdead_0000` against `tag 0x8000_0102, result 0` |
 // | M2 | the classify arm's `width: operand_width` reverted to `MemoryWidth::Dword` | the same two | the same descriptor pair, from the other end of the same path |
 // | M3 | the allowlist term widened from `insn.opcode == 0x85` to `matches!(.., 0x85 \| 0xa9)` | `the_gate_does_not_sweep_in_its_neighbours` | "0xA9 TEST AX,imm16 must stay a barrier at Word on the true arm": `Some(3)` against `None` |
 // | M4 | the allowlist term's `test_word_rows_enabled()` guard dropped | `the_word_test_row_flips_with_the_gate` | "unprefixed 85 /r ... must stay a barrier with the gate off": `Some(3)` against `None` -- the mutation that would destroy the A/B base |
 // | M5 | the arm's `DecodedOperand::Reg` bind relaxed to fall back to register 0 on memory | `the_gate_does_not_sweep_in_its_neighbours` | "85 /r MEMORY form must stay a barrier at Dword on the false arm": `Some(3)` against `None` |
+//
+// All five were RE-RUN against the reworked `operand_seed` sweep on 2026-08-21 and all five still
+// die. M1's surviving `result` moved `0xbeef_0000` -> `0xdead_0000` on the first failing case,
+// which is the N1 fix visible in the failure text itself: on an aliasing pair the value that now
+// survives into the register is `a`, where before it was `b` overwriting `a`.
 //
 // M1 and M2 are the same defect entered from the two ends of the width field, and BOTH were run
 // because the emitter and the classifier are separately editable; the shared failure text is the
