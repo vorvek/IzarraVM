@@ -107,7 +107,20 @@ fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
 /// changed nothing'". A mistyped sweep leg is the same trap wearing the same
 /// clothes: it reads as "that threshold changed nothing".
 ///
-/// Unset is the only silent path, because unset is a spelling of "the default".
+/// **UNSET AND EMPTY BOTH MEAN "THE DEFAULT", and only those two are silent.**
+///
+/// The empty string has to be a spelling of unset here, and this is not a
+/// convenience: `[Environment]::SetEnvironmentVariable($name, $null, "Process")`
+/// — how every harness in this repo clears a variable it does not want — leaves
+/// the variable PRESENT AND EMPTY on Windows. That is the same
+/// nulling-is-not-unsetting trap that made three earlier evidence directories
+/// measure their default-ON knobs off, and it bit this branch's own re-ladder
+/// script on the first run after these panics landed: six legs died in 60 ms
+/// each on `IZARRAVM_ATA_POLL_FLOOR_US=""`.
+///
+/// A numeric knob has no "off" value the way the main gate does, so empty
+/// cannot mean anything but "use the default". A NON-EMPTY unparseable value is
+/// still a typo and still panics, which is the case this exists for.
 fn sweep_knob(name: &str, value: Result<String, std::env::VarError>, what: &str) -> Option<u64> {
     let raw = match value {
         Err(std::env::VarError::NotPresent) => return None,
@@ -116,7 +129,11 @@ fn sweep_knob(name: &str, value: Result<String, std::env::VarError>, what: &str)
         }
         Ok(raw) => raw,
     };
-    match raw.trim().parse::<u64>() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<u64>() {
         Ok(parsed) => Some(parsed),
         Err(_) => panic!(
             "{name}={raw:?} is not a number; it takes {what}. \

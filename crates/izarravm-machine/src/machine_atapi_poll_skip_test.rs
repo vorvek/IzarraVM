@@ -1247,14 +1247,25 @@ fn ata_poll_skip_sweep_knobs_panic_on_a_typo() {
     assert_eq!(
         run::sweep_knob_for_test("X", Err(VarError::NotPresent)),
         None,
-        "unset is the ONLY silent path -- it is a spelling of 'the default'"
+        "unset is a spelling of 'the default'"
     );
+    for empty in ["", "   "] {
+        assert_eq!(
+            run::sweep_knob_for_test("X", Ok(empty.to_string())),
+            None,
+            "AND SO IS EMPTY, which is not a convenience: PowerShell's \
+             SetEnvironmentVariable(name, $null) -- how every harness here clears a variable \
+             -- leaves it PRESENT AND EMPTY. Making empty panic killed this branch's own \
+             re-ladder on its first run, six legs in 60 ms each. A numeric knob has no 'off' \
+             value, so empty cannot mean anything but the default."
+        );
+    }
     assert_eq!(
         run::sweep_knob_for_test("X", Ok("  24  ".to_string())),
         Some(24),
         "a number still parses, trimmed"
     );
-    for typo in ["sixteen", "20us", "", "-1", "1.5"] {
+    for typo in ["sixteen", "20us", "-1", "1.5"] {
         let result =
             std::panic::catch_unwind(|| run::sweep_knob_for_test("X", Ok(typo.to_string())));
         assert!(result.is_err(), "sweep knob {typo:?} must panic");
