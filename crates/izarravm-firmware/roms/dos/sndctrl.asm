@@ -10,8 +10,9 @@
 ;
 ; What it changes, and when it takes effect:
 ;   * The live hardware, immediately. The SB16 mixer's Interrupt/DMA Setup
-;     registers (0x80/0x81) and the WSS config register (0x531) are both
-;     writable, so neither device needs a reboot to move.
+;     registers (0x80/0x81) and the WSS board configuration register (0x530,
+;     decoded at all four of 0x530-0x533) are both writable, so neither device
+;     needs a reboot to move.
 ;   * CMOS NVRAM 0x1B-0x21, so the assignment survives a power cycle. Those
 ;     bytes sit inside the 0x10..0x2D checksum window, so 0x2E/0x2F are
 ;     refreshed too -- without that the next POST discards the whole NVRAM as
@@ -54,11 +55,16 @@ WSS_BASE       equ 0x530
 ; line or a DMA channel.
 ;
 ; WRITE:  bits 5:3 select the IRQ, bits 1:0 the DMA channel, by the two fixed
-;         board tables (see wss_config_byte).
-; READ:   the presence signature only -- bits 5:0 read 0x04 on a card that is
-;         there, and the selection is NOT readable. So this tool cannot ask the
-;         card what routing it is on; CMOS is the record, the same way the MPU
-;         port is. Open bus (0xFF) means no card.
+;         board tables (see wss_config_byte). Bit 6 is the IRQ-verify strobe:
+;         raising it drives the selected interrupt line, lowering it releases
+;         the line. This tool never raises it -- it moves the routing and leaves
+;         the verifying to whoever wants it -- so every byte it writes has bit 6
+;         clear, which is also what keeps the write free of side effects.
+; READ:   the presence signature plus the strobe -- bits 5:0 read 0x04 on a card
+;         that is there, bit 6 reads back the last strobe, and the SELECTION is
+;         not readable at all. So this tool cannot ask the card what routing it
+;         is on; CMOS is the record, the same way the MPU port is. Open bus
+;         (0xFF) means no card.
 WSS_CONFIG     equ WSS_BASE
 WSS_SIG_MASK   equ 0x3F
 WSS_SIG_VALUE  equ 0x04
@@ -359,8 +365,9 @@ probe_sb:
 
 ; The board's presence signature, the same check every MSS driver makes: bits
 ; 5:0 of the configuration register read 0x04 on a card that is there. Bit 6 is
-; write-only scratch and bit 7 undefined, so both are masked off. An absent card
-; leaves the port on open bus (0xFF), which fails the compare.
+; the IRQ-verify strobe -- it reads back whatever the last write left there, so
+; it is masked off here along with undefined bit 7. An absent card leaves the
+; port on open bus (0xFF), which fails the compare.
 probe_wss:
     mov dx, WSS_CONFIG
     in al, dx
@@ -1630,9 +1637,14 @@ apply_hw:
 ; {7, 9, 10, 11} and opt_dma8 is {0, 1, 3}, both proper subsets -- so every
 ; selection the menus and the command line can produce has an exact encoding.
 ; Channel 0 uses code 1 rather than code 0; the two are equivalent on the board,
-; and code 1 is what real MSS drivers emit.
+; and code 1 is what real MSS drivers emit. Bit 6 (the IRQ-verify strobe) is left
+; clear, so applying a routing never drives an interrupt line.
+;
+; COUPLED TO opt_wssirq: the fall-through below encodes IRQ 11. Adding a line to
+; that list without adding a case here would silently encode it as 11 -- the
+; menu would show one line and the board would be on another.
 wss_config_byte:
-    mov ah, 0x20                ; IRQ 11 (code 4), the default
+    mov ah, 0x20                ; IRQ 11 (code 4), the fall-through default
     mov al, [FVAL(F_WSIRQ)]
     cmp al, 7
     jne .not_i7

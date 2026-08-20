@@ -2565,6 +2565,7 @@ impl CpuBus for MachineBus<'_> {
         // offset and returns (), so the range is checked first (mirrors read_io).
         if let Some(offset) = self.wss_offset(port) {
             self.wss.write_port(offset, value as u8);
+            self.sync_wss_board_irq();
             return Ok(());
         }
         if ide::IdeChannel::owns_port(port) {
@@ -3122,6 +3123,32 @@ impl MachineBus<'_> {
             9,
             self.wavetable_mpu.irq_level() || self.midi_mpu.irq_level(),
         );
+    }
+
+    /// Apply the WSS board's IRQ-verify strobe to the interrupt controller.
+    ///
+    /// Bit 6 of the config register is a board latch wired straight to the
+    /// selected ISA interrupt line: raising it drives that line, lowering it
+    /// releases it, and re-selecting while it is held moves the assertion to the
+    /// new line. An MSS install routine uses it to prove the line it picked
+    /// actually reaches the CPU. The codec core has no interrupt controller, so
+    /// it records the delta and this drains it on the guest's own `OUT` -- the
+    /// shape `sync_mpu_irq` above uses for the MPU-401 line.
+    ///
+    /// `set_irq_level` is the right primitive rather than `request`: the board
+    /// drives a *level*, and on the AT's edge-triggered 8259 the rising edge is
+    /// what latches into the IRR, exactly as it would on the wire. The codec's
+    /// own terminal-count edge stays on `request` and is unaffected.
+    fn sync_wss_board_irq(&mut self) {
+        let Some(strobe) = self.wss.take_board_irq_strobe() else {
+            return;
+        };
+        if let Some(line) = strobe.released {
+            self.pic.set_irq_level(line, false);
+        }
+        if let Some(line) = strobe.asserted {
+            self.pic.set_irq_level(line, true);
+        }
     }
 
     /// In-region offset (0..=7) of `port` within the AD1848 / WSS port window

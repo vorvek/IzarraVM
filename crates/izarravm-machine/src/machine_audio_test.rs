@@ -1002,6 +1002,113 @@ fn wss_hmi_start_sequence_selects_irq7_and_interrupts_on_that_line() {
     );
 }
 
+/// Bit 6 of the board config register is the IRQ-verify strobe: a 0->1 edge
+/// drives the interrupt line the same byte selected, a 1->0 edge releases it.
+/// That is how an MSS install routine proves the line it picked reaches the CPU,
+/// and it is the reason a write-mostly register has a readable bit at all.
+///
+/// The strobe is board glue, not codec: it fires with the AD1848 idle and
+/// unprogrammed, and it does not consult I10 IEN.
+#[test]
+fn the_board_irq_verify_strobe_asserts_the_selected_line() {
+    let mut machine = test_machine();
+    assert_eq!(
+        machine.wss_routing(),
+        Some((11, 0)),
+        "profile default before the guest touches the board"
+    );
+    assert!(!machine.pic.input_asserted(7));
+    assert!(!machine.pic.input_asserted(11));
+
+    // 0x49 = strobe | IRQ 7 | DMA 0. The line driven must be the one this byte
+    // selected, not the profile's.
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x530, BusWidth::Byte, 0x49, false).unwrap();
+    });
+    assert_eq!(machine.wss_routing(), Some((7, 0)));
+    assert!(
+        machine.pic.input_asserted(7),
+        "the strobe drives the selected line"
+    );
+    assert!(
+        machine.pic.irr_bit(7),
+        "and the rising edge latches a request on the edge-triggered 8259"
+    );
+    assert!(
+        !machine.pic.input_asserted(11),
+        "the profile's line is not the one the guest selected"
+    );
+    with_bus(&mut machine, |bus| {
+        assert_eq!(
+            bus.read_io(0x532, BusWidth::Byte, 0, false).unwrap(),
+            0x44,
+            "the strobe reads back, signature intact, through any mirror port"
+        );
+    });
+
+    // Releasing it lowers the line. The IRR stays latched -- an edge-triggered
+    // 8259 holds the request until it is acknowledged, which is the hardware
+    // behaviour, not a shortcut.
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x533, BusWidth::Byte, 0x09, false).unwrap();
+    });
+    assert!(
+        !machine.pic.input_asserted(7),
+        "the falling edge releases the line"
+    );
+    assert_eq!(machine.wss_routing(), Some((7, 0)), "selection unchanged");
+
+    // A slave line works the same way, and a re-selection while the strobe is
+    // held carries the assertion over rather than leaving two lines driven.
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x530, BusWidth::Byte, 0x61, false).unwrap(); // strobe | IRQ 11
+    });
+    assert!(machine.pic.input_asserted(11), "slave line driven");
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x530, BusWidth::Byte, 0x59, false).unwrap(); // strobe | IRQ 10
+    });
+    assert!(
+        !machine.pic.input_asserted(11),
+        "the old line is released when the held strobe is re-routed"
+    );
+    assert!(machine.pic.input_asserted(10), "and the new line is driven");
+}
+
+/// The strobe must never lower a line the board did not raise. IRQ 9 is shared
+/// with the MPU-401, whose own level lives on the same pin.
+#[test]
+fn a_board_config_write_does_not_clear_another_devices_level() {
+    let mut machine = test_machine();
+    // Another device raises IRQ 9 and holds it. Driven straight through the PIC
+    // so the precondition cannot silently stop holding: what is under test is
+    // the board's treatment of a line it did not raise, not who raised it.
+    machine.pic.set_irq_level(9, true);
+    assert!(
+        machine.pic.input_asserted(9),
+        "precondition: line 9 is held"
+    );
+
+    // Select IRQ 9 on the board with the strobe LOW, then move away again.
+    // Neither write drives the line, so neither may lower it either.
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x530, BusWidth::Byte, 0x11, false).unwrap(); // IRQ 9, no strobe
+        bus.write_io(0x530, BusWidth::Byte, 0x09, false).unwrap(); // IRQ 7, no strobe
+    });
+    assert!(
+        machine.pic.input_asserted(9),
+        "a board re-steer must not touch a line another device is driving"
+    );
+
+    // Beyond this the model does not go, and does not need to: the PIC carries
+    // one input level per line, not a wired-OR of per-device levels, so if the
+    // board *does* raise and release a line another device holds, that device's
+    // level goes with it. Two devices driving one ISA interrupt line is a bus
+    // conflict on real hardware -- which is why `AppConfig::validate` refuses to
+    // put the WSS and the SB16 on the same line in the first place -- so the
+    // guarantee worth having, and the one asserted above, is that the board
+    // never lowers a line it did not raise.
+}
+
 /// HMI's MSS detect probe, driven as guest port accesses through the bus. This
 /// is why Microsoft Sound System never appeared in the setup's autodetect list:
 /// the probe gives up at the `base+3` signature before it ever reaches the
@@ -1098,9 +1205,12 @@ fn wss_dma_position_advances_with_the_frames_the_guest_hears() {
         mid < start,
         "the guest-visible DMA position must advance as frames play (start {start}, now {mid})"
     );
+    // 80 frames of a 256-frame buffer leaves ~175. Anything at or below half the
+    // buffer means the advance consumed far more than it played -- the shape of
+    // the defect -- so the bound sits there rather than just above zero.
     assert!(
-        mid > 8,
-        "and it must NOT have run the whole buffer around inside one advance \
+        mid > 128,
+        "and it must NOT have run ahead of what it played inside one advance \
          (start {start}, now {mid})"
     );
 

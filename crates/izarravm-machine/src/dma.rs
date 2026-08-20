@@ -342,7 +342,29 @@ impl DmaChip {
         self.hi_lo = !self.hi_lo;
     }
 
+    /// Log a guest read of a channel's current address or current count
+    /// (`IZARRAVM_WSS_TRACE`, the codec's own trace knob).
+    ///
+    /// These two registers are how a sound engine follows the play position, so
+    /// a device that consumes DMA in the wrong shape shows up here and nowhere
+    /// else: it was 1,858 reads of channel 0's count all returning the same
+    /// value that identified the WSS prefetch defect, with the codec's own port
+    /// trace showing nothing wrong. Same gating discipline as
+    /// `trace_dma_mode` -- one `OnceLock` load at the call site, formatting
+    /// behind it -- and it is off in every normal run.
+    fn trace_position_read(&self, ci: usize, register: &str) {
+        if !izarravm_audio::wss_trace_enabled() {
+            return;
+        }
+        let ch = &self.channels[ci];
+        eprintln!(
+            "[DMA] read {register} ch{ci} cur_count={} cur_addr={:#06x} hi_lo={} mask={}",
+            ch.cur_count, ch.cur_addr, self.hi_lo, ch.mask,
+        );
+    }
+
     fn read_addr(&mut self, ci: usize) -> u8 {
+        self.trace_position_read(ci, "addr");
         let v = if !self.hi_lo {
             (self.channels[ci].cur_addr & 0xFF) as u8
         } else {
@@ -353,6 +375,7 @@ impl DmaChip {
     }
 
     fn read_count(&mut self, ci: usize) -> u8 {
+        self.trace_position_read(ci, "count");
         let v = if !self.hi_lo {
             (self.channels[ci].cur_count & 0xFF) as u8
         } else {

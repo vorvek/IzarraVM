@@ -144,9 +144,20 @@ fn sndctrl_refuses_to_put_both_devices_on_one_line() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `/S` reports without changing anything, and what it reports is what the
-/// hardware actually holds -- the tool reads the mixer and config register back
-/// rather than trusting the CMOS copy.
+/// `/S` reports without changing anything.
+///
+/// The two devices are read from different places, deliberately. The SB16 mixer
+/// holds its selection in readable registers, so the tool reads the card. The
+/// codec cannot be read: a WSS board answers its configuration register with the
+/// presence signature, not the selection, so the tool reports the CMOS record
+/// instead (the same treatment the MPU port already had).
+///
+/// This leg cannot tell those two sources apart for the codec -- CMOS and the
+/// card agree at power-on, both saying 11 -- so what it pins is that `/S`
+/// reports the right value and moves nothing. That the CMOS record is what
+/// SNDCTRL actually writes to the board is pinned by
+/// `sndctrl_moves_both_devices_and_records_the_choice`, which drives
+/// `/WSSIRQ:9` and then reads the *device* back through `wss_routing()`.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndctrl_status_reads_the_hardware_and_changes_nothing() {
@@ -158,7 +169,8 @@ fn sndctrl_status_reads_the_hardware_and_changes_nothing() {
     );
     assert!(
         screen.contains("IRQ 11"),
-        "the codec's line should be read back from its config register\n{screen}"
+        "the codec's line should be reported from the CMOS record, which the \
+         machine seeded from the profile default\n{screen}"
     );
     assert!(
         !screen

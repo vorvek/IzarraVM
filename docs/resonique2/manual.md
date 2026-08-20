@@ -127,9 +127,15 @@ cannot use a value, SNDCTRL refuses it and lists the values that the hardware
 can use. If a combination would put both devices on one line or on one
 channel, SNDCTRL refuses the combination and writes nothing.
 
-`SNDCTRL /S` reads the mixer and the codec. It does not report the last saved
-values. Thus it gives the current values of the card, even after a different
-program changed them.
+`SNDCTRL /S` reads the Sound Blaster mixer. Thus it gives the current values of
+that device, even after a different program changed them.
+
+The codec cannot be read this way. A Windows Sound System board answers its
+configuration register with an identification value, not with the line and the
+channel that were written into it, so no program can ask the card what routing
+it has. For the codec, `SNDCTRL` reports the saved assignment, the same way it
+reports the MPU-401 port. A game that moves the codec for its own run does not
+appear here.
 
 ### Why the machine config file has nothing to set
 

@@ -281,24 +281,68 @@ fn config_region_reads_the_wss_signature_at_every_offset() {
 }
 
 #[test]
-fn config_register_bit6_reads_back_and_the_rest_does_not() {
-    // Bit 6 is the one bit of the register that comes back as written; bits 5:0
-    // stay the signature whatever was written over them.
+fn the_irq_verify_strobe_drives_the_selected_line_on_its_edges() {
+    // Bit 6 is the board's IRQ-verify strobe, and the only bit of the register
+    // that reads back. A 0->1 edge drives the line the same byte selected; a
+    // 1->0 edge releases it. Nothing else in the byte moves the line.
     let mut dev = Ad1848::default();
-    assert_eq!(dev.read_port(0), 0x04, "bit 6 clear at power-on");
-    dev.write_port(0, 0x40 | 0x21);
+    assert_eq!(dev.read_port(0), 0x04, "strobe low at power-on");
+    assert_eq!(dev.take_board_irq_strobe(), None, "and nothing owed");
+
+    // 0x49 = strobe | IRQ 7 (code 1) | DMA 0 (code 1).
+    dev.write_port(0, 0x49);
+    assert_eq!(dev.irq(), 7, "the byte selected IRQ 7");
+    assert_eq!(
+        dev.take_board_irq_strobe(),
+        Some(BoardIrqStrobe {
+            released: None,
+            asserted: Some(7),
+        }),
+        "the rising edge drives the line the same write selected"
+    );
     for offset in 0..=3 {
         assert_eq!(
             dev.read_port(offset),
             0x44,
-            "bit 6 set, signature intact, at offset {offset}"
+            "strobe reads back, signature intact, at offset {offset}"
         );
     }
+
+    // Re-selecting while the strobe is held moves the assertion with it: the
+    // latch drives whichever line is currently routed. 0x61 = strobe | IRQ 11.
+    dev.write_port(2, 0x61);
+    assert_eq!(dev.irq(), 11);
+    assert_eq!(
+        dev.take_board_irq_strobe(),
+        Some(BoardIrqStrobe {
+            released: Some(7),
+            asserted: Some(11),
+        }),
+        "the held strobe follows the selection to the new line"
+    );
+
+    // Writing the same byte again is not an edge, so the board owes nothing.
+    dev.write_port(0, 0x61);
+    assert_eq!(dev.take_board_irq_strobe(), None, "no edge, no change");
+
+    // Falling edge releases -- and only the line the board actually raised.
     dev.write_port(3, 0x21);
     assert_eq!(
-        dev.read_port(1),
-        0x04,
-        "bit 6 cleared through a mirror port"
+        dev.take_board_irq_strobe(),
+        Some(BoardIrqStrobe {
+            released: Some(11),
+            asserted: None,
+        }),
+        "the falling edge releases the held line"
+    );
+    assert_eq!(dev.read_port(1), 0x04, "strobe reads low again");
+
+    // With the strobe low, re-selecting is pure routing: no line is touched.
+    dev.write_port(0, 0x0A);
+    assert_eq!(
+        dev.take_board_irq_strobe(),
+        None,
+        "no strobe, no line change"
     );
 }
 
@@ -356,33 +400,50 @@ fn every_config_code_names_a_real_line_and_a_real_channel() {
 }
 
 #[test]
-fn repointing_the_board_reinitialises_the_codec_but_a_no_op_write_does_not() {
-    // Selecting different resources must quiesce the codec: a transfer left
-    // running would keep driving the channel the board just gave up. A write
-    // that names the resources already selected is not a re-point and must
-    // leave a running transfer alone -- HMI writes its config byte before every
-    // playback start, and on a machine already on those resources that write is
-    // exactly a no-op.
+fn repointing_the_board_re_steers_resources_and_touches_nothing_else() {
+    // The config register is board glue: an ISA-side latch with no wire into
+    // the codec at base+4. A re-point moves which DRQ/DACK/INT lines the codec
+    // is on and leaves an in-flight transfer running on the new ones -- I9 PEN,
+    // the Current Count and the sticky R2 INT are all codec state and all
+    // guest-readable, so inventing a quiesce here would be a guest-visible lie.
     let mut dev = Ad1848::new(Ad1848Config { irq: 11, dma: 0 });
 
-    // Arm a transfer so there is something live to interrupt.
-    write_indirect(&mut dev, IDX_LOWER_COUNT as u8, 8);
+    // Arm a transfer and drive it to a terminal count, so every piece of state
+    // a quiesce used to clear is set when the re-point lands.
+    write_indirect(&mut dev, IDX_PIN_CONTROL as u8, I10_IEN);
+    write_indirect(&mut dev, IDX_LOWER_COUNT as u8, 1);
     write_indirect(&mut dev, IDX_IFACE_CONFIG as u8, I9_ACAL | I9_PEN);
     assert!(dev.is_playing(), "codec armed before the re-point");
+    let _ = dev.render_frame(|| Some(0x80));
+    let _ = dev.render_frame(|| Some(0x80)); // underflow: INT set, count reloads
+    assert_ne!(
+        dev.status() & R2_INT,
+        0,
+        "sticky INT set before the re-point"
+    );
+    let count_before = dev.current_count();
 
-    // 0x21 = IRQ 11 / DMA 0: the resources it is already on.
-    dev.write_port(0, 0x21);
-    assert_eq!((dev.irq(), dev.dma()), (11, 0), "selection unchanged");
-    assert!(dev.is_playing(), "a no-op config write must not disarm");
-
-    // 0x0B = IRQ 7 / DMA 3: a real move.
+    // 0x0B = IRQ 7 / DMA 3: a real move of both resources.
     dev.write_port(0, 0x0B);
     assert_eq!((dev.irq(), dev.dma()), (7, 3), "write selects IRQ7/DMA3");
+
     assert!(
-        !dev.is_playing(),
-        "re-pointing re-initialises: playback stopped"
+        dev.is_playing(),
+        "the transfer keeps running across a re-point"
     );
-    assert_eq!(dev.status() & 1, 0, "sticky INT cleared by the re-init");
+    assert_eq!(dev.current_count(), count_before, "Current Count untouched");
+    assert_ne!(dev.status() & R2_INT, 0, "sticky R2 INT untouched");
+    assert_ne!(
+        dev.peek_register(IDX_IFACE_CONFIG) & I9_PEN,
+        0,
+        "I9 PEN is codec state and stays exactly as the guest left it"
+    );
+
+    // And it keeps producing frames on the new channel.
+    assert!(
+        dev.render_frame(|| Some(0x80)).is_some(),
+        "playback continues after the board re-steers"
+    );
 }
 
 #[test]
@@ -394,6 +455,15 @@ fn the_hmi_detect_probe_finds_the_card() {
     assert_eq!(dev.read_port(4) & 0x80, 0, "R0 INIT must read clear");
     assert_eq!(dev.read_port(3) & 0x3F, 0x04, "MSS signature at base+3");
     dev.write_port(3, 0x00);
+    // That write is a real config write on real hardware too, and byte 0x00
+    // selects IRQ code 0 / DMA code 0. Pin what it does: it re-steers, with the
+    // strobe low so no line is driven.
+    assert_eq!(
+        (dev.irq(), dev.dma()),
+        (5, 0),
+        "the probe's write to base+3 re-steers the board, as it does on hardware"
+    );
+    assert_eq!(dev.take_board_irq_strobe(), None, "and drives no line");
     dev.write_port(4, 6);
     dev.write_port(5, 0xAA);
     dev.write_port(4, 6);
