@@ -4622,6 +4622,64 @@ impl DirectKind {
         )
     }
 
+    /// The operand address and access width of a slot whose emitter reaches the UNRELAXED wide
+    /// guard -- `emit_wide_page_guard`, whose alignment half SIDE-EXITS rather than falling into a
+    /// split-charge slow path. `None` for every other kind.
+    ///
+    /// THIS IS AN ENUMERATION OF EMITTER SITES, not of opcodes, and it is written against them one
+    /// for one. An earlier version of the certain-exit rule listed `RmwIncDec` alone and justified
+    /// the narrowness with "it is the only unrelaxed site this slice can reach"; that was FALSE,
+    /// and the review that caught it named the counterexample the tree already asserts 30 lines
+    /// from the claim (`the_non_relaxed_sites_still_refuse_a_misaligned_access` uses
+    /// `add dword [odd], imm8`, an `AluMemDest`). The list below is the whole of it:
+    ///
+    /// | kind | site |
+    /// |---|---|
+    /// | `RmwIncDec` | `emit_rmw_inc_dec` / `_dword` (`emit/mem.rs`) |
+    /// | `AluMemDest` with `op != 7` | `emit_alu_mem_dest`'s writing branch |
+    /// | `DoubleShiftMem` | `emit_double_shift_mem` |
+    /// | `PushMem` | `emit_push_mem`, the SOURCE read |
+    /// | `CallMem` | `emit_call_mem`, the SOURCE read |
+    /// | `JmpMem` | its emit arm, which calls `emit_ram_read_pointer_inner` directly |
+    /// | `DivMem` | `emit_div_mem`, likewise |
+    /// | `X87 { addr: Some(..) }` | `emit_x87_memory_pointer`, guard before either fast arm |
+    ///
+    /// `AluMemDest`'s CMP (`op == 7`) is excluded because that branch alone reads through
+    /// `emit_ram_read_pointer`, which dispatches to the relaxed lean site. `PushMem` and `CallMem`
+    /// guard their STACK access too, but that address is ESP-relative and so is never decidable by
+    /// the caller; only the source address is reported here.
+    ///
+    /// **Stated at the shipped one-lookup defaults.** `Load`, `LoadExtend`, `AluMemSource`,
+    /// `ImulMem`, `ImulMemAcc`, `TestImmMem`, `Store`, `SetCcMem` and CMP's read all dispatch to a
+    /// relaxed site through `emit_ram_read_pointer` / `emit_store`, and they do so only while
+    /// `one_lookup_load` and `one_lookup_store` are on. With either turned off they become
+    /// unrelaxed too and this list under-covers -- which costs a missed refusal, never a
+    /// miscompile, on an arm no fixture benches.
+    fn unrelaxed_wide_guard_access(self) -> Option<(DirectAddr, MemoryWidth)> {
+        match self {
+            Self::RmwIncDec { width, addr, .. } => Some((addr, width)),
+            Self::AluMemDest {
+                op: 0..=6,
+                width,
+                addr,
+                ..
+            } => Some((addr, width)),
+            Self::DoubleShiftMem { addr, .. }
+            | Self::PushMem { addr }
+            | Self::CallMem { addr, .. }
+            | Self::JmpMem { addr }
+            | Self::DivMem { addr, .. } => Some((addr, MemoryWidth::Dword)),
+            Self::X87 {
+                insn,
+                addr: Some(addr),
+            } => insn
+                .metadata()
+                .memory
+                .map(|access| (addr, x87_memory_width(access))),
+            _ => None,
+        }
+    }
+
     /// A correctness site, not bookkeeping. Defaulting a memory kind to `None` here makes
     /// `kind_segment_access_supported` trivially true AND keeps the segment out of the block's
     /// `SegmentLayout` mask, and `data_matches` SKIPS unused segments, so a cached block would
@@ -6972,15 +7030,49 @@ fn compile_with_instruction_limit(
             // prefix. Without this rule the slice would compile that block and exit from slot ZERO
             // on all of them.
             //
-            // NARROW ON PURPOSE, three ways. Only `RmwIncDec`, because it is the only unrelaxed
-            // site this slice can reach (the loop's other odd operands are a `Store` and an
-            // `AluMemSource`, both of which dispatch to relaxed lean sites and are SERVED
-            // misaligned). Only a base-less, index-less, lane-less address, because anything else
-            // is not decidable here. And only under the gate, so the off arm stays byte-identical
-            // to main -- widening it to every unrelaxed site, or shipping it ungated, is a separate
-            // change with its own A/B.
+            // SCOPE, and the first version of this comment got it wrong in a way worth recording.
+            // It said "only `RmwIncDec`, because it is the only unrelaxed site this slice can
+            // reach", and that was false: `emit_alu_mem_dest` takes the same unrelaxed guard for
+            // every op but CMP, `classify` lowers `0x81`/`0x83` memory forms at `operand_width`,
+            // and the CS clause of `prefixes_supported_for` is a PREFIX gate -- it unlocks every
+            // memory kind at once, not the two the tombraid loop happens to use. The census says
+            // so on its face: `0x83 /5 cs:` leaves the rejected table on the ON arm carrying
+            // 9,464,397 unbound exits. Tombraid's own instance is aligned, so nothing was measured
+            // wrong, but the argument was not sound and the next fixture would have found the hole.
+            //
+            // `DirectKind::unrelaxed_wide_guard_access` is the enumeration now, written against the
+            // emitter sites one for one.
+            //
+            // COMPLETENESS, argued rather than asserted this time. A certain-exit slot needs an
+            // unrelaxed site AND a statically decidable misaligned address, so the question is
+            // which of this slice's admissions can produce one. Taken one at a time:
+            //
+            //  * `PopSegReal` reads the stack, whose address is ESP-relative and therefore never
+            //    decidable here;
+            //  * `CarryFlag` and the ALU form-5 arm touch no memory at all;
+            //  * `0xa1` / `0xa3` produce `Load` and `Store`, which dispatch to the RELAXED lean
+            //    sites and are SERVED misaligned rather than exiting;
+            //  * the CS clause of `prefixes_supported_for` unlocks every memory kind at once,
+            //    including all eight unrelaxed ones.
+            //
+            // So the CS clause is the ONLY admission here that can create a certain-exit slot, and
+            // the rule is scoped to it. That is why the predicate tests `addr.segment == Cs`.
+            //
+            // Not scoping it that way was tried and is worse. An unconditional version refuses
+            // seven pre-existing fixtures that deliberately build a statically misaligned disp-only
+            // operand to exercise the RUNTIME guard (`the_non_relaxed_sites_still_refuse_a_
+            // misaligned_access`, `a_misaligned_x87_access_still_exits`, the double-shift and
+            // memory-ALU transactional rows, and two x87 alignment rows) -- and it would be
+            // changing a hazard that PRE-DATES this slice, on a knob whose A/B cannot price it.
+            // A statically misaligned `add dword [odd], imm8` through DS has certain-exited since
+            // long before this branch; turning that into a barrier is a real and separate slice,
+            // with its own measurement, and it is NOT this one.
+            //
+            // Still narrow one more way: only a base-less, index-less, lane-less address, because
+            // anything else is not decidable here. A register-relative CS operand keeps its runtime
+            // guard and is served or refused at run time exactly as before.
             PlannedInsn::Native(kind)
-                if v86_loop_rows_enabled() && certainly_misaligned_rmw(cpu, kind, d) =>
+                if v86_loop_rows_enabled() && certainly_exits_on_alignment(cpu, kind, d) =>
             {
                 PlannedInsn::HardBoundary
             }
@@ -7799,10 +7891,9 @@ fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u
     static_control_target(kind).is_none_or(|delta| entry_eip.wrapping_add(delta) <= limit)
 }
 
-/// Whether this slot is a read-modify-write whose operand address is decidable at compile time and
-/// FAILS the alignment guard `emit_rmw_inc_dec` will emit for it, i.e. a slot that would side-exit
-/// on every single execution. See the call site in the compile walk for why that is worse than the
-/// barrier it would replace.
+/// Whether this slot's operand address is decidable at compile time and FAILS the alignment guard
+/// its emitter will produce, i.e. a slot that would side-exit on every single execution. See the
+/// call site in the compile walk for why that is worse than the barrier it would replace.
 ///
 /// `base`, `index` and `disp_lane` must all be absent: with a register in the address the operand
 /// moves at run time, and with a lane the displacement itself is patchable, so neither is decidable
@@ -7812,10 +7903,28 @@ fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u
 /// The offset is masked the way `emit_effective_address` masks it -- to sixteen bits in a 16-bit
 /// code segment -- BEFORE the segment base is added, because that is the order the emitted address
 /// is computed in and a mask applied afterwards would name an address the guest never forms.
-fn certainly_misaligned_rmw(cpu: &CpuGsw, kind: DirectKind, d: bool) -> bool {
-    let DirectKind::RmwIncDec { width, addr, .. } = kind else {
+/// `emit_alignment_test` runs on RAX, i.e. on the LINEAR address after the base add, so the base
+/// belongs in this arithmetic. It is inert in real mode and V86, where a base is a multiple of 16
+/// and cannot move bit 0 or bit 1, and load-bearing in protected mode, where a data segment's base
+/// is arbitrary; `a_protected_mode_segment_base_decides_the_alignment` is the row that makes it so.
+fn certainly_exits_on_alignment(cpu: &CpuGsw, kind: DirectKind, d: bool) -> bool {
+    let Some((addr, width)) = kind.unrelaxed_wide_guard_access() else {
         return false;
     };
+    // A CS-OVERRIDE OPERAND, which is exactly and only what this gate newly admits. `decode` folds
+    // an explicit override into `AddrMode.segment` and no addressing mode DEFAULTS to CS (the
+    // defaults are DS, and SS for the BP forms), so `segment == Cs` is equivalent to "the
+    // instruction carried a `2E` prefix" and needs no separate flag to test.
+    //
+    // See the call site for why the rule stops here rather than covering every statically
+    // misaligned unrelaxed access: a non-CS one has certain-exited since long before this slice,
+    // and fixing that is a separate change with its own A/B.
+    if addr.segment != SegmentIndex::Cs {
+        return false;
+    }
+    if !width.needs_alignment_guard() {
+        return false;
+    }
     if addr.base.is_some() || addr.index.is_some() || addr.disp_lane.is_some() {
         return false;
     }

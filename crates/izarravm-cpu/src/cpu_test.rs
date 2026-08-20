@@ -3758,21 +3758,35 @@ mod v86;
 mod jit_general;
 
 /// One byte that the Direct classifier refuses, for fixtures that need a block to STOP at a
-/// known offset. CLC: no ModRM, no immediate, continuable, and absent from every arm of
+/// known offset. CMC: no ModRM, no immediate, continuable, and absent from every arm of
 /// `classify`, so the stop reason is `unclassifiable` and the rejected span is exactly one byte.
 ///
-/// It used to be 0x90, until NOP was lowered. Whatever this byte is, it will eventually be
-/// lowered too, and CLC is a likelier candidate than most now that `emit_set_cf_only` exists.
-/// What makes that safe is `direct_barrier_opcode_is_still_unclassifiable`: a fixture whose
+/// It used to be 0x90, until NOP was lowered. Then it was 0xF8, until CLC was lowered by the
+/// V86 loop-A slice — which is exactly what the previous version of this comment predicted, in
+/// these words: *"Whatever this byte is, it will eventually be lowered too, and CLC is a likelier
+/// candidate than most now that `emit_set_cf_only` exists."* It was, by that very helper, and the
+/// tripwire below is what caught it: with the byte left at 0xF8 the ON arm of
+/// `IZARRAVM_V86_LOOP_ROWS` ran 30 tests red in this crate, 23 of them pure collateral from this
+/// one line.
+///
+/// So the same warning applies to CMC, and the reason it is the choice anyway is that its refusal
+/// is ARGUED rather than incidental: `classify`'s CLC/STC arm names `0xf5` and says it stays out
+/// because it reads the incoming CF and complements it, which needs the current value rather than
+/// a constant, and because no census row measures it. A byte whose refusal has a written reason is
+/// a better barrier than one that is merely unimplemented.
+///
+/// What makes any of this safe is `direct_barrier_opcode_is_still_unclassifiable`: a fixture whose
 /// barrier quietly stops being a barrier keeps PASSING while certifying nothing, which is worse
 /// than a failure. That test is the only thing standing between this constant and a suite full
-/// of vacuous assertions, so do not delete it when you change the byte.
+/// of vacuous assertions, so do not delete it when you change the byte. It must be run on EVERY
+/// arm of every admission knob, not only the shipped default: the 0xF8 breakage above was
+/// invisible on the OFF arm and total on the ON one.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-const DIRECT_BARRIER: u8 = 0xf8;
+const DIRECT_BARRIER: u8 = 0xf5;
 
 #[cfg(all(
     feature = "jit",

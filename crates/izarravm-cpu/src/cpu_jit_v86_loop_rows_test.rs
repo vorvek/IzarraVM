@@ -302,17 +302,32 @@ fn loop_a_collateral() -> Vec<(&'static str, Vec<u8>)> {
 /// unpriced; a default that moved without a ladder would change every shipped binary's admission
 /// silently, and the CS-override reversal in particular would ride along unmeasured.
 ///
-/// It reads the AMBIENT knob deliberately -- no override -- so it also fails if
-/// `IZARRAVM_V86_LOOP_ROWS=1` is exported in the environment running the suite, which is the
-/// correct outcome: the rest of this file states its arm, and a fixture that means to pin the
-/// shipped default has nowhere else to read it from.
+/// It reads the AMBIENT knob deliberately -- no override -- and it must therefore agree with the
+/// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: the whole point
+/// of the `DIRECT_BARRIER` episode is that a knob's ON arm has to be green too, and a fixture that
+/// hard-asserted "off" would make that impossible by construction.
+///
+/// So the assertion is the spelling table applied to the real environment. With the variable unset
+/// it reduces to "the default is OFF", which is the claim this fixture exists for; with it exported
+/// it checks that the process-wide `OnceLock` reading agrees with the exported value, which is the
+/// same claim one level up and is exactly what a ladder leg depends on.
 #[test]
 fn v86_loop_rows_ship_off_by_default() {
     jit::direct::set_v86_loop_rows_for_test(None);
-    assert!(
-        !jit::direct::v86_loop_rows_enabled(),
-        "IZARRAVM_V86_LOOP_ROWS must default OFF until a tombraid-586 ladder prices it"
+    let ambient = std::env::var("IZARRAVM_V86_LOOP_ROWS");
+    let expected = jit::direct::parse_v86_loop_rows_arm_for_test(ambient.clone());
+    assert_eq!(
+        jit::direct::v86_loop_rows_enabled(),
+        expected,
+        "the process-wide reading must agree with the spelling table applied to \
+         IZARRAVM_V86_LOOP_ROWS={ambient:?}"
     );
+    if ambient.is_err() {
+        assert!(
+            !expected,
+            "IZARRAVM_V86_LOOP_ROWS must default OFF until a tombraid-586 ladder prices it"
+        );
+    }
 }
 
 /// The spelling table, both arms and the refusal.
@@ -543,7 +558,29 @@ fn pop_segment_is_refused_outside_real_mode_and_at_dword() {
         None,
         "the Dword POP ES form pops four bytes and is not lowered"
     );
+    // A THIRTY-TWO-BIT STACK in real mode (SS.B = 1, i.e. unreal mode), which is the cell the
+    // matrix owns and the two above do not. `PopSegReal` exists only in the 16-bit-stack shape, so
+    // `stack_width_kind` must refuse it here through its `(PopSegReal, _, _) => None` arm.
+    //
+    // Without this row the fixture that NAMES the matrix did not cover it: removing
+    // `| Self::PopSegReal { .. }` from `uses_stack()` -- which skips `stack_width_kind` entirely --
+    // was caught only by `the_loop_compiles_into_the_units_the_census_predicts`, three tests away.
+    assert_eq!(
+        compile_leading_block_on(sixteen_bit_cpu_with_thirty_two_bit_stack, false, &[0x07]),
+        None,
+        "POP ES on a 32-bit stack has no lowered shape and must be refused by the width matrix"
+    );
     jit::direct::set_v86_loop_rows_for_test(None);
+}
+
+/// The 16-bit fixture with SS.B forced to 1: an unreal-mode stack inside a 16-bit code segment.
+fn sixteen_bit_cpu_with_thirty_two_bit_stack() -> CpuGsw {
+    let mut cpu = sixteen_bit_cpu();
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = true;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    assert!(cpu.stack_is_32bit(), "the fixture must have a 32-bit stack");
+    cpu
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1238,8 +1275,8 @@ fn the_cs_override_word_memory_forms_match_the_interpreter() {
 // The CERTAIN-EXIT rule
 // ---------------------------------------------------------------------------------------------
 
-/// A read-modify-write whose operand address is a compile-time constant that FAILS the alignment
-/// guard must stay a BARRIER, not become a slot that exits on every execution.
+/// A CS-override operand whose address is a compile-time constant that FAILS the alignment guard
+/// must stay a BARRIER, not become a slot that exits on every execution.
 ///
 /// This is the finding the design review blocked on, and it is the one class of defect the
 /// differential rows above cannot see: a certain-exit slot is perfectly CORRECT -- the exit reports
@@ -1248,55 +1285,99 @@ fn the_cs_override_word_memory_forms_match_the_interpreter() {
 /// while this pays a dispatcher lookup, a segment check, a native entry, the address, the
 /// page-cross bound, the alignment test and an exit stub first.
 ///
-/// `emit_rmw_inc_dec` is one of the memory sites the one-lookup relaxation never reached: it guards
-/// with `emit_wide_page_guard`, whose alignment test side-exits rather than falling into a split
-/// charge. The tombraid row is exactly this shape -- `dec word cs:[0xf3]` resolves to linear
-/// `0xc8113` -- and its block is two slots ending in a terminal `Jcc`, which the walk admits.
+/// The tombraid row is exactly this shape: `dec word cs:[0xf3]` resolves to linear `0xc8113`, and
+/// its block is two slots ending in a terminal `Jcc`, which the walk admits.
 ///
-/// The ALIGNED counterpart must still compile, or the rule is a blanket refusal wearing a
-/// measurement's clothes. And the two SERVED misaligned shapes must still compile: a misaligned
-/// `Store` and a misaligned `AluMemSource` dispatch to relaxed lean sites that split the charge and
-/// keep running, so refusing them would cost the slice two of its rows for nothing.
+/// TWO SITES are covered here and they are the two the WRITE half of the enumeration can reach in
+/// a 16-bit segment: `RmwIncDec` (`emit_rmw_inc_dec`) and `AluMemDest` with a writing op
+/// (`emit_alu_mem_dest`'s non-CMP branch). The second is the one the review found missing from the
+/// rule's first version, and the census ranks it: `0x83 /5 cs:` carries 9,464,397 unbound exits.
+/// The read-side sites are in `a_protected_mode_segment_base_decides_the_alignment`, because
+/// `DivMem`, `PushMem`, `CallMem`, `JmpMem` and the x87 memory forms are all Dword-only and so
+/// unreachable in a 16-bit code segment.
+///
+/// THE ESCAPES ARE THE POINT, and each names a different clause of the predicate:
+///
+/// * ALIGNED must still compile, or the rule is a blanket refusal wearing a measurement's clothes;
+/// * `AluMemDest` at op 7 (CMP) reads through the RELAXED lean site and is SERVED misaligned, so it
+///   must compile -- that op is excluded from the enumeration for that reason and nothing else;
+/// * `AluMemSource` and `Store` are relaxed too, and refusing them would cost the slice two rows;
+/// * a register-relative operand is not decidable here and must be left alone whatever the
+///   displacement's parity;
+/// * **a NON-CS misaligned operand must still compile.** The rule is scoped to the segment the gate
+///   newly admits. A misaligned `dec word [odd]` through DS has certain-exited since long before
+///   this slice and continues to; fixing that is a separate change with its own A/B, and this row
+///   is what stops the scoping from being widened by accident.
 #[test]
-fn a_statically_misaligned_read_modify_write_stays_a_barrier() {
+fn a_statically_misaligned_cs_operand_stays_a_barrier() {
     select_v86_loop_rows(true);
     // CS base is 0 in this fixture, so the operand's parity is the displacement's.
     let odd = OPERAND | 1;
-    assert_eq!(
-        compile16(&[vec![0x2e, 0xff, 0x0e], w(odd)].concat()),
-        None,
-        "dec word cs:[odd] would exit at that slot on every execution and must stay a barrier"
-    );
-    assert_eq!(
-        compile16(&[vec![0xff, 0x0e], w(odd)].concat()),
-        None,
-        "the rule is about the ADDRESS, not the override: an unprefixed odd RMW is the same slot"
-    );
-    assert_eq!(
-        compile16(&[vec![0x2e, 0xff, 0x0e], w(OPERAND)].concat()),
-        Some(3),
-        "the ALIGNED read-modify-write must still compile, or the rule is a blanket refusal"
-    );
-    // The two shapes that ARE served misaligned, through the relaxed lean sites.
-    assert_eq!(
-        compile16(&[vec![0x2e, 0x2b, 0x06], w(odd)].concat()),
-        Some(3),
-        "a misaligned AluMemSource is served by the relaxed lean read site and must not be refused"
-    );
-    assert_eq!(
-        compile16(&[vec![0x2e, 0xa3], w(odd)].concat()),
-        Some(3),
-        "a misaligned moffs store is served by the relaxed lean store site and must not be refused"
-    );
-    // A register-relative address is NOT decidable here and must be left alone, whatever the
-    // displacement's parity: the operand moves at run time.
-    assert_eq!(
-        compile16(&[vec![0x2e, 0xff, 0x4f], vec![0x01]].concat()),
-        Some(3),
-        "dec word cs:[bx+1] has a run-time address and is outside the rule"
-    );
-    // ...and with the gate OFF the rule must not fire at all: the aligned CS form is refused by the
-    // prefix gate, and the unprefixed odd form keeps compiling exactly as it does on main.
+    for (name, code) in [
+        (
+            "dec word cs:[odd] (RmwIncDec)",
+            [vec![0x2e, 0xff, 0x0e], w(odd)].concat(),
+        ),
+        (
+            "sub word cs:[odd], 1 (AluMemDest /5)",
+            [vec![0x2e, 0x83, 0x2e], w(odd), vec![0x01]].concat(),
+        ),
+        (
+            "add word cs:[odd], 1 (AluMemDest /0)",
+            [vec![0x2e, 0x83, 0x06], w(odd), vec![0x01]].concat(),
+        ),
+    ] {
+        assert_eq!(
+            compile16(&code),
+            None,
+            "{name} would exit at that slot on every execution and must stay a barrier"
+        );
+    }
+    for (name, code) in [
+        (
+            "the ALIGNED read-modify-write",
+            [vec![0x2e, 0xff, 0x0e], w(OPERAND)].concat(),
+        ),
+        (
+            "the ALIGNED writing memory ALU",
+            [vec![0x2e, 0x83, 0x2e], w(OPERAND), vec![0x01]].concat(),
+        ),
+        (
+            "cmp word cs:[odd], 1 -- op 7 reads through the relaxed lean site",
+            [vec![0x2e, 0x83, 0x3e], w(odd), vec![0x01]].concat(),
+        ),
+        (
+            "a misaligned AluMemSource, served by the relaxed lean read site",
+            [vec![0x2e, 0x2b, 0x06], w(odd)].concat(),
+        ),
+        (
+            "a misaligned moffs store, served by the relaxed lean store site",
+            [vec![0x2e, 0xa3], w(odd)].concat(),
+        ),
+        (
+            "a misaligned word store, served by the relaxed lean store site",
+            [vec![0x2e, 0xc7, 0x06], w(odd), w(0xffff)].concat(),
+        ),
+        (
+            "dec word cs:[bx+1], whose address moves at run time",
+            vec![0x2e, 0xff, 0x4f, 0x01],
+        ),
+        (
+            "dec word [odd] with NO override: a pre-existing hazard the rule does not claim",
+            [vec![0xff, 0x0e], w(odd)].concat(),
+        ),
+        (
+            "sub word [odd], 1 with NO override: likewise",
+            [vec![0x83, 0x2e], w(odd), vec![0x01]].concat(),
+        ),
+    ] {
+        assert_eq!(
+            compile16(&code),
+            Some(3),
+            "{name} must still compile, or the rule is wider than its argument"
+        );
+    }
+    // ...and with the gate OFF the rule must not fire at all.
     select_v86_loop_rows(false);
     assert_eq!(
         compile16(&[vec![0xff, 0x0e], w(odd)].concat()),
@@ -1304,6 +1385,106 @@ fn a_statically_misaligned_read_modify_write_stays_a_barrier() {
         "the certain-exit rule must be inert on the off arm, or the A/B base is not main"
     );
     jit::direct::set_v86_loop_rows_for_test(None);
+}
+
+/// The SEGMENT BASE decides the alignment, and this is the row that makes that term load-bearing.
+///
+/// Catches deleting the base from `certainly_exits_on_alignment` (`let linear = offset;`). THAT
+/// MUTATION SURVIVED the first version of this file and the compiler even reported `cpu` as unused:
+/// every other row here runs in real mode or V86, where a segment base is a multiple of 16 and
+/// cannot move bit 0 or bit 1, so the term is genuinely inert there. Protected mode is where a data
+/// segment's base is arbitrary, and `emit_alignment_test` runs on RAX -- the LINEAR address, after
+/// `emit_segmented_linear_address` has added the base -- so the base belongs in the arithmetic.
+///
+/// The two rows differ ONLY in CS's base: at base 0 the even displacement is aligned and the block
+/// compiles; at base 1 the same displacement lands on an odd linear address and the slot would
+/// exit on every execution.
+///
+/// It doubles as the READ half of the enumeration's site coverage. `DivMem`, `PushMem`, `CallMem`,
+/// `JmpMem` and the x87 memory forms are Dword-only, so a 16-bit segment cannot reach them; and in
+/// protected mode a CS override can only READ (`segment_access_supported` refuses `write` to a code
+/// segment), which is exactly what these five do. `DoubleShiftMem` is the one enumerated kind with
+/// no cell here: it is Dword-only AND it writes, so it is unreachable through a CS override in
+/// either mode, and it is in the enumeration for completeness rather than for a reachable row.
+#[test]
+fn a_protected_mode_segment_base_decides_the_alignment() {
+    select_v86_loop_rows(true);
+    const AT: u32 = 0x1010;
+    let sites: &[(&str, Vec<u8>)] = &[
+        (
+            "div dword cs:[m] (DivMem)",
+            [vec![0x2e, 0xf7, 0x35], AT.to_le_bytes().to_vec()].concat(),
+        ),
+        (
+            "push dword cs:[m] (PushMem)",
+            [vec![0x2e, 0xff, 0x35], AT.to_le_bytes().to_vec()].concat(),
+        ),
+        (
+            "fld qword cs:[m] (x87 memory)",
+            [vec![0x2e, 0xdd, 0x05], AT.to_le_bytes().to_vec()].concat(),
+        ),
+    ];
+    for (name, code) in sites {
+        assert_eq!(
+            compile_protected_with_cs_base(0, code),
+            Some(3),
+            "{name} at CS base 0 lands on an ALIGNED linear address and must compile"
+        );
+        assert_eq!(
+            compile_protected_with_cs_base(1, code),
+            None,
+            "{name} at CS base 1 lands on an ODD linear address and must stay a barrier"
+        );
+    }
+    // The gate-off control: at base 1 the CS override is refused by the prefix gate rather than by
+    // the alignment rule, so both arms refuse and only the base-0 row separates them.
+    select_v86_loop_rows(false);
+    for (name, code) in sites {
+        assert_eq!(
+            compile_protected_with_cs_base(0, code),
+            None,
+            "{name} must be refused by the PREFIX gate on the off arm"
+        );
+    }
+    jit::direct::set_v86_loop_rows_for_test(None);
+}
+
+/// Compile `FILL_A / body / FILL_B / hlt` at linear `ENTRY` in protected mode with CS at `cs_base`.
+///
+/// EIP is `ENTRY - cs_base`, so the code sits at the same LINEAR address either way and the only
+/// thing that moves between the two calls is the base a CS-override operand is formed through.
+fn compile_protected_with_cs_base(cs_base: u32, body: &[u8]) -> Option<u8> {
+    let mut code = FILL_A.to_vec();
+    let body_at = ENTRY + code.len() as u32;
+    code.extend_from_slice(body);
+    let tail_at = ENTRY + code.len() as u32;
+    code.extend_from_slice(&FILL_B);
+    code.push(0xf4);
+
+    let mut memory = memory_fill();
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut cpu = flat_protected_cpu();
+    let mut cs = cpu.registers.segment(SegmentIndex::Cs);
+    cs.base = cs_base;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    cpu.set_fast_map_enabled_for_test(true);
+    for &linear in &[ENTRY, body_at, tail_at] {
+        cpu.set_eip(linear - cs_base);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    for page in (0..0x1_0000u32).step_by(0x1000) {
+        map_direct_page(&mut cpu, &mut bus, page);
+    }
+    cpu.set_eip(ENTRY - cs_base);
+    match jit::direct::compile(&mut cpu, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => Some(compilation.span.instructions),
+        _ => None,
+    }
 }
 
 /// The REAL block shapes of loop A, which are four compile units rather than one walk.

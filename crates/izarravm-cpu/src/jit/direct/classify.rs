@@ -92,11 +92,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // `0x0a /0 mem` keeps getting. `0xa0`, `0xa2` and `0xfe` are the same case one arm at a time
     // (`Load`/`Store`/`IncDecReg`, every one a literal `MemoryWidth::Byte`).
     //
-    // `0xa1` and `0xa3` sit between them in the opcode map and are the counterexample worth
-    // naming, because proximity is exactly how they would get swept in: both hard-code
-    // `MemoryWidth::Dword`, so admitting either at Word size moves four bytes where the guest
-    // moves two. They stay refused, as does `0xd0` -- not for a width reason, but because no
-    // classify arm exists for it, which makes listing it a no-op that reads like a lowering.
+    // `0xa1` and `0xa3` sat between them in the opcode map and WERE the counterexample worth
+    // naming, because proximity is exactly how they would have got swept in: both hard-coded
+    // `MemoryWidth::Dword`, so admitting either at Word size would have moved four bytes where the
+    // guest moves two. That is no longer the shape of the answer. The V86 loop-A slice gave both
+    // arms `operand_width` -- the same fix MOVZX/MOVSX got with `dst_width` rather than being kept
+    // off the list -- and put them on the GATED allowlist below. The hazard the paragraph named was
+    // real and is now expressed instead of avoided; see the two arms for the width argument at each
+    // end. `0xd0` does still stay refused, and not for a width reason: no classify arm exists for
+    // it, which makes listing it a no-op that reads like a lowering.
     //
     // `0x8c` is the one non-byte member and it is here for the same structural reason rather than
     // as an exception: its interpreter arm writes `OperandSize::Word` unconditionally, so the
@@ -104,8 +108,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
-    // `0xf7`, `0xa9`, `0xc7`, `0x81`, `0x85`, `0x8d`, `0xa3`. Every one is the Dword sibling of an
-    // admitted byte form and its kind hard-codes Dword with no width field.
+    // `0xf7`, `0xa9`, `0x85`, `0x8d`. Every one is the Dword sibling of an admitted byte form and
+    // its kind hard-codes Dword with no width field. (`0xc7` and `0x81` left this list when they
+    // grew width fields of their own; `0xa3` left it with the V86 loop-A slice, for the reason the
+    // paragraph above now gives.)
     //
     // `0xb8..=0xbf` WAS on that list and is the 16-bit campaign's fourth slice. It left the same
     // way `0x83` and `0xc7` did, by growing the width field the list existed to compensate for:
@@ -691,10 +697,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         lane: None,
                     });
                 }
-                // ALU accumulator forms with a full-width immediate (0x05/0x0d/.../0x3d). NOT in
-                // the Word allowlist above, so `operand_width` is Dword whenever this is reached;
-                // it is passed rather than hard-coded so the two `AluImm` producers state the width
-                // the same way.
+                // ALU accumulator forms with a full-width immediate (0x05/0x0d/.../0x3d). On the
+                // GATED half of the Word allowlist since the V86 loop-A slice, so `operand_width`
+                // is Word here whenever `IZARRAVM_V86_LOOP_ROWS` is on and the segment is 16-bit,
+                // and Dword otherwise. It has always been passed rather than hard-coded, which is
+                // what let the admission be an allowlist entry rather than an emitter change; the
+                // carry members are refused at Word by the forms-1|3|5 guard above.
                 5 => {
                     return Some(DirectKind::AluImm {
                         op,
