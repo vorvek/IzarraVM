@@ -5274,8 +5274,10 @@ pub(crate) fn disp_lanes_enabled() -> bool {
 /// is the only possible cause of, the arms being one binary differing in one environment variable:
 /// `smc_lane_accepts` +19.9% per registration, and ~9.8 M block-killing invalidations that stop
 /// happening (`code_invalidations` and `smc_narrow_kills` both ~−20%), which is what a laned write
-/// not killing a block looks like. **There is no `0x80`-specific lane counter in a plain build at
-/// all** (`smc_imm8_lane_registrations` is census-only); closing that is an owed follow-up.
+/// not killing a block looks like. `smc_imm8_lane_registrations` DOES ship in plain builds — it
+/// rides `DirectStallSnapshot` into `direct_stall_json` ungated (the flip doc first called it
+/// census-only, which the heat-gate design review refuted at the line). What a plain build still
+/// lacks is the `0x80`-specific runtime ACCEPT counter; closing that is the owed follow-up.
 ///
 /// # THE SPELLING TABLE
 ///
