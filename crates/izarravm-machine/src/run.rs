@@ -43,9 +43,11 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
 
 /// Whether the device-armed ATA/ATAPI clock skip is engaged.
 ///
-/// **DEFAULT OFF FOR THIS LANDING**, flipped in a separate commit after the
-/// ladder, exactly as `IZARRAVM_FPU_LOOP_ROWS` (`bc55e87b` then `a0d2123f`) and
-/// `IZARRAVM_COUNT_LANES` did.
+/// **DEFAULT ON SINCE THE 2026-08-21 FLIP.** Unset admits the skip; `0` / `off`
+/// is the escape, the pre-slice behaviour, and the A/B base every measurement
+/// here was read against. Landed default-off first and flipped in its own
+/// commit, exactly as `IZARRAVM_FPU_LOOP_ROWS` (`bc55e87b` then `a0d2123f`),
+/// `IZARRAVM_COUNT_LANES` and `IZARRAVM_V86_LOOP_ROWS` (`f844134b`) did.
 ///
 /// Deliberately NOT named `IZARRAVM_POLL_SKIP_ATA`: this is a different
 /// mechanism from `IZARRAVM_POLL_SKIP` (a device-armed clock skip, not an
@@ -54,31 +56,90 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
 /// THE SPELLING TABLE, trimmed and case-folded on the way in, matching the lane
 /// family exactly:
 ///
-/// * **unset** -> OFF, *today*. THE DAY THE DEFAULT FLIPS THIS BECOMES ON, and
-///   every off leg must then EXPORT `0` -- the same trap `ROTATE_ROWS`,
-///   `COUNT_LANES`, `FPU_LOOP_ROWS` and `V86_LOOP_ROWS` all carry. Nulling the
-///   variable is not unsetting it: PowerShell leaves it present and empty, and
-///   the empty string is spelled OFF one arm down, which is how three earlier
-///   evidence directories came to measure their default-on knobs off.
-/// * `` (empty), `0` or `off` -> OFF. The escape and the A/B base.
-/// * `1` / `on` -> ON.
+/// * **unset** or `1` / `on` -> ON. The shipped default. **Every OFF leg must
+///   now EXPORT `0`** -- the same trap `ROTATE_ROWS`, `COUNT_LANES`,
+///   `FPU_LOOP_ROWS` and `V86_LOOP_ROWS` all carry, and any leg recorded before
+///   this flip that merely left the variable alone is an OFF leg.
+/// * `` (empty), `0` or `off` -> OFF. The escape and the A/B base. **Empty is
+///   spelled OFF here on purpose**, because OFF is a real arm for this gate:
+///   nulling a variable in PowerShell leaves it PRESENT AND EMPTY, which is how
+///   three earlier evidence directories came to measure their default-on knobs
+///   off. (The numeric sweep knobs below spell empty as THE DEFAULT instead,
+///   because a threshold has no "off" value -- see `sweep_knob`.)
 /// * **anything else PANICS.** A mistyped ladder leg that fell through to the
 ///   default would be read as "the arm I asked for changed nothing".
+///
+/// WHAT PRICED THE FLIP, in the order the evidence was taken
+/// (`.bench/results/atapi-poll-skip-20260821/`):
+///
+/// * **tombraid-586 wall ladder**, one binary, A B B A A B, full 28e9 row:
+///   **-29.33% min-wall** (121.287 s against 171.618 s), arms fully
+///   non-overlapping with B's worst leg 49.4 s faster than A's best. Row rt
+///   0.9843 -> 1.3938, dispatcher entries 786.6M -> 341.4M, retired
+///   instructions 19.49G -> 16.82G. A second, earlier ladder on the
+///   pre-mitigation binary read -28.55% with **byte-identical counters**, which
+///   is what proves the interactive mitigation inert on the headless path.
+/// * **Mechanism assertions**, which are what actually carry the acceptance --
+///   the wall numbers corroborate them, not the other way round.
+///   `spans / atapi_packet_commands` = **2.9273** against the 3 that TOKACD's
+///   three separately-scheduled per-sector poll phases predict, so all three
+///   clear the 20 us floor; `ticks` / modelled ATAPI wait = **0.807**, a lower
+///   bound since `media_delay` is skipped too; `io_stall_ticks` moves by
+///   **exactly** `ata_poll_skip.ticks`; `halted_ticks` identical on both arms;
+///   `cd_pio_bytes` **byte-identical** (22,310,936) on all twelve ladder legs
+///   across both ladders, and `atapi_packet_commands` identical at 14,135.
+/// * **Windows**: the load window (guest 142-145) -68.6% wall and -89.3%
+///   dispatcher entries, the FMV window (guest 4-124) -33.0% wall.
+/// * **The interactive path**, which no headless leg can grade. A windowed run
+///   measured the GUI slice at a ~13 us median -- not the 1 ms the design
+///   assumed, because `execution_budget` is `min(credit, quantum)` and the
+///   credit binds in a paced window -- so most interactive slices sit below the
+///   floor. Before the batch-entry slice test the skip armed 538,305 times to
+///   commit 170,564 spans, with 364,753 clamped declines; after it, 169,467 arms
+///   for 167,806 spans and **385** clamped declines, with the skipped guest time
+///   unchanged. Crucially `ata_poll_skip_blocks` never tracked the clamped
+///   cause -- 2,988 blocks against 364,753 clamped declines, and blocks equals
+///   `declines_below_floor` exactly -- which is the R2-B split holding under a
+///   load no fixture could reproduce.
+/// * **Board, gate ON, main's scoreboard against this branch's binary**: 11 of
+///   12 passed before the pin move, the twelfth being the retired-instruction
+///   pin this flip moves. All eleven non-CD rows read `ata_poll_skip.arms == 0`
+///   with the gate ARMED -- inert because nothing arms, not because nothing ran.
+///   The board at the OFF default was 12/12 with all nine counters zero.
+/// * **The 0.5G exact-frame anchor is byte-identical with the skip active**, and
+///   that is counted rather than argued: the anchor run commits two spans
+///   (146 us) and returns the pinned hash on both arms.
+///
+/// THE PIN THIS FLIP MOVES, and where it physically lives. `tombraid-586`'s
+/// `final_instructions` centre goes 19,491,752,775 -> **16,822,094,052**,
+/// tolerance untouched at 5%, because the lever cuts retired instructions 13.696%
+/// BY CONSTRUCTION -- the elided poll iterations are not executed. The centre
+/// moved, never the band. **That edit is NOT in this repository's history and
+/// cannot be**: `scripts/fixture-scoreboard-invariants.json` is in
+/// `.git/info/exclude` and exists only in the main checkout's working tree, so
+/// there is exactly one pin set on the box and a worktree cannot carry its own.
+/// It was edited in main's checkout by the coordinator; git log will never show
+/// it. The compensating pins that now carry the weight, all checked rather than
+/// only the ones that pass: the 0.5G anchor, the non-black coverage and
+/// distinct-colour bands, the display class, the `cycle_limit` stop,
+/// `cd_pio_bytes` byte-identity whole-run, and `io_stall_ticks` moving by the
+/// predicted amount.
 pub(super) fn ata_poll_skip_default() -> bool {
     parse_ata_poll_skip_arm(std::env::var("IZARRAVM_ATA_POLL_SKIP"))
 }
 
 fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic
         // as a typo rather than the same silence as "unset": someone set the
         // variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_ATA_POLL_SKIP is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `0` / `off` (the shipped default: the ATA/ATAPI poll \
-                 skip stays disarmed) and `1` / `on` (the device-armed clock skip)"
+                 spellings are unset or `1` / `on` (the shipped default since 2026-08-21: the \
+                 device-armed ATA/ATAPI clock skip) and `0` / `off` (the escape, under which \
+                 the skip stays disarmed)"
             )
         }
         Ok(raw) => raw,
@@ -88,8 +149,8 @@ fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_ATA_POLL_SKIP={other:?} names no arm; accepted spellings are unset or \
-             `0` / `off` (the shipped default: the ATA/ATAPI poll skip stays disarmed) and \
-             `1` / `on` (the device-armed clock skip). \
+             `1` / `on` (the shipped default since 2026-08-21: the device-armed ATA/ATAPI \
+             clock skip) and `0` / `off` (the escape, under which the skip stays disarmed). \
              Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be \
              read as the arm it named doing nothing"
         ),

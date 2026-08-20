@@ -1209,23 +1209,35 @@ fn ata_poll_skip_does_not_arm_into_a_sub_floor_slice() {
 
 /// The spelling table, and THE DEFAULT PIN, two-sided.
 ///
-/// `IZARRAVM_ATA_POLL_SKIP` is OFF by default in this landing. THE DAY THE
-/// DEFAULT FLIPS this assertion is what forces the flip commit to say so, and
-/// the empty-string row is what stops a PowerShell `$env:X = $null` leg from
-/// silently measuring the wrong arm -- the trap that voided three earlier
-/// evidence directories.
+/// `IZARRAVM_ATA_POLL_SKIP` is **ON by default since the 2026-08-21 flip**; see
+/// `ata_poll_skip_default` for the evidence that priced it. Any leg recorded
+/// before that date which merely left the variable alone is an OFF leg.
+///
+/// **THE EMPTY-STRING ROW IS THE LOAD-BEARING ONE**, and the two knob families
+/// deliberately spell it differently:
+///
+/// * for THIS gate, empty is **OFF** -- OFF is a real arm, and nulling a
+///   variable in PowerShell leaves it PRESENT AND EMPTY, so a leg that meant to
+///   restore the default would silently measure the escape. That is the trap
+///   that voided three earlier evidence directories;
+/// * for the numeric SWEEP knobs, empty is **the default** -- a threshold has no
+///   "off" value, and the same nulling idiom killed this branch's own re-ladder
+///   when they briefly panicked on it. See the sweep fixture below.
+///
+/// Both rows live in the suite so neither can be "tidied" into agreement.
 #[test]
-fn ata_poll_skip_env_spelling_table_and_default() {
+fn ata_poll_skip_env_spelling_table_and_default_on() {
     use std::env::VarError;
     assert!(
-        !run::parse_ata_poll_skip_arm_for_test(Err(VarError::NotPresent)),
-        "IZARRAVM_ATA_POLL_SKIP must default OFF in this landing; flipping it is a separate \
-         commit that must move this assertion"
+        run::parse_ata_poll_skip_arm_for_test(Err(VarError::NotPresent)),
+        "IZARRAVM_ATA_POLL_SKIP defaults ON since the 2026-08-21 flip; unsetting it is not a \
+         way to get the pre-slice behaviour, exporting `0` is"
     );
     for off in ["", "0", "off", "OFF", "  0  "] {
         assert!(
             !run::parse_ata_poll_skip_arm_for_test(Ok(off.to_string())),
-            "{off:?} names the OFF arm"
+            "{off:?} names the OFF arm -- INCLUDING the empty string, which is what a nulled \
+             PowerShell variable actually is"
         );
     }
     for on in ["1", "on", "ON", " on "] {
