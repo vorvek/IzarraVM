@@ -918,6 +918,125 @@ fn wss_16bit_stereo_dma_plays_and_irqs_through_the_machine() {
     );
 }
 
+/// The exact port sequence HMI's MSS driver (`ms8m`, shipped with Tomb Raider)
+/// emits to start playback, replayed on a machine whose profile says IRQ 11.
+///
+/// The driver's very first write is the board config register, and it derives
+/// the PIC vector and mask it hooks from the same IRQ number it encoded there.
+/// So the terminal-count interrupt has to land on the line the config byte
+/// named, not on the profile's. Dropping that write -- which is what we used to
+/// do -- left the codec interrupting IRQ 11 while the guest waited on IRQ 7,
+/// and the setup utility's card test spun forever.
+#[test]
+fn wss_hmi_start_sequence_selects_irq7_and_interrupts_on_that_line() {
+    let mut machine = test_machine();
+    assert_eq!(
+        machine.wss_routing(),
+        Some((11, 0)),
+        "the profile default is IRQ 11; the guest is about to move it"
+    );
+
+    // 8 unsigned-8-bit mono samples at physical 0x01_0000.
+    for i in 0..8u32 {
+        machine.write_physical_u8(0x1_0000 + i, 0x80);
+    }
+
+    with_bus(&mut machine, |bus| {
+        // 1. The board config register, first, exactly as the driver's encoder
+        //    builds it: IRQ 7 -> 0x08, DMA 0 -> |= 0x01.
+        bus.write_io(0x530, BusWidth::Byte, 0x09, false).unwrap();
+
+        // 2. I6/I7 = 0: both DACs unmuted at 0 dB.
+        wss_write_indirect(bus, 6, 0x00);
+        wss_write_indirect(bus, 7, 0x00);
+        // 3. Format, programmed under MCE: 8-bit unsigned mono, 48000 Hz.
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x48, false)
+            .unwrap(); // R0 = MCE | index 8
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap(); // R0 = index 8, MCE cleared
+        // 4. R0 = 0x49 (MCE | index 9), I9 = SDC | PEN.
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x49, false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x05, false).unwrap();
+        // 5. R0 = 0x4A (MCE | index 10), I10 = IEN.
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x4A, false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x02, false).unwrap();
+        // 6. R0 = 0x0F (MCE CLEARED, index 15), I15 = count low; then I14 high.
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0F, false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x07, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0E, false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x00, false).unwrap();
+        // 7. The 8237: channel 0, single + auto-init + read(mem->I/O) = 0x58.
+        bus.write_io(0x0B, BusWidth::Byte, 0x58, false).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0000
+        bus.write_io(0x0C, BusWidth::Byte, 0x00, false).unwrap(); // clear flip-flop
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x0C, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x07, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+        // 8. Unmask the channel.
+        bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
+    });
+
+    assert_eq!(
+        machine.wss_routing(),
+        Some((7, 0)),
+        "the config write must move the codec to the line the guest hooked"
+    );
+
+    machine.advance_devices_clocks(200_000);
+
+    assert!(
+        machine.pic.irr_bit(7),
+        "terminal count must interrupt on IRQ 7 -- the line the guest's own \
+         config byte selected and whose vector it hooked"
+    );
+    assert!(
+        !machine.pic.irr_bit(11),
+        "and NOT on the profile's IRQ 11, which nothing is listening to"
+    );
+}
+
+/// HMI's MSS detect probe, driven as guest port accesses through the bus. This
+/// is why Microsoft Sound System never appeared in the setup's autodetect list:
+/// the probe gives up at the `base+3` signature before it ever reaches the
+/// codec.
+#[test]
+fn wss_detect_probe_finds_the_card_at_0x530() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        let r0 = bus.read_io(0x534, BusWidth::Byte, 0, false).unwrap();
+        assert_eq!(r0 & 0x80, 0, "R0 INIT must read clear");
+        let sig = bus.read_io(0x533, BusWidth::Byte, 0, false).unwrap();
+        assert_eq!(sig & 0x3F, 0x04, "MSS signature at base+3");
+        bus.write_io(0x533, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x534, BusWidth::Byte, 0x06, false).unwrap();
+        bus.write_io(0x535, BusWidth::Byte, 0xAA, false).unwrap();
+        bus.write_io(0x534, BusWidth::Byte, 0x06, false).unwrap();
+        assert_eq!(
+            bus.read_io(0x535, BusWidth::Byte, 0, false).unwrap(),
+            0xAA,
+            "I6 write/read-back closes the probe"
+        );
+    });
+}
+
+/// One answer to "what IRQ is the codec on". The audio crate's device-level
+/// default and the core profile default used to disagree (7 vs 11), so every
+/// unit test in the audio crate asserted a line the shipped machine never used.
+#[test]
+fn wss_device_default_matches_the_profile_default() {
+    let profile = izarravm_core::WssConfig::default();
+    let device = izarravm_audio::Ad1848Config::default();
+    assert_eq!(device.irq, profile.irq.line(), "IRQ default");
+    assert_eq!(usize::from(device.dma), profile.dma.channel(), "DMA default");
+}
+
 #[test]
 fn wss_16bit_stereo_auto_init_refills_across_live_clock_changes() {
     let mut machine = test_machine();
@@ -2290,15 +2409,15 @@ fn wss_port_window_edges_and_config_region_decode_through_the_bus() {
     // Pin the wss_offset window math (`port.checked_sub(base).filter(|o| o < 8)`)
     // at its boundaries through the machine bus, plus the config-region readback
     // the decode comment promises does not overlap the SB16/mixer/OPL ranges:
-    //   base+1 (0x531) -> IRQ11/DMA0 jumper byte 0xB0,
+    //   base+1 (0x531) -> the MSS presence signature 0x04,
     //   base+7 (0x537) -> decodes (Ok),
     //   base+8 (0x538) and base-1 (0x52F) -> nothing decodes them, so open bus.
     let mut machine = test_machine();
     with_bus(&mut machine, |bus| {
         assert_eq!(
             bus.read_io(0x531, BusWidth::Byte, 0, false).unwrap(),
-            0xB0,
-            "config region reads the IRQ11/DMA0 jumper byte"
+            0x04,
+            "config region reads the MSS presence signature"
         );
         assert!(
             bus.read_io(0x537, BusWidth::Byte, 0, false).is_ok(),

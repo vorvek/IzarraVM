@@ -254,40 +254,155 @@ fn i12_revision_reads_k_grade_pattern() {
 }
 
 #[test]
-fn config_region_reports_id_version_and_irq_dma_jumpers() {
+fn config_region_reads_the_wss_signature_at_every_offset() {
+    // A real MSS board answers all four low ports with the same presence
+    // signature in bits 5:0. HMI's detect probe reads base+3 specifically and
+    // requires `(value & 0x3f) == 0x04`, so an offset that reports something
+    // else -- a board ID at 0, a jumper readback at 1, zeroes at 2/3 -- makes
+    // the card undetectable at that offset.
     let mut dev = Ad1848::new(Ad1848Config { irq: 7, dma: 0 });
-    assert_eq!(dev.read_port(0), 0x04, "config region board/version ID");
-    // High nibble IRQ, low nibble DMA (IRQ7, DMA0 -> 0x70).
-    assert_eq!(dev.read_port(1), 0x70, "IRQ/DMA jumper readback");
+    for offset in 0..=3 {
+        assert_eq!(
+            dev.read_port(offset),
+            0x04,
+            "config region offset {offset} must read the WSS signature"
+        );
+    }
+    // The selection is not readable, at any offset: moving the codec does not
+    // change what the region reports.
     dev.set_config(Ad1848Config { irq: 9, dma: 3 });
-    assert_eq!(dev.read_port(1), (9 << 4) | 3, "config setter reflected");
+    for offset in 0..=3 {
+        assert_eq!(
+            dev.read_port(offset),
+            0x04,
+            "the selection must not leak into the signature at offset {offset}"
+        );
+    }
 }
 
 #[test]
-fn writing_the_config_region_repoints_resources_and_reinitialises_the_codec() {
-    // ReSonique II's config register is writable, so a guest can move the codec
-    // without restarting the machine. Selecting resources must also quiesce it:
-    // a transfer left running would keep driving the channel the board just gave
-    // up. The board ID and the mirror offsets stay read-only.
+fn config_register_bit6_reads_back_and_the_rest_does_not() {
+    // Bit 6 is the one bit of the register that comes back as written; bits 5:0
+    // stay the signature whatever was written over them.
+    let mut dev = Ad1848::default();
+    assert_eq!(dev.read_port(0), 0x04, "bit 6 clear at power-on");
+    dev.write_port(0, 0x40 | 0x21);
+    for offset in 0..=3 {
+        assert_eq!(
+            dev.read_port(offset),
+            0x44,
+            "bit 6 set, signature intact, at offset {offset}"
+        );
+    }
+    dev.write_port(3, 0x21);
+    assert_eq!(dev.read_port(1), 0x04, "bit 6 cleared through a mirror port");
+}
+
+#[test]
+fn board_config_write_selects_irq_and_dma_by_the_mss_encoding() {
+    // Bits 5:3 index the IRQ table, bits 1:0 index the DMA table. The six
+    // (port, IRQ, DMA) -> byte observations recorded from real MSS hardware,
+    // plus the HMI driver's own encoder, agree on exactly this mapping.
+    const OBSERVED: [(u8, u8, usize); 6] = [
+        (0x23, 11, 3),
+        (0x22, 11, 1),
+        (0x21, 11, 0),
+        (0x1A, 10, 1),
+        (0x12, 9, 1),
+        (0x0A, 7, 1),
+    ];
+    for offset in 0..=3 {
+        for (byte, irq, dma) in OBSERVED {
+            // Start somewhere that is never the answer, so a dropped write
+            // cannot pass by coincidence.
+            let mut dev = Ad1848::new(Ad1848Config { irq: 5, dma: 0 });
+            dev.write_port(offset, byte);
+            assert_eq!(
+                (dev.irq(), dev.dma()),
+                (irq, dma),
+                "config byte {byte:#04x} written at offset {offset}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_config_code_names_a_real_line_and_a_real_channel() {
+    // The tables are closed, so no byte -- not one of the 256 -- can select an
+    // out-of-range 8237 channel (the old unchecked path could produce channel
+    // 11, which panicked the machine's channel lookup) or IRQ 0.
+    const IRQS: [u8; 8] = [5, 7, 9, 10, 11, 12, 14, 15];
+    const DMAS: [usize; 4] = [0, 0, 1, 3];
+    for byte in 0..=u8::MAX {
+        let mut dev = Ad1848::default();
+        dev.write_port(0, byte);
+        assert_eq!(
+            dev.irq(),
+            IRQS[usize::from((byte >> 3) & 7)],
+            "IRQ code from {byte:#04x}"
+        );
+        assert_eq!(
+            dev.dma(),
+            DMAS[usize::from(byte & 3)],
+            "DMA code from {byte:#04x}"
+        );
+        assert!(dev.dma() < 4, "8-bit channel only");
+        assert!(dev.irq() >= 5, "never the PIT line");
+    }
+}
+
+#[test]
+fn repointing_the_board_reinitialises_the_codec_but_a_no_op_write_does_not() {
+    // Selecting different resources must quiesce the codec: a transfer left
+    // running would keep driving the channel the board just gave up. A write
+    // that names the resources already selected is not a re-point and must
+    // leave a running transfer alone -- HMI writes its config byte before every
+    // playback start, and on a machine already on those resources that write is
+    // exactly a no-op.
     let mut dev = Ad1848::new(Ad1848Config { irq: 11, dma: 0 });
-    assert_eq!(dev.read_port(1), 0xB0, "IRQ11/DMA0 readback");
 
     // Arm a transfer so there is something live to interrupt.
     write_indirect(&mut dev, IDX_LOWER_COUNT as u8, 8);
     write_indirect(&mut dev, IDX_IFACE_CONFIG as u8, I9_ACAL | I9_PEN);
     assert!(dev.is_playing(), "codec armed before the re-point");
 
-    dev.write_port(1, (7 << 4) | 3);
-    assert_eq!(dev.read_port(1), (7 << 4) | 3, "write selects IRQ7/DMA3");
+    // 0x21 = IRQ 11 / DMA 0: the resources it is already on.
+    dev.write_port(0, 0x21);
+    assert_eq!((dev.irq(), dev.dma()), (11, 0), "selection unchanged");
+    assert!(dev.is_playing(), "a no-op config write must not disarm");
+
+    // 0x0B = IRQ 7 / DMA 3: a real move.
+    dev.write_port(0, 0x0B);
+    assert_eq!((dev.irq(), dev.dma()), (7, 3), "write selects IRQ7/DMA3");
     assert!(
         !dev.is_playing(),
         "re-pointing re-initialises: playback stopped"
     );
     assert_eq!(dev.status() & 1, 0, "sticky INT cleared by the re-init");
+}
 
-    let id = dev.read_port(0);
-    dev.write_port(0, 0xFF);
-    assert_eq!(dev.read_port(0), id, "board ID stays read-only");
+#[test]
+fn the_hmi_detect_probe_finds_the_card() {
+    // The exact port sequence of HMI's `ms8md` MSS detect routine, which is
+    // what Tomb Raider's setup runs: R0 INIT clear, the base+3 signature, a
+    // write to base+3, then an I6 write/read-back.
+    let mut dev = Ad1848::default();
+    assert_eq!(dev.read_port(4) & 0x80, 0, "R0 INIT must read clear");
+    assert_eq!(dev.read_port(3) & 0x3F, 0x04, "MSS signature at base+3");
+    dev.write_port(3, 0x00);
+    dev.write_port(4, 6);
+    dev.write_port(5, 0xAA);
+    dev.write_port(4, 6);
+    assert_eq!(dev.read_port(5), 0xAA, "I6 write/read-back");
+}
+
+#[test]
+fn the_device_default_is_irq11_dma0() {
+    // One answer to "what IRQ is the codec on": this must agree with
+    // `WssConfig::default()` in izarravm-core (pinned across the crate boundary
+    // by `wss_device_default_matches_the_profile_default`).
+    let dev = Ad1848::default();
+    assert_eq!((dev.irq(), dev.dma()), (11, 0));
 }
 
 #[test]
