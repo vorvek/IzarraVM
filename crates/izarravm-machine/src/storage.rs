@@ -413,6 +413,60 @@ impl Machine {
         self.cd_pio_bytes
     }
 
+    /// ATAPI CDBs the guest has executed through the register handshake.
+    ///
+    /// The batch-invariant partner of `cd_access_count`: one count per CDB the
+    /// device executed, which does not move when the host lengthens or shortens
+    /// a batch.
+    ///
+    /// **It equals the SECTOR count only under a driver that requests one sector
+    /// per PACKET**, which TOKACD does (`tokacd.asm` sets transfer length 1 in
+    /// every READ(10)). A multi-sector READ(10) is ONE count and N
+    /// `PresentReadSector` boundaries, so a different driver breaks the
+    /// identity while leaving the counter itself correct.
+    pub fn atapi_packet_command_count(&self) -> u64 {
+        self.ide.packet_command_count()
+    }
+
+    /// Mechanism counters for the device-armed ATA/ATAPI clock skip. All zero
+    /// on a fixture that never streams a CD, and all zero on the OFF arm.
+    pub fn ata_poll_skip_counters(&self) -> crate::AtaPollSkipCounters {
+        self.ata_poll_skip.counters
+    }
+
+    /// Whether `IZARRAVM_ATA_POLL_SKIP` armed this machine.
+    pub fn ata_poll_skip_enabled(&self) -> bool {
+        self.ata_poll_skip_enabled
+    }
+
+    /// Force the arm for one machine, in either direction.
+    ///
+    /// The shipped gate is per-MACHINE state read once at construction, not a
+    /// process-wide `OnceLock` like the CPU lane knobs, so the fixtures need no
+    /// thread-local override to run both arms in one process -- they state the
+    /// arm on the machine they built. Every poll-skip fixture states it in BOTH
+    /// directions rather than inheriting the ambient environment, so the OFF
+    /// fixtures keep meaning what they say the day the default moves.
+    #[doc(hidden)]
+    pub fn set_ata_poll_skip_enabled(&mut self, enabled: bool) {
+        self.ata_poll_skip_enabled = enabled;
+    }
+
+    /// Sweep seam for `ATA_POLL_RUN` / `ATA_POLL_FLOOR_TICKS`, so a fixture can
+    /// pin the floor and the threshold without an environment write.
+    #[doc(hidden)]
+    pub fn set_ata_poll_skip_tuning(&mut self, run: u32, floor_ticks: u64) {
+        self.ata_poll_floor_ticks = floor_ticks;
+        let diag = self.ide.poll_skip_diag_enabled();
+        self.ide.configure_poll_skip(run, floor_ticks, diag);
+    }
+
+    /// The `IZARRAVM_ATA_POLL_SKIP_DIAG` run-length histogram, bucketed
+    /// 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+. All zero unless armed.
+    pub fn ata_poll_run_histogram(&self) -> [u64; 8] {
+        self.ide.poll_run_histogram()
+    }
+
     /// Leave ATAPI PACKET commands unanswered. This is a guest-driver timeout
     /// test seam; normal machines never enable it.
     #[doc(hidden)]

@@ -2003,6 +2003,17 @@ fn write_hdd_profile_json(
         })),
         "io_stall_ticks": machine.io_stall_ticks(),
         "halted_ticks": machine.halted_ticks(),
+        // The CD columns. `cd_pio_bytes` is the byte sum out of the ATAPI data
+        // phases and is invariant to batch geometry, so it is the fidelity
+        // falsifier for anything that changes how the host slices a CD read.
+        // `cd_accesses` is NOT: it counts device advances that carried bytes and
+        // collapses as batches lengthen. `atapi_packet_commands` is the
+        // batch-invariant per-command currency (one per 2048-byte sector under
+        // TOKACD).
+        "cd_pio_bytes": machine.cd_pio_byte_count(),
+        "cd_accesses": machine.cd_access_count(),
+        "atapi_packet_commands": machine.atapi_packet_command_count(),
+        "ata_poll_skip": ata_poll_skip_json(machine),
         "katea": machine.katea_storage_counters().map(|k| json!({
             "sector_reads": k.sector_reads,
             "host_file_reads": k.host_file_reads,
@@ -2715,6 +2726,37 @@ fn assert_callout_counts_closed(counts: izarravm_cpu::DirectCallOutOutcomeCounts
 /// so the histogram no longer predicts a rate — read it as the call-size shape of
 /// the workload, and read `stall_ticks` against `read_sectors - cache_hits` for
 /// the charge.
+/// The device-armed ATA/ATAPI clock-skip mechanism counters.
+///
+/// READ THESE BEFORE READING THE WALL. The wall number alone cannot separate
+/// "the arm never fired" from "the arm fired and the target was wrong", and the
+/// two have completely different fixes. `spans` against the sector count and
+/// `ticks` against `master_ticks` are what falsify the second.
+///
+/// `enabled` is emitted alongside because unset does not mean the same thing on
+/// both sides of the default flip; a leg that recorded zeros without recording
+/// its arm is not evidence.
+fn ata_poll_skip_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
+    let c = machine.ata_poll_skip_counters();
+    json!({
+        "enabled": machine.ata_poll_skip_enabled(),
+        "arms": c.arms,
+        "spans": c.spans,
+        "ticks": c.ticks,
+        "blocks": c.blocks,
+        "declines_not_pending": c.declines_not_pending,
+        "declines_below_floor": c.declines_below_floor,
+        "declines_deadline_clamped": c.declines_deadline_clamped,
+        "declines_halted": c.declines_halted,
+        "monitor_exempt": c.monitor_exempt,
+        // Terminal alt-status run lengths, bucketed 1, 2, 3-4, 5-8, 9-16,
+        // 17-32, 33-64, 65+. All zero unless IZARRAVM_ATA_POLL_SKIP_DIAG armed
+        // it; it exists so ATA_POLL_RUN can be re-derived from a run rather than
+        // a rebuild.
+        "run_histogram": machine.ata_poll_run_histogram().to_vec(),
+    })
+}
+
 fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
     json!({
         "read_calls": p.read_calls,
@@ -2762,6 +2804,20 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "jit_direct_entries": mark.perf.jit_direct_entries,
                 "io_stall_ticks": mark.io_stall_ticks,
                 "halted_ticks": mark.halted_ticks,
+                // THE CD COLUMNS. Read `cd_pio_bytes` for throughput: it is a
+                // byte sum and is split-invariant, so a lever that changes batch
+                // geometry cannot move it without changing what the drive
+                // delivered. `cd_accesses` is batch-shaped by construction (one
+                // per device advance that carried bytes) and must never be
+                // graded on; it is here so the ratio against `cd_pio_bytes` can
+                // be read as batch shape. `atapi_packet_commands` is the
+                // batch-invariant command count -- one per 2048-byte sector
+                // under TOKACD, i.e. the sector rate, which is what a per-sector
+                // assertion needs and what the 2026-08-20 disk-read audit had to
+                // infer from `brk_step` for want of this column.
+                "cd_pio_bytes": mark.cd_pio_bytes,
+                "cd_accesses": mark.cd_accesses,
+                "atapi_packet_commands": mark.atapi_packet_commands,
                 "katea_host_wall_ns": mark.katea.as_ref().map(|k| k.host_wall_ns),
                 // `_max_level_ns`, not `_max_ns`: this series is cumulative and
                 // consumers difference it column by column, and the difference of

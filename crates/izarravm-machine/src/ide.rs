@@ -35,6 +35,33 @@ const SPIN_UP_TICKS: u64 = MASTER_CLOCK_HZ / 5; // 200 ms
 const MAX_SEEK_TICKS: u64 = MASTER_CLOCK_HZ / 10; // 100 ms
 const CD_BYTES_PER_SECOND: u64 = 1_800 * 1024; // 12x CD-ROM
 
+/// Alt-status reads inside one CPU batch that arm the device poll skip.
+///
+/// A TUNING knob, not a safety knob: the skip target is bounded by the pending
+/// command's own deadline and by the next device edge, so an "early" arm cannot
+/// advance guest time by more than the guest would have spent spinning. 16 keeps
+/// a short probe (an IDENTIFY poll, a BIOS detect sweep) out of the mechanism
+/// entirely while costing ~0.2% of the wait: at ~129 ns of guest time per TOKACD
+/// poll iteration the arming window is ~2 us against a 50 us to 1.11 ms wait.
+pub(crate) const ATA_POLL_RUN: u32 = 16;
+
+/// Minimum skip, in master ticks: 20 us of guest time.
+///
+/// WITHOUT A FLOOR the arm buys a *guaranteed* batch break plus a
+/// deadline-cache invalidation against an unknown payoff, because a nearer
+/// device edge can win the target `min` -- an FDC byte at ~16 us during a floppy
+/// transfer, an MPU byte at 320 us, RTC periodic at 1024 Hz.
+///
+/// 20 us is derived, not picked. It sits below `PACKET_ACCEPT_TICKS` (50 us),
+/// the shortest deadline the ATAPI model ever schedules, net of the ~2 us the
+/// arming iterations themselves consume -- so all three of TOKACD's per-sector
+/// phases (50 us, 100 us, 1.11 ms) stay skippable, which is what the
+/// `spans ~= 3 x sectors` acceptance assertion depends on. And it is ~10x the
+/// arming window, so the break is amortised at <=10% even in the worst admitted
+/// case. IF `PACKET_ACCEPT_TICKS` EVER DROPS, the shortest phase silently stops
+/// being skippable and that assertion is what catches it.
+pub(crate) const ATA_POLL_FLOOR_TICKS: u64 = MASTER_CLOCK_HZ / 50_000;
+
 pub(crate) fn sector_transfer_ticks() -> u64 {
     (DATA_SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(CD_BYTES_PER_SECOND as u128) as u64
 }
@@ -128,6 +155,29 @@ pub struct IdeChannel {
     /// Test seam that leaves PACKET commands unanswered so guest timeout paths
     /// can run against a present drive.
     test_stall_packet: bool,
+    /// ATAPI CDBs executed since power-on. Always counted: it is the only cheap
+    /// per-command currency the phase series can carry, and every CD-throughput
+    /// question the disk-read audit had to infer from `brk_step` is really a
+    /// question about commands per guest second. One `u64` add per CDB, on a
+    /// path that is already doing a device dispatch.
+    packet_commands: u64,
+    /// Consecutive alt-status reads seen inside the current CPU batch. HOST
+    /// BOOKKEEPING for the poll skip; see `note_alt_status_read`.
+    alt_status_run: u32,
+    /// Suppresses further arming until the next `schedule` or a committed skip.
+    /// Set by a batch-end decline whose DEVICE-bounded target fell under the
+    /// floor, and by `write_port` / `soft_reset`. HOST BOOKKEEPING.
+    poll_skip_blocked: bool,
+    /// The arming threshold and the minimum skip, overridable per machine from
+    /// `IZARRAVM_ATA_POLL_RUN` / `IZARRAVM_ATA_POLL_FLOOR_US` for sweeps. Read
+    /// here rather than from the environment per access.
+    poll_run_threshold: u32,
+    poll_floor_ticks: u64,
+    /// `IZARRAVM_ATA_POLL_SKIP_DIAG` only: terminal run lengths, bucketed
+    /// 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+. Lets `ATA_POLL_RUN` be
+    /// re-derived from a run instead of a rebuild.
+    poll_run_histogram: [u64; 8],
+    poll_skip_diag: bool,
 }
 
 impl Default for IdeChannel {
@@ -160,6 +210,13 @@ impl Default for IdeChannel {
             read_lba: 0,
             last_access_bytes: 0,
             test_stall_packet: false,
+            packet_commands: 0,
+            alt_status_run: 0,
+            poll_skip_blocked: false,
+            poll_run_threshold: ATA_POLL_RUN,
+            poll_floor_ticks: ATA_POLL_FLOOR_TICKS,
+            poll_run_histogram: [0; 8],
+            poll_skip_diag: false,
         }
     }
 }
@@ -276,6 +333,156 @@ impl IdeChannel {
         }
     }
 
+    /// ATAPI CDBs executed since power-on. Monotonic, never cleared, and
+    /// deliberately NOT part of the canonical payload: it is host bookkeeping.
+    ///
+    /// This is the per-command currency `cd_accesses` is not. `cd_accesses`
+    /// increments once per *device advance that carried bytes*, so it collapses
+    /// as batches lengthen; this one counts commands the guest issued, which is
+    /// invariant to how the host slices its batches.
+    pub fn packet_command_count(&self) -> u64 {
+        self.packet_commands
+    }
+
+    // ------------------------------------------------------------------
+    // Device-armed poll skip, device half.
+    //
+    // THE SPLIT IS DELIBERATE. The counting, the pending test and the floor
+    // are DEVICE facts and live here. The timing-class gate, the `io_touched`
+    // suppression and the publication of the armed flag are BUS facts and live
+    // in `MachineBus::read_io`'s IDE arm. `read_port` has no non-test caller
+    // outside `bus.rs`, so the arm decision is returned alongside the value
+    // rather than inferred on either side.
+    //
+    // What the mechanism is: while `pending_command.is_some()` the channel is
+    // inert to every read and to every write except a control-port SRST, and
+    // `status == BSY` by construction (`schedule` is the only entry into the
+    // pending state and sets both; `finish_pending` is reachable only from
+    // `advance_master_ticks`, i.e. only from the timeline). So the byte the
+    // guest reads after a skip equals the byte it would have read having spun,
+    // provided the skip lands no later than `ticks_until_completion`.
+    // ------------------------------------------------------------------
+
+    /// Count one alt-status read and answer "arm the skip on this read".
+    ///
+    /// Called ONLY from the bus's IDE arm, and only after the bus has decided
+    /// this is a lazily-exempt alt-status read in the Approximate class that is
+    /// not the ring-0 monitor's own. Returning `true` means the caller should
+    /// end the batch on this read (by suppressing the lazy `io_touched` clear)
+    /// and publish the armed flag; the actuation itself happens at batch end.
+    ///
+    /// The run is ZEROED rather than frozen on every decline (review R2-N4), so
+    /// a later clear cannot arm on a stale count.
+    pub(crate) fn note_alt_status_read(&mut self) -> bool {
+        // Nothing pending: this is a read outside any wait -- TOKACD does one at
+        // `tokacd.asm:1506`, immediately after `wait_not_busy` returns -- and
+        // without this arm the run would carry across a completion boundary.
+        if self.pending_command.is_none() {
+            self.record_poll_run_length();
+            self.alt_status_run = 0;
+            return false;
+        }
+        if self.poll_skip_blocked {
+            self.record_poll_run_length();
+            self.alt_status_run = 0;
+            return false;
+        }
+        self.alt_status_run = self.alt_status_run.saturating_add(1);
+        if self.alt_status_run < self.poll_run_threshold {
+            return false;
+        }
+        // The arm-time floor is evaluated against the channel's OWN deadline,
+        // the only one the bus half can see cheaply, so a wait that is
+        // intrinsically not worth a batch break never costs one. It returns
+        // false WITHOUT touching the latch: only the batch-end check, which can
+        // see a nearer unrelated device edge, blocks.
+        let armed = self
+            .ticks_until_completion()
+            .is_some_and(|ticks| ticks >= self.poll_floor_ticks);
+        if armed {
+            // Zeroed on the arm as well, and it is a no-op behaviourally: the
+            // arm suppresses the lazy clear, so `io_touched` stays true and no
+            // later read in this batch can satisfy `!io_touched_before_read` to
+            // resume counting, and batch entry would zero it regardless. It is
+            // done anyway so the diagnostic histogram records each run ONCE --
+            // without it the arm and the batch-entry reset both bucket the same
+            // run and the 9-16 bucket reads twice the arm count.
+            self.record_poll_run_length();
+            self.alt_status_run = 0;
+        }
+        armed
+    }
+
+    /// Clear the run counter at a CPU batch boundary.
+    ///
+    /// THIS IS THE CERTIFICATE. It makes arming mean "N alt-status reads inside
+    /// ONE CPU batch with no other I/O to the channel", which is a much tighter
+    /// statement than "N reads eventually". With the 1 ms Approximate batch
+    /// grain and ~129 ns of guest time per poll iteration, roughly 7,700
+    /// iterations fit in one batch, so any threshold up to a few hundred arms on
+    /// the first batch of every sector.
+    pub(crate) fn reset_alt_status_run(&mut self) {
+        if self.alt_status_run != 0 {
+            self.record_poll_run_length();
+            self.alt_status_run = 0;
+        }
+    }
+
+    /// Bound the device-edge pathology: at most ONE wasted batch break per
+    /// pending command. Cleared by `schedule` and by a committed skip.
+    pub(crate) fn block_poll_skip(&mut self) {
+        self.poll_skip_blocked = true;
+    }
+
+    pub(crate) fn clear_poll_skip_block(&mut self) {
+        self.poll_skip_blocked = false;
+    }
+
+    /// Test seam: the latch state. The two truncation causes are told apart by
+    /// whether this is set, so a fixture has to be able to read it directly.
+    #[cfg(test)]
+    pub(crate) fn poll_skip_blocked(&self) -> bool {
+        self.poll_skip_blocked
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alt_status_run_for_test(&self) -> u32 {
+        self.alt_status_run
+    }
+
+    /// Sweep seam. Both values are read once at machine construction, never per
+    /// access -- the default-off-instrument tax rule.
+    pub(crate) fn configure_poll_skip(&mut self, run: u32, floor_ticks: u64, diag: bool) {
+        self.poll_run_threshold = run.max(1);
+        self.poll_floor_ticks = floor_ticks;
+        self.poll_skip_diag = diag;
+    }
+
+    pub(crate) fn poll_run_histogram(&self) -> [u64; 8] {
+        self.poll_run_histogram
+    }
+
+    pub(crate) fn poll_skip_diag_enabled(&self) -> bool {
+        self.poll_skip_diag
+    }
+
+    fn record_poll_run_length(&mut self) {
+        if !self.poll_skip_diag || self.alt_status_run == 0 {
+            return;
+        }
+        let bucket = match self.alt_status_run {
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=32 => 5,
+            33..=64 => 6,
+            _ => 7,
+        };
+        self.poll_run_histogram[bucket] = self.poll_run_histogram[bucket].saturating_add(1);
+    }
+
     /// Take and clear the access-byte count for the GUI LED.
     pub fn take_access_bytes(&mut self) -> usize {
         let bytes = self.last_access_bytes;
@@ -298,6 +505,18 @@ impl IdeChannel {
         if !(SECONDARY_CMD_BASE..=SECONDARY_CMD_BASE + 7).contains(&port) {
             return None;
         }
+        // Any OTHER read on the channel breaks the alt-status run: the arm means
+        // "N alt-status reads with no other I/O to the channel", so a status,
+        // error or data-register read is not part of a poll wait.
+        //
+        // The SECONDARY_CTRL arm above returns before this, and its counting is
+        // the bus half's `note_alt_status_read` call. An alt-status read whose
+        // arm predicate SHORT-CIRCUITED (the ring-0 monitor's own read, or a
+        // read after an earlier access already ended the batch) therefore
+        // neither increments nor resets the run. Unreachable today -- no monitor
+        // path pokes 0x376 -- and benign if it ever were, because an early arm
+        // is bounded by the mandatory ATA term and by the floor.
+        self.reset_alt_status_run();
         let reg = port - SECONDARY_CMD_BASE;
         let value = match reg {
             0 => self.read_data_byte(),
@@ -321,6 +540,25 @@ impl IdeChannel {
     /// Write one byte to a channel port. Word writes to the data register split
     /// into two byte writes at the bus layer, so the packet/data path is byte-fed.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
+        // GUARD 1 for the ring-0 SRST hazard, and the general "a write is not a
+        // poll" rule. A write to the control port can trigger SRST, which clears
+        // `pending_command` mid-batch; and the write-side ring-0 carve-out at
+        // `bus.rs:2398-2401` does NOT name 0x376, so such a write in the
+        // Approximate class does not end the batch. Clearing the run and SETTING
+        // the latch here means an armed flag raised before the write cannot be
+        // honoured after it.
+        //
+        // Ordering is load-bearing: `schedule` CLEARS the latch, and
+        // `write_command` below reaches `schedule`, so writing a new command
+        // re-enables skipping for that command. That is the intended sequence,
+        // not an accident of placement.
+        //
+        // GUARD 2 -- the batch-end actuation's mandatory
+        // `ticks_until_completion()` precondition -- is sufficient on its own
+        // after an SRST and is the one the fixture pins. This guard is cheap and
+        // keeps the device's own bookkeeping honest.
+        self.reset_alt_status_run();
+        self.poll_skip_blocked = true;
         if port == SECONDARY_CTRL {
             // Device control: bit 1 = nIEN, bit 2 = SRST (soft reset).
             self.interrupts_disabled = value & 0x02 != 0;
@@ -351,6 +589,12 @@ impl IdeChannel {
     }
 
     fn soft_reset(&mut self) {
+        // Same disposition as `write_port` (guard 1): the reset clears
+        // `pending_command`, so nothing armed before it may be honoured after.
+        // `new()` runs this on construction, which is why the latch's cleared
+        // state is owned by `schedule` rather than by the constructor.
+        self.reset_alt_status_run();
+        self.poll_skip_blocked = true;
         self.phase = Phase::Idle;
         self.packet_filled = 0;
         self.data_in.clear();
@@ -396,6 +640,12 @@ impl IdeChannel {
     }
 
     fn schedule(&mut self, action: PendingAction, ticks: u64) {
+        // A NEW pending command gets a fresh chance at the skip. This is what
+        // bounds the once-per-decline latch to one wasted batch break per
+        // command, and it is why each of TOKACD's three per-sector phases
+        // (PACKET accept, command latency, sector transfer) is separately
+        // skippable: each is its own `schedule`.
+        self.poll_skip_blocked = false;
         self.phase = Phase::Idle;
         self.status = status::BSY;
         self.error = 0;
@@ -407,6 +657,9 @@ impl IdeChannel {
     }
 
     fn finish_pending(&mut self, action: PendingAction) {
+        // A completion boundary ends the wait the run was counting. Arms that
+        // follow belong to the NEXT command, not this one.
+        self.reset_alt_status_run();
         match action {
             PendingAction::AcceptPacket => self.begin_packet(),
             PendingAction::ExecutePacket(cdb) => self.execute_packet(cdb),
@@ -555,6 +808,7 @@ impl IdeChannel {
     /// Execute an assembled CDB after command latency. Short replies become
     /// visible now; reads and seeks schedule their mechanical boundary.
     fn execute_packet(&mut self, cdb: [u8; 12]) {
+        self.packet_commands = self.packet_commands.saturating_add(1);
         if let Some(length) = data_out_length(&cdb).filter(|&length| length > 0) {
             self.begin_data_out(length);
             return;

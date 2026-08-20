@@ -669,12 +669,143 @@ pub struct PhaseMark {
     /// FastMap / direct-map whole-map wipe counters at this boundary. `Copy` and
     /// always-on in the CPU, so sampling it per mark costs a struct move.
     pub fast_map_audit: izarravm_cpu::FastMapAuditCounters,
+    /// Bytes moved through the ATAPI data phases at this boundary.
+    ///
+    /// THE CD COLUMN THE SERIES WAS MISSING. Before this, a CD-streaming
+    /// interval's throughput had to be inferred from `brk_step` (the disk-read
+    /// audit of 2026-08-20 did exactly that, and had to argue the identity
+    /// "736,626 word reads x 2 B = the modelled 12x rate" to make the inference
+    /// stand up). This is split-invariant: it is a byte sum out of
+    /// `IdeChannel::take_access_bytes`, so it reads the same however the host
+    /// slices its batches, which is what makes it a fidelity falsifier.
+    pub cd_pio_bytes: u64,
+    /// Device advances that carried ATAPI bytes, at this boundary.
+    ///
+    /// **BATCH-SHAPED. DO NOT GRADE ON IT.** It increments once per device
+    /// advance that moved bytes (`timing.rs`, next to `cd_pio_bytes`), so it
+    /// collapses as batches lengthen and rises as they shorten. Any lever that
+    /// changes batch geometry moves this without moving one byte of delivered
+    /// data. It is emitted because the ratio `cd_pio_bytes / cd_accesses` is a
+    /// useful read of batch shape, never because the level means anything.
+    pub cd_accesses: u64,
+    /// ATAPI CDBs executed at this boundary. One per 2048-byte sector under
+    /// TOKACD, and unlike `cd_accesses` it is invariant to batch geometry.
+    pub atapi_packet_commands: u64,
     /// The sampled CPU census at this boundary, when `IZARRAVM_CPU_PROFILE`
     /// armed it; `None` otherwise, so an unprofiled run pays nothing and reports
     /// no empty tables. Differencing consecutive marks gives the per-phase
     /// census the whole-run snapshot cannot: read as "the idle loop", a
     /// whole-run census is an inference, and this makes it a measurement.
     pub cpu_profile: Option<izarravm_cpu::CpuProfileSnapshot>,
+}
+
+/// Mechanism counters for the device-armed ATA/ATAPI clock skip.
+///
+/// ALWAYS ON, machine-side, and every decline names its own cause, so a
+/// zero-win leg is diagnosable without a rebuild. That is not decoration: the
+/// wall number alone cannot tell "the arm never fired" from "the arm fired and
+/// the target was wrong", and those two have completely different fixes.
+///
+/// The counters live outside `PERF_COUNTER_KEYS` (that list enumerates CPU perf
+/// counters), so adding them moves no CPU-side pin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AtaPollSkipCounters {
+    /// Alt-status reads that published the armed flag. One port only: a
+    /// per-port pair would have read zero on the primary channel as a fact
+    /// about the plumbing masquerading as evidence about the workload.
+    pub arms: u64,
+    /// Committed skips, and the master ticks they actually skipped.
+    ///
+    /// `spans` is the mechanism assertion. Under TOKACD each 2048-byte sector
+    /// runs three separately-scheduled poll phases, so `spans ~= 3 x sectors`;
+    /// a leg that arms at the right rate but skips a small fraction of the
+    /// guest clock has a truncated target, which no wall number would reveal.
+    pub spans: u64,
+    pub ticks: u64,
+    /// How often a command lost the rest of its wait to the once-per-decline
+    /// block. A high value against `spans` means a nearer DEVICE edge is biting
+    /// and the floor wants re-deriving. It must NOT track `declines_deadline_clamped`.
+    pub blocks: u64,
+    /// The mandatory ATA precondition failed: no command was pending at batch
+    /// end, so the skip declined and stalled nothing. Reachable two ways -- the
+    /// batch's own end-of-batch device advance crossing the completion, and a
+    /// ring-0 SRST landing mid-batch.
+    pub declines_not_pending: u64,
+    /// The DEVICE-bounded target was under the floor. **The only decline that
+    /// sets the latch.**
+    pub declines_below_floor: u64,
+    /// The caller's `deadline_ticks` cut the target under the floor. **Does not
+    /// block**, and the split is load-bearing on the interactive path: the GUI
+    /// slice is 1 ms against a 1.111 ms sector wait, so the slice boundary lands
+    /// inside the wait essentially every time. Blocking on that cause would make
+    /// the guest spin out the rest of every sector at full interpreted cost,
+    /// systematically, in the GUI only, invisible to every headless leg.
+    ///
+    /// Expected 0 headless -- or at most ONE per run call, attributable to the
+    /// run tail: the batch loop exits on `now >= deadline_ticks`, so the final
+    /// batch's post-advance remainder can land in (0, floor). Any value that
+    /// SCALES WITH SECTORS is the falsifier.
+    pub declines_deadline_clamped: u64,
+    /// Armed, but the batch halted, so the halt fast-forward owns the advance.
+    pub declines_halted: u64,
+    /// A lazily-exempt alt-status read taken under the ring-0 monitor port
+    /// exemption (`skip_io_touched`), which the arm predicate declines.
+    ///
+    /// Note what it is NOT: `!skip_io_touched` short-circuits BEFORE
+    /// `note_alt_status_read`, so this counts monitor reads, not arms that would
+    /// otherwise have fired. Expected 0 on every fixture either way -- no
+    /// monitor path pokes 0x376 -- and now actually reachable, which is the
+    /// point: the predicate it guards had to exist before the counter could
+    /// mean anything.
+    pub monitor_exempt: u64,
+}
+
+/// The counters plus the `IZARRAVM_ATA_POLL_SKIP_DIAG` summary.
+///
+/// A wrapper rather than a bare `AtaPollSkipCounters` field for one reason: the
+/// summary has to print for EVERY entry point (headless run, GUI session, a
+/// fixture), and the only seam that covers all of them is `Drop`. The counters
+/// therefore have to be owned by the thing that drops.
+///
+/// The run-length histogram is deliberately NOT printed here -- it lives on the
+/// channel, which drops independently, and the whole-run JSON is a better home
+/// for it anyway (`Machine::ata_poll_run_histogram`).
+#[derive(Debug, Default)]
+pub(crate) struct AtaPollSkipDiagnostics {
+    enabled: bool,
+    pub(crate) counters: AtaPollSkipCounters,
+}
+
+impl AtaPollSkipDiagnostics {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            counters: AtaPollSkipCounters::default(),
+        }
+    }
+}
+
+impl Drop for AtaPollSkipDiagnostics {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let c = &self.counters;
+        eprintln!(
+            "ata-poll-skip diag: arms={} spans={} ticks={} blocks={} declines_not_pending={} \
+             declines_below_floor={} declines_deadline_clamped={} declines_halted={} \
+             monitor_exempt={}",
+            c.arms,
+            c.spans,
+            c.ticks,
+            c.blocks,
+            c.declines_not_pending,
+            c.declines_below_floor,
+            c.declines_deadline_clamped,
+            c.declines_halted,
+            c.monitor_exempt,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1094,6 +1225,41 @@ pub struct Machine {
     // batch -- which is exactly the case the device-edge deadline cache must not
     // miss. Reset per batch alongside `io_touched`.
     exempt_io_touched: bool,
+    // The device-armed ATA/ATAPI clock skip (`IZARRAVM_ATA_POLL_SKIP`).
+    //
+    // WHY THIS IS NOT THE 0x3DA POLL SKIP. That one is an instruction-eliding
+    // SHAPE skip: it certifies a straight-line loop body, analytically replays N
+    // iterations and claims full state identity at the batch boundary. Four of
+    // its gates are closed against this workload and none is a policy knob --
+    // it is Interpreter-only, it refuses when the Direct backend is enabled and
+    // when the guest is in V86, it refuses 16-bit code segments outright, and
+    // every certified shape is a <=6-slot loop with no CALL. TOKACD's wait loops
+    // are 16-bit V86 code containing a `call timeout_expired` that writes two
+    // driver-private counter words.
+    //
+    // This one certifies at the DEVICE instead -- a run of alt-status reads
+    // while an ATAPI command is pending -- and inspects nothing about the
+    // guest's code shape, which is what makes it backend-independent by
+    // construction: the interpreter's `IN AL,DX` and the native V86 port
+    // call-out both land in the same `read_io` IDE arm.
+    //
+    // WHAT IT DOES NOT CLAIM: retired instruction counts and the guest register
+    // file at a boundary both differ, because the elided iterations are not
+    // executed. State identity IS claimed for the timeline, every device, and
+    // all guest memory outside the driver's own two counter words (which end
+    // HIGHER, making the driver's timeout strictly less likely to fire).
+    ata_poll_skip_enabled: bool,
+    // Reset at batch ENTRY next to `io_touched`, so no arm can survive into a
+    // batch that did not raise it; taken at batch end by the actuation.
+    ata_poll_skip_armed: bool,
+    // Set at batch entry when the caller's remaining deadline is already
+    // under the floor, so no skip armed in this batch could commit. See the
+    // site in `run_until_tick` for the measurement that produced it.
+    ata_poll_skip_slice_too_short: bool,
+    ata_poll_skip: AtaPollSkipDiagnostics,
+    // The minimum skip, in master ticks. A copy of the channel's own floor so
+    // the batch-end check does not have to reach through the device for it.
+    ata_poll_floor_ticks: u64,
     // Fixed ISA-bus time (in CPU clocks) accrued this batch by the OPL status poll,
     // added to the batch's device advance in the fast modes so a fast CPU
     // poll cannot outrun the 80 us OPL timer. See the batch-end use in
@@ -1569,6 +1735,11 @@ impl Machine {
             last_int_vector: None,
             io_touched: false,
             exempt_io_touched: false,
+            ata_poll_skip_enabled: run::ata_poll_skip_default(),
+            ata_poll_skip_armed: false,
+            ata_poll_skip_slice_too_short: false,
+            ata_poll_skip: AtaPollSkipDiagnostics::new(run::ata_poll_skip_diag_default()),
+            ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
             isa_io_batch_clocks: 0,
             pit_observer_fine_until: 0,
             device_edge_cache: timing::DeviceEdgeCache::Stale,
@@ -1685,6 +1856,13 @@ impl Machine {
             .cpu
             .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
         machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
+        // Both sweep knobs are read ONCE, here, and pushed onto the channel --
+        // never per access. See `ata_poll_run_default`.
+        machine.ide.configure_poll_skip(
+            run::ata_poll_run_default(),
+            machine.ata_poll_floor_ticks,
+            run::ata_poll_skip_diag_default(),
+        );
         machine.set_cmos_byte(CMOS_PRIMARY_BOOT_DEVICE, BootDevice::Floppy as u8);
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
@@ -2078,6 +2256,9 @@ impl Machine {
             halted_ticks: self.halted_ticks,
             int13: self.int13_profile,
             fast_map_audit: self.cpu.fast_map_audit_counters(),
+            cd_pio_bytes: self.cd_pio_bytes,
+            cd_accesses: self.cd_accesses,
+            atapi_packet_commands: self.ide.packet_command_count(),
             cpu_profile: self
                 .cpu
                 .profiling_enabled()
@@ -2157,6 +2338,9 @@ impl Machine {
             halted_ticks: self.halted_ticks,
             int13: self.int13_profile,
             fast_map_audit: self.cpu.fast_map_audit_counters(),
+            cd_pio_bytes: self.cd_pio_bytes,
+            cd_accesses: self.cd_accesses,
+            atapi_packet_commands: self.ide.packet_command_count(),
             cpu_profile: None,
         });
     }
@@ -3192,6 +3376,24 @@ struct MachineBus<'a> {
     io_touched: &'a mut bool,
     // Points at `Machine::exempt_io_touched`; see the field there.
     exempt_io_touched: &'a mut bool,
+    // `IZARRAVM_ATA_POLL_SKIP`, resolved once per machine at construction and
+    // copied in here per batch. When false the IDE arm in `read_io` is
+    // byte-identical to its pre-slice form: no counting, no suppressed clear,
+    // no counter movement.
+    ata_poll_skip_enabled: bool,
+    // Raised by the IDE arm when the device says a run of alt-status reads
+    // crossed the threshold with a command pending and the remaining deadline
+    // above the floor. Points at `Machine::ata_poll_skip_armed`, which the run
+    // loop clears at batch ENTRY (next to `io_touched`) and takes at batch end.
+    ata_poll_skip_armed: &'a mut bool,
+    // A copy of `Machine::ata_poll_skip_slice_too_short`, resolved once per
+    // batch. When true the arm predicate declines before it counts anything:
+    // a skip armed in this slice could not commit, and the arm would cost a
+    // forced batch break for nothing.
+    ata_poll_skip_slice_too_short: bool,
+    // Points at `Machine::ata_poll_skip`. The bus half owns `arms` and
+    // `monitor_exempt`; every other field is written by the batch-end actuation.
+    ata_poll_skip: &'a mut AtaPollSkipDiagnostics,
     // Accrues fixed ISA-bus time (CPU clocks) for the OPL status poll in the
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::isa_io_batch_clocks`.
