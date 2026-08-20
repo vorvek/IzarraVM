@@ -102,17 +102,43 @@ struct HostReadAhead {
     next_fill: u64,
 }
 
+/// One cluster-chain walk's view of the FAT, resolved a SECTOR at a time.
+///
+/// A FAT32 sector holds 128 entries, and a chain walks its clusters in ascending
+/// order, so one resolve answers up to 128 steps. See
+/// [`KateaTreeVolume::fat_entry_walked`] for what a resolve costs and why the
+/// per-cluster version it replaced made the projection pass scale with the
+/// mounted folder.
+///
+/// The cursor is only ever alive inside one walk, and nothing writes to the store
+/// or the host during a walk, so what it caches cannot go stale under it.
+#[derive(Default)]
+struct FatWalk {
+    /// The FAT-copy-relative sector index the cursor currently describes.
+    within: Option<u32>,
+    /// The guest's bytes for that sector, when the store holds it. `None` means
+    /// the base view answers, and the base view needs no sector at all --
+    /// `ClusterIndex::fat_entry` is a single `HashSet` probe. Boxed so the cursor
+    /// itself stays pointer-sized on the walk's stack frame.
+    overlay: Option<Box<[u8; SECTOR]>>,
+}
+
 #[derive(Clone, Copy)]
 struct HostReadContext<'a> {
     lba: u32,
     command_sectors: u32,
-    counters: &'a std::cell::Cell<KateaStorageCounters>,
+    counters: &'a KateaCounterCells,
     cache: &'a std::cell::RefCell<Vec<(PathBuf, File)>>,
     window: &'a std::cell::RefCell<Option<HostReadWindow>>,
     /// Read-ahead slots, MRU last. Empty when the read-ahead is disarmed.
     readahead: &'a std::cell::RefCell<Vec<HostReadAhead>>,
     /// Ceiling on one fill, or 0 when `IZARRAVM_HDD_READAHEAD=0` disarmed it.
     readahead_max: u64,
+    /// First data-region LBA of the volume. Carried only to assert the window's
+    /// range invariant where the window is filled -- see the `debug_assert` in
+    /// [`read_host_span`], which is what lets [`KateaTreeVolume::fat_entry_walked`]
+    /// resolve a FAT sector without consulting the window at all.
+    first_data_lba: u32,
 }
 
 /// DOS device names Win32 still resolves as character devices. Per Microsoft's
@@ -932,9 +958,11 @@ pub(crate) struct KateaTreeVolume {
     atomic_writes: u64,
     #[cfg(test)]
     atomic_write_bytes: u64,
-    /// Read-path attribution for the boot profiler. `Cell` because `read_sector`
+    /// Read-path attribution for the boot profiler. `Cell`s because `read_sector`
     /// is `&self`; the emulation thread owns the volume, so no sharing is implied.
-    counters: std::cell::Cell<KateaStorageCounters>,
+    /// One cell PER FIELD -- see [`katea_counter_block`] for why the single
+    /// whole-block `Cell` this replaced was a 352-byte copy per increment.
+    counters: KateaCounterCells,
     /// One open read handle for the host file most recently served, so a
     /// sequential read pays one `File::open` instead of one per 512-byte sector.
     /// A single entry is the right size: DOS reads one file at a time through one
@@ -991,12 +1019,19 @@ pub(crate) struct KateaTreeVolume {
     /// than to the clusters it walks, and a test reads it to prove that.
     #[cfg(test)]
     fat_sector_builds: std::cell::Cell<u64>,
+    /// How many times a [`FatWalk`] cursor has had to RESOLVE a FAT sector --
+    /// that is, ask the store whether the guest wrote it. The whole point of the
+    /// cursor is that this is proportional to the FAT sectors a walk crosses
+    /// (one per 128 clusters) rather than to the clusters it steps through, and a
+    /// test reads it to prove that.
+    #[cfg(test)]
+    fat_walk_resolves: std::cell::Cell<u64>,
     /// Arms the FAT / directory / free-space region census. Read once at mount
     /// from `IZARRAVM_KATEA_REGION_CENSUS=1`, and OFF by default: those two
-    /// counters were investigation residue, and each increment is a
-    /// read-modify-write of the whole `KateaStorageCounters` block on the
-    /// per-sector read path. House discipline is that a default-off instrument
-    /// is gated at its call site, not inside the helper it calls.
+    /// counters were investigation residue, and an increment is still a branch
+    /// and a read-modify-write on the per-sector read path. House discipline is
+    /// that a default-off instrument is gated at its call site, not inside the
+    /// helper it calls.
     region_census: bool,
 }
 
@@ -1021,25 +1056,73 @@ fn readahead_max_bytes() -> u64 {
     }
 }
 
-/// What the Katea host-folder read path did, for the boot profiler's disk phases.
+/// Declare the Katea counter block ONCE, in two shapes.
 ///
-/// Deliberately counters rather than a `MachineProfilePhaseKind`: the host reads
-/// below happen inside the INT 13h service, which is already timed as `SoftInt`,
-/// so a phase would nest and double-count in `classified_wall_ns`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KateaStorageCounters {
+/// [`KateaStorageCounters`] is the public, plain, `Copy` report the boot profiler
+/// subtracts field by field. [`KateaCounterCells`] is what the volume actually
+/// stores: the same names, each its own `Cell<u64>`.
+///
+/// The split exists because the counters used to live in a single
+/// `Cell<KateaStorageCounters>`, and `Cell::get` + `Cell::set` around one `+= 1`
+/// is a read-modify-write of the WHOLE block -- 44 `u64` fields, 352 bytes,
+/// copied twice per bump. There are bumps on the per-sector read path, inside
+/// `read_host_span`, and (before the FAT walk was fixed) once per cluster of
+/// every chain walk in the projection pass, so the block copy was ~2.1 KB per
+/// served sector and ~704 bytes per FAT entry. Per-field cells make a bump one
+/// 8-byte read-modify-write of one cell, and nothing else in the block is
+/// touched.
+///
+/// Generating both from one field list is what keeps them from drifting: a new
+/// counter cannot be added to the report without also getting its cell, and
+/// `snapshot` cannot forget it.
+macro_rules! katea_counter_block {
+    ($( $(#[$meta:meta])* $name:ident ),* $(,)?) => {
+        /// What the Katea host-folder read path did, for the boot profiler's disk phases.
+        ///
+        /// Deliberately counters rather than a `MachineProfilePhaseKind`: the host reads
+        /// below happen inside the INT 13h service, which is already timed as `SoftInt`,
+        /// so a phase would nest and double-count in `classified_wall_ns`.
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        pub struct KateaStorageCounters {
+            $( $(#[$meta])* pub $name: u64, )*
+        }
+
+        /// The live counters, one `Cell` per field. See [`katea_counter_block`].
+        #[derive(Debug, Default)]
+        pub(crate) struct KateaCounterCells {
+            $( pub(crate) $name: std::cell::Cell<u64>, )*
+        }
+
+        impl KateaCounterCells {
+            /// The plain report, for `storage_counters` and the profile emitters.
+            pub(crate) fn snapshot(&self) -> KateaStorageCounters {
+                KateaStorageCounters { $( $name: self.$name.get(), )* }
+            }
+        }
+    };
+}
+
+/// Add `n` to one counter cell, saturating. The saturation matters at exactly
+/// one place -- `host_bytes` and friends accumulate sizes -- and costs nothing
+/// where it does not.
+#[inline]
+fn bump(cell: &std::cell::Cell<u64>, n: u64) {
+    cell.set(cell.get().saturating_add(n));
+}
+
+katea_counter_block! {
     /// Sectors the facade served to the guest, from any source.
-    pub sector_reads: u64,
+    sector_reads,
     /// Sectors whose bytes came out of a host file.
-    pub host_file_reads: u64,
+    host_file_reads,
     /// Logical host-file bytes served to the guest.
-    pub host_bytes: u64,
+    host_bytes,
     /// Physical host read calls and bytes after command-local coalescing.
-    pub host_read_operations: u64,
-    pub host_read_bytes: u64,
+    host_read_operations,
+    host_read_bytes,
     /// Wall nanoseconds spent in physical host reads. Command-window hits do
     /// not enter this counter.
-    pub host_wall_ns: u64,
+    host_wall_ns,
     /// The longest SINGLE `read_host_span` this session, in nanoseconds.
     ///
     /// A sum cannot see a hitch: 784 ms of projection spread over a minute is
@@ -1047,19 +1130,19 @@ pub struct KateaStorageCounters {
     /// is what separates the two, and it is what the read-ahead and the projection
     /// scaling are graded against. Zero new syscalls: this reads the `Instant`
     /// pair the sum already computes.
-    pub host_read_max_ns: u64,
+    host_read_max_ns,
     /// Sectors served out of the cross-command read-ahead buffer (a memcpy, no
     /// host I/O). Derivable from `host_file_reads - host_read_operations` only
     /// while the command window is also in play; counted directly so a test can
     /// name the mechanism it is asserting on.
-    pub host_readahead_hits: u64,
+    host_readahead_hits,
     /// Read-ahead fills: physical host reads that pulled more than the command
     /// asked for, so a later command could be served from RAM.
-    pub host_readahead_fills: u64,
+    host_readahead_fills,
     /// Cluster-run table entries scanned to resolve data sectors. `data_sector`
     /// binary-searches the sorted `runs`, so this is now `log2(runs)` per sector
     /// rather than the tree-size-dependent linear walk it was built to expose.
-    pub run_scan_steps: u64,
+    run_scan_steps,
     /// Sectors served out of the synthesized FAT region. ZERO unless
     /// `IZARRAVM_KATEA_REGION_CENSUS=1` armed the volume: this is a diagnostic,
     /// gated at its call site so an ordinary run never pays for it.
@@ -1069,52 +1152,52 @@ pub struct KateaStorageCounters {
     /// `host_file_reads` is the signature of DOS re-walking a cluster chain
     /// rather than of the guest asking for data. That signature is what the
     /// 512-byte-cluster geometry bug looked like from here.
-    pub fat_sector_reads: u64,
+    fat_sector_reads,
     /// Sectors served out of the data region that were NOT file bytes: directory
     /// clusters and free space. Separating these from the FAT count is what tells
     /// a chain walk apart from a directory rescan. Same gate, same default: zero
     /// unless `IZARRAVM_KATEA_REGION_CENSUS=1`.
-    pub dir_or_free_sector_reads: u64,
+    dir_or_free_sector_reads,
     /// Host `File::open` calls. Distinct from `host_file_reads` (which counts
     /// SECTORS served from a host file) because the one-entry handle cache makes
     /// them differ: their ratio is what says the cache is working. Before the
     /// cache they were equal by construction.
-    pub host_file_opens: u64,
-    pub sector_writes: u64,
-    pub int13_read_commands: u64,
-    pub int13_read_sectors: u64,
-    pub int13_read_wait_ticks: u64,
-    pub int13_write_commands: u64,
-    pub int13_write_sectors: u64,
-    pub int13_write_wait_ticks: u64,
-    pub pio_read_commands: u64,
-    pub pio_read_sectors: u64,
-    pub pio_read_wait_ticks: u64,
-    pub pio_write_commands: u64,
-    pub pio_write_sectors: u64,
-    pub pio_write_wait_ticks: u64,
-    pub dma_read_commands: u64,
-    pub dma_read_sectors: u64,
-    pub dma_read_wait_ticks: u64,
-    pub dma_write_commands: u64,
-    pub dma_write_sectors: u64,
-    pub dma_write_wait_ticks: u64,
-    pub overlay_resident_sectors: u64,
-    pub overlay_pending_sectors: u64,
-    pub pending_unmapped_sectors: u64,
-    pub spill_operations: u64,
-    pub spill_bytes: u64,
-    pub spill_wall_ns: u64,
-    pub projection_operations: u64,
-    pub projection_bytes: u64,
-    pub projection_wall_ns: u64,
+    host_file_opens,
+    sector_writes,
+    int13_read_commands,
+    int13_read_sectors,
+    int13_read_wait_ticks,
+    int13_write_commands,
+    int13_write_sectors,
+    int13_write_wait_ticks,
+    pio_read_commands,
+    pio_read_sectors,
+    pio_read_wait_ticks,
+    pio_write_commands,
+    pio_write_sectors,
+    pio_write_wait_ticks,
+    dma_read_commands,
+    dma_read_sectors,
+    dma_read_wait_ticks,
+    dma_write_commands,
+    dma_write_sectors,
+    dma_write_wait_ticks,
+    overlay_resident_sectors,
+    overlay_pending_sectors,
+    pending_unmapped_sectors,
+    spill_operations,
+    spill_bytes,
+    spill_wall_ns,
+    projection_operations,
+    projection_bytes,
+    projection_wall_ns,
     /// The longest SINGLE projection operation this session, in nanoseconds --
     /// one `commit_guest_write_batch` or one `flush_guest_writes`, each of which
     /// runs synchronously on the emulation thread. See [`Self::host_read_max_ns`]
     /// for why the sum is not enough.
-    pub projection_max_ns: u64,
-    pub metadata_projection_passes: u64,
-    pub host_write_failures: u64,
+    projection_max_ns,
+    metadata_projection_passes,
+    host_write_failures,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1460,7 +1543,7 @@ impl KateaTreeVolume {
             atomic_writes: 0,
             #[cfg(test)]
             atomic_write_bytes: 0,
-            counters: std::cell::Cell::new(KateaStorageCounters::default()),
+            counters: KateaCounterCells::default(),
             host_read_cache: std::cell::RefCell::new(Vec::new()),
             host_read_window: std::cell::RefCell::new(None),
             host_readahead: std::cell::RefCell::new(Vec::new()),
@@ -1470,6 +1553,8 @@ impl KateaTreeVolume {
             fat_sector_cache: std::cell::RefCell::new(None),
             #[cfg(test)]
             fat_sector_builds: std::cell::Cell::new(0),
+            #[cfg(test)]
+            fat_walk_resolves: std::cell::Cell::new(0),
             region_census: region_census_enabled(),
         })
     }
@@ -1496,7 +1581,7 @@ impl KateaTreeVolume {
 
     /// What the read path has done since mount. See [`KateaStorageCounters`].
     pub(crate) fn storage_counters(&self) -> KateaStorageCounters {
-        let mut counters = self.counters.get();
+        let mut counters = self.counters.snapshot();
         let store = self.store.counters();
         counters.overlay_resident_sectors = store.resident_sectors;
         counters.overlay_pending_sectors = store.pending_sectors;
@@ -1527,6 +1612,32 @@ impl KateaTreeVolume {
     #[cfg(test)]
     pub(crate) fn reset_fat_sector_builds(&self) {
         self.fat_sector_builds.set(0);
+    }
+
+    /// FAT sectors a walk cursor has resolved since mount. See
+    /// [`Self::fat_walk_resolves`].
+    #[cfg(test)]
+    pub(crate) fn fat_walk_resolves(&self) -> u64 {
+        self.fat_walk_resolves.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_fat_walk_resolves(&self) {
+        self.fat_walk_resolves.set(0);
+    }
+
+    /// One FAT entry through a fresh walk cursor, so a differential test can
+    /// compare the walked path against `fat_entry` cluster by cluster.
+    #[cfg(test)]
+    pub(crate) fn fat_entry_via_walk(&self, c: u32) -> u32 {
+        let mut walk = FatWalk::default();
+        self.fat_entry_walked(c, &mut walk)
+    }
+
+    /// The reconcile path's chain walk, for the differential test.
+    #[cfg(test)]
+    pub(crate) fn chain_via_walk(&self, first: u32) -> Option<Vec<u32>> {
+        self.chain_of(first)
     }
 
     /// How many host read handles are cached, for the LRU bound test.
@@ -1600,6 +1711,7 @@ impl KateaTreeVolume {
             window: &self.host_read_window,
             readahead: &self.host_readahead,
             readahead_max: self.readahead_max_bytes,
+            first_data_lba: self.geo.part_start + self.geo.first_data_sector,
         }
     }
 
@@ -1666,10 +1778,8 @@ impl KateaTreeVolume {
         let mut bytes = [0u8; SECTOR];
         bytes[..available].copy_from_slice(&cached.bytes[offset..offset + available]);
         drop(slot);
-        let mut counters = self.counters.get();
-        counters.host_file_reads += 1;
-        counters.host_bytes = counters.host_bytes.saturating_add(available as u64);
-        self.counters.set(counters);
+        bump(&self.counters.host_file_reads, 1);
+        bump(&self.counters.host_bytes, available as u64);
         Some(SectorRead::ok(bytes))
     }
 
@@ -1709,6 +1819,14 @@ impl KateaTreeVolume {
     /// The 28-bit FAT entry for cluster `c`, reading the overlay-shadowed FAT (so
     /// guest-written chain links are honored) and falling back to the tree's
     /// computed FAT. Built on `read_sector`, which already consults the overlay.
+    ///
+    /// A CHAIN WALK MUST NOT COME THROUGH HERE. Every call materializes a whole
+    /// 512-byte sector BY VALUE to read four bytes of it, on top of the full
+    /// `read_sector_checked` dispatch, and the reconcile pass walks every live
+    /// file's chain three times over. Use [`Self::fat_entry_walked`] with a
+    /// [`FatWalk`] cursor, or the [`Self::chain_of`] wrapper that owns one. This
+    /// entry point survives for the single-entry probes (`freed` in phase 2, the
+    /// tests) where a cursor would have nothing to amortize over.
     pub(crate) fn fat_entry(&self, c: u32) -> u32 {
         let byte = c as usize * 4;
         let fat_sector_rel = u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
@@ -1716,6 +1834,106 @@ impl KateaTreeVolume {
         let off = byte % SECTOR;
         let sec = self.read_sector(lba);
         u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]) & 0x0FFF_FFFF
+    }
+
+    /// The same 28-bit FAT entry, resolved through a walk cursor.
+    ///
+    /// WHY. `fat_entry` was the dominant per-cluster cost of every chain walk in
+    /// the projection pass, and the pass therefore scaled with the size of the
+    /// MOUNTED FOLDER rather than with the size of the write. Per cluster it paid
+    /// a `SectorStore` lookup, a `RefCell` borrow for the command window, a
+    /// 512-byte copy out of the FAT memo, another into `SectorRead`, and a third
+    /// out of it -- to read four bytes. Measured anchor: a 47 MB folder
+    /// (~12,000 clusters) cost a 1.81 ms worst pass, which extrapolates to
+    /// ~19 ms at 500 MB, back into the freeze class.
+    ///
+    /// WHAT THIS DOES INSTEAD. The cursor resolves ONE FAT SECTOR -- 128 clusters
+    /// -- and holds the answer:
+    ///
+    /// * if the guest has written that FAT sector, the cursor owns its bytes and
+    ///   every entry in it is a four-byte read out of a buffer already in hand;
+    /// * if it has not, there is no sector at all. The base-view FAT is a pure
+    ///   function of the immutable `fat`/`geo` pair, and
+    ///   `ClusterIndex::fat_entry(c)` is exactly the value
+    ///   `fat.fat_sector(c / 128)[4 * (c % 128) ..]` would hold -- the sector
+    ///   synthesis fills entry `i` of sector `s` from `fat_entry(s * 128 + i)`.
+    ///   So the entry comes from one `HashSet` probe and no 512 bytes move.
+    ///
+    /// IDENTICAL ANSWERS. The same two sources in the same order as
+    /// `read_sector_checked`: the store's overlay, then the base view. The
+    /// command window is deliberately not consulted, and cannot matter: it is
+    /// filled at exactly one site, always from a data-region LBA (asserted there),
+    /// so it can never cover a FAT sector.
+    ///
+    /// IDENTICAL COUNTERS. `sector_reads` is still bumped once per cluster, and
+    /// the `IZARRAVM_KATEA_REGION_CENSUS` FAT-sector counter once per cluster
+    /// served from the base view, exactly as the old path did -- so no profile
+    /// field moves. The store's `read_errors` counter is the one number that
+    /// changes: a failed spill read is now registered once per FAT SECTOR rather
+    /// than once per cluster in it. Every reader compares it for INEQUALITY
+    /// against a snapshot ("did anything fail in this bracket?"), so one is as
+    /// good as 128.
+    ///
+    /// A cluster whose entry falls outside FAT copy 0 is handed to `fat_entry`
+    /// verbatim, so even a corrupt or guest-crafted link resolves exactly as
+    /// before.
+    fn fat_entry_walked(&self, c: u32, walk: &mut FatWalk) -> u32 {
+        let byte = c as usize * 4;
+        let within = (byte / SECTOR) as u32;
+        if within >= self.geo.fatsz {
+            return self.fat_entry(c);
+        }
+        let off = byte % SECTOR;
+        bump(&self.counters.sector_reads, 1);
+        if walk.within != Some(within) {
+            #[cfg(test)]
+            self.fat_walk_resolves
+                .set(self.fat_walk_resolves.get().saturating_add(1));
+            let lba = self.geo.part_start + u32::from(RESERVED_SECTORS) + within;
+            walk.overlay = match self.store.get(lba) {
+                Ok(Some(bytes)) => Some(Box::new(bytes)),
+                Ok(None) => None,
+                Err(e) => {
+                    // Same message, same substitute bytes, same held chain: the
+                    // store has already counted the error and `read_sector`
+                    // dropped the degraded flag and served zeros.
+                    eprintln!("katea: guest-written sector {lba} could not be read back: {e}");
+                    Some(Box::new([0u8; SECTOR]))
+                }
+            };
+            walk.within = Some(within);
+        }
+        match &walk.overlay {
+            Some(sector) => {
+                u32::from_le_bytes([
+                    sector[off],
+                    sector[off + 1],
+                    sector[off + 2],
+                    sector[off + 3],
+                ]) & 0x0FFF_FFFF
+            }
+            None => {
+                // Region census: default-off instrument, gated at the call site,
+                // and per CLUSTER because that is what the sector-reading path it
+                // replaces counted.
+                if self.region_census {
+                    bump(&self.counters.fat_sector_reads, 1);
+                }
+                self.fat.fat_entry(c) & 0x0FFF_FFFF
+            }
+        }
+    }
+
+    /// Follow the cluster chain starting at `first`, with a fresh walk cursor.
+    ///
+    /// Every chain walk in the reconcile path goes through here, so none of them
+    /// pays `fat_entry`'s per-cluster sector copy. The result is
+    /// `katea_write::chain`'s, unchanged.
+    fn chain_of(&self, first: u32) -> Option<Vec<u32>> {
+        let mut walk = FatWalk::default();
+        crate::katea_write::chain(first, self.max_chain(), |c| {
+            self.fat_entry_walked(c, &mut walk)
+        })
     }
 
     /// Absolute LBA of a data cluster's first sector. The reconcile pass and the
@@ -1957,12 +2175,11 @@ impl KateaTreeVolume {
             .iter()
             .map(|(_, bytes)| bytes.len() as u64)
             .sum::<u64>();
-        let mut counters = self.counters.get();
-        counters.projection_operations = counters
-            .projection_operations
-            .saturating_add(spans.len() as u64 + u64::from(set_len));
-        counters.projection_bytes = counters.projection_bytes.saturating_add(bytes);
-        self.counters.set(counters);
+        bump(
+            &self.counters.projection_operations,
+            spans.len() as u64 + u64::from(set_len),
+        );
+        bump(&self.counters.projection_bytes, bytes);
 
         for lba in acknowledged {
             self.store.acknowledge(lba);
@@ -2115,9 +2332,7 @@ impl KateaTreeVolume {
             .collect();
         for (key, file) in affected {
             let first = file.chain.first().copied().unwrap_or(0);
-            let Some(chain) = crate::katea_write::chain(first, self.max_chain(), |cluster| {
-                self.fat_entry(cluster)
-            }) else {
+            let Some(chain) = self.chain_of(first) else {
                 self.blocked_projection_keys.insert(key);
                 continue;
             };
@@ -2169,10 +2384,7 @@ impl KateaTreeVolume {
             operations = operations.saturating_add(1);
         }
         if operations > 0 {
-            let mut counters = self.counters.get();
-            counters.projection_operations =
-                counters.projection_operations.saturating_add(operations);
-            self.counters.set(counters);
+            bump(&self.counters.projection_operations, operations);
         }
         Ok(())
     }
@@ -2210,11 +2422,7 @@ impl KateaTreeVolume {
             if projected.size != entry.size {
                 return true;
             }
-            let Some(chain) =
-                crate::katea_write::chain(entry.first_cluster, self.max_chain(), |cluster| {
-                    self.fat_entry(cluster)
-                })
-            else {
+            let Some(chain) = self.chain_of(entry.first_cluster) else {
                 return true;
             };
             chain != projected.chain
@@ -2227,7 +2435,6 @@ impl KateaTreeVolume {
     fn gather_live(&self) -> Vec<LiveEntry> {
         let spc = u32::from(self.geo.spc);
         let cluster_bytes = spc as usize * SECTOR;
-        let max = self.max_chain();
         let mut work: Vec<u32> = self.dir_paths.keys().copied().collect();
         let mut seen: HashSet<u32> = HashSet::new();
         let mut out = Vec::new();
@@ -2235,9 +2442,7 @@ impl KateaTreeVolume {
             if !seen.insert(dir_cluster) {
                 continue;
             }
-            let Some(dir_chain) =
-                crate::katea_write::chain(dir_cluster, max, |c| self.fat_entry(c))
-            else {
+            let Some(dir_chain) = self.chain_of(dir_cluster) else {
                 continue;
             };
             if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
@@ -2311,32 +2516,27 @@ impl KateaTreeVolume {
     ) -> CommitGuestWriteResult {
         let projection_started = std::time::Instant::now();
         let sectors = self.batch_sector_writes;
-        let mut counters = self.counters.get();
-        let projection_operations_before = counters.projection_operations;
+        let projection_operations_before = self.counters.projection_operations.get();
         match route {
             GuestWriteRoute::Int13 => {
-                counters.int13_write_commands = counters.int13_write_commands.saturating_add(1);
-                counters.int13_write_sectors = counters.int13_write_sectors.saturating_add(sectors);
+                bump(&self.counters.int13_write_commands, 1);
+                bump(&self.counters.int13_write_sectors, sectors);
             }
             GuestWriteRoute::Pio => {
-                counters.pio_write_commands = counters.pio_write_commands.saturating_add(1);
-                counters.pio_write_sectors = counters.pio_write_sectors.saturating_add(sectors);
+                bump(&self.counters.pio_write_commands, 1);
+                bump(&self.counters.pio_write_sectors, sectors);
             }
             GuestWriteRoute::Dma => {
-                counters.dma_write_commands = counters.dma_write_commands.saturating_add(1);
-                counters.dma_write_sectors = counters.dma_write_sectors.saturating_add(sectors);
+                bump(&self.counters.dma_write_commands, 1);
+                bump(&self.counters.dma_write_sectors, sectors);
             }
         }
-        self.counters.set(counters);
         self.host_io_failed = false;
 
         if self.directory_dirty
             || (self.metadata_reconcile_pending && !self.fat_dirty_clusters.is_empty())
         {
-            let mut counters = self.counters.get();
-            counters.metadata_projection_passes =
-                counters.metadata_projection_passes.saturating_add(1);
-            self.counters.set(counters);
+            bump(&self.counters.metadata_projection_passes, 1);
             // Two whole-tree passes: `reconcile_mode` gathers every live entry
             // and `metadata_projection_pending` gathers them again to decide
             // whether the next command owes another pass. An incremental
@@ -2389,7 +2589,7 @@ impl KateaTreeVolume {
         self.batch_sector_writes = 0;
         self.directory_dirty = false;
         self.fat_dirty_clusters.clear();
-        let projected = self.counters.get().projection_operations > projection_operations_before;
+        let projected = self.counters.projection_operations.get() > projection_operations_before;
         let result = if self.host_io_failed {
             CommitGuestWriteResult::HostIoFailure
         } else if projected {
@@ -2407,56 +2607,38 @@ impl KateaTreeVolume {
         sectors: u64,
         wait_ticks: u64,
     ) {
-        let mut counters = self.counters.get();
         match route {
             GuestStorageRoute::Int13 => {
-                counters.int13_read_commands = counters.int13_read_commands.saturating_add(1);
-                counters.int13_read_sectors = counters.int13_read_sectors.saturating_add(sectors);
-                counters.int13_read_wait_ticks =
-                    counters.int13_read_wait_ticks.saturating_add(wait_ticks);
+                bump(&self.counters.int13_read_commands, 1);
+                bump(&self.counters.int13_read_sectors, sectors);
+                bump(&self.counters.int13_read_wait_ticks, wait_ticks);
             }
             GuestStorageRoute::Pio => {
-                counters.pio_read_commands = counters.pio_read_commands.saturating_add(1);
-                counters.pio_read_sectors = counters.pio_read_sectors.saturating_add(sectors);
-                counters.pio_read_wait_ticks =
-                    counters.pio_read_wait_ticks.saturating_add(wait_ticks);
+                bump(&self.counters.pio_read_commands, 1);
+                bump(&self.counters.pio_read_sectors, sectors);
+                bump(&self.counters.pio_read_wait_ticks, wait_ticks);
             }
             GuestStorageRoute::Dma => {
-                counters.dma_read_commands = counters.dma_read_commands.saturating_add(1);
-                counters.dma_read_sectors = counters.dma_read_sectors.saturating_add(sectors);
-                counters.dma_read_wait_ticks =
-                    counters.dma_read_wait_ticks.saturating_add(wait_ticks);
+                bump(&self.counters.dma_read_commands, 1);
+                bump(&self.counters.dma_read_sectors, sectors);
+                bump(&self.counters.dma_read_wait_ticks, wait_ticks);
             }
         }
-        self.counters.set(counters);
     }
 
     pub(crate) fn note_guest_write_wait(&self, route: GuestStorageRoute, wait_ticks: u64) {
-        let mut counters = self.counters.get();
         match route {
-            GuestStorageRoute::Int13 => {
-                counters.int13_write_wait_ticks =
-                    counters.int13_write_wait_ticks.saturating_add(wait_ticks);
-            }
-            GuestStorageRoute::Pio => {
-                counters.pio_write_wait_ticks =
-                    counters.pio_write_wait_ticks.saturating_add(wait_ticks);
-            }
-            GuestStorageRoute::Dma => {
-                counters.dma_write_wait_ticks =
-                    counters.dma_write_wait_ticks.saturating_add(wait_ticks);
-            }
+            GuestStorageRoute::Int13 => bump(&self.counters.int13_write_wait_ticks, wait_ticks),
+            GuestStorageRoute::Pio => bump(&self.counters.pio_write_wait_ticks, wait_ticks),
+            GuestStorageRoute::Dma => bump(&self.counters.dma_write_wait_ticks, wait_ticks),
         }
-        self.counters.set(counters);
     }
 
     pub(crate) fn flush_guest_writes(&mut self) -> CommitGuestWriteResult {
         let projection_started = std::time::Instant::now();
-        let projection_operations_before = self.counters.get().projection_operations;
+        let projection_operations_before = self.counters.projection_operations.get();
         self.host_io_failed = false;
-        let mut counters = self.counters.get();
-        counters.metadata_projection_passes = counters.metadata_projection_passes.saturating_add(1);
-        self.counters.set(counters);
+        bump(&self.counters.metadata_projection_passes, 1);
         self.reconcile_mode(ReconcileMode::Final);
         self.metadata_reconcile_pending = self.host_io_failed || self.metadata_projection_pending();
         if let Err(e) = self.flush_write_handles() {
@@ -2467,7 +2649,7 @@ impl KateaTreeVolume {
         self.batch_sector_writes = 0;
         self.directory_dirty = false;
         self.fat_dirty_clusters.clear();
-        let projected = self.counters.get().projection_operations > projection_operations_before;
+        let projected = self.counters.projection_operations.get() > projection_operations_before;
         let result = if self.host_io_failed {
             CommitGuestWriteResult::HostIoFailure
         } else if projected {
@@ -2481,27 +2663,23 @@ impl KateaTreeVolume {
 
     fn note_host_write_failure(&mut self) {
         self.host_io_failed = true;
-        let mut counters = self.counters.get();
-        counters.host_write_failures = counters.host_write_failures.saturating_add(1);
-        self.counters.set(counters);
+        bump(&self.counters.host_write_failures, 1);
     }
 
     fn note_projection_operation(&self, bytes: u64) {
-        let mut counters = self.counters.get();
-        counters.projection_operations = counters.projection_operations.saturating_add(1);
-        counters.projection_bytes = counters.projection_bytes.saturating_add(bytes);
-        self.counters.set(counters);
+        bump(&self.counters.projection_operations, 1);
+        bump(&self.counters.projection_bytes, bytes);
     }
 
     fn note_projection_wall(&self, started: std::time::Instant) {
         let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        let mut counters = self.counters.get();
-        counters.projection_wall_ns = counters.projection_wall_ns.saturating_add(elapsed);
+        bump(&self.counters.projection_wall_ns, elapsed);
         // The sum says how much of the session went into projection; the max says
         // whether any single pass was long enough for the user to see it as a
         // freeze. Same `Instant` pair, no extra clock read.
-        counters.projection_max_ns = counters.projection_max_ns.max(elapsed);
-        self.counters.set(counters);
+        self.counters
+            .projection_max_ns
+            .set(self.counters.projection_max_ns.get().max(elapsed));
     }
 
     fn reconcile_mode(&mut self, mode: ReconcileMode) {
@@ -2540,11 +2718,7 @@ impl KateaTreeVolume {
             .filter(|entry| !entry.is_dir && entry.first_cluster >= 2)
         {
             let key = (entry.dir_cluster, entry.name);
-            let Some(chain) =
-                crate::katea_write::chain(entry.first_cluster, self.max_chain(), |c| {
-                    self.fat_entry(c)
-                })
-            else {
+            let Some(chain) = self.chain_of(entry.first_cluster) else {
                 continue;
             };
             for cluster in chain {
@@ -2740,7 +2914,6 @@ impl KateaTreeVolume {
 
         let spc = u32::from(self.geo.spc);
         let cluster_bytes = spc as usize * SECTOR;
-        let max = self.max_chain();
 
         // PHASE 3: materialize creates/overwrites/grows + mkdir.
         // Fixpoint over known directories: MKDIR registers a new directory which is
@@ -2760,9 +2933,7 @@ impl KateaTreeVolume {
             // Bracketed: a zeroed directory sector would make `parse_dir` stop early
             // and hide live entries, which phase 2 would read as disappearances.
             let dir_errors_before = self.store.read_errors();
-            let Some(dir_chain) =
-                crate::katea_write::chain(dir_cluster, max, |c| self.fat_entry(c))
-            else {
+            let Some(dir_chain) = self.chain_of(dir_cluster) else {
                 continue; // a corrupt directory chain: hold the whole directory
             };
             if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
@@ -2798,10 +2969,9 @@ impl KateaTreeVolume {
                 eprintln!("katea: holding a directory after a failed read of guest-written data");
                 continue;
             }
-            let dir_written = dir_chain.iter().any(|c| {
-                let base = self.cluster_to_lba(*c);
-                (0..spc).any(|s| self.store.was_written(base + s))
-            });
+            let dir_written = dir_chain
+                .iter()
+                .any(|c| self.store.was_written_span(self.cluster_to_lba(*c), spc));
 
             // Decide every entry (read-only); collect actions, then apply.
             let mut mkdirs: Vec<(u32, [u8; 11], u32, std::path::PathBuf)> = Vec::new();
@@ -2840,9 +3010,7 @@ impl KateaTreeVolume {
                         // would make this file's safety depend on the shape of the
                         // corruption rather than on the failure itself.
                         let errors_before = self.store.read_errors();
-                        let Some(fchain) =
-                            crate::katea_write::chain(first_cluster, max, |c| self.fat_entry(c))
-                        else {
+                        let Some(fchain) = self.chain_of(first_cluster) else {
                             continue; // incomplete/corrupt chain: hold
                         };
                         if fchain.iter().any(|&c| !self.cluster_in_range(c)) {
@@ -2857,10 +3025,9 @@ impl KateaTreeVolume {
                         // when empty. Untouched tree/system files are skipped. This
                         // asks the store's historical bits, which remain after a
                         // projected sector is acknowledged.
-                        let data_written = fchain.iter().any(|c| {
-                            let base = self.cluster_to_lba(*c);
-                            (0..spc).any(|s| self.store.was_written(base + s))
-                        });
+                        let data_written = fchain
+                            .iter()
+                            .any(|c| self.store.was_written_span(self.cluster_to_lba(*c), spc));
                         let is_new = !self.mirrored.contains_key(&(dir_cluster, name));
                         if handled.contains(&(dir_cluster, name)) {
                             continue; // already moved/renamed in phase 2
@@ -3101,9 +3268,7 @@ impl KateaTreeVolume {
         if !metadata && !self.batch_lba_is_projected(lba) {
             self.note_unmapped(lba);
         }
-        let mut counters = self.counters.get();
-        counters.sector_writes = counters.sector_writes.saturating_add(1);
-        self.counters.set(counters);
+        bump(&self.counters.sector_writes, 1);
     }
 
     /// The data cluster holding `lba`, or `None` for a sector below the data
@@ -3174,9 +3339,7 @@ impl KateaTreeVolume {
 
     /// The same read, saying whether it degraded. See [`SectorRead`].
     pub(crate) fn read_sector_checked(&self, lba: u32) -> SectorRead {
-        let mut counters = self.counters.get();
-        counters.sector_reads += 1;
-        self.counters.set(counters);
+        bump(&self.counters.sector_reads, 1);
         match self.store.get(lba) {
             Ok(Some(s)) => return SectorRead::ok(s),
             Ok(None) => {}
@@ -3217,9 +3380,7 @@ impl KateaTreeVolume {
             // Region census: default-off instrument, gated at the call site so an
             // ordinary run never pays the read-modify-write of the counter block.
             if self.region_census {
-                let mut counters = self.counters.get();
-                counters.fat_sector_reads += 1;
-                self.counters.set(counters);
+                bump(&self.counters.fat_sector_reads, 1);
             }
             let within = (rel - reserved) % self.geo.fatsz;
             return SectorRead::ok(self.base_fat_sector(within));
@@ -3301,15 +3462,11 @@ impl KateaTreeVolume {
             .checked_sub(1)
             .and_then(|i| self.runs.get(i))
             .filter(|(_, last, _)| cluster <= *last);
-        let mut counters = self.counters.get();
-        counters.run_scan_steps = counters.run_scan_steps.saturating_add(steps);
-        self.counters.set(counters);
+        bump(&self.counters.run_scan_steps, steps);
         let Some(run) = found else {
             // Region census: default-off, gated at the call site (see the FAT arm).
             if self.region_census {
-                let mut counters = self.counters.get();
-                counters.dir_or_free_sector_reads += 1;
-                self.counters.set(counters);
+                bump(&self.counters.dir_or_free_sector_reads, 1);
             }
             return SectorRead::ok([0u8; SECTOR]); // free space
         };
@@ -3319,9 +3476,7 @@ impl KateaTreeVolume {
             Role::Dir(id) => {
                 // Region census: default-off, gated at the call site (see the FAT arm).
                 if self.region_census {
-                    let mut counters = self.counters.get();
-                    counters.dir_or_free_sector_reads += 1;
-                    self.counters.set(counters);
+                    bump(&self.counters.dir_or_free_sector_reads, 1);
                 }
                 let d = &self.dirs[*id];
                 let sector_in_dir = cluster_off * spc + sector_in_cluster;
@@ -3442,8 +3597,6 @@ fn read_host_span(
     if valid == 0 {
         return SectorRead::ok(out);
     }
-    let started = std::time::Instant::now();
-
     // A read-ahead hit is a memcpy out of RAM and nothing else: no open, no seek,
     // no read, and no entry in the wall counters -- the same accounting the
     // command window already gets, for the same reason. The range test is exact
@@ -3468,11 +3621,9 @@ fn read_host_span(
                 let ahead = slots.remove(index);
                 slots.push(ahead);
                 drop(slots);
-                let mut tally = context.counters.get();
-                tally.host_file_reads += 1;
-                tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
-                tally.host_readahead_hits = tally.host_readahead_hits.saturating_add(1);
-                context.counters.set(tally);
+                bump(&context.counters.host_file_reads, 1);
+                bump(&context.counters.host_bytes, valid as u64);
+                bump(&context.counters.host_readahead_hits, 1);
                 return SectorRead::ok(out);
             }
             // A miss. Only a miss that starts at exactly the end of this path's
@@ -3483,6 +3634,13 @@ fn read_host_span(
             }
         }
     }
+
+    // Below the hit test, not above it. A hit does no host I/O, does not enter
+    // `host_wall_ns`, and returns before this value is ever read -- so taking the
+    // timestamp first was a `QueryPerformanceCounter` bought and thrown away on
+    // every hit (duke486 E2: 10,625 of them). From here on the function always
+    // reaches the tally, so the clock read is always used.
+    let started = std::time::Instant::now();
 
     let mut opened = 0u64;
     let mut operations = 0u64;
@@ -3568,6 +3726,23 @@ fn read_host_span(
                                 next_fill,
                             });
                         } else if batch.len() > valid {
+                            // RANGE INVARIANT. The window is LBA-keyed with no
+                            // file identity, and it is consulted BEFORE the
+                            // region dispatch in `read_sector_checked`. It is
+                            // safe only because it is filled here and nowhere
+                            // else, and here `context.lba` always names a data
+                            // sector of a projected file. Asserting it at the
+                            // fill site is what makes the claim mechanical
+                            // rather than a comment: `fat_entry_walked` reads
+                            // FAT-region sectors without consulting the window,
+                            // and this is why it may.
+                            debug_assert!(
+                                context.lba >= context.first_data_lba,
+                                "the command window must never cover metadata: \
+                                 lba {} is below the data region at {}",
+                                context.lba,
+                                context.first_data_lba
+                            );
                             context.window.replace(Some(HostReadWindow {
                                 start_lba: context.lba,
                                 bytes: batch,
@@ -3606,16 +3781,17 @@ fn read_host_span(
     }
     drop(cache);
     let elapsed = crate::duration_ns_u64(started.elapsed());
-    let mut tally = context.counters.get();
-    tally.host_file_reads += 1;
-    tally.host_file_opens = tally.host_file_opens.saturating_add(opened);
-    tally.host_bytes = tally.host_bytes.saturating_add(valid as u64);
-    tally.host_read_operations = tally.host_read_operations.saturating_add(operations);
-    tally.host_read_bytes = tally.host_read_bytes.saturating_add(physical_bytes);
-    tally.host_readahead_fills = tally.host_readahead_fills.saturating_add(filled);
-    tally.host_wall_ns = tally.host_wall_ns.saturating_add(elapsed);
-    tally.host_read_max_ns = tally.host_read_max_ns.max(elapsed);
-    context.counters.set(tally);
+    bump(&context.counters.host_file_reads, 1);
+    bump(&context.counters.host_file_opens, opened);
+    bump(&context.counters.host_bytes, valid as u64);
+    bump(&context.counters.host_read_operations, operations);
+    bump(&context.counters.host_read_bytes, physical_bytes);
+    bump(&context.counters.host_readahead_fills, filled);
+    bump(&context.counters.host_wall_ns, elapsed);
+    context
+        .counters
+        .host_read_max_ns
+        .set(context.counters.host_read_max_ns.get().max(elapsed));
     SectorRead {
         bytes: out,
         degraded,

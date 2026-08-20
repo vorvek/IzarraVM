@@ -1172,6 +1172,19 @@ fn fat_entry_reads_overlay_then_tree() {
         0x0FFF_FFFF,
         "overlay FAT write is visible"
     );
+    // The walked path resolves the same two sources in the same order: an
+    // overlay HIT here (the guest wrote this FAT sector) and an overlay MISS
+    // for cluster 2, whose FAT sector nothing has written.
+    assert_eq!(
+        vol.fat_entry_via_walk(free),
+        0x0FFF_FFFF,
+        "the walk missed the overlay it must read"
+    );
+    assert_eq!(
+        vol.fat_entry_via_walk(2),
+        0x0FFF_FFFF,
+        "the walk's base-view arm disagreed with the tree's own FAT"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -3058,6 +3071,278 @@ fn a_one_file_write_does_not_resynthesize_the_fat_per_cluster() {
         builds * 8 < u64::from(allocated),
         "a one-file write synthesized {builds} FAT sectors over {allocated} \
          allocated clusters: the pass is still paying per cluster"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Build a volume with a mixture of MOUNT-TIME chains and GUEST-WRITTEN ones,
+/// so a FAT differential has both an overlay-served region and a base-view one,
+/// plus a chain the guest fragmented backwards through the FAT.
+fn seeded_volume(name: &str) -> (KateaTreeVolume, std::path::PathBuf) {
+    let root = scratch(name);
+    for i in 0..6u32 {
+        fs::write(root.join(format!("H{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    // Three guest-written files, one of them long enough to span several FAT
+    // sectors (128 clusters is one FAT sector at 4 bytes an entry).
+    let mut next = vol.fat.next_free();
+    next = stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "G0.BIN",
+        ATTR_ARCHIVE,
+        next,
+        &[1u8; 4096],
+    );
+    let long_first = next;
+    next = stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "G1.BIN",
+        ATTR_ARCHIVE,
+        next,
+        &vec![2u8; 300 * 4096],
+    );
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "G2.BIN",
+        ATTR_ARCHIVE,
+        next,
+        &[3u8; 8192],
+    );
+    // Fragment G1: point its first cluster's FAT entry backwards, at a cluster
+    // in a LOWER FAT sector, so a walk crosses sector boundaries in both
+    // directions and a cursor that only ever moves forward would be caught.
+    let byte = long_first as usize * 4;
+    let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+    let mut sec = vol.read_sector(lba);
+    let off = byte % SECTOR;
+    sec[off..off + 4].copy_from_slice(&(long_first + 200).to_le_bytes());
+    vol.write_sector(lba, &sec);
+    (vol, root)
+}
+
+/// THE WALKED FAT MUST ANSWER EXACTLY WHAT `fat_entry` ANSWERS.
+///
+/// `fat_entry_walked` reaches the base-view FAT through `ClusterIndex::fat_entry`
+/// instead of through a synthesized 512-byte sector, and it hoists the overlay
+/// lookup to once per FAT sector. Both are claims about COST. This is the claim
+/// about VALUE: over every cluster of a volume that has an overlay-shadowed FAT
+/// region, a base-view region, and entries past the end of the FAT, the two paths
+/// agree.
+///
+/// Swept three ways -- fresh cursor per cluster, one cursor ascending, one cursor
+/// descending -- because the cursor is the only state either path carries, and a
+/// stale-cursor bug shows up only when consecutive calls land in different FAT
+/// sectors.
+///
+/// NON-VACUOUS: dropping the `walk.within != Some(within)` guard (so the cursor
+/// never refreshes) fails the ascending sweep on the first sector boundary.
+#[test]
+fn the_walked_fat_agrees_with_fat_entry_over_every_cluster() {
+    let (vol, root) = seeded_volume("fat_walk_identity");
+    let last = vol.geo.count_of_clusters + 3;
+    let mut overlay_served = 0;
+    let mut base_served = 0;
+
+    for c in 0..last {
+        let want = vol.fat_entry(c);
+        assert_eq!(vol.fat_entry_via_walk(c), want, "cluster {c}, fresh cursor");
+        if c < vol.fat.next_free() {
+            base_served += 1;
+        }
+    }
+    // One cursor, ascending: the shape a real chain walk takes.
+    {
+        let mut walk = FatWalk::default();
+        for c in 0..last {
+            assert_eq!(
+                vol.fat_entry_walked(c, &mut walk),
+                vol.fat_entry(c),
+                "cluster {c}, shared cursor ascending"
+            );
+            if walk.overlay.is_some() {
+                overlay_served += 1;
+            }
+        }
+    }
+    // One cursor, descending: crosses every sector boundary the other way.
+    {
+        let mut walk = FatWalk::default();
+        for c in (0..last).rev() {
+            assert_eq!(
+                vol.fat_entry_walked(c, &mut walk),
+                vol.fat_entry(c),
+                "cluster {c}, shared cursor descending"
+            );
+        }
+    }
+    assert!(
+        overlay_served > 0,
+        "the sweep never hit an overlay-written FAT sector, so it proves nothing \
+         about the overlay arm"
+    );
+    assert!(base_served > 500, "want a volume worth sweeping");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// THE CHAIN THE RECONCILE PASS WALKS MUST BE THE CHAIN THE OLD PATH WALKED.
+///
+/// `chain_of` is what every reconcile-path walk now calls. Its result is compared
+/// here, chain for chain, against `katea_write::chain` driven by the untouched
+/// `fat_entry` -- including the deliberately fragmented and the deliberately
+/// corrupt cases, where the answer is `None` and the pass HOLDS the file. A
+/// disagreement on `None` would be the dangerous direction: it would let
+/// reconcile act on a chain it should have held.
+#[test]
+fn chain_of_agrees_with_the_old_per_cluster_walk() {
+    let (vol, root) = seeded_volume("chain_walk_identity");
+    let max = vol.max_chain();
+    let mut some = 0;
+    let mut none = 0;
+
+    // Past the mount's own clusters AND past everything the guest stamped above
+    // them, so the sweep ends in free space where a chain must come back `None`.
+    for first in 0..vol.fat.next_free() + 400 {
+        let old = crate::katea_write::chain(first, max, |c| vol.fat_entry(c));
+        let new = vol.chain_via_walk(first);
+        assert_eq!(new, old, "chain from cluster {first}");
+        match old {
+            Some(_) => some += 1,
+            None => none += 1,
+        }
+    }
+    assert!(some > 100, "want real chains in the sweep, got {some}");
+    assert!(
+        none > 0,
+        "the sweep never hit a held chain, so it proves nothing about the \
+         hold path"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A CHAIN WALK MUST ASK THE STORE ONCE PER FAT SECTOR, NOT ONCE PER CLUSTER.
+///
+/// This is the O(folder) fix itself. Before the walk cursor, every cluster of
+/// every chain paid a `SectorStore` lookup, a `RefCell` borrow and three
+/// 512-byte copies to read four bytes; a 47 MB folder cost a 1.71 ms worst
+/// projection pass and a 498 MB folder cost 18.47 ms, which is the visible-freeze
+/// class. A FAT32 sector holds 128 entries, so a contiguous chain may resolve at
+/// most `ceil(len / 128) + 1` sectors -- the `+ 1` covers a chain that starts
+/// mid-sector.
+///
+/// Counter parity is asserted alongside, because the walk deliberately keeps
+/// bumping `sector_reads` once per cluster: the profile field must not move.
+///
+/// NON-VACUOUS: routing `chain_of` back through `fat_entry` makes the resolve
+/// count equal the cluster count and fails the ratio by two orders of magnitude.
+#[test]
+fn a_chain_walk_resolves_one_fat_sector_per_128_clusters() {
+    let root = scratch("fat_walk_scaling");
+    // One host file long enough that its chain crosses several FAT sectors.
+    fs::write(root.join("BIG.BIN"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+    let vol = mount(&root);
+    let first = first_cluster_of(&vol, &root.join("BIG.BIN"));
+
+    vol.reset_fat_walk_resolves();
+    let before = vol.storage_counters();
+    let chain = vol.chain_via_walk(first).expect("a contiguous mount chain");
+    let after = vol.storage_counters();
+
+    let clusters = chain.len() as u64;
+    assert!(clusters > 512, "want a long chain, got {clusters} clusters");
+    let resolves = vol.fat_walk_resolves();
+    assert!(
+        resolves <= clusters.div_ceil(128) + 1,
+        "{clusters} clusters resolved {resolves} FAT sectors: the walk is still \
+         asking per cluster"
+    );
+    assert_eq!(
+        after.sector_reads - before.sector_reads,
+        clusters,
+        "sector_reads must still count one served sector per cluster, or the \
+         profile field moved under the fix"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The counter block is now one `Cell` per field rather than one `Cell` over the
+/// whole struct. The behaviour that has to survive is that a bump touches ITS
+/// field and nothing else -- the old whole-block read-modify-write made that true
+/// by construction, and per-field cells make it true by construction in a
+/// different way, so it is worth pinning.
+#[test]
+fn a_counter_bump_moves_exactly_one_field() {
+    let cells = KateaCounterCells::default();
+    assert_eq!(
+        cells.snapshot(),
+        KateaStorageCounters::default(),
+        "a fresh block must snapshot as the default report"
+    );
+    bump(&cells.host_read_operations, 3);
+    let mut want = KateaStorageCounters {
+        host_read_operations: 3,
+        ..Default::default()
+    };
+    assert_eq!(cells.snapshot(), want, "one bump, one field");
+    bump(&cells.projection_bytes, 512);
+    want.projection_bytes = 512;
+    assert_eq!(cells.snapshot(), want, "a second bump left the first alone");
+    // Saturation, so an accumulating counter cannot wrap back through zero.
+    bump(&cells.host_bytes, u64::MAX);
+    bump(&cells.host_bytes, 1);
+    want.host_bytes = u64::MAX;
+    assert_eq!(cells.snapshot(), want);
+}
+
+/// A read-ahead HIT does no host I/O, so it must not enter the wall counters --
+/// and, since it never uses one, must not pay for a clock read either. The
+/// counters are what a test can see: `host_wall_ns` and `host_read_max_ns` are
+/// frozen across a run of pure hits, which is only true while the `Instant` sits
+/// BELOW the hit test.
+#[test]
+fn a_readahead_hit_does_not_enter_the_wall_counters() {
+    let root = scratch("readahead_hit_wall");
+    fs::write(root.join("SEQ.BIN"), vec![9u8; 512 * 1024]).unwrap();
+    let vol = mount(&root);
+    let first = first_cluster_of(&vol, &root.join("SEQ.BIN"));
+    let base = vol.cluster_to_lba(first);
+
+    // One physical read puts this sector's bytes in the read-ahead slot, keyed by
+    // path and byte offset. Re-reading the SAME sector is then a guaranteed hit:
+    // same path, offset 0, whole sector inside the buffer.
+    let _ = vol.read_sector(base);
+    let primed = vol.storage_counters();
+    assert!(
+        primed.host_read_operations > 0,
+        "the priming read did no host I/O, so nothing was buffered"
+    );
+    for _ in 0..32 {
+        let _ = vol.read_sector(base);
+    }
+    let after = vol.storage_counters();
+
+    assert!(
+        after.host_readahead_hits > primed.host_readahead_hits,
+        "the sweep produced no read-ahead hits, so it proves nothing"
+    );
+    assert_eq!(
+        after.host_read_operations, primed.host_read_operations,
+        "a read-ahead hit performed a physical read"
+    );
+    assert_eq!(
+        after.host_wall_ns, primed.host_wall_ns,
+        "a read-ahead hit charged host wall time"
+    );
+    assert_eq!(
+        after.host_read_max_ns, primed.host_read_max_ns,
+        "a read-ahead hit moved the worst-single-read max"
     );
 
     fs::remove_dir_all(&root).ok();

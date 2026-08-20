@@ -347,6 +347,37 @@ impl SectorStore {
             .is_some_and(|c| c.was_written(lba))
     }
 
+    /// Was ANY sector in `[first, first + count)` ever written this session?
+    ///
+    /// Exactly `(first..first + count).any(|lba| self.was_written(lba))`, but
+    /// hashed once per 128 KiB chunk the span touches instead of once per sector.
+    /// The reconcile pass asks this per cluster of every live file's chain, so on
+    /// a `spc = 8` volume it was eight SipHash probes per cluster ON THE WHOLE
+    /// MOUNT for a write that touched one file -- the same
+    /// scales-with-the-folder shape `KateaTreeVolume::fat_entry_walked` was
+    /// built to remove, and what would be left holding the record once that one
+    /// was gone. A cluster normally sits inside one chunk, so this is one probe.
+    pub(crate) fn was_written_span(&self, first: u32, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let last = first.saturating_add(count - 1);
+        let mut lba = first;
+        for id in chunk_id(first)..=chunk_id(last) {
+            let end = ((id + 1) * CHUNK_SECTORS).min(last.saturating_add(1));
+            if let Some(chunk) = self.chunks.get(&id) {
+                while lba < end {
+                    if chunk.was_written(lba) {
+                        return true;
+                    }
+                    lba += 1;
+                }
+            }
+            lba = end;
+        }
+        false
+    }
+
     pub(crate) fn is_pending(&self, lba: u32) -> bool {
         self.chunks
             .get(&chunk_id(lba))

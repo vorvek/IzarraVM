@@ -120,7 +120,15 @@ pub(crate) fn classify(e: &DirEntry, system: &HashSet<[u8; 11]>) -> EntryAction 
 /// clusters, or `None` if the chain hits a free/reserved entry or fails to
 /// terminate within `max` clusters (corrupt/cyclic FAT) — the caller then holds.
 /// A `first` below 2 yields an empty chain (a legitimately empty file).
-pub(crate) fn chain(first: u32, max: usize, fat_entry: impl Fn(u32) -> u32) -> Option<Vec<u32>> {
+/// `FnMut`, not `Fn`: the reconcile path resolves entries through a per-walk FAT
+/// sector cursor (`katea_tree::FatWalk`), which the closure has to be able to
+/// update. Every existing caller passes a closure that borrows shared state and
+/// is unaffected.
+pub(crate) fn chain(
+    first: u32,
+    max: usize,
+    mut fat_entry: impl FnMut(u32) -> u32,
+) -> Option<Vec<u32>> {
     if first < 2 {
         return Some(Vec::new());
     }
