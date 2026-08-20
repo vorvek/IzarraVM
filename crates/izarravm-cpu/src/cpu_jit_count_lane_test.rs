@@ -22,6 +22,16 @@
 //! `the_shipped_count_lanes_default_is_the_on_arm` is the one test here that deliberately reads the
 //! ambient arm.
 //!
+//! **AND IT IS TWO ARMS, NOT ONE — `force_count_lanes` alone is not enough for a refusal
+//! fixture.** `lanes_registered_for` reads `smc_lane_registrations`, which counts EVERY lane class,
+//! so a shape this file calls a "near miss" for the count lane can still register an IMM8 lane and
+//! read non-zero. That was harmless while `IZARRAVM_IMM8_LANES` was default-OFF and became a red
+//! test the moment it flipped default-ON on 2026-08-21:
+//! `near_miss_shapes_take_no_count_lane` now uses `force_both_lane_arms(true, false)`. Any fixture
+//! here whose assertion is a lane COUNT rather than a count-lane-specific counter must state both
+//! arms; `count_lane_registrations` from the stall snapshot is the class-specific alternative where
+//! only the count lane is the subject.
+//!
 //! **THE BAKED EMITTERS KEEP THEIR OWN SWEEP, and the flip is why.** Before 2026-08-20 every
 //! unforced group-2 fixture in the tree exercised `emit_rotate_reg` and `emit_shift`; on today's
 //! default those same fixtures take a lane, so the baked path would have quietly lost its coverage
@@ -1012,7 +1022,12 @@ fn count_lane_is_refused_on_the_off_arm() {
 /// count is a REFUSAL and not a truncated walk.
 #[test]
 fn near_miss_shapes_take_no_count_lane() {
-    let _arm = force_count_lanes(true);
+    // BOTH arms are stated, not one. `lanes_registered_for` counts `smc_lane_registrations`, which
+    // is EVERY lane class, so a `0x80`-shaped near miss registers an IMM8 lane and this fixture
+    // reads non-zero the moment `IZARRAVM_IMM8_LANES` is on ambiently. It was written when that
+    // arm was default-OFF and could never happen; it is default-ON as of the 2026-08-21 flip.
+    // See the note at the top of this file.
+    let _arm = force_both_lane_arms(true, false);
     // `0xD1 /0` ROL r32, 1: the SAME `RotateReg` kind, but its count is the literal 1 baked into
     // the opcode and it carries no immediate at all, so `physical + 2` would name the NEXT
     // instruction's first byte. TWO bars refuse it -- the opcode test and `imm_len == 1` -- and
