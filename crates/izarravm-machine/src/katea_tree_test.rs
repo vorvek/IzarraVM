@@ -4945,3 +4945,92 @@ fn a_steady_state_pass_re_derives_no_chain_facts() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// R-1 -- A RETRACTION MUST NOT UN-FLAG A CLUSTER THAT IS STILL A DIRECTORY
+/// CLUSTER.
+///
+/// `retract_claim` decrements the survivor's `bad` only on the 2 -> 1 transition
+/// AND only when the cluster is not a directory cluster. The `!dir` half is
+/// load-bearing and the mutant runs in the DANGEROUS direction: with it deleted,
+/// a cluster that is both directory-owned and doubly claimed loses the
+/// survivor's flag when the other claimant is retracted, so `bad` reaches zero,
+/// phase 3 stops holding the file, and Katea materialises it over clusters a
+/// directory owns. That is precisely the clobber `ambiguous_files` exists to
+/// prevent.
+///
+/// The two ingredients are each covered already --
+/// `a_directory_cluster_taken_over_a_live_claim_flags_it` for the directory
+/// overlap, `retracting_a_claim_clears_the_flag_it_caused` for the two-claimant
+/// retraction -- but their CONJUNCTION followed by a retraction was not, and the
+/// random differential cannot reach it: its menu mutates FAT entries in a range
+/// that does not include the subdirectory, and a directory delete poisons the
+/// index, so the joint state never survives to an assertion.
+///
+/// NON-VACUOUS: deleting `!dir` from the guard at `retract_claim` leaves the
+/// whole katea suite green today; it fails the final assertion here, because the
+/// incremental answer drops B while the full scan keeps it.
+#[test]
+fn retracting_one_claim_leaves_a_directory_cluster_still_flagged() {
+    let (mut vol, root) = fresh_vol("claims_retract_dir_overlap");
+    // Not armed for verify: this fixture has to see the INCREMENTAL answer, and
+    // the verify harness would hand back the reference and hide the defect.
+    vol.disable_amortised_refresh();
+
+    // X is a real directory cluster, registered by a real pass.
+    let x = make_subdir(&mut vol, ROOT_CLUSTER, "SUB");
+    vol.reconcile();
+    assert!(
+        vol.is_directory_cluster(x),
+        "the subdirectory's cluster must be registered before the overlap"
+    );
+
+    // A and B are two files whose chains both run through X.
+    let a_first = next_free_for_test(&vol);
+    set_fat(&mut vol, a_first, x);
+    stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "A.BIN", ATTR_ARCHIVE, a_first, 4096);
+    let b_first = next_free_for_test(&vol);
+    set_fat(&mut vol, b_first, x);
+    stamp_file_entry_only(&mut vol, ROOT_CLUSTER, "B.BIN", ATTR_ARCHIVE, b_first, 4096);
+
+    let mut a_key = [b' '; 11];
+    a_key[..1].copy_from_slice(b"A");
+    a_key[8..11].copy_from_slice(b"BIN");
+    let mut b_key = [b' '; 11];
+    b_key[..1].copy_from_slice(b"B");
+    b_key[8..11].copy_from_slice(b"BIN");
+
+    let reference = vol.ambiguous_reference();
+    let (incremental, complete) = vol.ambiguous_incremental_for_test();
+    assert!(complete, "no torn directory here");
+    assert_eq!(incremental, reference, "both claims present");
+    assert!(
+        incremental.contains(&(ROOT_CLUSTER, a_key))
+            && incremental.contains(&(ROOT_CLUSTER, b_key)),
+        "both files share X AND X is a directory cluster, so both must be \
+         flagged: {incremental:?}"
+    );
+
+    // Retract A by removing its directory entry. Nothing touches a FAT sector, so
+    // B's claim token stays current and B is SKIPPED -- only the retraction can
+    // change B's flag.
+    delete_entry(&mut vol, ROOT_CLUSTER, "A.BIN");
+
+    let reference = vol.ambiguous_reference();
+    assert!(
+        reference.contains(&(ROOT_CLUSTER, b_key)),
+        "the full scan must still flag B: X is still a directory cluster"
+    );
+    let (incremental, _) = vol.ambiguous_incremental_for_test();
+    assert!(
+        incremental.contains(&(ROOT_CLUSTER, b_key)),
+        "retracting A un-flagged B on a cluster a DIRECTORY still owns. Phase 3 \
+         would now materialise B over the subdirectory's clusters -- the exact \
+         clobber the guard exists to prevent"
+    );
+    assert_eq!(
+        incremental, reference,
+        "and the answer must be the reference's"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

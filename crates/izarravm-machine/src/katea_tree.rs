@@ -359,9 +359,20 @@ const CLAIM_REFRESH_PERIOD: usize = 64;
 /// looks identical from `parse_dir`'s side: it stops early and silently hides
 /// every entry behind the hole.
 ///
-/// The signature is detectable, and it is the only one there is: a live or
-/// deleted entry (first byte anything but 0x00) sitting AFTER the first 0x00.
-/// DOS never writes that; a half-written directory does.
+/// The signature is a live or deleted entry (first byte anything but 0x00)
+/// sitting AFTER the first 0x00. DOS never writes that; a half-written directory
+/// does.
+///
+/// IT IS THE ONLY *DETECTABLE* SIGNATURE, WHICH IS NOT THE SAME AS THE ONLY ONE.
+/// A tear whose hole runs to the end of the image -- nothing but 0x00 behind it
+/// -- is indistinguishable from a directory the guest legitimately truncated,
+/// because DOS marks a deletion 0xE5 and never 0x00, so there is nothing left to
+/// look at. That undetectable case costs nothing here: the FULL SCAN reads the
+/// same truncated `live` set and is blind in exactly the same way, so the
+/// incremental answer still equals the reference -- which is what the
+/// differential and the verify harness grade -- and the retraction is correct
+/// relative to what the volume actually says. (A torn SECTOR cannot arise at
+/// all: `write_sector` inserts whole 512-byte sectors.)
 ///
 /// Used only to decide whether the incremental claim index may trust this pass's
 /// live set. The reconcile phases themselves are unchanged and still treat the
@@ -1965,6 +1976,21 @@ impl KateaTreeVolume {
     /// prove correct. The set it computes is discarded; only the index is kept.
     /// A folder that arrives with an incomplete directory simply leaves the index
     /// cold, and the first pass rebuilds it exactly as it would have.
+    ///
+    /// IT DOES NO HOST I/O. Every sector `gather_live` reads for a directory
+    /// comes from `data_sector`'s `Role::Dir` arm, which serves `self.dirs[id]`
+    /// out of memory, and every FAT entry comes from the walk cursor's base view
+    /// or the store -- so this addition is immune to the cold-host-filesystem
+    /// exposure the disk audit flags for mount generally (§5.8). It is CPU only.
+    ///
+    /// WHAT IT ADDS TO MOUNT, as a number, because mount has no instrument and a
+    /// comment is the only thing that will catch this regressing: **~12-13 ms on
+    /// a 498 MB folder** (~128,000 clusters). Derived from the measurement above
+    /// -- the cold build made a whole first pass cost 14.41 ms where the steady
+    /// state is ~1.7 ms, and it is that difference which moved here. It scales
+    /// with the folder's cluster count, so a 1 GB folder should expect ~25 ms.
+    /// If a mount ever starts feeling slow on a large folder, this is one of the
+    /// two O(folder) terms in it, `seed` being the other.
     fn prime_claim_index(&mut self) {
         if !self.incremental_claims {
             return;
