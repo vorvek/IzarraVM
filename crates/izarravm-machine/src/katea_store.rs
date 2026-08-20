@@ -450,6 +450,22 @@ impl SectorStore {
         self.seq
     }
 
+    /// The chunk covering `lba`. Callers cache a span's chunk ids once and then
+    /// revalidate through [`Self::chunk_last_seq`] instead of walking the span
+    /// again -- one probe per 128 KiB rather than one per sector.
+    pub(crate) fn chunk_of(lba: u32) -> u32 {
+        chunk_id(lba)
+    }
+
+    /// The write counter as of the last write anywhere in chunk `id`, or 0 if it
+    /// has never been written. The same chunk-granular over-approximation
+    /// [`Self::max_seq_in`] documents: a write to a neighbour in the same 128 KiB
+    /// makes an untouched range look newer than it is, which costs an
+    /// unnecessary re-check and never the opposite.
+    pub(crate) fn chunk_last_seq(&self, id: u32) -> u64 {
+        self.chunks.get(&id).map_or(0, |c| c.last_seq)
+    }
+
     /// Spill reads that have failed so far. Reconcile snapshots this around each
     /// decision unit.
     pub(crate) fn read_errors(&self) -> u64 {

@@ -4783,3 +4783,165 @@ fn re_pointing_a_directory_entry_expires_its_claim() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3 term B: the per-chain facts (`all_in_range`, `data_written`) cached
+// on the chain token.
+// ---------------------------------------------------------------------------
+
+/// F10 -- `data_written` MUST FLIP THE MOMENT THE GUEST WRITES THE CHAIN, and
+/// must not be re-derived while it cannot have changed.
+///
+/// This is term B's whole soundness argument in one fixture. The cached `false`
+/// is only allowed to stand while no chunk the chain's data spans has been
+/// written since it was taken; the cached `true` is allowed to stand forever,
+/// because the store's `written` bits are monotone.
+///
+/// The consequence of getting it wrong is not subtle: `data_written` is the gate
+/// at phase 3 that decides whether a file is materialized at all, so a stale
+/// `false` means a file the guest wrote never reaches the host folder.
+///
+/// NON-VACUOUS: making the revalidation unconditional (`data_chunks.iter().all(
+/// |_| true)`) leaves the cached `false` standing and the assertion that
+/// `LATE.BIN` reaches the host fails.
+#[test]
+fn a_cached_data_written_flips_on_the_first_write_to_its_chain() {
+    let root = scratch("chain_facts_data_written");
+    // A mount-time file: never written by the guest, so `data_written` is false
+    // and gets cached on the very first pass.
+    fs::write(root.join("COLD.BIN"), vec![0xC0u8; 64 * 1024]).unwrap();
+    let mut vol = mount(&root);
+    let cold_first = first_cluster_of(&vol, &root.join("COLD.BIN"));
+    vol.reconcile();
+    assert_eq!(
+        fs::read(root.join("COLD.BIN")).unwrap()[0],
+        0xC0,
+        "the untouched mount file must be left alone"
+    );
+
+    // Writes elsewhere on the volume: the cached `false` must survive these, or
+    // the cache is worthless.
+    let other = next_free_for_test(&vol);
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "LATE.BIN",
+        ATTR_ARCHIVE,
+        other,
+        &[0x11u8; 4096],
+    );
+    vol.reconcile();
+    assert_eq!(
+        fs::read(root.join("LATE.BIN")).unwrap(),
+        vec![0x11u8; 4096],
+        "the newly written file must reach the host"
+    );
+
+    // Now write INTO the cold file's own chain. The cached `false` must expire.
+    let base = vol.cluster_to_lba(cold_first);
+    vol.write_sector(base, &[0xEEu8; SECTOR]);
+    vol.reconcile();
+    let after = fs::read(root.join("COLD.BIN")).unwrap();
+    assert_eq!(
+        after[0], 0xEE,
+        "a write into a chain whose `data_written` was cached false never \
+         reached the host: the cache did not expire"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The cached `all_in_range` must be the `any()` it replaces, over both a chain
+/// that is entirely valid and one the guest has pointed outside the data region.
+///
+/// It rides the FAT token with no argument of its own -- it is a pure function
+/// of the chain and of the immutable geometry -- so what this pins is that the
+/// value is the same one, and that it moves when the chain does.
+///
+/// NON-VACUOUS: returning `true` unconditionally from `chain_facts` fails the
+/// second half, where the out-of-range chain must be HELD rather than
+/// materialized from an address that is not on the volume.
+#[test]
+fn the_cached_in_range_flag_matches_a_fresh_scan_of_the_chain() {
+    let (mut vol, root) = fresh_vol("chain_facts_in_range");
+    let first = next_free_for_test(&vol);
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "OK.BIN",
+        ATTR_ARCHIVE,
+        first,
+        &[7u8; 4096],
+    );
+    vol.reconcile();
+    assert!(root.join("OK.BIN").exists(), "the valid chain projects");
+
+    // Point the chain's tail past the end of the volume. Every caller must hold.
+    // Just past `count_of_clusters + 1` (the last valid data cluster) but still
+    // inside FAT copy 0, so this exercises the RANGE check rather than the
+    // out-of-FAT arm, which is a different mechanism with its own fixture.
+    let outside = vol.geo.count_of_clusters + 5;
+    assert!(
+        outside / 128 < vol.geo.fatsz,
+        "the out-of-range cluster must still have a FAT entry in copy 0"
+    );
+    set_fat(&mut vol, first, outside);
+    set_fat(&mut vol, outside, crate::fat32::FAT32_EOC);
+    set_entry_size(&mut vol, ROOT_CLUSTER, "OK.BIN", 8192);
+    let before = fs::read(root.join("OK.BIN")).unwrap();
+    vol.reconcile();
+    assert_eq!(
+        fs::read(root.join("OK.BIN")).unwrap(),
+        before,
+        "a chain reaching outside the data region was materialized anyway"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The cost claim for term B: a pass over a volume nothing has written must not
+/// walk any chain's clusters to re-derive facts it already has.
+///
+/// Measured through `sector_reads`, which the walk still bumps once per cluster:
+/// a pass that re-derived would have to re-walk, and a pass that re-walks shows
+/// up there. The directory reads it still does are proportional to the directory
+/// count, not to the data.
+#[test]
+fn a_steady_state_pass_re_derives_no_chain_facts() {
+    let root = scratch("chain_facts_steady");
+    for i in 0..8u32 {
+        fs::write(root.join(format!("S{i:02}.BIN")), vec![i as u8; 384 * 1024]).unwrap();
+    }
+    let mut vol = mount(&root);
+    let allocated = vol.fat.next_free() - ROOT_CLUSTER;
+    assert!(allocated > 400, "want a volume worth walking");
+    let first = vol.fat.next_free();
+    stamp_file(
+        &mut vol,
+        ROOT_CLUSTER,
+        "NEW.TXT",
+        ATTR_ARCHIVE,
+        first,
+        b"hi",
+    );
+    vol.reconcile();
+    vol.reconcile();
+
+    vol.reset_chain_walk_counts();
+    let before = vol.storage_counters();
+    vol.reconcile();
+    let after = vol.storage_counters();
+    let (walks, hits) = vol.chain_walk_counts();
+    assert!(
+        hits > 0,
+        "the pass asked for no chains, so it proves nothing"
+    );
+    assert_eq!(walks, 0, "an unchanged volume re-walked {walks} chains");
+    let reads = after.sector_reads - before.sector_reads;
+    assert!(
+        reads * 8 < u64::from(allocated),
+        "the pass resolved {reads} sectors over {allocated} allocated clusters"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

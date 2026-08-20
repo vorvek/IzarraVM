@@ -194,6 +194,38 @@ struct ChainMemo {
     sectors: Vec<u32>,
     /// `fat_epoch` when the walk ran.
     epoch: u64,
+    /// Whether every cluster of the chain is a valid data cluster.
+    ///
+    /// A pure function of the chain and of `geo`, which is immutable after
+    /// `new` -- so it rides the FAT token above with no argument of its own, and
+    /// there is no case in which the chain is current and this is not. Three
+    /// call sites used to evaluate it with an `any()` over the whole chain, per
+    /// live file, per pass.
+    all_in_range: bool,
+    /// The store chunks the chain's DATA sectors span, deduplicated.
+    ///
+    /// A chunk is 128 KiB -- 32 clusters at `spc = 8` -- so a chain of any
+    /// length collapses to a handful of ids, and revalidating
+    /// [`Self::data_written`] costs that handful of probes instead of one per
+    /// cluster.
+    data_chunks: Vec<u32>,
+    /// Whether the guest has ever written any sector of the chain, and the
+    /// store's write counter when that was decided.
+    ///
+    /// THE ASYMMETRY THAT MAKES THIS CHEAP. The store's `written` bits are
+    /// MONOTONE: `set_present` sets both `present` and `written`, and
+    /// `clear_present` clears only `present`. So `true` is permanent and needs
+    /// no revalidation at all, and `false` can only be falsified by a guest
+    /// write to a data sector of the chain -- which is a write to one of
+    /// `data_chunks`, and therefore visible as that chunk's `last_seq` passing
+    /// `data_seq`.
+    ///
+    /// Chunk granularity over-approximates: a write to a neighbouring file in
+    /// the same 128 KiB expires the cache. That direction costs a re-scan; the
+    /// opposite would cost a file not being projected. It is the same
+    /// approximation `SectorStore::max_seq_in` already makes and documents.
+    data_written: bool,
+    data_seq: u64,
 }
 
 /// The keys claiming one cluster.
@@ -2446,6 +2478,71 @@ impl KateaTreeVolume {
         }
     }
 
+    /// The three per-chain facts phase 3 used to recompute with an `any()` over
+    /// the whole chain, per live file, per pass: whether every cluster is in
+    /// range, which store chunks the chain's data spans, and whether the guest
+    /// has ever written into it.
+    fn chain_facts(&self, result: &Option<Vec<u32>>) -> (bool, Vec<u32>, bool, u64) {
+        let spc = u32::from(self.geo.spc);
+        let Some(chain) = result else {
+            // A held chain contributes no facts; the callers reject it first.
+            return (false, Vec::new(), false, self.store.seq());
+        };
+        let all_in_range = chain.iter().all(|c| self.cluster_in_range(*c));
+        let mut data_chunks: Vec<u32> = Vec::new();
+        let mut data_written = false;
+        for cluster in chain {
+            if !self.cluster_in_range(*cluster) {
+                // `cluster_to_lba` would overflow on an out-of-range cluster, and
+                // the callers hold such a chain anyway.
+                continue;
+            }
+            let base = self.cluster_to_lba(*cluster);
+            data_written |= self.store.was_written_span(base, spc);
+            let first_chunk = crate::katea_store::SectorStore::chunk_of(base);
+            let last_chunk =
+                crate::katea_store::SectorStore::chunk_of(base.saturating_add(spc - 1));
+            for id in first_chunk..=last_chunk {
+                if data_chunks.last() != Some(&id) {
+                    data_chunks.push(id);
+                }
+            }
+        }
+        data_chunks.sort_unstable();
+        data_chunks.dedup();
+        (all_in_range, data_chunks, data_written, self.store.seq())
+    }
+
+    /// The memoized chain plus its facts, revalidating `data_written` if it is
+    /// still `false` and something has been written since.
+    ///
+    /// Returns `None` for a held chain, exactly as `chain_of` does.
+    fn chain_and_facts(&self, first: u32) -> Option<(Vec<u32>, bool, bool)> {
+        let chain = self.chain_of(first)?;
+        let mut memo = self.chain_memo.borrow_mut();
+        let Some(entry) = memo.get_mut(&first) else {
+            // Not memoized: a degraded walk. Compute the facts directly rather
+            // than caching anything derived from an I/O failure.
+            drop(memo);
+            let (all_in_range, _, data_written, _) = self.chain_facts(&Some(chain.clone()));
+            return Some((chain, all_in_range, data_written));
+        };
+        if !entry.data_written
+            && !entry
+                .data_chunks
+                .iter()
+                .all(|id| self.store.chunk_last_seq(*id) <= entry.data_seq)
+        {
+            let spc = u32::from(self.geo.spc);
+            entry.data_written = chain.iter().any(|c| {
+                self.cluster_in_range(*c)
+                    && self.store.was_written_span(self.cluster_to_lba(*c), spc)
+            });
+            entry.data_seq = self.store.seq();
+        }
+        Some((chain, entry.all_in_range, entry.data_written))
+    }
+
     /// Follow the cluster chain starting at `first`, memoized.
     ///
     /// Every chain walk in the reconcile path goes through here, so none of them
@@ -2455,36 +2552,7 @@ impl KateaTreeVolume {
     /// [`ChainMemo`] for why the second one is the same answer and not merely a
     /// plausible one.
     fn chain_of(&self, first: u32) -> Option<Vec<u32>> {
-        if let Some(memo) = self.chain_memo.borrow().get(&first)
-            && self.chain_memo_is_current(memo)
-        {
-            #[cfg(test)]
-            self.chain_memo_hits
-                .set(self.chain_memo_hits.get().saturating_add(1));
-            return memo.result.clone();
-        }
-        #[cfg(test)]
-        self.chain_walks
-            .set(self.chain_walks.get().saturating_add(1));
-        let mut walk = FatWalk::default();
-        let result = crate::katea_write::chain(first, self.max_chain(), |c| {
-            self.fat_entry_walked(c, &mut walk)
-        });
-        if !walk.degraded {
-            let mut memo = self.chain_memo.borrow_mut();
-            if memo.len() >= CHAIN_MEMO_MAX_ENTRIES && !memo.contains_key(&first) {
-                memo.clear();
-            }
-            memo.insert(
-                first,
-                ChainMemo {
-                    result: result.clone(),
-                    sectors: walk.sectors,
-                    epoch: self.fat_epoch,
-                },
-            );
-        }
-        result
+        self.chain_with_token(first).0
     }
 
     /// Would re-walking this memo's chain read the same FAT entries it did?
@@ -2538,6 +2606,7 @@ impl KateaTreeVolume {
             return (result, None);
         }
         let token = (self.fat_epoch, walk.sectors.clone());
+        let (all_in_range, data_chunks, data_written, data_seq) = self.chain_facts(&result);
         let mut memo = self.chain_memo.borrow_mut();
         if memo.len() >= CHAIN_MEMO_MAX_ENTRIES && !memo.contains_key(&first) {
             memo.clear();
@@ -2548,6 +2617,10 @@ impl KateaTreeVolume {
                 result: result.clone(),
                 sectors: walk.sectors,
                 epoch: self.fat_epoch,
+                all_in_range,
+                data_chunks,
+                data_written,
+                data_seq,
             },
         );
         (result, Some(token))
@@ -2970,11 +3043,11 @@ impl KateaTreeVolume {
             .collect();
         for (key, file) in affected {
             let first = file.chain.first().copied().unwrap_or(0);
-            let Some(chain) = self.chain_of(first) else {
+            let Some((chain, in_range, _)) = self.chain_and_facts(first) else {
                 self.blocked_projection_keys.insert(key);
                 continue;
             };
-            if chain.iter().any(|cluster| !self.cluster_in_range(*cluster)) {
+            if !in_range {
                 self.blocked_projection_keys.insert(key);
                 continue;
             }
@@ -3103,11 +3176,11 @@ impl KateaTreeVolume {
             if !seen.insert(dir_cluster) {
                 continue;
             }
-            let Some(dir_chain) = self.chain_of(dir_cluster) else {
+            let Some((dir_chain, in_range, _)) = self.chain_and_facts(dir_cluster) else {
                 complete = false;
                 continue;
             };
-            if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
+            if !in_range {
                 complete = false;
                 continue;
             }
@@ -3922,10 +3995,10 @@ impl KateaTreeVolume {
             // Bracketed: a zeroed directory sector would make `parse_dir` stop early
             // and hide live entries, which phase 2 would read as disappearances.
             let dir_errors_before = self.store.read_errors();
-            let Some(dir_chain) = self.chain_of(dir_cluster) else {
+            let Some((dir_chain, in_range, dir_written)) = self.chain_and_facts(dir_cluster) else {
                 continue; // a corrupt directory chain: hold the whole directory
             };
-            if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
+            if !in_range {
                 continue; // a chain link outside the data region: hold this dir
             }
             // Grows here and is pruned only when a directory is deleted, so a
@@ -3959,9 +4032,6 @@ impl KateaTreeVolume {
                 eprintln!("katea: holding a directory after a failed read of guest-written data");
                 continue;
             }
-            let dir_written = dir_chain
-                .iter()
-                .any(|c| self.store.was_written_span(self.cluster_to_lba(*c), spc));
 
             // Decide every entry (read-only); collect actions, then apply.
             let mut mkdirs: Vec<(u32, [u8; 11], u32, std::path::PathBuf)> = Vec::new();
@@ -4000,10 +4070,12 @@ impl KateaTreeVolume {
                         // would make this file's safety depend on the shape of the
                         // corruption rather than on the failure itself.
                         let errors_before = self.store.read_errors();
-                        let Some(fchain) = self.chain_of(first_cluster) else {
+                        let Some((fchain, in_range, data_written)) =
+                            self.chain_and_facts(first_cluster)
+                        else {
                             continue; // incomplete/corrupt chain: hold
                         };
-                        if fchain.iter().any(|&c| !self.cluster_in_range(c)) {
+                        if !in_range {
                             continue; // chain references an out-of-range cluster: hold
                         }
                         let capacity = fchain.len() as u64 * cluster_bytes as u64;
@@ -4015,9 +4087,6 @@ impl KateaTreeVolume {
                         // when empty. Untouched tree/system files are skipped. This
                         // asks the store's historical bits, which remain after a
                         // projected sector is acknowledged.
-                        let data_written = fchain
-                            .iter()
-                            .any(|c| self.store.was_written_span(self.cluster_to_lba(*c), spc));
                         let is_new = !self.mirrored.contains_key(&(dir_cluster, name));
                         if handled.contains(&(dir_cluster, name)) {
                             continue; // already moved/renamed in phase 2
