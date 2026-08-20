@@ -357,6 +357,15 @@ impl SectorStore {
     /// scales-with-the-folder shape `KateaTreeVolume::fat_entry_walked` was
     /// built to remove, and what would be left holding the record once that one
     /// was gone. A cluster normally sits inside one chunk, so this is one probe.
+    ///
+    /// The chunk walk computes one-past-the-end of each chunk, so a span reaching
+    /// the last chunk of the LBA space would overflow that product. It is
+    /// saturated rather than left to a debug panic: every caller today passes a
+    /// `cluster_in_range`-checked cluster through `cluster_to_lba`, so the bound
+    /// is unreachable, but this is a general `pub(crate)` helper and an
+    /// unreachable bound that is not stated is one the next caller inherits
+    /// silently. Saturating is also the correct answer -- the clamp against
+    /// `last + 1` below already ends the walk at the span.
     pub(crate) fn was_written_span(&self, first: u32, count: u32) -> bool {
         if count == 0 {
             return false;
@@ -364,7 +373,10 @@ impl SectorStore {
         let last = first.saturating_add(count - 1);
         let mut lba = first;
         for id in chunk_id(first)..=chunk_id(last) {
-            let end = ((id + 1) * CHUNK_SECTORS).min(last.saturating_add(1));
+            let end = id
+                .saturating_add(1)
+                .saturating_mul(CHUNK_SECTORS)
+                .min(last.saturating_add(1));
             if let Some(chunk) = self.chunks.get(&id) {
                 while lba < end {
                     if chunk.was_written(lba) {

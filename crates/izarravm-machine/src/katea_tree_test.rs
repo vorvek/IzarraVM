@@ -3272,6 +3272,79 @@ fn a_chain_walk_resolves_one_fat_sector_per_128_clusters() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// A LINK PAST FAT COPY 0 MUST NOT BE MEMOIZED — THE ADVERSARIAL-GUEST CASE.
+///
+/// `fat_entry_walked` delegates a cluster whose entry falls outside FAT copy 0
+/// to `fat_entry`, which resolves it through an LBA in FAT COPY 1. That is an
+/// overlay sector the cursor never resolved, so it never lands in
+/// `walk.sectors` — and a memo whose dependency set is missing a sector it
+/// actually depends on would survive a guest write to that sector and serve a
+/// chain the FAT no longer says. `walk.degraded = true` on that arm is what
+/// stops the memo existing at all.
+///
+/// A guest can reach this deliberately: the FAT entry it writes is 28 bits wide
+/// and nothing stops it naming a cluster past the synthesized FAT.
+///
+/// NON-VACUOUS, and this is the mutant the review found survivable: deleting the
+/// `walk.degraded = true` line at the `within >= self.geo.fatsz` arm leaves the
+/// whole katea suite green. It fails BOTH assertions here — the memo appears,
+/// and the second walk then serves the pre-write chain.
+#[test]
+fn a_link_past_fat_copy_0_is_never_memoized() {
+    let (mut vol, root) = seeded_volume("fat_copy0_escape");
+    let fatsz = vol.geo.fatsz;
+    let max = vol.max_chain();
+    // The first cluster past what FAT copy 0 can address: 128 entries per sector.
+    let past_copy0 = fatsz * 128;
+    // A chain head deliberately NOT in FAT sector 0, so the copy-1 write below
+    // cannot expire the memo through the head's own sector. 200 / 128 = 1.
+    let head = 200u32;
+    assert_ne!(head / 128, 0, "the head must not share sector 0");
+
+    // The guest points `head` straight at a cluster past FAT copy 0.
+    let byte = head as usize * 4;
+    let head_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+    let mut sec = vol.read_sector(head_lba);
+    let off = byte % SECTOR;
+    sec[off..off + 4].copy_from_slice(&(past_copy0 & 0x0FFF_FFFF).to_le_bytes());
+    vol.write_sector(head_lba, &sec);
+
+    let reference = |v: &KateaTreeVolume| crate::katea_write::chain(head, max, |c| v.fat_entry(c));
+    let before = reference(&vol);
+    assert_eq!(vol.chain_via_walk(head), before, "the walk must be exact");
+    assert!(
+        before.as_ref().is_some_and(|c| c.contains(&past_copy0)),
+        "the fixture must actually reach a cluster past FAT copy 0, got {before:?}"
+    );
+    assert!(
+        !vol.chain_memo_holds(head),
+        "a walk that escaped FAT copy 0 was memoized: its dependency set cannot \
+         name the copy-1 sector it actually read"
+    );
+
+    // Now write the FAT COPY 1 sector that `past_copy0` resolves through. It is
+    // the sector at partition-relative `reserved + fatsz`, whose `within` is
+    // 0 -- NOT the head's sector, so a memo of the walk above would still look
+    // current.
+    let copy1_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + fatsz;
+    let mut sec = vol.read_sector(copy1_lba);
+    sec[0..4].copy_from_slice(&5u32.to_le_bytes());
+    vol.write_sector(copy1_lba, &sec);
+
+    let after = reference(&vol);
+    assert_ne!(
+        after, before,
+        "the copy-1 write must change the chain, or the second assertion is vacuous"
+    );
+    assert_eq!(
+        vol.chain_via_walk(head),
+        after,
+        "a stale memo served the pre-write chain across a FAT copy 1 write"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// THE CHAIN MEMO MUST NEVER SERVE A CHAIN THE FAT NO LONGER SAYS.
 ///
 /// This is the safety test for `ChainMemo`'s invalidation, and the dangerous

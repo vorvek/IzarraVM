@@ -164,6 +164,27 @@ struct FatWalk {
 /// entry rewritten from EOC to a link, and that entry is in a sector the walk
 /// read, so the memo expires. A chain that has been freed or re-pointed is the
 /// same argument.
+///
+/// WHAT A HIT DOES TO THE READ-ERROR BRACKETS, which is a liveness question
+/// rather than a staleness one and so is not answered by anything above.
+/// `reconcile_mode` and phase 3 bracket `store.read_errors()` around their reads
+/// (`:2877`, `:2905`, and per-file at the `MakeFile` arm) so a chain that could
+/// not be read back is HELD rather than acted on. A memo hit performs no store
+/// read, so a FAT sector that has become unreadable SINCE the memo was taken no
+/// longer trips those brackets and no longer holds the file.
+///
+/// That is safe, and it is safe in the strong direction. A memo can only be
+/// current if nothing has written its sectors, and a sector nothing has written
+/// is one whose value we already hold correctly -- the walk that produced the
+/// memo read it successfully. So the memoized chain IS the chain a successful
+/// fresh read would return, and proceeding on the true chain is strictly better
+/// than holding because we could not re-read a value we already knew. The
+/// brackets exist to stop the pass acting on ZEROS substituted for a failed
+/// read; a memo hit never substitutes anything.
+///
+/// The converse direction is closed by `FatWalk::degraded`: a walk that DID hit
+/// a substituted-zero sector, or a link past FAT copy 0, is never memoized, so
+/// no memo is ever derived from an I/O failure in the first place.
 #[derive(Debug)]
 struct ChainMemo {
     /// `katea_write::chain`'s answer, `None` included: a held chain is as worth
@@ -1192,7 +1213,19 @@ fn bump(cell: &std::cell::Cell<u64>, n: u64) {
 }
 
 katea_counter_block! {
-    /// Sectors the facade served to the guest, from any source.
+    /// Sectors the facade RESOLVED, from any source.
+    ///
+    /// Not "served to the guest": most of these are not guest reads at all. The
+    /// reconcile pass resolves a FAT sector per cluster of every chain it walks,
+    /// and on a 498 MB folder that was 3.6 M of the 3.7 M counted. Since the
+    /// cluster-chain memo landed, a walk served from the memo resolves NONE --
+    /// which is why this counter fell 78-96% on the measured rows with every
+    /// guest-visible number identical to the digit.
+    ///
+    /// So it is a work counter for THIS module, not a measure of guest I/O
+    /// (`int13_read_sectors` is that), and it is not comparable across builds
+    /// whose resolution strategy differs. Nothing gates or pins it; all five
+    /// readers display it.
     sector_reads,
     /// Sectors whose bytes came out of a host file.
     host_file_reads,
@@ -1741,6 +1774,14 @@ impl KateaTreeVolume {
         self.chain_memo_hits.set(0);
     }
 
+    /// Whether a chain starting at `first` is currently memoized at all. The
+    /// fixture for the out-of-FAT-copy-0 arm needs to see the ABSENCE of a memo,
+    /// which no behavioural assertion can show on its own.
+    #[cfg(test)]
+    pub(crate) fn chain_memo_holds(&self, first: u32) -> bool {
+        self.chain_memo.borrow().contains_key(&first)
+    }
+
     /// How many host read handles are cached, for the LRU bound test.
     #[cfg(test)]
     pub(crate) fn host_read_handles(&self) -> usize {
@@ -1983,8 +2024,18 @@ impl KateaTreeVolume {
         let within = (byte / SECTOR) as u32;
         if within >= self.geo.fatsz {
             // Outside FAT copy 0 entirely: a corrupt or guest-crafted link. The
-            // old path answers it, and the walk records nothing -- so a memo
-            // built from it must not be trusted, which `degraded` enforces.
+            // old path answers it verbatim, so the VALUE is exactly what it
+            // always was.
+            //
+            // `degraded` is load-bearing here, not defensive tidiness, and it is
+            // the adversarial-guest case. `fat_entry` resolves this cluster
+            // through an LBA in FAT copy 1 (or past the FAT region entirely) --
+            // an overlay sector the cursor never resolved and therefore never
+            // recorded in `walk.sectors`. A memo built from such a walk would
+            // depend on a sector outside its own dependency set, and a later
+            // guest write to that sector would not expire it. Marking the walk
+            // degraded is what keeps it out of the memo. See
+            // `a_link_past_fat_copy_0_is_never_memoized`.
             walk.degraded = true;
             return self.fat_entry(c);
         }

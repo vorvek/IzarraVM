@@ -891,6 +891,15 @@ fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: b
     // The run scan is only meaningful next to the sector count it multiplies, and
     // the host opens only next to the sectors they serve: both are ratios, and
     // both were one-per-sector before the read path was fixed.
+    //
+    // READ THE DENOMINATOR CAREFULLY. `sector_reads` counts sectors the facade
+    // RESOLVES, and since the reconcile pass gained its cluster-chain memo a
+    // chain walk served from that memo resolves none. `run_scan_steps` is bumped
+    // only in `data_sector`, which a chain walk never reaches, so this ratio has
+    // always been "run-table steps per DATA sector" over a denominator that also
+    // counted FAT sectors -- and the memo shrank the denominator by 78-96% on the
+    // measured rows without touching the numerator. It is a directional
+    // diagnostic, not a quantity to compare across builds.
     for row in &run.rows {
         if row.reached && row.katea.sector_reads > 0 {
             println!(
