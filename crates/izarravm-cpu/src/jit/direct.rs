@@ -5747,7 +5747,9 @@ pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::V
 /// `IZARRAVM_FPU_LOOP_ROWS` and `IZARRAVM_V86_LOOP_ROWS` all became the shipped default. Ranked by
 /// `runtime_hits` per [[barrier-census-mispredicts-both-ways]], the whole rejected table is
 /// 126,933,336 runtime hits over 287 rows, and **`0x85` register-form Word is 53,583,389 of them
-/// — 42.2%, spread over twelve rows and larger than the next row by 2.4x**:
+/// -- 42.2%, over twelve rows, 2.4x the next single row.** It is the head either way you count:
+/// the largest of the twelve is 25,275,365 on its own, which is still the table's #1 against
+/// `0x8E /0`'s 22,638,814.
 ///
 /// | `/reg` | asize | pfx | `runtime_hits` | `unbound_exits` | mean suffix | max suffix |
 /// |---|---|---|---:|---:|---:|---:|

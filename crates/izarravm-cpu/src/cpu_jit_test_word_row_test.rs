@@ -7,7 +7,7 @@
 //! taken after `IZARRAVM_ROTATE_ROWS`, `IZARRAVM_COUNT_LANES`, `IZARRAVM_FPU_LOOP_ROWS` and
 //! `IZARRAVM_V86_LOOP_ROWS` all became the shipped default
 //! (`.bench/results/duke-census-slice-20260821/`). Ranked by `runtime_hits`, twelve `0x85` rows
-//! carry **53,583,389 of the table's 126,933,336 hits -- 42.2%**, and 42,641,715 static unbound
+//! carry **53,583,389 of the table's 126,933,336 hits -- 42.2%**, and 42,642,774 static unbound
 //! exits behind them. The next row is `0x8E /0` at 22,638,814, which this slice deliberately
 //! leaves alone; see `test_word_rows_enabled` for the suffix measurement that separates them.
 //!
@@ -95,7 +95,7 @@ fn select_test_word_rows(enabled: bool) {
 }
 
 /// Real mode, CS.D = 0 and SS.B = 0. The unprefixed `85 /r` decodes at Word here, which is the
-/// census's `operand_size=word, prefix_mask=0` half (8,689,965 runtime hits over four rows).
+/// census's `operand_size=word, prefix_mask=0` half (15,743,159 runtime hits over four rows).
 fn sixteen_bit_cpu() -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw586);
@@ -109,8 +109,9 @@ fn sixteen_bit_cpu() -> CpuGsw {
 }
 
 /// Protected mode, flat, CS.D = 1. A `66`-prefixed `85 /r` decodes at Word here, which is the
-/// census's `operand_size=word, prefix_mask=1` half -- 44,893,424 runtime hits over eight rows and
-/// the larger of the two by five to one. duke3d runs DOS4GW, so this is the mode that matters.
+/// census's `operand_size=word, prefix_mask=1` half -- 37,840,230 runtime hits over eight rows and
+/// the larger of the two halves by 2.4 to one. duke3d runs DOS4GW, so this is the mode that
+/// carries the row.
 fn flat_protected_cpu() -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw586);
@@ -675,7 +676,7 @@ fn test_word_register_form_matches_the_interpreter_in_a_sixteen_bit_segment() {
 }
 
 /// The same row in the mode duke3d actually runs: 32-bit flat protected mode with a `0x66` prefix.
-/// This is 44,893,424 of the row's 53,583,389 runtime hits.
+/// This is 37,840,230 of the row's 53,583,389 runtime hits, against 15,743,159 unprefixed.
 #[test]
 fn test_word_register_form_matches_the_interpreter_in_a_thirty_two_bit_segment() {
     select_test_word_rows(true);
