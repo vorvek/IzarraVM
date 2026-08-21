@@ -108,10 +108,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
-    // `0xf7`, `0xa9`, `0x85`, `0x8d`. Every one is the Dword sibling of an admitted byte form and
-    // its kind hard-codes Dword with no width field. (`0xc7` and `0x81` left this list when they
-    // grew width fields of their own; `0xa3` left it with the V86 loop-A slice, for the reason the
-    // paragraph above now gives.)
+    // `0xf7` and `0xa9`. Both are the Dword sibling of an admitted byte form and their kinds
+    // hard-code Dword with no width field. (`0xc7` and `0x81` left this list when they grew width
+    // fields of their own; `0xa3` left it with the V86 loop-A slice, for the reason the paragraph
+    // above now gives; `0x85` left it with the Word TEST row; `0x8d` left it with the S1 width
+    // lift, which gave `Lea` a `width` and narrowed its destination write with
+    // `emit_write_gpr16`.)
     //
     // `0xb8..=0xbf` WAS on that list and is the 16-bit campaign's fourth slice. It left the same
     // way `0x83` and `0xc7` did, by growing the width field the list existed to compensate for:
@@ -234,6 +236,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8a
                 | 0x8b
                 | 0x8c
+                // LEA r16, m. Admitted with the S1 width lift, which is where `DirectKind::Lea`
+                // grew its `width` field: the arm used to end in a full 32-bit destination write,
+                // and the field is the admission rather than an accompaniment to it. The Tomb
+                // Raider DOS/4GW loader census of 2026-08-21 ranks the word row at 1,744,694
+                // block-stopping hits.
+                | 0x8d
                 | 0x8e
                 | 0x90
                 | 0x98
@@ -246,6 +254,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xc1
                 | 0xd1
                 | 0xc2
+                // ENTER imm16, imm8 and LEAVE, the Watcom frame-pointer pair. Every function in
+                // 16-bit C compiled with a frame pointer opens with one and closes with the
+                // other, which is why they head the loader census at 1,977,855 and 1,277,833
+                // block-stopping hits. Both are gated further inside their arms: ENTER at level 0
+                // only, and both through the stack-width matrix, which builds the (operand, SS.B)
+                // cell that has an emitter and refuses the one that does not.
+                | 0xc8
+                | 0xc9
                 | 0xc3
                 | 0xc6
                 | 0xc7
@@ -259,6 +275,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xec
                 | 0x0f80..=0x0f8f
                 | 0xf6
+                // CLD / STD. A POLICY lift and nothing else: `emit_direction_flag` is one `or` or
+                // `and` on the flag shadow, DF sits outside the lazy arithmetic descriptor, and
+                // neither interpreter arm consults `operand_size`, so the two widths are the same
+                // operation and `DirectionFlag` carries no width to get wrong. The deferral this
+                // replaces asked for a measurement; the loader census is it, at 736,877
+                // block-stopping hits for the word row.
+                | 0xfc
+                | 0xfd
                 | 0xfe
                 | 0xff
         )
@@ -291,10 +315,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         // below, both gated there as well; the entries here are what lets a 16-bit segment reach
         // them at all.
         //
-        // `0xfc` / `0xfd` CLD / STD are deliberately NOT here even though the same census measures
-        // a `0xfc` word row at 1,642,514 hits. They are a different arm from CLC/STC (a DF write
-        // with no lazy-descriptor interaction), so admitting them would put a second mechanism
-        // behind one knob and make this slice's A/B unattributable. A follow-on, not an omission.
+        // `0xfc` / `0xfd` CLD / STD were deliberately NOT here, even though the same census
+        // measures a `0xfc` word row at 1,642,514 hits: they are a different arm from CLC/STC (a
+        // DF write with no lazy-descriptor interaction), so admitting them under this knob would
+        // have put a second mechanism behind it and made that slice's A/B unattributable. The
+        // follow-on it asked for is the S1 width lift, and the pair sits on the UNGATED list
+        // above rather than here, which is what keeps the two attributable apart.
         && !(v86_loop_rows_enabled()
             && matches!(
                 insn.opcode,
@@ -779,11 +805,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x58..=0x5f => {
                 return Some(DirectKind::Pop { dst: opcode - 0x58 });
             }
-            // LEAVE. The 16-bit-stack form (SS.B = 0) moves only BP into SP and preserves
-            // ESP's high word, which the emitted full-width move would destroy; that case is
-            // refused at compile time by `uses_stack()` feeding the `stack_is_32bit` check,
-            // NOT here. The 16-bit OPERAND-size form is refused by the OperandSize::Word
-            // gate above, which does not list 0xc9.
+            // LEAVE is classified at the 0xc9 arm below and its (operand size x SS.B) cell is
+            // chosen by the stack-width matrix, not here. Three of the four cells are built as of
+            // the S1 width lift; the fourth, a Dword operand on a 16-bit stack, would move four
+            // bytes with a 16-bit pointer and stays refused.
             // NOP. In the Word allowlist since 2026-08-08: the claim that "no 16-bit block exists
             // on any persona" predated the JIT16 flip (wolf3d runs billions of 16-bit entries),
             // and the wolf3d demo-workload census measured `0x90` word at 79M block-stopping
@@ -894,9 +919,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // instruction coverage -- coverage share and dispatch-exit share are different
             // quantities, and an earlier slice dismissed this opcode on the wrong one.
             //
-            // Deliberately NOT added to the OperandSize::Word allowlist above, for the reason
-            // the NOP comment gives: no 16-bit block exists on any persona today, so the entry
-            // would be dead code no counter could gate.
+            // ON the OperandSize::Word allowlist above since the S1 width lift. The old refusal
+            // said the entry "would be dead code no counter could gate", which was true when no
+            // 16-bit block existed on any persona and stopped being true at the JIT16 flip. The
+            // Tomb Raider loader census measures the word row at 736,877 block-stopping hits.
+            // Nothing in the emitter moved: `DirectionFlag` carries no width and neither
+            // interpreter arm reads `operand_size`.
             0xfc | 0xfd => {
                 return Some(DirectKind::DirectionFlag {
                     set: opcode == 0xfd,
@@ -922,8 +950,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     set: opcode == 0xf9,
                 });
             }
+            // LEAVE. One kind out of this arm whatever the operand size; `stack_width_kind`
+            // splits it into `Leave` (Dword on a 32-bit stack), `Leave16 { stack32 }` (Word on
+            // either) and a refusal (Dword on a 16-bit stack). Deciding it here is impossible:
+            // SS.B is CPU state and `classify` has no CPU.
             0xc9 => {
                 return Some(DirectKind::Leave);
+            }
+            // ENTER imm16, imm8. WORD operand size and nesting level 0 only.
+            //
+            // The level bar is the real one. `decode` masks `imm2` to five bits, and a level above
+            // zero copies the enclosing display: a loop of `level - 1` stack reads and pushes plus
+            // one more push, each with its own fault point and its own partial-commit rewind. That
+            // is a different instruction from the one this kind emits, and it stays a hard
+            // boundary. Watcom's prologue is `enter imm16, 0`, so the census row and the admitted
+            // form are the same thing.
+            //
+            // The Dword operand form is refused because no emitter exists for it and no row asks:
+            // it would push four bytes and take the frame pointer at the full width. `stack32` is
+            // a placeholder here, exactly as `Push`'s `StoreSource::Flags { mask: u32::MAX }` is;
+            // `stack_width_kind` resolves it and nothing between the two reads it.
+            0xc8 => {
+                if insn.operand_size != OperandSize::Word || insn.imm2 != 0 {
+                    return None;
+                }
+                return Some(DirectKind::Enter16 {
+                    alloc: insn.imm as u16,
+                    stack32: false,
+                });
             }
             // PUSHFD. Fifth in the runtime-weighted reject audit at 1,194,127 dispatcher exits
             // (9.5%). The persona mask and the V86 refusal are resolved in `stack_width_kind`,
@@ -1286,6 +1340,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 return Some(DirectKind::Lea {
                     dst: m.reg,
                     addr: direct_addr(addr)?,
+                    // The OPERAND size, which is what the interpreter passes to
+                    // `write_gpr_sized`. The ADDRESS size is a different question and reaches the
+                    // emitter through the block's `address_wrap`.
+                    width: operand_width,
                 });
             }
             0xa0 => {

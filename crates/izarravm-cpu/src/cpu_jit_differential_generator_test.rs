@@ -1341,3 +1341,171 @@ fn generated_hma_load_tracks_a20_alias_and_cache_invalidation() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The S1 width lift: 66-prefixed ENTER, LEA and LEAVE inside a generated block.
+// ---------------------------------------------------------------------------
+
+/// Cases per mode for the width-lift sweep. Smaller than `CASES_PER_MODE` because the block is a
+/// ninth the size and the only thing that varies across cases is the frame size, the LEA
+/// displacement, the ALU operation and which registers they touch.
+const WIDTH_LIFT_CASES: u32 = 16;
+
+/// Instructions the width-lift block retires natively when every slot is classified: the ENTER,
+/// the LEA, the two register slots, the LEAVE, the TEST and the terminal Jcc.
+///
+/// The leading NOP is NOT among them. Admission keys the installed block at the SECOND
+/// instruction, so the starter runs interpreted and the block begins after it. That is the same
+/// accounting `GENERATED_BLOCK_NATIVE_INSTRUCTIONS` uses, which counts from the first slot after
+/// the starter for the same reason.
+const WIDTH_LIFT_NATIVE_INSTRUCTIONS: u64 = 7;
+
+/// The stack the width-lift block runs on. Well clear of the code at `0x1000 + index * 0x100` and
+/// of the fill pattern's other users, so the ENTER's word store cannot land on a code-watched page
+/// and turn the fixture into a test of the write guard.
+const WIDTH_LIFT_STACK: u32 = 0x0001_f000;
+
+/// A register index that is neither ESP nor EBP.
+///
+/// The block's whole shape is an ENTER and a LEAVE that must round-trip, so the frame pointer and
+/// the stack pointer are the two registers the randomized slots may not disturb. Drawing around
+/// them is what lets the LEAVE assert something: with EBP clobbered, `ESP <- EBP` would send the
+/// pop to an arbitrary address and every case would exit on a guard instead of retiring.
+fn non_stack_reg(rng: &mut Rng) -> u8 {
+    [0u8, 1, 2, 3, 6, 7][(rng.u32() % 6) as usize]
+}
+
+/// A 32-bit protected-mode block holding the three Word rows this slice lowered, at the (Word
+/// operand, SS.B = 1) cell that no unprefixed fixture can reach.
+///
+/// CLD and STD are deliberately absent: in a 32-bit code segment they decode at Dword and were
+/// already admitted, so a case here would exercise the arm that shipped rather than the policy
+/// lift. Their Word row is covered by `cpu_jit_width_lift_test.rs`, which runs a real 16-bit code
+/// segment.
+///
+/// The ENTER/LEAVE pair round-trips on purpose. ENTER pushes BP and leaves EBP holding the low
+/// half of the post-push ESP; LEAVE then moves the FULL EBP back into ESP, which only lands where
+/// it started because EBP entered the block equal to ESP and both live below 64K. That is not a
+/// convenience: it is what makes a wrong width on either side of either instruction show up as a
+/// diverged pointer rather than as a fault both roles take.
+fn width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_c7d0_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let op = ((index + mode_offset) & 7) as u8;
+    let mut bytes = Vec::with_capacity(32);
+
+    // The NOP starter, as the main generator has: it is a lowered slot and it puts the block's
+    // entry one byte before the first row under test.
+    bytes.push(0x90);
+
+    // 66 C8 iw ib -- ENTER imm16, 0 at Word operand size. The frame size is even and non-zero
+    // across the cases, and case 0 draws zero, which is the arm that emits no allocation at all.
+    let alloc = (index * 2) as u16;
+    bytes.extend_from_slice(&[0x66, 0xC8]);
+    bytes.extend_from_slice(&alloc.to_le_bytes());
+    bytes.push(0x00);
+
+    // 66 8D /r -- LEA r16, [EBP + disp8]. Word operand size over a DWORD address size, which is
+    // the shape that separates the destination's width from the address former's.
+    let lea_dst = non_stack_reg(&mut rng);
+    bytes.extend_from_slice(&[0x66, 0x8D, 0x45 | (lea_dst << 3), (rng.u32() & 0x7f) as u8]);
+
+    // Two register slots between the frame instructions, so the LEAVE is not adjacent to the
+    // ENTER and a block that silently split between them loses a retirement rather than passing.
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    push_u32(&mut bytes, rng.u32());
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+
+    // 66 C9 -- LEAVE at Word operand size on a 32-bit stack.
+    bytes.extend_from_slice(&[0x66, 0xC9]);
+
+    // The terminal condition, shaped like the main generator's: TEST defines every flag the
+    // condition can read, and the branch lands on the first of two HLTs either way.
+    bytes.extend_from_slice(&[0x85, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32();
+    }
+    gpr[4] = WIDTH_LIFT_STACK;
+    gpr[5] = WIDTH_LIFT_STACK;
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+fn run_width_lift_mode(mode: GswMode, mode_offset: u32) {
+    for index in 0..WIDTH_LIFT_CASES {
+        let case = width_lift_case(index, mode_offset);
+        let pristine = single_case_memory(&case);
+        let mut interpreter = generated_cpu(mode);
+        let mut direct = generated_cpu(mode);
+        let mut interpreter_bus = TestBus::with_memory(pristine.clone());
+        let mut direct_bus = TestBus::with_memory(pristine.clone());
+        for bus in [&mut interpreter_bus, &mut direct_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.flat_direct_page_clocks = true;
+        }
+
+        restore_bus(&mut interpreter_bus, &pristine);
+        arm(&mut interpreter, &case);
+        run_to_halt(&mut interpreter, &mut interpreter_bus, &case).unwrap();
+        prime_direct(&mut direct, &mut direct_bus, &pristine, &case);
+
+        let retired = assert_measured_pair(
+            &mut interpreter,
+            &mut interpreter_bus,
+            &mut direct,
+            &mut direct_bus,
+            &pristine,
+            &case,
+            true,
+        );
+        // NON-VACUITY, and it is an equality rather than a `> 0`: the three rows under test are
+        // the ones that used to END a block, so an admission that quietly reverted would leave
+        // the leading NOP retiring natively and everything after it interpreted, and the state
+        // comparison above would still pass.
+        assert_eq!(
+            retired,
+            WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            "a width-lift slot lost its classification: {case:#?}, perf={:#?}",
+            direct.perf_counters()
+        );
+        assert_eq!(
+            direct.registers.esp(),
+            WIDTH_LIFT_STACK,
+            "the ENTER/LEAVE pair must round-trip the stack pointer: {case:#?}"
+        );
+        assert_eq!(
+            direct.registers.ebp(),
+            WIDTH_LIFT_STACK,
+            "the ENTER/LEAVE pair must round-trip the frame pointer: {case:#?}"
+        );
+    }
+}
+
+/// Randomized whole-block differential for the width lift, on both Approximate personas.
+#[test]
+fn generated_width_lift_blocks_match_the_interpreter() {
+    run_width_lift_mode(GswMode::Gsw486, 0);
+    run_width_lift_mode(GswMode::Gsw586, WIDTH_LIFT_CASES);
+}

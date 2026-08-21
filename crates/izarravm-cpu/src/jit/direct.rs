@@ -3423,9 +3423,22 @@ pub(crate) enum DirectKind {
         dst: u8,
         imm: u8,
     },
+    /// LEA r16/r32, m. `width` is the OPERAND size and decides how much of the effective address
+    /// reaches the destination: Dword replaces the register, Word merges sixteen bits and leaves
+    /// the high half alone, exactly as `write_gpr_sized(reg, Word, offset)` does.
+    ///
+    /// The field is what the Word admission needed. The arm previously ended in `mov_r32_r32`,
+    /// which defines all 32 bits, so a 66-prefixed LEA would have clobbered the destination's
+    /// high half. This is the same fix MOVZX/MOVSX got with `dst_width` and `Shift` with `width`.
+    ///
+    /// ADDRESS size is a separate question and does not live here: it rides the block-level
+    /// `address_wrap`, which `emit_effective_address` consumes. The two are independent, and the
+    /// `lea16_at_a_dword_address_size_keeps_the_high_half` fixture is the cell that separates
+    /// them.
     Lea {
         dst: u8,
         addr: DirectAddr,
+        width: MemoryWidth,
     },
     IncDecReg {
         dst: u8,
@@ -3926,17 +3939,50 @@ pub(crate) enum DirectKind {
     Pop16 {
         dst: u8,
     },
-    Leave,
-    /// LEAVE (0xC9): `ESP <- EBP` then `POP EBP`. Fieldless because the instruction has no
-    /// operands and its 16-bit operand-size form never reaches the classifier (the
-    /// OperandSize::Word gate rejects 0xc9 before the opcode arms). It cannot be spelled as
-    /// `Pop { dst: 5 }` plus a register move, because `raw_clocks`, `read_segment` and the
-    /// dword-read membership all key on the variant.
+    /// LEAVE (0xC9) at DWORD operand size on a 32-bit stack: `ESP <- EBP` then `POP EBP`.
+    /// Fieldless because the instruction has no operands and this variant stands for one cell of
+    /// the (operand size x SS.B) matrix. It cannot be spelled as `Pop { dst: 5 }` plus a register
+    /// move, because `raw_clocks`, `read_segment` and the dword-read membership all key on the
+    /// variant.
     ///
-    /// There is deliberately no `Leave16`. The 16-bit STACK form (SS.B = 0) moves only BP into
-    /// SP and preserves ESP[31:16], which the emitted full-width move would destroy; it is
-    /// refused by the stack-width admission matrix in `compile_with_instruction_limit`, which
-    /// sends any `uses_stack()` kind that is not an admitted (width, size) pair to `Retry`.
+    /// The Word cells are `Leave16` below. The fourth cell, Dword operand on a 16-bit stack, is
+    /// still refused: it would move four bytes with a 16-bit pointer, which is a miscompile
+    /// rather than a missed lowering. `stack_width_kind` is what says so.
+    Leave,
+    /// LEAVE (0xC9) at WORD operand size, on either stack width. `stack32` is SS.B, resolved in
+    /// `stack_width_kind` because `classify` has no CPU; it is safe to bake because SS.B is bit 3
+    /// of `jit_mode_key`, so a block compiled for one stack width can never be entered with the
+    /// other.
+    ///
+    /// The two halves of the instruction follow DIFFERENT widths and that is the whole content of
+    /// this variant (386 PRM 17-96). The pointer move follows SS.B: a 32-bit stack moves the FULL
+    /// EBP into ESP even here, and a 16-bit stack moves only BP into SP and leaves ESP[31:16]
+    /// alone. The popped frame pointer follows the OPERAND size and is two bytes merged into BP.
+    ///
+    /// A separate variant rather than a field on `Leave` for the reason `Pop16` is separate from
+    /// `Pop`: `Leave`'s emitter hard-codes the Dword read, the +4 advance and a full 32-bit
+    /// destination write, and `raw_clocks`, `read_segment` and the access-lane membership all key
+    /// on the variant.
+    Leave16 {
+        stack32: bool,
+    },
+    /// ENTER imm16, 0 (0xC8) at WORD operand size, on either stack width. `alloc` is the frame
+    /// size and `stack32` is SS.B, resolved the same way `Leave16`'s is.
+    ///
+    /// Three effects in order: push the old BP as two bytes, set BP to the stack pointer AFTER
+    /// that push, then subtract `alloc` from the pointer. The middle step reads the pointer at
+    /// StackAddrSize and writes it at the operand size (386 PRM 17-62), so on a 32-bit stack BP
+    /// takes the low half of the full ESP. The allocation is an implicit stack reference with no
+    /// memory access, so it follows SS.B rather than the operand size.
+    ///
+    /// NESTING LEVEL 0 ONLY. A level above zero copies the enclosing display with a loop of reads
+    /// and pushes, each with its own fault point and its own partial-commit rewind; `classify`
+    /// refuses it and the block stops there. The Dword operand form is refused for the same
+    /// reason it has no emitter: no census row asks for it.
+    Enter16 {
+        alloc: u16,
+        stack32: bool,
+    },
     Call {
         return_delta: u32,
         target_delta: u32,
@@ -4369,7 +4415,15 @@ impl DirectKind {
             // default, an omitted arm here undercharges every pop by 2 core clocks and no test
             // would fail. LEAVE joins them: it is `ESP <- EBP` then POP and the interpreter
             // charges the same clocks(4) for the 0xc9 arm.
-            Self::Pop { .. } | Self::Pop16 { .. } | Self::Leave => 4,
+            // `Leave16` joins them: the interpreter's 0xc9 arm returns one `clocks(4)` for both
+            // operand sizes and both stack widths.
+            Self::Pop { .. } | Self::Pop16 { .. } | Self::Leave | Self::Leave16 { .. } => 4,
+            // ENTER's interpreter arm returns `clocks(10)` (execute.rs, 0xc8) against a default
+            // of 2, so an omitted arm here under-charges every lowered ENTER by eight raw clocks.
+            // Invisible from inside the emitter for the reason the `CallOut` note below gives:
+            // `completed_raw` sums this same accessor, so the end-of-emit assertion agrees with
+            // itself whatever this returns.
+            Self::Enter16 { .. } => 10,
             // 0F A3 returns clocks(6) irrespective of operand size. Without this arm it rides
             // the `_ => 2` default and undercharges every BT by 4.
             Self::Bt { .. } => 6,
@@ -4504,6 +4558,9 @@ impl DirectKind {
                     ..
                 } | Self::Pop16 { .. }
                     | Self::PopSegReal { .. }
+                    // ONE word read at either stack width: the popped frame pointer follows the
+                    // OPERAND size, which is Word for both `Leave16` cells.
+                    | Self::Leave16 { .. }
                     | Self::Ret16 { .. }
                     | Self::TestImmMem {
                         width: MemoryWidth::Word,
@@ -4588,6 +4645,10 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::Push16 { .. }
+                    // ONE word store at either stack width: the saved frame pointer is pushed at
+                    // the OPERAND size. The frame allocation that follows is an implicit stack
+                    // reference with no memory access at all.
+                    | Self::Enter16 { .. }
                     | Self::Call16 { .. }
             ) || matches!(
                 self,
@@ -4735,6 +4796,7 @@ impl DirectKind {
             // an unrelated ES reload moved a value the slot never reads.
             | Self::PopSegReal { .. }
             | Self::Leave
+            | Self::Leave16 { .. }
             | Self::Ret { .. }
             | Self::Ret16 { .. } => Some(SegmentIndex::Ss),
             _ => None,
@@ -4829,6 +4891,7 @@ impl DirectKind {
             }
             Self::Push { .. }
             | Self::Push16 { .. }
+            | Self::Enter16 { .. }
             | Self::Call { .. }
             | Self::Call16 { .. }
             | Self::CallReg { .. }
@@ -4873,6 +4936,11 @@ impl DirectKind {
                 // the matrix entirely and emit a 16-bit stack read against a 32-bit ESP.
                 | Self::PopSegReal { .. }
                 | Self::Leave
+                // Both new kinds are here for the load-bearing reason `PushMem` and `PopSegReal`
+                // are: the stack-width matrix is only consulted for kinds this predicate accepts,
+                // and it is what pairs the emitted pointer arithmetic with SS.B.
+                | Self::Leave16 { .. }
+                | Self::Enter16 { .. }
                 | Self::Call { .. }
                 | Self::Call16 { .. }
                 | Self::Ret { .. }
@@ -6510,6 +6578,19 @@ fn stack_width_kind(
             Some(DirectKind::PopSegReal { segment })
         }
         (DirectKind::PopSegReal { .. }, _, _) => None,
+        // ENTER, matched BEFORE the blanket 32-bit-stack arm below for the reason `PopSegReal` is:
+        // `classify` refuses the Dword operand form, so nothing could reach that arm today, but a
+        // future admission of the Dword form would otherwise be waved through to an emitter that
+        // only knows the Word one. Both stack widths are built, and each carries its own pointer
+        // arithmetic in the emitter.
+        (DirectKind::Enter16 { alloc, .. }, stack32, OperandSize::Word) => {
+            Some(DirectKind::Enter16 { alloc, stack32 })
+        }
+        (DirectKind::Enter16 { .. }, _, _) => None,
+        // LEAVE's Word cells, both stack widths. The Dword cells fall through: SS.B = 1 is the
+        // blanket arm below, and SS.B = 0 reaches `_ => None`, which is the refusal the
+        // `Leave` variant's doc comment names.
+        (DirectKind::Leave, stack32, OperandSize::Word) => Some(DirectKind::Leave16 { stack32 }),
         (kind, true, OperandSize::Dword) => Some(kind),
         (DirectKind::Push { source }, false, OperandSize::Word) => {
             Some(DirectKind::Push16 { source })

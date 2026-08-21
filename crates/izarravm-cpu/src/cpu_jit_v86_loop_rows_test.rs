@@ -430,9 +430,13 @@ fn every_v86_loop_row_flips_with_the_gate() {
 /// * `0x17` POP SS -- `PopSegReal`'s sibling in the same neighbourhood. It arms the
 ///   one-instruction interrupt shadow, which a native block never passes through.
 /// * `0xf5` CMC -- CLC/STC's neighbour. It needs the INCOMING carry rather than a constant.
-/// * `0xfc` CLD -- an existing kind whose opcode is deliberately still off the Word allowlist.
-/// * `0xc7 /0` REGISTER form at Word -- refused inside its own arm since before this slice, and
-///   the `0xa1`/`0xa3` width work must not have disturbed it.
+/// * `0xc7 /0` REGISTER form at Word -- refused inside its own arm since before this slice.
+///
+/// `0xfc` CLD was on this list, as "an existing kind whose opcode is deliberately still off the
+/// Word allowlist". The S1 width lift put it ON the UNGATED list, which is what keeps the two
+/// slices attributable apart, so it now belongs with the rows admitted before this gate rather
+/// than with the rows this gate must not sweep in. The `0xa1`/`0xa3` width work must not have
+/// disturbed any of them.
 #[test]
 fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
     select_v86_loop_rows(true);
@@ -441,7 +445,6 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
         ("0x1D SBB AX,imm16", [vec![0x1d], w(0x1234)].concat()),
         ("0x17 POP SS", vec![0x17]),
         ("0xF5 CMC", vec![0xf5]),
-        ("0xFC CLD", vec![0xfc]),
         (
             "0xC7 /0 MOV AX,imm16",
             [vec![0xc7, 0xc0], w(0x1234)].concat(),
@@ -471,6 +474,10 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
             "0x2B /0 SUB ax,[m], NO override",
             [vec![0x2b, 0x06], w(OPERAND)].concat(),
         ),
+        // Admitted by the S1 width lift rather than by this gate, and asserted here for that
+        // reason: it must be admitted on BOTH arms of this knob, which is what says the two
+        // slices are attributable apart.
+        ("0xFC CLD (S1 width lift, ungated)", vec![0xfc]),
     ] {
         assert_eq!(
             compile16(&code),

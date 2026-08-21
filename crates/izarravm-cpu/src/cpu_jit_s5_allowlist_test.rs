@@ -135,6 +135,14 @@ fn word_size_dword_siblings_stay_refused() {
     // `word_size_0x81_register_forms_are_lowered` and
     // `word_size_group3_test_forms_follow_the_slice` below.
     //
+    // `0x8d` left it with the S1 width lift, and for the reason this table's header gives rather
+    // than as an exception to it: the row was refused because `DirectKind::Lea` hard-coded a
+    // 32-bit destination write, and it grew a `width` field in the same commit that admitted it.
+    // The Tomb Raider loader census ranks the word row at 1,744,694 block-stopping hits. Its
+    // admission is pinned from the other side by `cpu_jit_width_lift_test.rs`
+    // (`lea16_writes_low_half_only` and `lea16_at_a_dword_address_size_keeps_the_high_half`), and
+    // the flip is asserted at the end of this test so leaving the table is not a silent removal.
+    //
     // The `bool` is `refused_on_the_v86_on_arm` and it names ONE gate: `IZARRAVM_V86_LOOP_ROWS`,
     // the arm the loop below sweeps. It was written when that was the only gate in play; two are
     // now, so the name is spelled out rather than left as "refused on the ON arm too", which at the
@@ -150,7 +158,6 @@ fn word_size_dword_siblings_stay_refused() {
         // Refused on both V86 arms, but only while TEST_WORD_ROWS is off — stated at the top of
         // this test and flipped at the bottom.
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0], true),
-        ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10], true),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12], true),
         ("0xf7 /2 not r/m", &[0x66, 0xf7, 0xd1], true),
         ("0xf7 /3 neg r/m", &[0x66, 0xf7, 0xd9], true),
@@ -204,6 +211,22 @@ fn word_size_dword_siblings_stay_refused() {
          register form"
     );
     jit::direct::set_test_word_rows_for_test(None);
+
+    // ...and the row that left the table outright, asserted here so its removal above is a moved
+    // row rather than a deleted one. `0x8d` is ungated: it needs neither knob.
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&[0x66, 0x8d, 0x40, 0x10]);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "0x8d lea ax,[eax+0x10] must JOIN the block since the S1 width lift"
+    );
 }
 
 /// One row of the table above: three filler INCs, the form under test, and the block must stop at

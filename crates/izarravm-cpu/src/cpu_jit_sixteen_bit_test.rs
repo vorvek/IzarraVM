@@ -56,7 +56,7 @@ fn counts(cpu: &CpuGsw) -> Counts {
 /// `fresh()` loads every segment in real mode and then forces `cs.default_size_32 = true`. This
 /// drops that one line, so CS.D is 0 and SS.B is 0: the ordinary DOS configuration, and the
 /// population S4 admits.
-fn sixteen_bit_code_cpu(entry: u32) -> CpuGsw {
+pub(super) fn sixteen_bit_code_cpu(entry: u32) -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw586);
     for segment in [
@@ -72,7 +72,7 @@ fn sixteen_bit_code_cpu(entry: u32) -> CpuGsw {
     cpu
 }
 
-fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
+pub(super) fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     bus
@@ -81,7 +81,7 @@ fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
 /// Arm a CPU to run 16-bit blocks natively: fast map on, and every page the fixture touches
 /// mapped for read and write. A memory-form slot silently never compiles without this, and the
 /// test then passes interpreted.
-fn arm_native_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, pages: &[u32]) {
+pub(super) fn arm_native_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, pages: &[u32]) {
     cpu.set_fast_map_enabled_for_test(true);
     for &page in pages {
         map_direct_page(
@@ -133,7 +133,7 @@ fn install_sixteen_bit_block(
 }
 
 /// Warm the decode cache over `starts`, which the compile loop reads through `decode_cache.get`.
-fn warm_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, starts: &[u32]) {
+pub(super) fn warm_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, starts: &[u32]) {
     let saved = cpu.registers.eip;
     for &linear in starts {
         cpu.set_eip(linear);
