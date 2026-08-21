@@ -19,9 +19,13 @@ use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioPlayer, MidiEngine};
 use izarravm_core::{GswMode, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
 use izarravm_input::{
-    GamepadManager, HostKeyboard, JoystickBinding, JoystickSample, JoystickWizard,
+    AxisSpan, ControllerConfig, ControllerDevice, ControllerDeviceMatcher, ControllerKeyBinding,
+    ControllerManager, ControllerMapper, DigitalDirection, GravisHandedness, GravisMode,
+    GuestControllerProfile, GuestKey, GuestKeyChord, GuestKeyRouter, GuestKeySource,
+    GuestKeyTransition, HostControlId, HostControlValue, HostControllerBatch, HostDigitalBinding,
+    HostKeyboard, JoystickAxis, JoystickButton, keyboard_controls, resolve_control_value,
 };
-use izarravm_machine::{CdAudioState, JoystickState};
+use izarravm_machine::{CdAudioState, GamePortButtonTransition, GamePortUpdate, JoystickState};
 use session::{
     AppliedState, CdSource, FloppySource, GuestInput, GuiSession, PreparedCd, PreparedFloppy,
     PreparedInitialMedia, RequestId, SessionClosed, SessionEvent, SessionFailure, SessionFrame,
@@ -618,9 +622,13 @@ pub struct GuiApp {
     session_snapshot: SessionSnapshot,
     session_frame: Option<SessionFrame>,
     host_input: HostInputPolicy,
-    gamepads: Option<GamepadManager>,
-    joystick_binding: Option<JoystickBinding>,
-    last_joystick_sent: Option<Option<JoystickSample>>,
+    controllers: Option<ControllerManager>,
+    controller_config: Option<ControllerConfig>,
+    controller_mapper: Option<ControllerMapper>,
+    controller_values: Vec<HostControlValue>,
+    last_controller_gameport: Option<izarravm_input::ControllerGamePortState>,
+    guest_keys: GuestKeyRouter,
+    controller_setup: Option<ControllerSetupDialog>,
     title: String,
     // Input-capture state, the single source of truth for routing. When true the
     // OS cursor is confined and hidden over the window, all keyboard input goes
@@ -726,8 +734,6 @@ enum BindTarget {
 struct ConfigDialog {
     input_release: KeyBinding,
     fullscreen: KeyBinding,
-    joystick_binding: Option<JoystickBinding>,
-    joystick_wizard: Option<JoystickWizard>,
     crt_style: CrtStyle,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
@@ -739,17 +745,18 @@ struct ConfigDialog {
     capturing: Option<BindTarget>,
 }
 
-fn apply_joystick_binding(
-    live: &mut Option<JoystickBinding>,
-    prefs: &mut GuiPrefs,
-    staged: &Option<JoystickBinding>,
-    last_sent: &mut Option<Option<JoystickSample>>,
-) {
-    if staged != live {
-        *live = staged.clone();
-        *last_sent = None;
-    }
-    prefs.joystick_binding = staged.clone();
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ControllerSetupTab {
+    #[default]
+    Assignments,
+    InputTest,
+}
+
+struct ControllerSetupDialog {
+    staged: Option<ControllerConfig>,
+    tab: ControllerSetupTab,
+    selected_device: Option<ControllerDeviceMatcher>,
+    capturing_key: Option<usize>,
 }
 
 fn path_text(path: Option<&PathBuf>) -> String {
@@ -1055,10 +1062,11 @@ impl GuiApp {
         let crt_style = prefs.crt_style;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
-        let joystick_binding = prefs.joystick_binding.clone();
-        let gamepads = host_input
+        let controller_config = prefs.controller.clone();
+        let controller_mapper = controller_config.clone().map(ControllerMapper::new);
+        let controllers = host_input
             .joystick_enabled()
-            .then(GamepadManager::new)
+            .then(ControllerManager::new)
             .and_then(|result| match result {
                 Ok(manager) => Some(manager),
                 Err(err) => {
@@ -1072,9 +1080,13 @@ impl GuiApp {
             session_snapshot: initial_update.snapshot,
             session_frame: initial_update.newest_frame,
             host_input,
-            gamepads,
-            joystick_binding,
-            last_joystick_sent: None,
+            controllers,
+            controller_config,
+            controller_mapper,
+            controller_values: Vec::new(),
+            last_controller_gameport: None,
+            guest_keys: GuestKeyRouter::default(),
+            controller_setup: None,
             title: String::from("IzarraVM"),
             input_captured: false,
             guest_locks: [false; HOST_LOCK_KEYS.len()],
@@ -1173,7 +1185,9 @@ impl GuiApp {
     fn reset_presentation_state(&mut self) {
         self.frame_seq = u64::MAX;
         self.session_frame = None;
-        self.last_joystick_sent = None;
+        self.last_controller_gameport = None;
+        self.controller_mapper = self.controller_config.clone().map(ControllerMapper::new);
+        self.guest_keys = GuestKeyRouter::default();
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
     }
 
@@ -1332,13 +1346,25 @@ impl GuiApp {
         }
     }
 
-    /// Forward already-translated Set 1 bytes to the emulation thread. Empty
-    /// slices (an unmapped key, nothing held) are dropped.
+    /// Forward source-arbitrated Set 1 bytes to the emulation thread.
     fn send_keys_to_guest(&self, codes: Vec<u8>) {
-        if !self.host_input.keyboard_enabled() || codes.is_empty() {
+        if codes.is_empty() {
             return;
         }
         let _ = self.session.send_input(GuestInput::Keys(codes));
+    }
+
+    fn send_physical_key(&mut self, transition: GuestKeyTransition) {
+        let codes = self.guest_keys.apply(GuestKeySource::Physical, transition);
+        self.send_keys_to_guest(codes);
+    }
+
+    fn release_physical_keys(&mut self, transitions: Vec<GuestKeyTransition>) {
+        let mut codes = Vec::new();
+        for transition in transitions {
+            codes.extend(self.guest_keys.apply(GuestKeySource::Physical, transition));
+        }
+        self.send_keys_to_guest(codes);
     }
 
     /// The guest's published vertical refresh rate, used to pace the host
@@ -1392,8 +1418,8 @@ impl GuiApp {
                 .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
             window.set_cursor_visible(false);
         } else {
-            let releases = self.host_input.release_scancodes(kbd);
-            self.send_keys_to_guest(releases);
+            let releases = self.host_input.release_key_transitions(kbd);
+            self.release_physical_keys(releases);
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
             window.set_cursor_visible(true);
         }
@@ -1482,47 +1508,68 @@ impl GuiApp {
             .send_input(GuestInput::MouseRelative(dx, dy, self.last_buttons));
     }
 
-    /// Drain host-controller events and forward only changed 8-bit gameport samples.
+    /// Drain one ordered host-controller batch and apply it atomically.
     fn poll_joystick(&mut self) {
-        let completed = if let Some(gamepads) = &mut self.gamepads {
-            let wizard = self
-                .config_dialog
-                .as_mut()
-                .and_then(|dialog| dialog.joystick_wizard.as_mut());
-            gamepads.poll_wizard(wizard);
-            self.config_dialog
-                .as_ref()
-                .and_then(|dialog| dialog.joystick_wizard.as_ref())
-                .and_then(JoystickWizard::binding)
-        } else {
-            None
+        let setup_config = self
+            .controller_setup
+            .as_ref()
+            .and_then(|setup| setup.staged.as_ref());
+        let Some(config) = setup_config.or(self.controller_config.as_ref()) else {
+            return;
         };
-        if let Some(binding) = completed
-            && let Some(dialog) = &mut self.config_dialog
-        {
-            dialog.joystick_binding = Some(binding);
-            dialog.joystick_wizard = None;
-        }
-
-        let sample = if self.host_input.joystick_enabled() {
-            self.gamepads
-                .as_ref()
-                .zip(self.joystick_binding.as_ref())
-                .and_then(|(gamepads, binding)| gamepads.sample(binding))
-        } else {
-            None
+        let Some(controllers) = self.controllers.as_mut() else {
+            return;
         };
-        if self.last_joystick_sent.as_ref() == Some(&sample) {
+        let batch = controllers.poll(config);
+        self.controller_values = batch.final_values.clone();
+        if self.controller_setup.is_some() {
             return;
         }
-        self.last_joystick_sent = Some(sample);
-        let _ = self
-            .session
-            .send_input(GuestInput::Joystick(sample.map(|sample| JoystickState {
-                x: sample.x,
-                y: sample.y,
-                buttons: sample.buttons,
-            })));
+        let Some(mapper) = self.controller_mapper.as_mut() else {
+            return;
+        };
+        let delta = mapper.apply(batch);
+        self.send_controller_delta(delta);
+    }
+
+    fn send_controller_delta(&mut self, delta: izarravm_input::ControllerGuestDelta) {
+        let mut keys = Vec::new();
+        for change in delta.keys {
+            keys.extend(
+                self.guest_keys
+                    .apply(GuestKeySource::Controller(change.source), change.transition),
+            );
+        }
+        let unchanged = delta.gameport == self.last_controller_gameport
+            && delta.button_transitions.is_empty()
+            && !delta.reset_gameport;
+        if keys.is_empty() && unchanged {
+            return;
+        }
+        self.last_controller_gameport = delta.gameport;
+        let state = delta.gameport.map(|state| JoystickState {
+            axes: state.axes,
+            axis_present: state.axis_present,
+            buttons: state.normal_buttons,
+            turbo_buttons: state.turbo_buttons,
+        });
+        let button_transitions = delta
+            .button_transitions
+            .into_iter()
+            .map(|transition| GamePortButtonTransition {
+                line: transition.line,
+                normal_held: transition.normal_held,
+                turbo_held: transition.turbo_held,
+            })
+            .collect();
+        let _ = self.session.send_input(GuestInput::Controller {
+            keys,
+            gameport: GamePortUpdate {
+                state,
+                button_transitions,
+                reset_replay: delta.reset_gameport,
+            },
+        });
     }
 
     /// Mirror the host's NumLock/CapsLock/ScrollLock onto the guest. Each lock
@@ -1542,9 +1589,27 @@ impl GuiApp {
                 return;
             };
             if host_on != self.guest_locks[i] {
-                let _ = self
-                    .session
-                    .send_input(GuestInput::Keys(vec![*make, *make | 0x80]));
+                let key = GuestKey {
+                    make: *make,
+                    extended: false,
+                };
+                let mut codes = self.guest_keys.apply(
+                    GuestKeySource::System,
+                    GuestKeyTransition {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                    },
+                );
+                codes.extend(self.guest_keys.apply(
+                    GuestKeySource::System,
+                    GuestKeyTransition {
+                        key,
+                        pressed: false,
+                        repeat: false,
+                    },
+                ));
+                self.send_keys_to_guest(codes);
                 self.guest_locks[i] = host_on;
             }
         }

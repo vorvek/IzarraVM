@@ -2,24 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use izarravm_input::{JoystickAxis, JoystickAxisBinding, JoystickButton, JoystickPolarity};
-
-fn test_joystick_binding(name: &str) -> JoystickBinding {
-    JoystickBinding {
-        controller_uuid: format!("uuid-{name}"),
-        controller_name: name.into(),
-        x: JoystickAxisBinding {
-            control: JoystickAxis::LeftStickX,
-            polarity: JoystickPolarity::Positive,
-        },
-        y: JoystickAxisBinding {
-            control: JoystickAxis::LeftStickY,
-            polarity: JoystickPolarity::Negative,
-        },
-        button_1: JoystickButton::South,
-        button_2: JoystickButton::East,
-    }
-}
 
 #[test]
 fn cpu_mode_label_preserves_fractional_clock_rates() {
@@ -31,42 +13,6 @@ fn cpu_mode_label_preserves_fractional_clock_rates() {
         cpu_mode_label(GswMode::Gsw586),
         "GSW-586 - 586 mode - 166 MHz"
     );
-}
-
-#[test]
-fn parent_accept_activates_only_the_staged_joystick_binding() {
-    let original = test_joystick_binding("Original");
-    let replacement = test_joystick_binding("Replacement");
-    let mut live = Some(original);
-    let mut prefs = GuiPrefs::default();
-    let mut last_sent = Some(Some(JoystickSample {
-        x: 128,
-        y: 128,
-        buttons: 0,
-    }));
-
-    apply_joystick_binding(
-        &mut live,
-        &mut prefs,
-        &Some(replacement.clone()),
-        &mut last_sent,
-    );
-
-    assert_eq!(live, Some(replacement.clone()));
-    assert_eq!(prefs.joystick_binding, Some(replacement));
-    assert_eq!(last_sent, None, "new binding must be injected immediately");
-}
-
-#[test]
-fn wizard_and_parent_cancellation_leave_the_live_binding_unchanged() {
-    let original = test_joystick_binding("Original");
-    let live = Some(original.clone());
-    let partial_wizard = JoystickWizard::default();
-    drop(partial_wizard);
-    let staged = Some(test_joystick_binding("Replacement"));
-    drop(staged);
-
-    assert_eq!(live, Some(original));
 }
 
 #[test]

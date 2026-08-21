@@ -10,8 +10,8 @@
 //! falls back to defaults rather than aborting the run.
 
 use izarravm_core::MidiConfig;
-use izarravm_input::JoystickBinding;
-use serde::{Deserialize, Serialize};
+use izarravm_input::{ControllerConfig, JoystickBinding};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -190,8 +190,7 @@ impl CrtStyle {
 
 /// Host-side GUI preferences. Fields are optional where a "not set yet" state is
 /// meaningful, so an older or hand-edited file with missing keys still loads.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GuiPrefs {
     /// Master output volume, 0.0..[`MAX_VOLUME`]. The HOST's level: the powered
     /// speakers the machine's line-out feeds, applied to the finished mix on its
@@ -205,8 +204,8 @@ pub struct GuiPrefs {
     pub input_release: KeyBinding,
     /// Hotkey that toggles fullscreen. Default Super+F4.
     pub fullscreen: KeyBinding,
-    /// Optional host controller mapping for the Izarra gameport.
-    pub joystick_binding: Option<JoystickBinding>,
+    /// Host controller mappings for guest keys and the Izarra gameport.
+    pub controller: Option<ControllerConfig>,
     /// Last floppy IMG mounted, re-mounted on startup if it still exists.
     pub last_floppy_image: Option<PathBuf>,
     /// Last CD image (.iso/.cue/.bin) mounted, re-mounted on startup if it still
@@ -230,13 +229,71 @@ impl Default for GuiPrefs {
             crt_style: CrtStyle::Subtle,
             input_release: default_input_release(),
             fullscreen: default_fullscreen(),
-            joystick_binding: None,
+            controller: None,
             last_floppy_image: None,
             last_cd_image: None,
             last_cd_folder: None,
             panel_open: true,
             midi: MidiConfig::default(),
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct GuiPrefsWire {
+    master_volume: f32,
+    crt_style: CrtStyle,
+    input_release: KeyBinding,
+    fullscreen: KeyBinding,
+    controller: Option<ControllerConfig>,
+    joystick_binding: Option<JoystickBinding>,
+    last_floppy_image: Option<PathBuf>,
+    last_cd_image: Option<PathBuf>,
+    last_cd_folder: Option<PathBuf>,
+    panel_open: bool,
+    midi: MidiConfig,
+}
+
+impl Default for GuiPrefsWire {
+    fn default() -> Self {
+        let prefs = GuiPrefs::default();
+        Self {
+            master_volume: prefs.master_volume,
+            crt_style: prefs.crt_style,
+            input_release: prefs.input_release,
+            fullscreen: prefs.fullscreen,
+            controller: None,
+            joystick_binding: None,
+            last_floppy_image: prefs.last_floppy_image,
+            last_cd_image: prefs.last_cd_image,
+            last_cd_folder: prefs.last_cd_folder,
+            panel_open: prefs.panel_open,
+            midi: prefs.midi,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GuiPrefs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GuiPrefsWire::deserialize(deserializer)?;
+        Ok(Self {
+            master_volume: wire.master_volume,
+            crt_style: wire.crt_style,
+            input_release: wire.input_release,
+            fullscreen: wire.fullscreen,
+            controller: wire
+                .controller
+                .or_else(|| wire.joystick_binding.map(ControllerConfig::from_legacy)),
+            last_floppy_image: wire.last_floppy_image,
+            last_cd_image: wire.last_cd_image,
+            last_cd_folder: wire.last_cd_folder,
+            panel_open: wire.panel_open,
+            midi: wire.midi,
+        })
     }
 }
 

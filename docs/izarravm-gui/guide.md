@@ -79,8 +79,8 @@ This is a TOML file with the GUI preferences that must stay between runs:
 - The master volume
 - The CRT emulation style (below)
 - The hotkeys that you set for input release and for full screen
-- The optional host-controller UUID, two axis controls with their polarity,
-  and two buttons
+- The optional host-controller identity, guest target, calibrated axes,
+  buttons, and guest-key combinations
 - The last floppy image, the last CD image, and the last CD folder that you
   mounted
 - The state of the control panel: expanded or collapsed
@@ -128,20 +128,48 @@ Win keys work as usual again when you release the input or when the window
 loses the focus. Windows reserves Ctrl+Alt+Del and Win+L. No program can
 absorb those two.
 
-**Set joystick buttons** opens a setup window in the foreground, and disables
-the modal below it. Obey its instructions: center the stick, move X to the
-right, center the stick again, move Y down, and then press Button 1 and Button
-2. Cancel discards an incomplete capture. At the end, the setup window changes
-only the staged settings in the modal. The Accept button of the modal saves
-the binding and makes it active, and the VM does not reset.
+**Controller setup** maps a host gamepad, joystick, or wheel to guest gameport
+controls, guest keys, or both. The saved device identity includes the input
+backend, platform, GUID, USB vendor and product IDs when available,
+operating-system name, and occurrence among identical devices. After a device
+reconnects, its mapping stays inactive until the assigned controls return to
+their calibrated rest positions.
 
-The first accepted controller sets the binding to its UUID. The setup window
-refuses a duplicate axis or a duplicate button, and it records the polarity of
-each axis. During operation, IzarraVM applies a deadzone of 0.15 and sends
-only the 8-bit samples that changed. If that UUID is not connected, the
-gameport is not connected. If two identical controllers have one UUID,
-IzarraVM uses the first connected controller. `[input].joystick = false` in
-the machine config disables the input, even with a saved GUI binding.
+The guest target can be Keyboard only, a standard two-axis joystick, a 4 button
+gamepad, or wheel and pedals. Keyboard only starts with both stick directions,
+the D-pad, the four face buttons, shoulders, triggers, Select, Start, and stick
+presses laid out as three compact columns. Click a field and type a guest key or
+a Ctrl, Shift, or Alt combination. The left stick and D-pad initially use the
+arrow keys. The face buttons initially use Ctrl, Alt, Space, and Shift.
+
+The 4 button gamepad target has four directions and four buttons. Its 4-button
+mode drives the four gameport button lines. Its two-button autofire mode keeps A
+and B normal, makes C autofire A, and makes D autofire B. Its handedness switch
+is a host-mapping preset that reverses both direction axes. Autofire runs at 10
+Hz with a 50 percent duty cycle on guest time.
+
+Each guest axis can use all host travel, the center-to-positive half, or
+the center-to-negative half. Inversion is applied after that span selection.
+Deadzone and saturation are applied before it. The half spans let a centered
+gamepad stick act as an accelerator, brake, or clutch. A wheel target exposes
+steering, accelerator, brake, and a clutch or spare axis.
+
+Guest-key mappings may contain one key or a combination and can be added to any
+gameport target. A combination presses its modifiers first and releases them
+last. Mapped keys use the same ownership tracking as the physical keyboard, so
+releasing a controller button cannot release a key that is still held on the
+keyboard. Focus loss releases only physical keyboard ownership. Digital mappings
+from an analog axis use hysteresis: they press at 0.65 and release at 0.50. A
+trigger mapping accepts either the analog trigger axis or the equivalent host
+button, depending on how the operating system reports that controller.
+
+The compact device preview uses separate face and shoulder views of a generic
+gamepad. Pressed buttons and directions turn red, and the two stick caps move
+with the live axes. The Input Test tab lists every raw capability reported by
+the host backend. If the saved controller is absent,
+the guest gameport is disconnected and its guest key sources are released.
+`[input].joystick = false` disables all controller input, including guest-key
+mappings, but `[input].keyboard = false` disables only the physical keyboard.
 
 **Display**: **CRT emulation**, with three values:
 

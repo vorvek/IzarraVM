@@ -2370,14 +2370,12 @@ impl CpuBus for MachineBus<'_> {
         if (0x0200..=0x0207).contains(&port) {
             // The gameport is the strongest lazy candidate in the machine and the
             // only one whose VALUE does not move when the batch stops ending
-            // here: `GamePort::read` takes `&self` and is a pure function of the
-            // two RC discharge deadlines and `guest_tick_now()`, the SAME
-            // in-batch instant both timing classes already sample it at. Nothing
-            // in `advance_devices` touches those deadlines -- their only writers
-            // are `charge` (the 0x201 WRITE) and `set_state` (host-side
-            // injection, which the worker drains BETWEEN `machine.run` slices, a
-            // coarser boundary than a batch, so no batch boundary can reorder a
-            // button edge).
+            // here: `GamePort::read` advances only button replay state to the
+            // supplied guest tick, then samples the four RC discharge deadlines
+            // at that same in-batch instant. Nothing in `advance_devices` touches
+            // those deadlines. Their writers are `charge` (the 0x201 WRITE) and
+            // `set_state` (host-side injection, drained between `machine.run`
+            // slices, so no batch boundary can reorder a button edge).
             //
             // The arm keys on DEVICE STATE, not on the persona switch, because
             // the persona is not what makes the read time-independent -- an idle

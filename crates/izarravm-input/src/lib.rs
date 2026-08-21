@@ -3,10 +3,21 @@
 
 #![forbid(unsafe_code)]
 
+mod controller;
 mod joystick;
 mod keyboard;
-pub use joystick::{
-    GamepadManager, JoystickAxis, JoystickAxisBinding, JoystickBinding, JoystickButton,
-    JoystickPolarity, JoystickSample, JoystickWizard, JoystickWizardStep,
+pub use controller::{
+    AxisCalibration, AxisSpan, AxisTransform, ControllerAxisBinding, ControllerButtonBinding,
+    ControllerButtonState, ControllerConfig, ControllerDevice, ControllerDeviceMatcher,
+    ControllerGamePortState, ControllerGuestDelta, ControllerKeyBinding, ControllerKeyTransition,
+    ControllerManager, ControllerMapper, DigitalDirection, GravisHandedness, GravisMode,
+    GuestControllerProfile, HostControlId, HostControlKind, HostControlValue, HostControllerBatch,
+    HostDigitalBinding, HostSemanticControl, KeyboardControlSpec, keyboard_controls,
+    resolve_control_value,
 };
-pub use keyboard::HostKeyboard;
+pub use joystick::{
+    JoystickAxis, JoystickAxisBinding, JoystickBinding, JoystickButton, JoystickPolarity,
+};
+pub use keyboard::{
+    GuestKey, GuestKeyChord, GuestKeyRouter, GuestKeySource, GuestKeyTransition, HostKeyboard,
+};

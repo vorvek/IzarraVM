@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use izarravm_core::InputConfig;
-use izarravm_input::HostKeyboard;
+use izarravm_input::{GuestKeyTransition, HostKeyboard};
 use winit::keyboard::KeyCode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,24 +25,31 @@ impl HostInputPolicy {
         Self::new(config.keyboard, config.mouse, config.joystick)
     }
 
-    pub(crate) fn key_scancodes(
+    pub(crate) fn key_transition(
         self,
         keyboard: &mut HostKeyboard,
         code: KeyCode,
         pressed: bool,
         repeat: bool,
-    ) -> Vec<u8> {
+    ) -> Option<GuestKeyTransition> {
         if self.keyboard {
-            keyboard.key_with_repeat(code, pressed, repeat)
+            keyboard.transition(code, pressed, repeat)
         } else {
-            keyboard.release_all();
-            Vec::new()
+            keyboard.release_all_transitions();
+            None
         }
     }
 
-    pub(crate) fn release_scancodes(self, keyboard: &mut HostKeyboard) -> Vec<u8> {
-        let codes = keyboard.release_all();
-        if self.keyboard { codes } else { Vec::new() }
+    pub(crate) fn release_key_transitions(
+        self,
+        keyboard: &mut HostKeyboard,
+    ) -> Vec<GuestKeyTransition> {
+        let transitions = keyboard.release_all_transitions();
+        if self.keyboard {
+            transitions
+        } else {
+            Vec::new()
+        }
     }
 
     pub(crate) const fn keyboard_enabled(self) -> bool {

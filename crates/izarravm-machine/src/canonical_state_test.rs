@@ -36,7 +36,7 @@ const ATA_MID_SECTOR_PAYLOAD_LEN: usize = ATA_IDLE_PAYLOAD_LEN + crate::ata::SEC
 const BMIDE_IDLE_PAYLOAD_LEN: usize = 60;
 const BMIDE_BASE: u16 = 0xf000;
 const ATAPI_IDLE_PAYLOAD_LEN: usize = 130;
-const GAMEPORT_PAYLOAD_LEN: usize = 20;
+const GAMEPORT_PAYLOAD_LEN: usize = 192;
 const PIT_COUNTER_PAYLOAD_LEN: usize = PIT_PAYLOAD_LEN / 3;
 const PIT_CHANNEL_2_GATE_OFFSET: usize = 2 * PIT_COUNTER_PAYLOAD_LEN + 10;
 const PIIX_IDE_DEVFN: u8 = 7 << 3 | 1;
@@ -450,7 +450,7 @@ fn gameport_payload(machine: &Machine) -> Vec<u8> {
     state
         .section(
             CanonicalSectionId::new(0x0002_000f).unwrap(),
-            CanonicalSectionVersion::new(1).unwrap(),
+            CanonicalSectionVersion::new(2).unwrap(),
             CanonicalSectionRequirement::Required,
             |out| capture.write_gameport_payload(out),
         )
@@ -692,7 +692,7 @@ fn foundation_sections_pin_ids_versions_order_and_namespaces() {
             (0x0002_000c, 1),
             (0x0002_000d, 1),
             (0x0002_000e, 1),
-            (0x0002_000f, 1),
+            (0x0002_000f, 2),
         ]
     );
     assert!(
@@ -771,23 +771,24 @@ fn gameport_payload_captures_attachment_controls_and_absolute_deadlines() {
     let mut machine = test_machine();
     assert_eq!(gameport_payload(&machine), vec![0; GAMEPORT_PAYLOAD_LEN]);
 
-    machine.set_joystick_state(Some(JoystickState {
-        x: 17,
-        y: 231,
-        buttons: 0x03,
-    }));
+    machine.set_joystick_state(Some(JoystickState::joystick_a(17, 231, 0x03)));
     let uncharged = gameport_payload(&machine);
-    assert_eq!(&uncharged[..4], &[1, 17, 231, 3]);
-    assert_eq!(&uncharged[4..], &[0; 16]);
+    assert_eq!(&uncharged[..8], &[1, 3, 17, 231, 0, 0, 3, 0]);
+    assert_eq!(&uncharged[8..40], &[0; 32]);
+    assert_eq!(uncharged[58], 1, "button 1 current normal drive");
+    assert_eq!(uncharged[60], 1, "button 1 target normal drive");
+    assert_eq!(uncharged[96], 1, "button 2 current normal drive");
+    assert_eq!(uncharged[98], 1, "button 2 target normal drive");
 
     {
         let mut bus = machine.make_bus();
         bus.write_io(0x0207, BusWidth::Byte, 0, false).unwrap();
     }
     let charged = gameport_payload(&machine);
-    assert_eq!(&charged[..4], &[1, 17, 231, 3]);
-    assert_ne!(&charged[4..12], &[0; 8]);
-    assert_ne!(&charged[12..20], &[0; 8]);
+    assert_eq!(&charged[..8], &[1, 3, 17, 231, 0, 0, 3, 0]);
+    assert_ne!(&charged[8..16], &[0; 8]);
+    assert_ne!(&charged[16..24], &[0; 8]);
+    assert_eq!(&charged[24..40], &[0; 16]);
 
     machine.set_joystick_state(None);
     assert_eq!(gameport_payload(&machine), vec![0; GAMEPORT_PAYLOAD_LEN]);

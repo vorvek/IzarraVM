@@ -4,7 +4,7 @@
 use izarravm_audio::{AudioDebugSnapshot, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiConfig, MidiStatus};
 use izarravm_machine::{
-    CdAudioState, CdImage, CueSource, JoystickState, Machine, MachineProfile, StopReason,
+    CdAudioState, CdImage, CueSource, GamePortUpdate, Machine, MachineProfile, StopReason,
     VideoHostMetricsSnapshot,
 };
 use serde::Serialize;
@@ -146,7 +146,10 @@ pub(super) enum GuestInput {
     Keys(Vec<u8>),
     MouseRelative(i32, i32, u8),
     MouseWheel(i32),
-    Joystick(Option<JoystickState>),
+    Controller {
+        keys: Vec<u8>,
+        gameport: GamePortUpdate,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1572,7 +1575,10 @@ fn apply_guest_input(machine: &mut Machine, input: GuestInput) {
             machine.inject_mouse_relative(dx, dy, buttons)
         }
         GuestInput::MouseWheel(dz) => machine.inject_mouse_wheel(dz),
-        GuestInput::Joystick(state) => machine.set_joystick_state(state),
+        GuestInput::Controller { keys, gameport } => {
+            machine.inject_key_scancodes(&keys);
+            machine.update_gameport(gameport);
+        }
     }
 }
 

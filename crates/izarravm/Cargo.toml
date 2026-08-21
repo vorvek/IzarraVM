@@ -37,6 +37,7 @@ int-trace = ["izarravm-cpu/int-trace"]
 [dependencies]
 clap.workspace = true
 egui.workspace = true
+egui_extras.workspace = true
 egui-winit.workspace = true
 egui-wgpu.workspace = true
 winit.workspace = true

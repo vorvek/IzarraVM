@@ -20,10 +20,21 @@ fn context<'a>(
 ) -> KeyRouteContext<'a> {
     KeyRouteContext {
         capturing_bind,
+        capture_modifier_key: false,
         input_captured,
         input_release,
         fullscreen,
         host_super_down: false,
+    }
+}
+
+fn controller_capture_context<'a>(
+    input_release: &'a KeyBinding,
+    fullscreen: &'a KeyBinding,
+) -> KeyRouteContext<'a> {
+    KeyRouteContext {
+        capture_modifier_key: true,
+        ..context(true, false, input_release, fullscreen)
     }
 }
 
@@ -45,7 +56,10 @@ fn guest_bytes(route: &KeyRoute, router: &mut HostKeyRouter, policy: HostInputPo
             code,
             pressed,
             repeat,
-        } => policy.key_scancodes(router.keyboard_mut(), code, pressed, repeat),
+        } => policy
+            .key_transition(router.keyboard_mut(), code, pressed, repeat)
+            .map(|transition| transition.key.scancodes(transition.pressed))
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -67,7 +81,7 @@ fn rebind_press_repeat_and_release_never_leak_to_the_guest() {
     assert_eq!(
         route,
         KeyRoute::Rebind {
-            key: "KeyA".into(),
+            code: KeyCode::KeyA,
             ctrl: false,
             shift: false,
             alt: false,
@@ -92,7 +106,91 @@ fn rebind_press_repeat_and_release_never_leak_to_the_guest() {
     );
     assert!(guest_bytes(&release, &mut router, policy).is_empty());
     assert_eq!(release, KeyRoute::Swallowed);
-    assert!(policy.release_scancodes(router.keyboard_mut()).is_empty());
+    assert!(
+        policy
+            .release_key_transitions(router.keyboard_mut())
+            .is_empty()
+    );
+}
+
+#[test]
+fn controller_chord_capture_swallows_modifiers_and_can_capture_one_alone() {
+    let mut router = HostKeyRouter::default();
+    let policy = HostInputPolicy::new(true, true, true);
+    let input_release = binding(true, "F2");
+    let fullscreen = binding(true, "F11");
+
+    let shift = router.route(
+        KeyCode::ShiftLeft,
+        true,
+        false,
+        controller_capture_context(&input_release, &fullscreen),
+    );
+    assert_eq!(shift, KeyRoute::Swallowed);
+    assert!(guest_bytes(&shift, &mut router, policy).is_empty());
+    assert_eq!(
+        router.route(
+            KeyCode::KeyA,
+            true,
+            false,
+            controller_capture_context(&input_release, &fullscreen),
+        ),
+        KeyRoute::Rebind {
+            code: KeyCode::KeyA,
+            ctrl: false,
+            shift: true,
+            alt: false,
+            super_key: false,
+        }
+    );
+    assert_eq!(
+        router.route(
+            KeyCode::KeyA,
+            false,
+            false,
+            context(false, false, &input_release, &fullscreen),
+        ),
+        KeyRoute::Swallowed
+    );
+    assert_eq!(
+        router.route(
+            KeyCode::ShiftLeft,
+            false,
+            false,
+            context(false, false, &input_release, &fullscreen),
+        ),
+        KeyRoute::Swallowed
+    );
+
+    assert_eq!(
+        router.route(
+            KeyCode::AltRight,
+            true,
+            false,
+            controller_capture_context(&input_release, &fullscreen),
+        ),
+        KeyRoute::Swallowed
+    );
+    assert_eq!(
+        router.route(
+            KeyCode::AltRight,
+            false,
+            false,
+            controller_capture_context(&input_release, &fullscreen),
+        ),
+        KeyRoute::Rebind {
+            code: KeyCode::AltRight,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            super_key: false,
+        }
+    );
+    assert!(
+        policy
+            .release_key_transitions(router.keyboard_mut())
+            .is_empty()
+    );
 }
 
 #[test]
@@ -127,7 +225,11 @@ fn held_guest_key_repeat_cannot_become_a_rebind_trigger() {
     );
     assert!(matches!(release, KeyRoute::Guest { pressed: false, .. }));
     assert_eq!(guest_bytes(&release, &mut router, policy), vec![0x9e]);
-    assert!(policy.release_scancodes(router.keyboard_mut()).is_empty());
+    assert!(
+        policy
+            .release_key_transitions(router.keyboard_mut())
+            .is_empty()
+    );
 }
 
 #[test]
@@ -189,7 +291,7 @@ fn keyboard_off_keeps_fullscreen_rebind_and_input_release_host_side() {
     assert_eq!(
         rebind,
         KeyRoute::Rebind {
-            key: "KeyB".into(),
+            code: KeyCode::KeyB,
             ctrl: true,
             shift: false,
             alt: false,
@@ -224,7 +326,14 @@ fn focus_loss_releases_enabled_keys_and_silently_clears_disabled_keys() {
     );
     assert!(enabled.ctrl_down);
     assert!(enabled.swallowed.contains(&KeyCode::F11));
-    assert_eq!(enabled.focus_lost(enabled_policy), vec![0x9d]);
+    assert_eq!(
+        enabled
+            .focus_lost(enabled_policy)
+            .into_iter()
+            .flat_map(|transition| transition.key.scancodes(transition.pressed))
+            .collect::<Vec<_>>(),
+        vec![0x9d]
+    );
     assert!(!enabled.ctrl_down);
     assert!(enabled.swallowed.is_empty());
     assert!(!enabled.is_pressed(KeyCode::ControlLeft));
@@ -301,7 +410,7 @@ fn super_is_a_modifier_and_never_reaches_the_guest_or_a_rebind() {
         false,
         context(true, true, &input_release, &fullscreen),
     );
-    assert!(matches!(held, KeyRoute::Guest { .. }));
+    assert_eq!(held, KeyRoute::Swallowed);
     assert!(guest_bytes(&held, &mut router, policy).is_empty());
     assert!(router.super_down);
 
@@ -313,7 +422,7 @@ fn super_is_a_modifier_and_never_reaches_the_guest_or_a_rebind() {
             context(true, true, &input_release, &fullscreen),
         ),
         KeyRoute::Rebind {
-            key: "KeyA".into(),
+            code: KeyCode::KeyA,
             ctrl: false,
             shift: false,
             alt: false,
@@ -348,11 +457,7 @@ fn super_is_a_modifier_and_never_reaches_the_guest_or_a_rebind() {
             false,
             context(false, true, &input_release, &fullscreen),
         ),
-        KeyRoute::Guest {
-            code: KeyCode::SuperLeft,
-            pressed: false,
-            repeat: false,
-        }
+        KeyRoute::Swallowed
     );
     assert!(!router.super_down);
     let _ = router.route(

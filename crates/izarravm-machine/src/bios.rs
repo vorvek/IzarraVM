@@ -718,15 +718,17 @@ impl Machine {
     fn int15_joystick(&mut self) {
         match self.cpu.registers.edx() as u16 {
             0x0000 => {
-                self.set_eax_al(self.gameport.bios_switches());
+                let now = self.master_ticks();
+                let switches = self.gameport.bios_switches(now);
+                self.set_eax_al(switches);
                 self.set_int_frame_carry(false);
             }
             0x0001 => {
-                let (x, y) = self.gameport.bios_axes();
-                self.set_ax(x);
-                self.set_bx(y);
-                self.set_cx(0x0000);
-                self.set_dx(0x0000);
+                let [ax, ay, bx, by] = self.gameport.bios_axes();
+                self.set_ax(ax);
+                self.set_bx(ay);
+                self.set_cx(bx);
+                self.set_dx(by);
                 self.set_int_frame_carry(false);
             }
             _ => {

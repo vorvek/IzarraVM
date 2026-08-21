@@ -22,7 +22,7 @@ enum KeyRoute {
         repeat: bool,
     },
     Rebind {
-        key: String,
+        code: KeyCode,
         ctrl: bool,
         shift: bool,
         alt: bool,
@@ -36,6 +36,7 @@ enum KeyRoute {
 #[derive(Clone, Copy)]
 struct KeyRouteContext<'a> {
     capturing_bind: bool,
+    capture_modifier_key: bool,
     input_captured: bool,
     input_release: &'a KeyBinding,
     fullscreen: &'a KeyBinding,
@@ -80,15 +81,6 @@ impl HostKeyRouter {
             self.pressed.swap_remove(index);
         }
 
-        if !pressed {
-            if let Some(index) = self.swallowed.iter().position(|held| *held == code) {
-                self.swallowed.swap_remove(index);
-                return KeyRoute::Swallowed;
-            }
-        } else if self.swallowed.contains(&code) {
-            return KeyRoute::Swallowed;
-        }
-
         let is_modifier = matches!(
             code,
             KeyCode::ControlLeft
@@ -104,10 +96,35 @@ impl HostKeyRouter {
         let (ctrl, shift, alt) = (self.ctrl_down, self.shift_down, self.alt_down);
         let super_key = self.super_down || context.host_super_down;
 
+        if !pressed {
+            if let Some(index) = self.swallowed.iter().position(|held| *held == code) {
+                self.swallowed.swap_remove(index);
+                if is_modifier && context.capturing_bind && context.capture_modifier_key {
+                    return KeyRoute::Rebind {
+                        code,
+                        ctrl,
+                        shift,
+                        alt,
+                        super_key,
+                    };
+                }
+                return KeyRoute::Swallowed;
+            }
+        } else if self.swallowed.contains(&code) {
+            return KeyRoute::Swallowed;
+        }
+
+        if context.capturing_bind && is_modifier {
+            if pressed && !repeat {
+                self.swallow(code);
+            }
+            return KeyRoute::Swallowed;
+        }
+
         if pressed && !repeat && !is_modifier && context.capturing_bind {
             self.swallow(code);
             return KeyRoute::Rebind {
-                key,
+                code,
                 ctrl,
                 shift,
                 alt,
@@ -155,8 +172,8 @@ impl HostKeyRouter {
         &mut self.keyboard
     }
 
-    fn focus_lost(&mut self, policy: HostInputPolicy) -> Vec<u8> {
-        let releases = policy.release_scancodes(&mut self.keyboard);
+    fn focus_lost(&mut self, policy: HostInputPolicy) -> Vec<GuestKeyTransition> {
+        let releases = policy.release_key_transitions(&mut self.keyboard);
         self.ctrl_down = false;
         self.shift_down = false;
         self.alt_down = false;
@@ -289,6 +306,7 @@ impl WinitApp {
             repeat,
             KeyRouteContext {
                 capturing_bind: self.gui.is_capturing_bind(),
+                capture_modifier_key: self.gui.is_capturing_controller_key(),
                 input_captured: self.gui.input_captured,
                 input_release: &self.gui.input_release,
                 fullscreen: &self.gui.fullscreen_key,
@@ -301,21 +319,23 @@ impl WinitApp {
                 pressed,
                 repeat,
             } => {
-                let codes = self.gui.host_input.key_scancodes(
+                let transition = self.gui.host_input.key_transition(
                     self.keys.keyboard_mut(),
                     code,
                     pressed,
                     repeat,
                 );
-                self.gui.send_keys_to_guest(codes);
+                if let Some(transition) = transition {
+                    self.gui.send_physical_key(transition);
+                }
             }
             KeyRoute::Rebind {
-                key,
+                code,
                 ctrl,
                 shift,
                 alt,
                 super_key,
-            } => self.gui.record_bind(&key, ctrl, shift, alt, super_key),
+            } => self.gui.record_bind(code, ctrl, shift, alt, super_key),
             KeyRoute::ReleaseCapture => {
                 if let Some(window) = self.window.clone() {
                     self.gui.toggle_capture(&window, self.keys.keyboard_mut());
@@ -455,7 +475,8 @@ impl ApplicationHandler for WinitApp {
                 // stuck down would arm a hotkey on the next plain key.
                 clear_host_super();
                 let releases = self.keys.focus_lost(self.gui.host_input);
-                self.gui.send_keys_to_guest(releases);
+                self.gui.release_physical_keys(releases);
+                self.gui.cancel_bind_capture();
                 return;
             }
             // Focused(true): fall through so egui also observes regained focus.
@@ -817,6 +838,7 @@ pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     let event_loop = build_event_loop(raw_mouse.clone(), host_input.mouse_enabled())?;
     let gui = GuiApp::new(launch)?;
     let egui_ctx = egui::Context::default();
+    egui_extras::install_image_loaders(&egui_ctx);
     enlarge_ui_fonts(&egui_ctx);
     apply_black_theme(&egui_ctx);
     let mut app = WinitApp {

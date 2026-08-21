@@ -3,33 +3,217 @@
 
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, MASTER_CLOCK_HZ};
 
-/// The 558 quad one-shot's fixed term: 24.2 us before the pot resistance is
-/// counted at all.
 const RC_BASE_NS: u64 = 24_200;
-/// The pot's own contribution at full deflection. The 555/558 formula is
-/// ~11 us per kOhm, and a PC joystick axis pot runs 0-100 kOhm, so the span is
-/// 1,100 us and a centred axis lands near 0.57 ms. 86Box derives exactly that
-/// (`src/game/gameport.c:269-273`: `axis * 100 / 65` ohms, then `* 11 / 1000`
-/// us, then `+ 24`); DOSBox-X's `read_p201_timed` agrees within 20 %. The old
-/// 2,750 us here implied a 250 kOhm pot and stretched every pulse 2.5x.
 const RC_SPAN_NS: u64 = 1_100_000;
+const BUTTON_REPLAY_CAPACITY: usize = 8;
+const BUTTON_MIN_DWELL_TICKS: u64 = MASTER_CLOCK_HZ / 1_000;
+const TURBO_HALF_PERIOD_TICKS: u64 = MASTER_CLOCK_HZ / 20;
 
-/// What INT 15h AH=84h BX=1 reports for an axis whose one-shot never fires.
-/// See `GamePort::bios_axes`.
+const _: () = assert!(MASTER_CLOCK_HZ.is_multiple_of(20));
+
 pub(crate) const BIOS_AXIS_TIMEOUT: u16 = u16::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JoystickState {
-    pub x: u8,
-    pub y: u8,
-    /// Bits 0 and 1 are set while joystick A buttons 1 and 2 are pressed.
+    pub axes: [u8; 4],
+    /// Bits 0 through 3 identify electrically connected axis lines.
+    pub axis_present: u8,
+    /// Normal held sources for button lines 1 through 4.
     pub buttons: u8,
+    /// Autofire held sources for button lines 1 through 4.
+    pub turbo_buttons: u8,
+}
+
+impl JoystickState {
+    pub fn joystick_a(x: u8, y: u8, buttons: u8) -> Self {
+        Self {
+            axes: [x, y, 0, 0],
+            axis_present: 0x03,
+            buttons: buttons & 0x0f,
+            turbo_buttons: 0,
+        }
+    }
+
+    fn sanitized(mut self) -> Self {
+        self.axis_present &= 0x0f;
+        self.buttons &= 0x0f;
+        self.turbo_buttons &= 0x0f;
+        self
+    }
+
+    fn button_drive(self, line: usize) -> ButtonDriveState {
+        let bit = 1 << line;
+        ButtonDriveState {
+            normal_held: self.buttons & bit != 0,
+            turbo_held: self.turbo_buttons & bit != 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GamePortButtonTransition {
+    pub line: u8,
+    pub normal_held: bool,
+    pub turbo_held: bool,
+}
+
+impl GamePortButtonTransition {
+    fn drive(self) -> ButtonDriveState {
+        ButtonDriveState {
+            normal_held: self.normal_held,
+            turbo_held: self.turbo_held,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GamePortUpdate {
+    pub state: Option<JoystickState>,
+    pub button_transitions: Vec<GamePortButtonTransition>,
+    /// Flushes obsolete replay before a disconnect or profile change.
+    pub reset_replay: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ButtonDriveState {
+    normal_held: bool,
+    turbo_held: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ButtonReplayLine {
+    queue: [ButtonDriveState; BUTTON_REPLAY_CAPACITY],
+    head: u8,
+    len: u8,
+    current: ButtonDriveState,
+    target: ButtonDriveState,
+    next_transition_tick: u64,
+    turbo_epoch: u64,
+}
+
+impl Default for ButtonReplayLine {
+    fn default() -> Self {
+        Self {
+            queue: [ButtonDriveState::default(); BUTTON_REPLAY_CAPACITY],
+            head: 0,
+            len: 0,
+            current: ButtonDriveState::default(),
+            target: ButtonDriveState::default(),
+            next_transition_tick: 0,
+            turbo_epoch: 0,
+        }
+    }
+}
+
+impl ButtonReplayLine {
+    fn reset(&mut self, target: ButtonDriveState, now: u64, attached: bool) {
+        *self = Self::default();
+        if !attached || target == ButtonDriveState::default() {
+            return;
+        }
+        self.target = target;
+        self.next_transition_tick = now.saturating_add(BUTTON_MIN_DWELL_TICKS);
+        self.push_unchecked(target);
+    }
+
+    fn update_target(
+        &mut self,
+        transitions: impl Iterator<Item = ButtonDriveState>,
+        target: ButtonDriveState,
+        now: u64,
+    ) {
+        self.advance(now);
+        if self.len == 0 && self.next_transition_tick < now {
+            self.next_transition_tick = now;
+        }
+        self.target = target;
+        for transition in transitions {
+            if self.enqueue(transition) {
+                self.advance(now);
+                return;
+            }
+        }
+        let _ = self.enqueue(target);
+        self.advance(now);
+    }
+
+    /// Returns true when intermediate history overflowed and was replaced by target.
+    fn enqueue(&mut self, drive: ButtonDriveState) -> bool {
+        if self.last_scheduled() == drive {
+            return false;
+        }
+        if usize::from(self.len) == BUTTON_REPLAY_CAPACITY {
+            self.head = 0;
+            self.len = 0;
+            self.queue = [ButtonDriveState::default(); BUTTON_REPLAY_CAPACITY];
+            if self.current != self.target {
+                self.push_unchecked(self.target);
+            }
+            return true;
+        }
+        self.push_unchecked(drive);
+        false
+    }
+
+    fn push_unchecked(&mut self, drive: ButtonDriveState) {
+        let tail = (usize::from(self.head) + usize::from(self.len)) % BUTTON_REPLAY_CAPACITY;
+        self.queue[tail] = drive;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> ButtonDriveState {
+        let index = usize::from(self.head);
+        let drive = self.queue[index];
+        self.queue[index] = ButtonDriveState::default();
+        self.head = ((index + 1) % BUTTON_REPLAY_CAPACITY) as u8;
+        self.len -= 1;
+        drive
+    }
+
+    fn last_scheduled(&self) -> ButtonDriveState {
+        if self.len == 0 {
+            self.current
+        } else {
+            let index =
+                (usize::from(self.head) + usize::from(self.len) - 1) % BUTTON_REPLAY_CAPACITY;
+            self.queue[index]
+        }
+    }
+
+    fn advance(&mut self, now: u64) {
+        while self.len != 0 && self.next_transition_tick <= now {
+            let at = if self.next_transition_tick == 0 {
+                now
+            } else {
+                self.next_transition_tick
+            };
+            let next = self.pop();
+            if !self.current.turbo_held && next.turbo_held {
+                self.turbo_epoch = at;
+            } else if !next.turbo_held {
+                self.turbo_epoch = 0;
+            }
+            self.current = next;
+            self.next_transition_tick = at.saturating_add(BUTTON_MIN_DWELL_TICKS);
+        }
+    }
+
+    fn pressed(&self, now: u64) -> bool {
+        self.current.normal_held
+            || (self.current.turbo_held
+                && (now.saturating_sub(self.turbo_epoch) / TURBO_HALF_PERIOD_TICKS) & 1 == 0)
+    }
+
+    fn time_dependent(&self) -> bool {
+        self.len != 0 || self.current.turbo_held
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct GamePort {
     state: Option<JoystickState>,
-    discharge_deadlines: [u64; 2],
+    discharge_deadlines: [u64; 4],
+    button_lines: [ButtonReplayLine; 4],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,92 +222,136 @@ pub(crate) struct CanonicalGamePort<'a> {
 }
 
 impl GamePort {
-    pub(crate) fn set_state(&mut self, state: Option<JoystickState>) {
-        self.state = state.map(|state| JoystickState {
-            buttons: state.buttons & 0x03,
-            ..state
-        });
-        if self.state.is_none() {
-            self.discharge_deadlines = [0; 2];
+    pub(crate) fn set_state(&mut self, state: Option<JoystickState>, now: u64) {
+        let state = state.map(JoystickState::sanitized);
+        self.state = state;
+        if let Some(state) = state {
+            for line in 0..4 {
+                let target = state.button_drive(line);
+                self.button_lines[line] = ButtonReplayLine {
+                    current: target,
+                    target,
+                    next_transition_tick: now.saturating_add(BUTTON_MIN_DWELL_TICKS),
+                    turbo_epoch: if target.turbo_held { now } else { 0 },
+                    ..ButtonReplayLine::default()
+                };
+            }
+        } else {
+            self.discharge_deadlines = [0; 4];
+            self.button_lines = [ButtonReplayLine::default(); 4];
+        }
+    }
+
+    pub(crate) fn apply_update(&mut self, update: GamePortUpdate, now: u64) {
+        let state = update.state.map(JoystickState::sanitized);
+        if state.is_none() {
+            self.state = None;
+            self.discharge_deadlines = [0; 4];
+            self.button_lines = [ButtonReplayLine::default(); 4];
+            return;
+        }
+
+        let state = state.expect("checked attached state");
+        let profile_changed = self
+            .state
+            .is_some_and(|old| old.axis_present != state.axis_present);
+        self.state = Some(state);
+
+        for line in 0..4 {
+            let target = state.button_drive(line);
+            if update.reset_replay || profile_changed {
+                self.button_lines[line].reset(target, now, true);
+                continue;
+            }
+            let transitions = update
+                .button_transitions
+                .iter()
+                .copied()
+                .filter(move |transition| usize::from(transition.line) == line)
+                .map(GamePortButtonTransition::drive);
+            self.button_lines[line].update_target(transitions, target, now);
         }
     }
 
     pub(crate) fn charge(&mut self, now: u64) {
         let Some(state) = self.state else {
-            self.discharge_deadlines = [0; 2];
+            self.discharge_deadlines = [0; 4];
             return;
         };
-        self.discharge_deadlines = [
-            now.saturating_add(axis_ticks(state.x)),
-            now.saturating_add(axis_ticks(state.y)),
-        ];
+        for (axis, deadline) in self.discharge_deadlines.iter_mut().enumerate() {
+            *deadline = if state.axis_present & (1 << axis) != 0 {
+                now.saturating_add(axis_ticks(state.axes[axis]))
+            } else {
+                0
+            };
+        }
     }
 
-    pub(crate) fn read(&self, now: u64) -> u8 {
+    pub(crate) fn read(&mut self, now: u64) -> u8 {
         let Some(state) = self.state else {
-            // An empty connector is an open circuit on every line. The one-shots
-            // cannot be triggered, so the axis bits stay pulled up and software
-            // times out waiting for them to fall, and the button lines read
-            // released for the same reason. 86Box returns 0xff with no joystick
-            // (`src/game/gameport.c:307`) and DOSBox-X leaves the bits set. The
-            // old 0xF0 here read as "all four axes fired instantly".
             return 0xff;
         };
-        let mut value = 0xf0;
-        value |= u8::from(now < self.discharge_deadlines[0]);
-        value |= u8::from(now < self.discharge_deadlines[1]) << 1;
-        // Compatibility behaviour, NOT hardware: while any one-shot is still
-        // discharging the button lines read released. Real cards do not do this;
-        // 86Box ships it (`src/game/gameport.c:315-317`, `if (state & 0x0f)
-        // buttons = 0xf0;`) because software depends on it, so we ship it too.
-        // Do not "fix" this back out.
-        if value & 0x03 == 0 {
-            value &= !((state.buttons & 0x03) << 4);
+        for line in &mut self.button_lines {
+            line.advance(now);
+        }
+
+        let mut axes = !state.axis_present & 0x0f;
+        for axis in 0..4 {
+            if state.axis_present & (1 << axis) != 0 && now < self.discharge_deadlines[axis] {
+                axes |= 1 << axis;
+            }
+        }
+        let mut value = 0xf0 | axes;
+        if axes & state.axis_present == 0 {
+            for (line, replay) in self.button_lines.iter().enumerate() {
+                if replay.pressed(now) {
+                    value &= !(1 << (line + 4));
+                }
+            }
         }
         value
     }
 
-    /// INT 15h AH=84h BX=0 reports the joystick switch settings in bits 4-7.
-    /// With no stick attached those lines are open, so they read released --
-    /// the same 1s `read` reports for the same physical reason, which is why
-    /// the whole byte follows `read`'s absent-stick answer rather than keeping
-    /// a separate 0xF0 convention. Bits 0-3 are not switch state on either
-    /// path; a guest that masks the nibble, as every documented user does, sees
-    /// no difference.
-    pub(crate) fn bios_switches(&self) -> u8 {
-        self.state
-            .map_or(0xff, |state| 0xf0 & !((state.buttons & 0x03) << 4))
+    pub(crate) fn bios_switches(&mut self, now: u64) -> u8 {
+        if self.state.is_none() {
+            return 0xff;
+        }
+        for line in &mut self.button_lines {
+            line.advance(now);
+        }
+        let mut value = 0xf0;
+        for (line, replay) in self.button_lines.iter().enumerate() {
+            if replay.pressed(now) {
+                value &= !(1 << (line + 4));
+            }
+        }
+        value
     }
 
-    /// True when nothing about a `read` at `now` is time-dependent: either no
-    /// stick is attached (so the one-shots can never fire and the deadlines are
-    /// held at zero by `set_state`/`charge`) or both monostables have already
-    /// discharged. The button lines are host-event state, not time state, so
-    /// they are not part of this question.
-    ///
-    /// This is the whole precondition for serving a gameport read without
-    /// ending the CPU batch; see the caller in `MachineBus::read_io`.
     pub(crate) fn is_idle(&self, now: u64) -> bool {
-        self.state.is_none()
-            || (now >= self.discharge_deadlines[0] && now >= self.discharge_deadlines[1])
+        if self.state.is_none() {
+            return true;
+        }
+        let axes_idle = self
+            .discharge_deadlines
+            .iter()
+            .all(|deadline| now >= *deadline);
+        axes_idle && self.button_lines.iter().all(|line| !line.time_dependent())
     }
 
-    /// INT 15h AH=84h BX=1 reports each axis as the count a resistance-timing
-    /// loop reached. With no stick attached the one-shot never fires, so a real
-    /// BIOS's loop runs to its terminal count and returns that -- it does NOT
-    /// report a centred stick at zero, which is what this used to do and what
-    /// let calibration code accept a phantom joystick.
-    ///
-    /// The count is `BIOS_AXIS_TIMEOUT`. This service is high-level emulation
-    /// with no timing loop of its own to run out, so the number is chosen
-    /// rather than measured: it is where a 16-bit counter saturates, which is
-    /// both what an AT-class BIOS's word-sized loop leaves in AX and a value no
-    /// real pot can produce, so software that range-checks sees "out of range"
-    /// exactly as it would on hardware.
-    pub(crate) fn bios_axes(&self) -> (u16, u16) {
-        self.state
-            .map(|state| (u16::from(state.x), u16::from(state.y)))
-            .unwrap_or((BIOS_AXIS_TIMEOUT, BIOS_AXIS_TIMEOUT))
+    pub(crate) fn bios_axes(&self) -> [u16; 4] {
+        let Some(state) = self.state else {
+            return [BIOS_AXIS_TIMEOUT, BIOS_AXIS_TIMEOUT, 0, 0];
+        };
+        std::array::from_fn(|axis| {
+            if state.axis_present & (1 << axis) != 0 {
+                u16::from(state.axes[axis])
+            } else if axis < 2 {
+                BIOS_AXIS_TIMEOUT
+            } else {
+                0
+            }
+        })
     }
 
     pub(crate) fn canonical_projection(&self) -> CanonicalGamePort<'_> {
@@ -145,11 +373,30 @@ impl CanonicalGamePort<'_> {
     ) -> Result<(), CanonicalStateError> {
         let state = self.gameport.state.unwrap_or_default();
         out.write_bool(self.gameport.state.is_some())?;
-        out.write_u8(state.x)?;
-        out.write_u8(state.y)?;
+        out.write_u8(state.axis_present)?;
+        for axis in state.axes {
+            out.write_u8(axis)?;
+        }
         out.write_u8(state.buttons)?;
-        out.write_u64(self.gameport.discharge_deadlines[0])?;
-        out.write_u64(self.gameport.discharge_deadlines[1])
+        out.write_u8(state.turbo_buttons)?;
+        for deadline in self.gameport.discharge_deadlines {
+            out.write_u64(deadline)?;
+        }
+        for line in &self.gameport.button_lines {
+            out.write_u8(line.head)?;
+            out.write_u8(line.len)?;
+            for entry in line.queue {
+                out.write_bool(entry.normal_held)?;
+                out.write_bool(entry.turbo_held)?;
+            }
+            out.write_bool(line.current.normal_held)?;
+            out.write_bool(line.current.turbo_held)?;
+            out.write_bool(line.target.normal_held)?;
+            out.write_bool(line.target.turbo_held)?;
+            out.write_u64(line.next_transition_tick)?;
+            out.write_u64(line.turbo_epoch)?;
+        }
+        Ok(())
     }
 }
 

@@ -4,8 +4,10 @@
 use super::*;
 use izarravm_core::{MidiBackend, MidiPortId};
 use izarravm_input::{
-    JoystickAxis, JoystickAxisBinding, JoystickBinding, JoystickButton, JoystickPolarity,
+    ControllerDeviceMatcher, GuestControllerProfile, GuestKey, GuestKeyChord, JoystickAxis,
+    JoystickAxisBinding, JoystickBinding, JoystickButton, JoystickPolarity,
 };
+use winit::keyboard::KeyCode;
 
 fn joystick_binding() -> JoystickBinding {
     JoystickBinding {
@@ -31,7 +33,7 @@ fn round_trips_through_toml() {
         crt_style: CrtStyle::YeOlde,
         input_release: KeyBinding::new(true, true, false, true, "F4"),
         fullscreen: KeyBinding::new(false, false, true, false, "Enter"),
-        joystick_binding: Some(joystick_binding()),
+        controller: Some(ControllerConfig::from_legacy(joystick_binding())),
         last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
         last_cd_image: Some(PathBuf::from("/tmp/game.iso")),
         last_cd_folder: None,
@@ -72,22 +74,84 @@ fn missing_keys_fall_back_to_defaults() {
         parsed.fullscreen,
         KeyBinding::new(false, false, false, true, "F4")
     );
-    assert_eq!(parsed.joystick_binding, None);
+    assert_eq!(parsed.controller, None);
     assert!(parsed.panel_open, "panel defaults to open for older files");
     assert_eq!(parsed.midi, MidiConfig::default());
 }
 
 #[test]
-fn joystick_binding_round_trips_with_named_controls_and_polarity() {
+fn legacy_joystick_binding_migrates_and_is_not_written_back() {
+    let text = r#"
+[joystick_binding]
+controller_uuid = "00010203-0405-0607-0809-0a0b0c0d0e0f"
+controller_name = "Test Controller"
+button_1 = "south"
+button_2 = "east"
+
+[joystick_binding.x]
+control = "left_stick_x"
+polarity = "positive"
+
+[joystick_binding.y]
+control = "left_stick_y"
+polarity = "negative"
+"#;
+    let prefs = toml::from_str::<GuiPrefs>(text).unwrap();
+    let controller = prefs.controller.as_ref().expect("legacy mapping migrated");
+    assert_eq!(controller.profile, GuestControllerProfile::Standard);
+    assert!(!controller.axes[0].transform.inverted);
+    assert!(controller.axes[1].transform.inverted);
+    let saved = toml::to_string_pretty(&prefs).unwrap();
+    assert!(saved.contains("[controller]"));
+    assert!(!saved.contains("joystick_binding"));
+    assert_eq!(toml::from_str::<GuiPrefs>(&saved).unwrap(), prefs);
+}
+
+#[test]
+fn controller_key_chords_round_trip_and_accept_the_old_single_key_shape() {
+    let device = ControllerDeviceMatcher {
+        backend: "gilrs-wgi".into(),
+        platform: "windows".into(),
+        guid: "controller-guid".into(),
+        vendor_id: Some(0x1234),
+        product_id: Some(0x5678),
+        name: "Test Controller".into(),
+        occurrence: 0,
+    };
+    let mut controller = ControllerConfig::default_keyboard(device);
+    controller.keys[0].host.host.raw_code = Some(0);
+    let shift = GuestKey::from_key_code(KeyCode::ShiftLeft).unwrap();
+    let letter = GuestKey::from_key_code(KeyCode::KeyA).unwrap();
+    controller.keys[12].guest = GuestKeyChord::new([shift, letter]);
     let prefs = GuiPrefs {
-        joystick_binding: Some(joystick_binding()),
+        controller: Some(controller),
         ..GuiPrefs::default()
     };
+
     let text = toml::to_string_pretty(&prefs).unwrap();
-    assert!(text.contains("[joystick_binding.x]"));
-    assert!(text.contains("control = \"left_stick_x\""));
-    assert!(text.contains("polarity = \"positive\""));
-    assert_eq!(toml::from_str::<GuiPrefs>(&text).unwrap(), prefs);
+    assert!(text.contains("raw_code = 0"));
+    let parsed = toml::from_str::<GuiPrefs>(&text).unwrap();
+    assert_eq!(parsed, prefs);
+
+    let mut legacy = toml::Value::try_from(&prefs).unwrap();
+    let keys = legacy
+        .get_mut("controller")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|controller| controller.get_mut("keys"))
+        .and_then(toml::Value::as_array_mut)
+        .expect("serialized controller keys");
+    let old_single_key = keys[0]
+        .get("guest")
+        .and_then(toml::Value::as_array)
+        .and_then(|chord| chord.first())
+        .cloned()
+        .expect("default chord key");
+    keys[0]
+        .as_table_mut()
+        .expect("key binding table")
+        .insert("guest".into(), old_single_key);
+    let migrated = legacy.try_into::<GuiPrefs>().unwrap();
+    assert_eq!(migrated.controller.unwrap().keys[0].guest.keys().len(), 1);
 }
 
 #[test]

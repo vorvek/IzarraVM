@@ -3302,11 +3302,7 @@ fn with_lazy_386_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -
 fn accurate_machine_with_joystick() -> Machine {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw386);
-    machine.set_joystick_state(Some(JoystickState {
-        x: 0x80,
-        y: 0x40,
-        buttons: 0,
-    }));
+    machine.set_joystick_state(Some(JoystickState::joystick_a(0x80, 0x40, 0)));
     machine.run_cycles(5_000).unwrap();
     machine
 }
@@ -3348,11 +3344,7 @@ fn a_gameport_read_ends_the_batch_only_while_a_one_shot_is_charged() {
     for mode in [GswMode::Gsw386, GswMode::Gsw586] {
         let mut machine = test_machine();
         machine.set_mode(mode);
-        machine.set_joystick_state(Some(JoystickState {
-            x: 0x80,
-            y: 0x40,
-            buttons: 0,
-        }));
+        machine.set_joystick_state(Some(JoystickState::joystick_a(0x80, 0x40, 0)));
         machine.run_cycles(5_000).unwrap();
         let (mid_pulse, mid_touched, late, late_touched) = with_bus(&mut machine, |bus| {
             // The guest arms the one-shots, then samples. Clear the flag the
@@ -3453,8 +3445,9 @@ fn the_386_lazy_switch_leaves_the_opl_charging_rules_alone() {
 #[test]
 fn a_lazy_gameport_read_matches_a_real_advance_devices_of_the_same_clocks() {
     // The exactness proof for the one port whose VALUE provably cannot move:
-    // `GamePort::read` is a pure function of the two RC discharge deadlines and
-    // `guest_tick_now()`, and nothing in advance_devices touches the deadlines.
+    // `GamePort::read` advances button replay to the supplied tick and samples
+    // the four RC discharge deadlines there. Nothing in advance_devices touches
+    // those deadlines.
     // Differential form, same as predicted_beam/predicted_pit_out: read the
     // predicted machine mid-batch at total T, advance the other machine for
     // real by the same T and read it at zero offset, require equality.

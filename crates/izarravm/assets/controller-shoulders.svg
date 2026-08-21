@@ -1,0 +1,11 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 100">
+  <path fill="#D4C9A8" stroke="#6B6248" stroke-width="2" d="M20 12H220C230 12 236 20 236 30V76C236 84 231 88 222 88H150C139 88 133 84 128 79C123 74 117 74 112 79C107 84 101 88 90 88H18C9 88 4 84 4 76V30C4 20 10 12 20 12Z"/>
+  <path fill="none" stroke="#8C8164" d="M8 50H232"/>
+  <rect x="20" y="21" width="60" height="22" rx="7" fill="#81775F" stroke="#6B6248"/>
+  <rect x="26" y="57" width="50" height="21" rx="7" fill="#A59A7B" stroke="#6B6248"/>
+  <rect x="160" y="21" width="60" height="22" rx="7" fill="#81775F" stroke="#6B6248"/>
+  <rect x="164" y="57" width="50" height="21" rx="7" fill="#A59A7B" stroke="#6B6248"/>
+</svg>

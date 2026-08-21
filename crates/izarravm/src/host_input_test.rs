@@ -5,6 +5,13 @@ use super::*;
 use izarravm_input::HostKeyboard;
 use winit::keyboard::KeyCode;
 
+fn bytes(transitions: Vec<izarravm_input::GuestKeyTransition>) -> Vec<u8> {
+    transitions
+        .into_iter()
+        .flat_map(|transition| transition.key.scancodes(transition.pressed))
+        .collect()
+}
+
 fn policy(keyboard: bool, mouse: bool, joystick: bool) -> HostInputPolicy {
     let mut config = InputConfig::default();
     config.keyboard = keyboard;
@@ -20,7 +27,10 @@ fn keyboard_mouse_matrix_gates_guest_paths_independently() {
             let policy = policy(keyboard_enabled, mouse_enabled, true);
             let mut keyboard = HostKeyboard::default();
 
-            let codes = policy.key_scancodes(&mut keyboard, KeyCode::KeyA, true, false);
+            let codes = policy
+                .key_transition(&mut keyboard, KeyCode::KeyA, true, false)
+                .map(|transition| transition.key.scancodes(transition.pressed))
+                .unwrap_or_default();
 
             assert_eq!(codes, if keyboard_enabled { vec![0x1e] } else { vec![] });
             assert_eq!(keyboard.is_held(KeyCode::KeyA), keyboard_enabled);
@@ -37,7 +47,10 @@ fn disabled_keyboard_clears_preheld_keys_without_emitting_scancodes() {
     let mut keyboard = HostKeyboard::default();
     assert_eq!(keyboard.key(KeyCode::KeyA, true), vec![0x1e]);
 
-    let codes = policy(false, true, false).key_scancodes(&mut keyboard, KeyCode::KeyB, true, false);
+    let codes = policy(false, true, false)
+        .key_transition(&mut keyboard, KeyCode::KeyB, true, false)
+        .map(|transition| transition.key.scancodes(transition.pressed))
+        .unwrap_or_default();
 
     assert!(codes.is_empty());
     assert!(!keyboard.is_held(KeyCode::KeyA));
@@ -49,7 +62,7 @@ fn focus_release_returns_breaks_only_when_keyboard_is_enabled() {
     let mut enabled_keyboard = HostKeyboard::default();
     enabled_keyboard.key(KeyCode::KeyA, true);
     assert_eq!(
-        policy(true, true, false).release_scancodes(&mut enabled_keyboard),
+        bytes(policy(true, true, false).release_key_transitions(&mut enabled_keyboard)),
         vec![0x9e]
     );
     assert!(enabled_keyboard.release_all().is_empty());
@@ -58,7 +71,7 @@ fn focus_release_returns_breaks_only_when_keyboard_is_enabled() {
     disabled_keyboard.key(KeyCode::KeyA, true);
     assert!(
         policy(false, true, false)
-            .release_scancodes(&mut disabled_keyboard)
+            .release_key_transitions(&mut disabled_keyboard)
             .is_empty()
     );
     assert!(disabled_keyboard.release_all().is_empty());

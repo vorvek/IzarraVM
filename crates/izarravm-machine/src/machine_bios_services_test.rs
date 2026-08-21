@@ -624,11 +624,7 @@ fn int15_84_reports_absent_joystick() {
 #[test]
 fn int15_84_reports_joystick_a_and_leaves_joystick_b_unpopulated() {
     let mut m = int15_machine(16);
-    m.set_joystick_state(Some(JoystickState {
-        x: 0x24,
-        y: 0xc8,
-        buttons: 0x01,
-    }));
+    m.set_joystick_state(Some(JoystickState::joystick_a(0x24, 0xc8, 0x01)));
 
     prime_dos_int_frame(&mut m);
     m.cpu.registers.set_eax(0x8400);
@@ -645,6 +641,34 @@ fn int15_84_reports_joystick_a_and_leaves_joystick_b_unpopulated() {
     assert_eq!(m.cpu.registers.ebx() as u16, 0xc8);
     assert_eq!(m.cpu.registers.ecx() as u16, 0);
     assert_eq!(m.cpu.registers.edx() as u16, 0);
+    assert_eq!(dos_int_flags(&m) & 1, 0);
+}
+
+#[test]
+fn int15_84_reports_all_four_axes_and_switches_for_a_wheel_profile() {
+    let mut m = int15_machine(16);
+    m.set_joystick_state(Some(JoystickState {
+        axes: [0x11, 0x22, 0x33, 0x44],
+        axis_present: 0x0f,
+        buttons: 0x0a,
+        turbo_buttons: 0,
+    }));
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x8400);
+    m.cpu.registers.set_edx(0x0000);
+    m.handle_int15();
+    assert_eq!(m.cpu.registers.eax() as u8, 0x50);
+    assert_eq!(dos_int_flags(&m) & 1, 0);
+
+    prime_dos_int_frame(&mut m);
+    m.cpu.registers.set_eax(0x8400);
+    m.cpu.registers.set_edx(0x0001);
+    m.handle_int15();
+    assert_eq!(m.cpu.registers.eax() as u16, 0x11);
+    assert_eq!(m.cpu.registers.ebx() as u16, 0x22);
+    assert_eq!(m.cpu.registers.ecx() as u16, 0x33);
+    assert_eq!(m.cpu.registers.edx() as u16, 0x44);
     assert_eq!(dos_int_flags(&m) & 1, 0);
 }
 
@@ -2105,11 +2129,7 @@ fn game_port_reports_no_joystick() {
 #[test]
 fn game_port_aliases_share_joystick_state_and_charge_deadlines() {
     let mut m = int15_machine(16);
-    m.set_joystick_state(Some(JoystickState {
-        x: 0,
-        y: u8::MAX,
-        buttons: 0x02,
-    }));
+    m.set_joystick_state(Some(JoystickState::joystick_a(0, u8::MAX, 0x02)));
     let mut bus = m.make_bus();
     for port in 0x0200..=0x0207 {
         bus.write_io(port, BusWidth::Byte, 0, false).unwrap();
@@ -2121,7 +2141,12 @@ fn game_port_aliases_share_joystick_state_and_charge_deadlines() {
         assert_eq!(value & 0xf0, 0xf0, "switches at {port:#06x}");
     }
     drop(bus);
-    assert_eq!(m.gameport.bios_switches(), 0xd0, "INT 15h sees the press");
+    let now = m.master_ticks();
+    assert_eq!(
+        m.gameport.bios_switches(now),
+        0xd0,
+        "INT 15h sees the press"
+    );
 }
 
 #[test]

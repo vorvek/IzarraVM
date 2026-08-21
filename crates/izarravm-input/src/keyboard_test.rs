@@ -22,6 +22,28 @@ fn maps_core_and_extended_keys() {
 }
 
 #[test]
+fn guest_key_choices_cover_every_named_set_one_key_once() {
+    let choices = GuestKey::choices().collect::<Vec<_>>();
+    assert_eq!(choices.len(), GUEST_KEY_CHOICES.len());
+    let unique = choices.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(unique.len(), choices.len());
+    assert!(
+        choices
+            .iter()
+            .all(|key| !key.display().starts_with("Set 1"))
+    );
+}
+
+#[test]
+fn guest_key_chords_keep_order_and_remove_duplicates() {
+    let shift = GuestKey::from_key_code(KeyCode::ShiftLeft).unwrap();
+    let letter = GuestKey::from_key_code(KeyCode::KeyA).unwrap();
+    let chord = GuestKeyChord::new([shift, letter, shift]);
+    assert_eq!(chord.keys(), [shift, letter]);
+    assert_eq!(chord.display(), "Left Shift+A");
+}
+
+#[test]
 fn press_and_release_emit_make_then_break() {
     let mut kb = HostKeyboard::default();
     assert_eq!(kb.key(KeyCode::ShiftLeft, true), vec![0x2a]);
@@ -96,4 +118,74 @@ fn unmapped_key_emits_nothing_and_is_not_tracked() {
     let mut kb = HostKeyboard::default();
     assert!(kb.key(KeyCode::F24, true).is_empty());
     assert!(kb.release_all().is_empty());
+}
+
+#[test]
+fn guest_key_router_breaks_only_after_the_last_source_releases() {
+    let key = GuestKey::from_key_code(KeyCode::Space).unwrap();
+    let press = GuestKeyTransition {
+        key,
+        pressed: true,
+        repeat: false,
+    };
+    let release = GuestKeyTransition {
+        pressed: false,
+        ..press
+    };
+    let mut router = GuestKeyRouter::default();
+    assert_eq!(router.apply(GuestKeySource::Physical, press), vec![0x39]);
+    assert!(
+        router
+            .apply(GuestKeySource::Controller(7), press)
+            .is_empty()
+    );
+    assert!(router.apply(GuestKeySource::Physical, release).is_empty());
+    assert_eq!(
+        router.apply(GuestKeySource::Controller(7), release),
+        vec![0xb9]
+    );
+}
+
+#[test]
+fn releasing_physical_keys_does_not_release_controller_owned_keys() {
+    let key = GuestKey::from_key_code(KeyCode::ArrowUp).unwrap();
+    let press = GuestKeyTransition {
+        key,
+        pressed: true,
+        repeat: false,
+    };
+    let mut router = GuestKeyRouter::default();
+    router.apply(GuestKeySource::Controller(1), press);
+    router.apply(GuestKeySource::Physical, press);
+    assert!(router.release_source(GuestKeySource::Physical).is_empty());
+    assert_eq!(
+        router.release_source(GuestKeySource::Controller(1)),
+        vec![0xe0, 0xc8]
+    );
+}
+
+#[test]
+fn physical_typematic_can_repeat_a_key_with_another_owner() {
+    let key = GuestKey::from_key_code(KeyCode::KeyS).unwrap();
+    let mut router = GuestKeyRouter::default();
+    let press = GuestKeyTransition {
+        key,
+        pressed: true,
+        repeat: false,
+    };
+    assert_eq!(
+        router.apply(GuestKeySource::Controller(2), press),
+        vec![0x1f]
+    );
+    assert!(router.apply(GuestKeySource::Physical, press).is_empty());
+    assert_eq!(
+        router.apply(
+            GuestKeySource::Physical,
+            GuestKeyTransition {
+                repeat: true,
+                ..press
+            }
+        ),
+        vec![0x1f]
+    );
 }

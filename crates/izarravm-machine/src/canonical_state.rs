@@ -135,7 +135,7 @@ const STATE_SNAPSHOT_V1_FOUNDATION_SECTIONS: [StateSnapshotV1FoundationSection; 
     },
     StateSnapshotV1FoundationSection {
         id: 0x0002_000f,
-        version: 1,
+        version: 2,
         requirement: CanonicalSectionRequirement::Required,
     },
 ];

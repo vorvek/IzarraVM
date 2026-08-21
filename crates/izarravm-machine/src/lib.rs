@@ -156,7 +156,7 @@ pub(crate) use firmware_contract::address::{
     VGA_BIOS_INT1F_FONT_OFF, VGA_BIOS_INT44_FONT_ADDR, VGA_BIOS_INT44_FONT_OFF,
 };
 use firmware_contract::{Bios32Call, install_boot_memory, patch_rom};
-pub use gameport::JoystickState;
+pub use gameport::{GamePortButtonTransition, GamePortUpdate, JoystickState};
 
 pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureError};
 pub use katea_tree::KateaGeometryReport;
@@ -2609,10 +2609,16 @@ impl Machine {
         self.last_abs = (x.clamp(0, MOUSE_GUEST_MAX_X), y.clamp(0, MOUSE_GUEST_MAX_Y));
     }
 
-    /// Replace the state presented by joystick A on the ISA gameport. `None`
-    /// electrically detaches the joystick and clears any charged RC timers.
+    /// Replace the ISA gameport state and discard pending button replay.
     pub fn set_joystick_state(&mut self, state: Option<JoystickState>) {
-        self.gameport.set_state(state);
+        let now = self.master_ticks();
+        self.gameport.set_state(state, now);
+    }
+
+    /// Apply one ordered host-controller update at the current guest time.
+    pub fn update_gameport(&mut self, update: GamePortUpdate) {
+        let now = self.master_ticks();
+        self.gameport.apply_update(update, now);
     }
 
     /// Test seam: register a mouse packet handler (the INT 15h C207 effect),
