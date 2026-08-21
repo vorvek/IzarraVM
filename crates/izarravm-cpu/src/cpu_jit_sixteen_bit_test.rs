@@ -477,10 +477,13 @@ fn a_wrapping_bp_operand_reads_the_masked_address() {
 /// interpreter writes an already-narrowed offset while an unmasked path would add the whole
 /// 32-bit base register, so the divergence is arbitrary rather than merely high.
 ///
-/// It needs an explicit 0x66. `0x8d` is NOT in the Word allowlist, so an unprefixed `8D 46 22` in
-/// a 16-bit segment is refused before the emitter is reached. **The corollary is worth stating:
-/// on ordinary unprefixed 16-bit code this path stays unreachable even after S4, so this fixture
-/// is what discharges it, and nothing on any corpus will.**
+/// The explicit 0x66 is what keeps this fixture about the DWORD operand form. It used to be what
+/// made the fixture possible at all -- `0x8d` was off the Word allowlist, so an unprefixed
+/// `8D 46 22` in a 16-bit segment was refused before the emitter was reached, and the corollary
+/// recorded here was that nothing on any corpus would ever reach this path. The S1 width lift
+/// admitted the row, so the unprefixed form is now ordinary loader traffic and is covered by
+/// `cpu_jit_width_lift_test.rs`. What this fixture still owns is the cell that one does not: a
+/// Dword destination write over a 16-bit address.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
