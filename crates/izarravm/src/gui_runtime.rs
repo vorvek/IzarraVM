@@ -218,6 +218,10 @@ struct WinitApp {
 }
 
 impl WinitApp {
+    fn resume_controller_input(&mut self) {
+        self.gui.resume_controllers();
+    }
+
     /// Draw one frame: run the egui pass and present it. Called every frame from
     /// about_to_wait, and on demand for OS-driven repaints (resize). Driving the
     /// steady-state redraw from about_to_wait rather than request_redraw matters
@@ -382,6 +386,7 @@ impl ApplicationHandler for WinitApp {
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        self.window = Some(window.clone());
         // Ask winit for raw device input while focused, so the guest keyboard can
         // read DeviceEvent::Key (Win32 Raw Input) instead of the cooked
         // WindowEvent path, and raw mouse motion for capture.
@@ -435,7 +440,10 @@ impl ApplicationHandler for WinitApp {
             queue,
             config,
         });
-        self.window = Some(window);
+        self.focused = window.has_focus();
+        if self.focused {
+            self.resume_controller_input();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -461,6 +469,7 @@ impl ApplicationHandler for WinitApp {
             return;
         }
         if let WindowEvent::Focused(focused) = &event {
+            let was_focused = self.focused;
             self.focused = *focused;
             // Settle the grab on the same edge: losing the foreground hands the
             // Super keys straight back to the shell, and regaining it takes
@@ -473,11 +482,17 @@ impl ApplicationHandler for WinitApp {
                 // normally sees the release, but Win+L reaches the secure
                 // desktop, which this process never observes; a Super left
                 // stuck down would arm a hotkey on the next plain key.
-                clear_host_super();
-                let releases = self.keys.focus_lost(self.gui.host_input);
-                self.gui.release_physical_keys(releases);
-                self.gui.cancel_bind_capture();
+                if was_focused {
+                    clear_host_super();
+                    let releases = self.keys.focus_lost(self.gui.host_input);
+                    self.gui.release_physical_keys(releases);
+                    self.gui.cancel_bind_capture();
+                    self.gui.suspend_controllers();
+                }
                 return;
+            }
+            if !was_focused {
+                self.resume_controller_input();
             }
             // Focused(true): fall through so egui also observes regained focus.
         }
@@ -583,7 +598,9 @@ impl ApplicationHandler for WinitApp {
             self.next_mouse_flush = now + Duration::from_secs_f64(1.0 / MOUSE_FLUSH_HZ);
         }
         if now >= self.next_joystick_poll {
-            self.gui.poll_joystick();
+            if self.focused {
+                self.gui.poll_joystick();
+            }
             self.next_joystick_poll = now + Duration::from_secs_f64(1.0 / JOYSTICK_POLL_HZ);
         }
         // Pace rendering to the guest refresh rate. Render directly here once the
@@ -845,7 +862,7 @@ pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
         gui,
         keys: HostKeyRouter::default(),
         is_fullscreen: false,
-        focused: true,
+        focused: false,
         raw_keys: false,
         window: None,
         wgpu: None,

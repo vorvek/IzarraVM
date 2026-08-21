@@ -54,6 +54,114 @@ fn repeated_controller_names_receive_stable_ordinals() {
 }
 
 #[test]
+fn windows_controller_names_use_backend_scoped_suffixes() {
+    let matcher = |backend: &str, occurrence| ControllerDeviceMatcher {
+        backend: backend.to_owned(),
+        platform: "windows".to_owned(),
+        guid: format!("{backend}-{occurrence}"),
+        vendor_id: None,
+        product_id: None,
+        name: "Controller".to_owned(),
+        occurrence,
+    };
+    let devices = [
+        ControllerDevice {
+            runtime_id: 0,
+            matcher: matcher("gilrs-wgi", 0),
+        },
+        ControllerDevice {
+            runtime_id: 1,
+            matcher: matcher("gilrs-wgi", 1),
+        },
+        ControllerDevice {
+            runtime_id: 0,
+            matcher: matcher("xinput", 0),
+        },
+    ];
+    assert_eq!(
+        controller_device_display_name(&devices, &devices[0].matcher),
+        "Controller (1) (WGI)"
+    );
+    assert_eq!(
+        controller_device_display_name(&devices, &devices[1].matcher),
+        "Controller (2) (WGI)"
+    );
+    assert_eq!(
+        controller_device_display_name(&devices, &devices[2].matcher),
+        "Controller (XInput)"
+    );
+}
+
+#[test]
+fn hardware_name_upgrade_updates_selected_and_staged_matchers() {
+    let live = ControllerDeviceMatcher {
+        backend: "gilrs-wgi".into(),
+        platform: "windows".into(),
+        guid: "00000000-0000-0000-0000-000000000000".into(),
+        vendor_id: Some(0x3434),
+        product_id: Some(0x1061),
+        name: "Xbox 360 Controller for Windows".into(),
+        occurrence: 0,
+    };
+    let mut resolved = live.clone();
+    resolved.name = "Keychron Q6 HE 8K".into();
+    let mut selected = live.clone();
+    let mut staged = live.clone();
+    assert!(upgrade_controller_name(
+        &mut selected,
+        &live,
+        Some(&resolved.name)
+    ));
+    assert!(upgrade_controller_name(
+        &mut staged,
+        &live,
+        Some(&resolved.name)
+    ));
+    assert_eq!(selected.name, "Keychron Q6 HE 8K");
+    assert_eq!(staged.name, "Keychron Q6 HE 8K");
+    assert!(selected.strongly_matches(&live));
+}
+
+#[test]
+fn name_only_legacy_matcher_is_not_rewritten() {
+    let live = ControllerDeviceMatcher {
+        backend: "gilrs-wgi".into(),
+        platform: "windows".into(),
+        guid: String::new(),
+        vendor_id: None,
+        product_id: None,
+        name: "Generic pad".into(),
+        occurrence: 0,
+    };
+    let mut resolved = live.clone();
+    resolved.name = "Guessed hardware".into();
+    let mut target = live.clone();
+    assert!(!upgrade_controller_name(
+        &mut target,
+        &live,
+        Some(&resolved.name)
+    ));
+    assert_eq!(target.name, "Generic pad");
+}
+
+#[test]
+fn missing_hardware_name_never_downgrades_an_enriched_matcher() {
+    let live = ControllerDeviceMatcher {
+        backend: "gilrs-wgi".into(),
+        platform: "windows".into(),
+        guid: "00000000-0000-0000-0000-000000000000".into(),
+        vendor_id: Some(0x3434),
+        product_id: Some(0x1061),
+        name: "Xbox 360 Controller for Windows".into(),
+        occurrence: 0,
+    };
+    let mut target = live.clone();
+    target.name = "Keychron Q6 HE 8K".into();
+    assert!(!upgrade_controller_name(&mut target, &live, None));
+    assert_eq!(target.name, "Keychron Q6 HE 8K");
+}
+
+#[test]
 fn capture_keeps_a_modifier_typed_on_its_own() {
     let chord = guest_chord_from_capture(KeyCode::ShiftRight, false, false, false).unwrap();
     assert_eq!(
@@ -113,4 +221,19 @@ fn embedded_controller_svgs_render_without_external_assets() {
     let options = Default::default();
     assert!(egui_extras::image::load_svg_bytes(CONTROLLER_FACE_SVG, &options).is_ok());
     assert!(egui_extras::image::load_svg_bytes(CONTROLLER_SHOULDERS_SVG, &options).is_ok());
+}
+
+#[test]
+fn input_test_keeps_trigger_axes_unipolar() {
+    let trigger = visual_value(HostControlId::semantic_axis(JoystickAxis::LeftZ), 0.0);
+    let stick = visual_value(HostControlId::semantic_axis(JoystickAxis::LeftStickX), 0.0);
+    assert_eq!(input_test_progress(trigger), 0.0);
+    assert_eq!(input_test_progress(stick), 0.5);
+    assert_eq!(
+        input_test_progress(visual_value(
+            HostControlId::semantic_axis(JoystickAxis::RightZ),
+            1.0,
+        )),
+        1.0
+    );
 }

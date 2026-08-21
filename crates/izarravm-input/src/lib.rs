@@ -4,8 +4,12 @@
 #![forbid(unsafe_code)]
 
 mod controller;
+#[cfg(windows)]
+mod controller_windows;
 mod joystick;
 mod keyboard;
+#[cfg(windows)]
+mod xinput;
 pub use controller::{
     AxisCalibration, AxisSpan, AxisTransform, ControllerAxisBinding, ControllerButtonBinding,
     ControllerButtonState, ControllerConfig, ControllerDevice, ControllerDeviceMatcher,

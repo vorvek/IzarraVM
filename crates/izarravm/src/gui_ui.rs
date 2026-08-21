@@ -704,11 +704,26 @@ impl GuiApp {
         let Some(mut setup) = self.controller_setup.take() else {
             return;
         };
-        let devices = self
-            .controllers
-            .as_ref()
-            .map(|controllers| controllers.devices().to_vec())
-            .unwrap_or_default();
+        let (devices, topology_generation) = self.controllers.as_ref().map_or_else(
+            || (Vec::new(), 0),
+            |controllers| {
+                (
+                    controllers.devices().to_vec(),
+                    controllers.topology_generation(),
+                )
+            },
+        );
+        self.controller_names.refresh(topology_generation);
+        let display_devices = self.controller_names.display_devices(&devices);
+        for live in &devices {
+            let hardware_name = self.controller_names.hardware_name(&live.matcher);
+            if let Some(selected) = setup.selected_device.as_mut() {
+                upgrade_controller_name(selected, &live.matcher, hardware_name);
+            }
+            if let Some(staged) = setup.staged.as_mut() {
+                upgrade_controller_name(&mut staged.device, &live.matcher, hardware_name);
+            }
+        }
         let controls = controller_controls(&self.controller_values);
         let values = self.controller_values.clone();
         let mut keep_open = true;
@@ -738,27 +753,52 @@ impl GuiApp {
                             ui.label("HOST DEVICE");
                             let selected = setup.selected_device.as_ref().map_or_else(
                                 || "Select a controller".to_owned(),
-                                |device| controller_device_display_name(&devices, device),
+                                |selected| {
+                                    display_devices
+                                        .iter()
+                                        .find(|device| {
+                                            selected == &device.matcher
+                                                || selected.strongly_matches(&device.matcher)
+                                        })
+                                        .map_or_else(
+                                            || {
+                                                controller_device_display_name(
+                                                    &display_devices,
+                                                    selected,
+                                                )
+                                            },
+                                            |device| {
+                                                controller_device_display_name(
+                                                    &display_devices,
+                                                    &device.matcher,
+                                                )
+                                            },
+                                        )
+                                },
                             );
                             egui::ComboBox::from_id_salt("controller-device")
                                 .selected_text(selected)
                                 .width(360.0)
                                 .show_ui(ui, |ui| {
-                                    for device in &devices {
-                                        let is_selected = setup.selected_device.as_ref()
-                                            == Some(&device.matcher);
+                                    for (device, display) in devices.iter().zip(&display_devices) {
+                                        let is_selected = setup.selected_device.as_ref().is_some_and(
+                                            |selected| {
+                                                selected == &device.matcher
+                                                    || selected.strongly_matches(&device.matcher)
+                                            },
+                                        );
                                         let label = controller_device_display_name(
-                                            &devices,
-                                            &device.matcher,
+                                            &display_devices,
+                                            &display.matcher,
                                         );
                                         if ui
                                             .selectable_label(is_selected, label)
                                             .clicked()
                                             && !is_selected
                                         {
-                                            setup.selected_device = Some(device.matcher.clone());
+                                            setup.selected_device = Some(display.matcher.clone());
                                             setup.staged = Some(ControllerConfig::default_keyboard(
-                                                device.matcher.clone(),
+                                                display.matcher.clone(),
                                             ));
                                             setup.capturing_key = None;
                                         }
@@ -977,17 +1017,42 @@ fn controller_device_display_name(
 ) -> String {
     let duplicate_count = devices
         .iter()
-        .filter(|device| device.matcher.name == matcher.name)
+        .filter(|device| {
+            device.matcher.backend == matcher.backend && device.matcher.name == matcher.name
+        })
         .count();
-    if duplicate_count < 2 {
-        return matcher.name.clone();
+    let name = if duplicate_count < 2 {
+        matcher.name.clone()
+    } else {
+        let ordinal = devices
+            .iter()
+            .filter(|device| {
+                device.matcher.backend == matcher.backend && device.matcher.name == matcher.name
+            })
+            .position(|device| &device.matcher == matcher)
+            .map_or(usize::from(matcher.occurrence) + 1, |index| index + 1);
+        format!("{} ({ordinal})", matcher.name)
+    };
+    match matcher.backend.as_str() {
+        "gilrs-wgi" => format!("{name} (WGI)"),
+        "xinput" => format!("{name} (XInput)"),
+        _ => name,
     }
-    let ordinal = devices
-        .iter()
-        .filter(|device| device.matcher.name == matcher.name)
-        .position(|device| &device.matcher == matcher)
-        .map_or(usize::from(matcher.occurrence) + 1, |index| index + 1);
-    format!("{} ({ordinal})", matcher.name)
+}
+
+fn upgrade_controller_name(
+    target: &mut ControllerDeviceMatcher,
+    live: &ControllerDeviceMatcher,
+    hardware_name: Option<&str>,
+) -> bool {
+    let Some(hardware_name) = hardware_name else {
+        return false;
+    };
+    if !target.strongly_matches(live) || target.name == hardware_name {
+        return false;
+    }
+    target.name = hardware_name.to_owned();
+    true
 }
 
 fn controller_controls(values: &[HostControlValue]) -> Vec<HostControlId> {
@@ -1227,10 +1292,10 @@ fn paint_controller_face(painter: &egui::Painter, rect: egui::Rect, state: Contr
 
 fn paint_controller_shoulders(painter: &egui::Painter, rect: egui::Rect, active: [bool; 4]) {
     for ((view_rect, label), active) in [
-        ([26.0, 57.0, 76.0, 78.0], "LT"),
-        ([20.0, 21.0, 80.0, 43.0], "LB"),
-        ([160.0, 21.0, 220.0, 43.0], "RB"),
-        ([164.0, 57.0, 214.0, 78.0], "RT"),
+        ([20.0, 22.0, 80.0, 52.0], "LT"),
+        ([22.0, 66.0, 78.0, 79.0], "LB"),
+        ([162.0, 66.0, 218.0, 79.0], "RB"),
+        ([160.0, 22.0, 220.0, 52.0], "RT"),
     ]
     .into_iter()
     .zip(active)
@@ -1816,26 +1881,41 @@ fn controller_input_test_ui(ui: &mut egui::Ui, values: &[HostControlValue]) {
                         let name = value.control.display();
                         ui.add_sized([92.0, 18.0], egui::Label::new(&name).truncate())
                             .on_hover_text(name);
-                        let normalized = match value.control.kind {
-                            izarravm_input::HostControlKind::Axis => (value.value + 1.0) * 0.5,
-                            izarravm_input::HostControlKind::Button => value.value,
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(normalized.clamp(0.0, 1.0))
-                                .desired_width(72.0)
-                                .text(format!("{:+.2}", value.value)),
-                        );
-                        ui.monospace(
-                            value
-                                .control
-                                .raw_code
-                                .map_or_else(|| "-".to_owned(), |raw| raw.to_string()),
-                        );
+                        let normalized = input_test_progress(*value);
+                        ui.scope(|ui| {
+                            ui.visuals_mut().extreme_bg_color = BEVEL_HI;
+                            ui.visuals_mut().override_text_color = Some(egui::Color32::BLACK);
+                            ui.add(
+                                egui::ProgressBar::new(normalized)
+                                    .desired_width(72.0)
+                                    .fill(BEVEL_LO)
+                                    .text(
+                                        egui::RichText::new(format!("{:+.2}", value.value))
+                                            .strong()
+                                            .color(egui::Color32::BLACK),
+                                    ),
+                            );
+                        });
                     });
                 }
             }
         });
     });
+}
+
+fn input_test_progress(value: HostControlValue) -> f32 {
+    let unipolar_axis = matches!(
+        value.control.semantic,
+        Some(izarravm_input::HostSemanticControl::Axis(
+            JoystickAxis::LeftZ | JoystickAxis::RightZ
+        ))
+    );
+    let normalized = match value.control.kind {
+        izarravm_input::HostControlKind::Axis if unipolar_axis => value.value,
+        izarravm_input::HostControlKind::Axis => (value.value + 1.0) * 0.5,
+        izarravm_input::HostControlKind::Button => value.value,
+    };
+    normalized.clamp(0.0, 1.0)
 }
 
 impl GuiApp {

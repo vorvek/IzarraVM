@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use gilrs::{EventType, Gamepad, Gilrs, GilrsBuilder, ev::Code};
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,32 @@ pub struct ControllerDeviceMatcher {
     pub name: String,
     #[serde(default)]
     pub occurrence: u16,
+}
+
+impl ControllerDeviceMatcher {
+    pub fn matches(&self, actual: &Self) -> bool {
+        device_matches(self, actual)
+    }
+
+    pub fn strongly_matches(&self, actual: &Self) -> bool {
+        if !self.matches(actual) {
+            return false;
+        }
+        let usb_matches = matches!(
+            (
+                self.vendor_id,
+                self.product_id,
+                actual.vendor_id,
+                actual.product_id,
+            ),
+            (Some(vendor), Some(product), Some(other_vendor), Some(other_product))
+                if vendor == other_vendor && product == other_product
+        );
+        let guid_matches = meaningful_guid(&self.guid)
+            && meaningful_guid(&actual.guid)
+            && self.guid.eq_ignore_ascii_case(&actual.guid);
+        usb_matches || guid_matches
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -972,34 +999,98 @@ pub struct ControllerDevice {
     pub matcher: ControllerDeviceMatcher,
 }
 
-pub struct ControllerManager {
-    gilrs: Gilrs,
-    values: BTreeMap<(usize, HostControlKind, u32), HostControlValue>,
-    devices: Vec<ControllerDevice>,
-    connection: ControllerConnectionLatch,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ControllerBackendKind {
+    Gilrs,
+    #[cfg(windows)]
+    XInput,
 }
 
-impl ControllerManager {
-    pub fn new() -> Result<Self, String> {
+impl ControllerBackendKind {
+    pub(super) fn for_matcher(matcher: &ControllerDeviceMatcher) -> Option<Self> {
+        if matcher.backend == backend_name() {
+            return Some(Self::Gilrs);
+        }
+        #[cfg(windows)]
+        if matcher.backend == "xinput" {
+            return Some(Self::XInput);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct ControllerRuntimeKey {
+    pub(super) backend: ControllerBackendKind,
+    pub(super) runtime_id: usize,
+}
+
+#[derive(Default)]
+struct ControllerSelection {
+    matcher: Option<ControllerDeviceMatcher>,
+}
+
+impl ControllerSelection {
+    fn update(&mut self, matcher: &ControllerDeviceMatcher) -> bool {
+        if self
+            .matcher
+            .as_ref()
+            .is_some_and(|current| current == matcher || current.strongly_matches(matcher))
+        {
+            self.matcher = Some(matcher.clone());
+            return false;
+        }
+        self.matcher = Some(matcher.clone());
+        true
+    }
+}
+
+#[derive(Default)]
+pub(super) struct BackendPoll {
+    pub(super) events: Vec<HostControlValue>,
+    pub(super) selected_disconnected: bool,
+    pub(super) devices_changed: bool,
+    pub(super) boundary_reset: bool,
+}
+
+pub(super) trait ControllerBackendDriver {
+    fn devices(&self) -> &[ControllerDevice];
+    fn topology_generation(&self) -> u64;
+    fn focus_gained(&mut self, now: Instant);
+    fn focus_lost(&mut self);
+    fn poll(&mut self, selected: Option<ControllerRuntimeKey>, now: Instant) -> BackendPoll;
+    fn final_values(&mut self, runtime: ControllerRuntimeKey) -> Vec<HostControlValue>;
+}
+
+pub(super) struct GilrsBackend {
+    gilrs: Gilrs,
+    values: BTreeMap<(ControllerRuntimeKey, HostControlKind, u32), HostControlValue>,
+    devices: Vec<ControllerDevice>,
+    topology_generation: u64,
+}
+
+impl GilrsBackend {
+    #[cfg(not(windows))]
+    pub(super) fn new() -> Result<Self, String> {
+        Self::new_with_previous(&[])
+    }
+
+    pub(super) fn new_with_previous(previous: &[ControllerDevice]) -> Result<Self, String> {
         let gilrs = GilrsBuilder::new()
             .with_default_filters(false)
             .build()
             .map_err(|error| error.to_string())?;
-        let mut manager = Self {
+        let mut backend = Self {
             gilrs,
             values: BTreeMap::new(),
-            devices: Vec::new(),
-            connection: ControllerConnectionLatch::default(),
+            devices: previous.to_vec(),
+            topology_generation: 0,
         };
-        manager.refresh_devices();
-        Ok(manager)
+        backend.refresh_devices(true);
+        Ok(backend)
     }
 
-    pub fn devices(&self) -> &[ControllerDevice] {
-        &self.devices
-    }
-
-    fn refresh_devices(&mut self) {
+    pub(super) fn refresh_devices(&mut self, force_generation: bool) {
         let previous = self.devices.clone();
         let mut devices = self
             .gilrs
@@ -1019,40 +1110,216 @@ impl ControllerManager {
             })
             .collect::<Vec<_>>();
         assign_device_occurrences(&previous, &mut devices);
+        if force_generation || devices != previous {
+            self.topology_generation = self.topology_generation.wrapping_add(1);
+        }
         self.devices = devices;
     }
 
-    pub fn poll(&mut self, config: &ControllerConfig) -> HostControllerBatch {
-        let previous = self.connection.active_runtime;
-        let mut ordered = Vec::new();
-        let mut active_disconnected = false;
-        let mut devices_changed = false;
+    pub(super) fn poll_events(&mut self, selected: Option<ControllerRuntimeKey>) -> BackendPoll {
+        let selected = selected.filter(|key| key.backend == ControllerBackendKind::Gilrs);
+        let mut poll = BackendPoll::default();
         while let Some(event) = self.gilrs.next_event() {
             let runtime = usize::from(event.id);
-            devices_changed |=
+            let key = ControllerRuntimeKey {
+                backend: ControllerBackendKind::Gilrs,
+                runtime_id: runtime,
+            };
+            poll.devices_changed |=
                 matches!(event.event, EventType::Connected | EventType::Disconnected);
-            if let Some(value) = event_value(&self.gilrs.gamepad(event.id), event.event) {
+            if selected.is_some()
+                && let Some(value) = event_value(&self.gilrs.gamepad(event.id), event.event)
+            {
                 if let Some(raw_code) = value.control.raw_code {
                     self.values
-                        .insert((runtime, value.control.kind, raw_code), value);
+                        .insert((key, value.control.kind, raw_code), value);
                 }
-                if previous == Some(runtime) {
-                    ordered.push(value);
+                if selected == Some(key) {
+                    poll.events.push(value);
                 }
             }
             if matches!(event.event, EventType::Disconnected) {
-                self.values.retain(|(id, _, _), _| *id != runtime);
-                active_disconnected |= previous == Some(runtime);
+                self.values.retain(|(cached, _, _), _| *cached != key);
+                poll.selected_disconnected |= selected == Some(key);
             }
         }
 
-        if devices_changed {
-            self.refresh_devices();
+        if poll.devices_changed {
+            self.refresh_devices(true);
         }
+        poll
+    }
+
+    pub(super) fn final_values(&mut self, runtime: ControllerRuntimeKey) -> Vec<HostControlValue> {
         self.refresh_values();
+        self.values
+            .iter()
+            .filter(|((key, _, _), _)| *key == runtime)
+            .map(|(_, value)| *value)
+            .collect()
+    }
+
+    fn refresh_values(&mut self) {
+        for (id, gamepad) in self
+            .gilrs
+            .gamepads()
+            .filter(|(_, gamepad)| gamepad.is_connected())
+        {
+            let runtime = usize::from(id);
+            let key = ControllerRuntimeKey {
+                backend: ControllerBackendKind::Gilrs,
+                runtime_id: runtime,
+            };
+            for (code, data) in gamepad.state().axes() {
+                let control = control_id(&gamepad, HostControlKind::Axis, code);
+                self.values.insert(
+                    (key, HostControlKind::Axis, code.into_u32()),
+                    HostControlValue {
+                        control,
+                        value: data.value(),
+                    },
+                );
+            }
+            for (code, data) in gamepad.state().buttons() {
+                let control = control_id(&gamepad, HostControlKind::Button, code);
+                self.values.insert(
+                    (key, HostControlKind::Button, code.into_u32()),
+                    HostControlValue {
+                        control,
+                        value: data.value(),
+                    },
+                );
+            }
+        }
+    }
+
+    pub(super) fn devices(&self) -> &[ControllerDevice] {
+        &self.devices
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn topology_generation(&self) -> u64 {
+        self.topology_generation
+    }
+}
+
+#[cfg(not(windows))]
+impl ControllerBackendDriver for GilrsBackend {
+    fn devices(&self) -> &[ControllerDevice] {
+        self.devices()
+    }
+
+    fn topology_generation(&self) -> u64 {
+        self.topology_generation()
+    }
+
+    fn focus_gained(&mut self, _now: Instant) {}
+
+    fn focus_lost(&mut self) {}
+
+    fn poll(&mut self, selected: Option<ControllerRuntimeKey>, _now: Instant) -> BackendPoll {
+        self.poll_events(selected)
+    }
+
+    fn final_values(&mut self, runtime: ControllerRuntimeKey) -> Vec<HostControlValue> {
+        self.final_values(runtime)
+    }
+}
+
+pub struct ControllerManager {
+    backend: Box<dyn ControllerBackendDriver>,
+    selection: ControllerSelection,
+    connection: ControllerConnectionLatch,
+    focused: bool,
+}
+
+impl ControllerManager {
+    pub fn new() -> Result<Self, String> {
+        #[cfg(windows)]
+        let backend: Box<dyn ControllerBackendDriver> =
+            Box::new(crate::controller_windows::WindowsControllerBackend::new());
+        #[cfg(not(windows))]
+        let backend: Box<dyn ControllerBackendDriver> = Box::new(GilrsBackend::new()?);
+        Ok(Self {
+            backend,
+            selection: ControllerSelection::default(),
+            connection: ControllerConnectionLatch::default(),
+            focused: false,
+        })
+    }
+
+    pub fn devices(&self) -> &[ControllerDevice] {
+        self.backend.devices()
+    }
+
+    pub fn topology_generation(&self) -> u64 {
+        self.backend.topology_generation()
+    }
+
+    pub fn focus_gained(&mut self) {
+        if self.focused {
+            return;
+        }
+        self.focused = true;
+        self.backend.focus_gained(Instant::now());
+    }
+
+    pub fn maintain(&mut self) {
+        if self.focused {
+            let _ = self.backend.poll(None, Instant::now());
+        }
+    }
+
+    pub fn focus_lost(&mut self) -> HostControllerBatch {
+        if !self.focused {
+            return HostControllerBatch {
+                connected: false,
+                reset: false,
+                events: Vec::new(),
+                final_values: Vec::new(),
+            };
+        }
+        self.focused = false;
+        self.backend.focus_lost();
+        self.connection.update(None, true, false);
+        HostControllerBatch {
+            connected: false,
+            reset: true,
+            events: Vec::new(),
+            final_values: Vec::new(),
+        }
+    }
+
+    pub fn poll(&mut self, config: &ControllerConfig) -> HostControllerBatch {
+        if !self.focused {
+            return HostControllerBatch {
+                connected: false,
+                reset: false,
+                events: Vec::new(),
+                final_values: Vec::new(),
+            };
+        }
+        let selection_changed = self.selection.update(&config.device);
+        let selected_before = self.matching_runtime(&config.device);
+        let poll = self.backend.poll(selected_before, Instant::now());
+        if selection_changed || poll.boundary_reset {
+            self.connection.update(None, true, false);
+            return HostControllerBatch {
+                connected: false,
+                reset: true,
+                events: Vec::new(),
+                final_values: Vec::new(),
+            };
+        }
+
         let active = self.matching_runtime(&config.device);
+        let final_values =
+            active.map_or_else(Vec::new, |runtime| self.backend.final_values(runtime));
+        let mut ordered = poll.events;
         let Some(runtime) = active else {
-            let decision = self.connection.update(None, active_disconnected, false);
+            let decision = self
+                .connection
+                .update(None, poll.selected_disconnected, false);
             return HostControllerBatch {
                 connected: false,
                 reset: decision.reset,
@@ -1060,15 +1327,9 @@ impl ControllerManager {
                 final_values: Vec::new(),
             };
         };
-        let final_values = self
-            .values
-            .iter()
-            .filter(|((id, _, _), _)| *id == runtime)
-            .map(|(_, value)| *value)
-            .collect::<Vec<_>>();
         let decision = self.connection.update(
-            active,
-            active_disconnected,
+            Some(runtime),
+            poll.selected_disconnected,
             controls_neutral(config, &final_values),
         );
         if decision.reset {
@@ -1086,41 +1347,16 @@ impl ControllerManager {
         }
     }
 
-    fn matching_runtime(&self, matcher: &ControllerDeviceMatcher) -> Option<usize> {
-        self.devices
+    fn matching_runtime(&self, matcher: &ControllerDeviceMatcher) -> Option<ControllerRuntimeKey> {
+        let backend = ControllerBackendKind::for_matcher(matcher)?;
+        self.backend
+            .devices()
             .iter()
             .find(|device| device_matches(matcher, &device.matcher))
-            .map(|device| device.runtime_id)
-    }
-
-    fn refresh_values(&mut self) {
-        for (id, gamepad) in self
-            .gilrs
-            .gamepads()
-            .filter(|(_, gamepad)| gamepad.is_connected())
-        {
-            let runtime = usize::from(id);
-            for (code, data) in gamepad.state().axes() {
-                let control = control_id(&gamepad, HostControlKind::Axis, code);
-                self.values.insert(
-                    (runtime, HostControlKind::Axis, code.into_u32()),
-                    HostControlValue {
-                        control,
-                        value: data.value(),
-                    },
-                );
-            }
-            for (code, data) in gamepad.state().buttons() {
-                let control = control_id(&gamepad, HostControlKind::Button, code);
-                self.values.insert(
-                    (runtime, HostControlKind::Button, code.into_u32()),
-                    HostControlValue {
-                        control,
-                        value: data.value(),
-                    },
-                );
-            }
-        }
+            .map(|device| ControllerRuntimeKey {
+                backend,
+                runtime_id: device.runtime_id,
+            })
     }
 }
 
@@ -1171,7 +1407,7 @@ fn assign_device_occurrences(previous: &[ControllerDevice], devices: &mut [Contr
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ControllerConnectionLatch {
-    active_runtime: Option<usize>,
+    active_runtime: Option<ControllerRuntimeKey>,
     ready: bool,
 }
 
@@ -1184,7 +1420,7 @@ struct ControllerConnectionDecision {
 impl ControllerConnectionLatch {
     fn update(
         &mut self,
-        active_runtime: Option<usize>,
+        active_runtime: Option<ControllerRuntimeKey>,
         active_disconnected: bool,
         controls_neutral: bool,
     ) -> ControllerConnectionDecision {
@@ -1203,6 +1439,10 @@ impl ControllerConnectionLatch {
             reset: connection_reset || (active_runtime.is_some() && !self.ready),
         }
     }
+}
+
+fn meaningful_guid(guid: &str) -> bool {
+    !guid.is_empty() && !guid.eq_ignore_ascii_case("00000000-0000-0000-0000-000000000000")
 }
 
 fn device_matches(expected: &ControllerDeviceMatcher, actual: &ControllerDeviceMatcher) -> bool {

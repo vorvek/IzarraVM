@@ -64,6 +64,8 @@ toml.workspace = true
 # Raw Input FFI for the WM_INPUT mouse hook that keeps a high-polling-rate mouse
 # from flooding winit's event pump. Matches the version winit already pulls in.
 windows-sys = { version = "0.59", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_UI_Input",
     "Win32_UI_WindowsAndMessaging",

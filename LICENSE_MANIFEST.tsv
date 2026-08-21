@@ -1,5 +1,5 @@
 path	class	origin	license	sha256
-Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	86a97567da22acc37a20ab852a3a363ad39eab64df80aa198328f652c5a598ab
+Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	1e160db68f9f0763336487c6fb1c9f6533606e33a90a06be732ad9265ddbcc7a
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	3a28e206e40cdfb041639f638fdf66e8d9c4cc3ed84b43014f47e934d67fcde9
 crates/izarravm-cdaudio/tests/fixtures/tone-22k-mono.wav	generated-test-fixture	IzarraVM project source	GPL-3.0-only	98b43874f2cdcac75465cf3df534f8654b635f24612f49f0158affb87a9d6234

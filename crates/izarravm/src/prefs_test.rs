@@ -155,6 +155,35 @@ fn controller_key_chords_round_trip_and_accept_the_old_single_key_shape() {
 }
 
 #[test]
+fn resolved_controller_name_survives_an_actual_config_save_and_load() {
+    let device = ControllerDeviceMatcher {
+        backend: "gilrs-wgi".into(),
+        platform: "windows".into(),
+        guid: "00000000-0000-0000-0000-000000000000".into(),
+        vendor_id: Some(0x3434),
+        product_id: Some(0x1061),
+        name: "Keychron Q6 HE 8K".into(),
+        occurrence: 0,
+    };
+    let prefs = GuiPrefs {
+        controller: Some(ControllerConfig::default_keyboard(device)),
+        ..GuiPrefs::default()
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "izarravm-controller-name-{}-{nonce}.conf",
+        std::process::id()
+    ));
+    prefs.save(&path);
+    let loaded = GuiPrefs::load_with(&path, |path| std::fs::read_to_string(path));
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(loaded, prefs);
+}
+
+#[test]
 fn key_binding_display_strips_winit_prefixes() {
     assert_eq!(
         KeyBinding::new(false, false, false, true, "F2").display(),

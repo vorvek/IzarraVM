@@ -9,6 +9,7 @@ mod bench;
 mod bench_reference;
 mod bootprofile;
 mod cmos;
+mod controller_names;
 mod crt;
 mod gui;
 mod host_input;

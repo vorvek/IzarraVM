@@ -42,6 +42,13 @@ fn value(control: HostControlId, value: f32) -> HostControlValue {
     HostControlValue { control, value }
 }
 
+fn runtime(backend: ControllerBackendKind, runtime_id: usize) -> ControllerRuntimeKey {
+    ControllerRuntimeKey {
+        backend,
+        runtime_id,
+    }
+}
+
 #[test]
 fn keyboard_profile_covers_the_common_physical_controls_once() {
     let controls = keyboard_controls();
@@ -279,14 +286,14 @@ fn keyboard_chords_press_modifiers_first_and_release_them_last() {
 fn reconnect_latch_preserves_reset_and_waits_for_neutral() {
     let mut latch = ControllerConnectionLatch::default();
     assert_eq!(
-        latch.update(Some(7), false, true),
+        latch.update(Some(runtime(ControllerBackendKind::Gilrs, 7)), false, true,),
         ControllerConnectionDecision {
             connected: true,
             reset: true,
         }
     );
     assert_eq!(
-        latch.update(Some(7), true, true),
+        latch.update(Some(runtime(ControllerBackendKind::Gilrs, 7)), true, true,),
         ControllerConnectionDecision {
             connected: true,
             reset: true,
@@ -294,26 +301,82 @@ fn reconnect_latch_preserves_reset_and_waits_for_neutral() {
         "same-poll disconnect and reconnect must retain the reset edge"
     );
     assert_eq!(
-        latch.update(Some(7), true, false),
+        latch.update(Some(runtime(ControllerBackendKind::Gilrs, 7)), true, false,),
         ControllerConnectionDecision {
             connected: false,
             reset: true,
         }
     );
     assert_eq!(
-        latch.update(Some(7), false, false),
+        latch.update(Some(runtime(ControllerBackendKind::Gilrs, 7)), false, false,),
         ControllerConnectionDecision {
             connected: false,
             reset: true,
         }
     );
     assert_eq!(
-        latch.update(Some(7), false, true),
+        latch.update(Some(runtime(ControllerBackendKind::Gilrs, 7)), false, true,),
         ControllerConnectionDecision {
             connected: true,
             reset: false,
         }
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn backend_identity_prevents_runtime_zero_collisions() {
+    let gilrs = runtime(ControllerBackendKind::Gilrs, 0);
+    let xinput = runtime(ControllerBackendKind::XInput, 0);
+    assert_ne!(gilrs, xinput);
+
+    let mut latch = ControllerConnectionLatch::default();
+    assert!(latch.update(Some(gilrs), false, true).reset);
+    assert!(latch.update(Some(xinput), false, true).reset);
+}
+
+#[test]
+fn controller_selection_only_resets_for_a_different_row() {
+    let mut selection = ControllerSelection::default();
+    let wgi = device();
+    assert!(selection.update(&wgi));
+    assert!(!selection.update(&wgi));
+
+    let mut xinput = wgi.clone();
+    xinput.backend = "xinput".into();
+    xinput.guid = "xinput-slot-0".into();
+    assert!(selection.update(&xinput));
+    assert!(!device_matches(&wgi, &xinput));
+}
+
+#[test]
+fn controller_selection_ignores_a_strongly_matched_name_upgrade() {
+    let mut selection = ControllerSelection::default();
+    let generic = device();
+    assert!(selection.update(&generic));
+
+    let mut enriched = generic.clone();
+    enriched.name = "Keychron Q6 HE 8K".into();
+    assert!(!selection.update(&enriched));
+    assert_eq!(selection.matcher.as_ref().unwrap().name, enriched.name);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_manager_starts_without_polling_or_publishing_a_backend() {
+    let mut manager = ControllerManager::new().unwrap();
+    assert!(manager.devices().is_empty());
+    assert_eq!(manager.topology_generation(), 0);
+    assert!(!manager.focus_lost().reset);
+}
+
+#[cfg(windows)]
+#[test]
+fn controller_focus_loss_is_idempotent() {
+    let mut manager = ControllerManager::new().unwrap();
+    manager.focus_gained();
+    assert!(manager.focus_lost().reset);
+    assert!(!manager.focus_lost().reset);
 }
 
 #[test]

@@ -13,6 +13,7 @@ pub use runtime::run;
 // so the accepted formats and the error messages stay one list.
 pub(crate) use session::load_cd_image_from_path;
 
+use crate::controller_names::ControllerNameResolver;
 use crate::host_input::HostInputPolicy;
 use crate::prefs::{CrtStyle, GuiPrefs, KeyBinding, MAX_VOLUME};
 use crate::startup::GuiLaunch;
@@ -623,6 +624,7 @@ pub struct GuiApp {
     session_frame: Option<SessionFrame>,
     host_input: HostInputPolicy,
     controllers: Option<ControllerManager>,
+    controller_names: ControllerNameResolver,
     controller_config: Option<ControllerConfig>,
     controller_mapper: Option<ControllerMapper>,
     controller_values: Vec<HostControlValue>,
@@ -1081,6 +1083,7 @@ impl GuiApp {
             session_frame: initial_update.newest_frame,
             host_input,
             controllers,
+            controller_names: ControllerNameResolver::default(),
             controller_config,
             controller_mapper,
             controller_values: Vec::new(),
@@ -1514,10 +1517,12 @@ impl GuiApp {
             .controller_setup
             .as_ref()
             .and_then(|setup| setup.staged.as_ref());
-        let Some(config) = setup_config.or(self.controller_config.as_ref()) else {
+        let Some(controllers) = self.controllers.as_mut() else {
             return;
         };
-        let Some(controllers) = self.controllers.as_mut() else {
+        let Some(config) = setup_config.or(self.controller_config.as_ref()) else {
+            controllers.maintain();
+            self.controller_values.clear();
             return;
         };
         let batch = controllers.poll(config);
@@ -1530,6 +1535,24 @@ impl GuiApp {
         };
         let delta = mapper.apply(batch);
         self.send_controller_delta(delta);
+    }
+
+    fn suspend_controllers(&mut self) {
+        self.controller_values.clear();
+        let Some(controllers) = self.controllers.as_mut() else {
+            return;
+        };
+        let batch = controllers.focus_lost();
+        if let Some(mapper) = self.controller_mapper.as_mut() {
+            let delta = mapper.apply(batch);
+            self.send_controller_delta(delta);
+        }
+    }
+
+    fn resume_controllers(&mut self) {
+        if let Some(controllers) = self.controllers.as_mut() {
+            controllers.focus_gained();
+        }
     }
 
     fn send_controller_delta(&mut self, delta: izarravm_input::ControllerGuestDelta) {

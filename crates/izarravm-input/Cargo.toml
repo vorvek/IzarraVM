@@ -14,3 +14,6 @@ authors.workspace = true
 gilrs.workspace = true
 serde.workspace = true
 winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+rusty-xinput = "1.3"
