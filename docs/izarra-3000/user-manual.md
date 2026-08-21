@@ -150,7 +150,7 @@ The connector has four 100 kOhm RC axis lines and four active-low button lines.
 An OUT instruction charges each connected axis timer, and a read shows the
 four timer states and four button states. A standard joystick or 4 button gamepad
 connects joystick A X and Y and leaves joystick B X and Y open. A wheel and
-pedals profile can connect all four axes. INT 15h AH=84h reports the four
+pedals target can connect all four axes. INT 15h AH=84h reports the four
 switches and returns A X, A Y, B X, and B Y in AX, BX, CX, and DX. An absent B
 axis keeps the BIOS compatibility value of zero.
 
@@ -158,6 +158,10 @@ The Keyboard only target leaves the gameport disconnected. Controller
 directions, buttons, and triggers send AT keyboard keys or modifier combinations
 instead. Trigger rows accept either analog-axis or digital-button reports from
 the host input backend.
+
+The host application saves these assignments in controller profiles. See
+[Controller emulation](../izarravm-gui/guide.md#controller-emulation) in the
+GUI guide.
 
 ## Next
 

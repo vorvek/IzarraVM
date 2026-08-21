@@ -222,6 +222,7 @@ pub(super) struct GuiLaunch {
     pub(super) host_input: HostInputPolicy,
     pub(super) prefs: prefs::GuiPrefs,
     pub(super) prefs_path: PathBuf,
+    pub(super) state_dir: PathBuf,
 }
 
 pub(super) struct StartupError(ConfigError);
@@ -294,6 +295,7 @@ impl ResolvedStartup {
             host_input: self.host_input,
             prefs: self.prefs,
             prefs_path: self.prefs_path,
+            state_dir: self.state_dir,
         }
     }
 }

@@ -144,6 +144,11 @@ fn default_fullscreen() -> KeyBinding {
     KeyBinding::new(false, false, false, true, "F4")
 }
 
+/// The hotkey that saves a screenshot.
+fn default_screenshot() -> KeyBinding {
+    KeyBinding::new(false, false, false, true, "F12")
+}
+
 /// The two defaults these replaced, as (retired, current) pairs. A file written
 /// before Super was a modifier carries the retired combination, which nobody
 /// picked: it was whatever the build shipped. `migrate_retired_hotkeys` moves
@@ -200,12 +205,20 @@ pub struct GuiPrefs {
     pub master_volume: f32,
     /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
     pub crt_style: CrtStyle,
+    /// Whether a new GUI window starts in borderless full screen.
+    pub start_fullscreen: bool,
     /// Hotkey that releases captured input. Default Super+F2.
     pub input_release: KeyBinding,
     /// Hotkey that toggles fullscreen. Default Super+F4.
     pub fullscreen: KeyBinding,
-    /// Host controller mappings for guest keys and the Izarra gameport.
+    /// Hotkey that saves a PNG screenshot. Default Super+F12.
+    pub screenshot: KeyBinding,
+    /// Legacy inline controller mapping. The GUI migrates this into a profile
+    /// file and clears it before the next successful preferences save.
     pub controller: Option<ControllerConfig>,
+    /// Controller profile selected for the next run. The mapping itself stays
+    /// in the Controller Profiles directory.
+    pub controller_profile: Option<String>,
     /// Last floppy IMG mounted, re-mounted on startup if it still exists.
     pub last_floppy_image: Option<PathBuf>,
     /// Last CD image (.iso/.cue/.bin) mounted, re-mounted on startup if it still
@@ -227,9 +240,12 @@ impl Default for GuiPrefs {
         Self {
             master_volume: DEFAULT_VOLUME,
             crt_style: CrtStyle::Subtle,
+            start_fullscreen: false,
             input_release: default_input_release(),
             fullscreen: default_fullscreen(),
+            screenshot: default_screenshot(),
             controller: None,
+            controller_profile: None,
             last_floppy_image: None,
             last_cd_image: None,
             last_cd_folder: None,
@@ -244,9 +260,12 @@ impl Default for GuiPrefs {
 struct GuiPrefsWire {
     master_volume: f32,
     crt_style: CrtStyle,
+    start_fullscreen: bool,
     input_release: KeyBinding,
     fullscreen: KeyBinding,
+    screenshot: KeyBinding,
     controller: Option<ControllerConfig>,
+    controller_profile: Option<String>,
     joystick_binding: Option<JoystickBinding>,
     last_floppy_image: Option<PathBuf>,
     last_cd_image: Option<PathBuf>,
@@ -261,9 +280,12 @@ impl Default for GuiPrefsWire {
         Self {
             master_volume: prefs.master_volume,
             crt_style: prefs.crt_style,
+            start_fullscreen: prefs.start_fullscreen,
             input_release: prefs.input_release,
             fullscreen: prefs.fullscreen,
+            screenshot: prefs.screenshot,
             controller: None,
+            controller_profile: prefs.controller_profile,
             joystick_binding: None,
             last_floppy_image: prefs.last_floppy_image,
             last_cd_image: prefs.last_cd_image,
@@ -283,11 +305,14 @@ impl<'de> Deserialize<'de> for GuiPrefs {
         Ok(Self {
             master_volume: wire.master_volume,
             crt_style: wire.crt_style,
+            start_fullscreen: wire.start_fullscreen,
             input_release: wire.input_release,
             fullscreen: wire.fullscreen,
+            screenshot: wire.screenshot,
             controller: wire
                 .controller
                 .or_else(|| wire.joystick_binding.map(ControllerConfig::from_legacy)),
+            controller_profile: wire.controller_profile,
             last_floppy_image: wire.last_floppy_image,
             last_cd_image: wire.last_cd_image,
             last_cd_folder: wire.last_cd_folder,

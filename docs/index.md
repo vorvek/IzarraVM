@@ -27,7 +27,8 @@ machine.
 - **[Toka-DOS licensing](toka-dos/licensing.md)**: the parts of the system,
   and their license terms.
 - **[IzarraVM GUI guide](izarravm-gui/guide.md)**: the host application. It
-  describes the configuration, how to mount media, and where the files are.
+  describes the Settings windows, hotkeys, controller profiles, media, and
+  file locations.
 - **[Troubleshooting and FAQ](troubleshooting.md)**: frequent problems, and
   what to do about them.
 

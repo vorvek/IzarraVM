@@ -4,6 +4,15 @@
 use super::*;
 use winit::keyboard::KeyCode;
 
+#[test]
+fn startup_fullscreen_uses_borderless_mode_only_when_enabled() {
+    assert!(matches!(
+        fullscreen_mode(true),
+        Some(winit::window::Fullscreen::Borderless(None))
+    ));
+    assert!(fullscreen_mode(false).is_none());
+}
+
 fn binding(ctrl: bool, key: &str) -> KeyBinding {
     KeyBinding::new(ctrl, false, false, false, key)
 }
@@ -24,7 +33,20 @@ fn context<'a>(
         input_captured,
         input_release,
         fullscreen,
+        screenshot: fullscreen,
         host_super_down: false,
+    }
+}
+
+fn screenshot_context<'a>(
+    input_captured: bool,
+    input_release: &'a KeyBinding,
+    fullscreen: &'a KeyBinding,
+    screenshot: &'a KeyBinding,
+) -> KeyRouteContext<'a> {
+    KeyRouteContext {
+        screenshot,
+        ..context(false, input_captured, input_release, fullscreen)
     }
 }
 
@@ -299,6 +321,117 @@ fn keyboard_off_keeps_fullscreen_rebind_and_input_release_host_side() {
         }
     );
     assert!(guest_bytes(&rebind, &mut router, policy).is_empty());
+}
+
+#[test]
+fn screenshot_hotkey_is_host_only_and_uses_super_from_either_input_path() {
+    let policy = HostInputPolicy::new(true, true, true);
+    let input_release = super_binding("F2");
+    let fullscreen = super_binding("F4");
+    let screenshot = super_binding("F12");
+    let mut router = HostKeyRouter::default();
+
+    let super_press = router.route(
+        KeyCode::SuperLeft,
+        true,
+        false,
+        screenshot_context(false, &input_release, &fullscreen, &screenshot),
+    );
+    assert!(guest_bytes(&super_press, &mut router, policy).is_empty());
+    let route = router.route(
+        KeyCode::F12,
+        true,
+        false,
+        screenshot_context(false, &input_release, &fullscreen, &screenshot),
+    );
+    assert_eq!(route, KeyRoute::SaveScreenshot);
+    assert!(guest_bytes(&route, &mut router, policy).is_empty());
+    assert_eq!(
+        router.route(
+            KeyCode::F12,
+            true,
+            true,
+            screenshot_context(false, &input_release, &fullscreen, &screenshot),
+        ),
+        KeyRoute::Swallowed
+    );
+    assert_eq!(
+        router.route(
+            KeyCode::F12,
+            false,
+            false,
+            screenshot_context(false, &input_release, &fullscreen, &screenshot),
+        ),
+        KeyRoute::Swallowed
+    );
+
+    let mut hooked = HostKeyRouter::default();
+    let route = hooked.route(
+        KeyCode::F12,
+        true,
+        false,
+        KeyRouteContext {
+            host_super_down: true,
+            ..screenshot_context(true, &input_release, &fullscreen, &screenshot)
+        },
+    );
+    assert_eq!(route, KeyRoute::SaveScreenshot);
+    assert!(guest_bytes(&route, &mut hooked, policy).is_empty());
+}
+
+#[test]
+fn profile_name_input_releases_guest_keys_and_swallows_raw_keys() {
+    let policy = HostInputPolicy::new(true, true, true);
+    let input_release = super_binding("F2");
+    let fullscreen = super_binding("F4");
+    let screenshot = super_binding("F12");
+    let mut router = HostKeyRouter::default();
+
+    let guest_press = router.route(
+        KeyCode::KeyA,
+        true,
+        false,
+        screenshot_context(false, &input_release, &fullscreen, &screenshot),
+    );
+    assert_eq!(guest_bytes(&guest_press, &mut router, policy), vec![0x1e]);
+    assert_eq!(
+        router
+            .set_text_input_active(true, policy)
+            .into_iter()
+            .flat_map(|transition| transition.key.scancodes(transition.pressed))
+            .collect::<Vec<_>>(),
+        vec![0x9e]
+    );
+    assert!(router.text_input_active());
+
+    let screenshot_press = router.route(
+        KeyCode::F12,
+        true,
+        false,
+        KeyRouteContext {
+            host_super_down: true,
+            ..screenshot_context(false, &input_release, &fullscreen, &screenshot)
+        },
+    );
+    assert_eq!(screenshot_press, KeyRoute::Swallowed);
+    assert_eq!(
+        router.route(
+            KeyCode::F12,
+            false,
+            false,
+            screenshot_context(false, &input_release, &fullscreen, &screenshot),
+        ),
+        KeyRoute::Swallowed
+    );
+
+    assert!(router.set_text_input_active(false, policy).is_empty());
+    let guest_press = router.route(
+        KeyCode::KeyB,
+        true,
+        false,
+        screenshot_context(false, &input_release, &fullscreen, &screenshot),
+    );
+    assert_eq!(guest_bytes(&guest_press, &mut router, policy), vec![0x30]);
 }
 
 #[test]

@@ -300,8 +300,11 @@ impl GuiApp {
     fn open_config_dialog(&mut self) {
         let midi_config = self.session_snapshot.midi_config.clone();
         self.config_dialog = Some(ConfigDialog {
+            page: ConfigPage::Settings,
+            start_fullscreen: self.prefs.start_fullscreen,
             input_release: self.input_release.clone(),
             fullscreen: self.fullscreen_key.clone(),
+            screenshot: self.screenshot_key.clone(),
             crt_style: self.crt_style,
             midi_backend: midi_config.backend,
             external_midi_port: midi_config.external_port,
@@ -331,6 +334,15 @@ impl GuiApp {
             .is_some_and(|setup| setup.capturing_key.is_some())
     }
 
+    pub(super) fn is_editing_profile_name(&self) -> bool {
+        self.controller_setup.as_ref().is_some_and(|setup| {
+            matches!(
+                setup.profile_prompt.as_ref(),
+                Some(ControllerProfilePrompt::Add { .. })
+            )
+        })
+    }
+
     pub(super) fn cancel_bind_capture(&mut self) {
         if let Some(dialog) = self.config_dialog.as_mut() {
             dialog.capturing = None;
@@ -358,6 +370,7 @@ impl GuiApp {
             match target {
                 BindTarget::InputRelease => dialog.input_release = binding,
                 BindTarget::Fullscreen => dialog.fullscreen = binding,
+                BindTarget::Screenshot => dialog.screenshot = binding,
             }
             return;
         }
@@ -377,8 +390,7 @@ impl GuiApp {
         }
     }
 
-    /// Render the configuration modal. Accept applies the staged settings and
-    /// closes; Cancel, the backdrop, or Esc discards and closes.
+    /// Render the settings window and its hotkey and MIDI subwindows.
     fn config_ui(&mut self, ctx: &egui::Context) {
         if self.controller_setup.is_some() {
             return;
@@ -397,9 +409,12 @@ impl GuiApp {
         let Some(mut dialog) = self.config_dialog.take() else {
             return;
         };
+        let page = dialog.page;
         let mut keep_open = true;
         let mut accept = false;
+        let mut apply = false;
         let mut open_controller_setup = false;
+        let mut return_to_settings = false;
         let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
             egui::Frame::new()
                 .fill(PANEL_FACE)
@@ -416,204 +431,247 @@ impl GuiApp {
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
                     ui.vertical_centered(|ui| {
-                        ui.label(header_text("Configuration", 18.0));
+                        let title = match page {
+                            ConfigPage::Settings => "SETTINGS",
+                            ConfigPage::Hotkeys => "APPLICATION HOTKEYS",
+                            ConfigPage::Midi => "MIDI EMULATION",
+                        };
+                        ui.label(header_text(title, 18.0));
                     });
                     ui.add_space(6.0);
 
-                    ui.label(egui::RichText::new("INPUT").color(LABEL).size(11.0));
-                    beige_group(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label("Input release");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    bind_button(ui, &mut dialog, BindTarget::InputRelease);
-                                },
+                    match page {
+                        ConfigPage::Settings => {
+                            ui.label(
+                                egui::RichText::new("APPLICATION SETTINGS")
+                                    .color(LABEL)
+                                    .size(11.0),
                             );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Full screen");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    bind_button(ui, &mut dialog, BindTarget::Fullscreen);
-                                },
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Game controller");
-                            let bound = self.controller_config.as_ref().map_or_else(
-                                || "Not set".to_owned(),
-                                |config| config.device.name.clone(),
-                            );
-                            ui.label(bound);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add_enabled(
-                                            self.host_input.joystick_enabled()
-                                                && self.controllers.is_some(),
-                                            egui::Button::new("Controller setup..."),
-                                        )
-                                        .clicked()
-                                    {
-                                        open_controller_setup = true;
-                                    }
-                                },
-                            );
-                        });
-                        if !self.host_input.joystick_enabled() {
-                            ui.small("Joystick input is disabled in izarravm.toml.");
-                        } else if self.controllers.is_none() {
-                            ui.small("Host controller input is unavailable.");
+                            beige_group(ui, |ui| {
+                                ui.checkbox(&mut dialog.start_fullscreen, "Start in Full Screen");
+                                ui.horizontal(|ui| {
+                                    ui.label("CRT emulation");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.selectable_value(
+                                                &mut dialog.crt_style,
+                                                CrtStyle::YeOlde,
+                                                "Ye Olde Screene",
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.crt_style,
+                                                CrtStyle::Subtle,
+                                                "Subtle",
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.crt_style,
+                                                CrtStyle::Off,
+                                                "No",
+                                            );
+                                        },
+                                    );
+                                });
+                            });
+
+                            ui.add_space(8.0);
+                            let width = ui.available_width();
+                            if ui
+                                .add_sized(
+                                    [width, 30.0],
+                                    egui::Button::new("Application Hotkeys..."),
+                                )
+                                .clicked()
+                            {
+                                dialog.page = ConfigPage::Hotkeys;
+                            }
+                            if ui
+                                .add_sized(
+                                    [width, 30.0],
+                                    egui::Button::new("Controller emulation..."),
+                                )
+                                .clicked()
+                            {
+                                open_controller_setup = true;
+                            }
+                            if let Some(profile) = &self.controller_profile {
+                                ui.small(format!("Selected controller profile: {profile}"));
+                            }
+                            if !self.host_input.joystick_enabled() {
+                                ui.small("Joystick input is disabled in izarravm.toml.");
+                            } else if self.controllers.is_none() {
+                                ui.small("Host controller input is unavailable.");
+                            }
+                            if ui
+                                .add_sized([width, 30.0], egui::Button::new("MIDI emulation..."))
+                                .clicked()
+                            {
+                                dialog.page = ConfigPage::Midi;
+                            }
                         }
-                    });
-
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("DISPLAY").color(LABEL).size(11.0));
-                    beige_group(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("CRT emulation");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.selectable_value(
-                                        &mut dialog.crt_style,
-                                        CrtStyle::YeOlde,
-                                        "Ye Olde Screene",
-                                    );
-                                    ui.selectable_value(
-                                        &mut dialog.crt_style,
-                                        CrtStyle::Subtle,
-                                        "Subtle",
-                                    );
-                                    ui.selectable_value(&mut dialog.crt_style, CrtStyle::Off, "No");
-                                },
-                            );
-                        });
-                    });
-
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("AUDIO").color(LABEL).size(11.0));
-                    beige_group(ui, |ui| {
-                        // Levels INSIDE the machine's audio chain -- the card's
-                        // output stage, the PC speaker's leg, every source
-                        // balance -- belong to the guest and are set with
-                        // SNDMIXER.COM, on the card's own registers, the way
-                        // they were on the hardware this models. What the host
-                        // owns is the far end of the line-out: the speakers,
-                        // which is the volume fader on the machine panel, and
-                        // which synthesiser answers the two MIDI ports.
-                        ui.small(
-                            "Levels inside the machine are set in DOS with SNDMIXER. \
-                             The panel's volume knob is the speakers.",
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label("P300 wavetable output");
-                            ui.label("FluidSynth");
-                        });
-                        soundfont_picker(ui, &mut dialog.soundfont);
-                        let wavetable_color = if wavetable_status == MidiStatus::Ready {
-                            INK
-                        } else {
-                            egui::Color32::from_rgb(170, 62, 48)
-                        };
-                        ui.colored_label(wavetable_color, midi_status_text(wavetable_status));
-                        ui.add_space(6.0);
-                        let munt_ready =
-                            munt_roms_available(&dialog.mt32_control_rom, &dialog.mt32_pcm_rom);
-                        let munt_label = if munt_ready {
-                            "Munt (MT-32)"
-                        } else {
-                            "Munt (MT-32) (missing ROMs)"
-                        };
-                        let receiver_label = match dialog.midi_backend {
-                            MidiBackend::Off => midi_backend_label(MidiBackend::Off).to_owned(),
-                            MidiBackend::Munt => munt_label.to_owned(),
-                            MidiBackend::External => dialog
-                                .external_midi_port
-                                .as_ref()
-                                .map(midi_port_label)
-                                .unwrap_or_else(|| "Select a host MIDI device".to_owned()),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label("P330 MIDI receiver");
-                            egui::ComboBox::from_id_salt("midi-backend")
-                                .selected_text(receiver_label)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut dialog.midi_backend,
-                                        MidiBackend::Off,
-                                        midi_backend_label(MidiBackend::Off),
-                                    );
-                                    ui.add_enabled_ui(munt_ready, |ui| {
-                                        ui.selectable_value(
-                                            &mut dialog.midi_backend,
-                                            MidiBackend::Munt,
-                                            munt_label,
+                        ConfigPage::Hotkeys => {
+                            beige_group(ui, |ui| {
+                                for (label, target) in [
+                                    ("Input release", BindTarget::InputRelease),
+                                    ("Full screen", BindTarget::Fullscreen),
+                                    ("Screenshot", BindTarget::Screenshot),
+                                ] {
+                                    ui.horizontal(|ui| {
+                                        ui.label(label);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| bind_button(ui, &mut dialog, target),
                                         );
                                     });
-                                    for port in &dialog.midi_ports {
-                                        let selected = dialog.midi_backend == MidiBackend::External
-                                            && dialog.external_midi_port.as_ref() == Some(port);
-                                        if ui
-                                            .selectable_label(selected, midi_port_label(port))
-                                            .clicked()
-                                        {
-                                            dialog.midi_backend = MidiBackend::External;
-                                            dialog.external_midi_port = Some(port.clone());
-                                        }
-                                    }
+                                }
+                            });
+                            ui.small(format!(
+                                "Screenshots are saved in {}.",
+                                self.screenshots_dir.display()
+                            ));
+                        }
+                        ConfigPage::Midi => {
+                            beige_group(ui, |ui| {
+                                ui.small(
+                                    "Set levels inside the machine in DOS with SNDMIXER. \
+                                     The panel volume controls the host speakers.",
+                                );
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("P300 wavetable output");
+                                    ui.label("FluidSynth");
                                 });
-                        });
-                        if dialog.midi_ports.is_empty() {
-                            ui.small("No host MIDI destination ports were found.");
+                                soundfont_picker(ui, &mut dialog.soundfont);
+                                let wavetable_color = if wavetable_status == MidiStatus::Ready {
+                                    INK
+                                } else {
+                                    egui::Color32::from_rgb(170, 62, 48)
+                                };
+                                ui.colored_label(
+                                    wavetable_color,
+                                    midi_status_text(wavetable_status),
+                                );
+                                ui.add_space(6.0);
+                                let munt_ready = munt_roms_available(
+                                    &dialog.mt32_control_rom,
+                                    &dialog.mt32_pcm_rom,
+                                );
+                                let munt_label = if munt_ready {
+                                    "Munt (MT-32)"
+                                } else {
+                                    "Munt (MT-32) (missing ROMs)"
+                                };
+                                let receiver_label = match dialog.midi_backend {
+                                    MidiBackend::Off => {
+                                        midi_backend_label(MidiBackend::Off).to_owned()
+                                    }
+                                    MidiBackend::Munt => munt_label.to_owned(),
+                                    MidiBackend::External => dialog
+                                        .external_midi_port
+                                        .as_ref()
+                                        .map(midi_port_label)
+                                        .unwrap_or_else(|| "Select a host MIDI device".to_owned()),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label("P330 MIDI receiver");
+                                    egui::ComboBox::from_id_salt("midi-backend")
+                                        .selected_text(receiver_label)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut dialog.midi_backend,
+                                                MidiBackend::Off,
+                                                midi_backend_label(MidiBackend::Off),
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.midi_backend,
+                                                MidiBackend::Munt,
+                                                munt_label,
+                                            );
+                                            for port in &dialog.midi_ports {
+                                                let selected = dialog.midi_backend
+                                                    == MidiBackend::External
+                                                    && dialog.external_midi_port.as_ref()
+                                                        == Some(port);
+                                                if ui
+                                                    .selectable_label(
+                                                        selected,
+                                                        midi_port_label(port),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    dialog.midi_backend = MidiBackend::External;
+                                                    dialog.external_midi_port = Some(port.clone());
+                                                }
+                                            }
+                                        });
+                                });
+                                if dialog.midi_ports.is_empty() {
+                                    ui.small("No host MIDI destination ports were found.");
+                                }
+                                if midi_rom_selection_visible(dialog.midi_backend) {
+                                    midi_path_picker(
+                                        ui,
+                                        "MT-32 control ROM",
+                                        &mut dialog.mt32_control_rom,
+                                        "ROM image",
+                                        &["rom", "bin"],
+                                        "ROM file or the set's folder",
+                                    );
+                                    midi_path_picker(
+                                        ui,
+                                        "MT-32 PCM ROM",
+                                        &mut dialog.mt32_pcm_rom,
+                                        "ROM image",
+                                        &["rom", "bin"],
+                                        "ROM file or the set's folder",
+                                    );
+                                }
+                                let status_color = if midi_status == MidiStatus::Ready {
+                                    INK
+                                } else {
+                                    egui::Color32::from_rgb(170, 62, 48)
+                                };
+                                ui.colored_label(status_color, midi_status_text(midi_status));
+                            });
                         }
-                        if dialog.midi_backend == MidiBackend::Munt || !munt_ready {
-                            midi_path_picker(
-                                ui,
-                                "MT-32 control ROM",
-                                &mut dialog.mt32_control_rom,
-                                "ROM image",
-                                &["rom", "bin"],
-                                "ROM file or the set's folder",
-                            );
-                            midi_path_picker(
-                                ui,
-                                "MT-32 PCM ROM",
-                                &mut dialog.mt32_pcm_rom,
-                                "ROM image",
-                                &["rom", "bin"],
-                                "ROM file or the set's folder",
-                            );
-                        }
-                        let status_color = if midi_status == MidiStatus::Ready {
-                            INK
-                        } else {
-                            egui::Color32::from_rgb(170, 62, 48)
-                        };
-                        ui.colored_label(status_color, midi_status_text(midi_status));
-                    });
+                    }
 
                     ui.add_space(14.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Accept").clicked() {
-                            accept = true;
-                            keep_open = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep_open = false;
+                        if page == ConfigPage::Settings {
+                            if ui.button("Accept").clicked() {
+                                accept = true;
+                                keep_open = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                keep_open = false;
+                            }
+                        } else {
+                            if ui.button("Apply").clicked() {
+                                apply = true;
+                            }
+                            if ui.button("Back").clicked() {
+                                return_to_settings = true;
+                            }
                         }
                     });
                 });
         });
         if modal.should_close() {
-            keep_open = false;
+            if page == ConfigPage::Settings {
+                keep_open = false;
+            } else {
+                return_to_settings = true;
+            }
+        }
+        if return_to_settings {
+            dialog.page = ConfigPage::Settings;
+            dialog.capturing = None;
         }
         if accept {
+            self.apply_config(&dialog);
+        }
+        if apply {
             self.apply_config(&dialog);
         }
         if open_controller_setup {
@@ -629,9 +687,12 @@ impl GuiApp {
     fn apply_config(&mut self, dialog: &ConfigDialog) {
         self.input_release = dialog.input_release.clone();
         self.fullscreen_key = dialog.fullscreen.clone();
+        self.screenshot_key = dialog.screenshot.clone();
         self.crt_style = dialog.crt_style;
+        self.prefs.start_fullscreen = dialog.start_fullscreen;
         self.prefs.input_release = dialog.input_release.clone();
         self.prefs.fullscreen = dialog.fullscreen.clone();
+        self.prefs.screenshot = dialog.screenshot.clone();
         self.prefs.crt_style = dialog.crt_style;
         let midi_config = MidiConfig {
             backend: dialog.midi_backend,
@@ -656,24 +717,43 @@ impl GuiApp {
 
     fn open_controller_setup(&mut self) {
         self.disconnect_controller_mapper();
+        let (profiles, mut profile_error) = match self.controller_profiles.list() {
+            Ok(profiles) => (profiles, None),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        };
+        let selected_profile = self.controller_profile.clone();
         let first_device = self.controllers.as_ref().and_then(|controllers| {
             controllers
                 .devices()
                 .first()
                 .map(|device| device.matcher.clone())
         });
-        let selected_device = self
-            .controller_config
+        let staged = selected_profile
+            .as_ref()
+            .and_then(|name| match self.controller_profiles.load(name) {
+                Ok(config) => Some(config),
+                Err(err) => {
+                    profile_error = Some(err.to_string());
+                    self.controller_config.clone()
+                }
+            })
+            .or_else(|| {
+                selected_profile
+                    .is_none()
+                    .then(|| first_device.clone().map(ControllerConfig::default_keyboard))
+                    .flatten()
+            });
+        let selected_device = staged
             .as_ref()
             .map(|config| config.device.clone())
             .or_else(|| first_device.clone());
-        let staged = self
-            .controller_config
-            .clone()
-            .or_else(|| first_device.map(ControllerConfig::default_keyboard));
         self.controller_setup = Some(ControllerSetupDialog {
             staged,
             tab: ControllerSetupTab::Assignments,
+            profiles,
+            selected_profile,
+            profile_prompt: None,
+            profile_error,
             selected_device,
             capturing_key: None,
         });
@@ -691,13 +771,28 @@ impl GuiApp {
         }
     }
 
-    fn apply_controller_setup(&mut self, config: Option<ControllerConfig>) {
+    fn apply_controller_setup(
+        &mut self,
+        profile: Option<String>,
+        config: Option<ControllerConfig>,
+    ) -> Result<(), String> {
+        match (&profile, &config) {
+            (Some(profile), Some(config)) => self
+                .controller_profiles
+                .save(profile, config)
+                .map_err(|err| err.to_string())?,
+            (None, None) => {}
+            _ => return Err("Add a controller profile before you save this mapping.".into()),
+        }
         self.disconnect_controller_mapper();
+        self.controller_profile = profile.clone();
         self.controller_config = config.clone();
         self.controller_mapper = config.clone().map(ControllerMapper::new);
-        self.prefs.controller = config;
+        self.prefs.controller = None;
+        self.prefs.controller_profile = profile;
         self.last_controller_gameport = None;
         self.save_prefs();
+        Ok(())
     }
 
     fn controller_setup_ui(&mut self, ctx: &egui::Context) {
@@ -728,6 +823,9 @@ impl GuiApp {
         let values = self.controller_values.clone();
         let mut keep_open = true;
         let mut save = false;
+        let mut select_profile = None;
+        let mut add_profile = None;
+        let mut delete_profile = None;
         let modal = egui::Modal::new(egui::Id::new("controller-setup-modal")).show(ctx, |ui| {
             egui::Frame::new()
                 .fill(PANEL_FACE)
@@ -778,7 +876,7 @@ impl GuiApp {
                             );
                             egui::ComboBox::from_id_salt("controller-device")
                                 .selected_text(selected)
-                                .width(360.0)
+                                .width(300.0)
                                 .show_ui(ui, |ui| {
                                     for (device, display) in devices.iter().zip(&display_devices) {
                                         let is_selected = setup.selected_device.as_ref().is_some_and(
@@ -804,6 +902,50 @@ impl GuiApp {
                                         }
                                     }
                                 });
+                            ui.label("PROFILE");
+                            egui::ComboBox::from_id_salt("controller-saved-profile")
+                                .selected_text(
+                                    setup
+                                        .selected_profile
+                                        .as_deref()
+                                        .unwrap_or("Select a profile"),
+                                )
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for profile in &setup.profiles {
+                                        let selected =
+                                            setup.selected_profile.as_ref() == Some(profile);
+                                        if ui.selectable_label(selected, profile).clicked()
+                                            && !selected
+                                        {
+                                            select_profile = Some(profile.clone());
+                                        }
+                                    }
+                                });
+                            if ui
+                                .add_enabled(
+                                    setup.staged.is_some() || setup.selected_device.is_some(),
+                                    egui::Button::new("Add new profile"),
+                                )
+                                .clicked()
+                            {
+                                setup.profile_prompt = Some(ControllerProfilePrompt::Add {
+                                    name: String::new(),
+                                    error: None,
+                                    request_focus: true,
+                                });
+                            }
+                            if ui
+                                .add_enabled(
+                                    setup.selected_profile.is_some(),
+                                    egui::Button::new("Delete Profile"),
+                                )
+                                .clicked()
+                                && let Some(name) = setup.selected_profile.clone()
+                            {
+                                setup.profile_prompt =
+                                    Some(ControllerProfilePrompt::Delete { name });
+                            }
                             if ui
                                 .add_enabled(
                                     setup.staged.is_some(),
@@ -812,11 +954,20 @@ impl GuiApp {
                                 .clicked()
                             {
                                 setup.staged = None;
+                                setup.selected_profile = None;
                                 setup.capturing_key = None;
                             }
                         });
+                        if let Some(error) = &setup.profile_error {
+                            ui.colored_label(egui::Color32::from_rgb(170, 62, 48), error);
+                        }
+                        ui.small(
+                            "Add creates a named profile. Delete asks for confirmation. Save applies mapping edits.",
+                        );
                         if devices.is_empty() {
                             ui.small("No connected host controller was found. Saved mappings remain available.");
+                        } else if setup.staged.is_some() && setup.selected_profile.is_none() {
+                            ui.small("Add a profile before you save this mapping.");
                         }
                     });
 
@@ -867,15 +1018,21 @@ impl GuiApp {
                     } else {
                         ui.add_space(20.0);
                         ui.vertical_centered(|ui| {
-                            ui.label("Choose a connected device to create a mapping.");
+                            ui.label("Choose a device or a saved profile to create a mapping.");
                         });
                     }
 
                     ui.add_space(12.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Save").clicked() {
+                        let can_save = controller_setup_can_save(
+                            setup.selected_profile.as_deref(),
+                            setup.staged.is_some(),
+                        );
+                        if ui
+                            .add_enabled(can_save, egui::Button::new("Save"))
+                            .clicked()
+                        {
                             save = true;
-                            keep_open = false;
                         }
                         if ui.button("Cancel").clicked() {
                             keep_open = false;
@@ -886,8 +1043,158 @@ impl GuiApp {
         if modal.should_close() {
             keep_open = false;
         }
+        if keep_open && let Some(mut prompt) = setup.profile_prompt.take() {
+            let mut keep_prompt = true;
+            let prompt_modal =
+                egui::Modal::new(egui::Id::new("controller-profile-prompt")).show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(PANEL_FACE)
+                        .inner_margin(egui::Margin::same(14))
+                        .corner_radius(4.0)
+                        .show(ui, |ui| {
+                            beige_visuals(ui);
+                            ui.set_width(340.0);
+                            match &mut prompt {
+                                ControllerProfilePrompt::Add {
+                                    name,
+                                    error,
+                                    request_focus,
+                                } => {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(header_text("ADD CONTROLLER PROFILE", 17.0));
+                                    });
+                                    ui.label("Profile name");
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(name)
+                                            .hint_text("Game or profile name")
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    if *request_focus {
+                                        response.request_focus();
+                                        *request_focus = false;
+                                    }
+                                    if let Some(error) = error {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(170, 62, 48),
+                                            error,
+                                        );
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !name.trim().is_empty(),
+                                                    egui::Button::new("Add"),
+                                                )
+                                                .clicked()
+                                            {
+                                                add_profile = Some(name.trim().to_owned());
+                                                keep_prompt = false;
+                                            }
+                                            if ui.button("Cancel").clicked() {
+                                                keep_prompt = false;
+                                            }
+                                        },
+                                    );
+                                }
+                                ControllerProfilePrompt::Delete { name } => {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(header_text("DELETE CONTROLLER PROFILE", 17.0));
+                                    });
+                                    ui.label(format!("Delete profile {name:?}?"));
+                                    ui.label("You cannot undo this action.");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("Delete").clicked() {
+                                                delete_profile = Some(name.clone());
+                                                keep_prompt = false;
+                                            }
+                                            if ui.button("Cancel").clicked() {
+                                                keep_prompt = false;
+                                            }
+                                        },
+                                    );
+                                }
+                            }
+                        });
+                });
+            if prompt_modal.should_close() {
+                keep_prompt = false;
+            }
+            if keep_prompt {
+                setup.profile_prompt = Some(prompt);
+            }
+        }
+        if let Some(profile) = select_profile {
+            match self.controller_profiles.load(&profile) {
+                Ok(config) => {
+                    setup.selected_device = Some(config.device.clone());
+                    setup.staged = Some(config);
+                    setup.selected_profile = Some(profile);
+                    setup.profile_error = None;
+                    setup.capturing_key = None;
+                }
+                Err(err) => setup.profile_error = Some(err.to_string()),
+            }
+        }
+        if let Some(name) = add_profile {
+            let config = setup.staged.clone().or_else(|| {
+                setup
+                    .selected_device
+                    .clone()
+                    .map(ControllerConfig::default_keyboard)
+            });
+            if let Some(config) = config {
+                match self.controller_profiles.create_named(&name, &config) {
+                    Ok(()) => {
+                        match self.controller_profiles.list() {
+                            Ok(profiles) => {
+                                setup.profiles = profiles;
+                                setup.profile_error = None;
+                            }
+                            Err(err) => setup.profile_error = Some(err.to_string()),
+                        }
+                        setup.selected_profile = Some(name);
+                        setup.staged = Some(config);
+                    }
+                    Err(err) => {
+                        setup.profile_prompt = Some(ControllerProfilePrompt::Add {
+                            name,
+                            error: Some(err.to_string()),
+                            request_focus: true,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(profile) = delete_profile {
+            match self.controller_profiles.delete(&profile) {
+                Ok(()) => {
+                    setup.profiles.retain(|candidate| candidate != &profile);
+                    if setup.selected_profile.as_ref() == Some(&profile) {
+                        setup.selected_profile = None;
+                        setup.staged = None;
+                        setup.capturing_key = None;
+                    }
+                    setup.profile_error = None;
+                    if self.controller_profile.as_ref() == Some(&profile) {
+                        let _ = self.apply_controller_setup(None, None);
+                    }
+                }
+                Err(err) => setup.profile_error = Some(err.to_string()),
+            }
+        }
         if save {
-            self.apply_controller_setup(setup.staged.take());
+            match self.apply_controller_setup(setup.selected_profile.clone(), setup.staged.clone())
+            {
+                Ok(()) => keep_open = false,
+                Err(err) => {
+                    setup.profile_error = Some(err);
+                    keep_open = true;
+                }
+            }
         }
         if keep_open {
             self.controller_setup = Some(setup);

@@ -1727,6 +1727,7 @@ dependencies = [
  "izarravm-input",
  "izarravm-machine",
  "izarravm-video",
+ "png 0.17.16",
  "pollster",
  "rfd",
  "serde",

@@ -3,6 +3,8 @@
 
 #[path = "gui_runtime.rs"]
 mod runtime;
+#[path = "screenshot.rs"]
+mod screenshot;
 #[path = "gui_session.rs"]
 mod session;
 #[path = "gui_ui.rs"]
@@ -14,6 +16,7 @@ pub use runtime::run;
 pub(crate) use session::load_cd_image_from_path;
 
 use crate::controller_names::ControllerNameResolver;
+use crate::controller_profiles::ControllerProfileStore;
 use crate::host_input::HostInputPolicy;
 use crate::prefs::{CrtStyle, GuiPrefs, KeyBinding, MAX_VOLUME};
 use crate::startup::GuiLaunch;
@@ -27,6 +30,7 @@ use izarravm_input::{
     HostKeyboard, JoystickAxis, JoystickButton, keyboard_controls, resolve_control_value,
 };
 use izarravm_machine::{CdAudioState, GamePortButtonTransition, GamePortUpdate, JoystickState};
+use screenshot::ScreenshotFrame;
 use session::{
     AppliedState, CdSource, FloppySource, GuestInput, GuiSession, PreparedCd, PreparedFloppy,
     PreparedInitialMedia, RequestId, SessionClosed, SessionEvent, SessionFailure, SessionFrame,
@@ -37,7 +41,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -622,9 +626,12 @@ pub struct GuiApp {
     session: GuiSession,
     session_snapshot: SessionSnapshot,
     session_frame: Option<SessionFrame>,
+    screenshot_frame: Option<ScreenshotFrame>,
     host_input: HostInputPolicy,
     controllers: Option<ControllerManager>,
     controller_names: ControllerNameResolver,
+    controller_profiles: ControllerProfileStore,
+    controller_profile: Option<String>,
     controller_config: Option<ControllerConfig>,
     controller_mapper: Option<ControllerMapper>,
     controller_values: Vec<HostControlValue>,
@@ -705,11 +712,12 @@ pub struct GuiApp {
     // CRT presentation style (off / subtle / Ye Olde). Persisted; read by
     // monitor_ui each frame and mapped to the shader's style uniform.
     crt_style: CrtStyle,
-    // Live hotkeys for releasing captured input and toggling fullscreen. The
+    // Live host hotkeys. The
     // event loop matches physical keys against these; the config dialog edits
     // staged copies and writes them back on Accept.
     input_release: KeyBinding,
     fullscreen_key: KeyBinding,
+    screenshot_key: KeyBinding,
     // The configuration modal, when open. Holds a staged copy of the settings it
     // edits so Cancel discards and Accept applies.
     config_dialog: Option<ConfigDialog>,
@@ -717,6 +725,7 @@ pub struct GuiApp {
     // file sits next to the C: root and is rewritten on a change.
     prefs: GuiPrefs,
     prefs_path: PathBuf,
+    screenshots_dir: PathBuf,
     // Whether the beige control panel is expanded. Mirrors prefs.panel_open and
     // is persisted on toggle.
     panel_open: bool,
@@ -729,13 +738,25 @@ pub struct GuiApp {
 enum BindTarget {
     InputRelease,
     Fullscreen,
+    Screenshot,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ConfigPage {
+    #[default]
+    Settings,
+    Hotkeys,
+    Midi,
 }
 
 /// Staged settings edited by the configuration modal. Seeded from the live
 /// values when opened; applied on Accept, discarded on Cancel.
 struct ConfigDialog {
+    page: ConfigPage,
+    start_fullscreen: bool,
     input_release: KeyBinding,
     fullscreen: KeyBinding,
+    screenshot: KeyBinding,
     crt_style: CrtStyle,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
@@ -757,8 +778,23 @@ enum ControllerSetupTab {
 struct ControllerSetupDialog {
     staged: Option<ControllerConfig>,
     tab: ControllerSetupTab,
+    profiles: Vec<String>,
+    selected_profile: Option<String>,
+    profile_prompt: Option<ControllerProfilePrompt>,
+    profile_error: Option<String>,
     selected_device: Option<ControllerDeviceMatcher>,
     capturing_key: Option<usize>,
+}
+
+enum ControllerProfilePrompt {
+    Add {
+        name: String,
+        error: Option<String>,
+        request_focus: bool,
+    },
+    Delete {
+        name: String,
+    },
 }
 
 fn path_text(path: Option<&PathBuf>) -> String {
@@ -769,6 +805,43 @@ fn path_text(path: Option<&PathBuf>) -> String {
 fn optional_path(text: &str) -> Option<PathBuf> {
     let text = text.trim();
     (!text.is_empty()).then(|| PathBuf::from(text))
+}
+
+/// Load the selected controller profile and migrate the old inline mapping.
+/// A failed migration keeps the inline mapping live so an unrelated preferences
+/// save cannot silently disable the controller.
+fn restore_controller_profile(
+    store: &ControllerProfileStore,
+    prefs: &mut GuiPrefs,
+) -> (Option<String>, Option<ControllerConfig>, bool) {
+    let selected = prefs.controller_profile.clone();
+    if let Some(name) = selected.as_deref() {
+        match store.load(name) {
+            Ok(config) => {
+                let changed = prefs.controller.take().is_some();
+                return (Some(name.to_owned()), Some(config), changed);
+            }
+            Err(err) => {
+                warn!(profile = name, %err, "could not load selected controller profile");
+            }
+        }
+    }
+
+    if let Some(config) = prefs.controller.clone() {
+        match store.create(&config) {
+            Ok(name) => {
+                prefs.controller = None;
+                prefs.controller_profile = Some(name.clone());
+                return (Some(name), Some(config), true);
+            }
+            Err(err) => {
+                warn!(%err, "could not migrate inline controller mapping to a profile");
+                return (selected, Some(config), false);
+            }
+        }
+    }
+
+    (selected, None, false)
 }
 
 fn cpu_mode_label(mode: GswMode) -> String {
@@ -787,6 +860,14 @@ fn midi_backend_label(backend: MidiBackend) -> &'static str {
         MidiBackend::External => "External MIDI",
         MidiBackend::Munt => "Munt (MT-32)",
     }
+}
+
+fn midi_rom_selection_visible(backend: MidiBackend) -> bool {
+    backend == MidiBackend::Munt
+}
+
+fn controller_setup_can_save(profile: Option<&str>, has_mapping: bool) -> bool {
+    profile.is_some() == has_mapping
 }
 
 /// Whether the two ROM boxes name something the loader can work with.
@@ -1034,6 +1115,7 @@ impl GuiApp {
             host_input,
             mut prefs,
             prefs_path,
+            state_dir,
         } = launch;
         // Always built, even with no sound device on the host: the queue is
         // what the emulation thread writes to, and it has to exist before a
@@ -1060,11 +1142,17 @@ impl GuiApp {
         };
         let mut session = GuiSession::start(spec, initial_media)?;
         let initial_update = session.poll();
-        let initial_prefs_changed = remember_initial_media(&mut prefs, &initial_update.snapshot);
+        let mut initial_prefs_changed =
+            remember_initial_media(&mut prefs, &initial_update.snapshot);
         let crt_style = prefs.crt_style;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
-        let controller_config = prefs.controller.clone();
+        let screenshot_key = prefs.screenshot.clone();
+        let screenshots_dir = screenshot::screenshots_dir(&state_dir);
+        let controller_profiles = ControllerProfileStore::new(&state_dir);
+        let (controller_profile, controller_config, profile_prefs_changed) =
+            restore_controller_profile(&controller_profiles, &mut prefs);
+        initial_prefs_changed |= profile_prefs_changed;
         let controller_mapper = controller_config.clone().map(ControllerMapper::new);
         let controllers = host_input
             .joystick_enabled()
@@ -1077,13 +1165,20 @@ impl GuiApp {
                 }
             });
         let panel_open = prefs.panel_open;
+        let screenshot_frame = initial_update
+            .newest_frame
+            .as_ref()
+            .map(|frame| ScreenshotFrame::new(frame.words.clone(), frame.width, frame.height));
         let app = Self {
             session,
             session_snapshot: initial_update.snapshot,
             session_frame: initial_update.newest_frame,
+            screenshot_frame,
             host_input,
             controllers,
             controller_names: ControllerNameResolver::default(),
+            controller_profiles,
+            controller_profile,
             controller_config,
             controller_mapper,
             controller_values: Vec::new(),
@@ -1119,9 +1214,11 @@ impl GuiApp {
             crt_style,
             input_release,
             fullscreen_key,
+            screenshot_key,
             config_dialog: None,
             prefs,
             prefs_path,
+            screenshots_dir,
             panel_open,
             logo: None,
         };
@@ -1135,6 +1232,11 @@ impl GuiApp {
         let update = self.session.poll();
         self.session_snapshot = update.snapshot;
         if let Some(frame) = update.newest_frame {
+            self.screenshot_frame = Some(ScreenshotFrame::new(
+                frame.words.clone(),
+                frame.width,
+                frame.height,
+            ));
             // FOLD, do not overwrite. The frame already sitting here was polled
             // and never painted -- egui may have discarded the pass, or two
             // polls may fall between two paints -- and its scanline runs are the
@@ -1174,6 +1276,7 @@ impl GuiApp {
         }
         if !self.session_snapshot.powered {
             self.session_frame = None;
+            self.screenshot_frame = None;
             self.frame_seq = u64::MAX;
         }
         if prefs_changed {
@@ -1188,6 +1291,7 @@ impl GuiApp {
     fn reset_presentation_state(&mut self) {
         self.frame_seq = u64::MAX;
         self.session_frame = None;
+        self.screenshot_frame = None;
         self.last_controller_gameport = None;
         self.controller_mapper = self.controller_config.clone().map(ControllerMapper::new);
         self.guest_keys = GuestKeyRouter::default();
@@ -1237,6 +1341,19 @@ impl GuiApp {
         self.poll_session();
         self.save_prefs();
         self.reset_presentation_state();
+    }
+
+    fn save_screenshot(&self) {
+        let Some(frame) = &self.screenshot_frame else {
+            warn!("could not save screenshot because no guest frame is available");
+            return;
+        };
+        match frame.save(&self.screenshots_dir) {
+            Ok(path) => info!(path = %path.display(), "saved guest screenshot"),
+            Err(err) => {
+                warn!(%err, path = %self.screenshots_dir.display(), "could not save screenshot")
+            }
+        }
     }
 }
 
@@ -1963,6 +2080,7 @@ fn bind_button(ui: &mut egui::Ui, dialog: &mut ConfigDialog, target: BindTarget)
         match target {
             BindTarget::InputRelease => dialog.input_release.display(),
             BindTarget::Fullscreen => dialog.fullscreen.display(),
+            BindTarget::Screenshot => dialog.screenshot.display(),
         }
     };
     if ui.selectable_label(capturing, label).clicked() {

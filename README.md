@@ -96,9 +96,12 @@ On a host that is not Windows, change the `c_drive` path in
 `examples/machine.toml`. You can also use `--c-drive /path/to/dosroot`.
 
 By default, the C: drive, `cmos.bin`, and `izarravm.conf` are in the
-`~/.izarravm` directory of the user. Thus the program writes nothing into the
-working directory. Use `--portable` to keep them in a `c_drive` folder beside
-the executable. This gives an installation in one place.
+`~/.izarravm` directory of the user. Controller profiles are in
+`~/.izarravm/Controller Profiles`, and screenshots are in
+`~/.izarravm/screenshots`. Thus the program writes nothing into the working
+directory. Use `--portable` to keep the C: drive, `cmos.bin`, and
+`izarravm.conf` beside the executable. Controller profiles and screenshots
+stay in the application state directory.
 
 ## Optional MT-32 and Glide files
 
@@ -112,13 +115,16 @@ needs one control ROM, and the PCM ROM of the same machine:
 | CM-32L | `ctrl_cm32l_1_00.rom` or `ctrl_cm32l_1_02.rom` | `pcm_cm32l.rom` |
 | CM-32LN | `ctrl_cm32ln_1_00.rom` | `pcm_cm32l.rom` |
 
-The Settings window accepts any control path and any PCM path. Thus you can
-select the archive file names directly. For automatic discovery, copy an MT-32
-pair and give the copies the names `~/.izarravm/MT32_CONTROL.ROM` and
+In **Settings**, select **MIDI emulation...**. In **MIDI EMULATION**, select
+**Munt (MT-32)**. The ROM selectors then appear. Each selector accepts any
+control path or PCM path.
+Thus you can select the archive file names directly. For automatic discovery,
+copy an MT-32 pair and give the copies the names
+`~/.izarravm/MT32_CONTROL.ROM` and
 `~/.izarravm/MT32_PCM.ROM`. For a CM-32L or a CM-32LN pair, use the names
 `~/.izarravm/CM32L_CONTROL.ROM` and `~/.izarravm/CM32L_PCM.ROM`. The discovery
 ignores the letter case of ASCII characters. `--portable` disables the
-discovery, but a path in the Settings window continues to operate. The names
+discovery, but a path in **MIDI EMULATION** continues to operate. The names
 in the table are the names in the `mt32pi` directory of the
 [Roland MT-32 ROMs archive](https://archive.org/details/Roland-MT-32-ROMs).
 

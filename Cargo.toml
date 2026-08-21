@@ -51,6 +51,7 @@ egui_extras = { version = "0.32", default-features = false, features = ["svg"] }
 egui-winit = "0.32"
 egui-wgpu = { version = "0.32", features = ["winit"] }
 pollster = "0.4"
+png = "0.17"
 rfd = "0.15"
 softbuffer = "0.4.8"
 # Default features pull in Matroska, AIFF, ADPCM and more; this is only the

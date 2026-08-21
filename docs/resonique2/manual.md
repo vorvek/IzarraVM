@@ -302,9 +302,9 @@ interface supplies recording, external clock sync, metronome input, or MPU
 reference filters.
 
 IzarraVM supplies the daughterboard and the external receiver separately. The
-[GUI guide](../izarravm-gui/guide.md#the-config-modal) describes those host
-settings and their status messages. The [recipes](../recipes/index.md) give
-the procedures that use them.
+[GUI guide](../izarravm-gui/guide.md#the-settings-window) describes the MIDI
+emulation settings and their status messages. The
+[recipes](../recipes/index.md) give the procedures that use them.
 
 ## Next
 

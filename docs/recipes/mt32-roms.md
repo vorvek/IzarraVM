@@ -17,10 +17,11 @@ after you have a set.
 
 ## What the loader accepts
 
-The two boxes in the config modal have the labels **MT-32 control ROM** and
-**MT-32 PCM ROM**. But neither box is a fixed slot. Each box accepts one ROM
-file, or the folder with the ROM set. The loader identifies an image by its
-content, and not by its file name. Thus:
+Select **Munt (MT-32)** in the **MIDI EMULATION** window. Two ROM boxes then
+appear. They have the labels **MT-32 control ROM** and **MT-32 PCM ROM**. The
+boxes are hidden for the other P330 receivers. Neither box is a fixed slot.
+Each box accepts one ROM file, or the folder with the ROM set. The loader
+identifies an image by its content, and not by its file name. Thus:
 
 - **The file name is not important.** `MT32_CONTROL.ROM` and `MT32_PCM.ROM`
   load. A set with firmware version names loads. A set with other names loads.
@@ -41,24 +42,25 @@ content, and not by its file name. Thus:
 1. Put the ROM set in its own folder, with no other file in it. The loader
    also scans a folder with other files, but that scan stops after the first
    64 files.
-2. Open the config modal from the control panel, and find the Audio section.
-3. Give the set to **MT-32 control ROM** and **MT-32 PCM ROM**. The folder in
+2. Open **Settings**.
+3. Select **MIDI emulation...**.
+4. Select Munt as the **P330 MIDI receiver**. If the ROM paths are empty, the
+   label is **Munt (MT-32) (missing ROMs)**. The two ROM boxes appear after you
+   select it.
+5. Give the set to **MT-32 control ROM** and **MT-32 PCM ROM**. The folder in
    both boxes is sufficient. The two file names are also sufficient if each
    file is a whole image.
-4. Select **Munt (MT-32)** as the **P330 MIDI receiver**. You can select this
-   entry only after both boxes name a file or a folder that exists. Before
-   that, the entry shows `Munt (MT-32) (missing ROMs)`. The two ROM boxes stay
-   on the screen with each receiver.
-5. Press **Accept**, and read the status line below the selector. `Ready`
-   means that the synthesizer opened.
-6. Start the game, and select **MT-32**, **LAPC-I**, or **MPU-401** at port
-   `330`.
+6. Select **Apply**.
+7. Read the status line below the selector. `Ready` means that the synthesizer
+   opened.
+8. Start the game.
+9. In the setup program of the game, select **MT-32**, **LAPC-I**, or
+   **MPU-401** at port `330`.
 
 ## Automatic discovery
 
-If both boxes are always empty, IzarraVM looks one time at startup. It looks
-in the state directory that holds `cmos.bin` and `izarravm.conf`. It takes the
-first of these that it finds:
+If both boxes are empty, IzarraVM looks one time at startup. It looks in
+`~/.izarravm`. It takes the first of these that it finds:
 
 - `MT32_CONTROL.ROM` with `MT32_PCM.ROM`, or `CM32L_CONTROL.ROM` with
   `CM32L_PCM.ROM`, directly in that directory. The name check ignores the
@@ -72,9 +74,9 @@ This function is for a set that you copy into that directory. It is not a
 search. It does not operate under `--portable`, and it looks in no other
 directory. It does not change a path that is already in a box.
 
-**Accept** is also the retry control. You can correct a set outside the
+**Apply** is also the retry control. You can correct a set outside the
 emulator. For example, you can copy an absent file into the folder, or change
-the name of the folder. Press **Accept** again to load the corrected set. A
+the name of the folder. Select **Apply** again to load the corrected set. A
 change in the panel is not necessary, and a restart of the machine is not
 necessary.
 
@@ -110,7 +112,7 @@ is more useful than a list with one entry.
 
 - [How to use your own MIDI player](host-midi-player.md): how to send P330 to
   the host.
-- [IzarraVM GUI guide](../izarravm-gui/guide.md#the-config-modal): the full
-  Audio section.
+- [IzarraVM GUI guide](../izarravm-gui/guide.md#the-settings-window): the MIDI
+  emulation settings.
 - [ReSonique II sound card manual](../resonique2/manual.md#midi-and-wavetable):
   the MPU-401 ports, as the guest finds them.

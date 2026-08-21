@@ -25,23 +25,24 @@ Erichsen), which is free for personal use.
    permitted. A special name, for example `IzarraVM`, is easier to find in a
    list. The port exists while loopMIDI operates, and loopMIDI makes its saved
    ports again at each start.
-3. Make the port before you open the config modal of IzarraVM. The modal reads
-   the MIDI destinations of the host when it opens. It does not read them
-   again while it is open. If the port exists but the list does not show it,
-   close the modal and open it again.
-4. In IzarraVM, open the config modal from the control panel. Find **P330 MIDI
-   receiver** in the Audio section. Select the loopMIDI port by its name. A
-   host destination has its name and then a number, for example
+3. Make the port before you open **Settings** in IzarraVM.
+4. Open **Settings**. It reads the MIDI destinations of the host when it opens.
+   It does not read them again while it is open. If the list does not show the
+   port, close **Settings** and open it again.
+5. Select **MIDI emulation...**.
+6. Select the loopMIDI port in **P330 MIDI receiver**. A host destination has
+   its name and then a number, for example
    `IzarraVM #1`. The number separates two interfaces with the same name.
-5. Press **Accept**. The status line below the selector shows `Ready` when the
+7. Select **Apply**. The status line below the selector shows `Ready` when the
    port opens.
-6. In the MIDI player, select the same loopMIDI port as its MIDI **input**.
+8. In the MIDI player, select the same loopMIDI port as its MIDI **input**.
    The player must listen before the guest starts a song. Most players open
    the input when their window opens, and not at the start of the playback.
-7. Start the game. In its setup program, select **General MIDI**,
-   **MPU-401**, or **MIDI** at port `330`. The music then goes from the guest,
-   through the loopMIDI port, to the host application. The host application
-   plays it through its own audio device.
+9. Start the game.
+10. In the setup program of the game, select **General MIDI**, **MPU-401**, or
+    **MIDI** at port `330`. The music then goes through the loopMIDI port to
+    the host application. The host application plays it through its own audio
+    device.
 
 The selection is a host preference, and IzarraVM writes it to
 `izarravm.conf`. Thus it stays after a restart. The named destination is a
@@ -49,7 +50,7 @@ fixed choice, and IzarraVM does not replace it.
 
 The port can be absent at power-on. The usual cause is that loopMIDI did not
 start. The status line then reports that the selected host MIDI destination is
-not available, and P330 stays silent. Press **Accept** again after the port
+not available, and P330 stays silent. Select **Apply** again after the port
 exists.
 
 ## Notes
@@ -80,7 +81,7 @@ exists.
   specified instrument at its end.
 - [Nuked-SC55 for Sound Canvas playback](nuked-sc55.md): the same instrument,
   from its own ROMs.
-- [IzarraVM GUI guide](../izarravm-gui/guide.md#the-config-modal): each field
-  in the Audio section, and the status messages.
+- [IzarraVM GUI guide](../izarravm-gui/guide.md#the-settings-window): the MIDI
+  emulation settings and the status messages.
 - [ReSonique II sound card manual](../resonique2/manual.md#midi-and-wavetable):
   the two MPU-401 ports, as the guest finds them.

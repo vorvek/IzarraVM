@@ -30,6 +30,7 @@ enum KeyRoute {
     },
     ReleaseCapture,
     ToggleFullscreen,
+    SaveScreenshot,
     Swallowed,
 }
 
@@ -40,6 +41,7 @@ struct KeyRouteContext<'a> {
     input_captured: bool,
     input_release: &'a KeyBinding,
     fullscreen: &'a KeyBinding,
+    screenshot: &'a KeyBinding,
     // Super-key state the host reports outside winit. On Windows the keyboard
     // hook can swallow a Super key before winit sees it, so the hook's own view
     // is the only complete one; it is ORed with what the router tracked.
@@ -50,6 +52,7 @@ struct KeyRouteContext<'a> {
 #[derive(Default)]
 struct HostKeyRouter {
     keyboard: HostKeyboard,
+    text_input_active: bool,
     ctrl_down: bool,
     shift_down: bool,
     alt_down: bool,
@@ -114,6 +117,13 @@ impl HostKeyRouter {
             return KeyRoute::Swallowed;
         }
 
+        if self.text_input_active {
+            if pressed && !repeat {
+                self.swallow(code);
+            }
+            return KeyRoute::Swallowed;
+        }
+
         if context.capturing_bind && is_modifier {
             if pressed && !repeat {
                 self.swallow(code);
@@ -150,6 +160,15 @@ impl HostKeyRouter {
             self.swallow(code);
             return KeyRoute::ToggleFullscreen;
         }
+        if pressed
+            && !repeat
+            && context
+                .screenshot
+                .matches(&key, ctrl, shift, alt, super_key)
+        {
+            self.swallow(code);
+            return KeyRoute::SaveScreenshot;
+        }
 
         KeyRoute::Guest {
             code,
@@ -170,6 +189,24 @@ impl HostKeyRouter {
 
     fn keyboard_mut(&mut self) -> &mut HostKeyboard {
         &mut self.keyboard
+    }
+
+    fn text_input_active(&self) -> bool {
+        self.text_input_active
+    }
+
+    fn set_text_input_active(
+        &mut self,
+        active: bool,
+        policy: HostInputPolicy,
+    ) -> Vec<GuestKeyTransition> {
+        let releases = if active && !self.text_input_active {
+            self.focus_lost(policy)
+        } else {
+            Vec::new()
+        };
+        self.text_input_active = active;
+        releases
     }
 
     fn focus_lost(&mut self, policy: HostInputPolicy) -> Vec<GuestKeyTransition> {
@@ -299,7 +336,7 @@ impl WinitApp {
     }
 
     /// Translate one physical key transition to the guest. The configurable input
-    /// release and fullscreen hotkeys are intercepted (and withheld from the
+    /// release, fullscreen, and screenshot hotkeys are intercepted (and withheld from the
     /// guest); a pending rebind capture swallows the next key; everything else
     /// goes through HostKeyboard and on to the emulation thread. Used by both the
     /// raw DeviceEvent::Key path and the cooked WindowEvent fallback.
@@ -314,6 +351,7 @@ impl WinitApp {
                 input_captured: self.gui.input_captured,
                 input_release: &self.gui.input_release,
                 fullscreen: &self.gui.fullscreen_key,
+                screenshot: &self.gui.screenshot_key,
                 host_super_down: host_super_down(),
             },
         );
@@ -346,6 +384,7 @@ impl WinitApp {
                 }
             }
             KeyRoute::ToggleFullscreen => self.toggle_fullscreen(),
+            KeyRoute::SaveScreenshot => self.gui.save_screenshot(),
             KeyRoute::Swallowed => {}
         }
         self.sync_super_grab();
@@ -363,16 +402,24 @@ impl WinitApp {
         set_super_grabbed(self.focused && owns_keyboard);
     }
 
+    fn sync_text_input(&mut self) {
+        let releases = self
+            .keys
+            .set_text_input_active(self.gui.is_editing_profile_name(), self.gui.host_input);
+        self.gui.release_physical_keys(releases);
+    }
+
     /// Toggle borderless fullscreen on the window.
     fn toggle_fullscreen(&mut self) {
         self.is_fullscreen = !self.is_fullscreen;
         if let Some(window) = &self.window {
-            let mode = self
-                .is_fullscreen
-                .then_some(winit::window::Fullscreen::Borderless(None));
-            window.set_fullscreen(mode);
+            window.set_fullscreen(fullscreen_mode(self.is_fullscreen));
         }
     }
+}
+
+fn fullscreen_mode(enabled: bool) -> Option<winit::window::Fullscreen> {
+    enabled.then_some(winit::window::Fullscreen::Borderless(None))
 }
 
 impl ApplicationHandler for WinitApp {
@@ -384,7 +431,8 @@ impl ApplicationHandler for WinitApp {
             .with_title("IzarraVM")
             .with_window_icon(star_window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
-            .with_min_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            .with_min_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+            .with_fullscreen(fullscreen_mode(self.is_fullscreen));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.window = Some(window.clone());
         // Ask winit for raw device input while focused, so the guest keyboard can
@@ -451,11 +499,12 @@ impl ApplicationHandler for WinitApp {
         // which is immune to the Windows NumLock/fake-shift mangling that drops
         // numpad releases on this cooked WindowEvent path. The cooked path is the
         // fallback only until a raw key event arrives (e.g. on Wayland, where
-        // device key events may not fire). Either way keys never reach egui (no
-        // text widgets), so this arm consumes them.
+        // device key events may not fire). The profile-name editor is the one
+        // text-input owner; while it is open, its cooked events continue to egui.
         if let WindowEvent::KeyboardInput {
             event: key_event, ..
         } = &event
+            && !self.keys.text_input_active()
         {
             if !self.raw_keys
                 && let PhysicalKey::Code(code) = key_event.physical_key
@@ -541,8 +590,12 @@ impl ApplicationHandler for WinitApp {
                     wgpu.surface.configure(&wgpu.device, &wgpu.config);
                 }
                 self.render(event_loop);
+                self.sync_text_input();
             }
-            WindowEvent::RedrawRequested => self.render(event_loop),
+            WindowEvent::RedrawRequested => {
+                self.render(event_loop);
+                self.sync_text_input();
+            }
             _ => {}
         }
     }
@@ -609,6 +662,7 @@ impl ApplicationHandler for WinitApp {
         // flood that would starve the WM_PAINT request_redraw posts on Windows.
         if now >= self.next_frame {
             self.render(event_loop);
+            self.sync_text_input();
             let hz = self.gui.guest_refresh_hz().max(1.0);
             self.next_frame = now + Duration::from_secs_f64(1.0 / hz);
         }
@@ -854,6 +908,7 @@ pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     let host_input = launch.host_input;
     let event_loop = build_event_loop(raw_mouse.clone(), host_input.mouse_enabled())?;
     let gui = GuiApp::new(launch)?;
+    let is_fullscreen = gui.prefs.start_fullscreen;
     let egui_ctx = egui::Context::default();
     egui_extras::install_image_loaders(&egui_ctx);
     enlarge_ui_fonts(&egui_ctx);
@@ -861,7 +916,7 @@ pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
     let mut app = WinitApp {
         gui,
         keys: HostKeyRouter::default(),
-        is_fullscreen: false,
+        is_fullscreen,
         focused: false,
         raw_keys: false,
         window: None,

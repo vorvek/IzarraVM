@@ -3,37 +3,20 @@
 
 use super::*;
 use izarravm_core::{MidiBackend, MidiPortId};
-use izarravm_input::{
-    ControllerDeviceMatcher, GuestControllerProfile, GuestKey, GuestKeyChord, JoystickAxis,
-    JoystickAxisBinding, JoystickBinding, JoystickButton, JoystickPolarity,
-};
+use izarravm_input::{ControllerDeviceMatcher, GuestControllerProfile, GuestKey, GuestKeyChord};
 use winit::keyboard::KeyCode;
-
-fn joystick_binding() -> JoystickBinding {
-    JoystickBinding {
-        controller_uuid: "00010203-0405-0607-0809-0a0b0c0d0e0f".into(),
-        controller_name: "Test Controller".into(),
-        x: JoystickAxisBinding {
-            control: JoystickAxis::LeftStickX,
-            polarity: JoystickPolarity::Positive,
-        },
-        y: JoystickAxisBinding {
-            control: JoystickAxis::LeftStickY,
-            polarity: JoystickPolarity::Negative,
-        },
-        button_1: JoystickButton::South,
-        button_2: JoystickButton::East,
-    }
-}
 
 #[test]
 fn round_trips_through_toml() {
     let prefs = GuiPrefs {
         master_volume: 0.65,
         crt_style: CrtStyle::YeOlde,
+        start_fullscreen: true,
         input_release: KeyBinding::new(true, true, false, true, "F4"),
         fullscreen: KeyBinding::new(false, false, true, false, "Enter"),
-        controller: Some(ControllerConfig::from_legacy(joystick_binding())),
+        screenshot: KeyBinding::new(false, true, false, true, "F10"),
+        controller: None,
+        controller_profile: Some("Quake".into()),
         last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
         last_cd_image: Some(PathBuf::from("/tmp/game.iso")),
         last_cd_folder: None,
@@ -74,7 +57,13 @@ fn missing_keys_fall_back_to_defaults() {
         parsed.fullscreen,
         KeyBinding::new(false, false, false, true, "F4")
     );
+    assert_eq!(
+        parsed.screenshot,
+        KeyBinding::new(false, false, false, true, "F12")
+    );
     assert_eq!(parsed.controller, None);
+    assert_eq!(parsed.controller_profile, None);
+    assert!(!parsed.start_fullscreen);
     assert!(parsed.panel_open, "panel defaults to open for older files");
     assert_eq!(parsed.midi, MidiConfig::default());
 }

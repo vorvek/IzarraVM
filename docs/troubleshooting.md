@@ -67,8 +67,9 @@ Compare the device that the game looks for with the
   internal pin headers of the ReSonique II, and IzarraVM emulates it with
   FluidSynth.
 - **External MIDI / MT-32**: select MPU-401 output at port `330`. This is the
-  rear MPU-401/gameport of the Izarra3000. In Settings, select Munt, or select
-  the exact host destination on the MIDI IN side of the receiver. See the
+  rear MPU-401/gameport of the Izarra3000. In **Settings**, select **MIDI
+  emulation...**. In **MIDI EMULATION**, select Munt or the exact host
+  destination on the MIDI IN side of the receiver. See the
   [ReSonique II manual](resonique2/manual.md#midi-and-wavetable), and the
   recipes for [your own MIDI player](recipes/host-midi-player.md) and for
   [MT-32 ROMs](recipes/mt32-roms.md).
@@ -102,15 +103,16 @@ Select one control ROM and the PCM ROM from the same row:
 | CM-32L | `ctrl_cm32l_1_00.rom` or `ctrl_cm32l_1_02.rom` | `pcm_cm32l.rom` |
 | CM-32LN | `ctrl_cm32ln_1_00.rom` | `pcm_cm32l.rom` |
 
-The Settings window accepts any control path and any PCM path. Thus you can
-select the archive file names directly.
+In **Settings**, select **MIDI emulation...**. In **MIDI EMULATION**, select
+**Munt (MT-32)**. The ROM selectors then appear. Each selector accepts any
+control path or PCM path. Thus you can select the archive file names directly.
 
 For automatic discovery, copy an MT-32 pair and give the copies the names
 `~/.izarravm/MT32_CONTROL.ROM` and `~/.izarravm/MT32_PCM.ROM`. For a CM-32L or
 a CM-32LN pair, use the names `~/.izarravm/CM32L_CONTROL.ROM` and
 `~/.izarravm/CM32L_PCM.ROM`. The discovery ignores the letter case of ASCII
-characters. `--portable` disables the discovery, but a path in the Settings
-window continues to operate. The names in the table are the names in the
+characters. `--portable` disables the discovery, but a path in **MIDI
+EMULATION** continues to operate. The names in the table are the names in the
 `mt32pi` directory of the
 [Roland MT-32 ROMs archive](https://archive.org/details/Roland-MT-32-ROMs).
 
@@ -138,10 +140,12 @@ for the contract of the emulated hardware.
 
 ## Where does IzarraVM keep the files?
 
-By default, IzarraVM writes all of its files in `~/.izarravm`. These files are
-the contents of the C: drive, `cmos.bin`, and `izarravm.conf`. It does not
-write them beside the executable or in the current directory. Use
-`--portable` at the start to keep them beside the executable. See the
+By default, IzarraVM writes the C: drive, `cmos.bin`, and `izarravm.conf` in
+`~/.izarravm`. Controller profiles are in `~/.izarravm/Controller Profiles`.
+PNG screenshots are in `~/.izarravm/screenshots`. Use `--portable` at the
+start to keep the C: drive, `cmos.bin`, and `izarravm.conf` beside the
+executable. Controller profiles and screenshots stay in the application state
+directory. See the
 [IzarraVM GUI guide](izarravm-gui/guide.md#where-the-files-are) for the full
 list.
 

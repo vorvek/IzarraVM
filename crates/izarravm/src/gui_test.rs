@@ -3,6 +3,65 @@
 
 use super::*;
 
+fn controller_config(name: &str) -> ControllerConfig {
+    ControllerConfig::default_keyboard(ControllerDeviceMatcher {
+        backend: "test".into(),
+        platform: "test".into(),
+        guid: format!("guid-{name}"),
+        vendor_id: Some(1),
+        product_id: Some(2),
+        name: name.into(),
+        occurrence: 0,
+    })
+}
+
+#[test]
+fn midi_rom_selection_is_visible_only_for_munt() {
+    assert!(!midi_rom_selection_visible(MidiBackend::Off));
+    assert!(!midi_rom_selection_visible(MidiBackend::External));
+    assert!(midi_rom_selection_visible(MidiBackend::Munt));
+}
+
+#[test]
+fn controller_setup_saves_only_complete_or_cleared_selections() {
+    assert!(controller_setup_can_save(Some("Quake"), true));
+    assert!(controller_setup_can_save(None, false));
+    assert!(!controller_setup_can_save(Some("Missing"), false));
+    assert!(!controller_setup_can_save(None, true));
+}
+
+#[test]
+fn inline_controller_mapping_migrates_to_a_selected_profile() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "izarravm-controller-migration-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = ControllerProfileStore::new(&state_dir);
+    let config = controller_config("Legacy controller");
+    let mut prefs = GuiPrefs {
+        controller: Some(config.clone()),
+        ..GuiPrefs::default()
+    };
+
+    let (selected, restored, changed) = restore_controller_profile(&store, &mut prefs);
+
+    assert!(changed);
+    assert_eq!(selected.as_deref(), Some("New Profile"));
+    assert_eq!(restored, Some(config.clone()));
+    assert_eq!(prefs.controller, None);
+    assert_eq!(prefs.controller_profile, selected);
+    assert_eq!(store.load("New Profile").unwrap(), config);
+    let saved = toml::to_string_pretty(&prefs).unwrap();
+    assert!(!saved.contains("[controller]"));
+    assert!(saved.contains("controller_profile = \"New Profile\""));
+
+    std::fs::remove_dir_all(state_dir).unwrap();
+}
+
 #[test]
 fn cpu_mode_label_preserves_fractional_clock_rates() {
     assert_eq!(

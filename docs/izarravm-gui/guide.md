@@ -4,9 +4,10 @@
 # IzarraVM GUI Guide
 
 The IzarraVM desktop application shows the emulated Izarra3000 in a control
-panel. The window has a display, a beige panel of controls below the display,
-and a config modal. The config modal holds the settings that you do not need
-in each session. This page describes the host application, and not the
+panel. The window has a display and a beige panel of controls below the
+display. The **Settings** window holds the settings that you do not need in
+each session. It opens separate windows for the hotkeys, controller emulation,
+and MIDI emulation. This page describes the host application, and not the
 emulated machine. See the
 [Izarra3000 user manual](../izarra-3000/user-manual.md) for the guest.
 
@@ -33,6 +34,12 @@ carry on a USB stick.
 | `c_drive/` | The C: hard disk of the Izarra3000, as a host folder. | `~/.izarravm/`, or beside the executable with `--portable` |
 | `cmos.bin` | The 64-byte RTC/NVRAM image: the keyboard layout, the CPU mode, and the other settings that the [setup panel](../izbios/configuration-panel.md) saves. | One level above `c_drive/` |
 | `izarravm.conf` | The host GUI preferences (below). | One level above `c_drive/`, with `cmos.bin` |
+| `Controller Profiles/` | One TOML file for each controller profile. | In the application state directory. The normal path is `~/.izarravm/Controller Profiles/`. |
+| `screenshots/` | PNG files made with the screenshot hotkey. | In the application state directory. The normal path is `~/.izarravm/screenshots/`. |
+
+The controller profiles and screenshots do not use the C: drive location.
+They stay in the application state directory when you use `--portable` or a
+custom C: drive path.
 
 If `cmos.bin` does not exist, IzarraVM makes a new one with the default
 values. If its checksum does not agree, IzarraVM repairs the file. This is the
@@ -77,20 +84,29 @@ of the flags that it ignored.
 This is a TOML file with the GUI preferences that must stay between runs:
 
 - The master volume
+- The **Start in Full Screen** setting
 - The CRT emulation style (below)
-- The hotkeys that you set for input release and for full screen
-- The optional host-controller identity, guest target, calibrated axes,
-  buttons, and guest-key combinations
+- The hotkeys that you set for input release, full screen, and screenshots
+- The name of the selected controller profile
 - The last floppy image, the last CD image, and the last CD folder that you
   mounted
 - The state of the control panel: expanded or collapsed
 - The P330 receiver, the exact host destination, the P300 SoundFont, and the
   MT-32 ROM paths
 
-Each field has a default. Thus an old or incomplete `izarravm.conf` continues
-to load after an upgrade. The master volume is the only audio level in this
-file. It is the playback level of the host, from 0.0 to 5.0, and 1.0 is unity.
-See "The volume knob" below.
+New controller mappings are not stored in `izarravm.conf`. The file keeps only
+the name of the selected controller profile. Each controller profile is a
+separate TOML file in the `Controller Profiles` directory.
+
+If `izarravm.conf` contains an old controller mapping, IzarraVM saves it as a
+new profile. It selects the new profile. The generated name starts with **New
+Profile**. IzarraVM removes the old mapping from `izarravm.conf` only after it
+saves the profile.
+
+Each field in `izarravm.conf` has a default. Thus an old or incomplete file
+continues to load after an upgrade. The master volume is the only audio level
+in this file. It is the playback level of the host, from 0.0 to 5.0, and 1.0
+is unity. See "The volume knob" below.
 
 `amp_gain`, `output_gain`, and `pc_speaker_volume` are removed. They named
 levels in the mixer of the machine. A file that contains them loads, and
@@ -98,17 +114,46 @@ IzarraVM writes one log line with their names. The next save removes them from
 the file. Set those levels from DOS with `SNDMIXER`, which writes the
 registers of the card. The guest can read those registers.
 
-## The config modal
+## The Settings window
 
-The control panel opens the config modal. The modal has three sections.
+The control panel opens **Settings**. The **APPLICATION SETTINGS** section has
+these controls:
 
-**Input**: set the "Input release" hotkey and the "Full screen" hotkey. The
-"Input release" hotkey gives the keyboard focus and the mouse focus back to
-the host. The default for "Input release" is Win+F2. The default for "Full
-screen" is Win+F4.
+- **Start in Full Screen**: starts IzarraVM in full screen at the next start.
+  This option is off by default.
+- **CRT emulation**: selects the display effect. The table below gives the
+  available values.
 
-The Win key is the key with the Windows logo. On Windows the modal writes it
-"Win". On Linux the modal writes it "Super", the name that the Linux desktops
+Three buttons open separate settings windows:
+
+- **Application Hotkeys...**
+- **Controller emulation...**
+- **MIDI emulation...**
+
+In **APPLICATION HOTKEYS** and **MIDI EMULATION**, **Apply** saves the changes
+and keeps the window open. **Back** returns to **Settings**. In **Settings**,
+**Accept** saves the changes and closes the window. **Cancel** discards changes
+that you did not apply.
+
+### Application Hotkeys
+
+The **APPLICATION HOTKEYS** window has three hotkeys:
+
+| Hotkey | Default | Function |
+| --- | --- | --- |
+| **Input release** | Win+F2 on Windows, Super+F2 on Linux | Gives keyboard and mouse control back to the host. |
+| **Full screen** | Win+F4 on Windows, Super+F4 on Linux | Changes between full screen and windowed mode. |
+| **Screenshot** | Win+F12 on Windows, Super+F12 on Linux | Saves the current emulated display as a PNG file. |
+
+The screenshot contains only the emulated display before the CRT effect. It
+does not contain the application controls or the **Settings** window. IzarraVM
+saves the file in the application state directory. It creates the screenshot
+directory when it saves the first PNG file. The normal directory is
+`~/.izarravm/screenshots`. IzarraVM uses this directory also with
+`--portable` or a custom C: drive path.
+
+The Win key is the key with the Windows logo. On Windows the window writes it
+"Win". On Linux the window writes it "Super", the name that Linux desktops
 give the same key. The name in `izarravm.conf` is `super` on both. Thus one
 file reads correctly on either host. The left key and the right key give the
 same modifier.
@@ -118,18 +163,52 @@ Win are modifiers. The key that you press with them completes the hotkey.
 
 A file that still holds the previous defaults, Ctrl+F2 and Ctrl+F11, moves to
 the new defaults at the next start. IzarraVM writes one log line for each
-move. Set a different combination in this section if you do not want the new
+move. Set a different combination in this window if you do not want the new
 default.
 
-While IzarraVM holds the input, and while this section waits for a hotkey, the
+While IzarraVM holds the input, and while this window waits for a hotkey, the
 two Win keys do not reach the Windows shell. Thus a press of a Win key does
 not open the Start menu and does not take the focus away from the guest. The
 Win keys work as usual again when you release the input or when the window
 loses the focus. Windows reserves Ctrl+Alt+Del and Win+L. No program can
 absorb those two.
 
-**Controller setup** maps a host gamepad, joystick, or wheel to guest gameport
-controls, guest keys, or both. The saved device identity includes the input
+### Controller emulation
+
+The **Controller emulation...** button opens **CONTROLLER SETUP**. This window
+maps a host gamepad, joystick, or wheel to guest gameport controls, guest keys,
+or both.
+
+The device picker is at the top left. The profile controls are to its right:
+
+- The profile picker selects a saved profile.
+- **Add new profile** opens a window where you enter a profile name.
+- **Delete Profile** asks you to confirm before it deletes the selected profile.
+
+When you add a profile or confirm a deletion, IzarraVM changes the profile file
+immediately. **Cancel** does not undo these file operations. **Save** writes the
+mapping changes and makes that profile active. **Cancel** discards mapping and
+selection changes that you did not save. If you delete the active profile,
+IzarraVM disables its mapping immediately. **Cancel** does not restore it.
+
+To make a profile:
+
+1. Select a host device.
+2. Select **Add new profile**.
+3. Enter a name for the game or the mapping. Then select **Add**.
+4. Change the guest target and the assignments.
+5. Select **Save**.
+
+To activate a saved profile, select it in the profile picker. Then select
+**Save**.
+
+Use a separate profile when a game needs different gamepad-to-keyboard
+bindings. Each profile is a TOML file in
+`~/.izarravm/Controller Profiles`. This directory is in the application state
+directory and does not move with the C: drive.
+
+A profile contains the device identity, guest target, calibrated axes,
+buttons, and guest-key combinations. The device identity includes the input
 backend, platform, GUID, USB vendor and product IDs when available,
 operating-system name, and occurrence among identical devices. After a device
 reconnects, its mapping stays inactive until the assigned controls return to
@@ -171,7 +250,9 @@ the guest gameport is disconnected and its guest key sources are released.
 `[input].joystick = false` disables all controller input, including guest-key
 mappings, but `[input].keyboard = false` disables only the physical keyboard.
 
-**Display**: **CRT emulation**, with three values:
+### CRT emulation
+
+**CRT emulation** has three values:
 
 | On-screen label | What it does |
 | --- | --- |
@@ -179,12 +260,15 @@ mappings, but `[input].keyboard = false` disables only the physical keyboard.
 | **Subtle** | A light shadow-mask CRT effect. This is the default. |
 | **Ye Olde Screene** | A stronger CRT effect, for the full period appearance. |
 
-**Audio**: select the synthesizer for each MIDI port. This section does not
-set the levels. The output stage of the card, the level of the PC speaker, and
-the balance between the sources are ReSonique II mixer registers, and
-`SNDMIXER` sets them from DOS. The volume knob on the machine panel is the
-playback level of the host, which is equivalent to the powered speakers on the
-line-out of the machine.
+### MIDI emulation
+
+The **MIDI emulation...** button opens **MIDI EMULATION**. P300 always uses
+FluidSynth. You can select its SoundFont. For P330, you can select no receiver,
+Munt, or a host MIDI device. The window does not set the levels. The output
+stage of the card, the level of the PC speaker, and the balance between the
+sources are ReSonique II mixer registers. `SNDMIXER` sets them from DOS. The
+volume knob on the machine panel is the playback level of the host. It is
+equivalent to the powered speakers on the line-out of the machine.
 
 P300 is a wavetable daughterboard on the internal pin headers of the ReSonique
 2. IzarraVM emulates that board with FluidSynth and the embedded FluidR3Mono
@@ -215,6 +299,9 @@ set with the names `MT32_CONTROL.ROM` and `MT32_PCM.ROM` loads. A set with
 version names loads. A set in half-images loads. The box that you put each
 file in is not important.
 
+The ROM boxes are visible only when **Munt (MT-32)** is the P330 receiver.
+They are hidden when **Off** or a host MIDI destination is selected.
+
 If a set does not load, the status line gives the cause: an absent control
 image, an absent PCM image, or a control image and a PCM image from different
 machines. The log gives the name of each file that IzarraVM tried.
@@ -225,15 +312,13 @@ Each section has its own status line. Thus an absent host destination or an
 absent ROM cannot hide a failed SoundFont. A failure in one section does not
 hide the related guest MPU.
 
-Accept tries a failed synthesizer again, even after no change. Thus IzarraVM
+**Apply** tries a failed synthesizer again, even after no change. Thus IzarraVM
 can use a fix that you made outside the emulator, without a restart of the
 machine.
 
 IzarraVM resolves the startup settings one field at a time. The order of
 priority is: a command-line option, then a key in the `--config` TOML file,
 then the saved GUI preference, then the built-in default.
-
-Accept applies your changes and closes the modal. Cancel discards them.
 
 The [recipes](../recipes/index.md) give step-by-step procedures that use these
 settings. Two examples are a route from P330 to a player on the host, and a
@@ -353,9 +438,8 @@ the level that it always meant.
   Use it for a program that writes its log there and not to the screen.
 - An About window with the license information.
 
-The GUI has no drag-and-drop function for a mount, and it has no screenshot
-function. Use the screenshot tool of your host operating system on the
-IzarraVM window.
+The GUI has no drag-and-drop function for a mount. Use **Screenshot** in
+**APPLICATION HOTKEYS** to set the PNG screenshot hotkey.
 
 ## Next
 

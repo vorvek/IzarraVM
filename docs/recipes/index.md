@@ -27,7 +27,7 @@ as the program shows it.
 ## Next
 
 - [IzarraVM GUI guide](../izarravm-gui/guide.md): the host application and its
-  config modal.
+  Settings windows.
 - [ReSonique II sound card manual](../resonique2/manual.md): the card behind
   P300 and P330.
 - [Troubleshooting and FAQ](../troubleshooting.md): problems that a setup
