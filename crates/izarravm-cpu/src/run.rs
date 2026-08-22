@@ -637,6 +637,15 @@ impl CpuGsw {
     ) -> Result<BudgetedRunOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
+        // The call-out window is opened and closed inside one helper call, which is itself inside
+        // one native entry, so it can never be open at the top of a run. Asserted here as well as
+        // at the native return because this is the OTHER door into guest execution: a window left
+        // open would make every code write from here on silently deferred and never drained.
+        #[cfg(feature = "jit")]
+        debug_assert!(
+            !self.deferred_code_writes.is_open(),
+            "a call-out window was open at a dispatcher entry"
+        );
         // Run-scoped latch, cleared on every entry so it can never carry across a batch. It used
         // to be a local here; it moved onto `direct_runtime` so the whole admission decision is one
         // call, and this clear is what keeps that move behaviour-preserving.
@@ -1996,10 +2005,25 @@ impl CpuGsw {
         // access, which is what POP r/m does. A row that wanted three would need this term
         // widened with it, and the constant beside the allowlist is where that is recorded.
         //
-        // No fetch term and no page-walk term. The helper refuses (ABNORMAL) unless the decode
-        // line is already resident, so nothing on its path decodes; and it charges the slot's
+        // No FETCH term, and that one is a proof: the helper returns ABNORMAL unless the decode
+        // line is already resident, so nothing on its path decodes, and it charges the slot's
         // instruction fetch only on the fault arm, where the block reports the prefix and
-        // `fetch_upper` above covers one fewer instruction than it prices.
+        // `fetch_upper` above has already priced one more instruction than it reports.
+        //
+        // No PAGE-WALK term, and that one is NOT a proof, it is ACCEPTED OVERSHOOT. The step's own
+        // stack read and operand write go through the interpreter's ordinary memory path, which
+        // walks the page table on a TLB miss, and each walk is bus traffic this bound does not
+        // contain. It is bounded (two accesses, so at most two walks per slot) and it is the same
+        // class of overshoot the owner's ruling of 2026-07-30 accepted for the chain quota, quoted
+        // at the chain-pricing note in `run_direct_block`: sub-perceptual timing exactness is not
+        // worth pricing every worst case, real parts of one stepping vary between packages, and
+        // `brk_cap` plus the scaled-bus term still end the run one block late rather than many
+        // times early. Pricing it would inflate every InterpretOne block's bound by two full page
+        // walks for traffic a warm TLB never generates.
+        //
+        // What this must NOT become is a silent claim. The earlier revision of this comment said
+        // the path could not walk at all, which was false, and a false proof in a budget bound is
+        // worse than a stated overshoot.
         let callout_bus_upper = u64::from(block.callout_port_slots())
             .saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte))
             .saturating_add(
@@ -2659,7 +2683,7 @@ impl CpuGsw {
         // cannot observe the stale window, which is the property the placement has to preserve.
         self.drain_deferred_code_writes();
         debug_assert!(
-            !self.in_native_callout,
+            !self.deferred_code_writes.is_open(),
             "a call-out window outlived the native entry that opened it"
         );
 

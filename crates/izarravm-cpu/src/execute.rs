@@ -622,7 +622,7 @@ impl CpuGsw {
                     self.registers.set_esp(esp_before);
                     return Err(err);
                 }
-                Ok(clocks(5))
+                Ok(clocks(POP_RM_CORE_CLOCKS))
             }
             0x9c => {
                 // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The

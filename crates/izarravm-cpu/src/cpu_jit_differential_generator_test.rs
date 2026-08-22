@@ -571,25 +571,36 @@ fn assert_measured_pair_with_split(
             direct.elapsed_clocks, interpreter.elapsed_clocks
         );
     }
-    // SETTLE BOTH ROLES before the whole-CPU comparison, because `registers.eflags` is a
-    // REPRESENTATION and not the architectural value. While `pending_flags` is live the six
-    // arithmetic bits in that word are stale by definition (see `PendingFlags`), and two roles at
-    // the same architectural state are free to carry different (base, descriptor) pairs for it.
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are. This assertion is the substantive
+    // one and it has to come before anything settles them, or it becomes a tautology: materialise
+    // both and `eflags()` reads back what materialising just computed.
+    assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
+    // THEN the whole-CPU comparison, on SETTLED CLONES. `registers.eflags` is a REPRESENTATION and
+    // not the architectural value: while `pending_flags` is live the six arithmetic bits in that
+    // word are stale by definition (see `PendingFlags`), and two roles at the same architectural
+    // state are free to carry different (base, descriptor) pairs for it.
     //
     // They now do. An `InterpretOne` call-out settles the flags on the way in, because the
     // instruction it is about to run may READ them, and that folds a live descriptor into the base
-    // where the interpreter would have left it alone. Nothing guest-visible moves -- every reader
-    // goes through `eflags()`, which recomputes the six bits from the descriptor and takes only
-    // the control bits from the base -- but the raw words differ, and comparing them is comparing
-    // the noise the lazy-flag optimisation exists to create.
+    // where the interpreter would have left it alone. Nothing guest-visible moves; the raw words
+    // differ, and comparing them is comparing the noise the lazy-flag optimisation exists to
+    // create.
+    //
+    // CLONES rather than the roles themselves, so nothing this comparison does is visible to the
+    // caller: `run_generated_sweep` asserts on `direct` after this returns, and a comparison that
+    // silently settled the CPU under test would be deciding what those assertions see. Cloning is
+    // faithful here because every field `CpuGsw::clone` resets carries an always-equal `PartialEq`
+    // (the JIT state, the decode cache, the deferred-write window), so the reset cannot mask a
+    // difference this comparison would otherwise have caught.
     //
     // What this does NOT weaken: a WRONG descriptor still fails, because materialising is exactly
     // what turns it into flags. Only "the two roles hold the same flags in different forms" stops
     // being a failure.
-    direct.materialize_flags();
-    interpreter.materialize_flags();
-    assert_eq!(direct, interpreter, "{case:#?}");
-    assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
+    let mut direct_settled = direct.clone();
+    let mut interpreter_settled = interpreter.clone();
+    direct_settled.materialize_flags();
+    interpreter_settled.materialize_flags();
+    assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
     assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
     assert_eq!(
         direct_bus.trace.elapsed_clocks() - interpreter_bus.trace.elapsed_clocks(),

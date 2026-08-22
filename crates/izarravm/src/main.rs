@@ -2998,6 +2998,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_callout_interpret_one_resync_fault": snapshot.callout_interpret_one_resync_fault,
         "jit_direct_callout_interpret_one_abnormal": snapshot.callout_interpret_one_abnormal,
         "jit_direct_callout_interpret_one_demoted": snapshot.callout_interpret_one_demoted,
+        "jit_direct_callout_deferred_code_writes": snapshot.callout_deferred_code_writes,
         "jit_direct_callout_slot_cap_hits": snapshot.callout_slot_cap_hits,
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
         // Unprefixed, unlike their `jit_direct_` neighbours, and deliberately: these are the

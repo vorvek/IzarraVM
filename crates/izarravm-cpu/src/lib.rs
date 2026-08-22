@@ -1922,6 +1922,7 @@ pub struct DirectStallSnapshot {
     pub callout_interpret_one_resync_fault: u64,
     pub callout_interpret_one_abnormal: u64,
     pub callout_interpret_one_demoted: u64,
+    pub callout_deferred_code_writes: u64,
     pub callout_slot_cap_hits: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.
     pub reject_callout_privileged: u64,
@@ -2285,14 +2286,14 @@ pub struct CpuGsw {
     /// memset every instruction.
     written_count: u8,
     written_pages_overflow: bool,
-    /// An `InterpretOne` call-out is running one interpreter instruction with a native block live
-    /// on the host stack. While set, `note_code_write_inner` records instead of invalidating; see
-    /// the branch there for why a retire under a live frame is the hazard and not the write
-    /// itself. Cleared by the helper before it returns, so no dispatcher entry ever sees it set.
-    /// Host-side window state, exactly like `native_callout`: not guest state, never compared.
-    #[cfg(feature = "jit")]
-    pub(crate) in_native_callout: bool,
-    /// The writes that window deferred, replayed by `run_direct_block` after the native return.
+    /// The call-out window: whether an `InterpretOne` slot is running one interpreter instruction
+    /// with a native block live on the host stack, and the code writes that window has deferred.
+    ///
+    /// The flag and the list are ONE mechanism and are one field for that reason. An earlier
+    /// revision had the flag loose on `CpuGsw` with a comment claiming it was never compared,
+    /// which the derived `PartialEq` and `Clone` made false. Here it inherits the always-equal
+    /// `PartialEq` and the resetting `Clone` the list already had, so the claim is enforced by the
+    /// type instead of asserted by a comment.
     #[cfg(feature = "jit")]
     deferred_code_writes: DeferredCodeWrites,
     // Direct-mapped cache of decoded instructions keyed by linear EIP. Skips re-decoding hot-loop
@@ -2507,8 +2508,6 @@ impl Default for CpuGsw {
             written_pages: [None; TRACKED_WRITE_PAGES],
             written_count: 0,
             written_pages_overflow: false,
-            #[cfg(feature = "jit")]
-            in_native_callout: false,
             #[cfg(feature = "jit")]
             deferred_code_writes: DeferredCodeWrites::default(),
             decode_cache,
@@ -4493,6 +4492,8 @@ impl DeferredCodeWrite {
 #[cfg(feature = "jit")]
 #[derive(Debug)]
 pub(crate) struct DeferredCodeWrites {
+    /// Whether the window is OPEN: an `InterpretOne` step is running under a live native frame.
+    open: bool,
     entries: [DeferredCodeWrite; MAX_DEFERRED_CODE_WRITES],
     count: u8,
     overflow: bool,
@@ -4502,6 +4503,7 @@ pub(crate) struct DeferredCodeWrites {
 impl Default for DeferredCodeWrites {
     fn default() -> Self {
         Self {
+            open: false,
             entries: [DeferredCodeWrite::EMPTY; MAX_DEFERRED_CODE_WRITES],
             count: 0,
             overflow: false,
@@ -4531,6 +4533,26 @@ impl DeferredCodeWrites {
     /// True when nothing was deferred: the helper's R5 clause and the drain's early out.
     pub(crate) fn is_empty(&self) -> bool {
         self.count == 0 && !self.overflow
+    }
+
+    /// Whether a code write must be recorded rather than acted on.
+    #[inline]
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Open the window. Paired with `close` on EVERY path out of the helper, including the fault
+    /// arm, where the pairing is the whole of design review B1's sibling hazard: exception
+    /// delivery pushes three to five words and can write page-walk accessed bits, and a tiny-model
+    /// stack puts those writes on the block's own page.
+    pub(crate) fn open(&mut self) {
+        debug_assert!(!self.open, "a call-out window opened inside another");
+        self.open = true;
+    }
+
+    pub(crate) fn close(&mut self) {
+        debug_assert!(self.open, "a call-out window closed without being opened");
+        self.open = false;
     }
 
     fn push(&mut self, write: DeferredCodeWrite) {

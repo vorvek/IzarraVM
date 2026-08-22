@@ -444,11 +444,25 @@ pub(crate) struct DirectStallTally {
     pub callout_port_v86_served: u64,
     /// The `InterpretOne` family, five counters that price the mechanism on its own terms.
     ///
-    /// `executed` is every slot the helper entered, the DENOMINATOR the other four need.
+    /// `executed` is every slot the helper ENTERED, the denominator the rest need.
     /// `resync` and `resync_fault` are the two RESYNC statuses -- the predicate refusing after a
-    /// retired instruction, and the step faulting. `abnormal` is the fail-closed arm: no resident
-    /// decode view, or a demoted slot. `demoted` counts CELLS the governor gave up on, once each,
-    /// not the executions that then take the abnormal exit.
+    /// retired instruction, and the step faulting. `abnormal` is the helper's one fail-closed
+    /// return: NO RESIDENT DECODE VIEW, and nothing else.
+    ///
+    /// **A demoted slot is not in `abnormal`, and cannot be.** The demotion is a byte the emitted
+    /// prologue tests before the call, so a demoted execution never reaches the helper and never
+    /// reaches any counter here. It is observable as the DIFFERENCE between two counters that do
+    /// fire: `side_exit_callout_abnormal` counts every execution that took the abnormal exit,
+    /// `callout_interpret_one_abnormal` counts the subset that got there through the helper, and
+    /// the gap is executions refused by the governor. `demoted` then counts the CELLS, once each
+    /// at the transition, so `gap / demoted` is what a demotion costs the block that carries it.
+    ///
+    /// The design asked for a `BarrierStop::CallOutDemoted` row instead. It is not implementable
+    /// as specified and the reason is worth recording rather than leaving as an omission: the
+    /// barrier census records COMPILE-WALK stops, and demotion is a runtime event on an already
+    /// compiled block that never changes its classification (design review M11 replaced
+    /// demotion-by-recompile precisely so it would not have to). There is no compile walk to
+    /// attribute a row to.
     ///
     /// Separate from `callout_executed` and `side_exit_callout_abnormal` rather than folded into
     /// them, for the reason `callout_port_v86_served` is separate: those sum every helper class,
@@ -459,6 +473,15 @@ pub(crate) struct DirectStallTally {
     pub callout_interpret_one_resync_fault: u64,
     pub callout_interpret_one_abnormal: u64,
     pub callout_interpret_one_demoted: u64,
+    /// Code writes taken while a call-out window was open, i.e. writes that reported a hit and
+    /// were replayed at the drain instead of invalidating under a live native frame.
+    ///
+    /// The always-on evidence for design review B2, and the only evidence there can be: the
+    /// deferral is invisible from outside because the drain makes the outcome identical. A slot
+    /// whose step stores onto watched code contributes one; a slot whose step FAULTS onto watched
+    /// code contributes one per pushed word of the delivery frame, which is the case the window
+    /// has to stay open across.
+    pub callout_deferred_code_writes: u64,
     /// Compile walks that stopped because the block already held `MAX_BLOCK_CALLOUT_SLOTS`. The
     /// evidence for or against raising the cap, which S5 prices; zero says the cap is not what
     /// bounds the loader's blocks.
@@ -1750,6 +1773,7 @@ impl crate::jit::JitState {
             callout_interpret_one_resync_fault: self.stalls.callout_interpret_one_resync_fault,
             callout_interpret_one_abnormal: self.stalls.callout_interpret_one_abnormal,
             callout_interpret_one_demoted: self.stalls.callout_interpret_one_demoted,
+            callout_deferred_code_writes: self.stalls.callout_deferred_code_writes,
             callout_slot_cap_hits: self.stalls.callout_slot_cap_hits,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             callout_governor_trials: self.stalls.callout_governor_trials,
@@ -1845,6 +1869,10 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_interpret_one_demoted(&mut self) {
         self.stalls.callout_interpret_one_demoted += 1;
+    }
+
+    pub(crate) fn note_deferred_code_write(&mut self) {
+        self.stalls.callout_deferred_code_writes += 1;
     }
 
     pub(crate) fn note_callout_slot_cap_hit(&mut self) {

@@ -277,7 +277,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use super::emit::{eflags_offset, emit_store_homes, gpr_offset};
 use super::*;
 use crate::{
-    FLAG_IF, FLAG_VM, IN_AL_DX_CORE_CLOCKS, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags,
+    FLAG_IF, FLAG_TF, FLAG_VM, IN_AL_DX_CORE_CLOCKS, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS,
+    PendingFlags,
 };
 use izarravm_bus::{BusAccessKind, BusWidth, CpuBus};
 
@@ -1125,6 +1126,15 @@ impl ResumeSnapshot {
     /// M6). A block entered with the shadow already set therefore resyncs, which is conservative
     /// and costs nothing: the dispatcher does not hand out blocks in that state.
     ///
+    /// R3 also carries TF, and it is a CLAUSE rather than an entry-gate argument on purpose. The
+    /// entry gate nearly does it: `classify` admits no row that can set TF, since the flag-image
+    /// loads are on no allowlist, so a block that entered with TF clear cannot acquire it. What
+    /// that does not cover is a block ENTERED with TF already set -- the Direct dispatcher has no
+    /// TF refusal to lean on, because single-step delivery is the run loop's business and happens
+    /// at instruction boundaries a native block does not produce. Testing the live flag after the
+    /// step costs one mask, needs no argument, and stays true when S3 admits a row that can write
+    /// EFLAGS.
+    ///
     /// R4 is conservative rather than exact, and the reason is worth stating. The FAST MAP needs
     /// no clause: emitted code never reads `mapping_epochs` at all, its table bases are stable for
     /// the process, and an invalidation CLEARS entries in place -- so a wipe mid-block makes the
@@ -1152,6 +1162,7 @@ impl ResumeSnapshot {
             || cpu.control.cr4 != self.cr4
             || (cpu.registers.eflags & FLAG_VM != 0) != self.virtual_mode
             || (!self.interrupt_enable && cpu.registers.eflags & FLAG_IF != 0)
+            || cpu.registers.eflags & FLAG_TF != 0
             || cpu.interrupt_shadow
         {
             return false;
@@ -1223,6 +1234,13 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
     // relatively (`emit_advance_eip` is a load, an add and a store on the live field), so a helper
     // that leaves EIP anywhere else corrupts every later exit. Snapshot it, move it to the slot,
     // and put it back on the resume path only. Design review B1.
+    //
+    // The add cannot wrap, and the compile walk is what guarantees it. A slot only joins a block
+    // after `compile` has checked that the instruction's LAST byte is within `cs.limit` and that
+    // its whole span shares one page with the block's entry (jit/direct.rs, the `slot_eip` limit
+    // test and the `BLOCK_PAGE_SHIFT` comparison directly below it), so `entry_eip + slot_delta`
+    // is an address the segment already admitted and the 16-bit retire wrap has nothing to do
+    // here. A `wrapping_add` rather than a checked one because the guarantee is upstream.
     let entry_eip = cpu.registers.eip;
     let start_eip = entry_eip.wrapping_add(u32::from(cell.slot_delta));
 
@@ -1235,12 +1253,40 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
     // and for the same reason; see the long note there. `core_clocks_so_far` is stale by the whole
     // run prefix inside a block, and an interpreted instruction that reads a timer or a beam would
     // sample the past. Design review m12.
+    //
+    // SAVED AND RESTORED, not left advanced, and that is the difference between this and the port
+    // helper: `port_read_al_dx` computes the same value into a LOCAL and hands it to `read_io`
+    // without touching the field, because it can. This helper cannot -- the interpreter reads the
+    // field through `execute_hot_cached_or_decoded` and there is no argument to thread -- so it
+    // writes the preview and puts the entry value back on every path out. `run_direct_block` sets
+    // the field ONCE per entry, to the run's total; leaving it advanced would make the SECOND
+    // call-out in a block preview a prefix that already contained the first one's, and would hand
+    // a following `0xEC` port slot a timestamp base that had drifted by the whole block prefix.
     let fp =
         crate::jit::native_x87::scale_weighted_fp_clocks(prefix_weighted_fp_clocks, cpu.fp_rem);
-    cpu.core_clocks_so_far = cpu
-        .core_clocks_so_far
+    let entry_core_clocks = cpu.core_clocks_so_far;
+    cpu.core_clocks_so_far = entry_core_clocks
         .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks.saturating_add(fp.clocks)));
 
+    // The rest is a separate function for ONE reason: it returns from five places, and the restore
+    // above has to happen on all five. A wrapper is a proof of that; five copies of one assignment
+    // would have been five chances to miss one.
+    let status = interpret_one_step(cpu, bus, cell, entry_eip, start_eip);
+
+    cpu.core_clocks_so_far = entry_core_clocks;
+    status
+}
+
+/// Steps 4 to 10 of the helper contract: everything between the clock preview and the status word.
+///
+/// See `interpret_one` for why this is not inlined into its caller.
+fn interpret_one_step<B: CpuBus>(
+    cpu: &mut CpuGsw,
+    bus: &mut B,
+    cell: &InterpretOneCell,
+    entry_eip: u32,
+    start_eip: u32,
+) -> i64 {
     // STEP 4. The predicate's inputs, before anything can move them.
     let snapshot = ResumeSnapshot::capture(cpu);
     let start_cs = snapshot.cs.selector;
@@ -1264,8 +1310,7 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
     // STEP 6. Run it. `execute_hot_cached_or_decoded` and not `run_one_cached`, which would charge
     // the fetch, `elapsed_clocks` and `perf.instructions` a second time on top of the block's own
     // accounting and would consume `timing_rem`; and NOT `begin_instruction`, which would clear
-    // the block's write record and drop a prefetch invalidation the block still owes. Design
-    // review B3 and M6.
+    // the block's write record before the step instead of after it. Design review B3 and M6.
     //
     // The EIP advance is done by hand because the interpreter does it inside the fetch CHARGE
     // (`charge_fetch_run`), and the charge is the half this must not repeat: the block's
@@ -1273,9 +1318,8 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
     // read EIP expecting it to sit past the instruction, so the advance is not optional.
     let end_eip = start_eip.wrapping_add(u32::from(view.insn.len));
     cpu.registers.eip = end_eip;
-    cpu.in_native_callout = true;
+    cpu.deferred_code_writes.open();
     let result = cpu.execute_hot_cached_or_decoded(&view.insn, bus);
-    cpu.in_native_callout = false;
 
     let Ok(outcome) = result else {
         // STEP 7. The fault arm. `finish_instruction` is the run loop's own tail: it rewinds EIP
@@ -1284,13 +1328,24 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
         // of that is DONE by the time it returns, which is why this arm reports "not retired" and
         // returns zero clocks: the block must count neither again.
         //
+        // THE WINDOW IS STILL OPEN ACROSS THE DELIVERY, and that is the whole of this arm's
+        // hazard. `deliver_exception` pushes three to five words onto the guest stack and, under
+        // paging, can write accessed bits during the walks that reach them. A tiny-model guest --
+        // which is exactly what the loader is -- puts SS on the same page as CS, so those pushes
+        // can land on the running block's own bytes. Closing the window before this call let them
+        // reach `invalidate_physical_range` with the block's native frame still on the host stack,
+        // which retires the block the helper has to RETURN THROUGH. Closing it after is the fix
+        // and there is nothing else to it; the drain then replays them.
+        //
         // A `CpuError` is a machine stop rather than a guest fault, and the helper cannot return
         // one through an `i64`. It is parked and `run_direct_block` propagates it after the native
-        // return, which is the same boundary the run loop would have propagated it from.
+        // return, which is the same boundary the run loop would have propagated it from. The close
+        // below is AFTER the `if let`, so it covers that branch too.
         if let Err(error) = cpu.finish_instruction(bus, result, start_eip, start_cs, 0, None, None)
         {
             cpu.direct_runtime.callout_error = Some(error);
         }
+        cpu.deferred_code_writes.close();
         // The instruction fetch the block will not charge, because this arm reports the prefix
         // only. It cannot fault: the line is resident, and `DecodeCache::put` refuses any line
         // that straddles a page, so the crossing arm is unreachable from here.
@@ -1300,6 +1355,7 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
             charged.is_ok(),
             "a resident decode line's fetch charge cannot fault"
         );
+        cpu.settle_write_record();
         publish_flags(cpu);
         if cell.note_execution(true) {
             cpu.jit_direct.note_interpret_one_demoted();
@@ -1307,6 +1363,16 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
         cpu.jit_direct.note_interpret_one_resync_fault();
         return 1i64 << STATUS_RESYNC_FAULT_BIT;
     };
+    cpu.deferred_code_writes.close();
+
+    // The `begin_instruction` half this step owes the slot after it, which is native and will
+    // never run one. See `CpuGsw::settle_write_record`: it acts on the prefetch queue and clears
+    // the record, and doing it here rather than leaving it to the next INTERPRETED instruction is
+    // what keeps the invalidation on time and the record from accumulating across the block.
+    //
+    // Before the predicate and after the step, so it sees exactly this instruction's writes. It
+    // cannot disturb R5: that clause reads the DEFERRED list, which is a different record.
+    cpu.settle_write_record();
 
     // STEP 8. The resume predicate.
     let resume = snapshot.allows_resume(cpu, end_eip);

@@ -554,6 +554,18 @@ fn interpret_one_resync_on_interrupt_shadow() {
     assert!(!snapshot.allows_resume(&cpu, end_eip));
 }
 
+/// R3: the trap flag. A block cannot produce the instruction boundary single-step delivery wants,
+/// so a step that leaves TF set has to hand the boundary back to the run loop.
+///
+/// Predicate-level because no row on the S2 allowlist can SET TF; the clause exists for the block
+/// that was ENTERED with it set, which the Direct dispatcher has no refusal against.
+#[test]
+fn interpret_one_resync_on_trap_flag() {
+    let (mut cpu, snapshot, end_eip) = snapshot_fixture();
+    cpu.registers.eflags |= FLAG_TF;
+    assert!(!snapshot.allows_resume(&cpu, end_eip));
+}
+
 /// R4: a LIVE mapping epoch that moved. The paging generation changed under the block.
 #[test]
 fn interpret_one_resync_on_mapping_epoch_change() {
@@ -779,6 +791,335 @@ fn interpret_one_demotes_after_three_resyncs() {
         native.registers.eip,
         ENTRY + 3,
         "the demoted slot must leave EIP at the call-out"
+    );
+}
+
+/// Design review round 2, BLOCKER 1: the call-out window stays OPEN across the fault delivery.
+///
+/// `deliver_exception` pushes three words in real mode, and a TINY-MODEL guest -- SS and CS on one
+/// page, which is what the loader is -- puts those pushes on the running block's own bytes. If the
+/// window closes before `finish_instruction`, they reach `invalidate_physical_range` with the
+/// block's native frame still on the host stack and retire the block the helper has to RETURN
+/// THROUGH. Closing after is the whole fix.
+///
+/// The fixture aims the frame at the block deliberately: SP starts at 0x104, the POP takes the
+/// word there and leaves SP at 0x106, and the three pushes then land at 0x104, 0x102 and 0x100 --
+/// the block's own three instructions.
+///
+/// `callout_deferred_code_writes` is what makes it a test rather than a hope. With the window
+/// closed too early the delivery's writes invalidate immediately and the counter reads ZERO,
+/// because the POP itself faulted before it could store; with the window held open it reads the
+/// frame. That counter is also the only always-on evidence design review B2 can have, since the
+/// drain makes the outcome identical either way.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_window_stays_open_across_fault_delivery() {
+    /// SP inside the block, so all three words of the delivery frame land on the code.
+    ///
+    /// The POP does NOT move it: its `0x8f` arm restores the pre-pop (E)SP when the store faults,
+    /// so the instruction is restartable. The frame therefore starts here and grows down through
+    /// 0x104, 0x102 and 0x100 -- the block's whole span. Two bytes lower and the last word would
+    /// fall below the block and only two of the three would be watched, which is what the first
+    /// version of this fixture measured.
+    const TINY_MODEL_SP: u32 = ENTRY + 6;
+
+    fn arm_tiny_model(cpu: &mut CpuGsw, _: &mut TestBus) {
+        cpu.registers.set_esp(TINY_MODEL_SP);
+        // Past the real-mode DS limit at a word width, which is the #GP the POP's store takes.
+        cpu.registers.set_ebx(0xffff);
+    }
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_fault_handler(&mut program);
+
+    let mut interp_bus = sixteen_bit_bus(program.clone());
+    let mut interp = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut interp, &mut interp_bus);
+    arm_tiny_model(&mut interp, &mut interp_bus);
+    drive(&mut interp, &mut interp_bus);
+
+    let (mut native, mut native_bus, block) = build_native(CODE, STARTS);
+    arm_fixture(&mut native, &mut native_bus);
+    arm_tiny_model(&mut native, &mut native_bus);
+    assert_eq!(native.jit_direct.len(), 1);
+    let deferred_before = native.direct_stall_snapshot().callout_deferred_code_writes;
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("a delivery onto the block's own page must not stop the machine"),
+        "the block must run"
+    );
+
+    let stalls = native.direct_stall_snapshot();
+    assert_eq!(
+        stalls.callout_deferred_code_writes - deferred_before,
+        3,
+        "the three words of the real-mode delivery frame must all have been DEFERRED, which they \
+         are only if the window was still open across `finish_instruction`"
+    );
+    assert_eq!(
+        stalls.callout_interpret_one_resync_fault, 1,
+        "the step faulted, so this is the not-retired RESYNC"
+    );
+    // The drain ran on the way out of `run_direct_block`, so the block is gone by the time control
+    // is back here. That it went through the DRAIN rather than through the live frame is what the
+    // counter above says.
+    assert_eq!(
+        native.jit_direct.len(),
+        0,
+        "the deferred delivery writes must have retired the block at the drain"
+    );
+
+    drive(&mut native, &mut native_bus);
+    native.materialize_flags();
+    interp.materialize_flags();
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native_bus.memory, interp_bus.memory, "guest RAM");
+    assert_eq!(
+        native.perf_counters().instructions,
+        interp.perf_counters().instructions
+    );
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+}
+
+/// Design review round 2, MAJOR 2: the helper puts `core_clocks_so_far` back.
+///
+/// The field is the base a device sees for guest time. `run_direct_block` sets it ONCE per entry
+/// and `port_read_al_dx` previews on top of it without writing it back, because it can compute
+/// into a local. `interpret_one` cannot -- the interpreter reads the field -- so it writes the
+/// preview and must restore the entry value on the way out. Leaving it advanced makes the NEXT
+/// call-out in the same block preview a prefix that already contained this one's.
+///
+/// The fixture is exactly that block: a POP call-out followed by a port call-out, and the oracle
+/// is the timestamp the interpreted leg's `read_io` receives. A leaked preview shows up there and
+/// nowhere else -- no register moves, no clock total changes, and the block still completes.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_restores_the_device_timestamp_base() {
+    // EIGHT `mov ax,imm16` | pop word [bx] | in al,dx | inc ax | hlt.
+    //
+    // The eight are not padding. The leak this pins is the POP slot's own clock PREVIEW left in
+    // the field, and that preview is `prefix_raw * num / den` -- one twelfth on both Approximate
+    // personas. With a two-instruction prefix it rounds to zero and a leaked zero is invisible, so
+    // the fixture puts sixteen raw clocks of prefix in front of the call-out and the preview
+    // becomes a clock the port slot's timestamp either carries twice or does not.
+    const PORT_CODE: &[u8] = &[
+        0xB8, 0x11, 0x11, 0xB8, 0x22, 0x22, 0xB8, 0x33, 0x33, 0xB8, 0x44, 0x44, 0xB8, 0x55, 0x55,
+        0xB8, 0x66, 0x66, 0xB8, 0x77, 0x77, 0xB8, 0x88, 0x88, 0x8F, 0x07, 0xEC, 0x40, 0xF4,
+    ];
+    const PORT_STARTS: &[u32] = &[0, 3, 6, 9, 12, 15, 18, 21, 24, 26, 27];
+
+    fn arm_port(cpu: &mut CpuGsw, _: &mut TestBus) {
+        cpu.registers.set_edx(0x0201);
+    }
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + PORT_CODE.len()].copy_from_slice(PORT_CODE);
+    seed_fault_handler(&mut program);
+
+    let mut interp_bus = sixteen_bit_bus(program.clone());
+    let mut interp = sixteen_bit_code_cpu(ENTRY);
+    // WARMED like the native role, and that is part of the oracle rather than setup. The timestamp
+    // a device sees is the clocks retired SO FAR IN THIS RUN, so a cold interpreted leg that broke
+    // its straight-line run on a decode miss would restart the count and read zero at the port for
+    // reasons that have nothing to do with the call-out.
+    let interp_linears: Vec<u32> = PORT_STARTS.iter().map(|offset| ENTRY + offset).collect();
+    warm_sixteen_bit(&mut interp, &mut interp_bus, &interp_linears);
+    arm_fixture(&mut interp, &mut interp_bus);
+    arm_port(&mut interp, &mut interp_bus);
+    drive(&mut interp, &mut interp_bus);
+
+    let (mut native, mut native_bus, block) = build_native(PORT_CODE, PORT_STARTS);
+    assert_eq!(
+        block.callout_interpret_one_slots(),
+        1,
+        "the fixture needs the POP slot"
+    );
+    assert_eq!(
+        block.callout_port_slots(),
+        1,
+        "and the port slot after it, or the leak has nothing to show up in"
+    );
+    arm_fixture(&mut native, &mut native_bus);
+    arm_port(&mut native, &mut native_bus);
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("the port fixture must not stop the machine")
+    );
+    drive(&mut native, &mut native_bus);
+
+    assert_eq!(
+        native_bus.io_reads.len(),
+        1,
+        "the fixture is vacuous unless the port slot served"
+    );
+    assert_eq!(
+        native_bus.io_reads, interp_bus.io_reads,
+        "the port slot saw a different guest timestamp than the interpreter did, so the call-out \
+         before it left `core_clocks_so_far` advanced"
+    );
+    native.materialize_flags();
+    interp.materialize_flags();
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+}
+
+/// Design review round 2, MAJOR 3: the step settles the write record it leaves behind.
+///
+/// The interpreter clears the record at the head of every instruction (`begin_instruction`). A
+/// call-out's successor is a NATIVE slot and never runs one, so without `settle_write_record` the
+/// call-out's writes ride the rest of the block: the prefetch invalidation they owe runs at the
+/// first interpreted instruction after the BLOCK, and the record itself -- four `CpuGsw` fields
+/// the whole-CPU differential compares -- accumulates.
+///
+/// Compared against the interpreter stepped to the SAME boundary, which is the only place the two
+/// can be asked to agree: by the time both halt, the interpreted HLT has cleared the record on
+/// both roles and the difference is gone. That is what makes this a latent flake rather than a
+/// visible failure, and why it needs a boundary assertion rather than an end-state one.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_settles_the_write_record_for_the_next_slot() {
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_fault_handler(&mut program);
+
+    let mut interp_bus = sixteen_bit_bus(program.clone());
+    let mut interp = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut interp, &mut interp_bus);
+    // The three instructions the block covers, one at a time, so the comparison lands on the
+    // boundary the block exits at.
+    for _ in 0..BLOCK_INSTRUCTIONS {
+        interp.cycle(&mut interp_bus).expect("interpreted step");
+    }
+
+    let (mut native, mut native_bus, block) = build_native(CODE, STARTS);
+    arm_fixture(&mut native, &mut native_bus);
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("the fixture must not stop the machine")
+    );
+
+    assert_eq!(
+        native.written_count, interp.written_count,
+        "the call-out's write record outlived its own instruction"
+    );
+    assert_eq!(native.written_pages, interp.written_pages);
+    assert_eq!(native.written_pages_overflow, interp.written_pages_overflow);
+    assert_eq!(native.last_written_page, interp.last_written_page);
+    // Non-vacuity: the POP really did store, so there was a record to settle.
+    assert_eq!(
+        u16::from_le_bytes(
+            native_bus.memory[POP_TARGET as usize..POP_TARGET as usize + 2]
+                .try_into()
+                .unwrap()
+        ),
+        POPPED
+    );
+}
+
+/// The other half of `settle_write_record`, on its own: a write onto the page the prefetch queue
+/// is holding drops the queue.
+///
+/// A unit test rather than a fixture, and that is the honest shape for it. The 486 prefetch queue
+/// is a SNAPSHOT of already-fetched bytes, so the invalidation only becomes guest-visible when
+/// something later fetches through the queue over bytes the call-out overwrote -- and with S2's
+/// allowlist every slot after a call-out is native and fetches through nothing. The clause is
+/// emitted because it is what makes the CLEAR beside it safe: clearing the record without acting
+/// on it would lose the invalidation entirely rather than delay it.
+#[test]
+fn settle_write_record_invalidates_the_prefetch_queue() {
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    // A bus WITHOUT direct pages, deliberately. The prefetch queue is the slow fetch path's
+    // snapshot; a direct-RAM page is read in place and never fills it, so on the fixtures' usual
+    // bus this clause has nothing to act on and the test would be vacuous.
+    let mut bus = TestBus::with_memory(program);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut cpu, &mut bus);
+    // EXECUTED, not merely decoded: the queue is filled by the fetch path, and a decode that hits
+    // the cache never touches it.
+    cpu.cycle(&mut bus)
+        .expect("the fixture must execute one instruction");
+    let page = cpu
+        .prefetch
+        .physical_page()
+        .expect("the fixture must leave the prefetch queue hot");
+
+    // A write somewhere else leaves it alone.
+    cpu.record_write_page((page + 1) << 12);
+    cpu.settle_write_record();
+    assert_eq!(
+        cpu.prefetch.physical_page(),
+        Some(page),
+        "an unrelated page must not drop the queue"
+    );
+    assert_eq!(cpu.written_count, 0, "the record is cleared either way");
+
+    // A write ON the page drops it.
+    cpu.record_write_page(page << 12);
+    cpu.settle_write_record();
+    assert_eq!(
+        cpu.prefetch.physical_page(),
+        None,
+        "a write onto the queue's own page must drop it"
+    );
+}
+
+/// Design review round 2, MAJOR 5: `POP_RM_CORE_CLOCKS` is what the interpreter actually charges.
+///
+/// The constant is the budget bound's input (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and, since this
+/// round, the literal in `execute.rs`'s `0x8f` arm as well, so the two cannot drift apart. The pin
+/// is a pair of roles: one CPU RUNS the instruction, the other scales the constant from the same
+/// fresh state, and they agree only if the arm charges the constant.
+///
+/// TWENTY-FOUR of them, not one. Both Approximate personas scale core clocks by one twelfth with a
+/// carried remainder, so a single POP charges zero however wrong the constant is; the difference
+/// only leaves the rounding after a couple of dozen. That is the same reason
+/// `cpu_jit_callout_matrix_test.rs` separates the call-out clock lanes by ACCUMULATION.
+#[test]
+fn pop_rm_core_clocks_is_what_the_interpreter_charges() {
+    const REPEATS: usize = 24;
+    let mut program = vec![0u8; 0x2000];
+    for index in 0..REPEATS {
+        // pop word [bx]
+        let at = ENTRY as usize + index * 2;
+        program[at..at + 2].copy_from_slice(&[0x8F, 0x07]);
+    }
+    program[ENTRY as usize + REPEATS * 2] = 0xF4;
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut cpu, &mut bus);
+    let mut oracle = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut oracle, &mut bus);
+
+    let mut expected = 0u64;
+    for _ in 0..REPEATS {
+        cpu.cycle(&mut bus).expect("the POP must execute");
+        expected += oracle.scale_clocks(crate::POP_RM_CORE_CLOCKS);
+    }
+    assert!(
+        expected > 0,
+        "the fixture must clear the timing dial's rounding"
+    );
+    assert_eq!(
+        cpu.elapsed_clocks, expected,
+        "the 0x8f arm charges something other than POP_RM_CORE_CLOCKS"
     );
 }
 

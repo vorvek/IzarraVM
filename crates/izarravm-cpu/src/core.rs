@@ -471,7 +471,7 @@ impl CpuGsw {
         //
         // One predictable bool test on a path that is already the invalidation choke rather than
         // the store path: `note_code_write_hit` reaches here only behind `code_write_watched`.
-        if self.in_native_callout {
+        if self.deferred_code_writes.is_open() {
             self.record_deferred_code_write(physical, width, lanes);
             return true;
         }
@@ -622,6 +622,7 @@ impl CpuGsw {
     #[cold]
     #[inline(never)]
     fn record_deferred_code_write(&mut self, physical: u32, width: u32, lanes: bool) {
+        self.jit_direct.note_deferred_code_write();
         self.deferred_code_writes.push(crate::DeferredCodeWrite {
             physical,
             width,
@@ -639,10 +640,11 @@ impl CpuGsw {
     ///
     /// The overflow arm is coarse and unreachable in practice. `MAX_DEFERRED_CODE_WRITES` is
     /// sized for one instruction's stores plus a whole exception delivery's pushes and page-walk
-    /// accessed-bit writes; past that the only sound answer is to invalidate everything the
-    /// instruction is known to have touched, which is the write-page record `begin_instruction`
-    /// was deliberately not called to preserve, and if THAT overflowed too, to drop every compiled
-    /// block and every decode line.
+    /// accessed-bit writes; past that the only sound answer is to drop every compiled block and
+    /// every decode line, which is what it does. It deliberately does NOT consult the write-page
+    /// record: that record is settled at the end of the step (`settle_write_record`), so by the
+    /// time this runs it names nothing, and making the drain depend on it would have coupled two
+    /// mechanisms for a path that cannot be reached.
     #[cfg(feature = "jit")]
     pub(super) fn drain_deferred_code_writes(&mut self) {
         if self.deferred_code_writes.is_empty() {
@@ -658,16 +660,8 @@ impl CpuGsw {
             }
         }
         if deferred.overflow {
-            if self.written_pages_overflow {
-                self.jit_direct.clear();
-                self.invalidate_code_caches();
-            } else {
-                for index in 0..usize::from(self.written_count) {
-                    if let Some(page) = self.written_pages[index] {
-                        self.note_code_write(page << 12, 0x1000);
-                    }
-                }
-            }
+            self.jit_direct.clear();
+            self.invalidate_code_caches();
         }
     }
 
@@ -705,8 +699,24 @@ impl CpuGsw {
                 self.flag(FLAG_CF),
             );
         }
-        // A 486 prefetch queue is a snapshot: writes to already fetched bytes are
-        // not observed until control flow or the next refill invalidates the queue.
+        self.settle_write_record();
+    }
+
+    /// Act on the write record the instruction just finished left, then clear it.
+    ///
+    /// TWO CALLERS, and the second is why this is a function. The interpreter reaches it through
+    /// `begin_instruction`, once per instruction, which is where it has always lived. An
+    /// `InterpretOne` call-out reaches it directly, at the END of its step, because the slot after
+    /// it is NATIVE and will never call `begin_instruction` -- so without this the record would
+    /// accumulate across the rest of the block and the prefetch invalidation below would run at
+    /// the first interpreted instruction AFTER the block instead of at the next slot.
+    ///
+    /// The prefetch half is not bookkeeping. A 486 prefetch queue is a SNAPSHOT: writes to bytes
+    /// already fetched are not observed until control flow or a refill drops the queue, so a
+    /// call-out that patches the bytes ahead of it must invalidate here or the interpreter fetches
+    /// what the guest just overwrote.
+    #[inline]
+    pub(super) fn settle_write_record(&mut self) {
         if self.written_pages_overflow {
             self.prefetch.invalidate();
         } else if self.written_count > 0
