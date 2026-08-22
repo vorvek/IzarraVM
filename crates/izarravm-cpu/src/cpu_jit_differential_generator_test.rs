@@ -1612,6 +1612,17 @@ struct SweepExpectations {
     /// Whether the block carries an `InterpretOne` slot, which decides whether the call-out
     /// counters are asserted clean or asserted absent.
     interpret_one_slots: bool,
+    /// Whether the two roles must return the SAME SEQUENCE of `run_budgeted` outcomes, or only
+    /// the same total clocks.
+    ///
+    /// True for every sweep but the STI one, and the exception is the approved caveat rather than
+    /// slack. `run_budgeted_inner` ends a run the instant an instruction makes an interrupt
+    /// serviceable, which interpreted means the instruction right after the STI; natively the STI
+    /// and the instruction behind it are both inside the block, so the run ends at the block's
+    /// boundary instead. The owner accepted that on 2026-08-22. Everything the caveat does NOT
+    /// cover is still asserted at full strength on this path: total consumed clocks, the whole
+    /// settled CPU (which includes `interrupt_shadow`), guest RAM and the bus-clock total.
+    exact_run_boundaries: bool,
 }
 
 /// One randomized sweep: build a case, run it wholly interpreted and again with Direct armed, and
@@ -1628,6 +1639,7 @@ fn run_generated_sweep(
         native_instructions,
         stack_round_trip,
         interpret_one_slots,
+        exact_run_boundaries,
     } = expect;
     for index in 0..WIDTH_LIFT_CASES {
         let case = build_case(index, mode_offset);
@@ -1654,7 +1666,7 @@ fn run_generated_sweep(
             &mut direct_bus,
             &pristine,
             &case,
-            true,
+            exact_run_boundaries,
         );
         // NON-VACUITY, and it is an equality rather than a `> 0`: the three rows under test are
         // the ones that used to END a block, so an admission that quietly reverted would leave
@@ -1727,6 +1739,7 @@ fn generated_width_lift_blocks_match_the_interpreter() {
             native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
             stack_round_trip: true,
             interpret_one_slots: false,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -1739,6 +1752,7 @@ fn generated_width_lift_blocks_match_the_interpreter() {
             native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
             stack_round_trip: true,
             interpret_one_slots: false,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -1751,6 +1765,7 @@ fn generated_width_lift_blocks_match_the_interpreter() {
             native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
             stack_round_trip: true,
             interpret_one_slots: false,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -1763,6 +1778,7 @@ fn generated_width_lift_blocks_match_the_interpreter() {
             native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
             stack_round_trip: true,
             interpret_one_slots: false,
+            exact_run_boundaries: true,
         },
     );
 }
@@ -1929,6 +1945,7 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
             native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -1941,6 +1958,7 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
             native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -1953,6 +1971,7 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
             native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -1965,6 +1984,7 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
             native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
 }
@@ -2085,6 +2105,21 @@ fn policy_cli(_: &mut [u32; 8]) -> Vec<u8> {
     vec![0xFA]
 }
 
+/// `FB`: STI, the S4d row and the only one that may resume with `interrupt_shadow` ARMED.
+///
+/// What the sweep adds here that the execution tests cannot: the whole-CPU comparison at the end
+/// of `assert_measured_pair` includes `interrupt_shadow`, so every case carrying this row asserts
+/// that the block's boundary left the flag exactly where a wholly interpreted run left it, at
+/// every position the sweep puts the row in and against a randomly drawn register file.
+///
+/// Every case draws EFLAGS with IF already set, so this is the REDUNDANT-STI shape: IF does not
+/// move and the shadow is armed anyway. The 0-to-1 edge is covered by
+/// `interpret_one_sti_resumes_across_the_interrupt_flag_edge`, which seeds IF clear; the sweep
+/// cannot, because its EFLAGS seeding is shared by every row.
+fn policy_sti(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xFB]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
 const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_mov_sreg_memory_32,
@@ -2189,6 +2224,21 @@ fn policy_xchg_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
 /// the flag shadow the helper republished, so a row that left EFLAGS wrong sends the two roles to
 /// different addresses.
 fn policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    policy_case_with(
+        index,
+        mode_offset,
+        POLICY_ROWS_32[(index + mode_offset) as usize % POLICY_ROWS_32.len()],
+    )
+}
+
+/// One STI case in the 32-bit machine. See `sti_rows_match_the_interpreter`.
+fn sti_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    policy_case_with(index, mode_offset, policy_sti)
+}
+
+/// `policy_case`'s body with the row handed in rather than drawn from the table, so the STI sweep
+/// runs the SAME generated program shape as the policy sweep and differs only in the row.
+fn policy_case_with(index: u32, mode_offset: u32, row: PolicyRow) -> GeneratedCase {
     let seed = 0x5715_80f3_0000_0001u64
         ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let mut rng = Rng::new(seed);
@@ -2204,7 +2254,6 @@ fn policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
     let dst = non_stack_reg(&mut rng);
     bytes.push(0xb8 + dst);
     push_u32(&mut bytes, rng.u32());
-    let row = POLICY_ROWS_32[(index + mode_offset) as usize % POLICY_ROWS_32.len()];
     bytes.extend_from_slice(&row(&mut gpr));
     let op = ((index + mode_offset) & 7) as u8;
     bytes.extend_from_slice(&[
@@ -2233,6 +2282,20 @@ fn policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
 /// The 16-bit half: the same shape unprefixed in a 16-bit code segment on a 16-bit stack, which is
 /// the machine the loader census measured every one of these rows on.
 fn sixteen_bit_policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(
+        index,
+        mode_offset,
+        POLICY_ROWS_16[(index + mode_offset) as usize % POLICY_ROWS_16.len()],
+    )
+}
+
+/// One STI case in the 16-bit machine. See `sti_rows_match_the_interpreter`.
+fn sixteen_bit_sti_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(index, mode_offset, policy_sti)
+}
+
+/// `sixteen_bit_policy_case`'s body with the row handed in. See `policy_case_with`.
+fn sixteen_bit_policy_case_with(index: u32, mode_offset: u32, row: PolicyRow) -> GeneratedCase {
     let seed = 0x5715_80f4_0000_0001u64
         ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let mut rng = Rng::new(seed);
@@ -2255,7 +2318,6 @@ fn sixteen_bit_policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
     let dst = non_stack_reg(&mut rng);
     bytes.push(0xb8 + dst);
     bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
-    let row = POLICY_ROWS_16[(index + mode_offset) as usize % POLICY_ROWS_16.len()];
     bytes.extend_from_slice(&row(&mut gpr));
     // ADC and SBB have no Word lane and are refused by the classifier, so the op set is the other
     // six; the same choice `sixteen_bit_interpret_one_case` makes.
@@ -2303,6 +2365,7 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
             native_instructions: POLICY_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -2315,6 +2378,7 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
             native_instructions: POLICY_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -2327,6 +2391,7 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
             native_instructions: POLICY_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
     run_generated_sweep(
@@ -2339,6 +2404,68 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
             native_instructions: POLICY_NATIVE_INSTRUCTIONS,
             stack_round_trip: false,
             interpret_one_slots: true,
+            exact_run_boundaries: true,
         },
     );
+}
+
+/// The STI row (S4d), on the same generated program shape as the policy sweep.
+///
+/// A sweep of its own rather than a twelfth entry in the row tables, and the reason is the one
+/// thing this row changes that no other row does. `run_budgeted_inner` ends a run the instant an
+/// instruction makes an interrupt serviceable. Interpreted, that is the instruction right after
+/// the STI; natively, the STI and the instruction behind it are both inside the block, so the run
+/// ends at the block's boundary instead. The sequence of `run_budgeted` outcomes therefore
+/// differs, which is the caveat the owner approved on 2026-08-22 and not something to assert away
+/// for the other eleven rows as well.
+///
+/// Everything the caveat does not cover is asserted at full strength: total consumed clocks, the
+/// whole settled CPU including `interrupt_shadow`, guest RAM, the bus-clock total, and the
+/// retirement equality that says the row resumed rather than resynced.
+#[test]
+fn generated_sti_blocks_match_the_interpreter() {
+    for (label, mode, offset, build_cpu, build_case) in [
+        (
+            "flat, SS.B=1",
+            GswMode::Gsw486,
+            0,
+            generated_cpu as fn(GswMode) -> CpuGsw,
+            sti_case as fn(u32, u32) -> GeneratedCase,
+        ),
+        (
+            "flat, SS.B=1",
+            GswMode::Gsw586,
+            WIDTH_LIFT_CASES,
+            generated_cpu,
+            sti_case,
+        ),
+        (
+            "16-bit code, SS.B=0",
+            GswMode::Gsw486,
+            2 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_sti_case,
+        ),
+        (
+            "16-bit code, SS.B=0",
+            GswMode::Gsw586,
+            3 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_sti_case,
+        ),
+    ] {
+        run_generated_sweep(
+            label,
+            mode,
+            offset,
+            build_cpu,
+            build_case,
+            SweepExpectations {
+                native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+                stack_round_trip: false,
+                interpret_one_slots: true,
+                exact_run_boundaries: false,
+            },
+        );
+    }
 }

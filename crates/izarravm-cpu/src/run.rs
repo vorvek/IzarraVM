@@ -652,6 +652,12 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         {
             self.direct_runtime.skip_direct_once = false;
+            // Same reason, same scope: an STI call-out's latch belongs to the entry that set it,
+            // and `run_direct_block` takes it at the boundary. This clear is the backstop for the
+            // test seams that call that function directly. It lives on the block cache rather than
+            // here beside `skip_direct_once`, because this struct sits ahead of the CPU offsets
+            // emitted code bakes.
+            self.jit_direct.take_interrupt_shadow_armed();
         }
         #[cfg(feature = "jit")]
         let native_continuations_active = {
@@ -712,7 +718,11 @@ impl CpuGsw {
         #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
         let mut seam_declines: u64 = 0;
         loop {
-            let can_take_before = self.can_take_interrupt();
+            // `mut` for one reason: a native block that consumed an STI's interrupt shadow
+            // inside itself turns this answer false after the fact. See the fold below the
+            // dispatch.
+            #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
+            let mut can_take_before = self.can_take_interrupt();
             let outcome = if first {
                 first = false;
                 self.cycle_no_interrupt_check_with_budget(bus, Some(rep_budget))?
@@ -845,6 +855,21 @@ impl CpuGsw {
                     }
                 }
             };
+            // The exit-path re-check design section 10 asks for. An STI call-out that resumed
+            // left the shadow for `run_direct_block` to clear at the boundary, so as far as the
+            // interrupt-transition test below is concerned this iteration IS the shadowed
+            // instruction: the state it must compare against is the one BEFORE the STI ran, where
+            // no interrupt could be taken. Without this the block's own entry state would be used
+            // and a transition the interpreter breaks on would be missed.
+            //
+            // Under the pendency rule the row enforces (`interpret_one_step`) nothing can be
+            // pending here, so this cannot fire in production. It is written anyway because the
+            // rule is a premise about the batch and this is the place that would otherwise have to
+            // trust it.
+            #[cfg(feature = "jit")]
+            if self.jit_direct.take_interrupt_shadow_consumed() {
+                can_take_before = false;
+            }
             total += u64::from(outcome.core_clocks);
             // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
             // machine can service an event or interrupt before any further iteration.
@@ -2574,6 +2599,32 @@ impl CpuGsw {
             self.wrap_16bit_sequential_run_off();
         }
         let final_eip = self.registers.eip;
+        // The STI call-out's boundary decision (design section 10.1, B1). The helper armed
+        // nothing and cleared nothing: it latched the EIP its slot left behind, and the question
+        // here is whether the block went on past it.
+        //
+        // `final_eip != armed_at` means at least one instruction retired after the STI, so the
+        // one-instruction shadow was consumed INSIDE the block and the flag must not survive the
+        // boundary. Equal means nothing retired after it -- the STI was the block's last slot, or
+        // the slot behind it side-exited before retiring -- and the flag stays armed for the
+        // interpreter to consume on the next instruction, which is what hardware does and what
+        // keeps `sti; hlt` from taking its interrupt one instruction early.
+        //
+        // The comparison is on EIP rather than on a completed-instruction index, and the reason is
+        // chaining: `exit.instructions` counts the whole chain from its head, while a slot index
+        // is relative to the block that holds the slot, so comparing the two is only correct when
+        // the STI is in the head block. EIP is the one quantity both ends agree on. It has one
+        // ambiguous shape -- a loop whose body starts immediately after the STI can exit with EIP
+        // back at `armed_at` having run the body -- and that shape resolves to LEAVING THE FLAG
+        // ARMED, which costs at most one instruction of extra interrupt latency and one refused
+        // native entry. The opposite error would deliver early, which is the thing B1 bars.
+        if let Some(armed_at) = self.jit_direct.take_interrupt_shadow_armed()
+            && self.interrupt_shadow
+            && final_eip != armed_at
+        {
+            self.interrupt_shadow = false;
+            self.jit_direct.note_interrupt_shadow_consumed();
+        }
         let cs_base = self.registers.cs().base;
         if exit.dynamic_link_cell != 0 {
             debug_assert_eq!(exit.dynamic_target_eip, final_eip);

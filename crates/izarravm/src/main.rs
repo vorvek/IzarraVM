@@ -2987,6 +2987,11 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
                 json!({ "cause": counts.cause, "count": counts.count, "keys": counts.keys })
             })
             .collect::<Vec<_>>(),
+        // The S4d M5 measurement: interpreted MOV SS / POP SS split by whether the load moved
+        // the SS record. The SS call-out rows resume only on the unchanged shape, so this ratio
+        // is what decides whether they are worth building.
+        "ss_load_same_record": snapshot.ss_load_same_record,
+        "ss_load_changed_record": snapshot.ss_load_changed_record,
         "link_refusals": snapshot
             .link_refusals
             .iter()

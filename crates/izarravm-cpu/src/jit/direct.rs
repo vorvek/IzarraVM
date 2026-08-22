@@ -801,6 +801,29 @@ pub(crate) struct BlockCache {
     /// At most one is ever pending: a cell latches its demotion once, and the entry that observed
     /// it returns before another can start.
     callout_retire_pending: Option<BlockKey>,
+    /// The guest EIP an `InterpretOne` STI slot left behind, latched when that slot RESUMED with
+    /// `interrupt_shadow` still armed and read once by `run_direct_block` after the native return.
+    ///
+    /// The question it answers is "did any instruction retire after the arming slot". The helper
+    /// cannot: when it returns, the rest of the block has not run yet. The boundary can, by
+    /// comparing the block's final EIP against this one, and that comparison decides whether the
+    /// shadow was consumed inside the block (clear it) or the block ended at the STI (leave it
+    /// armed for the interpreter, which is what hardware does).
+    ///
+    /// HERE and not on `DirectRuntimeState` beside the other two run-scoped latches, for the
+    /// reason `callout_retire_pending` moved here in the S3 review round: that struct is inline in
+    /// `CpuGsw` ahead of `registers` and `pending_flags`, whose offsets emitted code BAKES. Adding
+    /// a field there moves them and breaks the layout pins. The block cache is behind a `Box`, so
+    /// nothing it holds can move a baked offset.
+    ///
+    /// At most one is ever live, for `callout_retire_pending`'s reason: the entry that set it
+    /// returns before another can start.
+    interrupt_shadow_armed_at: Option<u32>,
+    /// Set when the boundary above CLEARED the shadow, i.e. the block consumed an STI's
+    /// one-instruction reprieve inside itself. `run_budgeted_inner` reads it to run the
+    /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
+    /// beside `can_take_before`.
+    interrupt_shadow_consumed: bool,
     /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
     lane_trial_override: Option<bool>,
@@ -967,6 +990,8 @@ impl BlockCache {
             top_mismatch_retires: HashMap::default(),
             demoted_callout_sites: HashSet::default(),
             callout_retire_pending: None,
+            interrupt_shadow_armed_at: None,
+            interrupt_shadow_consumed: false,
             lane_trial_override: None,
             block_portals: Vec::new(),
             link_cells: Vec::new(),
@@ -1647,6 +1672,37 @@ impl BlockCache {
     /// would then change the block cache for a demotion that happened inside a different run.
     pub(crate) fn take_callout_retire_pending(&mut self) -> Option<BlockKey> {
         self.callout_retire_pending.take()
+    }
+
+    /// Latch the EIP an arming call-out slot left behind. See the field.
+    pub(crate) fn note_interrupt_shadow_armed(&mut self, end_eip: u32) {
+        self.interrupt_shadow_armed_at = Some(end_eip);
+    }
+
+    /// Take the arming slot's EIP, clearing it. Both the native return and the dispatcher entry
+    /// call this, for the reason `take_callout_retire_pending` gives: a latch left behind would be
+    /// read by an entry that did not set it.
+    pub(crate) fn take_interrupt_shadow_armed(&mut self) -> Option<u32> {
+        self.interrupt_shadow_armed_at.take()
+    }
+
+    /// The M5 measurement: one interpreted SS load, classified by whether it moved the record.
+    pub(crate) fn note_ss_load(&mut self, same_record: bool) {
+        if same_record {
+            self.stalls.ss_load_same_record += 1;
+        } else {
+            self.stalls.ss_load_changed_record += 1;
+        }
+    }
+
+    /// Record that a block consumed an STI's shadow inside itself. See the field.
+    pub(crate) fn note_interrupt_shadow_consumed(&mut self) {
+        self.interrupt_shadow_consumed = true;
+    }
+
+    /// Take that record, clearing it, so the interrupt-transition test runs once per block.
+    pub(crate) fn take_interrupt_shadow_consumed(&mut self) -> bool {
+        std::mem::take(&mut self.interrupt_shadow_consumed)
     }
 
     /// Drop every demoted site the write at `physical..physical + width` lands on, because the

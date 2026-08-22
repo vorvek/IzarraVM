@@ -1446,6 +1446,23 @@ impl CpuGsw {
         self.data_write_pages.set_mapping_epoch_for_test(epoch);
     }
 
+    /// One interpreted SS load, classified for the S4d M5 measurement by whether the record
+    /// moved. `before` is the SS record as it stood at the top of the arm.
+    ///
+    /// Here rather than at the two call sites so the comparison is written once: the question is
+    /// the same one R2 asks of the six records, and two copies of it could drift apart.
+    pub(crate) fn note_ss_load_record(&mut self, before: crate::SegmentRegister) {
+        #[cfg(feature = "jit")]
+        {
+            let same = self.registers.segment(crate::SegmentIndex::Ss) == before;
+            self.jit_direct.note_ss_load(same);
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            let _ = before;
+        }
+    }
+
     pub fn direct_stall_snapshot(&self) -> crate::DirectStallSnapshot {
         #[cfg(feature = "jit")]
         {

@@ -405,13 +405,16 @@ pub(crate) enum InterpretOneRow {
     Cli,
     /// `0x8E` MOV Sreg,r/m: FS and GS in any form, ES and DS through memory or in protected mode.
     MovSreg,
+    /// `0xFB` STI, the S4d row. The only row that may leave `interrupt_shadow` ARMED and still
+    /// resume; see `arms_interrupt_shadow` for what that costs and what bounds it.
+    Sti,
 }
 
 impl InterpretOneRow {
     /// Every row, in discriminant order. The census array is indexed by `as usize`, so this is
     /// what keeps the two in step: a variant added without an entry here fails the length pin in
     /// `interpret_one_row_labels_cover_every_variant`.
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::PopRm,
         Self::MovRmSreg,
         Self::Xchg,
@@ -421,6 +424,7 @@ impl InterpretOneRow {
         Self::PushRm,
         Self::Cli,
         Self::MovSreg,
+        Self::Sti,
     ];
 
     /// How many rows the census array holds.
@@ -439,7 +443,29 @@ impl InterpretOneRow {
             Self::PushRm => "0xff6_push_rm16",
             Self::Cli => "0xfa_cli",
             Self::MovSreg => "0x8e_mov_sreg",
+            Self::Sti => "0xfb_sti",
         }
+    }
+
+    /// Whether this row may leave `interrupt_shadow` ARMED after its step and still resume.
+    ///
+    /// Every other row must find the flag clear, which is R3's unconditional post-step clause. It
+    /// is relaxed HERE, per row, rather than globally, because a global relaxation would hand the
+    /// same free pass to any future arming row and would also swallow a shadow the block was
+    /// ENTERED with (design section 10.1, B3; the entry half is a separate clause that stays
+    /// unconditional).
+    ///
+    /// What the relaxation buys and what it costs. STI arms a one-instruction shadow that the
+    /// interpreter consumes at the start of the next instruction. A native block has no such
+    /// point, so the flag would sit armed across the rest of the block and refuse the next entry.
+    /// Instead the helper LEAVES IT ARMED and `run_direct_block` decides at the boundary: an
+    /// instruction retired after the STI means the shadow was consumed inside the block and the
+    /// flag is cleared; nothing retired after it (`sti; hlt` is the shape that always does this,
+    /// since HLT is a barrier) means the flag stays armed and the interpreter consumes it exactly
+    /// as it would have. The helper itself never clears it, which is what keeps delivery from
+    /// moving EARLIER than hardware.
+    pub(crate) fn arms_interrupt_shadow(self) -> bool {
+        matches!(self, Self::Sti)
     }
 
     pub(crate) fn index(self) -> usize {
@@ -1208,6 +1234,12 @@ pub(crate) struct ResumeSnapshot {
     /// carries the six arithmetic bits and nothing else.
     interrupt_enable: bool,
     virtual_mode: bool,
+    /// The shadow as it stood BEFORE the step. R3 refuses an entry shadow unconditionally, for
+    /// every row: the relaxation the `Sti` row gets is about a shadow the step ARMED, and a block
+    /// that was entered with one already set has a reprieve it did not earn. The dispatcher does
+    /// not hand out blocks in that state (`run_direct_block` refuses on `interrupt_shadow`), so
+    /// this clause costs nothing and does not depend on that refusal staying put.
+    interrupt_shadow: bool,
     read_mapping_epoch: u64,
     write_mapping_epoch: u64,
     #[cfg(debug_assertions)]
@@ -1224,6 +1256,7 @@ impl ResumeSnapshot {
             cr4: cpu.control.cr4,
             interrupt_enable: cpu.registers.eflags & FLAG_IF != 0,
             virtual_mode: cpu.registers.eflags & FLAG_VM != 0,
+            interrupt_shadow: cpu.interrupt_shadow,
             read_mapping_epoch: cpu.data_read_pages.mapping_epoch(),
             write_mapping_epoch: cpu.data_write_pages.mapping_epoch(),
             #[cfg(debug_assertions)]
@@ -1244,19 +1277,24 @@ impl ResumeSnapshot {
     /// | R6 | x87 pad addressing (debug only; the compile walk refuses the mix) |
     /// | R7/R8 | the run loop's own state: no halt, no paused REP |
     ///
-    /// R2 subsumes the SS-shadow rule at no cost: a segment load moves a record here AND arms
-    /// `interrupt_shadow` in R3, so the rows that load SS can never resume however they are
-    /// admitted.
+    /// R2 covers the SS-load rows on its own: a segment load moves a record here, so a row that
+    /// loads SS can never resume however it is admitted. The shadow clause below is a SEPARATE
+    /// rule and no longer a restatement of that one; the note that claimed R2 subsumed it was
+    /// rewritten at design review 10.1 B3, because the `Sti` row arms the shadow while moving no
+    /// segment record at all.
     ///
     /// R3's IF clause is DIRECTIONAL by design review M8. IF going 1 to 0 resumes, because the run
     /// loop has no delivery point on that edge: disabling interrupts cannot make one serviceable.
     /// IF going 0 to 1 resyncs, because the boundary after it is exactly where the run loop would
-    /// deliver.
+    /// deliver -- EXCEPT for the `Sti` row, whose whole purpose is that edge and which pays for it
+    /// with a pendency test in the helper (`bus.interrupt_pending()`) that this predicate has no
+    /// bus to ask.
     ///
-    /// R3's shadow clause reads the flag AFTER the step rather than comparing it, because the seam
-    /// the helper uses does not clear it first the way `run_one_cached` does (design section 9,
-    /// M6). A block entered with the shadow already set therefore resyncs, which is conservative
-    /// and costs nothing: the dispatcher does not hand out blocks in that state.
+    /// R3's shadow clause is two rules, not one. A shadow that was ALREADY SET when the block
+    /// entered refuses for every row, always: the seam the helper uses does not clear it first the
+    /// way `run_one_cached` does (design section 9, M6), so it would otherwise survive as a
+    /// reprieve nothing consumed. A shadow the STEP armed refuses for every row except the ones
+    /// `arms_interrupt_shadow` names, which is `Sti` alone today.
     ///
     /// R3 also carries TF, and it is a CLAUSE rather than an entry-gate argument on purpose. The
     /// entry gate nearly does it: `classify` admits no row that can set TF, since the flag-image
@@ -1275,7 +1313,7 @@ impl ResumeSnapshot {
     /// block, which is the event that clearing is driven by.
     ///
     /// See `epoch_moved` for why a COLD FILL is not a move.
-    pub(crate) fn allows_resume(&self, cpu: &CpuGsw, end_eip: u32) -> bool {
+    pub(crate) fn allows_resume(&self, cpu: &CpuGsw, end_eip: u32, row: InterpretOneRow) -> bool {
         // R1.
         if cpu.registers.eip != end_eip || cpu.registers.cs() != self.cs {
             return false;
@@ -1289,13 +1327,15 @@ impl ResumeSnapshot {
             return false;
         }
         // R3.
+        let arming = row.arms_interrupt_shadow();
         if cpu.control.cr0 != self.cr0
             || cpu.control.cr3 != self.cr3
             || cpu.control.cr4 != self.cr4
             || (cpu.registers.eflags & FLAG_VM != 0) != self.virtual_mode
-            || (!self.interrupt_enable && cpu.registers.eflags & FLAG_IF != 0)
+            || (!arming && !self.interrupt_enable && cpu.registers.eflags & FLAG_IF != 0)
             || cpu.registers.eflags & FLAG_TF != 0
-            || cpu.interrupt_shadow
+            || self.interrupt_shadow
+            || (!arming && cpu.interrupt_shadow)
         {
             return false;
         }
@@ -1536,8 +1576,28 @@ fn interpret_one_step<B: CpuBus>(
     // cannot disturb R5: that clause reads the DEFERRED list, which is a different record.
     cpu.settle_write_record();
 
-    // STEP 8. The resume predicate.
-    let resume = snapshot.allows_resume(cpu, end_eip);
+    // STEP 8. The resume predicate, plus the one clause it has no bus to ask.
+    //
+    // THE PENDENCY CLAUSE (design section 10.1, B2) and the premise it rests on. STI is the only
+    // row admitted to run with IF going 0 to 1, and continuing past it moves where the run ENDS:
+    // interpreted, the instruction after STI consumes the shadow and `run_budgeted_inner`'s
+    // interrupt-transition break ends the run right there; natively, the run goes on to the
+    // block's own boundary. That is only equivalent if no interrupt became deliverable in
+    // between, and the premise that makes it so is the batch rule stated at `cycle`:
+    // `bus.interrupt_pending()` is driven by the PIC and cannot change inside a batch, because
+    // devices advance only after the batch and any guest PIC access ends it. No `InterpretOne`
+    // row writes a port; the one call-out that touches a port at all is `0xEC`, a READ, and it
+    // ends the block through the step-break bit.
+    //
+    // So: nothing pending here means nothing pending at the boundary either, and the delivery
+    // point does not move at all. Something pending means RESYNC with the shadow armed, which is
+    // bit-identical to the interpreted path. That is why this slice keeps the `perf.instructions`
+    // and `elapsed_clocks` identity pins.
+    //
+    // Asked AFTER the step rather than before it because the step runs on either answer -- STI
+    // retires whatever this returns -- and executing it cannot change what is pending.
+    let resume = snapshot.allows_resume(cpu, end_eip, cell.row())
+        && !(cell.row().arms_interrupt_shadow() && bus.interrupt_pending());
 
     // STEP 9. Sync OUT for the flags, on every path. The interpreter may have left a descriptor
     // and RBP is reloaded from the memory copy, so the copy has to be the whole architectural
@@ -1560,6 +1620,22 @@ fn interpret_one_step<B: CpuBus>(
 
     // STEP 10. Resume. The block-body EIP invariant is restored, so the exit that eventually runs
     // advances the entry value by its own delta exactly once.
+    //
+    // BEFORE the EIP is restored, because the value latched is the guest EIP the STI left behind
+    // and the line below overwrites it. The helper does NOT clear the shadow: it hands
+    // `run_direct_block` the address that decides whether anything retired after the arming slot,
+    // and that boundary makes the call. Clearing it here would deliver an interrupt EARLIER than
+    // hardware for every block that ends AT the STI, which is design review 10.1's blocker B1.
+    //
+    // A second STI in the same block simply overwrites the latch, which is right: only the LAST
+    // arming slot's shadow can still be live at the boundary.
+    if cpu.interrupt_shadow {
+        debug_assert!(
+            cell.row().arms_interrupt_shadow(),
+            "only an arming row may resume with the shadow set"
+        );
+        cpu.jit_direct.note_interrupt_shadow_armed(end_eip);
+    }
     cpu.registers.eip = entry_eip;
     clocks | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
 }

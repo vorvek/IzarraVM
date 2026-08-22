@@ -1930,6 +1930,10 @@ pub struct DirectStallSnapshot {
     /// The `compile_retry` entry of `dormant` split by which compile-walk gate gave up, per
     /// `RetryCause`. The `count` column sums to that entry exactly.
     pub retry_causes: Vec<RetryCauseCounts>,
+    /// Interpreted MOV SS / POP SS executions split by whether the load changed the SS record.
+    /// The S4d design's M5 measurement; see `DirectStallTally`.
+    pub ss_load_same_record: u64,
+    pub ss_load_changed_record: u64,
     /// (label, count) per `LinkRefusal`.
     pub link_refusals: Vec<(&'static str, u64)>,
     /// (label, count) per `LinkClearCause` — the cause split behind the aggregate
@@ -4648,9 +4652,15 @@ pub(crate) const INC_DEC_RM8_CORE_CLOCKS: u32 = 2;
 /// What PUSH r/m charges (execute_extended.rs, group 5 arm `6`), at both operand widths.
 pub(crate) const PUSH_RM_CORE_CLOCKS: u32 = 2;
 
-/// What CLI charges (execute.rs `0xfa`). STI charges the same, and is deliberately not on the
-/// `InterpretOne` allowlist: see the classifier's `0xfa` arm.
+/// What CLI charges (execute.rs `0xfa`).
 pub(crate) const CLI_CORE_CLOCKS: u32 = 3;
+
+/// What STI charges (execute.rs `0xfb`).
+///
+/// The same number as `CLI_CORE_CLOCKS` and a separate constant anyway, because they are separate
+/// interpreter arms doing opposite things: folding them would make a future divergence in one of
+/// them silently change the other row's budget term.
+pub(crate) const STI_CORE_CLOCKS: u32 = 3;
 
 /// What MOV Sreg, r/m16 charges (execute.rs `0x8e`), at every segment, both operand forms and
 /// every mode: the arm returns one `clocks(7)` after the load, whether that load was a real-mode
@@ -4684,6 +4694,7 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0xFF /6 memory at Word | execute_extended.rs group 5 | `PUSH_RM_CORE_CLOCKS` |
 /// | 0xFA CLI | execute.rs `0xfa` | `CLI_CORE_CLOCKS` |
 /// | 0x8E MOV Sreg,r/m | execute.rs `0x8e` | `MOV_SREG_CORE_CLOCKS` |
+/// | 0xFB STI | execute.rs `0xfb` | `STI_CORE_CLOCKS` |
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
@@ -4697,7 +4708,7 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
             larger(GROUP3_CORE_CLOCKS, INC_DEC_RM8_CORE_CLOCKS),
             larger(
                 larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
-                MOV_SREG_CORE_CLOCKS,
+                larger(MOV_SREG_CORE_CLOCKS, STI_CORE_CLOCKS),
             ),
         ),
     ),
@@ -4719,6 +4730,7 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
 /// | 0xFE memory | read + write-back = 2 |
 /// | 0xFF /6 memory | operand read + stack store = 2 |
 /// | 0xFA CLI | none |
+/// | 0xFB STI | none |
 /// | 0x8E memory, PROTECTED mode | operand read + two descriptor dwords + accessed-bit write-back = 4 |
 ///
 /// The last row is why this is FOUR rather than two, and it is the one the S3 policy widening

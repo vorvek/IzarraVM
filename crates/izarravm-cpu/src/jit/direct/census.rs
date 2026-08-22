@@ -682,6 +682,22 @@ pub(crate) struct DirectStallTally {
     pub decline_memo_hits: u64,
     pub decline_memo_advances: u64,
     pub decline_memo_sweeps: u64,
+    /// Interpreted `MOV SS, r/m` and `POP SS` executions, split by whether the load left the SS
+    /// RECORD byte-identical (selector, base, limit, access, B) or changed it.
+    ///
+    /// A MEASUREMENT and not a mechanism, and design review 10.1 M5 is the whole of its purpose.
+    /// The S4d slice admits STI alone; the two SS rows behind it can only resume when R2 finds
+    /// the six segment records unchanged, so a guest that switches stacks at those instructions
+    /// would resync every time and demote the slot. The loader census reports 484 k MOV SS and
+    /// 483 k POP SS hits with no split between the two shapes, and this pair is what supplies it.
+    /// The SS rows get built only if `same` is the large share.
+    ///
+    /// Counted at the two interpreter arms rather than inside `load_segment_arming_ss_shadow`,
+    /// which would also catch LSS: LSS was dropped from the slice at M4 (five data accesses
+    /// against a bound of four) and is not a candidate row, so folding it in would bias the
+    /// number the decision is made on.
+    pub ss_load_same_record: u64,
+    pub ss_load_changed_record: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -2063,6 +2079,8 @@ impl crate::jit::JitState {
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
+            ss_load_same_record: self.stalls.ss_load_same_record,
+            ss_load_changed_record: self.stalls.ss_load_changed_record,
             decline_memo_hits: self.stalls.decline_memo_hits,
             decline_memo_advances: self.stalls.decline_memo_advances,
             decline_memo_sweeps: self.stalls.decline_memo_sweeps,

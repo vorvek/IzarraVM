@@ -879,7 +879,7 @@ fn v86_sensitive_opcodes_keep_their_word_answers() {
         (&[0x9c], true, false),  // PUSHF: lowered at Dword, allowlist-refused at Word
         (&[0x9d], false, false), // POPF: no classify arm
         (&[0xfa], false, true),  // CLI: an InterpretOne call-out since the S3 widening
-        (&[0xfb], false, false), // STI: refused by design review M8
+        (&[0xfb], false, true),  // STI: an InterpretOne call-out since S4d
         (&[0xcd, 0x20], false, false), // INT imm8: no classify arm
         (&[0xcf], false, false), // IRET: no classify arm
     ];

@@ -477,6 +477,12 @@ fn interpret_one_reloads_the_flag_shadow_on_resume() {
 // 2. The resume predicate, clause by clause.
 // ---------------------------------------------------------------------------
 
+/// The row every clause test below is written against. `0x8F` POP r/m is the mechanism's first
+/// and plainest row and it arms nothing, so passing it here keeps each clause at its STRICT
+/// reading. The two clauses that a row can loosen (the IF 0-to-1 edge and a step-armed
+/// `interrupt_shadow`) have their own fixtures further down, and those pass `STI`.
+const POP_RM: jit::direct::InterpretOneRow = jit::direct::InterpretOneRow::PopRm;
+
 /// A CPU and the snapshot taken from it, for the predicate-level clauses. `end_eip` is the EIP a
 /// well-behaved step would have left.
 fn snapshot_fixture() -> (CpuGsw, jit::direct::ResumeSnapshot, u32) {
@@ -492,7 +498,7 @@ fn snapshot_fixture() -> (CpuGsw, jit::direct::ResumeSnapshot, u32) {
 #[test]
 fn interpret_one_resumes_when_nothing_moved() {
     let (cpu, snapshot, end_eip) = snapshot_fixture();
-    assert!(snapshot.allows_resume(&cpu, end_eip));
+    assert!(snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 /// R1: the step must leave EIP exactly past the instruction. A transfer that moved it resyncs, and
@@ -501,7 +507,7 @@ fn interpret_one_resumes_when_nothing_moved() {
 fn interpret_one_resync_on_eip_move() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.set_eip(end_eip + 2);
-    assert!(!snapshot.allows_resume(&cpu, end_eip));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 /// R2: a segment record the block baked moved under it.
@@ -515,7 +521,7 @@ fn interpret_one_resync_on_segment_change() {
     let mut ds = cpu.registers.segment(SegmentIndex::Ds);
     ds.base = ds.base.wrapping_add(0x10);
     cpu.registers.set_segment(SegmentIndex::Ds, ds);
-    assert!(!snapshot.allows_resume(&cpu, end_eip));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 /// R3, the CS half of R1: the block's whole compilation is keyed on CS.
@@ -525,7 +531,7 @@ fn interpret_one_resync_on_cs_change() {
     let mut cs = cpu.registers.cs();
     cs.selector = cs.selector.wrapping_add(1);
     cpu.registers.set_segment(SegmentIndex::Cs, cs);
-    assert!(!snapshot.allows_resume(&cpu, end_eip));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 /// R3: a control register the mode key or the paging state depends on.
@@ -542,7 +548,7 @@ fn interpret_one_resync_on_control_register_change() {
         let (mut cpu, snapshot, end_eip) = snapshot_fixture();
         apply(&mut cpu);
         assert!(
-            !snapshot.allows_resume(&cpu, end_eip),
+            !snapshot.allows_resume(&cpu, end_eip, POP_RM),
             "a moved {name} must resync"
         );
     }
@@ -557,7 +563,7 @@ fn interpret_one_resync_on_if_0_to_1() {
     cpu.set_eip(ENTRY + 5);
     let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
     cpu.registers.eflags |= FLAG_IF;
-    assert!(!snapshot.allows_resume(&cpu, ENTRY + 5));
+    assert!(!snapshot.allows_resume(&cpu, ENTRY + 5, POP_RM));
 }
 
 /// Design item M8, the resuming direction: IF going 1 to 0 has no delivery point, so refusing it
@@ -566,7 +572,7 @@ fn interpret_one_resync_on_if_0_to_1() {
 fn interpret_one_resumes_on_if_1_to_0() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.registers.eflags &= !FLAG_IF;
-    assert!(snapshot.allows_resume(&cpu, end_eip));
+    assert!(snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 /// R3: the one-instruction interrupt shadow. The seam the helper uses does not clear it on the way
@@ -575,7 +581,7 @@ fn interpret_one_resumes_on_if_1_to_0() {
 fn interpret_one_resync_on_interrupt_shadow() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.interrupt_shadow = true;
-    assert!(!snapshot.allows_resume(&cpu, end_eip));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 /// R3: the trap flag. A block cannot produce the instruction boundary single-step delivery wants,
@@ -587,7 +593,7 @@ fn interpret_one_resync_on_interrupt_shadow() {
 fn interpret_one_resync_on_trap_flag() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.registers.eflags |= FLAG_TF;
-    assert!(!snapshot.allows_resume(&cpu, end_eip));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 /// R4: a LIVE mapping epoch that moved. The paging generation changed under the block.
@@ -596,13 +602,13 @@ fn interpret_one_resync_on_mapping_epoch_change() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.set_data_write_mapping_epoch_for_test(7);
     assert!(
-        snapshot.allows_resume(&cpu, end_eip),
+        snapshot.allows_resume(&cpu, end_eip, POP_RM),
         "0 to n is a cold fill, not a mapping change"
     );
     let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
     cpu.set_data_write_mapping_epoch_for_test(8);
     assert!(
-        !snapshot.allows_resume(&cpu, end_eip),
+        !snapshot.allows_resume(&cpu, end_eip, POP_RM),
         "n to m is a mapping change and must resync"
     );
 }
@@ -613,7 +619,7 @@ fn interpret_one_resync_on_mapping_epoch_change() {
 fn interpret_one_resync_on_halt() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.halted = true;
-    assert!(!snapshot.allows_resume(&cpu, end_eip));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
 }
 
 // ---------------------------------------------------------------------------
@@ -2424,20 +2430,27 @@ fn interpret_one_cli_resumes_on_both_edges() {
     }
 }
 
-/// STI stays refused, which is the other half of design review M8.
+/// STI JOINS the block beside CLI, which is the S4d admission.
 ///
-/// It takes the IF 0-to-1 edge AND arms the interrupt shadow, so it fails two clauses of R3 on
-/// every execution. Admitting it would spend a call-out and a governor execution to reach the
-/// boundary it already produces. The census measures it at 486 k hits, larger than CLI's 244 k,
-/// which is exactly why the refusal has to be stated rather than left to look like an oversight.
+/// The pin MOVED here on 2026-08-22 rather than being deleted. It used to assert the opposite,
+/// on design review M8's reasoning: STI takes the IF 0-to-1 edge AND arms the interrupt shadow,
+/// so it failed two clauses of R3 on every execution. Both clauses are now scoped to the row
+/// (`InterpretOneRow::arms_interrupt_shadow`), and the row pays for the relaxation with a
+/// pendency test the other rows do not run. The census measures it at 486 k hits against CLI's
+/// 244 k, which is why it was worth reopening.
+///
+/// The block shape is the whole assertion: five slots means the STI joined AND the `inc` behind
+/// it retired natively, which is the extension the row exists for. A block that stopped at three
+/// would be the old answer.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn sti_stays_a_boundary_beside_the_admitted_cli() {
+fn sti_joins_the_block_beside_the_admitted_cli() {
     assert_row_is_a_call_out(&[0xFA]);
+    assert_row_is_a_call_out(&[0xFB]);
 
     let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
     code.push(0xFB);
@@ -2446,10 +2459,10 @@ fn sti_stays_a_boundary_beside_the_admitted_cli() {
     let (_, _, block) = build_native(&code, &starts);
     assert_eq!(
         block.span().instructions,
-        3,
-        "STI must still end the block where CLI no longer does"
+        5,
+        "STI must join the block and let the instruction behind it retire natively"
     );
-    assert_eq!(block.callout_interpret_one_slots(), 0);
+    assert_eq!(block.callout_interpret_one_slots(), 1);
 }
 
 /// `CLI_CORE_CLOCKS` is what the interpreter charges.
@@ -4002,5 +4015,300 @@ fn overwriting_a_demoted_sites_code_lets_it_be_a_call_out_again() {
     assert_eq!(
         recompiled.callout_interpret_one_slots, 1,
         "and the instruction there may be a call-out again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. The STI row (S4d), and the interrupt shadow it leaves behind.
+//
+// Every other row must find `interrupt_shadow` clear after its step. STI always arms it, and a
+// native block has no point at which the interpreter would consume it. The mechanism is that the
+// helper NEVER clears the flag: it latches the EIP its slot left behind and `run_direct_block`
+// decides at the boundary. The two fixtures that matter are the two answers that decision can
+// give, and design review 10.1's blocker B1 is the second one.
+// ---------------------------------------------------------------------------
+
+/// Run a fixture's block ONCE and stop at the boundary, before the interpreted tail.
+///
+/// `run_both` drives past the block on both legs, which is right for a state comparison and wrong
+/// for every question here: the interpreted leg's next instruction consumes the shadow, so by the
+/// time it stops the two legs agree whatever the boundary did. These tests have to look at the
+/// CPU while the block's own answer is still the last thing that happened.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn run_block_to_boundary(
+    code: &[u8],
+    starts: &[u32],
+    perturb: fn(&mut CpuGsw, &mut TestBus),
+) -> (CpuGsw, TestBus, u64, jit::direct::CompiledBlock) {
+    let (mut cpu, mut bus, block) = build_native(code, starts);
+    arm_fixture(&mut cpu, &mut bus);
+    perturb(&mut cpu, &mut bus);
+    let before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the installed block must actually run"
+    );
+    let native_insns = cpu.perf_counters().jit_direct_insns - before;
+    (cpu, bus, native_insns, block)
+}
+
+fn clear_if(cpu: &mut CpuGsw, _: &mut TestBus) {
+    cpu.registers.eflags = 0x002;
+}
+
+/// STI resumes across the IF 0-to-1 edge, and the whole-state comparison holds.
+///
+/// This is the row's identity pin: `assert_row_resumes` compares registers, EFLAGS, guest RAM,
+/// `elapsed_clocks` and `perf.instructions` against a wholly interpreted leg, and asserts the
+/// block retired all three of its slots rather than resyncing at the STI.
+///
+/// MUTATION: make `arms_interrupt_shadow` return false for `Sti` and the block resyncs, so
+/// `native_insns` is two instead of three.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_sti_resumes_across_the_interrupt_flag_edge() {
+    for perturb in [no_perturb as fn(&mut CpuGsw, &mut TestBus), clear_if] {
+        let legs = assert_row_resumes(&[0xFB], perturb);
+        assert_ne!(
+            legs.native.eflags() & crate::FLAG_IF,
+            0,
+            "STI must have set IF on the native leg"
+        );
+    }
+}
+
+/// The boundary CLEARS the shadow when the block ran past the STI.
+///
+/// `mov ax,0x1111; sti; inc ax` is three native slots, so the `inc` is the one shadowed
+/// instruction and it retired inside the block. The flag must not survive the boundary: leaving
+/// it armed would hand the guest a second reprieve the hardware never gives.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_block_that_runs_past_the_sti_clears_the_shadow_at_its_boundary() {
+    let (code, starts) = row_program(&[0xFB]);
+    let (cpu, _, native_insns, _) = run_block_to_boundary(&code, &starts, clear_if);
+    assert_eq!(native_insns, 3, "the block must have resumed past the STI");
+    assert!(
+        !cpu.interrupt_shadow,
+        "the shadowed instruction retired inside the block, so the flag must be clear"
+    );
+    assert!(cpu.can_take_interrupt());
+}
+
+/// Design review 10.1, B1: a block that ENDS at the STI exits with the shadow still armed, and the
+/// interrupt lands after exactly one further instruction.
+///
+/// `mov ax,0x1111; inc ax; sti` are the three slots; the `cmc` behind them is unclassifiable and
+/// is what makes the STI last. Nothing retired after the STI, so the one-instruction reprieve has
+/// not been used and the interpreter owes it. A helper that cleared the flag itself would deliver
+/// here, one instruction EARLY, which is outside the caveat the owner approved.
+///
+/// MUTATION: clear `interrupt_shadow` unconditionally at the boundary instead of comparing the
+/// latched EIP, and the first `service_pending_interrupt` below delivers.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_block_that_ends_at_the_sti_leaves_the_shadow_for_the_interpreter() {
+    // mov ax,0x1111; inc ax; sti; cmc; hlt
+    let code = [0xB8, 0x11, 0x11, 0x40, 0xFB, 0xF5, 0xF4];
+    let starts = [0, 3, 4, 5];
+    let (mut cpu, mut bus, native_insns, block) = run_block_to_boundary(&code, &starts, clear_if);
+    assert_eq!(
+        native_insns, 3,
+        "the block must end AT the STI, or this fixture is testing the other branch"
+    );
+    assert!(
+        cpu.interrupt_shadow,
+        "nothing retired after the STI, so its reprieve is still owed"
+    );
+    assert!(!cpu.can_take_interrupt());
+
+    // And the dispatcher refuses one entry while it stands, which is the counter design review
+    // 10.1 M6 pre-registers as this slice's one expected counter RISE. The refusal is not a
+    // regression: it is the shadow doing its job, and it costs exactly one block.
+    let refused = cpu.perf_counters().jit_direct_reject_interrupt_shadow;
+    assert!(
+        !cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("a refused entry is not a machine stop"),
+        "a block must not be entered while the shadow is armed"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_interrupt_shadow - refused,
+        1
+    );
+
+    // The IRQ arrives after the block. The shadow defers it by exactly one instruction, which is
+    // the `cmc`, and the vector then lands: the fixture's IVT is all zeros and address zero holds
+    // a HLT, so a delivered interrupt puts EIP at 0.
+    bus.pending_irq = Some(0x08);
+    assert!(
+        cpu.service_pending_interrupt(&mut bus)
+            .expect("the shadow must defer rather than fault")
+            .is_none(),
+        "the shadow must defer the interrupt by one instruction"
+    );
+    cpu.cycle_no_interrupt_check(&mut bus)
+        .expect("the shadowed instruction runs");
+    assert!(!cpu.interrupt_shadow, "the cmc consumed the reprieve");
+    assert!(
+        cpu.service_pending_interrupt(&mut bus)
+            .expect("delivery must not fault")
+            .is_some(),
+        "the interrupt lands on the instruction after the shadowed one"
+    );
+    assert_eq!(cpu.registers.eip, 0, "delivery jumped through the IVT");
+}
+
+/// Design review 10.1, B2: STI does not resume while an interrupt is pending.
+///
+/// The premise the row rests on is that pendency cannot change inside a batch, so "nothing pending
+/// at the STI" means the delivery point does not move at all. When something IS pending the row
+/// resyncs with the shadow armed, which is bit-identical to the interpreted path, and that is what
+/// keeps the identity pins holding for this slice.
+///
+/// MUTATION: drop the `bus.interrupt_pending()` term from the resume expression and the block
+/// resumes here, reporting three instructions instead of two.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn the_sti_row_resyncs_while_an_interrupt_is_pending() {
+    fn pend(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        clear_if(cpu, bus);
+        bus.pending_irq = Some(0x08);
+    }
+    let (code, starts) = row_program(&[0xFB]);
+    let (cpu, _, native_insns, _) = run_block_to_boundary(&code, &starts, pend);
+    assert_eq!(
+        native_insns, 2,
+        "the STI retired but the block must not have continued past it"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_executed, 1);
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert!(
+        cpu.interrupt_shadow,
+        "a resync leaves the interpreter exactly the state it would have produced"
+    );
+}
+
+/// Design review 10.1, B3: the relaxation is about a shadow the STEP armed. A shadow the block was
+/// ENTERED with refuses for every row, `Sti` included.
+///
+/// Without the split, a block entered under a shadow would resume and the reprieve would be spent
+/// on an instruction that never consumed it.
+#[test]
+fn an_entry_interrupt_shadow_refuses_resume_for_every_row() {
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    cpu.registers.eflags = 0x202;
+    cpu.set_eip(ENTRY + 5);
+    cpu.interrupt_shadow = true;
+    let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
+    for row in jit::direct::InterpretOneRow::ALL {
+        assert!(
+            !snapshot.allows_resume(&cpu, ENTRY + 5, row),
+            "{} resumed under an entry shadow",
+            row.label()
+        );
+    }
+}
+
+/// Only `Sti` may resume with the shadow the step armed. Every other row must refuse.
+#[test]
+fn only_the_sti_row_may_resume_with_a_step_armed_shadow() {
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    cpu.registers.eflags = 0x202;
+    cpu.set_eip(ENTRY + 5);
+    let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
+    cpu.interrupt_shadow = true;
+    for row in jit::direct::InterpretOneRow::ALL {
+        assert_eq!(
+            snapshot.allows_resume(&cpu, ENTRY + 5, row),
+            row.arms_interrupt_shadow(),
+            "{} disagreed with its own arming answer",
+            row.label()
+        );
+    }
+}
+
+/// `STI_CORE_CLOCKS` is what the interpreter charges.
+#[test]
+fn sti_core_clocks_is_what_the_interpreter_charges() {
+    assert_row_charges(&[0xFB], crate::STI_CORE_CLOCKS, |_, _| {});
+}
+
+/// Design review 10.1, M5: the SS-load measurement splits same-record loads from record-moving
+/// ones, at both interpreter arms.
+///
+/// The S4d slice admits STI alone. The two SS rows behind it can only resume when R2 finds the
+/// segment records unchanged, so whether they are worth building at all is a question about a real
+/// guest's mix, and this pair of counters is what supplies it on the loader phase. The test is
+/// what makes the number trustworthy: a counter that classified every load the same way would
+/// answer the question with a constant.
+#[test]
+fn the_ss_load_measurement_splits_same_record_from_changed_record() {
+    // `mov ax, imm16; mov ss, ax; hlt`, and `mov ax, 0; push ax; pop ss; hlt`.
+    let cases: &[(&str, &[u8], u64, u64)] = &[
+        // Reloading the selector SS already holds leaves every field of the record alone.
+        ("mov ss, same", &[0xB8, 0x00, 0x00, 0x8E, 0xD0, 0xF4], 1, 0),
+        // A different real-mode selector moves the base with it.
+        ("mov ss, other", &[0xB8, 0x00, 0x01, 0x8E, 0xD0, 0xF4], 0, 1),
+        // The 0x17 arm, which is the other site the measurement has to cover.
+        ("pop ss, same", &[0xB8, 0x00, 0x00, 0x50, 0x17, 0xF4], 1, 0),
+    ];
+    for (label, code, same, changed) in cases {
+        let mut program = vec![0u8; 0x2000];
+        program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
+        let mut bus = sixteen_bit_bus(program);
+        let mut cpu = sixteen_bit_code_cpu(ENTRY);
+        cpu.registers.set_esp(STACK_TOP);
+        while !cpu.halted {
+            cpu.cycle(&mut bus).expect("the fixture must run");
+        }
+        let stalls = cpu.direct_stall_snapshot();
+        assert_eq!(
+            (stalls.ss_load_same_record, stalls.ss_load_changed_record),
+            (*same, *changed),
+            "{label}"
+        );
+    }
+}
+
+/// The measurement must not fire for a segment that is not SS. Without this the "same record"
+/// column could be inflated by every `mov ds, ax` a guest runs, and the ratio the SS rows are
+/// judged on would be meaningless.
+#[test]
+fn the_ss_load_measurement_ignores_the_other_segments() {
+    // mov ax, 0; mov ds, ax; mov es, ax; hlt
+    let code = [0xB8, 0x00, 0x00, 0x8E, 0xD8, 0x8E, 0xC0, 0xF4];
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    while !cpu.halted {
+        cpu.cycle(&mut bus).expect("the fixture must run");
+    }
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        (stalls.ss_load_same_record, stalls.ss_load_changed_record),
+        (0, 0)
     );
 }

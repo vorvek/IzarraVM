@@ -316,11 +316,14 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // boundary after it is exactly where the run loop would deliver. A CLI that
                 // clears an already-clear IF resumes for the same reason.
                 //
-                // `0xfb` STI is NOT here and is the row M8 removed from the design's list. It
-                // takes the 0-to-1 edge AND arms `interrupt_shadow`, so it fails two clauses of
-                // R3 on every execution: admitting it would burn a call-out and a governor
-                // execution to arrive at the boundary it already produces.
-                | 0xfa
+                // `0xfb` STI joined on 2026-08-22 (S4d). Design review M8 had removed it because
+                // it takes the IF 0-to-1 edge AND arms `interrupt_shadow`, failing two clauses of
+                // R3 on every execution. Both clauses are now scoped to the row rather than
+                // relaxed globally, and the row pays for the relaxation with a pendency test the
+                // other rows do not run: see `InterpretOneRow::arms_interrupt_shadow` and the
+                // pendency note in `interpret_one_step`. Loader census: 486,000 block-stopping
+                // hits.
+                | 0xfa | 0xfb
                 // CLD / STD. A POLICY lift and nothing else: `emit_direction_flag` is one `or` or
                 // `and` on the flag shadow, DF sits outside the lazy arithmetic descriptor, and
                 // neither interpreter arm consults `operand_size`, so the two widths are the same
@@ -1119,6 +1122,27 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 return Some(DirectKind::CallOut {
                     helper: CallOutHelper::InterpretOne {
                         row: InterpretOneRow::Cli,
+                    },
+                });
+            }
+            // STI, the S4d row and CLI's mirror in encoding but not in consequence. CLI only
+            // clears IF, which the run loop has no delivery point for; STI sets IF and arms the
+            // one-instruction shadow, and a native block has no point at which that shadow is
+            // consumed.
+            //
+            // What makes it admissible is that the shadow is decided at the BLOCK BOUNDARY instead
+            // of inside the helper (design section 10.1, B1), and that the row refuses to resume
+            // while an interrupt is pending (B2), which is what keeps the run's end point where
+            // the interpreter would have put it. The owner accepted the residual caveat on
+            // 2026-08-22: a pending interrupt is delivered at the next block boundary rather than
+            // after exactly one shadowed instruction.
+            //
+            // V86 with IOPL < 3 needs nothing here: the interpreter's arm calls `check_v86_iopl`
+            // and the helper's fault arm delivers the #GP exactly as it does for every other row.
+            0xfb => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Sti,
                     },
                 });
             }

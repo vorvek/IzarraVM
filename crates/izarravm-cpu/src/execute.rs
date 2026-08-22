@@ -389,7 +389,15 @@ impl CpuGsw {
                         });
                     }
                 };
+                // Design review 10.1 M5: does a real guest's MOV SS leave the record alone? The
+                // snapshot is taken only when SS is the target, so every other segment pays one
+                // compare against an enum.
+                let ss_before =
+                    (segment == SegmentIndex::Ss).then(|| self.registers.segment(SegmentIndex::Ss));
                 self.load_segment_arming_ss_shadow(bus, segment, value as u16)?;
+                if let Some(before) = ss_before {
+                    self.note_ss_load_record(before);
+                }
                 // Named because FS, GS and every memory form are `InterpretOne` call-out rows:
                 // their budget bound and this arm must charge the same number.
                 Ok(clocks(MOV_SREG_CORE_CLOCKS))
@@ -550,7 +558,10 @@ impl CpuGsw {
                 // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
                 // Same 386 PRM operand-size rule as POP ES above.
                 let value = self.pop(bus, operand_size)? as u16;
+                // The M5 measurement's other half. See the `0x8e` arm.
+                let before = self.registers.segment(SegmentIndex::Ss);
                 self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
+                self.note_ss_load_record(before);
                 Ok(clocks(7))
             }
             0x1e => {
@@ -1201,7 +1212,7 @@ impl CpuGsw {
                 self.check_v86_iopl()?;
                 self.set_flag(FLAG_IF, true);
                 self.interrupt_shadow = true;
-                Ok(clocks(3))
+                Ok(clocks(STI_CORE_CLOCKS))
             }
             0xfc => {
                 // CLD: clear the direction flag.
