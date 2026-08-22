@@ -303,6 +303,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xec
                 | 0x0f80..=0x0f8f
                 | 0xf6
+                // CLI, the S3 policy widening's seventh row, at 244 k block-stopping hits in the
+                // post-S2 loader census. It is a CALL-OUT rather than a lowering because of the
+                // resume predicate rather than the emitter: clearing IF is one `and` on the flag
+                // shadow, but the run loop's interrupt DELIVERY points are what the block's
+                // boundaries are, and only R3 can decide whether the edge the instruction just
+                // took is one of them.
+                //
+                // It resumes. Design review M8 made R3's IF clause DIRECTIONAL: IF going 1 to 0
+                // cannot make an interrupt serviceable, so the run loop has no delivery point on
+                // that edge and the block may carry on; IF going 0 to 1 resyncs, because the
+                // boundary after it is exactly where the run loop would deliver. A CLI that
+                // clears an already-clear IF resumes for the same reason.
+                //
+                // `0xfb` STI is NOT here and is the row M8 removed from the design's list. It
+                // takes the 0-to-1 edge AND arms `interrupt_shadow`, so it fails two clauses of
+                // R3 on every execution: admitting it would burn a call-out and a governor
+                // execution to arrive at the boundary it already produces.
+                | 0xfa
                 // CLD / STD. A POLICY lift and nothing else: `emit_direction_flag` is one `or` or
                 // `and` on the flag shadow, DF sits outside the lazy arithmetic descriptor, and
                 // neither interpreter arm consults `operand_size`, so the two widths are the same
@@ -1082,6 +1100,18 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0xfc | 0xfd => {
                 return Some(DirectKind::DirectionFlag {
                     set: opcode == 0xfd,
+                });
+            }
+            // CLI, an `InterpretOne` call-out. See the entry beside `0xfa` on the Word allowlist
+            // above for why it resumes and why STI is not here with it.
+            //
+            // It is the only admitted row that touches no memory and no general register, so it is
+            // also the cheapest possible proof that the mechanism's cost is the CALL rather than
+            // the work: a demoted CLI slot and an admitted one differ by exactly one helper
+            // invocation.
+            0xfa => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne,
                 });
             }
             // CLC (0xf8) and STC (0xf9). Behind `IZARRAVM_V86_LOOP_ROWS`; `0xf8` is the tombraid

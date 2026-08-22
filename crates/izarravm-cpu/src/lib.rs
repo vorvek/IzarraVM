@@ -4606,6 +4606,10 @@ pub(crate) const INC_DEC_RM8_CORE_CLOCKS: u32 = 2;
 /// What PUSH r/m charges (execute_extended.rs, group 5 arm `6`), at both operand widths.
 pub(crate) const PUSH_RM_CORE_CLOCKS: u32 = 2;
 
+/// What CLI charges (execute.rs `0xfa`). STI charges the same, and is deliberately not on the
+/// `InterpretOne` allowlist: see the classifier's `0xfa` arm.
+pub(crate) const CLI_CORE_CLOCKS: u32 = 3;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -4631,6 +4635,7 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0xF7 group 3 at Word | execute.rs `0xf7` | `GROUP3_CORE_CLOCKS` |
 /// | 0xFE /0 /1 memory | execute.rs `0xfe` | `INC_DEC_RM8_CORE_CLOCKS` |
 /// | 0xFF /6 memory at Word | execute_extended.rs group 5 | `PUSH_RM_CORE_CLOCKS` |
+/// | 0xFA CLI | execute.rs `0xfa` | `CLI_CORE_CLOCKS` |
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
@@ -4642,7 +4647,7 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
         larger(XCHG_CORE_CLOCKS, BIT_STRING_CORE_CLOCKS),
         larger(
             larger(GROUP3_CORE_CLOCKS, INC_DEC_RM8_CORE_CLOCKS),
-            PUSH_RM_CORE_CLOCKS,
+            larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
         ),
     ),
 );

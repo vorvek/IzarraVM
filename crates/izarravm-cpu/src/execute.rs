@@ -1188,7 +1188,9 @@ impl CpuGsw {
                 // CLI. IOPL-sensitive: faults to the monitor in a V86 task below IOPL 3.
                 self.check_v86_iopl()?;
                 self.set_flag(FLAG_IF, false);
-                Ok(clocks(3))
+                // Named because CLI is an `InterpretOne` call-out row: its budget bound and this
+                // arm must charge the same number.
+                Ok(clocks(CLI_CORE_CLOCKS))
             }
             0xfb => {
                 // STI sets IF and arms the one-instruction shadow so the instruction immediately

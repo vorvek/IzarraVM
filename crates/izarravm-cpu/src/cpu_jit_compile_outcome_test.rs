@@ -855,18 +855,27 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 /// raise #GP. Its Word arm is still refused by the allowlist, and the Dword control here proves
 /// the arm is live so this test cannot rot into "refused at every size" vacuity the way the port
 /// test once did.
+///
+/// CLI (0xfa) LEFT the barrier list with the S3 policy widening and is asserted from the other
+/// side in the same table: it joins the block at both widths as an `InterpretOne` call-out. Its
+/// V86 cover is not a compile-time refusal at all but the helper's fault arm -- `check_v86_iopl`
+/// is the interpreter's own first statement in that opcode's arm, so a V86 task below IOPL 3
+/// raises the same #GP from inside the call-out that it raises at a barrier, delivered by
+/// `finish_instruction` with the block reporting the prefix only. STI stays refused beside it,
+/// and the pair is the point: they are one instruction apart in the encoding and get opposite
+/// answers, so a widening that swept STI in with CLI fails here.
 #[test]
-fn v86_sensitive_opcodes_stay_word_barriers() {
-    // (bytes, admitted_at_dword)
-    let table: &[(&[u8], bool)] = &[
-        (&[0x9c], true),        // PUSHF: lowered at Dword, allowlist-refused at Word
-        (&[0x9d], false),       // POPF: no classify arm
-        (&[0xfa], false),       // CLI: no classify arm
-        (&[0xfb], false),       // STI: no classify arm
-        (&[0xcd, 0x20], false), // INT imm8: no classify arm
-        (&[0xcf], false),       // IRET: no classify arm
+fn v86_sensitive_opcodes_keep_their_word_answers() {
+    // (bytes, admitted_at_dword, call_out_at_every_width)
+    let table: &[(&[u8], bool, bool)] = &[
+        (&[0x9c], true, false),  // PUSHF: lowered at Dword, allowlist-refused at Word
+        (&[0x9d], false, false), // POPF: no classify arm
+        (&[0xfa], false, true),  // CLI: an InterpretOne call-out since the S3 widening
+        (&[0xfb], false, false), // STI: refused by design review M8
+        (&[0xcd, 0x20], false, false), // INT imm8: no classify arm
+        (&[0xcf], false, false), // IRET: no classify arm
     ];
-    for (op, admitted_at_dword) in table {
+    for (op, admitted_at_dword, call_out_at_every_width) in table {
         for prefixed in [false, true] {
             let mut code = vec![0x40, 0x41, 0x42];
             let mut offsets = vec![0u32, 1, 2, 3];
@@ -883,7 +892,16 @@ fn v86_sensitive_opcodes_stay_word_barriers() {
             warm(&mut cpu, &mut bus, &addresses);
             let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
             let first = op[0];
-            if !prefixed && *admitted_at_dword {
+            if *call_out_at_every_width {
+                assert!(
+                    compilation.span.instructions > 3,
+                    "{first:#04x} (prefixed={prefixed}) must join the block as a call-out"
+                );
+                assert_eq!(
+                    compilation.callout_interpret_one_slots, 1,
+                    "{first:#04x} (prefixed={prefixed}) must join as a call-out, not a lowering"
+                );
+            } else if !prefixed && *admitted_at_dword {
                 assert!(
                     compilation.span.instructions > 3,
                     "{first:#04x} at Dword has a classify arm and must not end the block;                      if this fails the Dword control is dead and the Word assertions below                      can no longer distinguish Word-refusal from always-refusal"

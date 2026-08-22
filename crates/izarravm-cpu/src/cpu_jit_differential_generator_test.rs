@@ -2079,6 +2079,12 @@ fn policy_push_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
     vec![0x66, 0xFF, 0x75, 0x00]
 }
 
+/// `FA`: CLI, the only admitted row that touches neither memory nor a general register. Every case
+/// draws its EFLAGS with IF set, so the sweep always exercises the 1-to-0 edge that R3 admits.
+fn policy_cli(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xFA]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
 const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_mov_sreg_memory_32,
@@ -2091,6 +2097,7 @@ const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_group3_multiply_16bit_operand,
     policy_inc_byte_memory_32,
     policy_push_memory_32,
+    policy_cli,
 ];
 
 /// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
@@ -2108,6 +2115,7 @@ const POLICY_ROWS_16: &[PolicyRow] = &[
     policy_group3_multiply,
     policy_inc_byte_memory_16,
     policy_push_memory_16,
+    policy_cli,
 ];
 
 /// `FF /6` with mod 01, r/m 110, disp8 0: `push word [bp+0]`, unprefixed on a 16-bit stack.

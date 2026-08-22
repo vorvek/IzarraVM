@@ -6253,9 +6253,15 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     //     `jit/direct/callout.rs` and the note on `classify`'s `0xec` arm.
     //   * PUSHF: its PUSHFD arm is refused by `stack_width_kind` in V86 (`StoreSource::Flags`,
     //     IOPL check), and its Word form is off the allowlist.
-    //   * POPF, CLI, STI, INT, IRET: no `classify` arm at any size. That absence is now PINNED by
-    //     `v86_sensitive_opcodes_stay_word_barriers` (cpu_jit_compile_outcome_test.rs), because
-    //     an absence defended by nothing is exactly what a coverage campaign widens by accident.
+    //   * POPF, STI, INT, IRET: no `classify` arm at any size. That absence is PINNED by
+    //     `v86_sensitive_opcodes_keep_their_word_answers` (cpu_jit_compile_outcome_test.rs),
+    //     because an absence defended by nothing is exactly what a coverage campaign widens by
+    //     accident.
+    //   * CLI: an `InterpretOne` call-out since the S3 policy widening, so its V86 cover is the
+    //     helper's fault arm rather than a compile-time refusal. `check_v86_iopl` is the first
+    //     statement of the interpreter's own `0xfa` arm, which is the arm the helper runs, so a
+    //     V86 task below IOPL 3 raises the same #GP from inside the call-out that it raised at
+    //     the barrier. The same test pins that, from the other side.
     //
     // V86 blocks stay key-separated by mode-key bit 2.
     if !d && !word_operands_admitted(cpu) {

@@ -2139,3 +2139,71 @@ fn push_rm_memory_takes_the_call_out_at_word_size_only() {
 fn push_rm_core_clocks_is_what_the_interpreter_charges() {
     assert_row_charges(&[0xFF, 0x37], crate::PUSH_RM_CORE_CLOCKS, |_, _| {});
 }
+
+/// Row 7: CLI, on both of the edges it can take.
+///
+/// IF 1 to 0 is the interesting one and it RESUMES, by design review M8: disabling interrupts
+/// cannot make one serviceable, so the run loop has no delivery point on that edge. IF 0 to 0
+/// resumes for the same reason, and it is a separate case rather than an obvious corollary because
+/// R3's clause is written as "IF did not go 0 to 1" rather than as "IF did not change" -- a
+/// predicate that compared IF for equality would resume on the first and resync on neither, and
+/// only running both says which one is implemented.
+///
+/// MUTATION: change R3's IF clause to an equality (`interrupt_enable != live IF`) and the first
+/// case resyncs while the second still passes.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_cli_resumes_on_both_edges() {
+    fn clear_interrupt_flag(cpu: &mut CpuGsw, _: &mut TestBus) {
+        cpu.registers.eflags = 0x002;
+    }
+    for perturb in [
+        no_perturb as fn(&mut CpuGsw, &mut TestBus),
+        clear_interrupt_flag,
+    ] {
+        let legs = assert_row_resumes(&[0xFA], perturb);
+        assert_eq!(
+            legs.native.eflags() & crate::FLAG_IF,
+            0,
+            "CLI must have cleared IF on the native leg"
+        );
+    }
+}
+
+/// STI stays refused, which is the other half of design review M8.
+///
+/// It takes the IF 0-to-1 edge AND arms the interrupt shadow, so it fails two clauses of R3 on
+/// every execution. Admitting it would spend a call-out and a governor execution to reach the
+/// boundary it already produces. The census measures it at 486 k hits, larger than CLI's 244 k,
+/// which is exactly why the refusal has to be stated rather than left to look like an oversight.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn sti_stays_a_boundary_beside_the_admitted_cli() {
+    assert_row_is_a_call_out(&[0xFA]);
+
+    let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+    code.push(0xFB);
+    code.extend_from_slice(&[0x40, 0xF4]);
+    let starts = vec![0, 3, 4, 5, 6];
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        3,
+        "STI must still end the block where CLI no longer does"
+    );
+    assert_eq!(block.callout_interpret_one_slots(), 0);
+}
+
+/// `CLI_CORE_CLOCKS` is what the interpreter charges.
+#[test]
+fn cli_core_clocks_is_what_the_interpreter_charges() {
+    assert_row_charges(&[0xFA], crate::CLI_CORE_CLOCKS, |_, _| {});
+}
