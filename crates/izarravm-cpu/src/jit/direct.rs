@@ -126,11 +126,11 @@ pub(crate) const MAX_BLOCK_INSTRUCTIONS: usize = 32;
 /// (`MAX_X87_BLOCK_INSTRUCTIONS`, `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`) sized to keep such a block
 /// inside its page. Pricing them low leaves those blocks forming exactly as they do today; pricing
 /// them high would shorten blocks whose length is already governed elsewhere.
-const EMITTED_BLOCK_FIXED_BYTES: u32 = 576;
-const EMITTED_REGISTER_SLOT_BYTES: u32 = 40;
-const EMITTED_MEMORY_SLOT_BYTES: u32 = 352;
-const EMITTED_CALL_OUT_SLOT_BYTES: u32 = 592;
-const EMITTED_TERMINAL_SLOT_EXTRA_BYTES: u32 = 208;
+pub(super) const EMITTED_BLOCK_FIXED_BYTES: u32 = 576;
+pub(super) const EMITTED_REGISTER_SLOT_BYTES: u32 = 40;
+pub(super) const EMITTED_MEMORY_SLOT_BYTES: u32 = 352;
+pub(super) const EMITTED_CALL_OUT_SLOT_BYTES: u32 = 592;
+pub(super) const EMITTED_TERMINAL_SLOT_EXTRA_BYTES: u32 = 208;
 pub(crate) const HOT_LOOKUP_LEN: usize = 65_536;
 pub(crate) const MAX_CHAIN_BLOCKS: usize = 256;
 pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
@@ -5060,7 +5060,7 @@ impl DirectKind {
     /// new arm here. A slot that names no access is register-only; every other non-call-out slot
     /// carries an address computation, a fast-map probe and a watched/device fallback, which is
     /// what the memory rate pays for.
-    fn emitted_bytes_estimate(self) -> u32 {
+    pub(super) fn emitted_bytes_estimate(self) -> u32 {
         let body = if self.is_call_out() {
             EMITTED_CALL_OUT_SLOT_BYTES
         } else if self.byte_reads()
@@ -7312,6 +7312,7 @@ fn compile_with_budget(
                         x87_slots,
                         dirty_segments,
                         model_dirty: true,
+                        estimated_bytes,
                     },
                 );
             }
@@ -7347,6 +7348,7 @@ fn compile_with_budget(
                         x87_slots,
                         dirty_segments,
                         model_dirty: true,
+                        estimated_bytes,
                     },
                 );
             }
@@ -7475,6 +7477,7 @@ fn compile_with_budget(
                             x87_slots,
                             dirty_segments,
                             model_dirty: true,
+                            estimated_bytes,
                         },
                     );
                 }
@@ -7554,6 +7557,7 @@ fn compile_with_budget(
                         x87_slots,
                         dirty_segments,
                         model_dirty: true,
+                        estimated_bytes,
                     },
                 );
             }
@@ -7654,6 +7658,7 @@ fn compile_with_budget(
                         // The arm whose suffix prices the dirty rule's own removal, so it is the
                         // one arm that must not apply it.
                         model_dirty: false,
+                        estimated_bytes,
                     },
                 );
             }

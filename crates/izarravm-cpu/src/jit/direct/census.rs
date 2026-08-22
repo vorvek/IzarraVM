@@ -80,6 +80,10 @@ pub(super) struct SuffixSeed {
     pub(super) x87_slots: u8,
     /// Segments the block had already overwritten when the barrier stopped it.
     pub(super) dirty_segments: u8,
+    /// Host bytes the block's emitted code was estimated at when the barrier stopped it, as the
+    /// compile walk's own running total. The scan continues it, so the page budget stops the two
+    /// in the same place. See `EMITTED_BLOCK_FIXED_BYTES`.
+    pub(super) estimated_bytes: u32,
     /// Whether the forward scan applies the dirty-segment rule at all.
     ///
     /// TRUE for every arm but one, because the rule survives lowering the opcode those arms name:
@@ -192,7 +196,20 @@ pub(super) fn record_structural_barrier(
 ///
 /// The audit that produced the current form found SIX divergences. Three are closed here, one is
 /// deliberately left open, and two belong to the dirty-segment slice. A seventh arrived with the
-/// 2026-08-19 L1 arm and is closed below:
+/// 2026-08-19 L1 arm; an eighth and a ninth with the 2026-08-22 page budget and demoted-site stop.
+/// All three are closed below:
+///
+/// * CLOSED, the PAGE BUDGET. The compile walk stops when its running emitted-size estimate
+///   reaches one host page (`EMITTED_BLOCK_FIXED_BYTES`), which on a memory-heavy path binds long
+///   before `MAX_BLOCK_INSTRUCTIONS`. A scan without the mirror reports the pre-budget length, so
+///   every row over-reports and the memory-heavy rows -- exactly the ones a coverage slice ranks
+///   -- over-report most. `SuffixSeed::estimated_bytes` carries the walk's total and the scan
+///   continues it.
+///
+/// * CLOSED, the DEMOTED-SITE stop. A slot the governor demoted is a boundary for every later walk
+///   over that instruction, so a suffix that counts it claims a block the compiler will never
+///   build. Both mirrors sit BELOW `stack_width_kind`, where the compile walk's own copies are and
+///   for the same reason: `classify` does not produce the protected-mode `MOV ES/DS,r16` call-out.
 ///
 /// * CLOSED, the L1 heat gate (`IZARRAVM_ROTATE_ROWS=heat`). That arm's refusal is NOT a
 ///   `classify` None -- `classify` admits the group-2 row and the compile walk downgrades it to
@@ -254,7 +271,11 @@ fn census_native_suffix(
         x87_slots,
         mut dirty_segments,
         model_dirty,
+        estimated_bytes,
     } = seed;
+    // The barrier occupies one slot of the counterfactual block, so its own emitted bytes join the
+    // running total before the scan starts. See the budget mirror below for why the memory rate.
+    let mut estimated_bytes = estimated_bytes.saturating_add(EMITTED_MEMORY_SLOT_BYTES);
     let cs = cpu.registers.cs();
     let mut result = CensusSuffix::default();
     while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
@@ -323,6 +344,36 @@ fn census_native_suffix(
         let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
             break;
         };
+        // The demoted-site stop, mirrored from the compile walk. A slot the governor demoted is a
+        // BOUNDARY for every later walk over that instruction, so a suffix that counted it is
+        // claiming a block the compiler will never build. Below `stack_width_kind` for the reason
+        // the compile walk's own copy is: `classify` does not produce the protected-mode
+        // `MOV ES/DS,r16` call-out, that conversion does.
+        if kind
+            .call_out_helper()
+            .is_some_and(CallOutHelper::interprets_one)
+            && cpu
+                .jit_direct
+                .callout_site_demoted(expected_phys, key.mode_key)
+        {
+            break;
+        }
+        // The page budget, mirrored from the compile walk. Without it every row's suffix reports
+        // the pre-budget block length -- up to `MAX_BLOCK_INSTRUCTIONS` -- while the compiler
+        // stops at one host page, and the over-report is worst on exactly the memory-heavy rows a
+        // coverage slice is trying to rank.
+        //
+        // The BARRIER itself is charged at the memory-slot rate. The suffix counts it as one slot
+        // of the counterfactual block (`prefix_instructions + 1`), and its lowered size is by
+        // definition unknown -- there is no `kind` for an instruction the classifier refused. The
+        // memory rate is the same conservative choice the slot-count caps make, and it is one slot
+        // of error at worst.
+        let next_estimated_bytes = estimated_bytes.saturating_add(kind.emitted_bytes_estimate());
+        if usize::try_from(next_estimated_bytes).unwrap_or(usize::MAX)
+            > super::super::exec_mem::host_page_len()
+        {
+            break;
+        }
         if kind.is_x87()
             || !static_control_target_within_limit(
                 kind,
@@ -344,6 +395,7 @@ fn census_native_suffix(
         {
             break;
         }
+        estimated_bytes = next_estimated_bytes;
         stack_accesses += u8::from(kind.uses_stack());
         memory_alu_slots += u8::from(kind.is_memory_alu());
         callout_slots += u8::from(kind.is_call_out());

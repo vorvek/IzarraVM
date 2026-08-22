@@ -430,6 +430,14 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
 //  * restoring the bare `!insn.continuable` makes
 //    `census_suffix_admits_the_non_continuable_imul_forms` read 0 where it must read 3.
 //
+//  * deleting the page-budget mirror makes `census_suffix_stops_where_the_page_budget_does` read
+//    31 where it must read 9. That divergence is the one the S3 page budget introduced, and it is
+//    not bounded by a constant: it grows with how memory-heavy the path is, which is the axis the
+//    suffix column ranks on.
+//
+//  * deleting the demoted-site mirror makes `census_suffix_stops_at_a_demoted_call_out_site` read
+//    5 where it must read 2, which is a demoted row claiming the coverage it just gave back.
+//
 //  * deleting the L1 heat-gate mirror makes `census_suffix_mirrors_the_l1_heat_gate` read 4 on its
 //    hot leg where it must read 2. That is the seventh divergence, and it is the only one whose
 //    over-report is CORRELATED with the quantity the arm measures rather than merely bounded.
@@ -3833,5 +3841,103 @@ fn barrier_census_closure_dormant_heat_site_reports_whether_a_walk_ever_reached_
         "the walked set spans every entry the backend compiled, not only the dormant ones: \
          {} run-wide against {walked_dormant} walked dormant sites",
         snapshot.walked_entries_run_wide
+    );
+}
+
+/// The suffix must stop where the compile walk's PAGE BUDGET stops, and the claim is an equality
+/// against the block the walk actually installs.
+///
+/// The eighth divergence in `census_native_suffix`'s ledger. The budget ends the walk when the
+/// running emitted-size estimate reaches one host page, which on a memory-heavy path binds long
+/// before `MAX_BLOCK_INSTRUCTIONS`; a scan without the mirror walks on to the instruction cap and
+/// reports a block nothing will ever build. It is not a bounded over-report either -- it grows
+/// with how memory-heavy the path is, which is the axis this column ranks on.
+///
+/// Both legs are the same instruction stream. The census leg puts the barrier in front of it, and
+/// the suffix then counts every slot of the counterfactual block except the barrier itself, so the
+/// two must differ by exactly one.
+#[test]
+fn census_suffix_stops_where_the_page_budget_does() {
+    const COUNT: usize = 31;
+    // `mov eax,[0x3000]`: a memory load, so the block hits the page budget well inside
+    // `MAX_BLOCK_INSTRUCTIONS`. A register-only stream could not -- at forty bytes a slot the
+    // instruction cap binds first, and the fixture would pass with the mirror deleted.
+    const LOAD: [u8; 6] = [0x8b, 0x05, 0x00, 0x30, 0x00, 0x00];
+
+    let mut plain = Vec::new();
+    let mut plain_starts = Vec::new();
+    for _ in 0..COUNT {
+        plain_starts.push(plain.len() as u32);
+        plain.extend_from_slice(&LOAD);
+    }
+    let (mut cpu, mut bus) = fixture(&plain);
+    let addresses: Vec<_> = plain_starts.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let installed = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert!(
+        usize::from(installed.span.instructions) < COUNT,
+        "the fixture must be a stream the budget actually cuts: {} of {COUNT} slots",
+        installed.span.instructions
+    );
+
+    let mut barred = vec![DIRECT_BARRIER];
+    let mut barred_starts = vec![0u32];
+    for _ in 0..COUNT {
+        barred_starts.push(barred.len() as u32);
+        barred.extend_from_slice(&LOAD);
+    }
+    assert_eq!(
+        barrier_suffix(&barred, &barred_starts),
+        u64::from(installed.span.instructions) - 1,
+        "the counterfactual block the suffix describes must be the block the walk installs: the \
+         barrier is one of its slots, and the rest are the suffix"
+    );
+}
+
+/// The suffix must stop at a DEMOTED call-out site, for the same reason it stops at any other
+/// boundary: no later compile walk will put that slot in a block, so a suffix that counts it is
+/// describing a block that cannot exist.
+///
+/// The ninth divergence in `census_native_suffix`'s ledger, and the one whose over-report is
+/// self-reinforcing: the rows that demote are the rows a widening slice is being asked to keep, so
+/// a column that ignores demotions makes a losing row look like a winning one.
+///
+/// The site is marked directly rather than earned by three resyncs. `note_demoted_callout_site` is
+/// the same door the governor uses, and driving a real demotion needs a protected-mode machine
+/// this file does not have; what is under test here is the SCAN, not the governor.
+#[test]
+fn census_suffix_stops_at_a_demoted_call_out_site() {
+    // barrier, two `inc eax`, `pop dword [0x3000]`, two more `inc eax`.
+    const SLOT: u32 = ENTRY + 3;
+    let mut code = vec![DIRECT_BARRIER, 0x40, 0x40];
+    code.extend_from_slice(&[0x8f, 0x05, 0x00, 0x30, 0x00, 0x00]);
+    code.extend_from_slice(&[0x40, 0x40]);
+    let starts: &[u32] = &[0, 1, 2, 3, 9, 10];
+
+    assert_eq!(
+        barrier_suffix(&code, starts),
+        5,
+        "control: with the site clean the call-out joins and everything behind it follows"
+    );
+
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = starts.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    // Physical is linear in this fixture, so the slot's site is its address.
+    assert!(cpu.jit_direct.note_demoted_callout_site(SLOT, key.mode_key));
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+        .expect("the barrier row");
+    assert_eq!(
+        row.native_suffix_instructions, 2,
+        "the two slots in front of the demoted site, and nothing past it"
     );
 }
