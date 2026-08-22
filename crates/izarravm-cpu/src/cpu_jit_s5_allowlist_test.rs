@@ -444,20 +444,25 @@ fn word_size_group3_test_forms_follow_the_slice() {
     );
 }
 
-/// `PUSH DS` and `PUSH ES` at Word size, the read half of the segment family.
+/// `PUSH DS`, `PUSH ES`, `PUSH CS` and `PUSH SS` at Word size, the read half of the segment
+/// family.
 ///
 /// One word store and no reads: the selector is a compile-time constant baked from the block's
 /// `SegmentLayout`, so the only memory the slot touches is the stack. `PUSH CS` joined on
 /// 2026-08-08 (158M wolf3d census hits): `SegmentLayout::selector` reads the separate `cs`
 /// field and `cs_matches` pins CS for every block unconditionally, so keeping CS out of the
-/// `selector_segment` mask stays correct. `PUSH SS` is asserted refused in the table below: it
-/// belongs to the family the write half excludes over the interrupt shadow.
+/// `selector_segment` mask stays correct. `PUSH SS` MOVED HERE on 2026-08-22 from the refusal
+/// table below (747,415 tombraid loader census hits). The shadow argument that kept it out is
+/// about POP SS and MOV SS, which LOAD the stack segment; PUSH SS reads the selector and arms
+/// nothing. Unlike CS it takes the ordinary data path, so it has to be in `used`, and every push
+/// already puts it there through `write_segment`.
 #[test]
 fn word_size_push_segment_forms_are_lowered() {
     for (label, opcode) in [
         ("0x1e push ds", 0x1eu8),
         ("0x06 push es", 0x06),
         ("0x0e push cs", 0x0e),
+        ("0x16 push ss", 0x16),
     ] {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(&[0x66, opcode]);
@@ -502,10 +507,11 @@ fn word_size_push_segment_forms_are_lowered() {
 /// about the allowlist.
 /// `0x07` and `0x1f` moved on 2026-08-20: the V86 loop-A slice lowers POP ES and POP DS behind
 /// `IZARRAVM_V86_LOOP_ROWS`, so both are allowlist refusals on the OFF arm and lowerings on the ON
-/// one. `0x16` PUSH SS and `0x17` POP SS stay refused on BOTH arms, and that is the pairing this
-/// table exists to hold: the two segments this backend can load in real mode and V86 flip, and the
-/// stack segment does not, because loading SS arms a one-instruction interrupt shadow that a
-/// native block never passes through.
+/// one. `0x17` POP SS stays refused on BOTH arms, and that is the pairing this table exists to
+/// hold: the two segments this backend can load in real mode and V86 flip, and the stack segment
+/// does not, because LOADING SS arms a one-instruction interrupt shadow that a native block never
+/// passes through. `0x16` PUSH SS left this table on 2026-08-22 for the positive one above. It
+/// loads nothing and arms nothing, so the shadow argument never applied to it.
 ///
 /// `flat_fixture` builds a REAL-mode CPU (`fresh()` with CS.D forced on), and the rows above force
 /// SS.B off, which is exactly the cell `PopSegReal` is admitted in: real mode, 16-bit stack, Word
@@ -515,7 +521,6 @@ fn word_size_push_segment_forms_are_lowered() {
 fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
     // The `bool` is "refused on the ON arm too".
     let cases: &[(&str, &[u8], bool)] = &[
-        ("0x16 push ss", &[0x66, 0x16], true),
         ("0x1f pop ds", &[0x66, 0x1f], false),
         ("0x07 pop es", &[0x66, 0x07], false),
         ("0x17 pop ss", &[0x66, 0x17], true),

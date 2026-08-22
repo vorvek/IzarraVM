@@ -221,7 +221,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x01 | 0x09 | 0x21 | 0x29 | 0x31
                 | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
                 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
-                | 0x06 | 0x0e | 0x1e
+                | 0x06 | 0x0e | 0x16 | 0x1e
                 | 0x40..=0x4f
                 | 0x50..=0x5f
                 | 0x68
@@ -1198,23 +1198,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x9e if fpu_loop_rows_enabled() => {
                 return Some(DirectKind::Sahf);
             }
-            // PUSH DS (0x1e) and PUSH ES (0x06), the read half of the segment family. Both are
-            // ordinary word stack stores of a value the block already pins: the selector is baked
+            // PUSH DS (0x1e), PUSH ES (0x06), PUSH CS (0x0e) and PUSH SS (0x16), the read half
+            // of the segment family. All four are ordinary word stack stores of a value the block already pins: the selector is baked
             // from the `SegmentLayout` in `emit_store`, exactly as `MovSegToReg` bakes one, and
             // `selector_segment` reports the segment so `data_matches` refuses re-entry after a
             // guest reload.
             //
-            // PUSH SS (0x16) is NOT here: it belongs to the family the write half excludes over
-            // the interrupt shadow, and no census row measures it (36 hits when this arm was
-            // built). PUSH CS (0x0e) joined on 2026-08-08 when the wolf3d demo-workload census
+            // PUSH CS (0x0e) joined on 2026-08-08 when the wolf3d demo-workload census
             // ranked it at 158M block-stopping hits: it needs NO `selector_segment` entry because
             // CS is not in `SegmentLayout.data` at all — `SegmentLayout::selector` reads the
             // separate `cs` field and `cs_matches` pins it for every block unconditionally, the
             // same argument that already carries `mov r16, cs` through `MovSegToReg`.
-            0x0e | 0x1e | 0x06 => {
+            //
+            // PUSH SS joined on 2026-08-22, and what kept it out until then was a misreading this
+            // arm carried in prose: "it belongs to the family the write half excludes over the
+            // interrupt shadow". That argument is about POP SS and MOV SS, which LOAD the stack
+            // segment and arm a one-instruction shadow (`load_segment_arming_ss_shadow`). PUSH SS
+            // only READS the selector and arms nothing: the interpreter's 0x16 arm is the 0x06 arm
+            // with a different `SegmentIndex` and the same two clocks. SS takes the ORDINARY data
+            // path here, unlike CS. It lives in `SegmentLayout.data`, so `selector_segment` must
+            // report it, and every push already has it in `used` because `write_segment` names SS
+            // as the segment the store goes through. The tombraid DOS/4GW loader census of
+            // 2026-08-22 ranks it at 747,415 block-stopping hits, the largest remaining barrier
+            // row after S3.
+            0x0e | 0x16 | 0x1e | 0x06 => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Selector(match opcode {
                         0x0e => SegmentIndex::Cs,
+                        0x16 => SegmentIndex::Ss,
                         0x1e => SegmentIndex::Ds,
                         _ => SegmentIndex::Es,
                     }),

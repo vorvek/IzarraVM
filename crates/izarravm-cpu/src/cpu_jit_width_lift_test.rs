@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! The S1 width lift: native Word emitters for ENTER imm16,0, LEAVE and LEA, plus the CLD/STD
-//! Word policy lift.
+//! Word policy lift. The S4b row (native PUSH SS) joins at the end of the file: it is a different
+//! slice, but it is the same question at the same seam (an operand size and a stack width chosen
+//! independently), and `WidthCase` is the harness that asks it. A second copy of this machinery
+//! in its own file would be the duplication house rule 6 bars.
 //!
 //! The rows are here because the Tomb Raider DOS/4GW loader phase measures them at the top of its
 //! barrier census on 2026-08-21: ENTER 1,977,855 runtime hits, LEAVE 1,277,833, LEA 1,744,694 and
@@ -153,12 +156,46 @@ enum Machine {
     /// Flat 32-bit code with a 16-bit stack. The block's `address_wrap` is None while every stack
     /// site must wrap at 64K.
     Code32Stack16,
+    // The three `...Ss` machines below give SS a selector that is DISTINCT FROM EVERY OTHER
+    // SEGMENT's. A fixture that pushes the stack selector is vacuous without that, in two
+    // different ways that both look like a pass:
+    //
+    //  * on the plain 16-bit machine every selector is 0, so a slot that pushed nothing at all
+    //    would agree with a slot that pushed SS, because the stack is zero-filled already;
+    //  * on the two flat machines `flat_stack_cpu` gives DS, SS, ES, FS and GS the SAME
+    //    `flat(0x10, 0x93)`, so a classifier arm that mapped 0x16 to ES would agree with one
+    //    that mapped it to SS. That mutation survived the first version of these fixtures and is
+    //    why the two flat variants exist.
+    //
+    /// `Code16Stack16` with SS at a non-zero real-mode selector. Base 0x1000 also keeps the
+    /// stack off the block's own code page, which the module note above explains.
+    Code16Stack16Ss,
+    /// `Code32Stack32` with SS at its own selector. Base and access byte are untouched, so
+    /// nothing but the pushed value can tell the two machines apart.
+    Code32Stack32Ss,
+    /// `Code32Stack16` with SS at its own selector, SS.B and ESP left as that machine sets them.
+    Code32Stack16Ss,
+}
+
+/// Give SS a selector no other segment carries, without disturbing its base, limit, access byte
+/// or B bit: the block still bakes the same stack base, and the only observable change is the
+/// value `PUSH SS` stores.
+fn distinguish_ss(cpu: &mut CpuGsw) {
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.selector = 0x0018;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
 }
 
 impl Machine {
     /// The compile key's `d`, which is CS.D and nothing else.
     fn d(self) -> bool {
-        matches!(self, Self::Code32Stack32 | Self::Code32Stack16)
+        matches!(
+            self,
+            Self::Code32Stack32
+                | Self::Code32Stack16
+                | Self::Code32Stack32Ss
+                | Self::Code32Stack16Ss
+        )
     }
 
     fn cpu(self, entry: u32) -> CpuGsw {
@@ -176,6 +213,22 @@ impl Machine {
             }
             Self::Code32Stack32 => flat_stack_cpu(entry),
             Self::Code32Stack16 => sixteen_bit_stack_cpu(entry),
+            Self::Code16Stack16Ss => {
+                let mut cpu = sixteen_bit_code_cpu(entry);
+                cpu.load_segment_real(SegmentIndex::Ss, 0x0100);
+                cpu.registers.set_esp(0x0700);
+                cpu
+            }
+            Self::Code32Stack32Ss => {
+                let mut cpu = flat_stack_cpu(entry);
+                distinguish_ss(&mut cpu);
+                cpu
+            }
+            Self::Code32Stack16Ss => {
+                let mut cpu = sixteen_bit_stack_cpu(entry);
+                distinguish_ss(&mut cpu);
+                cpu
+            }
         }
     }
 }
@@ -949,4 +1002,172 @@ fn std_word_row_is_native() {
         crate::FLAG_DF,
         "STD must leave DF set"
     );
+}
+
+// ---------------------------------------------------------------------------
+// S4b: PUSH SS (0x16), the last member of the selector-push arm.
+//
+// 747,415 block-stopping hits on the tombraid DOS/4GW loader census of 2026-08-22, the largest
+// remaining barrier row after S3. It was excluded from the `0x06 | 0x0e | 0x1e` arm on a
+// misreading: the interrupt-shadow argument belongs to POP SS and MOV SS, which LOAD the stack
+// segment. PUSH SS reads the selector and arms nothing, and the interpreter's 0x16 arm is the
+// 0x06 arm with a different `SegmentIndex`.
+//
+// Three cells, which is every cell `stack_width_kind` admits a push in:
+//
+//   SS.B = 0 + Word   `Push16`, two bytes, the pointer wraps at 64K
+//   SS.B = 1 + Dword  `Push`, four bytes
+//   SS.B = 1 + Word   no cell, refused (asserted in cpu_jit_s5_allowlist_test.rs)
+//
+// The Word cell is reached unprefixed from a 16-bit code segment and 66-prefixed from a 32-bit
+// one, and both are here because they take different paths to the same kind.
+// ---------------------------------------------------------------------------
+
+fn arm_push_ss(cpu: &mut CpuGsw, bus: &mut TestBus, esp: u32) {
+    cpu.halted = false;
+    cpu.registers.gpr = [0; 8];
+    cpu.registers.set_esp(esp);
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    bus.trace = BusTrace::default();
+}
+
+fn arm_push_ss16(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    arm_push_ss(cpu, bus, 0x0700);
+}
+
+fn arm_push_ss32(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    arm_push_ss(cpu, bus, 0x0000_1800);
+}
+
+/// The stack pointer's upper half is non-zero and its low half is zero, so the two-byte push
+/// wraps SP to 0xFFFE. A lowering that took the pointer width from the operand size would move
+/// ESP to 0x1233_FFFE and write four bytes at a different page.
+fn arm_push_ss_wrap(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    arm_push_ss(cpu, bus, 0x1234_0000);
+}
+
+/// PUSH SS unprefixed in a 16-bit code segment on a 16-bit stack: the loader's own shape.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn push_ss16_ssb0_stores_the_stack_selector() {
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code16Stack16Ss,
+        // inc ax; push ss; inc cx; hlt
+        code: &[0x40, 0x16, 0x41, 0xF4],
+        starts: &[0, 1, 2],
+        instructions: 3,
+        // 2 (inc) + 2 (the 0x16 arm's clocks(2)) + 2 (inc).
+        raw_clocks: 6,
+        pages: &[0x0000, 0x1000],
+        memory_len: 0x2000,
+        arm: arm_push_ss16,
+    });
+    assert_same_state(&outcome);
+
+    assert_eq!(
+        outcome.native.registers.esp(),
+        0x0000_06fe,
+        "SP drops by two, not four"
+    );
+    // SS base 0x1000 plus SP 0x06FE. The selector, not the base and not zero: this is the
+    // assertion the machine variant exists for.
+    assert_eq!(
+        u16::from_le_bytes(
+            outcome.native_bus.memory[0x16fe..0x1700]
+                .try_into()
+                .expect("two stack bytes")
+        ),
+        0x0100,
+        "the pushed word is the SS SELECTOR"
+    );
+    assert_eq!(outcome.block_len, 3);
+}
+
+/// PUSH SS unprefixed in a 32-bit code segment on a 32-bit stack: four bytes, the selector
+/// zero-extended, exactly as PUSH ES already does in that cell (386 PRM).
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn push_ss32_ssb1_stores_the_zero_extended_selector() {
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code32Stack32Ss,
+        // inc eax; push ss; inc ecx; hlt
+        code: &[0x40, 0x16, 0x41, 0xF4],
+        starts: &[0, 1, 2],
+        instructions: 3,
+        raw_clocks: 6,
+        pages: &[0x0000, 0x1000],
+        memory_len: 0x2000,
+        arm: arm_push_ss32,
+    });
+    assert_same_state(&outcome);
+
+    assert_eq!(
+        outcome.native.registers.esp(),
+        0x0000_17fc,
+        "ESP drops by four"
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            outcome.native_bus.memory[0x17fc..0x1800]
+                .try_into()
+                .expect("four stack bytes")
+        ),
+        0x0000_0018,
+        "the pushed dword is the SS SELECTOR, zero-extended, and not ES's"
+    );
+    assert_eq!(outcome.block_len, 3);
+}
+
+/// The 66-prefixed form, which is the only way a 32-bit code segment reaches the Word cell.
+///
+/// On a 16-bit stack, so it also pins the two things a width-confused lowering gets wrong: the
+/// pointer wraps at 64K and ESP's upper half survives.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn push_ss16_prefixed_wraps_the_pointer_and_keeps_the_upper_half() {
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code32Stack16Ss,
+        // inc eax; 66 push ss; inc ecx; hlt
+        code: &[0x40, 0x66, 0x16, 0x41, 0xF4],
+        starts: &[0, 1, 3],
+        instructions: 3,
+        raw_clocks: 6,
+        pages: &[0x0000, 0xf000],
+        memory_len: 0x1_0000,
+        arm: arm_push_ss_wrap,
+    });
+    assert_same_state(&outcome);
+
+    assert_eq!(
+        outcome.native.registers.esp(),
+        0x1234_fffe,
+        "SP wraps to 0xFFFE and ESP[31:16] survives"
+    );
+    assert_eq!(
+        u16::from_le_bytes(
+            outcome.native_bus.memory[0xfffe..0x1_0000]
+                .try_into()
+                .expect("two stack bytes")
+        ),
+        0x0018,
+        "the pushed word is the SS SELECTOR, and not ES's"
+    );
+    assert_eq!(outcome.block_len, 4);
 }
