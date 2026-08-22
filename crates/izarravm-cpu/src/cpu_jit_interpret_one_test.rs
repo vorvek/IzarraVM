@@ -1714,3 +1714,140 @@ fn xchg_core_clocks_is_what_the_interpreter_charges() {
         assert_row_charges(row, crate::XCHG_CORE_CLOCKS, |_, _| {});
     }
 }
+
+/// The other half of `assert_row_is_a_call_out`: the row is still lowered NATIVELY, so the block
+/// carries it without a helper at all.
+///
+/// Needed wherever a slice splits one opcode between the two answers, which the bit-string family
+/// is the first to do: `0F A3` register keeps its emitter at Dword and becomes a call-out at Word.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn assert_row_is_native(row: &[u8]) {
+    let (code, starts) = row_program(row);
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        BLOCK_INSTRUCTIONS,
+        "the block stopped early, so row {row:02x?} is a boundary rather than a lowering"
+    );
+    assert_eq!(
+        block.callout_interpret_one_slots(),
+        0,
+        "row {row:02x?} must keep its native emitter, not become a call-out"
+    );
+}
+
+/// Row 3: the bit-string family, every form the S3 arm takes.
+///
+/// `0F BA` carries the immediate index and `0F A3`/`AB`/`B3`/`BB` carry it in a register; the four
+/// sub-operations differ only in whether and how they write the bit back. Both operand shapes of
+/// each, because the memory shape is the one whose effective address moves with the index at
+/// runtime and the register shape is the one whose index is masked to the operand width.
+///
+/// The memory index is `AX`, which the block's first slot sets to 0x1111, so the row addresses 546
+/// bytes above `[bx]`: on the mapped data page, inside the real-mode DS limit, and away from the
+/// stack. That is deliberate rather than incidental, and it is what makes these cases exercise the
+/// runtime address adjustment instead of a zero offset.
+///
+/// MUTATION: delete the `0F AB | 0F B3 | 0F BB` opcodes from the routing arm and their four cases
+/// fail on the block shape while the `0F A3` and `0F BA` cases still pass.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_bit_string_family_resumes() {
+    for row in [
+        // 0F BA /4../7 with mod 00 r/m 111: bt/bts/btr/btc word [bx], 3.
+        &[0x0Fu8, 0xBA, 0x27, 0x03][..],
+        &[0x0F, 0xBA, 0x2F, 0x03],
+        &[0x0F, 0xBA, 0x37, 0x03],
+        &[0x0F, 0xBA, 0x3F, 0x03],
+        // The same four with mod 11 r/m 011: bt/bts/btr/btc bx, 3.
+        &[0x0F, 0xBA, 0xE3, 0x03],
+        &[0x0F, 0xBA, 0xEB, 0x03],
+        &[0x0F, 0xBA, 0xF3, 0x03],
+        &[0x0F, 0xBA, 0xFB, 0x03],
+        // 0F A3/AB/B3/BB memory form: bt/bts/btr/btc [bx], ax.
+        &[0x0F, 0xA3, 0x07],
+        &[0x0F, 0xAB, 0x07],
+        &[0x0F, 0xB3, 0x07],
+        &[0x0F, 0xBB, 0x07],
+        // The register forms of the three that write back, plus the Word BT the native arm
+        // refuses.
+        &[0x0F, 0xA3, 0xC3],
+        &[0x0F, 0xAB, 0xC3],
+        &[0x0F, 0xB3, 0xC3],
+        &[0x0F, 0xBB, 0xC3],
+    ] {
+        assert_row_resumes(row, no_perturb);
+    }
+}
+
+/// The width split: `0F A3` register keeps its native lowering at Dword and becomes a call-out at
+/// Word.
+///
+/// This is the pin the routing arm's whole placement exists for. `DirectKind::Bt` carries no width
+/// and the emitter masks the index with `& 31`, while at Word the interpreter masks with `& 15`.
+/// Before this slice the Word form was kept out by the allowlist's silence; now the allowlist
+/// admits the family and the width test lives in the arm, so it has to be visible from a test.
+///
+/// The Dword case is a 66-prefixed encoding inside the SAME 16-bit code segment, which is what
+/// `prefixes_supported_for` admits for an operand-size override under CS.D = 0. No second harness.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn bt_register_form_splits_native_dword_from_call_out_word() {
+    assert_row_is_native(&[0x66, 0x0F, 0xA3, 0xC3]);
+    assert_row_is_a_call_out(&[0x0F, 0xA3, 0xC3]);
+}
+
+/// `0F BA /0../3` are not bit-test operations and stay refused.
+///
+/// The interpreter answers them with #UD before the operation runs. Admitting them would compile a
+/// block around an instruction that can only ever fault, burning a call-out and a governor
+/// execution on each one.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn bit_string_immediate_form_refuses_the_undefined_extensions() {
+    for reg in 0u8..4 {
+        // 0F BA /reg with mod 11 r/m 011, then three native slots ahead of it so the block that
+        // stops here is long enough to compile.
+        let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+        code.extend_from_slice(&[0x0F, 0xBA, 0xC3 | (reg << 3), 0x03]);
+        code.extend_from_slice(&[0x40, 0xF4]);
+        let starts = vec![0, 3, 4, 5, 9];
+        let (_, _, block) = build_native(&code, &starts);
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "0F BA /{reg} must still end the block"
+        );
+        assert_eq!(block.callout_interpret_one_slots(), 0);
+    }
+}
+
+/// `BIT_STRING_CORE_CLOCKS` is what the interpreter charges, on both arms of the family and both
+/// operand forms.
+#[test]
+fn bit_string_core_clocks_is_what_the_interpreter_charges() {
+    for row in [
+        &[0x0Fu8, 0xBA, 0xE3, 0x03][..],
+        &[0x0F, 0xBA, 0x27, 0x03],
+        &[0x0F, 0xA3, 0xC3],
+        &[0x0F, 0xA3, 0x07],
+    ] {
+        assert_row_charges(row, crate::BIT_STRING_CORE_CLOCKS, |_, _| {});
+    }
+}

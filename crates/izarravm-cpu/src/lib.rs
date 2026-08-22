@@ -4590,6 +4590,11 @@ pub(crate) const MOV_RM_SREG_CORE_CLOCKS: u32 = 2;
 /// there as carrying it too.
 pub(crate) const XCHG_CORE_CLOCKS: u32 = 3;
 
+/// What the bit-string family charges (execute_extended.rs `0x0fa3 | 0x0fab | 0x0fb3 | 0x0fbb`
+/// and `0x0fba`). One constant for both arms because both return the same `clocks(6)`, whatever
+/// the sub-operation, the operand form or the width.
+pub(crate) const BIT_STRING_CORE_CLOCKS: u32 = 6;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -4611,14 +4616,15 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0x8F POP r/m | execute.rs `0x8f` | `POP_RM_CORE_CLOCKS` |
 /// | 0x8C MOV r/m16,Sreg memory | execute.rs `0x8c` | `MOV_RM_SREG_CORE_CLOCKS` |
 /// | 0x86/0x87/0x91..=0x97 XCHG | execute.rs `0x86`, `0x87`, `0x91..=0x97` | `XCHG_CORE_CLOCKS` |
+/// | BT/BTS/BTR/BTC | execute_extended.rs `0x0fa3..`, `0x0fba` | `BIT_STRING_CORE_CLOCKS` |
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
 /// instruction that faults at a block boundary, and the helper returns zero -- so nothing on that
 /// path reaches the lane this constant bounds. Widening the allowlist means widening this.
 pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
-    POP_RM_CORE_CLOCKS,
-    larger(MOV_RM_SREG_CORE_CLOCKS, XCHG_CORE_CLOCKS),
+    larger(POP_RM_CORE_CLOCKS, MOV_RM_SREG_CORE_CLOCKS),
+    larger(XCHG_CORE_CLOCKS, BIT_STRING_CORE_CLOCKS),
 );
 
 /// The largest core charge any admitted call-out helper can return, and the term

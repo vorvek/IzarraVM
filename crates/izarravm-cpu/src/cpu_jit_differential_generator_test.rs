@@ -1958,11 +1958,27 @@ fn policy_xchg_stack_pointer(_: &mut [u32; 8]) -> Vec<u8> {
     vec![0x94]
 }
 
+/// `0F BA /5` with mod 01, r/m 101, disp8 0: `bts dword [ebp+0], 5`, the immediate-index memory
+/// form. BTS rather than BT so the row WRITES, which is the half of the family the native `Bt`
+/// lowering does not have.
+fn policy_bit_string_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x0F, 0xBA, 0x6D, 0x00, 0x05]
+}
+
+/// `0F BB C3`: `btc ebx, eax`, the register-index register form, whose index the interpreter masks
+/// to the operand width from whatever random value the case drew.
+fn policy_bit_string_register(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x0F, 0xBB, 0xC3]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
 const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_mov_sreg_memory_32,
     policy_xchg_memory_32,
     policy_xchg_stack_pointer,
+    policy_bit_string_memory_32,
+    policy_bit_string_register,
 ];
 
 /// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
@@ -1973,7 +1989,15 @@ const POLICY_ROWS_16: &[PolicyRow] = &[
     policy_mov_sreg_memory_16,
     policy_xchg_memory_16,
     policy_xchg_stack_pointer,
+    policy_bit_string_memory_16,
+    policy_bit_string_register,
 ];
+
+/// `0F BA /5` with mod 01, r/m 110, disp8 0: `bts word [bp+0], 5`.
+fn policy_bit_string_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0x0F, 0xBA, 0x6E, 0x00, 0x05]
+}
 
 /// `87 /r` with mod 01, r/m 110, disp8 0: `xchg [bp+0], ax`.
 fn policy_xchg_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {

@@ -105,7 +105,7 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let index = self.read_gpr_sized(modrm.reg, operand_size);
                 self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
-                Ok(clocks(6))
+                Ok(clocks(BIT_STRING_CORE_CLOCKS))
             }
             0x0fba => {
                 // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 was fetched by
@@ -129,7 +129,7 @@ impl CpuGsw {
                     address_size,
                     false,
                 )?;
-                Ok(clocks(6))
+                Ok(clocks(BIT_STRING_CORE_CLOCKS))
             }
             0x0fa4 | 0x0fac => {
                 // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 count was fetched by `decode` into

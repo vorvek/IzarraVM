@@ -282,6 +282,17 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xc3
                 | 0xc6
                 | 0xc7
+                // The BIT-STRING family, admitted to the S3 `InterpretOne` allowlist. In a 16-bit
+                // segment every one of them decodes at Word, so without this entry the loader's
+                // rows never reach the classifier arm. What makes it safe is that the native `Bt`
+                // lowering below is now gated on Dword IN ITS ARM rather than by this list's
+                // silence: at Word the interpreter masks the bit index with `& 15` and that kind
+                // carries no width, so the gate had to move somewhere it is stated.
+                | 0x0fa3
+                | 0x0fab
+                | 0x0fb3
+                | 0x0fbb
+                | 0x0fba
                 | 0x0fb6
                 | 0x0fb7
                 | 0x0fbe
@@ -438,15 +449,62 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }),
         };
     }
+    // The BIT-STRING family, everything the native `Bt` arm below does not take, as `InterpretOne`
+    // call-outs. The S3 policy widening's third row: the post-S2 loader census ranks `0F BA /4`
+    // dword register at 971 k block-stopping hits (5.5%) and `0F A3` memory dword at 257 k.
+    //
+    // ROUTED HERE, ABOVE the `u8::try_from(insn.opcode).ok()` truncation further down, for the
+    // reason 0x0faf and MOVZX/MOVSX state: that truncation returns None for every two-byte opcode,
+    // so an arm among the u8 arms below would be silently unreachable. Nothing would fail; the
+    // admission would simply never fire.
+    //
+    // What this arm takes, and what it deliberately leaves to the native one immediately below:
+    //
+    // | form | answer |
+    // |---|---|
+    // | `0F A3` register, Dword | falls through to the native `Bt` lowering, which is free |
+    // | `0F A3` register, Word | call-out: at Word the interpreter masks the index with `& 15`, not `& 31`, and `DirectKind::Bt` carries no width |
+    // | `0F A3` memory, any width | call-out: the effective address is adjusted by the bit index at runtime, which a static `DirectAddr` cannot express |
+    // | `0F AB`, `0F B3`, `0F BB`, any form | call-out: BTS/BTR/BTC WRITE the operand back and `Bt` does not |
+    // | `0F BA /4../7`, any form | call-out: the index is an immediate rather than a register, and /5../7 write back |
+    // | `0F BA /0../3` | refused: not defined bit-test ops, the interpreter #UDs them before the operation runs |
+    //
+    // The register forms of BTS/BTR/BTC ride the arm with their memory forms, and that is the
+    // closure rule at the top of this file rather than a widening for its own sake: `0F BA /5`
+    // register is a call-out because the whole `0F BA` group is one interpreter arm, so refusing
+    // `0F AB` register -- the same operation with the index in a register instead of an immediate,
+    // through the same `bit_string_op` -- would be arbitrary. They reach one helper because the
+    // helper runs the decode line.
+    //
+    // The whole family joins the `OperandSize::Word` allowlist above with this slice. That is what
+    // lets a Word form reach here at all, and it is safe only because of the first two table rows:
+    // the native `Bt` lowering is now guarded on Dword explicitly rather than by the allowlist's
+    // absence, so the `& 15` masking difference cannot reach an emitter that assumes `& 31`.
+    if matches!(insn.opcode, 0x0fa3 | 0x0fab | 0x0fb3 | 0x0fbb | 0x0fba) {
+        let m = insn.modrm?;
+        if insn.opcode == 0x0fba && m.reg < 4 {
+            return None;
+        }
+        let native_bt = insn.opcode == 0x0fa3
+            && insn.operand_size == OperandSize::Dword
+            && matches!(insn.operand?, DecodedOperand::Reg(_));
+        if !native_bt {
+            return Some(DirectKind::CallOut {
+                helper: CallOutHelper::InterpretOne,
+            });
+        }
+    }
     // BT r/m32, r32, REGISTER form only. Keyed on the full u16 opcode and placed ABOVE the
     // `u8::try_from(insn.opcode).ok()` truncation for the same reason 0x0faf and the MOVZX/MOVSX
     // family are: that truncation returns None for every two-byte opcode, so an arm among the u8
     // arms below would be unreachable and nothing would fail, the lowering would simply never
     // fire.
     //
-    // Must stay BELOW the OperandSize::Word gate. A 66-prefixed BT is not in that gate's
-    // allowlist so it is already refused, and it must be: at Word the interpreter masks the bit
-    // index with `& 15`, not `& 31` (`bits = operand_size.bytes() * 8`).
+    // Reached only for the Dword register form, which the arm above filters to. It used to be
+    // reached for the Word forms as well and be kept out of them by the `OperandSize::Word` gate's
+    // silence; that gate now admits the family, so the width test moved into the arm above where
+    // it is stated. At Word the interpreter masks the bit index with `& 15`, not `& 31`
+    // (`bits = operand_size.bytes() * 8`), and this kind carries no width.
     //
     // Only 0xa3 of the four-opcode family, and only the register form. BTS/BTR/BTC (0xab, 0xb3,
     // 0xbb) WRITE the operand back; this arm's kind does not, and the interpreter skips the
