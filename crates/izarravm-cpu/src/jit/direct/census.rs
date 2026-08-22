@@ -684,16 +684,30 @@ pub(crate) struct DirectStallTally {
     /// recovery search re-walks after a page overflow are counted once, through the one prefix
     /// that installs, instead of once per walk.
     ///
-    /// Charged on the CAP arm alone. Every family's knob is tested first and returns before the
-    /// cap is consulted, so an off arm reads zero here rather than reporting its whole population
-    /// as budget pressure. The cap test also sits UNDER its family's shape bars rather than over
-    /// them, which is what makes the split per-family: a slot the cap refuses has already passed
-    /// its family's kind, opcode, prefix and length tests, so exactly one counter moves per
-    /// refused slot instead of all four. The bars each family puts above the cap are listed on its
-    /// matcher; in three of the four the cap sits above `direct_host_bytes` so a capped block
-    /// stops paying the fetch-cache scan, and in `disp_lane_cap_refusals` it stays below both the
-    /// `has_record_range` heat gate (required: without it doom's never-patched `0x8A` loads would
-    /// all read as budget pressure) and that scan.
+    /// Charged on the CAP arm alone. Each lane CLASS knob (`IZARRAVM_IMM8_LANES`,
+    /// `IZARRAVM_COUNT_LANES`, `IZARRAVM_DISP_LANES`) is tested first and returns before the cap is
+    /// consulted, so its off arm reads zero here rather than reporting the family's whole
+    /// population as budget pressure. `IZARRAVM_LANE_FAMILY` is NOT such a knob and is not covered
+    /// by that sentence: it narrows `imm_lane_for`'s admission set to `/0 ADD` instead of switching
+    /// the class off, so on its narrow arm the `/0` shapes still reach the cap and still charge
+    /// while the widened `0x81 /r` shapes charge nothing. A leg that moves that knob is comparing
+    /// two admission sets, not an on arm against an off one.
+    ///
+    /// The cap test sits UNDER its family's shape bars rather than over them, which is what makes
+    /// the split per-family: a slot the cap refuses has already passed its family's kind, opcode,
+    /// prefix and length tests, so exactly one counter moves per refused slot instead of all four.
+    /// The bars each family puts above the cap are listed on its matcher.
+    ///
+    /// WHERE THE PAGE GUARD SITS, and it is NOT the same in all four, so the four numbers are not
+    /// quite the same measurement. `imm_lane_cap_refusals`, `imm8_lane_cap_refusals` and
+    /// `count_lane_cap_refusals` test the cap ABOVE `direct_host_bytes`, so a capped block stops
+    /// paying the fetch-cache scan per slot and those three counters INCLUDE slots the page guard
+    /// would have refused anyway. Read them as "lane-shaped slots the budget turned away", an upper
+    /// bound on what a larger budget could actually have laned. `disp_lane_cap_refusals` keeps the
+    /// cap below both its `has_record_range` heat gate (required: without it doom's never-patched
+    /// `0x8A` loads would all read as budget pressure) and that scan, so it is the tighter number:
+    /// every slot it counts had a host pointer waiting. On a corpus whose code pages are all
+    /// fetch-cached the two definitions coincide, which is why the cheaper ordering was taken.
     ///
     /// Compile path only, and unconditional there: a heat-coupled counter that is armed on one
     /// leg and absent on the other confounds the policy with an epoch re-phasing, so the cost is

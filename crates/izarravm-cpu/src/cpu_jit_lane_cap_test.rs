@@ -10,7 +10,7 @@
 //! ladder that reads its registrations flat needs to know whether the family was unlaneable or
 //! whether the budget turned it away, because the two point at completely different next steps.
 //!
-//! # The three things every fixture here pins
+//! # The four things the fixtures here pin
 //!
 //! **The cap arm is charged to ONE family.** Each matcher tests the cap UNDER its own kind,
 //! opcode, prefix and length bars, so the slot that trips the budget has already been narrowed to
@@ -21,16 +21,29 @@
 //! **The cap arm is NOT the knob arm.** Three of the four matchers used to read
 //! `lanes_used >= MAX_BLOCK_IMM_LANES || !<knob>_enabled()` as one disjunction, and a counter on
 //! that fused refusal cannot tell budget pressure from an off arm, which makes it worthless on
-//! exactly the A/B leg it would be read on. The knob is tested first and returns before the cap
-//! is consulted, so an off arm reads zero. The off-arm fixtures below are what hold that.
+//! exactly the A/B leg it would be read on. Each lane CLASS knob is now tested first and returns
+//! before the cap is consulted, so its off arm reads zero. `IZARRAVM_LANE_FAMILY` is a different
+//! kind of knob and its fixtures say a different thing: it narrows `imm_lane_for`'s admission set
+//! rather than switching a class off, so on its narrow arm the `/0` fillers still charge when
+//! capped and only the widened `0x81 /5` tail goes uncounted.
+//!
+//! **The cap sits on a chosen SIDE of the page guard, and the side differs by family.**
+//! `imm_lane_for`, `imm8_lane_for` and `count_lane_for` test the budget above `direct_host_bytes`,
+//! so a capped block stops paying the fetch-cache scan per slot and their counters include slots
+//! the page guard would also have refused. `disp_lane_for` keeps the budget below both its heat
+//! gate (required) and that scan, so its counter is the tighter number. Both directions are
+//! pinned, by `a_capped_slot_whose_lane_bytes_are_not_direct_mapped_still_charges_its_family` and
+//! `a_disp_slot_whose_lane_bytes_are_not_direct_mapped_charges_no_cap_refusal`, which run the same
+//! clipped fetch entry against the two orderings and assert opposite answers.
 //!
 //! **The tally counts INSTALLED blocks, and nothing else.** The refusals are recorded on the walk
 //! (`LaneCapRefusals`, carried on the `Compilation`) and folded into the census tally by
-//! `JitState::install` on its success arm. That is what gives them the same denominator as the
-//! lane REGISTRATIONS they are read against, and the reason it matters is that the compile path
-//! walks a block more than once: `compile_with_page_len`'s recovery search re-walks prefixes after
-//! an emission overruns the arena page, and a walk can end in a `Retry` the caller throws away.
-//! `a_walk_that_does_not_install_charges_nothing` and
+//! `JitState::install` on the success arm of its inner install. That is what gives them the same
+//! denominator as the lane REGISTRATIONS they are read against, and the reason it matters is that
+//! the compile path walks a block more than once: `compile_with_page_len`'s recovery search
+//! re-walks prefixes after an emission overruns the arena page, and a walk can end in a `Retry`
+//! the caller throws away. `a_walk_that_does_not_install_charges_nothing` (which also forges a
+//! FAILED install, the arm that says which side of the `?` the fold sits on) and
 //! `re_walking_the_same_bytes_charges_only_the_walk_that_installs` are what hold that.
 //!
 //! # Why the filler is the `0x81` family and the subject is one trailing slot
@@ -52,19 +65,18 @@
 //!
 //! # Mutation record
 //!
-//! Each of these was applied to the source named and the whole file re-run. Fourteen died and ONE
-//! SURVIVED, which is recorded as a survivor rather than dropped. The fixture named first is the
-//! one whose claim the mutant contradicts most directly, and the count in brackets is how many of
-//! the fourteen fixtures failed in total.
+//! Twenty-one mutants, each applied to the source named and the whole file re-run. ALL TWENTY-ONE
+//! DIED. The fixture named first is the one whose claim the mutant contradicts most directly, and
+//! the count in brackets is how many of the fifteen fixtures failed in total.
 //!
 //! ## The counter exists, per family
 //!
 //! 1. Drop the `LANE_CAP_IMM` add in `imm_lane_for` ->
-//!    `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [4].
+//!    `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [5].
 //! 2. Drop the `LANE_CAP_IMM8` add in `imm8_lane_for` ->
-//!    `imm8_lane_cap_refusal_is_charged_to_the_imm8_family` [1].
+//!    `imm8_lane_cap_refusal_is_charged_to_the_imm8_family` [2].
 //! 3. Drop the `LANE_CAP_COUNT` add in `count_lane_for` ->
-//!    `count_lane_cap_refusal_is_charged_to_the_count_family` [1].
+//!    `count_lane_cap_refusal_is_charged_to_the_count_family` [2].
 //! 4. Drop the `LANE_CAP_DISP` add in `disp_lane_for` ->
 //!    `disp_lane_cap_refusal_is_charged_to_the_disp_family` [1].
 //!
@@ -72,12 +84,12 @@
 //!
 //! 5. Fuse the arms back in `imm8_lane_for` (`lanes_used >= MAX_BLOCK_IMM_LANES ||
 //!    !imm8_lanes_enabled()` at the head, charging there, the split test removed) ->
-//!    `imm8_lane_cap_counter_stays_zero_on_the_off_arm` [12: every fixture whose block reaches the
+//!    `imm8_lane_cap_counter_stays_zero_on_the_off_arm` [13: every fixture whose block reaches the
 //!    cap now charges imm8 as well, which is the conflation the split exists to prevent]. The same
-//!    mutant in `count_lane_for` -> `count_lane_cap_counter_stays_zero_on_the_off_arm` [12], and in
-//!    `disp_lane_for` -> `disp_lane_cap_counter_stays_zero_on_the_off_arm` [12].
+//!    mutant in `count_lane_for` -> `count_lane_cap_counter_stays_zero_on_the_off_arm` [13], and in
+//!    `disp_lane_for` -> `disp_lane_cap_counter_stays_zero_on_the_off_arm` [13].
 //! 6. Charge on the KNOB arm instead of the cap arm in `imm8_lane_for` (charge where
-//!    `!imm8_lanes_enabled()` refuses) -> `imm8_lane_cap_counter_stays_zero_on_the_off_arm` [2].
+//!    `!imm8_lanes_enabled()` refuses) -> `imm8_lane_cap_counter_stays_zero_on_the_off_arm` [3].
 //! 7. Charge the imm family where `!lane_family_enabled()` refuses the widened shape ->
 //!    `imm_lane_cap_counter_stays_zero_on_the_lane_family_off_arm` [1].
 //!
@@ -85,33 +97,43 @@
 //!
 //! 8. Hoist the cap test above the shape bars, directly below the knob (below the family arm, for
 //!    `imm_lane_for`). In `imm_lane_for` -> `imm8_lane_cap_refusal_is_charged_to_the_imm8_family`
-//!    [9]; in `imm8_lane_for` -> `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [11]; in
-//!    `count_lane_for` -> `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [11]; in
-//!    `disp_lane_for` -> `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [11]. In every
+//!    [10]; in `imm8_lane_for` -> `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [12]; in
+//!    `count_lane_for` -> `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [12]; in
+//!    `disp_lane_for` -> `imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot` [12]. In every
 //!    case the "every other counter is zero" half of the assertions is what dies, which is the
 //!    per-family split.
+//!
+//! ## The cap sits on the RIGHT SIDE of the page guard, per family
+//!
+//! The two directions are pinned separately because they disagree by family, and the pair is what
+//! makes the ordering a decision rather than an accident.
+//!
 //! 9. Sink the cap test in `disp_lane_for` ABOVE the `has_record_range` heat gate ->
 //!    `an_ungated_disp_slot_charges_no_cap_refusal` [2].
 //! 10. Hoist the cap test in `disp_lane_for` above its `direct_host_bytes` call, so it sits where
-//!     the other three now sit ->
-//!     `a_disp_slot_whose_lane_bytes_are_not_direct_mapped_charges_no_cap_refusal` [1]. That
-//!     fixture exists for this mutant and kills nothing else.
+//!     the other three sit ->
+//!     `a_disp_slot_whose_lane_bytes_are_not_direct_mapped_charges_no_cap_refusal` [1].
+//! 11. Sink the cap test BELOW `direct_host_bytes` in `imm_lane_for` (the tightening the disp
+//!     family takes, at the price of the fetch-cache scan on every slot of a capped block) ->
+//!     `a_capped_slot_whose_lane_bytes_are_not_direct_mapped_still_charges_its_family` [1]. The
+//!     same mutant in `imm8_lane_for` [1] and in `count_lane_for` [1], each killed by that one
+//!     fixture and nothing else.
 //!
 //! ## The denominator is installed blocks
 //!
-//! 11. Fold at the END OF THE WALK instead of at install (charge `cpu.jit_direct` where
+//! 12. Fold at the END OF THE WALK instead of at install (charge `cpu.jit_direct` where
 //!     `CompileOutcome::Compiled` is built, and drop the fold in `JitState::install`), which is
 //!     what the first revision of this slice did through the matchers ->
 //!     `a_walk_that_does_not_install_charges_nothing` [7].
-//! 12. Fold in `JitState::install` BEFORE the inner install rather than after its `?` -> **NOTHING
-//!     FAILS. This mutant SURVIVES**, and the gap is stated rather than papered over: every fixture
-//!     in this file installs successfully, so the failed-install arm is not covered from here.
-//!     Forging an install failure (a full arena, a key the cache has not Seen) would pin it, and
-//!     the judgement is that the `?` is the same one the lane REGISTRATIONS in `run.rs` sit behind,
-//!     so the two counter sets fail that arm together or not at all.
-//! 13. Sum the four cells into `imm_lane_cap_refusals` in `note_lane_cap_refusals`, dropping the
+//! 13. Fold in `JitState::install` BEFORE the inner install rather than after its `?` ->
+//!     `a_walk_that_does_not_install_charges_nothing` [1], through the forged install failure at
+//!     the end of that fixture. This mutant SURVIVED the first round of this file and the forged
+//!     failure was added for it: every other block here installs successfully, so without it the
+//!     failed-install arm was uncovered and the fold could have moved to the wrong side of the
+//!     `?` unnoticed.
+//! 14. Sum the four cells into `imm_lane_cap_refusals` in `note_lane_cap_refusals`, dropping the
 //!     per-family split at the fold instead of at the matcher ->
-//!     `imm8_lane_cap_refusal_is_charged_to_the_imm8_family` [3].
+//!     `imm8_lane_cap_refusal_is_charged_to_the_imm8_family` [4].
 
 use super::*;
 
@@ -232,9 +254,11 @@ fn map_flat_pages(cpu: &mut CpuGsw, bus: &mut TestBus) {
 ///
 /// The trailing `0xF4` is a STOPPER, not a slot. `decode_at` primes exactly the starts returned
 /// here, so the walk meets a decode miss at that byte and ends there with
-/// `CompileStop::Retry(DecodeMiss)`, which is a clean end for a block that already has its three
-/// slots. The byte is there so the miss lands on something deliberate rather than on whatever
-/// `HLT` would have decoded to if a later change ever primed it.
+/// `CompileStop::Retry(DecodeMiss)`. That is a clean end rather than a refusal: the walk's
+/// minimum-length rule only turns a `Retry` stop into a rejected block when fewer than three slots
+/// were formed, and every image here carries twelve or thirteen. The byte is there so the miss
+/// lands on something deliberate rather than on whatever `HLT` would have decoded to if a later
+/// change ever primed it.
 fn image(fillers: usize, tail: &[u8]) -> (Vec<u8>, Vec<u32>) {
     let mut code = Vec::new();
     let mut starts = Vec::new();
@@ -613,12 +637,64 @@ fn a_walk_that_does_not_install_charges_nothing() {
         [0, 0, 0, 0],
         "a compilation nobody installed must leave the tally alone"
     );
-    drop(compilation);
+    // AND THE FAILED INSTALL, forged the way `failed_install_consumes_seen_without_a_code_watch`
+    // forges it: an empty code buffer is one of the shapes `BlockCache::install` refuses outright.
+    // This is the arm that separates "folded after the install succeeded" from "folded on the way
+    // in"; without it, moving the fold above the inner install's `?` survives every fixture here,
+    // because every other block in this file installs.
+    let mut refused = compilation;
+    refused.code.clear();
+    assert!(
+        cpu.jit_direct.install(&refused).is_none(),
+        "an empty code buffer must be refused, or the fixture is not testing a failed install"
+    );
     assert_eq!(
         cap_refusals(&cpu),
         [0, 0, 0, 0],
-        "and dropping it must not charge either"
+        "an install that failed is not an installed block and must charge nothing"
     );
+}
+
+/// The cap sits ABOVE the page guard in the imm, imm8 and count families, and this is what says
+/// so. It is the mirror of the disp fixture above: same clip, same capped block, and the OPPOSITE
+/// answer, because those three matchers test the budget before they scan the fetch-page cache and
+/// `disp_lane_for` does not.
+///
+/// The counter therefore means "lane-shaped slots the budget turned away" for these three, not
+/// "lanes a larger budget would certainly have taken": the thirteenth slot charges even though no
+/// direct page could have supplied its bytes. That is the reading `DirectStallTally` states, and
+/// sinking any of the three caps back under `direct_host_bytes` to tighten it (at the price of the
+/// scan on every slot of a capped block) fails here.
+#[test]
+fn a_capped_slot_whose_lane_bytes_are_not_direct_mapped_still_charges_its_family() {
+    let _arms = force_arms(true, true, true, true);
+    for (family, tail, expected) in [
+        ("imm", IMM_SLOT.as_slice(), [1, 0, 0, 0]),
+        ("imm8", IMM8_SLOT.as_slice(), [0, 1, 0, 0]),
+        ("count", COUNT_SLOT.as_slice(), [0, 0, 1, 0]),
+    ] {
+        let (mut cpu, _bus, starts) = fixture(LANES, tail, false);
+        let tail_start = *starts.last().expect("the image has a tail slot");
+        // Exactly at the end of the last filler's lane: twelve lanes still resolve, and the tail's
+        // lane bytes reach past the clip whatever its width.
+        clip_fetch_entry(&mut cpu, 0, tail_start as usize);
+
+        let compilation = compile_checked(&mut cpu, &starts);
+        assert_eq!(
+            compilation.imm_lane_count(),
+            LANES,
+            "{family}: the twelve fillers must still lane, or the block never reaches the cap"
+        );
+        cpu.jit_direct
+            .install(&compilation)
+            .expect("the fixture block installs");
+        assert_eq!(
+            cap_refusals(&cpu),
+            expected,
+            "{family}: the cap is above the page guard, so a capped slot charges whether or not \
+             its lane bytes are fetch-cached"
+        );
+    }
 }
 
 /// RE-WALKING the same bytes charges once, not once per walk.
