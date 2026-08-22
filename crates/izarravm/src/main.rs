@@ -854,9 +854,10 @@ const MOUSE_PACKET_SPACING_MS: u64 = 5;
 /// time, which is nothing against a schedule measured in guest seconds.
 const MOUSE_HOME_PACKETS: usize = 20;
 
-/// Largest motion one PS/2 packet can carry, so a longer move is split.
-/// `Machine::inject_mouse_relative` clamps rather than splits, matching real
-/// hardware, which means the splitting has to happen here.
+/// Largest motion one PS/2 packet can carry, so a longer move is split into
+/// steps with a dwell between them: the device would deliver the same total
+/// over later samples on its own, but a per-step dwell keeps the schedule's
+/// timing explicit and deterministic.
 const MOUSE_PACKET_MAX_DELTA: i32 = 255;
 
 /// How long `click` holds the button down, in guest milliseconds.

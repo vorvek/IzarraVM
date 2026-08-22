@@ -513,3 +513,81 @@ fn controller_and_device_deadlines_are_batch_invariant() {
     assert_eq!(whole.read_port(0x60), Some(0xee));
     assert_eq!(split.read_port(0x60), Some(0xee));
 }
+
+/// Model of the guest side of a mouse ISR: whenever the 8042 latches an aux
+/// byte, read it at once and assemble four-byte IntelliMouse packets. Returns
+/// the signed X motion the packets carried.
+struct AuxDrain {
+    index: usize,
+    status: u8,
+    dx_sum: i32,
+}
+
+impl AuxDrain {
+    fn drain(&mut self, kbd: &mut Keyboard8042) {
+        while kbd.read_port(0x64).unwrap() & STATUS_OBF != 0 {
+            let byte = kbd.read_port(0x60).unwrap();
+            match self.index {
+                0 => self.status = byte,
+                1 => {
+                    let mut dx = i32::from(byte);
+                    if self.status & 0x10 != 0 {
+                        dx -= 256;
+                    }
+                    self.dx_sum += dx;
+                }
+                _ => {}
+            }
+            self.index = (self.index + 1) % 4;
+        }
+    }
+}
+
+#[test]
+fn host_motion_faster_than_the_aux_wire_does_not_backlog() {
+    // The host flushes motion at 200 Hz of WALL time. When the guest runs below
+    // real time (rt 0.5 here), those flushes arrive every 2.5 ms of GUEST time,
+    // while the aux wire moves one byte per ms and an IntelliMouse packet is four
+    // bytes. A per-flush packet queue then grows without bound: after one guest
+    // second it held 150 packets, 0.6 s of stale motion the cursor replayed after
+    // the hand stopped. A real mouse (and 86Box's model) samples an accumulator at
+    // the sample rate instead, so the wire never carries more than one packet of
+    // backlog and the motion left over rides the next sample.
+    let mut kbd = Keyboard8042::default();
+    enable_mouse(&mut kbd);
+    kbd.enable_mouse_wheel();
+    let flush_ticks = DEVICE_BYTE_TICKS * 5 / 2; // 2.5 ms of guest time
+    let mut drain = AuxDrain {
+        index: 0,
+        status: 0,
+        dx_sum: 0,
+    };
+    let mut max_backlog = 0usize;
+    for _ in 0..400 {
+        kbd.inject_mouse(3, 0, 0);
+        max_backlog = max_backlog.max(kbd.mouse.queue.len());
+        let mut left = flush_ticks;
+        while left > 0 {
+            let step = kbd.ticks_until_event().unwrap_or(left).min(left);
+            kbd.advance_master_ticks(step);
+            left -= step;
+            drain.drain(&mut kbd);
+        }
+    }
+    assert!(
+        max_backlog <= 4,
+        "the aux queue backlogged {max_backlog} bytes; host motion must coalesce"
+    );
+    let (pending_dx, _) = kbd.mouse.pending_motion();
+    assert_eq!(
+        drain.dx_sum + pending_dx,
+        3 * 400,
+        "coalescing must conserve motion: {} delivered, {pending_dx} pending",
+        drain.dx_sum
+    );
+    assert!(
+        drain.dx_sum >= 3 * 400 - 256,
+        "the wire kept up with the host: only {} of 1200 delivered",
+        drain.dx_sum
+    );
+}

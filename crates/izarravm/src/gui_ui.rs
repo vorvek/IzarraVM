@@ -302,6 +302,7 @@ impl GuiApp {
         self.config_dialog = Some(ConfigDialog {
             page: ConfigPage::Settings,
             start_fullscreen: self.prefs.start_fullscreen,
+            mouse_sensitivity: self.prefs.mouse_sensitivity,
             input_release: self.input_release.clone(),
             fullscreen: self.fullscreen_key.clone(),
             screenshot: self.screenshot_key.clone(),
@@ -468,6 +469,23 @@ impl GuiApp {
                                                 &mut dialog.crt_style,
                                                 CrtStyle::Off,
                                                 "No",
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Mouse sensitivity");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut dialog.mouse_sensitivity,
+                                                    crate::prefs::MIN_MOUSE_SENSITIVITY
+                                                        ..=crate::prefs::MAX_MOUSE_SENSITIVITY,
+                                                )
+                                                .suffix("%")
+                                                .logarithmic(true),
                                             );
                                         },
                                     );
@@ -690,6 +708,8 @@ impl GuiApp {
         self.screenshot_key = dialog.screenshot.clone();
         self.crt_style = dialog.crt_style;
         self.prefs.start_fullscreen = dialog.start_fullscreen;
+        self.prefs.mouse_sensitivity = dialog.mouse_sensitivity;
+        self.mouse_scale = crate::host_input::mouse_sensitivity_scale(dialog.mouse_sensitivity);
         self.prefs.input_release = dialog.input_release.clone();
         self.prefs.fullscreen = dialog.fullscreen.clone();
         self.prefs.screenshot = dialog.screenshot.clone();

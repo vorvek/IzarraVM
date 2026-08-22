@@ -206,3 +206,6 @@ mod gswmode;
 
 #[path = "tokados_bootscreen_test.rs"]
 mod bootscreen;
+
+#[path = "tokados_mouse_test.rs"]
+mod mouse;

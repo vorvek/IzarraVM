@@ -2585,20 +2585,13 @@ impl Machine {
         self.inject_mouse_relative(dx, dy, buttons);
     }
 
-    /// Inject a relative mouse motion (the host's per-flush coalesced delta) as one
-    /// PS/2 packet. A real PS/2 mouse only ever conveys one packet's worth of motion
-    /// (the 9-bit signed range, +-255) however far it physically travelled between
-    /// samples; it does not retroactively split an extreme delta into a train of
-    /// catch-up packets, so a clamp here matches real hardware (and a low-resolution
-    /// DOS game's cursor has no use for more precision than that anyway). Splitting
-    /// instead of clamping was tried first and made a violent host flick queue
-    /// dozens of packets at once -- far more than any real mouse could transmit --
-    /// which starved the guest's other interrupts (timer, keyboard) for long enough
-    /// to look like a freeze while it drained the backlog.
+    /// Inject a relative mouse motion (the host's per-flush coalesced delta) into
+    /// the PS/2 device's accumulator. The device samples it into packets at its
+    /// sample rate, each carrying at most the 9-bit range (+-255) and leaving the
+    /// rest for the next sample (`Ps2Mouse::sample`), so nothing is clamped away
+    /// here and a large delta never becomes a burst of packets either.
     pub fn inject_mouse_relative(&mut self, dx: i32, dy: i32, buttons: u8) {
-        let sx = dx.clamp(-255, 255);
-        let sy = dy.clamp(-255, 255);
-        self.inject_mouse(sx, sy, buttons);
+        self.inject_mouse(dx, dy, buttons);
     }
 
     /// Seed the absolute-pointer origin without injecting motion, called when the

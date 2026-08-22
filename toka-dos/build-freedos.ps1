@@ -305,7 +305,10 @@ if (-not (Test-Path $editExe)) { throw "edit.exe not produced" }
 Write-Host "EDIT.COM: $((Get-Item $editExe).Length) bytes"
 
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
-$tokamous = Join-Path $root 'build-freedos-tokamous.com'
+# A committed binary in the firmware crate, like TOKAEMM.SYS below: the image
+# builder takes it from there on both of its paths, and the driver tests mount
+# it directly, so a driver change never depends on a full image rebuild.
+$tokamous = Join-Path $root '..\crates\izarravm-firmware\roms\dos\tokamous.com'
 & nasm -f bin (Join-Path $root 'tools\tokamous.asm') -o $tokamous
 if ($LASTEXITCODE) { throw "nasm tokamous failed" }
 if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }

@@ -230,9 +230,6 @@ def main(check: bool = False) -> int:
         vbr = bytearray(open(os.path.join(kdir, "boot", "fat32lba.bin"), "rb").read())
         kernel = open(os.path.join(kdir, "bin", "kernel.sys"), "rb").read()
         shell = open(os.path.join(fcdir, "command.com"), "rb").read()
-        tokamous = open(
-            os.path.join(repo, "toka-dos", "build-freedos-tokamous.com"), "rb"
-        ).read()
         izcdex = open(
             os.path.join(repo, "toka-dos", "build-freedos-izcdex.com"), "rb"
         ).read()
@@ -253,7 +250,6 @@ def main(check: bool = False) -> int:
         mbr, vbr, prev_files = extract_from_image(prev)
         kernel = prev_files["KERNEL.SYS"]
         shell = prev_files["COMMAND.COM"]
-        tokamous = prev_files["TOKAMOUS.COM"]
         izcdex = prev_files["IZCDEX.COM"]
         move = prev_files["MOVE.EXE"]
         sort = prev_files["SORT.EXE"]
@@ -286,6 +282,8 @@ def main(check: bool = False) -> int:
     # The small Toka-DOS drivers and GSWMODE.COM are committed binaries (built
     # straight from NASM source by toka-dos/build-freedos.ps1 into the firmware
     # crate), never extracted from the previous image.
+    tokamous = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "tokamous.com"), "rb").read()
     tokaemm = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokaemm.sys"), "rb").read()
     tokacd = open(os.path.join(

@@ -97,6 +97,9 @@ pub const CDAUDIO_COM_SOURCE: &str = include_str!("../roms/dos/cdaudio.asm");
 pub const CDTIME_COM: &[u8] = include_bytes!("../roms/dos/cdtime.com");
 pub const CDTIME_COM_SOURCE: &str = include_str!("../roms/dos/cdtime.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
+pub const TOKAMOUS_COM: &[u8] = include_bytes!("../roms/dos/tokamous.com");
+pub const MOUSEGFX_COM: &[u8] = include_bytes!("../roms/dos/mousegfx.com");
+pub const MOUSEGFX_COM_SOURCE: &str = include_str!("../roms/dos/mousegfx.asm");
 pub const UNHALT_COM: &[u8] = include_bytes!("../roms/dos/unhalt.com");
 pub const UNHALT_COM_SOURCE: &str = include_str!("../roms/dos/unhalt.asm");
 pub const SNDCTRL_COM: &[u8] = include_bytes!("../roms/dos/sndctrl.com");
@@ -532,6 +535,21 @@ pub fn tokacd_sys() -> &'static [u8] {
 /// redirector and device list, then reads a known file from D: through DOS.
 pub fn cdtest_com() -> &'static [u8] {
     CDTEST_COM
+}
+
+/// TOKAMOUS.COM: the Toka-DOS INT 33h PS/2 mouse driver TSR, built from
+/// `toka-dos/tools/tokamous.asm` by `toka-dos/build-freedos.ps1`. Ships on the
+/// Toka-DOS image (see build-freedos-hdd-image.py, which takes this committed
+/// binary on both of its paths) and is mounted directly by the driver tests.
+pub fn tokamous_com() -> &'static [u8] {
+    TOKAMOUS_COM
+}
+
+/// Guest fixture for TOKAMOUS's mode 13h graphics cursor: draw, hide, move,
+/// a vertical range past the mode's height, the INT 10h mode-set hook, and a
+/// fn 09h user shape. Exits with 0 or the first failing step.
+pub fn mousegfx_com() -> &'static [u8] {
+    MOUSEGFX_COM
 }
 
 /// Guest fixture that calls TOKACD's request-packet entry points directly.

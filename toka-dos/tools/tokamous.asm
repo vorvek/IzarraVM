@@ -4,6 +4,9 @@
 ; TOKAMOUS.COM - Toka-DOS PS/2 mouse driver (INT 33h), a TSR.
 ; Installs an INT 33h dispatcher and registers a PS/2 packet handler with the
 ; BIOS (INT 15h AX=C207). The BIOS INT 74h ISR far-calls the handler per packet.
+; Hooks INT 10h so a mode set hides the cursor and re-sizes the virtual range,
+; the way the Microsoft driver does. Draws the software cursor in text mode 03h
+; and in VGA mode 13h (the fn 09h mask over a saved 16x16 background).
 ; Assemble: nasm -f bin tools/tokamous.asm -o TOKAMOUS.COM
     cpu 386
     org 0x100
@@ -15,6 +18,10 @@ CENTER_Y        equ VIRT_MAX_Y / 2
 MCB_SCAN_START  equ 0x0050
 MCB_SCAN_LIMIT  equ 0x0300
 ARENA_TOP       equ 0xA000
+CURSOR_W        equ 16                ; graphics cursor is a 16x16 mask pair
+CURSOR_H        equ 16
+MODE13_W        equ 320
+MODE13_H        equ 200
 
 start:
     jmp install
@@ -22,6 +29,9 @@ start:
 ; ---- resident state (lives in the COM image, kept after TSR) ----
 old_int33_off   dw 0
 old_int33_seg   dw 0
+; Saved INT 10h vector, laid out offset-then-segment for `jmp far [old_int10]`.
+old_int10       dw 0
+old_int10_seg   dw 0
 cur_x           dw CENTER_X
 cur_y           dw CENTER_Y
 buttons         db 0
@@ -69,6 +79,73 @@ in_callback     db 0                 ; re-entrancy guard for the user callback
 cond_active     db 0                 ; 1 = a conditional-off region is in effect
 cb_live_tmp     db 0                 ; scratch result byte for callback validation
 
+; ---- graphics cursor (fn 09h) ----
+; The Microsoft contract: 16 words of screen mask (AND) then 16 words of cursor
+; mask (XOR), bit 15 = leftmost pixel, plus a hot spot. The defaults are the
+; standard arrow. Mode 13h presents a pixel as (screen bit ? background : 0)
+; XOR (cursor bit ? 0Fh : 0), the DOSBox-X rendering of the same masks.
+hot_x           dw 0
+hot_y           dw 0
+gfx_screen_mask dw 0x3FFF, 0x1FFF, 0x0FFF, 0x07FF, 0x03FF, 0x01FF, 0x00FF, 0x007F
+                dw 0x003F, 0x001F, 0x01FF, 0x00FF, 0x30FF, 0xF87F, 0xF87F, 0xFCFF
+gfx_cursor_mask dw 0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7C00, 0x7E00, 0x7F00
+                dw 0x7F80, 0x7C00, 0x6C00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000
+gfx_drawn       db 0                 ; 1 = a graphics cursor is on screen (restore needed)
+drawn_kind      db 0                 ; the vid_kind it was drawn in (a mode change drops it)
+gfx_back_x      dw 0                 ; top-left pixel of the drawn cursor (signed, may clip)
+gfx_back_y      dw 0
+row_scr         dw 0                 ; per-row mask scratch shifted one bit per column
+row_cur         dw 0
+px_val          db 0                 ; colour handed to px_put
+gfx_back        times CURSOR_W * CURSOR_H db 0   ; background under the drawn cursor
+
+; ---- active video mode, classified from BDA 40:49 (see apply_mode) ----
+; The kinds are the DOSBox-X INT10 PutPixel families the cursor can draw in.
+VID_NONE        equ 0                ; unknown or SVGA: ranges only, no drawing
+VID_TEXT        equ 1                ; colour text 03h (B800 cells)
+VID_MODE13      equ 2                ; 320x200x256, one byte per pixel at A000
+VID_PLANAR      equ 3                ; EGA/VGA 16-colour planar (0Dh-12h)
+VID_CGA4        equ 4                ; 320x200x4 (04h/05h), two bits per pixel at B800
+VID_CGA2        equ 5                ; 640x200x2 (06h), one bit per pixel at B800
+vid_kind        db VID_TEXT
+vid_w           dw 640               ; pixels across
+vid_h           dw 200               ; pixels down
+vid_shift       db 0                 ; virtual x >> vid_shift = pixel x (1 in 320-wide modes)
+vid_bpr         dw 80                ; bytes per pixel row (planar/CGA: of one plane / bank)
+scr_max_x       dw VIRT_MAX_X        ; horizontal virtual max for the active video mode
+vesa_active     db 0                 ; 1 = the last mode set went through VBE 4F02h
+vesa_w          dw 640               ; that VBE mode's size, from 4F01h
+vesa_h          dw 480
+vga_save        times 8 db 0         ; GC 0,1,3,4,5,8 and SEQ 2 around a planar draw
+vbe_info        times 256 db 0       ; VBE 4F01h mode-info buffer
+
+; BDA mode byte -> kind, virtual-x shift, width, height, bytes per row.
+MODE_ENTRY      equ 9
+mode_table:
+    db 0x03, VID_TEXT,   0
+    dw 640, 200, 160
+    db 0x04, VID_CGA4,   1
+    dw 320, 200, 80
+    db 0x05, VID_CGA4,   1
+    dw 320, 200, 80
+    db 0x06, VID_CGA2,   0
+    dw 640, 200, 80
+    db 0x0D, VID_PLANAR, 1
+    dw 320, 200, 40
+    db 0x0E, VID_PLANAR, 0
+    dw 640, 200, 80
+    db 0x0F, VID_PLANAR, 0
+    dw 640, 350, 80
+    db 0x10, VID_PLANAR, 0
+    dw 640, 350, 80
+    db 0x11, VID_PLANAR, 0
+    dw 640, 480, 80
+    db 0x12, VID_PLANAR, 0
+    dw 640, 480, 80
+    db 0x13, VID_MODE13, 1
+    dw 320, 200, 320
+    db 0xFF
+
 ; ---- INT 33h dispatcher ----
 ; A flat compare ladder over the core function set 0x00..0x10. AX > 0x10 falls
 ; through to x33_high, which currently just returns.
@@ -111,44 +188,89 @@ int33:
     je m_cond_off
     jmp x33_high
 
-; Size the vertical virtual range to the active BIOS video mode (BDA 40:49). The
-; INT 33h coordinate system is 0..639 x 0..(rows-1): text and 200-line modes use
-; 0..199, the 640x350 EGA modes 0..349, and the 640x480 VGA modes 0..479. Without
-; this a high-res mode (BGI sets 0x12) leaves the cursor clamped to the top 199
-; rows. Sets scr_max_y/max_y/cond_bottom and reclamps the cursor. Preserves ALL.
-apply_mode_yrange:
+; Classify the active BIOS video mode (BDA 40:49) and size the virtual space to
+; it. The INT 33h coordinate system is 640 wide in every standard mode (so a
+; 320-pixel mode sees even x only) and (rows-1) tall: 0..199 for text and the
+; 200-line modes, 0..349 for the EGA modes, 0..479 for the VGA modes. A mode the
+; table does not know draws nothing; if it was set through VBE 4F02h the range is
+; that mode's pixel size (DOSBox-X takes CurMode's width/height there), else the
+; 640x200 default. Sets vid_*, scr_max_x/y, max_x/max_y, cond_right/bottom and
+; reclamps the cursor. Preserves ALL.
+apply_mode:
     push ax
     push bx
+    push cx
+    push dx
+    push si
     push es
     mov ax, 0x40
     mov es, ax
     mov al, [es:0x49]                  ; current video mode
     and al, 0x7F                       ; drop the no-clear flag bit
-    mov bx, VIRT_MAX_Y                 ; default 199 (text + 200-line modes)
-    cmp al, 0x0F
-    je .y349
-    cmp al, 0x10
-    je .y349
-    cmp al, 0x11
-    je .y479
-    cmp al, 0x12
-    je .y479
-    jmp .store
-.y349:
-    mov bx, 349
-    jmp .store
-.y479:
-    mov bx, 479
-.store:
+    ; A VBE mode set leaves the BDA byte stale (this BIOS does not rewrite
+    ; 40:49 on 4F02h), so the recorded VBE state wins over the table: otherwise
+    ; an SVGA mode would classify as the text mode it replaced and the cursor
+    ; would be drawn into B800.
+    cmp byte [cs:vesa_active], 0
+    jne .unknown
+    mov si, mode_table
+.scan:
+    mov ah, [cs:si]
+    cmp ah, 0xFF
+    je .unknown
+    cmp ah, al
+    je .found
+    add si, MODE_ENTRY
+    jmp .scan
+.found:
+    mov al, [cs:si + 1]
+    mov [cs:vid_kind], al
+    mov al, [cs:si + 2]
+    mov [cs:vid_shift], al
+    mov cx, [cs:si + 3]
+    mov dx, [cs:si + 5]
+    mov ax, [cs:si + 7]
+    mov [cs:vid_bpr], ax
+    jmp .size
+.unknown:
+    mov byte [cs:vid_kind], VID_NONE
+    mov byte [cs:vid_shift], 0
+    mov cx, 640
+    mov dx, 200
+    cmp byte [cs:vesa_active], 0
+    je .size
+    mov cx, [cs:vesa_w]
+    mov dx, [cs:vesa_h]
+.size:
+    mov [cs:vid_w], cx
+    mov [cs:vid_h], dx
+    ; virtual extent: width << shift (320-wide modes span 0..639), height as is
+    push cx
+    mov cl, [cs:vid_shift]
+    mov ax, [cs:vid_w]
+    shl ax, cl
+    pop cx
+    dec ax
+    mov [cs:scr_max_x], ax
+    mov [cs:max_x], ax
+    mov [cs:cond_right], ax
+    mov bx, dx
+    dec bx
     mov [cs:scr_max_y], bx
     mov [cs:max_y], bx
     mov [cs:cond_bottom], bx
-    mov ax, [cs:cur_y]                 ; reclamp the cursor into the new range
-    cmp ax, bx
+    cmp [cs:cur_x], ax                 ; reclamp the cursor into the new range
+    jbe .y_clamp
+    mov [cs:cur_x], ax
+.y_clamp:
+    cmp [cs:cur_y], bx
     jbe .done
     mov [cs:cur_y], bx
 .done:
     pop es
+    pop si
+    pop dx
+    pop cx
     pop bx
     pop ax
     ret
@@ -158,11 +280,13 @@ apply_mode_yrange:
 ; (AX=0xFFFF) with two buttons. Returns AX,BX; preserves CX,DX,SI,DI.
 m_reset:
     call cursor_hide                   ; restore any drawn cell before clearing state
-    mov word [cs:cur_x], CENTER_X
-    call apply_mode_yrange             ; size the vertical range to the video mode
+    call apply_mode                    ; size the virtual space to the video mode
+    mov ax, [cs:scr_max_x]
+    shr ax, 1
+    mov [cs:cur_x], ax                 ; centre in the active range
     mov ax, [cs:scr_max_y]
     shr ax, 1
-    mov [cs:cur_y], ax                 ; centre vertically in the active range
+    mov [cs:cur_y], ax
     mov word [cs:show_count], 0xFFFF
     mov byte [cs:buttons], 0
     mov byte [cs:wheel], 0             ; clear the accumulated wheel counter
@@ -196,9 +320,44 @@ m_reset:
     mov word [cs:cb_off], 0
     mov word [cs:cb_owner], 0
     mov word [cs:cb_mcb_seg], 0
+    mov word [cs:min_x], 0             ; the range is the whole screen again
+    mov word [cs:min_y], 0             ; (apply_mode set max_x/max_y)
+    call gfx_default_cursor            ; back to the arrow, hot spot (0,0)
     mov ax, 0xFFFF
     mov bx, 2
     iret
+
+; Restore the default arrow masks and a (0,0) hot spot. Preserves ALL.
+gfx_default_cursor:
+    push ax
+    push cx
+    push si
+    push di
+    push ds
+    push es
+    push cs
+    pop ds
+    push cs
+    pop es
+    mov word [hot_x], 0
+    mov word [hot_y], 0
+    mov si, default_screen_mask
+    mov di, gfx_screen_mask
+    mov cx, CURSOR_H * 2               ; both masks are contiguous, 32 words
+    cld
+    rep movsw
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+
+default_screen_mask dw 0x3FFF, 0x1FFF, 0x0FFF, 0x07FF, 0x03FF, 0x01FF, 0x00FF, 0x007F
+                    dw 0x003F, 0x001F, 0x01FF, 0x00FF, 0x30FF, 0xF87F, 0xF87F, 0xFCFF
+default_cursor_mask dw 0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7C00, 0x7E00, 0x7F00
+                    dw 0x7F80, 0x7C00, 0x6C00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000
 
 ; 0x01 show: show_count = min(show_count+1, 0) (signed saturate at 0). Returns
 ; nothing; preserve ALL (AX is scratch here, so save and restore it).
@@ -310,9 +469,12 @@ m_release_info:
     mov bx, 0
     iret
 
-; 0x07 set horizontal range. order(CX,DX) -> min_x,max_x, clamp to 0..VIRT_MAX_X,
-; then reclamp the cursor into the new range. Returns nothing; preserve ALL
-; (AX,BX are scratch).
+; 0x07 set horizontal range. order(CX,DX) -> min_x,max_x as the program asked,
+; then reclamp the cursor into the new range. The values are NOT clamped to the
+; driver's idea of the screen: a program in an SVGA mode (which the BIOS mode byte
+; does not describe) or one that wants a larger virtual space sets whatever range
+; it draws its own cursor in, and the Microsoft driver and DOSBox-X both take it
+; as given. Returns nothing; preserve ALL (AX,BX are scratch).
 m_set_hrange:
     push ax
     push bx
@@ -322,16 +484,6 @@ m_set_hrange:
     jle .ordered
     xchg ax, bx                       ; swap so ax <= bx
 .ordered:
-    ; clamp low to >= 0
-    cmp ax, 0
-    jge .lo_ok
-    xor ax, ax
-.lo_ok:
-    ; clamp high to <= VIRT_MAX_X
-    cmp bx, VIRT_MAX_X
-    jle .hi_ok
-    mov bx, VIRT_MAX_X
-.hi_ok:
     mov [cs:min_x], ax
     mov [cs:max_x], bx
     ; reclamp cur_x
@@ -345,12 +497,14 @@ m_set_hrange:
     mov ax, [cs:max_x]
 .cx_hi:
     mov [cs:cur_x], ax
+    call cursor_hide                  ; the cursor may have moved: redraw
+    call cursor_show
     pop bx
     pop ax
     iret
 
-; 0x08 set vertical range, the min_y/max_y mirror of 0x07. Returns nothing;
-; preserve ALL (AX,BX are scratch).
+; 0x08 set vertical range, the min_y/max_y mirror of 0x07 (same no-clamp rule).
+; Returns nothing; preserve ALL (AX,BX are scratch).
 m_set_vrange:
     push ax
     push bx
@@ -360,14 +514,6 @@ m_set_vrange:
     jle .ordered
     xchg ax, bx
 .ordered:
-    cmp ax, 0
-    jge .lo_ok
-    xor ax, ax
-.lo_ok:
-    cmp bx, [cs:scr_max_y]
-    jle .hi_ok
-    mov bx, [cs:scr_max_y]
-.hi_ok:
     mov [cs:min_y], ax
     mov [cs:max_y], bx
     mov ax, [cs:cur_y]
@@ -380,12 +526,43 @@ m_set_vrange:
     mov ax, [cs:max_y]
 .cy_hi:
     mov [cs:cur_y], ax
+    call cursor_hide
+    call cursor_show
     pop bx
     pop ax
     iret
 
-; 0x09 define graphics cursor: accept, inert in v1. Returns nothing; preserve ALL.
+; 0x09 define graphics cursor. BX = hot spot column, CX = hot spot row (signed,
+; -16..16), ES:DX -> 16 words of screen mask then 16 words of cursor mask. Copies
+; the masks into the resident state and redraws so a visible cursor changes shape
+; at once (Microsoft Word calls this in text mode too; there it is harmless).
+; Returns nothing; preserve ALL.
 m_def_gfx_cursor:
+    push ax
+    push cx
+    push si
+    push di
+    push ds
+    push es
+    mov [cs:hot_x], bx
+    mov [cs:hot_y], cx
+    call cursor_hide                  ; the old shape must come off the screen first
+    push es
+    pop ds
+    mov si, dx                        ; DS:SI = caller's mask block
+    push cs
+    pop es
+    mov di, gfx_screen_mask           ; ES:DI = resident masks (screen then cursor)
+    mov cx, CURSOR_H * 2
+    cld
+    rep movsw
+    call cursor_show
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop cx
+    pop ax
     iret
 
 ; 0x0A define text cursor. BX==0 selects the software cursor: store the screen
@@ -911,35 +1088,67 @@ callback_still_live:
     cmp byte [cs:cb_live_tmp], 0
     ret
 
-; ---- text-mode software cursor (page 0, mode 03h, B800:0) ----
-; The cursor cell is col = cur_x >> 3, row = cur_y >> 3 (fixed 200-line Microsoft
-; convention: 8 virtual lines per text row). Byte offset in B800 =
-; (row*80 + col)*2. Presentation: cell' = (cell AND screen_mask) XOR cursor_mask.
-; Both routines work on the resident state via [cs:...] and reach B800 through ES,
-; so they are correct regardless of the caller's DS and safe from interrupt
-; context. Each saves and restores every register it touches.
+; ---- software cursor ----
+; Text mode 03h: the cursor cell is col = cur_x >> 3, row = cur_y >> 3 (fixed
+; 200-line Microsoft convention: 8 virtual lines per text row). Byte offset in
+; B800 = (row*80 + col)*2. Presentation: cell' = (cell AND screen_mask) XOR
+; cursor_mask.
+; Graphics modes (vid_kind MODE13, PLANAR, CGA4, CGA2): the 16x16 fn 09h masks at
+; pixel (cur_x >> vid_shift - hot_x, cur_y - hot_y). A pixel becomes
+; (screen bit ? background : 0) XOR (cursor bit ? 0Fh : 0), the DOSBox-X
+; rendering of the Microsoft masks; the CGA kinds keep the low bits of that. The
+; background under the cursor is saved so it can be put back before the next
+; draw. Pixel access goes through px_get/px_put, one routine per kind, the way
+; DOSBox-X's INT10 GetPixel/PutPixel families do it: a byte at A000 for mode 13h,
+; set/reset plus bit mask through the graphics controller for the planar modes,
+; and the interleaved B800 banks for CGA.
+; SVGA (VBE) modes draw nothing: DOSBox-X inhibits drawing there too, and the
+; programs that use them draw their own cursor.
+; All routines work on the resident state via [cs:...] and reach the video
+; aperture through ES, so they are correct regardless of the caller's DS and safe
+; from interrupt context. Each saves and restores every register it touches.
 
-; Return ZF=1 when the active BIOS video mode is color text mode 03h. The software
-; cursor knows only the B800 80-column text layout; in graphics modes it must not
-; touch the video aperture.
+; Return ZF=1 when the active mode is the colour text mode.
 cursor_text_mode:
+    cmp byte [cs:vid_kind], VID_TEXT
+    ret
+
+; Return ZF=1 when the active mode is one the graphics cursor draws in.
+cursor_gfx_mode:
     push ax
-    push es
-    mov ax, 0x40
-    mov es, ax
-    mov al, [es:0x49]
-    and al, 0x7F
-    cmp al, 0x03
-    pop es
+    mov al, [cs:vid_kind]
+    cmp al, VID_MODE13
+    je .yes
+    cmp al, VID_PLANAR
+    je .yes
+    cmp al, VID_CGA4
+    je .yes
+    cmp al, VID_CGA2
+    je .yes
+    cmp al, 0xFF                      ; never equal: ZF=0
+    pop ax
+    ret
+.yes:
+    cmp al, al                        ; ZF=1
     pop ax
     ret
 
-; cursor_hide: if a cell is currently drawn (saved_off != 0xFFFF), write the saved
-; cell back to B800 and mark none drawn. Safe to call when nothing is drawn.
+; cursor_hide: put back whatever the cursor covers (a text cell, or the saved
+; graphics block) and mark nothing drawn. Safe to call when nothing is drawn.
+; If the mode changed under a drawn cursor, the saved image is dropped rather
+; than written into a different layout.
 cursor_hide:
     push ax
     push bx
     push es
+    cmp byte [cs:gfx_drawn], 0
+    je .text
+    mov byte [cs:gfx_drawn], 0
+    mov al, [cs:drawn_kind]
+    cmp al, [cs:vid_kind]
+    jne .text
+    call gfx_restore
+.text:
     mov bx, [cs:saved_off]
     cmp bx, 0xFFFF
     je .done
@@ -958,17 +1167,15 @@ cursor_hide:
     ret
 
 ; cursor_show: if visible (show_count == 0) and the cursor's virtual position is
-; outside the conditional-off box, save the underlying cell and draw
-; (cell AND screen_mask) XOR cursor_mask. No-op otherwise. Assumes nothing is
-; currently drawn (call cursor_hide first when moving).
+; outside the conditional-off box, draw the cursor for the active mode. No-op
+; otherwise. Assumes nothing is currently drawn (call cursor_hide first when
+; moving).
 cursor_show:
     push ax
     push bx
     push cx
     push dx
     push es
-    call cursor_text_mode
-    jne .done
     cmp word [cs:show_count], 0
     jne .done                         ; hidden
     cmp byte [cs:cond_active], 0
@@ -986,6 +1193,13 @@ cursor_show:
     jg .visible
     jmp .done                         ; inside the hidden box
 .visible:
+    call cursor_gfx_mode
+    jne .not_gfx
+    call gfx_draw
+    jmp .done
+.not_gfx:
+    call cursor_text_mode
+    jne .done
     ; cell offset = (row*80 + col)*2 ; col=cur_x>>3, row=cur_y>>3
     mov ax, [cs:cur_y]
     shr ax, 3
@@ -1010,6 +1224,568 @@ cursor_show:
     pop cx
     pop bx
     pop ax
+    ret
+
+; ---- graphics cursor drawing ----
+; Both routines walk the 16x16 block row by row; a pixel outside the screen is
+; skipped (the masks still shift so the shape stays aligned). DS = CS inside.
+
+; gfx_draw: save the background under the cursor into gfx_back and draw the
+; masks. Records the top-left pixel and the mode kind so gfx_restore can find
+; the block again.
+gfx_draw:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+    push cs
+    pop ds
+    mov al, [vid_kind]
+    mov [drawn_kind], al
+    cmp al, VID_PLANAR
+    jne .no_vga
+    call vga_enter
+.no_vga:
+    mov ax, [cur_x]
+    mov cl, [vid_shift]
+    sar ax, cl                        ; virtual x -> pixel x
+    sub ax, [hot_x]
+    mov [gfx_back_x], ax
+    mov ax, [cur_y]
+    sub ax, [hot_y]
+    mov [gfx_back_y], ax
+    mov byte [gfx_drawn], 1
+    xor si, si                        ; si = row 0..15
+.row:
+    mov bx, si
+    shl bx, 1                         ; word index into the masks
+    mov ax, [gfx_screen_mask + bx]
+    mov [row_scr], ax
+    mov ax, [gfx_cursor_mask + bx]
+    mov [row_cur], ax
+    mov di, si
+    shl di, 4                         ; di = row*16 into gfx_back
+    xor cx, cx                        ; cx = column 0..15
+.col:
+    shl word [row_scr], 1             ; CF = screen-mask bit for this column
+    setc dl                           ; dl = 1 keep background, 0 black
+    shl word [row_cur], 1
+    setc dh                           ; dh = 1 invert (XOR 0Fh)
+    mov bx, [gfx_back_y]
+    add bx, si                        ; bx = screen y
+    cmp bx, 0
+    jl .next_col
+    cmp bx, [vid_h]
+    jge .next_col
+    mov ax, [gfx_back_x]
+    add ax, cx                        ; ax = screen x
+    cmp ax, 0
+    jl .next_col
+    cmp ax, [vid_w]
+    jge .next_col
+    push ax                           ; px_get answers in AL; keep x for px_put
+    call px_get                       ; al = background pixel at (ax, bx)
+    mov [gfx_back + di], al           ; save it
+    test dl, dl
+    jnz .keep
+    xor al, al                        ; screen bit clear: black
+.keep:
+    test dh, dh
+    jz .store
+    xor al, 0x0F                      ; cursor bit set: invert
+.store:
+    mov [px_val], al
+    pop ax
+    call px_put
+.next_col:
+    inc di
+    inc cx
+    cmp cx, CURSOR_W
+    jb .col
+    inc si
+    cmp si, CURSOR_H
+    jb .row
+    cmp byte [drawn_kind], VID_PLANAR
+    jne .done
+    call vga_leave
+.done:
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; gfx_restore: write the saved background back at the recorded block position.
+; Clips exactly as gfx_draw did, so every byte that was saved is the one put back.
+gfx_restore:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+    push cs
+    pop ds
+    cmp byte [drawn_kind], VID_PLANAR
+    jne .no_vga
+    call vga_enter
+.no_vga:
+    xor si, si
+.row:
+    mov di, si
+    shl di, 4
+    xor cx, cx
+.col:
+    mov bx, [gfx_back_y]
+    add bx, si
+    cmp bx, 0
+    jl .next_col
+    cmp bx, [vid_h]
+    jge .next_col
+    mov ax, [gfx_back_x]
+    add ax, cx
+    cmp ax, 0
+    jl .next_col
+    cmp ax, [vid_w]
+    jge .next_col
+    mov dl, [gfx_back + di]
+    mov [px_val], dl
+    call px_put
+.next_col:
+    inc di
+    inc cx
+    cmp cx, CURSOR_W
+    jb .col
+    inc si
+    cmp si, CURSOR_H
+    jb .row
+    cmp byte [drawn_kind], VID_PLANAR
+    jne .done
+    call vga_leave
+.done:
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ---- per-kind pixel access ----
+; px_get: ax = x, bx = y (inside the screen) -> al = colour. Preserves all else.
+; px_put: ax = x, bx = y, [px_val] = colour. Preserves ALL.
+
+px_get:
+    push bx
+    push cx
+    push dx
+    push di
+    push es
+    mov dl, [cs:vid_kind]
+    cmp dl, VID_MODE13
+    je .m13
+    cmp dl, VID_PLANAR
+    je .planar
+    cmp dl, VID_CGA4
+    je .cga4
+    cmp dl, VID_CGA2
+    je .cga2
+    xor al, al
+    jmp .done
+.m13:
+    call off_mode13
+    mov al, [es:di]
+    jmp .done
+.planar:
+    call off_planar                   ; di = byte, cl = bit shift
+    xor ah, ah                        ; ah collects one bit per plane
+    xor ch, ch                        ; ch = plane 0..3
+    mov dx, 0x3CE
+.plane:
+    mov al, 4                         ; GC4 read map select
+    out dx, al
+    inc dx
+    mov al, ch
+    out dx, al
+    dec dx
+    mov al, [es:di]
+    shr al, cl
+    and al, 1
+    push cx
+    mov cl, ch
+    shl al, cl                        ; into the plane's colour bit
+    pop cx
+    or ah, al
+    inc ch
+    cmp ch, 4
+    jb .plane
+    mov al, ah
+    jmp .done
+.cga4:
+    call off_cga                      ; di = row base, ax = x
+    mov cx, ax
+    shr ax, 2
+    add di, ax
+    and cl, 3
+    xor cl, 3
+    shl cl, 1                         ; shift = (3 - (x & 3)) * 2
+    mov al, [es:di]
+    shr al, cl
+    and al, 3
+    jmp .done
+.cga2:
+    call off_cga
+    mov cx, ax
+    shr ax, 3
+    add di, ax
+    and cl, 7
+    xor cl, 7                         ; shift = 7 - (x & 7)
+    mov al, [es:di]
+    shr al, cl
+    and al, 1
+.done:
+    pop es
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+px_put:
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+    push es
+    mov dl, [cs:vid_kind]
+    cmp dl, VID_MODE13
+    je .m13
+    cmp dl, VID_PLANAR
+    je .planar
+    cmp dl, VID_CGA4
+    je .cga4
+    cmp dl, VID_CGA2
+    je .cga2
+    jmp .done
+.m13:
+    call off_mode13
+    mov al, [cs:px_val]
+    mov [es:di], al
+    jmp .done
+.planar:
+    ; Write mode 0 (vga_enter set it): the bit mask picks the pixel, set/reset
+    ; supplies the colour to every plane, and the write data is irrelevant.
+    call off_planar
+    mov al, 1
+    shl al, cl                        ; bit mask for this pixel (bit 7 = leftmost)
+    mov ah, al
+    mov dx, 0x3CE
+    mov al, 8                         ; GC8 bit mask
+    out dx, al
+    inc dx
+    mov al, ah
+    out dx, al
+    dec dx
+    mov al, 0                         ; GC0 set/reset = colour
+    out dx, al
+    inc dx
+    mov al, [cs:px_val]
+    out dx, al
+    dec dx
+    mov al, 1                         ; GC1 enable set/reset on all planes
+    out dx, al
+    inc dx
+    mov al, 0x0F
+    out dx, al
+    mov al, [es:di]                   ; load the latches
+    mov byte [es:di], 0xFF
+    jmp .done
+.cga4:
+    call off_cga
+    mov cx, ax
+    shr ax, 2
+    add di, ax
+    and cl, 3
+    xor cl, 3
+    shl cl, 1
+    mov ah, 3
+    shl ah, cl
+    not ah                            ; ah = keep mask
+    mov al, [cs:px_val]
+    and al, 3
+    shl al, cl
+    mov dl, [es:di]
+    and dl, ah
+    or dl, al
+    mov [es:di], dl
+    jmp .done
+.cga2:
+    call off_cga
+    mov cx, ax
+    shr ax, 3
+    add di, ax
+    and cl, 7
+    xor cl, 7
+    mov ah, 1
+    shl ah, cl
+    not ah
+    mov al, [cs:px_val]
+    and al, 1
+    shl al, cl
+    mov dl, [es:di]
+    and dl, ah
+    or dl, al
+    mov [es:di], dl
+.done:
+    pop es
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; off_mode13: ax = x, bx = y -> es = A000, di = y*320 + x. Preserves ax, bx, cx.
+; y*320 = y*256 + y*64, which fits a word for y < 200.
+off_mode13:
+    push ax
+    push dx
+    mov dx, 0xA000
+    mov es, dx
+    mov di, bx
+    shl di, 6
+    mov dx, bx
+    shl dx, 8
+    add di, dx
+    pop dx
+    pop ax
+    add di, ax
+    ret
+
+; off_planar: ax = x, bx = y -> es = A000, di = y*bpr + x/8, cl = 7 - (x & 7).
+; Preserves ax, bx.
+off_planar:
+    push ax
+    push dx
+    mov dx, 0xA000
+    mov es, dx
+    mov ax, bx
+    mul word [cs:vid_bpr]             ; dx:ax = y*bpr (fits a word for any VGA mode)
+    mov di, ax
+    pop dx
+    pop ax
+    mov cx, ax
+    shr cx, 3
+    add di, cx
+    mov cl, al
+    and cl, 7
+    xor cl, 7
+    ret
+
+; off_cga: bx = y -> es = B800, di = (y/2)*80 + (y & 1)*2000h. Preserves ax, bx.
+off_cga:
+    push ax
+    push dx
+    mov dx, 0xB800
+    mov es, dx
+    mov ax, bx
+    shr ax, 1
+    mov di, ax
+    shl di, 4                         ; *16
+    shl ax, 6                         ; *64
+    add di, ax                        ; *80
+    test bl, 1
+    jz .even
+    add di, 0x2000
+.even:
+    pop dx
+    pop ax
+    ret
+
+; vga_enter / vga_leave: around a planar draw, save the graphics-controller and
+; sequencer registers the pixel routines touch (GC 0,1,3,4,5,8 and SEQ 2), put
+; the card into write mode 0 / read mode 0 with all planes enabled, and restore
+; them afterwards (DOSBox-X: SaveVgaRegisters / RestoreVgaRegisters). A game
+; interrupted mid-blit gets its register state back untouched. Preserve ALL.
+vga_enter:
+    push ax
+    push bx
+    push dx
+    push si
+    ; The index ports first: the interrupted code may sit between selecting a
+    ; register and touching its data port, so the selection must come back too.
+    mov dx, 0x3CE
+    in al, dx
+    mov [cs:vga_gc_index], al
+    mov dx, 0x3C4
+    in al, dx
+    mov [cs:vga_seq_index], al
+    mov si, vga_save
+    mov dx, 0x3CE
+    mov bx, gc_saved_regs
+.save_gc:
+    mov al, [cs:bx]
+    cmp al, 0xFF
+    je .save_seq
+    out dx, al
+    inc dx
+    in al, dx
+    dec dx
+    mov [cs:si], al
+    inc si
+    inc bx
+    jmp .save_gc
+.save_seq:
+    mov dx, 0x3C4
+    mov al, 2
+    out dx, al
+    inc dx
+    in al, dx
+    mov [cs:si], al
+    ; SEQ2 map mask: all planes
+    mov al, 0x0F
+    out dx, al
+    mov dx, 0x3CE
+    mov al, 3                         ; GC3 data rotate / function: replace
+    out dx, al
+    inc dx
+    xor al, al
+    out dx, al
+    dec dx
+    mov al, 5                         ; GC5 mode: write mode 0, read mode 0
+    out dx, al
+    inc dx
+    xor al, al
+    out dx, al
+    pop si
+    pop dx
+    pop bx
+    pop ax
+    ret
+
+vga_leave:
+    push ax
+    push bx
+    push dx
+    push si
+    mov si, vga_save
+    mov dx, 0x3CE
+    mov bx, gc_saved_regs
+.restore_gc:
+    mov al, [cs:bx]
+    cmp al, 0xFF
+    je .restore_seq
+    out dx, al
+    inc dx
+    mov al, [cs:si]
+    out dx, al
+    dec dx
+    inc si
+    inc bx
+    jmp .restore_gc
+.restore_seq:
+    mov dx, 0x3C4
+    mov al, 2
+    out dx, al
+    inc dx
+    mov al, [cs:si]
+    out dx, al
+    ; The index selections last, so the interrupted code finds them as left.
+    mov dx, 0x3C4
+    mov al, [cs:vga_seq_index]
+    out dx, al
+    mov dx, 0x3CE
+    mov al, [cs:vga_gc_index]
+    out dx, al
+    pop si
+    pop dx
+    pop bx
+    pop ax
+    ret
+
+gc_saved_regs   db 0, 1, 3, 4, 5, 8, 0xFF
+vga_gc_index    db 0                 ; 3CEh index as the interrupted code left it
+vga_seq_index   db 0                 ; 3C4h index likewise
+
+; ---- INT 10h hook ----
+; A mode set (AH=00h, or VBE AX=4F02h) takes the cursor off the screen first
+; (the saved background belongs to the old layout), runs the BIOS, then
+; re-classifies the mode and leaves the cursor hidden, as the Microsoft driver
+; does after a mode change (DOSBox-X: Mouse_Before/AfterNewVideoMode). A BIOS
+; mode set also resets the range to the whole screen and drops any
+; conditional-off region. A VBE mode set keeps the range the program set
+; (DOSBox-X does not reset min/max on an SVGA set-mode: some programs set their
+; range first and switch modes after) and records the mode's pixel size for the
+; next fn 00h reset. Every other INT 10h function goes straight through.
+int10_hook:
+    cmp ah, 0x00
+    je .set_mode
+    cmp ax, 0x4F02
+    je .vesa_set
+    jmp far [cs:old_int10]
+.set_mode:
+    call cursor_hide
+    mov word [cs:show_count], 0xFFFF
+    pushf
+    call far [cs:old_int10]           ; run the BIOS mode set as an interrupt call
+    mov byte [cs:vesa_active], 0
+    call apply_mode                   ; new mode: new kind and virtual space
+    mov word [cs:min_x], 0
+    mov word [cs:min_y], 0
+    mov byte [cs:cond_active], 0
+    iret
+.vesa_set:
+    call cursor_hide
+    mov word [cs:show_count], 0xFFFF
+    pushf
+    call far [cs:old_int10]
+    cmp ax, 0x004F
+    jne .vesa_done                    ; the set failed: nothing changed
+    call vesa_record
+    push word [cs:max_x]              ; apply_mode resets these; the program's
+    push word [cs:max_y]              ; range survives a VBE set (see above)
+    call apply_mode
+    pop word [cs:max_y]
+    pop word [cs:max_x]
+.vesa_done:
+    iret
+
+; vesa_record: BX = the mode just set. Ask VBE 4F01h for its size and remember
+; it as the unknown-mode virtual space. Preserves ALL (AX carries the 4F02h
+; status back to the caller).
+vesa_record:
+    pusha
+    push es
+    push cs
+    pop es
+    mov di, vbe_info
+    mov cx, bx
+    and cx, 0x3FFF                    ; drop the LFB / no-clear request bits
+    mov ax, 0x4F01
+    int 0x10
+    cmp ax, 0x004F
+    jne .done
+    mov ax, [cs:vbe_info + 0x12]      ; XResolution
+    mov [cs:vesa_w], ax
+    mov ax, [cs:vbe_info + 0x14]      ; YResolution
+    mov [cs:vesa_h], ax
+    mov byte [cs:vesa_active], 1
+.done:
+    pop es
+    popa
     ret
 
 ; ---- PS/2 packet handler (far-called by the BIOS INT 74h ISR) ----
@@ -1322,9 +2098,15 @@ install:
     mov [cs:old_int33_off], ax
     mov ax, [es:0x33*4 + 2]
     mov [cs:old_int33_seg], ax
+    mov ax, [es:0x10*4]
+    mov [cs:old_int10], ax
+    mov ax, [es:0x10*4 + 2]
+    mov [cs:old_int10_seg], ax
     cli
     mov word [es:0x33*4], int33
     mov [es:0x33*4 + 2], cs
+    mov word [es:0x10*4], int10_hook
+    mov [es:0x10*4 + 2], cs
     sti
     pop es
     mov ax, 0xC205
