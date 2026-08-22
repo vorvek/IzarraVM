@@ -1598,23 +1598,37 @@ fn generated_sixteen_bit_cpu(mode: GswMode) -> CpuGsw {
     cpu
 }
 
-/// One randomized sweep: build a case, run it wholly interpreted and again with Direct armed,
-/// and compare. `native_instructions` is the retirement count every case must reach, and it is an
-/// EQUALITY rather than a floor for the reason the width-lift sweep's comment gives: the rows under
-/// test used to end a block, so an admission that quietly reverted would still pass every state
-/// comparison while retiring only the starter.
-///
-/// `stack_round_trip` is the ENTER/LEAVE pair's own invariant and is asked only of the sweep that
-/// carries one.
+/// What one sweep demands of every case it builds, bundled so the sweep runner keeps a signature a
+/// reader can hold: the three fields are independent claims about the SAME block and grew one at a
+/// time, which is how the parameter list reached eight.
+struct SweepExpectations {
+    /// Instructions the block must retire natively. An EQUALITY rather than a floor, for the
+    /// reason the width-lift sweep's comment gives: the rows under test used to end a block, so an
+    /// admission that quietly reverted would still pass every state comparison while retiring only
+    /// the starter.
+    native_instructions: u64,
+    /// The ENTER/LEAVE pair's own invariant, asked only of the sweep that carries one.
+    stack_round_trip: bool,
+    /// Whether the block carries an `InterpretOne` slot, which decides whether the call-out
+    /// counters are asserted clean or asserted absent.
+    interpret_one_slots: bool,
+}
+
+/// One randomized sweep: build a case, run it wholly interpreted and again with Direct armed, and
+/// compare. `expect` carries the three claims every case must satisfy; see `SweepExpectations`.
 fn run_generated_sweep(
     label: &str,
     mode: GswMode,
     mode_offset: u32,
     build_cpu: fn(GswMode) -> CpuGsw,
     build_case: fn(u32, u32) -> GeneratedCase,
-    native_instructions: u64,
-    stack_round_trip: bool,
+    expect: SweepExpectations,
 ) {
+    let SweepExpectations {
+        native_instructions,
+        stack_round_trip,
+        interpret_one_slots,
+    } = expect;
     for index in 0..WIDTH_LIFT_CASES {
         let case = build_case(index, mode_offset);
         let pristine = single_case_memory(&case);
@@ -1652,6 +1666,34 @@ fn run_generated_sweep(
             "{label}: a generated slot lost its classification: {case:#?}, perf={:#?}",
             direct.perf_counters()
         );
+        // THE RETIREMENT EQUALITY IS NOT SUFFICIENT ON ITS OWN once a sweep carries a call-out. A
+        // slot that RESYNCs ends the native run where it sits, and the priming passes have
+        // installed a block at the instruction AFTER it as well, so the run re-enters and the two
+        // blocks together can retire the same total a clean resume would. Nothing in the state
+        // comparison sees a resync either: the interpreter finishes the same program. These
+        // counters are what say the slot resumed rather than merely that the program ran.
+        let stalls = direct.direct_stall_snapshot();
+        if interpret_one_slots {
+            assert!(
+                stalls.callout_interpret_one_executed > 0,
+                "{label}: no InterpretOne slot ran, so the sweep is testing a lowering: {case:#?}"
+            );
+            assert_eq!(
+                (
+                    stalls.callout_interpret_one_resync,
+                    stalls.callout_interpret_one_resync_fault,
+                    stalls.callout_interpret_one_abnormal,
+                    stalls.callout_interpret_one_demoted,
+                ),
+                (0, 0, 0, 0),
+                "{label}: a call-out slot did not resume cleanly: {case:#?}"
+            );
+        } else {
+            assert_eq!(
+                stalls.callout_interpret_one_executed, 0,
+                "{label}: this sweep carries no call-out row: {case:#?}"
+            );
+        }
         if stack_round_trip {
             // ENTER pushes the entry BP and LEAVE pops it back, while LEAVE's pointer move undoes
             // the push and the allocation together, so BOTH registers return to their entry
@@ -1681,8 +1723,11 @@ fn generated_width_lift_blocks_match_the_interpreter() {
         0,
         generated_cpu,
         width_lift_case,
-        WIDTH_LIFT_NATIVE_INSTRUCTIONS,
-        true,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+        },
     );
     run_generated_sweep(
         "flat, SS.B=1",
@@ -1690,8 +1735,11 @@ fn generated_width_lift_blocks_match_the_interpreter() {
         WIDTH_LIFT_CASES,
         generated_cpu,
         width_lift_case,
-        WIDTH_LIFT_NATIVE_INSTRUCTIONS,
-        true,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+        },
     );
     run_generated_sweep(
         "16-bit code, SS.B=0",
@@ -1699,8 +1747,11 @@ fn generated_width_lift_blocks_match_the_interpreter() {
         2 * WIDTH_LIFT_CASES,
         generated_sixteen_bit_cpu,
         sixteen_bit_width_lift_case,
-        WIDTH_LIFT_NATIVE_INSTRUCTIONS,
-        true,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+        },
     );
     run_generated_sweep(
         "16-bit code, SS.B=0",
@@ -1708,8 +1759,11 @@ fn generated_width_lift_blocks_match_the_interpreter() {
         3 * WIDTH_LIFT_CASES,
         generated_sixteen_bit_cpu,
         sixteen_bit_width_lift_case,
-        WIDTH_LIFT_NATIVE_INSTRUCTIONS,
-        true,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+        },
     );
 }
 
@@ -1871,8 +1925,11 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
         0,
         generated_cpu,
         interpret_one_case,
-        INTERPRET_ONE_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
     run_generated_sweep(
         "flat, SS.B=1",
@@ -1880,8 +1937,11 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
         WIDTH_LIFT_CASES,
         generated_cpu,
         interpret_one_case,
-        INTERPRET_ONE_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
     run_generated_sweep(
         "16-bit code, SS.B=0",
@@ -1889,8 +1949,11 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
         2 * WIDTH_LIFT_CASES,
         generated_sixteen_bit_cpu,
         sixteen_bit_interpret_one_case,
-        INTERPRET_ONE_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
     run_generated_sweep(
         "16-bit code, SS.B=0",
@@ -1898,8 +1961,11 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
         3 * WIDTH_LIFT_CASES,
         generated_sixteen_bit_cpu,
         sixteen_bit_interpret_one_case,
-        INTERPRET_ONE_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
 }
 
@@ -1994,6 +2060,17 @@ fn policy_group3_multiply_16bit_operand(_: &mut [u32; 8]) -> Vec<u8> {
     vec![0x66, 0xF7, 0xE3]
 }
 
+/// `FE /0` with mod 01, r/m 101, disp8 0: `inc byte [ebp+0]`, the first row on the allowlist that
+/// stores a BYTE, and therefore the first that can reach the invalidation choke through the
+/// value-aware door instead of the sized one. Which of the two doors a given store takes depends
+/// on the addressing and the page state rather than on the row, so the unsized door has its own
+/// end-to-end fixture (`interpret_one_inc_dec_byte_memory_resumes`) and this case covers the row
+/// against the randomized surroundings.
+fn policy_inc_byte_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0xFE, 0x45, 0x00]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
 const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_mov_sreg_memory_32,
@@ -2004,6 +2081,7 @@ const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_group3_memory_32,
     policy_group3_register_16bit_operand,
     policy_group3_multiply_16bit_operand,
+    policy_inc_byte_memory_32,
 ];
 
 /// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
@@ -2019,7 +2097,14 @@ const POLICY_ROWS_16: &[PolicyRow] = &[
     policy_group3_memory_16,
     policy_group3_register,
     policy_group3_multiply,
+    policy_inc_byte_memory_16,
 ];
+
+/// `FE /0` with mod 01, r/m 110, disp8 0: `inc byte [bp+0]`.
+fn policy_inc_byte_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0xFE, 0x46, 0x00]
+}
 
 /// `F7 /3` with mod 01, r/m 110, disp8 0: `neg word [bp+0]`, unprefixed in a 16-bit segment.
 fn policy_group3_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
@@ -2166,8 +2251,11 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
         0,
         generated_cpu,
         policy_case,
-        POLICY_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
     run_generated_sweep(
         "flat, SS.B=1",
@@ -2175,8 +2263,11 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
         WIDTH_LIFT_CASES,
         generated_cpu,
         policy_case,
-        POLICY_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
     run_generated_sweep(
         "16-bit code, SS.B=0",
@@ -2184,8 +2275,11 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
         2 * WIDTH_LIFT_CASES,
         generated_sixteen_bit_cpu,
         sixteen_bit_policy_case,
-        POLICY_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
     run_generated_sweep(
         "16-bit code, SS.B=0",
@@ -2193,7 +2287,10 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
         3 * WIDTH_LIFT_CASES,
         generated_sixteen_bit_cpu,
         sixteen_bit_policy_case,
-        POLICY_NATIVE_INSTRUCTIONS,
-        false,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+        },
     );
 }

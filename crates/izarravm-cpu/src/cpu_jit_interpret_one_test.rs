@@ -2004,3 +2004,70 @@ fn group3_core_clocks_is_what_the_interpreter_charges() {
         });
     }
 }
+
+/// Row 5: INC and DEC r/m8 through memory.
+///
+/// The first admitted row that STORES A BYTE, which is why the deferred-code-write probe had to be
+/// fixed before it could be worth anything: a byte store reaches the invalidation choke on
+/// `changed` alone, so without that probe every execution here would have recorded a write, failed
+/// R5 and RESYNCed. This test would have passed anyway on state, which is what the resume count in
+/// `assert_row_resumes` is for.
+///
+/// MUTATION: put the memory arm back to `None` and both cases fail on the block shape. Revert the
+/// `code_write_watched` probe in `note_code_write_inner` instead and both cases still agree on
+/// every register and every byte of RAM, and fail on the resume alone. That second mutant is
+/// caught HERE and by nothing else in the suite -- the generated sweep's byte store takes the
+/// sized door, which pre-gates on `code_write_watched` and never reaches the window's own probe.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_inc_dec_byte_memory_resumes() {
+    for (row, expected) in [(&[0xFEu8, 0x07][..], 1u8), (&[0xFE, 0x0F], 0xff)] {
+        let legs = assert_row_resumes(row, no_perturb);
+        assert_eq!(
+            legs.native_bus.memory[POP_TARGET as usize], expected,
+            "row {row:02x?} must have written the byte back"
+        );
+    }
+}
+
+/// The REGISTER form keeps its native lowering, and `/2../7` stay refused.
+///
+/// `0xFE` has three answers now -- a lowering, a call-out and a refusal -- and the arm decides
+/// between them on two independent fields, so both boundaries are pinned rather than one.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn inc_dec_byte_splits_native_register_from_call_out_memory() {
+    // FE /0 with mod 11 r/m 011: inc bl.
+    assert_row_is_native(&[0xFE, 0xC3]);
+    assert_row_is_a_call_out(&[0xFE, 0x07]);
+
+    for reg in 2u8..8 {
+        let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+        code.extend_from_slice(&[0xFE, 0x07 | (reg << 3)]);
+        code.extend_from_slice(&[0x40, 0xF4]);
+        let starts = vec![0, 3, 4, 5, 7];
+        let (_, _, block) = build_native(&code, &starts);
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "0xFE /{reg} is #UD and must still end the block"
+        );
+        assert_eq!(block.callout_interpret_one_slots(), 0);
+    }
+}
+
+/// `INC_DEC_RM8_CORE_CLOCKS` is what the interpreter charges.
+#[test]
+fn inc_dec_rm8_core_clocks_is_what_the_interpreter_charges() {
+    for row in [&[0xFEu8, 0x07][..], &[0xFE, 0xC3]] {
+        assert_row_charges(row, crate::INC_DEC_RM8_CORE_CLOCKS, |_, _| {});
+    }
+}

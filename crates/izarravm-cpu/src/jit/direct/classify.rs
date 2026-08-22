@@ -2003,11 +2003,20 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     release: if opcode == 0xc2 { insn.imm as u16 } else { 0 },
                 });
             }
-            // INC/DEC r/m8, REGISTER form only. The byte sibling of the 0xff group below.
+            // INC/DEC r/m8. The REGISTER form is lowered; the MEMORY form is an `InterpretOne`
+            // call-out as of the S3 policy widening, where the post-S2 loader census ranks it at
+            // 484 k block-stopping hits.
             //
-            // The memory form is deliberately absent: `emit_rmw_inc_dec` handles Dword and Word
-            // and debug-asserts on the rest, and a Byte path needs its own code-watch width,
-            // counter lane and the fact that a byte access takes NO alignment guard at all.
+            // The memory form's old refusal named a real cost and the call-out pays none of it:
+            // `emit_rmw_inc_dec` handles Dword and Word and debug-asserts on the rest, and a Byte
+            // path would need its own code-watch width, its own counter lane and an answer for the
+            // fact that a byte access takes NO alignment guard at all. The helper runs the
+            // interpreter's arm instead, which has all three already.
+            //
+            // This is the row the deferred-code-write probe in `note_code_write_inner` was fixed
+            // for. A byte store reaches the invalidation choke on `changed` alone, without the
+            // `code_write_watched` pre-gate the sized path makes, so before that fix every
+            // execution of this row would have recorded a write, failed R5 and RESYNCed.
             //
             // `dst` here is a BYTE-REGISTER index, where 4..7 mean AH/CH/DH/BH rather than
             // ESP/EBP/ESI/EDI. The emitter's byte branch reads and writes through the lane
@@ -2024,7 +2033,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         is_dec: m.reg == 1,
                         width: MemoryWidth::Byte,
                     }),
-                    DecodedOperand::Mem(_) => None,
+                    DecodedOperand::Mem(_) => Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne,
+                    }),
                 };
             }
             0xff => {

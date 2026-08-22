@@ -936,7 +936,9 @@ impl CpuGsw {
                         let value = u32::from(self.read_operand_u8(bus, operand)?);
                         let result = self.inc_dec(value, modrm.reg == 1, BusWidth::Byte) as u8;
                         self.write_operand_u8(bus, operand, result)?;
-                        Ok(clocks(2))
+                        // Named because the MEMORY form is an `InterpretOne` call-out row: its
+                        // budget bound and this arm must charge the same number.
+                        Ok(clocks(INC_DEC_RM8_CORE_CLOCKS))
                     }
                     _extension => Err(undefined_opcode()),
                 }
