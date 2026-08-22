@@ -43,7 +43,10 @@ pub(crate) use callout_attribution::{
 #[cfg(feature = "smc-census")]
 pub(crate) use smc_census::{SmcCensus, smc_census_default};
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use izarravm_core::{CpuPersona, GswMode};
 
@@ -143,6 +146,14 @@ pub(crate) const MAX_X87_SLOTS: u8 = 8;
 /// carries; `brk_cap` byte-identity on the no-call-out fixture is the isolation that this bound
 /// does not leak into blocks that hold none.
 pub(crate) const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
+
+/// Code sites the demoted-call-out set will hold. A memory bound on a map that deliberately
+/// outlives the blocks it was learned from, so containment in `entries` cannot bound it.
+///
+/// 4,096 sites is 32 KiB of set at two `u32`s a site, and two orders of magnitude above what a
+/// whole loader phase produces: the tombraid loader demotes 405 slots in 500 M cycles, all of them
+/// one row (`0x8e_mov_sreg`). See `note_demoted_callout_site` for what happens at the cap.
+const DEMOTED_CALLOUT_SITE_CAP: usize = 4_096;
 
 /// Untried entries a call-out block may spend at trial quota before the governor gives up on
 /// classifying it. A call-out behind a rarely-taken branch would otherwise sit at quota 1
@@ -761,6 +772,27 @@ pub(crate) struct BlockCache {
     /// `DEFAULT_ENTRY_CAP` without an eviction policy, and it is why a rewritten page hands the
     /// new code at that address a fresh budget instead of its predecessor's stickiness.
     top_mismatch_retires: HashMap<BlockKey, u8, PodKeyBuildHasher>,
+    /// Code sites, by `(physical, mode_key)`, whose `InterpretOne` call-out the governor demoted.
+    /// The compile walk reads it and ends the block BEFORE such a slot, so the recompile produces
+    /// the hard boundary the row had before it was admitted.
+    ///
+    /// A SITE and not a block key, because the demotion is a property of the instruction: the same
+    /// `MOV DS,[bx]` reached from a second entry is the same losing bet, and keying on the block
+    /// entry would let every other entry re-learn it over eight more executions. Physical rather
+    /// than linear for the reason invalidation is physical: the code byte is what was judged.
+    ///
+    /// Bounded by `DEMOTED_CALLOUT_SITE_CAP` rather than by containment in `entries`, because it
+    /// deliberately OUTLIVES the block it was learned from -- that is the whole mechanism. It does
+    /// NOT outlive a whole-cache wipe: `reset_storage` clears it with every other map, on the
+    /// invariant that a cache that has thrown away its rejected spans, its dormant heat and its
+    /// admission classes has learned nothing. Re-learning costs three resyncs, a retire and a
+    /// recompile per site, which at the 64 sites the tombraid loader finds is not worth a special
+    /// case; and a reset can follow an overlay load, where a physical address holding different
+    /// code would otherwise inherit the old code's judgement. MEASURED both ways on the loader and
+    /// byte-identical, because that fixture takes no cache reset at all (`jit_direct_cache_resets`
+    /// is 0), so this is an argument and not a measurement -- said plainly rather than dressed up
+    /// as one.
+    demoted_callout_sites: HashSet<(u32, u32), PodKeyBuildHasher>,
     /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
     lane_trial_override: Option<bool>,
@@ -925,6 +957,7 @@ impl BlockCache {
             block_imm_lane_widths: Vec::new(),
             lane_trial_epochs: HashMap::default(),
             top_mismatch_retires: HashMap::default(),
+            demoted_callout_sites: HashSet::default(),
             lane_trial_override: None,
             block_portals: Vec::new(),
             link_cells: Vec::new(),
@@ -1538,6 +1571,40 @@ impl BlockCache {
         } else {
             DormantLift::StillDormant
         }
+    }
+
+    /// Record that the governor demoted the `InterpretOne` slot at this code site, so every later
+    /// compile walk ends its block before the instruction instead of emitting a slot whose only
+    /// remaining behaviour is the abnormal exit.
+    ///
+    /// Silently full at `DEMOTED_CALLOUT_SITE_CAP`: the set is a COST policy, and a guest that
+    /// somehow reached the cap is better served by paying the prologue test on the overflow sites
+    /// than by an eviction policy that could thrash a site in and out of the allowlist. The cap is
+    /// far above what a whole loader phase produces (405 sites on tombraid, 2026-08-22).
+    pub(crate) fn note_demoted_callout_site(&mut self, physical: u32, mode_key: u32) {
+        if self.demoted_callout_sites.len() >= DEMOTED_CALLOUT_SITE_CAP {
+            return;
+        }
+        self.demoted_callout_sites.insert((physical, mode_key));
+    }
+
+    /// Whether the compile walk must treat this code site as a hard boundary.
+    ///
+    /// The emptiness test is first and is the shape that matters: on a guest that never demotes a
+    /// slot -- which is every guest until one does -- this costs a length load per call-out slot
+    /// and no hash at all.
+    pub(crate) fn callout_site_demoted(&self, physical: u32, mode_key: u32) -> bool {
+        !self.demoted_callout_sites.is_empty()
+            && self.demoted_callout_sites.contains(&(physical, mode_key))
+    }
+
+    pub(crate) fn demoted_callout_sites_len(&self) -> usize {
+        self.demoted_callout_sites.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn demoted_callout_site_count_for_test(&self) -> usize {
+        self.demoted_callout_sites.len()
     }
 
     /// Retire one descriptor-specialized block while keeping its key in the observed state. The
@@ -2483,6 +2550,7 @@ impl BlockCache {
         self.block_imm_lane_widths.clear();
         self.lane_trial_epochs.clear();
         self.top_mismatch_retires.clear();
+        self.demoted_callout_sites.clear();
         self.link_cells.clear();
         self.interpret_one_cells.clear();
         self.link_sources.clear();
@@ -7444,6 +7512,55 @@ fn compile_with_budget(
             stop = CompileStop::Retry;
             break;
         };
+        // The governor's answer, applied at compile time instead of at every execution. A slot it
+        // demoted has exactly one behaviour left -- test the byte, take the abnormal exit, hand
+        // the instruction to the interpreter -- which is the boundary the row had before it was
+        // admitted, reached through a prologue and a side exit that the boundary does not pay.
+        // Ending the block here IS that boundary, and it also drops the slots after it, which a
+        // demoted block carries and can never reach.
+        //
+        // BELOW `stack_width_kind` and not beside the `PlannedInsn::HardBoundary` arm above, which
+        // is where it was written first and where it was worth exactly nothing. `classify` does
+        // not produce every call-out: the protected-mode `MOV Sreg,r/m` arrives as `LoadSegReal`
+        // and BECOMES a `CallOut` inside `stack_width_kind`, because the mode is CPU state.
+        // `0x8e_mov_sreg` is also the only row the tombraid loader demotes, so a check above that
+        // conversion saw none of them -- 402,264 demotions with the mechanism "on", identical to
+        // the run without it, which is how the placement was caught.
+        //
+        // Read only for a slot that actually interprets one instruction: the port and stack-frame
+        // helpers have no cell and no governor, so no site of theirs can be in the set.
+        if kind
+            .call_out_helper()
+            .is_some_and(CallOutHelper::interprets_one)
+            && cpu
+                .jit_direct
+                .callout_site_demoted(expected_phys, key.mode_key)
+        {
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                record_structural_barrier(
+                    cpu,
+                    &insn,
+                    BarrierStop::CallOutDemoted,
+                    key,
+                    entry_lin,
+                    d,
+                    SuffixSeed {
+                        scan_start: next,
+                        prefix_instructions: slots.len(),
+                        stack_accesses,
+                        memory_alu_slots,
+                        callout_slots,
+                        x87_slots,
+                        dirty_segments,
+                        model_dirty: true,
+                    },
+                );
+            }
+            stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
+            break;
+        }
         // A Word-size relative branch masks its target to 16 bits: `relative_jump` computes
         // `(eip + rel) & operand_size.mask()`. The emitted form bakes an unmasked delta, so it is
         // only correct where that mask is a no-op. Clamping the limit to 0xFFFF for Word makes

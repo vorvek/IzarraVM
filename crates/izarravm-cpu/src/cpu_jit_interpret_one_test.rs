@@ -98,6 +98,30 @@ struct Legs {
     any(target_os = "windows", target_os = "linux")
 ))]
 fn build_native(code: &[u8], starts: &[u32]) -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
+    let (cpu, bus, block, _) = build_native_keeping_compilation(code, starts);
+    (cpu, bus, block)
+}
+
+/// `build_native`, and the `Compilation` it installed.
+///
+/// The compilation is worth keeping for exactly one caller: installing it AGAIN produces a block
+/// that shares the SAME `InterpretOneCell` allocations, because `install` clones a
+/// `Vec<Arc<InterpretOneCell>>` and an `Arc` clone is the same cell. That is the only way to enter
+/// a demoted slot on purpose now that a demotion retires its block.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn build_native_keeping_compilation(
+    code: &[u8],
+    starts: &[u32],
+) -> (
+    CpuGsw,
+    TestBus,
+    jit::direct::CompiledBlock,
+    jit::direct::Compilation,
+) {
     let mut program = vec![0u8; 0x2000];
     program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
     seed_fault_handler(&mut program);
@@ -118,7 +142,7 @@ fn build_native(code: &[u8], starts: &[u32]) -> (CpuGsw, TestBus, jit::direct::C
         .install(&compilation)
         .expect("install the fixture block");
     let block = cpu.jit_direct.block(id).expect("the block must be live");
-    (cpu, bus, block)
+    (cpu, bus, block, compilation)
 }
 
 /// Run `code` interpreted and again with its leading block installed, and hand back both worlds.
@@ -749,6 +773,16 @@ fn interpret_one_abnormal_when_decode_view_missing() {
 /// The faulting fixture is the driver because it resyncs on EVERY execution while leaving the
 /// block installed -- the watched-code case retires the block on its first, so it cannot count to
 /// three. Each iteration re-arms the CPU and re-enters, which is what the dispatcher would do.
+///
+/// The FOURTH entry needs a block the demotion did not take away, and the demotion now retires the
+/// one it was learned on (`a_demoted_slot_recompiles_as_a_hard_boundary`). Re-installing the same
+/// `Compilation` gives one: `install` clones the cell `Arc`s, so the new block reads the SAME
+/// governor byte, and entering it is the only way to reach the emitted prologue on purpose.
+///
+/// That prologue is not made dead by the retire, which is why this claim is still worth pinning. A
+/// SELF-LOOP block runs its slots more than once inside one native entry, so a slot demoted on the
+/// first iteration is met again on the second, before any retire can happen -- and the demotion
+/// can land on a resume path, where the block keeps running after it.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -756,9 +790,24 @@ fn interpret_one_abnormal_when_decode_view_missing() {
 ))]
 #[test]
 fn interpret_one_demotes_after_three_resyncs() {
-    let (mut native, mut native_bus, block) = build_native(CODE, STARTS);
+    let (mut native, mut native_bus, block, compilation) =
+        build_native_keeping_compilation(CODE, STARTS);
     let mut executed = Vec::new();
-    for _ in 0..4 {
+    for entry in 0..4 {
+        // The demotion lands on the third entry and retires the block, so the fourth needs its
+        // own installation of the same code -- and of the same cells.
+        let block = if entry < 3 {
+            block
+        } else {
+            let id = native
+                .jit_direct
+                .install(&compilation)
+                .expect("re-install the fixture block");
+            native
+                .jit_direct
+                .block(id)
+                .expect("the re-installed block must be live")
+        };
         arm_fixture(&mut native, &mut native_bus);
         native.registers.set_ebx(0xffff);
         assert!(
@@ -791,6 +840,147 @@ fn interpret_one_demotes_after_three_resyncs() {
         native.registers.eip,
         ENTRY + 3,
         "the demoted slot must leave EIP at the call-out"
+    );
+}
+
+/// `mov ax,0x1111; inc ax; inc ax; pop word [bx]; inc ax; inc ax; inc ax; hlt`.
+///
+/// Three instructions on EACH side of the call-out, and that is what the fixture is for rather
+/// than the shared `CODE`'s one. It makes both halves of the demoted-site claim non-vacuous:
+///
+/// * the block that ends BEFORE the slot still has three slots, so it installs and can be run,
+///   instead of dying on `compile_with_instruction_limit`'s short-block return for a reason that
+///   has nothing to do with the demotion;
+/// * a walk STARTING at the slot has three more instructions behind it, so before the demotion it
+///   compiles into a real block carrying the call-out. After it, the same walk stops on its first
+///   slot. A two-instruction tail would have refused that entry either way.
+const DEMOTED_SITE_CODE: &[u8] = &[
+    0xB8, 0x11, 0x11, // mov ax, 0x1111        +0
+    0x40, // inc ax                            +3
+    0x40, // inc ax                            +4
+    0x8F, 0x07, // pop word [bx]               +5   <- the call-out slot
+    0x40, // inc ax                            +7
+    0x40, // inc ax                            +8
+    0x40, // inc ax                            +9
+    0xF4, // hlt                               +10
+];
+const DEMOTED_SITE_STARTS: &[u32] = &[0, 3, 4, 5, 7, 8, 9];
+/// Where the call-out sits in `DEMOTED_SITE_CODE`.
+const DEMOTED_SITE_SLOT: u32 = ENTRY + 5;
+
+/// A demoted slot must stop being a slot: the demotion retires the block and marks the SITE, and
+/// the recompile ends its block before the instruction.
+///
+/// The thing this exists to prevent, measured on the tombraid loader before it existed: 405
+/// demoted cells produced 1,965,674 abnormal side exits, because a demoted slot keeps its place in
+/// the block and every later execution runs `test byte [cell], 0x80; jnz abnormal` and pays a
+/// dispatcher round trip to reach the boundary the governor already decided on. The block also
+/// keeps carrying the slots after it, which that exit guarantees are unreachable.
+///
+/// The site is keyed on the instruction and not on the block, so the assertion that matters is the
+/// SECOND compile: a walk entering AT the slot -- a different key, a different block -- stops too.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_demoted_slot_recompiles_as_a_hard_boundary() {
+    let (mut native, mut native_bus, block) = build_native(DEMOTED_SITE_CODE, DEMOTED_SITE_STARTS);
+    assert_eq!(
+        block.callout_interpret_one_slots(),
+        1,
+        "control: the fresh block carries the slot"
+    );
+    let at_slot = jit::direct::compile(&mut native, DEMOTED_SITE_SLOT, false)
+        .expect("control: the slot leads a compilable block before the demotion");
+    assert_eq!(
+        at_slot.callout_interpret_one_slots, 1,
+        "control: a walk entering at the slot admits it too"
+    );
+    let key = jit::direct::key_for(&native, ENTRY, false).expect("a key for the fixture block");
+
+    // Three faulting executions: the same driver `interpret_one_demotes_after_three_resyncs`
+    // uses, and the only one that resyncs every time while leaving the block installed.
+    for _ in 0..3 {
+        arm_fixture(&mut native, &mut native_bus);
+        native.registers.set_ebx(0xffff);
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .expect("the fixture must not stop the machine")
+        );
+    }
+    assert_eq!(
+        native.direct_stall_snapshot().callout_interpret_one_demoted,
+        1
+    );
+    assert_eq!(
+        native.jit_direct.demoted_callout_site_count_for_test(),
+        1,
+        "the demotion must name the code SITE, not only the cell"
+    );
+    assert!(
+        !native.jit_direct.retire_key_for_recompile(key),
+        "the demotion must already have retired the block, so this second retire finds nothing"
+    );
+
+    let recompiled = jit::direct::compile(&mut native, ENTRY, false)
+        .expect("the prefix before the slot must still compile");
+    assert_eq!(
+        recompiled.callout_interpret_one_slots, 0,
+        "the recompile must not re-admit the demoted slot"
+    );
+    assert_eq!(
+        recompiled.span.instructions, 3,
+        "the block ends BEFORE the slot: mov ax, inc ax, inc ax"
+    );
+    assert_eq!(
+        u32::from(recompiled.span.guest_len),
+        DEMOTED_SITE_SLOT - ENTRY,
+        "so the successor starts AT the instruction the boundary hands to the interpreter"
+    );
+    assert!(
+        matches!(
+            jit::direct::compile(&mut native, DEMOTED_SITE_SLOT, false),
+            jit::direct::CompileOutcome::StructuralReject(_)
+        ),
+        "the site is a boundary for EVERY walk, so the one that starts on it has no first slot          and lands on the same structural reject an unlowered opcode there would have"
+    );
+    let after = jit::direct::compile(&mut native, DEMOTED_SITE_SLOT + 2, false)
+        .expect("the instruction after the slot leads the next block");
+    assert_eq!(after.span.instructions, 3, "inc ax, inc ax, inc ax");
+
+    // And the exit the storm was made of is gone: the recompiled block has no call-out prologue to
+    // take it from, so no number of later executions can grow the counter.
+    let abnormal_before = native.direct_stall_snapshot().side_exit_callout_abnormal;
+    let id = native
+        .jit_direct
+        .install(&recompiled)
+        .expect("install the recompiled block");
+    let installed = native.jit_direct.block(id).expect("the block must be live");
+    for _ in 0..4 {
+        arm_fixture(&mut native, &mut native_bus);
+        native.registers.set_ebx(0xffff);
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, installed)
+                .expect("the boundary block must not stop the machine")
+        );
+        assert_eq!(
+            native.jit_direct.last_side_exit_reason_for_test(),
+            None,
+            "a block that ENDS at the boundary completes; it has no exit to take"
+        );
+        assert_eq!(
+            native.registers.eip, DEMOTED_SITE_SLOT,
+            "and it leaves EIP at the instruction, exactly as the pre-slice barrier did"
+        );
+    }
+    assert_eq!(
+        native.direct_stall_snapshot().side_exit_callout_abnormal,
+        abnormal_before,
+        "no later execution may pay an abnormal exit"
     );
 }
 
@@ -3149,5 +3339,117 @@ fn interpret_one_cli_faults_in_v86_with_the_window_open() {
         cpu.registers.eflags & crate::FLAG_IF,
         0,
         "an interrupt gate clears IF on entry, so the guest's own CLI never ran"
+    );
+}
+
+/// The demoted-site boundary on the row that actually demotes: the protected-mode segment load,
+/// through `MOV ES,r16` and not `MOV FS,r16`.
+///
+/// The register choice is the whole point, and it is not interchangeable. `classify` admits FS and
+/// GS as call-outs on its own, so a FS fixture reaches the mechanism through the same path the
+/// 16-bit `POP r/m` one does and proves nothing new. ES and DS in REGISTER form arrive as
+/// `LoadSegReal` and only become a `CallOut` inside `stack_width_kind`, once the mode is in hand --
+/// which is below where a demoted-site check naturally wants to sit, beside the
+/// `PlannedInsn::HardBoundary` arm.
+///
+/// That is where it was written first, and the tombraid loader then measured 402,264 demotions and
+/// 716,777 compile attempts with the mechanism "on", byte-identical to the run without it, because
+/// every site it demotes is this form. This fixture is the one that fails on that placement.
+///
+/// `SEL_OTHER` is the driver: a descriptor whose record differs in the field R2 compares, so the
+/// load retires and the block resyncs, every time.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_demoted_protected_mode_segment_load_recompiles_as_a_hard_boundary() {
+    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`.
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    const STARTS_ES: &[u32] = &[0, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE_ES.len()].copy_from_slice(CODE_ES);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    let warm = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        for offset in STARTS_ES {
+            let linear = ENTRY + offset;
+            cpu.set_eip(linear);
+            cpu.begin_instruction();
+            cpu.fetch_decoded(bus, linear).expect("fixture decode");
+        }
+        cpu.set_eip(ENTRY);
+    };
+    warm(&mut cpu, &mut bus);
+
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("the ES fixture must compile as a block");
+    assert_eq!(
+        compilation.span.instructions, BLOCK_INSTRUCTIONS,
+        "control: the load joins the block instead of ending it"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "control: and it joins as an InterpretOne slot"
+    );
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    for _ in 0..3 {
+        arm_protected(&mut cpu, &mut bus, SEL_OTHER);
+        // Put ES back where `protected_cpu` seeds it. Without this the SECOND load of `SEL_OTHER`
+        // is a re-establishing load, which is exactly the case R2 RESUMES, and the governor would
+        // never see its third resync.
+        cpu.registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::flat(SEL_DATA, 0x93));
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block)
+                .expect("a resyncing load must not stop the machine")
+        );
+        assert_eq!(
+            cpu.jit_direct.last_side_exit_reason_for_test(),
+            Some(jit::direct::SideExitReason::CallOutResync as u32),
+            "a descriptor with a different limit must RESYNC"
+        );
+    }
+    assert_eq!(
+        cpu.direct_stall_snapshot().callout_interpret_one_demoted,
+        1,
+        "three resyncs in the first eight executions demote the slot"
+    );
+    assert_eq!(
+        cpu.jit_direct.demoted_callout_site_count_for_test(),
+        1,
+        "and the demotion must reach the site map from the protected-mode arm too"
+    );
+    assert!(
+        !cpu.jit_direct.retire_key_for_recompile(key),
+        "the demotion must already have retired the block"
+    );
+
+    // Put the CPU back exactly where the control compile ran from, decode lines included, so the
+    // ONLY difference between that Compiled outcome and this one is the demoted site.
+    arm_protected(&mut cpu, &mut bus, SEL_OTHER);
+    cpu.registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::flat(SEL_DATA, 0x93));
+    warm(&mut cpu, &mut bus);
+    assert!(
+        matches!(
+            jit::direct::compile(&mut cpu, ENTRY, true),
+            jit::direct::CompileOutcome::StructuralReject(_)
+        ),
+        "the recompile must end before the demoted slot. One instruction is left in front of it,          which is under the walk's three-instruction floor, so the boundary shows up as the whole          key refusing -- the same structural reject this key produced before 0x8E was admitted.          What matters is that it is not Compiled: with the site check disabled, or placed above          stack_width_kind where this call-out does not exist yet, the same call returns a          three-slot block carrying the slot again"
     );
 }

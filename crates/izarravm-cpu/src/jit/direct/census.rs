@@ -467,12 +467,14 @@ pub(crate) struct DirectStallTally {
     /// the gap is executions refused by the governor. `demoted` then counts the CELLS, once each
     /// at the transition, so `gap / demoted` is what a demotion costs the block that carries it.
     ///
-    /// The design asked for a `BarrierStop::CallOutDemoted` row instead. It is not implementable
-    /// as specified and the reason is worth recording rather than leaving as an omission: the
-    /// barrier census records COMPILE-WALK stops, and demotion is a runtime event on an already
-    /// compiled block that never changes its classification (design review M11 replaced
-    /// demotion-by-recompile precisely so it would not have to). There is no compile walk to
-    /// attribute a row to.
+    /// The design asked for a `BarrierStop::CallOutDemoted` row instead, and when this was written
+    /// it was not implementable: the barrier census records COMPILE-WALK stops, and demotion was a
+    /// runtime event on an already compiled block that never changed its classification. The
+    /// demoted-site map changed that -- a demotion now retires the block and marks the site, so
+    /// the RECOMPILE walk stops there and has a row to be attributed to. The variant exists.
+    ///
+    /// The gap described above still exists and is still the way to price a demotion, because it
+    /// covers the executions between the demotion and the retire.
     ///
     /// Separate from `callout_executed` and `side_exit_callout_abnormal` rather than folded into
     /// them, for the reason `callout_port_v86_served` is separate: those sum every helper class,
@@ -1115,6 +1117,14 @@ pub(crate) enum BarrierStop {
     ///
     /// Its suffix is computed with the dirty rule DISABLED. See `SuffixSeed::model_dirty`.
     DirtySegment,
+    /// An `InterpretOne` call-out the governor DEMOTED, met again by a later compile walk.
+    ///
+    /// Separate from `HardBoundary` because the cause is different in kind: `classify` still
+    /// admits the row, and what stops the walk is a runtime judgement about this code site. The
+    /// column therefore answers a question no other row can -- how much of the barrier population
+    /// a widened row won and then gave back -- and folding it into `HardBoundary` would make an
+    /// admitted row look like an unlowered one.
+    CallOutDemoted,
 }
 
 impl BarrierStop {
@@ -1125,6 +1135,7 @@ impl BarrierStop {
             Self::NonContinuable => "non_continuable",
             Self::WordPersona => "word_persona",
             Self::DirtySegment => "dirty_segment",
+            Self::CallOutDemoted => "call_out_demoted",
         }
     }
 
@@ -1827,6 +1838,12 @@ impl crate::jit::JitState {
             callout_slot_cap_hits: self.stalls.callout_slot_cap_hits,
             compile_page_overflows: self.stalls.compile_page_overflows,
             compile_page_search_steps: self.stalls.compile_page_search_steps,
+            // A GAUGE and not a running total: the size of a map, read here rather than kept on
+            // the tally. Against `callout_interpret_one_demoted` it says whether a demotion is
+            // being LEARNED once per site or re-learned -- the two are within a rounding error of
+            // each other when the demoted-site map is doing its job, and orders apart when it is
+            // not, which is how the misplaced site check was found.
+            demoted_callout_sites: self.demoted_callout_sites_len() as u64,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             callout_governor_trials: self.stalls.callout_governor_trials,
             callout_governor_lazy: self.stalls.callout_governor_lazy,

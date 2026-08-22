@@ -1378,6 +1378,33 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
 
 /// Steps 4 to 10 of the helper contract: everything between the clock preview and the status word.
 ///
+/// Everything one demotion has to do, in one place because it happens on two paths (the resume
+/// predicate refusing, and the step faulting) and skipping half of it on either is invisible.
+///
+/// The counter is the census row. The SITE goes into the block cache's demoted set so the next
+/// compile walk over this instruction ends its block before the slot, and the latch asks
+/// `run_direct_block` to retire the block that is running so that walk actually happens. Without
+/// the last two the demoted slot keeps its place in the block and every later execution pays a
+/// prologue test and an abnormal side exit to reach the boundary it already decided on -- which
+/// is what the tombraid loader measured as 1.97 M abnormal exits from 405 cells.
+///
+/// `physical` is the instruction's first byte as the compile walk computes it (`expected_phys`),
+/// and `mode_key` is the ENTRY mode key -- read before the step, not after it. That is what makes
+/// the two sides name the same site, and the second half is the one that is easy to get wrong: the
+/// demoting row on the loader is `MOV Sreg,r/m`, and `jit_mode_key` carries CS.D, SS.B, PE, PG and
+/// VM, every one of which that instruction, or a fault delivery behind it, can move. Read
+/// afterwards, the site would be filed under a mode key no compile walk ever asks for and the
+/// recompile would re-admit the slot.
+///
+/// Honest about the evidence: on the tombraid loader the two readings measure IDENTICAL, because
+/// the resyncs that demote there are R2 record compares and move none of those bits. This is a
+/// correctness argument about the key, not a measured win.
+fn note_demotion(cpu: &mut CpuGsw, cell: &InterpretOneCell, physical: u32, mode_key: u32) {
+    cpu.jit_direct.note_interpret_one_demoted(cell.row());
+    cpu.jit_direct.note_demoted_callout_site(physical, mode_key);
+    cpu.request_callout_block_retire();
+}
+
 /// See `interpret_one` for why this is not inlined into its caller.
 fn interpret_one_step<B: CpuBus>(
     cpu: &mut CpuGsw,
@@ -1389,6 +1416,9 @@ fn interpret_one_step<B: CpuBus>(
     // STEP 4. The predicate's inputs, before anything can move them.
     let snapshot = ResumeSnapshot::capture(cpu);
     let start_cs = snapshot.cs.selector;
+    // The mode key the BLOCK was compiled under, taken before the step can move any of the state
+    // it is made of. See `note_demotion`.
+    let entry_mode_key = cpu.jit_mode_key();
 
     // STEP 5. The decode view. A MISS is ABNORMAL and not a re-decode: `decode` fetches through
     // the code path, which page-walks on a TLB miss, and a walk writes accessed bits with this
@@ -1457,7 +1487,7 @@ fn interpret_one_step<B: CpuBus>(
         cpu.settle_write_record();
         publish_flags(cpu);
         if cell.note_execution(true) {
-            cpu.jit_direct.note_interpret_one_demoted(cell.row());
+            note_demotion(cpu, cell, view.phys_start, entry_mode_key);
         }
         cpu.jit_direct.note_interpret_one_resync_fault(cell.row());
         return 1i64 << STATUS_RESYNC_FAULT_BIT;
@@ -1483,7 +1513,7 @@ fn interpret_one_step<B: CpuBus>(
     publish_flags(cpu);
 
     if cell.note_execution(!resume) {
-        cpu.jit_direct.note_interpret_one_demoted(cell.row());
+        note_demotion(cpu, cell, view.phys_start, entry_mode_key);
     }
 
     let clocks = i64::from(outcome.core_clocks);

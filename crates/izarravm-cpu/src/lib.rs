@@ -1948,6 +1948,7 @@ pub struct DirectStallSnapshot {
     /// same name on the census stalls struct for what each one grades.
     pub compile_page_overflows: u64,
     pub compile_page_search_steps: u64,
+    pub demoted_callout_sites: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.
     pub reject_callout_privileged: u64,
     /// The call-out admission governor: entries spent at trial quota, and the two classifications
@@ -2117,6 +2118,15 @@ struct DirectRuntimeState {
     /// `CpuGsw` tail because that is where the other run-scoped, equality-excluded, clone-resetting
     /// latch already lives.
     callout_error: Option<CpuError>,
+    /// "The governor demoted a slot in the block that is running", parked for `run_direct_block`
+    /// to act on after the native return.
+    ///
+    /// A latch rather than a direct retire, because the demotion is observed from INSIDE the
+    /// running block: `retire_key_for_recompile` frees the block's metadata slot and unlinks it,
+    /// and doing that while its code is on the host stack would pull the ground out from under the
+    /// return. `run_direct_block` takes it once every counter and charge is settled. Run-scoped,
+    /// equality-excluded and clone-resetting, like the two latches beside it.
+    callout_retire_pending: bool,
 }
 
 #[cfg(feature = "jit")]
