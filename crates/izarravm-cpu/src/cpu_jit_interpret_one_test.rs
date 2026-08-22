@@ -1176,6 +1176,66 @@ fn the_call_out_window_defers_watched_writes_only() {
     );
 }
 
+/// An UNWATCHED write made inside the window still reaches the body's diagnostics.
+///
+/// The window branch's own comment says an unwatched write falls through to the ordinary body, so
+/// the unit-sim feed, the SMC trace and the smc-census choke keep observing while a call-out runs.
+/// It shipped as a nested early return, which made that sentence false: for as long as a window
+/// was open those three stopped seeing anything. Nothing was unsound -- none of them invalidates --
+/// but a diagnostic that goes blind during exactly the mechanism under measurement is worse than
+/// one that was never turned on.
+///
+/// The SMC trace is the observer because it is the one that records EVERY write reaching the body,
+/// watched or not: `traced` is built from `smc_trace.0.is_some()` alone, and `trace.record` runs
+/// unconditionally at the end. Its `events=` line is therefore a direct count of writes that got
+/// past the window branch.
+///
+/// MUTATION: put the early return back and the unwatched case reads `events=0`.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn an_unwatched_write_inside_the_window_still_reaches_the_diagnostics() {
+    let (mut cpu, _bus, _block) = build_native(CODE, STARTS);
+    cpu.set_smc_trace_enabled(true);
+
+    // A page the fixture's code and decode lines are not on.
+    cpu.deferred_code_writes.open();
+    assert!(!cpu.note_code_write_hit(POP_TARGET, 1));
+    cpu.deferred_code_writes.close();
+    assert!(
+        cpu.deferred_code_writes.is_empty(),
+        "an unwatched write must not be deferred"
+    );
+    let report = cpu
+        .take_smc_trace_report()
+        .expect("the trace was enabled above");
+    assert!(
+        report[0].starts_with("smc_trace events=1 "),
+        "the unwatched write must have reached the body: {}",
+        report[0]
+    );
+
+    // The WATCHED write is the other direction: it is recorded and returns BEFORE the body, so the
+    // trace must not see it. Without this half the assertion above would also pass for a branch
+    // that deferred nothing at all.
+    cpu.set_smc_trace_enabled(true);
+    cpu.deferred_code_writes.open();
+    assert!(cpu.note_code_write_hit(ENTRY + 3, 1));
+    cpu.deferred_code_writes.close();
+    assert!(!cpu.deferred_code_writes.is_empty());
+    let report = cpu
+        .take_smc_trace_report()
+        .expect("the trace was enabled above");
+    assert!(
+        report[0].starts_with("smc_trace events=0 "),
+        "a deferred write must not reach the body until the drain: {}",
+        report[0]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. Emitted shape.
 // ---------------------------------------------------------------------------

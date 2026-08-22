@@ -480,18 +480,32 @@ impl CpuGsw {
         // demoted by the governor for traffic that touches no code at all. It cost S3's XCHG r/m8
         // and INC/DEC r/m8 rows their whole value until it was found.
         //
-        // Falling through is SOUND for an unwatched write, and that is the other half of the fix:
-        // the body below invalidates only what `range_hits_compiled_code` and
-        // `decode_cache::range_hits_code` actually name, so a write that hits neither reaches no
-        // invalidation door and cannot retire the running block. It also keeps the unit-sim and
-        // SMC-trace feeds on their ordinary path instead of deferring them.
+        // An unwatched write FALLS THROUGH to the body, and the `&&` below rather than a nested
+        // early return is what makes that true. It shipped as a nested `return false`, which the
+        // paragraph after it already claimed was a fall-through: the two disagreed and the code
+        // won, so a store made inside a window skipped the unit-sim feed, the SMC trace and the
+        // smc-census choke for as long as the window was open. None of those three invalidates
+        // anything, so nothing was unsound; they are DIAGNOSTICS, and a diagnostic that silently
+        // stops observing during exactly the mechanism under measurement is worse than one that
+        // never ran.
         //
-        // `false` rather than `true` on that arm for the same reason: it is what the body below
-        // would have returned, having invalidated nothing.
-        if self.deferred_code_writes.is_open() {
-            if !self.code_write_watched(physical, width) {
-                return false;
-            }
+        // Falling through is SOUND for an unwatched write: the body below invalidates only what
+        // `range_hits_compiled_code` and `decode_cache::range_hits_code` name, and
+        // `code_write_watched` IS the disjunction of those two, so a write that fails it reaches
+        // no invalidation door and cannot retire the running block. It returns `invalidated`,
+        // which is `false` on that path, having invalidated nothing.
+        //
+        // THE SIZED PATH PROBES TWICE while a window is open, and that is accepted rather than
+        // threaded. `write_linear_fragment` and `finish_fast_map_write` both compute `watched`
+        // for their own same-value elision and then call in here, which asks again. Threading
+        // the answer through would mean a second entry point: the BYTE door
+        // (`note_code_byte_write_hit`) genuinely does not know -- that is the whole reason this
+        // probe exists -- so a single `watched: bool` parameter would force the byte path to
+        // compute one on every changed store, including the vast majority that never see a
+        // window. That trades a cost confined to one probe per InterpretOne store for a cost on
+        // the shipped byte-store path, which is the wrong direction. Revisit only if the loader
+        // ladder puts `code_write_watched` in the profile.
+        if self.deferred_code_writes.is_open() && self.code_write_watched(physical, width) {
             self.record_deferred_code_write(physical, width, lanes);
             return true;
         }
