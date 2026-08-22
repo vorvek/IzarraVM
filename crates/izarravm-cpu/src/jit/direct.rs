@@ -1630,11 +1630,21 @@ impl BlockCache {
     /// Drop every demoted site the write at `physical..physical + width` lands on, because the
     /// code the judgement was about is being replaced.
     ///
-    /// Called from the code-write door and NOT from `invalidate_physical_range`, which is where it
-    /// naturally belongs and where it would not run: that function is gated behind
-    /// `range_hits_compiled_code`, and a demotion RETIRES its block, so by the time an overlay is
-    /// written over the site there is usually no compiled block left to make the range hit. This
-    /// map outlives blocks by design and has to be maintained where the writes are seen.
+    /// Called from BOTH of `note_code_write_inner`'s invalidation doors -- the compiled-block one
+    /// and the decode-line one -- and from neither `invalidate_physical_range` nor the top of that
+    /// function. Each of those three placements is wrong in its own way:
+    ///
+    /// * `invalidate_physical_range` alone misses most of it. A demotion RETIRES its block, so by
+    ///   the time an overlay lands there is usually no compiled block left to make
+    ///   `range_hits_compiled_code` true. The decode line is still live, because the interpreter
+    ///   is now running that instruction.
+    /// * the top of `note_code_write_inner` catches everything and costs too much: that is the
+    ///   door every CHANGED byte store takes, watched or not, and a `retain` over sixty entries on
+    ///   each of several million stores measured 1.15x min wall against this placement on the
+    ///   tombraid loader (four interleaved pairs). The `is_empty` shortcut only helps a run that
+    ///   has demoted nothing, which is every run until one does.
+    /// * the two doors together cost nothing measurable: both have already established that the
+    ///   write touches code, which is a tiny fraction of stores.
     ///
     /// Left stale, the ban follows the address into whatever code is written there next and only a
     /// whole-cache wipe lifts it: a permanent, silent coverage loss on an overlay-loading guest.

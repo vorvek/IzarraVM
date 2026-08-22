@@ -509,13 +509,6 @@ impl CpuGsw {
             self.record_deferred_code_write(physical, width, lanes);
             return true;
         }
-        // The demoted-call-out map, maintained HERE rather than at an invalidation door, because
-        // it outlives the blocks it was learned from and the doors are gated on a block still
-        // covering the range. See `BlockCache::forget_demoted_sites_in`. Below the window branch
-        // above on purpose: a write the window defers is replayed through this same function with
-        // the flag clear, so it reaches this line then instead of twice.
-        #[cfg(feature = "jit")]
-        self.jit_direct.forget_demoted_sites_in(physical, width);
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
@@ -561,6 +554,10 @@ impl CpuGsw {
             {
                 census_block_scan = true;
             }
+            // The demoted-call-out map. See `BlockCache::forget_demoted_sites_in`, and the note in
+            // the decode branch below for why it is called from BOTH doors and from neither the
+            // top of this function nor `invalidate_physical_range`.
+            self.jit_direct.forget_demoted_sites_in(physical, width);
             let outcome = self
                 .jit_direct
                 .invalidate_physical_range(physical, width, lanes);
@@ -578,6 +575,26 @@ impl CpuGsw {
         let _ = lanes;
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
+            // The demoted-call-out map, at the second of the two doors. It has to be BOTH because
+            // it outlives blocks: a demotion retires its block, so an overwrite that arrives later
+            // often reaches only this one -- the interpreter is still running that instruction, so
+            // its decode line is live even though its block is gone.
+            //
+            // And it has to be HERE and not at the top of this function, which is where it was
+            // written first: that is the door EVERY changed byte store takes, watched or not, and
+            // a `retain` over the map's sixty entries on each of several million stores is not a
+            // probe, it is a scan. MEASURED on the tombraid loader, four interleaved pairs of the
+            // two placements, min wall 8.075 s against 7.007 s -- 1.15x, on a host loaded enough
+            // that both arms ran a second above their quiet-host figures, which interleaving is
+            // what controls for. Both branches it now sits in have already established that the
+            // write touches code, which is a tiny fraction of stores.
+            //
+            // What that trades away, said plainly: a write that hits neither a compiled block nor
+            // a decode line leaves the site stale. That is the same population the block cache
+            // itself never hears about, so the map is exactly as current as `entries` is, and the
+            // residue is one missed lowering at one address until the next wipe.
+            #[cfg(feature = "jit")]
+            self.jit_direct.forget_demoted_sites_in(physical, width);
             if self.profile.enabled {
                 // Flush-source census (64-byte physical blocks): locates the code/data byte
                 // sharing behind a residual SMC flush storm. Off the common path (flushes only).
