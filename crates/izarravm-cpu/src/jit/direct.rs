@@ -6587,10 +6587,14 @@ fn stack_width_kind(
             Some(DirectKind::Enter16 { alloc, stack32 })
         }
         (DirectKind::Enter16 { .. }, _, _) => None,
-        // LEAVE's Word cells, both stack widths. The Dword cells fall through: SS.B = 1 is the
-        // blanket arm below, and SS.B = 0 reaches `_ => None`, which is the refusal the
-        // `Leave` variant's doc comment names.
+        // LEAVE's Word cells, both stack widths. The Dword cell on a 32-bit stack is the blanket
+        // arm below.
         (DirectKind::Leave, stack32, OperandSize::Word) => Some(DirectKind::Leave16 { stack32 }),
+        // The fourth cell, spelled out rather than left to `_ => None`: a Dword LEAVE on a 16-bit
+        // stack would read four bytes and advance four with a 16-bit pointer, and no emitter
+        // builds that. A silent fallthrough is the same answer for as long as no arm below
+        // happens to match `Leave`, which is a property of the arm order rather than a decision.
+        (DirectKind::Leave, false, OperandSize::Dword) => None,
         (kind, true, OperandSize::Dword) => Some(kind),
         (DirectKind::Push { source }, false, OperandSize::Word) => {
             Some(DirectKind::Push16 { source })
