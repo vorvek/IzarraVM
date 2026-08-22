@@ -139,7 +139,7 @@ fn build_n(bodies: &[&[u8]], seed: Seed) -> Roles {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: the form is still a barrier")
         }
-        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     assert_eq!(
         usize::from(compilation.span.instructions),

@@ -239,7 +239,7 @@ fn slot_block_with(
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: IN AL,DX is still a barrier")
         }
-        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     assert_eq!(
         compilation.span.instructions, 3,
@@ -1752,7 +1752,7 @@ fn governor_block(
     let compilation = match jit::direct::compile(&mut cpu, ENTRY, true) {
         jit::direct::CompileOutcome::Compiled(compilation) => compilation,
         jit::direct::CompileOutcome::StructuralReject(_) => panic!("structurally rejected"),
-        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     assert_eq!(
         usize::from(compilation.span.instructions),
@@ -2247,7 +2247,7 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("block B structurally rejected")
         }
-        jit::direct::CompileOutcome::Retry => panic!("block B asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("block B asked for a retry"),
     };
     assert_eq!(compilation.span.instructions, 3);
     assert_eq!(compilation.callout_slots, 0);

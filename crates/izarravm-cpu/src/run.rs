@@ -1470,9 +1470,12 @@ impl CpuGsw {
                         self.sweep_block_watch_edges();
                         return Ok(DirectContinuation::Interpret);
                     }
-                    jit::direct::CompileOutcome::Retry => {
-                        self.jit_direct
-                            .dormant(key, jit::direct::DormantReason::CompileRetry);
+                    jit::direct::CompileOutcome::Retry(cause) => {
+                        self.jit_direct.dormant(
+                            key,
+                            jit::direct::DormantReason::CompileRetry,
+                            Some(cause),
+                        );
                         return Ok(DirectContinuation::Interpret);
                     }
                 };
@@ -1493,7 +1496,7 @@ impl CpuGsw {
                 });
                 if !code_page_covers_block {
                     self.jit_direct
-                        .dormant(key, jit::direct::DormantReason::PageCoverFailed);
+                        .dormant(key, jit::direct::DormantReason::PageCoverFailed, None);
                     return Ok(DirectContinuation::Interpret);
                 }
                 // G1 pre-install gate (full span): the compiled block may cover chunks past its
@@ -1525,7 +1528,7 @@ impl CpuGsw {
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {
                     self.jit_direct
-                        .dormant(key, jit::direct::DormantReason::InstallFailed);
+                        .dormant(key, jit::direct::DormantReason::InstallFailed, None);
                     return Ok(DirectContinuation::Interpret);
                 };
                 // E2 sweep before this or any block runs (watched-page-bit design D4): the

@@ -7115,7 +7115,7 @@ fn an_override_naming_an_inaccessible_segment_refuses_to_compile_at_all() {
                         "{label} control: the block must span both INCs and the access"
                     );
                 }
-                jit::direct::CompileOutcome::Retry => assert!(
+                jit::direct::CompileOutcome::Retry(_) => assert!(
                     !expect_block,
                     "{label} control: the accessible descriptor must compile"
                 ),

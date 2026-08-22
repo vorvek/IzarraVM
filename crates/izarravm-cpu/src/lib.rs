@@ -1906,6 +1906,19 @@ pub struct InterpretOneRowCounts {
     pub demoted: u64,
 }
 
+/// One compile-walk retry cause, named by its census label.
+///
+/// `cause` is the label rather than the enum for `InterpretOneRowCounts`' reason: this struct is
+/// the crate's PUBLIC reporting surface and the walk's cause enum is an internal detail of the
+/// JIT. `count` is attempts and `keys` is distinct keys parked; see `DirectStallTally` for the
+/// difference and why both are worth carrying.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetryCauseCounts {
+    pub cause: &'static str,
+    pub count: u64,
+    pub keys: u64,
+}
+
 /// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here
 /// used to fold into a state (`Dormant`), a bool (`try_link_inner` returning false) or one
 /// catch-all counter (`SideExitReason::Other`), which is why the three largest unattributed exit
@@ -1914,6 +1927,9 @@ pub struct InterpretOneRowCounts {
 pub struct DirectStallSnapshot {
     /// (label, count) per `DormantReason`.
     pub dormant: Vec<(&'static str, u64)>,
+    /// The `compile_retry` entry of `dormant` split by which compile-walk gate gave up, per
+    /// `RetryCause`. The `count` column sums to that entry exactly.
+    pub retry_causes: Vec<RetryCauseCounts>,
     /// (label, count) per `LinkRefusal`.
     pub link_refusals: Vec<(&'static str, u64)>,
     /// (label, count) per `LinkClearCause` — the cause split behind the aggregate

@@ -2976,6 +2976,17 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
             .iter()
             .map(|(label, count)| json!({ "reason": label, "count": count }))
             .collect::<Vec<_>>(),
+        // The `compile_retry` row of `dormant` split by which compile-walk gate gave up. `count`
+        // is attempts and sums to that row exactly; `keys` counts the distinct block keys each
+        // cause parked, which is the column that joins against the dormant population a barrier
+        // census reports.
+        "jit_direct_retry_causes": snapshot
+            .retry_causes
+            .iter()
+            .map(|counts| {
+                json!({ "cause": counts.cause, "count": counts.count, "keys": counts.keys })
+            })
+            .collect::<Vec<_>>(),
         "link_refusals": snapshot
             .link_refusals
             .iter()

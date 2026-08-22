@@ -58,7 +58,7 @@ use census::{BarrierStop, SuffixSeed, record_structural_barrier};
 pub(crate) use census::AdmissionDecline;
 pub(crate) use census::{
     BlockCacheStats, DirectBarrierCensus, DirectStallTally, DormantReason, LinkClearCause,
-    LinkRefusal, UnboundTarget, barrier_census_default,
+    LinkRefusal, RetryCause, UnboundTarget, barrier_census_default,
 };
 #[cfg(feature = "direct-link-refusal-census")]
 pub(crate) use census::{DirectLinkRefusalCensus, direct_link_refusal_census_default};
@@ -1341,9 +1341,31 @@ impl BlockCache {
     /// question the counter answers is "how often did this gate fire", not "how many keys does
     /// the map now hold in each state", and a key already Dormant from an earlier attempt would
     /// otherwise vanish from the tally.
-    pub(crate) fn dormant(&mut self, key: BlockKey, reason: DormantReason) {
+    ///
+    /// `retry_cause` is `Some` exactly when `reason` is `CompileRetry`: it is the compile walk's
+    /// own answer, threaded here through `CompileOutcome::Retry` because this is the one site
+    /// that runs once per compile attempt. The `keys` column is incremented only on the branch
+    /// that actually parks the entry, which makes it a count of DISTINCT keys parked for that
+    /// cause rather than of attempts.
+    pub(crate) fn dormant(
+        &mut self,
+        key: BlockKey,
+        reason: DormantReason,
+        retry_cause: Option<RetryCause>,
+    ) {
+        debug_assert_eq!(
+            retry_cause.is_some(),
+            reason == DormantReason::CompileRetry,
+            "a compile Retry park carries its cause and no other park has one"
+        );
         self.stalls.dormant[reason as usize] += 1;
+        if let Some(cause) = retry_cause {
+            self.stalls.retry_causes[cause as usize] += 1;
+        }
         if self.entries.get(&key) == Some(&BlockState::Seen) {
+            if let Some(cause) = retry_cause {
+                self.stalls.retry_cause_keys[cause as usize] += 1;
+            }
             self.entries.insert(key, BlockState::Dormant(reason));
         }
     }
@@ -1552,7 +1574,7 @@ impl BlockCache {
     }
 
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
-        self.dormant(key, DormantReason::SpanHot);
+        self.dormant(key, DormantReason::SpanHot, None);
         let _ = heat.bump(key.physical, 1, epoch);
     }
 
@@ -3168,7 +3190,10 @@ impl std::fmt::Debug for BlockCache {
 pub(crate) enum CompileOutcome {
     Compiled(Compilation),
     StructuralReject(RejectedSpan),
-    Retry,
+    /// The walk gave up without naming a rejected span. The payload is WHICH gate gave up; it
+    /// reaches `BlockCache::dormant` unchanged and is the whole of `DirectStallTally`'s
+    /// `retry_causes` column.
+    Retry(RetryCause),
 }
 
 #[cfg(test)]
@@ -3176,7 +3201,7 @@ impl CompileOutcome {
     pub(crate) fn expect(self, message: &str) -> Compilation {
         match self {
             Self::Compiled(compilation) => compilation,
-            Self::StructuralReject(_) | Self::Retry => panic!("{message}"),
+            Self::StructuralReject(_) | Self::Retry(_) => panic!("{message}"),
         }
     }
 
@@ -3187,7 +3212,7 @@ impl CompileOutcome {
     pub(crate) fn unwrap_or_else(self, fallback: impl FnOnce() -> Compilation) -> Compilation {
         match self {
             Self::Compiled(compilation) => compilation,
-            Self::StructuralReject(_) | Self::Retry => fallback(),
+            Self::StructuralReject(_) | Self::Retry(_) => fallback(),
         }
     }
 
@@ -6479,8 +6504,15 @@ fn compile_with_page_len(
         cpu.jit_direct.note_compile_page_search_step();
         let candidate = match compile_with_instruction_limit(cpu, entry_lin, d, midpoint) {
             CompileOutcome::Compiled(compilation) => compilation,
-            CompileOutcome::StructuralReject(_) | CompileOutcome::Retry => {
-                return CompileOutcome::Retry;
+            // The INNER cause propagates. This arm is defence in depth rather than a live
+            // path: a search step walks a PREFIX of a block the full walk already compiled, so
+            // every per-slot gate it meets has already answered yes, its `stop` can only be the
+            // loop-limit `Boundary`, and `midpoint` is never below three. Nothing here can
+            // Retry today. It is written to carry the cause anyway so that a future gate which
+            // does depend on the block's length reports itself instead of the host page.
+            CompileOutcome::Retry(cause) => return CompileOutcome::Retry(cause),
+            CompileOutcome::StructuralReject(_) => {
+                return CompileOutcome::Retry(RetryCause::HostPageLen);
             }
         };
         if candidate.code.len() <= page_len {
@@ -6490,7 +6522,10 @@ fn compile_with_page_len(
             upper = midpoint - 1;
         }
     }
-    best.map_or(CompileOutcome::Retry, CompileOutcome::Compiled)
+    best.map_or(
+        CompileOutcome::Retry(RetryCause::HostPageLen),
+        CompileOutcome::Compiled,
+    )
 }
 
 #[cfg(test)]
@@ -6506,7 +6541,7 @@ pub(crate) fn compile_with_page_len_for_test(
 #[derive(Clone, Copy)]
 enum CompileStop {
     Structural(RejectedSpan),
-    Retry,
+    Retry(RetryCause),
     Boundary,
 }
 
@@ -7202,7 +7237,7 @@ fn compile_with_budget(
     byte_budget: usize,
 ) -> CompileOutcome {
     let Some(key) = key_for(cpu, entry_lin, d) else {
-        return CompileOutcome::Retry;
+        return CompileOutcome::Retry(RetryCause::NoKey);
     };
     // B.3: "a compile walk started here", recorded before anything can refuse the block, so a walk
     // that stops on its first slot still counts as tried. `key.linear()` and not `entry_lin` on
@@ -7267,16 +7302,16 @@ fn compile_with_budget(
             break;
         }
         let Some(insn) = cpu.decode_cache.get(lin, d) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::DecodeMiss);
             break;
         };
         let insn_len = u32::from(insn.len);
         if insn_len == 0 {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::DecodeMiss);
             break;
         }
         let Some(next) = lin.checked_add(insn_len) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::PageCross);
             break;
         };
         let slot_eip = lin.wrapping_sub(cs.base);
@@ -7284,22 +7319,31 @@ fn compile_with_budget(
             .checked_add(insn_len - 1)
             .is_none_or(|last| last > cs.limit)
         {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::SegmentLimit);
             break;
         }
         if entry_lin >> BLOCK_PAGE_SHIFT != next.wrapping_sub(1) >> BLOCK_PAGE_SHIFT {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::PageCross);
             break;
         }
         let Some(expected_phys) = key.physical.checked_add(lin.wrapping_sub(entry_lin)) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::PageCross);
             break;
         };
         let physical_page_local = expected_phys
             .checked_add(insn_len - 1)
             .is_some_and(|last| key.physical >> BLOCK_PAGE_SHIFT == last >> BLOCK_PAGE_SHIFT);
-        if !physical_page_local || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys) {
-            stop = CompileStop::Retry;
+        // Two different failures, and the retry instrument splits them because a retry policy
+        // would treat them differently: leaving the physical page is decided by the key and the
+        // instruction lengths and will read the same on every future walk, while a decode line
+        // whose physical start disagrees with the key's projection is the TRANSLATION having
+        // moved, which a later walk can find repaired.
+        if !physical_page_local {
+            stop = CompileStop::Retry(RetryCause::PageCross);
+            break;
+        }
+        if cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys) {
+            stop = CompileStop::Retry(RetryCause::TranslationMismatch);
             break;
         }
         let structural_span = RejectedSpan::new(key, next.wrapping_sub(entry_lin) as usize);
@@ -7351,7 +7395,10 @@ fn compile_with_budget(
                     },
                 );
             }
-            stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
+            stop = structural_span.map_or(
+                CompileStop::Retry(RetryCause::SpanUnformable),
+                CompileStop::Structural,
+            );
             break;
         }
         // Quake's 586 renderer benefits from native word operations. Doom's 486 self-patching
@@ -7387,7 +7434,10 @@ fn compile_with_budget(
                     },
                 );
             }
-            stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
+            stop = structural_span.map_or(
+                CompileStop::Retry(RetryCause::SpanUnformable),
+                CompileStop::Structural,
+            );
             break;
         }
         let planned = DirectUnitPlanner::classify(&insn, lin, entry_lin);
@@ -7516,7 +7566,10 @@ fn compile_with_budget(
                         },
                     );
                 }
-                stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
+                stop = structural_span.map_or(
+                    CompileStop::Retry(RetryCause::SpanUnformable),
+                    CompileStop::Structural,
+                );
                 break;
             }
         };
@@ -7546,7 +7599,7 @@ fn compile_with_budget(
         // it here is safe against block reuse because `jit_mode_key` already carries SS.B, so a
         // block compiled for one stack width can never be entered with the other.
         let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AdmissionMatrix);
             break;
         };
         // The governor's answer, applied at compile time instead of at every execution. A slot it
@@ -7596,7 +7649,10 @@ fn compile_with_budget(
                     },
                 );
             }
-            stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
+            stop = structural_span.map_or(
+                CompileStop::Retry(RetryCause::SpanUnformable),
+                CompileStop::Structural,
+            );
             break;
         }
         // A Word-size relative branch masks its target to 16 bits: `relative_jump` computes
@@ -7641,7 +7697,7 @@ fn compile_with_budget(
             }
         }
         if !control_target_ok || !kind_segment_access_supported(cpu, kind) {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AdmissionMatrix);
             break;
         }
         // The dirty-segment rule. Every base and selector a block uses is a compile-time
@@ -7703,7 +7759,7 @@ fn compile_with_budget(
         if kind.is_x87()
             && (x87_slots == MAX_X87_SLOTS || slots.len() >= MAX_X87_BLOCK_INSTRUCTIONS)
         {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::X87Cap);
             break;
         }
         // x87 and call-out slots do not share a block, in either order. The call-out hands the
@@ -7714,7 +7770,7 @@ fn compile_with_budget(
         // carry previewed across the call for no fixture that wants it. Refusing is a missed
         // lowering; admitting would be a silently wrong device timestamp.
         if (kind.is_x87() && callout_slots != 0) || (kind.is_call_out() && x87_slots != 0) {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::X87Cap);
             break;
         }
         if kind.is_call_out() && callout_slots == MAX_BLOCK_CALLOUT_SLOTS {
@@ -7722,18 +7778,18 @@ fn compile_with_budget(
             // the cap actually stops a walk, so it is a count of BLOCKS SHORTENED and not of
             // blocks that happen to hold four slots.
             cpu.jit_direct.note_callout_slot_cap_hit();
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::CalloutCap);
             break;
         }
         if kind.is_memory_alu()
             && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
                 || slots.len() >= MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS)
         {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::MemoryAluCap);
             break;
         }
         if kind.uses_stack() && stack_accesses == MAX_BLOCK_STACK_ACCESSES {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::StackAccessCap);
             break;
         }
         // The page budget. A BOUNDARY, not a Retry: the block simply ends here and its successor
@@ -7762,36 +7818,36 @@ fn compile_with_budget(
         }
         let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.persona());
         let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks()) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         let Some(next_weighted_fp_clocks) = weighted_fp_clocks.checked_add(slot_weighted_fp_clocks)
         else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         let Some(next_byte_reads) = byte_reads.checked_add(kind.byte_reads()) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         let Some(next_word_reads) = word_reads.checked_add(kind.word_reads()) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         let Some(next_dword_reads) = dword_reads.checked_add(kind.dword_reads()) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         let Some(next_byte_stores) = byte_stores.checked_add(kind.byte_stores()) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         let Some(next_word_stores) = word_stores.checked_add(kind.word_stores()) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         let Some(next_dword_stores) = dword_stores.checked_add(kind.dword_stores()) else {
-            stop = CompileStop::Retry;
+            stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
         stack_accesses += u8::from(kind.uses_stack());
@@ -7949,23 +8005,29 @@ fn compile_with_budget(
     {
         return match stop {
             CompileStop::Structural(span) => CompileOutcome::StructuralReject(span),
-            CompileStop::Retry | CompileStop::Boundary => CompileOutcome::Retry,
+            // The inner cause wins whenever the walk had already given up: the min-length rule
+            // did not decide anything there, it would only re-report the same failure.
+            // `Boundary` is the case the rule OWNS -- the walk ended cleanly on a terminal slot,
+            // the page budget or the dirty-segment rule, and the block is short only because the
+            // rule says three.
+            CompileStop::Retry(cause) => CompileOutcome::Retry(cause),
+            CompileStop::Boundary => CompileOutcome::Retry(RetryCause::TooShort),
         };
     }
     let Some(last) = slots.last() else {
-        return CompileOutcome::Retry;
+        return CompileOutcome::Retry(RetryCause::PostWalk);
     };
     let guest_len = last
         .lin
         .wrapping_add(u32::from(last.len))
         .wrapping_sub(entry_lin) as usize;
     let Some(span) = BlockSpan::new(key, guest_len, slots.len()) else {
-        return CompileOutcome::Retry;
+        return CompileOutcome::Retry(RetryCause::PostWalk);
     };
     let Some(segment_layout) =
         SegmentLayout::capture(cpu, read_segments, write_segments, pinned_segments)
     else {
-        return CompileOutcome::Retry;
+        return CompileOutcome::Retry(RetryCause::PostWalk);
     };
     // A self-loop block accounts by MULTIPLYING its whole static accounting by the iteration
     // count at exit, so nothing inside the loop body may deposit into the runtime lanes per
@@ -7997,7 +8059,7 @@ fn compile_with_budget(
             Some(DirectKind::Jcc { taken_delta: 0, .. })
         );
     if self_loop && x87_slots != 0 && x87_entry_top != x87_exit_top {
-        return CompileOutcome::Retry;
+        return CompileOutcome::Retry(RetryCause::PostWalk);
     }
     #[cfg(all(
         target_arch = "x86_64",
@@ -8013,7 +8075,7 @@ fn compile_with_budget(
         None
     } else {
         let Some(bases) = cpu.jit_fast_map.native_bases() else {
-            return CompileOutcome::Retry;
+            return CompileOutcome::Retry(RetryCause::PostWalk);
         };
         Some(bases)
     };
@@ -8030,7 +8092,7 @@ fn compile_with_budget(
     {
         None
     } else {
-        return CompileOutcome::Retry;
+        return CompileOutcome::Retry(RetryCause::PostWalk);
     };
     let memory_cpl3 = cpu.current_privilege_level() == 3;
     #[cfg(all(
@@ -8052,7 +8114,7 @@ fn compile_with_budget(
     let code_watch_tables = if byte_stores == 0 && word_stores == 0 && dword_stores == 0 {
         None
     } else {
-        return CompileOutcome::Retry;
+        return CompileOutcome::Retry(RetryCause::PostWalk);
     };
     // Republish the bases this block would bake, BEFORE it can be installed:
     // any block emitted on the R15 arm only ever runs after its own compile
@@ -8359,7 +8421,7 @@ pub(crate) fn compile_with_instruction_limit_for_test(
 ) -> Option<Compilation> {
     match compile_with_instruction_limit(cpu, entry_lin, d, instruction_limit) {
         CompileOutcome::Compiled(compilation) => Some(compilation),
-        CompileOutcome::StructuralReject(_) | CompileOutcome::Retry => None,
+        CompileOutcome::StructuralReject(_) | CompileOutcome::Retry(_) => None,
     }
 }
 

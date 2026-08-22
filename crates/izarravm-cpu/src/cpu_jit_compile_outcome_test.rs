@@ -84,7 +84,7 @@ fn structural(outcome: jit::direct::CompileOutcome) -> jit::direct::RejectedSpan
     match outcome {
         jit::direct::CompileOutcome::StructuralReject(span) => span,
         jit::direct::CompileOutcome::Compiled(_) => panic!("fixture unexpectedly compiled"),
-        jit::direct::CompileOutcome::Retry => panic!("fixture unexpectedly requested a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("fixture unexpectedly requested a retry"),
     }
 }
 
@@ -94,7 +94,7 @@ fn compiled(outcome: jit::direct::CompileOutcome) -> jit::direct::Compilation {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("fixture unexpectedly became a structural rejection")
         }
-        jit::direct::CompileOutcome::Retry => panic!("fixture unexpectedly requested a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("fixture unexpectedly requested a retry"),
     }
 }
 
@@ -1465,7 +1465,7 @@ fn missing_third_decode_retries_then_compiles_without_a_guest_write() {
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
     assert!(matches!(
         jit::direct::compile(&mut cpu, ENTRY, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     warm(&mut cpu, &mut bus, &[ENTRY + 2]);
@@ -1656,7 +1656,7 @@ fn page_straddling_barrier_retries_instead_of_becoming_persistent() {
 
     assert!(matches!(
         jit::direct::compile(&mut cpu, 0xfff, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
     assert!(cpu.decode_cache.get(0xfff, true).is_none());
 }
@@ -1672,7 +1672,7 @@ fn live_cs_limit_failure_retries_and_recovers_without_a_write() {
 
     assert!(matches!(
         jit::direct::compile(&mut cpu, ENTRY, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     cs.limit = old_limit;
@@ -1693,7 +1693,7 @@ fn live_segment_state_failure_retries_and_recovers_without_a_write() {
 
     assert!(matches!(
         jit::direct::compile(&mut cpu, ENTRY, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     ds.access = old_access;
@@ -1708,7 +1708,7 @@ fn emitted_size_exhaustion_is_retryable_for_short_and_long_blocks() {
     warm(&mut terminal_cpu, &mut terminal_bus, &[ENTRY]);
     assert!(matches!(
         jit::direct::compile_with_page_len_for_test(&mut terminal_cpu, ENTRY, true, 1),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     let (mut prefix_cpu, mut prefix_bus) = fixture(&[0x40, 0x41, 0x42, 0x43]);
@@ -1719,7 +1719,7 @@ fn emitted_size_exhaustion_is_retryable_for_short_and_long_blocks() {
     );
     assert!(matches!(
         jit::direct::compile_with_page_len_for_test(&mut prefix_cpu, ENTRY, true, 1),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 }
 
@@ -1859,8 +1859,11 @@ fn failed_install_consumes_seen_without_a_code_watch() {
     compilation.code.clear();
 
     assert!(cpu.jit_direct.install(&compilation).is_none());
-    cpu.jit_direct
-        .dormant(key, jit::direct::DormantReason::CompileRetry);
+    cpu.jit_direct.dormant(
+        key,
+        jit::direct::DormantReason::CompileRetry,
+        Some(jit::direct::RetryCause::TooShort),
+    );
     assert!(matches!(
         cpu.jit_direct.probe(key),
         jit::direct::BlockProbe::Rejected
@@ -3939,5 +3942,208 @@ fn census_suffix_stops_at_a_demoted_call_out_site() {
     assert_eq!(
         row.native_suffix_instructions, 2,
         "the two slots in front of the demoted site, and nothing past it"
+    );
+}
+
+// The retry-cause instrument (S4a). `DormantReason::CompileRetry` used to be the whole answer
+// for every non-structural compile failure, and on the tombraid loader that one label held 464
+// dormant keys absorbing 3.9 M static_unbound exits with no way to tell which of them a retry
+// could ever help. These fixtures pin one cause per family and pin the two counter columns.
+
+fn retry_cause(outcome: jit::direct::CompileOutcome) -> jit::direct::RetryCause {
+    match outcome {
+        jit::direct::CompileOutcome::Retry(cause) => cause,
+        jit::direct::CompileOutcome::Compiled(_) => panic!("fixture unexpectedly compiled"),
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("fixture unexpectedly became a structural rejection")
+        }
+    }
+}
+
+#[test]
+fn retry_cause_is_decode_miss_when_a_slot_has_no_line() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::DecodeMiss
+    );
+}
+
+#[test]
+fn retry_cause_is_segment_limit_when_a_slot_runs_past_cs_limit() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let mut cs = cpu.registers.cs();
+    cs.limit = ENTRY;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::SegmentLimit
+    );
+}
+
+/// The block-page rule, which is the walk's own 4 KiB boundary and not the guest's paging.
+/// Two slots fit below `0x1000` and the third does not, so the walk stops there with a prefix
+/// the min-length rule cannot install. The cause reported is the INNER one: `PageCross` and not
+/// `TooShort`, because the walk had already given up before the length rule looked at it. That
+/// ordering is the point of the assertion.
+#[test]
+fn retry_cause_is_page_cross_when_the_block_leaves_its_page() {
+    let mut memory = vec![0; 0x2000];
+    memory[0xffe..0x1001].copy_from_slice(&[0x40, 0x41, 0x42]);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = fresh();
+    cpu.set_fast_map_enabled_for_test(true);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .expect("initialize direct map");
+    warm(&mut cpu, &mut bus, &[0xffe, 0xfff, 0x1000]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, 0xffe, true)),
+        jit::direct::RetryCause::PageCross
+    );
+}
+
+/// The min-length rule owns the answer only when the walk itself ended on a BOUNDARY. The
+/// dirty-segment rule is the one boundary a two-slot block can reach: `mov ds,ax` overwrites the
+/// segment whose base the following load would bake, so the walk ends cleanly at one slot and
+/// the block is too short to install.
+#[test]
+fn retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block() {
+    let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::TooShort
+    );
+}
+
+/// The four block caps (x87 slots, call-out slots, memory-ALU slots, stack accesses) can only
+/// fire once the walk already holds three or more slots, so each of them SHORTENS a block and
+/// none of them can park a key. That is a structural property of the thresholds and not an
+/// accident of this fixture, and it is why `RetryCause::CalloutCap` reads zero on every
+/// workload today. Five `pop dword [eax]` slots against `MAX_BLOCK_CALLOUT_SLOTS` of four:
+/// the block installs with four and the cap counter moves.
+#[test]
+fn the_call_out_cap_shortens_the_block_instead_of_parking_the_key() {
+    let code = [0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00];
+    let (mut cpu, mut bus) = fixture(&code);
+    let addresses: Vec<_> = (0..5).map(|slot| ENTRY + slot * 2).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 4);
+    assert_eq!(cpu.direct_stall_snapshot().callout_slot_cap_hits, 1);
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::CalloutCap),
+        (0, 0)
+    );
+}
+
+/// The one member of the cap family that CAN park a key, because it is not a budget: x87 and
+/// call-out slots never share a block, in either order, and that rule fires at the second slot.
+/// `pop dword [eax]` then `fld1` leaves a one-slot prefix the min-length rule cannot install,
+/// and the inner cause is what gets reported.
+#[test]
+fn retry_cause_is_x87_cap_when_a_float_slot_follows_a_call_out() {
+    let (mut cpu, mut bus) = fixture(&[0x8f, 0x00, 0xd9, 0xe8, 0xd9, 0xe8]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2, ENTRY + 4]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::X87Cap
+    );
+}
+
+/// A one-byte arena page: the full walk compiles, overflows, and the recovery search finds no
+/// prefix that fits. That failure belongs to the search itself, so the cause is `HostPageLen`.
+#[test]
+fn retry_cause_is_host_page_len_when_no_prefix_fits_the_arena_page() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0x43]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    assert_eq!(
+        retry_cause(jit::direct::compile_with_page_len_for_test(
+            &mut cpu, ENTRY, true, 1
+        )),
+        jit::direct::RetryCause::HostPageLen
+    );
+}
+
+/// The fold in `compile_with_page_len` must not overwrite a cause the walk already named. Same
+/// one-byte page as above, but the full-length walk never reaches the size question because a
+/// slot has no decode line: the reported cause stays `DecodeMiss`.
+#[test]
+fn the_host_page_fold_reports_the_inner_cause() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    assert_eq!(
+        retry_cause(jit::direct::compile_with_page_len_for_test(
+            &mut cpu, ENTRY, true, 1
+        )),
+        jit::direct::RetryCause::DecodeMiss
+    );
+}
+
+fn retry_cause_counts(cpu: &CpuGsw, cause: jit::direct::RetryCause) -> (u64, u64) {
+    let snapshot = cpu.direct_stall_snapshot();
+    let compile_retry = snapshot
+        .dormant
+        .iter()
+        .find(|(label, _)| *label == "compile_retry")
+        .expect("the compile_retry dormant row")
+        .1;
+    assert_eq!(
+        snapshot
+            .retry_causes
+            .iter()
+            .map(|counts| counts.count)
+            .sum::<u64>(),
+        compile_retry,
+        "the cause split must sum to the dormant row it splits"
+    );
+    let row = snapshot
+        .retry_causes
+        .iter()
+        .find(|counts| counts.cause == cause.label())
+        .expect("every cause has a row");
+    (row.count, row.keys)
+}
+
+/// The two columns are different questions. `count` is attempts and rises on every park;
+/// `keys` counts the distinct keys the park moved out of `Seen`, so a second attempt on a key
+/// that is already Dormant raises the first and not the second.
+#[test]
+fn retry_causes_are_counted_once_per_attempt_and_once_per_key() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    cpu.set_jit_auto_admit(true);
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss),
+        (0, 0)
+    );
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("first observation parks the key Seen");
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("the compile attempt retries");
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss),
+        (1, 1)
+    );
+
+    // A second park of the same key. The entry is no longer `Seen`, so only the attempt column
+    // moves; that is what makes `keys` a count of the dormant population rather than of work.
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    cpu.jit_direct.dormant(
+        key,
+        jit::direct::DormantReason::CompileRetry,
+        Some(jit::direct::RetryCause::DecodeMiss),
+    );
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss),
+        (2, 1)
     );
 }

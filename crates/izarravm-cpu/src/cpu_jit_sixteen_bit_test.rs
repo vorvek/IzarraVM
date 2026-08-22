@@ -111,7 +111,7 @@ fn install_sixteen_bit_block(
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("the 16-bit block became a structural rejection")
         }
-        jit::direct::CompileOutcome::Retry => panic!("the 16-bit block requested a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("the 16-bit block requested a retry"),
     };
     assert_eq!(
         compilation.span.instructions, expected_instructions,
@@ -907,7 +907,7 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("the Word group-2 block must still compile: structural reject")
         }
-        jit::direct::CompileOutcome::Retry => {
+        jit::direct::CompileOutcome::Retry(_) => {
             panic!("the Word group-2 block must still compile: retry")
         }
     };

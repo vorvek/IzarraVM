@@ -467,6 +467,24 @@ pub(crate) struct DirectStallTally {
     /// that had simply never been hot enough to try -- which is what made the 5.2M-exit
     /// seen-not-compiled bucket unattributable.
     pub dormant: [u64; DormantReason::COUNT],
+    /// The `DormantReason::CompileRetry` column split by which compile-walk gate gave up,
+    /// indexed by `RetryCause`. Sums to `dormant[CompileRetry]` exactly, which is the pin the
+    /// tests assert.
+    ///
+    /// Counted HERE, in `BlockCache::dormant`, and not at the twenty-odd `CompileStop::Retry`
+    /// sites, for one reason: `compile_with_page_len` re-enters the walk once per step of its
+    /// recovery binary search, so a per-site counter would multiply a single failed compile by
+    /// the search depth and would let two steps of the same search disagree about the cause.
+    /// `dormant` fires exactly once per compile attempt, so the count is per attempt by
+    /// construction and needs no census gate to stay honest. That is the same reason the
+    /// `instruction_limit >= MAX_BLOCK_INSTRUCTIONS && barrier_census_enabled()` pattern guards
+    /// the in-walk `record_structural_barrier` calls and is absent here.
+    pub retry_causes: [u64; RetryCause::COUNT],
+    /// The same split counted once per KEY rather than once per attempt: incremented only when
+    /// the park actually moved an entry from `Seen` to `Dormant`. `retry_causes` divided by this
+    /// is how many attempts a dormant key costs before it settles, and this column is the one
+    /// that joins against the 464-key dormant population the loader census reports.
+    pub retry_cause_keys: [u64; RetryCause::COUNT],
     /// Why `try_link_inner` refused an edge, indexed by `LinkRefusal`. Every one of these leaves
     /// the source cell on the zero portal, so the exit reports `StaticUnbound` and is
     /// indistinguishable from a target that was never compiled.
@@ -671,10 +689,11 @@ pub(crate) struct DirectStallTally {
 /// outcome; see `BlockCacheStats::dormant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DormantReason {
-    /// `CompileOutcome::Retry`. Twenty distinct `CompileStop::Retry` sites fold into this one
-    /// value, so it is still coarse -- but it separates "the compiler gave up" from the three
-    /// post-compile gates below, which is the split that decides whether retrying is worth
-    /// anything.
+    /// `CompileOutcome::Retry`. Every `CompileStop::Retry` site folds into this one value, so it
+    /// separates "the compiler gave up" from the three post-compile gates below, which is the
+    /// split that decides whether retrying is worth anything. WHICH site gave up is the second
+    /// question, and `RetryCause` answers it: the outcome carries the cause and
+    /// `BlockCache::dormant` files it under `DirectStallTally::retry_causes`.
     CompileRetry,
     /// G4: no single RAM direct page covers the block's whole physical span.
     PageCoverFailed,
@@ -700,6 +719,117 @@ impl DormantReason {
             Self::PageCoverFailed => "page_cover_failed",
             Self::SpanHot => "span_hot",
             Self::InstallFailed => "install_failed",
+        }
+    }
+}
+
+/// Which family of compile-walk gate produced a `CompileOutcome::Retry`.
+///
+/// WHY THIS EXISTS. On the tombraid loader phase, 464 dormant keys absorb 3.9 M `static_unbound`
+/// exits and are never retried, and every one of them is filed under the single
+/// `DormantReason::CompileRetry` label. That label answers "the compiler gave up" and nothing
+/// else, so it cannot say whether a retry would ever succeed. The split here is the precondition
+/// for a retry policy: some of these causes are DETERMINISTIC in the key (the caps, the
+/// admission matrix, the min-length rule) and re-walking would reach the same answer forever,
+/// while others are CLEARABLE by state that moves independently of the code bytes (a decode line
+/// that was not resident, a translation that has since been refilled, an arena page that was
+/// full). A lift arm may only re-probe the second group.
+///
+/// One variant per cause FAMILY, not per site: eleven accumulator overflows share
+/// `AccumulatorOverflow` because no retry policy would ever treat two of them differently, and
+/// three separate `record_structural_barrier` arms share `SpanUnformable` because what they have
+/// in common (the walk found a real barrier but could not name a span for it) is the whole
+/// content of the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryCause {
+    /// `key_for` could not canonicalize the entry: no translation, or a key the cache cannot
+    /// form. Clearable.
+    NoKey,
+    /// The decode cache had no line for the slot, or handed back a zero-length instruction.
+    /// Clearable: the line is refilled by the interpreter running the same bytes.
+    DecodeMiss,
+    /// The block's guest span left its page, or an address computation wrapped the linear or
+    /// physical address space. Deterministic in the key.
+    PageCross,
+    /// The slot ran past `cs.limit`. Clearable only by a segment reload, which moves the mode
+    /// key, so from THIS key's point of view it is deterministic.
+    SegmentLimit,
+    /// The decode line's physical start disagreed with the key's own physical projection: the
+    /// translation moved under the walk. Clearable.
+    TranslationMismatch,
+    /// A real structural barrier whose `RejectedSpan` could not be formed (the prefix is too
+    /// long for the span's length field), so the walk cannot park the span as `Rejected` and
+    /// falls back to a whole-key Retry. Deterministic.
+    SpanUnformable,
+    /// `stack_width_kind` refused the SS.B / operand-size cell, the control-transfer target left
+    /// the clamped limit, or the segment access is unsupported. Deterministic in the key, which
+    /// carries SS.B and the segment layout.
+    AdmissionMatrix,
+    /// The x87 slot budget, or the rule that x87 and call-out slots never share a block.
+    /// Deterministic.
+    X87Cap,
+    /// `MAX_BLOCK_CALLOUT_SLOTS`. Deterministic.
+    CalloutCap,
+    /// `MAX_MEMORY_ALU_SLOTS` or the memory-ALU block length. Deterministic.
+    MemoryAluCap,
+    /// `MAX_BLOCK_STACK_ACCESSES`. Deterministic.
+    StackAccessCap,
+    /// One of the eleven `checked_add` accumulators (clocks, per-width reads and stores)
+    /// saturated. Deterministic.
+    AccumulatorOverflow,
+    /// The post-walk min-length rule: fewer than three slots and the last one is not terminal.
+    /// Raised only when the walk itself ended on a BOUNDARY, so this names the min-length rule
+    /// as the cause rather than shadowing an inner Retry. Deterministic for a given block shape,
+    /// and the reason a call-out-led two-slot block never installs (`is_terminal` excludes
+    /// `CallOut`).
+    TooShort,
+    /// A post-walk structure the block needs could not be built: the span, the segment layout,
+    /// the fast-map bases, the code-watch tables, or the self-loop x87 TOP rule. Mostly
+    /// clearable (the map bases and watch tables are host-side state).
+    PostWalk,
+    /// The host-page recovery search in `compile_with_page_len` could not find any prefix that
+    /// fits one arena page. Clearable in principle (the size model and the page length are host
+    /// state) but expected to be near zero since the walk gained its own page budget.
+    HostPageLen,
+}
+
+impl RetryCause {
+    pub(crate) const COUNT: usize = 15;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::NoKey,
+        Self::DecodeMiss,
+        Self::PageCross,
+        Self::SegmentLimit,
+        Self::TranslationMismatch,
+        Self::SpanUnformable,
+        Self::AdmissionMatrix,
+        Self::X87Cap,
+        Self::CalloutCap,
+        Self::MemoryAluCap,
+        Self::StackAccessCap,
+        Self::AccumulatorOverflow,
+        Self::TooShort,
+        Self::PostWalk,
+        Self::HostPageLen,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NoKey => "no_key",
+            Self::DecodeMiss => "decode_miss",
+            Self::PageCross => "page_cross",
+            Self::SegmentLimit => "segment_limit",
+            Self::TranslationMismatch => "translation_mismatch",
+            Self::SpanUnformable => "span_unformable",
+            Self::AdmissionMatrix => "admission_matrix",
+            Self::X87Cap => "x87_cap",
+            Self::CalloutCap => "callout_cap",
+            Self::MemoryAluCap => "memory_alu_cap",
+            Self::StackAccessCap => "stack_access_cap",
+            Self::AccumulatorOverflow => "accumulator_overflow",
+            Self::TooShort => "too_short",
+            Self::PostWalk => "post_walk",
+            Self::HostPageLen => "host_page_len",
         }
     }
 }
@@ -1857,6 +1987,14 @@ impl crate::jit::JitState {
             dormant: DormantReason::ALL
                 .iter()
                 .map(|r| (r.label(), self.stalls.dormant[*r as usize]))
+                .collect(),
+            retry_causes: RetryCause::ALL
+                .iter()
+                .map(|c| crate::RetryCauseCounts {
+                    cause: c.label(),
+                    count: self.stalls.retry_causes[*c as usize],
+                    keys: self.stalls.retry_cause_keys[*c as usize],
+                })
                 .collect(),
             link_refusals: LinkRefusal::ALL
                 .iter()

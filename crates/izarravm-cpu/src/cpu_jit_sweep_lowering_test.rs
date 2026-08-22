@@ -139,7 +139,7 @@ fn differential_full(
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("{context}: structurally rejected; the opcode is still a barrier")
         }
-        jit::direct::CompileOutcome::Retry => panic!("{context}: compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("{context}: compile asked for a retry"),
     };
     let id = native
         .jit_direct

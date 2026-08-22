@@ -527,7 +527,7 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: the row under test is still a barrier")
         }
-        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     assert_eq!(
         compilation.span.instructions, 3,

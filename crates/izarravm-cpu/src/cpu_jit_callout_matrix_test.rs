@@ -148,7 +148,7 @@ fn build(
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: IN AL,DX is still a barrier")
         }
-        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     let instructions = compilation.span.instructions;
     let callout_slots = compilation.callout_slots;

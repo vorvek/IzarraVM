@@ -163,7 +163,7 @@ fn build(body: &[u8], seed: Seed) -> Roles {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: the F7 form is still a barrier")
         }
-        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     assert_eq!(
         compilation.span.instructions, 3,

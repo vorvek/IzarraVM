@@ -1727,7 +1727,11 @@ fn lift_cold_smc_dormant_reports_which_of_its_three_shapes_it_took() {
     );
 
     // Dormant with no heat stamp (compile Retry, G4 cover failure): parked, and parked again.
-    cache.dormant(seen, DormantReason::CompileRetry);
+    cache.dormant(
+        seen,
+        DormantReason::CompileRetry,
+        Some(RetryCause::TooShort),
+    );
     assert_eq!(
         cache.lift_cold_smc_dormant(&mut heat, seen, 0),
         DormantLift::StillDormant
@@ -2848,14 +2852,18 @@ fn unbound_target_classes_are_exhaustive() {
     // Dormant, split by reason. `SpanHot` is the heat lane; the other three share the residual.
     let heat = key(0x1100);
     assert!(matches!(cache.probe(heat), BlockProbe::Interpret));
-    cache.dormant(heat, DormantReason::SpanHot);
+    cache.dormant(heat, DormantReason::SpanHot, None);
     assert_eq!(
         cache.classify_unbound_target(heat),
         UnboundTarget::DormantHeat
     );
     let other = key(0x1200);
     assert!(matches!(cache.probe(other), BlockProbe::Interpret));
-    cache.dormant(other, DormantReason::CompileRetry);
+    cache.dormant(
+        other,
+        DormantReason::CompileRetry,
+        Some(RetryCause::TooShort),
+    );
     assert_eq!(
         cache.classify_unbound_target(other),
         UnboundTarget::DormantOther
@@ -2915,7 +2923,11 @@ fn admission_census_rejected_probe_classifier_covers_every_cache_state_and_disab
 
     let dormant = key(0x1a00);
     assert!(matches!(cache.probe(dormant), BlockProbe::Interpret));
-    cache.dormant(dormant, DormantReason::CompileRetry);
+    cache.dormant(
+        dormant,
+        DormantReason::CompileRetry,
+        Some(RetryCause::TooShort),
+    );
     assert_eq!(
         cache.classify_rejected_probe(dormant),
         Some(AdmissionDecline::DormantProbe)
