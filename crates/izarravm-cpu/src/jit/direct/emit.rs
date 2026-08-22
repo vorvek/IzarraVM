@@ -128,6 +128,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         x87_entry_top,
         memory,
         link_cell_ptrs,
+        interpret_one_cells,
         fetch_trace,
     } = input;
     let full_accounting = StaticAccounting {
@@ -202,6 +203,11 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     let mut terminal = false;
     let mut x87_gate_emitted = false;
     let mut current_x87_top = x87_entry_top;
+    // Which `InterpretOne` cell the next such slot takes. The cells are allocated by the compile
+    // walk in slot order, so a cursor is the whole of the mapping; keying them by slot index would
+    // have meant a sparse array `MAX_BLOCK_INSTRUCTIONS` long for at most
+    // `MAX_BLOCK_CALLOUT_SLOTS` entries.
+    let mut interpret_one_index = 0usize;
     for slot in slots {
         match slot.kind {
             DirectKind::MovReg { dst, src, width } => match width {
@@ -1511,12 +1517,27 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let abnormal_stub = e.label();
                 let step_break_common = e.label();
                 let step_break_stub = e.label();
+                // The `InterpretOne` class needs its slot cell (the fourth argument and the
+                // governor byte) and the two RESYNC stubs; the other three classes need neither
+                // and emit neither, which is what keeps their bytes identical.
+                let slot_cell = helper.interprets_one().then(|| {
+                    let cell = interpret_one_cells
+                        .get(interpret_one_index)
+                        .copied()
+                        .expect("every InterpretOne slot must have been allocated a cell");
+                    interpret_one_index += 1;
+                    cell
+                });
+                let resync_labels =
+                    slot_cell.map(|_| ((e.label(), e.label()), (e.label(), e.label())));
                 callout::emit_call_out(
                     &mut e,
                     helper,
                     completed_raw,
                     abnormal_stub,
                     step_break_stub,
+                    slot_cell,
+                    resync_labels.map(|((stub, _), (fault_stub, _))| (stub, fault_stub)),
                 );
                 side_exit_reason_stubs.push((
                     abnormal_stub,
@@ -1554,6 +1575,56 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed_weighted_fp_clocks,
                     ),
                 ));
+                // The two RESYNC exits, and the whole of what makes them different from every
+                // other exit in this function: their EIP DELTA IS ZERO. The helper already left
+                // `cpu.eip` at the architectural next address -- which for a fault is the
+                // handler's entry, not the instruction after the slot -- so `emit_advance_eip`
+                // must add nothing. Every other exit here computes a delta from the block's entry
+                // linear because the body never moved EIP; these two are the exception because the
+                // body did.
+                if let Some(((resync_stub, resync_common), (fault_stub, fault_common))) =
+                    resync_labels
+                {
+                    side_exit_reason_stubs.push((
+                        resync_stub,
+                        resync_common,
+                        SideExitReason::CallOutResync,
+                    ));
+                    side_exits.push((
+                        resync_common,
+                        0,
+                        side_exit(
+                            // RETIRED: the instruction ran, so the block owns its retirement and
+                            // its fetch, exactly as the step-break arm does.
+                            completed + 1,
+                            completed_raw,
+                            completed_byte_reads,
+                            completed_word_reads,
+                            completed_dword_reads,
+                            completed_weighted_fp_clocks,
+                        ),
+                    ));
+                    side_exit_reason_stubs.push((
+                        fault_stub,
+                        fault_common,
+                        SideExitReason::CallOutResyncFault,
+                    ));
+                    side_exits.push((
+                        fault_common,
+                        0,
+                        side_exit(
+                            // NOT retired: `finish_instruction` already counted the instruction in
+                            // `perf.instructions` and charged its clocks, and the helper charged
+                            // its fetch, so the block reports the prefix and nothing more.
+                            completed,
+                            completed_raw,
+                            completed_byte_reads,
+                            completed_word_reads,
+                            completed_dword_reads,
+                            completed_weighted_fp_clocks,
+                        ),
+                    ));
+                }
             }
             DirectKind::Call {
                 return_delta,
@@ -4363,7 +4434,7 @@ fn eip_offset() -> i32 {
     (core::mem::offset_of!(CpuGsw, registers) + core::mem::offset_of!(Registers, eip)) as i32
 }
 
-fn eflags_offset() -> i32 {
+pub(super) fn eflags_offset() -> i32 {
     (core::mem::offset_of!(CpuGsw, registers) + core::mem::offset_of!(Registers, eflags)) as i32
 }
 

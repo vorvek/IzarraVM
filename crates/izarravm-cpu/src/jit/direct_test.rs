@@ -70,6 +70,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         callout_slots: 0,
         callout_port_slots: 0,
         callout_memory_slots: 0,
+        callout_interpret_one_slots: 0,
         x87_entry_top: 0,
         x87_exit_top: 0,
         dynamic_successor: false,
@@ -77,6 +78,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets: [None, None],
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
+        interpret_one_cells: Vec::new(),
         body_offset: 0,
         imm_lanes: [NO_IMM_LANE; MAX_BLOCK_IMM_LANES],
         imm_lane_widths: [0; MAX_BLOCK_IMM_LANES],

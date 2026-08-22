@@ -25,8 +25,10 @@ pub(crate) use native_exit::{
 /// `jit::direct::X` path that named a segment-layout item keeps naming it here.
 pub(crate) use segment_layout::*;
 
+#[cfg(test)]
+pub(crate) use callout::ResumeSnapshot;
 pub(crate) use callout::{
-    CALL_OUT_STACK_FRAME_DWORDS, CallOutHelper, CallOutSlotCounts, CallOutTable,
+    CALL_OUT_STACK_FRAME_DWORDS, CallOutHelper, CallOutSlotCounts, CallOutTable, InterpretOneCell,
 };
 #[cfg(test)]
 pub(crate) use callout::{
@@ -461,6 +463,14 @@ impl CompiledBlock {
         self.callout_slots.memory()
     }
 
+    /// Call-out slots that run one interpreter instruction. Priced at
+    /// `INTERPRET_ONE_MAX_CORE_CLOCKS` plus two worst-width data accesses each in
+    /// `compute_iteration_upper`, because unlike the other two classes this one is a maximum over
+    /// an allowlist rather than one opcode's constant.
+    pub(crate) fn callout_interpret_one_slots(&self) -> u32 {
+        self.callout_slots.interpret_one()
+    }
+
     pub(crate) fn weighted_fp_clocks(&self) -> u32 {
         self.weighted_fp_clocks
     }
@@ -726,6 +736,16 @@ pub(crate) struct BlockCache {
     lane_trial_override: Option<bool>,
     block_portals: Vec<Arc<BlockPortal>>,
     link_cells: Vec<[Arc<LinkCell>; 2]>,
+    /// One `InterpretOneCell` per `InterpretOne` slot, per block, in slot order.
+    ///
+    /// Beside `link_cells` and kept alive the same way, which is the whole of design review M11:
+    /// the governor's state has to survive as long as the emitted code that bakes its address, and
+    /// it must NOT be keyed by anything `retire_block` can recycle. A block's own allocation is
+    /// the only place with exactly that lifetime, and it is why the demotion needs no recompile.
+    ///
+    /// A `Vec` per block rather than a fixed array: `MAX_BLOCK_CALLOUT_SLOTS` blocks carry none at
+    /// all, and this vector is never read on an entry path -- only at install and at retire.
+    interpret_one_cells: Vec<Vec<Arc<InterpretOneCell>>>,
     link_sources: HashMap<usize, LinkSource<BlockId>>,
     outbound: Vec<[Option<BlockId>; 2]>,
     dynamic_next_slots: Vec<u8>,
@@ -878,6 +898,7 @@ impl BlockCache {
             lane_trial_override: None,
             block_portals: Vec::new(),
             link_cells: Vec::new(),
+            interpret_one_cells: Vec::new(),
             link_sources: HashMap::new(),
             outbound: Vec::new(),
             global_block_upper_cache: [0; 2],
@@ -1078,9 +1099,16 @@ impl BlockCache {
         // the total from the split, and `compute_iteration_upper` prices the split, so a classless
         // slot would be invisible to both.
         debug_assert_eq!(
-            compilation.callout_port_slots + compilation.callout_memory_slots,
+            compilation.callout_port_slots
+                + compilation.callout_memory_slots
+                + compilation.callout_interpret_one_slots,
             compilation.callout_slots,
-            "a call-out slot belongs to neither the port class nor the memory class"
+            "a call-out slot belongs to none of the three helper classes"
+        );
+        debug_assert_eq!(
+            usize::from(compilation.callout_interpret_one_slots),
+            compilation.interpret_one_cells.len(),
+            "every InterpretOne slot owns exactly one governor cell"
         );
         let block = CompiledBlock {
             id,
@@ -1104,6 +1132,7 @@ impl BlockCache {
             callout_slots: CallOutSlotCounts::new(
                 compilation.callout_port_slots,
                 compilation.callout_memory_slots,
+                compilation.callout_interpret_one_slots,
             ),
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
@@ -1128,6 +1157,8 @@ impl BlockCache {
                 self.block_portals[index].clear();
             }
             self.link_cells.push(compilation.link_cells.clone());
+            self.interpret_one_cells
+                .push(compilation.interpret_one_cells.clone());
             self.outbound.push([None, None]);
             self.dynamic_next_slots.push(0);
             self.block_link_epochs.push(0);
@@ -1152,6 +1183,7 @@ impl BlockCache {
             self.block_imm_lanes[index] = compilation.imm_lanes;
             self.block_imm_lane_widths[index] = compilation.imm_lane_widths;
             self.link_cells[index] = compilation.link_cells.clone();
+            self.interpret_one_cells[index] = compilation.interpret_one_cells.clone();
             self.outbound[index] = [None, None];
             self.dynamic_next_slots[index] = 0;
             self.block_link_epochs[index] = 0;
@@ -2422,6 +2454,7 @@ impl BlockCache {
         self.lane_trial_epochs.clear();
         self.top_mismatch_retires.clear();
         self.link_cells.clear();
+        self.interpret_one_cells.clear();
         self.link_sources.clear();
         self.outbound.clear();
         self.dynamic_next_slots.clear();
@@ -2988,6 +3021,9 @@ pub(crate) struct Compilation {
     /// The memory-class subset (`0x60`, `0x61`), each of which moves
     /// `CALL_OUT_STACK_FRAME_DWORDS` dwords of guest stack.
     pub callout_memory_slots: u8,
+    /// Slots whose helper runs one interpreter instruction; see `CallOutHelper::interprets_one`.
+    /// The length of `interpret_one_cells`, asserted at install.
+    pub callout_interpret_one_slots: u8,
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
     /// Readable outside this module for the same reason as `successors` below: a terminal that
@@ -3001,6 +3037,8 @@ pub(crate) struct Compilation {
     #[cfg(feature = "direct-link-refusal-census")]
     pub(crate) emitted_static_targets: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
+    /// One governor cell per `InterpretOne` slot, in slot order; see `BlockCache`'s field.
+    pub interpret_one_cells: Vec<Arc<InterpretOneCell>>,
     body_offset: usize,
     /// Physical start of each mutable immediate this block's emitted code reads from guest RAM,
     /// `NO_IMM_LANE` for an unused slot. `install` copies these into the cache's per-block lane
@@ -6995,6 +7033,11 @@ fn compile_with_instruction_limit(
     let mut callout_slots = 0u8;
     let mut callout_port_slots = 0u8;
     let mut callout_memory_slots = 0u8;
+    let mut callout_interpret_one_slots = 0u8;
+    // Built during the walk rather than after it, because each cell carries its slot's GUEST
+    // OFFSET and length, which are in hand here and would have to be recovered from `slots` and
+    // `span.key.linear` afterwards.
+    let mut interpret_one_cells: Vec<Arc<InterpretOneCell>> = Vec::new();
     let x87_entry_top = cpu.fpu.top();
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
@@ -7411,6 +7454,10 @@ fn compile_with_instruction_limit(
             break;
         }
         if kind.is_call_out() && callout_slots == MAX_BLOCK_CALLOUT_SLOTS {
+            // The evidence for or against raising the cap, which S5 prices. Counted at the point
+            // the cap actually stops a walk, so it is a count of BLOCKS SHORTENED and not of
+            // blocks that happen to hold four slots.
+            cpu.jit_direct.note_callout_slot_cap_hit();
             stop = CompileStop::Retry;
             break;
         }
@@ -7465,6 +7512,16 @@ fn compile_with_instruction_limit(
         if let Some(helper) = kind.call_out_helper() {
             callout_port_slots += u8::from(helper.probes_io_permission());
             callout_memory_slots += u8::from(helper.moves_a_stack_frame());
+            callout_interpret_one_slots += u8::from(helper.interprets_one());
+            if helper.interprets_one() {
+                // The slot's offset from the block's ENTRY linear, which is what the helper adds
+                // to the live `cpu.eip` to reach the instruction. `lin` is this instruction's
+                // linear address and `entry_lin` the block's; both are page-local by
+                // `BlockSpan::new`, so the difference fits a `u16` with three bits to spare.
+                let slot_delta = u16::try_from(lin.wrapping_sub(entry_lin))
+                    .expect("a page-local block's slot offset fits a u16");
+                interpret_one_cells.push(Arc::new(InterpretOneCell::new(slot_delta, insn.len)));
+            }
         }
         if let DirectKind::X87 { insn, .. } = kind {
             x87_exit_top = insn.advance_top(x87_exit_top);
@@ -7925,6 +7982,10 @@ fn compile_with_instruction_limit(
             .flatten(),
     ];
     let link_cells = [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())];
+    let interpret_one_cell_ptrs: Vec<usize> = interpret_one_cells
+        .iter()
+        .map(|cell| cell.address())
+        .collect();
     let emitted = emit::emit(EmitInput {
         slots: &slots,
         span,
@@ -7954,6 +8015,7 @@ fn compile_with_instruction_limit(
             },
         },
         link_cell_ptrs: link_cells.each_ref().map(|cell| cell.address()),
+        interpret_one_cells: &interpret_one_cell_ptrs,
         fetch_trace: cpu.jit_direct.native_fetch_trace,
     });
     CompileOutcome::Compiled(Compilation {
@@ -7975,6 +8037,7 @@ fn compile_with_instruction_limit(
         callout_slots,
         callout_port_slots,
         callout_memory_slots,
+        callout_interpret_one_slots,
         x87_entry_top,
         x87_exit_top,
         dynamic_successor,
@@ -7982,6 +8045,7 @@ fn compile_with_instruction_limit(
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets,
         link_cells,
+        interpret_one_cells,
         body_offset: emitted.body_offset,
         imm_lanes,
         imm_lane_widths,

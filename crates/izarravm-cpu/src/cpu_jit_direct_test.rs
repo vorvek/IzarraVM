@@ -3394,6 +3394,9 @@ mod sixteen_bit;
 #[path = "cpu_jit_width_lift_test.rs"]
 mod width_lift;
 
+#[path = "cpu_jit_interpret_one_test.rs"]
+mod interpret_one;
+
 #[path = "cpu_jit_direct_timing_test.rs"]
 mod timing;
 

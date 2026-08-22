@@ -2993,6 +2993,12 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "side_exit_callout_abnormal": snapshot.side_exit_callout_abnormal,
         "jit_direct_callout_executed": snapshot.callout_executed,
         "jit_direct_callout_port_v86_served": snapshot.callout_port_v86_served,
+        "jit_direct_callout_interpret_one_executed": snapshot.callout_interpret_one_executed,
+        "jit_direct_callout_interpret_one_resync": snapshot.callout_interpret_one_resync,
+        "jit_direct_callout_interpret_one_resync_fault": snapshot.callout_interpret_one_resync_fault,
+        "jit_direct_callout_interpret_one_abnormal": snapshot.callout_interpret_one_abnormal,
+        "jit_direct_callout_interpret_one_demoted": snapshot.callout_interpret_one_demoted,
+        "jit_direct_callout_slot_cap_hits": snapshot.callout_slot_cap_hits,
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
         // Unprefixed, unlike their `jit_direct_` neighbours, and deliberately: these are the
         // names the round-2 acceptance gate pre-registered for its bars, and a reader diffing a

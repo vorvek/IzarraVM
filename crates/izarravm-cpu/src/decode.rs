@@ -403,6 +403,37 @@ impl CpuGsw {
         self.charge_fetch_run(bus, lin, len, physical)
     }
 
+    /// `charge_cached_fetch_at` WITHOUT the eip advance, for the one caller that has already
+    /// moved eip itself and must not move it again: the `InterpretOne` call-out's fault arm.
+    ///
+    /// The helper skips the fetch charge on the way in, because the block's own `fetch_lens`
+    /// accounting covers every slot it reports as completed. On the fault arm it does NOT report
+    /// the slot (the instruction is counted and charged by `finish_instruction` instead), so the
+    /// block charges the prefix only and this is what puts the missing instruction fetch back.
+    /// By then `finish_instruction` has rewound eip onto the faulting instruction and delivered
+    /// the exception, so the advance `charge_fetch_run` performs would corrupt the handler's
+    /// entry point.
+    ///
+    /// The ORDER this produces differs from the interpreter's by one step and nothing else: the
+    /// interpreter charges the fetch before the instruction executes, this charges it after the
+    /// delivery. Both are the same cycles on the same address; only a bus that records the
+    /// SEQUENCE of observations can tell, and native fetch accounting is already reshaped for
+    /// those buses (`native_fetches_are_uniform`, `charge_native_cached_fetches`).
+    #[cfg(feature = "jit")]
+    pub(super) fn charge_cached_fetch_at_without_advance<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        len: u8,
+        physical: u32,
+    ) -> ExecResult<()> {
+        bus.note_code_fetch_linear(lin);
+        let eip = self.registers.eip;
+        let result = self.charge_fetch_run(bus, lin, len, physical);
+        self.registers.eip = eip;
+        result
+    }
+
     /// The charge + eip advance shared by both entry points, past the point where the physical
     /// start is known.
     ///

@@ -1334,6 +1334,18 @@ impl Encoder {
         self.bytes.push(count);
     }
 
+    /// `bt dst64, imm8` (REX.W 0F BA /4 ib): copy bit `index` of `dst` into CF and touch nothing
+    /// else. The call-out status word is read this way rather than by shifting because bits 33 and
+    /// 34 have to be distinguished from each other and from bit 32 while RAX still holds the whole
+    /// status: a shift would fold them together.
+    pub(crate) fn bt_r64_imm8(&mut self, dst: Reg, index: u8) {
+        debug_assert!(index < 64, "a quadword bit index must fit six bits");
+        self.rex(true, false, false, dst.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xBA]);
+        self.modrm(0b11, 4, dst.low3());
+        self.bytes.push(index);
+    }
+
     /// `movzx dst32, word [base + disp32]` (0F B7 /r).
     pub(crate) fn movzx_r32_word_disp32(&mut self, dst: Reg, base: Reg, disp32: i32) {
         self.optional_rex(false, dst.ext(), false, base.ext());

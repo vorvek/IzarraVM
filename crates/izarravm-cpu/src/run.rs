@@ -1776,6 +1776,18 @@ impl CpuGsw {
             // term for every slot count. Same reachable set as that term: no TSS probe, because
             // the helper refuses the privilege state that would reach one.
             .saturating_add(bus.jit_io_cost_clocks(BusWidth::Byte));
+        // The INTERPRET-ONE class's traffic, added once for the whole block exactly as the memory
+        // class's term below is, and dominating `compute_iteration_upper`'s matching term by the
+        // same construction: `interpret_one_slots <= MAX_BLOCK_CALLOUT_SLOTS`, and `max_store` is
+        // the maximum over every width and both the RAM and Mode 13h dials, so it is at least the
+        // `dword_data_upper` that term uses. Two accesses per slot, the same shape.
+        let callout_interpret_one_bus = if has_x87 {
+            0
+        } else {
+            u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
+                .saturating_mul(2)
+                .saturating_mul(max_store)
+        };
         // The MEMORY class's traffic, added ONCE for the whole block rather than folded into the
         // per-instruction term, and the difference is not cosmetic.
         //
@@ -1820,7 +1832,8 @@ impl CpuGsw {
         };
         let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
             .saturating_mul(per_instruction_bus)
-            .saturating_add(callout_memory_bus);
+            .saturating_add(callout_memory_bus)
+            .saturating_add(callout_interpret_one_bus);
         let own_class = max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
         if has_x87 {
             return own_class;
@@ -1880,11 +1893,21 @@ impl CpuGsw {
         //
         // Keep this in step with `classify`'s call-out admission: a new helper needs a class here,
         // and one whose charge is not a constant needs its maximum.
+        //
+        // The THIRD class, `InterpretOne`, is the one that is a WORST CASE rather than the only
+        // case. Its slot runs whatever row `classify` admitted, so it is priced at
+        // `INTERPRET_ONE_MAX_CORE_CLOCKS`: the maximum, over that allowlist, of the interpreter's
+        // own charge. Widening the allowlist means widening the constant, which is why the
+        // constant is derived beside the per-opcode ones rather than written here.
         let callout_core_upper = u64::from(block.callout_port_slots())
             .saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS))
             .saturating_add(
                 u64::from(block.callout_memory_slots())
                     .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),
+            )
+            .saturating_add(
+                u64::from(block.callout_interpret_one_slots())
+                    .saturating_mul(u64::from(INTERPRET_ONE_MAX_CORE_CLOCKS)),
             );
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
@@ -1966,11 +1989,27 @@ impl CpuGsw {
         // `jit_data_cost_clocks(Dword)` alone so a Mode13h dial that exceeds the RAM dial cannot
         // make this an under-estimate; the aperture itself is refused by the pre-check, so the
         // `max` is slack rather than reachable traffic.
+        //
+        // INTERPRET-ONE: TWO worst-width data accesses per slot, which is the shape of the whole
+        // allowlist rather than a guess. The rows on it are one-operand memory forms; the widest
+        // traffic any of them presents is one implicit stack access plus one explicit operand
+        // access, which is what POP r/m does. A row that wanted three would need this term
+        // widened with it, and the constant beside the allowlist is where that is recorded.
+        //
+        // No fetch term and no page-walk term. The helper refuses (ABNORMAL) unless the decode
+        // line is already resident, so nothing on its path decodes; and it charges the slot's
+        // instruction fetch only on the fault arm, where the block reports the prefix and
+        // `fetch_upper` above covers one fewer instruction than it prices.
         let callout_bus_upper = u64::from(block.callout_port_slots())
             .saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte))
             .saturating_add(
                 u64::from(block.callout_memory_slots())
                     .saturating_mul(u64::from(jit::direct::CALL_OUT_STACK_FRAME_DWORDS))
+                    .saturating_mul(dword_data_upper),
+            )
+            .saturating_add(
+                u64::from(block.callout_interpret_one_slots())
+                    .saturating_mul(2)
                     .saturating_mul(dword_data_upper),
             );
         let raw_bus_upper = fetch_upper
@@ -2605,6 +2644,25 @@ impl CpuGsw {
         }
         self.registers.eip = final_eip;
 
+        // THE DEFERRED CODE WRITES (design review B2). An `InterpretOne` slot may have STORED, and
+        // while it ran `note_code_write_inner` recorded instead of invalidating, because
+        // invalidating would have retired the block whose native frame the helper still had to
+        // return through. This is where the invalidation actually happens, with the window shut
+        // and no native code live.
+        //
+        // NOT immediately after the native return, which is what the plan asked for, and the
+        // reason is the loop directly above: on a bus whose fetches are not uniform, the block
+        // trace names every block this entry ran and `block_for_trace` EXPECTS each one to still
+        // be live. Draining first retires exactly the block a self-modifying store hit, which is
+        // the block the trace is most likely to name. Nothing between the return and here can run
+        // guest code or enter native code -- it is fetch and clock accounting -- so the guest
+        // cannot observe the stale window, which is the property the placement has to preserve.
+        self.drain_deferred_code_writes();
+        debug_assert!(
+            !self.in_native_callout,
+            "a call-out window outlived the native entry that opened it"
+        );
+
         debug_assert!(mode13_byte_reads <= byte_reads);
         debug_assert!(mode13_word_reads <= word_reads);
         debug_assert!(exit.mode13_dword_reads <= dword_reads);
@@ -2768,6 +2826,11 @@ impl CpuGsw {
         self.perf.jit_native_store_hits += writes;
         self.perf.data_direct_writes += writes;
         self.perf.direct_data_pointer_writes += writes;
+        // TEST-ONLY, and compiled out entirely otherwise: production distinguishes exit reasons
+        // through the per-reason counters below, which is why there is no non-test reader.
+        #[cfg(test)]
+        self.jit_direct
+            .note_last_side_exit_for_test(side_exit.then_some(exit.side_exit_reason));
         if side_exit {
             self.perf.jit_direct_side_exits += 1;
             match exit.side_exit_reason {
@@ -2798,6 +2861,15 @@ impl CpuGsw {
                 reason if reason == jit::direct::SideExitReason::CallOutAbnormal as u32 => {
                     self.jit_direct.note_side_exit_callout_abnormal();
                 }
+                // The two RESYNC exits are counted by the HELPER, not here, and the asymmetry is
+                // deliberate. `note_interpret_one_resync` and `_resync_fault` fire beside the
+                // predicate that decided them, where the reason is known; `NativeExit` carries no
+                // block id, so counting them here would only re-derive what the helper already
+                // knows. This arm exists so they do not fall into `jit_direct_exit_other`, which
+                // is where the campaign has lost a mechanism's visibility before.
+                reason
+                    if reason == jit::direct::SideExitReason::CallOutResync as u32
+                        || reason == jit::direct::SideExitReason::CallOutResyncFault as u32 => {}
                 _ => self.perf.jit_direct_exit_other += 1,
             }
         }
@@ -2808,6 +2880,14 @@ impl CpuGsw {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
             halted: false,
         };
+        // A machine-stopping error an `InterpretOne` slot's fault delivery produced. The helper
+        // returns an `i64` and cannot carry one, so it parks it and this is the boundary that
+        // propagates it -- the same boundary `run_budgeted_inner` would have propagated it from
+        // had the instruction run interpreted. Taken LAST, after every counter and every charge,
+        // so a stopping run accounts for the work it actually did.
+        if let Some(error) = self.direct_runtime.callout_error.take() {
+            return Err(error);
+        }
         if side_exit {
             Ok(DirectBlockOutcome::Prefix(outcome))
         } else {

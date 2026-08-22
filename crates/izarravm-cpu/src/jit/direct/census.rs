@@ -442,6 +442,27 @@ pub(crate) struct DirectStallTally {
     /// anything at all. This is the numerator of the slice's non-vacuity ratio; `executed` stays
     /// the denominator.
     pub callout_port_v86_served: u64,
+    /// The `InterpretOne` family, five counters that price the mechanism on its own terms.
+    ///
+    /// `executed` is every slot the helper entered, the DENOMINATOR the other four need.
+    /// `resync` and `resync_fault` are the two RESYNC statuses -- the predicate refusing after a
+    /// retired instruction, and the step faulting. `abnormal` is the fail-closed arm: no resident
+    /// decode view, or a demoted slot. `demoted` counts CELLS the governor gave up on, once each,
+    /// not the executions that then take the abnormal exit.
+    ///
+    /// Separate from `callout_executed` and `side_exit_callout_abnormal` rather than folded into
+    /// them, for the reason `callout_port_v86_served` is separate: those sum every helper class,
+    /// so on a guest running both they cannot say whether THIS class served anything. The
+    /// acceptance ratio the slice is graded on is `resync / executed`.
+    pub callout_interpret_one_executed: u64,
+    pub callout_interpret_one_resync: u64,
+    pub callout_interpret_one_resync_fault: u64,
+    pub callout_interpret_one_abnormal: u64,
+    pub callout_interpret_one_demoted: u64,
+    /// Compile walks that stopped because the block already held `MAX_BLOCK_CALLOUT_SLOTS`. The
+    /// evidence for or against raising the cap, which S5 prices; zero says the cap is not what
+    /// bounds the loader's blocks.
+    pub callout_slot_cap_hits: u64,
     /// G1 lane trials granted: hot-chunk compilations allowed through the heat gates on the
     /// one-per-key-per-epoch budget (`lane_trial_enabled`), and how many of them installed a
     /// lane-carrying block under a hot span. The gap between the two is trials that learned
@@ -1724,6 +1745,12 @@ impl crate::jit::JitState {
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
             callout_executed: self.stalls.callout_executed,
             callout_port_v86_served: self.stalls.callout_port_v86_served,
+            callout_interpret_one_executed: self.stalls.callout_interpret_one_executed,
+            callout_interpret_one_resync: self.stalls.callout_interpret_one_resync,
+            callout_interpret_one_resync_fault: self.stalls.callout_interpret_one_resync_fault,
+            callout_interpret_one_abnormal: self.stalls.callout_interpret_one_abnormal,
+            callout_interpret_one_demoted: self.stalls.callout_interpret_one_demoted,
+            callout_slot_cap_hits: self.stalls.callout_slot_cap_hits,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             callout_governor_trials: self.stalls.callout_governor_trials,
             callout_governor_lazy: self.stalls.callout_governor_lazy,
@@ -1796,6 +1823,32 @@ impl crate::jit::JitState {
     /// `note_callout_executed` is ungated: the gate would cost as much as the work.
     pub(crate) fn note_callout_port_v86_served(&mut self) {
         self.stalls.callout_port_v86_served += 1;
+    }
+
+    /// The `InterpretOne` family's five increments, all on the helper's already-off-native path
+    /// or on a compile walk, and ungated for the reason `note_callout_executed` is.
+    pub(crate) fn note_interpret_one_executed(&mut self) {
+        self.stalls.callout_interpret_one_executed += 1;
+    }
+
+    pub(crate) fn note_interpret_one_resync(&mut self) {
+        self.stalls.callout_interpret_one_resync += 1;
+    }
+
+    pub(crate) fn note_interpret_one_resync_fault(&mut self) {
+        self.stalls.callout_interpret_one_resync_fault += 1;
+    }
+
+    pub(crate) fn note_interpret_one_abnormal(&mut self) {
+        self.stalls.callout_interpret_one_abnormal += 1;
+    }
+
+    pub(crate) fn note_interpret_one_demoted(&mut self) {
+        self.stalls.callout_interpret_one_demoted += 1;
+    }
+
+    pub(crate) fn note_callout_slot_cap_hit(&mut self) {
+        self.stalls.callout_slot_cap_hits += 1;
     }
 
     pub(crate) fn note_reject_callout_privileged(&mut self) {

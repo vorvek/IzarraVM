@@ -23,6 +23,11 @@ pub(super) struct EmitInput<'a> {
     pub(super) x87_entry_top: Option<u8>,
     pub(super) memory: MemoryEmitContext,
     pub(super) link_cell_ptrs: [usize; 2],
+    /// One address per `InterpretOne` slot, in SLOT ORDER, allocated by the compile walk beside
+    /// the link cells. The emitter bakes each into its slot's prologue and passes it as the
+    /// helper's fourth argument; it is both the governor's byte and the only place the helper
+    /// learns which slot called it.
+    pub(super) interpret_one_cells: &'a [usize],
     /// Whether completed paths, self-loop returns and side-exit returns emit the
     /// `NativeBlockTrace` append preamble (`emit_fetch_trace`).
     ///

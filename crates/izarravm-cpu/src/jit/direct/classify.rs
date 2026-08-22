@@ -236,6 +236,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8a
                 | 0x8b
                 | 0x8c
+                // POP r/m16, the S2 `InterpretOne` row. Word matters more than Dword here: the
+                // loader is Watcom-compiled 16-bit C and the census row is the word form. There is
+                // no emitter and no width field to get wrong, because the helper runs the decode
+                // line through the interpreter, so this entry is admission and nothing else.
+                | 0x8f
                 // LEA r16, m. Admitted with the S1 width lift, which is where `DirectKind::Lea`
                 // grew its `width` field: the arm used to end in a full 32-bit destination write,
                 // and the field is the admission rather than an accompaniment to it. The Tomb
@@ -906,6 +911,39 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0xec => {
                 return Some(DirectKind::CallOut {
                     helper: CallOutHelper::PortReadAlDx,
+                });
+            }
+            // POP r/m16/32 (group 1A), the first row on the generic `InterpretOne` allowlist and
+            // the top of the Tomb Raider loader's barrier census after the S1 width lift at
+            // 12.4% of block-stopping hits.
+            //
+            // It is a CALL-OUT and not a lowering, and the reason is the whole point of the S2
+            // mechanism rather than a property of this opcode: POP r/m has no emitter, is not
+            // worth one on its own, and used to end the block. Now it costs one helper call and
+            // the block continues. What makes it the right FIRST row is that it STORES: the
+            // deferred-code-write contract (design review B2) is exercised on day one instead of
+            // being carried untested behind rows that only read.
+            //
+            // BOTH forms, register and memory, and every width. The register form is a two-line
+            // interpreter arm and the memory form is the census row; refusing the cheap sibling of
+            // an admitted row is the arbitrariness this file's header rules out, and both reach
+            // the identical helper because the helper runs the decode line rather than a lowering.
+            //
+            // `reg != 0` is refused HERE rather than left to the helper. Those encodings are
+            // illegal and the interpreter's arm answers them with `undefined_opcode`, which the
+            // helper would deliver through its fault arm -- correct, but it would burn a call-out
+            // and a governor execution on every one of them, and a block would be compiled around
+            // an instruction that can only ever fault.
+            //
+            // Everything else the row needs is already gated above and inherited rather than
+            // restated: `prefixes_supported_for` refuses REP, LOCK and the address-size override,
+            // so the helper never meets a REP whose single step would be one iteration of many;
+            // the Word allowlist decides whether a 16-bit form is admitted at all; and
+            // `block_continuable` admits 0x8F through `DecodeGroup::Stack` on every persona, so
+            // there is no class gate to inherit.
+            0x8f if insn.modrm.is_some_and(|m| m.reg == 0) => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne,
                 });
             }
             // CWD / CDQ, same reasoning as 0x98 immediately above.

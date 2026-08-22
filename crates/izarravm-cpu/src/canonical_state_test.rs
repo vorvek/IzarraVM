@@ -879,8 +879,8 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The JIT arena-size slice adds one PerfCounters field (jit_direct_arena_compaction_ns;
     // 8 bytes), moving the pin 4480 -> 4488 -- measured, not derived. Host wall nanoseconds are
     // not architectural state, so both canonical payloads are unchanged by it.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4536);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4536);
 }

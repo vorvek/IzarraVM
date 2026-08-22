@@ -272,9 +272,13 @@
 //! pre-existing sampling gap -- a profiler sampling INSIDE the callee walks back to a call site
 //! whose CFA is `CALLOUT_CALL_FRAME` bytes off -- and it is accepted on the same terms.
 
-use super::emit::{emit_store_homes, gpr_offset};
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use super::emit::{eflags_offset, emit_store_homes, gpr_offset};
 use super::*;
-use crate::{IN_AL_DX_CORE_CLOCKS, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS};
+use crate::{
+    FLAG_IF, FLAG_VM, IN_AL_DX_CORE_CLOCKS, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags,
+};
 use izarravm_bus::{BusAccessKind, BusWidth, CpuBus};
 
 /// How many dwords `PUSHAD`/`POPAD` move. Eight registers, one dword each -- the SP slot included,
@@ -286,6 +290,14 @@ pub(crate) const CALL_OUT_STACK_FRAME_DWORDS: u32 = 8;
 /// walking back through the call site would read the frame against unwind info that does not
 /// describe `CALLOUT_CALL_FRAME`.
 pub(crate) type CallOutFn = unsafe extern "C" fn(*mut CpuGsw, u64, u64) -> i64;
+
+/// The ABI of a helper that needs its SLOT identified, which the three fixed-opcode helpers do
+/// not: they know what they are, `interpret_one` does not. The fourth argument is the address of
+/// this slot's `InterpretOneCell`, which carries both the slot's guest offset and its governor
+/// state. One pointer rather than an offset immediate plus a cell immediate, because the cell has
+/// to exist anyway and a two-field read out of it is cheaper than a second argument register on
+/// every execution.
+pub(crate) type CallOutSlotFn = unsafe extern "C" fn(*mut CpuGsw, u64, u64, u64) -> i64;
 
 /// The live bus and the monomorphised helpers for it, published by `run_direct_block` for the
 /// duration of one native entry into a block that carries at least one call-out slot.
@@ -307,6 +319,8 @@ pub(crate) struct CallOutTable {
     pub(crate) push_all_dword: usize,
     /// `CallOutHelper::PopAllDword`.
     pub(crate) pop_all_dword: usize,
+    /// `CallOutHelper::InterpretOne`, a `CallOutSlotFn` rather than a `CallOutFn`.
+    pub(crate) interpret_one: usize,
 }
 
 impl Default for CallOutTable {
@@ -316,6 +330,7 @@ impl Default for CallOutTable {
             port_read_al_dx: 0,
             push_all_dword: 0,
             pop_all_dword: 0,
+            interpret_one: 0,
         }
     }
 }
@@ -348,6 +363,7 @@ impl CallOutTable {
             port_read_al_dx: port_read_al_dx::<B> as CallOutFn as usize,
             push_all_dword: push_all_dword::<B> as CallOutFn as usize,
             pop_all_dword: pop_all_dword::<B> as CallOutFn as usize,
+            interpret_one: interpret_one::<B> as CallOutSlotFn as usize,
         }
     }
 }
@@ -363,6 +379,10 @@ pub(crate) enum CallOutHelper {
     PushAllDword,
     /// `0x61` POPAD.
     PopAllDword,
+    /// Any row on the `InterpretOne` allowlist (`classify`), S2's being 0x8F POP r/m alone. The
+    /// only variant that is not one opcode, and the only one whose slot has to identify itself to
+    /// the helper.
+    InterpretOne,
 }
 
 impl CallOutHelper {
@@ -375,7 +395,7 @@ impl CallOutHelper {
     pub(crate) fn probes_io_permission(self) -> bool {
         match self {
             Self::PortReadAlDx => true,
-            Self::PushAllDword | Self::PopAllDword => false,
+            Self::PushAllDword | Self::PopAllDword | Self::InterpretOne => false,
         }
     }
 
@@ -384,56 +404,102 @@ impl CallOutHelper {
     /// access counters do not contain.
     pub(crate) fn moves_a_stack_frame(self) -> bool {
         match self {
-            Self::PortReadAlDx => false,
+            Self::PortReadAlDx | Self::InterpretOne => false,
             Self::PushAllDword | Self::PopAllDword => true,
+        }
+    }
+
+    /// True for the INTERPRET-ONE class: helpers that run whatever instruction sits at the slot,
+    /// so `compute_iteration_upper` prices them at the allowlist's worst charge rather than at
+    /// one opcode's constant, and so the emitted slot knows it owes a fourth argument.
+    ///
+    /// A third predicate rather than a `!port && !memory` derivation, for the reason the pair
+    /// above are two predicates: a fifth helper must CHOOSE a class, and the install-time
+    /// `debug_assert` that the three counts sum to `callout_slots` is what makes forgetting to
+    /// choose a failure instead of an under-budgeted block.
+    pub(crate) fn interprets_one(self) -> bool {
+        match self {
+            Self::PortReadAlDx | Self::PushAllDword | Self::PopAllDword => false,
+            Self::InterpretOne => true,
         }
     }
 }
 
 /// The per-class interpreter call-out slot counts, packed into ONE byte.
 ///
-/// Two counts, each bounded by `MAX_BLOCK_CALLOUT_SLOTS` (4), so each fits a nibble. Packed rather
-/// than carried as two `u8` fields because `CompiledBlock` is memcpy'd several times per Direct
-/// entry and `compiled_block_stays_small_enough_to_copy_per_entry` pins its size at 120 bytes --
-/// that byte budget is exactly full, so a second field costs eight bytes of alignment padding on
-/// every one of ~47 M entries in a Quake run. The packing is a size decision rather than a
-/// cleverness: each accessor is one mask or one shift, and the total is one add.
+/// THREE counts now, each bounded by `MAX_BLOCK_CALLOUT_SLOTS` (4). Two fitted a nibble each;
+/// three do not fit three bits each, and the byte is not negotiable: `CompiledBlock` is memcpy'd
+/// several times per Direct entry, `compiled_block_stays_small_enough_to_copy_per_entry` pins it
+/// at 120 bytes, and that budget is exactly full -- a second byte would round the struct to 128
+/// and cost eight bytes on every one of ~47 M entries in a Quake run.
+///
+/// So the packing is BASE FIVE. Each count is in `0..=4`, and `5^3 = 125` fits a `u8` with room
+/// to spare. Each accessor is a divide by a constant, which the compiler turns into a multiply and
+/// a shift; `port` is the only one read per entry, and it sits beside a privilege check that
+/// already costs more than that. `interpret_one` and `memory` are read only by
+/// `compute_iteration_upper`, which is memoised per block.
+///
+/// The alternative that keeps `port` a mask -- three bits, three bits, two bits -- cannot hold
+/// four `InterpretOne` slots, which is exactly the block the loader produces.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CallOutSlotCounts(u8);
 
+/// The base-5 radix, named once so the accessors and the round-trip test cannot drift apart from
+/// the constructor.
+const SLOT_COUNT_RADIX: u8 = 5;
+
 impl CallOutSlotCounts {
-    pub(super) fn new(port: u8, memory: u8) -> Self {
+    pub(super) fn new(port: u8, memory: u8, interpret_one: u8) -> Self {
         debug_assert!(
-            port <= 0xf && memory <= 0xf,
-            "MAX_BLOCK_CALLOUT_SLOTS bounds both counts well below a nibble"
+            port < SLOT_COUNT_RADIX
+                && memory < SLOT_COUNT_RADIX
+                && interpret_one < SLOT_COUNT_RADIX,
+            "MAX_BLOCK_CALLOUT_SLOTS bounds every class below the base-5 radix"
         );
-        Self((port & 0xf) | ((memory & 0xf) << 4))
+        debug_assert!(
+            port + memory + interpret_one <= MAX_BLOCK_CALLOUT_SLOTS,
+            "the classes share one per-block slot budget"
+        );
+        Self(port + SLOT_COUNT_RADIX * memory + SLOT_COUNT_RADIX * SLOT_COUNT_RADIX * interpret_one)
     }
 
     /// Slots whose helper can reach `check_io_permission`; see `CallOutHelper::probes_io_permission`.
     pub(super) fn port(self) -> u32 {
-        u32::from(self.0 & 0xf)
+        u32::from(self.0 % SLOT_COUNT_RADIX)
     }
 
     /// Slots whose helper moves a guest stack frame; see `CallOutHelper::moves_a_stack_frame`.
     pub(super) fn memory(self) -> u32 {
-        u32::from(self.0 >> 4)
+        u32::from((self.0 / SLOT_COUNT_RADIX) % SLOT_COUNT_RADIX)
     }
 
-    /// The two counts summed. TEST-ONLY, and gated for the same reason
+    /// Slots that run one interpreter instruction; see `CallOutHelper::interprets_one`.
+    pub(super) fn interpret_one(self) -> u32 {
+        u32::from(self.0 / (SLOT_COUNT_RADIX * SLOT_COUNT_RADIX))
+    }
+
+    /// The three counts summed. TEST-ONLY, and gated for the same reason
     /// `CompiledBlock::callout_slots` is: nothing in the budget path reads a total, because
-    /// `compute_iteration_upper` prices the two classes separately, and asserting this against the
-    /// pair it sums is vacuous. See that accessor's comment for where the real check lives.
+    /// `compute_iteration_upper` prices the classes separately, and asserting this against the
+    /// triple it sums is vacuous. See that accessor's comment for where the real check lives.
     #[cfg(test)]
     pub(super) fn total(self) -> u32 {
-        self.port() + self.memory()
+        self.port() + self.memory() + self.interpret_one()
     }
 }
 
-/// Status encoding. Negative is abnormal; otherwise the low 32 bits are raw core clocks and bit
-/// 32 asks the caller to end the native run after this instruction.
+/// Status encoding. Negative is abnormal; otherwise the low 32 bits are raw core clocks and the
+/// three bits above them are, in order, "end the native run after this instruction", "the
+/// instruction retired but the block may not continue", and "the step faulted and the fault path
+/// has already counted and charged it".
+///
+/// At most one of the two RESYNC bits is ever set, and the step-break bit is only read when
+/// neither is: a RESYNC ends the run whatever the bus wants. The emitted slot tests them in that
+/// order (34, then 33, then 32) for exactly that reason.
 const STATUS_ABNORMAL: i64 = -1;
 pub(crate) const STATUS_STEP_BREAK_BIT: u32 = 32;
+pub(crate) const STATUS_RESYNC_RETIRED_BIT: u32 = 33;
+pub(crate) const STATUS_RESYNC_FAULT_BIT: u32 = 34;
 
 /// Which byte in `CallOutTable` an emitted slot loads its function pointer from.
 fn helper_offset(helper: CallOutHelper) -> i32 {
@@ -441,6 +507,7 @@ fn helper_offset(helper: CallOutHelper) -> i32 {
         CallOutHelper::PortReadAlDx => core::mem::offset_of!(CallOutTable, port_read_al_dx),
         CallOutHelper::PushAllDword => core::mem::offset_of!(CallOutTable, push_all_dword),
         CallOutHelper::PopAllDword => core::mem::offset_of!(CallOutTable, pop_all_dword),
+        CallOutHelper::InterpretOne => core::mem::offset_of!(CallOutTable, interpret_one),
     };
     (core::mem::offset_of!(CpuGsw, native_callout) + field) as i32
 }
@@ -913,6 +980,385 @@ unsafe extern "C" fn pop_all_dword<B: CpuBus>(
     }
 }
 
+/// One `InterpretOne` slot's per-block cell: what the slot IS, and what the governor has learned
+/// about it.
+///
+/// `#[repr(C)]` with `state` first because emitted code reads that byte directly: the slot's
+/// prologue is `mov rax, imm64 cell; test byte [rax], DEMOTED; jnz abnormal`, which is the whole
+/// of the governor on the fast path. The other two fields are compile-time constants the helper
+/// reads instead of receiving as further arguments; see `CallOutSlotFn`.
+///
+/// Allocated beside the block's link cells and kept alive by the same `Arc` discipline, which is
+/// why the demotion survives without a recompile: `retire_block` cannot re-key a governor state
+/// that lives in the block's own allocation, and a recompile would have had to (design section 9,
+/// M11).
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct InterpretOneCell {
+    /// bits 0..4 executions seen, saturating at `GOVERNOR_WINDOW`; bits 4..7 RESYNCs seen; bit 7
+    /// DEMOTED. Atomic for the reason `LinkCell`'s fields are: a formality for a single-owner
+    /// cache, matching the neighbours rather than claiming a cross-thread guarantee.
+    state: AtomicU8,
+    /// The instruction's length, so the resume predicate can name the EIP it demands without
+    /// re-reading the decode line after the step.
+    insn_len: u8,
+    /// The slot's guest offset from the block's ENTRY eip. Page-local by `BlockSpan::new`, so a
+    /// `u16` is generous.
+    slot_delta: u16,
+}
+
+/// Executions the governor watches before it stops deciding, and RESYNCs within that window that
+/// demote the slot. Three in eight: the same order as the call-out admission governor's
+/// `MAX_UNTRIED_TRIALS`, and deliberately cheap to reach, because a slot that resyncs is strictly
+/// worse than the boundary it replaced -- spill, call, run, reload, side exit, and then the
+/// dispatcher trip the boundary would have taken anyway.
+const GOVERNOR_WINDOW: u8 = 8;
+const GOVERNOR_RESYNC_LIMIT: u8 = 3;
+const STATE_EXECUTIONS_MASK: u8 = 0x0f;
+const STATE_RESYNC_SHIFT: u32 = 4;
+const STATE_RESYNC_MASK: u8 = 0x70;
+/// The bit the emitted prologue tests. Bit 7 rather than "the byte is non-zero": the counts share
+/// the byte, so a zero test would refuse the slot on its second execution.
+pub(crate) const STATE_DEMOTED: u8 = 0x80;
+
+impl InterpretOneCell {
+    pub(crate) fn new(slot_delta: u16, insn_len: u8) -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            insn_len,
+            slot_delta,
+        }
+    }
+
+    pub(crate) fn address(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Fold one execution into the governor and answer whether this execution DEMOTED the slot,
+    /// so the counter fires once per cell rather than once per later abnormal exit.
+    ///
+    /// The whole governor is confined to the first `GOVERNOR_WINDOW` executions. Once the
+    /// execution count saturates the cell is frozen: a slot that survived its window is admitted
+    /// for the block's lifetime, and a slot that did not is refused for it. That is the same
+    /// terminal shape `CallOutAdmission` has, and for the same reason -- a governor that keeps
+    /// re-deciding churns without converging.
+    fn note_execution(&self, resynced: bool) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        let executions = state & STATE_EXECUTIONS_MASK;
+        if state & STATE_DEMOTED != 0 || executions >= GOVERNOR_WINDOW {
+            return false;
+        }
+        let resyncs = ((state & STATE_RESYNC_MASK) >> STATE_RESYNC_SHIFT) + u8::from(resynced);
+        let demoted = resyncs >= GOVERNOR_RESYNC_LIMIT;
+        let next = (executions + 1)
+            | (resyncs << STATE_RESYNC_SHIFT)
+            | if demoted { STATE_DEMOTED } else { 0 };
+        self.state.store(next, Ordering::Release);
+        demoted
+    }
+}
+
+/// Everything the resume predicate compares, captured before the step.
+///
+/// A struct rather than a pile of locals so the predicate is testable on its own. That is not a
+/// convenience: with S2's allowlist holding 0x8F alone, NO admitted instruction can move a segment
+/// record, a control register or IF, so the only way to pin those clauses is to evaluate the
+/// predicate against a CPU a test moved by hand. S3's rows will reach them for real.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResumeSnapshot {
+    cs: SegmentRegister,
+    segments: [SegmentRegister; 6],
+    cr0: u32,
+    cr3: u32,
+    cr4: u32,
+    /// EFLAGS.IF and EFLAGS.VM, read plain: neither is ever deferred into `pending_flags`, which
+    /// carries the six arithmetic bits and nothing else.
+    interrupt_enable: bool,
+    virtual_mode: bool,
+    read_mapping_epoch: u64,
+    write_mapping_epoch: u64,
+    #[cfg(debug_assertions)]
+    x87_top: u8,
+}
+
+impl ResumeSnapshot {
+    pub(crate) fn capture(cpu: &CpuGsw) -> Self {
+        Self {
+            cs: cpu.registers.cs(),
+            segments: SEGMENT_ORDER.map(|segment| cpu.registers.segment(segment)),
+            cr0: cpu.control.cr0,
+            cr3: cpu.control.cr3,
+            cr4: cpu.control.cr4,
+            interrupt_enable: cpu.registers.eflags & FLAG_IF != 0,
+            virtual_mode: cpu.registers.eflags & FLAG_VM != 0,
+            read_mapping_epoch: cpu.data_read_pages.mapping_epoch(),
+            write_mapping_epoch: cpu.data_write_pages.mapping_epoch(),
+            #[cfg(debug_assertions)]
+            x87_top: cpu.fpu.top(),
+        }
+    }
+
+    /// The whole resume predicate, clause by clause. `end_eip` is the EIP the instruction must
+    /// have left behind: the slot's start plus its length.
+    ///
+    /// | clause | what the block relies on |
+    /// |---|---|
+    /// | R1 | EIP is the next slot's, and CS still describes the code the block was compiled for |
+    /// | R2 | every baked segment base and limit, and the stack width |
+    /// | R3 | `jit_mode_key`, paging, and the run loop's interrupt delivery points |
+    /// | R4 | the paging generation the interpreter's direct-page caches key on |
+    /// | R5 | the block's own bytes, and every other installed block |
+    /// | R6 | x87 pad addressing (debug only; the compile walk refuses the mix) |
+    /// | R7/R8 | the run loop's own state: no halt, no paused REP |
+    ///
+    /// R2 subsumes the SS-shadow rule at no cost: a segment load moves a record here AND arms
+    /// `interrupt_shadow` in R3, so the rows that load SS can never resume however they are
+    /// admitted.
+    ///
+    /// R3's IF clause is DIRECTIONAL by design review M8. IF going 1 to 0 resumes, because the run
+    /// loop has no delivery point on that edge: disabling interrupts cannot make one serviceable.
+    /// IF going 0 to 1 resyncs, because the boundary after it is exactly where the run loop would
+    /// deliver.
+    ///
+    /// R3's shadow clause reads the flag AFTER the step rather than comparing it, because the seam
+    /// the helper uses does not clear it first the way `run_one_cached` does (design section 9,
+    /// M6). A block entered with the shadow already set therefore resyncs, which is conservative
+    /// and costs nothing: the dispatcher does not hand out blocks in that state.
+    ///
+    /// R4 is conservative rather than exact, and the reason is worth stating. The FAST MAP needs
+    /// no clause: emitted code never reads `mapping_epochs` at all, its table bases are stable for
+    /// the process, and an invalidation CLEARS entries in place -- so a wipe mid-block makes the
+    /// next native memory slot probe an unavailable page and side-exit, rather than run against a
+    /// dead pointer. What this pair of epochs catches is the PAGING GENERATION moving under the
+    /// block, which is the event that clearing is driven by.
+    ///
+    /// See `epoch_moved` for why a COLD FILL is not a move.
+    pub(crate) fn allows_resume(&self, cpu: &CpuGsw, end_eip: u32) -> bool {
+        // R1.
+        if cpu.registers.eip != end_eip || cpu.registers.cs() != self.cs {
+            return false;
+        }
+        // R2.
+        if SEGMENT_ORDER
+            .iter()
+            .enumerate()
+            .any(|(index, segment)| cpu.registers.segment(*segment) != self.segments[index])
+        {
+            return false;
+        }
+        // R3.
+        if cpu.control.cr0 != self.cr0
+            || cpu.control.cr3 != self.cr3
+            || cpu.control.cr4 != self.cr4
+            || (cpu.registers.eflags & FLAG_VM != 0) != self.virtual_mode
+            || (!self.interrupt_enable && cpu.registers.eflags & FLAG_IF != 0)
+            || cpu.interrupt_shadow
+        {
+            return false;
+        }
+        // R4.
+        if epoch_moved(self.read_mapping_epoch, cpu.data_read_pages.mapping_epoch())
+            || epoch_moved(
+                self.write_mapping_epoch,
+                cpu.data_write_pages.mapping_epoch(),
+            )
+        {
+            return false;
+        }
+        // R5.
+        if !cpu.deferred_code_writes.is_empty() {
+            return false;
+        }
+        // R6. A `debug_assert` rather than a clause: `compile` refuses a block that mixes x87 and
+        // call-out slots in either order, so a moved TOP here is a compile-walk defect and not a
+        // guest event the predicate should absorb.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            cpu.fpu.top(),
+            self.x87_top,
+            "an InterpretOne slot moved x87 TOP inside a block that cannot hold an x87 slot"
+        );
+        // R7 and R8.
+        !cpu.halted && !cpu.rep_resume_active
+    }
+}
+
+/// Run ONE interpreter instruction at a slot inside a live native block, and answer whether the
+/// block may carry on.
+///
+/// This is the generic arm: the other three helpers each are one opcode and know their own
+/// semantics, this one knows none and runs whatever `classify` admitted. What it therefore cannot
+/// do is pre-check. `port_read_al_dx` and the PUSHAD pair refuse before any effect; this executes
+/// first and asks afterwards. That is why its answer is a RESYNC (the instruction RAN, the block
+/// stops here) rather than an ABNORMAL (nothing ran, the interpreter re-runs it).
+///
+/// ABNORMAL survives for exactly two fail-closed cases: no resident decode view, because a full
+/// re-decode from in here could take a page fault, which is the hazard class this design will not
+/// open; and the governor's demotion, which the emitted prologue takes without calling at all.
+///
+/// # Safety
+///
+/// See `port_read_al_dx`, plus: `cell` must be the address of an `InterpretOneCell` the running
+/// block owns, baked into its emitted bytes by `emit` and kept alive by `BlockCache`.
+unsafe extern "C" fn interpret_one<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    prefix_raw_clocks: u64,
+    prefix_weighted_fp_clocks: u64,
+    cell: u64,
+) -> i64 {
+    // SAFETY: by the contract above, `cpu` is the live CPU and no other reference to it is alive
+    // across the call (emitted code holds only its ADDRESS, in R15).
+    let cpu = unsafe { &mut *cpu };
+    // SAFETY: as `push_all_dword`.
+    let Some(bus) = (unsafe { published_bus::<B>(cpu) }) else {
+        return STATUS_ABNORMAL;
+    };
+    // SAFETY: the slot baked this address from the `Arc<InterpretOneCell>` the block holds, and
+    // `BlockCache` keeps that `Arc` alive for as long as the block is installed.
+    let cell = unsafe { &*(cell as usize as *const InterpretOneCell) };
+    cpu.jit_direct.note_callout_executed();
+    cpu.jit_direct.note_interpret_one_executed();
+
+    // STEP 1. The block body keeps EIP at the ENTRY value throughout and every exit advances it
+    // relatively (`emit_advance_eip` is a load, an add and a store on the live field), so a helper
+    // that leaves EIP anywhere else corrupts every later exit. Snapshot it, move it to the slot,
+    // and put it back on the resume path only. Design review B1.
+    let entry_eip = cpu.registers.eip;
+    let start_eip = entry_eip.wrapping_add(u32::from(cell.slot_delta));
+
+    // STEP 2. Sync IN for the flags. RBP shadows `materialized_eflags()`, not `registers.eflags`,
+    // and a descriptor produced by an earlier slot in this block is still LIVE here, so the memory
+    // copy the interpreter is about to read is stale unless it is settled first. Design review B4.
+    cpu.materialize_flags();
+
+    // STEP 3. The device's view of guest time, previewed exactly as `port_read_al_dx` computes it
+    // and for the same reason; see the long note there. `core_clocks_so_far` is stale by the whole
+    // run prefix inside a block, and an interpreted instruction that reads a timer or a beam would
+    // sample the past. Design review m12.
+    let fp =
+        crate::jit::native_x87::scale_weighted_fp_clocks(prefix_weighted_fp_clocks, cpu.fp_rem);
+    cpu.core_clocks_so_far = cpu
+        .core_clocks_so_far
+        .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks.saturating_add(fp.clocks)));
+
+    // STEP 4. The predicate's inputs, before anything can move them.
+    let snapshot = ResumeSnapshot::capture(cpu);
+    let start_cs = snapshot.cs.selector;
+
+    // STEP 5. The decode view. A MISS is ABNORMAL and not a re-decode: `decode` fetches through
+    // the code path, which page-walks on a TLB miss, and a walk writes accessed bits with this
+    // block's native code live on the host stack. Fail closed instead: the run ends at the
+    // instruction and the interpreter decodes it at the boundary, refilling the line for next
+    // time. Design review M10.
+    let lin = snapshot.cs.base.wrapping_add(start_eip);
+    let Some(view) = cpu.decode_cache.get_view(lin, snapshot.cs.default_size_32) else {
+        cpu.jit_direct.note_interpret_one_abnormal();
+        return STATUS_ABNORMAL;
+    };
+    debug_assert_eq!(
+        u32::from(view.insn.len),
+        u32::from(cell.insn_len),
+        "an InterpretOne slot's decode line changed length under its cell"
+    );
+
+    // STEP 6. Run it. `execute_hot_cached_or_decoded` and not `run_one_cached`, which would charge
+    // the fetch, `elapsed_clocks` and `perf.instructions` a second time on top of the block's own
+    // accounting and would consume `timing_rem`; and NOT `begin_instruction`, which would clear
+    // the block's write record and drop a prefetch invalidation the block still owes. Design
+    // review B3 and M6.
+    //
+    // The EIP advance is done by hand because the interpreter does it inside the fetch CHARGE
+    // (`charge_fetch_run`), and the charge is the half this must not repeat: the block's
+    // `fetch_lens` accounting already covers every slot it reports completed. The execute arms
+    // read EIP expecting it to sit past the instruction, so the advance is not optional.
+    let end_eip = start_eip.wrapping_add(u32::from(view.insn.len));
+    cpu.registers.eip = end_eip;
+    cpu.in_native_callout = true;
+    let result = cpu.execute_hot_cached_or_decoded(&view.insn, bus);
+    cpu.in_native_callout = false;
+
+    let Ok(outcome) = result else {
+        // STEP 7. The fault arm. `finish_instruction` is the run loop's own tail: it rewinds EIP
+        // and CS onto the faulting instruction, delivers the exception, charges the architectural
+        // 59 clocks into `elapsed_clocks` and counts the instruction in `perf.instructions`. All
+        // of that is DONE by the time it returns, which is why this arm reports "not retired" and
+        // returns zero clocks: the block must count neither again.
+        //
+        // A `CpuError` is a machine stop rather than a guest fault, and the helper cannot return
+        // one through an `i64`. It is parked and `run_direct_block` propagates it after the native
+        // return, which is the same boundary the run loop would have propagated it from.
+        if let Err(error) = cpu.finish_instruction(bus, result, start_eip, start_cs, 0, None, None)
+        {
+            cpu.direct_runtime.callout_error = Some(error);
+        }
+        // The instruction fetch the block will not charge, because this arm reports the prefix
+        // only. It cannot fault: the line is resident, and `DecodeCache::put` refuses any line
+        // that straddles a page, so the crossing arm is unreachable from here.
+        let charged =
+            cpu.charge_cached_fetch_at_without_advance(bus, lin, view.insn.len, view.phys_start);
+        debug_assert!(
+            charged.is_ok(),
+            "a resident decode line's fetch charge cannot fault"
+        );
+        publish_flags(cpu);
+        if cell.note_execution(true) {
+            cpu.jit_direct.note_interpret_one_demoted();
+        }
+        cpu.jit_direct.note_interpret_one_resync_fault();
+        return 1i64 << STATUS_RESYNC_FAULT_BIT;
+    };
+
+    // STEP 8. The resume predicate.
+    let resume = snapshot.allows_resume(cpu, end_eip);
+
+    // STEP 9. Sync OUT for the flags, on every path. The interpreter may have left a descriptor
+    // and RBP is reloaded from the memory copy, so the copy has to be the whole architectural
+    // value. Written as the two statements rather than `materialize_flags()` so a no-op publish
+    // moves no counter: the interpreter does not materialise after every instruction either.
+    publish_flags(cpu);
+
+    if cell.note_execution(!resume) {
+        cpu.jit_direct.note_interpret_one_demoted();
+    }
+
+    let clocks = i64::from(outcome.core_clocks);
+    if !resume {
+        cpu.jit_direct.note_interpret_one_resync();
+        // EIP is left EXACTLY where the interpreter put it and the stub advances it by zero: the
+        // instruction retired, so the architectural next address is already correct, and it is not
+        // necessarily `start_eip + len` once S3 admits a row that can move it.
+        return clocks | (1i64 << STATUS_RESYNC_RETIRED_BIT);
+    }
+
+    // STEP 10. Resume. The block-body EIP invariant is restored, so the exit that eventually runs
+    // advances the entry value by its own delta exactly once.
+    cpu.registers.eip = entry_eip;
+    clocks | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+}
+
+/// R4's comparison, with the one case that is a FILL rather than a MOVE excluded.
+///
+/// `DirectPageCache` starts at epoch 0 and `invalidate` puts it back to 0; the first mapping
+/// inserted afterwards adopts the bus's live epoch. So `0 -> n` is a cache warming up, not a
+/// mapping changing, and refusing it would make the FIRST memory-touching call-out after every
+/// cold start and every invalidation resync for nothing -- three of the governor's eight
+/// executions, on a fixture that is behaving perfectly.
+///
+/// It is sound to admit because the invalidation that produced the zero happened BEFORE the step:
+/// whatever it cleared, it cleared while the block was not running, and every later native slot
+/// probes the fast map fresh. `n -> 0` and `n -> m` are both moves and both refuse.
+#[inline]
+fn epoch_moved(before: u64, after: u64) -> bool {
+    before != 0 && before != after
+}
+
+/// Settle whatever the interpreter left into the memory copy emitted code reloads RBP from.
+#[inline]
+fn publish_flags(cpu: &mut CpuGsw) {
+    cpu.registers.eflags = cpu.materialized_eflags();
+    cpu.pending_flags = PendingFlags::default();
+}
+
 /// Drive `push_all_dword` exactly as an emitted slot does, for the helper-level tests.
 #[cfg(test)]
 pub(crate) fn push_all_dword_for_test<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> i64 {
@@ -981,6 +1427,15 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 /// added to the runtime lane so the helper sees the whole prefix (the lane alone carries only
 /// what earlier chained blocks and exits deposited).
 ///
+/// `slot_cell` is the fourth argument, present for the `InterpretOne` class and absent for the
+/// three fixed-opcode helpers. `None` emits nothing at all rather than a zero, which is what keeps
+/// those three arms BYTE-IDENTICAL across this slice: `interpret_one_leaves_the_port_slot_bytes_
+/// unchanged` is the pin.
+///
+/// `resync` and `resync_fault` are likewise `Some` only for the `InterpretOne` class. A helper
+/// that cannot return the two RESYNC statuses emits no test for them, so the port and stack-frame
+/// slots keep their exact instruction sequence.
+///
 /// `abnormal` and `step_break` are side-exit reason stubs the caller has already registered; this
 /// function only branches to them.
 pub(super) fn emit_call_out(
@@ -989,7 +1444,32 @@ pub(super) fn emit_call_out(
     static_prefix_raw: u16,
     abnormal: Label,
     step_break: Label,
+    slot_cell: Option<usize>,
+    resync: Option<(Label, Label)>,
 ) {
+    debug_assert_eq!(
+        helper.interprets_one(),
+        slot_cell.is_some(),
+        "the fourth argument and the InterpretOne class are the same question"
+    );
+    debug_assert_eq!(
+        helper.interprets_one(),
+        resync.is_some(),
+        "only InterpretOne can return a RESYNC status"
+    );
+    // The GOVERNOR, and the whole of it on the fast path: one immediate load, one byte test
+    // against the demoted bit, one not-taken branch. A demoted slot leaves through the abnormal
+    // stub, which is the pre-slice hard boundary exactly -- the block ends AT the instruction with
+    // nothing done and the interpreter runs it.
+    //
+    // Bit 7 rather than a compare against zero (which is what the plan sketched): the cell's low
+    // bits are the execution and RESYNC counts, so a zero test would refuse the slot from its
+    // second execution onwards.
+    if let Some(cell) = slot_cell {
+        e.mov_r64_imm64(Reg::RAX, cell as u64);
+        e.test_byte_disp8_imm8(Reg::RAX, 0, STATE_DEMOTED);
+        e.jnz(abnormal);
+    }
     // Whole-set spill. Deliberately NOT a partial spill keyed on what IN reads and writes: this
     // phase buys correctness, and a partial set would have to be re-derived per helper.
     emit_store_homes(e);
@@ -1008,6 +1488,12 @@ pub(super) fn emit_call_out(
     e.mov_r64_r64(QUOTA_ARG, Reg::RDX);
     e.mov_r64_r64(FLAGS_ARG, Reg::RAX);
     e.mov_r64_r64(CPU_ARG, Reg::R15);
+    // Argument 4, and only for the class that has one. `EXIT_ARG` is R9 on Windows and RCX on
+    // SysV: neither is a `GUEST_HOMES` register, so nothing live is destroyed and the reload after
+    // the call does not have to cover it.
+    if let Some(cell) = slot_cell {
+        e.mov_r64_imm64(EXIT_ARG, cell as u64);
+    }
     e.load_r64_disp32(Reg::RAX, Reg::R15, helper_offset(helper));
     e.call_r64(Reg::RAX);
     e.add_r64_imm32(Reg::RSP, CALLOUT_CALL_FRAME);
@@ -1021,12 +1507,37 @@ pub(super) fn emit_call_out(
     // 0x8 is the x86 sign condition: `js abnormal`.
     e.jcc(0x8, abnormal);
     // The RUNTIME clock lane. `mov r32, r32` zero-extends, which is what isolates the raw-clock
-    // field from the step-break bit above it. The mutation record for this slice is this pair
+    // field from the status bits above it. The mutation record for this slice is this pair
     // deleted: the differential fixture's core-clock comparison then fails by exactly the
     // interpreter's charge for the IN.
+    //
+    // ABOVE the RESYNC branches, deliberately, and the plan's ordering is wrong here for a reason
+    // the plan itself supplies: a RESYNC-RETIRED slot DID run its instruction, and a call-out's
+    // whole charge is this runtime lane (`DirectKind::raw_clocks` is 0 for the kind), so branching
+    // first would drop it. The fault arm returns zero clocks, so the add is a no-op there.
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.add_r64_to_mem_disp8(Reg::RSP, STACK_RAW_CLOCKS, Reg::RDX);
-    // ModRM /5 is SHR. The shift sets ZF against the step-break bit directly, so no compare.
+    // The two RESYNC statuses, tested with `bt` rather than by shifting: bits 33 and 34 have to be
+    // told apart from each other and from the step-break bit at 32, and one shift folds them
+    // together. Fault first, because it is the arm that must not report a retirement.
+    if let Some((resync, resync_fault)) = resync {
+        e.bt_r64_imm8(Reg::RAX, STATUS_RESYNC_FAULT_BIT as u8);
+        // 0x2 is the x86 carry condition: `jc`.
+        e.jcc(0x2, resync_fault);
+        e.bt_r64_imm8(Reg::RAX, STATUS_RESYNC_RETIRED_BIT as u8);
+        e.jcc(0x2, resync);
+    }
+    // ModRM /5 is SHR. The shift sets ZF against the step-break bit directly, so no compare. It is
+    // sound after the two branches above precisely because they were taken: on this path bits 33
+    // and 34 are clear, so the shifted value is the step-break bit alone.
     e.shift_r64_imm8(5, Reg::RAX, STATUS_STEP_BREAK_BIT as u8);
     e.jnz(step_break);
+    // RBP is the block body's EFLAGS shadow and the helper has just republished the architectural
+    // value into memory, so the RESUME path -- and only it -- reloads the register from there.
+    // Every other path leaves through `shared_return`, which does NOT store RBP back, so a reload
+    // on those would be dead work and a reload BEFORE the status branch would have to be undone.
+    // Design review B4.
+    if slot_cell.is_some() {
+        e.load_r32_disp32(Reg::RBP, Reg::R15, eflags_offset());
+    }
 }

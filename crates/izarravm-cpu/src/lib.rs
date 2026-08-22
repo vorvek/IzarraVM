@@ -1916,6 +1916,13 @@ pub struct DirectStallSnapshot {
     pub callout_executed: u64,
     /// Port call-outs served through the TSS-bitmap arm. See `BlockCacheStats`.
     pub callout_port_v86_served: u64,
+    /// The `InterpretOne` call-out family; see `DirectStallTally` for what each one denominates.
+    pub callout_interpret_one_executed: u64,
+    pub callout_interpret_one_resync: u64,
+    pub callout_interpret_one_resync_fault: u64,
+    pub callout_interpret_one_abnormal: u64,
+    pub callout_interpret_one_demoted: u64,
+    pub callout_slot_cap_hits: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.
     pub reject_callout_privileged: u64,
     /// The call-out admission governor: entries spent at trial quota, and the two classifications
@@ -2075,6 +2082,16 @@ struct DirectRuntimeState {
     /// from CPU equality and resets on clone. It lives here rather than as a run-loop local so the
     /// whole admission decision fits in one dispatcher call.
     skip_direct_once: bool,
+    /// A machine-stopping `CpuError` an `InterpretOne` call-out's fault delivery produced, parked
+    /// for `run_direct_block` to propagate after the native return.
+    ///
+    /// The helper answers emitted code through an `i64` status word and has no way to return a
+    /// `CpuError` through it; the alternative would have been to swallow the stop, which turns a
+    /// triple fault into a guest that keeps running. Run-scoped and never live across a dispatcher
+    /// entry: the helper sets it and the same entry's return takes it. Here rather than at the
+    /// `CpuGsw` tail because that is where the other run-scoped, equality-excluded, clone-resetting
+    /// latch already lives.
+    callout_error: Option<CpuError>,
 }
 
 #[cfg(feature = "jit")]
@@ -2268,6 +2285,16 @@ pub struct CpuGsw {
     /// memset every instruction.
     written_count: u8,
     written_pages_overflow: bool,
+    /// An `InterpretOne` call-out is running one interpreter instruction with a native block live
+    /// on the host stack. While set, `note_code_write_inner` records instead of invalidating; see
+    /// the branch there for why a retire under a live frame is the hazard and not the write
+    /// itself. Cleared by the helper before it returns, so no dispatcher entry ever sees it set.
+    /// Host-side window state, exactly like `native_callout`: not guest state, never compared.
+    #[cfg(feature = "jit")]
+    pub(crate) in_native_callout: bool,
+    /// The writes that window deferred, replayed by `run_direct_block` after the native return.
+    #[cfg(feature = "jit")]
+    deferred_code_writes: DeferredCodeWrites,
     // Direct-mapped cache of decoded instructions keyed by linear EIP. Skips re-decoding hot-loop
     // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
     // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
@@ -2480,6 +2507,10 @@ impl Default for CpuGsw {
             written_pages: [None; TRACKED_WRITE_PAGES],
             written_count: 0,
             written_pages_overflow: false,
+            #[cfg(feature = "jit")]
+            in_native_callout: false,
+            #[cfg(feature = "jit")]
+            deferred_code_writes: DeferredCodeWrites::default(),
             decode_cache,
             #[cfg(feature = "jit")]
             jit_direct,
@@ -4431,6 +4462,113 @@ pub(crate) const PUSH_ALL_CORE_CLOCKS: u32 = 18;
 /// What `POPA`/`POPAD` (0x61) charges. See `PUSH_ALL_CORE_CLOCKS`.
 pub(crate) const POP_ALL_CORE_CLOCKS: u32 = 18;
 
+/// One code write taken while an `InterpretOne` call-out held a native block live, kept until
+/// `run_direct_block` can replay it with the window shut. `lanes` is which of the two invalidation
+/// doors the original caller opened, carried so the replay is the same call and not merely a
+/// similar one.
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredCodeWrite {
+    pub(crate) physical: u32,
+    pub(crate) width: u32,
+    pub(crate) lanes: bool,
+}
+
+#[cfg(feature = "jit")]
+impl DeferredCodeWrite {
+    const EMPTY: Self = Self {
+        physical: 0,
+        width: 0,
+        lanes: false,
+    };
+}
+
+/// The call-out window's deferred-write list.
+///
+/// Its own type for the reason `CallOutTable` is one: this is HOST-SIDE window state that is
+/// empty at every point a `CpuGsw` can be observed from outside a native entry, and the derived
+/// `PartialEq` on `CpuGsw` would otherwise compare the stale tail two architecturally identical
+/// CPUs are free to differ in (the drain resets `count`, not the bytes behind it). So equality is
+/// always true and `Clone` resets, exactly as they do there.
+#[cfg(feature = "jit")]
+#[derive(Debug)]
+pub(crate) struct DeferredCodeWrites {
+    entries: [DeferredCodeWrite; MAX_DEFERRED_CODE_WRITES],
+    count: u8,
+    overflow: bool,
+}
+
+#[cfg(feature = "jit")]
+impl Default for DeferredCodeWrites {
+    fn default() -> Self {
+        Self {
+            entries: [DeferredCodeWrite::EMPTY; MAX_DEFERRED_CODE_WRITES],
+            count: 0,
+            overflow: false,
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Clone for DeferredCodeWrites {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(feature = "jit")]
+impl PartialEq for DeferredCodeWrites {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Eq for DeferredCodeWrites {}
+
+#[cfg(feature = "jit")]
+impl DeferredCodeWrites {
+    /// True when nothing was deferred: the helper's R5 clause and the drain's early out.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0 && !self.overflow
+    }
+
+    fn push(&mut self, write: DeferredCodeWrite) {
+        let index = usize::from(self.count);
+        if index >= MAX_DEFERRED_CODE_WRITES {
+            self.overflow = true;
+            return;
+        }
+        self.entries[index] = write;
+        self.count += 1;
+    }
+}
+
+/// How many deferred writes one call-out can record before the drain falls back to the coarse
+/// write-page replay. Sized for the worst reachable instruction rather than for the common one: a
+/// memory-form POP stores once (twice if it splits a page), and the FAULT path adds a whole
+/// exception delivery -- up to five pushes plus the accessed-bit write of every page walk they
+/// take. Sixteen covers that with room; the overflow arm exists because "covers it with room" is
+/// not a proof.
+#[cfg(feature = "jit")]
+pub(crate) const MAX_DEFERRED_CODE_WRITES: usize = 16;
+
+/// What POP r/m16/32 charges (execute.rs `0x8f`), and through `INTERPRET_ONE_MAX_CORE_CLOCKS` the
+/// whole of what an `InterpretOne` slot can deposit in the block's runtime raw lane while the S2
+/// allowlist holds one opcode. Named for the reason `IN_AL_DX_CORE_CLOCKS` is: the budget bound
+/// and the interpreter must charge the SAME number, so there is one definition of it.
+pub(crate) const POP_RM_CORE_CLOCKS: u32 = 5;
+
+/// The largest core charge an `InterpretOne` slot can return on its RESUME or RESYNC-RETIRED
+/// status: the maximum, over the `InterpretOne` allowlist, of the interpreter's own charge for
+/// those rows. S2's allowlist is 0x8F alone.
+///
+/// The FAULT status is deliberately not in this maximum. There the clocks are charged by
+/// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
+/// instruction that faults at a block boundary, and the helper returns zero -- so nothing on that
+/// path reaches the lane this constant bounds. Widening the allowlist means widening this.
+pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = POP_RM_CORE_CLOCKS;
+
 /// The largest core charge any admitted call-out helper can return, and the term
 /// `compute_iteration_upper` / `compute_global_block_upper` must price a slot at when they cannot
 /// tell the helpers apart. Derived from the three constants above rather than written down, so a
@@ -4442,10 +4580,15 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     } else {
         PUSH_ALL_CORE_CLOCKS
     };
-    if a > POP_ALL_CORE_CLOCKS {
+    let b = if a > POP_ALL_CORE_CLOCKS {
         a
     } else {
         POP_ALL_CORE_CLOCKS
+    };
+    if b > INTERPRET_ONE_MAX_CORE_CLOCKS {
+        b
+    } else {
+        INTERPRET_ONE_MAX_CORE_CLOCKS
     }
 };
 

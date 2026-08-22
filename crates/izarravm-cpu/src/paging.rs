@@ -271,6 +271,15 @@ impl DirectPageCache {
         self.mapping_epoch
     }
 
+    /// Move the epoch without a mapping to insert, so a test can stage what a paging change looks
+    /// like to the `InterpretOne` resume predicate. The predicate is the only reader that treats
+    /// this value as a generation rather than as a cache key, and no admitted opcode can move it,
+    /// so there is no fixture that reaches the clause any other way.
+    #[cfg(test)]
+    pub(crate) fn set_mapping_epoch_for_test(&mut self, epoch: u64) {
+        self.mapping_epoch = epoch;
+    }
+
     #[inline]
     pub(crate) fn invalidate(&mut self) {
         self.entries.fill(DirectPageCacheEntry::default());

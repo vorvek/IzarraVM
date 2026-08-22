@@ -455,6 +455,26 @@ impl CpuGsw {
     /// runs, and a block cannot patch its own lane from under itself.
     #[inline]
     fn note_code_write_inner(&mut self, physical: u32, width: u32, lanes: bool) -> bool {
+        // THE CALL-OUT WINDOW. `InterpretOne` runs one interpreter instruction with a native block
+        // live on the host stack, and that instruction is allowed to STORE. The proof this
+        // function's doc comment rests on -- "no compiled block is mid-execution when this runs" --
+        // is exactly what stops holding there, and the consequence is not academic: the block's
+        // own page is code-watched, so a store into it reaches `invalidate_physical_range`, which
+        // retires the running block, frees its arena bytes and can hand them to the next
+        // compilation while the helper still has to RETURN through them.
+        //
+        // So while the window is open the write is RECORDED and reported as a hit, and nothing is
+        // invalidated. Reporting the hit is what makes the helper's R5 clause fire, which ends the
+        // native run at this instruction; `run_direct_block` then drains the list through this
+        // same function with the flag clear, so the invalidation happens for real one step later,
+        // before any guest instruction can observe the stale code.
+        //
+        // One predictable bool test on a path that is already the invalidation choke rather than
+        // the store path: `note_code_write_hit` reaches here only behind `code_write_watched`.
+        if self.in_native_callout {
+            self.record_deferred_code_write(physical, width, lanes);
+            return true;
+        }
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
@@ -594,6 +614,61 @@ impl CpuGsw {
             trace.record(physical, width, pre, action);
         }
         invalidated
+    }
+
+    /// Record one code write taken while an `InterpretOne` call-out held a native block live.
+    /// Separate from the branch above and `#[cold]` so the open-window case costs the choke one
+    /// not-taken branch and no register pressure.
+    #[cold]
+    #[inline(never)]
+    fn record_deferred_code_write(&mut self, physical: u32, width: u32, lanes: bool) {
+        self.deferred_code_writes.push(crate::DeferredCodeWrite {
+            physical,
+            width,
+            lanes,
+        });
+    }
+
+    /// Replay every write the call-out window deferred, with the window CLOSED, and clear the
+    /// list. Called by `run_direct_block` once per native entry, after the fetch accounting and
+    /// before it returns.
+    ///
+    /// Exact for the recorded entries: each replays the same `(physical, width)` through the same
+    /// door (`lanes` picks the value-aware one) that the interpreter's store path chose, so the
+    /// lane-absorption decision and every SMC counter land where they would have landed.
+    ///
+    /// The overflow arm is coarse and unreachable in practice. `MAX_DEFERRED_CODE_WRITES` is
+    /// sized for one instruction's stores plus a whole exception delivery's pushes and page-walk
+    /// accessed-bit writes; past that the only sound answer is to invalidate everything the
+    /// instruction is known to have touched, which is the write-page record `begin_instruction`
+    /// was deliberately not called to preserve, and if THAT overflowed too, to drop every compiled
+    /// block and every decode line.
+    #[cfg(feature = "jit")]
+    pub(super) fn drain_deferred_code_writes(&mut self) {
+        if self.deferred_code_writes.is_empty() {
+            return;
+        }
+        let deferred = core::mem::take(&mut self.deferred_code_writes);
+        for index in 0..usize::from(deferred.count) {
+            let write = deferred.entries[index];
+            if write.lanes {
+                self.note_code_write_hit(write.physical, write.width);
+            } else {
+                self.note_code_write(write.physical, write.width);
+            }
+        }
+        if deferred.overflow {
+            if self.written_pages_overflow {
+                self.jit_direct.clear();
+                self.invalidate_code_caches();
+            } else {
+                for index in 0..usize::from(self.written_count) {
+                    if let Some(page) = self.written_pages[index] {
+                        self.note_code_write(page << 12, 0x1000);
+                    }
+                }
+            }
+        }
     }
 
     /// G1 heat epoch: the retired-instruction megacount. Both the invalidation choke (which bumps
@@ -1297,6 +1372,12 @@ impl CpuGsw {
     }
 
     /// Always available, unlike the census: see `DirectStallSnapshot`.
+    /// See `DirectPageCache::set_mapping_epoch_for_test`.
+    #[cfg(test)]
+    pub(crate) fn set_data_write_mapping_epoch_for_test(&mut self, epoch: u64) {
+        self.data_write_pages.set_mapping_epoch_for_test(epoch);
+    }
+
     pub fn direct_stall_snapshot(&self) -> crate::DirectStallSnapshot {
         #[cfg(feature = "jit")]
         {
