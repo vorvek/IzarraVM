@@ -1944,6 +1944,10 @@ pub struct DirectStallSnapshot {
     pub callout_interpret_one_rows: Vec<InterpretOneRowCounts>,
     pub callout_deferred_code_writes: u64,
     pub callout_slot_cap_hits: u64,
+    /// The compile walk's page budget and the recovery search behind it. See the fields of the
+    /// same name on the census stalls struct for what each one grades.
+    pub compile_page_overflows: u64,
+    pub compile_page_search_steps: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.
     pub reject_callout_privileged: u64,
     /// The call-out admission governor: entries spent at trial quota, and the two classifications

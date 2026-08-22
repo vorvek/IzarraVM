@@ -510,6 +510,19 @@ pub(crate) struct DirectStallTally {
     /// evidence for or against raising the cap, which S5 prices; zero says the cap is not what
     /// bounds the loader's blocks.
     pub callout_slot_cap_hits: u64,
+    /// The compile walk's page budget, priced from the other side: `overflows` counts full-length
+    /// walks whose emission still exceeded one host page, and `search_steps` the candidate
+    /// re-compiles `compile_with_page_len`'s recovery search then paid for them.
+    ///
+    /// One pair rather than a ratio because they answer different questions. `overflows` grades
+    /// the size model (`EMITTED_BLOCK_FIXED_BYTES`): it should be a rounding error against
+    /// `jit_direct_compile_attempts`, and a large value says the model is wrong for this guest's
+    /// slot mix, not that the search is expensive. `search_steps` is the cost itself, and it is
+    /// the counter that made the S3 regression legible -- 956,976 steps against 280,000 compiles,
+    /// each one a full re-walk AND a full re-emission, which is where 4.4 seconds of the loader's
+    /// wall went.
+    pub compile_page_overflows: u64,
+    pub compile_page_search_steps: u64,
     /// G1 lane trials granted: hot-chunk compilations allowed through the heat gates on the
     /// one-per-key-per-epoch budget (`lane_trial_enabled`), and how many of them installed a
     /// lane-carrying block under a hot span. The gap between the two is trials that learned
@@ -1812,6 +1825,8 @@ impl crate::jit::JitState {
                 .collect(),
             callout_deferred_code_writes: self.stalls.callout_deferred_code_writes,
             callout_slot_cap_hits: self.stalls.callout_slot_cap_hits,
+            compile_page_overflows: self.stalls.compile_page_overflows,
+            compile_page_search_steps: self.stalls.compile_page_search_steps,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             callout_governor_trials: self.stalls.callout_governor_trials,
             callout_governor_lazy: self.stalls.callout_governor_lazy,
@@ -1924,6 +1939,16 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_callout_slot_cap_hit(&mut self) {
         self.stalls.callout_slot_cap_hits += 1;
+    }
+
+    /// A full-length walk whose emission did not fit one host page, and each candidate the
+    /// recovery search then compiled. See `compile_page_overflows`.
+    pub(crate) fn note_compile_page_overflow(&mut self) {
+        self.stalls.compile_page_overflows += 1;
+    }
+
+    pub(crate) fn note_compile_page_search_step(&mut self) {
+        self.stalls.compile_page_search_steps += 1;
     }
 
     pub(crate) fn note_reject_callout_privileged(&mut self) {

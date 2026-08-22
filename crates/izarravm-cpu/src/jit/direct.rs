@@ -101,6 +101,33 @@ use super::fast_map::{
 struct NativeMapBases;
 
 pub(crate) const MAX_BLOCK_INSTRUCTIONS: usize = 32;
+/// Emitted-size model for the compile walk, in host bytes. It exists for ONE reason: an installed
+/// block owns exactly one host page, and when the walk runs past that page `compile_with_page_len`
+/// recovers by binary-searching shorter prefixes, which re-walks AND RE-EMITS the block four more
+/// times. The model lets the walk stop at the page instead of discovering it afterwards.
+///
+/// It is a COST estimate, never a correctness one. Under-predicting costs nothing but the search
+/// that was going to run anyway; over-predicting costs a slot of block length. The search stays as
+/// the net, so no arm of this table can make a block that does not fit install.
+///
+/// MEASURED 2026-08-22 on the tombraid loader phase (`.bench/tombraid_loader_c`, 19,489 sampled
+/// emissions, least squares against the real `code.len()`): intercept 489.5, register-only slot
+/// 33.4, memory slot 341.3, call-out slot 572.7, terminal slot +195.3; RMS residual 27.5 bytes and
+/// 95th-percentile absolute residual 15 bytes against a 3,789-byte mean, agreeing with the
+/// one-page boundary on every sample. The constants below round those fits UP, because the two
+/// errors are not symmetric: an under-prediction pays four extra compiles and an over-prediction
+/// pays a fraction of one slot.
+///
+/// x87 and memory-ALU slots are deliberately priced at the memory-slot rate rather than measured:
+/// the loader carries none of either, and both classes already have their own instruction caps
+/// (`MAX_X87_BLOCK_INSTRUCTIONS`, `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`) sized to keep such a block
+/// inside its page. Pricing them low leaves those blocks forming exactly as they do today; pricing
+/// them high would shorten blocks whose length is already governed elsewhere.
+const EMITTED_BLOCK_FIXED_BYTES: u32 = 576;
+const EMITTED_REGISTER_SLOT_BYTES: u32 = 40;
+const EMITTED_MEMORY_SLOT_BYTES: u32 = 352;
+const EMITTED_CALL_OUT_SLOT_BYTES: u32 = 592;
+const EMITTED_TERMINAL_SLOT_EXTRA_BYTES: u32 = 208;
 pub(crate) const HOT_LOOKUP_LEN: usize = 65_536;
 pub(crate) const MAX_CHAIN_BLOCKS: usize = 256;
 pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
@@ -4863,6 +4890,36 @@ impl DirectKind {
             Self::AluMemDest { .. } | Self::DoubleShiftMem { .. } | Self::TestImmMem { .. }
         )
     }
+
+    /// This slot's contribution to the block's emitted host bytes, for the walk's page budget.
+    /// Derivation and the measurement behind the constants: `EMITTED_BLOCK_FIXED_BYTES`.
+    ///
+    /// Three classes and one adder, all read off methods this walk already calls, so a new
+    /// `DirectKind` variant is priced the moment it declares its accesses rather than needing a
+    /// new arm here. A slot that names no access is register-only; every other non-call-out slot
+    /// carries an address computation, a fast-map probe and a watched/device fallback, which is
+    /// what the memory rate pays for.
+    fn emitted_bytes_estimate(self) -> u32 {
+        let body = if self.is_call_out() {
+            EMITTED_CALL_OUT_SLOT_BYTES
+        } else if self.byte_reads()
+            | self.word_reads()
+            | self.dword_reads()
+            | self.byte_stores()
+            | self.word_stores()
+            | self.dword_stores()
+            != 0
+        {
+            EMITTED_MEMORY_SLOT_BYTES
+        } else {
+            EMITTED_REGISTER_SLOT_BYTES
+        };
+        body + if self.is_terminal() {
+            EMITTED_TERMINAL_SLOT_EXTRA_BYTES
+        } else {
+            0
+        }
+    }
 }
 
 mod frame;
@@ -6298,22 +6355,26 @@ fn compile_with_page_len(
     d: bool,
     page_len: usize,
 ) -> CompileOutcome {
-    let full = match compile_with_instruction_limit(cpu, entry_lin, d, MAX_BLOCK_INSTRUCTIONS) {
+    let full = match compile_with_budget(cpu, entry_lin, d, MAX_BLOCK_INSTRUCTIONS, page_len) {
         CompileOutcome::Compiled(compilation) => compilation,
         other => return other,
     };
     if full.code.len() <= page_len {
         return CompileOutcome::Compiled(full);
     }
+    cpu.jit_direct.note_compile_page_overflow();
 
-    // Shorter candidates use the same fallthrough exit, so emitted size increases with the
-    // instruction count. Find the longest prefix that fits one arena page. Two-instruction
+    // The size model under-predicted this block. Fall back to the search WITHOUT the budget, so
+    // the recovery path keeps exactly the semantics it had before the model existed: shorter
+    // candidates use the same fallthrough exit, so emitted size increases with the instruction
+    // count, and the longest prefix that fits one arena page is what installs. Two-instruction
     // nonterminal prefixes remain interpreter-only.
     let mut lower = 3usize;
     let mut upper = usize::from(full.span.instructions).saturating_sub(1);
     let mut best = None;
     while lower <= upper {
         let midpoint = lower + (upper - lower) / 2;
+        cpu.jit_direct.note_compile_page_search_step();
         let candidate = match compile_with_instruction_limit(cpu, entry_lin, d, midpoint) {
             CompileOutcome::Compiled(compilation) => compilation,
             CompileOutcome::StructuralReject(_) | CompileOutcome::Retry => {
@@ -7019,11 +7080,24 @@ fn rotate_row_count_byte_is_patched(cpu: &CpuGsw, insn: &DecodedInsn, physical: 
     cpu.jit_direct.smc_heat.has_record_range(count_byte, 1)
 }
 
+/// The walk without a page budget: every prefix the instruction limit allows, whatever it emits.
+/// `compile_with_page_len`'s recovery search takes this door so its behaviour does not depend on
+/// the size model that sent it there.
 fn compile_with_instruction_limit(
     cpu: &mut CpuGsw,
     entry_lin: u32,
     d: bool,
     instruction_limit: usize,
+) -> CompileOutcome {
+    compile_with_budget(cpu, entry_lin, d, instruction_limit, usize::MAX)
+}
+
+fn compile_with_budget(
+    cpu: &mut CpuGsw,
+    entry_lin: u32,
+    d: bool,
+    instruction_limit: usize,
+    byte_budget: usize,
 ) -> CompileOutcome {
     let Some(key) = key_for(cpu, entry_lin, d) else {
         return CompileOutcome::Retry;
@@ -7079,6 +7153,9 @@ fn compile_with_instruction_limit(
     let mut imm8_lane_count = 0u8;
     let mut count_lane_count = 0u8;
     let mut stop = CompileStop::Boundary;
+    // Running estimate of what this block will emit, against `byte_budget` (the arena page).
+    // See `EMITTED_BLOCK_FIXED_BYTES` for why the walk carries this at all.
+    let mut estimated_bytes = EMITTED_BLOCK_FIXED_BYTES;
 
     while slots.len() < instruction_limit.min(MAX_BLOCK_INSTRUCTIONS) {
         if x87_slots != 0 && slots.len() == MAX_X87_BLOCK_INSTRUCTIONS {
@@ -7503,6 +7580,19 @@ fn compile_with_instruction_limit(
             stop = CompileStop::Retry;
             break;
         }
+        // The page budget. A BOUNDARY, not a Retry: the block simply ends here and its successor
+        // starts at this instruction, which is the same shape the walk takes at a terminal slot.
+        // Held below the three-instruction floor `compile_with_instruction_limit`'s tail applies,
+        // so the budget can never be the reason a block is too short to install -- at the rates in
+        // `EMITTED_BLOCK_FIXED_BYTES` the cheapest three slots that could trip it are three
+        // call-outs, which come to less than half a page.
+        let next_estimated_bytes = estimated_bytes.saturating_add(kind.emitted_bytes_estimate());
+        if slots.len() >= 3
+            && usize::try_from(next_estimated_bytes).unwrap_or(usize::MAX) > byte_budget
+        {
+            stop = CompileStop::Boundary;
+            break;
+        }
         let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.persona());
         let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks()) else {
             stop = CompileStop::Retry;
@@ -7562,6 +7652,7 @@ fn compile_with_instruction_limit(
             x87_exit_top = insn.advance_top(x87_exit_top);
         }
         memory_alu_slots += u8::from(kind.is_memory_alu());
+        estimated_bytes = next_estimated_bytes;
         raw_clocks = next_raw_clocks;
         weighted_fp_clocks = next_weighted_fp_clocks;
         byte_reads = next_byte_reads;
