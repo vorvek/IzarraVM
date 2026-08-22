@@ -70,6 +70,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         callout_slots: 0,
         callout_port_slots: 0,
         callout_memory_slots: 0,
+        callout_interpret_one_slots: 0,
         x87_entry_top: 0,
         x87_exit_top: 0,
         dynamic_successor: false,
@@ -77,6 +78,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets: [None, None],
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
+        interpret_one_cells: Vec::new(),
         body_offset: 0,
         imm_lanes: [NO_IMM_LANE; MAX_BLOCK_IMM_LANES],
         imm_lane_widths: [0; MAX_BLOCK_IMM_LANES],
@@ -1725,7 +1727,11 @@ fn lift_cold_smc_dormant_reports_which_of_its_three_shapes_it_took() {
     );
 
     // Dormant with no heat stamp (compile Retry, G4 cover failure): parked, and parked again.
-    cache.dormant(seen, DormantReason::CompileRetry);
+    cache.dormant(
+        seen,
+        DormantReason::CompileRetry,
+        Some(RetryCause::TooShort),
+    );
     assert_eq!(
         cache.lift_cold_smc_dormant(&mut heat, seen, 0),
         DormantLift::StillDormant
@@ -2846,14 +2852,18 @@ fn unbound_target_classes_are_exhaustive() {
     // Dormant, split by reason. `SpanHot` is the heat lane; the other three share the residual.
     let heat = key(0x1100);
     assert!(matches!(cache.probe(heat), BlockProbe::Interpret));
-    cache.dormant(heat, DormantReason::SpanHot);
+    cache.dormant(heat, DormantReason::SpanHot, None);
     assert_eq!(
         cache.classify_unbound_target(heat),
         UnboundTarget::DormantHeat
     );
     let other = key(0x1200);
     assert!(matches!(cache.probe(other), BlockProbe::Interpret));
-    cache.dormant(other, DormantReason::CompileRetry);
+    cache.dormant(
+        other,
+        DormantReason::CompileRetry,
+        Some(RetryCause::TooShort),
+    );
     assert_eq!(
         cache.classify_unbound_target(other),
         UnboundTarget::DormantOther
@@ -2913,7 +2923,11 @@ fn admission_census_rejected_probe_classifier_covers_every_cache_state_and_disab
 
     let dormant = key(0x1a00);
     assert!(matches!(cache.probe(dormant), BlockProbe::Interpret));
-    cache.dormant(dormant, DormantReason::CompileRetry);
+    cache.dormant(
+        dormant,
+        DormantReason::CompileRetry,
+        Some(RetryCause::TooShort),
+    );
     assert_eq!(
         cache.classify_rejected_probe(dormant),
         Some(AdmissionDecline::DormantProbe)
@@ -3688,4 +3702,256 @@ fn link_mask_resets_the_chain_requirement_when_a_slot_is_recycled() {
     newcomer_compilation.successors[0] = Some(link_target_of(root));
     let newcomer_id = install_chain_block(&mut cache, &newcomer_compilation);
     assert_eq!(cache.outbound[newcomer_id.index()][0], Some(reborn));
+}
+
+// ---------------------------------------------------------------------------
+// The retry lift (S4 part 2). `lift_cold_smc_dormant` re-admits keys the SMC heat gate parked,
+// driven by a stamp aging out. Nothing re-admitted the keys the COMPILE WALK parked, and on the
+// tombraid loader phase 194 of 466 of those are `DecodeMiss`, a cause that clears the moment the
+// interpreter runs the same bytes and refills the line.
+// ---------------------------------------------------------------------------
+
+/// A clearable cause lifts at exactly `RETRY_LIFT_VISITS`, and not one visit sooner.
+///
+/// The exact count matters more than it looks: the lift's cost is a compile attempt, and a gate
+/// that fired at the first visit would hand every dormant key one compile per memo era. The
+/// boundary is asserted from both sides.
+///
+/// MUTATION: change the comparison to `<=` and the key lifts one visit early, which the
+/// still-dormant assertion inside the loop catches.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn a_clearable_retry_cause_lifts_at_the_visit_threshold() {
+    set_retry_lift_for_test(Some(true));
+    let mut cache = BlockCache::default();
+    let k = key(0x2000);
+    cache.park_dormant_for_test(k, DormantReason::CompileRetry, Some(RetryCause::DecodeMiss));
+    assert!(matches!(cache.probe(k), BlockProbe::Rejected));
+
+    for visit in 1..RETRY_LIFT_VISITS {
+        assert!(
+            !cache.lift_clearable_retry_dormant(k),
+            "visit {visit} lifted before the threshold"
+        );
+        assert!(cache.is_dormant_for_test(k));
+    }
+    assert!(
+        cache.lift_clearable_retry_dormant(k),
+        "the threshold visit must lift"
+    );
+    assert!(!cache.is_dormant_for_test(k), "a lifted key is Seen again");
+    assert_eq!(cache.stall_snapshot().retry_lifts, 1);
+    // Seen, so the next observation is a compile rather than another decline.
+    assert!(matches!(cache.probe(k), BlockProbe::Compile));
+    set_retry_lift_for_test(None);
+}
+
+/// A DETERMINISTIC cause is never lifted, however long it waits.
+///
+/// `TooShort` is the post-walk min-length rule: it reads the shape of the block the walk formed,
+/// which is a function of the code bytes and the key, so a re-walk reaches the same answer for
+/// ever. Lifting it would be a compile attempt per key per window with a guaranteed park behind
+/// it, on the population that is already the largest unattributed exit class.
+///
+/// MUTATION: make `clearable_by_retry` return true for `TooShort` and this fails on the first
+/// iteration past the threshold.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn a_deterministic_retry_cause_is_never_lifted() {
+    set_retry_lift_for_test(Some(true));
+    let mut cache = BlockCache::default();
+    for cause in [
+        RetryCause::TooShort,
+        RetryCause::AdmissionMatrix,
+        RetryCause::X87Cap,
+        RetryCause::CalloutCap,
+        RetryCause::MemoryAluCap,
+        RetryCause::StackAccessCap,
+        RetryCause::PostWalk,
+        RetryCause::HostPageLen,
+        RetryCause::PageCross,
+        RetryCause::SegmentLimit,
+    ] {
+        let k = key(0x3000 + (cause as u32) * 0x10);
+        cache.park_dormant_for_test(k, DormantReason::CompileRetry, Some(cause));
+        for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
+            assert!(
+                !cache.lift_clearable_retry_dormant(k),
+                "{} was lifted",
+                cause.label()
+            );
+        }
+        assert!(cache.is_dormant_for_test(k), "{}", cause.label());
+    }
+    assert_eq!(cache.stall_snapshot().retry_lifts, 0);
+    // And the heat lane keeps its own answer: a `SpanHot` park carries no cause at all, so this
+    // arm must not touch it even though `lift_cold_smc_dormant` would.
+    let heat = key(0x3900);
+    cache.park_dormant_for_test(heat, DormantReason::SpanHot, None);
+    for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
+        assert!(!cache.lift_clearable_retry_dormant(heat));
+    }
+    set_retry_lift_for_test(None);
+}
+
+/// One lift per key per cause. A key that comes straight back with the SAME cause is parked
+/// permanently, and the counter says so.
+///
+/// The lift is an offer to re-walk once. A key that takes it and lands on the same gate has
+/// supplied the evidence that re-walking does not help, and without this rule it would buy
+/// another window and another compile for ever -- which is precisely the treadmill
+/// `note_demoted_callout_site` exists to avoid one level down.
+///
+/// A DIFFERENT cause is a different question and gets its own window, which is the boundary this
+/// also pins -- and the THIRD leg is what makes the bound real: the key comes back to the first
+/// cause, and that is a repark too. `clearable_by_retry` names two causes, so a key can spend at
+/// most two lifts, and an alternating key runs out rather than looping. That leg fails against a
+/// per-key record, which remembers only the last cause.
+///
+/// MUTATION: drop the `retry_lift_spent` read from `dormant` and the second window fires; make it
+/// a `HashMap<BlockKey, RetryCause>` again and the third leg lifts for ever.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn a_lifted_key_that_reparks_with_the_same_cause_is_never_lifted_again() {
+    set_retry_lift_for_test(Some(true));
+    let mut cache = BlockCache::default();
+    let k = key(0x4000);
+    cache.park_dormant_for_test(k, DormantReason::CompileRetry, Some(RetryCause::DecodeMiss));
+    cache.set_dormant_visits_for_test(k, RETRY_LIFT_VISITS - 1);
+    assert!(cache.lift_clearable_retry_dormant(k));
+
+    // Straight back with the same answer.
+    cache.dormant(k, DormantReason::CompileRetry, Some(RetryCause::DecodeMiss));
+    assert_eq!(cache.stall_snapshot().retry_lift_reparks, 1);
+    for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
+        assert!(
+            !cache.lift_clearable_retry_dormant(k),
+            "a permanently parked key must never lift again"
+        );
+    }
+    assert_eq!(cache.stall_snapshot().retry_lifts, 1);
+
+    // A DIFFERENT clearable cause is a different question, and gets its own window.
+    let other = key(0x4100);
+    cache.park_dormant_for_test(
+        other,
+        DormantReason::CompileRetry,
+        Some(RetryCause::DecodeMiss),
+    );
+    cache.set_dormant_visits_for_test(other, RETRY_LIFT_VISITS - 1);
+    assert!(cache.lift_clearable_retry_dormant(other));
+    cache.dormant(
+        other,
+        DormantReason::CompileRetry,
+        Some(RetryCause::TranslationMismatch),
+    );
+    assert_eq!(
+        cache.stall_snapshot().retry_lift_reparks,
+        1,
+        "a different cause is not a repark"
+    );
+    cache.set_dormant_visits_for_test(other, RETRY_LIFT_VISITS - 1);
+    assert!(cache.lift_clearable_retry_dormant(other));
+    assert_eq!(cache.stall_snapshot().retry_lifts, 3);
+
+    // THE THIRD LEG, and the one the bound actually rests on: back to the FIRST cause. Both
+    // `DecodeMiss` and `TranslationMismatch` are clearable, so a key that alternates them was the
+    // one shape a per-key record could not stop -- it remembered only the last cause and was
+    // overwritten every time, which is a lift every window for ever. The record is a set of
+    // (key, cause) PAIRS, so this key has now spent both of the two causes there are.
+    cache.dormant(
+        other,
+        DormantReason::CompileRetry,
+        Some(RetryCause::DecodeMiss),
+    );
+    assert_eq!(
+        cache.stall_snapshot().retry_lift_reparks,
+        2,
+        "coming back to a cause it already spent IS a repark"
+    );
+    for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
+        assert!(
+            !cache.lift_clearable_retry_dormant(other),
+            "an alternating key must run out of causes, not lift for ever"
+        );
+    }
+    assert_eq!(cache.stall_snapshot().retry_lifts, 3);
+    set_retry_lift_for_test(None);
+}
+
+/// The retry lift is OFF by default, and the off arm is the pre-slice behaviour exactly.
+///
+/// Every fixture above forces the arm ON, which is the convention this backend's knobs use and is
+/// also what makes this test necessary: with the arm stated everywhere else, nothing was asserting
+/// what an unstated build does. `IZARRAVM_RETRY_LIFT` defaulted OFF on 2026-08-22 while the duke
+/// regression is unattributed, so this is the arm that ships.
+///
+/// MUTATION: drop the gate read from `lift_clearable_retry_dormant` and the key lifts here.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn the_retry_lift_is_off_by_default() {
+    let mut cache = BlockCache::default();
+    let k = key(0x5000);
+    cache.park_dormant_for_test(k, DormantReason::CompileRetry, Some(RetryCause::DecodeMiss));
+    for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
+        assert!(
+            !cache.lift_clearable_retry_dormant(k),
+            "the default arm must never lift"
+        );
+    }
+    assert!(cache.is_dormant_for_test(k));
+    assert_eq!(cache.stall_snapshot().retry_lifts, 0);
+
+    // Control: the same key on the ON arm lifts at the threshold, so the assertion above is about
+    // the gate and not about the fixture.
+    set_retry_lift_for_test(Some(true));
+    cache.set_dormant_visits_for_test(k, RETRY_LIFT_VISITS - 1);
+    assert!(cache.lift_clearable_retry_dormant(k));
+    set_retry_lift_for_test(None);
+}
+
+/// `IZARRAVM_RETRY_LIFT`'s spelling table. Default OFF, `1` / `on` is the opt-in.
+#[test]
+fn the_retry_lift_knob_spellings() {
+    assert!(
+        !parse_retry_lift_arm_for_test(Err(std::env::VarError::NotPresent)),
+        "unset is OFF"
+    );
+    for on in ["1", "on", "ON", " on "] {
+        assert!(parse_retry_lift_arm_for_test(Ok(on.to_string())), "{on}");
+    }
+    for off in ["0", "off", "OFF", "", "  "] {
+        assert!(!parse_retry_lift_arm_for_test(Ok(off.to_string())), "{off}");
+    }
+}
+
+/// `BlockState` did not grow when `Dormant` learned its retry cause, its visit count and its
+/// permanence.
+///
+/// `entries` is the map every probe, every invalidation and every classify walks, so a wider value
+/// is a broader cache-miss cost than anything the payload buys -- and it would be an
+/// everywhere-regression with exactly the shape the duke numbers have, which is why this is pinned
+/// rather than argued. It is free because `Rejected(RejectedSpan)` already carries a `BlockKey`
+/// plus a `u16` and `Compiled(BlockId)` already forces 8-byte alignment: the four bytes
+/// `DormantEntry` adds land inside padding the enum was already paying for.
+#[test]
+fn the_block_state_payload_stayed_the_same_width() {
+    assert_eq!(
+        std::mem::size_of::<BlockState>(),
+        std::mem::size_of::<RejectedSpan>() + std::mem::align_of::<BlockId>(),
+        "BlockState must stay as wide as its largest arm plus one aligned tag"
+    );
+    assert!(std::mem::size_of::<DormantEntry>() <= std::mem::size_of::<RejectedSpan>());
 }

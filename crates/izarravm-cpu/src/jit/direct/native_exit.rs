@@ -71,11 +71,22 @@ pub(crate) enum SideExitReason {
     /// per-EXECUTION property of the data like `X87Eligibility`, not a per-compile property of
     /// the address, so it can fire on a block that will never bind differently.
     DivideGuard = 10,
+    /// An `InterpretOne` call-out RAN its instruction and the resume predicate then refused: some
+    /// input the rest of the block depends on moved under it (a segment record, a control
+    /// register, IF going 0 to 1, a mapping epoch, a write onto a watched code page). The
+    /// instruction RETIRED, so the exit reports `prefix + 1`, and EIP is left exactly where the
+    /// interpreter put it -- the stub advances it by zero.
+    CallOutResync = 11,
+    /// An `InterpretOne` call-out's step returned `Err` and `finish_instruction` delivered it. The
+    /// fault path already counted the instruction in `perf.instructions` and already charged its
+    /// clocks, so the exit reports `prefix` and adds no clocks of its own. EIP is wherever the
+    /// delivery left it, which is normally the handler's first byte.
+    CallOutResyncFault = 12,
 }
 
 impl SideExitReason {
     /// The largest discriminant emitted code can store, for the `run.rs` bound assertion.
-    pub(crate) const MAX: u32 = Self::DivideGuard as u32;
+    pub(crate) const MAX: u32 = Self::CallOutResyncFault as u32;
 }
 
 #[repr(u32)]

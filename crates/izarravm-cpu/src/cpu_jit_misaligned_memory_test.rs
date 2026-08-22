@@ -242,7 +242,7 @@ fn build_slots(bodies: &[&[u8]], watch: Option<u32>) -> Roles {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: the tested form never reached the memory guard")
         }
-        jit::direct::CompileOutcome::Retry => panic!("compile asked for a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     assert_eq!(
         compilation.span.instructions, slots,

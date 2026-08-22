@@ -2976,6 +2976,35 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
             .iter()
             .map(|(label, count)| json!({ "reason": label, "count": count }))
             .collect::<Vec<_>>(),
+        // The `compile_retry` row of `dormant` split by which compile-walk gate gave up. `count`
+        // is attempts and sums to that row exactly; `keys` counts the distinct block keys each
+        // cause parked, which is the column that joins against the dormant population a barrier
+        // census reports.
+        "jit_direct_retry_causes": snapshot
+            .retry_causes
+            .iter()
+            .map(|counts| {
+                json!({ "cause": counts.cause, "count": counts.count, "keys": counts.keys })
+            })
+            .collect::<Vec<_>>(),
+        // The other currency on the same 466 keys: static-unbound EXITS that landed on a dormant
+        // key, split by the cause it was parked with. `jit_direct_retry_causes` says how many
+        // keys each gate parked; this says how much traffic those keys absorb, which is what a
+        // lift policy is priced against. Barrier-census gated, so a plain run reports zeroes.
+        "jit_direct_retry_cause_hits": snapshot
+            .retry_cause_hits
+            .iter()
+            .map(|(label, hits)| json!({ "cause": label, "hits": hits }))
+            .collect::<Vec<_>>(),
+        // The retry lift's own pair, read as a ratio: `reparks / lifts` is how often a lifted key
+        // came straight back with the same cause, which is the arm's miss rate.
+        "jit_direct_retry_lifts": snapshot.retry_lifts,
+        "jit_direct_retry_lift_reparks": snapshot.retry_lift_reparks,
+        // The S4d M5 measurement: interpreted MOV SS / POP SS split by whether the load moved
+        // the SS record. The SS call-out rows resume only on the unchanged shape, so this ratio
+        // is what decides whether they are worth building.
+        "ss_load_same_record": snapshot.ss_load_same_record,
+        "ss_load_changed_record": snapshot.ss_load_changed_record,
         "link_refusals": snapshot
             .link_refusals
             .iter()
@@ -2993,6 +3022,42 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "side_exit_callout_abnormal": snapshot.side_exit_callout_abnormal,
         "jit_direct_callout_executed": snapshot.callout_executed,
         "jit_direct_callout_port_v86_served": snapshot.callout_port_v86_served,
+        "jit_direct_callout_interpret_one_executed": snapshot.callout_interpret_one_executed,
+        "jit_direct_callout_interpret_one_resync": snapshot.callout_interpret_one_resync,
+        // The price of the PREFIX half of the segment mask: resyncs the suffix-only rule would
+        // have carried. A subset of the resync count above, not a separate lane.
+        "jit_direct_callout_interpret_one_resume_refused_prefix_use":
+            snapshot.callout_interpret_one_resume_refused_prefix_use,
+        // Which arm of the knob this run compiled under. Reported so a ladder leg cannot be read
+        // as the arm it named while having run the other one.
+        "jit_direct_callout_segment_resume": snapshot.callout_segment_resume_enabled,
+        "jit_direct_callout_interpret_one_resync_fault": snapshot.callout_interpret_one_resync_fault,
+        "jit_direct_callout_interpret_one_abnormal": snapshot.callout_interpret_one_abnormal,
+        "jit_direct_callout_interpret_one_demoted": snapshot.callout_interpret_one_demoted,
+        // Per-ROW, beside the scalars rather than instead of them. The scalars sum these four
+        // columns and stay the family's headline; this array is what the plan's "a row demoted on
+        // the loader at more than 50% is refuted" rule has to read, because a whole-CPU ratio
+        // cannot say WHICH of the nine admitted rows resynced.
+        "jit_direct_callout_interpret_one_rows": snapshot
+            .callout_interpret_one_rows
+            .iter()
+            .map(|counts| {
+                json!({
+                    "row": counts.row,
+                    "executed": counts.executed,
+                    "resync": counts.resync,
+                    "resync_fault": counts.resync_fault,
+                    "demoted": counts.demoted,
+                    "resume_refused_prefix_use": counts.resume_refused_prefix_use,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "jit_direct_callout_deferred_code_writes": snapshot.callout_deferred_code_writes,
+        "jit_direct_callout_slot_cap_hits": snapshot.callout_slot_cap_hits,
+        "jit_direct_compile_page_overflows": snapshot.compile_page_overflows,
+        "jit_direct_compile_page_search_steps": snapshot.compile_page_search_steps,
+        "jit_direct_demoted_callout_sites": snapshot.demoted_callout_sites,
+        "jit_direct_demoted_callout_sites_refused": snapshot.demoted_callout_sites_refused,
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
         // Unprefixed, unlike their `jit_direct_` neighbours, and deliberately: these are the
         // names the round-2 acceptance gate pre-registered for its bars, and a reader diffing a

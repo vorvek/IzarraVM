@@ -252,7 +252,7 @@ impl CpuGsw {
                 let reg = self.read_gpr8(modrm.reg);
                 self.write_operand_u8(bus, operand, reg)?;
                 self.write_gpr8(modrm.reg, rm);
-                Ok(clocks(3))
+                Ok(clocks(XCHG_CORE_CLOCKS))
             }
             0x87 => {
                 // XCHG r/m16/32, r16/32. Cross-write.
@@ -261,7 +261,7 @@ impl CpuGsw {
                 let reg = self.read_gpr_sized(modrm.reg, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, reg)?;
                 self.write_gpr_sized(modrm.reg, operand_size, rm);
-                Ok(clocks(3))
+                Ok(clocks(XCHG_CORE_CLOCKS))
             }
             0x88 => {
                 // MOV r/m8, r8.
@@ -346,7 +346,10 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = u32::from(self.segment_from_reg_field(modrm.reg).selector);
                 self.write_operand_sized(bus, operand, OperandSize::Word, value)?;
-                Ok(clocks(2))
+                // Named rather than a literal for the reason the `0x8f` arm's charge is: the
+                // memory form is an `InterpretOne` call-out row, and its budget bound
+                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same number.
+                Ok(clocks(MOV_RM_SREG_CORE_CLOCKS))
             }
             0x8d => {
                 // LEA reg, m: load the effective address, not the memory it points at. mod=3 (a
@@ -386,8 +389,19 @@ impl CpuGsw {
                         });
                     }
                 };
+                // Design review 10.1 M5: does a real guest's MOV SS leave the record alone?
+                // Behind the barrier-census gate since the S4 review round, so a plain build pays
+                // one predicate on an already-loaded flag rather than a segment compare and a
+                // record read on every execution of this arm.
+                let ss_before = (self.ss_load_census_active() && segment == SegmentIndex::Ss)
+                    .then(|| self.registers.segment(SegmentIndex::Ss));
                 self.load_segment_arming_ss_shadow(bus, segment, value as u16)?;
-                Ok(clocks(7))
+                if let Some(before) = ss_before {
+                    self.note_ss_load_record(before);
+                }
+                // Named because FS, GS and every memory form are `InterpretOne` call-out rows:
+                // their budget bound and this arm must charge the same number.
+                Ok(clocks(MOV_SREG_CORE_CLOCKS))
             }
             0x90 => {
                 // NOP (XCHG (E)AX, (E)AX): a no-op with the same clocks as the other XCHG-acc forms.
@@ -400,7 +414,7 @@ impl CpuGsw {
                 let other = self.read_gpr_sized(reg, operand_size);
                 self.write_gpr_sized(0, operand_size, other);
                 self.write_gpr_sized(reg, operand_size, acc);
-                Ok(clocks(3))
+                Ok(clocks(XCHG_CORE_CLOCKS))
             }
             0xa0 => {
                 // MOV AL, moffs8: byte form, ignores the operand-size prefix, flags untouched. The
@@ -545,8 +559,18 @@ impl CpuGsw {
                 // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
                 // Same 386 PRM operand-size rule as POP ES above.
                 let value = self.pop(bus, operand_size)? as u16;
+                // The M5 measurement's other half, behind the same gate. See the `0x8e` arm.
+                let before = self
+                    .ss_load_census_active()
+                    .then(|| self.registers.segment(SegmentIndex::Ss));
                 self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
-                Ok(clocks(7))
+                if let Some(before) = before {
+                    self.note_ss_load_record(before);
+                }
+                // NAMED, because `POP_SS_CORE_CLOCKS` is what the block budget bound
+                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) folds for this row: a literal here and a
+                // constant there are two numbers that can drift apart silently.
+                Ok(clocks(POP_SS_CORE_CLOCKS))
             }
             0x1e => {
                 // PUSH DS. Same 386 PRM operand-size rule as PUSH ES above.
@@ -622,7 +646,7 @@ impl CpuGsw {
                     self.registers.set_esp(esp_before);
                     return Err(err);
                 }
-                Ok(clocks(5))
+                Ok(clocks(POP_RM_CORE_CLOCKS))
             }
             0x9c => {
                 // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The
@@ -920,7 +944,10 @@ impl CpuGsw {
                         return Err(undefined_opcode());
                     }
                 }
-                Ok(clocks(2))
+                // Named for the reason the `0x8f` and `0x8c` charges are: `/2../7` at Word are
+                // `InterpretOne` call-out rows, and their budget bound
+                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same number.
+                Ok(clocks(GROUP3_CORE_CLOCKS))
             }
             0xfe => {
                 // Group 4 INC/DEC byte. /0 INC, /1 DEC; any other reg is #UD (the fused reference's
@@ -930,7 +957,9 @@ impl CpuGsw {
                         let value = u32::from(self.read_operand_u8(bus, operand)?);
                         let result = self.inc_dec(value, modrm.reg == 1, BusWidth::Byte) as u8;
                         self.write_operand_u8(bus, operand, result)?;
-                        Ok(clocks(2))
+                        // Named because the MEMORY form is an `InterpretOne` call-out row: its
+                        // budget bound and this arm must charge the same number.
+                        Ok(clocks(INC_DEC_RM8_CORE_CLOCKS))
                     }
                     _extension => Err(undefined_opcode()),
                 }
@@ -1180,7 +1209,9 @@ impl CpuGsw {
                 // CLI. IOPL-sensitive: faults to the monitor in a V86 task below IOPL 3.
                 self.check_v86_iopl()?;
                 self.set_flag(FLAG_IF, false);
-                Ok(clocks(3))
+                // Named because CLI is an `InterpretOne` call-out row: its budget bound and this
+                // arm must charge the same number.
+                Ok(clocks(CLI_CORE_CLOCKS))
             }
             0xfb => {
                 // STI sets IF and arms the one-instruction shadow so the instruction immediately
@@ -1189,7 +1220,7 @@ impl CpuGsw {
                 self.check_v86_iopl()?;
                 self.set_flag(FLAG_IF, true);
                 self.interrupt_shadow = true;
-                Ok(clocks(3))
+                Ok(clocks(STI_CORE_CLOCKS))
             }
             0xfc => {
                 // CLD: clear the direction flag.

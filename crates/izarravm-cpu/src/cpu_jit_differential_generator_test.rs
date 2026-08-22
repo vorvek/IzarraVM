@@ -571,8 +571,36 @@ fn assert_measured_pair_with_split(
             direct.elapsed_clocks, interpreter.elapsed_clocks
         );
     }
-    assert_eq!(direct, interpreter, "{case:#?}");
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are. This assertion is the substantive
+    // one and it has to come before anything settles them, or it becomes a tautology: materialise
+    // both and `eflags()` reads back what materialising just computed.
     assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
+    // THEN the whole-CPU comparison, on SETTLED CLONES. `registers.eflags` is a REPRESENTATION and
+    // not the architectural value: while `pending_flags` is live the six arithmetic bits in that
+    // word are stale by definition (see `PendingFlags`), and two roles at the same architectural
+    // state are free to carry different (base, descriptor) pairs for it.
+    //
+    // They now do. An `InterpretOne` call-out settles the flags on the way in, because the
+    // instruction it is about to run may READ them, and that folds a live descriptor into the base
+    // where the interpreter would have left it alone. Nothing guest-visible moves; the raw words
+    // differ, and comparing them is comparing the noise the lazy-flag optimisation exists to
+    // create.
+    //
+    // CLONES rather than the roles themselves, so nothing this comparison does is visible to the
+    // caller: `run_generated_sweep` asserts on `direct` after this returns, and a comparison that
+    // silently settled the CPU under test would be deciding what those assertions see. Cloning is
+    // faithful here because every field `CpuGsw::clone` resets carries an always-equal `PartialEq`
+    // (the JIT state, the decode cache, the deferred-write window), so the reset cannot mask a
+    // difference this comparison would otherwise have caught.
+    //
+    // What this does NOT weaken: a WRONG descriptor still fails, because materialising is exactly
+    // what turns it into flags. Only "the two roles hold the same flags in different forms" stops
+    // being a failure.
+    let mut direct_settled = direct.clone();
+    let mut interpreter_settled = interpreter.clone();
+    direct_settled.materialize_flags();
+    interpreter_settled.materialize_flags();
+    assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
     assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
     assert_eq!(
         direct_bus.trace.elapsed_clocks() - interpreter_bus.trace.elapsed_clocks(),
@@ -1338,6 +1366,1173 @@ fn generated_hma_load_tracks_a20_alias_and_cache_invalidation() {
             direct.jit_direct.len(),
             0,
             "A20 change retained native code"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The S1 width lift: 66-prefixed ENTER, LEA and LEAVE inside a generated block.
+// ---------------------------------------------------------------------------
+
+/// Cases per mode for the width-lift sweep. Smaller than `CASES_PER_MODE` because the block is a
+/// ninth the size and the only thing that varies across cases is the frame size, the LEA
+/// displacement, the ALU operation and which registers they touch.
+const WIDTH_LIFT_CASES: u32 = 16;
+
+/// Instructions the width-lift block retires natively when every slot is classified: the ENTER,
+/// the LEA, the two register slots, the LEAVE, the TEST and the terminal Jcc.
+///
+/// The leading NOP is NOT among them. Admission keys the installed block at the SECOND
+/// instruction, so the starter runs interpreted and the block begins after it. That is the same
+/// accounting `GENERATED_BLOCK_NATIVE_INSTRUCTIONS` uses, which counts from the first slot after
+/// the starter for the same reason.
+const WIDTH_LIFT_NATIVE_INSTRUCTIONS: u64 = 7;
+
+/// The stack the width-lift block runs on. Well clear of the code at `0x1000 + index * 0x100` and
+/// of the fill pattern's other users, so the ENTER's word store cannot land on a code-watched page
+/// and turn the fixture into a test of the write guard.
+const WIDTH_LIFT_STACK: u32 = 0x0001_f000;
+
+/// A register index that is neither ESP nor EBP.
+///
+/// The block's whole shape is an ENTER and a LEAVE that must round-trip, so the frame pointer and
+/// the stack pointer are the two registers the randomized slots may not disturb. Drawing around
+/// them is what lets the LEAVE assert something: with EBP clobbered, `ESP <- EBP` would send the
+/// pop to an arbitrary address and every case would exit on a guard instead of retiring.
+fn non_stack_reg(rng: &mut Rng) -> u8 {
+    [0u8, 1, 2, 3, 6, 7][(rng.u32() % 6) as usize]
+}
+
+/// A 32-bit protected-mode block holding the three Word rows this slice lowered, at the (Word
+/// operand, SS.B = 1) cell that no unprefixed fixture can reach.
+///
+/// CLD and STD are deliberately absent: in a 32-bit code segment they decode at Dword and were
+/// already admitted, so a case here would exercise the arm that shipped rather than the policy
+/// lift. Their Word row is covered by `cpu_jit_width_lift_test.rs`, which runs a real 16-bit code
+/// segment.
+///
+/// The ENTER/LEAVE pair round-trips on purpose. ENTER pushes BP and leaves EBP holding the low
+/// half of the post-push ESP; LEAVE then moves the FULL EBP back into ESP, which only lands where
+/// it started because EBP entered the block equal to ESP and both live below 64K. That is not a
+/// convenience: it is what makes a wrong width on either side of either instruction show up as a
+/// diverged pointer rather than as a fault both roles take.
+fn width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_c7d0_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let op = ((index + mode_offset) & 7) as u8;
+    let mut bytes = Vec::with_capacity(32);
+
+    // The NOP starter, as the main generator has: it is a lowered slot and it puts the block's
+    // entry one byte before the first row under test.
+    bytes.push(0x90);
+
+    // 66 C8 iw ib -- ENTER imm16, 0 at Word operand size. The frame size is even and non-zero
+    // across the cases, and case 0 draws zero, which is the arm that emits no allocation at all.
+    let alloc = (index * 2) as u16;
+    bytes.extend_from_slice(&[0x66, 0xC8]);
+    bytes.extend_from_slice(&alloc.to_le_bytes());
+    bytes.push(0x00);
+
+    // 66 8D /r -- LEA r16, [EBP + disp8]. Word operand size over a DWORD address size, which is
+    // the shape that separates the destination's width from the address former's.
+    let lea_dst = non_stack_reg(&mut rng);
+    bytes.extend_from_slice(&[0x66, 0x8D, 0x45 | (lea_dst << 3), (rng.u32() & 0x7f) as u8]);
+
+    // Two register slots between the frame instructions, so the LEAVE is not adjacent to the
+    // ENTER and a block that silently split between them loses a retirement rather than passing.
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    push_u32(&mut bytes, rng.u32());
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+
+    // 66 C9 -- LEAVE at Word operand size on a 32-bit stack.
+    bytes.extend_from_slice(&[0x66, 0xC9]);
+
+    // The terminal condition, shaped like the main generator's: TEST defines every flag the
+    // condition can read, and the branch lands on the first of two HLTs either way.
+    bytes.extend_from_slice(&[0x85, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32();
+    }
+    gpr[4] = WIDTH_LIFT_STACK;
+    gpr[5] = WIDTH_LIFT_STACK;
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// The 16-bit half of the sweep: the same block shape UNPREFIXED in a 16-bit code segment on a
+/// 16-bit stack, which is the loader's own machine and the population the census rows came from.
+///
+/// Three things vary per case that the 32-bit sweep holds fixed, and each is a width decision the
+/// emitted stack sites make on their own:
+///
+/// * SP. Four classes over the index: two ordinary even pointers, one AT ZERO so the ENTER's
+///   two-byte push borrows across bit 16 and lands at 0xFFFE, and one at 0x0004 so the FRAME
+///   ALLOCATION wraps SP below zero after the push. A 32-bit subtract anywhere in the pair leaves
+///   a pointer with a changed high half, and the round-trip assertion is what says so.
+/// * BP. Fully randomized, and it does not have to equal SP for the pair to round-trip: ENTER
+///   pushes the entry BP and LEAVE pops it back, while LEAVE's `SP <- BP` restores the pointer
+///   ENTER left. Both registers therefore return to their entry values whatever they were.
+/// * The LEA displacement, negative on the odd cases. `[BP+disp8]` with a negative displacement is
+///   what a Watcom local looks like, and at a Word address size the sum wraps rather than going
+///   negative.
+///
+/// ADC and SBB are excluded from the ALU slot's operation pool: both are refused at Word size (no
+/// carry-in lane), so drawing one would stop the block and cost a retirement.
+fn sixteen_bit_width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_16b1_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut bytes = Vec::with_capacity(32);
+
+    bytes.push(0x90);
+
+    // C8 iw ib -- ENTER imm16, 0 at Word operand size, unprefixed in a 16-bit segment.
+    let alloc = ((rng.u32() % 0x21) * 2) as u16;
+    bytes.push(0xC8);
+    bytes.extend_from_slice(&alloc.to_le_bytes());
+    bytes.push(0x00);
+
+    // 8D /r -- LEA r16, [BP+disp8]. ModRM 0x46 is mod 01 with r/m 110, the [BP+disp8] form.
+    let lea_dst = non_stack_reg(&mut rng);
+    let disp = if index % 2 == 1 {
+        0u8.wrapping_sub(1 + (rng.u32() % 64) as u8)
+    } else {
+        (rng.u32() % 0x80) as u8
+    };
+    bytes.extend_from_slice(&[0x8D, 0x46 | (lea_dst << 3), disp]);
+
+    // B8+r iw -- MOV r16, imm16. THREE bytes here, not five: the immediate follows the operand
+    // size, which is Word in a 16-bit segment.
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
+
+    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+
+    // C9 -- LEAVE at Word operand size on a 16-bit stack.
+    bytes.push(0xC9);
+
+    // The flag producer is the BYTE form: `0x85` at Word sits behind IZARRAVM_TEST_WORD_ROWS, and
+    // a fixture that inherited that knob would lose a retirement on its off arm.
+    bytes.extend_from_slice(&[0x84, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32() & 0xffff;
+    }
+    // EVEN, always: a misaligned Word stack access side-exits at the wide-access guard, and the
+    // retirement pin below is an equality.
+    gpr[4] = match index % 4 {
+        0 => 0x8000 + (rng.u32() % 0x400) * 2,
+        // SP AT ZERO. The push borrows across bit 16 and lands at 0xFFFE.
+        1 => 0x0000,
+        // The push is ordinary and the ALLOCATION is what wraps below zero.
+        2 => 0x0004,
+        _ => 0xe000 + (rng.u32() % 0x400) * 2,
+    };
+    gpr[5] = rng.u32() & 0xfffe;
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// A 16-bit code segment in real mode with a 16-bit stack, at the persona under test.
+///
+/// The admission arm is STATED rather than inherited. `sixteen_bit_level` is seeded from
+/// `IZARRAVM_JIT16` and `word_at_486` decides whether a 16-bit segment keys at all on the 486
+/// persona; a sweep that read either from the environment would go VACUOUS, not red, on a machine
+/// where it is off, and this file's header records that lesson twice already.
+fn generated_sixteen_bit_cpu(mode: GswMode) -> CpuGsw {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(mode);
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.set_sixteen_bit_admission_level(1);
+    cpu.set_word_operands_at_486(true);
+    cpu
+}
+
+/// What one sweep demands of every case it builds, bundled so the sweep runner keeps a signature a
+/// reader can hold: the three fields are independent claims about the SAME block and grew one at a
+/// time, which is how the parameter list reached eight.
+struct SweepExpectations {
+    /// Instructions the block must retire natively. An EQUALITY rather than a floor, for the
+    /// reason the width-lift sweep's comment gives: the rows under test used to end a block, so an
+    /// admission that quietly reverted would still pass every state comparison while retiring only
+    /// the starter.
+    native_instructions: u64,
+    /// The ENTER/LEAVE pair's own invariant, asked only of the sweep that carries one.
+    stack_round_trip: bool,
+    /// Whether the block carries an `InterpretOne` slot, which decides whether the call-out
+    /// counters are asserted clean or asserted absent.
+    interpret_one_slots: bool,
+    /// Whether the two roles must return the SAME SEQUENCE of `run_budgeted` outcomes, or only
+    /// the same total clocks.
+    ///
+    /// True for every sweep but the STI one, and the exception is the approved caveat rather than
+    /// slack. `run_budgeted_inner` ends a run the instant an instruction makes an interrupt
+    /// serviceable, which interpreted means the instruction right after the STI; natively the STI
+    /// and the instruction behind it are both inside the block, so the run ends at the block's
+    /// boundary instead. The owner accepted that on 2026-08-22. Everything the caveat does NOT
+    /// cover is still asserted at full strength on this path: total consumed clocks, the whole
+    /// settled CPU (which includes `interrupt_shadow`), guest RAM and the bus-clock total.
+    exact_run_boundaries: bool,
+}
+
+/// One randomized sweep: build a case, run it wholly interpreted and again with Direct armed, and
+/// compare. `expect` carries the three claims every case must satisfy; see `SweepExpectations`.
+fn run_generated_sweep(
+    label: &str,
+    mode: GswMode,
+    mode_offset: u32,
+    build_cpu: fn(GswMode) -> CpuGsw,
+    build_case: fn(u32, u32) -> GeneratedCase,
+    expect: SweepExpectations,
+) {
+    let SweepExpectations {
+        native_instructions,
+        stack_round_trip,
+        interpret_one_slots,
+        exact_run_boundaries,
+    } = expect;
+    for index in 0..WIDTH_LIFT_CASES {
+        let case = build_case(index, mode_offset);
+        let pristine = single_case_memory(&case);
+        let mut interpreter = build_cpu(mode);
+        let mut direct = build_cpu(mode);
+        let mut interpreter_bus = TestBus::with_memory(pristine.clone());
+        let mut direct_bus = TestBus::with_memory(pristine.clone());
+        for bus in [&mut interpreter_bus, &mut direct_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.flat_direct_page_clocks = true;
+        }
+
+        restore_bus(&mut interpreter_bus, &pristine);
+        arm(&mut interpreter, &case);
+        run_to_halt(&mut interpreter, &mut interpreter_bus, &case).unwrap();
+        prime_direct(&mut direct, &mut direct_bus, &pristine, &case);
+
+        let retired = assert_measured_pair(
+            &mut interpreter,
+            &mut interpreter_bus,
+            &mut direct,
+            &mut direct_bus,
+            &pristine,
+            &case,
+            exact_run_boundaries,
+        );
+        // NON-VACUITY, and it is an equality rather than a `> 0`: the three rows under test are
+        // the ones that used to END a block, so an admission that quietly reverted would leave
+        // the leading NOP retiring natively and everything after it interpreted, and the state
+        // comparison above would still pass.
+        assert_eq!(
+            retired,
+            native_instructions,
+            "{label}: a generated slot lost its classification: {case:#?}, perf={:#?}",
+            direct.perf_counters()
+        );
+        // THE RETIREMENT EQUALITY IS NOT SUFFICIENT ON ITS OWN once a sweep carries a call-out. A
+        // slot that RESYNCs ends the native run where it sits, and the priming passes have
+        // installed a block at the instruction AFTER it as well, so the run re-enters and the two
+        // blocks together can retire the same total a clean resume would. Nothing in the state
+        // comparison sees a resync either: the interpreter finishes the same program. These
+        // counters are what say the slot resumed rather than merely that the program ran.
+        let stalls = direct.direct_stall_snapshot();
+        if interpret_one_slots {
+            assert!(
+                stalls.callout_interpret_one_executed > 0,
+                "{label}: no InterpretOne slot ran, so the sweep is testing a lowering: {case:#?}"
+            );
+            assert_eq!(
+                (
+                    stalls.callout_interpret_one_resync,
+                    stalls.callout_interpret_one_resync_fault,
+                    stalls.callout_interpret_one_abnormal,
+                    stalls.callout_interpret_one_demoted,
+                ),
+                (0, 0, 0, 0),
+                "{label}: a call-out slot did not resume cleanly: {case:#?}"
+            );
+        } else {
+            assert_eq!(
+                stalls.callout_interpret_one_executed, 0,
+                "{label}: this sweep carries no call-out row: {case:#?}"
+            );
+        }
+        if stack_round_trip {
+            // ENTER pushes the entry BP and LEAVE pops it back, while LEAVE's pointer move undoes
+            // the push and the allocation together, so BOTH registers return to their entry
+            // values. A pointer arithmetic width taken from the wrong place lands somewhere else.
+            assert_eq!(
+                direct.registers.esp(),
+                case.gpr[4],
+                "{label}: the ENTER/LEAVE pair must round-trip the stack pointer: {case:#?}"
+            );
+            assert_eq!(
+                direct.registers.ebp(),
+                case.gpr[5],
+                "{label}: the ENTER/LEAVE pair must round-trip the frame pointer: {case:#?}"
+            );
+        }
+    }
+}
+
+/// Randomized whole-block differential for the width lift on both Approximate personas, and on
+/// BOTH machines: the 66-prefixed rows on a 32-bit stack, and the unprefixed rows in a 16-bit code
+/// segment on a 16-bit stack, which is the population the census rows were measured on.
+#[test]
+fn generated_width_lift_blocks_match_the_interpreter() {
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw486,
+        0,
+        generated_cpu,
+        width_lift_case,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw586,
+        WIDTH_LIFT_CASES,
+        generated_cpu,
+        width_lift_case,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw486,
+        2 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_width_lift_case,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw586,
+        3 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_width_lift_case,
+        SweepExpectations {
+            native_instructions: WIDTH_LIFT_NATIVE_INSTRUCTIONS,
+            stack_round_trip: true,
+            interpret_one_slots: false,
+            exact_run_boundaries: true,
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The S2 generic call-out: `InterpretOne` slots inside a generated block.
+// ---------------------------------------------------------------------------
+
+/// Instructions the `InterpretOne` block retires natively: the MOV, the memory POP, the ALU slot,
+/// the register POP, the TEST and the terminal Jcc. The leading NOP is the starter and is not
+/// among them, for the reason `WIDTH_LIFT_NATIVE_INSTRUCTIONS` states.
+const INTERPRET_ONE_NATIVE_INSTRUCTIONS: u64 = 6;
+
+/// Where the memory POP writes. On the stack page but well above the pointer, so the destination
+/// is a plain mapped word that the pops themselves never walk over: a destination inside the
+/// popped range would make the fixture a test of its own overlap rather than of the call-out.
+const INTERPRET_ONE_FRAME: u32 = WIDTH_LIFT_STACK + 0x80;
+
+/// Two `InterpretOne` slots in one 32-bit block: the memory form at the EARLIEST position a
+/// call-out may take, and the register form at the LAST position before the terminator.
+///
+/// Earliest and not first: the compile walk refuses a block whose leading slot is a call-out, a
+/// pre-existing rule this slice does not touch, so the starter NOP plus one lowered MOV is as far
+/// forward as a slot goes. Two slots rather than one is the accumulation the port class needed for
+/// its own clock arm: a single call-out's charge floors away against the block's, and a wrong
+/// per-slot lane only separates from a right one when it is added twice.
+///
+/// The Jcc AFTER the second call-out is the flag reader the plan asks for. It is a native slot
+/// that consults the RBP shadow, so a helper that republished the wrong EFLAGS, or a slot that
+/// skipped the reload, sends it the other way and the two roles diverge on EIP.
+fn interpret_one_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_80f1_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut bytes = Vec::with_capacity(32);
+
+    bytes.push(0x90);
+
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    push_u32(&mut bytes, rng.u32());
+
+    // 8F /0 -- POP dword [EBP+0]. ModRM 0x45 is mod 01 with r/m 101, the [EBP+disp8] form, which
+    // is the only way to name EBP with no SIB.
+    bytes.extend_from_slice(&[0x8F, 0x45, 0x00]);
+
+    let op = ((index + mode_offset) & 7) as u8;
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+
+    // 8F /0 with mod 11 -- POP into a register, the sibling form. It must not be ESP or EBP: the
+    // first would make the second pop's own pointer the thing under test and the second would move
+    // the destination the first pop just wrote through.
+    bytes.extend_from_slice(&[0x8F, 0xc0 | non_stack_reg(&mut rng)]);
+
+    bytes.extend_from_slice(&[0x85, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32();
+    }
+    gpr[4] = WIDTH_LIFT_STACK;
+    gpr[5] = INTERPRET_ONE_FRAME;
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// The 16-bit half: the same shape unprefixed in a 16-bit code segment on a 16-bit stack, which is
+/// the machine the loader census measured the row on.
+///
+/// SP varies over the same four classes the width-lift sweep uses, including the two that make a
+/// pop's pointer arithmetic wrap at sixteen bits. The destination is `[BP+0]`, which at a Word
+/// address size is the form a Watcom local takes.
+fn sixteen_bit_interpret_one_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_80f2_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut bytes = Vec::with_capacity(32);
+
+    bytes.push(0x90);
+
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
+
+    // 8F /0 -- POP word [BP+0]. ModRM 0x46 is mod 01 with r/m 110, the [BP+disp8] form.
+    bytes.extend_from_slice(&[0x8F, 0x46, 0x00]);
+
+    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+
+    bytes.extend_from_slice(&[0x8F, 0xc0 | non_stack_reg(&mut rng)]);
+
+    // The BYTE test form, for the reason the width-lift sweep states: `0x85` at Word sits behind
+    // IZARRAVM_TEST_WORD_ROWS and a fixture that inherited that knob would lose a retirement.
+    bytes.extend_from_slice(&[0x84, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32() & 0xffff;
+    }
+    // EVEN, always: a misaligned Word stack access side-exits at the wide-access guard, and the
+    // retirement pin is an equality.
+    gpr[4] = match index % 4 {
+        0 => 0x8000 + (rng.u32() % 0x400) * 2,
+        // SP near zero, so the two pops carry it across bit 16 on the way up.
+        1 => 0xfffc,
+        2 => 0x0004,
+        _ => 0xe000 + (rng.u32() % 0x400) * 2,
+    };
+    // Clear of the popped range whichever class SP drew, and even.
+    gpr[5] = 0x4000;
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// Randomized whole-block differential for the `InterpretOne` call-out, on both Approximate
+/// personas and on both machines.
+///
+/// Gate G2 for the S2 slice. A SEPARATE sweep rather than rows added to the main generated block,
+/// for the reason the plan gives: that block is pinned at `MAX_BLOCK_INSTRUCTIONS` and has no room.
+#[test]
+fn generated_interpret_one_blocks_match_the_interpreter() {
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw486,
+        0,
+        generated_cpu,
+        interpret_one_case,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw586,
+        WIDTH_LIFT_CASES,
+        generated_cpu,
+        interpret_one_case,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw486,
+        2 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_interpret_one_case,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw586,
+        3 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_interpret_one_case,
+        SweepExpectations {
+            native_instructions: INTERPRET_ONE_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The S3 policy widening: one generated row per admitted opcode.
+// ---------------------------------------------------------------------------
+
+/// Instructions the policy block retires natively: the MOV, the row under test, the ALU slot, the
+/// TEST and the terminal Jcc. The leading NOP is the starter and is not among them, for the reason
+/// `WIDTH_LIFT_NATIVE_INSTRUCTIONS` states.
+///
+/// It is an EQUALITY and it is the whole anti-vacuity gate for this sweep. A row that lost its
+/// classifier arm ends the block where it used to and retires two; a row that RESYNCs instead of
+/// resuming retires two as well. Neither shows up in the state comparison, because both leave the
+/// interpreter to finish the same program.
+const POLICY_NATIVE_INSTRUCTIONS: u64 = 5;
+
+/// Where the memory-form rows read and write in a 32-bit case: the frame `interpret_one_case`
+/// already uses, above the stack pointer and clear of the code.
+const POLICY_FRAME_32: u32 = INTERPRET_ONE_FRAME;
+
+/// The same for a 16-bit case, where the address size is Word and the frame has to fit in it.
+const POLICY_FRAME_16: u32 = 0x4000;
+
+/// One S3 row as bytes for a 32-bit protected-mode case, and the register seeding it needs.
+///
+/// A TABLE of builders rather than a `match` on a row number, so a commit that admits a row adds
+/// one entry and the sweep's coverage grows by construction. The seeding travels with the bytes
+/// because several rows need a register set to a value that keeps them fault-free: a row that
+/// faults takes the RESYNC-after-fault stub, which is correct behaviour and has its own execution
+/// test, but it retires fewer instructions than the equality above admits and would turn this
+/// sweep into a test of the fault path under a misleading name.
+type PolicyRow = fn(&mut [u32; 8]) -> Vec<u8>;
+
+/// `8C /0` with mod 01, r/m 101, disp8 0: `mov [ebp+0], es`, the memory form of MOV r/m16, Sreg.
+fn policy_mov_sreg_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x8C, 0x45, 0x00]
+}
+
+/// `8C /0` with mod 01, r/m 110, disp8 0: `mov [bp+0], es`.
+fn policy_mov_sreg_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0x8C, 0x46, 0x00]
+}
+
+/// `87 /r` with mod 01, r/m 101, disp8 0: `xchg [ebp+0], eax`, the memory cross-write.
+fn policy_xchg_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x87, 0x45, 0x00]
+}
+
+/// `94`: `xchg eax, esp`, the accumulator form that writes the STACK POINTER. The one XCHG shape
+/// whose soundness is an argument rather than an observation, so it is the one the sweep carries.
+fn policy_xchg_stack_pointer(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x94]
+}
+
+/// `0F BA /5` with mod 01, r/m 101, disp8 0: `bts dword [ebp+0], 5`, the immediate-index memory
+/// form. BTS rather than BT so the row WRITES, which is the half of the family the native `Bt`
+/// lowering does not have.
+fn policy_bit_string_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x0F, 0xBA, 0x6D, 0x00, 0x05]
+}
+
+/// `0F BB C3`: `btc ebx, eax`, the register-index register form, whose index the interpreter masks
+/// to the operand width from whatever random value the case drew.
+fn policy_bit_string_register(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x0F, 0xBB, 0xC3]
+}
+
+/// `66 F7 /3` with mod 01, r/m 101, disp8 0: `neg word [ebp+0]`, a group-3 Word memory form. The
+/// 0x66 prefix is what puts a Word row in a 32-bit segment at all, and `prefixes_supported_for`
+/// admits exactly that override.
+fn policy_group3_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x66, 0xF7, 0x5D, 0x00]
+}
+
+/// `66 F7 /2` with mod 11 r/m 011: `not bx`, the register form whose native sibling writes a full
+/// 32-bit destination. If the Word interception ever moved below the lowerings, this case is the
+/// one that reports it as a register difference rather than a block-shape one.
+fn policy_group3_register_16bit_operand(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x66, 0xF7, 0xD3]
+}
+
+/// `66 F7 /4` with mod 11 r/m 011: `mul bx`, the Word multiply that merges into DX and AX rather
+/// than replacing EDX and EAX. Two destination registers from one call-out, which is what the
+/// helper's whole-GPR reload has to carry.
+fn policy_group3_multiply_16bit_operand(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x66, 0xF7, 0xE3]
+}
+
+/// `FE /0` with mod 01, r/m 101, disp8 0: `inc byte [ebp+0]`, the first row on the allowlist that
+/// stores a BYTE, and therefore the first that can reach the invalidation choke through the
+/// value-aware door instead of the sized one. Which of the two doors a given store takes depends
+/// on the addressing and the page state rather than on the row, so the unsized door has its own
+/// end-to-end fixture (`interpret_one_inc_dec_byte_memory_resumes`) and this case covers the row
+/// against the randomized surroundings.
+fn policy_inc_byte_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0xFE, 0x45, 0x00]
+}
+
+/// `66 FF /6` with mod 01, r/m 101, disp8 0: `push word [ebp+0]`, the only admitted row whose
+/// store lands on the STACK. It moves the pointer the slots after it address through, which is the
+/// property `emit_store_homes` plus the unconditional reload has to carry.
+fn policy_push_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x66, 0xFF, 0x75, 0x00]
+}
+
+/// `FA`: CLI, the only admitted row that touches neither memory nor a general register. Every case
+/// draws its EFLAGS with IF set, so the sweep always exercises the 1-to-0 edge that R3 admits.
+fn policy_cli(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xFA]
+}
+
+/// `FB`: STI, the S4d row and the only one that may resume with `interrupt_shadow` ARMED.
+///
+/// What the sweep adds here that the execution tests cannot: the whole-CPU comparison at the end
+/// of `assert_measured_pair` includes `interrupt_shadow`, so every case carrying this row asserts
+/// that the block's boundary left the flag exactly where a wholly interpreted run left it, at
+/// every position the sweep puts the row in and against a randomly drawn register file.
+///
+/// Every case draws EFLAGS with IF already set, so this is the REDUNDANT-STI shape: IF does not
+/// move and the shadow is armed anyway. The 0-to-1 edge is covered by
+/// `interpret_one_sti_resumes_across_the_interrupt_flag_edge`, which seeds IF clear; the sweep
+/// cannot, because its EFLAGS seeding is shared by every row.
+fn policy_sti(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xFB]
+}
+
+/// `8E D3`: `MOV SS, BX`, with BX set to the selector SS already holds in the 16-bit machine.
+///
+/// SAME-RECORD by construction, because that is the half of the row that resumes: R2 byte-compares
+/// the six segment records after the step, so a case that switched stacks would resync and the
+/// sweep's retirement equality would be measuring the boundary rather than the row. The
+/// record-moving half has its own fixture in `cpu_jit_interpret_one_test.rs`, where a resync is
+/// the assertion instead of a failure.
+fn policy_mov_ss(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[3] = 0;
+    vec![0x8E, 0xD3]
+}
+
+/// `17`: `POP SS` off the generated stack, which holds zero -- the selector SS already has.
+///
+/// `single_case_memory` zeroes everything but the program bytes and the 16-bit stack pointers the
+/// case builder picks are all clear of them, so this is the same-record shape for the reason
+/// `policy_mov_ss` is. It moves SP by two and nothing later in the program reads it.
+fn policy_pop_ss(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x17]
+}
+
+/// The rows a 32-bit protected-mode case can carry.
+const POLICY_ROWS_32: &[PolicyRow] = &[
+    policy_mov_sreg_memory_32,
+    policy_xchg_memory_32,
+    policy_xchg_stack_pointer,
+    policy_bit_string_memory_32,
+    policy_bit_string_register,
+    policy_group3_memory_32,
+    policy_group3_register_16bit_operand,
+    policy_group3_multiply_16bit_operand,
+    policy_inc_byte_memory_32,
+    policy_push_memory_32,
+    policy_cli,
+];
+
+/// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
+/// width parameter, because the two machines do not admit the same set: a protected-mode segment
+/// load reads a descriptor out of a GDT this harness does not build, so the rows that load a
+/// segment register live on the 16-bit side alone and the split says so.
+const POLICY_ROWS_16: &[PolicyRow] = &[
+    policy_mov_sreg_memory_16,
+    policy_xchg_memory_16,
+    policy_xchg_stack_pointer,
+    policy_bit_string_memory_16,
+    policy_bit_string_register,
+    policy_group3_memory_16,
+    policy_group3_register,
+    policy_group3_multiply,
+    policy_inc_byte_memory_16,
+    policy_push_memory_16,
+    policy_cli,
+    policy_mov_sreg_reload,
+];
+
+/// `8E /4` with mod 11 r/m 000: `mov fs, ax`.
+///
+/// SIXTEEN-BIT ONLY, and the split between the two row tables is exactly this: the 32-bit harness
+/// is protected mode, where a segment load reads a descriptor out of a GDT. `generated_cpu` builds
+/// none -- its `gdtr` is the default, base 0 limit 0 -- so every load there would be a #GP on a
+/// selector past the table.
+///
+/// CONSIDERED AND DECLINED for this slice rather than overlooked: giving `generated_cpu` a GDT
+/// changes the machine every OTHER sweep in this file runs on, including the ones pinned at a
+/// retirement count, and the protected-mode descriptor path is covered end to end by
+/// `cpu_jit_interpret_one_test.rs` section 6 (reload resumes, a different descriptor resyncs, a
+/// bad selector takes the fault stub, and the Accessed-bit write-back is visible to R5). What a
+/// generated row would add over those is randomized SURROUNDINGS, not a new path.
+///
+/// In real mode the load is `base = selector << 4`, and the case seeds AX with the selector FS
+/// already holds, so the record does not move and R2 admits the resume. A random selector would
+/// resync, which is correct behaviour and has its own execution fixture, but it retires fewer
+/// instructions than this sweep's equality admits.
+fn policy_mov_sreg_reload(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[0] = 0;
+    vec![0x8E, 0xE0]
+}
+
+/// `FF /6` with mod 01, r/m 110, disp8 0: `push word [bp+0]`, unprefixed on a 16-bit stack.
+fn policy_push_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0xFF, 0x76, 0x00]
+}
+
+/// `FE /0` with mod 01, r/m 110, disp8 0: `inc byte [bp+0]`.
+fn policy_inc_byte_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0xFE, 0x46, 0x00]
+}
+
+/// `F7 /3` with mod 01, r/m 110, disp8 0: `neg word [bp+0]`, unprefixed in a 16-bit segment.
+fn policy_group3_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0xF7, 0x5E, 0x00]
+}
+
+/// `F7 /2` with mod 11 r/m 011: `not bx`.
+fn policy_group3_register(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xF7, 0xD3]
+}
+
+/// `F7 /4` with mod 11 r/m 011: `mul bx`.
+fn policy_group3_multiply(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xF7, 0xE3]
+}
+
+/// `0F BA /5` with mod 01, r/m 110, disp8 0: `bts word [bp+0], 5`.
+fn policy_bit_string_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0x0F, 0xBA, 0x6E, 0x00, 0x05]
+}
+
+/// `87 /r` with mod 01, r/m 110, disp8 0: `xchg [bp+0], ax`.
+fn policy_xchg_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0x87, 0x46, 0x00]
+}
+
+/// A 32-bit block whose middle slot is one S3 row.
+///
+/// The row is neither first nor last: the compile walk refuses a block whose leading slot is a
+/// call-out, and a row at the tail would pass with a broken EIP restore. The Jcc at the end reads
+/// the flag shadow the helper republished, so a row that left EFLAGS wrong sends the two roles to
+/// different addresses.
+fn policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    policy_case_with(
+        index,
+        mode_offset,
+        POLICY_ROWS_32[(index + mode_offset) as usize % POLICY_ROWS_32.len()],
+    )
+}
+
+/// One STI case in the 32-bit machine. See `sti_rows_match_the_interpreter`.
+fn sti_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    policy_case_with(index, mode_offset, policy_sti)
+}
+
+/// `policy_case`'s body with the row handed in rather than drawn from the table, so the STI sweep
+/// runs the SAME generated program shape as the policy sweep and differs only in the row.
+fn policy_case_with(index: u32, mode_offset: u32, row: PolicyRow) -> GeneratedCase {
+    let seed = 0x5715_80f3_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32();
+    }
+    gpr[4] = WIDTH_LIFT_STACK;
+
+    let mut bytes = Vec::with_capacity(32);
+    bytes.push(0x90);
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    push_u32(&mut bytes, rng.u32());
+    bytes.extend_from_slice(&row(&mut gpr));
+    let op = ((index + mode_offset) & 7) as u8;
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+    bytes.extend_from_slice(&[0x85, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// The 16-bit half: the same shape unprefixed in a 16-bit code segment on a 16-bit stack, which is
+/// the machine the loader census measured every one of these rows on.
+fn sixteen_bit_policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(
+        index,
+        mode_offset,
+        POLICY_ROWS_16[(index + mode_offset) as usize % POLICY_ROWS_16.len()],
+    )
+}
+
+/// One STI case in the 16-bit machine. See `sti_rows_match_the_interpreter`.
+fn sixteen_bit_sti_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(index, mode_offset, policy_sti)
+}
+
+/// One `MOV SS, BX` case in the 16-bit machine.
+fn sixteen_bit_mov_ss_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(index, mode_offset, policy_mov_ss)
+}
+
+/// One `POP SS` case in the 16-bit machine.
+fn sixteen_bit_pop_ss_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(index, mode_offset, policy_pop_ss)
+}
+
+/// `sixteen_bit_policy_case`'s body with the row handed in. See `policy_case_with`.
+fn sixteen_bit_policy_case_with(index: u32, mode_offset: u32, row: PolicyRow) -> GeneratedCase {
+    let seed = 0x5715_80f4_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32() & 0xffff;
+    }
+    // EVEN, always: a misaligned Word stack access side-exits at the wide-access guard, and the
+    // retirement pin is an equality.
+    gpr[4] = match index % 4 {
+        0 => 0x8000 + (rng.u32() % 0x400) * 2,
+        1 => 0xfffc,
+        2 => 0x0004,
+        _ => 0xe000 + (rng.u32() % 0x400) * 2,
+    };
+
+    let mut bytes = Vec::with_capacity(32);
+    bytes.push(0x90);
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
+    bytes.extend_from_slice(&row(&mut gpr));
+    // ADC and SBB have no Word lane and are refused by the classifier, so the op set is the other
+    // six; the same choice `sixteen_bit_interpret_one_case` makes.
+    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+    // The BYTE test form: `0x85` at Word sits behind IZARRAVM_TEST_WORD_ROWS and a fixture that
+    // inherited that knob would lose a retirement.
+    bytes.extend_from_slice(&[0x84, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// Randomized whole-block differential for the S3 policy widening, on both Approximate personas
+/// and on both machines.
+///
+/// Gate G2 for the S3 slice. A SEPARATE sweep rather than rows added to the S2 block, for the
+/// reason the plan gives about the main generated block: a block pinned at a retirement count has
+/// no room for a new slot without moving the pin, and a moved pin is not a regression test.
+#[test]
+fn generated_policy_widening_blocks_match_the_interpreter() {
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw486,
+        0,
+        generated_cpu,
+        policy_case,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw586,
+        WIDTH_LIFT_CASES,
+        generated_cpu,
+        policy_case,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw486,
+        2 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_policy_case,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw586,
+        3 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_policy_case,
+        SweepExpectations {
+            native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+            stack_round_trip: false,
+            interpret_one_slots: true,
+            exact_run_boundaries: true,
+        },
+    );
+}
+
+/// The three SHADOW-ARMING rows, on the same generated program shape as the policy sweep.
+///
+/// A sweep of its own rather than three more entries in the row tables, and the reason is the one
+/// thing these rows change that no other row does. `run_budgeted_inner` ends a run the instant an
+/// instruction makes an interrupt serviceable. Interpreted, that is the instruction right after
+/// the arming one; natively, the arming row and the instruction behind it are both inside the
+/// block, so the run ends at the block's boundary instead. The sequence of `run_budgeted` outcomes
+/// therefore differs, which is the caveat the owner approved on 2026-08-22 and not something to
+/// assert away for the other eleven rows as well.
+///
+/// Everything the caveat does not cover is asserted at full strength: total consumed clocks, the
+/// whole settled CPU including `interrupt_shadow`, guest RAM, the bus-clock total, and the
+/// retirement equality that says the row resumed rather than resynced.
+///
+/// STI runs on both machines; the two SS rows run on the 16-BIT one only, and that is a property
+/// of the fixture rather than of the rows. `generated_cpu` sets CR0.PE with no GDT at all -- it
+/// never needed one, because no row before these could load a segment -- so a protected-mode SS
+/// load there can only raise #GP and would be measuring the fault path at every index. The
+/// protected-mode SS path is covered instead by `interpret_one_protected_mode_ss_reload_resumes`
+/// and its siblings, which build a real GDT and reach the descriptor fetch, the writable-data type
+/// check and both fault vectors.
+#[test]
+fn generated_shadow_arming_blocks_match_the_interpreter() {
+    for (label, mode, offset, build_cpu, build_case) in [
+        (
+            "sti, flat, SS.B=1",
+            GswMode::Gsw486,
+            0,
+            generated_cpu as fn(GswMode) -> CpuGsw,
+            sti_case as fn(u32, u32) -> GeneratedCase,
+        ),
+        (
+            "sti, flat, SS.B=1",
+            GswMode::Gsw586,
+            WIDTH_LIFT_CASES,
+            generated_cpu,
+            sti_case,
+        ),
+        (
+            "sti, 16-bit code, SS.B=0",
+            GswMode::Gsw486,
+            2 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_sti_case,
+        ),
+        (
+            "sti, 16-bit code, SS.B=0",
+            GswMode::Gsw586,
+            3 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_sti_case,
+        ),
+        (
+            "mov ss, 16-bit code, SS.B=0",
+            GswMode::Gsw486,
+            4 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_mov_ss_case,
+        ),
+        (
+            "mov ss, 16-bit code, SS.B=0",
+            GswMode::Gsw586,
+            5 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_mov_ss_case,
+        ),
+        (
+            "pop ss, 16-bit code, SS.B=0",
+            GswMode::Gsw486,
+            6 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_pop_ss_case,
+        ),
+        (
+            "pop ss, 16-bit code, SS.B=0",
+            GswMode::Gsw586,
+            7 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_pop_ss_case,
+        ),
+    ] {
+        run_generated_sweep(
+            label,
+            mode,
+            offset,
+            build_cpu,
+            build_case,
+            SweepExpectations {
+                native_instructions: POLICY_NATIVE_INSTRUCTIONS,
+                stack_round_trip: false,
+                interpret_one_slots: true,
+                exact_run_boundaries: false,
+            },
         );
     }
 }

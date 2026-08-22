@@ -3391,6 +3391,12 @@ mod execution;
 #[path = "cpu_jit_sixteen_bit_test.rs"]
 mod sixteen_bit;
 
+#[path = "cpu_jit_width_lift_test.rs"]
+mod width_lift;
+
+#[path = "cpu_jit_interpret_one_test.rs"]
+mod interpret_one;
+
 #[path = "cpu_jit_direct_timing_test.rs"]
 mod timing;
 
@@ -7109,7 +7115,7 @@ fn an_override_naming_an_inaccessible_segment_refuses_to_compile_at_all() {
                         "{label} control: the block must span both INCs and the access"
                     );
                 }
-                jit::direct::CompileOutcome::Retry => assert!(
+                jit::direct::CompileOutcome::Retry(_) => assert!(
                     !expect_block,
                     "{label} control: the accessible descriptor must compile"
                 ),

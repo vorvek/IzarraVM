@@ -80,6 +80,10 @@ pub(super) struct SuffixSeed {
     pub(super) x87_slots: u8,
     /// Segments the block had already overwritten when the barrier stopped it.
     pub(super) dirty_segments: u8,
+    /// Host bytes the block's emitted code was estimated at when the barrier stopped it, as the
+    /// compile walk's own running total. The scan continues it, so the page budget stops the two
+    /// in the same place. See `EMITTED_BLOCK_FIXED_BYTES`.
+    pub(super) estimated_bytes: u32,
     /// Whether the forward scan applies the dirty-segment rule at all.
     ///
     /// TRUE for every arm but one, because the rule survives lowering the opcode those arms name:
@@ -192,7 +196,20 @@ pub(super) fn record_structural_barrier(
 ///
 /// The audit that produced the current form found SIX divergences. Three are closed here, one is
 /// deliberately left open, and two belong to the dirty-segment slice. A seventh arrived with the
-/// 2026-08-19 L1 arm and is closed below:
+/// 2026-08-19 L1 arm; an eighth and a ninth with the 2026-08-22 page budget and demoted-site stop.
+/// All three are closed below:
+///
+/// * CLOSED, the PAGE BUDGET. The compile walk stops when its running emitted-size estimate
+///   reaches one host page (`EMITTED_BLOCK_FIXED_BYTES`), which on a memory-heavy path binds long
+///   before `MAX_BLOCK_INSTRUCTIONS`. A scan without the mirror reports the pre-budget length, so
+///   every row over-reports and the memory-heavy rows -- exactly the ones a coverage slice ranks
+///   -- over-report most. `SuffixSeed::estimated_bytes` carries the walk's total and the scan
+///   continues it.
+///
+/// * CLOSED, the DEMOTED-SITE stop. A slot the governor demoted is a boundary for every later walk
+///   over that instruction, so a suffix that counts it claims a block the compiler will never
+///   build. Both mirrors sit BELOW `stack_width_kind`, where the compile walk's own copies are and
+///   for the same reason: `classify` does not produce the protected-mode `MOV ES/DS,r16` call-out.
 ///
 /// * CLOSED, the L1 heat gate (`IZARRAVM_ROTATE_ROWS=heat`). That arm's refusal is NOT a
 ///   `classify` None -- `classify` admits the group-2 row and the compile walk downgrades it to
@@ -254,7 +271,11 @@ fn census_native_suffix(
         x87_slots,
         mut dirty_segments,
         model_dirty,
+        estimated_bytes,
     } = seed;
+    // The barrier occupies one slot of the counterfactual block, so its own emitted bytes join the
+    // running total before the scan starts. See the budget mirror below for why the memory rate.
+    let mut estimated_bytes = estimated_bytes.saturating_add(EMITTED_MEMORY_SLOT_BYTES);
     let cs = cpu.registers.cs();
     let mut result = CensusSuffix::default();
     while prefix_instructions + 1 + result.instructions < MAX_BLOCK_INSTRUCTIONS {
@@ -323,6 +344,36 @@ fn census_native_suffix(
         let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
             break;
         };
+        // The demoted-site stop, mirrored from the compile walk. A slot the governor demoted is a
+        // BOUNDARY for every later walk over that instruction, so a suffix that counted it is
+        // claiming a block the compiler will never build. Below `stack_width_kind` for the reason
+        // the compile walk's own copy is: `classify` does not produce the protected-mode
+        // `MOV ES/DS,r16` call-out, that conversion does.
+        if kind
+            .call_out_helper()
+            .is_some_and(CallOutHelper::interprets_one)
+            && cpu
+                .jit_direct
+                .callout_site_demoted(expected_phys, key.mode_key)
+        {
+            break;
+        }
+        // The page budget, mirrored from the compile walk. Without it every row's suffix reports
+        // the pre-budget block length -- up to `MAX_BLOCK_INSTRUCTIONS` -- while the compiler
+        // stops at one host page, and the over-report is worst on exactly the memory-heavy rows a
+        // coverage slice is trying to rank.
+        //
+        // The BARRIER itself is charged at the memory-slot rate. The suffix counts it as one slot
+        // of the counterfactual block (`prefix_instructions + 1`), and its lowered size is by
+        // definition unknown -- there is no `kind` for an instruction the classifier refused. The
+        // memory rate is the same conservative choice the slot-count caps make, and it is one slot
+        // of error at worst.
+        let next_estimated_bytes = estimated_bytes.saturating_add(kind.emitted_bytes_estimate());
+        if usize::try_from(next_estimated_bytes).unwrap_or(usize::MAX)
+            > super::super::exec_mem::host_page_len()
+        {
+            break;
+        }
         if kind.is_x87()
             || !static_control_target_within_limit(
                 kind,
@@ -344,6 +395,7 @@ fn census_native_suffix(
         {
             break;
         }
+        estimated_bytes = next_estimated_bytes;
         stack_accesses += u8::from(kind.uses_stack());
         memory_alu_slots += u8::from(kind.is_memory_alu());
         callout_slots += u8::from(kind.is_call_out());
@@ -388,6 +440,19 @@ pub(crate) struct BlockCacheStats {
     pub portals_hidden: u64,
 }
 
+/// One allowlist row's four outcome counts. A struct rather than four parallel arrays so a row's
+/// numbers stay adjacent in the tally, the report and the probe JSON alike.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InterpretOneRowTally {
+    pub(crate) executed: u64,
+    pub(crate) resync: u64,
+    pub(crate) resync_fault: u64,
+    pub(crate) demoted: u64,
+    /// The subset of `resync` that the SUFFIX-only segment mask would have carried. See
+    /// `DirectStallTally::callout_interpret_one_resume_refused_prefix_use`.
+    pub(crate) resume_refused_prefix_use: u64,
+}
+
 /// The stall tallies, deliberately NOT part of `BlockCacheStats`.
 ///
 /// `BlockCacheStats` is DRAINED by `take_stats` on every dispatcher exit and folded into
@@ -405,6 +470,57 @@ pub(crate) struct DirectStallTally {
     /// that had simply never been hot enough to try -- which is what made the 5.2M-exit
     /// seen-not-compiled bucket unattributable.
     pub dormant: [u64; DormantReason::COUNT],
+    /// The static-unbound EXITS that landed on a compile-Retry dormant key, split by the cause
+    /// that key was parked with.
+    ///
+    /// The sibling of `retry_causes` and a different currency. That one counts compile ATTEMPTS,
+    /// which is what says how many keys each gate parked; this counts the exits those keys then
+    /// absorb, which is what says how much wall a lift could reach. On the tombraid loader phase
+    /// the two answer opposite questions about the same 466 keys: `admission_matrix` parks the
+    /// most keys (206) and `decode_miss` (194) is the largest clearable one, and until this column
+    /// existed nothing said which of them the 4.40 M exits actually go to.
+    ///
+    /// GATED with the barrier census, like the class table it rides on: it is one array increment
+    /// per static-unbound exit, on a path that runs millions of times in a loader phase, and it is
+    /// read only on census legs.
+    ///
+    /// THE STATIC LANE ONLY. `classify_dynamic_miss_exit` classifies the same key population
+    /// through the same `UnboundTarget` table, and folding it in would put two populations with
+    /// different fixes into one column -- a static unbound wants the target compiled, a dynamic
+    /// miss whose target is dormant wants the same thing but arrives through the inline cache, and
+    /// the 4.40 M figure this column is compared against is the static one. If the dynamic lane
+    /// ever needs the same split it gets its own array.
+    ///
+    /// WHAT IT SUMS TO. Not `dormant_other` for the lane, which also holds the parks that carry no
+    /// cause at all (`PageCoverFailed`, `InstallFailed`); it sums to the compile-Retry SUBSET of
+    /// that column, and the difference is exactly those two reasons.
+    pub retry_cause_hits: [u64; RetryCause::COUNT],
+    /// Keys the retry lift re-admitted, and keys that came straight back with the same cause and
+    /// were parked permanently. Always on: both fire on a cold path, at most once per key.
+    ///
+    /// The PAIR is the report, not either half. Lifts alone say the arm fired; reparks alone say
+    /// nothing. `reparks / lifts` is the arm's hit rate, and a ratio near one says the causes
+    /// being lifted are not clearable in practice however clearable they are in principle.
+    pub retry_lifts: u64,
+    pub retry_lift_reparks: u64,
+    /// The `DormantReason::CompileRetry` column split by which compile-walk gate gave up,
+    /// indexed by `RetryCause`. Sums to `dormant[CompileRetry]` exactly, which is the pin the
+    /// tests assert.
+    ///
+    /// Counted HERE, in `BlockCache::dormant`, and not at the twenty-odd `CompileStop::Retry`
+    /// sites, for one reason: `compile_with_page_len` re-enters the walk once per step of its
+    /// recovery binary search, so a per-site counter would multiply a single failed compile by
+    /// the search depth and would let two steps of the same search disagree about the cause.
+    /// `dormant` fires exactly once per compile attempt, so the count is per attempt by
+    /// construction and needs no census gate to stay honest. That is the same reason the
+    /// `instruction_limit >= MAX_BLOCK_INSTRUCTIONS && barrier_census_enabled()` pattern guards
+    /// the in-walk `record_structural_barrier` calls and is absent here.
+    pub retry_causes: [u64; RetryCause::COUNT],
+    /// The same split counted once per KEY rather than once per attempt: incremented only when
+    /// the park actually moved an entry from `Seen` to `Dormant`. `retry_causes` divided by this
+    /// is how many attempts a dormant key costs before it settles, and this column is the one
+    /// that joins against the 464-key dormant population the loader census reports.
+    pub retry_cause_keys: [u64; RetryCause::COUNT],
     /// Why `try_link_inner` refused an edge, indexed by `LinkRefusal`. Every one of these leaves
     /// the source cell on the zero portal, so the exit reports `StaticUnbound` and is
     /// indistinguishable from a target that was never compiled.
@@ -442,6 +558,96 @@ pub(crate) struct DirectStallTally {
     /// anything at all. This is the numerator of the slice's non-vacuity ratio; `executed` stays
     /// the denominator.
     pub callout_port_v86_served: u64,
+    /// The `InterpretOne` family, five counters that price the mechanism on its own terms.
+    ///
+    /// `executed` is every slot the helper ENTERED, the denominator the rest need.
+    /// `resync` and `resync_fault` are the two RESYNC statuses -- the predicate refusing after a
+    /// retired instruction, and the step faulting. `abnormal` is the helper's one fail-closed
+    /// return: NO RESIDENT DECODE VIEW, and nothing else.
+    ///
+    /// **A demoted slot is not in `abnormal`, and cannot be.** The demotion is a byte the emitted
+    /// prologue tests before the call, so a demoted execution never reaches the helper and never
+    /// reaches any counter here. It is observable as the DIFFERENCE between two counters that do
+    /// fire: `side_exit_callout_abnormal` counts every execution that took the abnormal exit,
+    /// `callout_interpret_one_abnormal` counts the subset that got there through the helper, and
+    /// the gap is executions refused by the governor. `demoted` then counts the CELLS, once each
+    /// at the transition, so `gap / demoted` is what a demotion costs the block that carries it.
+    ///
+    /// The design asked for a `BarrierStop::CallOutDemoted` row instead, and when this was written
+    /// it was not implementable: the barrier census records COMPILE-WALK stops, and demotion was a
+    /// runtime event on an already compiled block that never changed its classification. The
+    /// demoted-site map changed that -- a demotion now retires the block and marks the site, so
+    /// the RECOMPILE walk stops there and has a row to be attributed to. The variant exists.
+    ///
+    /// The gap described above still exists and is still the way to price a demotion, because it
+    /// covers the executions between the demotion and the retire.
+    ///
+    /// Separate from `callout_executed` and `side_exit_callout_abnormal` rather than folded into
+    /// them, for the reason `callout_port_v86_served` is separate: those sum every helper class,
+    /// so on a guest running both they cannot say whether THIS class served anything. The
+    /// acceptance ratio the slice is graded on is `resync / executed`.
+    pub callout_interpret_one_executed: u64,
+    pub callout_interpret_one_resync: u64,
+    /// Resyncs a segment-writing call-out took because the record it moved is baked by a slot
+    /// BEFORE it, which the suffix-only mask would have let through.
+    ///
+    /// The price of the prefix half of the mask, and the number the `IZARRAVM_CALLOUT_SEGMENT_RESUME`
+    /// A/B is read against. Without the prefix, those slots resume and the block then fails its own
+    /// `data_matches` on the next entry, retires and recompiles: the first loader gate measured
+    /// that as `reject_data_segment` 307,714 -> 514,327 and 206,000 extra compile attempts. This
+    /// counter is the other side of that trade, in the currency the ladder can subtract.
+    ///
+    /// A SUBSET of `callout_interpret_one_resync`, never a separate lane: the resync happened and
+    /// is counted there too.
+    pub callout_interpret_one_resume_refused_prefix_use: u64,
+    pub callout_interpret_one_resync_fault: u64,
+    pub callout_interpret_one_abnormal: u64,
+    pub callout_interpret_one_demoted: u64,
+    /// The same family, split by the allowlist ROW the slot was admitted as, indexed by
+    /// `InterpretOneRow::index`.
+    ///
+    /// The scalars above cannot answer the question the plan grades this slice on. Its rule is "a
+    /// row the governor demotes on the loader at more than 50% is refuted and removed from the
+    /// list", and a whole-CPU `resync / executed` says the family resynced without saying which
+    /// row did it. With nine rows admitted, one bad row hiding behind eight good ones is exactly
+    /// the shape that ratio cannot see.
+    ///
+    /// ABNORMAL is deliberately not among the four. A demoted slot takes the abnormal exit from
+    /// its emitted prologue WITHOUT calling the helper, so there is no cell in scope to attribute
+    /// it to and a per-row abnormal count would be silently short by every post-demotion exit.
+    /// The scalar stays the honest home for it.
+    pub callout_interpret_one_rows: [InterpretOneRowTally; InterpretOneRow::COUNT],
+    /// Code writes taken while a call-out window was open, i.e. writes that reported a hit and
+    /// were replayed at the drain instead of invalidating under a live native frame.
+    ///
+    /// The always-on evidence for design review B2, and the only evidence there can be: the
+    /// deferral is invisible from outside because the drain makes the outcome identical. A slot
+    /// whose step stores onto watched code contributes one; a slot whose step FAULTS onto watched
+    /// code contributes one per pushed word of the delivery frame, which is the case the window
+    /// has to stay open across.
+    pub callout_deferred_code_writes: u64,
+    /// Compile walks that stopped because the block already held `MAX_BLOCK_CALLOUT_SLOTS`. The
+    /// evidence for or against raising the cap, which S5 prices; zero says the cap is not what
+    /// bounds the loader's blocks.
+    pub callout_slot_cap_hits: u64,
+    /// The compile walk's page budget, priced from the other side: `overflows` counts full-length
+    /// walks whose emission still exceeded one host page, and `search_steps` the candidate
+    /// re-compiles `compile_with_page_len`'s recovery search then paid for them.
+    ///
+    /// One pair rather than a ratio because they answer different questions. `overflows` grades
+    /// the size model (`EMITTED_BLOCK_FIXED_BYTES`): it should be a rounding error against
+    /// `jit_direct_compile_attempts`, and a large value says the model is wrong for this guest's
+    /// slot mix, not that the search is expensive. `search_steps` is the cost itself, and it is
+    /// the counter that made the S3 regression legible -- 956,976 steps against 280,000 compiles,
+    /// each one a full re-walk AND a full re-emission, which is where 4.4 seconds of the loader's
+    /// wall went.
+    pub compile_page_overflows: u64,
+    pub compile_page_search_steps: u64,
+    /// Demotions whose code site `DEMOTED_CALLOUT_SITE_CAP` refused to record, and which therefore
+    /// did NOT retire their block. Non-zero says the cap is binding and the sites past it are back
+    /// to paying the emitted prologue test on every execution; it must stay zero on any workload
+    /// the cap was sized for.
+    pub demoted_callout_sites_refused: u64,
     /// G1 lane trials granted: hot-chunk compilations allowed through the heat gates on the
     /// one-per-key-per-epoch budget (`lane_trial_enabled`), and how many of them installed a
     /// lane-carrying block under a hot span. The gap between the two is trials that learned
@@ -524,6 +730,25 @@ pub(crate) struct DirectStallTally {
     pub decline_memo_hits: u64,
     pub decline_memo_advances: u64,
     pub decline_memo_sweeps: u64,
+    /// Interpreted `MOV SS, r/m` and `POP SS` executions, split by whether the load left the SS
+    /// RECORD byte-identical (selector, base, limit, access, B) or changed it.
+    ///
+    /// A MEASUREMENT and not a mechanism, and design review 10.1 M5 is the whole of its purpose.
+    /// The S4d slice admits STI alone; the two SS rows behind it can only resume when R2 finds
+    /// the six segment records unchanged, so a guest that switches stacks at those instructions
+    /// would resync every time and demote the slot. The loader census reports 484 k MOV SS and
+    /// 483 k POP SS hits with no split between the two shapes, and this pair is what supplies it.
+    /// The SS rows get built only if `same` is the large share.
+    ///
+    /// Counted at the two interpreter arms rather than inside `load_segment_arming_ss_shadow`,
+    /// which would also catch LSS: LSS was dropped from the slice at M4 (five data accesses
+    /// against a bound of four) and is not a candidate row, so folding it in would bias the
+    /// number the decision is made on.
+    ///
+    /// GATED with the barrier census since the S4 review round: both arms are interpreter hot
+    /// paths and this is read on census legs only. A plain build reports zeroes.
+    pub ss_load_same_record: u64,
+    pub ss_load_changed_record: u64,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -531,10 +756,11 @@ pub(crate) struct DirectStallTally {
 /// outcome; see `BlockCacheStats::dormant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DormantReason {
-    /// `CompileOutcome::Retry`. Twenty distinct `CompileStop::Retry` sites fold into this one
-    /// value, so it is still coarse -- but it separates "the compiler gave up" from the three
-    /// post-compile gates below, which is the split that decides whether retrying is worth
-    /// anything.
+    /// `CompileOutcome::Retry`. Every `CompileStop::Retry` site folds into this one value, so it
+    /// separates "the compiler gave up" from the three post-compile gates below, which is the
+    /// split that decides whether retrying is worth anything. WHICH site gave up is the second
+    /// question, and `RetryCause` answers it: the outcome carries the cause and
+    /// `BlockCache::dormant` files it under `DirectStallTally::retry_causes`.
     CompileRetry,
     /// G4: no single RAM direct page covers the block's whole physical span.
     PageCoverFailed,
@@ -560,6 +786,176 @@ impl DormantReason {
             Self::PageCoverFailed => "page_cover_failed",
             Self::SpanHot => "span_hot",
             Self::InstallFailed => "install_failed",
+        }
+    }
+}
+
+/// Which family of compile-walk gate produced a `CompileOutcome::Retry`.
+///
+/// WHY THIS EXISTS. On the tombraid loader phase, 464 dormant keys absorb 3.9 M `static_unbound`
+/// exits and are never retried, and every one of them is filed under the single
+/// `DormantReason::CompileRetry` label. That label answers "the compiler gave up" and nothing
+/// else, so it cannot say whether a retry would ever succeed. The split here is the precondition
+/// for a retry policy: some of these causes are DETERMINISTIC in the key (the caps, the
+/// admission matrix, the min-length rule) and re-walking would reach the same answer forever,
+/// while others are CLEARABLE by state that moves independently of the code bytes (a decode line
+/// that was not resident, a translation that has since been refilled, an arena page that was
+/// full). A lift arm may only re-probe the second group.
+///
+/// One variant per cause FAMILY, not per site: eleven accumulator overflows share
+/// `AccumulatorOverflow` because no retry policy would ever treat two of them differently, and
+/// three separate `record_structural_barrier` arms share `SpanUnformable` because what they have
+/// in common (the walk found a real barrier but could not name a span for it) is the whole
+/// content of the answer.
+/// `Hash` because `BlockCache::retry_lift_spent` is a set of `(BlockKey, RetryCause)` pairs: one
+/// lift per key PER CAUSE, which a map from key to cause could not express -- it remembered only
+/// the last one, and a key alternating two clearable causes lifted for ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RetryCause {
+    /// `key_for` could not canonicalize the entry: no translation, or a key the cache cannot
+    /// form. Clearable.
+    NoKey,
+    /// The decode cache had no line for the slot, or handed back a zero-length instruction.
+    /// Clearable: the line is refilled by the interpreter running the same bytes.
+    DecodeMiss,
+    /// The block's guest span left its page, or an address computation wrapped the linear or
+    /// physical address space. Deterministic in the key.
+    PageCross,
+    /// The slot ran past `cs.limit`. Clearable only by a segment reload, which moves the mode
+    /// key, so from THIS key's point of view it is deterministic.
+    SegmentLimit,
+    /// The decode line's physical start disagreed with the key's own physical projection: the
+    /// translation moved under the walk. Clearable.
+    TranslationMismatch,
+    /// A real structural barrier whose `RejectedSpan` could not be formed (the prefix is too
+    /// long for the span's length field), so the walk cannot park the span as `Rejected` and
+    /// falls back to a whole-key Retry. Deterministic.
+    SpanUnformable,
+    /// `stack_width_kind` refused the SS.B / operand-size cell, the control-transfer target left
+    /// the clamped limit, or the segment access is unsupported. Deterministic in the key, which
+    /// carries SS.B and the segment layout.
+    AdmissionMatrix,
+    /// The x87 slot budget, or the rule that x87 and call-out slots never share a block.
+    /// Deterministic.
+    X87Cap,
+    /// `MAX_BLOCK_CALLOUT_SLOTS`. Deterministic.
+    CalloutCap,
+    /// `MAX_MEMORY_ALU_SLOTS` or the memory-ALU block length. Deterministic.
+    MemoryAluCap,
+    /// `MAX_BLOCK_STACK_ACCESSES`. Deterministic.
+    StackAccessCap,
+    /// One of the eleven `checked_add` accumulators (clocks, per-width reads and stores)
+    /// saturated. Deterministic.
+    AccumulatorOverflow,
+    /// The post-walk min-length rule: fewer than three slots and the last one is not terminal.
+    /// Raised only when the walk itself ended on a BOUNDARY, so this names the min-length rule
+    /// as the cause rather than shadowing an inner Retry. Deterministic for a given block shape,
+    /// and the reason a call-out-led two-slot block never installs (`is_terminal` excludes
+    /// `CallOut`).
+    TooShort,
+    /// A post-walk structure the block needs could not be built: the span, the segment layout,
+    /// the fast-map bases, the code-watch tables, or the self-loop x87 TOP rule. Mostly
+    /// clearable (the map bases and watch tables are host-side state).
+    PostWalk,
+    /// The host-page recovery search in `compile_with_page_len` could not find any prefix that
+    /// fits one arena page. Clearable in principle (the size model and the page length are host
+    /// state) but expected to be near zero since the walk gained its own page budget.
+    HostPageLen,
+    /// A search step in `compile_with_page_len` hit a STRUCTURAL barrier the full walk did not,
+    /// so the prefix cannot be compiled and cannot be parked as a rejected span either.
+    /// Deterministic. Split out of `HostPageLen` at review finding F7, which is the label it wore
+    /// while having nothing to do with the arena page; whether the arm is reachable at all is now
+    /// a question the counter answers rather than one the label pre-judges.
+    SearchStructural,
+    /// The walk ended cleanly with NO slots at all: the block-page budget or the instruction
+    /// limit refused the very first instruction. Deterministic in the key. Split out of
+    /// `TooShort` at review finding F7 -- the min-length rule never looked at this block, so
+    /// filing a budget refusal under it made the one cause a retry policy most wants to trust
+    /// mean two different things.
+    BudgetFirstSlot,
+}
+
+impl RetryCause {
+    pub(crate) const COUNT: usize = 17;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::NoKey,
+        Self::DecodeMiss,
+        Self::PageCross,
+        Self::SegmentLimit,
+        Self::TranslationMismatch,
+        Self::SpanUnformable,
+        Self::AdmissionMatrix,
+        Self::X87Cap,
+        Self::CalloutCap,
+        Self::MemoryAluCap,
+        Self::StackAccessCap,
+        Self::AccumulatorOverflow,
+        Self::TooShort,
+        Self::PostWalk,
+        Self::HostPageLen,
+        Self::SearchStructural,
+        Self::BudgetFirstSlot,
+    ];
+
+    /// Whether a re-walk of the SAME key could ever reach a different answer, which is the whole
+    /// admission rule for the retry lift (`BlockCache::lift_clearable_retry_dormant`).
+    ///
+    /// EXHAUSTIVE, with no catch-all arm, because the default has to be "no": a cause added
+    /// without an answer must be a compile error rather than a silent lift of a gate that refuses
+    /// deterministically. Only two say yes today.
+    ///
+    /// The line is drawn at what the cause DEPENDS ON, not at how it feels. `DecodeMiss` and
+    /// `TranslationMismatch` both fail on host-side state that the interpreter running the same
+    /// bytes repairs: the decode line refills and the translation settles. Everything else depends
+    /// on the key, the code bytes or a fixed budget, and re-walking reaches the same answer for
+    /// ever.
+    ///
+    /// The near misses, named so they are not re-litigated. `NoKey` looks clearable and is not
+    /// reachable here at all: the walk needs a key before it can park one. `SegmentLimit` clears
+    /// only through a segment reload, which moves the mode key and therefore produces a DIFFERENT
+    /// key. `PostWalk` and `HostPageLen` do rest on host state, but both are near zero on every
+    /// measured workload, so a lift for them would be an unmeasurable arm; they are candidates for
+    /// a later slice with a census behind it, not for this one.
+    pub(crate) fn clearable_by_retry(self) -> bool {
+        match self {
+            Self::DecodeMiss | Self::TranslationMismatch => true,
+            Self::NoKey
+            | Self::PageCross
+            | Self::SegmentLimit
+            | Self::SpanUnformable
+            | Self::AdmissionMatrix
+            | Self::X87Cap
+            | Self::CalloutCap
+            | Self::MemoryAluCap
+            | Self::StackAccessCap
+            | Self::AccumulatorOverflow
+            | Self::TooShort
+            | Self::PostWalk
+            | Self::HostPageLen
+            | Self::SearchStructural
+            | Self::BudgetFirstSlot => false,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NoKey => "no_key",
+            Self::DecodeMiss => "decode_miss",
+            Self::PageCross => "page_cross",
+            Self::SegmentLimit => "segment_limit",
+            Self::TranslationMismatch => "translation_mismatch",
+            Self::SpanUnformable => "span_unformable",
+            Self::AdmissionMatrix => "admission_matrix",
+            Self::X87Cap => "x87_cap",
+            Self::CalloutCap => "callout_cap",
+            Self::MemoryAluCap => "memory_alu_cap",
+            Self::StackAccessCap => "stack_access_cap",
+            Self::AccumulatorOverflow => "accumulator_overflow",
+            Self::TooShort => "too_short",
+            Self::PostWalk => "post_walk",
+            Self::HostPageLen => "host_page_len",
+            Self::SearchStructural => "search_structural",
+            Self::BudgetFirstSlot => "budget_first_slot",
         }
     }
 }
@@ -1034,6 +1430,14 @@ pub(crate) enum BarrierStop {
     ///
     /// Its suffix is computed with the dirty rule DISABLED. See `SuffixSeed::model_dirty`.
     DirtySegment,
+    /// An `InterpretOne` call-out the governor DEMOTED, met again by a later compile walk.
+    ///
+    /// Separate from `HardBoundary` because the cause is different in kind: `classify` still
+    /// admits the row, and what stops the walk is a runtime judgement about this code site. The
+    /// column therefore answers a question no other row can -- how much of the barrier population
+    /// a widened row won and then gave back -- and folding it into `HardBoundary` would make an
+    /// admitted row look like an unlowered one.
+    CallOutDemoted,
 }
 
 impl BarrierStop {
@@ -1044,6 +1448,7 @@ impl BarrierStop {
             Self::NonContinuable => "non_continuable",
             Self::WordPersona => "word_persona",
             Self::DirtySegment => "dirty_segment",
+            Self::CallOutDemoted => "call_out_demoted",
         }
     }
 
@@ -1666,7 +2071,24 @@ impl crate::jit::JitState {
 
     /// Record why a static successor was unbound. No-op unless the census is allocated, and the
     /// CALLER still gates on `barrier_census_active` so the key construction is skipped too.
-    pub(crate) fn note_unbound_target(&mut self, kind: UnboundTarget, linear: u32) {
+    pub(crate) fn note_unbound_target(
+        &mut self,
+        kind: UnboundTarget,
+        linear: u32,
+        key: Option<BlockKey>,
+    ) {
+        // The per-cause split of `dormant_other`, taken here rather than inside
+        // `classify_unbound_target` so the plain build pays nothing for it: the class table is
+        // read on every static-unbound exit, and this arm is one map probe on top. See
+        // `DirectStallTally::retry_cause_hits` for what the column sums to and why the dynamic
+        // lane is not folded into it.
+        if self.direct_barrier_census.is_some()
+            && kind == UnboundTarget::DormantOther
+            && let Some(key) = key
+            && let Some(cause) = self.direct.dormant_retry_cause(key)
+        {
+            self.stalls.retry_cause_hits[cause as usize] += 1;
+        }
         if let Some(census) = self.direct_barrier_census.as_mut() {
             census.note_unbound(kind);
             if kind == UnboundTarget::Rejected {
@@ -1709,6 +2131,20 @@ impl crate::jit::JitState {
                 .iter()
                 .map(|r| (r.label(), self.stalls.dormant[*r as usize]))
                 .collect(),
+            retry_lifts: self.stalls.retry_lifts,
+            retry_lift_reparks: self.stalls.retry_lift_reparks,
+            retry_cause_hits: RetryCause::ALL
+                .iter()
+                .map(|c| (c.label(), self.stalls.retry_cause_hits[*c as usize]))
+                .collect(),
+            retry_causes: RetryCause::ALL
+                .iter()
+                .map(|c| crate::RetryCauseCounts {
+                    cause: c.label(),
+                    count: self.stalls.retry_causes[*c as usize],
+                    keys: self.stalls.retry_cause_keys[*c as usize],
+                })
+                .collect(),
             link_refusals: LinkRefusal::ALL
                 .iter()
                 .map(|r| (r.label(), self.stalls.link_refusals[*r as usize]))
@@ -1724,6 +2160,49 @@ impl crate::jit::JitState {
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
             callout_executed: self.stalls.callout_executed,
             callout_port_v86_served: self.stalls.callout_port_v86_served,
+            callout_interpret_one_executed: self.stalls.callout_interpret_one_executed,
+            callout_interpret_one_resync: self.stalls.callout_interpret_one_resync,
+            callout_interpret_one_resume_refused_prefix_use: self
+                .stalls
+                .callout_interpret_one_resume_refused_prefix_use,
+            callout_segment_resume_enabled: super::callout_segment_resume_enabled(),
+            callout_interpret_one_resync_fault: self.stalls.callout_interpret_one_resync_fault,
+            callout_interpret_one_abnormal: self.stalls.callout_interpret_one_abnormal,
+            callout_interpret_one_demoted: self.stalls.callout_interpret_one_demoted,
+            callout_interpret_one_rows: InterpretOneRow::ALL
+                .iter()
+                .map(|row| {
+                    let tally = self.stalls.callout_interpret_one_rows[row.index()];
+                    crate::InterpretOneRowCounts {
+                        row: row.label(),
+                        executed: tally.executed,
+                        resync: tally.resync,
+                        resync_fault: tally.resync_fault,
+                        demoted: tally.demoted,
+                        resume_refused_prefix_use: tally.resume_refused_prefix_use,
+                    }
+                })
+                .collect(),
+            callout_deferred_code_writes: self.stalls.callout_deferred_code_writes,
+            callout_slot_cap_hits: self.stalls.callout_slot_cap_hits,
+            compile_page_overflows: self.stalls.compile_page_overflows,
+            compile_page_search_steps: self.stalls.compile_page_search_steps,
+            demoted_callout_sites_refused: self.stalls.demoted_callout_sites_refused,
+            // A GAUGE and not a running total: the size of a map, read here rather than kept on
+            // the tally. Against `callout_interpret_one_demoted` it says whether a demotion is
+            // being LEARNED once per site or re-learned -- the two are within a rounding error of
+            // each other when the demoted-site map is doing its job, and orders apart when it is
+            // not, which is how the misplaced site check was found.
+            //
+            // THE BAR, for any gate that reads this pair out of the probe JSON as
+            // `jit_direct_demoted_callout_sites` and `..._refused`: the gauge must stay strictly
+            // below `DEMOTED_CALLOUT_SITE_CAP` and the refusal count must be ZERO. Either one
+            // failing says the cap is binding on a real workload, which is the one condition under
+            // which the mechanism degrades to the emitted prologue test it exists to remove, and
+            // it is a cap value question rather than a defect. The tombraid loader reads 64 and 0.
+            // Stated here because the loader gate's runner is not in this repository, so a doc on
+            // the counter is the only place the bar can live where it cannot be lost.
+            demoted_callout_sites: self.demoted_callout_sites_len() as u64,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             callout_governor_trials: self.stalls.callout_governor_trials,
             callout_governor_lazy: self.stalls.callout_governor_lazy,
@@ -1738,6 +2217,8 @@ impl crate::jit::JitState {
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
+            ss_load_same_record: self.stalls.ss_load_same_record,
+            ss_load_changed_record: self.stalls.ss_load_changed_record,
             decline_memo_hits: self.stalls.decline_memo_hits,
             decline_memo_advances: self.stalls.decline_memo_advances,
             decline_memo_sweeps: self.stalls.decline_memo_sweeps,
@@ -1796,6 +2277,64 @@ impl crate::jit::JitState {
     /// `note_callout_executed` is ungated: the gate would cost as much as the work.
     pub(crate) fn note_callout_port_v86_served(&mut self) {
         self.stalls.callout_port_v86_served += 1;
+    }
+
+    /// The `InterpretOne` family's five increments, all on the helper's already-off-native path
+    /// or on a compile walk, and ungated for the reason `note_callout_executed` is.
+    ///
+    /// Four of the five keep a PER-ROW count beside the scalar, and the pair costs one extra
+    /// increment on a path that is already off the native lane -- the row index is a field of the
+    /// cell the helper is holding, so there is no lookup. Nothing is gated: these sit exactly
+    /// where the scalars already sat.
+    pub(crate) fn note_interpret_one_executed(&mut self, row: InterpretOneRow) {
+        self.stalls.callout_interpret_one_executed += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].executed += 1;
+    }
+
+    pub(crate) fn note_interpret_one_resync(&mut self, row: InterpretOneRow) {
+        self.stalls.callout_interpret_one_resync += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].resync += 1;
+    }
+
+    /// A resync the suffix-only mask would have carried. Counted BESIDE the resync above, not
+    /// instead of it: it is a subset, and a lane that replaced the resync would break the sum the
+    /// per-row pin checks.
+    pub(crate) fn note_interpret_one_resume_refused_prefix_use(&mut self, row: InterpretOneRow) {
+        self.stalls.callout_interpret_one_resume_refused_prefix_use += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].resume_refused_prefix_use += 1;
+    }
+
+    pub(crate) fn note_interpret_one_resync_fault(&mut self, row: InterpretOneRow) {
+        self.stalls.callout_interpret_one_resync_fault += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].resync_fault += 1;
+    }
+
+    /// No per-row sibling; see the `callout_interpret_one_rows` field for why.
+    pub(crate) fn note_interpret_one_abnormal(&mut self) {
+        self.stalls.callout_interpret_one_abnormal += 1;
+    }
+
+    pub(crate) fn note_interpret_one_demoted(&mut self, row: InterpretOneRow) {
+        self.stalls.callout_interpret_one_demoted += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].demoted += 1;
+    }
+
+    pub(crate) fn note_deferred_code_write(&mut self) {
+        self.stalls.callout_deferred_code_writes += 1;
+    }
+
+    pub(crate) fn note_callout_slot_cap_hit(&mut self) {
+        self.stalls.callout_slot_cap_hits += 1;
+    }
+
+    /// A full-length walk whose emission did not fit one host page, and each candidate the
+    /// recovery search then compiled. See `compile_page_overflows`.
+    pub(crate) fn note_compile_page_overflow(&mut self) {
+        self.stalls.compile_page_overflows += 1;
+    }
+
+    pub(crate) fn note_compile_page_search_step(&mut self) {
+        self.stalls.compile_page_search_steps += 1;
     }
 
     pub(crate) fn note_reject_callout_privileged(&mut self) {

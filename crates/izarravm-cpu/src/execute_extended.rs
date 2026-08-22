@@ -105,7 +105,7 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let index = self.read_gpr_sized(modrm.reg, operand_size);
                 self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
-                Ok(clocks(6))
+                Ok(clocks(BIT_STRING_CORE_CLOCKS))
             }
             0x0fba => {
                 // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 was fetched by
@@ -129,7 +129,7 @@ impl CpuGsw {
                     address_size,
                     false,
                 )?;
-                Ok(clocks(6))
+                Ok(clocks(BIT_STRING_CORE_CLOCKS))
             }
             0x0fa4 | 0x0fac => {
                 // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 count was fetched by `decode` into
@@ -939,7 +939,9 @@ impl CpuGsw {
                     6 => {
                         let value = self.read_operand_sized(bus, operand, operand_size)?;
                         self.push(bus, value, operand_size)?;
-                        Ok(clocks(2))
+                        // Named because the Word memory form is an `InterpretOne` call-out row:
+                        // its budget bound and this arm must charge the same number.
+                        Ok(clocks(PUSH_RM_CORE_CLOCKS))
                     }
                     3 | 5 => {
                         // Far CALL (/3) and far JMP (/5) via memory. The operand must be memory;

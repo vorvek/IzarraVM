@@ -84,7 +84,7 @@ fn structural(outcome: jit::direct::CompileOutcome) -> jit::direct::RejectedSpan
     match outcome {
         jit::direct::CompileOutcome::StructuralReject(span) => span,
         jit::direct::CompileOutcome::Compiled(_) => panic!("fixture unexpectedly compiled"),
-        jit::direct::CompileOutcome::Retry => panic!("fixture unexpectedly requested a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("fixture unexpectedly requested a retry"),
     }
 }
 
@@ -94,7 +94,7 @@ fn compiled(outcome: jit::direct::CompileOutcome) -> jit::direct::Compilation {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("fixture unexpectedly became a structural rejection")
         }
-        jit::direct::CompileOutcome::Retry => panic!("fixture unexpectedly requested a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("fixture unexpectedly requested a retry"),
     }
 }
 
@@ -429,6 +429,14 @@ fn barrier_census_does_not_admit_an_unaudited_structural_stop() {
 //    where it must read 0;
 //  * restoring the bare `!insn.continuable` makes
 //    `census_suffix_admits_the_non_continuable_imul_forms` read 0 where it must read 3.
+//
+//  * deleting the page-budget mirror makes `census_suffix_stops_where_the_page_budget_does` read
+//    31 where it must read 9. That divergence is the one the S3 page budget introduced, and it is
+//    not bounded by a constant: it grows with how memory-heavy the path is, which is the axis the
+//    suffix column ranks on.
+//
+//  * deleting the demoted-site mirror makes `census_suffix_stops_at_a_demoted_call_out_site` read
+//    5 where it must read 2, which is a demoted row claiming the coverage it just gave back.
 //
 //  * deleting the L1 heat-gate mirror makes `census_suffix_mirrors_the_l1_heat_gate` read 4 on its
 //    hot leg where it must read 2. That is the seventh divergence, and it is the only one whose
@@ -855,18 +863,30 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 /// raise #GP. Its Word arm is still refused by the allowlist, and the Dword control here proves
 /// the arm is live so this test cannot rot into "refused at every size" vacuity the way the port
 /// test once did.
+///
+/// CLI (0xfa) LEFT the barrier list with the S3 policy widening and is asserted from the other
+/// side in the same table: it joins the block at both widths as an `InterpretOne` call-out. Its
+/// V86 cover is not a compile-time refusal at all but the helper's fault arm -- `check_v86_iopl`
+/// is the interpreter's own first statement in that opcode's arm, so a V86 task below IOPL 3
+/// raises the same #GP from inside the call-out that it raises at a barrier, delivered by
+/// `finish_instruction` with the block reporting the prefix only.
+///
+/// STI (0xfb) joined it on 2026-08-22 with S4d and the table says so. The prose here used to claim
+/// the opposite, as the pair that "get opposite answers"; the row was flipped and the sentence was
+/// not. What the pair pins now is that both take the CALL-OUT answer at both widths while POPF,
+/// one encoding further on, still has no arm at all.
 #[test]
-fn v86_sensitive_opcodes_stay_word_barriers() {
-    // (bytes, admitted_at_dword)
-    let table: &[(&[u8], bool)] = &[
-        (&[0x9c], true),        // PUSHF: lowered at Dword, allowlist-refused at Word
-        (&[0x9d], false),       // POPF: no classify arm
-        (&[0xfa], false),       // CLI: no classify arm
-        (&[0xfb], false),       // STI: no classify arm
-        (&[0xcd, 0x20], false), // INT imm8: no classify arm
-        (&[0xcf], false),       // IRET: no classify arm
+fn v86_sensitive_opcodes_keep_their_word_answers() {
+    // (bytes, admitted_at_dword, call_out_at_every_width)
+    let table: &[(&[u8], bool, bool)] = &[
+        (&[0x9c], true, false),  // PUSHF: lowered at Dword, allowlist-refused at Word
+        (&[0x9d], false, false), // POPF: no classify arm
+        (&[0xfa], false, true),  // CLI: an InterpretOne call-out since the S3 widening
+        (&[0xfb], false, true),  // STI: an InterpretOne call-out since S4d
+        (&[0xcd, 0x20], false, false), // INT imm8: no classify arm
+        (&[0xcf], false, false), // IRET: no classify arm
     ];
-    for (op, admitted_at_dword) in table {
+    for (op, admitted_at_dword, call_out_at_every_width) in table {
         for prefixed in [false, true] {
             let mut code = vec![0x40, 0x41, 0x42];
             let mut offsets = vec![0u32, 1, 2, 3];
@@ -883,7 +903,16 @@ fn v86_sensitive_opcodes_stay_word_barriers() {
             warm(&mut cpu, &mut bus, &addresses);
             let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
             let first = op[0];
-            if !prefixed && *admitted_at_dword {
+            if *call_out_at_every_width {
+                assert!(
+                    compilation.span.instructions > 3,
+                    "{first:#04x} (prefixed={prefixed}) must join the block as a call-out"
+                );
+                assert_eq!(
+                    compilation.callout_interpret_one_slots, 1,
+                    "{first:#04x} (prefixed={prefixed}) must join as a call-out, not a lowering"
+                );
+            } else if !prefixed && *admitted_at_dword {
                 assert!(
                     compilation.span.instructions > 3,
                     "{first:#04x} at Dword has a classify arm and must not end the block;                      if this fails the Dword control is dead and the Word assertions below                      can no longer distinguish Word-refusal from always-refusal"
@@ -1022,7 +1051,7 @@ fn only_the_call_out_port_opcode_is_admitted_at_word() {
 
 /// A block that overwrites a segment register is counted at the dispatcher entry.
 ///
-/// `segment_writes != 0` makes `compile` publish `successors = [None, None]`, which makes
+/// A nonzero segment-write count makes `compile` publish `successors = [None, None]`, which makes
 /// `chain_eligible` false and clamps the quota to 1: the block can never chain, so every entry
 /// runs it alone and returns through the full prologue and epilogue. That is the cost the
 /// dirty-stop census cannot see, because it applies to EVERY block containing a segment write and
@@ -1038,32 +1067,62 @@ fn only_the_call_out_port_opcode_is_admitted_at_word() {
 fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     // inc eax / inc ecx / mov ds,ax / <barrier>, against inc eax / inc ecx / inc edx / <barrier>.
     let writes = [0x40, 0x41, 0x8e, 0xd8, DIRECT_BARRIER, 0x43, 0x44];
+    // The SECOND producer of a segment write, added with S4f: an `InterpretOne` row whose
+    // `may_write_segment` says yes. `mov fs,ax` is a call-out in every mode, so it reaches the bar
+    // through `callout_segment_writes` rather than through the `LoadSegReal` lowering above --
+    // and the bar is what pays for the whole-block segment mask.
+    //
+    // It runs on BOTH arms of `IZARRAVM_CALLOUT_SEGMENT_RESUME` and gets OPPOSITE answers, which is
+    // what the knob means at this level: on the ON arm the row bars the block's successors, and on
+    // the OFF arm -- the shipped one since the 2026-08-22 refutation -- nothing feeds
+    // `callout_segment_writes` and the block publishes its fallthrough like any other. The three
+    // rows around it are arm-independent, because a `LoadSegReal` lowering reaches
+    // `segment_writes` and never the call-out accumulator.
+    let callout = [0x40, 0x41, 0x8e, 0xe0, DIRECT_BARRIER, 0x43, 0x44];
     let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x43, 0x44, 0x45];
     // The OTHER arm that publishes `[None, None]`: a terminal whose successor is dynamic. It is
     // what makes the `!dynamic_successor` conjunct load-bearing, because a predicate written as
     // `successors == [None, None]` alone would count this block and be wrong.
     let ret = [0x40, 0x41, 0x42, 0xc3, 0x43, 0x44, 0x45];
 
-    for (label, code, offsets, expected) in [
+    for (label, code, offsets, expected, segment_resume) in [
         (
             "segment write",
             writes.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
+            false,
+        ),
+        (
+            "segment-writing call-out, knob on",
+            callout.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            1,
+            true,
+        ),
+        (
+            "segment-writing call-out, knob off",
+            callout.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            0,
+            false,
         ),
         (
             "fallthrough control",
             control.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
+            false,
         ),
         (
             "dynamic terminal control",
             ret.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
+            false,
         ),
     ] {
+        jit::direct::set_callout_segment_resume_for_test(Some(segment_resume));
         let (mut cpu, mut bus) = fixture(code);
         cpu.registers.set_esp(0x1000);
         let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
@@ -1109,6 +1168,7 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
                 "{label}: control must not deposit into the instruction lane"
             );
         }
+        jit::direct::set_callout_segment_resume_for_test(None);
     }
 }
 
@@ -1138,7 +1198,7 @@ fn a_dirty_segment_row_does_not_claim_the_rejected_span_map() {
     // An exit reporting a REJECTED target at the dirty block's own entry linear. If the dirty stop
     // had registered there, this credits its row.
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY, None);
 
     let snapshot = cpu
         .direct_barrier_census_snapshot()
@@ -1439,7 +1499,7 @@ fn missing_third_decode_retries_then_compiles_without_a_guest_write() {
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
     assert!(matches!(
         jit::direct::compile(&mut cpu, ENTRY, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     warm(&mut cpu, &mut bus, &[ENTRY + 2]);
@@ -1630,7 +1690,7 @@ fn page_straddling_barrier_retries_instead_of_becoming_persistent() {
 
     assert!(matches!(
         jit::direct::compile(&mut cpu, 0xfff, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
     assert!(cpu.decode_cache.get(0xfff, true).is_none());
 }
@@ -1646,7 +1706,7 @@ fn live_cs_limit_failure_retries_and_recovers_without_a_write() {
 
     assert!(matches!(
         jit::direct::compile(&mut cpu, ENTRY, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     cs.limit = old_limit;
@@ -1667,7 +1727,7 @@ fn live_segment_state_failure_retries_and_recovers_without_a_write() {
 
     assert!(matches!(
         jit::direct::compile(&mut cpu, ENTRY, true),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     ds.access = old_access;
@@ -1682,7 +1742,7 @@ fn emitted_size_exhaustion_is_retryable_for_short_and_long_blocks() {
     warm(&mut terminal_cpu, &mut terminal_bus, &[ENTRY]);
     assert!(matches!(
         jit::direct::compile_with_page_len_for_test(&mut terminal_cpu, ENTRY, true, 1),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 
     let (mut prefix_cpu, mut prefix_bus) = fixture(&[0x40, 0x41, 0x42, 0x43]);
@@ -1693,7 +1753,7 @@ fn emitted_size_exhaustion_is_retryable_for_short_and_long_blocks() {
     );
     assert!(matches!(
         jit::direct::compile_with_page_len_for_test(&mut prefix_cpu, ENTRY, true, 1),
-        jit::direct::CompileOutcome::Retry
+        jit::direct::CompileOutcome::Retry(_)
     ));
 }
 
@@ -1833,8 +1893,11 @@ fn failed_install_consumes_seen_without_a_code_watch() {
     compilation.code.clear();
 
     assert!(cpu.jit_direct.install(&compilation).is_none());
-    cpu.jit_direct
-        .dormant(key, jit::direct::DormantReason::CompileRetry);
+    cpu.jit_direct.dormant(
+        key,
+        jit::direct::DormantReason::CompileRetry,
+        Some(jit::direct::RetryCause::TooShort),
+    );
     assert!(matches!(
         cpu.jit_direct.probe(key),
         jit::direct::BlockProbe::Rejected
@@ -3460,9 +3523,9 @@ fn barrier_census_closure_counts_rejected_exits_the_map_cannot_attribute() {
     // ENTRY is in the rejected-span map; a linear the compiler never refused is not.
     const UNMAPPED: u32 = ENTRY + 0x4000;
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY, None);
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::Rejected, UNMAPPED);
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, UNMAPPED, None);
     cpu.jit_direct
         .note_dynamic_miss_target(jit::direct::UnboundTarget::Rejected, ENTRY);
     cpu.jit_direct
@@ -3556,7 +3619,7 @@ fn barrier_census_closure_totals_match_the_class_arrays_and_the_perf_counters() 
         jit::direct::UnboundTarget::Seen,
         jit::direct::UnboundTarget::Seen,
     ] {
-        cpu.jit_direct.note_unbound_target(kind, ENTRY);
+        cpu.jit_direct.note_unbound_target(kind, ENTRY, None);
     }
     cpu.jit_direct
         .note_dynamic_miss_target(jit::direct::UnboundTarget::Compiled, ENTRY);
@@ -3610,22 +3673,28 @@ fn barrier_census_closure_dormant_heat_histogram_closes_on_its_class() {
     // rather than by class.
     for _ in 0..5 {
         cpu.jit_direct
-            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY, None);
     }
     for _ in 0..2 {
-        cpu.jit_direct
-            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x40);
+        cpu.jit_direct.note_unbound_target(
+            jit::direct::UnboundTarget::DormantHeat,
+            ENTRY + 0x40,
+            None,
+        );
     }
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80, None);
     for _ in 0..3 {
         cpu.jit_direct
             .note_dynamic_miss_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
     }
     cpu.jit_direct
         .note_dynamic_miss_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80);
-    cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantOther, ENTRY + 0xc0);
+    cpu.jit_direct.note_unbound_target(
+        jit::direct::UnboundTarget::DormantOther,
+        ENTRY + 0xc0,
+        None,
+    );
 
     let snapshot = cpu
         .direct_barrier_census_snapshot()
@@ -3702,6 +3771,7 @@ fn barrier_census_closure_dormant_heat_histogram_carries_its_truncated_tail() {
             cpu.jit_direct.note_unbound_target(
                 jit::direct::UnboundTarget::DormantHeat,
                 ENTRY + (index as u32) * 0x10,
+                None,
             );
         }
     }
@@ -3772,9 +3842,9 @@ fn barrier_census_closure_dormant_heat_site_reports_whether_a_walk_ever_reached_
 
     const NEVER_WALKED: u32 = ENTRY + 0x4000;
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY, None);
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, NEVER_WALKED);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, NEVER_WALKED, None);
 
     let snapshot = cpu
         .direct_barrier_census_snapshot()
@@ -3815,5 +3885,643 @@ fn barrier_census_closure_dormant_heat_site_reports_whether_a_walk_ever_reached_
         "the walked set spans every entry the backend compiled, not only the dormant ones: \
          {} run-wide against {walked_dormant} walked dormant sites",
         snapshot.walked_entries_run_wide
+    );
+}
+
+/// The suffix must stop where the compile walk's PAGE BUDGET stops, and the claim is an equality
+/// against the block the walk actually installs.
+///
+/// The eighth divergence in `census_native_suffix`'s ledger. The budget ends the walk when the
+/// running emitted-size estimate reaches one host page, which on a memory-heavy path binds long
+/// before `MAX_BLOCK_INSTRUCTIONS`; a scan without the mirror walks on to the instruction cap and
+/// reports a block nothing will ever build. It is not a bounded over-report either -- it grows
+/// with how memory-heavy the path is, which is the axis this column ranks on.
+///
+/// Both legs are the same instruction stream. The census leg puts the barrier in front of it, and
+/// the suffix then counts every slot of the counterfactual block except the barrier itself, so the
+/// two must differ by exactly one.
+#[test]
+fn census_suffix_stops_where_the_page_budget_does() {
+    const COUNT: usize = 31;
+    // `mov eax,[0x3000]`: a memory load, so the block hits the page budget well inside
+    // `MAX_BLOCK_INSTRUCTIONS`. A register-only stream could not -- at forty bytes a slot the
+    // instruction cap binds first, and the fixture would pass with the mirror deleted.
+    const LOAD: [u8; 6] = [0x8b, 0x05, 0x00, 0x30, 0x00, 0x00];
+
+    let mut plain = Vec::new();
+    let mut plain_starts = Vec::new();
+    for _ in 0..COUNT {
+        plain_starts.push(plain.len() as u32);
+        plain.extend_from_slice(&LOAD);
+    }
+    let (mut cpu, mut bus) = fixture(&plain);
+    let addresses: Vec<_> = plain_starts.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let installed = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert!(
+        usize::from(installed.span.instructions) < COUNT,
+        "the fixture must be a stream the budget actually cuts: {} of {COUNT} slots",
+        installed.span.instructions
+    );
+
+    let mut barred = vec![DIRECT_BARRIER];
+    let mut barred_starts = vec![0u32];
+    for _ in 0..COUNT {
+        barred_starts.push(barred.len() as u32);
+        barred.extend_from_slice(&LOAD);
+    }
+    assert_eq!(
+        barrier_suffix(&barred, &barred_starts),
+        u64::from(installed.span.instructions) - 1,
+        "the counterfactual block the suffix describes must be the block the walk installs: the \
+         barrier is one of its slots, and the rest are the suffix"
+    );
+}
+
+/// The suffix must stop at a DEMOTED call-out site, for the same reason it stops at any other
+/// boundary: no later compile walk will put that slot in a block, so a suffix that counts it is
+/// describing a block that cannot exist.
+///
+/// The ninth divergence in `census_native_suffix`'s ledger, and the one whose over-report is
+/// self-reinforcing: the rows that demote are the rows a widening slice is being asked to keep, so
+/// a column that ignores demotions makes a losing row look like a winning one.
+///
+/// The site is marked directly rather than earned by three resyncs. `note_demoted_callout_site` is
+/// the same door the governor uses, and driving a real demotion needs a protected-mode machine
+/// this file does not have; what is under test here is the SCAN, not the governor.
+#[test]
+fn census_suffix_stops_at_a_demoted_call_out_site() {
+    // barrier, two `inc eax`, `pop dword [0x3000]`, two more `inc eax`.
+    const SLOT: u32 = ENTRY + 3;
+    let mut code = vec![DIRECT_BARRIER, 0x40, 0x40];
+    code.extend_from_slice(&[0x8f, 0x05, 0x00, 0x30, 0x00, 0x00]);
+    code.extend_from_slice(&[0x40, 0x40]);
+    let starts: &[u32] = &[0, 1, 2, 3, 9, 10];
+
+    assert_eq!(
+        barrier_suffix(&code, starts),
+        5,
+        "control: with the site clean the call-out joins and everything behind it follows"
+    );
+
+    let (mut cpu, mut bus) = fixture(&code);
+    cpu.enable_direct_barrier_census(true);
+    let addresses: Vec<_> = starts.iter().map(|offset| ENTRY + offset).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    // Physical is linear in this fixture, so the slot's site is its address.
+    assert!(cpu.jit_direct.note_demoted_callout_site(SLOT, key.mode_key));
+    let _ = jit::direct::compile(&mut cpu, ENTRY, true);
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("enabled census snapshot");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.opcode == u16::from(DIRECT_BARRIER))
+        .expect("the barrier row");
+    assert_eq!(
+        row.native_suffix_instructions, 2,
+        "the two slots in front of the demoted site, and nothing past it"
+    );
+}
+
+// The retry-cause instrument (S4a). `DormantReason::CompileRetry` used to be the whole answer
+// for every non-structural compile failure, and on the tombraid loader that one label held 464
+// dormant keys absorbing 3.9 M static_unbound exits with no way to tell which of them a retry
+// could ever help. These fixtures pin one cause per family and pin the two counter columns.
+
+fn retry_cause(outcome: jit::direct::CompileOutcome) -> jit::direct::RetryCause {
+    match outcome {
+        jit::direct::CompileOutcome::Retry(cause) => cause,
+        jit::direct::CompileOutcome::Compiled(_) => panic!("fixture unexpectedly compiled"),
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("fixture unexpectedly became a structural rejection")
+        }
+    }
+}
+
+#[test]
+fn retry_cause_is_decode_miss_when_a_slot_has_no_line() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::DecodeMiss
+    );
+}
+
+#[test]
+fn retry_cause_is_segment_limit_when_a_slot_runs_past_cs_limit() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let mut cs = cpu.registers.cs();
+    cs.limit = ENTRY;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::SegmentLimit
+    );
+}
+
+/// The block-page rule, which is the walk's own 4 KiB boundary and not the guest's paging.
+/// Two slots fit below `0x1000` and the third does not, so the walk stops there with a prefix
+/// the min-length rule cannot install. The cause reported is the INNER one: `PageCross` and not
+/// `TooShort`, because the walk had already given up before the length rule looked at it. That
+/// ordering is the point of the assertion.
+#[test]
+fn retry_cause_is_page_cross_when_the_block_leaves_its_page() {
+    let mut memory = vec![0; 0x2000];
+    memory[0xffe..0x1001].copy_from_slice(&[0x40, 0x41, 0x42]);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = fresh();
+    cpu.set_fast_map_enabled_for_test(true);
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
+        .expect("initialize direct map");
+    warm(&mut cpu, &mut bus, &[0xffe, 0xfff, 0x1000]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, 0xffe, true)),
+        jit::direct::RetryCause::PageCross
+    );
+}
+
+/// The min-length rule owns the answer only when the walk itself ended on a BOUNDARY. The
+/// dirty-segment rule is the one boundary a two-slot block can reach: `mov ds,ax` overwrites the
+/// segment whose base the following load would bake, so the walk ends cleanly at one slot and
+/// the block is too short to install.
+#[test]
+fn retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block() {
+    let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::TooShort
+    );
+}
+
+/// A walk that ends with NO slots is a BUDGET refusal, not the min-length rule.
+///
+/// The two were one cause until the S4 review round (finding F7). `TooShort` is the post-walk
+/// rule that a block of fewer than three non-terminal slots does not install, and it is the cause
+/// a retry policy most wants to trust as deterministic; a walk that never formed a slot at all
+/// never reached that rule, and filing it there made one label mean two things.
+///
+/// The instruction limit is the same shape the block-page budget produces when it refuses the
+/// very first instruction, and it is the one a fixture can reach on demand.
+///
+/// MUTATION: fold the arm back into `TooShort` and this reads `too_short`.
+#[test]
+fn a_walk_with_no_slots_reports_the_budget_and_not_the_length_rule() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let outcome =
+        jit::direct::compile_outcome_with_instruction_limit_for_test(&mut cpu, ENTRY, true, 0);
+    assert_eq!(
+        retry_cause(outcome),
+        jit::direct::RetryCause::BudgetFirstSlot
+    );
+    // And the length rule still owns the case it was written for.
+    let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::TooShort
+    );
+}
+
+/// Every retry cause has a distinct label and an explicit answer to "could a re-walk decide this
+/// differently", including the two the review round split out.
+///
+/// `SearchStructural` has no fixture and is not expected to have one: a search step walks a
+/// PREFIX of a block the full walk already compiled, so every per-slot gate it meets has already
+/// answered yes. It exists because the arm exists, and because it wore the `HostPageLen` label
+/// while having nothing to do with the arena page. The counter is how its reachability gets
+/// answered on a workload rather than argued about here.
+#[test]
+fn every_retry_cause_has_a_distinct_label_and_a_stated_clearability() {
+    let mut labels: Vec<&str> = jit::direct::RetryCause::ALL
+        .iter()
+        .map(|cause| cause.label())
+        .collect();
+    labels.sort_unstable();
+    let distinct = labels.len();
+    labels.dedup();
+    assert_eq!(distinct, labels.len(), "cause labels must be unique");
+    assert_eq!(labels.len(), jit::direct::RetryCause::COUNT);
+
+    let clearable: Vec<&str> = jit::direct::RetryCause::ALL
+        .iter()
+        .filter(|cause| cause.clearable_by_retry())
+        .map(|cause| cause.label())
+        .collect();
+    assert_eq!(
+        clearable,
+        vec!["decode_miss", "translation_mismatch"],
+        "the retry lift's admitted set is these two and nothing else"
+    );
+}
+
+/// A lift clears ONE slot's decline memo and leaves every other slot's alone.
+///
+/// The memo is what makes a declined address cheap: it short-circuits the admission chain before
+/// `key_for_phys` and the probe. A lifted key has to lose its own memo, or it would be re-admitted
+/// and then never looked at again for the rest of the era -- but the era stamp is GLOBAL, so
+/// advancing it to achieve that invalidates all 65,536 slots at once and sends every declined
+/// address in the process back through the full chain. On a workload with thousands of lifts that
+/// is thousands of whole-array invalidations, and it would show up as a decline storm rather than
+/// as anything the lift itself did.
+///
+/// The fixture is two addresses in one program: one dormant key one visit short of its lift, and
+/// one unrelated slot carrying a memo armed by hand. The lift must fire and the bystander must
+/// still answer.
+///
+/// The lifted slot carries a STALE memo rather than none, which is what makes the clear
+/// observable: parked by hand it would have had no memo at all and the assertion would have been
+/// reading a byte nobody wrote. It is made stale the way production makes one stale -- cross an
+/// epoch, let the next ask advance the era -- and the bystander's is then written fresh under the
+/// new stamp, so the two differ in exactly the thing under test.
+///
+/// MUTATIONS: drop the `set_decline_memo_at(slot, 0)` on the lift path and the lifted slot keeps
+/// its stale byte; replace it with `sweep_decline_memos()` -- which is what an era advance amounts
+/// to once the era term has moved -- and the bystander stops answering.
+///
+/// A NOTE ON THE OBVIOUS MUTANT: swapping the clear for a bare `advance_decline_memo_era()` does
+/// NOT fail this fixture, and that is a fact about the era rather than a hole. The advance is
+/// conditional -- it fires only when the heat epoch or `heat_resets` has moved since the last one
+/// -- so on a quiet CPU it is a no-op that clears nothing at all, the lifted slot included. An era
+/// advance is a wipe only when the term happens to have moved.
+#[test]
+fn a_lift_clears_only_its_own_decline_memo() {
+    jit::direct::set_retry_lift_for_test(Some(true));
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+
+    // The key under test: parked for a clearable cause, one visit short of the threshold.
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    cpu.jit_direct.park_dormant_for_test(
+        key,
+        jit::direct::DormantReason::CompileRetry,
+        Some(jit::direct::RetryCause::DecodeMiss),
+    );
+    cpu.jit_direct
+        .set_dormant_visits_for_test(key, jit::direct::RETRY_LIFT_VISITS - 1);
+
+    // The bystander: a different decode slot, carrying a memo written the way the production
+    // decline path writes one.
+    let slot_lifted = cpu
+        .decode_cache
+        .get_packed(ENTRY, true)
+        .expect("a live line at the entry")
+        .slot;
+    let slot_other = cpu
+        .decode_cache
+        .get_packed(ENTRY + 1, true)
+        .expect("a live line at the bystander")
+        .slot;
+    assert_ne!(
+        slot_lifted, slot_other,
+        "the two addresses must land in different slots or the fixture proves nothing"
+    );
+
+    // A memo on the LIFTED slot, then aged out, so the byte is non-zero and does not answer: the
+    // probe below has to reach the Rejected arm, and the clear has to be observable.
+    let _ = cpu.advance_decline_memo_era();
+    let stale = cpu.decline_memo_comparand();
+    cpu.decode_cache.set_decline_memo_at(slot_lifted, stale);
+    cpu.perf.instructions += 1 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+    assert!(
+        !cpu.decline_memo_hit(slot_lifted),
+        "the epoch crossing must have aged the lifted slot's memo out"
+    );
+    assert_ne!(
+        cpu.decode_cache.decline_memo_at(slot_lifted),
+        0,
+        "aged out is not erased: the byte must survive for the clear to be visible"
+    );
+
+    // And a LIVE one on the bystander, under the stamp the crossing just moved to.
+    let live = cpu.decline_memo_comparand();
+    assert_ne!(live, stale, "the era must actually have advanced");
+    cpu.decode_cache.set_decline_memo_at(slot_other, live);
+    assert!(
+        cpu.decline_memo_hit(slot_other),
+        "the bystander's memo must answer before the lift, or the assertion below is vacuous"
+    );
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("the dormant probe must not stop the machine");
+
+    assert_eq!(
+        cpu.direct_stall_snapshot().retry_lifts,
+        1,
+        "the lift must have fired, or nothing was under test"
+    );
+    assert_eq!(
+        cpu.decode_cache.decline_memo_at(slot_lifted),
+        0,
+        "the lifted key's own memo must be cleared, or the re-admission is never looked at"
+    );
+    assert!(
+        cpu.decline_memo_hit(slot_other),
+        "an unrelated slot's memo must survive a lift: advancing the era to clear one slot \
+         invalidates all 65,536"
+    );
+    jit::direct::set_retry_lift_for_test(None);
+}
+
+/// The retry lift end to end: a `DecodeMiss` key whose line has come back compiles again, and the
+/// sticky-decline memo is what paces it.
+///
+/// This is the claim the whole slice is for. `retry_state_stays_dormant_after_decode_recovery_until_cache_clear`
+/// pins the OLD behaviour from the other side and still holds: a thousand probes inside one memo
+/// era buy nothing, because the memo answers before the probe and the visit is never taken. What
+/// changes is what happens across ERAS. One probe reaches the key per era, and after
+/// `RETRY_LIFT_VISITS` of them the key is re-admitted and compiles with the line it was missing.
+///
+/// THE VISIT COUNT IS ERAS, and the first half of this fixture is what makes that concrete rather
+/// than a claim in a doc comment: without the era crossings the loop below never lifts, however
+/// many times it probes.
+///
+/// The memo assertion is the handshake. A lifted key with a live memo at its slot would be
+/// re-admitted and then never looked at again for the rest of the era, so the lift path clears the
+/// byte instead of writing a fresh decline over it.
+///
+/// MUTATION: write the ordinary memo on the lift path instead of clearing it and the block never
+/// installs; make `clearable_by_retry` false for `DecodeMiss` and the lift never fires at all.
+#[test]
+fn a_lifted_decode_miss_key_compiles_once_its_line_is_back() {
+    jit::direct::set_retry_lift_for_test(Some(true));
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+
+    // Observation one is `Seen`; observation two compiles, misses the third line and parks.
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("first observation");
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("missing decode retry");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss).1,
+        1,
+        "the fixture must park for the cause under test"
+    );
+
+    // The line comes back, which is what makes the cause CLEARABLE rather than a label.
+    warm(&mut cpu, &mut bus, &[ENTRY + 2]);
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+
+    // A thousand probes inside ONE memo era buy nothing: the memo answers before the probe.
+    for _ in 0..1_000 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("dormant probe");
+    }
+    assert_eq!(
+        cpu.direct_stall_snapshot().retry_lifts,
+        0,
+        "the memo must pace the lift; without it the visit count is meaningless"
+    );
+
+    // One probe per era, and the lift fires at the threshold.
+    let mut eras = 0u32;
+    while cpu.direct_stall_snapshot().retry_lifts == 0 {
+        eras += 1;
+        assert!(
+            eras <= u32::from(jit::direct::RETRY_LIFT_VISITS) + 4,
+            "the lift never fired"
+        );
+        cpu.perf.instructions += 1 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("dormant probe");
+    }
+    let slot = cpu
+        .decode_cache
+        .get_packed(ENTRY, true)
+        .expect("a live decode line at the entry")
+        .slot;
+    assert_eq!(
+        cpu.decode_cache.decline_memo_at(slot),
+        0,
+        "the lift must clear the memo that would otherwise short-circuit the key it re-admitted"
+    );
+
+    // And the re-admitted key compiles, with the line that was missing the first time.
+    for _ in 0..4 {
+        cpu.perf.instructions += 1 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("post-lift probe");
+    }
+    assert!(
+        cpu.perf_counters().jit_direct_blocks_installed > installed,
+        "a lifted key whose cause has cleared must install"
+    );
+    assert_eq!(cpu.direct_stall_snapshot().retry_lift_reparks, 0);
+    jit::direct::set_retry_lift_for_test(None);
+}
+
+/// A dormant key's EXITS are attributed to the cause it was parked with, not just its parks.
+///
+/// The two columns answer different questions about the same 466 keys and the campaign needs
+/// both: `retry_causes` says how many keys each gate parked, and this says how much traffic those
+/// keys then absorb. On the tombraid loader `admission_matrix` parks the most keys and
+/// `decode_miss` is the largest clearable one, and nothing said which of them the 4.40 M
+/// static-unbound exits actually go to.
+///
+/// The key is parked through the REAL compile walk rather than by hand: the cause under test is
+/// whatever `retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block` measures, so the
+/// two cannot drift apart into a fixture that attributes a cause the walk never produces.
+///
+/// MUTATION: drop the cause from `BlockState::Dormant` and read it back as `None`, and the hits
+/// land nowhere; count the hits ungated and the census-off leg below reads five instead of zero.
+#[test]
+fn a_dormant_keys_unbound_exits_are_attributed_to_its_retry_cause() {
+    const HITS: u64 = 5;
+    for census in [false, true] {
+        let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);
+        warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+        let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture");
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let cause = retry_cause(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(cause, jit::direct::RetryCause::TooShort);
+        cpu.jit_direct
+            .dormant(key, jit::direct::DormantReason::CompileRetry, Some(cause));
+        assert_eq!(
+            cpu.jit_direct.classify_unbound_target(key),
+            jit::direct::UnboundTarget::DormantOther,
+            "the fixture must produce the class the counter hangs off"
+        );
+
+        cpu.enable_direct_barrier_census(census);
+        for _ in 0..HITS {
+            cpu.jit_direct.note_unbound_target(
+                jit::direct::UnboundTarget::DormantOther,
+                key.linear(),
+                Some(key),
+            );
+        }
+
+        let hits: Vec<_> = cpu.direct_stall_snapshot().retry_cause_hits;
+        let expected = if census { HITS } else { 0 };
+        for (label, count) in &hits {
+            let wanted = if *label == "too_short" { expected } else { 0 };
+            assert_eq!(
+                *count, wanted,
+                "census={census}: {label} reported {count} exits"
+            );
+        }
+        assert_eq!(
+            hits.len(),
+            jit::direct::RetryCause::ALL.len(),
+            "every cause must have a column, or a hot one can vanish from the report"
+        );
+    }
+}
+
+/// The four block caps (x87 slots, call-out slots, memory-ALU slots, stack accesses) can only
+/// fire once the walk already holds three or more slots, so each of them SHORTENS a block and
+/// none of them can park a key. That is a structural property of the thresholds and not an
+/// accident of this fixture, and it is why `RetryCause::CalloutCap` reads zero on every
+/// workload today. Five `pop dword [eax]` slots against `MAX_BLOCK_CALLOUT_SLOTS` of four:
+/// the block installs with four and the cap counter moves.
+#[test]
+fn the_call_out_cap_shortens_the_block_instead_of_parking_the_key() {
+    let code = [0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00];
+    let (mut cpu, mut bus) = fixture(&code);
+    let addresses: Vec<_> = (0..5).map(|slot| ENTRY + slot * 2).collect();
+    warm(&mut cpu, &mut bus, &addresses);
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(compilation.span.instructions, 4);
+    assert_eq!(cpu.direct_stall_snapshot().callout_slot_cap_hits, 1);
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::CalloutCap),
+        (0, 0)
+    );
+}
+
+/// The one member of the cap family that CAN park a key, because it is not a budget: x87 and
+/// call-out slots never share a block, in either order, and that rule fires at the second slot.
+/// `pop dword [eax]` then `fld1` leaves a one-slot prefix the min-length rule cannot install,
+/// and the inner cause is what gets reported.
+#[test]
+fn retry_cause_is_x87_cap_when_a_float_slot_follows_a_call_out() {
+    let (mut cpu, mut bus) = fixture(&[0x8f, 0x00, 0xd9, 0xe8, 0xd9, 0xe8]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2, ENTRY + 4]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::X87Cap
+    );
+}
+
+/// A one-byte arena page: the full walk compiles, overflows, and the recovery search finds no
+/// prefix that fits. That failure belongs to the search itself, so the cause is `HostPageLen`.
+#[test]
+fn retry_cause_is_host_page_len_when_no_prefix_fits_the_arena_page() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0x43]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    assert_eq!(
+        retry_cause(jit::direct::compile_with_page_len_for_test(
+            &mut cpu, ENTRY, true, 1
+        )),
+        jit::direct::RetryCause::HostPageLen
+    );
+}
+
+/// The fold in `compile_with_page_len` must not overwrite a cause the walk already named. Same
+/// one-byte page as above, but the full-length walk never reaches the size question because a
+/// slot has no decode line: the reported cause stays `DecodeMiss`.
+#[test]
+fn the_host_page_fold_reports_the_inner_cause() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    assert_eq!(
+        retry_cause(jit::direct::compile_with_page_len_for_test(
+            &mut cpu, ENTRY, true, 1
+        )),
+        jit::direct::RetryCause::DecodeMiss
+    );
+}
+
+fn retry_cause_counts(cpu: &CpuGsw, cause: jit::direct::RetryCause) -> (u64, u64) {
+    let snapshot = cpu.direct_stall_snapshot();
+    let compile_retry = snapshot
+        .dormant
+        .iter()
+        .find(|(label, _)| *label == "compile_retry")
+        .expect("the compile_retry dormant row")
+        .1;
+    assert_eq!(
+        snapshot
+            .retry_causes
+            .iter()
+            .map(|counts| counts.count)
+            .sum::<u64>(),
+        compile_retry,
+        "the cause split must sum to the dormant row it splits"
+    );
+    let row = snapshot
+        .retry_causes
+        .iter()
+        .find(|counts| counts.cause == cause.label())
+        .expect("every cause has a row");
+    (row.count, row.keys)
+}
+
+/// The two columns are different questions. `count` is attempts and rises on every park;
+/// `keys` counts the distinct keys the park moved out of `Seen`, so a second attempt on a key
+/// that is already Dormant raises the first and not the second.
+///
+/// The "sums exactly" assertion inside `retry_cause_counts` is a REFACTOR GUARD and nothing more,
+/// and the review round asked for that to be said out loud. Both sides of it are incremented by
+/// the same statement in `BlockCache::dormant`, so it cannot fail for any reason a reader would
+/// call a bug in the attribution; what it catches is a future edit that counts one of them
+/// somewhere else, which is exactly how the per-site version of this instrument would have
+/// multiplied one failed compile by the recovery search's depth.
+#[test]
+fn retry_causes_are_counted_once_per_attempt_and_once_per_key() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    cpu.set_jit_auto_admit(true);
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss),
+        (0, 0)
+    );
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("first observation parks the key Seen");
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("the compile attempt retries");
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss),
+        (1, 1)
+    );
+
+    // A second park of the same key. The entry is no longer `Seen`, so only the attempt column
+    // moves; that is what makes `keys` a count of the dormant population rather than of work.
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    cpu.jit_direct.dormant(
+        key,
+        jit::direct::DormantReason::CompileRetry,
+        Some(jit::direct::RetryCause::DecodeMiss),
+    );
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss),
+        (2, 1)
     );
 }

@@ -128,6 +128,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
         x87_entry_top,
         memory,
         link_cell_ptrs,
+        interpret_one_cells,
         fetch_trace,
     } = input;
     let full_accounting = StaticAccounting {
@@ -202,6 +203,11 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     let mut terminal = false;
     let mut x87_gate_emitted = false;
     let mut current_x87_top = x87_entry_top;
+    // Which `InterpretOne` cell the next such slot takes. The cells are allocated by the compile
+    // walk in slot order, so a cursor is the whole of the mapping; keying them by slot index would
+    // have meant a sparse array `MAX_BLOCK_INSTRUCTIONS` long for at most
+    // `MAX_BLOCK_CALLOUT_SLOTS` entries.
+    let mut interpret_one_index = 0usize;
     for slot in slots {
         match slot.kind {
             DirectKind::MovReg { dst, src, width } => match width {
@@ -414,13 +420,24 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.mov_r32_imm32(Reg::RDX, u32::from(imm));
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
             }
-            DirectKind::Lea { dst, addr } => {
+            DirectKind::Lea { dst, addr, width } => {
                 // LEA never reaches a segment, so it is the one address consumer that would have
                 // been missed by putting the wrap on the segmented helper. The interpreter writes
                 // `mem.offset`, which a Word `AddrMode` has already masked, while this path adds
                 // the whole 32-bit base register.
+                //
+                // The WRITE width is the operand size and is a separate question from the wrap
+                // above. At Word the interpreter's `write_gpr_sized(reg, Word, offset)` merges
+                // sixteen bits and leaves the destination's high half alone, which is what
+                // `emit_write_gpr16` does and what the `mov_r32_r32` below would destroy.
                 emit_effective_address(&mut e, addr, memory.address_wrap);
-                e.mov_r32_r32(home(dst), Reg::RAX);
+                match width {
+                    MemoryWidth::Dword => e.mov_r32_r32(home(dst), Reg::RAX),
+                    MemoryWidth::Word => emit_write_gpr16(&mut e, dst, Reg::RAX),
+                    MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+                        unreachable!("classify only ever produces Word or Dword for 0x8d")
+                    }
+                }
             }
             DirectKind::IncDecReg { dst, is_dec, width } => {
                 emit_inc_dec_reg(&mut e, dst, is_dec, width);
@@ -1312,6 +1329,121 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     ),
                 ));
             }
+            // LEAVE at Word operand size, both stack widths. The guard runs first, against
+            // SS:(E)BP, for the reason the Dword arm above gives: that is the address the pop
+            // reads from precisely because the pointer is about to become the frame pointer, and
+            // guarding it there leaves a side exit with the whole instruction un-started.
+            //
+            // Two things differ from the Dword arm and each follows a DIFFERENT width. The READ is
+            // Word and the destination write merges sixteen bits, both from the operand size. The
+            // pointer move and its advance follow SS.B: 32-bit register operations on a 32-bit
+            // stack, and 16-bit ones on a 16-bit stack, where they preserve bits 31 to 16 rather
+            // than zero-extending and so reproduce `write_gpr16(4, ..)` exactly.
+            //
+            // The ORDER of the last two writes matters and matches the Dword arm: home(5) is read
+            // into the pointer before the popped word overwrites it. There is no POP SP hazard
+            // here the way `Pop16` has one, because the destination is fixed at BP.
+            DirectKind::Leave16 { stack32 } => {
+                let side = e.label();
+                let frame = frame_addr();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(frame));
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    frame,
+                    memory,
+                    reasons,
+                    if stack32 {
+                        AddressWrap::None
+                    } else {
+                        AddressWrap::Word
+                    },
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                if stack32 {
+                    e.mov_r32_r32(home(4), home(5));
+                    e.add_r32_imm32(home(4), 2);
+                } else {
+                    e.mov_r16_r16(home(4), home(5));
+                    e.alu_r16_imm16(0, home(4), 2);
+                }
+                emit_write_gpr16(&mut e, 5, Reg::RDX);
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+            }
+            // ENTER imm16, 0 at Word operand size, both stack widths.
+            //
+            // The store PRECEDES every pointer update, which is the invariant `Push16` and `Push`
+            // both carry: a faulting push must leave the pointer at its pre-instruction value, or
+            // a lazy-commit host that retries the instruction double-decrements it. The side exit
+            // is published between the store and the updates for the same reason, so an exit
+            // leaves the instruction un-started.
+            //
+            // The three register operations after it are the interpreter's three steps in its
+            // order. The pointer moves by two FIRST, then BP takes the pointer (which is why the
+            // store reads home(5) before this line overwrites it), then the frame allocation.
+            // Splitting the two subtractions is not an accident of style: BP must hold the
+            // pointer AFTER the push and BEFORE the allocation, so they cannot be folded into one.
+            //
+            // On a 32-bit stack the pointer arithmetic is 32-bit throughout while BP still takes
+            // only the low half, which is the 386 PRM 17-62 split: the saved frame pointer is read
+            // at StackAddrSize and written at the operand size.
+            DirectKind::Enter16 { alloc, stack32 } => {
+                let side = e.label();
+                let slot_addr = stack_addr(0u32.wrapping_sub(2));
+                let wrap = if stack32 {
+                    AddressWrap::None
+                } else {
+                    AddressWrap::Word
+                };
+                let reasons = MemorySideExits::new(&mut e, memory, Some(slot_addr));
+                emit_store(
+                    &mut e,
+                    StoreSource::Reg(5),
+                    MemoryWidth::Word,
+                    slot_addr,
+                    memory,
+                    reasons,
+                    wrap,
+                );
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                if stack32 {
+                    e.alu_r32_imm32(5, home(4), 2);
+                } else {
+                    e.alu_r16_imm16(5, home(4), 2);
+                }
+                e.mov_r16_r16(home(5), home(4));
+                if alloc != 0 {
+                    if stack32 {
+                        e.alu_r32_imm32(5, home(4), u32::from(alloc));
+                    } else {
+                        e.alu_r16_imm16(5, home(4), alloc);
+                    }
+                }
+            }
             DirectKind::X87 { insn, addr } => {
                 let side = e.label();
                 let eligibility = e.label();
@@ -1385,12 +1517,27 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let abnormal_stub = e.label();
                 let step_break_common = e.label();
                 let step_break_stub = e.label();
+                // The `InterpretOne` class needs its slot cell (the fourth argument and the
+                // governor byte) and the two RESYNC stubs; the other three classes need neither
+                // and emit neither, which is what keeps their bytes identical.
+                let slot_cell = helper.interprets_one().then(|| {
+                    let cell = interpret_one_cells
+                        .get(interpret_one_index)
+                        .copied()
+                        .expect("every InterpretOne slot must have been allocated a cell");
+                    interpret_one_index += 1;
+                    cell
+                });
+                let resync_labels =
+                    slot_cell.map(|_| ((e.label(), e.label()), (e.label(), e.label())));
                 callout::emit_call_out(
                     &mut e,
                     helper,
                     completed_raw,
                     abnormal_stub,
                     step_break_stub,
+                    slot_cell,
+                    resync_labels.map(|((stub, _), (fault_stub, _))| (stub, fault_stub)),
                 );
                 side_exit_reason_stubs.push((
                     abnormal_stub,
@@ -1428,6 +1575,56 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed_weighted_fp_clocks,
                     ),
                 ));
+                // The two RESYNC exits, and the whole of what makes them different from every
+                // other exit in this function: their EIP DELTA IS ZERO. The helper already left
+                // `cpu.eip` at the architectural next address -- which for a fault is the
+                // handler's entry, not the instruction after the slot -- so `emit_advance_eip`
+                // must add nothing. Every other exit here computes a delta from the block's entry
+                // linear because the body never moved EIP; these two are the exception because the
+                // body did.
+                if let Some(((resync_stub, resync_common), (fault_stub, fault_common))) =
+                    resync_labels
+                {
+                    side_exit_reason_stubs.push((
+                        resync_stub,
+                        resync_common,
+                        SideExitReason::CallOutResync,
+                    ));
+                    side_exits.push((
+                        resync_common,
+                        0,
+                        side_exit(
+                            // RETIRED: the instruction ran, so the block owns its retirement and
+                            // its fetch, exactly as the step-break arm does.
+                            completed + 1,
+                            completed_raw,
+                            completed_byte_reads,
+                            completed_word_reads,
+                            completed_dword_reads,
+                            completed_weighted_fp_clocks,
+                        ),
+                    ));
+                    side_exit_reason_stubs.push((
+                        fault_stub,
+                        fault_common,
+                        SideExitReason::CallOutResyncFault,
+                    ));
+                    side_exits.push((
+                        fault_common,
+                        0,
+                        side_exit(
+                            // NOT retired: `finish_instruction` already counted the instruction in
+                            // `perf.instructions` and charged its clocks, and the helper charged
+                            // its fetch, so the block reports the prefix and nothing more.
+                            completed,
+                            completed_raw,
+                            completed_byte_reads,
+                            completed_word_reads,
+                            completed_dword_reads,
+                            completed_weighted_fp_clocks,
+                        ),
+                    ));
+                }
             }
             DirectKind::Call {
                 return_delta,
@@ -4237,7 +4434,7 @@ fn eip_offset() -> i32 {
     (core::mem::offset_of!(CpuGsw, registers) + core::mem::offset_of!(Registers, eip)) as i32
 }
 
-fn eflags_offset() -> i32 {
+pub(super) fn eflags_offset() -> i32 {
     (core::mem::offset_of!(CpuGsw, registers) + core::mem::offset_of!(Registers, eflags)) as i32
 }
 

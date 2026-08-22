@@ -455,6 +455,60 @@ impl CpuGsw {
     /// runs, and a block cannot patch its own lane from under itself.
     #[inline]
     fn note_code_write_inner(&mut self, physical: u32, width: u32, lanes: bool) -> bool {
+        // THE CALL-OUT WINDOW. `InterpretOne` runs one interpreter instruction with a native block
+        // live on the host stack, and that instruction is allowed to STORE. The proof this
+        // function's doc comment rests on -- "no compiled block is mid-execution when this runs" --
+        // is exactly what stops holding there, and the consequence is not academic: the block's
+        // own page is code-watched, so a store into it reaches `invalidate_physical_range`, which
+        // retires the running block, frees its arena bytes and can hand them to the next
+        // compilation while the helper still has to RETURN through them.
+        //
+        // So while the window is open the write is RECORDED and reported as a hit, and nothing is
+        // invalidated. Reporting the hit is what makes the helper's R5 clause fire, which ends the
+        // native run at this instruction; `run_direct_block` then drains the list through this
+        // same function with the flag clear, so the invalidation happens for real one step later,
+        // before any guest instruction can observe the stale code.
+        //
+        // The window branch asks `code_write_watched` FOR ITSELF, and the reason is that the
+        // sentence this comment used to end with was wrong: "`note_code_write_hit` reaches here
+        // only behind `code_write_watched`" is true of the SIZED store path and false of the BYTE
+        // one. `write_linear_u8` routes through `note_code_byte_write_hit` on `changed` alone, by
+        // design, so that a one-byte immediate patch can be absorbed as a lane -- see the two-doors
+        // note in `write_linear_fragment`. Without the probe here, EVERY changed byte store made
+        // from inside a call-out would be recorded, R5 would read a non-empty list, and every
+        // byte-storing row on the `InterpretOne` allowlist would RESYNC on every execution and be
+        // demoted by the governor for traffic that touches no code at all. It cost S3's XCHG r/m8
+        // and INC/DEC r/m8 rows their whole value until it was found.
+        //
+        // An unwatched write FALLS THROUGH to the body, and the `&&` below rather than a nested
+        // early return is what makes that true. It shipped as a nested `return false`, which the
+        // paragraph after it already claimed was a fall-through: the two disagreed and the code
+        // won, so a store made inside a window skipped the unit-sim feed, the SMC trace and the
+        // smc-census choke for as long as the window was open. None of those three invalidates
+        // anything, so nothing was unsound; they are DIAGNOSTICS, and a diagnostic that silently
+        // stops observing during exactly the mechanism under measurement is worse than one that
+        // never ran.
+        //
+        // Falling through is SOUND for an unwatched write: the body below invalidates only what
+        // `range_hits_compiled_code` and `decode_cache::range_hits_code` name, and
+        // `code_write_watched` IS the disjunction of those two, so a write that fails it reaches
+        // no invalidation door and cannot retire the running block. It returns `invalidated`,
+        // which is `false` on that path, having invalidated nothing.
+        //
+        // THE SIZED PATH PROBES TWICE while a window is open, and that is accepted rather than
+        // threaded. `write_linear_fragment` and `finish_fast_map_write` both compute `watched`
+        // for their own same-value elision and then call in here, which asks again. Threading
+        // the answer through would mean a second entry point: the BYTE door
+        // (`note_code_byte_write_hit`) genuinely does not know -- that is the whole reason this
+        // probe exists -- so a single `watched: bool` parameter would force the byte path to
+        // compute one on every changed store, including the vast majority that never see a
+        // window. That trades a cost confined to one probe per InterpretOne store for a cost on
+        // the shipped byte-store path, which is the wrong direction. Revisit only if the loader
+        // ladder puts `code_write_watched` in the profile.
+        if self.deferred_code_writes.is_open() && self.code_write_watched(physical, width) {
+            self.record_deferred_code_write(physical, width, lanes);
+            return true;
+        }
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
@@ -500,6 +554,10 @@ impl CpuGsw {
             {
                 census_block_scan = true;
             }
+            // The demoted-call-out map. See `BlockCache::forget_demoted_sites_in`, and the note in
+            // the decode branch below for why it is called from BOTH doors and from neither the
+            // top of this function nor `invalidate_physical_range`.
+            self.jit_direct.forget_demoted_sites_in(physical, width);
             let outcome = self
                 .jit_direct
                 .invalidate_physical_range(physical, width, lanes);
@@ -517,6 +575,26 @@ impl CpuGsw {
         let _ = lanes;
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
+            // The demoted-call-out map, at the second of the two doors. It has to be BOTH because
+            // it outlives blocks: a demotion retires its block, so an overwrite that arrives later
+            // often reaches only this one -- the interpreter is still running that instruction, so
+            // its decode line is live even though its block is gone.
+            //
+            // And it has to be HERE and not at the top of this function, which is where it was
+            // written first: that is the door EVERY changed byte store takes, watched or not, and
+            // a `retain` over the map's sixty entries on each of several million stores is not a
+            // probe, it is a scan. MEASURED on the tombraid loader, four interleaved pairs of the
+            // two placements, min wall 8.075 s against 7.007 s -- 1.15x, on a host loaded enough
+            // that both arms ran a second above their quiet-host figures, which interleaving is
+            // what controls for. Both branches it now sits in have already established that the
+            // write touches code, which is a tiny fraction of stores.
+            //
+            // What that trades away, said plainly: a write that hits neither a compiled block nor
+            // a decode line leaves the site stale. That is the same population the block cache
+            // itself never hears about, so the map is exactly as current as `entries` is, and the
+            // residue is one missed lowering at one address until the next wipe.
+            #[cfg(feature = "jit")]
+            self.jit_direct.forget_demoted_sites_in(physical, width);
             if self.profile.enabled {
                 // Flush-source census (64-byte physical blocks): locates the code/data byte
                 // sharing behind a residual SMC flush storm. Off the common path (flushes only).
@@ -596,6 +674,55 @@ impl CpuGsw {
         invalidated
     }
 
+    /// Record one code write taken while an `InterpretOne` call-out held a native block live.
+    /// Separate from the branch above and `#[cold]` so the open-window case costs the choke one
+    /// not-taken branch and no register pressure.
+    #[cold]
+    #[inline(never)]
+    fn record_deferred_code_write(&mut self, physical: u32, width: u32, lanes: bool) {
+        self.jit_direct.note_deferred_code_write();
+        self.deferred_code_writes.push(crate::DeferredCodeWrite {
+            physical,
+            width,
+            lanes,
+        });
+    }
+
+    /// Replay every write the call-out window deferred, with the window CLOSED, and clear the
+    /// list. Called by `run_direct_block` once per native entry, after the fetch accounting and
+    /// before it returns.
+    ///
+    /// Exact for the recorded entries: each replays the same `(physical, width)` through the same
+    /// door (`lanes` picks the value-aware one) that the interpreter's store path chose, so the
+    /// lane-absorption decision and every SMC counter land where they would have landed.
+    ///
+    /// The overflow arm is coarse and unreachable in practice. `MAX_DEFERRED_CODE_WRITES` is
+    /// sized for one instruction's stores plus a whole exception delivery's pushes and page-walk
+    /// accessed-bit writes; past that the only sound answer is to drop every compiled block and
+    /// every decode line, which is what it does. It deliberately does NOT consult the write-page
+    /// record: that record is settled at the end of the step (`settle_write_record`), so by the
+    /// time this runs it names nothing, and making the drain depend on it would have coupled two
+    /// mechanisms for a path that cannot be reached.
+    #[cfg(feature = "jit")]
+    pub(super) fn drain_deferred_code_writes(&mut self) {
+        if self.deferred_code_writes.is_empty() {
+            return;
+        }
+        let deferred = core::mem::take(&mut self.deferred_code_writes);
+        for index in 0..usize::from(deferred.count) {
+            let write = deferred.entries[index];
+            if write.lanes {
+                self.note_code_write_hit(write.physical, write.width);
+            } else {
+                self.note_code_write(write.physical, write.width);
+            }
+        }
+        if deferred.overflow {
+            self.jit_direct.clear();
+            self.invalidate_code_caches();
+        }
+    }
+
     /// G1 heat epoch: the retired-instruction megacount. Both the invalidation choke (which bumps
     /// heat) and the admission gate (which reads it) derive the epoch from this one clock, so a
     /// chunk's churn count is only live within the ~1M-instruction window it accrued in.
@@ -630,8 +757,24 @@ impl CpuGsw {
                 self.flag(FLAG_CF),
             );
         }
-        // A 486 prefetch queue is a snapshot: writes to already fetched bytes are
-        // not observed until control flow or the next refill invalidates the queue.
+        self.settle_write_record();
+    }
+
+    /// Act on the write record the instruction just finished left, then clear it.
+    ///
+    /// TWO CALLERS, and the second is why this is a function. The interpreter reaches it through
+    /// `begin_instruction`, once per instruction, which is where it has always lived. An
+    /// `InterpretOne` call-out reaches it directly, at the END of its step, because the slot after
+    /// it is NATIVE and will never call `begin_instruction` -- so without this the record would
+    /// accumulate across the rest of the block and the prefetch invalidation below would run at
+    /// the first interpreted instruction AFTER the block instead of at the next slot.
+    ///
+    /// The prefetch half is not bookkeeping. A 486 prefetch queue is a SNAPSHOT: writes to bytes
+    /// already fetched are not observed until control flow or a refill drops the queue, so a
+    /// call-out that patches the bytes ahead of it must invalidate here or the interpreter fetches
+    /// what the guest just overwrote.
+    #[inline]
+    pub(super) fn settle_write_record(&mut self) {
         if self.written_pages_overflow {
             self.prefetch.invalidate();
         } else if self.written_count > 0
@@ -1297,6 +1440,52 @@ impl CpuGsw {
     }
 
     /// Always available, unlike the census: see `DirectStallSnapshot`.
+    /// See `DirectPageCache::set_mapping_epoch_for_test`.
+    #[cfg(test)]
+    pub(crate) fn set_data_write_mapping_epoch_for_test(&mut self, epoch: u64) {
+        self.data_write_pages.set_mapping_epoch_for_test(epoch);
+    }
+
+    /// Whether the SS-load shape measurement is being taken at all.
+    ///
+    /// GATED with the barrier census since the S4 review round. The pair of counters behind it
+    /// sits in two INTERPRETER arms and is read on census legs only, which is the same bargain
+    /// every other diagnostic on a hot path takes here; before the gate, `0x8e` paid a segment
+    /// compare and `0x17` an unconditional record read on every execution, in every build.
+    ///
+    /// The measurement itself is answered: the tombraid loader phase split 484,385 same-record
+    /// against 488,498 record-moving, which is what design review 10.1 M5 asked for and what the
+    /// two SS call-out rows were built on. It stays because the ladder still reads it, not
+    /// because anything is waiting on it.
+    #[inline]
+    pub(crate) fn ss_load_census_active(&self) -> bool {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.barrier_census_active()
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            false
+        }
+    }
+
+    /// One interpreted SS load, classified for the S4d M5 measurement by whether the record
+    /// moved. `before` is the SS record as it stood at the top of the arm.
+    ///
+    /// Here rather than at the two call sites so the comparison is written once: the question is
+    /// the same one R2 asks of the six records, and two copies of it could drift apart.
+    pub(crate) fn note_ss_load_record(&mut self, before: crate::SegmentRegister) {
+        #[cfg(feature = "jit")]
+        {
+            let same = self.registers.segment(crate::SegmentIndex::Ss) == before;
+            self.jit_direct.note_ss_load(same);
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            let _ = before;
+        }
+    }
+
     pub fn direct_stall_snapshot(&self) -> crate::DirectStallSnapshot {
         #[cfg(feature = "jit")]
         {
@@ -1343,7 +1532,10 @@ impl CpuGsw {
         if dynamic {
             self.jit_direct.note_dynamic_miss_target(kind, linear);
         } else {
-            self.jit_direct.note_unbound_target(kind, linear);
+            // No key: this seam names a class and an address, and the per-cause split of
+            // `dormant_other` is about a key the caller does not have. It reads as zero here,
+            // which is the honest answer for a synthesised exit.
+            self.jit_direct.note_unbound_target(kind, linear, None);
         }
     }
 

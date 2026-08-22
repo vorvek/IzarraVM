@@ -108,10 +108,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
     // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
-    // `0xf7`, `0xa9`, `0x85`, `0x8d`. Every one is the Dword sibling of an admitted byte form and
-    // its kind hard-codes Dword with no width field. (`0xc7` and `0x81` left this list when they
-    // grew width fields of their own; `0xa3` left it with the V86 loop-A slice, for the reason the
-    // paragraph above now gives.)
+    // `0xf7` and `0xa9`. Both are the Dword sibling of an admitted byte form and their kinds
+    // hard-code Dword with no width field. (`0xc7` and `0x81` left this list when they grew width
+    // fields of their own; `0xa3` left it with the V86 loop-A slice, for the reason the paragraph
+    // above now gives; `0x85` left it with the Word TEST row; `0x8d` left it with the S1 width
+    // lift, which gave `Lea` a `width` and narrowed its destination write with
+    // `emit_write_gpr16`.)
     //
     // `0xb8..=0xbf` WAS on that list and is the 16-bit campaign's fourth slice. It left the same
     // way `0x83` and `0xc7` did, by growing the width field the list existed to compensate for:
@@ -219,7 +221,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x01 | 0x09 | 0x21 | 0x29 | 0x31
                 | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
                 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
-                | 0x06 | 0x0e | 0x1e
+                | 0x06 | 0x0e | 0x16 | 0x1e
+                // POP SS, the S4 part-2 row. It is on this list rather than folded in with the
+                // pushes above because it LOADS the stack segment: the arm below turns it into an
+                // `InterpretOne` call-out whose resume depends on R2 finding the SS record
+                // unchanged, and the loader census ranks it at 483,000 block-stopping hits.
+                | 0x17
                 | 0x40..=0x4f
                 | 0x50..=0x5f
                 | 0x68
@@ -234,8 +241,31 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x8a
                 | 0x8b
                 | 0x8c
+                // POP r/m16, the S2 `InterpretOne` row. Word matters more than Dword here: the
+                // loader is Watcom-compiled 16-bit C and the census row is the word form. There is
+                // no emitter and no width field to get wrong, because the helper runs the decode
+                // line through the interpreter, so this entry is admission and nothing else.
+                | 0x8f
+                // LEA r16, m. Admitted with the S1 width lift, which is where `DirectKind::Lea`
+                // grew its `width` field: the arm used to end in a full 32-bit destination write,
+                // and the field is the admission rather than an accompaniment to it. The Tomb
+                // Raider DOS/4GW loader census of 2026-08-21 ranks the word row at 1,744,694
+                // block-stopping hits.
+                | 0x8d
                 | 0x8e
+                // XCHG, the whole family, admitted to the S3 `InterpretOne` allowlist. Every one
+                // of them decodes at `OperandSize::Word` in a 16-bit segment whatever its actual
+                // operand width -- `0x86` is a byte exchange and takes its size from the encoding
+                // -- so without this entry the Word gate refuses the loader's rows before the
+                // classifier arm can see them. The census ranks `0x87` register word at 1.21 M
+                // block-stopping hits and `0x93`/`0x97` at 507 k.
+                //
+                // No width field to get wrong: the arm produces a call-out, and the helper runs
+                // the interpreter's own arm at whatever width the decode line carries.
+                | 0x86
+                | 0x87
                 | 0x90
+                | 0x91..=0x97
                 | 0x98
                 | 0x99
                 | 0xa0
@@ -246,9 +276,28 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xc1
                 | 0xd1
                 | 0xc2
+                // ENTER imm16, imm8 and LEAVE, the Watcom frame-pointer pair. Every function in
+                // 16-bit C compiled with a frame pointer opens with one and closes with the
+                // other, which is why they head the loader census at 1,977,855 and 1,277,833
+                // block-stopping hits. Both are gated further inside their arms: ENTER at level 0
+                // only, and both through the stack-width matrix, which builds the (operand, SS.B)
+                // cell that has an emitter and refuses the one that does not.
+                | 0xc8
+                | 0xc9
                 | 0xc3
                 | 0xc6
                 | 0xc7
+                // The BIT-STRING family, admitted to the S3 `InterpretOne` allowlist. In a 16-bit
+                // segment every one of them decodes at Word, so without this entry the loader's
+                // rows never reach the classifier arm. What makes it safe is that the native `Bt`
+                // lowering below is now gated on Dword IN ITS ARM rather than by this list's
+                // silence: at Word the interpreter masks the bit index with `& 15` and that kind
+                // carries no width, so the gate had to move somewhere it is stated.
+                | 0x0fa3
+                | 0x0fab
+                | 0x0fb3
+                | 0x0fbb
+                | 0x0fba
                 | 0x0fb6
                 | 0x0fb7
                 | 0x0fbe
@@ -259,6 +308,35 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xec
                 | 0x0f80..=0x0f8f
                 | 0xf6
+                // CLI, the S3 policy widening's seventh row, at 244 k block-stopping hits in the
+                // post-S2 loader census. It is a CALL-OUT rather than a lowering because of the
+                // resume predicate rather than the emitter: clearing IF is one `and` on the flag
+                // shadow, but the run loop's interrupt DELIVERY points are what the block's
+                // boundaries are, and only R3 can decide whether the edge the instruction just
+                // took is one of them.
+                //
+                // It resumes. Design review M8 made R3's IF clause DIRECTIONAL: IF going 1 to 0
+                // cannot make an interrupt serviceable, so the run loop has no delivery point on
+                // that edge and the block may carry on; IF going 0 to 1 resyncs, because the
+                // boundary after it is exactly where the run loop would deliver. A CLI that
+                // clears an already-clear IF resumes for the same reason.
+                //
+                // `0xfb` STI joined on 2026-08-22 (S4d). Design review M8 had removed it because
+                // it takes the IF 0-to-1 edge AND arms `interrupt_shadow`, failing two clauses of
+                // R3 on every execution. Both clauses are now scoped to the row rather than
+                // relaxed globally, and the row pays for the relaxation with a pendency test the
+                // other rows do not run: see `InterpretOneRow::arms_interrupt_shadow` and the
+                // pendency note in `interpret_one_step`. Loader census: 486,000 block-stopping
+                // hits.
+                | 0xfa | 0xfb
+                // CLD / STD. A POLICY lift and nothing else: `emit_direction_flag` is one `or` or
+                // `and` on the flag shadow, DF sits outside the lazy arithmetic descriptor, and
+                // neither interpreter arm consults `operand_size`, so the two widths are the same
+                // operation and `DirectionFlag` carries no width to get wrong. The deferral this
+                // replaces asked for a measurement; the loader census is it, at 736,877
+                // block-stopping hits for the word row.
+                | 0xfc
+                | 0xfd
                 | 0xfe
                 | 0xff
         )
@@ -291,10 +369,12 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         // below, both gated there as well; the entries here are what lets a 16-bit segment reach
         // them at all.
         //
-        // `0xfc` / `0xfd` CLD / STD are deliberately NOT here even though the same census measures
-        // a `0xfc` word row at 1,642,514 hits. They are a different arm from CLC/STC (a DF write
-        // with no lazy-descriptor interaction), so admitting them would put a second mechanism
-        // behind one knob and make this slice's A/B unattributable. A follow-on, not an omission.
+        // `0xfc` / `0xfd` CLD / STD were deliberately NOT here, even though the same census
+        // measures a `0xfc` word row at 1,642,514 hits: they are a different arm from CLC/STC (a
+        // DF write with no lazy-descriptor interaction), so admitting them under this knob would
+        // have put a second mechanism behind it and made that slice's A/B unattributable. The
+        // follow-on it asked for is the S1 width lift, and the pair sits on the UNGATED list
+        // above rather than here, which is what keeps the two attributable apart.
         && !(v86_loop_rows_enabled()
             && matches!(
                 insn.opcode,
@@ -325,14 +405,25 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         // ZERO `0xA9` rows at any width, and an unmeasured admission is the campaign's standing
         // refusal rather than a free ride. `0x84`/`0xA8` are byte forms and were never at issue.
         && !(test_word_rows_enabled() && insn.opcode == 0x85)
-        // Group 3's `/0` (TEST r/m16, imm16) is the ONE width-safe member of `0xf7`, so it is
-        // admitted by sub-opcode here rather than by adding `0xf7` to the list above: every other
-        // member's arm (NEG, MUL, IMUL, DIV) deliberately carries no width field and documents
-        // this gate as the ONLY thing keeping a word form out — listing the opcode wholesale
-        // would turn each of those comments into a miscompile. The wolf3d demo-workload census
-        // ranks the register form at 634M block-stopping hits; the word MEMORY form is refused
-        // inside the arm (no measured row).
-        && !(insn.opcode == 0xf7 && insn.modrm.is_some_and(|m| m.reg == 0))
+        // Group 3, admitted by SUB-OPCODE rather than by adding `0xf7` to the list above, because
+        // the group's members do not get the same answer and the list cannot say so.
+        //
+        // `/0` (TEST r/m16, imm16) is the width-safe one: `emit_test_preloaded` has carried a full
+        // Word lane since the width field landed. The wolf3d demo-workload census ranks the
+        // register form at 634M block-stopping hits.
+        //
+        // `/2../7` (NOT, NEG, MUL, IMUL, DIV, IDIV) are the S3 policy widening's fourth row and
+        // are admitted as `InterpretOne` CALL-OUTS, never as lowerings. Every one of those arms
+        // deliberately carries no width field and names this gate as the only thing keeping a word
+        // form out of it; the classifier arm below therefore intercepts the Word forms and routes
+        // them to the helper BEFORE any of them is reached, so the comments they carry stay true.
+        // The post-S2 loader census ranks /6 DIV r16 at 729 k block-stopping hits, /4 MUL r16 at
+        // 482 k and /0 word memory TEST at 242 k.
+        //
+        // `/1` is not a group-3 operation at all -- the interpreter answers it with
+        // `undefined_opcode` -- so it stays refused here rather than being compiled into a block
+        // that can only ever fault.
+        && !(insn.opcode == 0xf7 && insn.modrm.is_some_and(|m| m.reg != 1))
     {
         return None;
     }
@@ -395,15 +486,64 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }),
         };
     }
+    // The BIT-STRING family, everything the native `Bt` arm below does not take, as `InterpretOne`
+    // call-outs. The S3 policy widening's third row: the post-S2 loader census ranks `0F BA /4`
+    // dword register at 971 k block-stopping hits (5.5%) and `0F A3` memory dword at 257 k.
+    //
+    // ROUTED HERE, ABOVE the `u8::try_from(insn.opcode).ok()` truncation further down, for the
+    // reason 0x0faf and MOVZX/MOVSX state: that truncation returns None for every two-byte opcode,
+    // so an arm among the u8 arms below would be silently unreachable. Nothing would fail; the
+    // admission would simply never fire.
+    //
+    // What this arm takes, and what it deliberately leaves to the native one immediately below:
+    //
+    // | form | answer |
+    // |---|---|
+    // | `0F A3` register, Dword | falls through to the native `Bt` lowering, which is free |
+    // | `0F A3` register, Word | call-out: at Word the interpreter masks the index with `& 15`, not `& 31`, and `DirectKind::Bt` carries no width |
+    // | `0F A3` memory, any width | call-out: the effective address is adjusted by the bit index at runtime, which a static `DirectAddr` cannot express |
+    // | `0F AB`, `0F B3`, `0F BB`, any form | call-out: BTS/BTR/BTC WRITE the operand back and `Bt` does not |
+    // | `0F BA /4../7`, any form | call-out: the index is an immediate rather than a register, and /5../7 write back |
+    // | `0F BA /0../3` | refused: not defined bit-test ops, the interpreter #UDs them before the operation runs |
+    //
+    // The register forms of BTS/BTR/BTC ride the arm with their memory forms, and that is the
+    // closure rule at the top of this file rather than a widening for its own sake: `0F BA /5`
+    // register is a call-out because the whole `0F BA` group is one interpreter arm, so refusing
+    // `0F AB` register -- the same operation with the index in a register instead of an immediate,
+    // through the same `bit_string_op` -- would be arbitrary. They reach one helper because the
+    // helper runs the decode line.
+    //
+    // The whole family joins the `OperandSize::Word` allowlist above with this slice. That is what
+    // lets a Word form reach here at all, and it is safe only because of the first two table rows:
+    // the native `Bt` lowering is now guarded on Dword explicitly rather than by the allowlist's
+    // absence, so the `& 15` masking difference cannot reach an emitter that assumes `& 31`.
+    if matches!(insn.opcode, 0x0fa3 | 0x0fab | 0x0fb3 | 0x0fbb | 0x0fba) {
+        let m = insn.modrm?;
+        if insn.opcode == 0x0fba && m.reg < 4 {
+            return None;
+        }
+        let native_bt = insn.opcode == 0x0fa3
+            && insn.operand_size == OperandSize::Dword
+            && matches!(insn.operand?, DecodedOperand::Reg(_));
+        if !native_bt {
+            return Some(DirectKind::CallOut {
+                helper: CallOutHelper::InterpretOne {
+                    row: InterpretOneRow::BitString,
+                },
+            });
+        }
+    }
     // BT r/m32, r32, REGISTER form only. Keyed on the full u16 opcode and placed ABOVE the
     // `u8::try_from(insn.opcode).ok()` truncation for the same reason 0x0faf and the MOVZX/MOVSX
     // family are: that truncation returns None for every two-byte opcode, so an arm among the u8
     // arms below would be unreachable and nothing would fail, the lowering would simply never
     // fire.
     //
-    // Must stay BELOW the OperandSize::Word gate. A 66-prefixed BT is not in that gate's
-    // allowlist so it is already refused, and it must be: at Word the interpreter masks the bit
-    // index with `& 15`, not `& 31` (`bits = operand_size.bytes() * 8`).
+    // Reached only for the Dword register form, which the arm above filters to. It used to be
+    // reached for the Word forms as well and be kept out of them by the `OperandSize::Word` gate's
+    // silence; that gate now admits the family, so the width test moved into the arm above where
+    // it is stated. At Word the interpreter masks the bit index with `& 15`, not `& 31`
+    // (`bits = operand_size.bytes() * 8`), and this kind carries no width.
     //
     // Only 0xa3 of the four-opcode family, and only the register form. BTS/BTR/BTC (0xab, 0xb3,
     // 0xbb) WRITE the operand back; this arm's kind does not, and the interpreter skips the
@@ -779,17 +919,53 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x58..=0x5f => {
                 return Some(DirectKind::Pop { dst: opcode - 0x58 });
             }
-            // LEAVE. The 16-bit-stack form (SS.B = 0) moves only BP into SP and preserves
-            // ESP's high word, which the emitted full-width move would destroy; that case is
-            // refused at compile time by `uses_stack()` feeding the `stack_is_32bit` check,
-            // NOT here. The 16-bit OPERAND-size form is refused by the OperandSize::Word
-            // gate above, which does not list 0xc9.
+            // LEAVE is classified at the 0xc9 arm below and its (operand size x SS.B) cell is
+            // chosen by the stack-width matrix, not here. Three of the four cells are built as of
+            // the S1 width lift; the fourth, a Dword operand on a 16-bit stack, would move four
+            // bytes with a 16-bit pointer and stays refused.
             // NOP. In the Word allowlist since 2026-08-08: the claim that "no 16-bit block exists
             // on any persona" predated the JIT16 flip (wolf3d runs billions of 16-bit entries),
             // and the wolf3d demo-workload census measured `0x90` word at 79M block-stopping
             // hits. `Nop` emits nothing width-dependent.
             0x90 => {
                 return Some(DirectKind::Nop);
+            }
+            // XCHG, the whole family, as `InterpretOne` call-outs. The S3 policy widening's second
+            // row: `0x87` register form is the post-S2 loader census's second row at 1.21 M
+            // block-stopping hits (6.9%) and `0x93`/`0x97` add 507 k.
+            //
+            // A call-out and not a lowering, and the reason is the SHAPE rather than the census.
+            // Every one of these is a CROSS-WRITE: the interpreter reads both operands, then
+            // writes both back (`execute.rs` 0x86/0x87/0x91..=0x97). A lowered memory form is a
+            // guarded read and a guarded store to the SAME address with the register exchange in
+            // between, which is two address computations, two fast-map probes, two permission
+            // checks and two side-exit stub sets for an instruction that appears once per Watcom
+            // pointer swap. The helper is a fixed call whatever the form.
+            //
+            // ALL FOUR FORMS ride one arm. `0x86` is the byte width and `0x87` the operand width;
+            // `0x91..=0x97` take the register from the low three opcode bits and exchange it with
+            // the accumulator. They reach ONE helper because the helper runs the decode line, so
+            // the closure rule at the top of this file applies at its strongest here: there is no
+            // per-form lowering that could be right for one and wrong for another.
+            //
+            // `0x90` is NOT in this arm and must not be. It is XCHG (E)AX,(E)AX architecturally,
+            // but it has a native `Nop` lowering that emits nothing at all, which is strictly
+            // better than a call-out; the arm above keeps it.
+            //
+            // `0x94` XCHG (E)AX,(E)SP writes the stack pointer, and that is sound for the reason
+            // the module docs derive for POPAD: `emit_store_homes` and the unconditional reload
+            // cover all eight GPRs, and later slots address the stack through `home(4)`, which the
+            // reload has just refreshed. Nothing bakes an ESP value.
+            //
+            // LOCK is refused upstream by `prefixes_supported_for`, which matters here more than
+            // for most rows: `XCHG` with a memory operand is implicitly locked on real silicon and
+            // the explicit prefix is common. A LOCK'd form never reaches this arm.
+            0x86 | 0x87 | 0x91..=0x97 => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Xchg,
+                    },
+                });
             }
             // CBW / CWDE. Unlike NOP and CLD/STD immediately below, this one IS in the
             // Word-size allowlist above: the interpreter's arm switches on `operand_size` (the
@@ -883,6 +1059,41 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     helper: CallOutHelper::PortReadAlDx,
                 });
             }
+            // POP r/m16/32 (group 1A), the first row on the generic `InterpretOne` allowlist and
+            // the top of the Tomb Raider loader's barrier census after the S1 width lift at
+            // 12.4% of block-stopping hits.
+            //
+            // It is a CALL-OUT and not a lowering, and the reason is the whole point of the S2
+            // mechanism rather than a property of this opcode: POP r/m has no emitter, is not
+            // worth one on its own, and used to end the block. Now it costs one helper call and
+            // the block continues. What makes it the right FIRST row is that it STORES: the
+            // deferred-code-write contract (design review B2) is exercised on day one instead of
+            // being carried untested behind rows that only read.
+            //
+            // BOTH forms, register and memory, and every width. The register form is a two-line
+            // interpreter arm and the memory form is the census row; refusing the cheap sibling of
+            // an admitted row is the arbitrariness this file's header rules out, and both reach
+            // the identical helper because the helper runs the decode line rather than a lowering.
+            //
+            // `reg != 0` is refused HERE rather than left to the helper. Those encodings are
+            // illegal and the interpreter's arm answers them with `undefined_opcode`, which the
+            // helper would deliver through its fault arm -- correct, but it would burn a call-out
+            // and a governor execution on every one of them, and a block would be compiled around
+            // an instruction that can only ever fault.
+            //
+            // Everything else the row needs is already gated above and inherited rather than
+            // restated: `prefixes_supported_for` refuses REP, LOCK and the address-size override,
+            // so the helper never meets a REP whose single step would be one iteration of many;
+            // the Word allowlist decides whether a 16-bit form is admitted at all; and
+            // `block_continuable` admits 0x8F through `DecodeGroup::Stack` on every persona, so
+            // there is no class gate to inherit.
+            0x8f if insn.modrm.is_some_and(|m| m.reg == 0) => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::PopRm,
+                    },
+                });
+            }
             // CWD / CDQ, same reasoning as 0x98 immediately above.
             0x99 => {
                 return Some(DirectKind::Cdq {
@@ -894,12 +1105,50 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // instruction coverage -- coverage share and dispatch-exit share are different
             // quantities, and an earlier slice dismissed this opcode on the wrong one.
             //
-            // Deliberately NOT added to the OperandSize::Word allowlist above, for the reason
-            // the NOP comment gives: no 16-bit block exists on any persona today, so the entry
-            // would be dead code no counter could gate.
+            // ON the OperandSize::Word allowlist above since the S1 width lift. The old refusal
+            // said the entry "would be dead code no counter could gate", which was true when no
+            // 16-bit block existed on any persona and stopped being true at the JIT16 flip. The
+            // Tomb Raider loader census measures the word row at 736,877 block-stopping hits.
+            // Nothing in the emitter moved: `DirectionFlag` carries no width and neither
+            // interpreter arm reads `operand_size`.
             0xfc | 0xfd => {
                 return Some(DirectKind::DirectionFlag {
                     set: opcode == 0xfd,
+                });
+            }
+            // CLI, an `InterpretOne` call-out. See the entry beside `0xfa` on the Word allowlist
+            // above for why it resumes and why STI is not here with it.
+            //
+            // It is the only admitted row that touches no memory and no general register, so it is
+            // also the cheapest possible proof that the mechanism's cost is the CALL rather than
+            // the work: a demoted CLI slot and an admitted one differ by exactly one helper
+            // invocation.
+            0xfa => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Cli,
+                    },
+                });
+            }
+            // STI, the S4d row and CLI's mirror in encoding but not in consequence. CLI only
+            // clears IF, which the run loop has no delivery point for; STI sets IF and arms the
+            // one-instruction shadow, and a native block has no point at which that shadow is
+            // consumed.
+            //
+            // What makes it admissible is that the shadow is decided at the BLOCK BOUNDARY instead
+            // of inside the helper (design section 10.1, B1), and that the row refuses to resume
+            // while an interrupt is pending (B2), which is what keeps the run's end point where
+            // the interpreter would have put it. The owner accepted the residual caveat on
+            // 2026-08-22: a pending interrupt is delivered at the next block boundary rather than
+            // after exactly one shadowed instruction.
+            //
+            // V86 with IOPL < 3 needs nothing here: the interpreter's arm calls `check_v86_iopl`
+            // and the helper's fault arm delivers the #GP exactly as it does for every other row.
+            0xfb => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Sti,
+                    },
                 });
             }
             // CLC (0xf8) and STC (0xf9). Behind `IZARRAVM_V86_LOOP_ROWS`; `0xf8` is the tombraid
@@ -922,8 +1171,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     set: opcode == 0xf9,
                 });
             }
+            // LEAVE. One kind out of this arm whatever the operand size; `stack_width_kind`
+            // splits it into `Leave` (Dword on a 32-bit stack), `Leave16 { stack32 }` (Word on
+            // either) and a refusal (Dword on a 16-bit stack). Deciding it here is impossible:
+            // SS.B is CPU state and `classify` has no CPU.
             0xc9 => {
                 return Some(DirectKind::Leave);
+            }
+            // ENTER imm16, imm8. WORD operand size and nesting level 0 only.
+            //
+            // The level bar is the real one. `decode` masks `imm2` to five bits, and a level above
+            // zero copies the enclosing display: a loop of `level - 1` stack reads and pushes plus
+            // one more push, each with its own fault point and its own partial-commit rewind. That
+            // is a different instruction from the one this kind emits, and it stays a hard
+            // boundary. Watcom's prologue is `enter imm16, 0`, so the census row and the admitted
+            // form are the same thing.
+            //
+            // The Dword operand form is refused because no emitter exists for it and no row asks:
+            // it would push four bytes and take the frame pointer at the full width. `stack32` is
+            // a placeholder here, exactly as `Push`'s `StoreSource::Flags { mask: u32::MAX }` is;
+            // `stack_width_kind` resolves it and nothing between the two reads it.
+            0xc8 => {
+                if insn.operand_size != OperandSize::Word || insn.imm2 != 0 {
+                    return None;
+                }
+                return Some(DirectKind::Enter16 {
+                    alloc: insn.imm as u16,
+                    stack32: false,
+                });
             }
             // PUSHFD. Fifth in the runtime-weighted reject audit at 1,194,127 dispatcher exits
             // (9.5%). The persona mask and the V86 refusal are resolved in `stack_width_kind`,
@@ -952,23 +1227,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             0x9e if fpu_loop_rows_enabled() => {
                 return Some(DirectKind::Sahf);
             }
-            // PUSH DS (0x1e) and PUSH ES (0x06), the read half of the segment family. Both are
-            // ordinary word stack stores of a value the block already pins: the selector is baked
+            // PUSH DS (0x1e), PUSH ES (0x06), PUSH CS (0x0e) and PUSH SS (0x16), the read half
+            // of the segment family. All four are ordinary word stack stores of a value the block already pins: the selector is baked
             // from the `SegmentLayout` in `emit_store`, exactly as `MovSegToReg` bakes one, and
             // `selector_segment` reports the segment so `data_matches` refuses re-entry after a
             // guest reload.
             //
-            // PUSH SS (0x16) is NOT here: it belongs to the family the write half excludes over
-            // the interrupt shadow, and no census row measures it (36 hits when this arm was
-            // built). PUSH CS (0x0e) joined on 2026-08-08 when the wolf3d demo-workload census
+            // PUSH CS (0x0e) joined on 2026-08-08 when the wolf3d demo-workload census
             // ranked it at 158M block-stopping hits: it needs NO `selector_segment` entry because
             // CS is not in `SegmentLayout.data` at all — `SegmentLayout::selector` reads the
             // separate `cs` field and `cs_matches` pins it for every block unconditionally, the
             // same argument that already carries `mov r16, cs` through `MovSegToReg`.
-            0x0e | 0x1e | 0x06 => {
+            //
+            // PUSH SS joined on 2026-08-22, and what kept it out until then was a misreading this
+            // arm carried in prose: "it belongs to the family the write half excludes over the
+            // interrupt shadow". That argument is about POP SS and MOV SS, which LOAD the stack
+            // segment and arm a one-instruction shadow (`load_segment_arming_ss_shadow`). PUSH SS
+            // only READS the selector and arms nothing: the interpreter's 0x16 arm is the 0x06 arm
+            // with a different `SegmentIndex` and the same two clocks. SS takes the ORDINARY data
+            // path here, unlike CS. It lives in `SegmentLayout.data`, so `selector_segment` must
+            // report it, and every push already has it in `used` because `write_segment` names SS
+            // as the segment the store goes through. The tombraid DOS/4GW loader census of
+            // 2026-08-22 ranks it at 747,415 block-stopping hits, the largest remaining barrier
+            // row after S3.
+            0x0e | 0x16 | 0x1e | 0x06 => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Selector(match opcode {
                         0x0e => SegmentIndex::Cs,
+                        0x16 => SegmentIndex::Ss,
                         0x1e => SegmentIndex::Ds,
                         _ => SegmentIndex::Es,
                     }),
@@ -979,13 +1265,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // loop-A census's largest row at 97,347,816 interpreted hits and 95,057,524 static
             // unbound exits, and `0x1f` rides the same arm with 6,016,460 of its own.
             //
-            // POP SS (0x17) is left off both this arm and the gated allowlist above, and the reason
-            // is exactly the one `0x8e /2` states in its own arm: loading SS arms a one-instruction
-            // interrupt shadow (`load_segment_arming_ss_shadow`) that the interpreter consumes at
-            // the start of the NEXT instruction. A native block never passes through that point,
-            // so a block that continued after it would hold the shadow open across every remaining
-            // slot, which moves where an interrupt is delivered. FS and GS have no `POP` encoding
-            // in the one-byte map at all, so the DS/ES pair is the whole family here.
+            // POP SS (0x17) has its OWN arm below and is not part of this one. FS and GS have no
+            // `POP` encoding in the one-byte map at all, so the DS/ES pair is the whole family
+            // here.
             //
             // WORD ONLY, and the refusal is in this arm rather than downstream. At `Dword` the
             // interpreter pops FOUR bytes and loads the low 16 (386 PRM), which is a different
@@ -1001,6 +1283,41 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         SegmentIndex::Es
                     } else {
                         SegmentIndex::Ds
+                    },
+                });
+            }
+            // POP SS, the S4 part-2 row, and DELIBERATELY not a `PopSegReal` with a third segment.
+            //
+            // Two things separate it from POP ES and POP DS, and each one on its own decides the
+            // answer. It arms the one-instruction interrupt shadow
+            // (`load_segment_arming_ss_shadow`), which no lowering can honour: the interpreter
+            // consumes the shadow at the start of the next instruction and a native block has no
+            // such point. And it loads the STACK segment, so a resumed block's remaining slots
+            // address through the record it just wrote.
+            //
+            // Both are answered by the call-out rather than by a refusal. The shadow is left armed
+            // and decided at the block boundary (design section 10.1, B1); the record is
+            // byte-compared by R2 after the step, so a stack SWITCH resyncs before any later slot
+            // runs and only a reload of the same record resumes. The loader measured that split at
+            // 484,385 same-record loads against 488,498 record-moving ones across both SS arms,
+            // which is design review 10.1 M5 and the gate this row was built behind.
+            //
+            // NOT through `stack_width_kind`. `PopSegReal` is refused there in protected mode and
+            // refused again on a 32-bit stack, because its emitter knows one shape: three stores
+            // computing `base = selector << 4` off a 16-bit stack read. This row has no emitter at
+            // all -- the helper runs the interpreter's own `0x17` arm -- so every mode and both
+            // stack widths are the interpreter's, including the 386 PRM rule that a Dword POP SS
+            // moves four bytes of stack and loads the low sixteen. `DirectKind::CallOut` is not in
+            // `uses_stack`, so the width matrix is not consulted and does not need to be.
+            //
+            // The V86 and protected-mode fault paths are the interpreter's too: a null selector, a
+            // non-writable descriptor and a privilege mismatch each raise #GP and a present-bit
+            // clear raises #SS, all from inside `load_protected_segment` and all delivered by the
+            // helper's fault arm exactly as they are at a boundary.
+            0x17 => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::PopSs,
                     },
                 });
             }
@@ -1243,38 +1560,134 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     _ => return None,
                 };
                 let DecodedOperand::Reg(dst) = insn.operand? else {
-                    return None;
+                    // The MEMORY form, an `InterpretOne` call-out and the first row of the S3
+                    // policy widening. It tops the post-S2 loader census at 2.20 M block-stopping
+                    // hits (12.4%), and it is a call-out rather than a lowering for the same
+                    // reason 0x8F is: a two-byte store of a selector is not worth an emitter, an
+                    // address computation, a fast-map probe, a code-watch guard and a side-exit
+                    // stub set, and until this row was lifted it ended the block instead.
+                    //
+                    // ALL FOUR Sreg values the census measures ride the arm together, and so do
+                    // the other two of 0..=5: the helper runs the decode line, so there is no
+                    // per-segment lowering to get wrong and refusing four of six would be the
+                    // arbitrariness this file's header rules out. `/6` and `/7` stay refused by
+                    // the match above, on the same ground the register form refuses them --
+                    // `segment_from_reg_field` folds them into GS through a catch-all rather
+                    // than by intent, and a block compiled around an accident is worse than a
+                    // boundary.
+                    //
+                    // No width question. The interpreter writes `OperandSize::Word` whatever the
+                    // operand size, which is what already lets `0x8c` sit on the Word allowlist,
+                    // and the call-out inherits that by running the interpreter's own arm.
+                    return Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::MovRmSreg,
+                        },
+                    });
                 };
                 return Some(DirectKind::MovSegToReg { dst, segment });
             }
-            // MOV Sreg, r16, the write half of the segment family. DS and ES only, register
-            // source only, and REAL MODE or V86 only -- the mode gate is not here because
-            // `classify` has no CPU; it lives beside the `stack_width_kind` call, which is where
-            // PUSHF's V86 refusal lives for the same reason.
+            // MOV Sreg, r/m16, the write half of the segment family. FOUR answers now, and the
+            // arm's whole job is to keep them apart:
+            //
+            // | form | answer |
+            // |---|---|
+            // | `/0` ES or `/3` DS, register source, real mode or V86 | `LoadSegReal`, a lowering |
+            // | `/0` ES or `/3` DS, register source, protected mode | an `InterpretOne` call-out, chosen in `stack_width_kind` where the mode is in scope |
+            // | `/0` ES, `/3` DS, `/4` FS or `/5` GS, memory source, any mode | an `InterpretOne` call-out |
+            // | `/4` FS or `/5` GS, register source, any mode | an `InterpretOne` call-out |
+            // | `/2` SS, any source, any mode | an `InterpretOne` call-out on its OWN census row |
+            // | `/1` CS, `/6`, `/7` | refused |
+            //
+            // The call-out arms are the S3 policy widening's eighth row: the post-S2 loader census
+            // ranks `0x8E` at 1.27 M block-stopping hits, of which the memory form is 786 k.
+            //
+            // WHAT THE CALL-OUT ADMITS THAT THE LOWERING CANNOT. `LoadSegReal` emits
+            // `base = selector << 4` and nothing else, which is what a segment load IS in real
+            // mode and V86 and is nothing like what it is in protected mode: a GDT or LDT fetch
+            // with type, privilege and present checks, an accessed-bit write-back, and three
+            // fault vectors. The helper runs the interpreter's arm, so every one of those is the
+            // interpreter's, exactly.
+            //
+            // WHAT IT COSTS, as revised by S4f. R2 compares the segments the slots STRICTLY
+            // AFTER this one bake, plus CS and SS, and not all six records. So a load that moves
+            // a record NO LATER SLOT USES resumes, and one that moves a record a later slot bakes
+            // resyncs -- and the second still demotes after three of its first eight executions,
+            // back to the boundary it had before.
+            //
+            // The relaxation is the S4 census's answer to its own top remaining barrier class:
+            // 2.23 M `call_out_demoted` hits on this opcode, DS and ES far-pointer reloads whose
+            // new record nothing downstream reads. The re-establishing `mov ds, ax` a 16-bit C
+            // runtime emits resumed before it and still does; what S4f adds is the far-pointer
+            // shape. The mask lives on the slot's `InterpretOneCell` and is filled by a backward
+            // pass after the compile walk.
             //
             // `/1` (CS), `/6` and `/7` are refused HERE rather than left off the allowlist,
             // because they are not loads at all: the interpreter raises #GP(0) for each
-            // (`execute.rs`, the 0x8e arm). Lowering them would turn a fault into a silent write,
-            // and 0x8c is NOT the symmetric case to copy -- `MOV r16, CS` is legal where
-            // `MOV CS, r16` is not.
+            // (`execute.rs`, the 0x8e arm). Compiling a block around an instruction that can only
+            // fault burns a call-out and a governor execution on every execution, and 0x8c is NOT
+            // the symmetric case to copy -- `MOV r16, CS` is legal where `MOV CS, r16` is not.
             //
-            // `/2` (SS) is refused for a reason of its own: loading SS arms a one-instruction
-            // interrupt shadow (`load_segment_arming_ss_shadow`), which the interpreter consumes
-            // at the start of the NEXT instruction. A native block never passes through that
-            // point, so a block that continued after an SS load would hold the shadow open across
-            // every remaining slot -- a guest-visible change in where an interrupt is delivered.
-            // The census measures 1,303 SS hits against 17.8 million for DS.
+            // A CALL-OUT SLOT REPORTS NO SEGMENT WRITE, unlike the `LoadSegReal` lowering it
+            // replaces: `DirectKind::written_segment` answers `None` for it, so the block's
+            // `dirty_segments` mask does not learn that this instruction can move a record and the
+            // compile walk goes on admitting later slots that address through it. That is safe for
+            // exactly one reason, and it is worth stating because it is not local: R2 compares
+            // every record the LATER SLOTS bake, so a slot that moved one of those ends the run
+            // before any of them executes. A resumed block therefore baked nothing stale, and a
+            // block that would have baked something stale never resumed. The mask is built from
+            // `DirectKind::pinned_segments` over exactly those slots, which is the same accessor
+            // `SegmentLayout::capture` builds `used` from.
             //
-            // FS and GS are absent for census reasons alone and would be safe to add.
+            // What the walk gives up in exchange is the block's SUCCESSORS. A row that can write a
+            // segment feeds `segment_write_block`, so the block publishes neither a static nor a
+            // dynamic successor and cannot chain: a chained transfer skips `data_matches`, and the
+            // suffix mask says nothing about what a successor bakes.
+            //
+            // `/2` (SS) is a call-out too since S4 part 2, and a row of its OWN rather than a
+            // `/2` folded into `MovSreg`. What used to keep it out was R3's shadow clause: loading
+            // SS arms a one-instruction interrupt shadow (`load_segment_arming_ss_shadow`) and
+            // every row had to find that flag clear. The clause is now scoped per row
+            // (`InterpretOneRow::arms_interrupt_shadow`), the shadow is decided at the block
+            // boundary rather than inside the helper, and the row carries the pendency test that
+            // bounds what leaving it armed can cost.
+            //
+            // A SEPARATE ROW because the census question is different. `MovSreg` asks whether a
+            // guest re-establishes the same data segment; `MovSsReg` asks how often a guest
+            // switches STACKS at this instruction, which the loader answered as 484,385
+            // same-record against 488,498 record-moving across both SS arms. One label would
+            // average two unrelated populations.
+            //
+            // Every form and every mode, unlike `/0` and `/3`: those keep the real-mode
+            // `LoadSegReal` lowering for their register form and only become a call-out where the
+            // lowering cannot go. There is no SS lowering to keep.
             0x8e => {
                 let m = insn.modrm?;
                 let segment = match m.reg {
                     0 => SegmentIndex::Es,
+                    2 => {
+                        return Some(DirectKind::CallOut {
+                            helper: CallOutHelper::InterpretOne {
+                                row: InterpretOneRow::MovSsReg,
+                            },
+                        });
+                    }
                     3 => SegmentIndex::Ds,
+                    4 | 5 => {
+                        return Some(DirectKind::CallOut {
+                            helper: CallOutHelper::InterpretOne {
+                                row: InterpretOneRow::MovSreg,
+                            },
+                        });
+                    }
                     _ => return None,
                 };
                 let DecodedOperand::Reg(src) = insn.operand? else {
-                    return None;
+                    return Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::MovSreg,
+                        },
+                    });
                 };
                 return Some(DirectKind::LoadSegReal { segment, src });
             }
@@ -1286,6 +1699,10 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 return Some(DirectKind::Lea {
                     dst: m.reg,
                     addr: direct_addr(addr)?,
+                    // The OPERAND size, which is what the interpreter passes to
+                    // `write_gpr_sized`. The ADDRESS size is a different question and reaches the
+                    // emitter through the block's `address_wrap`.
+                    width: operand_width,
                 });
             }
             0xa0 => {
@@ -1581,6 +1998,39 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }
             0xf6 | 0xf7 => {
                 let m = insn.modrm?;
+                // GROUP 3 AT WORD, `/2../7`, as `InterpretOne` call-outs. The S3 policy widening's
+                // fourth row: NOT, NEG, MUL, IMUL, DIV and IDIV, both operand forms.
+                //
+                // FIRST in the arm, and that placement is the whole safety argument. Every
+                // lowering below carries NO width field and says so in its own comment: `NegReg`
+                // writes a full 32-bit destination, `MulReg` replaces EDX and EAX rather than
+                // merging DX and AX, `DivReg`/`DivMem` read four bytes. Each names the
+                // `OperandSize::Word` gate as the only thing keeping a 66-prefixed form away from
+                // it. That gate now admits `0xf7 /2../7`, so the guard has to move HERE, in front
+                // of them, or every one of those comments becomes a miscompile. The Dword forms
+                // fall past this and reach their emitters unchanged.
+                //
+                // `/2` NOT has no lowering at any width and is a call-out at Word only, which is
+                // where the census measures it. Widening it to Dword would be an unmeasured
+                // admission, which this file's header rules out; the Dword form stays the boundary
+                // it has always been.
+                //
+                // DIV and IDIV can raise #DE from inside the helper. That is the ordinary
+                // RESYNC-after-fault path and needs nothing new: `finish_instruction` rewinds onto
+                // the instruction, delivers the exception, counts and charges it, and the block
+                // reports the prefix only. It is the first admitted row whose fault arm fires on
+                // ORDINARY DATA rather than on a bad address, which is why it has a fixture of its
+                // own.
+                if opcode == 0xf7
+                    && insn.operand_size == OperandSize::Word
+                    && matches!(m.reg, 2..=7)
+                {
+                    return Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::Group3,
+                        },
+                    });
+                }
                 // NEG r/m32, register form. Deliberately carries NO width field: this arm sits
                 // below the OperandSize::Word gate at the top of `classify`, and that allowlist
                 // (which does not contain 0xf7) is the ONLY thing stopping a 586-mode `66 F7 /3`
@@ -1694,12 +2144,16 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     return None;
                 }
                 // `/0` TEST. `0xf6` is the byte form regardless of prefix; `0xf7` follows the
-                // operand size, and it is the only group-3 member the Word gate's sub-opcode
-                // escape lets through (see the gate) — `emit_test_preloaded` has carried a full
-                // Word lane (66-prefixed `test`, 0x100 descriptor tag) since the width field
-                // landed, with no caller until the wolf3d census ranked the register form at
-                // 634M block-stopping hits. The word MEMORY form stays refused: no fixture
-                // measures a row for it, and an unmeasured admission has no counter to gate it.
+                // operand size, and it is the group-3 member with a real Word LOWERING --
+                // `emit_test_preloaded` has carried a full Word lane (66-prefixed `test`, 0x100
+                // descriptor tag) since the width field landed, with no caller until the wolf3d
+                // census ranked the register form at 634M block-stopping hits.
+                //
+                // The word MEMORY form is an `InterpretOne` CALL-OUT as of the S3 policy widening,
+                // where it is the loader census's 242 k row. It is not a lowering, and the reason
+                // is an admission question rather than a capability one: the refusal it used to
+                // carry here said "no fixture measures a row for it", the census now does, and the
+                // call-out answers it without an emitter change at all.
                 let width = if opcode == 0xf6 {
                     MemoryWidth::Byte
                 } else {
@@ -1713,7 +2167,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     }),
                     DecodedOperand::Mem(addr) => {
                         if width == MemoryWidth::Word {
-                            return None;
+                            return Some(DirectKind::CallOut {
+                                helper: CallOutHelper::InterpretOne {
+                                    row: InterpretOneRow::Group3,
+                                },
+                            });
                         }
                         Some(DirectKind::TestImmMem {
                             imm: insn.imm,
@@ -1733,11 +2191,20 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     release: if opcode == 0xc2 { insn.imm as u16 } else { 0 },
                 });
             }
-            // INC/DEC r/m8, REGISTER form only. The byte sibling of the 0xff group below.
+            // INC/DEC r/m8. The REGISTER form is lowered; the MEMORY form is an `InterpretOne`
+            // call-out as of the S3 policy widening, where the post-S2 loader census ranks it at
+            // 484 k block-stopping hits.
             //
-            // The memory form is deliberately absent: `emit_rmw_inc_dec` handles Dword and Word
-            // and debug-asserts on the rest, and a Byte path needs its own code-watch width,
-            // counter lane and the fact that a byte access takes NO alignment guard at all.
+            // The memory form's old refusal named a real cost and the call-out pays none of it:
+            // `emit_rmw_inc_dec` handles Dword and Word and debug-asserts on the rest, and a Byte
+            // path would need its own code-watch width, its own counter lane and an answer for the
+            // fact that a byte access takes NO alignment guard at all. The helper runs the
+            // interpreter's arm instead, which has all three already.
+            //
+            // This is the row the deferred-code-write probe in `note_code_write_inner` was fixed
+            // for. A byte store reaches the invalidation choke on `changed` alone, without the
+            // `code_write_watched` pre-gate the sized path makes, so before that fix every
+            // execution of this row would have recorded a write, failed R5 and RESYNCed.
             //
             // `dst` here is a BYTE-REGISTER index, where 4..7 mean AH/CH/DH/BH rather than
             // ESP/EBP/ESI/EDI. The emitter's byte branch reads and writes through the lane
@@ -1754,7 +2221,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         is_dec: m.reg == 1,
                         width: MemoryWidth::Byte,
                     }),
-                    DecodedOperand::Mem(_) => None,
+                    DecodedOperand::Mem(_) => Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::IncDecRm8,
+                        },
+                    }),
                 };
             }
             0xff => {
@@ -1822,6 +2293,26 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     let DecodedOperand::Mem(addr) = insn.operand? else {
                         return None;
                     };
+                    // WORD is an `InterpretOne` call-out, the S3 policy widening's sixth row;
+                    // Dword keeps `PushMem`.
+                    //
+                    // The split is the stack, not the read. `PushMem` is a `uses_stack()` kind, so
+                    // the Word form already reached the compile loop's stack-width matrix, which
+                    // has no `PushMem16` cell and refuses it in BOTH stack widths -- a Word push
+                    // moves two bytes and decrements the pointer by two, and no emitter builds
+                    // that. Deciding it here rather than there is what keeps the matrix's arms
+                    // about emitters: a call-out is not a stack kind and never reaches it.
+                    //
+                    // The operand size and the STACK width are independent, and only the first is
+                    // in scope here. That is enough: the call-out is correct for either stack
+                    // width because the interpreter's own `push` reads SS.B for itself.
+                    if insn.operand_size != OperandSize::Dword {
+                        return Some(DirectKind::CallOut {
+                            helper: CallOutHelper::InterpretOne {
+                                row: InterpretOneRow::PushRm,
+                            },
+                        });
+                    }
                     return Some(DirectKind::PushMem {
                         addr: direct_addr(addr)?,
                     });
@@ -1849,6 +2340,25 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // rejected row), and the clock charge is not a guess -- `execute_extended.rs`
                 // group-5 arm 4 returns `clocks(7)` unconditionally, reading its target through
                 // `read_operand_sized`, which serves the register and memory operands alike.
+                // NOT ON THE `InterpretOne` ALLOWLIST, and the reason is structural rather than
+                // a matter of census weight. The S3 policy widening was asked to consider the
+                // Word memory form (510 k block-stopping hits on the post-S2 loader census, with
+                // a segment override) and REFUTED it.
+                //
+                // An `InterpretOne` slot resumes only when `ResumeSnapshot::allows_resume`'s R1
+                // holds, and R1 demands `cpu.registers.eip == slot_start + insn_len`. A JMP sets
+                // EIP to its TARGET. The two are equal only for a jump to the next instruction,
+                // so the slot resyncs on every real execution, and the governor demotes it after
+                // three of the first eight -- back to the boundary it replaced, having paid a
+                // spill, a call, a run, a reload and a side exit three times over to get there.
+                //
+                // The compile walk makes the same point from the other side. `DirectKind::JmpMem`
+                // is `is_terminal()` and a `CallOut` is not, so admitting the row would let the
+                // walk keep appending slots AFTER the jump: slots the resync guarantees can never
+                // retire, carried in the block's static accounting and its budget bound.
+                //
+                // A native `JmpMem16` is the shape that would serve this row, and it is an S4
+                // question about an emitter rather than an S3 question about policy.
                 if m.reg == 4 {
                     if insn.operand_size != OperandSize::Dword {
                         return None;

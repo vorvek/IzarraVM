@@ -185,7 +185,7 @@ fn barrier_census_closure_dormant_heat_site_reports_a_matched_imm_lane() {
     );
 
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY, None);
     let snapshot = cpu
         .direct_barrier_census_snapshot()
         .expect("enabled census snapshot");

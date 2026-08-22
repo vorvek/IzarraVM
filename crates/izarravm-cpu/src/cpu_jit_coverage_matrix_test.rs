@@ -127,7 +127,7 @@ fn probe_compile(candidate: &[u8]) -> (CellOutcome, u8) {
                 }
             }
             jit::direct::CompileOutcome::StructuralReject(_) => (CellOutcome::Structural, 0),
-            jit::direct::CompileOutcome::Retry => (CellOutcome::Retry, 0),
+            jit::direct::CompileOutcome::Retry(_) => (CellOutcome::Retry, 0),
         }
     }));
     probed.unwrap_or((CellOutcome::Panicked, 0))

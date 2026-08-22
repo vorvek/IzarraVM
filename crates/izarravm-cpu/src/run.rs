@@ -637,12 +637,32 @@ impl CpuGsw {
     ) -> Result<BudgetedRunOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
+        // The call-out window is opened and closed inside one helper call, which is itself inside
+        // one native entry, so it can never be open at the top of a run. Asserted here as well as
+        // at the native return because this is the OTHER door into guest execution: a window left
+        // open would make every code write from here on silently deferred and never drained.
+        #[cfg(feature = "jit")]
+        debug_assert!(
+            !self.deferred_code_writes.is_open(),
+            "a call-out window was open at a dispatcher entry"
+        );
         // Run-scoped latch, cleared on every entry so it can never carry across a batch. It used
         // to be a local here; it moved onto `direct_runtime` so the whole admission decision is one
         // call, and this clear is what keeps that move behaviour-preserving.
         #[cfg(feature = "jit")]
         {
             self.direct_runtime.skip_direct_once = false;
+            // Same reason, same scope: an arming call-out's latch belongs to the entry that set
+            // it, and `run_direct_block` takes it at the boundary. This clear is the backstop for
+            // the test seams that call that function directly. It lives on the block cache rather
+            // than here beside `skip_direct_once`, because this struct sits ahead of the CPU
+            // offsets emitted code bakes.
+            //
+            // BOTH latches, since review finding F5. The consumed flag is read once per iteration
+            // below and taken there, but a run that ends between the set and the take would
+            // otherwise hand the next run a transition that happened inside the previous one.
+            self.jit_direct.take_interrupt_shadow_armed();
+            self.jit_direct.take_interrupt_shadow_consumed();
         }
         #[cfg(feature = "jit")]
         let native_continuations_active = {
@@ -703,7 +723,11 @@ impl CpuGsw {
         #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
         let mut seam_declines: u64 = 0;
         loop {
-            let can_take_before = self.can_take_interrupt();
+            // `mut` for one reason: a native block that consumed an STI's interrupt shadow
+            // inside itself turns this answer false after the fact. See the fold below the
+            // dispatch.
+            #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
+            let mut can_take_before = self.can_take_interrupt();
             let outcome = if first {
                 first = false;
                 self.cycle_no_interrupt_check_with_budget(bus, Some(rep_budget))?
@@ -836,6 +860,30 @@ impl CpuGsw {
                     }
                 }
             };
+            // The exit-path re-check design section 10 asks for. An arming call-out that resumed
+            // left the shadow for `run_direct_block` to clear at the boundary, so as far as the
+            // interrupt-transition test below is concerned this iteration IS the shadowed
+            // instruction: the state it must compare against is the one BEFORE the arming row
+            // ran, where no interrupt could be taken. Without this the block's own entry state
+            // would be used and a transition the interpreter breaks on would be missed.
+            //
+            // THIS FIRES ON EVERY BLOCK THAT RESUMES PAST AN ARMING ROW, and the comment that
+            // used to stand here said the opposite (review finding F3). `can_take_interrupt`
+            // never consults the bus, so the break below is about the TRANSITION and not about
+            // pendency: interpreted, the instruction after the arming one consumes the shadow and
+            // ends the run there; natively, this fold is the only thing that reproduces it. The
+            // counter it moves, `perf.brk_interrupt`, is therefore PRESERVED across the slice
+            // rather than lowered by it, which corrects design section 10.1 M6.
+            //
+            // It also bounds the one hazard the row's own pendency rule does not cover. That rule
+            // is a premise about PORTS -- devices advance after the batch and no admitted row
+            // writes one -- and an `InterpretOne` row whose operand read lands on an MMIO aperture
+            // is outside it. Such a read could make an interrupt pending inside the block; this
+            // re-check is what still ends the run at the transition when it does.
+            #[cfg(feature = "jit")]
+            if self.jit_direct.take_interrupt_shadow_consumed() {
+                can_take_before = false;
+            }
             total += u64::from(outcome.core_clocks);
             // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
             // machine can service an event or interrupt before any further iteration.
@@ -1406,11 +1454,29 @@ impl CpuGsw {
                 if lift == jit::direct::DormantLift::StillDormant
                     && !self.jit_direct.direct.cache_disabled()
                 {
-                    // Advance FIRST: an advance that wraps sweeps the whole pack array, and a
-                    // sweep after the store would erase the memo this decline just earned.
-                    let _ = self.advance_decline_memo_era();
-                    let live = self.decline_memo_comparand();
-                    self.decode_cache.set_decline_memo_at(screen.slot, live);
+                    // S4 part 2: the RETRY lift, which is the other reason a Dormant key can come
+                    // back. The heat lift above answers "the stamp aged out"; this one answers
+                    // "the compile walk failed on state that has had time to change", counts its
+                    // own visits, and only offers the deal to a cause a re-walk could ever
+                    // decide differently.
+                    //
+                    // The memo is the reason it is HERE and not on some cheaper path. This site
+                    // is the only place a parked key is observed, and the memo throttles it to
+                    // about one visit per era, so the visit count is what it is. More important,
+                    // the memo would UNDO the lift: it short-circuits before the probe, so a key
+                    // re-admitted with a live memo at its slot would never be looked at again.
+                    // Clearing that byte (0 is the reserved "no memo" value) is the whole of the
+                    // handshake, and it is cheaper and tighter than advancing the era, which
+                    // would invalidate every other slot's memo to serve this one key.
+                    if self.jit_direct.direct.lift_clearable_retry_dormant(key) {
+                        self.decode_cache.set_decline_memo_at(screen.slot, 0);
+                    } else {
+                        // Advance FIRST: an advance that wraps sweeps the whole pack array, and a
+                        // sweep after the store would erase the memo this decline just earned.
+                        let _ = self.advance_decline_memo_era();
+                        let live = self.decline_memo_comparand();
+                        self.decode_cache.set_decline_memo_at(screen.slot, live);
+                    }
                 }
                 return Ok(DirectContinuation::Interpret);
             }
@@ -1461,9 +1527,12 @@ impl CpuGsw {
                         self.sweep_block_watch_edges();
                         return Ok(DirectContinuation::Interpret);
                     }
-                    jit::direct::CompileOutcome::Retry => {
-                        self.jit_direct
-                            .dormant(key, jit::direct::DormantReason::CompileRetry);
+                    jit::direct::CompileOutcome::Retry(cause) => {
+                        self.jit_direct.dormant(
+                            key,
+                            jit::direct::DormantReason::CompileRetry,
+                            Some(cause),
+                        );
                         return Ok(DirectContinuation::Interpret);
                     }
                 };
@@ -1484,7 +1553,7 @@ impl CpuGsw {
                 });
                 if !code_page_covers_block {
                     self.jit_direct
-                        .dormant(key, jit::direct::DormantReason::PageCoverFailed);
+                        .dormant(key, jit::direct::DormantReason::PageCoverFailed, None);
                     return Ok(DirectContinuation::Interpret);
                 }
                 // G1 pre-install gate (full span): the compiled block may cover chunks past its
@@ -1516,7 +1585,7 @@ impl CpuGsw {
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {
                     self.jit_direct
-                        .dormant(key, jit::direct::DormantReason::InstallFailed);
+                        .dormant(key, jit::direct::DormantReason::InstallFailed, None);
                     return Ok(DirectContinuation::Interpret);
                 };
                 // E2 sweep before this or any block runs (watched-page-bit design D4): the
@@ -1776,6 +1845,20 @@ impl CpuGsw {
             // term for every slot count. Same reachable set as that term: no TSS probe, because
             // the helper refuses the privilege state that would reach one.
             .saturating_add(bus.jit_io_cost_clocks(BusWidth::Byte));
+        // The INTERPRET-ONE class's traffic, added once for the whole block exactly as the memory
+        // class's term below is, and dominating `compute_iteration_upper`'s matching term by the
+        // same construction: `interpret_one_slots <= MAX_BLOCK_CALLOUT_SLOTS`, and `max_store` is
+        // the maximum over every width and both the RAM and Mode 13h dials, so it is at least the
+        // `dword_data_upper` that term uses. `INTERPRET_ONE_MAX_DATA_ACCESSES` per slot, the same
+        // shape and the same constant, so the two bounds cannot drift apart when the allowlist
+        // grows a row with wider traffic.
+        let callout_interpret_one_bus = if has_x87 {
+            0
+        } else {
+            u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
+                .saturating_mul(INTERPRET_ONE_MAX_DATA_ACCESSES)
+                .saturating_mul(max_store)
+        };
         // The MEMORY class's traffic, added ONCE for the whole block rather than folded into the
         // per-instruction term, and the difference is not cosmetic.
         //
@@ -1820,7 +1903,8 @@ impl CpuGsw {
         };
         let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
             .saturating_mul(per_instruction_bus)
-            .saturating_add(callout_memory_bus);
+            .saturating_add(callout_memory_bus)
+            .saturating_add(callout_interpret_one_bus);
         let own_class = max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
         if has_x87 {
             return own_class;
@@ -1880,11 +1964,21 @@ impl CpuGsw {
         //
         // Keep this in step with `classify`'s call-out admission: a new helper needs a class here,
         // and one whose charge is not a constant needs its maximum.
+        //
+        // The THIRD class, `InterpretOne`, is the one that is a WORST CASE rather than the only
+        // case. Its slot runs whatever row `classify` admitted, so it is priced at
+        // `INTERPRET_ONE_MAX_CORE_CLOCKS`: the maximum, over that allowlist, of the interpreter's
+        // own charge. Widening the allowlist means widening the constant, which is why the
+        // constant is derived beside the per-opcode ones rather than written here.
         let callout_core_upper = u64::from(block.callout_port_slots())
             .saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS))
             .saturating_add(
                 u64::from(block.callout_memory_slots())
                     .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),
+            )
+            .saturating_add(
+                u64::from(block.callout_interpret_one_slots())
+                    .saturating_mul(u64::from(INTERPRET_ONE_MAX_CORE_CLOCKS)),
             );
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
@@ -1966,11 +2060,44 @@ impl CpuGsw {
         // `jit_data_cost_clocks(Dword)` alone so a Mode13h dial that exceeds the RAM dial cannot
         // make this an under-estimate; the aperture itself is refused by the pre-check, so the
         // `max` is slack rather than reachable traffic.
+        //
+        // INTERPRET-ONE: `INTERPRET_ONE_MAX_DATA_ACCESSES` worst-width accesses per slot, and that
+        // constant is derived row by row beside the allowlist rather than restated here. It was
+        // TWO while every admitted row was a one-operand memory form -- one implicit stack access
+        // plus one explicit operand access, which is what POP r/m does -- and the S3 policy
+        // widening raised it to FOUR when `0x8E` joined: a protected-mode segment load reads two
+        // descriptor dwords out of the GDT or LDT and writes an accessed bit back, on top of its
+        // own operand read. A row that wants five widens the constant, and both bounds follow.
+        //
+        // No FETCH term, and that one is a proof: the helper returns ABNORMAL unless the decode
+        // line is already resident, so nothing on its path decodes, and it charges the slot's
+        // instruction fetch only on the fault arm, where the block reports the prefix and
+        // `fetch_upper` above has already priced one more instruction than it reports.
+        //
+        // No PAGE-WALK term, and that one is NOT a proof, it is ACCEPTED OVERSHOOT. The step's own
+        // stack read and operand write go through the interpreter's ordinary memory path, which
+        // walks the page table on a TLB miss, and each walk is bus traffic this bound does not
+        // contain. It is bounded (two accesses, so at most two walks per slot) and it is the same
+        // class of overshoot the owner's ruling of 2026-07-30 accepted for the chain quota, quoted
+        // at the chain-pricing note in `run_direct_block`: sub-perceptual timing exactness is not
+        // worth pricing every worst case, real parts of one stepping vary between packages, and
+        // `brk_cap` plus the scaled-bus term still end the run one block late rather than many
+        // times early. Pricing it would inflate every InterpretOne block's bound by two full page
+        // walks for traffic a warm TLB never generates.
+        //
+        // What this must NOT become is a silent claim. The earlier revision of this comment said
+        // the path could not walk at all, which was false, and a false proof in a budget bound is
+        // worse than a stated overshoot.
         let callout_bus_upper = u64::from(block.callout_port_slots())
             .saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte))
             .saturating_add(
                 u64::from(block.callout_memory_slots())
                     .saturating_mul(u64::from(jit::direct::CALL_OUT_STACK_FRAME_DWORDS))
+                    .saturating_mul(dword_data_upper),
+            )
+            .saturating_add(
+                u64::from(block.callout_interpret_one_slots())
+                    .saturating_mul(INTERPRET_ONE_MAX_DATA_ACCESSES)
                     .saturating_mul(dword_data_upper),
             );
         let raw_bus_upper = fetch_upper
@@ -2029,11 +2156,17 @@ impl CpuGsw {
         // class totals fall short of `jit_direct_unresolved_static_unbound` by an unknown amount,
         // and the whole point of the table is that it closes on that counter — see
         // `unbound_target_classes_are_exhaustive` (jit/direct_test.rs).
-        let (kind, linear) = match jit::direct::key_for(self, lin, d) {
-            Some(key) => (self.jit_direct.classify_unbound_target(key), key.linear()),
-            None => (jit::direct::UnboundTarget::NoKey, 0),
+        let (kind, linear, key) = match jit::direct::key_for(self, lin, d) {
+            Some(key) => (
+                self.jit_direct.classify_unbound_target(key),
+                key.linear(),
+                Some(key),
+            ),
+            None => (jit::direct::UnboundTarget::NoKey, 0, None),
         };
-        self.jit_direct.note_unbound_target(kind, linear);
+        // The KEY as well as the class since S4 part 2: a `DormantOther` target carries the
+        // `RetryCause` it was parked with, and the census splits the class by it.
+        self.jit_direct.note_unbound_target(kind, linear, key);
     }
 
     /// The dynamic-successor counterpart of `classify_unbound_exit`. Same recovery of the key
@@ -2450,6 +2583,12 @@ impl CpuGsw {
         // without returning here, so an entry block with no call-out can reach a chained block
         // that has one. The entry block's own slot count says nothing about the chain.
         self.native_callout = jit::direct::CallOutTable::publish(bus);
+        // R3's entry-shadow clause reads THIS, not the live flag (review finding F2). Published
+        // once per entry and cleared after the return, so a shadow an arming slot leaves behind
+        // mid-block does not refuse every call-out sitting behind it. The refusal above means it
+        // is always false in production; the clause exists so that it does not have to be.
+        self.jit_direct
+            .set_block_entry_interrupt_shadow(self.interrupt_shadow);
         unsafe {
             entry(
                 self as *mut CpuGsw,
@@ -2458,6 +2597,7 @@ impl CpuGsw {
                 &mut exit as *mut jit::direct::NativeExit,
             );
         }
+        self.jit_direct.set_block_entry_interrupt_shadow(false);
         self.native_callout = jit::direct::CallOutTable::default();
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
         debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
@@ -2504,6 +2644,42 @@ impl CpuGsw {
             self.wrap_16bit_sequential_run_off();
         }
         let final_eip = self.registers.eip;
+        // The STI call-out's boundary decision (design section 10.1, B1). The helper armed
+        // nothing and cleared nothing: it latched the EIP its slot left behind, and the question
+        // here is whether the block went on past it.
+        //
+        // `final_eip != armed_at` means at least one instruction retired after the STI, so the
+        // one-instruction shadow was consumed INSIDE the block and the flag must not survive the
+        // boundary. Equal means nothing retired after it -- the STI was the block's last slot, or
+        // the slot behind it side-exited before retiring -- and the flag stays armed for the
+        // interpreter to consume on the next instruction, which is what hardware does and what
+        // keeps `sti; hlt` from taking its interrupt one instruction early.
+        //
+        // The comparison is on EIP rather than on a completed-instruction index, and the reason is
+        // chaining: `exit.instructions` counts the whole chain from its head, while a slot index
+        // is relative to the block that holds the slot, so comparing the two is only correct when
+        // the STI is in the head block. EIP is the one quantity both ends agree on. It has one
+        // ambiguous shape -- a loop whose body starts immediately after the STI can exit with EIP
+        // back at `armed_at` having run the body -- and that shape resolves to LEAVING THE FLAG
+        // ARMED, which costs at most one instruction of extra interrupt latency and one refused
+        // native entry. The opposite error would deliver early, which is the thing B1 bars.
+        if let Some((armed_at, arms)) = self.jit_direct.take_interrupt_shadow_armed()
+            && self.interrupt_shadow
+        {
+            // The latch must be the LAST arming slot's, or the comparison below is against the
+            // wrong address and can clear a shadow a later slot armed. The helper writes it on
+            // every path an arming row can leave by, so the counts always agree; they did not
+            // before review finding F1, and this is what says so.
+            debug_assert_eq!(
+                arms,
+                self.jit_direct.interrupt_shadow_arms(),
+                "the boundary is comparing against a stale arming latch"
+            );
+            if final_eip != armed_at {
+                self.interrupt_shadow = false;
+                self.jit_direct.note_interrupt_shadow_consumed();
+            }
+        }
         let cs_base = self.registers.cs().base;
         if exit.dynamic_link_cell != 0 {
             debug_assert_eq!(exit.dynamic_target_eip, final_eip);
@@ -2604,6 +2780,25 @@ impl CpuGsw {
             debug_assert_eq!(traced_instructions, instructions);
         }
         self.registers.eip = final_eip;
+
+        // THE DEFERRED CODE WRITES (design review B2). An `InterpretOne` slot may have STORED, and
+        // while it ran `note_code_write_inner` recorded instead of invalidating, because
+        // invalidating would have retired the block whose native frame the helper still had to
+        // return through. This is where the invalidation actually happens, with the window shut
+        // and no native code live.
+        //
+        // NOT immediately after the native return, which is what the plan asked for, and the
+        // reason is the loop directly above: on a bus whose fetches are not uniform, the block
+        // trace names every block this entry ran and `block_for_trace` EXPECTS each one to still
+        // be live. Draining first retires exactly the block a self-modifying store hit, which is
+        // the block the trace is most likely to name. Nothing between the return and here can run
+        // guest code or enter native code -- it is fetch and clock accounting -- so the guest
+        // cannot observe the stale window, which is the property the placement has to preserve.
+        self.drain_deferred_code_writes();
+        debug_assert!(
+            !self.deferred_code_writes.is_open(),
+            "a call-out window outlived the native entry that opened it"
+        );
 
         debug_assert!(mode13_byte_reads <= byte_reads);
         debug_assert!(mode13_word_reads <= word_reads);
@@ -2768,6 +2963,11 @@ impl CpuGsw {
         self.perf.jit_native_store_hits += writes;
         self.perf.data_direct_writes += writes;
         self.perf.direct_data_pointer_writes += writes;
+        // TEST-ONLY, and compiled out entirely otherwise: production distinguishes exit reasons
+        // through the per-reason counters below, which is why there is no non-test reader.
+        #[cfg(test)]
+        self.jit_direct
+            .note_last_side_exit_for_test(side_exit.then_some(exit.side_exit_reason));
         if side_exit {
             self.perf.jit_direct_side_exits += 1;
             match exit.side_exit_reason {
@@ -2798,6 +2998,15 @@ impl CpuGsw {
                 reason if reason == jit::direct::SideExitReason::CallOutAbnormal as u32 => {
                     self.jit_direct.note_side_exit_callout_abnormal();
                 }
+                // The two RESYNC exits are counted by the HELPER, not here, and the asymmetry is
+                // deliberate. `note_interpret_one_resync` and `_resync_fault` fire beside the
+                // predicate that decided them, where the reason is known; `NativeExit` carries no
+                // block id, so counting them here would only re-derive what the helper already
+                // knows. This arm exists so they do not fall into `jit_direct_exit_other`, which
+                // is where the campaign has lost a mechanism's visibility before.
+                reason
+                    if reason == jit::direct::SideExitReason::CallOutResync as u32
+                        || reason == jit::direct::SideExitReason::CallOutResyncFault as u32 => {}
                 _ => self.perf.jit_direct_exit_other += 1,
             }
         }
@@ -2808,6 +3017,48 @@ impl CpuGsw {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
             halted: false,
         };
+        // The governor demoted a slot in a block this entry ran. Retiring that block's key makes
+        // the recompile consult the demoted-site map and end its block BEFORE the slot. Left
+        // un-retired, the block keeps a slot whose only behaviour is
+        // `test byte [cell], 0x80; jnz abnormal` -- a dispatcher round trip per execution to reach
+        // a boundary the walk can reach for free, plus the slots after it that the exit guarantees
+        // are unreachable.
+        //
+        // The key comes off the CELL and is not `span.key`: a chained entry runs successor blocks,
+        // and the demoted slot may be in one of those. See
+        // `BlockCache::callout_retire_pending`.
+        //
+        // TAKEN HERE, above the `callout_error` return, and ACTED ON above it too. That return
+        // leaves this function, and a latch left set on it is read by the NEXT entry -- which
+        // would retire a block on a demotion that happened inside a different one.
+        let retire = self.jit_direct.take_callout_retire_pending();
+        // ACTED ON BEFORE the error return, and the ordering is the point rather than a detail.
+        // `retire_key_for_recompile` frees the block's metadata slot, so it has to come after
+        // every counter and every charge -- but the error return is not one of those, it is a way
+        // OUT. With the retire below it, a stopping error swallowed the demotion for good: the
+        // machine stops, the GUI resumes it, and the block comes back with the demoted slot still
+        // in place, paying `test byte [cell], 0x80; jnz abnormal` and a dispatcher round trip on
+        // every execution for the rest of the run, with no second demotion ever to re-latch it
+        // (`note_execution` latches once per cell).
+        //
+        // The path is reachable rather than theoretical: `finish_instruction`'s `InternalFault::Cpu`
+        // arm turns a machine-stopping condition into exactly this parked error, and it can fire
+        // from the delivery a demoted slot's own fault took.
+        //
+        // Safe in this order because the retire reads NOTHING from `block`: it takes the key off
+        // the cell the latch carried, and the error return below reads nothing from the cache.
+        if let Some(key) = retire {
+            self.jit_direct.retire_key_for_recompile(key);
+        }
+        // A machine-stopping error an `InterpretOne` slot's fault delivery produced. The helper
+        // returns an `i64` and cannot carry one, so it parks it and this is the boundary that
+        // propagates it -- the same boundary `run_budgeted_inner` would have propagated it from
+        // had the instruction run interpreted. Taken LAST, after every counter, every charge and
+        // the demotion retire, so a stopping run accounts for the work it actually did and leaves
+        // behind the same block cache a non-stopping one would have.
+        if let Some(error) = self.direct_runtime.callout_error.take() {
+            return Err(error);
+        }
         if side_exit {
             Ok(DirectBlockOutcome::Prefix(outcome))
         } else {

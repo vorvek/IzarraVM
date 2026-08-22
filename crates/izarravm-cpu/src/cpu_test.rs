@@ -59,8 +59,12 @@ fn cpu_registers_field_offset_is_stable() {
     // emitter re-reads the offset, so updating this number is a documentation change, not a code
     // fix. The decode-line first-touch slice adds the packed side array's `Box` to `DecodeCache`,
     // which sits ahead of `registers`, moving this pin from 464 to 480 -- measured, not derived.
+    // The S2 `InterpretOne` call-out adds the deferred code-write list (16 entries of a `u32`, a
+    // `u32` and a `bool`, plus a count and an overflow bit) and the window flag to `CpuGsw`,
+    // moving this pin from 480 to 520 -- measured, not derived. The list is sized for one
+    // instruction's stores plus a whole exception delivery's; see `MAX_DEFERRED_CODE_WRITES`.
     assert_eq!(
-        off, 480,
+        off, 520,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -1886,7 +1890,12 @@ fn pending_flags_offset() {
     // in PerfCounters rather than at the CpuGsw tail because the phase-mark series carries
     // `PerfCounters` by value and this counter's whole purpose is to appear per-interval beside
     // jit_direct_arena_compactions, which is where compaction wall is read.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4488);
+    // The S2 `InterpretOne` call-out adds `CallOutTable::interpret_one` (8 bytes), the call-out
+    // window flag and the deferred code-write list to `CpuGsw`, moving this pin 4488 -> 4536 --
+    // measured off a failing-test readout, not derived. None of it is guest state: the flag and
+    // the list are host-side window bookkeeping with an always-equal `PartialEq`, exactly like
+    // `native_callout` beside them.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4536);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

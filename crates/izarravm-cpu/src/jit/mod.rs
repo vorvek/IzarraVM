@@ -226,6 +226,10 @@ pub(crate) struct JitState {
     pub(crate) pending_watch_edges: Vec<u32>,
     #[cfg(feature = "direct-callout-attribution")]
     pub(crate) direct_callout_attribution: Option<Box<direct::CallOutAttribution>>,
+    /// The last native entry's `SideExitReason`, or `None` when the block completed. TEST-ONLY;
+    /// see `note_last_side_exit_for_test` for why it lives here and not on `CpuGsw`.
+    #[cfg(test)]
+    last_side_exit_reason: Option<u32>,
 }
 
 /// Seed for `JitState::one_lookup_store`, read once per process from
@@ -285,6 +289,8 @@ impl JitState {
             pending_watch_edges: Vec::new(),
             #[cfg(feature = "direct-callout-attribution")]
             direct_callout_attribution: direct::direct_callout_attribution_default(),
+            #[cfg(test)]
+            last_side_exit_reason: None,
         }
     }
 }
@@ -329,6 +335,8 @@ impl Clone for JitState {
             pending_watch_edges: Vec::new(),
             #[cfg(feature = "direct-callout-attribution")]
             direct_callout_attribution: None,
+            #[cfg(test)]
+            last_side_exit_reason: None,
         }
     }
 }
@@ -360,6 +368,16 @@ impl JitState {
             .reject(&mut self.code_watch, &mut self.pending_watch_edges, span);
     }
 
+    #[cfg(test)]
+    pub(crate) fn demoted_callout_site_count_for_test(&self) -> usize {
+        self.direct.demoted_callout_sites_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_demoted_callout_sites_for_test(&mut self) {
+        self.direct.fill_demoted_callout_sites_for_test();
+    }
+
     pub(crate) fn retire_key_for_recompile(&mut self, key: direct::BlockKey) -> bool {
         self.direct
             .retire_key_for_recompile(&mut self.code_watch, key)
@@ -372,6 +390,23 @@ impl JitState {
 
     pub(crate) fn clear(&mut self) {
         self.direct.clear(&mut self.code_watch);
+    }
+
+    /// The `SideExitReason` of the last native entry, or `None` when the block completed.
+    ///
+    /// TEST-ONLY and stored on `JitState` rather than on `CpuGsw` deliberately: `JitState` is
+    /// boxed, so a `cfg(test)` field here cannot move `CpuGsw`'s layout and cannot falsify the
+    /// `pending_flags` and `registers` offset pins, which are themselves tests. Production reads
+    /// the reason through the per-reason counters instead, which is why there is no non-test
+    /// accessor.
+    #[cfg(test)]
+    pub(crate) fn note_last_side_exit_for_test(&mut self, reason: Option<u32>) {
+        self.last_side_exit_reason = reason;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_side_exit_reason_for_test(&self) -> Option<u32> {
+        self.last_side_exit_reason
     }
 
     pub(crate) fn invalidate_physical_range(

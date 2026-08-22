@@ -228,7 +228,7 @@ fn lanes_registered_for_warm(middle: &[u8], instructions: u8, warm: &[u32]) -> u
     let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
     let compilation = match outcome {
         jit::direct::CompileOutcome::Compiled(c) => c,
-        jit::direct::CompileOutcome::Retry => {
+        jit::direct::CompileOutcome::Retry(_) => {
             panic!("fixture block did not compile: {middle:02x?} -> Retry")
         }
         jit::direct::CompileOutcome::StructuralReject(r) => {
@@ -764,7 +764,7 @@ fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
     jit::direct::set_imm8_lanes_for_test(None);
     match outcome {
         jit::direct::CompileOutcome::Compiled(c) => c.code.len(),
-        jit::direct::CompileOutcome::Retry => panic!("fixture block did not compile: Retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("fixture block did not compile: Retry"),
         jit::direct::CompileOutcome::StructuralReject(r) => {
             panic!("fixture block did not compile: reject {r:?}")
         }

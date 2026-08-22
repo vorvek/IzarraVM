@@ -1,15 +1,22 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Cold, opt-in attribution for the three interpreter call-out helpers.
+//! Cold, opt-in attribution for the interpreter call-out helpers.
+//!
+//! FOUR of them since S2, and this file did not learn about the fourth until the S4 review round:
+//! `CallOutHelper::InterpretOne` was added with the generic call-out and every `match` here kept
+//! its three arms, so `cargo build --all-features` had not compiled since. The four-arm shape is
+//! restored below and `--all-features` is a build gate from now on -- a feature nobody builds is a
+//! feature that rots, and this one is the attribution instrument the call-out campaign reaches for
+//! whenever a helper's outcome mix is in question.
 
-use super::CallOutHelper;
+use super::{CallOutHelper, InterpretOneRow};
 use crate::{
     DirectCallOutAttributionHelperRow, DirectCallOutAttributionPortRow,
     DirectCallOutAttributionSnapshot, DirectCallOutOutcomeCounts, DirectStallSnapshot,
 };
 
-const HELPER_COUNT: usize = 3;
+const HELPER_COUNT: usize = 4;
 const PORT_COUNT: usize = 1 << 16;
 
 #[derive(Clone, Copy)]
@@ -25,6 +32,12 @@ impl CallOutHelper {
             Self::PortReadAlDx => 0,
             Self::PushAllDword => 1,
             Self::PopAllDword => 2,
+            // ONE index for the whole `InterpretOne` family, not one per row. This instrument is
+            // about the HELPERS -- which of them is being called and how its calls end -- and the
+            // per-row split already exists as `callout_interpret_one_rows`, which is ungated and
+            // carries executed, resync, resync_fault and demoted. A second row axis here would be
+            // the same census under a feature flag.
+            Self::InterpretOne { .. } => 3,
         }
     }
 
@@ -33,6 +46,7 @@ impl CallOutHelper {
             Self::PortReadAlDx => "in_al_dx",
             Self::PushAllDword => "pushad",
             Self::PopAllDword => "popad",
+            Self::InterpretOne { .. } => "interpret_one",
         }
     }
 }
@@ -111,7 +125,12 @@ impl CallOutAttribution {
                 self.ports[usize::from(port.expect("IN AL,DX attribution needs its port"))]
                     .note(outcome);
             }
-            CallOutHelper::PushAllDword | CallOutHelper::PopAllDword => {
+            // `InterpretOne` joins the no-port arm rather than getting one of its own: it reaches
+            // no port at all, which is exactly what the existing assertion says. The one call-out
+            // that touches a port is `0xEC`, and it is the arm above.
+            CallOutHelper::PushAllDword
+            | CallOutHelper::PopAllDword
+            | CallOutHelper::InterpretOne { .. } => {
                 debug_assert!(port.is_none(), "memory helper attribution carried a port");
             }
         }
@@ -124,6 +143,12 @@ impl CallOutAttribution {
             CallOutHelper::PortReadAlDx,
             CallOutHelper::PushAllDword,
             CallOutHelper::PopAllDword,
+            // The row carried here is arbitrary and unused: `attribution_index` and
+            // `attribution_label` both match `InterpretOne { .. }` without reading it, because
+            // this axis is the helper and not the row. `PopRm` is the family's first member.
+            CallOutHelper::InterpretOne {
+                row: InterpretOneRow::PopRm,
+            },
         ];
         let helpers = helper_kinds
             .into_iter()

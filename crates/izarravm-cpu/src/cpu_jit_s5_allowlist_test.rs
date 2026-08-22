@@ -135,6 +135,23 @@ fn word_size_dword_siblings_stay_refused() {
     // `word_size_0x81_register_forms_are_lowered` and
     // `word_size_group3_test_forms_follow_the_slice` below.
     //
+    // `0xf7 /2`, `/3`, `/4` and `/6` left it with the S3 policy widening, and NOT because they
+    // grew a width field the way `0x8d` did: they have none, and lowering any of them at Word
+    // would still be the miscompile this table's header describes. What changed is that the
+    // classifier now intercepts the Word forms IN FRONT of those lowerings and routes them to an
+    // `InterpretOne` call-out, so the block carries the instruction without an emitter. Their
+    // admission is pinned by `group3_word_subops_join_as_call_outs_not_lowerings`
+    // (cpu_jit_test_imm_test.rs), which asserts the SLOT CLASS and not just the block length, and
+    // the flip is asserted at the end of this test so leaving the table is not a silent removal.
+    //
+    // `0x8d` left it with the S1 width lift, and for the reason this table's header gives rather
+    // than as an exception to it: the row was refused because `DirectKind::Lea` hard-coded a
+    // 32-bit destination write, and it grew a `width` field in the same commit that admitted it.
+    // The Tomb Raider loader census ranks the word row at 1,744,694 block-stopping hits. Its
+    // admission is pinned from the other side by `cpu_jit_width_lift_test.rs`
+    // (`lea16_writes_low_half_only` and `lea16_at_a_dword_address_size_keeps_the_high_half`), and
+    // the flip is asserted at the end of this test so leaving the table is not a silent removal.
+    //
     // The `bool` is `refused_on_the_v86_on_arm` and it names ONE gate: `IZARRAVM_V86_LOOP_ROWS`,
     // the arm the loop below sweeps. It was written when that was the only gate in play; two are
     // now, so the name is spelled out rather than left as "refused on the ON arm too", which at the
@@ -150,12 +167,7 @@ fn word_size_dword_siblings_stay_refused() {
         // Refused on both V86 arms, but only while TEST_WORD_ROWS is off — stated at the top of
         // this test and flipped at the bottom.
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0], true),
-        ("0x8d lea", &[0x66, 0x8d, 0x40, 0x10], true),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12], true),
-        ("0xf7 /2 not r/m", &[0x66, 0xf7, 0xd1], true),
-        ("0xf7 /3 neg r/m", &[0x66, 0xf7, 0xd9], true),
-        ("0xf7 /4 mul r/m", &[0x66, 0xf7, 0xe1], true),
-        ("0xf7 /6 div r/m", &[0x66, 0xf7, 0xf1], true),
     ];
 
     for arm in [false, true] {
@@ -204,6 +216,50 @@ fn word_size_dword_siblings_stay_refused() {
          register form"
     );
     jit::direct::set_test_word_rows_for_test(None);
+
+    // ...and the group-3 rows that left the table outright, asserted here so their removal above
+    // is a moved set rather than a deleted one. The slot-class assertion lives with them in
+    // `group3_word_subops_join_as_call_outs_not_lowerings`; what this one owes is the flip.
+    for (label, form) in [
+        ("0xf7 /2 not r/m", [0x66u8, 0xf7, 0xd1]),
+        ("0xf7 /3 neg r/m", [0x66, 0xf7, 0xd9]),
+        ("0xf7 /4 mul r/m", [0x66, 0xf7, 0xe1]),
+        ("0xf7 /6 div r/m", [0x66, 0xf7, 0xf1]),
+    ] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label} at Word must JOIN the block since the S3 policy widening"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, 1,
+            "{label} must join as a call-out, never through a dword lowering"
+        );
+    }
+
+    // ...and the row that left the table outright, asserted here so its removal above is a moved
+    // row rather than a deleted one. `0x8d` is ungated: it needs neither knob.
+    let mut code = vec![0x40, 0x41, 0x42];
+    code.extend_from_slice(&[0x66, 0x8d, 0x40, 0x10]);
+    let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "0x8d lea ax,[eax+0x10] must JOIN the block since the S1 width lift"
+    );
 }
 
 /// One row of the table above: three filler INCs, the form under test, and the block must stop at
@@ -331,10 +387,16 @@ fn word_size_0x81_carry_forms_stay_refused() {
     }
 }
 
-/// Group 3's `/0` at Word size: the REGISTER form is lowered through `TestImmReg`'s word lane,
-/// the MEMORY form stays refused (no measured row), and both halves are what the gate's
-/// sub-opcode escape promises. The wolf3d census ranked the register form at 634M
-/// block-stopping hits.
+/// Group 3's `/0` at Word size: the REGISTER form is lowered through `TestImmReg`'s word lane and
+/// the MEMORY form joins the block as an `InterpretOne` call-out. The wolf3d census ranked the
+/// register form at 634M block-stopping hits and the post-S2 loader census ranks the memory form
+/// at 242 k.
+///
+/// The memory half used to assert a REFUSAL, on the ground that no fixture measured a row for it.
+/// The loader census measures one, and the S3 policy widening answers it with the call-out rather
+/// than with an emitter, so the assertion moved from "the block ends here" to "the block carries
+/// it, and carries it as a call-out": lowering it through `TestImmMem` at Word would still be the
+/// bug the old refusal guarded against, and the slot-count check is what says it did not happen.
 #[test]
 fn word_size_group3_test_forms_follow_the_slice() {
     let register = [0x66u8, 0xf7, 0xc1, 0x34, 0x12];
@@ -369,25 +431,38 @@ fn word_size_group3_test_forms_follow_the_slice() {
     );
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(
-        compilation.span.instructions, 3,
-        "test word [mem], imm16: the memory form must stay refused"
+        compilation.span.instructions, 4,
+        "test word [mem], imm16: the memory form must join the block"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "test word [mem], imm16: it must join as a call-out, not through TestImmMem's word lane"
+    );
+    assert_eq!(
+        compilation.word_reads, 0,
+        "a call-out slot declares no static access"
     );
 }
 
-/// `PUSH DS` and `PUSH ES` at Word size, the read half of the segment family.
+/// `PUSH DS`, `PUSH ES`, `PUSH CS` and `PUSH SS` at Word size, the read half of the segment
+/// family.
 ///
 /// One word store and no reads: the selector is a compile-time constant baked from the block's
 /// `SegmentLayout`, so the only memory the slot touches is the stack. `PUSH CS` joined on
 /// 2026-08-08 (158M wolf3d census hits): `SegmentLayout::selector` reads the separate `cs`
 /// field and `cs_matches` pins CS for every block unconditionally, so keeping CS out of the
-/// `selector_segment` mask stays correct. `PUSH SS` is asserted refused in the table below: it
-/// belongs to the family the write half excludes over the interrupt shadow.
+/// `selector_segment` mask stays correct. `PUSH SS` MOVED HERE on 2026-08-22 from the refusal
+/// table below (747,415 tombraid loader census hits). The shadow argument that kept it out is
+/// about POP SS and MOV SS, which LOAD the stack segment; PUSH SS reads the selector and arms
+/// nothing. Unlike CS it takes the ordinary data path, so it has to be in `used`, and every push
+/// already puts it there through `write_segment`.
 #[test]
 fn word_size_push_segment_forms_are_lowered() {
     for (label, opcode) in [
         ("0x1e push ds", 0x1eu8),
         ("0x06 push es", 0x06),
         ("0x0e push cs", 0x0e),
+        ("0x16 push ss", 0x16),
     ] {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(&[0x66, opcode]);
@@ -432,10 +507,14 @@ fn word_size_push_segment_forms_are_lowered() {
 /// about the allowlist.
 /// `0x07` and `0x1f` moved on 2026-08-20: the V86 loop-A slice lowers POP ES and POP DS behind
 /// `IZARRAVM_V86_LOOP_ROWS`, so both are allowlist refusals on the OFF arm and lowerings on the ON
-/// one. `0x16` PUSH SS and `0x17` POP SS stay refused on BOTH arms, and that is the pairing this
-/// table exists to hold: the two segments this backend can load in real mode and V86 flip, and the
-/// stack segment does not, because loading SS arms a one-instruction interrupt shadow that a
-/// native block never passes through.
+/// one. `0x16` PUSH SS left this table on 2026-08-22 for the positive one above; it loads nothing
+/// and arms nothing, so the shadow argument never applied to it.
+///
+/// `0x17` POP SS left it on the same day for a different reason and is asserted from the other
+/// side just below: it is an `InterpretOne` call-out on BOTH arms, independent of this gate,
+/// because the interrupt shadow it arms is decided at the block boundary rather than refused at
+/// compile time. That pairing is what the table now holds: two rows that flip with the gate and
+/// one that does not depend on it at all.
 ///
 /// `flat_fixture` builds a REAL-mode CPU (`fresh()` with CS.D forced on), and the rows above force
 /// SS.B off, which is exactly the cell `PopSegReal` is admitted in: real mode, 16-bit stack, Word
@@ -445,10 +524,8 @@ fn word_size_push_segment_forms_are_lowered() {
 fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
     // The `bool` is "refused on the ON arm too".
     let cases: &[(&str, &[u8], bool)] = &[
-        ("0x16 push ss", &[0x66, 0x16], true),
         ("0x1f pop ds", &[0x66, 0x1f], false),
         ("0x07 pop es", &[0x66, 0x07], false),
-        ("0x17 pop ss", &[0x66, 0x17], true),
     ];
 
     for arm in [false, true] {
@@ -484,6 +561,55 @@ fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
     jit::direct::set_v86_loop_rows_for_test(None);
 }
 
+/// `POP SS` joins the block as an `InterpretOne` call-out at BOTH operand sizes and on both arms
+/// of the V86 loop-rows gate, which is the row's whole admission claim stated positively.
+///
+/// Both sizes because the two are different instructions to the interpreter: the 386 PRM has a
+/// Dword POP SS move four bytes of stack and load the low sixteen, and the Word allowlist entry
+/// only reaches the first of them. If the Dword form ever needed refusing, it would have to be
+/// refused in the arm, and this is the assertion that would fail.
+///
+/// Both gate arms because `0x17` is not part of the V86 loop-rows slice at all. Its two
+/// neighbours in the encoding, `0x07` and `0x1f`, are, and the table above pins them flipping;
+/// this pins that the stack segment does not flip with them.
+///
+/// MUTATION: route `0x17` through the `PopSegReal` arm instead of its own and the Dword row fails
+/// here, because `stack_width_kind` refuses that kind at every cell but the 16-bit Word one.
+#[test]
+fn word_and_dword_pop_ss_join_the_block_as_call_outs() {
+    for arm in [false, true] {
+        jit::direct::set_v86_loop_rows_for_test(Some(arm));
+        for (label, form) in [
+            ("0x17 pop ss", &[0x17u8][..]),
+            ("66 17 pop ss", &[0x66, 0x17]),
+        ] {
+            let mut code = vec![0x40, 0x41, 0x42];
+            code.extend_from_slice(form);
+            let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+            let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+            ss.default_size_32 = false;
+            cpu.registers.set_segment(SegmentIndex::Ss, ss);
+            cpu.registers.set_esp(0x1000);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
+
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(
+                compilation.span.instructions, 4,
+                "{label}: must join the block (v86 loop rows = {arm})"
+            );
+            assert_eq!(
+                compilation.callout_interpret_one_slots, 1,
+                "{label}: must join as a call-out, never as a lowering (v86 loop rows = {arm})"
+            );
+        }
+    }
+    jit::direct::set_v86_loop_rows_for_test(None);
+}
+
 /// `MOV DS, r16` and `MOV ES, r16` at Word size, the write half of the segment family.
 ///
 /// `flat_fixture` is real mode with big limits, which is the mode this lowering is admitted in.
@@ -513,29 +639,40 @@ fn word_size_load_segment_forms_are_lowered() {
     }
 }
 
-/// The `0x8e` shapes that stay refused, all inside the classifier arm rather than by the
-/// allowlist, so each would keep passing if the allowlist entry were reverted.
+/// Every `0x8e` shape that is NOT the real-mode register lowering, and the answer each gets.
 ///
-/// `/1`, `/6` and `/7` are the ones that matter most: they are not segment loads at all. The
-/// interpreter raises #GP(0) for each, so lowering them would turn a fault into a silent write.
-/// `/2` is SS, refused over the one-instruction interrupt shadow a native block cannot honour.
-/// The memory form is refused because the slice is the register shape and nothing else.
+/// `/1`, `/6` and `/7` are the ones that matter most and they stay REFUSED: they are not segment
+/// loads at all, the interpreter raises #GP(0) for each, and compiling a block around an
+/// instruction that can only fault burns a call-out on every execution.
+///
+/// `/2` SS was refused beside them over the one-instruction interrupt shadow until S4 part 2,
+/// which admits it as a call-out on its own census row: the shadow clause is scoped per row now
+/// and the flag is decided at the block boundary. It sits in this table rather than with `/4` and
+/// `/5` because it is still the shape whose answer a widening is most likely to get wrong, and
+/// because a refusal reappearing here would be a silent revert.
+///
+/// `/4` FS, `/5` GS and the memory forms were refused here as "out of scope" until the S3 policy
+/// widening, which admits them as `InterpretOne` CALL-OUTS. The claim moves rather than lapses:
+/// what this table said was that they must not be LOWERED as `LoadSegReal`, which emits
+/// `base = selector << 4` and nothing else, and the slot-class column is how that is said now.
 #[test]
-fn word_size_load_segment_shapes_outside_the_slice_stay_refused() {
-    let cases: &[(&str, &[u8])] = &[
-        ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8]),
-        ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0]),
-        ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8]),
-        ("/2 mov ss,ax arms the shadow", &[0x66, 0x8e, 0xd0]),
-        ("/4 mov fs,ax is out of scope", &[0x66, 0x8e, 0xe0]),
-        ("/5 mov gs,ax is out of scope", &[0x66, 0x8e, 0xe8]),
+fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
+    // (label, bytes, call-out slots; `None` means the shape must end the block)
+    let cases: &[(&str, &[u8], Option<u8>)] = &[
+        ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8], None),
+        ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0], None),
+        ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8], None),
+        ("/2 mov ss,ax calls out", &[0x66, 0x8e, 0xd0], Some(1)),
+        ("/4 mov fs,ax calls out", &[0x66, 0x8e, 0xe0], Some(1)),
+        ("/5 mov gs,ax calls out", &[0x66, 0x8e, 0xe8], Some(1)),
         (
-            "/3 memory form",
+            "/3 memory form calls out",
             &[0x66, 0x8e, 0x1d, 0x00, 0x20, 0x00, 0x00],
+            Some(1),
         ),
     ];
 
-    for &(label, form) in cases {
+    for &(label, form, call_outs) in cases {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(form);
         let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
@@ -547,22 +684,38 @@ fn word_size_load_segment_shapes_outside_the_slice_stay_refused() {
         );
 
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-        assert_eq!(
-            compilation.span.instructions, 3,
-            "{label}: must stay refused, so the block is the three fillers"
-        );
+        match call_outs {
+            None => assert_eq!(
+                compilation.span.instructions, 3,
+                "{label}: must stay refused, so the block is the three fillers"
+            ),
+            Some(slots) => {
+                assert_eq!(
+                    compilation.span.instructions, 4,
+                    "{label}: must join the block"
+                );
+                assert_eq!(
+                    compilation.callout_interpret_one_slots, slots,
+                    "{label}: must join as a call-out, never through LoadSegReal"
+                );
+            }
+        }
     }
 }
 
-/// `MOV Sreg, r16` stays refused in PROTECTED mode, where a segment load is a descriptor fetch
-/// with type, privilege and present checks rather than `selector << 4`.
+/// `MOV Sreg, r16` in PROTECTED mode, where a segment load is a descriptor fetch with type,
+/// privilege and present checks rather than `selector << 4`.
 ///
-/// The refusal lives beside the `stack_width_kind` call because `classify` has no CPU. The mode
-/// key is what makes it sufficient once made -- a block admitted in real mode can never be
-/// entered in protected mode -- but the key alone would not stop the block being COMPILED here,
-/// which is the failure this pins.
+/// The decision lives beside the `stack_width_kind` call because `classify` has no CPU. It used to
+/// be a refusal; since the S3 policy widening it is an `InterpretOne` call-out, which runs
+/// `load_protected_segment` with every check, every fault vector and the accessed-bit write-back,
+/// and then lets R2 decide whether the block may carry on.
+///
+/// What this pins is that it is NOT `LoadSegReal`. The mode key would stop a real-mode block from
+/// being ENTERED in protected mode, but it would not stop one being COMPILED here, which is the
+/// failure this test has always been about.
 #[test]
-fn the_protected_mode_load_segment_form_stays_refused() {
+fn the_protected_mode_load_segment_form_calls_out_rather_than_lowering() {
     let mut code = vec![0x40, 0x41, 0x42];
     code.extend_from_slice(&[0x66, 0x8e, 0xd8]);
     let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
@@ -575,9 +728,40 @@ fn the_protected_mode_load_segment_form_stays_refused() {
 
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(
-        compilation.span.instructions, 3,
-        "protected mode must stay refused, so the block is the three fillers"
+        compilation.span.instructions, 4,
+        "protected mode must join the block"
     );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "protected mode must call out, never lower a descriptor fetch as selector << 4"
+    );
+}
+
+/// `POP ES` and `POP DS` keep the protected-mode refusal `MOV Sreg` left behind.
+///
+/// They share `stack_width_kind`'s arm with `LoadSegReal` and used to share its answer. They are
+/// not on the `InterpretOne` allowlist -- no census row measures them -- so the arm splits, and
+/// this is the half that would otherwise have been swept along by proximity.
+#[test]
+fn the_protected_mode_pop_segment_form_stays_refused() {
+    for (label, opcode) in [("pop es", 0x07u8), ("pop ds", 0x1f)] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.push(opcode);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        cpu.control.cr0 |= CR0_PE;
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused in protected mode"
+        );
+        assert_eq!(compilation.callout_interpret_one_slots, 0);
+    }
 }
 
 /// `MOV r16, imm16` at Word size, the 16-bit campaign's fourth slice.
@@ -1182,16 +1366,22 @@ fn a_word_near_jmp_above_the_wrap_is_refused_while_the_same_block_below_it_compi
 
 /// A 66-prefixed `FF /6` must stay REFUSED, and nothing else in the crate can catch it.
 ///
-/// `0xff` is in the Word allowlist, so this form reaches the classifier and produces a `PushMem`.
-/// What refuses it is the stack-width admission matrix, which is consulted only for kinds whose
-/// `uses_stack()` is true. Admitting it would push two bytes while decrementing ESP by four,
-/// which is a miscompile rather than a missed lowering.
+/// `0xff` is in the Word allowlist, so this form reaches the classifier. Until the S3 policy
+/// widening it produced a `PushMem` there and was refused one step later by the stack-width
+/// admission matrix, which is consulted only for kinds whose `uses_stack()` is true; admitting it
+/// as `PushMem` would push two bytes while decrementing ESP by four, which is a miscompile rather
+/// than a missed lowering.
 ///
-/// The assertion is an EXACT count, and it is paired against a POSITIVE CONTROL: the unprefixed
-/// `FF /6` at the same entry, on the same stack width, must lower and grow the block to four
-/// instructions. Without the control, "the block is three instructions" is satisfied identically
-/// by the Word form being correctly refused OR by `PushMem` never reaching the classifier at all,
-/// and the fixture cannot tell those apart.
+/// It now joins the block as an `InterpretOne` call-out instead, decided in the classifier arm
+/// rather than in the matrix. The claim this fixture makes is unchanged in substance and moves
+/// from a count to a SLOT CLASS: the Word form must not be lowered as `PushMem`, and the way to
+/// say so now that it compiles is that its slot is a call-out and the block declares no static
+/// stack access for it.
+///
+/// The POSITIVE CONTROL stays and does more work than before: the unprefixed `FF /6` at the same
+/// entry, on the same stack width, must lower through `PushMem` with no call-out slot at all. The
+/// two cases now differ in HOW they join rather than in whether they do, which is a sharper pairing
+/// than the old one.
 ///
 /// Both cases widen SS to a 32-bit stack explicitly. `flat_fixture` widens the CS and SS LIMITS
 /// but leaves `SS.default_size_32` alone, and the stack-width admission matrix refuses `PushMem`
@@ -1200,22 +1390,22 @@ fn a_word_near_jmp_above_the_wrap_is_refused_while_the_same_block_below_it_compi
 /// the pairing would prove nothing. Widening SS here makes the prefix the ONLY difference between
 /// the two cases.
 #[test]
-fn word_size_push_through_memory_stays_refused() {
+fn word_size_push_through_memory_calls_out_rather_than_lowering() {
     let cases: &[(&str, &[u8], u8)] = &[
         (
             "unprefixed control",
             &[0xff, 0x35, 0x00, 0x08, 0x00, 0x00],
-            4,
+            0,
         ),
         (
             // 66 ff 35 00 08 00 00: push word [0x800] at Word operand size.
             "0x66-prefixed",
             &[0x66, 0xff, 0x35, 0x00, 0x08, 0x00, 0x00],
-            3,
+            1,
         ),
     ];
 
-    for &(label, form, expected_instructions) in cases {
+    for &(label, form, expected_call_outs) in cases {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(form);
         let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
@@ -1231,8 +1421,12 @@ fn word_size_push_through_memory_stays_refused() {
 
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
         assert_eq!(
-            compilation.span.instructions, expected_instructions,
-            "{label}: the Dword form must lower and the Word form must stay refused"
+            compilation.span.instructions, 4,
+            "{label}: both forms must carry the whole four-slot block"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, expected_call_outs,
+            "{label}: the Dword form must lower through PushMem and the Word form must call out"
         );
     }
 }
@@ -1246,7 +1440,7 @@ fn word_size_push_through_memory_stays_refused() {
 /// `SS.B`, the same PushMem precedent.
 ///
 /// Both cases widen SS to a 32-bit stack explicitly, for the same reason
-/// `word_size_push_through_memory_stays_refused` does: `flat_fixture` leaves `SS.default_size_32`
+/// `word_size_push_through_memory_calls_out_rather_than_lowering` does: `flat_fixture` leaves `SS.default_size_32`
 /// alone, and on a 16-bit stack (`SS.B` = 0) even the UNPREFIXED Dword control has no matrix arm
 /// (the `(false, Dword)` cell is a stop, four bytes on a 16-bit SP not being built yet) and would
 /// also come out refused, for a reason that has nothing to do with the 0x66 prefix. Widening SS

@@ -1891,6 +1891,36 @@ pub struct DirectSmcCensusSnapshot {
     pub windowed: DirectSmcCensusPhase,
 }
 
+/// One `InterpretOne` allowlist row's outcome counts, named by its census label.
+///
+/// `row` is the label rather than the enum because `DirectStallSnapshot` is the crate's PUBLIC
+/// reporting surface and the classifier's row enum is an internal detail of the JIT; the label is
+/// what a probe JSON and a ladder report key on, exactly as `links_cleared` carries its cause as a
+/// `&'static str`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InterpretOneRowCounts {
+    pub row: &'static str,
+    pub executed: u64,
+    pub resync: u64,
+    pub resync_fault: u64,
+    pub demoted: u64,
+    /// The subset of `resync` the suffix-only segment mask would have carried.
+    pub resume_refused_prefix_use: u64,
+}
+
+/// One compile-walk retry cause, named by its census label.
+///
+/// `cause` is the label rather than the enum for `InterpretOneRowCounts`' reason: this struct is
+/// the crate's PUBLIC reporting surface and the walk's cause enum is an internal detail of the
+/// JIT. `count` is attempts and `keys` is distinct keys parked; see `DirectStallTally` for the
+/// difference and why both are worth carrying.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetryCauseCounts {
+    pub cause: &'static str,
+    pub count: u64,
+    pub keys: u64,
+}
+
 /// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here
 /// used to fold into a state (`Dormant`), a bool (`try_link_inner` returning false) or one
 /// catch-all counter (`SideExitReason::Other`), which is why the three largest unattributed exit
@@ -1899,6 +1929,21 @@ pub struct DirectSmcCensusSnapshot {
 pub struct DirectStallSnapshot {
     /// (label, count) per `DormantReason`.
     pub dormant: Vec<(&'static str, u64)>,
+    /// The `compile_retry` entry of `dormant` split by which compile-walk gate gave up, per
+    /// `RetryCause`. The `count` column sums to that entry exactly.
+    pub retry_causes: Vec<RetryCauseCounts>,
+    /// (label, hits) per `RetryCause`: the static-unbound EXITS that landed on a dormant key
+    /// parked for that cause. Barrier-census gated, so it reads all zeroes on a plain build.
+    /// See `DirectStallTally::retry_cause_hits`.
+    pub retry_cause_hits: Vec<(&'static str, u64)>,
+    /// Keys the retry lift re-admitted, and keys it then had to park permanently because the
+    /// re-walk reached the same cause. Read as a ratio; see `DirectStallTally::retry_lifts`.
+    pub retry_lifts: u64,
+    pub retry_lift_reparks: u64,
+    /// Interpreted MOV SS / POP SS executions split by whether the load changed the SS record.
+    /// The S4d design's M5 measurement; see `DirectStallTally`.
+    pub ss_load_same_record: u64,
+    pub ss_load_changed_record: u64,
     /// (label, count) per `LinkRefusal`.
     pub link_refusals: Vec<(&'static str, u64)>,
     /// (label, count) per `LinkClearCause` — the cause split behind the aggregate
@@ -1916,6 +1961,32 @@ pub struct DirectStallSnapshot {
     pub callout_executed: u64,
     /// Port call-outs served through the TSS-bitmap arm. See `BlockCacheStats`.
     pub callout_port_v86_served: u64,
+    /// The `InterpretOne` call-out family; see `DirectStallTally` for what each one denominates.
+    pub callout_interpret_one_executed: u64,
+    pub callout_interpret_one_resync: u64,
+    /// The subset of `callout_interpret_one_resync` that the SUFFIX-only segment mask would have
+    /// carried: the price of including the block's PREFIX in R2's mask. See the tally field.
+    pub callout_interpret_one_resume_refused_prefix_use: u64,
+    /// Which arm of `IZARRAVM_CALLOUT_SEGMENT_RESUME` this run compiled under. Reported so a
+    /// ladder leg cannot be read as the arm it named while having run the other one, which is the
+    /// trap every default-ON knob in this backend has already sprung once.
+    pub callout_segment_resume_enabled: bool,
+    pub callout_interpret_one_resync_fault: u64,
+    pub callout_interpret_one_abnormal: u64,
+    pub callout_interpret_one_demoted: u64,
+    /// The same family split by allowlist ROW, in `InterpretOneRow` order, so a ladder can rank
+    /// the rows against each other. The scalars above sum these four columns; `abnormal` has no
+    /// per-row column, because a demoted slot exits from its emitted prologue without a cell in
+    /// scope to attribute it to.
+    pub callout_interpret_one_rows: Vec<InterpretOneRowCounts>,
+    pub callout_deferred_code_writes: u64,
+    pub callout_slot_cap_hits: u64,
+    /// The compile walk's page budget and the recovery search behind it. See the fields of the
+    /// same name on the census stalls struct for what each one grades.
+    pub compile_page_overflows: u64,
+    pub compile_page_search_steps: u64,
+    pub demoted_callout_sites: u64,
+    pub demoted_callout_sites_refused: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.
     pub reject_callout_privileged: u64,
     /// The call-out admission governor: entries spent at trial quota, and the two classifications
@@ -2075,6 +2146,16 @@ struct DirectRuntimeState {
     /// from CPU equality and resets on clone. It lives here rather than as a run-loop local so the
     /// whole admission decision fits in one dispatcher call.
     skip_direct_once: bool,
+    /// A machine-stopping `CpuError` an `InterpretOne` call-out's fault delivery produced, parked
+    /// for `run_direct_block` to propagate after the native return.
+    ///
+    /// The helper answers emitted code through an `i64` status word and has no way to return a
+    /// `CpuError` through it; the alternative would have been to swallow the stop, which turns a
+    /// triple fault into a guest that keeps running. Run-scoped and never live across a dispatcher
+    /// entry: the helper sets it and the same entry's return takes it. Here rather than at the
+    /// `CpuGsw` tail because that is where the other run-scoped, equality-excluded, clone-resetting
+    /// latch already lives.
+    callout_error: Option<CpuError>,
 }
 
 #[cfg(feature = "jit")]
@@ -2268,6 +2349,16 @@ pub struct CpuGsw {
     /// memset every instruction.
     written_count: u8,
     written_pages_overflow: bool,
+    /// The call-out window: whether an `InterpretOne` slot is running one interpreter instruction
+    /// with a native block live on the host stack, and the code writes that window has deferred.
+    ///
+    /// The flag and the list are ONE mechanism and are one field for that reason. An earlier
+    /// revision had the flag loose on `CpuGsw` with a comment claiming it was never compared,
+    /// which the derived `PartialEq` and `Clone` made false. Here it inherits the always-equal
+    /// `PartialEq` and the resetting `Clone` the list already had, so the claim is enforced by the
+    /// type instead of asserted by a comment.
+    #[cfg(feature = "jit")]
+    deferred_code_writes: DeferredCodeWrites,
     // Direct-mapped cache of decoded instructions keyed by linear EIP. Skips re-decoding hot-loop
     // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
     // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
@@ -2480,6 +2571,8 @@ impl Default for CpuGsw {
             written_pages: [None; TRACKED_WRITE_PAGES],
             written_count: 0,
             written_pages_overflow: false,
+            #[cfg(feature = "jit")]
+            deferred_code_writes: DeferredCodeWrites::default(),
             decode_cache,
             #[cfg(feature = "jit")]
             jit_direct,
@@ -4431,6 +4524,263 @@ pub(crate) const PUSH_ALL_CORE_CLOCKS: u32 = 18;
 /// What `POPA`/`POPAD` (0x61) charges. See `PUSH_ALL_CORE_CLOCKS`.
 pub(crate) const POP_ALL_CORE_CLOCKS: u32 = 18;
 
+/// One code write taken while an `InterpretOne` call-out held a native block live, kept until
+/// `run_direct_block` can replay it with the window shut. `lanes` is which of the two invalidation
+/// doors the original caller opened, carried so the replay is the same call and not merely a
+/// similar one.
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredCodeWrite {
+    pub(crate) physical: u32,
+    pub(crate) width: u32,
+    pub(crate) lanes: bool,
+}
+
+#[cfg(feature = "jit")]
+impl DeferredCodeWrite {
+    const EMPTY: Self = Self {
+        physical: 0,
+        width: 0,
+        lanes: false,
+    };
+}
+
+/// The call-out window's deferred-write list.
+///
+/// Its own type for the reason `CallOutTable` is one: this is HOST-SIDE window state that is
+/// empty at every point a `CpuGsw` can be observed from outside a native entry, and the derived
+/// `PartialEq` on `CpuGsw` would otherwise compare the stale tail two architecturally identical
+/// CPUs are free to differ in (the drain resets `count`, not the bytes behind it). So equality is
+/// always true and `Clone` resets, exactly as they do there.
+#[cfg(feature = "jit")]
+#[derive(Debug)]
+pub(crate) struct DeferredCodeWrites {
+    /// Whether the window is OPEN: an `InterpretOne` step is running under a live native frame.
+    open: bool,
+    entries: [DeferredCodeWrite; MAX_DEFERRED_CODE_WRITES],
+    count: u8,
+    overflow: bool,
+}
+
+#[cfg(feature = "jit")]
+impl Default for DeferredCodeWrites {
+    fn default() -> Self {
+        Self {
+            open: false,
+            entries: [DeferredCodeWrite::EMPTY; MAX_DEFERRED_CODE_WRITES],
+            count: 0,
+            overflow: false,
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Clone for DeferredCodeWrites {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(feature = "jit")]
+impl PartialEq for DeferredCodeWrites {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Eq for DeferredCodeWrites {}
+
+#[cfg(feature = "jit")]
+impl DeferredCodeWrites {
+    /// True when nothing was deferred: the helper's R5 clause and the drain's early out.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0 && !self.overflow
+    }
+
+    /// Whether a code write must be recorded rather than acted on.
+    #[inline]
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Open the window. Paired with `close` on EVERY path out of the helper, including the fault
+    /// arm, where the pairing is the whole of design review B1's sibling hazard: exception
+    /// delivery pushes three to five words and can write page-walk accessed bits, and a tiny-model
+    /// stack puts those writes on the block's own page.
+    pub(crate) fn open(&mut self) {
+        debug_assert!(!self.open, "a call-out window opened inside another");
+        self.open = true;
+    }
+
+    pub(crate) fn close(&mut self) {
+        debug_assert!(self.open, "a call-out window closed without being opened");
+        self.open = false;
+    }
+
+    fn push(&mut self, write: DeferredCodeWrite) {
+        let index = usize::from(self.count);
+        if index >= MAX_DEFERRED_CODE_WRITES {
+            self.overflow = true;
+            return;
+        }
+        self.entries[index] = write;
+        self.count += 1;
+    }
+}
+
+/// How many deferred writes one call-out can record before the drain falls back to the coarse
+/// write-page replay. Sized for the worst reachable instruction rather than for the common one: a
+/// memory-form POP stores once (twice if it splits a page), and the FAULT path adds a whole
+/// exception delivery -- up to five pushes plus the accessed-bit write of every page walk they
+/// take. Sixteen covers that with room; the overflow arm exists because "covers it with room" is
+/// not a proof.
+#[cfg(feature = "jit")]
+pub(crate) const MAX_DEFERRED_CODE_WRITES: usize = 16;
+
+/// What POP r/m16/32 charges (execute.rs `0x8f`), and through `INTERPRET_ONE_MAX_CORE_CLOCKS` the
+/// whole of what an `InterpretOne` slot can deposit in the block's runtime raw lane while the S2
+/// allowlist holds one opcode. Named for the reason `IN_AL_DX_CORE_CLOCKS` is: the budget bound
+/// and the interpreter must charge the SAME number, so there is one definition of it.
+pub(crate) const POP_RM_CORE_CLOCKS: u32 = 5;
+
+/// What MOV r/m16, Sreg charges (execute.rs `0x8c`). The S3 policy widening's first row, and the
+/// register form's charge as much as the memory form's: the arm returns one `clocks(2)` for both.
+pub(crate) const MOV_RM_SREG_CORE_CLOCKS: u32 = 2;
+
+/// What the XCHG family charges (execute.rs `0x86`, `0x87` and `0x91..=0x97`). One constant for
+/// all four forms because all four arms return the same `clocks(3)`, and `0x90` NOP is documented
+/// there as carrying it too.
+pub(crate) const XCHG_CORE_CLOCKS: u32 = 3;
+
+/// What the bit-string family charges (execute_extended.rs `0x0fa3 | 0x0fab | 0x0fb3 | 0x0fbb`
+/// and `0x0fba`). One constant for both arms because both return the same `clocks(6)`, whatever
+/// the sub-operation, the operand form or the width.
+pub(crate) const BIT_STRING_CORE_CLOCKS: u32 = 6;
+
+/// What group 3 charges (execute.rs `0xf6 | 0xf7`). One constant for the whole group: the arm
+/// returns a single `clocks(2)` after the sub-opcode match, so TEST, NOT, NEG, MUL, IMUL, DIV and
+/// IDIV all carry it at both widths and both operand forms.
+pub(crate) const GROUP3_CORE_CLOCKS: u32 = 2;
+
+/// What group 4 charges (execute.rs `0xfe`), which is INC and DEC r/m8 in both operand forms.
+pub(crate) const INC_DEC_RM8_CORE_CLOCKS: u32 = 2;
+
+/// What PUSH r/m charges (execute_extended.rs, group 5 arm `6`), at both operand widths.
+pub(crate) const PUSH_RM_CORE_CLOCKS: u32 = 2;
+
+/// What CLI charges (execute.rs `0xfa`).
+pub(crate) const CLI_CORE_CLOCKS: u32 = 3;
+
+/// What STI charges (execute.rs `0xfb`).
+///
+/// The same number as `CLI_CORE_CLOCKS` and a separate constant anyway, because they are separate
+/// interpreter arms doing opposite things: folding them would make a future divergence in one of
+/// them silently change the other row's budget term.
+pub(crate) const STI_CORE_CLOCKS: u32 = 3;
+
+/// What MOV Sreg, r/m16 charges (execute.rs `0x8e`), at every segment, both operand forms and
+/// every mode: the arm returns one `clocks(7)` after the load, whether that load was a real-mode
+/// base computation or a full protected-mode descriptor fetch.
+///
+/// `MovSsReg` (`0x8E /2`) is priced by this constant too and not by one of its own, because it IS
+/// this arm: the interpreter's 0x8e case returns the same charge for SS as for every other
+/// segment. The row is separate in the census, where the question is about resume shapes; it is
+/// not separate here, where the question is what the interpreter charged.
+pub(crate) const MOV_SREG_CORE_CLOCKS: u32 = 7;
+
+/// What POP SS charges (execute.rs `0x17`), at both operand sizes and every mode.
+///
+/// The same number as `MOV_SREG_CORE_CLOCKS` and a separate constant anyway, for the reason
+/// `STI_CORE_CLOCKS` is separate from `CLI_CORE_CLOCKS`: they are separate interpreter arms, and
+/// folding them would make a future divergence in one silently change the other row's budget term.
+pub(crate) const POP_SS_CORE_CLOCKS: u32 = 7;
+
+/// The two-argument `max` the constant below folds with. A `const fn` rather than
+/// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
+/// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
+/// and this one folds the whole `InterpretOne` allowlist, one term per admitted row.
+const fn larger(a: u32, b: u32) -> u32 {
+    if a > b { a } else { b }
+}
+
+/// The largest core charge an `InterpretOne` slot can return on its RESUME or RESYNC-RETIRED
+/// status: the maximum, over the `InterpretOne` allowlist, of the interpreter's own charge for
+/// those rows.
+///
+/// ONE TERM PER ROW, folded rather than written down as a number, so that admitting a row without
+/// pricing it is a missing term a reader can see rather than a silently stale literal. The rows
+/// and their `execute.rs` arms:
+///
+/// | row | arm | charge |
+/// |---|---|---|
+/// | 0x8F POP r/m | execute.rs `0x8f` | `POP_RM_CORE_CLOCKS` |
+/// | 0x8C MOV r/m16,Sreg memory | execute.rs `0x8c` | `MOV_RM_SREG_CORE_CLOCKS` |
+/// | 0x86/0x87/0x91..=0x97 XCHG | execute.rs `0x86`, `0x87`, `0x91..=0x97` | `XCHG_CORE_CLOCKS` |
+/// | BT/BTS/BTR/BTC | execute_extended.rs `0x0fa3..`, `0x0fba` | `BIT_STRING_CORE_CLOCKS` |
+/// | 0xF7 group 3 at Word | execute.rs `0xf7` | `GROUP3_CORE_CLOCKS` |
+/// | 0xFE /0 /1 memory | execute.rs `0xfe` | `INC_DEC_RM8_CORE_CLOCKS` |
+/// | 0xFF /6 memory at Word | execute_extended.rs group 5 | `PUSH_RM_CORE_CLOCKS` |
+/// | 0xFA CLI | execute.rs `0xfa` | `CLI_CORE_CLOCKS` |
+/// | 0x8E MOV Sreg,r/m | execute.rs `0x8e` | `MOV_SREG_CORE_CLOCKS` |
+/// | 0xFB STI | execute.rs `0xfb` | `STI_CORE_CLOCKS` |
+/// | 0x8E /2 MOV SS,r/m | execute.rs `0x8e` | `MOV_SREG_CORE_CLOCKS` |
+/// | 0x17 POP SS | execute.rs `0x17` | `POP_SS_CORE_CLOCKS` |
+///
+/// The FAULT status is deliberately not in this maximum. There the clocks are charged by
+/// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
+/// instruction that faults at a block boundary, and the helper returns zero -- so nothing on that
+/// path reaches the lane this constant bounds. Widening the allowlist means widening this.
+pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
+    larger(POP_RM_CORE_CLOCKS, MOV_RM_SREG_CORE_CLOCKS),
+    larger(
+        larger(XCHG_CORE_CLOCKS, BIT_STRING_CORE_CLOCKS),
+        larger(
+            larger(GROUP3_CORE_CLOCKS, INC_DEC_RM8_CORE_CLOCKS),
+            larger(
+                larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
+                larger(
+                    larger(MOV_SREG_CORE_CLOCKS, STI_CORE_CLOCKS),
+                    POP_SS_CORE_CLOCKS,
+                ),
+            ),
+        ),
+    ),
+);
+
+/// The most DATA ACCESSES an `InterpretOne` slot can present, and the multiplicand
+/// `compute_iteration_upper` and `compute_global_block_upper` price its bus traffic at.
+///
+/// Derived from the allowlist rather than guessed, one row at a time, because the budget bound
+/// is sound only if it dominates every admitted row:
+///
+/// | row | accesses |
+/// |---|---|
+/// | 0x8F POP r/m memory | stack read + operand store = 2 |
+/// | 0x8C memory | one store = 1 |
+/// | XCHG memory | read + store = 2 |
+/// | BT/BTS/BTR/BTC memory | read + write-back = 2 |
+/// | 0xF7 memory | read + write-back = 2 |
+/// | 0xFE memory | read + write-back = 2 |
+/// | 0xFF /6 memory | operand read + stack store = 2 |
+/// | 0xFA CLI | none |
+/// | 0xFB STI | none |
+/// | 0x8E memory, PROTECTED mode | operand read + two descriptor dwords + accessed-bit write-back = 4 |
+/// | 0x8E /2 memory, PROTECTED mode | the same four |
+/// | 0x17 POP SS, PROTECTED mode | stack read + two descriptor dwords + accessed-bit write-back = 4 |
+///
+/// The protected-mode segment rows are why this is FOUR rather than two, and the first of them is
+/// the one the S3 policy widening moved: a protected-mode segment load reads eight bytes of
+/// descriptor out of the GDT or the LDT through `read_system_linear_u32` and writes the accessed
+/// bit back when it was clear (`load_protected_segment`, control.rs). The register-source form of
+/// `0x8E` is one access fewer, so its memory form is the bound; POP SS has no register form and
+/// its one stack read takes that slot, so it lands on the same four and the bound does not move.
+///
+/// PAGE WALKS are still not priced. That is the accepted overshoot the bus term already records
+/// rather than a hole this constant opens: any of these accesses can miss the TLB and walk, and
+/// the owner's ruling of 2026-07-30 accepted that class of overshoot for the chain quota.
+pub(crate) const INTERPRET_ONE_MAX_DATA_ACCESSES: u64 = 4;
+
 /// The largest core charge any admitted call-out helper can return, and the term
 /// `compute_iteration_upper` / `compute_global_block_upper` must price a slot at when they cannot
 /// tell the helpers apart. Derived from the three constants above rather than written down, so a
@@ -4442,10 +4792,15 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     } else {
         PUSH_ALL_CORE_CLOCKS
     };
-    if a > POP_ALL_CORE_CLOCKS {
+    let b = if a > POP_ALL_CORE_CLOCKS {
         a
     } else {
         POP_ALL_CORE_CLOCKS
+    };
+    if b > INTERPRET_ONE_MAX_CORE_CLOCKS {
+        b
+    } else {
+        INTERPRET_ONE_MAX_CORE_CLOCKS
     }
 };
 

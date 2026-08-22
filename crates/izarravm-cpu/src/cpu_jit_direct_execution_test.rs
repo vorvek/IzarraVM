@@ -2824,3 +2824,127 @@ fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
         "nothing may have run: a chained read here would have used the baked base"
     );
 }
+
+/// The compile walk's page budget: a block long enough to overflow one host page must come out of
+/// the walk already inside it, without `compile_with_page_len`'s recovery search running at all.
+///
+/// The regression this pins, measured on the tombraid loader (2026-08-22): once the S3 call-out
+/// rows joined blocks that used to end at those instructions, 85.5% of full-length walks emitted
+/// past the 4 KiB page, and each one paid four MORE walks and four more emissions to rediscover
+/// the length the size model can compute during the first one. That was 4.4 seconds of a 10.1
+/// second phase, and `jit_direct_compile_ns` fell 81% when the walk learned to stop.
+///
+/// Written as three claims, because any one alone can pass while the mechanism is absent:
+///
+/// 1. the UNBUDGETED walk over the same bytes really does overflow, so the fixture is a case the
+///    search would have had to handle (delete the budget and this still passes);
+/// 2. the budgeted block fits and is shorter, so the budget bound it (delete the budget and this
+///    fails only because of 3, since the search produces a fitting block too);
+/// 3. `compile_page_overflows` and `compile_page_search_steps` are BOTH zero, which is the only
+///    claim that separates "the walk stopped" from "the search cleaned up afterwards".
+#[test]
+fn the_page_budget_ends_the_walk_before_the_recovery_search_runs() {
+    const TARGET: u32 = 0x3000;
+    const COUNT: usize = 32;
+    // `mov eax, [0x3000]`: a plain memory load, deliberately NOT a memory-ALU form, whose block
+    // length is already governed by `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` and would make the page
+    // budget untestable through it.
+    let instruction = [0x8b, 0x05, 0x00, 0x30, 0x00, 0x00];
+    let mut pristine = vec![0; 0x5000];
+    pristine[(ALU_MEM_ENTRY - 1) as usize] = 0x90;
+    let mut starts = Vec::with_capacity(COUNT);
+    let mut cursor = ALU_MEM_ENTRY as usize;
+    for _ in 0..COUNT {
+        starts.push(cursor as u32);
+        pristine[cursor..cursor + instruction.len()].copy_from_slice(&instruction);
+        cursor += instruction.len();
+    }
+    pristine[cursor] = 0xf4;
+
+    let mut native = flat_stack_cpu(ALU_MEM_ENTRY);
+    let mut bus = TestBus::with_memory(pristine);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut native, &mut bus, &starts);
+    map_direct_page(
+        &mut native,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        true,
+    );
+
+    let page = jit::exec_mem::host_page_len();
+    let unbudgeted = jit::direct::compile_with_instruction_limit_for_test(
+        &mut native,
+        ALU_MEM_ENTRY,
+        true,
+        jit::direct::MAX_BLOCK_INSTRUCTIONS,
+    )
+    .expect("the unbudgeted walk must compile something");
+    assert!(
+        unbudgeted.code.len() > page,
+        "the fixture must be a case the recovery search would have had to handle; {} bytes fits \
+         a {page}-byte page",
+        unbudgeted.code.len()
+    );
+
+    let before = native.direct_stall_snapshot();
+    let budgeted = jit::direct::compile(&mut native, ALU_MEM_ENTRY, true)
+        .expect("the budgeted walk must compile a shorter block");
+    assert!(
+        budgeted.code.len() <= page,
+        "the budgeted block emitted {} bytes into a {page}-byte page",
+        budgeted.code.len()
+    );
+    assert!(
+        budgeted.span.instructions < unbudgeted.span.instructions,
+        "the budget must have stopped the walk short: {} of {} instructions",
+        budgeted.span.instructions,
+        unbudgeted.span.instructions
+    );
+    // 4. how far the model's answer sits from the longest prefix that actually fits, which is the
+    //    claim that separates a working size model from a merely conservative one. An EQUALITY is
+    //    what one would want here and it is not true, deliberately: the constants are calibrated
+    //    on the tombraid loader, whose memory slots average 341 emitted bytes, and this fixture's
+    //    `mov eax,[disp32]` is the cheapest memory shape there is at 250. The model therefore ends
+    //    the block early on it, and this pins BY HOW MUCH -- three slots of a thirteen-slot
+    //    maximum. Re-calibrating the constants moves this number; a broken budget moves it a lot.
+    let n = usize::from(budgeted.span.instructions);
+    let mut longest = 0usize;
+    for k in 3..=usize::from(unbudgeted.span.instructions) {
+        let candidate = jit::direct::compile_with_instruction_limit_for_test(
+            &mut native,
+            ALU_MEM_ENTRY,
+            true,
+            k,
+        )
+        .expect("every prefix of this fixture compiles unbudgeted");
+        if candidate.code.len() <= page {
+            longest = k;
+        }
+    }
+    assert!(
+        n <= longest,
+        "the budget must never admit MORE than fits: {n} slots against a {longest}-slot maximum"
+    );
+    assert!(
+        longest - n <= 3,
+        "the model gave up {} slots of {longest}, which is past the slack this fixture measured          (3). Either the constants moved or the estimate stopped tracking the emitter",
+        longest - n
+    );
+
+    let after = native.direct_stall_snapshot();
+    assert_eq!(
+        after.compile_page_overflows - before.compile_page_overflows,
+        0,
+        "the size model must have kept the full-length walk inside the page"
+    );
+    assert_eq!(
+        after.compile_page_search_steps - before.compile_page_search_steps,
+        0,
+        "and so the recovery search must not have compiled a single candidate"
+    );
+}

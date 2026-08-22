@@ -56,7 +56,7 @@ fn counts(cpu: &CpuGsw) -> Counts {
 /// `fresh()` loads every segment in real mode and then forces `cs.default_size_32 = true`. This
 /// drops that one line, so CS.D is 0 and SS.B is 0: the ordinary DOS configuration, and the
 /// population S4 admits.
-fn sixteen_bit_code_cpu(entry: u32) -> CpuGsw {
+pub(super) fn sixteen_bit_code_cpu(entry: u32) -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw586);
     for segment in [
@@ -72,7 +72,7 @@ fn sixteen_bit_code_cpu(entry: u32) -> CpuGsw {
     cpu
 }
 
-fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
+pub(super) fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     bus
@@ -81,7 +81,7 @@ fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
 /// Arm a CPU to run 16-bit blocks natively: fast map on, and every page the fixture touches
 /// mapped for read and write. A memory-form slot silently never compiles without this, and the
 /// test then passes interpreted.
-fn arm_native_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, pages: &[u32]) {
+pub(super) fn arm_native_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, pages: &[u32]) {
     cpu.set_fast_map_enabled_for_test(true);
     for &page in pages {
         map_direct_page(
@@ -111,7 +111,7 @@ fn install_sixteen_bit_block(
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("the 16-bit block became a structural rejection")
         }
-        jit::direct::CompileOutcome::Retry => panic!("the 16-bit block requested a retry"),
+        jit::direct::CompileOutcome::Retry(_) => panic!("the 16-bit block requested a retry"),
     };
     assert_eq!(
         compilation.span.instructions, expected_instructions,
@@ -133,7 +133,7 @@ fn install_sixteen_bit_block(
 }
 
 /// Warm the decode cache over `starts`, which the compile loop reads through `decode_cache.get`.
-fn warm_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, starts: &[u32]) {
+pub(super) fn warm_sixteen_bit(cpu: &mut CpuGsw, bus: &mut TestBus, starts: &[u32]) {
     let saved = cpu.registers.eip;
     for &linear in starts {
         cpu.set_eip(linear);
@@ -477,10 +477,13 @@ fn a_wrapping_bp_operand_reads_the_masked_address() {
 /// interpreter writes an already-narrowed offset while an unmasked path would add the whole
 /// 32-bit base register, so the divergence is arbitrary rather than merely high.
 ///
-/// It needs an explicit 0x66. `0x8d` is NOT in the Word allowlist, so an unprefixed `8D 46 22` in
-/// a 16-bit segment is refused before the emitter is reached. **The corollary is worth stating:
-/// on ordinary unprefixed 16-bit code this path stays unreachable even after S4, so this fixture
-/// is what discharges it, and nothing on any corpus will.**
+/// The explicit 0x66 is what keeps this fixture about the DWORD operand form. It used to be what
+/// made the fixture possible at all -- `0x8d` was off the Word allowlist, so an unprefixed
+/// `8D 46 22` in a 16-bit segment was refused before the emitter was reached, and the corollary
+/// recorded here was that nothing on any corpus would ever reach this path. The S1 width lift
+/// admitted the row, so the unprefixed form is now ordinary loader traffic and is covered by
+/// `cpu_jit_width_lift_test.rs`. What this fixture still owns is the cell that one does not: a
+/// Dword destination write over a 16-bit address.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -904,7 +907,7 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("the Word group-2 block must still compile: structural reject")
         }
-        jit::direct::CompileOutcome::Retry => {
+        jit::direct::CompileOutcome::Retry(_) => {
             panic!("the Word group-2 block must still compile: retry")
         }
     };

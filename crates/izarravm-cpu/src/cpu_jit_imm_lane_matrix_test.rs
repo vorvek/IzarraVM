@@ -181,7 +181,9 @@ fn install_with_d(cpu: &mut CpuGsw, entry: u32, instructions: u8, d: bool) -> ji
         jit::direct::CompileOutcome::StructuralReject(span) => {
             panic!("fixture block at {entry:#x} was structurally rejected: {span:?}")
         }
-        jit::direct::CompileOutcome::Retry => panic!("fixture block at {entry:#x} asked for retry"),
+        jit::direct::CompileOutcome::Retry(_) => {
+            panic!("fixture block at {entry:#x} asked for retry")
+        }
     };
     assert_eq!(
         compilation.span.instructions, instructions,
