@@ -315,7 +315,10 @@ fn idle_f2_publishes_8bit_status_and_22f_cross_acknowledges_it() {
 }
 
 #[test]
-fn f2_after_16bit_arm_publishes_16bit_status_and_22e_cross_acknowledges_it() {
+fn f2_after_16bit_arm_publishes_8bit_status_and_22e_acknowledges_it() {
+    // 0xF2 is the documented 8-bit interrupt trigger (0xF3 is the 16-bit
+    // one), whatever DMA width was armed last. The source travels with the
+    // pending IRQ, not with the width latch.
     let mut machine = test_machine();
     with_bus(&mut machine, |bus| {
         for byte in [0xB0u8, 0x00, 0x00, 0x00, 0xF2] {
@@ -335,7 +338,7 @@ fn f2_after_16bit_arm_publishes_16bit_status_and_22e_cross_acknowledges_it() {
         let cleared = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
         (status, cleared)
     });
-    assert_eq!(status, 0x02);
+    assert_eq!(status, 0x01);
     assert_eq!(cleared, 0x00);
     assert!(
         machine.pic.irr_bit(7),
@@ -3147,4 +3150,75 @@ fn a_stray_zero_to_the_wavetable_registers_attenuates_rather_than_muting() {
     set_mixer_register(&mut machine, 0x50, 0x01);
     set_mixer_register(&mut machine, 0x51, 0x01);
     assert_eq!(machine.midi_gain(), (0.0, 0.0));
+}
+
+/// IF set, PICs initialized, only the SB16 mixer's selected line (IRQ7 in
+/// `test_machine`) unmasked.
+fn enable_sb16_irq_wake(machine: &mut Machine) {
+    machine.cpu.registers.eflags |= 0x0200;
+    with_bus(machine, |bus| {
+        for (port, value) in [
+            (0x20u16, 0x11u32),
+            (0x21, 0x08),
+            (0x21, 0x04),
+            (0x21, 0x01),
+            (0xa0, 0x11),
+            (0xa1, 0x70),
+            (0xa1, 0x02),
+            (0xa1, 0x01),
+            (0x21, 0x7f),
+            (0xa1, 0xff),
+        ] {
+            bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+        }
+    });
+}
+
+#[test]
+fn halted_cpu_wakes_for_a_pending_dsp_pause_interrupt() {
+    // A guest that sends 0x80 and then STI; HLT must be woken at the pause
+    // deadline, not at the next unrelated edge (Codex review on #733).
+    let mut machine = test_machine();
+    enable_sb16_irq_wake(&mut machine);
+    with_bus(&mut machine, |bus| {
+        for &b in &[0x41u8, 0x27, 0x10, 0x80, 0x09, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    });
+    let micros = machine.sb16.test_pause_micros_remaining().unwrap();
+    assert!(
+        micros >= 1_000,
+        "10 periods at 10 kHz, plus any folded span"
+    );
+    let ticks = micros * izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    let expected = machine
+        .timeline
+        .cpu_clocks_for_master_ticks_ceil(ticks)
+        .max(1);
+    assert_eq!(
+        machine.next_timer_wake(machine.master_ticks() + ticks * 4),
+        Some(expected)
+    );
+    assert!(machine.event_batch_cap(u64::MAX) <= expected);
+    // Nothing else is armed, so the cap is the pause itself.
+    assert_eq!(machine.event_batch_cap(u64::MAX), expected);
+}
+
+#[test]
+fn masked_sb16_line_does_not_offer_the_pause_wake() {
+    let mut machine = test_machine();
+    enable_sb16_irq_wake(&mut machine);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x21, BusWidth::Byte, 0xff, false).unwrap();
+        for &b in &[0x41u8, 0x27, 0x10, 0x80, 0x09, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    });
+    let ticks = 1_000 * izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    assert_eq!(
+        machine.next_timer_wake(machine.master_ticks() + ticks * 4),
+        None
+    );
 }

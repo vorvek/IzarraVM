@@ -200,9 +200,14 @@ pub struct SbDsp {
     auto_init: bool,
     playing: bool,
     irq_pending: bool,
+    irq_source: DspIrqSource,
     // Remaining microseconds of a 0x80 "pause DAC for a duration" command.
     // Counted down by `advance_micros`; raises the 8-bit IRQ when it elapses.
     pause_micros: Option<u64>,
+    // Set by the 0x80 dispatch and consumed by `arm_pause_at`, so a lazy
+    // class folds the already-pending batch span into exactly the write
+    // that armed the pause (the `arm_reset_at` pattern).
+    pause_fold_armed: bool,
     // 16-bit DMA playback state (SB16 0xBx family). dma_16bit selects the word
     // fetch and sample-depth path; stereo selects one vs. two words per frame;
     // sample_signed selects signed vs. unsigned 16-bit conversion.
@@ -236,6 +241,17 @@ pub struct SbDsp {
     peak_abs: i32,
 }
 
+/// Which interrupt a pending DSP IRQ is: the 8-bit DMA / SB-MIDI source
+/// (mixer Interrupt Status 0x82 bit 0) or the 16-bit DMA source (bit 1).
+/// Carried with the pending flag rather than derived from the armed DMA
+/// width, because the width latch outlives the transfer: a pause (0x80) or
+/// an 0xF2 after a 16-bit block is still the 8-bit interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DspIrqSource {
+    Dma8,
+    Dma16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct PendingCommand {
     command: u8,
@@ -260,7 +276,9 @@ impl Default for SbDsp {
             auto_init: false,
             playing: false,
             irq_pending: false,
+            irq_source: DspIrqSource::Dma8,
             pause_micros: None,
+            pause_fold_armed: false,
             dma_16bit: false,
             stereo: false,
             sample_signed: false,
@@ -288,9 +306,45 @@ impl SbDsp {
         if let Some(remaining) = self.pause_micros.as_mut() {
             *remaining = remaining.saturating_sub(micros);
             if *remaining == 0 {
-                self.irq_pending = true;
+                self.raise_irq(DspIrqSource::Dma8);
                 self.pause_micros = None;
             }
+        }
+        self.pause_fold_armed = false;
+    }
+
+    /// Microseconds left on a 0x80 pause, or None when no pause is armed.
+    /// The machine turns this into a wake deadline so a guest halted on the
+    /// pause interrupt (`STI; HLT`) resumes at the deadline rather than at
+    /// the next unrelated edge.
+    pub fn pause_micros_remaining(&self) -> Option<u64> {
+        self.pause_micros
+    }
+
+    /// Lazy-class arm compensation for the pause, the twin of
+    /// [`arm_reset_at`]: the batch-end advance applies the whole batch span,
+    /// including the part BEFORE the arming write, so that span is folded
+    /// into the countdown at the write. Only the write that dispatched the
+    /// 0x80 folds; later command writes and repeated calls are no-ops.
+    pub fn arm_pause_at(&mut self, pending_micros: u64) {
+        if self.pause_fold_armed {
+            self.pause_fold_armed = false;
+            if let Some(remaining) = self.pause_micros.as_mut() {
+                *remaining = remaining.saturating_add(pending_micros);
+            }
+        }
+    }
+
+    fn raise_irq(&mut self, source: DspIrqSource) {
+        self.irq_pending = true;
+        self.irq_source = source;
+    }
+
+    fn dma_irq_source(&self) -> DspIrqSource {
+        if self.dma_16bit {
+            DspIrqSource::Dma16
+        } else {
+            DspIrqSource::Dma8
         }
     }
 
@@ -487,6 +541,7 @@ impl SbDsp {
                 let rate = u64::from(self.rate_hz.max(1));
                 let micros = ((count + 1) * 1_000_000).div_ceil(rate);
                 self.pause_micros = Some(micros.max(1));
+                self.pause_fold_armed = true;
             }
             0x80 => {}
             0xF2 => {
@@ -494,7 +549,7 @@ impl SbDsp {
                 // IRQ-probe command drivers use to verify the IRQ wiring). Same
                 // pending state a DMA block boundary raises; acknowledged by
                 // reading port 0x22E.
-                self.irq_pending = true;
+                self.raise_irq(DspIrqSource::Dma8);
             }
             _ => {}
         }
@@ -896,7 +951,7 @@ impl SbDsp {
     fn advance_block(&mut self, mut consumed: u32) {
         while consumed > 0 && self.playing {
             if self.block_remaining == 0 {
-                self.irq_pending = true;
+                self.raise_irq(self.dma_irq_source());
                 if self.auto_init && self.block_size > 0 {
                     self.block_remaining = self.block_size;
                 } else {
@@ -910,7 +965,7 @@ impl SbDsp {
             consumed -= step;
 
             if self.block_remaining == 0 {
-                self.irq_pending = true;
+                self.raise_irq(self.dma_irq_source());
                 if self.auto_init && self.block_size > 0 {
                     self.block_remaining = self.block_size;
                 } else {
@@ -929,9 +984,18 @@ impl SbDsp {
 
     /// Take and clear a pending block-completion IRQ (cleared when the host reads 0x22E).
     pub fn take_irq(&mut self) -> bool {
-        let pending = self.irq_pending;
-        self.irq_pending = false;
-        pending
+        self.take_irq_source().is_some()
+    }
+
+    /// Take a pending IRQ together with its source (8-bit or 16-bit), which
+    /// the machine writes into mixer Interrupt Status 0x82.
+    pub fn take_irq_source(&mut self) -> Option<DspIrqSource> {
+        if self.irq_pending {
+            self.irq_pending = false;
+            Some(self.irq_source)
+        } else {
+            None
+        }
     }
 
     /// Last byte written by a direct 8-bit DAC command (0x10).
@@ -1034,6 +1098,7 @@ impl SbDsp {
                     self.block_remaining = 0;
                     self.irq_pending = false;
                     self.pause_micros = None;
+                    self.pause_fold_armed = false;
                     self.pending = None;
                     // The mode latches must clear too, or the idle 16-bit
                     // guard in render_frame keeps direct DAC dead after any

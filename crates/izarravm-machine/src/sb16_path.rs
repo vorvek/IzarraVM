@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use izarravm_audio::{Resampler, SbDsp, SbMixer};
+use izarravm_audio::{DspIrqSource, Resampler, SbDsp, SbMixer};
 use izarravm_bus::Memory;
 use izarravm_core::SoundBlasterConfig;
 use std::collections::VecDeque;
@@ -292,6 +292,23 @@ impl Sb16Path {
         }
     }
 
+    /// Lazy-class arm compensation for a 0x80 pause: see `SbDsp::arm_pause_at`.
+    pub(crate) fn arm_pause_at(&mut self, pending_micros: u64) {
+        if let Some(active) = self.active.as_mut() {
+            active.dsp.arm_pause_at(pending_micros);
+        }
+    }
+
+    /// The mixer-selected IRQ line and the master ticks until a pending 0x80
+    /// pause raises it. The pause counts microseconds, not output frames, so
+    /// it has its own term beside `irq_deadline`.
+    pub(crate) fn pause_irq_deadline(&self) -> Option<(u8, u64)> {
+        let active = self.active.as_ref()?;
+        let micros = active.dsp.pause_micros_remaining()?;
+        let ticks = micros.saturating_mul(izarravm_core::MASTER_CLOCK_HZ / 1_000_000);
+        Some((active.mixer.selected_irq(), ticks.max(1)))
+    }
+
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
         let Some(active) = self.active.as_mut() else {
             return false;
@@ -368,13 +385,13 @@ impl Sb16Path {
             if let Some(trace) = &mut active.trace {
                 trace.ticked_frames += ticked as u64;
             }
-            if active.dsp.take_irq() {
-                active.mixer.set_irq_status(active.dsp.is_16bit());
+            if let Some(source) = active.dsp.take_irq_source() {
+                active.mixer.set_irq_status(source == DspIrqSource::Dma16);
                 irq = Some(Sb16Irq { line: irq_line });
             }
         }
-        if active.dsp.take_irq() {
-            active.mixer.set_irq_status(active.dsp.is_16bit());
+        if let Some(source) = active.dsp.take_irq_source() {
+            active.mixer.set_irq_status(source == DspIrqSource::Dma16);
             irq = Some(Sb16Irq { line: irq_line });
         }
         if let Some(trace) = &mut active.trace {
@@ -564,6 +581,13 @@ impl Sb16Path {
         self.active
             .as_mut()
             .is_some_and(|active| active.dsp.take_irq())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_pause_micros_remaining(&self) -> Option<u64> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.dsp.pause_micros_remaining())
     }
 
     #[cfg(test)]

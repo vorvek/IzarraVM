@@ -2595,6 +2595,12 @@ impl CpuBus for MachineBus<'_> {
                 let pending = self.pending_device_micros();
                 self.sb16.arm_reset_at(pending);
             }
+            // Same for the pause countdown a 0x80 command arms: the DSP folds
+            // the span only when this write completed that command.
+            if self.lazy_port_reads && port == 0x22C {
+                let pending = self.pending_device_micros();
+                self.sb16.arm_pause_at(pending);
+            }
             self.opl_probe.record_sb(port, true, value as u8);
             return Ok(());
         }

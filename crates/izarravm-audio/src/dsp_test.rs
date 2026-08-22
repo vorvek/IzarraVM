@@ -821,3 +821,85 @@ fn dsp_reset_cancels_a_pending_pause() {
         "reset halts the DAC, so the pause IRQ never fires"
     );
 }
+
+#[test]
+fn block_completion_irq_reports_the_armed_dma_width_as_its_source() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]);
+    write_cmd(&mut dsp, &[0xB0, 0x10, 0x01, 0x00]); // 16-bit single, 2 words
+    let _ = dsp.render_frame(|| None, || Some(0x0000));
+    let _ = dsp.render_frame(|| None, || Some(0x0000));
+    assert_eq!(dsp.take_irq_source(), Some(DspIrqSource::Dma16));
+    assert_eq!(dsp.take_irq_source(), None, "take clears the source");
+}
+
+#[test]
+fn pause_irq_reports_the_8bit_source_even_after_a_16bit_transfer() {
+    // The 16-bit mode latch survives the transfer; the pause interrupt is
+    // still the documented 8-bit one, so mixer 0x82 must show bit 0.
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]);
+    write_cmd(&mut dsp, &[0xB0, 0x10, 0x01, 0x00]);
+    let _ = dsp.render_frame(|| None, || Some(0x0000));
+    let _ = dsp.render_frame(|| None, || Some(0x0000));
+    let _ = dsp.take_irq_source();
+    assert!(dsp.is_16bit(), "the mode latch is still 16-bit");
+    write_cmd(&mut dsp, &[0x80, 0x09, 0x00]);
+    dsp.advance_micros(1_000);
+    assert_eq!(dsp.take_irq_source(), Some(DspIrqSource::Dma8));
+}
+
+#[test]
+fn command_f2_reports_the_8bit_source() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xF2]);
+    assert_eq!(dsp.take_irq_source(), Some(DspIrqSource::Dma8));
+}
+
+#[test]
+fn pause_micros_remaining_tracks_the_countdown() {
+    let mut dsp = SbDsp::default();
+    assert_eq!(dsp.pause_micros_remaining(), None);
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]);
+    write_cmd(&mut dsp, &[0x80, 0x09, 0x00]);
+    assert_eq!(dsp.pause_micros_remaining(), Some(1_000));
+    dsp.advance_micros(400);
+    assert_eq!(dsp.pause_micros_remaining(), Some(600));
+    dsp.advance_micros(600);
+    assert_eq!(dsp.pause_micros_remaining(), None, "elapsed");
+}
+
+#[test]
+fn arm_pause_at_folds_the_pending_batch_span_into_a_fresh_pause() {
+    // Lazy classes apply the whole batch span at the batch end, including
+    // the part BEFORE the command write. The arm folds that span in so the
+    // batch-end advance lands the pause at (write + duration), not earlier.
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]);
+    write_cmd(&mut dsp, &[0x80, 0x09, 0x00]);
+    dsp.arm_pause_at(500);
+    assert_eq!(dsp.pause_micros_remaining(), Some(1_500));
+    dsp.advance_micros(1_000);
+    assert!(!dsp.take_irq(), "the pre-write span does not count");
+    dsp.advance_micros(500);
+    assert!(dsp.take_irq());
+}
+
+#[test]
+fn arm_pause_at_folds_only_the_arming_write() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]);
+    dsp.arm_pause_at(500);
+    assert_eq!(dsp.pause_micros_remaining(), None, "no pause to arm");
+    write_cmd(&mut dsp, &[0x80, 0x09, 0x00]);
+    dsp.arm_pause_at(500);
+    dsp.arm_pause_at(500);
+    assert_eq!(dsp.pause_micros_remaining(), Some(1_500), "folded once");
+    write_cmd(&mut dsp, &[0xD1]);
+    dsp.arm_pause_at(500);
+    assert_eq!(
+        dsp.pause_micros_remaining(),
+        Some(1_500),
+        "a later unrelated command write does not re-fold"
+    );
+}
