@@ -2552,19 +2552,23 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
     );
 }
 
-/// SS and the three illegal reg fields stay refused, from the side that can see them.
+/// The three illegal reg fields stay refused, from the side that can see them.
 ///
-/// `/2` fails R3's interrupt-shadow clause on every execution and `/1`, `/6` and `/7` can only
-/// fault, so each would be a call-out that never resumes. They are one bit apart from the four
-/// admitted values, which is why they are asserted rather than argued.
+/// `/1`, `/6` and `/7` can only fault, so each would be a call-out that never resumes. They are
+/// one bit apart from the admitted values, which is why they are asserted rather than argued.
+///
+/// `/2` left this list on 2026-08-22: it is the `MovSsReg` row now, with its own section below.
+/// The claim it used to carry -- that a shadow-arming load cannot be a plain `MovSreg` -- is kept
+/// by the row split rather than by a refusal, and `only_the_arming_rows_may_resume_with_a_step_armed_shadow`
+/// is where it is pinned.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn mov_sreg_refuses_ss_and_the_illegal_reg_fields() {
-    for reg in [1u8, 2, 6, 7] {
+fn mov_sreg_refuses_the_illegal_reg_fields() {
+    for reg in [1u8, 6, 7] {
         let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
         // 8E /reg with mod 11 r/m 010 (DX).
         code.extend_from_slice(&[0x8E, 0xC2 | (reg << 3)]);
@@ -2717,10 +2721,14 @@ const SEL_OTHER: u16 = 0x18;
 /// Index 4: `SEL_DATA`'s twin with the Accessed bit CLEAR, so loading it makes
 /// `load_protected_segment` write the descriptor back.
 const SEL_UNACCESSED: u16 = 0x20;
+/// Index 5: a writable data descriptor with the PRESENT bit clear. Loading it into SS raises #SS
+/// (vector 12) rather than the #NP every other segment gets, which is the 386 PRM 9.3 carve-out
+/// and the second fault vector the SS rows owe a test.
+const SEL_NOT_PRESENT: u16 = 0x28;
 /// Past the table limit, so the load is a #GP with no descriptor to blame.
 const SEL_BAD: u16 = 0x38;
-/// Four usable entries: `index + 7 > limit` refuses `SEL_BAD` and admits every other selector.
-const GDT_LIMIT: u16 = 0x27;
+/// Five usable entries: `index + 7 > limit` refuses `SEL_BAD` and admits every other selector.
+const GDT_LIMIT: u16 = 0x2f;
 
 /// One 8-byte descriptor, in the layout `descriptor_to_segment` reads back.
 fn descriptor(low: u32, high: u32) -> [u8; 8] {
@@ -2767,7 +2775,16 @@ fn seed_protected_tables(program: &mut [u8]) {
         GDT_BASE + u32::from(SEL_UNACCESSED),
         descriptor(0x0000_ffff, 0x00cf_9200),
     );
+    // Present clear, S set, type 2 (data, writable): legal for SS but not loadable.
+    put(
+        program,
+        GDT_BASE + u32::from(SEL_NOT_PRESENT),
+        descriptor(0x0000_ffff, 0x0040_1200),
+    );
     program[FAULT_HANDLER as usize] = 0xF4;
+    // 13 is #GP and 12 is #SS. Both land on the same handler: what the fixtures compare is the two
+    // LEGS of one vector against each other, not one vector against another.
+    put(program, IDT_BASE + 12 * 8, interrupt_gate(FAULT_HANDLER));
     put(program, IDT_BASE + 13 * 8, interrupt_gate(FAULT_HANDLER));
 }
 
@@ -2825,22 +2842,27 @@ fn arm_protected(cpu: &mut CpuGsw, bus: &mut TestBus, selector: u16) {
     bus.trace = BusTrace::default();
 }
 
+/// Build and install the protected-mode fixture over an arbitrary program.
+///
+/// Parameterised for the SS rows, which need `/2` and `0x17` in the middle slot where
+/// `PROTECTED_CODE` puts `mov fs,dx`. The block-shape assertions stay: they are what stops a
+/// fixture from silently measuring a block that ended at the row it was written for.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn build_protected() -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
+fn build_protected_program(
+    code: &[u8],
+    starts: &[u32],
+) -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
     let mut program = vec![0u8; 0x2000];
-    program[ENTRY as usize..ENTRY as usize + PROTECTED_CODE.len()].copy_from_slice(PROTECTED_CODE);
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
     seed_protected_tables(&mut program);
     let mut bus = sixteen_bit_bus(program);
     let mut cpu = protected_cpu();
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
-    let linears: Vec<u32> = PROTECTED_STARTS
-        .iter()
-        .map(|offset| ENTRY + offset)
-        .collect();
+    let linears: Vec<u32> = starts.iter().map(|offset| ENTRY + offset).collect();
     for &linear in &linears {
         cpu.set_eip(linear);
         cpu.begin_instruction();
@@ -2877,8 +2899,22 @@ fn build_protected() -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
     any(target_os = "windows", target_os = "linux")
 ))]
 fn run_both_protected(selector: u16, perturb: fn(&mut CpuGsw, &mut TestBus)) -> Legs {
+    run_both_protected_program(PROTECTED_CODE, PROTECTED_STARTS, selector, perturb)
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn run_both_protected_program(
+    code: &[u8],
+    starts: &[u32],
+    selector: u16,
+    perturb: fn(&mut CpuGsw, &mut TestBus),
+) -> Legs {
     let mut program = vec![0u8; 0x2000];
-    program[ENTRY as usize..ENTRY as usize + PROTECTED_CODE.len()].copy_from_slice(PROTECTED_CODE);
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
     seed_protected_tables(&mut program);
     let mut interp_bus = sixteen_bit_bus(program);
     let mut interp = protected_cpu();
@@ -2886,7 +2922,7 @@ fn run_both_protected(selector: u16, perturb: fn(&mut CpuGsw, &mut TestBus)) -> 
     perturb(&mut interp, &mut interp_bus);
     drive(&mut interp, &mut interp_bus);
 
-    let (mut native, mut native_bus, block) = build_protected();
+    let (mut native, mut native_bus, block) = build_protected_program(code, starts);
     arm_protected(&mut native, &mut native_bus, selector);
     perturb(&mut native, &mut native_bus);
 
@@ -3730,7 +3766,7 @@ fn a_demoted_site_is_filed_under_the_blocks_mode_key_and_not_the_live_one() {
 ))]
 #[test]
 fn a_demotion_past_the_site_cap_keeps_its_block_instead_of_recompiling_for_ever() {
-    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`, the shape `build_protected` uses with FS.
+    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`, the shape `PROTECTED_CODE` uses with FS.
     const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
     const STARTS_ES: &[u32] = &[0, 5, 7];
 
@@ -4231,9 +4267,13 @@ fn an_entry_interrupt_shadow_refuses_resume_for_every_row() {
     }
 }
 
-/// Only `Sti` may resume with the shadow the step armed. Every other row must refuse.
+/// Only the ARMING rows may resume with the shadow the step armed. Every other row must refuse.
+///
+/// Written against `arms_interrupt_shadow` rather than against a literal list, so admitting a row
+/// without deciding its shadow answer is a compile-time question rather than a silent pass. The
+/// set is `Sti`, `MovSsReg` and `PopSs`.
 #[test]
-fn only_the_sti_row_may_resume_with_a_step_armed_shadow() {
+fn only_the_arming_rows_may_resume_with_a_step_armed_shadow() {
     let mut cpu = sixteen_bit_code_cpu(ENTRY);
     cpu.registers.eflags = 0x202;
     cpu.set_eip(ENTRY + 5);
@@ -4253,6 +4293,37 @@ fn only_the_sti_row_may_resume_with_a_step_armed_shadow() {
 #[test]
 fn sti_core_clocks_is_what_the_interpreter_charges() {
     assert_row_charges(&[0xFB], crate::STI_CORE_CLOCKS, |_, _| {});
+}
+
+/// The IF 0-to-1 relaxation is NARROWER than the arming set, and the two must not be merged.
+///
+/// `arms_interrupt_shadow` names three rows; `takes_interrupt_enable_edge` names one. The SS rows
+/// arm the shadow and write no flag at all, so giving them the IF pass would be a relaxation
+/// nothing asked for, extended automatically to any future arming row that does write IF.
+///
+/// MUTATION: make `takes_interrupt_enable_edge` an alias of `arms_interrupt_shadow` and this
+/// fails on both SS rows.
+#[test]
+fn the_interrupt_enable_relaxation_is_the_sti_row_alone() {
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    // IF CLEAR before the step, SET after it: the edge the clause is about.
+    cpu.registers.eflags = 0x002;
+    cpu.set_eip(ENTRY + 5);
+    let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
+    cpu.registers.eflags = 0x202;
+    for row in jit::direct::InterpretOneRow::ALL {
+        assert_eq!(
+            snapshot.allows_resume(&cpu, ENTRY + 5, row),
+            row.takes_interrupt_enable_edge(),
+            "{} disagreed with its own interrupt-enable answer",
+            row.label()
+        );
+        assert!(
+            !row.takes_interrupt_enable_edge() || row.arms_interrupt_shadow(),
+            "{}: a row that takes the IF edge must also arm the shadow",
+            row.label()
+        );
+    }
 }
 
 /// Design review 10.1, M5: the SS-load measurement splits same-record loads from record-moving
@@ -4311,4 +4382,425 @@ fn the_ss_load_measurement_ignores_the_other_segments() {
         (stalls.ss_load_same_record, stalls.ss_load_changed_record),
         (0, 0)
     );
+}
+
+// ---------------------------------------------------------------------------
+// 11. The SS rows (S4 part 2): `0x8E /2` MOV SS,r/m and `0x17` POP SS.
+//
+// They are STI's siblings in the mechanism and its opposites in the measurement. STI arms the
+// shadow and always resumes; these arm the shadow and resume only when R2 finds the SS record
+// unchanged, which the tombraid loader split at 484,385 same-record loads against 488,498
+// record-moving ones (design review 10.1 M5). Both halves are here: the reload that carries on,
+// and the stack switch that stops the run exactly where it stopped before the rows existed.
+// ---------------------------------------------------------------------------
+
+/// `mov ss, cx` with CX zero, which is the selector SS already holds in the 16-bit fixture.
+///
+/// CX rather than AX because the shared program opens with `mov ax, 0x1111`: loading THAT into SS
+/// is the record-moving case, and it has its own fixture below.
+const MOV_SS_SAME: &[u8] = &[0x8E, 0xD1];
+/// `mov ss, ax`, which the same program has already loaded with 0x1111.
+const MOV_SS_CHANGED: &[u8] = &[0x8E, 0xD0];
+
+/// Put the selector SS already holds on top of the stack, so `pop ss` reloads the same record.
+///
+/// `arm_fixture` seeds `POPPED` there for the 0x8F row, which for POP SS would be a stack switch
+/// to segment 0x4321 and therefore the OTHER case.
+fn same_selector_on_the_stack(_: &mut CpuGsw, bus: &mut TestBus) {
+    bus.memory[STACK_TOP as usize..STACK_TOP as usize + 2].fill(0);
+}
+
+/// Both SS rows resume when the load leaves the record alone.
+///
+/// This is the half of the census split that is a win, and it is the whole reason the rows exist:
+/// a 16-bit runtime that re-establishes the stack it is already on pays a call-out instead of a
+/// block boundary. `assert_row_resumes` compares registers, EFLAGS, guest RAM, `elapsed_clocks`
+/// and `perf.instructions` against a wholly interpreted leg and asserts all three slots retired.
+///
+/// MUTATION: return `None` for `/2` in the `0x8e` arm, or delete the `0x17` arm, and
+/// `assert_row_is_a_call_out` fails on the block shape.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_ss_rows_resume_on_an_unchanged_record() {
+    let legs = assert_row_resumes(MOV_SS_SAME, no_perturb);
+    assert_eq!(legs.native.registers.segment(SegmentIndex::Ss).selector, 0);
+    let legs = assert_row_resumes(&[0x17], same_selector_on_the_stack);
+    assert_eq!(legs.native.registers.segment(SegmentIndex::Ss).selector, 0);
+    assert_eq!(
+        legs.native.registers.esp(),
+        STACK_TOP + 2,
+        "the pop must have moved the stack pointer"
+    );
+}
+
+/// The other half of the split: a load that MOVES the record resyncs, and it leaves the shadow
+/// armed for the interpreter exactly as an interpreted load would.
+///
+/// Three claims, and the third is the one that is easy to get wrong. The run ends at the row (two
+/// instructions retired, not three). The block's own state is the interpreter's. And
+/// `interrupt_shadow` is still ARMED at the boundary, so the dispatcher refuses the successor for
+/// exactly one instruction and the interpreter consumes the reprieve, which is what hardware does
+/// after any SS load. The helper never clears the flag and a RESYNC latches nothing, so the
+/// boundary has nothing to compare and leaves it alone.
+///
+/// MUTATION: drop the SS entry from R2's record compare and the run reports three instructions.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_ss_rows_resync_on_a_changed_record_with_the_shadow_armed() {
+    // `mov ax, 0x4321; push ax` is not available inside `row_program`, so the POP case takes the
+    // value `arm_fixture` already seeds at the top of the stack.
+    for (label, row, perturb) in [
+        (
+            "mov ss, ax",
+            MOV_SS_CHANGED,
+            no_perturb as fn(&mut CpuGsw, &mut TestBus),
+        ),
+        ("pop ss", &[0x17][..], no_perturb),
+    ] {
+        let (code, starts) = row_program(row);
+        let (mut cpu, mut bus, native_insns, block) =
+            run_block_to_boundary(&code, &starts, perturb);
+        assert_eq!(
+            native_insns, 2,
+            "{label}: the prefix plus the retired load, and nothing after it"
+        );
+        let stalls = cpu.direct_stall_snapshot();
+        assert_eq!(stalls.callout_interpret_one_executed, 1, "{label}");
+        assert_eq!(stalls.callout_interpret_one_resync, 1, "{label}");
+        assert!(
+            cpu.interrupt_shadow,
+            "{label}: a resync leaves the interpreter the state it would have produced"
+        );
+        assert!(!cpu.can_take_interrupt(), "{label}");
+
+        // The entry gate refuses ONE block while the reprieve stands, which is the counter design
+        // review 10.1 M6 pre-registers.
+        let refused = cpu.perf_counters().jit_direct_reject_interrupt_shadow;
+        assert!(
+            !cpu.try_run_direct_block_for_test(&mut bus, block)
+                .expect("a refused entry is not a machine stop"),
+            "{label}: a block must not be entered while the shadow is armed"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_reject_interrupt_shadow - refused,
+            1,
+            "{label}"
+        );
+
+        // One interpreted instruction consumes it, and the refusal does not repeat.
+        cpu.cycle_no_interrupt_check(&mut bus)
+            .expect("the shadowed instruction runs");
+        assert!(
+            !cpu.interrupt_shadow,
+            "{label}: one instruction, one reprieve"
+        );
+        let refused = cpu.perf_counters().jit_direct_reject_interrupt_shadow;
+        let _ = cpu.try_run_direct_block_for_test(&mut bus, block);
+        assert_eq!(
+            cpu.perf_counters().jit_direct_reject_interrupt_shadow - refused,
+            0,
+            "{label}: the refusal must cost exactly one instruction"
+        );
+    }
+}
+
+/// Drive a CPU the way `run_budgeted_inner` does and answer how many instructions retire before
+/// the pending vector lands.
+///
+/// The interrupt is asked ONLY where the run would end, which is the first boundary at which
+/// `can_take_interrupt` has turned true across an instruction: that is the interpreter's own
+/// delivery point (run.rs, the `!can_take_before && can_take_interrupt()` break), and the machine
+/// then services at the next batch entry. Calling `cycle` instead would service before the first
+/// instruction and measure the fixture rather than the mechanism.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn instructions_until_the_vector_lands(cpu: &mut CpuGsw, bus: &mut TestBus) -> u64 {
+    let start = cpu.perf_counters().instructions;
+    for _ in 0..16 {
+        let can_take_before = cpu.can_take_interrupt();
+        cpu.cycle_no_interrupt_check(bus)
+            .expect("the fixture must not stop the machine");
+        if !can_take_before && cpu.can_take_interrupt() {
+            let retired = cpu.perf_counters().instructions - start;
+            assert!(
+                cpu.service_pending_interrupt(bus)
+                    .expect("delivery must not fault")
+                    .is_some(),
+                "the run ended on the interrupt transition, so the vector must land here"
+            );
+            assert_eq!(cpu.registers.eip, 0, "delivery jumped through the IVT");
+            return retired;
+        }
+        assert!(
+            !cpu.halted,
+            "the guest halted with the interrupt still undelivered"
+        );
+    }
+    panic!("the vector never landed");
+}
+
+/// An IRQ pending across `mov ss, cx; mov sp, bx` is delivered at the SAME instruction the
+/// interpreter delivers it at.
+///
+/// The owner's caveat allows a LATER delivery when a block carried on past an arming row. It never
+/// allows an earlier one, and here it does not even allow a later one: the pendency clause makes
+/// the row resync while an interrupt is pending, so the block ends at the SS load and the
+/// interpreter runs the one shadowed instruction itself. Both legs deliver after three retired
+/// instructions.
+///
+/// MUTATION: drop the `bus.interrupt_pending()` term and the block resumes, reporting three
+/// native instructions instead of two.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn an_irq_across_an_ss_load_lands_where_the_interpreter_lands_it() {
+    fn pend(_: &mut CpuGsw, bus: &mut TestBus) {
+        bus.pending_irq = Some(0x08);
+    }
+    // mov ax,0x1111; mov ss,cx; mov sp,bx; hlt
+    let code = [0xB8, 0x11, 0x11, 0x8E, 0xD1, 0x8B, 0xE3, 0xF4];
+    let starts = [0, 3, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    seed_fault_handler(&mut program);
+    let mut interp_bus = sixteen_bit_bus(program);
+    let mut interp = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut interp, &mut interp_bus);
+    pend(&mut interp, &mut interp_bus);
+    let interpreted = instructions_until_the_vector_lands(&mut interp, &mut interp_bus);
+    assert_eq!(interpreted, 3, "the interpreted leg is the oracle");
+
+    let (mut cpu, mut bus, native_insns, _) = run_block_to_boundary(&code, &starts, pend);
+    assert_eq!(
+        native_insns, 2,
+        "the block must stop at the SS load while something is pending"
+    );
+    let native = native_insns + instructions_until_the_vector_lands(&mut cpu, &mut bus);
+    assert_eq!(
+        native, interpreted,
+        "the vector landed on a different instruction than the interpreter puts it on"
+    );
+}
+
+/// The pendency clause is what stops a later IF-clearing slot from LOSING the interrupt, which is
+/// a bigger error than the latency the caveat covers.
+///
+/// `mov ss, cx; nop; cli`: interpreted, the `nop` consumes the shadow, the run breaks on the
+/// interrupt transition and the vector lands BEFORE the CLI. A block that resumed past the SS load
+/// would run the CLI inside itself, reach its boundary with IF clear, and the interrupt would then
+/// wait for the next IF rise, which the fixture never performs.
+///
+/// MUTATION: drop the `bus.interrupt_pending()` term and this fixture halts with the interrupt
+/// still pending, which `instructions_until_the_vector_lands` reports as a panic.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn an_ss_load_does_not_lose_an_irq_to_a_later_cli_slot() {
+    fn pend(_: &mut CpuGsw, bus: &mut TestBus) {
+        bus.pending_irq = Some(0x08);
+    }
+    // mov ax,0x1111; mov ss,cx; nop; cli; hlt
+    let code = [0xB8, 0x11, 0x11, 0x8E, 0xD1, 0x90, 0xFA, 0xF4];
+    let starts = [0, 3, 5, 6, 7];
+    let (mut cpu, mut bus, native_insns, _) = run_block_to_boundary(&code, &starts, pend);
+    assert_eq!(native_insns, 2, "the block must stop at the SS load");
+    assert_eq!(
+        native_insns + instructions_until_the_vector_lands(&mut cpu, &mut bus),
+        3,
+        "the vector must land on the instruction after the SS load, before the CLI"
+    );
+}
+
+/// The IF term narrows the pendency clause: with interrupts disabled the block carries on.
+///
+/// Nothing is deliverable at the boundary or anywhere else while IF is clear, so continuing cannot
+/// move a delivery point, and refusing here would demote every SS slot a guest runs inside an
+/// interrupt handler. STI is unaffected by the term because a retired STI always leaves IF set.
+///
+/// MUTATION: delete the `FLAG_IF` term and this resyncs, reporting two instructions.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn an_ss_load_resumes_while_interrupts_are_disabled_and_an_irq_is_pending() {
+    fn pend_with_if_clear(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        clear_if(cpu, bus);
+        bus.pending_irq = Some(0x08);
+    }
+    let (code, starts) = row_program(MOV_SS_SAME);
+    let (cpu, _, native_insns, _) = run_block_to_boundary(&code, &starts, pend_with_if_clear);
+    assert_eq!(native_insns, 3, "the block must have carried on");
+    assert_eq!(cpu.direct_stall_snapshot().callout_interpret_one_resync, 0);
+}
+
+/// `POP_SS_CORE_CLOCKS` and `MOV_SREG_CORE_CLOCKS` are what the interpreter charges for the two
+/// rows, which is what the block budget bound is derived from.
+#[test]
+fn the_ss_rows_charge_what_the_interpreter_charges() {
+    // A stack clear of everything `arm_fixture` seeds, so twenty-four pops all load selector zero
+    // and the segment base stays inside the fixture's memory.
+    fn quiet_stack(cpu: &mut CpuGsw, _: &mut TestBus) {
+        cpu.registers.set_esp(0x1900);
+    }
+    assert_row_charges(&[0x17], crate::POP_SS_CORE_CLOCKS, quiet_stack);
+    assert_row_charges(MOV_SS_SAME, crate::MOV_SREG_CORE_CLOCKS, |_, _| {});
+}
+
+// The protected-mode half. A real-mode SS load is `base = selector << 4`; a protected-mode one is
+// a descriptor fetch with a type check the other segments do not run (a stack must be a WRITABLE
+// data segment), a privilege check, and two fault vectors instead of one.
+
+/// `mov eax,0x1111; mov ss,dx; inc eax; hlt`, the protected-mode SS fixture.
+const PROTECTED_MOV_SS: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xD2, 0x40, 0xF4];
+const PROTECTED_MOV_SS_STARTS: &[u32] = &[0, 5, 7];
+/// `mov eax,0x1111; pop ss; inc eax; hlt`, on the 32-BIT stack `protected_cpu` gives SS.
+const PROTECTED_POP_SS: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x17, 0x40, 0xF4];
+const PROTECTED_POP_SS_STARTS: &[u32] = &[0, 5, 6];
+
+/// Put `SEL_DATA` on top of the 32-bit stack, so the protected-mode POP SS reloads the record SS
+/// already holds. Four bytes, because CS.D is 1 here and the 386 PRM has a Dword POP SS move a
+/// full dword of stack and load the low sixteen.
+fn same_selector_on_the_dword_stack(_: &mut CpuGsw, bus: &mut TestBus) {
+    bus.memory[STACK_TOP as usize..STACK_TOP as usize + 4]
+        .copy_from_slice(&u32::from(SEL_DATA).to_le_bytes());
+}
+
+/// Reloading the same descriptor into SS resumes in protected mode, through both rows and
+/// therefore both stack widths: `mov ss,dx` on the 16-bit fixture above and `pop ss` here on a
+/// 32-bit stack, which is what `protected_cpu` gives SS.
+///
+/// The descriptor fetch, the writable-data type check, the privilege check and the accessed-bit
+/// branch are all the interpreter's, run from inside a live native frame.
+///
+/// MUTATION: refuse `0x17` in `stack_width_kind` the way `PopSegReal` is refused in protected mode
+/// and the block shape assertion inside `build_protected_program` fails.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_protected_mode_ss_reload_resumes() {
+    let mut legs = run_both_protected_program(
+        PROTECTED_MOV_SS,
+        PROTECTED_MOV_SS_STARTS,
+        SEL_DATA,
+        no_perturb,
+    );
+    assert_eq!(legs.exit_reason, None, "mov ss: the block should complete");
+    assert_eq!(legs.native_insns, u64::from(BLOCK_INSTRUCTIONS), "mov ss");
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native.registers.segment(SegmentIndex::Ss).selector,
+        SEL_DATA
+    );
+
+    let mut legs = run_both_protected_program(
+        PROTECTED_POP_SS,
+        PROTECTED_POP_SS_STARTS,
+        SEL_DATA,
+        same_selector_on_the_dword_stack,
+    );
+    assert_eq!(legs.exit_reason, None, "pop ss: the block should complete");
+    assert_eq!(legs.native_insns, u64::from(BLOCK_INSTRUCTIONS), "pop ss");
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native.registers.esp(),
+        STACK_TOP + 4,
+        "a Dword POP SS moves four bytes of stack"
+    );
+}
+
+/// A protected-mode load of a DIFFERENT descriptor moves the record, so the run ends at the row.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_protected_mode_ss_change_resyncs() {
+    let mut legs = run_both_protected_program(
+        PROTECTED_MOV_SS,
+        PROTECTED_MOV_SS_STARTS,
+        SEL_OTHER,
+        no_perturb,
+    );
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32)
+    );
+    assert_eq!(legs.native_insns, 2, "the prefix plus the retired load");
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native.registers.segment(SegmentIndex::Ss).limit,
+        0xffff,
+        "the load itself must have happened"
+    );
+}
+
+/// Both SS fault vectors, delivered from inside the helper through the not-retired stub.
+///
+/// #GP(13) for a selector past the table limit, and #SS(12) for a present-bit-clear descriptor,
+/// which is the 386 PRM 9.3 carve-out no other segment takes: every other register would get #NP.
+/// A row whose fault path was only ever argued about would pass every other test in this file.
+///
+/// MUTATION: return `STATUS_ABNORMAL` instead of the fault stub and the retirement count reads 0
+/// instead of the prefix, and `assert_legs_agree` fails on `perf.instructions`.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_protected_mode_ss_faults_take_the_fault_stub() {
+    for (label, selector) in [
+        ("#GP bad selector", SEL_BAD),
+        ("#SS not present", SEL_NOT_PRESENT),
+    ] {
+        let mut legs = run_both_protected_program(
+            PROTECTED_MOV_SS,
+            PROTECTED_MOV_SS_STARTS,
+            selector,
+            no_perturb,
+        );
+        assert_eq!(
+            legs.exit_reason,
+            Some(jit::direct::SideExitReason::CallOutResyncFault as u32),
+            "{label}"
+        );
+        assert_eq!(legs.native_insns, 1, "{label}: the prefix only");
+        assert_eq!(
+            legs.native
+                .direct_stall_snapshot()
+                .callout_interpret_one_resync_fault,
+            1,
+            "{label}"
+        );
+        assert_legs_agree(&mut legs);
+        assert_eq!(
+            legs.native.registers.segment(SegmentIndex::Ss).selector,
+            SEL_DATA,
+            "{label}: a faulting load must leave the old segment in place"
+        );
+    }
 }

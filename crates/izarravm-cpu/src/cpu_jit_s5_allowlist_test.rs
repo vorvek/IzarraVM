@@ -507,11 +507,14 @@ fn word_size_push_segment_forms_are_lowered() {
 /// about the allowlist.
 /// `0x07` and `0x1f` moved on 2026-08-20: the V86 loop-A slice lowers POP ES and POP DS behind
 /// `IZARRAVM_V86_LOOP_ROWS`, so both are allowlist refusals on the OFF arm and lowerings on the ON
-/// one. `0x17` POP SS stays refused on BOTH arms, and that is the pairing this table exists to
-/// hold: the two segments this backend can load in real mode and V86 flip, and the stack segment
-/// does not, because LOADING SS arms a one-instruction interrupt shadow that a native block never
-/// passes through. `0x16` PUSH SS left this table on 2026-08-22 for the positive one above. It
-/// loads nothing and arms nothing, so the shadow argument never applied to it.
+/// one. `0x16` PUSH SS left this table on 2026-08-22 for the positive one above; it loads nothing
+/// and arms nothing, so the shadow argument never applied to it.
+///
+/// `0x17` POP SS left it on the same day for a different reason and is asserted from the other
+/// side just below: it is an `InterpretOne` call-out on BOTH arms, independent of this gate,
+/// because the interrupt shadow it arms is decided at the block boundary rather than refused at
+/// compile time. That pairing is what the table now holds: two rows that flip with the gate and
+/// one that does not depend on it at all.
 ///
 /// `flat_fixture` builds a REAL-mode CPU (`fresh()` with CS.D forced on), and the rows above force
 /// SS.B off, which is exactly the cell `PopSegReal` is admitted in: real mode, 16-bit stack, Word
@@ -523,7 +526,6 @@ fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
     let cases: &[(&str, &[u8], bool)] = &[
         ("0x1f pop ds", &[0x66, 0x1f], false),
         ("0x07 pop es", &[0x66, 0x07], false),
-        ("0x17 pop ss", &[0x66, 0x17], true),
     ];
 
     for arm in [false, true] {
@@ -553,6 +555,55 @@ fn word_size_push_segment_forms_outside_the_slice_stay_refused() {
                 } else {
                     "JOIN the block as a fourth slot"
                 }
+            );
+        }
+    }
+    jit::direct::set_v86_loop_rows_for_test(None);
+}
+
+/// `POP SS` joins the block as an `InterpretOne` call-out at BOTH operand sizes and on both arms
+/// of the V86 loop-rows gate, which is the row's whole admission claim stated positively.
+///
+/// Both sizes because the two are different instructions to the interpreter: the 386 PRM has a
+/// Dword POP SS move four bytes of stack and load the low sixteen, and the Word allowlist entry
+/// only reaches the first of them. If the Dword form ever needed refusing, it would have to be
+/// refused in the arm, and this is the assertion that would fail.
+///
+/// Both gate arms because `0x17` is not part of the V86 loop-rows slice at all. Its two
+/// neighbours in the encoding, `0x07` and `0x1f`, are, and the table above pins them flipping;
+/// this pins that the stack segment does not flip with them.
+///
+/// MUTATION: route `0x17` through the `PopSegReal` arm instead of its own and the Dword row fails
+/// here, because `stack_width_kind` refuses that kind at every cell but the 16-bit Word one.
+#[test]
+fn word_and_dword_pop_ss_join_the_block_as_call_outs() {
+    for arm in [false, true] {
+        jit::direct::set_v86_loop_rows_for_test(Some(arm));
+        for (label, form) in [
+            ("0x17 pop ss", &[0x17u8][..]),
+            ("66 17 pop ss", &[0x66, 0x17]),
+        ] {
+            let mut code = vec![0x40, 0x41, 0x42];
+            code.extend_from_slice(form);
+            let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+            let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+            ss.default_size_32 = false;
+            cpu.registers.set_segment(SegmentIndex::Ss, ss);
+            cpu.registers.set_esp(0x1000);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
+
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(
+                compilation.span.instructions, 4,
+                "{label}: must join the block (v86 loop rows = {arm})"
+            );
+            assert_eq!(
+                compilation.callout_interpret_one_slots, 1,
+                "{label}: must join as a call-out, never as a lowering (v86 loop rows = {arm})"
             );
         }
     }
@@ -592,8 +643,13 @@ fn word_size_load_segment_forms_are_lowered() {
 ///
 /// `/1`, `/6` and `/7` are the ones that matter most and they stay REFUSED: they are not segment
 /// loads at all, the interpreter raises #GP(0) for each, and compiling a block around an
-/// instruction that can only fault burns a call-out on every execution. `/2` is SS, refused over
-/// the one-instruction interrupt shadow, which fails R3 on every execution for the same reason.
+/// instruction that can only fault burns a call-out on every execution.
+///
+/// `/2` SS was refused beside them over the one-instruction interrupt shadow until S4 part 2,
+/// which admits it as a call-out on its own census row: the shadow clause is scoped per row now
+/// and the flag is decided at the block boundary. It sits in this table rather than with `/4` and
+/// `/5` because it is still the shape whose answer a widening is most likely to get wrong, and
+/// because a refusal reappearing here would be a silent revert.
 ///
 /// `/4` FS, `/5` GS and the memory forms were refused here as "out of scope" until the S3 policy
 /// widening, which admits them as `InterpretOne` CALL-OUTS. The claim moves rather than lapses:
@@ -606,7 +662,7 @@ fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
         ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8], None),
         ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0], None),
         ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8], None),
-        ("/2 mov ss,ax arms the shadow", &[0x66, 0x8e, 0xd0], None),
+        ("/2 mov ss,ax calls out", &[0x66, 0x8e, 0xd0], Some(1)),
         ("/4 mov fs,ax calls out", &[0x66, 0x8e, 0xe0], Some(1)),
         ("/5 mov gs,ax calls out", &[0x66, 0x8e, 0xe8], Some(1)),
         (

@@ -2120,6 +2120,27 @@ fn policy_sti(_: &mut [u32; 8]) -> Vec<u8> {
     vec![0xFB]
 }
 
+/// `8E D3`: `MOV SS, BX`, with BX set to the selector SS already holds in the 16-bit machine.
+///
+/// SAME-RECORD by construction, because that is the half of the row that resumes: R2 byte-compares
+/// the six segment records after the step, so a case that switched stacks would resync and the
+/// sweep's retirement equality would be measuring the boundary rather than the row. The
+/// record-moving half has its own fixture in `cpu_jit_interpret_one_test.rs`, where a resync is
+/// the assertion instead of a failure.
+fn policy_mov_ss(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[3] = 0;
+    vec![0x8E, 0xD3]
+}
+
+/// `17`: `POP SS` off the generated stack, which holds zero -- the selector SS already has.
+///
+/// `single_case_memory` zeroes everything but the program bytes and the 16-bit stack pointers the
+/// case builder picks are all clear of them, so this is the same-record shape for the reason
+/// `policy_mov_ss` is. It moves SP by two and nothing later in the program reads it.
+fn policy_pop_ss(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x17]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
 const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_mov_sreg_memory_32,
@@ -2294,6 +2315,16 @@ fn sixteen_bit_sti_case(index: u32, mode_offset: u32) -> GeneratedCase {
     sixteen_bit_policy_case_with(index, mode_offset, policy_sti)
 }
 
+/// One `MOV SS, BX` case in the 16-bit machine.
+fn sixteen_bit_mov_ss_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(index, mode_offset, policy_mov_ss)
+}
+
+/// One `POP SS` case in the 16-bit machine.
+fn sixteen_bit_pop_ss_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    sixteen_bit_policy_case_with(index, mode_offset, policy_pop_ss)
+}
+
 /// `sixteen_bit_policy_case`'s body with the row handed in. See `policy_case_with`.
 fn sixteen_bit_policy_case_with(index: u32, mode_offset: u32, row: PolicyRow) -> GeneratedCase {
     let seed = 0x5715_80f4_0000_0001u64
@@ -2409,49 +2440,85 @@ fn generated_policy_widening_blocks_match_the_interpreter() {
     );
 }
 
-/// The STI row (S4d), on the same generated program shape as the policy sweep.
+/// The three SHADOW-ARMING rows, on the same generated program shape as the policy sweep.
 ///
-/// A sweep of its own rather than a twelfth entry in the row tables, and the reason is the one
-/// thing this row changes that no other row does. `run_budgeted_inner` ends a run the instant an
+/// A sweep of its own rather than three more entries in the row tables, and the reason is the one
+/// thing these rows change that no other row does. `run_budgeted_inner` ends a run the instant an
 /// instruction makes an interrupt serviceable. Interpreted, that is the instruction right after
-/// the STI; natively, the STI and the instruction behind it are both inside the block, so the run
-/// ends at the block's boundary instead. The sequence of `run_budgeted` outcomes therefore
-/// differs, which is the caveat the owner approved on 2026-08-22 and not something to assert away
-/// for the other eleven rows as well.
+/// the arming one; natively, the arming row and the instruction behind it are both inside the
+/// block, so the run ends at the block's boundary instead. The sequence of `run_budgeted` outcomes
+/// therefore differs, which is the caveat the owner approved on 2026-08-22 and not something to
+/// assert away for the other eleven rows as well.
 ///
 /// Everything the caveat does not cover is asserted at full strength: total consumed clocks, the
 /// whole settled CPU including `interrupt_shadow`, guest RAM, the bus-clock total, and the
 /// retirement equality that says the row resumed rather than resynced.
+///
+/// STI runs on both machines; the two SS rows run on the 16-BIT one only, and that is a property
+/// of the fixture rather than of the rows. `generated_cpu` sets CR0.PE with no GDT at all -- it
+/// never needed one, because no row before these could load a segment -- so a protected-mode SS
+/// load there can only raise #GP and would be measuring the fault path at every index. The
+/// protected-mode SS path is covered instead by `interpret_one_protected_mode_ss_reload_resumes`
+/// and its siblings, which build a real GDT and reach the descriptor fetch, the writable-data type
+/// check and both fault vectors.
 #[test]
-fn generated_sti_blocks_match_the_interpreter() {
+fn generated_shadow_arming_blocks_match_the_interpreter() {
     for (label, mode, offset, build_cpu, build_case) in [
         (
-            "flat, SS.B=1",
+            "sti, flat, SS.B=1",
             GswMode::Gsw486,
             0,
             generated_cpu as fn(GswMode) -> CpuGsw,
             sti_case as fn(u32, u32) -> GeneratedCase,
         ),
         (
-            "flat, SS.B=1",
+            "sti, flat, SS.B=1",
             GswMode::Gsw586,
             WIDTH_LIFT_CASES,
             generated_cpu,
             sti_case,
         ),
         (
-            "16-bit code, SS.B=0",
+            "sti, 16-bit code, SS.B=0",
             GswMode::Gsw486,
             2 * WIDTH_LIFT_CASES,
             generated_sixteen_bit_cpu,
             sixteen_bit_sti_case,
         ),
         (
-            "16-bit code, SS.B=0",
+            "sti, 16-bit code, SS.B=0",
             GswMode::Gsw586,
             3 * WIDTH_LIFT_CASES,
             generated_sixteen_bit_cpu,
             sixteen_bit_sti_case,
+        ),
+        (
+            "mov ss, 16-bit code, SS.B=0",
+            GswMode::Gsw486,
+            4 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_mov_ss_case,
+        ),
+        (
+            "mov ss, 16-bit code, SS.B=0",
+            GswMode::Gsw586,
+            5 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_mov_ss_case,
+        ),
+        (
+            "pop ss, 16-bit code, SS.B=0",
+            GswMode::Gsw486,
+            6 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_pop_ss_case,
+        ),
+        (
+            "pop ss, 16-bit code, SS.B=0",
+            GswMode::Gsw586,
+            7 * WIDTH_LIFT_CASES,
+            generated_sixteen_bit_cpu,
+            sixteen_bit_pop_ss_case,
         ),
     ] {
         run_generated_sweep(

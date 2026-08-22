@@ -4665,7 +4665,19 @@ pub(crate) const STI_CORE_CLOCKS: u32 = 3;
 /// What MOV Sreg, r/m16 charges (execute.rs `0x8e`), at every segment, both operand forms and
 /// every mode: the arm returns one `clocks(7)` after the load, whether that load was a real-mode
 /// base computation or a full protected-mode descriptor fetch.
+///
+/// `MovSsReg` (`0x8E /2`) is priced by this constant too and not by one of its own, because it IS
+/// this arm: the interpreter's 0x8e case returns the same charge for SS as for every other
+/// segment. The row is separate in the census, where the question is about resume shapes; it is
+/// not separate here, where the question is what the interpreter charged.
 pub(crate) const MOV_SREG_CORE_CLOCKS: u32 = 7;
+
+/// What POP SS charges (execute.rs `0x17`), at both operand sizes and every mode.
+///
+/// The same number as `MOV_SREG_CORE_CLOCKS` and a separate constant anyway, for the reason
+/// `STI_CORE_CLOCKS` is separate from `CLI_CORE_CLOCKS`: they are separate interpreter arms, and
+/// folding them would make a future divergence in one silently change the other row's budget term.
+pub(crate) const POP_SS_CORE_CLOCKS: u32 = 7;
 
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
@@ -4695,6 +4707,8 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0xFA CLI | execute.rs `0xfa` | `CLI_CORE_CLOCKS` |
 /// | 0x8E MOV Sreg,r/m | execute.rs `0x8e` | `MOV_SREG_CORE_CLOCKS` |
 /// | 0xFB STI | execute.rs `0xfb` | `STI_CORE_CLOCKS` |
+/// | 0x8E /2 MOV SS,r/m | execute.rs `0x8e` | `MOV_SREG_CORE_CLOCKS` |
+/// | 0x17 POP SS | execute.rs `0x17` | `POP_SS_CORE_CLOCKS` |
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
@@ -4708,7 +4722,10 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
             larger(GROUP3_CORE_CLOCKS, INC_DEC_RM8_CORE_CLOCKS),
             larger(
                 larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
-                larger(MOV_SREG_CORE_CLOCKS, STI_CORE_CLOCKS),
+                larger(
+                    larger(MOV_SREG_CORE_CLOCKS, STI_CORE_CLOCKS),
+                    POP_SS_CORE_CLOCKS,
+                ),
             ),
         ),
     ),
@@ -4732,12 +4749,15 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
 /// | 0xFA CLI | none |
 /// | 0xFB STI | none |
 /// | 0x8E memory, PROTECTED mode | operand read + two descriptor dwords + accessed-bit write-back = 4 |
+/// | 0x8E /2 memory, PROTECTED mode | the same four |
+/// | 0x17 POP SS, PROTECTED mode | stack read + two descriptor dwords + accessed-bit write-back = 4 |
 ///
-/// The last row is why this is FOUR rather than two, and it is the one the S3 policy widening
-/// moved: a protected-mode segment load reads eight bytes of descriptor out of the GDT or the
-/// LDT through `read_system_linear_u32` and writes the accessed bit back when it was clear
-/// (`load_protected_segment`, control.rs). The register-source form of the same row is one
-/// access fewer, so the memory form is the bound.
+/// The protected-mode segment rows are why this is FOUR rather than two, and the first of them is
+/// the one the S3 policy widening moved: a protected-mode segment load reads eight bytes of
+/// descriptor out of the GDT or the LDT through `read_system_linear_u32` and writes the accessed
+/// bit back when it was clear (`load_protected_segment`, control.rs). The register-source form of
+/// `0x8E` is one access fewer, so its memory form is the bound; POP SS has no register form and
+/// its one stack read takes that slot, so it lands on the same four and the bound does not move.
 ///
 /// PAGE WALKS are still not priced. That is the accepted overshoot the bus term already records
 /// rather than a hole this constant opens: any of these accesses can miss the TLB and walk, and

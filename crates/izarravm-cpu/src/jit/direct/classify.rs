@@ -222,6 +222,11 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
                 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
                 | 0x06 | 0x0e | 0x16 | 0x1e
+                // POP SS, the S4 part-2 row. It is on this list rather than folded in with the
+                // pushes above because it LOADS the stack segment: the arm below turns it into an
+                // `InterpretOne` call-out whose resume depends on R2 finding the SS record
+                // unchanged, and the loader census ranks it at 483,000 block-stopping hits.
+                | 0x17
                 | 0x40..=0x4f
                 | 0x50..=0x5f
                 | 0x68
@@ -1260,13 +1265,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // loop-A census's largest row at 97,347,816 interpreted hits and 95,057,524 static
             // unbound exits, and `0x1f` rides the same arm with 6,016,460 of its own.
             //
-            // POP SS (0x17) is left off both this arm and the gated allowlist above, and the reason
-            // is exactly the one `0x8e /2` states in its own arm: loading SS arms a one-instruction
-            // interrupt shadow (`load_segment_arming_ss_shadow`) that the interpreter consumes at
-            // the start of the NEXT instruction. A native block never passes through that point,
-            // so a block that continued after it would hold the shadow open across every remaining
-            // slot, which moves where an interrupt is delivered. FS and GS have no `POP` encoding
-            // in the one-byte map at all, so the DS/ES pair is the whole family here.
+            // POP SS (0x17) has its OWN arm below and is not part of this one. FS and GS have no
+            // `POP` encoding in the one-byte map at all, so the DS/ES pair is the whole family
+            // here.
             //
             // WORD ONLY, and the refusal is in this arm rather than downstream. At `Dword` the
             // interpreter pops FOUR bytes and loads the low 16 (386 PRM), which is a different
@@ -1282,6 +1283,41 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         SegmentIndex::Es
                     } else {
                         SegmentIndex::Ds
+                    },
+                });
+            }
+            // POP SS, the S4 part-2 row, and DELIBERATELY not a `PopSegReal` with a third segment.
+            //
+            // Two things separate it from POP ES and POP DS, and each one on its own decides the
+            // answer. It arms the one-instruction interrupt shadow
+            // (`load_segment_arming_ss_shadow`), which no lowering can honour: the interpreter
+            // consumes the shadow at the start of the next instruction and a native block has no
+            // such point. And it loads the STACK segment, so a resumed block's remaining slots
+            // address through the record it just wrote.
+            //
+            // Both are answered by the call-out rather than by a refusal. The shadow is left armed
+            // and decided at the block boundary (design section 10.1, B1); the record is
+            // byte-compared by R2 after the step, so a stack SWITCH resyncs before any later slot
+            // runs and only a reload of the same record resumes. The loader measured that split at
+            // 484,385 same-record loads against 488,498 record-moving ones across both SS arms,
+            // which is design review 10.1 M5 and the gate this row was built behind.
+            //
+            // NOT through `stack_width_kind`. `PopSegReal` is refused there in protected mode and
+            // refused again on a 32-bit stack, because its emitter knows one shape: three stores
+            // computing `base = selector << 4` off a 16-bit stack read. This row has no emitter at
+            // all -- the helper runs the interpreter's own `0x17` arm -- so every mode and both
+            // stack widths are the interpreter's, including the 386 PRM rule that a Dword POP SS
+            // moves four bytes of stack and loads the low sixteen. `DirectKind::CallOut` is not in
+            // `uses_stack`, so the width matrix is not consulted and does not need to be.
+            //
+            // The V86 and protected-mode fault paths are the interpreter's too: a null selector, a
+            // non-writable descriptor and a privilege mismatch each raise #GP and a present-bit
+            // clear raises #SS, all from inside `load_protected_segment` and all delivered by the
+            // helper's fault arm exactly as they are at a boundary.
+            0x17 => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::PopSs,
                     },
                 });
             }
@@ -1551,7 +1587,7 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 };
                 return Some(DirectKind::MovSegToReg { dst, segment });
             }
-            // MOV Sreg, r/m16, the write half of the segment family. THREE answers now, and the
+            // MOV Sreg, r/m16, the write half of the segment family. FOUR answers now, and the
             // arm's whole job is to keep them apart:
             //
             // | form | answer |
@@ -1560,7 +1596,8 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // | `/0` ES or `/3` DS, register source, protected mode | an `InterpretOne` call-out, chosen in `stack_width_kind` where the mode is in scope |
             // | `/0` ES, `/3` DS, `/4` FS or `/5` GS, memory source, any mode | an `InterpretOne` call-out |
             // | `/4` FS or `/5` GS, register source, any mode | an `InterpretOne` call-out |
-            // | `/1` CS, `/2` SS, `/6`, `/7` | refused |
+            // | `/2` SS, any source, any mode | an `InterpretOne` call-out on its OWN census row |
+            // | `/1` CS, `/6`, `/7` | refused |
             //
             // The call-out arms are the S3 policy widening's eighth row: the post-S2 loader census
             // ranks `0x8E` at 1.27 M block-stopping hits, of which the memory form is 786 k.
@@ -1596,15 +1633,34 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // the run before any later slot executes. A resumed block therefore baked nothing
             // stale, and a block that would have baked something stale never resumed.
             //
-            // `/2` (SS) is refused for a reason of its own, and it is the reason design review M8
-            // gives for keeping the whole SS family out: loading SS arms a one-instruction
-            // interrupt shadow (`load_segment_arming_ss_shadow`), so it fails R3's shadow clause
-            // on EVERY execution. Admitting it would be a call-out that always resyncs. The
-            // census measures 1,303 SS hits against 17.8 million for DS.
+            // `/2` (SS) is a call-out too since S4 part 2, and a row of its OWN rather than a
+            // `/2` folded into `MovSreg`. What used to keep it out was R3's shadow clause: loading
+            // SS arms a one-instruction interrupt shadow (`load_segment_arming_ss_shadow`) and
+            // every row had to find that flag clear. The clause is now scoped per row
+            // (`InterpretOneRow::arms_interrupt_shadow`), the shadow is decided at the block
+            // boundary rather than inside the helper, and the row carries the pendency test that
+            // bounds what leaving it armed can cost.
+            //
+            // A SEPARATE ROW because the census question is different. `MovSreg` asks whether a
+            // guest re-establishes the same data segment; `MovSsReg` asks how often a guest
+            // switches STACKS at this instruction, which the loader answered as 484,385
+            // same-record against 488,498 record-moving across both SS arms. One label would
+            // average two unrelated populations.
+            //
+            // Every form and every mode, unlike `/0` and `/3`: those keep the real-mode
+            // `LoadSegReal` lowering for their register form and only become a call-out where the
+            // lowering cannot go. There is no SS lowering to keep.
             0x8e => {
                 let m = insn.modrm?;
                 let segment = match m.reg {
                     0 => SegmentIndex::Es,
+                    2 => {
+                        return Some(DirectKind::CallOut {
+                            helper: CallOutHelper::InterpretOne {
+                                row: InterpretOneRow::MovSsReg,
+                            },
+                        });
+                    }
                     3 => SegmentIndex::Ds,
                     4 | 5 => {
                         return Some(DirectKind::CallOut {

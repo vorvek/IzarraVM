@@ -869,9 +869,12 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 /// V86 cover is not a compile-time refusal at all but the helper's fault arm -- `check_v86_iopl`
 /// is the interpreter's own first statement in that opcode's arm, so a V86 task below IOPL 3
 /// raises the same #GP from inside the call-out that it raises at a barrier, delivered by
-/// `finish_instruction` with the block reporting the prefix only. STI stays refused beside it,
-/// and the pair is the point: they are one instruction apart in the encoding and get opposite
-/// answers, so a widening that swept STI in with CLI fails here.
+/// `finish_instruction` with the block reporting the prefix only.
+///
+/// STI (0xfb) joined it on 2026-08-22 with S4d and the table says so. The prose here used to claim
+/// the opposite, as the pair that "get opposite answers"; the row was flipped and the sentence was
+/// not. What the pair pins now is that both take the CALL-OUT answer at both widths while POPF,
+/// one encoding further on, still has no arm at all.
 #[test]
 fn v86_sensitive_opcodes_keep_their_word_answers() {
     // (bytes, admitted_at_dword, call_out_at_every_width)

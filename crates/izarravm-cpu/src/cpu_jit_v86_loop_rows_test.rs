@@ -427,8 +427,6 @@ fn every_v86_loop_row_flips_with_the_gate() {
 ///   CLEARS host CF, then tags the descriptor as the SUB class. An admitted `15 iw` would compute
 ///   without the carry in and then evaluate its lazy CF as `a < b`. The forms-1|3|5 guard is what
 ///   refuses them.
-/// * `0x17` POP SS -- `PopSegReal`'s sibling in the same neighbourhood. It arms the
-///   one-instruction interrupt shadow, which a native block never passes through.
 /// * `0xf5` CMC -- CLC/STC's neighbour. It needs the INCOMING carry rather than a constant.
 /// * `0xc7 /0` REGISTER form at Word -- refused inside its own arm since before this slice.
 ///
@@ -437,6 +435,12 @@ fn every_v86_loop_row_flips_with_the_gate() {
 /// slices attributable apart, so it now belongs with the rows admitted independently of this gate
 /// rather than with the rows this gate must not sweep in. The `0xa1`/`0xa3` width work must not
 /// have disturbed any of them.
+///
+/// `0x17` POP SS made the same journey on 2026-08-22 and for the same kind of reason. It was here
+/// as `PopSegReal`'s sibling, refused over the one-instruction interrupt shadow a native block
+/// never passes through; S4 part 2 admits it as an `InterpretOne` call-out that leaves the shadow
+/// for the block boundary to decide. It is therefore in the ungated list below, and its two real
+/// neighbours `0x07` and `0x1f` are the rows that still flip with this gate.
 ///
 /// BOTH ARMS, the way `the_gate_moves_only_the_cs_clause_of_the_prefix_admission` runs. The
 /// refusals are the weaker half of that: the OFF arm is strictly more restrictive, so a row
@@ -456,7 +460,6 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings_on(arm: bool) {
     for (name, code) in [
         ("0x15 ADC AX,imm16", [vec![0x15], w(0x1234)].concat()),
         ("0x1D SBB AX,imm16", [vec![0x1d], w(0x1234)].concat()),
-        ("0x17 POP SS", vec![0x17]),
         ("0xF5 CMC", vec![0xf5]),
         (
             "0xC7 /0 MOV AX,imm16",
@@ -491,6 +494,10 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings_on(arm: bool) {
         // sweeps both arms: moving `0xfc` into the gated term would leave this row failing on the
         // OFF leg, which is exactly the attribution the two slices are kept apart for.
         ("0xFC CLD (S1 width lift, ungated)", vec![0xfc]),
+        // Admitted by S4 part 2 as a call-out, again independently of this gate. Its neighbours
+        // `0x07` and `0x1f` are the gated pair, so a widening that folded the stack segment in
+        // with them would show up as this row failing on the OFF leg.
+        ("0x17 POP SS (S4 call-out, ungated)", vec![0x17]),
     ] {
         assert_eq!(
             compile16(&code),
