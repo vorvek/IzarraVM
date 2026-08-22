@@ -2778,6 +2778,28 @@ impl KateaTreeVolume {
         }
     }
 
+    /// Does `chain` give an already-projected cluster a different host offset?
+    ///
+    /// A projected cluster's acknowledged payload lives in a host file at the
+    /// offset its `(key, index)` named when it was acknowledged, and nowhere
+    /// else: the store no longer holds it. A chain that moves such a cluster to
+    /// another index, or to another file, must therefore copy the bytes through
+    /// the projection that still maps them (a gather) before that projection
+    /// is replaced. Streaming under the new indexes writes nothing -- the
+    /// sectors are not pending -- and installing the new projection would make
+    /// every later read and write of the cluster resolve to the wrong offset.
+    /// Issue #729: a guest overwrite that re-points a file's head at its old
+    /// second cluster after the payload landed lost the payload this way.
+    fn chain_shifts_projection(&self, key: (u32, [u8; 11]), chain: &[u32]) -> bool {
+        chain.iter().enumerate().any(|(index, cluster)| {
+            self.projected_clusters
+                .get(cluster)
+                .is_some_and(|(owner, projected_index)| {
+                    *owner != key || u64::from(*projected_index) != index as u64
+                })
+        })
+    }
+
     fn stream_file_overlay(&mut self, mut pending: PendingStream) -> std::io::Result<()> {
         let spc = u32::from(self.geo.spc);
         // `set_len` marks a size that came from the guest's directory entry; a
@@ -3089,6 +3111,13 @@ impl KateaTreeVolume {
             if !conflicts.is_empty() {
                 self.blocked_projection_keys.insert(key);
                 self.blocked_projection_keys.extend(conflicts);
+                continue;
+            }
+            // A re-shaped chain keeps the old projection (which still maps the
+            // acknowledged bytes) and holds new payload until a reconcile
+            // gathers the file under the new shape.
+            if self.chain_shifts_projection(key, &chain) {
+                self.blocked_projection_keys.insert(key);
                 continue;
             }
             self.install_projection(
@@ -4117,7 +4146,12 @@ impl KateaTreeVolume {
                         if handled.contains(&(dir_cluster, name)) {
                             continue; // already moved/renamed in phase 2
                         }
-                        if !(data_written || (dir_written && is_new)) {
+                        // A re-pointed chain counts as touched even before any
+                        // payload lands: the projection still maps its clusters
+                        // at the old offsets, and the next data write would be
+                        // acknowledged there.
+                        let repointed = self.chain_shifts_projection((dir_cluster, name), &fchain);
+                        if !(data_written || (dir_written && is_new) || repointed) {
                             continue;
                         }
 
@@ -4160,7 +4194,11 @@ impl KateaTreeVolume {
                             chain_seq,
                         };
                         let retry_exact = self.retry_gathers.get(&key) == Some(&state);
-                        if mode == ReconcileMode::AfterWrite && !retry_exact {
+                        // A re-pointed chain takes the gather below: its bytes
+                        // are reachable only through the projection this pass
+                        // is about to replace, and a stream finds nothing
+                        // pending to write under the new offsets.
+                        if mode == ReconcileMode::AfterWrite && !retry_exact && !repointed {
                             let path = self
                                 .mirrored
                                 .get(&key)
