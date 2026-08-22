@@ -1972,6 +1972,28 @@ fn policy_bit_string_register(_: &mut [u32; 8]) -> Vec<u8> {
     vec![0x0F, 0xBB, 0xC3]
 }
 
+/// `66 F7 /3` with mod 01, r/m 101, disp8 0: `neg word [ebp+0]`, a group-3 Word memory form. The
+/// 0x66 prefix is what puts a Word row in a 32-bit segment at all, and `prefixes_supported_for`
+/// admits exactly that override.
+fn policy_group3_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x66, 0xF7, 0x5D, 0x00]
+}
+
+/// `66 F7 /2` with mod 11 r/m 011: `not bx`, the register form whose native sibling writes a full
+/// 32-bit destination. If the Word interception ever moved below the lowerings, this case is the
+/// one that reports it as a register difference rather than a block-shape one.
+fn policy_group3_register_16bit_operand(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x66, 0xF7, 0xD3]
+}
+
+/// `66 F7 /4` with mod 11 r/m 011: `mul bx`, the Word multiply that merges into DX and AX rather
+/// than replacing EDX and EAX. Two destination registers from one call-out, which is what the
+/// helper's whole-GPR reload has to carry.
+fn policy_group3_multiply_16bit_operand(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x66, 0xF7, 0xE3]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
 const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_mov_sreg_memory_32,
@@ -1979,6 +2001,9 @@ const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_xchg_stack_pointer,
     policy_bit_string_memory_32,
     policy_bit_string_register,
+    policy_group3_memory_32,
+    policy_group3_register_16bit_operand,
+    policy_group3_multiply_16bit_operand,
 ];
 
 /// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
@@ -1991,7 +2016,26 @@ const POLICY_ROWS_16: &[PolicyRow] = &[
     policy_xchg_stack_pointer,
     policy_bit_string_memory_16,
     policy_bit_string_register,
+    policy_group3_memory_16,
+    policy_group3_register,
+    policy_group3_multiply,
 ];
+
+/// `F7 /3` with mod 01, r/m 110, disp8 0: `neg word [bp+0]`, unprefixed in a 16-bit segment.
+fn policy_group3_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0xF7, 0x5E, 0x00]
+}
+
+/// `F7 /2` with mod 11 r/m 011: `not bx`.
+fn policy_group3_register(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xF7, 0xD3]
+}
+
+/// `F7 /4` with mod 11 r/m 011: `mul bx`.
+fn policy_group3_multiply(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0xF7, 0xE3]
+}
 
 /// `0F BA /5` with mod 01, r/m 110, disp8 0: `bts word [bp+0], 5`.
 fn policy_bit_string_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {

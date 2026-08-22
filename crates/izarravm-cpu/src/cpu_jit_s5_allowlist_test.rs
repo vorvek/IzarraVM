@@ -135,6 +135,15 @@ fn word_size_dword_siblings_stay_refused() {
     // `word_size_0x81_register_forms_are_lowered` and
     // `word_size_group3_test_forms_follow_the_slice` below.
     //
+    // `0xf7 /2`, `/3`, `/4` and `/6` left it with the S3 policy widening, and NOT because they
+    // grew a width field the way `0x8d` did: they have none, and lowering any of them at Word
+    // would still be the miscompile this table's header describes. What changed is that the
+    // classifier now intercepts the Word forms IN FRONT of those lowerings and routes them to an
+    // `InterpretOne` call-out, so the block carries the instruction without an emitter. Their
+    // admission is pinned by `group3_word_subops_join_as_call_outs_not_lowerings`
+    // (cpu_jit_test_imm_test.rs), which asserts the SLOT CLASS and not just the block length, and
+    // the flip is asserted at the end of this test so leaving the table is not a silent removal.
+    //
     // `0x8d` left it with the S1 width lift, and for the reason this table's header gives rather
     // than as an exception to it: the row was refused because `DirectKind::Lea` hard-coded a
     // 32-bit destination write, and it grew a `width` field in the same commit that admitted it.
@@ -159,10 +168,6 @@ fn word_size_dword_siblings_stay_refused() {
         // this test and flipped at the bottom.
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0], true),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12], true),
-        ("0xf7 /2 not r/m", &[0x66, 0xf7, 0xd1], true),
-        ("0xf7 /3 neg r/m", &[0x66, 0xf7, 0xd9], true),
-        ("0xf7 /4 mul r/m", &[0x66, 0xf7, 0xe1], true),
-        ("0xf7 /6 div r/m", &[0x66, 0xf7, 0xf1], true),
     ];
 
     for arm in [false, true] {
@@ -211,6 +216,34 @@ fn word_size_dword_siblings_stay_refused() {
          register form"
     );
     jit::direct::set_test_word_rows_for_test(None);
+
+    // ...and the group-3 rows that left the table outright, asserted here so their removal above
+    // is a moved set rather than a deleted one. The slot-class assertion lives with them in
+    // `group3_word_subops_join_as_call_outs_not_lowerings`; what this one owes is the flip.
+    for (label, form) in [
+        ("0xf7 /2 not r/m", [0x66u8, 0xf7, 0xd1]),
+        ("0xf7 /3 neg r/m", [0x66, 0xf7, 0xd9]),
+        ("0xf7 /4 mul r/m", [0x66, 0xf7, 0xe1]),
+        ("0xf7 /6 div r/m", [0x66, 0xf7, 0xf1]),
+    ] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.extend_from_slice(&form);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 4,
+            "{label} at Word must JOIN the block since the S3 policy widening"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, 1,
+            "{label} must join as a call-out, never through a dword lowering"
+        );
+    }
 
     // ...and the row that left the table outright, asserted here so its removal above is a moved
     // row rather than a deleted one. `0x8d` is ungated: it needs neither knob.
@@ -354,10 +387,16 @@ fn word_size_0x81_carry_forms_stay_refused() {
     }
 }
 
-/// Group 3's `/0` at Word size: the REGISTER form is lowered through `TestImmReg`'s word lane,
-/// the MEMORY form stays refused (no measured row), and both halves are what the gate's
-/// sub-opcode escape promises. The wolf3d census ranked the register form at 634M
-/// block-stopping hits.
+/// Group 3's `/0` at Word size: the REGISTER form is lowered through `TestImmReg`'s word lane and
+/// the MEMORY form joins the block as an `InterpretOne` call-out. The wolf3d census ranked the
+/// register form at 634M block-stopping hits and the post-S2 loader census ranks the memory form
+/// at 242 k.
+///
+/// The memory half used to assert a REFUSAL, on the ground that no fixture measured a row for it.
+/// The loader census measures one, and the S3 policy widening answers it with the call-out rather
+/// than with an emitter, so the assertion moved from "the block ends here" to "the block carries
+/// it, and carries it as a call-out": lowering it through `TestImmMem` at Word would still be the
+/// bug the old refusal guarded against, and the slot-count check is what says it did not happen.
 #[test]
 fn word_size_group3_test_forms_follow_the_slice() {
     let register = [0x66u8, 0xf7, 0xc1, 0x34, 0x12];
@@ -392,8 +431,16 @@ fn word_size_group3_test_forms_follow_the_slice() {
     );
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(
-        compilation.span.instructions, 3,
-        "test word [mem], imm16: the memory form must stay refused"
+        compilation.span.instructions, 4,
+        "test word [mem], imm16: the memory form must join the block"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "test word [mem], imm16: it must join as a call-out, not through TestImmMem's word lane"
+    );
+    assert_eq!(
+        compilation.word_reads, 0,
+        "a call-out slot declares no static access"
     );
 }
 

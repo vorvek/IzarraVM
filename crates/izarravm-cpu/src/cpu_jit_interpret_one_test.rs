@@ -1851,3 +1851,156 @@ fn bit_string_core_clocks_is_what_the_interpreter_charges() {
         assert_row_charges(row, crate::BIT_STRING_CORE_CLOCKS, |_, _| {});
     }
 }
+
+/// Row 4: group 3 at Word, `/2../7` in both operand forms plus the `/0` memory form.
+///
+/// The register and memory shapes of NOT, NEG, MUL, IMUL, DIV and IDIV, and TEST r/m16,imm16
+/// through memory. The divides run on DX:AX over BX, which the fixture leaves at the data pointer
+/// 0x1800, so the quotient fits and the row retires; the faulting case is a fixture of its own.
+///
+/// MUTATION: delete the Word interception at the head of the `0xf6 | 0xf7` arm and the first case
+/// (`not bx`, which has no lowering at any width) fails on the block shape. The cases behind it
+/// are the ones that motivate the arm's PLACEMENT rather than its existence: without the
+/// interception a Word NEG reaches `NegReg` and is emitted as a 32-bit operation, which is a
+/// miscompile rather than a missed lowering.
+/// `group3_word_subops_join_as_call_outs_not_lowerings` (cpu_jit_test_imm_test.rs) is the
+/// assertion that names that directly, by slot class rather than by state.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_group3_word_forms_resume() {
+    fn seed_divisor(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        // DX:AX / BX with DX clear, so no divide overflows. The MEMORY divides take their divisor
+        // from the word at [bx], which the shared arm seeds to zero, so it is seeded here as well:
+        // without it the two memory divide cases would be a divide-by-zero fixture wearing this
+        // test's name, and the fault has one of its own below.
+        cpu.registers.set_edx(0);
+        bus.memory[POP_TARGET as usize..POP_TARGET as usize + 2]
+            .copy_from_slice(&3u16.to_le_bytes());
+    }
+    for row in [
+        // F7 /2../7 with mod 11 r/m 011: not/neg/mul/imul/div/idiv bx.
+        &[0xF7u8, 0xD3][..],
+        &[0xF7, 0xDB],
+        &[0xF7, 0xE3],
+        &[0xF7, 0xEB],
+        &[0xF7, 0xF3],
+        &[0xF7, 0xFB],
+        // The same six with mod 00 r/m 111: the word at [bx].
+        &[0xF7, 0x17],
+        &[0xF7, 0x1F],
+        &[0xF7, 0x27],
+        &[0xF7, 0x2F],
+        &[0xF7, 0x37],
+        &[0xF7, 0x3F],
+        // F7 /0 with mod 00 r/m 111: test word [bx], 0x1234.
+        &[0xF7, 0x07, 0x34, 0x12],
+    ] {
+        assert_row_resumes(row, seed_divisor);
+    }
+}
+
+/// `/0` TEST keeps its native lowering in the REGISTER form and takes the call-out only through
+/// memory.
+///
+/// The two answers sit in one classifier arm, so a slice that widened the memory case by deleting
+/// the width test rather than by routing it would silently move the register case too.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn group3_test_word_splits_native_register_from_call_out_memory() {
+    // F7 /0 with mod 11 r/m 011: test bx, 0x1234.
+    assert_row_is_native(&[0xF7, 0xC3, 0x34, 0x12]);
+    assert_row_is_a_call_out(&[0xF7, 0x07, 0x34, 0x12]);
+}
+
+/// `/1` is not a group-3 operation and stays refused.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn group3_word_refuses_the_undefined_extension() {
+    let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+    // F7 /1 with mod 11 r/m 011.
+    code.extend_from_slice(&[0xF7, 0xCB]);
+    code.extend_from_slice(&[0x40, 0xF4]);
+    let starts = vec![0, 3, 4, 5, 7];
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        3,
+        "0xF7 /1 must still end the block"
+    );
+    assert_eq!(block.callout_interpret_one_slots(), 0);
+}
+
+/// The RESYNC-after-fault path on a row that faults on ORDINARY DATA.
+///
+/// Every fault fixture before this one aimed an address past a limit, which is a property of where
+/// the operand lives. A divide by zero is a property of the VALUE, so it is the first case where a
+/// perfectly ordinary block, compiled around perfectly ordinary addresses, faults inside the
+/// helper. The interpreted leg delivers the same #DE at the same point, so `perf.instructions`,
+/// `elapsed_clocks` and the handler EIP all have an oracle.
+///
+/// MUTATION: report `prefix + 1` from the fault stub instead of `prefix` and the retirement
+/// comparison in `assert_legs_agree` fails, because `finish_instruction` already counted the DIV.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_divide_by_zero_takes_the_fault_stub() {
+    fn zero_divisor(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        cpu.registers.set_edx(0);
+        cpu.registers.set_ebx(0);
+        // Vector 0's IVT entry IS the four bytes at address zero, which is exactly where
+        // `seed_fault_handler` parks the HLT it gives every OTHER vector. So #DE is the one fault
+        // that cannot use the shared handler: reading it as a far pointer would send both legs to
+        // 0000:00F4 and neither would ever halt. Point the vector at a handler of its own.
+        bus.memory[0..4].copy_from_slice(&[0x00, 0x05, 0x00, 0x00]);
+        bus.memory[0x500] = 0xF4;
+    }
+    // div bx
+    let row = [0xF7u8, 0xF3];
+    assert_row_is_a_call_out(&row);
+    let (code, starts) = row_program(&row);
+    let mut legs = run_both(&code, &starts, zero_divisor);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResyncFault as u32),
+        "a #DE inside the helper must take the not-retired RESYNC stub"
+    );
+    assert_eq!(
+        legs.native_insns, 1,
+        "the block must report the PREFIX only: the fault path already counted the DIV"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync_fault, 1);
+    assert_eq!(stalls.callout_interpret_one_resync, 0);
+    assert_legs_agree(&mut legs);
+}
+
+/// `GROUP3_CORE_CLOCKS` is what the interpreter charges, across the sub-opcodes and both operand
+/// forms.
+#[test]
+fn group3_core_clocks_is_what_the_interpreter_charges() {
+    for row in [
+        &[0xF7u8, 0xD3][..],
+        &[0xF7, 0xE3],
+        &[0xF7, 0x17],
+        &[0xF7, 0x07, 0x34, 0x12],
+    ] {
+        assert_row_charges(row, crate::GROUP3_CORE_CLOCKS, |cpu, _| {
+            cpu.registers.set_edx(0);
+        });
+    }
+}

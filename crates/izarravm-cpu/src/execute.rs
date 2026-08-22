@@ -923,7 +923,10 @@ impl CpuGsw {
                         return Err(undefined_opcode());
                     }
                 }
-                Ok(clocks(2))
+                // Named for the reason the `0x8f` and `0x8c` charges are: `/2../7` at Word are
+                // `InterpretOne` call-out rows, and their budget bound
+                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same number.
+                Ok(clocks(GROUP3_CORE_CLOCKS))
             }
             0xfe => {
                 // Group 4 INC/DEC byte. /0 INC, /1 DEC; any other reg is #UD (the fused reference's

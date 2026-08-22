@@ -379,14 +379,25 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
         // ZERO `0xA9` rows at any width, and an unmeasured admission is the campaign's standing
         // refusal rather than a free ride. `0x84`/`0xA8` are byte forms and were never at issue.
         && !(test_word_rows_enabled() && insn.opcode == 0x85)
-        // Group 3's `/0` (TEST r/m16, imm16) is the ONE width-safe member of `0xf7`, so it is
-        // admitted by sub-opcode here rather than by adding `0xf7` to the list above: every other
-        // member's arm (NEG, MUL, IMUL, DIV) deliberately carries no width field and documents
-        // this gate as the ONLY thing keeping a word form out — listing the opcode wholesale
-        // would turn each of those comments into a miscompile. The wolf3d demo-workload census
-        // ranks the register form at 634M block-stopping hits; the word MEMORY form is refused
-        // inside the arm (no measured row).
-        && !(insn.opcode == 0xf7 && insn.modrm.is_some_and(|m| m.reg == 0))
+        // Group 3, admitted by SUB-OPCODE rather than by adding `0xf7` to the list above, because
+        // the group's members do not get the same answer and the list cannot say so.
+        //
+        // `/0` (TEST r/m16, imm16) is the width-safe one: `emit_test_preloaded` has carried a full
+        // Word lane since the width field landed. The wolf3d demo-workload census ranks the
+        // register form at 634M block-stopping hits.
+        //
+        // `/2../7` (NOT, NEG, MUL, IMUL, DIV, IDIV) are the S3 policy widening's fourth row and
+        // are admitted as `InterpretOne` CALL-OUTS, never as lowerings. Every one of those arms
+        // deliberately carries no width field and names this gate as the only thing keeping a word
+        // form out of it; the classifier arm below therefore intercepts the Word forms and routes
+        // them to the helper BEFORE any of them is reached, so the comments they carry stay true.
+        // The post-S2 loader census ranks /6 DIV r16 at 729 k block-stopping hits, /4 MUL r16 at
+        // 482 k and /0 word memory TEST at 242 k.
+        //
+        // `/1` is not a group-3 operation at all -- the interpreter answers it with
+        // `undefined_opcode` -- so it stays refused here rather than being compiled into a block
+        // that can only ever fault.
+        && !(insn.opcode == 0xf7 && insn.modrm.is_some_and(|m| m.reg != 1))
     {
         return None;
     }
@@ -1803,6 +1814,37 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             }
             0xf6 | 0xf7 => {
                 let m = insn.modrm?;
+                // GROUP 3 AT WORD, `/2../7`, as `InterpretOne` call-outs. The S3 policy widening's
+                // fourth row: NOT, NEG, MUL, IMUL, DIV and IDIV, both operand forms.
+                //
+                // FIRST in the arm, and that placement is the whole safety argument. Every
+                // lowering below carries NO width field and says so in its own comment: `NegReg`
+                // writes a full 32-bit destination, `MulReg` replaces EDX and EAX rather than
+                // merging DX and AX, `DivReg`/`DivMem` read four bytes. Each names the
+                // `OperandSize::Word` gate as the only thing keeping a 66-prefixed form away from
+                // it. That gate now admits `0xf7 /2../7`, so the guard has to move HERE, in front
+                // of them, or every one of those comments becomes a miscompile. The Dword forms
+                // fall past this and reach their emitters unchanged.
+                //
+                // `/2` NOT has no lowering at any width and is a call-out at Word only, which is
+                // where the census measures it. Widening it to Dword would be an unmeasured
+                // admission, which this file's header rules out; the Dword form stays the boundary
+                // it has always been.
+                //
+                // DIV and IDIV can raise #DE from inside the helper. That is the ordinary
+                // RESYNC-after-fault path and needs nothing new: `finish_instruction` rewinds onto
+                // the instruction, delivers the exception, counts and charges it, and the block
+                // reports the prefix only. It is the first admitted row whose fault arm fires on
+                // ORDINARY DATA rather than on a bad address, which is why it has a fixture of its
+                // own.
+                if opcode == 0xf7
+                    && insn.operand_size == OperandSize::Word
+                    && matches!(m.reg, 2..=7)
+                {
+                    return Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne,
+                    });
+                }
                 // NEG r/m32, register form. Deliberately carries NO width field: this arm sits
                 // below the OperandSize::Word gate at the top of `classify`, and that allowlist
                 // (which does not contain 0xf7) is the ONLY thing stopping a 586-mode `66 F7 /3`
@@ -1916,12 +1958,16 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     return None;
                 }
                 // `/0` TEST. `0xf6` is the byte form regardless of prefix; `0xf7` follows the
-                // operand size, and it is the only group-3 member the Word gate's sub-opcode
-                // escape lets through (see the gate) — `emit_test_preloaded` has carried a full
-                // Word lane (66-prefixed `test`, 0x100 descriptor tag) since the width field
-                // landed, with no caller until the wolf3d census ranked the register form at
-                // 634M block-stopping hits. The word MEMORY form stays refused: no fixture
-                // measures a row for it, and an unmeasured admission has no counter to gate it.
+                // operand size, and it is the group-3 member with a real Word LOWERING --
+                // `emit_test_preloaded` has carried a full Word lane (66-prefixed `test`, 0x100
+                // descriptor tag) since the width field landed, with no caller until the wolf3d
+                // census ranked the register form at 634M block-stopping hits.
+                //
+                // The word MEMORY form is an `InterpretOne` CALL-OUT as of the S3 policy widening,
+                // where it is the loader census's 242 k row. It is not a lowering, and the reason
+                // is an admission question rather than a capability one: the refusal it used to
+                // carry here said "no fixture measures a row for it", the census now does, and the
+                // call-out answers it without an emitter change at all.
                 let width = if opcode == 0xf6 {
                     MemoryWidth::Byte
                 } else {
@@ -1935,7 +1981,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     }),
                     DecodedOperand::Mem(addr) => {
                         if width == MemoryWidth::Word {
-                            return None;
+                            return Some(DirectKind::CallOut {
+                                helper: CallOutHelper::InterpretOne,
+                            });
                         }
                         Some(DirectKind::TestImmMem {
                             imm: insn.imm,

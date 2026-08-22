@@ -2679,6 +2679,16 @@ fn compile_leading_block_at_with_heat(entry: u32, code: &[u8], heat_at: Option<u
 /// structural reject. A negative assertion on that shape passes whether or not the opcode is
 /// lowered, which is exactly how this test would have gone vacuous when NEG was admitted.
 fn compile_leading_block(code: &[u8]) -> Option<u8> {
+    compile_leading_block_outcome(code).map(|compilation| compilation.span.instructions)
+}
+
+/// The same walk, handing back the whole `Compilation` rather than its instruction count.
+///
+/// Split out when the S3 policy widening made "did it compile" and "how did it compile" different
+/// questions for the same bytes: a Word group-3 row now joins the block, and the claim the
+/// negative list below used to make about it -- that it is not lowered as a 32-bit operation -- is
+/// now the claim that it joined as a CALL-OUT.
+fn compile_leading_block_outcome(code: &[u8]) -> Option<jit::direct::Compilation> {
     let mut memory = vec![0; 0x5000];
     memory[(ENTRY - 1) as usize] = 0x90;
     let mut block = code.to_vec();
@@ -2694,9 +2704,7 @@ fn compile_leading_block(code: &[u8]) -> Option<u8> {
     ];
     decode_fixture(&mut cpu, &mut bus, &starts);
     let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
-    outcome
-        .is_some()
-        .then(|| outcome.unwrap().span.instructions)
+    outcome.is_some().then(|| outcome.unwrap())
 }
 
 fn arm_mul_reg(
@@ -2884,6 +2892,13 @@ fn group3_non_test_subops_remain_interpreter_only() {
     // Everything in group 3 except TEST (/0), the lowered dword NEG (/3), MUL (/4), IMUL (/5) and
     // the lowered dword DIV (/6) and IDIV (/7) REGISTER forms. The byte group 0xf6 stays entirely
     // interpreter-only, including its own /3 and /4.
+    //
+    // The 66-prefixed WORD forms of /3, /4, /6 and /7 used to be on this list, each pinning the
+    // `OperandSize::Word` allowlist as the only thing keeping a 16-bit operand away from a 32-bit
+    // lowering. The S3 policy widening admits them as `InterpretOne` call-outs, so the claim moved
+    // rather than lapsed: `group3_word_subops_join_as_call_outs_not_lowerings` below asserts they
+    // join the block AND that they join as call-outs, which is the same protection stated
+    // positively.
     for code in [
         vec![0xf7, 0xcb], // /1 TEST alias, undocumented
         vec![0xf7, 0xd3], // /2 NOT r/m32
@@ -2899,17 +2914,10 @@ fn group3_non_test_subops_remain_interpreter_only() {
         // would lower it as `NEG EAX` and survive the whole battery, including the differential
         // generator, which only ever emits the register encoding.
         vec![0xf7, 0x1d, 0x00, 0x50, 0x00, 0x00],
-        // 66-prefixed NEG r/m16. The classify comment names the OperandSize::Word allowlist as
-        // the only thing stopping this from being lowered as a 32-bit NEG; this pins it.
-        vec![0x66, 0xf7, 0xdb],
         // MUL dword [disp32]: the MEMORY form of the sub-opcode this slice lowers. Without it,
         // replacing the register-only `let-else` in the /4 arm with a defaulting match would
         // multiply by EAX instead of by the memory operand and survive every register battery.
         vec![0xf7, 0x25, 0x00, 0x50, 0x00, 0x00],
-        // 66-prefixed MUL r/m16, pinning the same OperandSize::Word allowlist for /4. A 16-bit MUL
-        // writes DX and AX as halves of the existing EDX and EAX rather than replacing them, so
-        // lowering it as the 32-bit form would clobber both high halves.
-        vec![0x66, 0xf7, 0xe3],
         // DIV/IDIV dword [disp32]: the MEMORY forms of the two sub-opcodes the F7 slice lowered.
         // Both are register-only on purpose (a memory divide has two independent side-exit causes
         // at one slot, and every fixture's memory row is under the campaign's 100k floor), so
@@ -2917,15 +2925,52 @@ fn group3_non_test_subops_remain_interpreter_only() {
         // by EAX instead of by the memory operand and survive every register battery.
         vec![0xf7, 0x35, 0x00, 0x50, 0x00, 0x00],
         vec![0xf7, 0x3d, 0x00, 0x50, 0x00, 0x00],
-        // 66-prefixed DIV/IDIV r/m16, pinning the OperandSize::Word allowlist for /6 and /7 the
-        // way the two entries above pin it for /3 and /4. A 16-bit DIV divides DX:AX and writes
-        // only the low halves of EAX and EDX, so the 32-bit lowering would clobber both.
-        vec![0x66, 0xf7, 0xf3],
-        vec![0x66, 0xf7, 0xfb],
     ] {
         assert!(
             compile_leading_block(&code).is_none(),
             "group 3 {code:02x?} must stay interpreter-only"
+        );
+    }
+}
+
+/// The Word half of the guard above, stated positively.
+///
+/// Each of these used to be on the negative list, pinning the `OperandSize::Word` allowlist as the
+/// only thing between a 16-bit operand and a 32-bit lowering. They compile now, so the pin has to
+/// be that they compile as CALL-OUTS: a Word NEG through `NegReg` would still write a full 32-bit
+/// destination, a Word MUL through `MulReg` would still replace EDX and EAX instead of merging
+/// into DX and AX, and a Word DIV through `DivReg` would still read four bytes. The slot count is
+/// what says none of that happened.
+#[test]
+fn group3_word_subops_join_as_call_outs_not_lowerings() {
+    for code in [
+        vec![0x66u8, 0xf7, 0xd3], // /2 NOT r/m16
+        vec![0x66, 0xf7, 0xdb],   // /3 NEG r/m16
+        vec![0x66, 0xf7, 0xe3],   // /4 MUL r/m16
+        vec![0x66, 0xf7, 0xeb],   // /5 IMUL r/m16
+        vec![0x66, 0xf7, 0xf3],   // /6 DIV r/m16
+        vec![0x66, 0xf7, 0xfb],   // /7 IDIV r/m16
+    ] {
+        let compilation = compile_leading_block_outcome(&code)
+            .unwrap_or_else(|| panic!("group 3 {code:02x?} must join the block"));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "group 3 {code:02x?} must carry the whole three-slot block"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, 1,
+            "group 3 {code:02x?} must join as a call-out, not through a dword lowering"
+        );
+    }
+}
+
+/// `/1` is not a group-3 operation at any width and stays refused on both sides of the prefix.
+#[test]
+fn group3_undefined_extension_stays_refused_at_both_widths() {
+    for code in [vec![0xf7u8, 0xcb], vec![0x66, 0xf7, 0xcb]] {
+        assert!(
+            compile_leading_block(&code).is_none(),
+            "group 3 {code:02x?} is #UD and must stay interpreter-only"
         );
     }
 }

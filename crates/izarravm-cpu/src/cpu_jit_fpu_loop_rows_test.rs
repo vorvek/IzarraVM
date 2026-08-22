@@ -156,6 +156,19 @@ fn map_direct_page(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, physical: u
 /// the fewer-than-three-slots gate reports the same `None` as a genuine reject -- so a negative
 /// assertion on an unwarmed shape passes whether or not the opcode is lowered.
 fn compile_leading_block_on(cpu_builder: fn() -> CpuGsw, code: &[u8]) -> Option<u8> {
+    compile_leading_block_outcome_on(cpu_builder, code)
+        .map(|compilation| compilation.span.instructions)
+}
+
+/// The same walk, handing back the whole `Compilation`.
+///
+/// Split out for the width bar below: since the S3 policy widening the `0xF7 /7` row at Word JOINS
+/// the block as an `InterpretOne` call-out instead of ending it, so the claim that fixture makes
+/// is about the slot CLASS -- it must not reach `DivMem` -- rather than about the block length.
+fn compile_leading_block_outcome_on(
+    cpu_builder: fn() -> CpuGsw,
+    code: &[u8],
+) -> Option<jit::direct::Compilation> {
     let mut memory = vec![0; 0x5000];
     memory[(ENTRY - 1) as usize] = 0x90;
     let mut block = code.to_vec();
@@ -178,9 +191,7 @@ fn compile_leading_block_on(cpu_builder: fn() -> CpuGsw, code: &[u8]) -> Option<
     // refused their DWORD forms too.
     map_direct_page(&mut cpu, &mut bus, RAM_TARGET, RAM_TARGET);
     let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
-    outcome
-        .is_some()
-        .then(|| outcome.unwrap().span.instructions)
+    outcome.is_some().then(|| outcome.unwrap())
 }
 
 fn flat_586() -> CpuGsw {
@@ -331,6 +342,12 @@ fn every_fpu_loop_row_flips_with_the_gate() {
 ///
 /// The gate is forced ON throughout: with it off the rows are refused for the wrong reason and the
 /// assertion would pass vacuously.
+///
+/// KNOWN WEAKNESS in the 16-bit half, found by the S3 policy widening and recorded rather than
+/// fixed here: `sixteen_bit_cpu` never calls `set_sixteen_bit_admission_level`, so that harness
+/// compiles NOTHING in a CS.D = 0 segment and its five `None` assertions hold for the harness's
+/// reason rather than the row's. The 32-bit half is the live one. Fixing it is its own change,
+/// because turning the admission level on may surface refusals unrelated to operand size.
 #[test]
 fn every_fpu_loop_row_stays_a_barrier_at_word_operand_size() {
     select_fpu_loop_rows(true);
@@ -351,14 +368,16 @@ fn every_fpu_loop_row_stays_a_barrier_at_word_operand_size() {
         );
     }
     // 32-bit code segment, 66-prefixed. WAIT and FRNDINT are covered by the FPU branch's blanket
-    // `operand_size != Dword` refusal; SAHF, IDIV and SETcc by the Word allowlist.
-    for (name, code) in [
-        ("66 9B", vec![0x66, 0x9b]),
-        ("66 9E", vec![0x66, 0x9e]),
-        ("66 D9 FC", vec![0x66, 0xd9, 0xfc]),
+    // `operand_size != Dword` refusal; SAHF and SETcc by the Word allowlist; IDIV by the group-3
+    // interception that routes it to a call-out.
+    for (name, code, group3) in [
+        ("66 9B", vec![0x66, 0x9b], false),
+        ("66 9E", vec![0x66, 0x9e], false),
+        ("66 D9 FC", vec![0x66, 0xd9, 0xfc], false),
         (
             "66 F7 /7 mem",
             [vec![0x66, 0xf7, 0x3d], RAM_TARGET.to_le_bytes().to_vec()].concat(),
+            true,
         ),
         (
             "66 0F94 /0 mem",
@@ -367,15 +386,49 @@ fn every_fpu_loop_row_stays_a_barrier_at_word_operand_size() {
                 RAM_TARGET.to_le_bytes().to_vec(),
             ]
             .concat(),
+            false,
         ),
     ] {
-        assert_eq!(
-            compile_leading_block(&code),
-            None,
-            "{name} decodes at Word in a 32-bit segment and must stay a barrier"
+        assert_word_form_never_reaches_the_lowering(
+            name,
+            compile_leading_block_outcome_on(flat_586, &code),
+            group3,
         );
     }
     jit::direct::set_fpu_loop_rows_for_test(None);
+}
+
+/// The width bar's assertion, in the two shapes the rows now come in.
+///
+/// Four of the five rows still END the block at Word: nothing lowers them and nothing calls out
+/// for them, so the bar is `None`. `0xF7 /7` is the exception since the S3 policy widening, which
+/// routes every Word group-3 form to an `InterpretOne` call-out AHEAD of the `DivMem`/`DivReg`
+/// arms. The thing this test exists to catch is unchanged in both shapes -- a Word operand
+/// reaching a Dword lowering -- so the group-3 arm asserts the SLOT CLASS instead of the absence
+/// of a block. A `DivMem` lowering would report a compiled block with zero call-out slots, which
+/// is neither of the two answers below.
+fn assert_word_form_never_reaches_the_lowering(
+    name: &str,
+    outcome: Option<jit::direct::Compilation>,
+    group3: bool,
+) {
+    if !group3 {
+        assert!(
+            outcome.is_none(),
+            "{name} decodes at Word and must stay a barrier"
+        );
+        return;
+    }
+    let compilation =
+        outcome.unwrap_or_else(|| panic!("{name} at Word must join the block as a call-out"));
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "{name} must carry the whole three-slot block"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "{name} must join as a call-out, never through DivMem's dword lowering"
+    );
 }
 
 /// The neighbours this slice must NOT have swept in.

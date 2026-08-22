@@ -4595,6 +4595,11 @@ pub(crate) const XCHG_CORE_CLOCKS: u32 = 3;
 /// the sub-operation, the operand form or the width.
 pub(crate) const BIT_STRING_CORE_CLOCKS: u32 = 6;
 
+/// What group 3 charges (execute.rs `0xf6 | 0xf7`). One constant for the whole group: the arm
+/// returns a single `clocks(2)` after the sub-opcode match, so TEST, NOT, NEG, MUL, IMUL, DIV and
+/// IDIV all carry it at both widths and both operand forms.
+pub(crate) const GROUP3_CORE_CLOCKS: u32 = 2;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -4617,6 +4622,7 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0x8C MOV r/m16,Sreg memory | execute.rs `0x8c` | `MOV_RM_SREG_CORE_CLOCKS` |
 /// | 0x86/0x87/0x91..=0x97 XCHG | execute.rs `0x86`, `0x87`, `0x91..=0x97` | `XCHG_CORE_CLOCKS` |
 /// | BT/BTS/BTR/BTC | execute_extended.rs `0x0fa3..`, `0x0fba` | `BIT_STRING_CORE_CLOCKS` |
+/// | 0xF7 group 3 at Word | execute.rs `0xf7` | `GROUP3_CORE_CLOCKS` |
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
@@ -4624,7 +4630,10 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// path reaches the lane this constant bounds. Widening the allowlist means widening this.
 pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
     larger(POP_RM_CORE_CLOCKS, MOV_RM_SREG_CORE_CLOCKS),
-    larger(XCHG_CORE_CLOCKS, BIT_STRING_CORE_CLOCKS),
+    larger(
+        larger(XCHG_CORE_CLOCKS, BIT_STRING_CORE_CLOCKS),
+        GROUP3_CORE_CLOCKS,
+    ),
 );
 
 /// The largest core charge any admitted call-out helper can return, and the term

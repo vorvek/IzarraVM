@@ -1581,12 +1581,19 @@ fn grp3_imul_neighbouring_forms_remain_interpreter_only() {
     mul_mem.extend_from_slice(&TARGET.to_le_bytes());
     let mut byte_imul = vec![0xf6u8, 0xae]; // F6 /5 mod=10 rm=110: IMUL byte [esi+disp32]
     byte_imul.extend_from_slice(&TARGET.to_le_bytes());
-    let mut word_imul = vec![0x66u8, 0xf7, 0xae]; // 66 F7 /5: IMUL word [esi+disp32]
-    word_imul.extend_from_slice(&TARGET.to_le_bytes());
     // The F7 /5 REGISTER form used to be a fourth case here. The rejected-row campaign's Slice 2
     // lowered it (`DirectKind::ImulRegAcc`), so its admission is now pinned positively in
     // `group3_dword_neg_register_form_is_lowered` and its behaviour in `cpu_jit_f7_group_test.rs`.
-    // The three cases left are the ones that must NOT reach either /5 arm.
+    //
+    // The 66-prefixed WORD memory IMUL used to be a fifth. The S3 policy widening routes every
+    // Word group-3 form to an `InterpretOne` call-out BEFORE the /5 arm is reached, so it no
+    // longer stays out of the block -- but it still never reaches that arm, which is what this
+    // list is about. The claim moved to `group3_word_subops_join_as_call_outs_not_lowerings`
+    // (cpu_jit_test_imm_test.rs), which asserts the slot class directly rather than inferring it
+    // from the block ending.
+    //
+    // The two cases left are the ones that must NOT reach either /5 arm and have no call-out to
+    // take instead.
     for (code, why) in [
         (
             mul_mem,
@@ -1595,10 +1602,6 @@ fn grp3_imul_neighbouring_forms_remain_interpreter_only() {
         (
             byte_imul,
             "F6 /5 byte IMUL: reaching the /5 arm would read a dword and write EAX and EDX",
-        ),
-        (
-            word_imul,
-            "66-prefixed word IMUL: the OperandSize::Word gate is the only thing stopping it",
         ),
     ] {
         let mut memory = vec![0; 0x0004_0000];
