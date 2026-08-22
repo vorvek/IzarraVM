@@ -3725,6 +3725,7 @@ fn link_mask_resets_the_chain_requirement_when_a_slot_is_recycled() {
 ))]
 #[test]
 fn a_clearable_retry_cause_lifts_at_the_visit_threshold() {
+    set_retry_lift_for_test(Some(true));
     let mut cache = BlockCache::default();
     let k = key(0x2000);
     cache.park_dormant_for_test(k, DormantReason::CompileRetry, Some(RetryCause::DecodeMiss));
@@ -3745,6 +3746,7 @@ fn a_clearable_retry_cause_lifts_at_the_visit_threshold() {
     assert_eq!(cache.stall_snapshot().retry_lifts, 1);
     // Seen, so the next observation is a compile rather than another decline.
     assert!(matches!(cache.probe(k), BlockProbe::Compile));
+    set_retry_lift_for_test(None);
 }
 
 /// A DETERMINISTIC cause is never lifted, however long it waits.
@@ -3762,6 +3764,7 @@ fn a_clearable_retry_cause_lifts_at_the_visit_threshold() {
 ))]
 #[test]
 fn a_deterministic_retry_cause_is_never_lifted() {
+    set_retry_lift_for_test(Some(true));
     let mut cache = BlockCache::default();
     for cause in [
         RetryCause::TooShort,
@@ -3794,6 +3797,7 @@ fn a_deterministic_retry_cause_is_never_lifted() {
     for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
         assert!(!cache.lift_clearable_retry_dormant(heat));
     }
+    set_retry_lift_for_test(None);
 }
 
 /// One lift per key per cause. A key that comes straight back with the SAME cause is parked
@@ -3818,6 +3822,7 @@ fn a_deterministic_retry_cause_is_never_lifted() {
 ))]
 #[test]
 fn a_lifted_key_that_reparks_with_the_same_cause_is_never_lifted_again() {
+    set_retry_lift_for_test(Some(true));
     let mut cache = BlockCache::default();
     let k = key(0x4000);
     cache.park_dormant_for_test(k, DormantReason::CompileRetry, Some(RetryCause::DecodeMiss));
@@ -3880,4 +3885,73 @@ fn a_lifted_key_that_reparks_with_the_same_cause_is_never_lifted_again() {
         );
     }
     assert_eq!(cache.stall_snapshot().retry_lifts, 3);
+    set_retry_lift_for_test(None);
+}
+
+/// The retry lift is OFF by default, and the off arm is the pre-slice behaviour exactly.
+///
+/// Every fixture above forces the arm ON, which is the convention this backend's knobs use and is
+/// also what makes this test necessary: with the arm stated everywhere else, nothing was asserting
+/// what an unstated build does. `IZARRAVM_RETRY_LIFT` defaulted OFF on 2026-08-22 while the duke
+/// regression is unattributed, so this is the arm that ships.
+///
+/// MUTATION: drop the gate read from `lift_clearable_retry_dormant` and the key lifts here.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn the_retry_lift_is_off_by_default() {
+    let mut cache = BlockCache::default();
+    let k = key(0x5000);
+    cache.park_dormant_for_test(k, DormantReason::CompileRetry, Some(RetryCause::DecodeMiss));
+    for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
+        assert!(
+            !cache.lift_clearable_retry_dormant(k),
+            "the default arm must never lift"
+        );
+    }
+    assert!(cache.is_dormant_for_test(k));
+    assert_eq!(cache.stall_snapshot().retry_lifts, 0);
+
+    // Control: the same key on the ON arm lifts at the threshold, so the assertion above is about
+    // the gate and not about the fixture.
+    set_retry_lift_for_test(Some(true));
+    cache.set_dormant_visits_for_test(k, RETRY_LIFT_VISITS - 1);
+    assert!(cache.lift_clearable_retry_dormant(k));
+    set_retry_lift_for_test(None);
+}
+
+/// `IZARRAVM_RETRY_LIFT`'s spelling table. Default OFF, `1` / `on` is the opt-in.
+#[test]
+fn the_retry_lift_knob_spellings() {
+    assert!(
+        !parse_retry_lift_arm_for_test(Err(std::env::VarError::NotPresent)),
+        "unset is OFF"
+    );
+    for on in ["1", "on", "ON", " on "] {
+        assert!(parse_retry_lift_arm_for_test(Ok(on.to_string())), "{on}");
+    }
+    for off in ["0", "off", "OFF", "", "  "] {
+        assert!(!parse_retry_lift_arm_for_test(Ok(off.to_string())), "{off}");
+    }
+}
+
+/// `BlockState` did not grow when `Dormant` learned its retry cause, its visit count and its
+/// permanence.
+///
+/// `entries` is the map every probe, every invalidation and every classify walks, so a wider value
+/// is a broader cache-miss cost than anything the payload buys -- and it would be an
+/// everywhere-regression with exactly the shape the duke numbers have, which is why this is pinned
+/// rather than argued. It is free because `Rejected(RejectedSpan)` already carries a `BlockKey`
+/// plus a `u16` and `Compiled(BlockId)` already forces 8-byte alignment: the four bytes
+/// `DormantEntry` adds land inside padding the enum was already paying for.
+#[test]
+fn the_block_state_payload_stayed_the_same_width() {
+    assert_eq!(
+        std::mem::size_of::<BlockState>(),
+        std::mem::size_of::<RejectedSpan>() + std::mem::align_of::<BlockId>(),
+        "BlockState must stay as wide as its largest arm plus one aligned tag"
+    );
+    assert!(std::mem::size_of::<DormantEntry>() <= std::mem::size_of::<RejectedSpan>());
 }

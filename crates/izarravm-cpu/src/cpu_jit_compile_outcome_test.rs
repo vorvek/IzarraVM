@@ -4122,6 +4122,119 @@ fn every_retry_cause_has_a_distinct_label_and_a_stated_clearability() {
     );
 }
 
+/// A lift clears ONE slot's decline memo and leaves every other slot's alone.
+///
+/// The memo is what makes a declined address cheap: it short-circuits the admission chain before
+/// `key_for_phys` and the probe. A lifted key has to lose its own memo, or it would be re-admitted
+/// and then never looked at again for the rest of the era -- but the era stamp is GLOBAL, so
+/// advancing it to achieve that invalidates all 65,536 slots at once and sends every declined
+/// address in the process back through the full chain. On a workload with thousands of lifts that
+/// is thousands of whole-array invalidations, and it would show up as a decline storm rather than
+/// as anything the lift itself did.
+///
+/// The fixture is two addresses in one program: one dormant key one visit short of its lift, and
+/// one unrelated slot carrying a memo armed by hand. The lift must fire and the bystander must
+/// still answer.
+///
+/// The lifted slot carries a STALE memo rather than none, which is what makes the clear
+/// observable: parked by hand it would have had no memo at all and the assertion would have been
+/// reading a byte nobody wrote. It is made stale the way production makes one stale -- cross an
+/// epoch, let the next ask advance the era -- and the bystander's is then written fresh under the
+/// new stamp, so the two differ in exactly the thing under test.
+///
+/// MUTATIONS: drop the `set_decline_memo_at(slot, 0)` on the lift path and the lifted slot keeps
+/// its stale byte; replace it with `sweep_decline_memos()` -- which is what an era advance amounts
+/// to once the era term has moved -- and the bystander stops answering.
+///
+/// A NOTE ON THE OBVIOUS MUTANT: swapping the clear for a bare `advance_decline_memo_era()` does
+/// NOT fail this fixture, and that is a fact about the era rather than a hole. The advance is
+/// conditional -- it fires only when the heat epoch or `heat_resets` has moved since the last one
+/// -- so on a quiet CPU it is a no-op that clears nothing at all, the lifted slot included. An era
+/// advance is a wipe only when the term happens to have moved.
+#[test]
+fn a_lift_clears_only_its_own_decline_memo() {
+    jit::direct::set_retry_lift_for_test(Some(true));
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+
+    // The key under test: parked for a clearable cause, one visit short of the threshold.
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    cpu.jit_direct.park_dormant_for_test(
+        key,
+        jit::direct::DormantReason::CompileRetry,
+        Some(jit::direct::RetryCause::DecodeMiss),
+    );
+    cpu.jit_direct
+        .set_dormant_visits_for_test(key, jit::direct::RETRY_LIFT_VISITS - 1);
+
+    // The bystander: a different decode slot, carrying a memo written the way the production
+    // decline path writes one.
+    let slot_lifted = cpu
+        .decode_cache
+        .get_packed(ENTRY, true)
+        .expect("a live line at the entry")
+        .slot;
+    let slot_other = cpu
+        .decode_cache
+        .get_packed(ENTRY + 1, true)
+        .expect("a live line at the bystander")
+        .slot;
+    assert_ne!(
+        slot_lifted, slot_other,
+        "the two addresses must land in different slots or the fixture proves nothing"
+    );
+
+    // A memo on the LIFTED slot, then aged out, so the byte is non-zero and does not answer: the
+    // probe below has to reach the Rejected arm, and the clear has to be observable.
+    let _ = cpu.advance_decline_memo_era();
+    let stale = cpu.decline_memo_comparand();
+    cpu.decode_cache.set_decline_memo_at(slot_lifted, stale);
+    cpu.perf.instructions += 1 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+    assert!(
+        !cpu.decline_memo_hit(slot_lifted),
+        "the epoch crossing must have aged the lifted slot's memo out"
+    );
+    assert_ne!(
+        cpu.decode_cache.decline_memo_at(slot_lifted),
+        0,
+        "aged out is not erased: the byte must survive for the clear to be visible"
+    );
+
+    // And a LIVE one on the bystander, under the stamp the crossing just moved to.
+    let live = cpu.decline_memo_comparand();
+    assert_ne!(live, stale, "the era must actually have advanced");
+    cpu.decode_cache.set_decline_memo_at(slot_other, live);
+    assert!(
+        cpu.decline_memo_hit(slot_other),
+        "the bystander's memo must answer before the lift, or the assertion below is vacuous"
+    );
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("the dormant probe must not stop the machine");
+
+    assert_eq!(
+        cpu.direct_stall_snapshot().retry_lifts,
+        1,
+        "the lift must have fired, or nothing was under test"
+    );
+    assert_eq!(
+        cpu.decode_cache.decline_memo_at(slot_lifted),
+        0,
+        "the lifted key's own memo must be cleared, or the re-admission is never looked at"
+    );
+    assert!(
+        cpu.decline_memo_hit(slot_other),
+        "an unrelated slot's memo must survive a lift: advancing the era to clear one slot \
+         invalidates all 65,536"
+    );
+    jit::direct::set_retry_lift_for_test(None);
+}
+
 /// The retry lift end to end: a `DecodeMiss` key whose line has come back compiles again, and the
 /// sticky-decline memo is what paces it.
 ///
@@ -4143,6 +4256,7 @@ fn every_retry_cause_has_a_distinct_label_and_a_stated_clearability() {
 /// installs; make `clearable_by_retry` false for `DecodeMiss` and the lift never fires at all.
 #[test]
 fn a_lifted_decode_miss_key_compiles_once_its_line_is_back() {
+    jit::direct::set_retry_lift_for_test(Some(true));
     let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
     cpu.set_jit_auto_admit(true);
@@ -4212,6 +4326,7 @@ fn a_lifted_decode_miss_key_compiles_once_its_line_is_back() {
         "a lifted key whose cause has cleared must install"
     );
     assert_eq!(cpu.direct_stall_snapshot().retry_lift_reparks, 0);
+    jit::direct::set_retry_lift_for_test(None);
 }
 
 /// A dormant key's EXITS are attributed to the cause it was parked with, not just its parks.

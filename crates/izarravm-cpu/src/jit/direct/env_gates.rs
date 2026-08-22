@@ -1135,6 +1135,81 @@ pub(crate) fn word_at_486_default() -> bool {
     *LEVEL.get_or_init(|| !matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("0")))
 }
 
+/// Whether a `Dormant` key parked for a CLEARABLE compile-walk cause is ever re-probed
+/// (`BlockCache::lift_clearable_retry_dormant`).
+///
+/// **DEFAULT OFF.** `1` or `on` admits the lift; unset, `0` or `off` keep every compile-Retry park
+/// permanent, which is the behaviour every measurement before 2026-08-22 was taken under.
+///
+/// WHY IT SHIPS DISABLED. `duke3d-586-short` regressed 109.9 -> 121.0 s between the S4 part-1
+/// binary and part 2, and the lift is the only part-2 change that alters WHICH keys get compiled,
+/// so it is the first thing an A/B has to be able to remove. It is NOT established as the cause,
+/// and the arithmetic argues against it: 1,961 lifts on that run, against duke's measured ~16 us
+/// per compile, is about 31 ms of compile time inside an 11 s regression. The counter signature
+/// there -- `linked_transfers` -99 M, `jit_direct_insns` -264 M, entries +54 M -- is a chaining
+/// and block-shape collapse, which is a different family of cause. Defaulting off is what makes
+/// the next duke run able to say so instead of guessing.
+///
+/// It also has no measurement in its favour yet. `retry_lifts` / `retry_lift_reparks` read 1,961
+/// and 10,265 on that run: more keys came back than were ever lifted. That is not by itself an
+/// indictment (see the counter's own doc for why the second number counts park EVENTS), but an
+/// arm whose only evidence is a ratio pointing the wrong way does not belong on by default.
+pub(crate) fn retry_lift_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = RETRY_LIFT_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_retry_lift_arm(std::env::var("IZARRAVM_RETRY_LIFT")))
+}
+
+/// The `IZARRAVM_RETRY_LIFT` spelling table. See `retry_lift_enabled`.
+fn parse_retry_lift_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset = OFF, so the PowerShell nulling trap damages the ON leg: an ON leg must EXPORT
+        // `1`, and a leg that merely nulls the variable measures the default.
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_RETRY_LIFT is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset, `0` or `off` (the shipped default: a compile-Retry park is \
+                 permanent), and `1` or `on` (re-probe a key whose cause is clearable after \
+                 RETRY_LIFT_VISITS visits)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_RETRY_LIFT={other:?} names no arm; accepted spellings are unset, `0` or \
+             `off` (the shipped default) and `1` or `on` (the retry lift). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason.
+#[cfg(test)]
+thread_local! {
+    static RETRY_LIFT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the retry-lift arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_RETRY_LIFT` reading.
+#[cfg(test)]
+pub(crate) fn set_retry_lift_for_test(forced: Option<bool>) {
+    RETRY_LIFT_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_test_word_rows_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_retry_lift_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_retry_lift_arm(value)
+}
+
 /// Whether a segment-loading `InterpretOne` call-out may RESUME its block when the record it moved
 /// is one no other slot in the block uses (design section 11, S4f).
 ///

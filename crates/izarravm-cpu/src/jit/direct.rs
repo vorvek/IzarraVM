@@ -1476,6 +1476,15 @@ impl BlockCache {
             // PERMANENTLY. The lift is an offer to re-walk once, and a re-park with the same
             // answer is the evidence that re-walking does not help; without this the key would
             // buy another 64 visits and another compile for ever.
+            //
+            // `retry_lift_reparks` counts PARK EVENTS, not distinct keys, and can therefore exceed
+            // `retry_lifts` -- 10,265 against 1,961 on duke. That is not a defect and not a
+            // treadmill: the permanence is enforced by `retry_lift_spent`, which this reads, so a
+            // key past its lift never lifts again however often it re-parks. What produces the
+            // extra events is a key returning to `Seen` by some OTHER path -- the SMC heat lift,
+            // or `retire_key_for_recompile` after an invalidation -- and then re-parking on the
+            // same gate. Read the pair as "the arm fired N times and its keys came back at least
+            // N' times", not as a per-key rate.
             let permanent =
                 retry_cause.is_some_and(|cause| self.retry_lift_spent.contains(&(key, cause)));
             if permanent {
@@ -1521,6 +1530,12 @@ impl BlockCache {
     /// Answers whether the key is now `Seen`, because the caller has to know not to write a
     /// sticky-decline memo over a key it just re-admitted.
     pub(crate) fn lift_clearable_retry_dormant(&mut self, key: BlockKey) -> bool {
+        // The whole mechanism, visit counting included, behind `IZARRAVM_RETRY_LIFT`. Default OFF
+        // since 2026-08-22: see the gate for what duke measured and why the arm has to be
+        // removable before anything else about that regression can be read.
+        if !retry_lift_enabled() {
+            return false;
+        }
         let Some(BlockState::Dormant(entry)) = self.entries.get_mut(&key) else {
             return false;
         };
