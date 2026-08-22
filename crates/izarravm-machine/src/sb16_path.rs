@@ -358,10 +358,24 @@ impl Sb16Path {
         memory: &mut Memory,
     ) -> Option<Sb16Irq> {
         let active = self.active.as_mut()?;
+        // Frames that fall inside a 0x80 pause are held, not produced. The
+        // countdown is applied first so a batch ending at the deadline raises
+        // the interrupt, but the frames of the pause window must then be
+        // excluded from the tick: the DSP's own render gate only sees the
+        // countdown AFTER this advance, which by then is gone.
+        let paused_before = active.dsp.pause_micros_remaining();
         active.dsp.advance_micros(micros);
         active.sample_stereo();
 
         let rate = active.dsp.output_frame_rate();
+        let held_frames = match paused_before {
+            Some(remaining) if remaining >= micros => due_frames,
+            Some(remaining) => (remaining * u64::from(rate))
+                .div_ceil(1_000_000)
+                .min(due_frames),
+            None => 0,
+        };
+        let due_frames = due_frames - held_frames;
         let irq_line = active.mixer.selected_irq();
         let dma8 = active.mixer.selected_dma_8();
         let dma16 = active.mixer.selected_dma_16();

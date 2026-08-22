@@ -3222,3 +3222,43 @@ fn masked_sb16_line_does_not_offer_the_pause_wake() {
         None
     );
 }
+
+#[test]
+fn pause_dac_holds_dma_across_the_batch_that_ends_at_its_deadline() {
+    // Codex on #734: `Sb16Path::advance` applied the countdown before it
+    // ticked the batch's frames, so a batch ending at the pause deadline
+    // cleared the pause and then consumed every frame of the pause window.
+    let mut machine = test_machine();
+    for i in 0..16u32 {
+        machine.write_physical_u8(0x1_0000 + i, 0x40);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+        // 10 kHz, 8-bit single block of 8, then pause 4 periods = 400 us.
+        for &b in &[0x41u8, 0x27, 0x10, 0x14, 0x07, 0x00, 0x80, 0x03, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    });
+    assert_eq!(machine.sb16.test_block_remaining(), 8);
+    let pause_micros = machine.sb16.test_pause_micros_remaining().unwrap();
+    let pause_ticks = pause_micros * izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    machine.advance_devices_ticks(pause_ticks);
+    assert!(machine.pic.irr_bit(7), "the pause interrupt is due on IRQ7");
+    assert_eq!(
+        machine.sb16.test_block_remaining(),
+        8,
+        "no DMA unit moves during the pause window"
+    );
+    machine.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ / 10_000 * 2);
+    assert!(
+        machine.sb16.test_block_remaining() < 8,
+        "output resumes after the pause"
+    );
+}
