@@ -2987,6 +2987,15 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
                 json!({ "cause": counts.cause, "count": counts.count, "keys": counts.keys })
             })
             .collect::<Vec<_>>(),
+        // The other currency on the same 466 keys: static-unbound EXITS that landed on a dormant
+        // key, split by the cause it was parked with. `jit_direct_retry_causes` says how many
+        // keys each gate parked; this says how much traffic those keys absorb, which is what a
+        // lift policy is priced against. Barrier-census gated, so a plain run reports zeroes.
+        "jit_direct_retry_cause_hits": snapshot
+            .retry_cause_hits
+            .iter()
+            .map(|(label, hits)| json!({ "cause": label, "hits": hits }))
+            .collect::<Vec<_>>(),
         // The S4d M5 measurement: interpreted MOV SS / POP SS split by whether the load moved
         // the SS record. The SS call-out rows resume only on the unchanged shape, so this ratio
         // is what decides whether they are worth building.

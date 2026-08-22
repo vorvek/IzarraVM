@@ -649,7 +649,7 @@ enum BlockState {
     /// heat-demoted (recoverable) dormants from the rest. The reason is stamped by the FIRST
     /// park: `dormant()` only rewrites a `Seen` entry, so a second gate firing on an
     /// already-dormant key counts in `DirectStallTally::dormant` but does not restamp the state.
-    Dormant(DormantReason),
+    Dormant(DormantReason, Option<RetryCause>),
     Rejected(RejectedSpan),
     Compiled(BlockId),
 }
@@ -1122,7 +1122,7 @@ impl BlockCache {
                 BlockProbe::Ready(id)
             }
             Some(BlockState::Seen) => BlockProbe::Compile,
-            Some(BlockState::Dormant(_) | BlockState::Rejected(_)) => BlockProbe::Rejected,
+            Some(BlockState::Dormant(..) | BlockState::Rejected(_)) => BlockProbe::Rejected,
             None => {
                 self.stats.lookup_misses += 1;
                 if self.entries.len() == self.entry_cap {
@@ -1396,7 +1396,8 @@ impl BlockCache {
             if let Some(cause) = retry_cause {
                 self.stalls.retry_cause_keys[cause as usize] += 1;
             }
-            self.entries.insert(key, BlockState::Dormant(reason));
+            self.entries
+                .insert(key, BlockState::Dormant(reason, retry_cause));
         }
     }
 
@@ -1623,7 +1624,7 @@ impl BlockCache {
         key: BlockKey,
         epoch: u32,
     ) -> DormantLift {
-        if !matches!(self.entries.get(&key), Some(BlockState::Dormant(_))) {
+        if !matches!(self.entries.get(&key), Some(BlockState::Dormant(..))) {
             return DormantLift::NotDormant;
         }
         if heat.take_stale_stamp(key.physical, epoch) {
@@ -2078,7 +2079,7 @@ impl BlockCache {
                         continue;
                     };
                     let overlaps = match state {
-                        BlockState::Seen | BlockState::Dormant(_) => {
+                        BlockState::Seen | BlockState::Dormant(..) => {
                             physical_range_contains(physical, width, key.physical)
                         }
                         BlockState::Rejected(span) => physical_ranges_overlap(
@@ -2188,7 +2189,7 @@ impl BlockCache {
                             watch.release_range(span.key.physical, u32::from(span.guest_len));
                         }
                         BlockState::Compiled(id) => self.retire_block(watch, id),
-                        BlockState::Seen | BlockState::Dormant(_) => {}
+                        BlockState::Seen | BlockState::Dormant(..) => {}
                     }
                     invalidated += 1;
                     #[cfg(feature = "smc-census")]
@@ -2258,12 +2259,25 @@ impl BlockCache {
     /// both refuted by counters that already existed — `x87_pad_bails` and `reject_x87_top` are
     /// flat zero, and the global `invalidate_translation` does not fire in steady state. This
     /// answers the question directly instead of inferring it a third time.
+    /// The `RetryCause` a dormant key was parked with, or `None` when it is not a compile-Retry
+    /// park at all (the heat gate, the page-cover failure and the install failure carry no cause).
+    ///
+    /// A LOOKUP rather than a second return value from `classify_unbound_target`, because only the
+    /// census lane wants it: the class table is read on every static-unbound exit in every build,
+    /// and this is read only when the census is armed and the class came back `DormantOther`.
+    pub(crate) fn dormant_retry_cause(&self, key: BlockKey) -> Option<RetryCause> {
+        match self.entries.get(&key) {
+            Some(BlockState::Dormant(_, cause)) => *cause,
+            _ => None,
+        }
+    }
+
     pub(crate) fn classify_unbound_target(&self, key: BlockKey) -> UnboundTarget {
         match self.entries.get(&key) {
             None => UnboundTarget::Absent,
             Some(BlockState::Seen) => UnboundTarget::Seen,
-            Some(BlockState::Dormant(DormantReason::SpanHot)) => UnboundTarget::DormantHeat,
-            Some(BlockState::Dormant(_)) => UnboundTarget::DormantOther,
+            Some(BlockState::Dormant(DormantReason::SpanHot, _)) => UnboundTarget::DormantHeat,
+            Some(BlockState::Dormant(..)) => UnboundTarget::DormantOther,
             Some(BlockState::Rejected(_)) => UnboundTarget::Rejected,
             Some(BlockState::Compiled(id)) => {
                 if self.active_index(*id).is_some() {
@@ -2284,7 +2298,7 @@ impl BlockCache {
             return None;
         }
         match self.entries.get(&key) {
-            Some(BlockState::Dormant(_)) => Some(AdmissionDecline::DormantProbe),
+            Some(BlockState::Dormant(..)) => Some(AdmissionDecline::DormantProbe),
             Some(BlockState::Rejected(_)) => Some(AdmissionDecline::RejectedProbe),
             None | Some(BlockState::Seen | BlockState::Compiled(_)) => None,
         }

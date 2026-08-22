@@ -1930,6 +1930,10 @@ pub struct DirectStallSnapshot {
     /// The `compile_retry` entry of `dormant` split by which compile-walk gate gave up, per
     /// `RetryCause`. The `count` column sums to that entry exactly.
     pub retry_causes: Vec<RetryCauseCounts>,
+    /// (label, hits) per `RetryCause`: the static-unbound EXITS that landed on a dormant key
+    /// parked for that cause. Barrier-census gated, so it reads all zeroes on a plain build.
+    /// See `DirectStallTally::retry_cause_hits`.
+    pub retry_cause_hits: Vec<(&'static str, u64)>,
     /// Interpreted MOV SS / POP SS executions split by whether the load changed the SS record.
     /// The S4d design's M5 measurement; see `DirectStallTally`.
     pub ss_load_same_record: u64,

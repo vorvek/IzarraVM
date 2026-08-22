@@ -2124,11 +2124,17 @@ impl CpuGsw {
         // class totals fall short of `jit_direct_unresolved_static_unbound` by an unknown amount,
         // and the whole point of the table is that it closes on that counter — see
         // `unbound_target_classes_are_exhaustive` (jit/direct_test.rs).
-        let (kind, linear) = match jit::direct::key_for(self, lin, d) {
-            Some(key) => (self.jit_direct.classify_unbound_target(key), key.linear()),
-            None => (jit::direct::UnboundTarget::NoKey, 0),
+        let (kind, linear, key) = match jit::direct::key_for(self, lin, d) {
+            Some(key) => (
+                self.jit_direct.classify_unbound_target(key),
+                key.linear(),
+                Some(key),
+            ),
+            None => (jit::direct::UnboundTarget::NoKey, 0, None),
         };
-        self.jit_direct.note_unbound_target(kind, linear);
+        // The KEY as well as the class since S4 part 2: a `DormantOther` target carries the
+        // `RetryCause` it was parked with, and the census splits the class by it.
+        self.jit_direct.note_unbound_target(kind, linear, key);
     }
 
     /// The dynamic-successor counterpart of `classify_unbound_exit`. Same recovery of the key

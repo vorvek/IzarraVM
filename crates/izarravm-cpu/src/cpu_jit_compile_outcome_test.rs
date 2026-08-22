@@ -1167,7 +1167,7 @@ fn a_dirty_segment_row_does_not_claim_the_rejected_span_map() {
     // An exit reporting a REJECTED target at the dirty block's own entry linear. If the dirty stop
     // had registered there, this credits its row.
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY, None);
 
     let snapshot = cpu
         .direct_barrier_census_snapshot()
@@ -3492,7 +3492,7 @@ fn barrier_census_closure_counts_rejected_exits_the_map_cannot_attribute() {
     // ENTRY is in the rejected-span map; a linear the compiler never refused is not.
     const UNMAPPED: u32 = ENTRY + 0x4000;
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY);
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY, None);
     cpu.jit_direct
         .note_unbound_target(jit::direct::UnboundTarget::Rejected, UNMAPPED);
     cpu.jit_direct
@@ -4020,6 +4020,67 @@ fn retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block() {
         retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
         jit::direct::RetryCause::TooShort
     );
+}
+
+/// A dormant key's EXITS are attributed to the cause it was parked with, not just its parks.
+///
+/// The two columns answer different questions about the same 466 keys and the campaign needs
+/// both: `retry_causes` says how many keys each gate parked, and this says how much traffic those
+/// keys then absorb. On the tombraid loader `admission_matrix` parks the most keys and
+/// `decode_miss` is the largest clearable one, and nothing said which of them the 4.40 M
+/// static-unbound exits actually go to.
+///
+/// The key is parked through the REAL compile walk rather than by hand: the cause under test is
+/// whatever `retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block` measures, so the
+/// two cannot drift apart into a fixture that attributes a cause the walk never produces.
+///
+/// MUTATION: drop the cause from `BlockState::Dormant` and read it back as `None`, and the hits
+/// land nowhere; count the hits ungated and the census-off leg below reads five instead of zero.
+#[test]
+fn a_dormant_keys_unbound_exits_are_attributed_to_its_retry_cause() {
+    const HITS: u64 = 5;
+    for census in [false, true] {
+        let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);
+        warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+        let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture");
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let cause = retry_cause(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(cause, jit::direct::RetryCause::TooShort);
+        cpu.jit_direct
+            .dormant(key, jit::direct::DormantReason::CompileRetry, Some(cause));
+        assert_eq!(
+            cpu.jit_direct.classify_unbound_target(key),
+            jit::direct::UnboundTarget::DormantOther,
+            "the fixture must produce the class the counter hangs off"
+        );
+
+        cpu.enable_direct_barrier_census(census);
+        for _ in 0..HITS {
+            cpu.jit_direct.note_unbound_target(
+                jit::direct::UnboundTarget::DormantOther,
+                key.linear(),
+                Some(key),
+            );
+        }
+
+        let hits: Vec<_> = cpu.direct_stall_snapshot().retry_cause_hits;
+        let expected = if census { HITS } else { 0 };
+        for (label, count) in &hits {
+            let wanted = if *label == "too_short" { expected } else { 0 };
+            assert_eq!(
+                *count, wanted,
+                "census={census}: {label} reported {count} exits"
+            );
+        }
+        assert_eq!(
+            hits.len(),
+            jit::direct::RetryCause::ALL.len(),
+            "every cause must have a column, or a hot one can vanish from the report"
+        );
+    }
 }
 
 /// The four block caps (x87 slots, call-out slots, memory-ALU slots, stack accesses) can only

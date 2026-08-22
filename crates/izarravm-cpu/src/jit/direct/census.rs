@@ -467,6 +467,31 @@ pub(crate) struct DirectStallTally {
     /// that had simply never been hot enough to try -- which is what made the 5.2M-exit
     /// seen-not-compiled bucket unattributable.
     pub dormant: [u64; DormantReason::COUNT],
+    /// The static-unbound EXITS that landed on a compile-Retry dormant key, split by the cause
+    /// that key was parked with.
+    ///
+    /// The sibling of `retry_causes` and a different currency. That one counts compile ATTEMPTS,
+    /// which is what says how many keys each gate parked; this counts the exits those keys then
+    /// absorb, which is what says how much wall a lift could reach. On the tombraid loader phase
+    /// the two answer opposite questions about the same 466 keys: `admission_matrix` parks the
+    /// most keys (206) and `decode_miss` (194) is the largest clearable one, and until this column
+    /// existed nothing said which of them the 4.40 M exits actually go to.
+    ///
+    /// GATED with the barrier census, like the class table it rides on: it is one array increment
+    /// per static-unbound exit, on a path that runs millions of times in a loader phase, and it is
+    /// read only on census legs.
+    ///
+    /// THE STATIC LANE ONLY. `classify_dynamic_miss_exit` classifies the same key population
+    /// through the same `UnboundTarget` table, and folding it in would put two populations with
+    /// different fixes into one column -- a static unbound wants the target compiled, a dynamic
+    /// miss whose target is dormant wants the same thing but arrives through the inline cache, and
+    /// the 4.40 M figure this column is compared against is the static one. If the dynamic lane
+    /// ever needs the same split it gets its own array.
+    ///
+    /// WHAT IT SUMS TO. Not `dormant_other` for the lane, which also holds the parks that carry no
+    /// cause at all (`PageCoverFailed`, `InstallFailed`); it sums to the compile-Retry SUBSET of
+    /// that column, and the difference is exactly those two reasons.
+    pub retry_cause_hits: [u64; RetryCause::COUNT],
     /// The `DormantReason::CompileRetry` column split by which compile-walk gate gave up,
     /// indexed by `RetryCause`. Sums to `dormant[CompileRetry]` exactly, which is the pin the
     /// tests assert.
@@ -1961,7 +1986,24 @@ impl crate::jit::JitState {
 
     /// Record why a static successor was unbound. No-op unless the census is allocated, and the
     /// CALLER still gates on `barrier_census_active` so the key construction is skipped too.
-    pub(crate) fn note_unbound_target(&mut self, kind: UnboundTarget, linear: u32) {
+    pub(crate) fn note_unbound_target(
+        &mut self,
+        kind: UnboundTarget,
+        linear: u32,
+        key: Option<BlockKey>,
+    ) {
+        // The per-cause split of `dormant_other`, taken here rather than inside
+        // `classify_unbound_target` so the plain build pays nothing for it: the class table is
+        // read on every static-unbound exit, and this arm is one map probe on top. See
+        // `DirectStallTally::retry_cause_hits` for what the column sums to and why the dynamic
+        // lane is not folded into it.
+        if self.direct_barrier_census.is_some()
+            && kind == UnboundTarget::DormantOther
+            && let Some(key) = key
+            && let Some(cause) = self.direct.dormant_retry_cause(key)
+        {
+            self.stalls.retry_cause_hits[cause as usize] += 1;
+        }
         if let Some(census) = self.direct_barrier_census.as_mut() {
             census.note_unbound(kind);
             if kind == UnboundTarget::Rejected {
@@ -2003,6 +2045,10 @@ impl crate::jit::JitState {
             dormant: DormantReason::ALL
                 .iter()
                 .map(|r| (r.label(), self.stalls.dormant[*r as usize]))
+                .collect(),
+            retry_cause_hits: RetryCause::ALL
+                .iter()
+                .map(|c| (c.label(), self.stalls.retry_cause_hits[*c as usize]))
                 .collect(),
             retry_causes: RetryCause::ALL
                 .iter()
