@@ -760,3 +760,64 @@ fn peak_amplitude_is_not_tracked_unless_the_sb_debug_report_is_armed() {
     );
     assert_eq!(dsp.take_peak_abs(), 0, "the instrument is not armed");
 }
+
+#[test]
+fn pause_dac_command_0x80_consumes_two_duration_bytes() {
+    // Tyrian 2000's IRQ probe sends `80 10 00`. The two bytes are the
+    // little-endian pause duration, not a direct-DAC 0x10 command (#732).
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x80, 0x10, 0x00]);
+    assert_eq!(
+        dsp.direct_dac_byte(),
+        None,
+        "the duration bytes must not be parsed as a direct-DAC command"
+    );
+    assert!(
+        !dsp.take_irq(),
+        "the IRQ fires after the duration, not at dispatch"
+    );
+    write_cmd(&mut dsp, &[0xE1]);
+    assert_eq!(
+        dsp.read_port(0x22A),
+        Some(DSP_VERSION_HI),
+        "the next command byte starts a fresh command"
+    );
+}
+
+#[test]
+fn pause_dac_raises_the_8bit_irq_when_the_duration_elapses() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]); // 10000 Hz: 100 us per sample
+    write_cmd(&mut dsp, &[0x80, 0x09, 0x00]); // (9 + 1) sampling periods = 1000 us
+    dsp.advance_micros(999);
+    assert!(!dsp.take_irq(), "not early: 999 of 1000 us elapsed");
+    dsp.advance_micros(1);
+    assert!(dsp.take_irq(), "raised when the duration completes");
+    dsp.advance_micros(5_000);
+    assert!(!dsp.take_irq(), "one-shot: no repeat after completion");
+}
+
+#[test]
+fn pause_dac_uses_the_time_constant_rate() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x40, 0xCE]); // 1_000_000 / (256 - 0xCE) = 20000 Hz, 50 us
+    write_cmd(&mut dsp, &[0x80, 0x01, 0x00]); // 2 periods = 100 us
+    dsp.advance_micros(99);
+    assert!(!dsp.take_irq());
+    dsp.advance_micros(1);
+    assert!(dsp.take_irq());
+}
+
+#[test]
+fn dsp_reset_cancels_a_pending_pause() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]);
+    write_cmd(&mut dsp, &[0x80, 0x09, 0x00]);
+    dsp.write_port(0x226, 0x01);
+    dsp.write_port(0x226, 0x00);
+    dsp.advance_micros(5_000);
+    assert!(
+        !dsp.take_irq(),
+        "reset halts the DAC, so the pause IRQ never fires"
+    );
+}

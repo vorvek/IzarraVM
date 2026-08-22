@@ -200,6 +200,9 @@ pub struct SbDsp {
     auto_init: bool,
     playing: bool,
     irq_pending: bool,
+    // Remaining microseconds of a 0x80 "pause DAC for a duration" command.
+    // Counted down by `advance_micros`; raises the 8-bit IRQ when it elapses.
+    pause_micros: Option<u64>,
     // 16-bit DMA playback state (SB16 0xBx family). dma_16bit selects the word
     // fetch and sample-depth path; stereo selects one vs. two words per frame;
     // sample_signed selects signed vs. unsigned 16-bit conversion.
@@ -257,6 +260,7 @@ impl Default for SbDsp {
             auto_init: false,
             playing: false,
             irq_pending: false,
+            pause_micros: None,
             dma_16bit: false,
             stereo: false,
             sample_signed: false,
@@ -281,6 +285,13 @@ impl SbDsp {
                 self.reset_micros = None;
             }
         }
+        if let Some(remaining) = self.pause_micros.as_mut() {
+            *remaining = remaining.saturating_sub(micros);
+            if *remaining == 0 {
+                self.irq_pending = true;
+                self.pause_micros = None;
+            }
+        }
     }
 
     fn queue_read(&mut self, byte: u8) {
@@ -296,6 +307,7 @@ impl SbDsp {
             0x40 => 1,        // set time constant
             0x41 => 2,        // set sample rate
             0x14 => 2,        // 8-bit single-cycle DMA output, length low/high
+            0x80 => 2,        // pause DAC for a duration, low/high
             // Single-cycle Creative ADPCM output: mode byte set by the opcode,
             // 2-byte length inline (like 0x14). Auto-init ADPCM (0x1F/0x7D/0x7F)
             // takes no args -- it uses the 0x48 block size.
@@ -464,6 +476,19 @@ impl SbDsp {
             0xD0 => self.playing = false,   // halt DMA (position kept)
             0xD4 => self.playing = true,    // continue DMA
             0xDA => self.auto_init = false, // exit auto-init: stop at next TC
+            0x80 if args.len() >= 2 => {
+                // Pause DAC for a duration: wait (count + 1) sampling periods at
+                // the current time constant, then raise the 8-bit interrupt.
+                // Tyrian 2000 Setup probes the IRQ wiring with `80 10 00` and
+                // rejects the card when no interrupt follows (#732).
+                // Limit: an active DMA transfer keeps producing during the pause;
+                // only the timed interrupt is modeled.
+                let count = u64::from(args[0]) | (u64::from(args[1]) << 8);
+                let rate = u64::from(self.rate_hz.max(1));
+                let micros = ((count + 1) * 1_000_000).div_ceil(rate);
+                self.pause_micros = Some(micros.max(1));
+            }
+            0x80 => {}
             0xF2 => {
                 // Request the 8-bit interrupt immediately (the documented DSP
                 // IRQ-probe command drivers use to verify the IRQ wiring). Same
@@ -1008,6 +1033,7 @@ impl SbDsp {
                     self.auto_init = false;
                     self.block_remaining = 0;
                     self.irq_pending = false;
+                    self.pause_micros = None;
                     self.pending = None;
                     // The mode latches must clear too, or the idle 16-bit
                     // guard in render_frame keeps direct DAC dead after any
