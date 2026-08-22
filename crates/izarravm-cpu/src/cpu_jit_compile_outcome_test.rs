@@ -4022,6 +4022,98 @@ fn retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block() {
     );
 }
 
+/// The retry lift end to end: a `DecodeMiss` key whose line has come back compiles again, and the
+/// sticky-decline memo is what paces it.
+///
+/// This is the claim the whole slice is for. `retry_state_stays_dormant_after_decode_recovery_until_cache_clear`
+/// pins the OLD behaviour from the other side and still holds: a thousand probes inside one memo
+/// era buy nothing, because the memo answers before the probe and the visit is never taken. What
+/// changes is what happens across ERAS. One probe reaches the key per era, and after
+/// `RETRY_LIFT_VISITS` of them the key is re-admitted and compiles with the line it was missing.
+///
+/// THE VISIT COUNT IS ERAS, and the first half of this fixture is what makes that concrete rather
+/// than a claim in a doc comment: without the era crossings the loop below never lifts, however
+/// many times it probes.
+///
+/// The memo assertion is the handshake. A lifted key with a live memo at its slot would be
+/// re-admitted and then never looked at again for the rest of the era, so the lift path clears the
+/// byte instead of writing a fresh decline over it.
+///
+/// MUTATION: write the ordinary memo on the lift path instead of clearing it and the block never
+/// installs; make `clearable_by_retry` false for `DecodeMiss` and the lift never fires at all.
+#[test]
+fn a_lifted_decode_miss_key_compiles_once_its_line_is_back() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+
+    // Observation one is `Seen`; observation two compiles, misses the third line and parks.
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("first observation");
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("missing decode retry");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+    assert_eq!(
+        retry_cause_counts(&cpu, jit::direct::RetryCause::DecodeMiss).1,
+        1,
+        "the fixture must park for the cause under test"
+    );
+
+    // The line comes back, which is what makes the cause CLEARABLE rather than a label.
+    warm(&mut cpu, &mut bus, &[ENTRY + 2]);
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+
+    // A thousand probes inside ONE memo era buy nothing: the memo answers before the probe.
+    for _ in 0..1_000 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("dormant probe");
+    }
+    assert_eq!(
+        cpu.direct_stall_snapshot().retry_lifts,
+        0,
+        "the memo must pace the lift; without it the visit count is meaningless"
+    );
+
+    // One probe per era, and the lift fires at the threshold.
+    let mut eras = 0u32;
+    while cpu.direct_stall_snapshot().retry_lifts == 0 {
+        eras += 1;
+        assert!(
+            eras <= u32::from(jit::direct::RETRY_LIFT_VISITS) + 4,
+            "the lift never fired"
+        );
+        cpu.perf.instructions += 1 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("dormant probe");
+    }
+    let slot = cpu
+        .decode_cache
+        .get_packed(ENTRY, true)
+        .expect("a live decode line at the entry")
+        .slot;
+    assert_eq!(
+        cpu.decode_cache.decline_memo_at(slot),
+        0,
+        "the lift must clear the memo that would otherwise short-circuit the key it re-admitted"
+    );
+
+    // And the re-admitted key compiles, with the line that was missing the first time.
+    for _ in 0..4 {
+        cpu.perf.instructions += 1 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("post-lift probe");
+    }
+    assert!(
+        cpu.perf_counters().jit_direct_blocks_installed > installed,
+        "a lifted key whose cause has cleared must install"
+    );
+    assert_eq!(cpu.direct_stall_snapshot().retry_lift_reparks, 0);
+}
+
 /// A dormant key's EXITS are attributed to the cause it was parked with, not just its parks.
 ///
 /// The two columns answer different questions about the same 466 keys and the campaign needs

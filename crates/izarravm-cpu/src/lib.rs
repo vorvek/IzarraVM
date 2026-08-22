@@ -1934,6 +1934,10 @@ pub struct DirectStallSnapshot {
     /// parked for that cause. Barrier-census gated, so it reads all zeroes on a plain build.
     /// See `DirectStallTally::retry_cause_hits`.
     pub retry_cause_hits: Vec<(&'static str, u64)>,
+    /// Keys the retry lift re-admitted, and keys it then had to park permanently because the
+    /// re-walk reached the same cause. Read as a ratio; see `DirectStallTally::retry_lifts`.
+    pub retry_lifts: u64,
+    pub retry_lift_reparks: u64,
     /// Interpreted MOV SS / POP SS executions split by whether the load changed the SS record.
     /// The S4d design's M5 measurement; see `DirectStallTally`.
     pub ss_load_same_record: u64,

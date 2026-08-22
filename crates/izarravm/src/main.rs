@@ -2996,6 +2996,10 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
             .iter()
             .map(|(label, hits)| json!({ "cause": label, "hits": hits }))
             .collect::<Vec<_>>(),
+        // The retry lift's own pair, read as a ratio: `reparks / lifts` is how often a lifted key
+        // came straight back with the same cause, which is the arm's miss rate.
+        "jit_direct_retry_lifts": snapshot.retry_lifts,
+        "jit_direct_retry_lift_reparks": snapshot.retry_lift_reparks,
         // The S4d M5 measurement: interpreted MOV SS / POP SS split by whether the load moved
         // the SS record. The SS call-out rows resume only on the unchanged shape, so this ratio
         // is what decides whether they are worth building.

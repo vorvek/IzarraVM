@@ -492,6 +492,14 @@ pub(crate) struct DirectStallTally {
     /// cause at all (`PageCoverFailed`, `InstallFailed`); it sums to the compile-Retry SUBSET of
     /// that column, and the difference is exactly those two reasons.
     pub retry_cause_hits: [u64; RetryCause::COUNT],
+    /// Keys the retry lift re-admitted, and keys that came straight back with the same cause and
+    /// were parked permanently. Always on: both fire on a cold path, at most once per key.
+    ///
+    /// The PAIR is the report, not either half. Lifts alone say the arm fired; reparks alone say
+    /// nothing. `reparks / lifts` is the arm's hit rate, and a ratio near one says the causes
+    /// being lifted are not clearable in practice however clearable they are in principle.
+    pub retry_lifts: u64,
+    pub retry_lift_reparks: u64,
     /// The `DormantReason::CompileRetry` column split by which compile-walk gate gave up,
     /// indexed by `RetryCause`. Sums to `dormant[CompileRetry]` exactly, which is the pin the
     /// tests assert.
@@ -853,6 +861,44 @@ impl RetryCause {
         Self::PostWalk,
         Self::HostPageLen,
     ];
+
+    /// Whether a re-walk of the SAME key could ever reach a different answer, which is the whole
+    /// admission rule for the retry lift (`BlockCache::lift_clearable_retry_dormant`).
+    ///
+    /// EXHAUSTIVE, with no catch-all arm, because the default has to be "no": a cause added
+    /// without an answer must be a compile error rather than a silent lift of a gate that refuses
+    /// deterministically. Only two say yes today.
+    ///
+    /// The line is drawn at what the cause DEPENDS ON, not at how it feels. `DecodeMiss` and
+    /// `TranslationMismatch` both fail on host-side state that the interpreter running the same
+    /// bytes repairs: the decode line refills and the translation settles. Everything else depends
+    /// on the key, the code bytes or a fixed budget, and re-walking reaches the same answer for
+    /// ever.
+    ///
+    /// The near misses, named so they are not re-litigated. `NoKey` looks clearable and is not
+    /// reachable here at all: the walk needs a key before it can park one. `SegmentLimit` clears
+    /// only through a segment reload, which moves the mode key and therefore produces a DIFFERENT
+    /// key. `PostWalk` and `HostPageLen` do rest on host state, but both are near zero on every
+    /// measured workload, so a lift for them would be an unmeasurable arm; they are candidates for
+    /// a later slice with a census behind it, not for this one.
+    pub(crate) fn clearable_by_retry(self) -> bool {
+        match self {
+            Self::DecodeMiss | Self::TranslationMismatch => true,
+            Self::NoKey
+            | Self::PageCross
+            | Self::SegmentLimit
+            | Self::SpanUnformable
+            | Self::AdmissionMatrix
+            | Self::X87Cap
+            | Self::CalloutCap
+            | Self::MemoryAluCap
+            | Self::StackAccessCap
+            | Self::AccumulatorOverflow
+            | Self::TooShort
+            | Self::PostWalk
+            | Self::HostPageLen => false,
+        }
+    }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -2046,6 +2092,8 @@ impl crate::jit::JitState {
                 .iter()
                 .map(|r| (r.label(), self.stalls.dormant[*r as usize]))
                 .collect(),
+            retry_lifts: self.stalls.retry_lifts,
+            retry_lift_reparks: self.stalls.retry_lift_reparks,
             retry_cause_hits: RetryCause::ALL
                 .iter()
                 .map(|c| (c.label(), self.stalls.retry_cause_hits[*c as usize]))

@@ -1440,11 +1440,29 @@ impl CpuGsw {
                 if lift == jit::direct::DormantLift::StillDormant
                     && !self.jit_direct.direct.cache_disabled()
                 {
-                    // Advance FIRST: an advance that wraps sweeps the whole pack array, and a
-                    // sweep after the store would erase the memo this decline just earned.
-                    let _ = self.advance_decline_memo_era();
-                    let live = self.decline_memo_comparand();
-                    self.decode_cache.set_decline_memo_at(screen.slot, live);
+                    // S4 part 2: the RETRY lift, which is the other reason a Dormant key can come
+                    // back. The heat lift above answers "the stamp aged out"; this one answers
+                    // "the compile walk failed on state that has had time to change", counts its
+                    // own visits, and only offers the deal to a cause a re-walk could ever
+                    // decide differently.
+                    //
+                    // The memo is the reason it is HERE and not on some cheaper path. This site
+                    // is the only place a parked key is observed, and the memo throttles it to
+                    // about one visit per era, so the visit count is what it is. More important,
+                    // the memo would UNDO the lift: it short-circuits before the probe, so a key
+                    // re-admitted with a live memo at its slot would never be looked at again.
+                    // Clearing that byte (0 is the reserved "no memo" value) is the whole of the
+                    // handshake, and it is cheaper and tighter than advancing the era, which
+                    // would invalidate every other slot's memo to serve this one key.
+                    if self.jit_direct.direct.lift_clearable_retry_dormant(key) {
+                        self.decode_cache.set_decline_memo_at(screen.slot, 0);
+                    } else {
+                        // Advance FIRST: an advance that wraps sweeps the whole pack array, and a
+                        // sweep after the store would erase the memo this decline just earned.
+                        let _ = self.advance_decline_memo_era();
+                        let live = self.decline_memo_comparand();
+                        self.decode_cache.set_decline_memo_at(screen.slot, live);
+                    }
                 }
                 return Ok(DirectContinuation::Interpret);
             }

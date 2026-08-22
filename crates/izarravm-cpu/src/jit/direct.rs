@@ -167,6 +167,25 @@ pub(crate) const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
 /// binds silently is a cap nobody finds.
 const DEMOTED_CALLOUT_SITE_CAP: usize = 4_096;
 
+/// Probes a `Dormant` key parked for a CLEARABLE compile-walk cause must absorb before the retry
+/// lift re-admits it. See `BlockCache::lift_clearable_retry_dormant` for what one visit is: the
+/// sticky-decline memo throttles this site to about one probe per memo era, so the constant buys a
+/// long-run gate rather than a 64-exit one.
+///
+/// Sixty-four rather than a smaller number because the failure mode of lifting too eagerly is a
+/// compile attempt per key per window with a park behind it, on the exact population that is
+/// already the largest unattributed exit class. A key whose decode line really has been refilled
+/// stays liftable for as long as the run goes on, so lateness costs latency and earliness costs
+/// compile time.
+pub(crate) const RETRY_LIFT_VISITS: u8 = 64;
+
+/// How many keys may hold a spent-lift record. The map grows by at most one entry per lift and a
+/// lift needs `RETRY_LIFT_VISITS` probes, so this is far above what any measured workload reaches
+/// (the loader parks 466 keys in total). Full means no further key is lifted, which fails closed
+/// to the pre-slice behaviour rather than to an eviction policy that could hand one key an endless
+/// supply of lifts.
+const RETRY_LIFT_SPENT_CAP: usize = 4_096;
+
 /// Untried entries a call-out block may spend at trial quota before the governor gives up on
 /// classifying it. A call-out behind a rarely-taken branch would otherwise sit at quota 1
 /// forever, which is a real regression for the block's OTHER instructions.
@@ -649,7 +668,7 @@ enum BlockState {
     /// heat-demoted (recoverable) dormants from the rest. The reason is stamped by the FIRST
     /// park: `dormant()` only rewrites a `Seen` entry, so a second gate firing on an
     /// already-dormant key counts in `DirectStallTally::dormant` but does not restamp the state.
-    Dormant(DormantReason, Option<RetryCause>),
+    Dormant(DormantEntry),
     Rejected(RejectedSpan),
     Compiled(BlockId),
 }
@@ -659,6 +678,25 @@ struct HotEntry {
     key: BlockKey,
     id: BlockId,
     generation: u32,
+}
+
+/// A parked key's Dormant record: why it parked, and everything the retry lift needs to decide
+/// whether to re-probe it.
+///
+/// Four bytes in a variant that had eight to spare (`Compiled` carries a `BlockId`), so the whole
+/// record is free in `entries`, which is the map every probe and every invalidation walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DormantEntry {
+    /// Which gate parked it. `SpanHot` is the heat lane and carries no cause.
+    reason: DormantReason,
+    /// The compile walk's own answer, `Some` exactly for `DormantReason::CompileRetry`.
+    cause: Option<RetryCause>,
+    /// Probes that reached this key while it was parked, saturating at `RETRY_LIFT_VISITS`.
+    /// See `lift_clearable_retry_dormant` for what a visit actually is.
+    visits: u8,
+    /// Set when the key already spent a lift for THIS cause and came straight back. The evidence
+    /// is in: re-walking reaches the same answer, so no further lift is offered.
+    permanent: bool,
 }
 
 /// What `lift_cold_smc_dormant` found. `StillDormant` is the sticky-decline memo's exact
@@ -829,6 +867,12 @@ pub(crate) struct BlockCache {
     /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
     /// beside `can_take_before`.
     interrupt_shadow_consumed: bool,
+    /// Keys that have already spent a retry lift, and the cause they spent it on.
+    ///
+    /// Read by `dormant` to mark a same-cause re-park PERMANENT, which is what stops a key that
+    /// the walk refuses deterministically-but-for-a-clearable-looking-reason from buying a lift
+    /// every `RETRY_LIFT_VISITS` probes for ever. Capped at `RETRY_LIFT_SPENT_CAP`.
+    retry_lift_spent: HashMap<BlockKey, RetryCause>,
     /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
     lane_trial_override: Option<bool>,
@@ -995,6 +1039,7 @@ impl BlockCache {
             top_mismatch_retires: HashMap::default(),
             demoted_callout_sites: HashSet::default(),
             callout_retire_pending: None,
+            retry_lift_spent: HashMap::default(),
             interrupt_shadow_armed_at: None,
             interrupt_shadow_consumed: false,
             lane_trial_override: None,
@@ -1396,9 +1441,75 @@ impl BlockCache {
             if let Some(cause) = retry_cause {
                 self.stalls.retry_cause_keys[cause as usize] += 1;
             }
-            self.entries
-                .insert(key, BlockState::Dormant(reason, retry_cause));
+            // A key that already spent its lift for THIS cause and came straight back parks
+            // PERMANENTLY. The lift is an offer to re-walk once, and a re-park with the same
+            // answer is the evidence that re-walking does not help; without this the key would
+            // buy another 64 visits and another compile for ever.
+            let permanent =
+                retry_cause.is_some_and(|cause| self.retry_lift_spent.get(&key) == Some(&cause));
+            if permanent {
+                self.stalls.retry_lift_reparks += 1;
+            }
+            self.entries.insert(
+                key,
+                BlockState::Dormant(DormantEntry {
+                    reason,
+                    cause: retry_cause,
+                    visits: 0,
+                    permanent,
+                }),
+            );
         }
+    }
+
+    /// The RETRY lift: re-admit a key whose compile-walk failure is one that outside state can
+    /// clear, after it has absorbed `RETRY_LIFT_VISITS` probes without being re-tried.
+    ///
+    /// `lift_cold_smc_dormant`'s sibling and deliberately not an extension of it. That one lifts
+    /// keys the SMC heat gate parked and is driven by a stamp aging out; this one lifts keys the
+    /// COMPILE WALK parked and is driven by a visit count, because there is no stamp to age: the
+    /// walk failed on state (a decode line that was not resident, a translation that moved) which
+    /// nothing about the key records. On the tombraid loader phase 194 of 466 dormant keys are
+    /// `DecodeMiss` and they are never re-probed at all.
+    ///
+    /// WHAT A VISIT IS, stated because the number is meaningless without it. This is called from
+    /// the `BlockProbe::Rejected` arm of `try_direct_continuation`, which the sticky-decline memo
+    /// already throttles to roughly ONE per memo era per decode slot. So 64 visits is 64 memo
+    /// eras, not 64 static-unbound exits, and the gate is a long-run one by construction rather
+    /// than by the size of the constant.
+    ///
+    /// ONLY CLEARABLE CAUSES, and the discrimination is `RetryCause::clearable_by_retry`, an
+    /// exhaustive match with no catch-all. A cap, the admission matrix or the min-length rule
+    /// reaches the same answer on every walk for ever, and lifting one would be a compile per 64
+    /// visits with a guaranteed park behind it.
+    ///
+    /// BOUNDED THREE WAYS: the visit gate, the one-lift-per-cause rule enforced by
+    /// `retry_lift_spent` and read back in `dormant`, and the cap on that map. Past the cap no
+    /// further key is lifted, which fails closed to today's behaviour.
+    ///
+    /// Answers whether the key is now `Seen`, because the caller has to know not to write a
+    /// sticky-decline memo over a key it just re-admitted.
+    pub(crate) fn lift_clearable_retry_dormant(&mut self, key: BlockKey) -> bool {
+        let Some(BlockState::Dormant(entry)) = self.entries.get_mut(&key) else {
+            return false;
+        };
+        if entry.permanent {
+            return false;
+        }
+        let Some(cause) = entry.cause.filter(|cause| cause.clearable_by_retry()) else {
+            return false;
+        };
+        entry.visits = entry.visits.saturating_add(1);
+        if entry.visits < RETRY_LIFT_VISITS {
+            return false;
+        }
+        if self.retry_lift_spent.len() >= RETRY_LIFT_SPENT_CAP {
+            return false;
+        }
+        self.retry_lift_spent.insert(key, cause);
+        self.entries.insert(key, BlockState::Seen);
+        self.stalls.retry_lifts += 1;
+        true
     }
 
     /// G1 demotion: park a heat-hot key Dormant AND stamp its entry chunk at the demote epoch.
@@ -1602,6 +1713,38 @@ impl BlockCache {
     #[cfg(test)]
     pub(crate) fn set_lane_trial_for_test(&mut self, on: bool) {
         self.lane_trial_override = Some(on);
+    }
+
+    /// Park a key Dormant from whatever state it is in, so a fixture can reach a park shape the
+    /// production path only produces after a specific compile failure.
+    ///
+    /// `dormant` insists the entry is exactly `Seen`, which is right for production (it is what
+    /// keeps a park from clobbering a Compiled entry) and is the one thing a fixture cannot
+    /// arrange for a key that is already parked for another reason.
+    #[cfg(test)]
+    pub(crate) fn park_dormant_for_test(
+        &mut self,
+        key: BlockKey,
+        reason: DormantReason,
+        cause: Option<RetryCause>,
+    ) {
+        self.entries.insert(key, BlockState::Seen);
+        self.dormant(key, reason, cause);
+    }
+
+    /// Wind a parked key's visit counter forward, so a fixture that needs the lift to fire on its
+    /// NEXT probe does not have to drive `RETRY_LIFT_VISITS` memo eras to get there.
+    #[cfg(test)]
+    pub(crate) fn set_dormant_visits_for_test(&mut self, key: BlockKey, visits: u8) {
+        if let Some(BlockState::Dormant(entry)) = self.entries.get_mut(&key) {
+            entry.visits = visits;
+        }
+    }
+
+    /// Whether a key is parked at all, for fixtures that assert the lift did or did not move it.
+    #[cfg(test)]
+    pub(crate) fn is_dormant_for_test(&self, key: BlockKey) -> bool {
+        matches!(self.entries.get(&key), Some(BlockState::Dormant(..)))
     }
 
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
@@ -2267,7 +2410,7 @@ impl BlockCache {
     /// and this is read only when the census is armed and the class came back `DormantOther`.
     pub(crate) fn dormant_retry_cause(&self, key: BlockKey) -> Option<RetryCause> {
         match self.entries.get(&key) {
-            Some(BlockState::Dormant(_, cause)) => *cause,
+            Some(BlockState::Dormant(entry)) => entry.cause,
             _ => None,
         }
     }
@@ -2276,7 +2419,9 @@ impl BlockCache {
         match self.entries.get(&key) {
             None => UnboundTarget::Absent,
             Some(BlockState::Seen) => UnboundTarget::Seen,
-            Some(BlockState::Dormant(DormantReason::SpanHot, _)) => UnboundTarget::DormantHeat,
+            Some(BlockState::Dormant(entry)) if entry.reason == DormantReason::SpanHot => {
+                UnboundTarget::DormantHeat
+            }
             Some(BlockState::Dormant(..)) => UnboundTarget::DormantOther,
             Some(BlockState::Rejected(_)) => UnboundTarget::Rejected,
             Some(BlockState::Compiled(id)) => {
