@@ -864,9 +864,28 @@ impl CpuGsw {
     }
 
     /// Write a value to a linear address through paging with implicit-supervisor
-    /// semantics. See `read_system_linear_u32`. Used for TSS busy-bit updates and
-    /// page-table-adjacent bookkeeping (accessed/dirty bits) done on the guest's
-    /// behalf while servicing a system-structure access.
+    /// semantics. See `read_system_linear_u32`. Used for TSS busy-bit updates, the segment
+    /// descriptor's Accessed bit, the task-switch state save, and page-table-adjacent
+    /// bookkeeping (accessed/dirty bits) done on the guest's behalf while servicing a
+    /// system-structure access.
+    ///
+    /// IT REPORTS THE WRITE, exactly as `write_page_walk_entry` (memory.rs) does for the other
+    /// on-the-guest's-behalf store the CPU makes. It did neither: no `record_write_page`, so a
+    /// descriptor write left the 486 prefetch queue holding bytes it had just overwritten, and no
+    /// `note_code_write`, so a descriptor sharing a page with code did not invalidate the decode
+    /// cache or a compiled block covering it.
+    ///
+    /// The `InterpretOne` call-out is where that second omission stopped being merely exotic.
+    /// `load_protected_segment` writes the Accessed bit from inside the helper, with a native
+    /// block live on the host stack, and R5 decides whether the block may resume by reading the
+    /// deferred list -- which `note_code_write` is the only thing that fills. A GDT entry on the
+    /// running block's own page was therefore invisible to R5, and the block resumed over code the
+    /// descriptor write had just changed. Reporting it here puts that store on the same footing as
+    /// every other write the guest can make: deferred while the window is open, drained after.
+    ///
+    /// Unconditional invalidation, no same-value elision, for `write_page_walk_entry`'s reason:
+    /// the old bytes were consumed before the write and re-reading them to compare would not earn
+    /// its cost on a path this cold.
     fn write_system_linear<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -876,6 +895,8 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         let physical = self.translate_linear_system(bus, linear, true)?;
         bus.write_memory(physical, width, value, BusAccessKind::DataWrite)?;
+        self.record_write_page(physical);
+        self.note_code_write(physical, width.bytes());
         Ok(())
     }
 

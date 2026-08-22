@@ -2122,9 +2122,19 @@ const POLICY_ROWS_16: &[PolicyRow] = &[
 /// `8E /4` with mod 11 r/m 000: `mov fs, ax`.
 ///
 /// SIXTEEN-BIT ONLY, and the split between the two row tables is exactly this: the 32-bit harness
-/// is protected mode, where a segment load reads a descriptor out of a GDT this generator does not
-/// build. In real mode the load is `base = selector << 4`, and the case seeds AX with the selector
-/// FS already holds, so the record does not move and R2 admits the resume. A random selector would
+/// is protected mode, where a segment load reads a descriptor out of a GDT. `generated_cpu` builds
+/// none -- its `gdtr` is the default, base 0 limit 0 -- so every load there would be a #GP on a
+/// selector past the table.
+///
+/// CONSIDERED AND DECLINED for this slice rather than overlooked: giving `generated_cpu` a GDT
+/// changes the machine every OTHER sweep in this file runs on, including the ones pinned at a
+/// retirement count, and the protected-mode descriptor path is covered end to end by
+/// `cpu_jit_interpret_one_test.rs` section 6 (reload resumes, a different descriptor resyncs, a
+/// bad selector takes the fault stub, and the Accessed-bit write-back is visible to R5). What a
+/// generated row would add over those is randomized SURROUNDINGS, not a new path.
+///
+/// In real mode the load is `base = selector << 4`, and the case seeds AX with the selector FS
+/// already holds, so the record does not move and R2 admits the resume. A random selector would
 /// resync, which is correct behaviour and has its own execution fixture, but it retires fewer
 /// instructions than this sweep's equality admits.
 fn policy_mov_sreg_reload(gpr: &mut [u32; 8]) -> Vec<u8> {

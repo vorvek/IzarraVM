@@ -2468,3 +2468,399 @@ fn the_widened_rows_still_refuse_an_address_size_prefix() {
         assert_eq!(block.callout_interpret_one_slots(), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. The protected-mode segment load, end to end.
+// ---------------------------------------------------------------------------
+//
+// Row 8's protected-mode arm had compile-shape coverage only: `stack_width_kind` routes
+// `LoadSegReal` to a call-out when `is_protected_mode()`, and the s5 allowlist test asserts the
+// slot class. Nothing ran one. This section builds the smallest machine that can: CR0.PE, a
+// hand-built GDT with four usable descriptors, and an IDT whose #GP gate lands on a HLT so a
+// faulting load has somewhere to go and both legs can be driven to a halt.
+//
+// It is what makes `load_protected_segment` -- a descriptor fetch with type, privilege and present
+// checks, an Accessed-bit write-back and three fault vectors -- an executed path rather than an
+// argument about which arm was chosen.
+
+/// The GDT and the IDT live on the DATA page, clear of the block's code.
+const GDT_BASE: u32 = 0x1200;
+const IDT_BASE: u32 = 0x1400;
+/// Where the #GP gate points. On the code page but far below `ENTRY`, so the delivery does not
+/// disturb the block and the guest still halts.
+const FAULT_HANDLER: u32 = 0x0800;
+
+/// Index 1: flat 32-bit code, the segment the fixture runs in.
+const SEL_CODE: u16 = 0x08;
+/// Index 2: flat 32-bit data. FS starts holding exactly this descriptor's record, so RELOADING it
+/// is the case R2 admits.
+const SEL_DATA: u16 = 0x10;
+/// Index 3: data again, but with G clear and a 64 KB limit, so its record DIFFERS from `SEL_DATA`
+/// in the one field R2 compares byte for byte.
+const SEL_OTHER: u16 = 0x18;
+/// Index 4: `SEL_DATA`'s twin with the Accessed bit CLEAR, so loading it makes
+/// `load_protected_segment` write the descriptor back.
+const SEL_UNACCESSED: u16 = 0x20;
+/// Past the table limit, so the load is a #GP with no descriptor to blame.
+const SEL_BAD: u16 = 0x38;
+/// Four usable entries: `index + 7 > limit` refuses `SEL_BAD` and admits every other selector.
+const GDT_LIMIT: u16 = 0x27;
+
+/// One 8-byte descriptor, in the layout `descriptor_to_segment` reads back.
+fn descriptor(low: u32, high: u32) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&low.to_le_bytes());
+    bytes[4..].copy_from_slice(&high.to_le_bytes());
+    bytes
+}
+
+/// A 32-bit interrupt gate: present, DPL 0, through `SEL_CODE`.
+fn interrupt_gate(offset: u32) -> [u8; 8] {
+    let low = (u32::from(SEL_CODE) << 16) | (offset & 0xffff);
+    let high = (offset & 0xffff_0000) | (0x8e << 8);
+    descriptor(low, high)
+}
+
+/// Seed the descriptor tables and the fault handler into a program image.
+fn seed_protected_tables(program: &mut [u8]) {
+    fn put(program: &mut [u8], at: u32, bytes: [u8; 8]) {
+        let at = at as usize;
+        program[at..at + 8].copy_from_slice(&bytes);
+    }
+    // 0x00CF9B00 / 0x00CF9300: base 0, limit 0xFFFFF with G, D set. The classic flat pair.
+    put(
+        program,
+        GDT_BASE + u32::from(SEL_CODE),
+        descriptor(0x0000_ffff, 0x00cf_9b00),
+    );
+    put(
+        program,
+        GDT_BASE + u32::from(SEL_DATA),
+        descriptor(0x0000_ffff, 0x00cf_9300),
+    );
+    // G clear, so `descriptor_to_segment` leaves the limit at 0xFFFF instead of scaling it.
+    put(
+        program,
+        GDT_BASE + u32::from(SEL_OTHER),
+        descriptor(0x0000_ffff, 0x0040_9300),
+    );
+    // Access 0x92 rather than 0x93: the Accessed bit is clear, which is what makes
+    // `load_protected_segment` take its write-back branch.
+    put(
+        program,
+        GDT_BASE + u32::from(SEL_UNACCESSED),
+        descriptor(0x0000_ffff, 0x00cf_9200),
+    );
+    program[FAULT_HANDLER as usize] = 0xF4;
+    put(program, IDT_BASE + 13 * 8, interrupt_gate(FAULT_HANDLER));
+}
+
+/// A protected-mode CPU whose FS already holds `SEL_DATA`'s record.
+///
+/// `SegmentRegister::flat(SEL_DATA, 0x93)` is not an approximation of what the GDT entry decodes
+/// to, it is the same value: `flat` gives base 0, limit 0xFFFF_FFFF, `default_size_32` true, and
+/// `descriptor_to_segment` of 0x00CF9300 gives exactly those three. That equality is the whole
+/// reason the reload case can resume, so it is stated rather than assumed.
+fn protected_cpu() -> CpuGsw {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.control.cr0 |= CR0_PE;
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(SEL_CODE, 0x9b));
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        cpu.registers
+            .set_segment(segment, SegmentRegister::flat(SEL_DATA, 0x93));
+    }
+    cpu.gdtr = DescriptorTable {
+        base: GDT_BASE,
+        limit: GDT_LIMIT,
+    };
+    cpu.idtr = DescriptorTable {
+        base: IDT_BASE,
+        limit: 0xff,
+    };
+    cpu.set_eip(ENTRY);
+    cpu
+}
+
+/// `mov eax,0x1111; mov fs,dx; inc eax; hlt`, with the segment load in the MIDDLE for the reason
+/// `CODE` states.
+const PROTECTED_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xE2, 0x40, 0xF4];
+const PROTECTED_STARTS: &[u32] = &[0, 5, 7];
+
+fn arm_protected(cpu: &mut CpuGsw, bus: &mut TestBus, selector: u16) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.registers.set_edx(u32::from(selector));
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    bus.trace = BusTrace::default();
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn build_protected() -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + PROTECTED_CODE.len()].copy_from_slice(PROTECTED_CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    let linears: Vec<u32> = PROTECTED_STARTS
+        .iter()
+        .map(|offset| ENTRY + offset)
+        .collect();
+    for &linear in &linears {
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("the protected-mode fixture must compile as a block");
+    assert_eq!(
+        compilation.span.instructions, BLOCK_INSTRUCTIONS,
+        "the block stopped early, so the protected-mode segment load is still a boundary"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "the protected-mode segment load must be an InterpretOne slot"
+    );
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+    (cpu, bus, block)
+}
+
+/// Run the protected-mode fixture interpreted and again with its block installed.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn run_both_protected(selector: u16, perturb: fn(&mut CpuGsw, &mut TestBus)) -> Legs {
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + PROTECTED_CODE.len()].copy_from_slice(PROTECTED_CODE);
+    seed_protected_tables(&mut program);
+    let mut interp_bus = sixteen_bit_bus(program);
+    let mut interp = protected_cpu();
+    arm_protected(&mut interp, &mut interp_bus, selector);
+    perturb(&mut interp, &mut interp_bus);
+    drive(&mut interp, &mut interp_bus);
+
+    let (mut native, mut native_bus, block) = build_protected();
+    arm_protected(&mut native, &mut native_bus, selector);
+    perturb(&mut native, &mut native_bus);
+
+    let before = native.perf_counters().jit_direct_insns;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the installed block must actually run"
+    );
+    let native_insns = native.perf_counters().jit_direct_insns - before;
+    let exit_reason = native.jit_direct.last_side_exit_reason_for_test();
+    drive(&mut native, &mut native_bus);
+
+    Legs {
+        interp,
+        interp_bus,
+        native,
+        native_bus,
+        exit_reason,
+        native_insns,
+    }
+}
+
+/// Reloading the SAME selector onto the same descriptor resumes.
+///
+/// This is the shape the census row is made of and the only one that is a win: a 16-bit C runtime
+/// re-establishes its data segment at every function that could have changed it, and the record
+/// R2 compares does not move.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_protected_mode_segment_reload_resumes() {
+    let mut legs = run_both_protected(SEL_DATA, no_perturb);
+    assert_legs_agree(&mut legs);
+    assert_eq!(legs.exit_reason, None, "the block should have completed");
+    assert_eq!(
+        legs.native_insns,
+        u64::from(BLOCK_INSTRUCTIONS),
+        "the block did not resume past the descriptor fetch"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_executed, 1);
+    assert_eq!(stalls.callout_interpret_one_resync, 0);
+    assert_eq!(
+        legs.native.registers.segment(SegmentIndex::Fs).selector,
+        SEL_DATA
+    );
+}
+
+/// A DIFFERENT descriptor moves the record, so R2 refuses and the run ends at the slot.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_protected_mode_segment_change_resyncs() {
+    let mut legs = run_both_protected(SEL_OTHER, no_perturb);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "a descriptor with a different limit must RESYNC"
+    );
+    assert_eq!(legs.native_insns, 2, "the prefix plus the retired load");
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native.registers.segment(SegmentIndex::Fs).limit,
+        0xffff,
+        "the load itself must have happened, and taken the unscaled limit"
+    );
+}
+
+/// A selector past the table limit is a #GP raised from inside `load_protected_segment`, delivered
+/// through the IDT with the block reporting the prefix only.
+///
+/// The three checks that make it more than "it did not crash": the exit is the NOT-RETIRED stub,
+/// the retirement count is the prefix, and every quantity in `assert_legs_agree` matches an
+/// interpreted leg that delivered the same fault from the same instruction.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_protected_mode_bad_selector_takes_the_fault_stub() {
+    let mut legs = run_both_protected(SEL_BAD, no_perturb);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResyncFault as u32),
+        "a #GP inside the helper must take the not-retired RESYNC stub"
+    );
+    assert_eq!(
+        legs.native_insns, 1,
+        "the block must report the PREFIX only: the fault path already counted the load"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync_fault, 1);
+    assert_eq!(stalls.callout_interpret_one_resync, 0);
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native.registers.segment(SegmentIndex::Fs).selector,
+        SEL_DATA,
+        "a faulting load must leave the old segment in place"
+    );
+}
+
+/// Put `SEL_UNACCESSED`'s own record into FS before the row runs, so RELOADING it moves nothing
+/// R2 compares.
+///
+/// Without this both Accessed-bit fixtures below would resync for the WRONG reason: FS starts on
+/// `SEL_DATA`, so any load of a different index changes the selector field and R2 refuses before
+/// the write-back is ever the question. The record here is what `descriptor_to_segment` produces
+/// for that entry, access byte included -- 0x92, the PRE-write-back value, because the cached
+/// record is built from the descriptor as it was READ and not as it was left.
+fn hold_the_unaccessed_descriptor(cpu: &mut CpuGsw, _: &mut TestBus) {
+    cpu.registers.set_segment(
+        SegmentIndex::Fs,
+        SegmentRegister::flat(SEL_UNACCESSED, 0x92),
+    );
+}
+
+/// Review MAJOR 2: the descriptor's Accessed-bit WRITE-BACK is a guest memory write, and R5 has to
+/// see it.
+///
+/// `load_protected_segment` sets bit 0 of the type field when it was clear, through
+/// `write_system_linear`. That function reported nothing -- no `record_write_page`, no
+/// `note_code_write` -- so a GDT entry sharing a watched page with the running block was invisible
+/// to R5 and the block resumed over code the descriptor write had just changed.
+///
+/// The fixture marks the descriptor's own bytes as watched code. That is the honest way to build
+/// it: the byte the write-back lands on has to be watched, and marking the range directly says so
+/// without corrupting an instruction either leg is going to execute.
+///
+/// MUTATION: drop the `note_code_write` from `write_system_linear` and this resumes instead of
+/// resyncing, with every register, every flag and every byte of RAM still matching the interpreted
+/// leg. Only the resume count and the exit reason move, which is why both are asserted.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_accessed_bit_write_onto_watched_code_resyncs() {
+    fn watch_the_descriptor(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        hold_the_unaccessed_descriptor(cpu, bus);
+        cpu.mark_block_code_for_test(GDT_BASE + u32::from(SEL_UNACCESSED), 8);
+    }
+    let mut legs = run_both_protected(SEL_UNACCESSED, watch_the_descriptor);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "the Accessed-bit write-back landed on watched code and must RESYNC"
+    );
+    assert_eq!(legs.native_insns, 2, "the prefix plus the retired load");
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native_bus.memory[(GDT_BASE + u32::from(SEL_UNACCESSED) + 5) as usize] & 0x01,
+        0x01,
+        "the write-back itself must have happened: a RESYNC is not an undo"
+    );
+}
+
+/// The control for the test above: the SAME descriptor, unwatched, resumes.
+///
+/// Without it, "the block resynced" is satisfied identically by the Accessed-bit write being seen
+/// and by the descriptor simply differing from FS's record. It also pins the half of MAJOR 2 that
+/// is easy to overshoot: reporting the write must not make EVERY protected-mode load resync.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_accessed_bit_write_off_watched_code_resumes() {
+    let mut legs = run_both_protected(SEL_UNACCESSED, hold_the_unaccessed_descriptor);
+    assert_eq!(
+        legs.exit_reason, None,
+        "an unwatched Accessed-bit write-back must not end the run"
+    );
+    assert_eq!(legs.native_insns, u64::from(BLOCK_INSTRUCTIONS));
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native_bus.memory[(GDT_BASE + u32::from(SEL_UNACCESSED) + 5) as usize] & 0x01,
+        0x01,
+        "the fixture is vacuous unless the write-back actually ran"
+    );
+}
