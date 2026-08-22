@@ -2343,3 +2343,68 @@ fn mov_sreg_core_clocks_is_what_the_interpreter_charges() {
         });
     }
 }
+
+/// Every S3 row still refuses a 0x67 address-size prefix, at the gate that runs BEFORE `classify`.
+///
+/// The policy widening added arms to `classify`, and `classify` is reached only after
+/// `prefixes_supported_for` and the persona gate have both passed, so the address-size refusal is
+/// inherited rather than restated per row. That inheritance is the thing worth pinning: the
+/// refusal is what keeps `MemoryEmitContext::address_wrap` -- a BLOCK property derived from CS.D
+/// alone -- true of every slot, and a row admitted at the wrong layer would falsify it for the
+/// whole block rather than for itself.
+///
+/// One row per shape the widening admits: a memory form with a ModRM, a register form, and a
+/// two-byte opcode routed above the `u8::try_from` truncation. Each is encoded with 32-bit
+/// addressing inside the 16-bit code segment, which is exactly what the 0x67 prefix means there.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn the_widened_rows_still_refuse_an_address_size_prefix() {
+    // THE POSITIVE CONTROL, first: the same shape unprefixed joins the block. Without it "the
+    // block is three instructions" is satisfied identically by the prefix being refused and by the
+    // fixture being unable to compile a fourth slot at all.
+    {
+        let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+        // 8C /0 with mod 00 r/m 111: mov [bx], es, the unprefixed sibling of the first row below.
+        code.extend_from_slice(&[0x8C, 0x07]);
+        code.extend_from_slice(&[0x40, 0xF4]);
+        let (_, _, block) = build_native(&code, &[0, 3, 4, 5, 7]);
+        assert_eq!(
+            block.span().instructions,
+            5,
+            "the control must carry the whole block, or the refusals below prove nothing"
+        );
+        assert_eq!(block.callout_interpret_one_slots(), 1);
+    }
+
+    // Each row with a 0x67 prefix and a dword-addressed operand where it has one.
+    for row in [
+        // 67 8C 05 <disp32>: mov [disp32], es.
+        &[0x67u8, 0x8C, 0x05, 0x00, 0x18, 0x00, 0x00][..],
+        // 67 87 05 <disp32>: xchg [disp32], ax.
+        &[0x67, 0x87, 0x05, 0x00, 0x18, 0x00, 0x00],
+        // 67 0F BA 2D <disp32> 03: bts word [disp32], 3, a two-byte opcode.
+        &[0x67, 0x0F, 0xBA, 0x2D, 0x00, 0x18, 0x00, 0x00, 0x03],
+        // 67 FE 05 <disp32>: inc byte [disp32].
+        &[0x67, 0xFE, 0x05, 0x00, 0x18, 0x00, 0x00],
+        // 67 FF 35 <disp32>: push word [disp32].
+        &[0x67, 0xFF, 0x35, 0x00, 0x18, 0x00, 0x00],
+        // 67 8E 05 <disp32>: mov es, [disp32].
+        &[0x67, 0x8E, 0x05, 0x00, 0x18, 0x00, 0x00],
+    ] {
+        let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+        code.extend_from_slice(row);
+        code.extend_from_slice(&[0x40, 0xF4]);
+        let starts = vec![0, 3, 4, 5, 5 + row.len() as u32];
+        let (_, _, block) = build_native(&code, &starts);
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "row {row:02x?} carries a 0x67 prefix and must end the block"
+        );
+        assert_eq!(block.callout_interpret_one_slots(), 0);
+    }
+}
