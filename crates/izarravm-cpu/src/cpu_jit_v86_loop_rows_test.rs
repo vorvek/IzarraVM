@@ -434,12 +434,25 @@ fn every_v86_loop_row_flips_with_the_gate() {
 ///
 /// `0xfc` CLD was on this list, as "an existing kind whose opcode is deliberately still off the
 /// Word allowlist". The S1 width lift put it ON the UNGATED list, which is what keeps the two
-/// slices attributable apart, so it now belongs with the rows admitted before this gate rather
-/// than with the rows this gate must not sweep in. The `0xa1`/`0xa3` width work must not have
-/// disturbed any of them.
+/// slices attributable apart, so it now belongs with the rows admitted independently of this gate
+/// rather than with the rows this gate must not sweep in. The `0xa1`/`0xa3` width work must not
+/// have disturbed any of them.
+///
+/// BOTH ARMS, the way `the_gate_moves_only_the_cs_clause_of_the_prefix_admission` runs. The
+/// refusals are the weaker half of that: the OFF arm is strictly more restrictive, so a row
+/// refused with the gate on is refused with it off too. The ADMITTED half is what needs the loop.
+/// Asserted on the ON arm alone, an edit that moved `0xfc` from the ungated list into the gated
+/// term would pass here and un-attribute the two slices; the OFF leg is what fails on it.
 #[test]
 fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
-    select_v86_loop_rows(true);
+    for arm in [false, true] {
+        select_v86_loop_rows(arm);
+        the_gate_does_not_sweep_in_the_neighbouring_encodings_on(arm);
+    }
+    jit::direct::set_v86_loop_rows_for_test(None);
+}
+
+fn the_gate_does_not_sweep_in_the_neighbouring_encodings_on(arm: bool) {
     for (name, code) in [
         ("0x15 ADC AX,imm16", [vec![0x15], w(0x1234)].concat()),
         ("0x1D SBB AX,imm16", [vec![0x1d], w(0x1234)].concat()),
@@ -453,10 +466,10 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
         assert_eq!(
             compile16(&code),
             None,
-            "{name} is not part of this slice and must stay a barrier"
+            "{name} is not part of this slice and must stay a barrier (v86 loop rows = {arm})"
         );
     }
-    // ...and the rows that were admitted BEFORE this slice and must not have been disturbed.
+    // ...and the rows admitted independently of this gate, which must hold on BOTH arms.
     for (name, code) in [
         (
             "0x3B CMP AX,[m] (word memory, pre-slice)",
@@ -474,18 +487,17 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
             "0x2B /0 SUB ax,[m], NO override",
             [vec![0x2b, 0x06], w(OPERAND)].concat(),
         ),
-        // Admitted by the S1 width lift rather than by this gate, and asserted here for that
-        // reason: it must be admitted on BOTH arms of this knob, which is what says the two
-        // slices are attributable apart.
+        // Admitted by the S1 width lift rather than by this gate, and the reason the loop above
+        // sweeps both arms: moving `0xfc` into the gated term would leave this row failing on the
+        // OFF leg, which is exactly the attribution the two slices are kept apart for.
         ("0xFC CLD (S1 width lift, ungated)", vec![0xfc]),
     ] {
         assert_eq!(
             compile16(&code),
             Some(3),
-            "{name} was admitted before this slice and must still be"
+            "{name} is admitted independently of this gate and must be on both arms              (v86 loop rows = {arm})"
         );
     }
-    jit::direct::set_v86_loop_rows_for_test(None);
 }
 
 /// The DATA-segment overrides must still be admitted with the gate OFF, and the CS one must not.

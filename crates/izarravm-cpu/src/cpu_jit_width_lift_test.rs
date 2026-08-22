@@ -132,15 +132,59 @@ fn leave_dword_encoding_is_unchanged() {
 /// from the emitter.
 type Arm = fn(&mut CpuGsw, &mut TestBus);
 
+/// The machine a fixture runs on: a CODE segment width and a STACK width, chosen independently.
+///
+/// They are independent in the architecture (386 PRM 16.2) and independent in the backend: CS.D
+/// picks the block's `address_wrap` and the compile key's `d`, SS.B picks the pointer width the
+/// stack sites emit. The two DIAGONAL machines are the common ones and the two OFF-DIAGONAL ones
+/// are why this is an enum rather than a bool: a lowering that took the stack pointer's width from
+/// the block's `address_wrap`, or the stack address's wrap from SS.B, agrees with the correct
+/// answer on both diagonals and is only caught off them.
+#[derive(Clone, Copy)]
+enum Machine {
+    /// Real mode, CS.D = 0, SS.B = 0. The loader's own machine and the ordinary DOS one.
+    Code16Stack16,
+    /// CS.D = 0 with a 32-bit stack, built by hand as
+    /// `a_thirty_two_bit_stack_in_a_sixteen_bit_segment_keeps_its_full_pointer` does. The block's
+    /// `address_wrap` is Word while every stack site must NOT wrap.
+    Code16Stack32,
+    /// Protected mode, flat, CS.D = 1, SS.B = 1.
+    Code32Stack32,
+    /// Flat 32-bit code with a 16-bit stack. The block's `address_wrap` is None while every stack
+    /// site must wrap at 64K.
+    Code32Stack16,
+}
+
+impl Machine {
+    /// The compile key's `d`, which is CS.D and nothing else.
+    fn d(self) -> bool {
+        matches!(self, Self::Code32Stack32 | Self::Code32Stack16)
+    }
+
+    fn cpu(self, entry: u32) -> CpuGsw {
+        match self {
+            Self::Code16Stack16 => sixteen_bit_code_cpu(entry),
+            Self::Code16Stack32 => {
+                let mut cpu = sixteen_bit_code_cpu(entry);
+                let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+                ss.default_size_32 = true;
+                // WIDENED on purpose. Left at real mode's 0xFFFF every stack access above 64K
+                // side-exits on the segment-limit compare and the fixture passes interpreted.
+                ss.limit = u32::MAX;
+                cpu.registers.set_segment(SegmentIndex::Ss, ss);
+                cpu
+            }
+            Self::Code32Stack32 => flat_stack_cpu(entry),
+            Self::Code32Stack16 => sixteen_bit_stack_cpu(entry),
+        }
+    }
+}
+
 /// A fixture: the same bytes run wholly interpreted and again with the leading block installed and
 /// entered natively, then compared on the WHOLE CPU (registers, EIP, EFLAGS, clocks) and on guest
 /// RAM.
-///
-/// `sixteen_bit` picks the code segment and with it the compile key's `d`; the stack width comes
-/// from whichever CPU constructor that selects, so the four (operand, SS.B) cells are addressed by
-/// choosing the segment and the prefix rather than by a knob.
 struct WidthCase {
-    sixteen_bit: bool,
+    machine: Machine,
     code: &'static [u8],
     /// Instruction START offsets from `ENTRY`, which is what the decode cache must be warmed over.
     starts: &'static [u32],
@@ -174,25 +218,17 @@ fn run_width_case(case: &WidthCase) -> WidthOutcome {
     program[ENTRY as usize..ENTRY as usize + case.code.len()].copy_from_slice(case.code);
 
     let mut interp_bus = sixteen_bit_bus(program.clone());
-    let mut interp = if case.sixteen_bit {
-        sixteen_bit_code_cpu(ENTRY)
-    } else {
-        flat_stack_cpu(ENTRY)
-    };
+    let mut interp = case.machine.cpu(ENTRY);
     (case.arm)(&mut interp, &mut interp_bus);
     drive(&mut interp, &mut interp_bus);
 
     let mut native_bus = sixteen_bit_bus(program);
-    let mut native = if case.sixteen_bit {
-        sixteen_bit_code_cpu(ENTRY)
-    } else {
-        flat_stack_cpu(ENTRY)
-    };
+    let mut native = case.machine.cpu(ENTRY);
     arm_native_sixteen_bit(&mut native, &mut native_bus, case.pages);
     let starts: Vec<u32> = case.starts.iter().map(|offset| ENTRY + offset).collect();
     warm_sixteen_bit(&mut native, &mut native_bus, &starts);
 
-    let d = !case.sixteen_bit;
+    let d = case.machine.d();
     let compilation = jit::direct::compile(&mut native, ENTRY, d)
         .expect("the width-lift fixture must compile as one block");
     assert_eq!(
@@ -292,7 +328,7 @@ fn arm_leave16_ssb0(cpu: &mut CpuGsw, bus: &mut TestBus) {
 #[test]
 fn leave16_ssb0_pops_bp_and_restores_sp() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: true,
+        machine: Machine::Code16Stack16,
         // inc ax; leave; inc cx; hlt
         code: &[0x40, 0xC9, 0x41, 0xF4],
         starts: &[0, 1, 2],
@@ -349,7 +385,7 @@ fn arm_leave16_ssb1(cpu: &mut CpuGsw, bus: &mut TestBus) {
 #[test]
 fn leave16_ssb1_pops_bp_and_restores_esp() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: false,
+        machine: Machine::Code32Stack32,
         // inc eax; 66 leave; inc ecx; hlt
         code: &[0x40, 0x66, 0xC9, 0x41, 0xF4],
         starts: &[0, 1, 3],
@@ -406,7 +442,7 @@ fn arm_enter16_ssb0(cpu: &mut CpuGsw, bus: &mut TestBus) {
 #[test]
 fn enter16_level0_pushes_bp_and_allocates_frame() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: true,
+        machine: Machine::Code16Stack16,
         // inc ax; enter 0x10,0; inc cx; hlt
         code: &[0x40, 0xC8, 0x10, 0x00, 0x00, 0x41, 0xF4],
         starts: &[0, 1, 5],
@@ -468,7 +504,7 @@ fn arm_enter16_ssb1(cpu: &mut CpuGsw, bus: &mut TestBus) {
 #[test]
 fn enter16_ssb1_allocates_on_the_full_pointer() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: false,
+        machine: Machine::Code32Stack32,
         // inc eax; 66 enter 0x10,0; inc ecx; hlt
         code: &[0x40, 0x66, 0xC8, 0x10, 0x00, 0x00, 0x41, 0xF4],
         starts: &[0, 1, 6],
@@ -584,6 +620,158 @@ fn leave_dword_on_a_sixteen_bit_stack_stays_a_hard_boundary() {
 }
 
 // ---------------------------------------------------------------------------
+// The two OFF-DIAGONAL machines: CS.D and SS.B disagreeing.
+// ---------------------------------------------------------------------------
+//
+// Every fixture above runs a machine where the code-segment width and the stack width match, and
+// on those two machines a lowering that read the stack pointer's width off the block's
+// `address_wrap`, or the stack address's wrap off SS.B, gives the RIGHT answer. These two are
+// where it does not. Each runs an ENTER and the LEAVE that undoes it, so the pair must return
+// both pointers to where they started, and each pre-seeds the address a wrongly-wrapped stack site
+// would have used so that a wrong answer is a wrong VALUE rather than an absence.
+
+fn arm_sixteen_bit_code_thirty_two_bit_stack(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    cpu.halted = false;
+    cpu.registers.gpr = [0; 8];
+    // ABOVE 64K, which is the whole point: the block's `address_wrap` is Word because CS.D is 0,
+    // and every stack site here must ignore it.
+    cpu.registers.set_esp(0x0001_8100);
+    cpu.registers.set_ebp(0x0001_8100);
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    // Both candidate slots seeded, and with values a correct run never writes.
+    bus.memory[0x1_80f0..0x1_8100].fill(0);
+    bus.memory[0x80fe..0x8100].copy_from_slice(&0xa5a5u16.to_le_bytes());
+    bus.trace = BusTrace::default();
+}
+
+/// UNPREFIXED ENTER and LEAVE in a 16-bit code segment on a 32-bit stack.
+///
+/// `Enter16 { stack32: true }` and `Leave16 { stack32: true }` reached without a prefix, which is
+/// the cell the 32-bit-segment fixtures reach only with one. The block's `address_wrap` is Word,
+/// so a stack site that took its wrap from the block instead of from SS.B pushes at 0x80FE and
+/// then pops the seeded 0xA5A5 back into BP.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn enter16_and_leave16_on_a_thirty_two_bit_stack_in_a_sixteen_bit_segment() {
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code16Stack32,
+        // inc ax; enter 0x10,0; leave; inc cx; hlt
+        code: &[0x40, 0xC8, 0x10, 0x00, 0x00, 0xC9, 0x41, 0xF4],
+        starts: &[0, 1, 5, 6],
+        instructions: 4,
+        // 2 (inc) + 10 (ENTER) + 4 (LEAVE) + 2 (inc).
+        raw_clocks: 18,
+        pages: &[0x0000, 0x8000, 0x1_8000],
+        memory_len: 0x2_0000,
+        arm: arm_sixteen_bit_code_thirty_two_bit_stack,
+    });
+    assert_same_state(&outcome);
+
+    assert_eq!(
+        u16::from_le_bytes(
+            outcome.native_bus.memory[0x1_80fe..0x1_8100]
+                .try_into()
+                .unwrap()
+        ),
+        0x8100,
+        "the pushed word must land at the UNWRAPPED ESP - 2"
+    );
+    assert_eq!(
+        u16::from_le_bytes(
+            outcome.native_bus.memory[0x80fe..0x8100]
+                .try_into()
+                .unwrap()
+        ),
+        0xa5a5,
+        "nothing may be written at the 16-bit-masked address"
+    );
+    assert_eq!(
+        outcome.native.registers.esp(),
+        0x0001_8100,
+        "the ENTER/LEAVE pair must return the full stack pointer"
+    );
+    assert_eq!(
+        outcome.native.registers.ebp(),
+        0x0001_8100,
+        "the ENTER/LEAVE pair must return the frame pointer"
+    );
+}
+
+fn arm_flat_code_sixteen_bit_stack(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    cpu.halted = false;
+    cpu.registers.gpr = [0; 8];
+    // SP AT ZERO, so the ENTER's two-byte push BORROWS across bit 16. A 32-bit subtract gives
+    // 0x1233_FFFE and a 16-bit one gives 0xFFFE with ESP[31:16] preserved, and the two differ in
+    // both the address written and the pointer left behind.
+    cpu.registers.set_esp(0x1234_0000);
+    cpu.registers.set_ebp(0x1234_0000);
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    bus.memory[0xfff0..0x1_0000].fill(0);
+    bus.trace = BusTrace::default();
+}
+
+/// 66-PREFIXED ENTER and LEAVE in a 32-bit code segment on a 16-bit stack.
+///
+/// `Enter16 { stack32: false }` and `Leave16 { stack32: false }` reached from a block whose
+/// `address_wrap` is None, which is the mirror of the fixture above. The stack sites must wrap and
+/// must move SP alone, and SP starts at zero so both halves of that borrow across bit 16: the
+/// pushed word lands at 0xFFFE rather than at 0x1233_FFFE, and ESP[31:16] survives the trip.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn enter16_and_leave16_on_a_sixteen_bit_stack_in_a_flat_segment() {
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code32Stack16,
+        // inc eax; 66 enter 0x10,0; 66 leave; inc ecx; hlt
+        code: &[0x40, 0x66, 0xC8, 0x10, 0x00, 0x00, 0x66, 0xC9, 0x41, 0xF4],
+        starts: &[0, 1, 6, 8],
+        instructions: 4,
+        raw_clocks: 18,
+        pages: &[0x0000, 0xf000],
+        memory_len: 0x1_0000,
+        arm: arm_flat_code_sixteen_bit_stack,
+    });
+    assert_same_state(&outcome);
+
+    assert_eq!(
+        u16::from_le_bytes(
+            outcome.native_bus.memory[0xfffe..0x1_0000]
+                .try_into()
+                .unwrap()
+        ),
+        0x0000,
+        "the pushed word is the old BP and it lands at (SP - 2) & 0xFFFF"
+    );
+    assert_eq!(
+        outcome.native.registers.esp(),
+        0x1234_0000,
+        "the pair must return SP with ESP[31:16] untouched"
+    );
+    assert_eq!(
+        outcome.native.registers.ebp(),
+        0x1234_0000,
+        "the pair must return BP with EBP[31:16] untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // LEA r16, m.
 // ---------------------------------------------------------------------------
 
@@ -618,7 +806,7 @@ fn arm_lea16(cpu: &mut CpuGsw, bus: &mut TestBus) {
 #[test]
 fn lea16_writes_low_half_only() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: true,
+        machine: Machine::Code16Stack16,
         // inc cx; lea ax,[bp+0x22]; inc dx; hlt
         code: &[0x41, 0x8D, 0x46, 0x22, 0x42, 0xF4],
         starts: &[0, 1, 4],
@@ -665,7 +853,7 @@ fn arm_lea16_dword_address(cpu: &mut CpuGsw, bus: &mut TestBus) {
 #[test]
 fn lea16_at_a_dword_address_size_keeps_the_high_half() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: false,
+        machine: Machine::Code32Stack32,
         // inc ecx; 66 lea ax,[ebp+0x22]; inc edx; hlt
         code: &[0x41, 0x66, 0x8D, 0x45, 0x22, 0x42, 0xF4],
         starts: &[0, 1, 5],
@@ -715,7 +903,7 @@ fn arm_cld(cpu: &mut CpuGsw, bus: &mut TestBus) {
 #[test]
 fn cld_word_row_is_native() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: true,
+        machine: Machine::Code16Stack16,
         // inc ax; cld; std; cld; inc cx; hlt
         code: &[0x40, 0xFC, 0xFD, 0xFC, 0x41, 0xF4],
         starts: &[0, 1, 2, 3, 4],
@@ -744,7 +932,7 @@ fn cld_word_row_is_native() {
 #[test]
 fn std_word_row_is_native() {
     let outcome = run_width_case(&WidthCase {
-        sixteen_bit: true,
+        machine: Machine::Code16Stack16,
         // inc ax; cld; std; inc cx; hlt
         code: &[0x40, 0xFC, 0xFD, 0x41, 0xF4],
         starts: &[0, 1, 2, 3],

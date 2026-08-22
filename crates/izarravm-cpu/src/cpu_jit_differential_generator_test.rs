@@ -1452,12 +1452,136 @@ fn width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
     }
 }
 
-fn run_width_lift_mode(mode: GswMode, mode_offset: u32) {
+/// The 16-bit half of the sweep: the same block shape UNPREFIXED in a 16-bit code segment on a
+/// 16-bit stack, which is the loader's own machine and the population the census rows came from.
+///
+/// Three things vary per case that the 32-bit sweep holds fixed, and each is a width decision the
+/// emitted stack sites make on their own:
+///
+/// * SP. Four classes over the index: two ordinary even pointers, one AT ZERO so the ENTER's
+///   two-byte push borrows across bit 16 and lands at 0xFFFE, and one at 0x0004 so the FRAME
+///   ALLOCATION wraps SP below zero after the push. A 32-bit subtract anywhere in the pair leaves
+///   a pointer with a changed high half, and the round-trip assertion is what says so.
+/// * BP. Fully randomized, and it does not have to equal SP for the pair to round-trip: ENTER
+///   pushes the entry BP and LEAVE pops it back, while LEAVE's `SP <- BP` restores the pointer
+///   ENTER left. Both registers therefore return to their entry values whatever they were.
+/// * The LEA displacement, negative on the odd cases. `[BP+disp8]` with a negative displacement is
+///   what a Watcom local looks like, and at a Word address size the sum wraps rather than going
+///   negative.
+///
+/// ADC and SBB are excluded from the ALU slot's operation pool: both are refused at Word size (no
+/// carry-in lane), so drawing one would stop the block and cost a retirement.
+fn sixteen_bit_width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_16b1_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut bytes = Vec::with_capacity(32);
+
+    bytes.push(0x90);
+
+    // C8 iw ib -- ENTER imm16, 0 at Word operand size, unprefixed in a 16-bit segment.
+    let alloc = ((rng.u32() % 0x21) * 2) as u16;
+    bytes.push(0xC8);
+    bytes.extend_from_slice(&alloc.to_le_bytes());
+    bytes.push(0x00);
+
+    // 8D /r -- LEA r16, [BP+disp8]. ModRM 0x46 is mod 01 with r/m 110, the [BP+disp8] form.
+    let lea_dst = non_stack_reg(&mut rng);
+    let disp = if index % 2 == 1 {
+        0u8.wrapping_sub(1 + (rng.u32() % 64) as u8)
+    } else {
+        (rng.u32() % 0x80) as u8
+    };
+    bytes.extend_from_slice(&[0x8D, 0x46 | (lea_dst << 3), disp]);
+
+    // B8+r iw -- MOV r16, imm16. THREE bytes here, not five: the immediate follows the operand
+    // size, which is Word in a 16-bit segment.
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
+
+    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+
+    // C9 -- LEAVE at Word operand size on a 16-bit stack.
+    bytes.push(0xC9);
+
+    // The flag producer is the BYTE form: `0x85` at Word sits behind IZARRAVM_TEST_WORD_ROWS, and
+    // a fixture that inherited that knob would lose a retirement on its off arm.
+    bytes.extend_from_slice(&[0x84, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32() & 0xffff;
+    }
+    // EVEN, always: a misaligned Word stack access side-exits at the wide-access guard, and the
+    // retirement pin below is an equality.
+    gpr[4] = match index % 4 {
+        0 => 0x8000 + (rng.u32() % 0x400) * 2,
+        // SP AT ZERO. The push borrows across bit 16 and lands at 0xFFFE.
+        1 => 0x0000,
+        // The push is ordinary and the ALLOCATION is what wraps below zero.
+        2 => 0x0004,
+        _ => 0xe000 + (rng.u32() % 0x400) * 2,
+    };
+    gpr[5] = rng.u32() & 0xfffe;
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// A 16-bit code segment in real mode with a 16-bit stack, at the persona under test.
+///
+/// The admission arm is STATED rather than inherited. `sixteen_bit_level` is seeded from
+/// `IZARRAVM_JIT16` and `word_at_486` decides whether a 16-bit segment keys at all on the 486
+/// persona; a sweep that read either from the environment would go VACUOUS, not red, on a machine
+/// where it is off, and this file's header records that lesson twice already.
+fn generated_sixteen_bit_cpu(mode: GswMode) -> CpuGsw {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(mode);
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.set_sixteen_bit_admission_level(1);
+    cpu.set_word_operands_at_486(true);
+    cpu
+}
+
+fn run_width_lift_sweep(
+    label: &str,
+    mode: GswMode,
+    mode_offset: u32,
+    build_cpu: fn(GswMode) -> CpuGsw,
+    build_case: fn(u32, u32) -> GeneratedCase,
+) {
     for index in 0..WIDTH_LIFT_CASES {
-        let case = width_lift_case(index, mode_offset);
+        let case = build_case(index, mode_offset);
         let pristine = single_case_memory(&case);
-        let mut interpreter = generated_cpu(mode);
-        let mut direct = generated_cpu(mode);
+        let mut interpreter = build_cpu(mode);
+        let mut direct = build_cpu(mode);
         let mut interpreter_bus = TestBus::with_memory(pristine.clone());
         let mut direct_bus = TestBus::with_memory(pristine.clone());
         for bus in [&mut interpreter_bus, &mut direct_bus] {
@@ -1487,25 +1611,56 @@ fn run_width_lift_mode(mode: GswMode, mode_offset: u32) {
         assert_eq!(
             retired,
             WIDTH_LIFT_NATIVE_INSTRUCTIONS,
-            "a width-lift slot lost its classification: {case:#?}, perf={:#?}",
+            "{label}: a width-lift slot lost its classification: {case:#?}, perf={:#?}",
             direct.perf_counters()
         );
+        // ENTER pushes the entry BP and LEAVE pops it back, while LEAVE's pointer move undoes the
+        // push and the allocation together, so BOTH registers return to their entry values. A
+        // pointer arithmetic width taken from the wrong place lands somewhere else.
         assert_eq!(
             direct.registers.esp(),
-            WIDTH_LIFT_STACK,
-            "the ENTER/LEAVE pair must round-trip the stack pointer: {case:#?}"
+            case.gpr[4],
+            "{label}: the ENTER/LEAVE pair must round-trip the stack pointer: {case:#?}"
         );
         assert_eq!(
             direct.registers.ebp(),
-            WIDTH_LIFT_STACK,
-            "the ENTER/LEAVE pair must round-trip the frame pointer: {case:#?}"
+            case.gpr[5],
+            "{label}: the ENTER/LEAVE pair must round-trip the frame pointer: {case:#?}"
         );
     }
 }
 
-/// Randomized whole-block differential for the width lift, on both Approximate personas.
+/// Randomized whole-block differential for the width lift on both Approximate personas, and on
+/// BOTH machines: the 66-prefixed rows on a 32-bit stack, and the unprefixed rows in a 16-bit code
+/// segment on a 16-bit stack, which is the population the census rows were measured on.
 #[test]
 fn generated_width_lift_blocks_match_the_interpreter() {
-    run_width_lift_mode(GswMode::Gsw486, 0);
-    run_width_lift_mode(GswMode::Gsw586, WIDTH_LIFT_CASES);
+    run_width_lift_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw486,
+        0,
+        generated_cpu,
+        width_lift_case,
+    );
+    run_width_lift_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw586,
+        WIDTH_LIFT_CASES,
+        generated_cpu,
+        width_lift_case,
+    );
+    run_width_lift_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw486,
+        2 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_width_lift_case,
+    );
+    run_width_lift_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw586,
+        3 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_width_lift_case,
+    );
 }
