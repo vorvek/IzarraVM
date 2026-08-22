@@ -3028,24 +3028,36 @@ impl CpuGsw {
         // and the demoted slot may be in one of those. See
         // `BlockCache::callout_retire_pending`.
         //
-        // TAKEN HERE, above the `callout_error` return, and acted on below it. That return leaves
-        // this function too, and a latch left set on it is read by the NEXT entry -- which would
-        // retire a block on a demotion that happened inside a different one.
+        // TAKEN HERE, above the `callout_error` return, and ACTED ON above it too. That return
+        // leaves this function, and a latch left set on it is read by the NEXT entry -- which
+        // would retire a block on a demotion that happened inside a different one.
         let retire = self.jit_direct.take_callout_retire_pending();
+        // ACTED ON BEFORE the error return, and the ordering is the point rather than a detail.
+        // `retire_key_for_recompile` frees the block's metadata slot, so it has to come after
+        // every counter and every charge -- but the error return is not one of those, it is a way
+        // OUT. With the retire below it, a stopping error swallowed the demotion for good: the
+        // machine stops, the GUI resumes it, and the block comes back with the demoted slot still
+        // in place, paying `test byte [cell], 0x80; jnz abnormal` and a dispatcher round trip on
+        // every execution for the rest of the run, with no second demotion ever to re-latch it
+        // (`note_execution` latches once per cell).
+        //
+        // The path is reachable rather than theoretical: `finish_instruction`'s `InternalFault::Cpu`
+        // arm turns a machine-stopping condition into exactly this parked error, and it can fire
+        // from the delivery a demoted slot's own fault took.
+        //
+        // Safe in this order because the retire reads NOTHING from `block`: it takes the key off
+        // the cell the latch carried, and the error return below reads nothing from the cache.
+        if let Some(key) = retire {
+            self.jit_direct.retire_key_for_recompile(key);
+        }
         // A machine-stopping error an `InterpretOne` slot's fault delivery produced. The helper
         // returns an `i64` and cannot carry one, so it parks it and this is the boundary that
         // propagates it -- the same boundary `run_budgeted_inner` would have propagated it from
-        // had the instruction run interpreted. Taken LAST, after every counter and every charge,
-        // so a stopping run accounts for the work it actually did.
+        // had the instruction run interpreted. Taken LAST, after every counter, every charge and
+        // the demotion retire, so a stopping run accounts for the work it actually did and leaves
+        // behind the same block cache a non-stopping one would have.
         if let Some(error) = self.direct_runtime.callout_error.take() {
             return Err(error);
-        }
-        // After every counter and every charge, and last because `retire_key_for_recompile` frees
-        // the block's metadata slot: nothing above may read `block` or its id afterwards. The
-        // `NotRun` shape the other retire sites use is not available here -- the block RAN -- so
-        // the outcome below is unchanged and only the block's future is.
-        if let Some(key) = retire {
-            self.jit_direct.retire_key_for_recompile(key);
         }
         if side_exit {
             Ok(DirectBlockOutcome::Prefix(outcome))

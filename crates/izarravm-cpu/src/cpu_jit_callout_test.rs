@@ -1497,10 +1497,21 @@ fn callout_attribution_splits_every_port_outcome() {
         );
 
         let snapshot = fixture.cpu.direct_callout_attribution_snapshot().unwrap();
-        assert_eq!(snapshot.helpers.len(), 3);
+        // FOUR helper rows since S2 gave `CallOutHelper` its `InterpretOne` arm. The count moved
+        // when this file's `--all-features` build was repaired: the attribution matched three arms
+        // against a four-arm enum and had not compiled since, so the pin had been asserting a
+        // shape no build could reach.
+        assert_eq!(snapshot.helpers.len(), 4);
         assert_eq!(callout_helper_counts(&snapshot, "in_al_dx"), expected);
         assert_eq!(callout_helper_counts(&snapshot, "pushad").attempts, 0);
         assert_eq!(callout_helper_counts(&snapshot, "popad").attempts, 0);
+        // The fixture drives the port helper alone, so the new row is present and silent -- which
+        // is the claim worth making: one index for the whole family, and it is not absorbing the
+        // port's calls.
+        assert_eq!(
+            callout_helper_counts(&snapshot, "interpret_one").attempts,
+            0
+        );
         assert_eq!(snapshot.ports.len(), 1);
         assert_eq!(snapshot.ports[0].port, PORT);
         assert_eq!(snapshot.ports[0].counts, expected);

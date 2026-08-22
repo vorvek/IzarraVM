@@ -618,12 +618,37 @@ fn interpret_one_resync_on_mapping_epoch_change() {
     );
 }
 
-/// R7 and R8: the run loop's own state. A halted step or a paused REP is not a boundary the block
-/// may run past.
+/// R7: a halted step is not a boundary the block may run past.
 #[test]
 fn interpret_one_resync_on_halt() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.halted = true;
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
+}
+
+/// R8, the halt clause's sibling and the half of that pair nothing was asserting.
+///
+/// A PAUSED REP is the run loop's own state exactly as a halt is: `rep_resume_active` means the
+/// interpreter stopped a string instruction part-way through a bounded chunk and owes it a
+/// restart, and `run_budgeted_inner` breaks the run on it (the `if self.rep_resume_active` break
+/// above the halt one). A block that carried on past that would run its remaining slots between a
+/// REP and its own continuation.
+///
+/// Unreachable today and asserted anyway, for the reason the whole clause table is: no row on the
+/// `InterpretOne` allowlist carries a REP prefix, so the flag can only be set by an instruction
+/// this predicate never sees. The clause is what makes admitting one later a decision rather than
+/// an accident, and the two halves of an `&&` are two claims.
+///
+/// MUTATION: drop the `!cpu.rep_resume_active` term and this passes while
+/// `interpret_one_resync_on_halt` still holds, which is the shape that made the pair look covered.
+#[test]
+fn interpret_one_resync_on_paused_rep() {
+    let (mut cpu, snapshot, end_eip) = snapshot_fixture();
+    assert!(
+        snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS),
+        "control: the fixture resumes before the flag is set"
+    );
+    cpu.rep_resume_active = true;
     assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
@@ -1375,6 +1400,80 @@ fn the_call_out_window_defers_watched_writes_only() {
         1,
         "the block must still be installed: the window defers, it does not invalidate"
     );
+}
+
+/// The deferred-write OVERFLOW arm, which had no fixture at all.
+///
+/// `MAX_DEFERRED_CODE_WRITES` is sixteen and the list is a fixed array: the seventeenth write sets
+/// `overflow` and is dropped. The drain then cannot replay what it did not record, so the only
+/// sound answer is the coarse one -- drop every compiled block and every decode line -- and that
+/// is what the arm does. Sizing prose is not a proof, and an arm reached only by a shape nobody
+/// has produced is exactly the kind that rots.
+///
+/// The CONTROL is what makes it non-vacuous, and it is one write apart. Sixteen deferred writes
+/// replay individually and take no cache reset; seventeen take one. `cache_resets` is the
+/// discriminator rather than `jit_direct.len()`, and it has to be: every write here is onto the
+/// block's own watched bytes, so the ordinary replay invalidates the block too and both legs end
+/// with an empty cache. Only the RESET counter tells the two paths apart.
+///
+/// MUTATION: drop the `if deferred.overflow` arm and the seventeen-write leg reads the control's
+/// zero.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_deferred_write_overflow_drops_the_whole_cache() {
+    for (label, writes, expected_resets) in [
+        ("at the cap", crate::MAX_DEFERRED_CODE_WRITES, 0),
+        ("one past it", crate::MAX_DEFERRED_CODE_WRITES + 1, 1),
+    ] {
+        let (mut cpu, _bus, _block) = build_native(CODE, STARTS);
+        assert_eq!(cpu.jit_direct.len(), 1, "{label}: the fixture must install");
+        let before = cpu.jit_direct.take_stats().cache_resets;
+
+        cpu.deferred_code_writes.open();
+        for _ in 0..writes {
+            // The block's own second instruction, which installing armed a watch over. The same
+            // address every time: the recorder appends without deduplicating, which is what lets a
+            // fixture reach the cap deterministically.
+            assert!(
+                cpu.note_code_write_hit(ENTRY + 3, 1),
+                "{label}: a watched write inside the window must report a hit"
+            );
+        }
+        cpu.deferred_code_writes.close();
+        assert!(
+            !cpu.deferred_code_writes.is_open(),
+            "{label}: the drain runs with the window CLOSED, which is its whole contract"
+        );
+        assert!(
+            !cpu.deferred_code_writes.is_empty(),
+            "{label}: the writes must have been deferred rather than acted on"
+        );
+
+        cpu.drain_deferred_code_writes();
+
+        assert!(
+            cpu.deferred_code_writes.is_empty(),
+            "{label}: the drain must leave nothing behind, overflow flag included"
+        );
+        assert!(
+            !cpu.deferred_code_writes.is_open(),
+            "{label}: and must not reopen the window"
+        );
+        assert_eq!(
+            cpu.jit_direct.take_stats().cache_resets - before,
+            expected_resets,
+            "{label}: cache resets"
+        );
+        assert_eq!(
+            cpu.jit_direct.len(),
+            0,
+            "{label}: either path invalidates the block the writes landed on"
+        );
+    }
 }
 
 /// An UNWATCHED write made inside the window still reaches the body's diagnostics.
@@ -2594,7 +2693,8 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
 /// `data_matches` at the next entry and recompiled every visit. The sibling below is that shape.
 ///
 /// MUTATION: drop `used_by_others` from the mask (compare all six) and this resyncs, reporting two
-/// instructions instead of three.///
+/// instructions instead of three.
+///
 /// STATES ITS ARM. `IZARRAVM_CALLOUT_SEGMENT_RESUME` defaulted OFF on 2026-08-22 after the loader
 /// measured the ON arm 10.5% slower, and a fixture that inherited the ambient reading would have
 /// started testing the refusal while claiming to test the relaxation.
@@ -2640,7 +2740,8 @@ fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
 /// A/B is read against, so a counter that never fired would make the two arms look free.
 ///
 /// MUTATION: mask with `suffix_used` instead of `used_by_others` and this resumes, reporting three
-/// instructions and leaving the counter at zero.///
+/// instructions and leaving the counter at zero.
+///
 /// STATES ITS ARM. `IZARRAVM_CALLOUT_SEGMENT_RESUME` defaulted OFF on 2026-08-22 after the loader
 /// measured the ON arm 10.5% slower, and a fixture that inherited the ambient reading would have
 /// started testing the refusal while claiming to test the relaxation.
@@ -4145,20 +4246,30 @@ fn a_demotion_past_the_site_cap_keeps_its_block_instead_of_recompiling_for_ever(
     assert!(cpu.jit_direct.key_is_compiled_for_test(key));
 }
 
-/// A demotion on an entry that ends in a machine-stopping `CpuError` must not leave its retire
-/// request behind for the NEXT entry to act on.
+/// A demotion on an entry that ends in a machine-stopping `CpuError` retires its block THERE, and
+/// leaves no request behind for the next entry to act on.
 ///
-/// The defect this pins: `run_direct_block` returned `Err` on `callout_error` before it took the
-/// retire latch, so the latch survived the return. The following entry -- any entry, in any block,
-/// possibly much later -- then found it set and retired on it. With the pre-fix bool latch that
-/// retired whatever block happened to be running; with the key it retires the right block at the
-/// wrong time, which is still a block cache that changes shape for a reason nothing at that call
-/// site can explain.
+/// TWO defects, one after the other, and the fixture pins both because the second was introduced
+/// by the fix for the first.
+///
+/// The original: `run_direct_block` returned `Err` on `callout_error` before it TOOK the retire
+/// latch, so the latch survived the return and the following entry -- any entry, in any block,
+/// possibly much later -- found it set and retired on it.
+///
+/// The one that replaced it: the latch was taken above the return and ACTED ON below it, so a
+/// stopping entry swallowed the demotion entirely. A `CpuError` is not the end of the world -- the
+/// GUI resumes the machine -- and the block came back with the demoted slot still in place, paying
+/// `test byte [cell], 0x80; jnz abnormal` and a dispatcher round trip on every execution for the
+/// rest of the run, with no second demotion ever to re-latch it because `note_execution` latches
+/// once per cell. The retire reads nothing from the block, so it belongs above the return.
 ///
 /// The error is reached by breaking the IDT under a faulting segment load: the #GP raised inside
 /// `load_protected_segment` has no gate to be delivered through, which escalates until the machine
 /// stops. Two clean resyncs first, so the third -- the faulting one -- is the execution that
 /// demotes.
+///
+/// MUTATION: move the retire back below the `callout_error` return and the block is still
+/// compiled after the stopping entry.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -4227,25 +4338,31 @@ fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
         "and it must be the execution that demoted the slot"
     );
     assert!(
-        cpu.jit_direct.key_is_compiled_for_test(key),
-        "the stopping entry drops its retire: the machine is going down, not recompiling"
+        !cpu.jit_direct.key_is_compiled_for_test(key),
+        "the demotion's retire must land BEFORE the error propagates: the machine stops, the GUI \
+         resumes it, and the block must not come back still carrying the demoted slot"
+    );
+    assert!(
+        cpu.jit_direct.take_callout_retire_pending().is_none(),
+        "and the latch must not survive the return either, or a later entry retires on a \
+         demotion that happened in a block it never ran"
     );
 
-    // The entry that must not inherit it. The slot is demoted, so this one exits from the emitted
-    // prologue and touches nothing else.
+    // The entry that would have inherited it. The block is gone, so the stale handle the fixture
+    // still holds fails its generational lookup and the dispatcher declines -- which is the same
+    // observation from the other side: the retire really happened rather than merely being
+    // counted. Before the retire moved above the return this entry ran the demoted slot's
+    // prologue and took an abnormal exit, once per execution, for ever.
     cpu.idtr.limit = 0xff;
     arm(&mut cpu, &mut bus, SEL_OTHER);
     assert!(
-        cpu.try_run_direct_block_for_test(&mut bus, block)
-            .expect("a demoted slot exits abnormally, it does not stop the machine")
-    );
-    assert_eq!(
-        cpu.jit_direct.last_side_exit_reason_for_test(),
-        Some(jit::direct::SideExitReason::CallOutAbnormal as u32)
+        !cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("a retired block is declined, not a machine stop"),
+        "the retired block must not be re-entered through a handle taken before it"
     );
     assert!(
-        cpu.jit_direct.key_is_compiled_for_test(key),
-        "this entry demoted nothing, so it must retire nothing"
+        cpu.jit_direct.take_callout_retire_pending().is_none(),
+        "this entry demoted nothing, so it must leave nothing to retire"
     );
 }
 
