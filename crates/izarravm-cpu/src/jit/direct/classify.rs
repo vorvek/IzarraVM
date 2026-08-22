@@ -248,7 +248,19 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // block-stopping hits.
                 | 0x8d
                 | 0x8e
+                // XCHG, the whole family, admitted to the S3 `InterpretOne` allowlist. Every one
+                // of them decodes at `OperandSize::Word` in a 16-bit segment whatever its actual
+                // operand width -- `0x86` is a byte exchange and takes its size from the encoding
+                // -- so without this entry the Word gate refuses the loader's rows before the
+                // classifier arm can see them. The census ranks `0x87` register word at 1.21 M
+                // block-stopping hits and `0x93`/`0x97` at 507 k.
+                //
+                // No width field to get wrong: the arm produces a call-out, and the helper runs
+                // the interpreter's own arm at whatever width the decode line carries.
+                | 0x86
+                | 0x87
                 | 0x90
+                | 0x91..=0x97
                 | 0x98
                 | 0x99
                 | 0xa0
@@ -820,6 +832,41 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // hits. `Nop` emits nothing width-dependent.
             0x90 => {
                 return Some(DirectKind::Nop);
+            }
+            // XCHG, the whole family, as `InterpretOne` call-outs. The S3 policy widening's second
+            // row: `0x87` register form is the post-S2 loader census's second row at 1.21 M
+            // block-stopping hits (6.9%) and `0x93`/`0x97` add 507 k.
+            //
+            // A call-out and not a lowering, and the reason is the SHAPE rather than the census.
+            // Every one of these is a CROSS-WRITE: the interpreter reads both operands, then
+            // writes both back (`execute.rs` 0x86/0x87/0x91..=0x97). A lowered memory form is a
+            // guarded read and a guarded store to the SAME address with the register exchange in
+            // between, which is two address computations, two fast-map probes, two permission
+            // checks and two side-exit stub sets for an instruction that appears once per Watcom
+            // pointer swap. The helper is a fixed call whatever the form.
+            //
+            // ALL FOUR FORMS ride one arm. `0x86` is the byte width and `0x87` the operand width;
+            // `0x91..=0x97` take the register from the low three opcode bits and exchange it with
+            // the accumulator. They reach ONE helper because the helper runs the decode line, so
+            // the closure rule at the top of this file applies at its strongest here: there is no
+            // per-form lowering that could be right for one and wrong for another.
+            //
+            // `0x90` is NOT in this arm and must not be. It is XCHG (E)AX,(E)AX architecturally,
+            // but it has a native `Nop` lowering that emits nothing at all, which is strictly
+            // better than a call-out; the arm above keeps it.
+            //
+            // `0x94` XCHG (E)AX,(E)SP writes the stack pointer, and that is sound for the reason
+            // the module docs derive for POPAD: `emit_store_homes` and the unconditional reload
+            // cover all eight GPRs, and later slots address the stack through `home(4)`, which the
+            // reload has just refreshed. Nothing bakes an ESP value.
+            //
+            // LOCK is refused upstream by `prefixes_supported_for`, which matters here more than
+            // for most rows: `XCHG` with a memory operand is implicitly locked on real silicon and
+            // the explicit prefix is common. A LOCK'd form never reaches this arm.
+            0x86 | 0x87 | 0x91..=0x97 => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne,
+                });
             }
             // CBW / CWDE. Unlike NOP and CLD/STD immediately below, this one IS in the
             // Word-size allowlist above: the interpreter's arm switches on `operand_size` (the

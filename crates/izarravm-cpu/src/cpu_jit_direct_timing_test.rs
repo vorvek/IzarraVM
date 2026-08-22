@@ -2064,7 +2064,15 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
         code.extend_from_slice(&[0x89, 0xff]);
     }
     starts.push(ENTRY + code.len() as u32);
-    code.extend_from_slice(&[0x66, 0x87, 0xc0]);
+    // The block-ender, never executed: the interpreted role runs exactly `span().instructions`
+    // cycles and the block stops here. HLT, and not the `66 87 c0` (XCHG AX,AX) this used to be.
+    // That one was chosen as an opcode the classifier refused, and the S3 policy widening admitted
+    // the whole XCHG family as `InterpretOne` call-outs, which grew every case's block from three
+    // slots to four and put a call-out inside a matrix that compares `pending_flags` between the
+    // two roles (the helper publishes a settled word where the interpreter leaves a descriptor).
+    // HLT cannot be admitted by any future slice -- it stops the machine -- so the fixture's
+    // boundary is a property of the instruction rather than of today's allowlist.
+    code.push(0xf4);
     let mut pristine = vec![0; 0x7000];
     pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
     pristine[DATA..DATA + 4].copy_from_slice(&2.5f32.to_bits().to_le_bytes());

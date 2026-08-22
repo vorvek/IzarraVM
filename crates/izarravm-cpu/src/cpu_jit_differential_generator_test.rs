@@ -1946,14 +1946,40 @@ fn policy_mov_sreg_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
     vec![0x8C, 0x46, 0x00]
 }
 
+/// `87 /r` with mod 01, r/m 101, disp8 0: `xchg [ebp+0], eax`, the memory cross-write.
+fn policy_xchg_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x87, 0x45, 0x00]
+}
+
+/// `94`: `xchg eax, esp`, the accumulator form that writes the STACK POINTER. The one XCHG shape
+/// whose soundness is an argument rather than an observation, so it is the one the sweep carries.
+fn policy_xchg_stack_pointer(_: &mut [u32; 8]) -> Vec<u8> {
+    vec![0x94]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
-const POLICY_ROWS_32: &[PolicyRow] = &[policy_mov_sreg_memory_32];
+const POLICY_ROWS_32: &[PolicyRow] = &[
+    policy_mov_sreg_memory_32,
+    policy_xchg_memory_32,
+    policy_xchg_stack_pointer,
+];
 
 /// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
 /// width parameter, because the two machines do not admit the same set: a protected-mode segment
 /// load reads a descriptor out of a GDT this harness does not build, so the rows that load a
 /// segment register live on the 16-bit side alone and the split says so.
-const POLICY_ROWS_16: &[PolicyRow] = &[policy_mov_sreg_memory_16];
+const POLICY_ROWS_16: &[PolicyRow] = &[
+    policy_mov_sreg_memory_16,
+    policy_xchg_memory_16,
+    policy_xchg_stack_pointer,
+];
+
+/// `87 /r` with mod 01, r/m 110, disp8 0: `xchg [bp+0], ax`.
+fn policy_xchg_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0x87, 0x46, 0x00]
+}
 
 /// A 32-bit block whose middle slot is one S3 row.
 ///

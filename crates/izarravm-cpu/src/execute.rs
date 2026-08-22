@@ -252,7 +252,7 @@ impl CpuGsw {
                 let reg = self.read_gpr8(modrm.reg);
                 self.write_operand_u8(bus, operand, reg)?;
                 self.write_gpr8(modrm.reg, rm);
-                Ok(clocks(3))
+                Ok(clocks(XCHG_CORE_CLOCKS))
             }
             0x87 => {
                 // XCHG r/m16/32, r16/32. Cross-write.
@@ -261,7 +261,7 @@ impl CpuGsw {
                 let reg = self.read_gpr_sized(modrm.reg, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, reg)?;
                 self.write_gpr_sized(modrm.reg, operand_size, rm);
-                Ok(clocks(3))
+                Ok(clocks(XCHG_CORE_CLOCKS))
             }
             0x88 => {
                 // MOV r/m8, r8.
@@ -403,7 +403,7 @@ impl CpuGsw {
                 let other = self.read_gpr_sized(reg, operand_size);
                 self.write_gpr_sized(0, operand_size, other);
                 self.write_gpr_sized(reg, operand_size, acc);
-                Ok(clocks(3))
+                Ok(clocks(XCHG_CORE_CLOCKS))
             }
             0xa0 => {
                 // MOV AL, moffs8: byte form, ignores the operand-size prefix, flags untouched. The

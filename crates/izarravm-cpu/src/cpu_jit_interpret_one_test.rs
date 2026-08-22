@@ -1583,3 +1583,134 @@ fn mov_rm16_sreg_memory_refuses_the_unnamed_reg_fields() {
         assert_eq!(block.callout_interpret_one_slots(), 0);
     }
 }
+
+/// Run a row twenty-four times interpreted and compare `elapsed_clocks` against its named core
+/// charge scaled the same number of times.
+///
+/// The generalisation of `pop_rm_core_clocks_is_what_the_interpreter_charges`, and it exists for
+/// the reason that test states: both Approximate personas scale core clocks by one twelfth with a
+/// carried remainder, so a single execution charges zero however wrong the constant is and the
+/// difference only leaves the rounding after a couple of dozen. `TestBus` charges nothing for
+/// fetch or data, so `elapsed_clocks` here is the core lane alone.
+///
+/// This is the per-row half of the `INTERPRET_ONE_MAX_CORE_CLOCKS` check: the constant is the
+/// budget bound's input, and the bound and the interpreter must agree on it.
+fn assert_row_charges(row: &[u8], expected: u32, seed: fn(&mut CpuGsw, &mut TestBus)) {
+    const REPEATS: usize = 24;
+    let mut program = vec![0u8; 0x2000];
+    for index in 0..REPEATS {
+        let at = ENTRY as usize + index * row.len();
+        program[at..at + row.len()].copy_from_slice(row);
+    }
+    program[ENTRY as usize + REPEATS * row.len()] = 0xF4;
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut cpu, &mut bus);
+    seed(&mut cpu, &mut bus);
+    let mut oracle = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut oracle, &mut bus);
+
+    let mut wanted = 0u64;
+    for _ in 0..REPEATS {
+        cpu.cycle(&mut bus).expect("the row must execute");
+        wanted += oracle.scale_clocks(expected);
+    }
+    assert!(
+        wanted > 0,
+        "the fixture must clear the timing dial's rounding"
+    );
+    assert_eq!(
+        cpu.elapsed_clocks, wanted,
+        "row {row:02x?} charges something other than its named constant"
+    );
+}
+
+/// Row 2: the XCHG family, all four forms.
+///
+/// `0x86` is the byte exchange, `0x87` the operand-width one, and `0x91..=0x97` the accumulator
+/// forms; each is tested in both the shapes it has. `0x94` is in the list on purpose: it writes
+/// the STACK POINTER, which is the case the call-out reload contract has to cover and the one the
+/// module docs derive for POPAD.
+///
+/// MUTATION: drop `0x86 | 0x87 | 0x91..=0x97` from the classifier arm and every case fails on the
+/// block shape; drop them from the Word allowlist instead and the same happens, because the
+/// fixture runs in a 16-bit code segment where every one of them decodes at Word.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_xchg_family_resumes() {
+    // xchg bl, al | xchg [bx], al | xchg bx, ax | xchg [bx], ax | xchg ax, cx | xchg ax, sp |
+    // xchg ax, di
+    for row in [
+        &[0x86u8, 0xC3][..],
+        &[0x86, 0x07],
+        &[0x87, 0xC3],
+        &[0x87, 0x07],
+        &[0x91],
+        &[0x94],
+        &[0x97],
+    ] {
+        assert_row_resumes(row, no_perturb);
+    }
+}
+
+/// The memory forms really exchange: the word the fixture seeded and the accumulator swap places.
+///
+/// Separate from the sweep above because it names the semantics rather than the seam. The whole
+/// point of a cross-write is that BOTH sides move, and a helper that ran only the read half would
+/// still resume and still agree on every clock.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_xchg_memory_form_exchanges_both_sides() {
+    let legs = assert_row_resumes(&[0x87, 0x07], no_perturb);
+    assert_eq!(
+        u16::from_le_bytes(
+            legs.native_bus.memory[POP_TARGET as usize..POP_TARGET as usize + 2]
+                .try_into()
+                .unwrap()
+        ),
+        0x1111,
+        "the accumulator must have reached memory"
+    );
+    // AX took the seeded zero and then `inc ax` ran.
+    assert_eq!(legs.native.registers.eax() & 0xffff, 0x0001);
+}
+
+/// `0x90` keeps its native `Nop` lowering rather than joining the family it belongs to
+/// architecturally.
+///
+/// XCHG (E)AX,(E)AX is a no-op, and an emitter that emits nothing beats a helper call that does
+/// nothing. This is the one member of the encoding family the S3 arm must NOT swallow, so it is
+/// pinned from the other side.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn xchg_eax_eax_stays_a_native_nop() {
+    let (code, starts) = row_program(&[0x90]);
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(block.span().instructions, BLOCK_INSTRUCTIONS);
+    assert_eq!(
+        block.callout_interpret_one_slots(),
+        0,
+        "0x90 must stay a native Nop, not become a call-out"
+    );
+}
+
+/// `XCHG_CORE_CLOCKS` is what the interpreter charges, on the register form and the memory form
+/// alike.
+#[test]
+fn xchg_core_clocks_is_what_the_interpreter_charges() {
+    for row in [&[0x87u8, 0xC3][..], &[0x87, 0x07], &[0x91]] {
+        assert_row_charges(row, crate::XCHG_CORE_CLOCKS, |_, _| {});
+    }
+}
