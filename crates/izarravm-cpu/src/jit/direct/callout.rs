@@ -498,6 +498,34 @@ impl InterpretOneRow {
         matches!(self, Self::Sti)
     }
 
+    /// Whether this row can overwrite a SEGMENT REGISTER, which is the whole admission rule for
+    /// the suffix-used relaxation of R2.
+    ///
+    /// EXHAUSTIVE, no catch-all arm, and that is design review 11.1 B1. The answer feeds two
+    /// consumers that must never disagree: the record mask R2 compares after the step, and the
+    /// accumulator that bars the block from publishing successors. Two derivations of the same
+    /// question is a miscompile in one direction (a relaxed mask on a block that still chains) and
+    /// a lost win in the other, so there is one.
+    ///
+    /// The near misses. `MovRmSreg` (`0x8C`) READS a selector into memory and writes no register.
+    /// `PopRm` (`0x8F`) pops into an r/m operand, which the classifier's `/0`-only arm keeps clear
+    /// of the segment encodings. `Xchg` cannot name a segment register at all. The three that say
+    /// yes are the three that call `load_segment_checked`.
+    pub(crate) fn may_write_segment(self) -> bool {
+        match self {
+            Self::MovSreg | Self::MovSsReg | Self::PopSs => true,
+            Self::PopRm
+            | Self::MovRmSreg
+            | Self::Xchg
+            | Self::BitString
+            | Self::Group3
+            | Self::IncDecRm8
+            | Self::PushRm
+            | Self::Cli
+            | Self::Sti => false,
+        }
+    }
+
     pub(crate) fn index(self) -> usize {
         self as usize
     }
@@ -1156,6 +1184,20 @@ pub(crate) struct InterpretOneCell {
     /// fields the helper reads on every execution: `state` must stay first because the emitted
     /// prologue tests byte 0 directly, and this one is read only on the four counter paths.
     row: InterpretOneRow,
+    /// The segments the slots STRICTLY AFTER this one in the block depend on: the union of their
+    /// `DirectKind::pinned_segments`, which is read union write union selector.
+    ///
+    /// This is what R2 compares for a row that can write a segment register, in place of all six
+    /// records. A `mov ds, ax` that moves DS's record cannot reach anything the block goes on to
+    /// do when no later slot bakes DS, and the S4 census says that is the common shape: 2.23 M
+    /// block-stopping hits on `0x8E` are DS and ES reloads with changed records, the extender
+    /// far-pointer pattern, which resynced and then demoted every time.
+    ///
+    /// Filled AFTER the walk, by slot index, because it is a fact about the block's tail that the
+    /// walk does not know while it is still growing. Zero until then, which is the conservative
+    /// value only in the sense that it compares fewer segments -- the mask is useless without CS
+    /// and SS, which `allows_resume` adds unconditionally rather than storing here.
+    suffix_used: u8,
     /// The key of the block this cell was compiled INTO, baked at the compile walk.
     ///
     /// Two things need it and neither can recover it at run time, which is why it is carried
@@ -1198,8 +1240,22 @@ impl InterpretOneCell {
             insn_len,
             slot_delta,
             row,
+            suffix_used: 0,
             key,
         }
+    }
+
+    /// Fill in the suffix mask once the walk knows what follows this slot. See the field.
+    ///
+    /// `&mut self` rather than interior mutability, and the compile walk reaches it through
+    /// `Arc::get_mut`: the cell is not shared with anything until `install` clones the vector, so
+    /// the uniqueness the call needs is a fact about the phase rather than a lock.
+    pub(crate) fn set_suffix_used(&mut self, mask: u8) {
+        self.suffix_used = mask;
+    }
+
+    pub(crate) fn suffix_used(&self) -> u8 {
+        self.suffix_used
     }
 
     pub(crate) fn row(&self) -> InterpretOneRow {
@@ -1321,13 +1377,41 @@ impl ResumeSnapshot {
     /// | R6 | x87 pad addressing (debug only; the compile walk refuses the mix) |
     /// | R7/R8 | the run loop's own state: no halt, no paused REP |
     ///
-    /// R2 is what decides the two SS-load rows, and it is the whole of their admission argument.
-    /// `MovSsReg` and `PopSs` move the SS record whenever the guest switches stacks, and R2
-    /// byte-compares all six records, so a stack SWITCH resyncs and only a reload of the record
-    /// the block was compiled under resumes. The loader splits almost evenly between the two
-    /// shapes (484,385 same-record against 488,498 record-moving), which is design review 10.1
-    /// M5's measurement and the reason the rows were built at all: the same-record half resumes
-    /// and the other half demotes to the boundary it already had.
+    /// R2 compares all six records for every row that cannot write a segment register, and a
+    /// MASK for the three that can (`InterpretOneRow::may_write_segment`). The mask is the
+    /// segments the slots strictly after this one depend on, plus CS and SS unconditionally.
+    ///
+    /// The relaxation is design section 11 and the census is what asked for it: 2.23 M of the S4
+    /// loader's remaining block-stopping hits are `0x8E` DS and ES reloads with CHANGED records,
+    /// the far-pointer pattern a DOS extender emits, and every one of them resynced under the
+    /// six-record compare and then demoted -- while no remaining slot in the block used the
+    /// segment that moved. A record nothing downstream bakes cannot reach anything the block goes
+    /// on to do.
+    ///
+    /// CS and SS are always in the mask and are not negotiable. CS is what R1 compares the code
+    /// itself against; SS carries the stack width that `jit_mode_key` bit 3 keys the whole block
+    /// on, and every stack slot bakes its base.
+    ///
+    /// WHAT IT COSTS AT THE NEXT ENTRY, stated because the mask does not mention it. `used` is the
+    /// BLOCK-WIDE pinned set and `data_matches` still compares all of it at every entry, so a slot
+    /// that resumes having moved a record an EARLIER slot bakes leaves the block failing its own
+    /// entry check next time round. That is the ordinary "the guest moved a segment this block
+    /// bakes" path and it is correct; it is also why `reject_data_segment` is pre-registered as a
+    /// counter this slice can move. The shape is `mov ax, ds` in front of `mov ds, bx`, which the
+    /// census does not rank.
+    ///
+    /// WHAT PAYS FOR IT is the successor bar rather than anything in this predicate. A block
+    /// holding such a slot publishes no static successor and no dynamic one, so a chained
+    /// transfer -- which jumps into a successor's body without re-running `data_matches` -- can
+    /// never enter code baked against a record this block just moved. That is the same argument
+    /// `is_segment_write_block` has always made for `LoadSegReal`, extended to the one other
+    /// producer of a segment write.
+    ///
+    /// R2 is also the whole admission argument for the two SS-load rows. `MovSsReg` and `PopSs`
+    /// move the SS record whenever the guest switches stacks, and SS is in the mask always, so a
+    /// stack SWITCH resyncs and only a reload of the record the block was compiled under resumes.
+    /// The loader splits almost evenly between the two shapes (484,385 same-record against
+    /// 488,498 record-moving), which is design review 10.1 M5's measurement.
     ///
     /// The shadow clause below is a SEPARATE rule and not a restatement of R2; the note that
     /// claimed R2 subsumed it was rewritten at design review 10.1 B3, because the `Sti` row arms
@@ -1366,17 +1450,31 @@ impl ResumeSnapshot {
     /// block, which is the event that clearing is driven by.
     ///
     /// See `epoch_moved` for why a COLD FILL is not a move.
-    pub(crate) fn allows_resume(&self, cpu: &CpuGsw, end_eip: u32, row: InterpretOneRow) -> bool {
+    pub(crate) fn allows_resume(
+        &self,
+        cpu: &CpuGsw,
+        end_eip: u32,
+        row: InterpretOneRow,
+        suffix_used: u8,
+    ) -> bool {
         // R1.
         if cpu.registers.eip != end_eip || cpu.registers.cs() != self.cs {
             return false;
         }
-        // R2.
-        if SEGMENT_ORDER
-            .iter()
-            .enumerate()
-            .any(|(index, segment)| cpu.registers.segment(*segment) != self.segments[index])
-        {
+        // R2. See the mask note above. The `!` arm is `u8::MAX` rather than the six live bits
+        // because the extra two are bits no `segment_bit` produces and `SEGMENT_ORDER` never
+        // indexes: widening the mask to "everything" is the same set as widening it to "all six".
+        let compare = if row.may_write_segment() {
+            suffix_used
+                | super::segment_bit(SegmentIndex::Cs)
+                | super::segment_bit(SegmentIndex::Ss)
+        } else {
+            u8::MAX
+        };
+        if SEGMENT_ORDER.iter().enumerate().any(|(index, segment)| {
+            compare & super::segment_bit(*segment) != 0
+                && cpu.registers.segment(*segment) != self.segments[index]
+        }) {
             return false;
         }
         // R3.
@@ -1663,7 +1761,7 @@ fn interpret_one_step<B: CpuBus>(
     //
     // Asked AFTER the step rather than before it because the step runs on either answer -- the row
     // retires whatever this returns -- and executing it cannot change what is pending.
-    let resume = snapshot.allows_resume(cpu, end_eip, cell.row())
+    let resume = snapshot.allows_resume(cpu, end_eip, cell.row(), cell.suffix_used())
         && !(cell.row().arms_interrupt_shadow()
             && cpu.registers.eflags & FLAG_IF != 0
             && bus.interrupt_pending());

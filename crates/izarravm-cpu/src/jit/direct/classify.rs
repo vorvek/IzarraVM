@@ -1609,14 +1609,18 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // fault vectors. The helper runs the interpreter's arm, so every one of those is the
             // interpreter's, exactly.
             //
-            // WHAT IT COSTS. R2 compares all six cached segment records, so a load that CHANGES
-            // the record resyncs and a load of the same selector onto the same descriptor
-            // resumes. A guest that reloads DS with a new selector therefore resyncs every time
-            // and the governor demotes the slot after three of its first eight executions, which
-            // is the boundary it had before. A guest that reloads the SAME selector -- the
-            // re-establishing `mov ds, ax` a 16-bit C runtime emits at every function that could
-            // have changed it -- resumes. Both are correct; only the second is a win, and the
-            // governor is what stops the first from being a loss.
+            // WHAT IT COSTS, as revised by S4f. R2 compares the segments the slots STRICTLY
+            // AFTER this one bake, plus CS and SS, and not all six records. So a load that moves
+            // a record NO LATER SLOT USES resumes, and one that moves a record a later slot bakes
+            // resyncs -- and the second still demotes after three of its first eight executions,
+            // back to the boundary it had before.
+            //
+            // The relaxation is the S4 census's answer to its own top remaining barrier class:
+            // 2.23 M `call_out_demoted` hits on this opcode, DS and ES far-pointer reloads whose
+            // new record nothing downstream reads. The re-establishing `mov ds, ax` a 16-bit C
+            // runtime emits resumed before it and still does; what S4f adds is the far-pointer
+            // shape. The mask lives on the slot's `InterpretOneCell` and is filled by a backward
+            // pass after the compile walk.
             //
             // `/1` (CS), `/6` and `/7` are refused HERE rather than left off the allowlist,
             // because they are not loads at all: the interpreter raises #GP(0) for each
@@ -1628,10 +1632,17 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // replaces: `DirectKind::written_segment` answers `None` for it, so the block's
             // `dirty_segments` mask does not learn that this instruction can move a record and the
             // compile walk goes on admitting later slots that address through it. That is safe for
-            // exactly one reason, and it is worth stating because it is not local: R2
-            // byte-compares all six cached records after the step, so a slot that moved one ends
-            // the run before any later slot executes. A resumed block therefore baked nothing
-            // stale, and a block that would have baked something stale never resumed.
+            // exactly one reason, and it is worth stating because it is not local: R2 compares
+            // every record the LATER SLOTS bake, so a slot that moved one of those ends the run
+            // before any of them executes. A resumed block therefore baked nothing stale, and a
+            // block that would have baked something stale never resumed. The mask is built from
+            // `DirectKind::pinned_segments` over exactly those slots, which is the same accessor
+            // `SegmentLayout::capture` builds `used` from.
+            //
+            // What the walk gives up in exchange is the block's SUCCESSORS. A row that can write a
+            // segment feeds `segment_write_block`, so the block publishes neither a static nor a
+            // dynamic successor and cannot chain: a chained transfer skips `data_matches`, and the
+            // suffix mask says nothing about what a successor bakes.
             //
             // `/2` (SS) is a call-out too since S4 part 2, and a row of its OWN rather than a
             // `/2` folded into `MovSreg`. What used to keep it out was R3's shadow clause: loading

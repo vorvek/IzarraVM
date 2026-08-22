@@ -477,6 +477,11 @@ fn interpret_one_reloads_the_flag_shadow_on_resume() {
 // 2. The resume predicate, clause by clause.
 // ---------------------------------------------------------------------------
 
+/// The suffix mask a clause test hands the predicate: everything, which is what a slot with no
+/// segment-writing row is compared against anyway and what keeps these cases about their own
+/// clause rather than about the mask.
+const ALL_SEGMENTS: u8 = u8::MAX;
+
 /// The row every clause test below is written against. `0x8F` POP r/m is the mechanism's first
 /// and plainest row and it arms nothing, so passing it here keeps each clause at its STRICT
 /// reading. The two clauses that a row can loosen (the IF 0-to-1 edge and a step-armed
@@ -498,7 +503,7 @@ fn snapshot_fixture() -> (CpuGsw, jit::direct::ResumeSnapshot, u32) {
 #[test]
 fn interpret_one_resumes_when_nothing_moved() {
     let (cpu, snapshot, end_eip) = snapshot_fixture();
-    assert!(snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 /// R1: the step must leave EIP exactly past the instruction. A transfer that moved it resyncs, and
@@ -507,7 +512,7 @@ fn interpret_one_resumes_when_nothing_moved() {
 fn interpret_one_resync_on_eip_move() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.set_eip(end_eip + 2);
-    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 /// R2: a segment record the block baked moved under it.
@@ -521,7 +526,7 @@ fn interpret_one_resync_on_segment_change() {
     let mut ds = cpu.registers.segment(SegmentIndex::Ds);
     ds.base = ds.base.wrapping_add(0x10);
     cpu.registers.set_segment(SegmentIndex::Ds, ds);
-    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 /// R3, the CS half of R1: the block's whole compilation is keyed on CS.
@@ -531,7 +536,7 @@ fn interpret_one_resync_on_cs_change() {
     let mut cs = cpu.registers.cs();
     cs.selector = cs.selector.wrapping_add(1);
     cpu.registers.set_segment(SegmentIndex::Cs, cs);
-    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 /// R3: a control register the mode key or the paging state depends on.
@@ -548,7 +553,7 @@ fn interpret_one_resync_on_control_register_change() {
         let (mut cpu, snapshot, end_eip) = snapshot_fixture();
         apply(&mut cpu);
         assert!(
-            !snapshot.allows_resume(&cpu, end_eip, POP_RM),
+            !snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS),
             "a moved {name} must resync"
         );
     }
@@ -563,7 +568,7 @@ fn interpret_one_resync_on_if_0_to_1() {
     cpu.set_eip(ENTRY + 5);
     let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
     cpu.registers.eflags |= FLAG_IF;
-    assert!(!snapshot.allows_resume(&cpu, ENTRY + 5, POP_RM));
+    assert!(!snapshot.allows_resume(&cpu, ENTRY + 5, POP_RM, ALL_SEGMENTS));
 }
 
 /// Design item M8, the resuming direction: IF going 1 to 0 has no delivery point, so refusing it
@@ -572,7 +577,7 @@ fn interpret_one_resync_on_if_0_to_1() {
 fn interpret_one_resumes_on_if_1_to_0() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.registers.eflags &= !FLAG_IF;
-    assert!(snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 /// R3: the one-instruction interrupt shadow. The seam the helper uses does not clear it on the way
@@ -581,7 +586,7 @@ fn interpret_one_resumes_on_if_1_to_0() {
 fn interpret_one_resync_on_interrupt_shadow() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.interrupt_shadow = true;
-    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 /// R3: the trap flag. A block cannot produce the instruction boundary single-step delivery wants,
@@ -593,7 +598,7 @@ fn interpret_one_resync_on_interrupt_shadow() {
 fn interpret_one_resync_on_trap_flag() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.registers.eflags |= FLAG_TF;
-    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 /// R4: a LIVE mapping epoch that moved. The paging generation changed under the block.
@@ -602,13 +607,13 @@ fn interpret_one_resync_on_mapping_epoch_change() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.set_data_write_mapping_epoch_for_test(7);
     assert!(
-        snapshot.allows_resume(&cpu, end_eip, POP_RM),
+        snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS),
         "0 to n is a cold fill, not a mapping change"
     );
     let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
     cpu.set_data_write_mapping_epoch_for_test(8);
     assert!(
-        !snapshot.allows_resume(&cpu, end_eip, POP_RM),
+        !snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS),
         "n to m is a mapping change and must resync"
     );
 }
@@ -619,7 +624,7 @@ fn interpret_one_resync_on_mapping_epoch_change() {
 fn interpret_one_resync_on_halt() {
     let (mut cpu, snapshot, end_eip) = snapshot_fixture();
     cpu.halted = true;
-    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM));
+    assert!(!snapshot.allows_resume(&cpu, end_eip, POP_RM, ALL_SEGMENTS));
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,6 +1675,31 @@ fn row_program(row: &[u8]) -> (Vec<u8>, Vec<u32>) {
     (code, starts)
 }
 
+/// `row_program` with a slot behind the row that BAKES FS, so a segment load in the row is compared
+/// by R2 rather than relaxed away.
+/// A `mov ax, Sreg` behind a segment-loading call-out, which is what puts that segment in the
+/// slot's SUFFIX MASK.
+///
+/// Since S4f, R2 compares only the segments the slots STRICTLY AFTER a segment-writing slot
+/// depend on (plus CS and SS), so a fixture whose tail is `inc ax` sees a changed record RESUME.
+/// Every resync and demotion fixture in this file therefore ends with a slot that bakes the
+/// segment the row loads. `0x8C` register form is the cheapest one: it reports through
+/// `selector_segment`, so it pins the segment while touching no memory.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn row_program_with_an_fs_user(row: &[u8]) -> (Vec<u8>, Vec<u32>) {
+    let mut code = vec![0xB8, 0x11, 0x11];
+    code.extend_from_slice(row);
+    // mov ax, fs
+    code.extend_from_slice(&[0x8C, 0xE0]);
+    code.push(0xF4);
+    let starts = vec![0, 3, 3 + row.len() as u32];
+    (code, starts)
+}
+
 /// The anti-vacuity gate every S3 row owes: the row compiles into an `InterpretOne` slot with a
 /// native slot on each side, rather than ending the block where it used to.
 ///
@@ -2527,10 +2557,10 @@ fn interpret_one_mov_sreg_resumes_on_an_unchanged_record() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
-    // mov ax,0x1111 | mov fs,ax | inc ax | hlt
+    // mov ax,0x1111 | mov fs,ax | mov ax,fs | hlt
     let row = [0x8Eu8, 0xE0];
     assert_row_is_a_call_out(&row);
-    let (code, starts) = row_program(&row);
+    let (code, starts) = row_program_with_an_fs_user(&row);
     let mut legs = run_both(&code, &starts, no_perturb);
     assert_eq!(
         legs.exit_reason,
@@ -2550,6 +2580,79 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
         0x1111,
         "the load itself must have happened: a RESYNC is not an undo"
     );
+}
+
+/// The other half of the split (S4f): a changed record the SUFFIX DOES NOT USE resumes.
+///
+/// Same row, same moved record, and the only difference is what follows it. `inc ax` bakes no
+/// segment, so FS is not in the slot's suffix mask, R2 does not compare it, and the block carries
+/// on. That is 2.23 M of the S4 loader's remaining barrier hits: DS and ES far-pointer reloads
+/// whose new record nothing downstream reads.
+///
+/// MUTATION: drop `suffix_used` from the mask (compare all six) and this resyncs, reporting two
+/// instructions instead of three.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_later_slot_uses() {
+    // mov ax,0x1111 | mov fs,ax | inc ax | hlt
+    let (code, starts) = row_program(&[0x8E, 0xE0]);
+    let mut legs = run_both(&code, &starts, no_perturb);
+    assert_eq!(legs.exit_reason, None, "the block should have completed");
+    assert_eq!(
+        legs.native_insns,
+        u64::from(BLOCK_INSTRUCTIONS),
+        "no later slot bakes FS, so the moved record cannot reach anything"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_executed, 1);
+    assert_eq!(stalls.callout_interpret_one_resync, 0);
+    assert_eq!(stalls.callout_interpret_one_demoted, 0);
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native.registers.segment(SegmentIndex::Fs).selector,
+        0x1111
+    );
+}
+
+/// The mask is built by SLOT INDEX and covers the whole suffix, not just the next slot.
+///
+/// The call-out sits at index 0 of three, which is the case an off-by-one gets wrong in the
+/// direction that matters: a union started at `i + 2` would leave FS out of the first slot's mask
+/// even though the last slot bakes it, and a changed record would resume against a stale baked
+/// selector.
+///
+/// MUTATION: make the mask the NEXT slot's pinned set alone and this resumes, reporting three.
+/// The other off-by-one -- a union that SKIPS the immediately next slot -- is killed by
+/// `interpret_one_mov_sreg_resyncs_on_a_changed_record` and its protected-mode sibling, whose
+/// user sits directly behind the load. The pair is what covers both directions.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn the_suffix_mask_reaches_past_the_next_slot() {
+    // mov fs,bx | inc ax | mov ax,fs | hlt -- the call-out is slot 0 and the user is slot 2.
+    //
+    // BX rather than CX because the record has to MOVE: `arm_fixture` clears CX, and FS starts at
+    // selector zero, so `mov fs,cx` is the re-establishing shape that resumes under any mask.
+    let code = [0x8E, 0xE3, 0x40, 0x8C, 0xE0, 0xF4];
+    let starts = [0, 2, 3];
+    let mut legs = run_both(&code, &starts, no_perturb);
+    assert_eq!(
+        legs.native_insns, 1,
+        "the call-out is the first slot, so a resync reports it alone"
+    );
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "FS is baked two slots later, so the moved record must RESYNC"
+    );
+    assert_legs_agree(&mut legs);
 }
 
 /// The three illegal reg fields stay refused, from the side that can see them.
@@ -2725,10 +2828,14 @@ const SEL_UNACCESSED: u16 = 0x20;
 /// (vector 12) rather than the #NP every other segment gets, which is the 386 PRM 9.3 carve-out
 /// and the second fault vector the SS rows owe a test.
 const SEL_NOT_PRESENT: u16 = 0x28;
+/// Index 6: a writable data descriptor with D/B and G CLEAR, so loading it into SS gives a
+/// 16-BIT stack. Its record differs from `SEL_DATA`'s in `default_size_32`, which is the field
+/// `jit_mode_key` bit 3 keys every block on and the reason SS is in R2's mask unconditionally.
+const SEL_SS16: u16 = 0x30;
 /// Past the table limit, so the load is a #GP with no descriptor to blame.
 const SEL_BAD: u16 = 0x38;
-/// Five usable entries: `index + 7 > limit` refuses `SEL_BAD` and admits every other selector.
-const GDT_LIMIT: u16 = 0x2f;
+/// Six usable entries: `index + 7 > limit` refuses `SEL_BAD` and admits every other selector.
+const GDT_LIMIT: u16 = 0x37;
 
 /// One 8-byte descriptor, in the layout `descriptor_to_segment` reads back.
 fn descriptor(low: u32, high: u32) -> [u8; 8] {
@@ -2781,6 +2888,13 @@ fn seed_protected_tables(program: &mut [u8]) {
         GDT_BASE + u32::from(SEL_NOT_PRESENT),
         descriptor(0x0000_ffff, 0x0040_1200),
     );
+    // 0x00009300: access 0x93 with D/B and G clear, so `descriptor_to_segment` reports a 16-bit
+    // stack with a 64 KB limit.
+    put(
+        program,
+        GDT_BASE + u32::from(SEL_SS16),
+        descriptor(0x0000_ffff, 0x0000_9300),
+    );
     program[FAULT_HANDLER as usize] = 0xF4;
     // 13 is #GP and 12 is #SS. Both land on the same handler: what the fixtures compare is the two
     // LEGS of one vector against each other, not one vector against another.
@@ -2822,10 +2936,25 @@ fn protected_cpu() -> CpuGsw {
     cpu
 }
 
-/// `mov eax,0x1111; mov fs,dx; inc eax; hlt`, with the segment load in the MIDDLE for the reason
+/// `mov eax,0x1111; mov fs,dx; mov ax,fs; hlt`, with the segment load in the MIDDLE for the reason
 /// `CODE` states.
-const PROTECTED_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xE2, 0x40, 0xF4];
+///
+/// The tail is `mov ax, fs` rather than `inc eax` since S4f: it BAKES FS through
+/// `selector_segment`, which is what puts FS in the call-out slot's suffix mask and keeps R2
+/// comparing the record these fixtures move. With `inc eax` behind it the mask is empty and a
+/// changed descriptor resumes, which is the relaxation and has its own fixture.
+const PROTECTED_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xE2, 0x8C, 0xE0, 0xF4];
 const PROTECTED_STARTS: &[u32] = &[0, 5, 7];
+
+/// The same fixture with `inc eax` behind the load instead, so the block pins FS NOWHERE.
+///
+/// Two fixtures need it, and both for the same reason: they PERTURB FS before the entry, and the
+/// `mov ax, fs` tail puts FS in the block's `used` set, which `data_matches` compares at the entry
+/// check. A block whose entry check refuses never runs at all, and neither of those two is about
+/// the record compare -- their resync comes from R5, the deferred code write the accessed-bit
+/// write-back produces.
+const PROTECTED_CODE_PLAIN: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xE2, 0x40, 0xF4];
+const PROTECTED_STARTS_PLAIN: &[u32] = &[0, 5, 7];
 
 fn arm_protected(cpu: &mut CpuGsw, bus: &mut TestBus, selector: u16) {
     cpu.halted = false;
@@ -3074,7 +3203,12 @@ fn interpret_one_accessed_bit_write_onto_watched_code_resyncs() {
         hold_the_unaccessed_descriptor(cpu, bus);
         cpu.mark_block_code_for_test(GDT_BASE + u32::from(SEL_UNACCESSED), 8);
     }
-    let mut legs = run_both_protected(SEL_UNACCESSED, watch_the_descriptor);
+    let mut legs = run_both_protected_program(
+        PROTECTED_CODE_PLAIN,
+        PROTECTED_STARTS_PLAIN,
+        SEL_UNACCESSED,
+        watch_the_descriptor,
+    );
     assert_eq!(
         legs.exit_reason,
         Some(jit::direct::SideExitReason::CallOutResync as u32),
@@ -3103,7 +3237,12 @@ fn interpret_one_accessed_bit_write_onto_watched_code_resyncs() {
 ))]
 #[test]
 fn interpret_one_accessed_bit_write_off_watched_code_resumes() {
-    let mut legs = run_both_protected(SEL_UNACCESSED, hold_the_unaccessed_descriptor);
+    let mut legs = run_both_protected_program(
+        PROTECTED_CODE_PLAIN,
+        PROTECTED_STARTS_PLAIN,
+        SEL_UNACCESSED,
+        hold_the_unaccessed_descriptor,
+    );
     assert_eq!(
         legs.exit_reason, None,
         "an unwatched Accessed-bit write-back must not end the run"
@@ -3220,7 +3359,7 @@ fn interpret_one_executions_are_attributed_to_their_own_row() {
 ))]
 #[test]
 fn interpret_one_resyncs_are_attributed_to_their_own_row() {
-    let (code, starts) = row_program(&[0x8E, 0xE0]);
+    let (code, starts) = row_program_with_an_fs_user(&[0x8E, 0xE0]);
     let legs = run_both(&code, &starts, no_perturb);
     let counts = row_counts(&legs.native, "0x8e_mov_sreg");
     assert_eq!(
@@ -3414,8 +3553,9 @@ fn interpret_one_cli_faults_in_v86_with_the_window_open() {
 ))]
 #[test]
 fn a_demoted_protected_mode_segment_load_recompiles_as_a_hard_boundary() {
-    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`.
-    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    /// `mov eax,0x1111; mov es,dx; mov ax,es; hlt`. The tail BAKES ES, which is what keeps
+    /// the moved record inside the slot's suffix mask; see `PROTECTED_CODE`.
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x8C, 0xC0, 0xF4];
     const STARTS_ES: &[u32] = &[0, 5, 7];
 
     let mut program = vec![0u8; 0x2000];
@@ -3529,17 +3669,19 @@ fn a_demoted_protected_mode_segment_load_recompiles_as_a_hard_boundary() {
 ))]
 #[test]
 fn a_demotion_in_a_chained_successor_retires_the_successor_and_not_the_root() {
-    // Block A: three `inc eax` and a jump into B. Block B: three `inc eax`, the segment load, one
-    // more, then HLT. `jmp +0` lands on the instruction after it, which is B's entry.
+    // Block A: three `inc eax` and a jump into B. Block B: three `inc eax`, the segment load, a
+    // `mov ax,es` behind it, then HLT. `jmp +0` lands on the instruction after it, which is B's
+    // entry. The tail reads ES back deliberately: since S4f that is what keeps the moved record
+    // inside the slot's suffix mask and therefore inside R2's compare.
     const CODE: &[u8] = &[
         0x40, 0x40, 0x40, // block A                    +0 +1 +2
         0xEB, 0x00, // jmp +0, terminal, static link     +3
         0x40, 0x40, 0x40, // block B                     +5 +6 +7
         0x8E, 0xC2, // mov es,dx -- the call-out slot    +8
-        0x40, // one slot after it, so it is mid-block   +10
-        0xF4, //                                         +11
+        0x8C, 0xC0, // mov ax,es -- mid-block, and BAKES ES so the suffix mask holds it  +10
+        0xF4, //                                         +12
     ];
-    const STARTS: &[u32] = &[0, 1, 2, 3, 5, 6, 7, 8, 10, 11];
+    const STARTS: &[u32] = &[0, 1, 2, 3, 5, 6, 7, 8, 10, 12];
     let entry_b = ENTRY + 5;
     let slot = ENTRY + 8;
 
@@ -3767,7 +3909,7 @@ fn a_demoted_site_is_filed_under_the_blocks_mode_key_and_not_the_live_one() {
 #[test]
 fn a_demotion_past_the_site_cap_keeps_its_block_instead_of_recompiling_for_ever() {
     /// `mov eax,0x1111; mov es,dx; inc eax; hlt`, the shape `PROTECTED_CODE` uses with FS.
-    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x8C, 0xC0, 0xF4];
     const STARTS_ES: &[u32] = &[0, 5, 7];
 
     let mut program = vec![0u8; 0x2000];
@@ -3878,8 +4020,9 @@ fn a_demotion_past_the_site_cap_keeps_its_block_instead_of_recompiling_for_ever(
 ))]
 #[test]
 fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
-    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`.
-    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    /// `mov eax,0x1111; mov es,dx; mov ax,es; hlt`. The tail BAKES ES, which is what keeps
+    /// the moved record inside the slot's suffix mask; see `PROTECTED_CODE`.
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x8C, 0xC0, 0xF4];
     const STARTS_ES: &[u32] = &[0, 5, 7];
 
     let mut program = vec![0u8; 0x2000];
@@ -3978,8 +4121,9 @@ fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
 ))]
 #[test]
 fn overwriting_a_demoted_sites_code_lets_it_be_a_call_out_again() {
-    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`.
-    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    /// `mov eax,0x1111; mov es,dx; mov ax,es; hlt`. The tail BAKES ES, which is what keeps
+    /// the moved record inside the slot's suffix mask; see `PROTECTED_CODE`.
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x8C, 0xC0, 0xF4];
     const STARTS_ES: &[u32] = &[0, 5, 7];
     let slot = ENTRY + 5;
 
@@ -4264,7 +4408,7 @@ fn an_entry_interrupt_shadow_refuses_resume_for_every_row() {
     let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
     for row in jit::direct::InterpretOneRow::ALL {
         assert!(
-            !snapshot.allows_resume(&cpu, ENTRY + 5, row),
+            !snapshot.allows_resume(&cpu, ENTRY + 5, row, ALL_SEGMENTS),
             "{} resumed under an entry shadow",
             row.label()
         );
@@ -4285,7 +4429,7 @@ fn only_the_arming_rows_may_resume_with_a_step_armed_shadow() {
     cpu.interrupt_shadow = true;
     for row in jit::direct::InterpretOneRow::ALL {
         assert_eq!(
-            snapshot.allows_resume(&cpu, ENTRY + 5, row),
+            snapshot.allows_resume(&cpu, ENTRY + 5, row, ALL_SEGMENTS),
             row.arms_interrupt_shadow(),
             "{} disagreed with its own arming answer",
             row.label()
@@ -4317,7 +4461,7 @@ fn the_interrupt_enable_relaxation_is_the_sti_row_alone() {
     cpu.registers.eflags = 0x202;
     for row in jit::direct::InterpretOneRow::ALL {
         assert_eq!(
-            snapshot.allows_resume(&cpu, ENTRY + 5, row),
+            snapshot.allows_resume(&cpu, ENTRY + 5, row, ALL_SEGMENTS),
             row.takes_interrupt_enable_edge(),
             "{} disagreed with its own interrupt-enable answer",
             row.label()
@@ -5056,5 +5200,197 @@ fn a_block_that_resumes_past_the_sti_breaks_the_run_where_the_interpreter_does()
     assert_eq!(
         native_breaks, interpreted,
         "the block must end the run at the same transition the interpreter breaks on"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. S4f: the suffix-used relaxation of R2, and the successor bar that pays for it.
+//
+// A segment-writing call-out compares only the records the slots BEHIND it depend on, plus CS and
+// SS. What makes that sound is not an argument about the block's own slots -- R2 covers those --
+// but the bar on publishing successors: a chained transfer jumps into a successor's body without
+// returning to `run_direct_block`, so its `data_matches` never runs, and nothing in the mask says
+// anything about what a successor bakes.
+// ---------------------------------------------------------------------------
+
+/// A block holding a segment-writing call-out publishes NO successors, and registers no waiting
+/// link either.
+///
+/// The two assertions are one claim seen from both ends. `is_segment_write_block` is what
+/// `run_direct_block` reads to clamp the quota to one; the `waiting` map is what `install` fills
+/// when a successor is not compiled yet, and a block that names no successor must add nothing to
+/// it. A predicate that said "no successors" while the install still queued the target would link
+/// the moment the target appeared.
+///
+/// MUTATION: leave `callout_segment_writes` out of `segment_write_block` and both fail.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn segment_writing_callout_block_publishes_no_successors() {
+    // mov ax,0x1111; mov fs,ax; inc ax; hlt -- the HLT is the barrier, so the block would
+    // otherwise publish its fallthrough.
+    let (code, starts) = row_program(&[0x8E, 0xE0]);
+    let (cpu, _, block) = build_native(&code, &starts);
+    assert!(
+        block.is_segment_write_block(),
+        "an InterpretOne row that can write a segment must bar the block's successors"
+    );
+    assert_eq!(
+        cpu.jit_direct.waiting_len_for_test(),
+        0,
+        "a block with no successors must queue no waiting link"
+    );
+
+    // The control differs by the row alone: `xchg ax,cx` is a call-out that writes no segment.
+    let (code, starts) = row_program(&[0x91]);
+    let (cpu, _, block) = build_native(&code, &starts);
+    assert!(
+        !block.is_segment_write_block(),
+        "control: a call-out that writes no segment must keep its successors"
+    );
+    assert_eq!(
+        cpu.jit_direct.waiting_len_for_test(),
+        1,
+        "control: and it must queue its fallthrough"
+    );
+}
+
+/// The chained shape, which is the one the bar exists for.
+///
+/// `A -> B -> C`, all three installed. A's `jmp +0` is a static link into B and the transfer
+/// happens inside the native run. B holds a segment-writing call-out that RESUMES -- no later slot
+/// in B bakes FS, so the moved record cannot reach anything -- and B's own `jmp +0` into C is
+/// published as nothing. C is therefore reached by returning to the dispatcher, which re-runs the
+/// entry check that a chained transfer would have skipped.
+///
+/// MUTATION: publish B's successors anyway and the linked-transfer count reads two instead of one,
+/// which is C entered against a base the call-out was free to move.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
+    const CODE: &[u8] = &[
+        0x40, 0x40, 0x40, // A: inc eax x3                    +0 +1 +2
+        0xEB, 0x00, // jmp +0, static link into B             +3
+        0x40, 0x40, // B: inc eax x2                          +5 +6
+        0x8E, 0xE2, // mov fs,dx -- the call-out that resumes +7
+        0x40, // inc eax; bakes NO segment              +9
+        0xEB, 0x00, // jmp +0, would link into C              +10
+        0x40, 0x40, 0x40, // C: inc eax x3                    +12 +13 +14
+        0xF4, //                                              +15
+    ];
+    const STARTS: &[u32] = &[0, 1, 2, 3, 5, 6, 7, 9, 10, 12, 13, 14, 15];
+    let entry_b = ENTRY + 5;
+    let entry_c = ENTRY + 12;
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+
+    let mut blocks = Vec::new();
+    // C is THREE: its `hlt` is unclassifiable, so it is the barrier rather than a fourth slot.
+    for (entry, slots) in [(ENTRY, 4u8), (entry_b, 5), (entry_c, 3)] {
+        let key = jit::direct::key_for(&cpu, entry, true).expect("fixture key");
+        let compilation =
+            jit::direct::compile(&mut cpu, entry, true).expect("every fixture block compiles");
+        assert_eq!(compilation.span.instructions, slots);
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let id = cpu
+            .jit_direct
+            .install(&compilation)
+            .expect("install the fixture block");
+        blocks.push(cpu.jit_direct.block(id).expect("the block must be live"));
+    }
+    assert!(
+        blocks[1].is_segment_write_block(),
+        "B carries the call-out that can write a segment"
+    );
+    assert!(!blocks[0].is_segment_write_block());
+    assert!(!blocks[2].is_segment_write_block());
+
+    arm_protected(&mut cpu, &mut bus, SEL_OTHER);
+    let transfers = cpu.perf_counters().jit_direct_linked_transfers;
+    let insns = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, blocks[0])
+            .expect("the chain must not stop the machine")
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - transfers,
+        1,
+        "A links into B and B links into nothing"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - insns,
+        9,
+        "A's four and B's five: the call-out resumed rather than ending the run"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_executed, 1);
+    assert_eq!(stalls.callout_interpret_one_resync, 0);
+    assert_eq!(
+        cpu.registers.eip, entry_c,
+        "the run must return to the dispatcher at C's entry"
+    );
+
+    // And C is reached from there, through the entry check a chained transfer would have skipped.
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, blocks[2])
+            .expect("C must not stop the machine")
+    );
+    assert_eq!(cpu.registers.eip, ENTRY + 15);
+}
+
+/// SS is in the mask ALWAYS, however empty the suffix is.
+///
+/// `mov ss,dx` with a 16-bit stack descriptor moves `default_size_32`, which is `jit_mode_key`
+/// bit 3 and the width every stack slot in every block is emitted against. The suffix here is a
+/// single `inc eax`, which bakes nothing at all, so this is exactly the case a mask built from the
+/// suffix alone would wave through.
+///
+/// MUTATION: drop the SS bit from the mask and this resumes, reporting three instructions.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_stack_width_change_resyncs_even_with_an_empty_suffix() {
+    // mov eax,0x1111; mov ss,dx; inc eax; hlt
+    const CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xD2, 0x40, 0xF4];
+    const STARTS: &[u32] = &[0, 5, 7];
+    let mut legs = run_both_protected_program(CODE, STARTS, SEL_SS16, no_perturb);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "a stack width change must RESYNC whatever the suffix uses"
+    );
+    assert_eq!(legs.native_insns, 2, "the prefix plus the retired load");
+    assert_legs_agree(&mut legs);
+    assert!(
+        !legs
+            .native
+            .registers
+            .segment(SegmentIndex::Ss)
+            .default_size_32,
+        "the load itself must have happened, and taken the 16-bit stack"
     );
 }

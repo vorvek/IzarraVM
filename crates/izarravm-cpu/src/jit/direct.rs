@@ -452,6 +452,12 @@ impl CompiledBlock {
     /// second conjunct is what separates them, and nothing else in the function can produce the
     /// pair.
     ///
+    /// `segment_write_block` itself has TWO PRODUCERS since S4f and the proof above is unchanged
+    /// by that: it is a proof about the two `successors` arms, not about what sets the flag. The
+    /// producers are the `LoadSegReal`/`PopSegReal` lowerings and the `InterpretOne` rows whose
+    /// `may_write_segment` says yes, and they reach the flag through separate accumulators so that
+    /// only the first also marks `dirty_segments`.
+    ///
     /// What this costs the block is not one extra boundary. `run_direct_block` computes
     /// `chain_eligible` from `has_linked_successor`, so a block with no successors can never
     /// chain and its quota is clamped to 1: every entry runs this block alone and returns through
@@ -1721,6 +1727,13 @@ impl BlockCache {
     pub(crate) fn note_decline_memo_advance(&mut self, swept: bool) {
         self.stalls.decline_memo_advances += 1;
         self.stalls.decline_memo_sweeps += u64::from(swept);
+    }
+
+    /// How many link targets are waiting for a block to appear. A block that publishes no
+    /// successors must add none, which is what the segment-write bar means at this level.
+    #[cfg(test)]
+    pub(crate) fn waiting_len_for_test(&self) -> usize {
+        self.waiting.len()
     }
 
     #[cfg(test)]
@@ -5749,9 +5762,10 @@ fn stack_width_kind(
         //
         // The kind that comes out reports NO segment write, where `LoadSegReal` reported one, so
         // this block's `dirty_segments` mask no longer learns that the instruction can move a
-        // record. Safe for one reason, stated because it is not local: R2 byte-compares all six
-        // cached records after the step, so a slot that moved one ends the run before any later
-        // slot addresses through it.
+        // record. Safe for one reason, stated because it is not local: R2 compares every record
+        // the LATER SLOTS bake, so a slot that moved one of those ends the run before any of them
+        // addresses through it -- and the block publishes no successors, so there is no chained
+        // body to enter against a record it moved either.
         DirectKind::LoadSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
             DirectKind::CallOut {
                 helper: CallOutHelper::InterpretOne {
@@ -6396,7 +6410,20 @@ fn compile_with_budget(
     // Built during the walk rather than after it, because each cell carries its slot's GUEST
     // OFFSET and length, which are in hand here and would have to be recovered from `slots` and
     // `span.key.linear` afterwards.
-    let mut interpret_one_cells: Vec<Arc<InterpretOneCell>> = Vec::new();
+    // Paired with the SLOT INDEX the cell belongs to, not left in walk order, and design review
+    // 11.1 B2 is the reason: the suffix mask is filled by index after the walk, and a cell pushed
+    // for an instruction that was then abandoned before `slots.push` would silently shift every
+    // later cell onto the wrong slot's suffix. Under-pinning a mask is a miscompile that no test
+    // asserting the count alone would see.
+    let mut interpret_one_cells: Vec<(usize, Arc<InterpretOneCell>)> = Vec::new();
+    // How many `InterpretOne` slots hold a row that can overwrite a segment register.
+    //
+    // Feeds `segment_write_block` and NOTHING ELSE -- in particular not `dirty_segments`, which
+    // would end the block at the next slot that uses the segment and take the whole relaxation
+    // with it. What makes that safe is R2: a resumed slot has already compared every record the
+    // remaining slots depend on, so a later slot only ever runs against records the step left
+    // alone.
+    let mut callout_segment_writes = 0usize;
     let x87_entry_top = cpu.fpu.top();
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
@@ -6984,9 +7011,14 @@ fn compile_with_budget(
                 let row = helper
                     .interpret_one_row()
                     .expect("an InterpretOne helper names its census row");
-                interpret_one_cells.push(Arc::new(InterpretOneCell::new(
-                    key, slot_delta, insn.len, row,
-                )));
+                callout_segment_writes += usize::from(row.may_write_segment());
+                // `slots.len()` IS the index this instruction is about to take: the push happens
+                // further down the same iteration and nothing between here and it can `break`.
+                // The assertion after the walk is what keeps that true.
+                interpret_one_cells.push((
+                    slots.len(),
+                    Arc::new(InterpretOneCell::new(key, slot_delta, insn.len, row)),
+                ));
             }
         }
         if let DirectKind::X87 { insn, .. } = kind {
@@ -7012,6 +7044,20 @@ fn compile_with_budget(
         if let Some(segment) = kind.write_segment() {
             write_segments |= segment_bit(segment);
         }
+        // Design review 11.1 M4: the suffix mask is only sound if a slot that ADDRESSES memory
+        // pins the segment it addresses through, because the mask is built out of exactly that
+        // answer. A kind that touched guest memory while pinning nothing would let a resumed
+        // segment write leave a stale base under it and R2 would compare nothing about it.
+        debug_assert!(
+            kind.pinned_segments() != 0
+                || (kind.byte_reads() == 0
+                    && kind.word_reads() == 0
+                    && kind.dword_reads() == 0
+                    && kind.byte_stores() == 0
+                    && kind.word_stores() == 0
+                    && kind.dword_stores() == 0),
+            "a kind with a data access must pin the segment it reaches it through"
+        );
         pinned_segments |= kind.pinned_segments();
         // AFTER the test above, never before, or the write would bar itself.
         if let Some(segment) = kind.written_segment() {
@@ -7139,6 +7185,63 @@ fn compile_with_budget(
             CompileStop::Boundary => CompileOutcome::Retry(RetryCause::TooShort),
         };
     }
+    // THE SUFFIX MASK (design section 11). One backward pass, after the walk, because the answer
+    // for a slot is a fact about everything behind it and the walk does not know that while it is
+    // still growing.
+    //
+    // The union is `pinned_segments`, which is read union write union selector, and it is that
+    // definition rather than "the segments a later slot reads": `MovSegToReg` bakes a SELECTOR as
+    // a compile-time constant and reports through neither read nor write, so a mask built from the
+    // access accessors alone would let a resumed `mov ds, ax` leave a stale selector baked into a
+    // `mov ax, ds` behind it.
+    //
+    // STRICTLY after: a slot's own pinned set is not in its mask. The slot has already run by the
+    // time R2 is asked, and its own operand was resolved against the records as they stood before
+    // the step.
+    {
+        debug_assert_eq!(
+            interpret_one_cells.len(),
+            slots
+                .iter()
+                .filter(|slot| slot
+                    .kind
+                    .call_out_helper()
+                    .is_some_and(|helper| helper.interprets_one()))
+                .count(),
+            "an InterpretOne cell was allocated for an instruction that did not become a slot"
+        );
+        let mut suffix = 0u8;
+        let mut cells = interpret_one_cells.iter_mut().rev().peekable();
+        for index in (0..slots.len()).rev() {
+            while cells.peek().is_some_and(|(at, _)| *at == index) {
+                let (_, cell) = cells.next().expect("peeked");
+                let cell = Arc::get_mut(cell)
+                    .expect("the compile walk owns its cells until install clones them");
+                cell.set_suffix_used(suffix);
+            }
+            suffix |= slots[index].kind.pinned_segments();
+        }
+        debug_assert!(
+            cells.next().is_none(),
+            "a cell named a slot index off the end"
+        );
+        // `used` IS `pinned_segments` (SegmentLayout::capture), and the mask is a union over a
+        // SUBSET of the slots that produced it, so this is a subset by construction. Asserted
+        // because the entry check leans on it: `data_matches` compares the block-wide `used`, and
+        // a mask reaching outside it would be comparing a record the block never pinned.
+        debug_assert_eq!(
+            interpret_one_cells
+                .iter()
+                .fold(0u8, |mask, (_, cell)| mask | cell.suffix_used())
+                & !pinned_segments,
+            0,
+            "a suffix mask named a segment the block does not pin"
+        );
+    }
+    let interpret_one_cells: Vec<Arc<InterpretOneCell>> = interpret_one_cells
+        .into_iter()
+        .map(|(_, cell)| cell)
+        .collect();
     let Some(last) = slots.last() else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
@@ -7344,7 +7447,18 @@ fn compile_with_budget(
     // base the write just invalidated. That argument survives the chain-used mask
     // (dev_docs/plans/2026-08-18-chain-used-link-mask.md), which is about frozen compile-time
     // capture and says nothing about a value the block is about to overwrite at run time.
-    let segment_write_block = segment_writes != 0;
+    // TWO producers now, not one. `segment_writes` counts the `LoadSegReal`/`PopSegReal`
+    // lowerings; `callout_segment_writes` counts the `InterpretOne` slots whose row can call
+    // `load_segment_checked`. The bar is the same and so is the argument for it: a chained
+    // transfer jumps into a successor's body without returning to `run_direct_block`, so its
+    // `data_matches` never runs, and a block that can overwrite a segment register must therefore
+    // be where the chain ENDS.
+    //
+    // The call-out producer is what pays for the suffix-used relaxation of R2. That relaxation
+    // lets a slot resume having moved a record no LATER SLOT IN THIS BLOCK uses; a linked
+    // successor is not a later slot in this block, and nothing in the mask says anything about
+    // what it bakes.
+    let segment_write_block = segment_writes != 0 || callout_segment_writes != 0;
     let dynamic_successor = !segment_write_block
         && matches!(
             slots.last().map(|slot| slot.kind),

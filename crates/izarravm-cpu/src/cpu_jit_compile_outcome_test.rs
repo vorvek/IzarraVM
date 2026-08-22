@@ -1051,7 +1051,7 @@ fn only_the_call_out_port_opcode_is_admitted_at_word() {
 
 /// A block that overwrites a segment register is counted at the dispatcher entry.
 ///
-/// `segment_writes != 0` makes `compile` publish `successors = [None, None]`, which makes
+/// A nonzero segment-write count makes `compile` publish `successors = [None, None]`, which makes
 /// `chain_eligible` false and clamps the quota to 1: the block can never chain, so every entry
 /// runs it alone and returns through the full prologue and epilogue. That is the cost the
 /// dirty-stop census cannot see, because it applies to EVERY block containing a segment write and
@@ -1067,6 +1067,11 @@ fn only_the_call_out_port_opcode_is_admitted_at_word() {
 fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     // inc eax / inc ecx / mov ds,ax / <barrier>, against inc eax / inc ecx / inc edx / <barrier>.
     let writes = [0x40, 0x41, 0x8e, 0xd8, DIRECT_BARRIER, 0x43, 0x44];
+    // The SECOND producer of a segment write, added with S4f: an `InterpretOne` row whose
+    // `may_write_segment` says yes. `mov fs,ax` is a call-out in every mode, so it reaches the bar
+    // through `callout_segment_writes` rather than through the `LoadSegReal` lowering above --
+    // and the bar is what pays for the suffix-used relaxation of R2.
+    let callout = [0x40, 0x41, 0x8e, 0xe0, DIRECT_BARRIER, 0x43, 0x44];
     let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x43, 0x44, 0x45];
     // The OTHER arm that publishes `[None, None]`: a terminal whose successor is dynamic. It is
     // what makes the `!dynamic_successor` conjunct load-bearing, because a predicate written as
@@ -1077,6 +1082,12 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
         (
             "segment write",
             writes.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            1,
+        ),
+        (
+            "segment-writing call-out",
+            callout.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
         ),
