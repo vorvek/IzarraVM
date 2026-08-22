@@ -388,6 +388,16 @@ pub(crate) struct BlockCacheStats {
     pub portals_hidden: u64,
 }
 
+/// One allowlist row's four outcome counts. A struct rather than four parallel arrays so a row's
+/// numbers stay adjacent in the tally, the report and the probe JSON alike.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InterpretOneRowTally {
+    pub(crate) executed: u64,
+    pub(crate) resync: u64,
+    pub(crate) resync_fault: u64,
+    pub(crate) demoted: u64,
+}
+
 /// The stall tallies, deliberately NOT part of `BlockCacheStats`.
 ///
 /// `BlockCacheStats` is DRAINED by `take_stats` on every dispatcher exit and folded into
@@ -473,6 +483,20 @@ pub(crate) struct DirectStallTally {
     pub callout_interpret_one_resync_fault: u64,
     pub callout_interpret_one_abnormal: u64,
     pub callout_interpret_one_demoted: u64,
+    /// The same family, split by the allowlist ROW the slot was admitted as, indexed by
+    /// `InterpretOneRow::index`.
+    ///
+    /// The scalars above cannot answer the question the plan grades this slice on. Its rule is "a
+    /// row the governor demotes on the loader at more than 50% is refuted and removed from the
+    /// list", and a whole-CPU `resync / executed` says the family resynced without saying which
+    /// row did it. With nine rows admitted, one bad row hiding behind eight good ones is exactly
+    /// the shape that ratio cannot see.
+    ///
+    /// ABNORMAL is deliberately not among the four. A demoted slot takes the abnormal exit from
+    /// its emitted prologue WITHOUT calling the helper, so there is no cell in scope to attribute
+    /// it to and a per-row abnormal count would be silently short by every post-demotion exit.
+    /// The scalar stays the honest home for it.
+    pub callout_interpret_one_rows: [InterpretOneRowTally; InterpretOneRow::COUNT],
     /// Code writes taken while a call-out window was open, i.e. writes that reported a hit and
     /// were replayed at the drain instead of invalidating under a live native frame.
     ///
@@ -1773,6 +1797,19 @@ impl crate::jit::JitState {
             callout_interpret_one_resync_fault: self.stalls.callout_interpret_one_resync_fault,
             callout_interpret_one_abnormal: self.stalls.callout_interpret_one_abnormal,
             callout_interpret_one_demoted: self.stalls.callout_interpret_one_demoted,
+            callout_interpret_one_rows: InterpretOneRow::ALL
+                .iter()
+                .map(|row| {
+                    let tally = self.stalls.callout_interpret_one_rows[row.index()];
+                    crate::InterpretOneRowCounts {
+                        row: row.label(),
+                        executed: tally.executed,
+                        resync: tally.resync,
+                        resync_fault: tally.resync_fault,
+                        demoted: tally.demoted,
+                    }
+                })
+                .collect(),
             callout_deferred_code_writes: self.stalls.callout_deferred_code_writes,
             callout_slot_cap_hits: self.stalls.callout_slot_cap_hits,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
@@ -1851,24 +1888,34 @@ impl crate::jit::JitState {
 
     /// The `InterpretOne` family's five increments, all on the helper's already-off-native path
     /// or on a compile walk, and ungated for the reason `note_callout_executed` is.
-    pub(crate) fn note_interpret_one_executed(&mut self) {
+    ///
+    /// Four of the five keep a PER-ROW count beside the scalar, and the pair costs one extra
+    /// increment on a path that is already off the native lane -- the row index is a field of the
+    /// cell the helper is holding, so there is no lookup. Nothing is gated: these sit exactly
+    /// where the scalars already sat.
+    pub(crate) fn note_interpret_one_executed(&mut self, row: InterpretOneRow) {
         self.stalls.callout_interpret_one_executed += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].executed += 1;
     }
 
-    pub(crate) fn note_interpret_one_resync(&mut self) {
+    pub(crate) fn note_interpret_one_resync(&mut self, row: InterpretOneRow) {
         self.stalls.callout_interpret_one_resync += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].resync += 1;
     }
 
-    pub(crate) fn note_interpret_one_resync_fault(&mut self) {
+    pub(crate) fn note_interpret_one_resync_fault(&mut self, row: InterpretOneRow) {
         self.stalls.callout_interpret_one_resync_fault += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].resync_fault += 1;
     }
 
+    /// No per-row sibling; see the `callout_interpret_one_rows` field for why.
     pub(crate) fn note_interpret_one_abnormal(&mut self) {
         self.stalls.callout_interpret_one_abnormal += 1;
     }
 
-    pub(crate) fn note_interpret_one_demoted(&mut self) {
+    pub(crate) fn note_interpret_one_demoted(&mut self, row: InterpretOneRow) {
         self.stalls.callout_interpret_one_demoted += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].demoted += 1;
     }
 
     pub(crate) fn note_deferred_code_write(&mut self) {

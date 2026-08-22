@@ -519,7 +519,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             && matches!(insn.operand?, DecodedOperand::Reg(_));
         if !native_bt {
             return Some(DirectKind::CallOut {
-                helper: CallOutHelper::InterpretOne,
+                helper: CallOutHelper::InterpretOne {
+                    row: InterpretOneRow::BitString,
+                },
             });
         }
     }
@@ -952,7 +954,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // the explicit prefix is common. A LOCK'd form never reaches this arm.
             0x86 | 0x87 | 0x91..=0x97 => {
                 return Some(DirectKind::CallOut {
-                    helper: CallOutHelper::InterpretOne,
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Xchg,
+                    },
                 });
             }
             // CBW / CWDE. Unlike NOP and CLD/STD immediately below, this one IS in the
@@ -1077,7 +1081,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // there is no class gate to inherit.
             0x8f if insn.modrm.is_some_and(|m| m.reg == 0) => {
                 return Some(DirectKind::CallOut {
-                    helper: CallOutHelper::InterpretOne,
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::PopRm,
+                    },
                 });
             }
             // CWD / CDQ, same reasoning as 0x98 immediately above.
@@ -1111,7 +1117,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // invocation.
             0xfa => {
                 return Some(DirectKind::CallOut {
-                    helper: CallOutHelper::InterpretOne,
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Cli,
+                    },
                 });
             }
             // CLC (0xf8) and STC (0xf9). Behind `IZARRAVM_V86_LOOP_ROWS`; `0xf8` is the tombraid
@@ -1501,7 +1509,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     // operand size, which is what already lets `0x8c` sit on the Word allowlist,
                     // and the call-out inherits that by running the interpreter's own arm.
                     return Some(DirectKind::CallOut {
-                        helper: CallOutHelper::InterpretOne,
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::MovRmSreg,
+                        },
                     });
                 };
                 return Some(DirectKind::MovSegToReg { dst, segment });
@@ -1542,6 +1552,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
             // fault burns a call-out and a governor execution on every execution, and 0x8c is NOT
             // the symmetric case to copy -- `MOV r16, CS` is legal where `MOV CS, r16` is not.
             //
+            // A CALL-OUT SLOT REPORTS NO SEGMENT WRITE, unlike the `LoadSegReal` lowering it
+            // replaces: `DirectKind::written_segment` answers `None` for it, so the block's
+            // `dirty_segments` mask does not learn that this instruction can move a record and the
+            // compile walk goes on admitting later slots that address through it. That is safe for
+            // exactly one reason, and it is worth stating because it is not local: R2
+            // byte-compares all six cached records after the step, so a slot that moved one ends
+            // the run before any later slot executes. A resumed block therefore baked nothing
+            // stale, and a block that would have baked something stale never resumed.
+            //
             // `/2` (SS) is refused for a reason of its own, and it is the reason design review M8
             // gives for keeping the whole SS family out: loading SS arms a one-instruction
             // interrupt shadow (`load_segment_arming_ss_shadow`), so it fails R3's shadow clause
@@ -1554,14 +1573,18 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     3 => SegmentIndex::Ds,
                     4 | 5 => {
                         return Some(DirectKind::CallOut {
-                            helper: CallOutHelper::InterpretOne,
+                            helper: CallOutHelper::InterpretOne {
+                                row: InterpretOneRow::MovSreg,
+                            },
                         });
                     }
                     _ => return None,
                 };
                 let DecodedOperand::Reg(src) = insn.operand? else {
                     return Some(DirectKind::CallOut {
-                        helper: CallOutHelper::InterpretOne,
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::MovSreg,
+                        },
                     });
                 };
                 return Some(DirectKind::LoadSegReal { segment, src });
@@ -1901,7 +1924,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     && matches!(m.reg, 2..=7)
                 {
                     return Some(DirectKind::CallOut {
-                        helper: CallOutHelper::InterpretOne,
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::Group3,
+                        },
                     });
                 }
                 // NEG r/m32, register form. Deliberately carries NO width field: this arm sits
@@ -2041,7 +2066,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     DecodedOperand::Mem(addr) => {
                         if width == MemoryWidth::Word {
                             return Some(DirectKind::CallOut {
-                                helper: CallOutHelper::InterpretOne,
+                                helper: CallOutHelper::InterpretOne {
+                                    row: InterpretOneRow::Group3,
+                                },
                             });
                         }
                         Some(DirectKind::TestImmMem {
@@ -2093,7 +2120,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         width: MemoryWidth::Byte,
                     }),
                     DecodedOperand::Mem(_) => Some(DirectKind::CallOut {
-                        helper: CallOutHelper::InterpretOne,
+                        helper: CallOutHelper::InterpretOne {
+                            row: InterpretOneRow::IncDecRm8,
+                        },
                     }),
                 };
             }
@@ -2177,7 +2206,9 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     // width because the interpreter's own `push` reads SS.B for itself.
                     if insn.operand_size != OperandSize::Dword {
                         return Some(DirectKind::CallOut {
-                            helper: CallOutHelper::InterpretOne,
+                            helper: CallOutHelper::InterpretOne {
+                                row: InterpretOneRow::PushRm,
+                            },
                         });
                     }
                     return Some(DirectKind::PushMem {

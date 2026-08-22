@@ -29,6 +29,7 @@ pub(crate) use segment_layout::*;
 pub(crate) use callout::ResumeSnapshot;
 pub(crate) use callout::{
     CALL_OUT_STACK_FRAME_DWORDS, CallOutHelper, CallOutSlotCounts, CallOutTable, InterpretOneCell,
+    InterpretOneRow,
 };
 #[cfg(test)]
 pub(crate) use callout::{
@@ -464,9 +465,11 @@ impl CompiledBlock {
     }
 
     /// Call-out slots that run one interpreter instruction. Priced at
-    /// `INTERPRET_ONE_MAX_CORE_CLOCKS` plus two worst-width data accesses each in
-    /// `compute_iteration_upper`, because unlike the other two classes this one is a maximum over
-    /// an allowlist rather than one opcode's constant.
+    /// `INTERPRET_ONE_MAX_CORE_CLOCKS` plus `INTERPRET_ONE_MAX_DATA_ACCESSES` worst-width data
+    /// accesses each in `compute_iteration_upper`, because unlike the other two classes this one
+    /// is a maximum over an allowlist rather than one opcode's constant. Both constants are named
+    /// rather than restated: the access count was two while every row was a one-operand memory
+    /// form and is four since `0x8E` joined, and a literal here would have gone stale.
     pub(crate) fn callout_interpret_one_slots(&self) -> u32 {
         self.callout_slots.interpret_one()
     }
@@ -6428,9 +6431,17 @@ fn stack_width_kind(
         //
         // Deciding it HERE and not in `classify` is the same reason the refusal was here: the
         // mode is CPU state and `classify` has no CPU.
+        //
+        // The kind that comes out reports NO segment write, where `LoadSegReal` reported one, so
+        // this block's `dirty_segments` mask no longer learns that the instruction can move a
+        // record. Safe for one reason, stated because it is not local: R2 byte-compares all six
+        // cached records after the step, so a slot that moved one ends the run before any later
+        // slot addresses through it.
         DirectKind::LoadSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
             DirectKind::CallOut {
-                helper: CallOutHelper::InterpretOne,
+                helper: CallOutHelper::InterpretOne {
+                    row: InterpretOneRow::MovSreg,
+                },
             }
         }
         DirectKind::PopSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
@@ -7540,7 +7551,11 @@ fn compile_with_instruction_limit(
                 // `BlockSpan::new`, so the difference fits a `u16` with three bits to spare.
                 let slot_delta = u16::try_from(lin.wrapping_sub(entry_lin))
                     .expect("a page-local block's slot offset fits a u16");
-                interpret_one_cells.push(Arc::new(InterpretOneCell::new(slot_delta, insn.len)));
+                let row = helper
+                    .interpret_one_row()
+                    .expect("an InterpretOne helper names its census row");
+                interpret_one_cells
+                    .push(Arc::new(InterpretOneCell::new(slot_delta, insn.len, row)));
             }
         }
         if let DirectKind::X87 { insn, .. } = kind {

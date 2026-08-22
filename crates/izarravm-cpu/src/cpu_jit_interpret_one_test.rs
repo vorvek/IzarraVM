@@ -2413,9 +2413,13 @@ fn mov_sreg_core_clocks_is_what_the_interpreter_charges() {
 /// alone -- true of every slot, and a row admitted at the wrong layer would falsify it for the
 /// whole block rather than for itself.
 ///
-/// One row per shape the widening admits: a memory form with a ModRM, a register form, and a
-/// two-byte opcode routed above the `u8::try_from` truncation. Each is encoded with 32-bit
-/// addressing inside the 16-bit code segment, which is exactly what the 0x67 prefix means there.
+/// One case per shape the widening admits: memory forms with a ModRM, a two-byte opcode routed
+/// above the `u8::try_from` truncation, a group-3 sub-opcode intercepted at the head of its arm,
+/// and REGISTER forms, which carry no memory operand at all and are here because the refusal is
+/// on the PREFIX rather than on the operand: `prefixes_supported_for` compares the whole
+/// `Prefixes` struct against one that permits only the operand-size override, so an address-size
+/// override refuses a row that would not have used it. Each memory case is encoded with 32-bit
+/// addressing inside the 16-bit code segment, which is what the 0x67 prefix means there.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -2454,6 +2458,15 @@ fn the_widened_rows_still_refuse_an_address_size_prefix() {
         &[0x67, 0xFF, 0x35, 0x00, 0x18, 0x00, 0x00],
         // 67 8E 05 <disp32>: mov es, [disp32].
         &[0x67, 0x8E, 0x05, 0x00, 0x18, 0x00, 0x00],
+        // 67 F7 5D 00: neg word [ebp+0], the group-3 row, intercepted at the head of its arm
+        // rather than by the allowlist, so it is the one that could most easily have been routed
+        // ahead of the prefix gate.
+        &[0x67, 0xF7, 0x5D, 0x00],
+        // 67 0F A3 05 <disp32>: bt [disp32], ax, a TWO-BYTE opcode keyed above the u8 truncation.
+        &[0x67, 0x0F, 0xA3, 0x05, 0x00, 0x18, 0x00, 0x00],
+        // 67 91: xchg ax, cx. A REGISTER form, which has no address to override; it refuses
+        // because the prefix is present at all, which is the property under test.
+        &[0x67, 0x91],
     ] {
         let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
         code.extend_from_slice(row);
@@ -2862,5 +2875,279 @@ fn interpret_one_accessed_bit_write_off_watched_code_resumes() {
         legs.native_bus.memory[(GDT_BASE + u32::from(SEL_UNACCESSED) + 5) as usize] & 0x01,
         0x01,
         "the fixture is vacuous unless the write-back actually ran"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. The per-row census.
+// ---------------------------------------------------------------------------
+
+/// One row's counts out of a snapshot, by census label.
+fn row_counts(cpu: &CpuGsw, label: &str) -> crate::InterpretOneRowCounts {
+    let snapshot = cpu.direct_stall_snapshot();
+    *snapshot
+        .callout_interpret_one_rows
+        .iter()
+        .find(|counts| counts.row == label)
+        .unwrap_or_else(|| panic!("no census row labelled {label}"))
+}
+
+/// Every `InterpretOneRow` variant is in `ALL`, and every label is distinct.
+///
+/// The census array is indexed by `index()`, which is the discriminant, so a variant missing from
+/// `ALL` would leave a row that increments a slot nothing ever reports. A duplicated label would
+/// merge two rows in the probe JSON, which is the same failure one step later.
+#[test]
+fn interpret_one_row_labels_cover_every_variant() {
+    let labels: Vec<&'static str> = jit::direct::InterpretOneRow::ALL
+        .iter()
+        .map(|row| row.label())
+        .collect();
+    assert_eq!(labels.len(), jit::direct::InterpretOneRow::COUNT);
+    let mut sorted = labels.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), labels.len(), "two rows share a census label");
+    for (index, row) in jit::direct::InterpretOneRow::ALL.iter().enumerate() {
+        assert_eq!(
+            row.index(),
+            index,
+            "{} is not at its discriminant's position in ALL",
+            row.label()
+        );
+    }
+}
+
+/// Review MAJOR 4: an execution lands on the row that was ADMITTED, and on no other.
+///
+/// The whole point of the split is that one bad row cannot hide behind eight good ones, so the
+/// assertion is not "the right row moved" but "the right row moved AND the rest are zero". Three
+/// families, each run on its own fixture: `0x8C` through memory, the XCHG family, and CLI, which
+/// between them cover a store row, a register row and a row that touches no memory at all.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_executions_are_attributed_to_their_own_row() {
+    for (row, label) in [
+        (&[0x8Cu8, 0x07][..], "0x8c_mov_rm_sreg"),
+        (&[0x87, 0x07], "0x86_87_91_97_xchg"),
+        (&[0xFA], "0xfa_cli"),
+    ] {
+        let legs = assert_row_resumes(row, no_perturb);
+        let counts = row_counts(&legs.native, label);
+        assert_eq!(
+            (
+                counts.executed,
+                counts.resync,
+                counts.resync_fault,
+                counts.demoted
+            ),
+            (1, 0, 0, 0),
+            "row {label} must carry the execution"
+        );
+        let total: u64 = legs
+            .native
+            .direct_stall_snapshot()
+            .callout_interpret_one_rows
+            .iter()
+            .map(|counts| counts.executed)
+            .sum();
+        assert_eq!(
+            total, 1,
+            "row {label}'s execution must not have landed on a second row as well"
+        );
+        assert_eq!(
+            legs.native
+                .direct_stall_snapshot()
+                .callout_interpret_one_executed,
+            total,
+            "the scalar must be the sum of the per-row column"
+        );
+    }
+}
+
+/// A RESYNC is attributed too, which is the column the plan's refutation rule actually reads.
+///
+/// `0x8E` is the row whose resync rate decides whether it stays on the allowlist, so it is the one
+/// worth pinning: a segment load that moves the record must charge `0x8e_mov_sreg` and nothing
+/// else.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_resyncs_are_attributed_to_their_own_row() {
+    let (code, starts) = row_program(&[0x8E, 0xE0]);
+    let legs = run_both(&code, &starts, no_perturb);
+    let counts = row_counts(&legs.native, "0x8e_mov_sreg");
+    assert_eq!(
+        (counts.executed, counts.resync, counts.resync_fault),
+        (1, 1, 0),
+        "the segment load's resync must land on its own row"
+    );
+    let snapshot = legs.native.direct_stall_snapshot();
+    let resyncs: u64 = snapshot
+        .callout_interpret_one_rows
+        .iter()
+        .map(|counts| counts.resync)
+        .sum();
+    assert_eq!(
+        resyncs, snapshot.callout_interpret_one_resync,
+        "the scalar must be the sum of the per-row column"
+    );
+    assert_eq!(resyncs, 1, "no other row may have been charged");
+}
+
+/// A #DE inside the helper is attributed to the group-3 row, not to the family at large.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_faults_are_attributed_to_their_own_row() {
+    fn zero_divisor(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        cpu.registers.set_edx(0);
+        cpu.registers.set_ebx(0);
+        bus.memory[0..4].copy_from_slice(&[0x00, 0x05, 0x00, 0x00]);
+        bus.memory[0x500] = 0xF4;
+    }
+    let (code, starts) = row_program(&[0xF7, 0xF3]);
+    let legs = run_both(&code, &starts, zero_divisor);
+    let counts = row_counts(&legs.native, "0xf7_group3_word");
+    assert_eq!(
+        (counts.executed, counts.resync, counts.resync_fault),
+        (1, 0, 1),
+        "the divide fault must land on the group-3 row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. CLI in V86, where it is the one admitted row that can fault on its own.
+// ---------------------------------------------------------------------------
+
+/// CLI below IOPL 3 in a V86 task raises #GP from inside the helper, and the window stays open
+/// across the delivery.
+///
+/// This is the case the classifier's `0xfa` arm claims and nothing ran: `check_v86_iopl` is the
+/// FIRST statement of the interpreter's own arm, which is the arm the helper runs, so a V86 guest
+/// below IOPL 3 must raise the same #GP from inside a call-out that it raised at the barrier. Every
+/// other CLI fixture is real mode, where CLI cannot fault at all.
+///
+/// The block holds no memory slot -- `mov ax,imm`, the call-out, `inc ax` -- which is what makes a
+/// V86 fixture affordable here: nothing needs the fast map, so the whole machine is
+/// `v86_world`'s paging, GDT, IDT and TSS with the block compiled at `d = false`.
+///
+/// THE WINDOW EVIDENCE is `callout_deferred_code_writes`, the same counter
+/// `interpret_one_window_stays_open_across_fault_delivery` uses and for the same reason: the
+/// deferral is invisible from outside, because the drain makes the outcome identical either way.
+/// The fixture marks the ring-0 stack the delivery frame lands on as watched code, so those pushes
+/// have to be deferred rather than reach `invalidate_physical_range` with the block's native frame
+/// live on the host stack. A real V86 monitor's stack is not code; marking it is how the hazard is
+/// made reachable without contriving a tiny-model layout.
+///
+/// MUTATION: close the window before `finish_instruction` on the fault arm and the counter reads
+/// zero, which is the shape design review round 2's BLOCKER 1 had.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_cli_faults_in_v86_with_the_window_open() {
+    /// `mov ax,0x1111; cli; inc ax; hlt` at the V86 guest's CS:0.
+    const V86_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0xFA, 0x40, 0xF4];
+    /// Where `v86_world` puts the guest image, which is `enter_v86_direct`'s CS base.
+    const V86_BASE: u32 = 0xA000;
+    /// The monitor's HLT, so the delivered #GP halts instead of running off.
+    const MONITOR: &[u8] = &[0xF4];
+
+    let (mut cpu, mut bus) = super::super::v86_world(MONITOR, V86_CODE, &[0x00]);
+    super::super::enter_v86_direct(&mut cpu, 0, 0x1000);
+    // IOPL 0, which `enter_v86_direct` already sets, is the whole condition: at IOPL 3 the same
+    // instruction would succeed and resume. Stated rather than inherited.
+    assert_eq!(cpu.registers.eflags & 0x3000, 0, "the fixture needs IOPL 0");
+    assert!(cpu.is_v86_mode());
+
+    for offset in [0u32, 3, 4] {
+        let linear = V86_BASE + offset;
+        cpu.set_eip(offset);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(0);
+
+    let compilation = jit::direct::compile(&mut cpu, V86_BASE, false)
+        .expect("the V86 fixture must compile as a block");
+    assert_eq!(
+        compilation.span.instructions, BLOCK_INSTRUCTIONS,
+        "the block must carry the CLI and the slot after it"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "CLI must be the block's call-out slot"
+    );
+    let key = jit::direct::key_for(&cpu, V86_BASE, false).expect("a key for the V86 block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the V86 block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    // The delivery frame is ten dwords below ESP0 on the ring-0 stack. Marking it watched is what
+    // makes the deferral observable; see the note above.
+    cpu.mark_block_code_for_test(0x7000 - 40, 40);
+
+    cpu.set_eip(0);
+    cpu.registers.set_eax(0);
+    let before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("a delivered #GP must not stop the machine"),
+        "the block must run"
+    );
+
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutResyncFault as u32),
+        "a V86 CLI below IOPL 3 must take the not-retired RESYNC stub"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - before,
+        1,
+        "the block must report the PREFIX only: the fault path already counted the CLI"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync_fault, 1);
+    assert_eq!(
+        row_counts(&cpu, "0xfa_cli").resync_fault,
+        1,
+        "the fault must be attributed to the CLI row"
+    );
+    assert!(
+        stalls.callout_deferred_code_writes > 0,
+        "the delivery's pushes must have been DEFERRED, so the window was still open"
+    );
+
+    // The fault really was delivered, and to the monitor.
+    assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+    assert_eq!(
+        cpu.registers.cs().selector,
+        0x08,
+        "the ring-0 code selector"
+    );
+    assert_eq!(cpu.registers.eip, 0x8000, "the monitor's entry point");
+    assert_eq!(
+        cpu.registers.eflags & crate::FLAG_IF,
+        0,
+        "an interrupt gate clears IF on entry, so the guest's own CLI never ran"
     );
 }

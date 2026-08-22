@@ -1891,6 +1891,21 @@ pub struct DirectSmcCensusSnapshot {
     pub windowed: DirectSmcCensusPhase,
 }
 
+/// One `InterpretOne` allowlist row's outcome counts, named by its census label.
+///
+/// `row` is the label rather than the enum because `DirectStallSnapshot` is the crate's PUBLIC
+/// reporting surface and the classifier's row enum is an internal detail of the JIT; the label is
+/// what a probe JSON and a ladder report key on, exactly as `links_cleared` carries its cause as a
+/// `&'static str`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InterpretOneRowCounts {
+    pub row: &'static str,
+    pub executed: u64,
+    pub resync: u64,
+    pub resync_fault: u64,
+    pub demoted: u64,
+}
+
 /// Why the Direct backend gave up, split by mechanism rather than by outcome. Every entry here
 /// used to fold into a state (`Dormant`), a bool (`try_link_inner` returning false) or one
 /// catch-all counter (`SideExitReason::Other`), which is why the three largest unattributed exit
@@ -1922,6 +1937,11 @@ pub struct DirectStallSnapshot {
     pub callout_interpret_one_resync_fault: u64,
     pub callout_interpret_one_abnormal: u64,
     pub callout_interpret_one_demoted: u64,
+    /// The same family split by allowlist ROW, in `InterpretOneRow` order, so a ladder can rank
+    /// the rows against each other. The scalars above sum these four columns; `abnormal` has no
+    /// per-row column, because a demoted slot exits from its emitted prologue without a cell in
+    /// scope to attribute it to.
+    pub callout_interpret_one_rows: Vec<InterpretOneRowCounts>,
     pub callout_deferred_code_writes: u64,
     pub callout_slot_cap_hits: u64,
     /// Native entries refused because a call-out-bearing block met the privileged port state.

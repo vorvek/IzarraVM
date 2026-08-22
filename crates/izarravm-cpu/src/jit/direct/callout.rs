@@ -369,6 +369,84 @@ impl CallOutTable {
     }
 }
 
+/// Which OPCODE FAMILY an `InterpretOne` slot came from, so the census can rank the allowlist's
+/// rows against each other instead of summing them.
+///
+/// The plan's acceptance rule for this slice is "a row the governor demotes on the loader at more
+/// than 50% is refuted and removed from the list". That rule was unmeasurable as shipped:
+/// `callout_interpret_one_executed` and its four siblings are whole-CPU scalars, and the cell a
+/// slot carries had no identity, so a run could say the family resynced 40% of the time and not
+/// which row did it. One class per admitted family, chosen at `classify` where the admission is
+/// made rather than re-derived from the opcode later, because a second derivation is a second
+/// chance to disagree with the first.
+///
+/// FAMILY and not opcode. `Xchg` covers `0x86`, `0x87` and `0x91..=0x97` because they are one
+/// classifier arm and one interpreter arm, and a census that split them would rank three shares of
+/// one decision. The families are exactly the units the S3 commits admitted, so a refutation lands
+/// on something that can be reverted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum InterpretOneRow {
+    /// `0x8F` POP r/m, the S2 row.
+    PopRm = 0,
+    /// `0x8C` MOV r/m16,Sreg, memory form.
+    MovRmSreg,
+    /// `0x86`, `0x87` and `0x91..=0x97`.
+    Xchg,
+    /// `0x0FA3`, `0x0FAB`, `0x0FB3`, `0x0FBB` and `0x0FBA`.
+    BitString,
+    /// `0xF7` group 3 at Word: `/2../7` both forms, and `/0` through memory.
+    Group3,
+    /// `0xFE` `/0` and `/1`, memory form.
+    IncDecRm8,
+    /// `0xFF /6` PUSH r/m16, memory form at Word.
+    PushRm,
+    /// `0xFA` CLI.
+    Cli,
+    /// `0x8E` MOV Sreg,r/m: FS and GS in any form, ES and DS through memory or in protected mode.
+    MovSreg,
+}
+
+impl InterpretOneRow {
+    /// Every row, in discriminant order. The census array is indexed by `as usize`, so this is
+    /// what keeps the two in step: a variant added without an entry here fails the length pin in
+    /// `interpret_one_row_labels_cover_every_variant`.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::PopRm,
+        Self::MovRmSreg,
+        Self::Xchg,
+        Self::BitString,
+        Self::Group3,
+        Self::IncDecRm8,
+        Self::PushRm,
+        Self::Cli,
+        Self::MovSreg,
+    ];
+
+    /// How many rows the census array holds.
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    /// The census label, which is what a ladder report and the probe JSON name the row by. Opcode
+    /// first so the rows sort into encoding order in a report that sorts by label.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PopRm => "0x8f_pop_rm",
+            Self::MovRmSreg => "0x8c_mov_rm_sreg",
+            Self::Xchg => "0x86_87_91_97_xchg",
+            Self::BitString => "0x0fba_a3_bit_string",
+            Self::Group3 => "0xf7_group3_word",
+            Self::IncDecRm8 => "0xfe_inc_dec_rm8",
+            Self::PushRm => "0xff6_push_rm16",
+            Self::Cli => "0xfa_cli",
+            Self::MovSreg => "0x8e_mov_sreg",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Which interpreter path a `DirectKind::CallOut` slot routes through. One variant per admitted
 /// opcode, never a catch-all: `callout::helper_offset` matches this exhaustively, so adding an
 /// opcode to `classify` without an execute path is a compile error rather than a silent misroute.
@@ -380,10 +458,14 @@ pub(crate) enum CallOutHelper {
     PushAllDword,
     /// `0x61` POPAD.
     PopAllDword,
-    /// Any row on the `InterpretOne` allowlist (`classify`), S2's being 0x8F POP r/m alone. The
-    /// only variant that is not one opcode, and the only one whose slot has to identify itself to
-    /// the helper.
-    InterpretOne,
+    /// Any row on the `InterpretOne` allowlist (`classify`). The only variant that is not one
+    /// opcode, and the only one whose slot has to identify itself to the helper.
+    ///
+    /// It carries its `InterpretOneRow` so the census can attribute the slot's outcomes to the
+    /// family that was admitted. The class is decided HERE, at the admission, and travels with the
+    /// kind into the cell; deriving it again from the opcode at the cell's allocation site would
+    /// be a second decision that can disagree with the first.
+    InterpretOne { row: InterpretOneRow },
 }
 
 impl CallOutHelper {
@@ -396,7 +478,7 @@ impl CallOutHelper {
     pub(crate) fn probes_io_permission(self) -> bool {
         match self {
             Self::PortReadAlDx => true,
-            Self::PushAllDword | Self::PopAllDword | Self::InterpretOne => false,
+            Self::PushAllDword | Self::PopAllDword | Self::InterpretOne { .. } => false,
         }
     }
 
@@ -405,7 +487,7 @@ impl CallOutHelper {
     /// access counters do not contain.
     pub(crate) fn moves_a_stack_frame(self) -> bool {
         match self {
-            Self::PortReadAlDx | Self::InterpretOne => false,
+            Self::PortReadAlDx | Self::InterpretOne { .. } => false,
             Self::PushAllDword | Self::PopAllDword => true,
         }
     }
@@ -418,10 +500,18 @@ impl CallOutHelper {
     /// above are two predicates: a fifth helper must CHOOSE a class, and the install-time
     /// `debug_assert` that the three counts sum to `callout_slots` is what makes forgetting to
     /// choose a failure instead of an under-budgeted block.
+    /// The slot's census family, for the one caller that allocates its cell.
+    pub(crate) fn interpret_one_row(self) -> Option<InterpretOneRow> {
+        match self {
+            Self::InterpretOne { row } => Some(row),
+            _ => None,
+        }
+    }
+
     pub(crate) fn interprets_one(self) -> bool {
         match self {
             Self::PortReadAlDx | Self::PushAllDword | Self::PopAllDword => false,
-            Self::InterpretOne => true,
+            Self::InterpretOne { .. } => true,
         }
     }
 }
@@ -508,7 +598,7 @@ fn helper_offset(helper: CallOutHelper) -> i32 {
         CallOutHelper::PortReadAlDx => core::mem::offset_of!(CallOutTable, port_read_al_dx),
         CallOutHelper::PushAllDword => core::mem::offset_of!(CallOutTable, push_all_dword),
         CallOutHelper::PopAllDword => core::mem::offset_of!(CallOutTable, pop_all_dword),
-        CallOutHelper::InterpretOne => core::mem::offset_of!(CallOutTable, interpret_one),
+        CallOutHelper::InterpretOne { .. } => core::mem::offset_of!(CallOutTable, interpret_one),
     };
     (core::mem::offset_of!(CpuGsw, native_callout) + field) as i32
 }
@@ -1006,6 +1096,10 @@ pub(crate) struct InterpretOneCell {
     /// The slot's guest offset from the block's ENTRY eip. Page-local by `BlockSpan::new`, so a
     /// `u16` is generous.
     slot_delta: u16,
+    /// Which allowlist family this slot was admitted as, for the per-row census. Last, after the
+    /// two fields the helper reads on every execution: `state` must stay first because the emitted
+    /// prologue tests byte 0 directly, and this one is read only on the four counter paths.
+    row: InterpretOneRow,
 }
 
 /// Executions the governor watches before it stops deciding, and RESYNCs within that window that
@@ -1023,12 +1117,17 @@ const STATE_RESYNC_MASK: u8 = 0x70;
 pub(crate) const STATE_DEMOTED: u8 = 0x80;
 
 impl InterpretOneCell {
-    pub(crate) fn new(slot_delta: u16, insn_len: u8) -> Self {
+    pub(crate) fn new(slot_delta: u16, insn_len: u8, row: InterpretOneRow) -> Self {
         Self {
             state: AtomicU8::new(0),
             insn_len,
             slot_delta,
+            row,
         }
+    }
+
+    pub(crate) fn row(&self) -> InterpretOneRow {
+        self.row
     }
 
     pub(crate) fn address(&self) -> usize {
@@ -1228,7 +1327,7 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
     // `BlockCache` keeps that `Arc` alive for as long as the block is installed.
     let cell = unsafe { &*(cell as usize as *const InterpretOneCell) };
     cpu.jit_direct.note_callout_executed();
-    cpu.jit_direct.note_interpret_one_executed();
+    cpu.jit_direct.note_interpret_one_executed(cell.row());
 
     // STEP 1. The block body keeps EIP at the ENTRY value throughout and every exit advances it
     // relatively (`emit_advance_eip` is a load, an add and a store on the live field), so a helper
@@ -1358,9 +1457,9 @@ fn interpret_one_step<B: CpuBus>(
         cpu.settle_write_record();
         publish_flags(cpu);
         if cell.note_execution(true) {
-            cpu.jit_direct.note_interpret_one_demoted();
+            cpu.jit_direct.note_interpret_one_demoted(cell.row());
         }
-        cpu.jit_direct.note_interpret_one_resync_fault();
+        cpu.jit_direct.note_interpret_one_resync_fault(cell.row());
         return 1i64 << STATUS_RESYNC_FAULT_BIT;
     };
     cpu.deferred_code_writes.close();
@@ -1384,12 +1483,12 @@ fn interpret_one_step<B: CpuBus>(
     publish_flags(cpu);
 
     if cell.note_execution(!resume) {
-        cpu.jit_direct.note_interpret_one_demoted();
+        cpu.jit_direct.note_interpret_one_demoted(cell.row());
     }
 
     let clocks = i64::from(outcome.core_clocks);
     if !resume {
-        cpu.jit_direct.note_interpret_one_resync();
+        cpu.jit_direct.note_interpret_one_resync(cell.row());
         // EIP is left EXACTLY where the interpreter put it and the stub advances it by zero: the
         // instruction retired, so the architectural next address is already correct, and it is not
         // necessarily `start_eip + len` once S3 admits a row that can move it.

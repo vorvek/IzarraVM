@@ -2998,6 +2998,23 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_callout_interpret_one_resync_fault": snapshot.callout_interpret_one_resync_fault,
         "jit_direct_callout_interpret_one_abnormal": snapshot.callout_interpret_one_abnormal,
         "jit_direct_callout_interpret_one_demoted": snapshot.callout_interpret_one_demoted,
+        // Per-ROW, beside the scalars rather than instead of them. The scalars sum these four
+        // columns and stay the family's headline; this array is what the plan's "a row demoted on
+        // the loader at more than 50% is refuted" rule has to read, because a whole-CPU ratio
+        // cannot say WHICH of the nine admitted rows resynced.
+        "jit_direct_callout_interpret_one_rows": snapshot
+            .callout_interpret_one_rows
+            .iter()
+            .map(|counts| {
+                json!({
+                    "row": counts.row,
+                    "executed": counts.executed,
+                    "resync": counts.resync,
+                    "resync_fault": counts.resync_fault,
+                    "demoted": counts.demoted,
+                })
+            })
+            .collect::<Vec<_>>(),
         "jit_direct_callout_deferred_code_writes": snapshot.callout_deferred_code_writes,
         "jit_direct_callout_slot_cap_hits": snapshot.callout_slot_cap_hits,
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
