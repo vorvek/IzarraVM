@@ -469,9 +469,29 @@ impl CpuGsw {
         // same function with the flag clear, so the invalidation happens for real one step later,
         // before any guest instruction can observe the stale code.
         //
-        // One predictable bool test on a path that is already the invalidation choke rather than
-        // the store path: `note_code_write_hit` reaches here only behind `code_write_watched`.
+        // The window branch asks `code_write_watched` FOR ITSELF, and the reason is that the
+        // sentence this comment used to end with was wrong: "`note_code_write_hit` reaches here
+        // only behind `code_write_watched`" is true of the SIZED store path and false of the BYTE
+        // one. `write_linear_u8` routes through `note_code_byte_write_hit` on `changed` alone, by
+        // design, so that a one-byte immediate patch can be absorbed as a lane -- see the two-doors
+        // note in `write_linear_fragment`. Without the probe here, EVERY changed byte store made
+        // from inside a call-out would be recorded, R5 would read a non-empty list, and every
+        // byte-storing row on the `InterpretOne` allowlist would RESYNC on every execution and be
+        // demoted by the governor for traffic that touches no code at all. It cost S3's XCHG r/m8
+        // and INC/DEC r/m8 rows their whole value until it was found.
+        //
+        // Falling through is SOUND for an unwatched write, and that is the other half of the fix:
+        // the body below invalidates only what `range_hits_compiled_code` and
+        // `decode_cache::range_hits_code` actually name, so a write that hits neither reaches no
+        // invalidation door and cannot retire the running block. It also keeps the unit-sim and
+        // SMC-trace feeds on their ordinary path instead of deferring them.
+        //
+        // `false` rather than `true` on that arm for the same reason: it is what the body below
+        // would have returned, having invalidated nothing.
         if self.deferred_code_writes.is_open() {
+            if !self.code_write_watched(physical, width) {
+                return false;
+            }
             self.record_deferred_code_write(physical, width, lanes);
             return true;
         }

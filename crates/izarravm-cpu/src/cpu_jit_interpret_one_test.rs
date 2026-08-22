@@ -1123,6 +1123,59 @@ fn pop_rm_core_clocks_is_what_the_interpreter_charges() {
     );
 }
 
+/// The deferred list records WATCHED writes only, and the byte door is why that has to be checked
+/// here rather than inherited from the caller.
+///
+/// `write_linear_fragment` pre-gates its call on `code_write_watched`, so for a sized store the
+/// probe inside the window is redundant. `write_linear_u8` does NOT: it calls its door on
+/// `changed` alone so that a one-byte immediate patch can be absorbed as a lane. With the window
+/// open and no probe, every changed byte store made from inside a call-out lands in the list, R5
+/// reads it as a code write and the block RESYNCs -- on every execution, until the governor
+/// demotes the slot. That is a per-execution loss for traffic that touches no code at all, and it
+/// is invisible to every S2 fixture because no S2 row stores a byte.
+///
+/// Both directions are pinned here. An unwatched byte write must leave the list empty and report
+/// no hit; a write onto the block's own page must still be recorded, which is the whole reason the
+/// window exists.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn the_call_out_window_defers_watched_writes_only() {
+    let (mut cpu, _bus, _block) = build_native(CODE, STARTS);
+
+    // A page the fixture's code and decode lines are not on.
+    cpu.deferred_code_writes.open();
+    assert!(
+        !cpu.note_code_write_hit(POP_TARGET, 1),
+        "an unwatched byte write must not report a code hit"
+    );
+    cpu.deferred_code_writes.close();
+    assert!(
+        cpu.deferred_code_writes.is_empty(),
+        "an unwatched write must not be deferred, or every byte-storing row resyncs"
+    );
+
+    // The block's own second instruction, which installing the block armed a watch over.
+    cpu.deferred_code_writes.open();
+    assert!(
+        cpu.note_code_write_hit(ENTRY + 3, 1),
+        "a write onto the running block must still report a hit"
+    );
+    cpu.deferred_code_writes.close();
+    assert!(
+        !cpu.deferred_code_writes.is_empty(),
+        "a watched write must be deferred rather than invalidating under the live block"
+    );
+    assert_eq!(
+        cpu.jit_direct.len(),
+        1,
+        "the block must still be installed: the window defers, it does not invalidate"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. Emitted shape.
 // ---------------------------------------------------------------------------
