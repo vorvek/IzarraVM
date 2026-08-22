@@ -1096,10 +1096,29 @@ pub(crate) struct InterpretOneCell {
     /// The slot's guest offset from the block's ENTRY eip. Page-local by `BlockSpan::new`, so a
     /// `u16` is generous.
     slot_delta: u16,
-    /// Which allowlist family this slot was admitted as, for the per-row census. Last, after the
-    /// two fields the helper reads on every execution: `state` must stay first because the emitted
+    /// Which allowlist family this slot was admitted as, for the per-row census. After the two
+    /// fields the helper reads on every execution: `state` must stay first because the emitted
     /// prologue tests byte 0 directly, and this one is read only on the four counter paths.
     row: InterpretOneRow,
+    /// The key of the block this cell was compiled INTO, baked at the compile walk.
+    ///
+    /// Two things need it and neither can recover it at run time, which is why it is carried
+    /// rather than derived:
+    ///
+    /// * the RETIRE. A demotion has to retire the block the demoted slot is in, and that block is
+    ///   not necessarily the one the dispatcher entered: a linked or hot transfer runs a chained
+    ///   successor, so `run_direct_block`'s own `span.key` names the ROOT. Retiring the root
+    ///   leaves the successor's slot in place with its cell already latched, and `note_execution`
+    ///   fires once per cell, so nothing ever asks again.
+    /// * the SITE's mode key. `jit_mode_key` is CPU state -- CS.D, SS.B, PE, PG, VM -- and any of
+    ///   it can move between the block's entry and this slot: an earlier `MOV SS,r/m` in the same
+    ///   block moves bit 3. Reading it live files the site under a key the compile walk never
+    ///   asks for, which is an inert entry AND a demote/retire/recompile treadmill.
+    ///
+    /// `key.physical + slot_delta` is the site's physical address, and it is the same value the
+    /// walk computed as `expected_phys` -- the walk pins that equality itself, refusing any slot
+    /// whose decode line does not start there.
+    key: BlockKey,
 }
 
 /// Executions the governor watches before it stops deciding, and RESYNCs within that window that
@@ -1117,17 +1136,31 @@ const STATE_RESYNC_MASK: u8 = 0x70;
 pub(crate) const STATE_DEMOTED: u8 = 0x80;
 
 impl InterpretOneCell {
-    pub(crate) fn new(slot_delta: u16, insn_len: u8, row: InterpretOneRow) -> Self {
+    pub(crate) fn new(key: BlockKey, slot_delta: u16, insn_len: u8, row: InterpretOneRow) -> Self {
         Self {
             state: AtomicU8::new(0),
             insn_len,
             slot_delta,
             row,
+            key,
         }
     }
 
     pub(crate) fn row(&self) -> InterpretOneRow {
         self.row
+    }
+
+    /// The block this slot was compiled into. See the field.
+    pub(crate) fn block_key(&self) -> BlockKey {
+        self.key
+    }
+
+    /// The code site this slot occupies, as the demoted-site map keys it. See the field.
+    pub(crate) fn site(&self) -> (u32, u32) {
+        (
+            self.key.physical.wrapping_add(u32::from(self.slot_delta)),
+            self.key.mode_key,
+        )
     }
 
     pub(crate) fn address(&self) -> usize {
@@ -1376,35 +1409,38 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
     status
 }
 
-/// Steps 4 to 10 of the helper contract: everything between the clock preview and the status word.
-///
 /// Everything one demotion has to do, in one place because it happens on two paths (the resume
 /// predicate refusing, and the step faulting) and skipping half of it on either is invisible.
 ///
 /// The counter is the census row. The SITE goes into the block cache's demoted set so the next
 /// compile walk over this instruction ends its block before the slot, and the latch asks
-/// `run_direct_block` to retire the block that is running so that walk actually happens. Without
+/// `run_direct_block` to retire the block the slot is IN so that walk actually happens. Without
 /// the last two the demoted slot keeps its place in the block and every later execution pays a
-/// prologue test and an abnormal side exit to reach the boundary it already decided on -- which
-/// is what the tombraid loader measured as 1.97 M abnormal exits from 405 cells.
+/// prologue test and an abnormal side exit to reach the boundary it already decided on -- which is
+/// what the tombraid loader measured as 1.97 M abnormal exits from 405 cells.
 ///
-/// `physical` is the instruction's first byte as the compile walk computes it (`expected_phys`),
-/// and `mode_key` is the ENTRY mode key -- read before the step, not after it. That is what makes
-/// the two sides name the same site, and the second half is the one that is easy to get wrong: the
-/// demoting row on the loader is `MOV Sreg,r/m`, and `jit_mode_key` carries CS.D, SS.B, PE, PG and
-/// VM, every one of which that instruction, or a fault delivery behind it, can move. Read
-/// afterwards, the site would be filed under a mode key no compile walk ever asks for and the
-/// recompile would re-admit the slot.
+/// Both of those come off the CELL and not off live CPU state: `InterpretOneCell::key` carries
+/// them, and its doc has the two ways reading them live goes wrong.
 ///
-/// Honest about the evidence: on the tombraid loader the two readings measure IDENTICAL, because
-/// the resyncs that demote there are R2 record compares and move none of those bits. This is a
-/// correctness argument about the key, not a measured win.
-fn note_demotion(cpu: &mut CpuGsw, cell: &InterpretOneCell, physical: u32, mode_key: u32) {
+/// The retire is gated on the site actually being RECORDED. `note_demoted_callout_site` refuses at
+/// its cap, and a retire whose recompile will re-admit the slot is a treadmill: demote, retire,
+/// recompile with the slot back, demote again. Past the cap the block keeps its slot and pays the
+/// prologue test, which is a bounded loss; the treadmill is not.
+///
+/// A site that was ALREADY recorded still retires, and must. That is the block compiled BEFORE the
+/// site was learned, demoting afterwards; the recompile it asks for ends before the slot, so it
+/// terminates -- at most one retire per cell, because `note_execution` latches at the transition.
+fn note_demotion(cpu: &mut CpuGsw, cell: &InterpretOneCell) {
     cpu.jit_direct.note_interpret_one_demoted(cell.row());
-    cpu.jit_direct.note_demoted_callout_site(physical, mode_key);
-    cpu.request_callout_block_retire();
+    let (physical, mode_key) = cell.site();
+    if cpu.jit_direct.note_demoted_callout_site(physical, mode_key) {
+        cpu.jit_direct
+            .request_callout_block_retire(cell.block_key());
+    }
 }
 
+/// Steps 4 to 10 of the helper contract: everything between the clock preview and the status word.
+///
 /// See `interpret_one` for why this is not inlined into its caller.
 fn interpret_one_step<B: CpuBus>(
     cpu: &mut CpuGsw,
@@ -1416,9 +1452,6 @@ fn interpret_one_step<B: CpuBus>(
     // STEP 4. The predicate's inputs, before anything can move them.
     let snapshot = ResumeSnapshot::capture(cpu);
     let start_cs = snapshot.cs.selector;
-    // The mode key the BLOCK was compiled under, taken before the step can move any of the state
-    // it is made of. See `note_demotion`.
-    let entry_mode_key = cpu.jit_mode_key();
 
     // STEP 5. The decode view. A MISS is ABNORMAL and not a re-decode: `decode` fetches through
     // the code path, which page-walks on a TLB miss, and a walk writes accessed bits with this
@@ -1487,7 +1520,7 @@ fn interpret_one_step<B: CpuBus>(
         cpu.settle_write_record();
         publish_flags(cpu);
         if cell.note_execution(true) {
-            note_demotion(cpu, cell, view.phys_start, entry_mode_key);
+            note_demotion(cpu, cell);
         }
         cpu.jit_direct.note_interpret_one_resync_fault(cell.row());
         return 1i64 << STATUS_RESYNC_FAULT_BIT;
@@ -1513,7 +1546,7 @@ fn interpret_one_step<B: CpuBus>(
     publish_flags(cpu);
 
     if cell.note_execution(!resume) {
-        note_demotion(cpu, cell, view.phys_start, entry_mode_key);
+        note_demotion(cpu, cell);
     }
 
     let clocks = i64::from(outcome.core_clocks);

@@ -151,8 +151,12 @@ pub(crate) const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
 /// outlives the blocks it was learned from, so containment in `entries` cannot bound it.
 ///
 /// 4,096 sites is 32 KiB of set at two `u32`s a site, and two orders of magnitude above what a
-/// whole loader phase produces: the tombraid loader demotes 405 slots in 500 M cycles, all of them
-/// one row (`0x8e_mov_sreg`). See `note_demoted_callout_site` for what happens at the cap.
+/// whole loader phase produces: the tombraid loader learns 64 sites in 500 M cycles, all of them
+/// one row (`0x8e_mov_sreg`). At the cap a further site is REFUSED and its demotion does not
+/// retire anything -- the block keeps its slot and pays the emitted prologue test on every
+/// execution, which is the pre-mechanism cost and is bounded. `note_demoted_callout_site` is where
+/// that is decided, and `jit_direct_demoted_callout_sites_refused` counts it, because a cap that
+/// binds silently is a cap nobody finds.
 const DEMOTED_CALLOUT_SITE_CAP: usize = 4_096;
 
 /// Untried entries a call-out block may spend at trial quota before the governor gives up on
@@ -770,6 +774,30 @@ pub(crate) struct BlockCache {
     /// is 0), so this is an argument and not a measurement -- said plainly rather than dressed up
     /// as one.
     demoted_callout_sites: HashSet<(u32, u32), PodKeyBuildHasher>,
+    /// The KEY of a block whose `InterpretOne` slot the governor just demoted, parked for
+    /// `run_direct_block` to retire once the native run returns.
+    ///
+    /// A latch rather than a direct retire, because the demotion is observed from INSIDE the
+    /// running block: `retire_key_for_recompile` frees the block's metadata slot and unlinks it,
+    /// and doing that while its code is on the host stack would pull the ground out from under the
+    /// return.
+    ///
+    /// The KEY and not a bool. A chained entry runs successor blocks, and `run_direct_block`'s own
+    /// `span.key` is the ROOT's, so a bool would retire the root and leave the demoted slot where
+    /// it is -- permanently, because `note_execution` latches once per cell and never asks again.
+    /// The key comes off the cell, which was compiled into exactly one block.
+    ///
+    /// HERE and not beside `callout_error` on `DirectRuntimeState`, which is where the two other
+    /// call-out latches live and where this one was written first: `DirectRuntimeState` is a
+    /// by-value field of `CpuGsw`, and sixteen bytes of `Option<BlockKey>` there moved
+    /// `CpuGsw.registers` and `CpuGsw.pending_flags`, both of which are pinned by tests precisely
+    /// so that the hot interpreter region is not reshuffled by accident. `BlockCache` is behind a
+    /// `Box`, so a field here costs the CPU struct nothing -- the same reason
+    /// `last_side_exit_reason` lives on `JitState`.
+    ///
+    /// At most one is ever pending: a cell latches its demotion once, and the entry that observed
+    /// it returns before another can start.
+    callout_retire_pending: Option<BlockKey>,
     /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
     lane_trial_override: Option<bool>,
@@ -935,6 +963,7 @@ impl BlockCache {
             lane_trial_epochs: HashMap::default(),
             top_mismatch_retires: HashMap::default(),
             demoted_callout_sites: HashSet::default(),
+            callout_retire_pending: None,
             lane_trial_override: None,
             block_portals: Vec::new(),
             link_cells: Vec::new(),
@@ -1554,15 +1583,75 @@ impl BlockCache {
     /// compile walk ends its block before the instruction instead of emitting a slot whose only
     /// remaining behaviour is the abnormal exit.
     ///
-    /// Silently full at `DEMOTED_CALLOUT_SITE_CAP`: the set is a COST policy, and a guest that
-    /// somehow reached the cap is better served by paying the prologue test on the overflow sites
-    /// than by an eviction policy that could thrash a site in and out of the allowlist. The cap is
-    /// far above what a whole loader phase produces (405 sites on tombraid, 2026-08-22).
-    pub(crate) fn note_demoted_callout_site(&mut self, physical: u32, mode_key: u32) {
+    /// Answers whether the site IS RECORDED afterwards, which is what the caller's retire has to
+    /// be gated on. See `note_demotion` in `jit/direct/callout.rs` for why: a retire whose
+    /// recompile will put the slot back is a demote/retire/recompile treadmill, and the one thing
+    /// that stops the recompile re-admitting is this map holding the site.
+    ///
+    /// Full at `DEMOTED_CALLOUT_SITE_CAP` answers FALSE, and that is the whole reason this returns
+    /// anything. The set is a COST policy, and a guest that somehow reached the cap is better
+    /// served by paying the prologue test on the overflow sites than by an eviction policy that
+    /// could thrash a site in and out of the allowlist -- but it must not also be paying a
+    /// recompile per execution to learn the same refusal again. The cap is far above what a whole
+    /// loader phase produces (64 sites on tombraid, 2026-08-22).
+    ///
+    /// A site that was ALREADY there answers TRUE, not false. It is recorded, so the recompile
+    /// ends before the slot and the retire the caller then asks for terminates. That case is a
+    /// block compiled before the site was learned, demoting afterwards, and it is exactly the
+    /// block whose slot needs removing. Same precedent as `X87_TOP_RETIRE_CAP`: the CAP is what
+    /// suppresses the retire, never the repeat.
+    pub(crate) fn note_demoted_callout_site(&mut self, physical: u32, mode_key: u32) -> bool {
+        if self.demoted_callout_sites.contains(&(physical, mode_key)) {
+            return true;
+        }
         if self.demoted_callout_sites.len() >= DEMOTED_CALLOUT_SITE_CAP {
-            return;
+            self.stalls.demoted_callout_sites_refused += 1;
+            return false;
         }
         self.demoted_callout_sites.insert((physical, mode_key));
+        true
+    }
+
+    /// Park a retire for `run_direct_block` to take after the native return. See the field.
+    pub(crate) fn request_callout_block_retire(&mut self, key: BlockKey) {
+        self.callout_retire_pending = Some(key);
+    }
+
+    /// Take whatever retire is parked, clearing it. Every exit from `run_direct_block` calls this,
+    /// including the machine-stopping one: a latch left behind is read by the NEXT entry, which
+    /// would then change the block cache for a demotion that happened inside a different run.
+    pub(crate) fn take_callout_retire_pending(&mut self) -> Option<BlockKey> {
+        self.callout_retire_pending.take()
+    }
+
+    /// Drop every demoted site the write at `physical..physical + width` lands on, because the
+    /// code the judgement was about is being replaced.
+    ///
+    /// Called from the code-write door and NOT from `invalidate_physical_range`, which is where it
+    /// naturally belongs and where it would not run: that function is gated behind
+    /// `range_hits_compiled_code`, and a demotion RETIRES its block, so by the time an overlay is
+    /// written over the site there is usually no compiled block left to make the range hit. This
+    /// map outlives blocks by design and has to be maintained where the writes are seen.
+    ///
+    /// Left stale, the ban follows the address into whatever code is written there next and only a
+    /// whole-cache wipe lifts it: a permanent, silent coverage loss on an overlay-loading guest.
+    ///
+    /// The low end is widened by the longest x86 instruction. A site names the instruction's FIRST
+    /// byte and the instruction runs to fifteen more, so a write landing inside it changes that
+    /// instruction without touching the address the map is keyed on. Over-retaining costs one
+    /// re-learn -- three resyncs and a recompile -- and under-retaining is the stale ban.
+    ///
+    /// The `is_empty` shortcut is what keeps this off the shipped store path in every run that
+    /// never demotes a slot: one length load and a not-taken branch.
+    pub(crate) fn forget_demoted_sites_in(&mut self, physical: u32, width: u32) {
+        if self.demoted_callout_sites.is_empty() || width == 0 {
+            return;
+        }
+        const MAX_INSTRUCTION_LEN: u32 = 15;
+        let low = physical.saturating_sub(MAX_INSTRUCTION_LEN);
+        let high = physical.saturating_add(width);
+        self.demoted_callout_sites
+            .retain(|&(site, _)| site < low || site >= high);
     }
 
     /// Whether the compile walk must treat this code site as a hard boundary.
@@ -1575,13 +1664,32 @@ impl BlockCache {
             && self.demoted_callout_sites.contains(&(physical, mode_key))
     }
 
+    /// Sites currently in the demoted-call-out map. Read by the census gauge and, under `cfg(test)`
+    /// as `demoted_callout_site_count_for_test`, by the fixtures -- one accessor, two names, so a
+    /// test cannot drift from what the gauge reports.
     pub(crate) fn demoted_callout_sites_len(&self) -> usize {
         self.demoted_callout_sites.len()
     }
 
+    /// Fill the demoted-site map to `DEMOTED_CALLOUT_SITE_CAP` with entries no fixture can
+    /// collide with, so a test can reach the cap without four thousand real demotions.
+    ///
+    /// `u32::MAX` as the mode key is what makes them inert: `jit_mode_key` packs five bits and a
+    /// persona rank, so no real key can equal it and no walk can match one of these.
     #[cfg(test)]
-    pub(crate) fn demoted_callout_site_count_for_test(&self) -> usize {
-        self.demoted_callout_sites.len()
+    pub(crate) fn fill_demoted_callout_sites_for_test(&mut self) {
+        for physical in 0..DEMOTED_CALLOUT_SITE_CAP as u32 {
+            self.demoted_callout_sites.insert((physical, u32::MAX));
+        }
+        assert_eq!(self.demoted_callout_sites.len(), DEMOTED_CALLOUT_SITE_CAP);
+    }
+
+    /// Whether `key` currently names an installed block. A read where
+    /// `retire_key_for_recompile`'s bool is the same fact with a side effect, which a test that
+    /// then asserts about a SECOND key cannot use.
+    #[cfg(test)]
+    pub(crate) fn key_is_compiled_for_test(&self, key: BlockKey) -> bool {
+        matches!(self.entries.get(&key), Some(BlockState::Compiled(_)))
     }
 
     /// Retire one descriptor-specialized block while keeping its key in the observed state. The
@@ -1967,6 +2075,13 @@ impl BlockCache {
                     // its block and its `entries` row, so it must keep its budget too. A genuine
                     // kill drops all three -- the code at this address is NEW and inheriting the
                     // previous occupant's stickiness would pin it out of specialization silently.
+                    //
+                    // The demoted-site map is the fourth thing that has to go and is NOT dropped
+                    // here: it is keyed on the INSTRUCTION rather than on the block entry, and it
+                    // outlives the block. By the time an overwrite arrives the demoted block has
+                    // usually been retired already, so this arm is not even reached --
+                    // `range_hits_compiled_code` is what gates the call. `forget_demoted_sites_in`
+                    // is called from the code-write door instead.
                     self.top_mismatch_retires.remove(&key);
                     let hot_index = key.hot_index();
                     if self.hot[hot_index].is_some_and(|hot| hot.key == key) {
@@ -2528,6 +2643,7 @@ impl BlockCache {
         self.lane_trial_epochs.clear();
         self.top_mismatch_retires.clear();
         self.demoted_callout_sites.clear();
+        self.callout_retire_pending = None;
         self.link_cells.clear();
         self.interpret_one_cells.clear();
         self.link_sources.clear();
@@ -7644,8 +7760,9 @@ fn compile_with_budget(
                 let row = helper
                     .interpret_one_row()
                     .expect("an InterpretOne helper names its census row");
-                interpret_one_cells
-                    .push(Arc::new(InterpretOneCell::new(slot_delta, insn.len, row)));
+                interpret_one_cells.push(Arc::new(InterpretOneCell::new(
+                    key, slot_delta, insn.len, row,
+                )));
             }
         }
         if let DirectKind::X87 { insn, .. } = kind {

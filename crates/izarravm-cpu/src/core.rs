@@ -509,6 +509,13 @@ impl CpuGsw {
             self.record_deferred_code_write(physical, width, lanes);
             return true;
         }
+        // The demoted-call-out map, maintained HERE rather than at an invalidation door, because
+        // it outlives the blocks it was learned from and the doors are gated on a block still
+        // covering the range. See `BlockCache::forget_demoted_sites_in`. Below the window branch
+        // above on purpose: a write the window defers is replayed through this same function with
+        // the flag clear, so it reaches this line then instead of twice.
+        #[cfg(feature = "jit")]
+        self.jit_direct.forget_demoted_sites_in(physical, width);
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.

@@ -1665,13 +1665,6 @@ impl CpuGsw {
         )
     }
 
-    /// Ask `run_direct_block` to retire the block it is running once it returns. Set by an
-    /// `InterpretOne` demotion; see `jit::direct::callout::note_demotion`.
-    #[cfg(feature = "jit")]
-    pub(crate) fn request_callout_block_retire(&mut self) {
-        self.direct_runtime.callout_retire_pending = true;
-    }
-
     #[cfg(all(test, feature = "jit"))]
     pub(super) fn skip_direct_once_for_test(&self) -> bool {
         self.direct_runtime.skip_direct_once
@@ -2915,6 +2908,21 @@ impl CpuGsw {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
             halted: false,
         };
+        // The governor demoted a slot in a block this entry ran. Retiring that block's key makes
+        // the recompile consult the demoted-site map and end its block BEFORE the slot. Left
+        // un-retired, the block keeps a slot whose only behaviour is
+        // `test byte [cell], 0x80; jnz abnormal` -- a dispatcher round trip per execution to reach
+        // a boundary the walk can reach for free, plus the slots after it that the exit guarantees
+        // are unreachable.
+        //
+        // The key comes off the CELL and is not `span.key`: a chained entry runs successor blocks,
+        // and the demoted slot may be in one of those. See
+        // `BlockCache::callout_retire_pending`.
+        //
+        // TAKEN HERE, above the `callout_error` return, and acted on below it. That return leaves
+        // this function too, and a latch left set on it is read by the NEXT entry -- which would
+        // retire a block on a demotion that happened inside a different one.
+        let retire = self.jit_direct.take_callout_retire_pending();
         // A machine-stopping error an `InterpretOne` slot's fault delivery produced. The helper
         // returns an `i64` and cannot carry one, so it parks it and this is the boundary that
         // propagates it -- the same boundary `run_budgeted_inner` would have propagated it from
@@ -2923,19 +2931,12 @@ impl CpuGsw {
         if let Some(error) = self.direct_runtime.callout_error.take() {
             return Err(error);
         }
-        // The governor demoted a slot in the block that just ran. Retire the key here, after every
-        // counter and every charge and after the native code has returned, so the recompile takes
-        // the demoted-site map and ends its block BEFORE the slot. Left un-retired, the block
-        // keeps a slot whose only behaviour is `test byte [cell], 0x80; jnz abnormal` -- a
-        // dispatcher round trip per execution to reach a boundary the walk can reach for free,
-        // plus the slots after it that the exit guarantees are unreachable.
-        //
-        // LAST, because `retire_key_for_recompile` frees this block's metadata slot: nothing above
-        // may read `block` or its id afterwards. The `NotRun` shape the other retire sites use is
-        // not available here -- the block RAN -- so the outcome below is unchanged and only the
-        // block's future is.
-        if std::mem::take(&mut self.direct_runtime.callout_retire_pending) {
-            self.jit_direct.retire_key_for_recompile(span.key);
+        // After every counter and every charge, and last because `retire_key_for_recompile` frees
+        // the block's metadata slot: nothing above may read `block` or its id afterwards. The
+        // `NotRun` shape the other retire sites use is not available here -- the block RAN -- so
+        // the outcome below is unchanged and only the block's future is.
+        if let Some(key) = retire {
+            self.jit_direct.retire_key_for_recompile(key);
         }
         if side_exit {
             Ok(DirectBlockOutcome::Prefix(outcome))

@@ -3020,6 +3020,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_compile_page_overflows": snapshot.compile_page_overflows,
         "jit_direct_compile_page_search_steps": snapshot.compile_page_search_steps,
         "jit_direct_demoted_callout_sites": snapshot.demoted_callout_sites,
+        "jit_direct_demoted_callout_sites_refused": snapshot.demoted_callout_sites_refused,
         "jit_direct_reject_callout_privileged": snapshot.reject_callout_privileged,
         // Unprefixed, unlike their `jit_direct_` neighbours, and deliberately: these are the
         // names the round-2 acceptance gate pre-registered for its bars, and a reader diffing a

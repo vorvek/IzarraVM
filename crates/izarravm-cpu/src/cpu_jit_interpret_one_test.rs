@@ -3453,3 +3453,554 @@ fn a_demoted_protected_mode_segment_load_recompiles_as_a_hard_boundary() {
         "the recompile must end before the demoted slot. One instruction is left in front of it,          which is under the walk's three-instruction floor, so the boundary shows up as the whole          key refusing -- the same structural reject this key produced before 0x8E was admitted.          What matters is that it is not Compiled: with the site check disabled, or placed above          stack_width_kind where this call-out does not exist yet, the same call returns a          three-slot block carrying the slot again"
     );
 }
+
+/// A demotion inside a CHAINED successor must retire that successor, not the block the dispatcher
+/// entered.
+///
+/// The defect this pins: the retire latch used to be a bool, and `run_direct_block` acted on it
+/// with its OWN `span.key` -- the ROOT of the chain. A linked transfer runs the successor without
+/// returning to Rust, so a slot demoted in the successor retired the root instead, and the
+/// successor kept its slot with the cell already latched. `note_execution` fires once per cell and
+/// never asks again, so that block would exit abnormally for the rest of its life while the
+/// recompile of an innocent root learned nothing. The key is now baked into the cell at compile
+/// time (`InterpretOneCell::key`) and the latch carries it.
+///
+/// Two fixture choices, each forced:
+///
+/// * PROTECTED 32-bit, not the 16-bit world most of this file uses. A chain needs a static link,
+///   and `classify` admits no control transfer at Word operand size -- which is every instruction
+///   in a CS.D = 0 segment -- so block A could not end in a jump at all.
+/// * `MOV ES,dx` with `SEL_OTHER`, so the resync is R2 refusing a record that moved. A FAULTING
+///   driver reloads CS through the IDT and invalidates the code caches, which clears the block
+///   cache and the links with it: the chain would be rebuilt every traversal and never taken.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_demotion_in_a_chained_successor_retires_the_successor_and_not_the_root() {
+    // Block A: three `inc eax` and a jump into B. Block B: three `inc eax`, the segment load, one
+    // more, then HLT. `jmp +0` lands on the instruction after it, which is B's entry.
+    const CODE: &[u8] = &[
+        0x40, 0x40, 0x40, // block A                    +0 +1 +2
+        0xEB, 0x00, // jmp +0, terminal, static link     +3
+        0x40, 0x40, 0x40, // block B                     +5 +6 +7
+        0x8E, 0xC2, // mov es,dx -- the call-out slot    +8
+        0x40, // one slot after it, so it is mid-block   +10
+        0xF4, //                                         +11
+    ];
+    const STARTS: &[u32] = &[0, 1, 2, 3, 5, 6, 7, 8, 10, 11];
+    let entry_b = ENTRY + 5;
+    let slot = ENTRY + 8;
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+
+    let key_a = jit::direct::key_for(&cpu, ENTRY, true).expect("block A key");
+    let key_b = jit::direct::key_for(&cpu, entry_b, true).expect("block B key");
+    let mut blocks = Vec::new();
+    for (entry, key, slots, call_outs) in [(ENTRY, key_a, 4u8, 0u8), (entry_b, key_b, 5, 1)] {
+        let compilation =
+            jit::direct::compile(&mut cpu, entry, true).expect("both fixture blocks must compile");
+        assert_eq!(compilation.span.instructions, slots);
+        assert_eq!(compilation.callout_interpret_one_slots, call_outs);
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let id = cpu
+            .jit_direct
+            .install(&compilation)
+            .expect("install the fixture block");
+        blocks.push(cpu.jit_direct.block(id).expect("the block must be live"));
+    }
+    let (block_a, block_b) = (blocks[0], blocks[1]);
+
+    let arm = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        arm_protected(cpu, bus, SEL_OTHER);
+        cpu.registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::flat(SEL_DATA, 0x93));
+    };
+
+    // Three traversals of A. Its jump is a STATIC link and both blocks are installed, so the
+    // transfer into B happens inside the native run on every one of them: the entry that demotes
+    // therefore has A's key on its span and B's key on the cell.
+    let transfers = cpu.perf_counters().jit_direct_linked_transfers;
+    for _ in 0..3 {
+        arm(&mut cpu, &mut bus);
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block_a)
+                .unwrap()
+        );
+        assert_eq!(
+            cpu.registers.eip,
+            slot + 2,
+            "the run must end where B's call-out resynced, not where A ends"
+        );
+    }
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - transfers,
+        3,
+        "every traversal must reach B through the CHAIN, not a second entry"
+    );
+    assert_eq!(
+        cpu.direct_stall_snapshot().callout_interpret_one_resync,
+        3,
+        "three resyncs is what the governor demotes on"
+    );
+    assert_eq!(cpu.direct_stall_snapshot().callout_interpret_one_demoted, 1);
+    let _ = block_b;
+
+    assert!(
+        !cpu.jit_direct.key_is_compiled_for_test(key_b),
+        "the demoted slot's OWN block must be the one retired"
+    );
+    assert!(
+        cpu.jit_direct.key_is_compiled_for_test(key_a),
+        "and the root of the chain must be untouched: it carries no call-out at all"
+    );
+    assert_eq!(
+        cpu.jit_direct.demoted_callout_site_count_for_test(),
+        1,
+        "the site must be filed under block B's key, which is what the recompile asks with"
+    );
+
+    // And B re-walks with the boundary: three `inc eax` in front of the slot, then it ends.
+    arm(&mut cpu, &mut bus);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    let recompiled = jit::direct::compile(&mut cpu, entry_b, true)
+        .expect("block B must still compile as its prefix");
+    assert_eq!(recompiled.callout_interpret_one_slots, 0);
+    assert_eq!(recompiled.span.instructions, 3);
+    assert_eq!(u32::from(recompiled.span.guest_len), slot - entry_b);
+}
+
+/// The demoted site must be filed under the mode key the BLOCK was compiled with, not under
+/// whatever the CPU holds when the demotion is noticed.
+///
+/// V86 CLI is the fixture because it is the one admitted row whose demotion path CHANGES the mode
+/// key before the demotion is recorded: the #GP is delivered through the monitor's interrupt gate
+/// from inside the helper, so by the time `note_demotion` runs, VM is clear and CS is the ring-0
+/// 32-bit selector -- `jit_mode_key` bits 2 and 0, both moved. A live read files the site under a
+/// key no compile walk ever asks for, which is an inert entry AND, because the retire still fires,
+/// a demote/retire/recompile treadmill on every later execution.
+///
+/// Nothing INSIDE a block can move the mode key on the non-faulting path, and that is not an
+/// accident worth relying on: `classify`'s `0x8e` arm refuses `/2` (SS) outright, so no admitted
+/// row moves SS.B, and none moves CS.D, PE or PG either. The fault arm is the reachable case, and
+/// it is the one this fixture takes.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_demoted_site_is_filed_under_the_blocks_mode_key_and_not_the_live_one() {
+    /// `mov ax,0x1111; cli; inc ax; hlt` at the V86 guest's CS:0.
+    const V86_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0xFA, 0x40, 0xF4];
+    const V86_BASE: u32 = 0xA000;
+    const MONITOR: &[u8] = &[0xF4];
+
+    let (mut cpu, mut bus) = super::super::v86_world(MONITOR, V86_CODE, &[0x00]);
+    super::super::enter_v86_direct(&mut cpu, 0, 0x1000);
+    let warm = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        for offset in [0u32, 3, 4] {
+            cpu.set_eip(offset);
+            cpu.begin_instruction();
+            cpu.fetch_decoded(bus, V86_BASE + offset)
+                .expect("fixture decode");
+        }
+        cpu.set_eip(0);
+    };
+    warm(&mut cpu, &mut bus);
+
+    let compilation = jit::direct::compile(&mut cpu, V86_BASE, false)
+        .expect("the V86 fixture must compile as a block");
+    assert_eq!(compilation.span.instructions, BLOCK_INSTRUCTIONS);
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "control: CLI is the block's call-out slot"
+    );
+    let key = jit::direct::key_for(&cpu, V86_BASE, false).expect("a key for the V86 block");
+    let v86_mode_key = key.mode_key;
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the V86 block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    // Three faulting executions. Each one delivers the #GP to the monitor, so the guest has to be
+    // put back into V86 before the next.
+    for _ in 0..3 {
+        super::super::enter_v86_direct(&mut cpu, 0, 0x1000);
+        warm(&mut cpu, &mut bus);
+        cpu.registers.set_eax(0);
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block)
+                .expect("a delivered #GP must not stop the machine")
+        );
+        assert_eq!(
+            cpu.jit_direct.last_side_exit_reason_for_test(),
+            Some(jit::direct::SideExitReason::CallOutResyncFault as u32)
+        );
+        assert!(
+            !cpu.is_v86_mode(),
+            "the delivery must have left V86, which is what moves the mode key under the demotion"
+        );
+        assert_ne!(
+            cpu.jit_mode_key(),
+            v86_mode_key,
+            "and the live mode key must therefore differ from the block's, or this fixture is \
+             asserting nothing"
+        );
+    }
+    assert_eq!(cpu.direct_stall_snapshot().callout_interpret_one_demoted, 1);
+    assert_eq!(cpu.jit_direct.demoted_callout_site_count_for_test(), 1);
+
+    // The recompile asks with the V86 key, and must find the site.
+    super::super::enter_v86_direct(&mut cpu, 0, 0x1000);
+    warm(&mut cpu, &mut bus);
+    assert_eq!(
+        jit::direct::key_for(&cpu, V86_BASE, false)
+            .expect("the V86 key")
+            .mode_key,
+        v86_mode_key,
+        "the guest is back where it was, so the walk asks with the same key it compiled under"
+    );
+    assert!(
+        matches!(
+            jit::direct::compile(&mut cpu, V86_BASE, false),
+            jit::direct::CompileOutcome::StructuralReject(_)
+        ),
+        "the recompile must end before the demoted CLI. One instruction is left in front of it, \
+         under the walk's three-instruction floor, so the boundary shows up as the whole key \
+         refusing. Filed under the monitor's mode key instead, this call returns a block carrying \
+         the call-out again"
+    );
+}
+
+/// A demotion the site cap REFUSES to record must not retire anything.
+///
+/// The defect this pins: the retire fired unconditionally while `note_demoted_callout_site`
+/// returned silently at `DEMOTED_CALLOUT_SITE_CAP`. Past the cap the recompile has nothing to
+/// consult, so it puts the slot straight back, the fresh cell demotes, and the block is retired
+/// again -- a compile per three executions, for ever. What the cap is supposed to buy is a bounded
+/// loss: the block keeps its slot and pays the emitted prologue test, which is the cost the
+/// mechanism was invented to remove but is still finite.
+///
+/// The precedent is `X87_TOP_RETIRE_CAP`, which suppresses the RETIRE and not the refusal, for the
+/// same reason: a retire whose recompile undoes it is a treadmill.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_demotion_past_the_site_cap_keeps_its_block_instead_of_recompiling_for_ever() {
+    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`, the shape `build_protected` uses with FS.
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    const STARTS_ES: &[u32] = &[0, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE_ES.len()].copy_from_slice(CODE_ES);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for offset in STARTS_ES {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("the ES fixture must compile as a block");
+    assert_eq!(compilation.callout_interpret_one_slots, 1);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    cpu.jit_direct.fill_demoted_callout_sites_for_test();
+    let filled = cpu.jit_direct.demoted_callout_site_count_for_test();
+
+    let run = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        arm_protected(cpu, bus, SEL_OTHER);
+        cpu.registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::flat(SEL_DATA, 0x93));
+        assert!(
+            cpu.try_run_direct_block_for_test(bus, block)
+                .expect("a resyncing load must not stop the machine")
+        );
+    };
+    for _ in 0..3 {
+        run(&mut cpu, &mut bus);
+    }
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        stalls.callout_interpret_one_demoted, 1,
+        "the governor still demotes: the cap is about what happens NEXT"
+    );
+    assert_eq!(
+        stalls.demoted_callout_sites_refused, 1,
+        "and the cap must have refused the site, or this fixture is testing the ordinary path"
+    );
+    assert_eq!(
+        cpu.jit_direct.demoted_callout_site_count_for_test(),
+        filled,
+        "a refused site must not be inserted"
+    );
+    assert!(
+        cpu.jit_direct.key_is_compiled_for_test(key),
+        "and the block must NOT have been retired: its recompile would put the slot straight back"
+    );
+
+    // Later executions take the demoted prologue and exit abnormally. That is the bounded loss the
+    // cap accepts. What must not happen is another demotion, which is what a retire-and-recompile
+    // treadmill looks like from here.
+    let abnormal = cpu.direct_stall_snapshot().side_exit_callout_abnormal;
+    for _ in 0..4 {
+        run(&mut cpu, &mut bus);
+        assert_eq!(
+            cpu.jit_direct.last_side_exit_reason_for_test(),
+            Some(jit::direct::SideExitReason::CallOutAbnormal as u32)
+        );
+    }
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        stalls.side_exit_callout_abnormal - abnormal,
+        4,
+        "the prologue test is the whole of what a capped-out demotion costs"
+    );
+    assert_eq!(
+        stalls.callout_interpret_one_demoted, 1,
+        "one demotion, not one per three executions"
+    );
+    assert_eq!(stalls.demoted_callout_sites_refused, 1);
+    assert!(cpu.jit_direct.key_is_compiled_for_test(key));
+}
+
+/// A demotion on an entry that ends in a machine-stopping `CpuError` must not leave its retire
+/// request behind for the NEXT entry to act on.
+///
+/// The defect this pins: `run_direct_block` returned `Err` on `callout_error` before it took the
+/// retire latch, so the latch survived the return. The following entry -- any entry, in any block,
+/// possibly much later -- then found it set and retired on it. With the pre-fix bool latch that
+/// retired whatever block happened to be running; with the key it retires the right block at the
+/// wrong time, which is still a block cache that changes shape for a reason nothing at that call
+/// site can explain.
+///
+/// The error is reached by breaking the IDT under a faulting segment load: the #GP raised inside
+/// `load_protected_segment` has no gate to be delivered through, which escalates until the machine
+/// stops. Two clean resyncs first, so the third -- the faulting one -- is the execution that
+/// demotes.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
+    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`.
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    const STARTS_ES: &[u32] = &[0, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE_ES.len()].copy_from_slice(CODE_ES);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for offset in STARTS_ES {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("the ES fixture must compile as a block");
+    assert_eq!(compilation.callout_interpret_one_slots, 1);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    let arm = |cpu: &mut CpuGsw, bus: &mut TestBus, selector: u16| {
+        arm_protected(cpu, bus, selector);
+        cpu.registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::flat(SEL_DATA, 0x93));
+    };
+    for _ in 0..2 {
+        arm(&mut cpu, &mut bus, SEL_OTHER);
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block)
+                .expect("a resyncing load must not stop the machine")
+        );
+    }
+    assert_eq!(cpu.direct_stall_snapshot().callout_interpret_one_demoted, 0);
+
+    // The third execution: a selector past the table limit raises #GP inside the helper, and an
+    // empty IDT gives that #GP nowhere to go.
+    arm(&mut cpu, &mut bus, SEL_BAD);
+    cpu.idtr.limit = 0;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block).is_err(),
+        "the fixture must actually reach the machine-stopping path"
+    );
+    assert_eq!(
+        cpu.direct_stall_snapshot().callout_interpret_one_demoted,
+        1,
+        "and it must be the execution that demoted the slot"
+    );
+    assert!(
+        cpu.jit_direct.key_is_compiled_for_test(key),
+        "the stopping entry drops its retire: the machine is going down, not recompiling"
+    );
+
+    // The entry that must not inherit it. The slot is demoted, so this one exits from the emitted
+    // prologue and touches nothing else.
+    cpu.idtr.limit = 0xff;
+    arm(&mut cpu, &mut bus, SEL_OTHER);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("a demoted slot exits abnormally, it does not stop the machine")
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutAbnormal as u32)
+    );
+    assert!(
+        cpu.jit_direct.key_is_compiled_for_test(key),
+        "this entry demoted nothing, so it must retire nothing"
+    );
+}
+
+/// Overwriting a demoted site's code must clear the judgement with it.
+///
+/// The defect this pins: `invalidate_physical_range` dropped `entries` and `top_mismatch_retires`
+/// for a genuinely killed key and left the demoted-site map alone, so an overlay written over that
+/// address inherited the previous occupant's ban. Nothing lifts it short of a whole-cache wipe, and
+/// nothing reports it -- the new instruction simply never becomes a call-out.
+///
+/// The retain lives at the top of `invalidate_physical_range` and not in its genuine-kill arm,
+/// which is what makes this fixture meaningful: the map is keyed on the INSTRUCTION and outlives
+/// the block, so a site whose block has already been retired -- exactly what a demotion leaves
+/// behind -- has no key left for that arm to visit.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn overwriting_a_demoted_sites_code_lets_it_be_a_call_out_again() {
+    /// `mov eax,0x1111; mov es,dx; inc eax; hlt`.
+    const CODE_ES: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xC2, 0x40, 0xF4];
+    const STARTS_ES: &[u32] = &[0, 5, 7];
+    let slot = ENTRY + 5;
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE_ES.len()].copy_from_slice(CODE_ES);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    let warm = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        for offset in STARTS_ES {
+            let linear = ENTRY + offset;
+            cpu.set_eip(linear);
+            cpu.begin_instruction();
+            cpu.fetch_decoded(bus, linear).expect("fixture decode");
+        }
+        cpu.set_eip(ENTRY);
+    };
+    warm(&mut cpu, &mut bus);
+
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("the ES fixture must compile as a block");
+    assert_eq!(compilation.callout_interpret_one_slots, 1);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    for _ in 0..3 {
+        arm_protected(&mut cpu, &mut bus, SEL_OTHER);
+        cpu.registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::flat(SEL_DATA, 0x93));
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block)
+                .expect("a resyncing load must not stop the machine")
+        );
+    }
+    assert_eq!(cpu.jit_direct.demoted_callout_site_count_for_test(), 1);
+    arm_protected(&mut cpu, &mut bus, SEL_OTHER);
+    cpu.registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::flat(SEL_DATA, 0x93));
+    warm(&mut cpu, &mut bus);
+    assert!(
+        matches!(
+            jit::direct::compile(&mut cpu, ENTRY, true),
+            jit::direct::CompileOutcome::StructuralReject(_)
+        ),
+        "control: the site is banned before the overwrite"
+    );
+
+    // The overlay: the same two bytes written back over the segment load. `note_code_write` is the
+    // door every SMC store reaches, and the block it would have killed is already gone.
+    assert!(cpu.note_code_write(slot, 2));
+    assert_eq!(
+        cpu.jit_direct.demoted_callout_site_count_for_test(),
+        0,
+        "the write must have taken the judgement about that code with it"
+    );
+
+    warm(&mut cpu, &mut bus);
+    let recompiled = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("the code at that address is new, so the walk starts over");
+    assert_eq!(
+        recompiled.callout_interpret_one_slots, 1,
+        "and the instruction there may be a call-out again"
+    );
+}

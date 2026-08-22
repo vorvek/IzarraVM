@@ -525,6 +525,11 @@ pub(crate) struct DirectStallTally {
     /// wall went.
     pub compile_page_overflows: u64,
     pub compile_page_search_steps: u64,
+    /// Demotions whose code site `DEMOTED_CALLOUT_SITE_CAP` refused to record, and which therefore
+    /// did NOT retire their block. Non-zero says the cap is binding and the sites past it are back
+    /// to paying the emitted prologue test on every execution; it must stay zero on any workload
+    /// the cap was sized for.
+    pub demoted_callout_sites_refused: u64,
     /// G1 lane trials granted: hot-chunk compilations allowed through the heat gates on the
     /// one-per-key-per-epoch budget (`lane_trial_enabled`), and how many of them installed a
     /// lane-carrying block under a hot span. The gap between the two is trials that learned
@@ -1838,6 +1843,7 @@ impl crate::jit::JitState {
             callout_slot_cap_hits: self.stalls.callout_slot_cap_hits,
             compile_page_overflows: self.stalls.compile_page_overflows,
             compile_page_search_steps: self.stalls.compile_page_search_steps,
+            demoted_callout_sites_refused: self.stalls.demoted_callout_sites_refused,
             // A GAUGE and not a running total: the size of a map, read here rather than kept on
             // the tally. Against `callout_interpret_one_demoted` it says whether a demotion is
             // being LEARNED once per site or re-learned -- the two are within a rounding error of

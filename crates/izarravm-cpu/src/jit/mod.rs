@@ -368,6 +368,16 @@ impl JitState {
             .reject(&mut self.code_watch, &mut self.pending_watch_edges, span);
     }
 
+    #[cfg(test)]
+    pub(crate) fn demoted_callout_site_count_for_test(&self) -> usize {
+        self.direct.demoted_callout_sites_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_demoted_callout_sites_for_test(&mut self) {
+        self.direct.fill_demoted_callout_sites_for_test();
+    }
+
     pub(crate) fn retire_key_for_recompile(&mut self, key: direct::BlockKey) -> bool {
         self.direct
             .retire_key_for_recompile(&mut self.code_watch, key)
