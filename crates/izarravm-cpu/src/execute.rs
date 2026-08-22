@@ -390,7 +390,9 @@ impl CpuGsw {
                     }
                 };
                 self.load_segment_arming_ss_shadow(bus, segment, value as u16)?;
-                Ok(clocks(7))
+                // Named because FS, GS and every memory form are `InterpretOne` call-out rows:
+                // their budget bound and this arm must charge the same number.
+                Ok(clocks(MOV_SREG_CORE_CLOCKS))
             }
             0x90 => {
                 // NOP (XCHG (E)AX, (E)AX): a no-op with the same clocks as the other XCHG-acc forms.

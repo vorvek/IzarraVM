@@ -583,29 +583,35 @@ fn word_size_load_segment_forms_are_lowered() {
     }
 }
 
-/// The `0x8e` shapes that stay refused, all inside the classifier arm rather than by the
-/// allowlist, so each would keep passing if the allowlist entry were reverted.
+/// Every `0x8e` shape that is NOT the real-mode register lowering, and the answer each gets.
 ///
-/// `/1`, `/6` and `/7` are the ones that matter most: they are not segment loads at all. The
-/// interpreter raises #GP(0) for each, so lowering them would turn a fault into a silent write.
-/// `/2` is SS, refused over the one-instruction interrupt shadow a native block cannot honour.
-/// The memory form is refused because the slice is the register shape and nothing else.
+/// `/1`, `/6` and `/7` are the ones that matter most and they stay REFUSED: they are not segment
+/// loads at all, the interpreter raises #GP(0) for each, and compiling a block around an
+/// instruction that can only fault burns a call-out on every execution. `/2` is SS, refused over
+/// the one-instruction interrupt shadow, which fails R3 on every execution for the same reason.
+///
+/// `/4` FS, `/5` GS and the memory forms were refused here as "out of scope" until the S3 policy
+/// widening, which admits them as `InterpretOne` CALL-OUTS. The claim moves rather than lapses:
+/// what this table said was that they must not be LOWERED as `LoadSegReal`, which emits
+/// `base = selector << 4` and nothing else, and the slot-class column is how that is said now.
 #[test]
-fn word_size_load_segment_shapes_outside_the_slice_stay_refused() {
-    let cases: &[(&str, &[u8])] = &[
-        ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8]),
-        ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0]),
-        ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8]),
-        ("/2 mov ss,ax arms the shadow", &[0x66, 0x8e, 0xd0]),
-        ("/4 mov fs,ax is out of scope", &[0x66, 0x8e, 0xe0]),
-        ("/5 mov gs,ax is out of scope", &[0x66, 0x8e, 0xe8]),
+fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
+    // (label, bytes, call-out slots; `None` means the shape must end the block)
+    let cases: &[(&str, &[u8], Option<u8>)] = &[
+        ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8], None),
+        ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0], None),
+        ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8], None),
+        ("/2 mov ss,ax arms the shadow", &[0x66, 0x8e, 0xd0], None),
+        ("/4 mov fs,ax calls out", &[0x66, 0x8e, 0xe0], Some(1)),
+        ("/5 mov gs,ax calls out", &[0x66, 0x8e, 0xe8], Some(1)),
         (
-            "/3 memory form",
+            "/3 memory form calls out",
             &[0x66, 0x8e, 0x1d, 0x00, 0x20, 0x00, 0x00],
+            Some(1),
         ),
     ];
 
-    for &(label, form) in cases {
+    for &(label, form, call_outs) in cases {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(form);
         let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
@@ -617,22 +623,38 @@ fn word_size_load_segment_shapes_outside_the_slice_stay_refused() {
         );
 
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-        assert_eq!(
-            compilation.span.instructions, 3,
-            "{label}: must stay refused, so the block is the three fillers"
-        );
+        match call_outs {
+            None => assert_eq!(
+                compilation.span.instructions, 3,
+                "{label}: must stay refused, so the block is the three fillers"
+            ),
+            Some(slots) => {
+                assert_eq!(
+                    compilation.span.instructions, 4,
+                    "{label}: must join the block"
+                );
+                assert_eq!(
+                    compilation.callout_interpret_one_slots, slots,
+                    "{label}: must join as a call-out, never through LoadSegReal"
+                );
+            }
+        }
     }
 }
 
-/// `MOV Sreg, r16` stays refused in PROTECTED mode, where a segment load is a descriptor fetch
-/// with type, privilege and present checks rather than `selector << 4`.
+/// `MOV Sreg, r16` in PROTECTED mode, where a segment load is a descriptor fetch with type,
+/// privilege and present checks rather than `selector << 4`.
 ///
-/// The refusal lives beside the `stack_width_kind` call because `classify` has no CPU. The mode
-/// key is what makes it sufficient once made -- a block admitted in real mode can never be
-/// entered in protected mode -- but the key alone would not stop the block being COMPILED here,
-/// which is the failure this pins.
+/// The decision lives beside the `stack_width_kind` call because `classify` has no CPU. It used to
+/// be a refusal; since the S3 policy widening it is an `InterpretOne` call-out, which runs
+/// `load_protected_segment` with every check, every fault vector and the accessed-bit write-back,
+/// and then lets R2 decide whether the block may carry on.
+///
+/// What this pins is that it is NOT `LoadSegReal`. The mode key would stop a real-mode block from
+/// being ENTERED in protected mode, but it would not stop one being COMPILED here, which is the
+/// failure this test has always been about.
 #[test]
-fn the_protected_mode_load_segment_form_stays_refused() {
+fn the_protected_mode_load_segment_form_calls_out_rather_than_lowering() {
     let mut code = vec![0x40, 0x41, 0x42];
     code.extend_from_slice(&[0x66, 0x8e, 0xd8]);
     let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
@@ -645,9 +667,40 @@ fn the_protected_mode_load_segment_form_stays_refused() {
 
     let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
     assert_eq!(
-        compilation.span.instructions, 3,
-        "protected mode must stay refused, so the block is the three fillers"
+        compilation.span.instructions, 4,
+        "protected mode must join the block"
     );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 1,
+        "protected mode must call out, never lower a descriptor fetch as selector << 4"
+    );
+}
+
+/// `POP ES` and `POP DS` keep the protected-mode refusal `MOV Sreg` left behind.
+///
+/// They share `stack_width_kind`'s arm with `LoadSegReal` and used to share its answer. They are
+/// not on the `InterpretOne` allowlist -- no census row measures them -- so the arm splits, and
+/// this is the half that would otherwise have been swept along by proximity.
+#[test]
+fn the_protected_mode_pop_segment_form_stays_refused() {
+    for (label, opcode) in [("pop es", 0x07u8), ("pop ds", 0x1f)] {
+        let mut code = vec![0x40, 0x41, 0x42];
+        code.push(opcode);
+        let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        cpu.control.cr0 |= CR0_PE;
+        warm(
+            &mut cpu,
+            &mut bus,
+            &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+        );
+
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{label}: must stay refused in protected mode"
+        );
+        assert_eq!(compilation.callout_interpret_one_slots, 0);
+    }
 }
 
 /// `MOV r16, imm16` at Word size, the 16-bit campaign's fourth slice.

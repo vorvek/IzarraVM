@@ -6417,9 +6417,23 @@ fn stack_width_kind(
         // it. The mode-key argument above carries across unchanged -- V86 is bit 2 of
         // `jit_mode_key`, so a block admitted here under real mode or V86 can never later be
         // entered under protected mode.
-        DirectKind::LoadSegReal { .. } | DirectKind::PopSegReal { .. }
-            if cpu.is_protected_mode() && !cpu.is_v86_mode() =>
-        {
+        //
+        // The two part company on the ANSWER since the S3 policy widening. `LoadSegReal` is
+        // `0x8E`, which is on the `InterpretOne` allowlist, so its protected-mode form takes the
+        // call-out instead of the boundary: the helper runs `load_protected_segment` with every
+        // check, every fault vector and the accessed-bit write-back, and R2 decides afterwards
+        // whether the block may carry on. `PopSegReal` is `0x07`/`0x1F` POP ES/POP DS, which is
+        // NOT on that allowlist, so it keeps the refusal. Admitting it would be an unmeasured
+        // row, and this file's rule is that an admission needs a census behind it.
+        //
+        // Deciding it HERE and not in `classify` is the same reason the refusal was here: the
+        // mode is CPU state and `classify` has no CPU.
+        DirectKind::LoadSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
+            DirectKind::CallOut {
+                helper: CallOutHelper::InterpretOne,
+            }
+        }
+        DirectKind::PopSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
             return None;
         }
         other => other,

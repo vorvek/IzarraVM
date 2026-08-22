@@ -4610,6 +4610,11 @@ pub(crate) const PUSH_RM_CORE_CLOCKS: u32 = 2;
 /// `InterpretOne` allowlist: see the classifier's `0xfa` arm.
 pub(crate) const CLI_CORE_CLOCKS: u32 = 3;
 
+/// What MOV Sreg, r/m16 charges (execute.rs `0x8e`), at every segment, both operand forms and
+/// every mode: the arm returns one `clocks(7)` after the load, whether that load was a real-mode
+/// base computation or a full protected-mode descriptor fetch.
+pub(crate) const MOV_SREG_CORE_CLOCKS: u32 = 7;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -4636,6 +4641,7 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0xFE /0 /1 memory | execute.rs `0xfe` | `INC_DEC_RM8_CORE_CLOCKS` |
 /// | 0xFF /6 memory at Word | execute_extended.rs group 5 | `PUSH_RM_CORE_CLOCKS` |
 /// | 0xFA CLI | execute.rs `0xfa` | `CLI_CORE_CLOCKS` |
+/// | 0x8E MOV Sreg,r/m | execute.rs `0x8e` | `MOV_SREG_CORE_CLOCKS` |
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
@@ -4647,10 +4653,42 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
         larger(XCHG_CORE_CLOCKS, BIT_STRING_CORE_CLOCKS),
         larger(
             larger(GROUP3_CORE_CLOCKS, INC_DEC_RM8_CORE_CLOCKS),
-            larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
+            larger(
+                larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
+                MOV_SREG_CORE_CLOCKS,
+            ),
         ),
     ),
 );
+
+/// The most DATA ACCESSES an `InterpretOne` slot can present, and the multiplicand
+/// `compute_iteration_upper` and `compute_global_block_upper` price its bus traffic at.
+///
+/// Derived from the allowlist rather than guessed, one row at a time, because the budget bound
+/// is sound only if it dominates every admitted row:
+///
+/// | row | accesses |
+/// |---|---|
+/// | 0x8F POP r/m memory | stack read + operand store = 2 |
+/// | 0x8C memory | one store = 1 |
+/// | XCHG memory | read + store = 2 |
+/// | BT/BTS/BTR/BTC memory | read + write-back = 2 |
+/// | 0xF7 memory | read + write-back = 2 |
+/// | 0xFE memory | read + write-back = 2 |
+/// | 0xFF /6 memory | operand read + stack store = 2 |
+/// | 0xFA CLI | none |
+/// | 0x8E memory, PROTECTED mode | operand read + two descriptor dwords + accessed-bit write-back = 4 |
+///
+/// The last row is why this is FOUR rather than two, and it is the one the S3 policy widening
+/// moved: a protected-mode segment load reads eight bytes of descriptor out of the GDT or the
+/// LDT through `read_system_linear_u32` and writes the accessed bit back when it was clear
+/// (`load_protected_segment`, control.rs). The register-source form of the same row is one
+/// access fewer, so the memory form is the bound.
+///
+/// PAGE WALKS are still not priced. That is the accepted overshoot the bus term already records
+/// rather than a hole this constant opens: any of these accesses can miss the TLB and walk, and
+/// the owner's ruling of 2026-07-30 accepted that class of overshoot for the chain quota.
+pub(crate) const INTERPRET_ONE_MAX_DATA_ACCESSES: u64 = 4;
 
 /// The largest core charge any admitted call-out helper can return, and the term
 /// `compute_iteration_upper` / `compute_global_block_upper` must price a slot at when they cannot

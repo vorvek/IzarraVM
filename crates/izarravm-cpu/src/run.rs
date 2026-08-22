@@ -1789,12 +1789,14 @@ impl CpuGsw {
         // class's term below is, and dominating `compute_iteration_upper`'s matching term by the
         // same construction: `interpret_one_slots <= MAX_BLOCK_CALLOUT_SLOTS`, and `max_store` is
         // the maximum over every width and both the RAM and Mode 13h dials, so it is at least the
-        // `dword_data_upper` that term uses. Two accesses per slot, the same shape.
+        // `dword_data_upper` that term uses. `INTERPRET_ONE_MAX_DATA_ACCESSES` per slot, the same
+        // shape and the same constant, so the two bounds cannot drift apart when the allowlist
+        // grows a row with wider traffic.
         let callout_interpret_one_bus = if has_x87 {
             0
         } else {
             u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
-                .saturating_mul(2)
+                .saturating_mul(INTERPRET_ONE_MAX_DATA_ACCESSES)
                 .saturating_mul(max_store)
         };
         // The MEMORY class's traffic, added ONCE for the whole block rather than folded into the
@@ -1999,11 +2001,13 @@ impl CpuGsw {
         // make this an under-estimate; the aperture itself is refused by the pre-check, so the
         // `max` is slack rather than reachable traffic.
         //
-        // INTERPRET-ONE: TWO worst-width data accesses per slot, which is the shape of the whole
-        // allowlist rather than a guess. The rows on it are one-operand memory forms; the widest
-        // traffic any of them presents is one implicit stack access plus one explicit operand
-        // access, which is what POP r/m does. A row that wanted three would need this term
-        // widened with it, and the constant beside the allowlist is where that is recorded.
+        // INTERPRET-ONE: `INTERPRET_ONE_MAX_DATA_ACCESSES` worst-width accesses per slot, and that
+        // constant is derived row by row beside the allowlist rather than restated here. It was
+        // TWO while every admitted row was a one-operand memory form -- one implicit stack access
+        // plus one explicit operand access, which is what POP r/m does -- and the S3 policy
+        // widening raised it to FOUR when `0x8E` joined: a protected-mode segment load reads two
+        // descriptor dwords out of the GDT or LDT and writes an accessed bit back, on top of its
+        // own operand read. A row that wants five widens the constant, and both bounds follow.
         //
         // No FETCH term, and that one is a proof: the helper returns ABNORMAL unless the decode
         // line is already resident, so nothing on its path decodes, and it charges the slot's
@@ -2033,7 +2037,7 @@ impl CpuGsw {
             )
             .saturating_add(
                 u64::from(block.callout_interpret_one_slots())
-                    .saturating_mul(2)
+                    .saturating_mul(INTERPRET_ONE_MAX_DATA_ACCESSES)
                     .saturating_mul(dword_data_upper),
             );
         let raw_bus_upper = fetch_upper

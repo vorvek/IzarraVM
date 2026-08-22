@@ -2116,7 +2116,21 @@ const POLICY_ROWS_16: &[PolicyRow] = &[
     policy_inc_byte_memory_16,
     policy_push_memory_16,
     policy_cli,
+    policy_mov_sreg_reload,
 ];
+
+/// `8E /4` with mod 11 r/m 000: `mov fs, ax`.
+///
+/// SIXTEEN-BIT ONLY, and the split between the two row tables is exactly this: the 32-bit harness
+/// is protected mode, where a segment load reads a descriptor out of a GDT this generator does not
+/// build. In real mode the load is `base = selector << 4`, and the case seeds AX with the selector
+/// FS already holds, so the record does not move and R2 admits the resume. A random selector would
+/// resync, which is correct behaviour and has its own execution fixture, but it retires fewer
+/// instructions than this sweep's equality admits.
+fn policy_mov_sreg_reload(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[0] = 0;
+    vec![0x8E, 0xE0]
+}
 
 /// `FF /6` with mod 01, r/m 110, disp8 0: `push word [bp+0]`, unprefixed on a 16-bit stack.
 fn policy_push_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {

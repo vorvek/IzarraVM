@@ -2207,3 +2207,139 @@ fn sti_stays_a_boundary_beside_the_admitted_cli() {
 fn cli_core_clocks_is_what_the_interpreter_charges() {
     assert_row_charges(&[0xFA], crate::CLI_CORE_CLOCKS, |_, _| {});
 }
+
+/// Row 8: MOV Sreg, r/m, the form the resume predicate actually decides.
+///
+/// R2 compares all six cached segment records, so this is the first admitted row whose answer
+/// depends on the VALUE it loads rather than on its shape. A load that leaves the record identical
+/// resumes; a load that changes it resyncs. Both are pinned here, because a predicate that always
+/// resumed and one that always resynced would each pass half of this test.
+///
+/// The resuming cases load selector 0 into ES and DS, which the fixture already holds:
+/// `sixteen_bit_code_cpu` installs them through `load_segment_real`, and `load_segment_real_mode`
+/// (the ordinary real-mode `MOV Sreg` path) rebuilds the same record from the same selector while
+/// preserving the limit, so the byte comparison finds nothing moved. That is the re-establishing
+/// `mov ds, ax` a 16-bit C runtime emits at every function that could have changed it, which is
+/// the shape the census row is made of.
+///
+/// MUTATION: delete the FS/GS arm and the two FS cases fail on the block shape; delete R2's
+/// segment comparison instead and the resync case reports a completed block where the interpreted
+/// leg is one instruction further along.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_mov_sreg_resumes_on_an_unchanged_record() {
+    fn zero_the_source(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        cpu.registers.set_edx(0);
+        bus.memory[POP_TARGET as usize..POP_TARGET as usize + 2].fill(0);
+    }
+    for row in [
+        // 8E /0 and /3 with mod 00 r/m 111: mov es,[bx] and mov ds,[bx], both reading zero.
+        &[0x8Eu8, 0x07][..],
+        &[0x8E, 0x1F],
+        // 8E /4 and /5 with mod 11 r/m 010: mov fs,dx and mov gs,dx, both loading zero.
+        &[0x8E, 0xE2],
+        &[0x8E, 0xEA],
+    ] {
+        assert_row_resumes(row, zero_the_source);
+    }
+}
+
+/// The other side of R2: a load that MOVES the record ends the run at the slot.
+///
+/// FS starts at its default record (base 0, limit 0, access 0) and the row loads 0x1111, so the
+/// real-mode path rebuilds base and access and the comparison sees a different segment. The block
+/// stops there; the interpreter finishes the program, and the two legs still agree on everything.
+///
+/// This is the row's expected behaviour on a guest that really changes segments, and the governor
+/// is what keeps it from being a loss: three of the first eight executions demote the slot back to
+/// the boundary it replaced.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
+    // mov ax,0x1111 | mov fs,ax | inc ax | hlt
+    let row = [0x8Eu8, 0xE0];
+    assert_row_is_a_call_out(&row);
+    let (code, starts) = row_program(&row);
+    let mut legs = run_both(&code, &starts, no_perturb);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "a segment record that moved must RESYNC"
+    );
+    assert_eq!(
+        legs.native_insns, 2,
+        "the block must report the prefix plus the retired segment load"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert_eq!(stalls.callout_interpret_one_resync_fault, 0);
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.native.registers.segment(SegmentIndex::Fs).selector,
+        0x1111,
+        "the load itself must have happened: a RESYNC is not an undo"
+    );
+}
+
+/// SS and the three illegal reg fields stay refused, from the side that can see them.
+///
+/// `/2` fails R3's interrupt-shadow clause on every execution and `/1`, `/6` and `/7` can only
+/// fault, so each would be a call-out that never resumes. They are one bit apart from the four
+/// admitted values, which is why they are asserted rather than argued.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn mov_sreg_refuses_ss_and_the_illegal_reg_fields() {
+    for reg in [1u8, 2, 6, 7] {
+        let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+        // 8E /reg with mod 11 r/m 010 (DX).
+        code.extend_from_slice(&[0x8E, 0xC2 | (reg << 3)]);
+        code.extend_from_slice(&[0x40, 0xF4]);
+        let starts = vec![0, 3, 4, 5, 7];
+        let (_, _, block) = build_native(&code, &starts);
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "0x8E /{reg} must still end the block"
+        );
+        assert_eq!(block.callout_interpret_one_slots(), 0);
+    }
+}
+
+/// ES and DS keep their REAL-MODE register lowering, which emits no helper call at all.
+///
+/// The row splits four ways and this is the cell that must not move: `LoadSegReal` is three stores
+/// and no call, so turning it into a call-out would be a loss on the fixture that measured it.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn mov_sreg_keeps_the_real_mode_register_lowering() {
+    for row in [&[0x8Eu8, 0xC2][..], &[0x8E, 0xDA]] {
+        assert_row_is_native(row);
+    }
+}
+
+/// `MOV_SREG_CORE_CLOCKS` is what the interpreter charges, on the register form and the memory
+/// form alike.
+#[test]
+fn mov_sreg_core_clocks_is_what_the_interpreter_charges() {
+    for row in [&[0x8Eu8, 0xE2][..], &[0x8E, 0x07]] {
+        assert_row_charges(row, crate::MOV_SREG_CORE_CLOCKS, |cpu, _| {
+            cpu.registers.set_edx(0);
+        });
+    }
+}

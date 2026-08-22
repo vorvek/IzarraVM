@@ -1506,34 +1506,63 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 };
                 return Some(DirectKind::MovSegToReg { dst, segment });
             }
-            // MOV Sreg, r16, the write half of the segment family. DS and ES only, register
-            // source only, and REAL MODE or V86 only -- the mode gate is not here because
-            // `classify` has no CPU; it lives beside the `stack_width_kind` call, which is where
-            // PUSHF's V86 refusal lives for the same reason.
+            // MOV Sreg, r/m16, the write half of the segment family. THREE answers now, and the
+            // arm's whole job is to keep them apart:
+            //
+            // | form | answer |
+            // |---|---|
+            // | `/0` ES or `/3` DS, register source, real mode or V86 | `LoadSegReal`, a lowering |
+            // | `/0` ES or `/3` DS, register source, protected mode | an `InterpretOne` call-out, chosen in `stack_width_kind` where the mode is in scope |
+            // | `/0` ES, `/3` DS, `/4` FS or `/5` GS, memory source, any mode | an `InterpretOne` call-out |
+            // | `/4` FS or `/5` GS, register source, any mode | an `InterpretOne` call-out |
+            // | `/1` CS, `/2` SS, `/6`, `/7` | refused |
+            //
+            // The call-out arms are the S3 policy widening's eighth row: the post-S2 loader census
+            // ranks `0x8E` at 1.27 M block-stopping hits, of which the memory form is 786 k.
+            //
+            // WHAT THE CALL-OUT ADMITS THAT THE LOWERING CANNOT. `LoadSegReal` emits
+            // `base = selector << 4` and nothing else, which is what a segment load IS in real
+            // mode and V86 and is nothing like what it is in protected mode: a GDT or LDT fetch
+            // with type, privilege and present checks, an accessed-bit write-back, and three
+            // fault vectors. The helper runs the interpreter's arm, so every one of those is the
+            // interpreter's, exactly.
+            //
+            // WHAT IT COSTS. R2 compares all six cached segment records, so a load that CHANGES
+            // the record resyncs and a load of the same selector onto the same descriptor
+            // resumes. A guest that reloads DS with a new selector therefore resyncs every time
+            // and the governor demotes the slot after three of its first eight executions, which
+            // is the boundary it had before. A guest that reloads the SAME selector -- the
+            // re-establishing `mov ds, ax` a 16-bit C runtime emits at every function that could
+            // have changed it -- resumes. Both are correct; only the second is a win, and the
+            // governor is what stops the first from being a loss.
             //
             // `/1` (CS), `/6` and `/7` are refused HERE rather than left off the allowlist,
             // because they are not loads at all: the interpreter raises #GP(0) for each
-            // (`execute.rs`, the 0x8e arm). Lowering them would turn a fault into a silent write,
-            // and 0x8c is NOT the symmetric case to copy -- `MOV r16, CS` is legal where
-            // `MOV CS, r16` is not.
+            // (`execute.rs`, the 0x8e arm). Compiling a block around an instruction that can only
+            // fault burns a call-out and a governor execution on every execution, and 0x8c is NOT
+            // the symmetric case to copy -- `MOV r16, CS` is legal where `MOV CS, r16` is not.
             //
-            // `/2` (SS) is refused for a reason of its own: loading SS arms a one-instruction
-            // interrupt shadow (`load_segment_arming_ss_shadow`), which the interpreter consumes
-            // at the start of the NEXT instruction. A native block never passes through that
-            // point, so a block that continued after an SS load would hold the shadow open across
-            // every remaining slot -- a guest-visible change in where an interrupt is delivered.
-            // The census measures 1,303 SS hits against 17.8 million for DS.
-            //
-            // FS and GS are absent for census reasons alone and would be safe to add.
+            // `/2` (SS) is refused for a reason of its own, and it is the reason design review M8
+            // gives for keeping the whole SS family out: loading SS arms a one-instruction
+            // interrupt shadow (`load_segment_arming_ss_shadow`), so it fails R3's shadow clause
+            // on EVERY execution. Admitting it would be a call-out that always resyncs. The
+            // census measures 1,303 SS hits against 17.8 million for DS.
             0x8e => {
                 let m = insn.modrm?;
                 let segment = match m.reg {
                     0 => SegmentIndex::Es,
                     3 => SegmentIndex::Ds,
+                    4 | 5 => {
+                        return Some(DirectKind::CallOut {
+                            helper: CallOutHelper::InterpretOne,
+                        });
+                    }
                     _ => return None,
                 };
                 let DecodedOperand::Reg(src) = insn.operand? else {
-                    return None;
+                    return Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne,
+                    });
                 };
                 return Some(DirectKind::LoadSegReal { segment, src });
             }
