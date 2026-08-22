@@ -2594,7 +2594,10 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
 /// `data_matches` at the next entry and recompiled every visit. The sibling below is that shape.
 ///
 /// MUTATION: drop `used_by_others` from the mask (compare all six) and this resyncs, reporting two
-/// instructions instead of three.
+/// instructions instead of three.///
+/// STATES ITS ARM. `IZARRAVM_CALLOUT_SEGMENT_RESUME` defaulted OFF on 2026-08-22 after the loader
+/// measured the ON arm 10.5% slower, and a fixture that inherited the ambient reading would have
+/// started testing the refusal while claiming to test the relaxation.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -2602,9 +2605,11 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
+    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov ax,0x1111 | mov fs,ax | inc ax | hlt
     let (code, starts) = row_program(&[0x8E, 0xE0]);
     let mut legs = run_both(&code, &starts, no_perturb);
+    jit::direct::set_callout_segment_resume_for_test(None);
     assert_eq!(legs.exit_reason, None, "the block should have completed");
     assert_eq!(
         legs.native_insns,
@@ -2635,7 +2640,10 @@ fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
 /// A/B is read against, so a counter that never fired would make the two arms look free.
 ///
 /// MUTATION: mask with `suffix_used` instead of `used_by_others` and this resumes, reporting three
-/// instructions and leaving the counter at zero.
+/// instructions and leaving the counter at zero.///
+/// STATES ITS ARM. `IZARRAVM_CALLOUT_SEGMENT_RESUME` defaulted OFF on 2026-08-22 after the loader
+/// measured the ON arm 10.5% slower, and a fixture that inherited the ambient reading would have
+/// started testing the refusal while claiming to test the relaxation.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -2643,10 +2651,12 @@ fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resyncs_when_an_earlier_slot_uses_the_segment() {
+    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov ax,fs | mov fs,bx | inc ax | hlt -- the user is slot 0 and the call-out is slot 1.
     let code = [0x8C, 0xE0, 0x8E, 0xE3, 0x40, 0xF4];
     let starts = [0, 2, 4];
     let mut legs = run_both(&code, &starts, no_perturb);
+    jit::direct::set_callout_segment_resume_for_test(None);
     assert_eq!(
         legs.exit_reason,
         Some(jit::direct::SideExitReason::CallOutResync as u32),
@@ -2667,7 +2677,8 @@ fn interpret_one_mov_sreg_resyncs_when_an_earlier_slot_uses_the_segment() {
     assert_legs_agree(&mut legs);
 }
 
-/// The knob's OFF arm is the pre-S4f behaviour, both halves of it.
+/// The knob's OFF arm is the pre-S4f behaviour, both halves of it, and it is the SHIPPED arm since
+/// the loader refuted the slice on 2026-08-22.
 ///
 /// The same fixture that resumes on the ON arm resyncs here, and the block that publishes no
 /// successors on the ON arm publishes its fallthrough again. Those are the two things S4f changed,
@@ -2717,20 +2728,31 @@ fn the_segment_resume_knob_restores_the_strict_rule_and_the_successors() {
     );
     assert_legs_agree(&mut legs);
 
-    // Control: the SAME program on the ON arm resumes and bars the successors.
+    // Control: the SAME program on the ON arm resumes and bars the successors. Stated rather than
+    // inherited, and since 2026-08-22 the ON arm is the one that has to be asked for.
+    jit::direct::set_callout_segment_resume_for_test(Some(true));
     let (cpu, _, block) = build_native(&code, &starts);
     assert!(block.is_segment_write_block());
     assert_eq!(cpu.jit_direct.waiting_len_for_test(), 0);
     let legs = run_both(&code, &starts, no_perturb);
+    jit::direct::set_callout_segment_resume_for_test(None);
     assert_eq!(legs.exit_reason, None);
     assert_eq!(legs.native_insns, u64::from(BLOCK_INSTRUCTIONS));
 }
 
-/// The knob's spelling table, unset included. Default ON, and `0` / `off` / empty are the escape.
+/// The knob's spelling table, unset included. DEFAULT OFF since the 2026-08-22 refutation, so
+/// unset, `0`, `off` and the empty string all name the shipped arm and `1` / `on` is the opt-in.
+///
+/// The empty string is asserted beside unset on purpose. It is the PowerShell nulling trap, and
+/// flipping the default inverted which leg it damages rather than removing it: an ON leg now has
+/// to EXPORT `1`, and a leg that merely nulls the variable measures the default.
 #[test]
 fn the_segment_resume_knob_spellings() {
     use jit::direct::parse_callout_segment_resume_arm_for_test as parse;
-    assert!(parse(Err(std::env::VarError::NotPresent)), "unset is ON");
+    assert!(
+        !parse(Err(std::env::VarError::NotPresent)),
+        "unset is OFF since the refutation"
+    );
     for on in ["1", "on", "ON", " on "] {
         assert!(parse(Ok(on.to_string())), "{on}");
     }
@@ -2758,6 +2780,7 @@ fn the_segment_resume_knob_spellings() {
 ))]
 #[test]
 fn the_suffix_mask_reaches_past_the_next_slot() {
+    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov fs,bx | inc ax | mov ax,fs | hlt -- the call-out is slot 0 and the user is slot 2.
     //
     // BX rather than CX because the record has to MOVE: `arm_fixture` clears CX, and FS starts at
@@ -2775,6 +2798,7 @@ fn the_suffix_mask_reaches_past_the_next_slot() {
         "FS is baked two slots later, so the moved record must RESYNC"
     );
     assert_legs_agree(&mut legs);
+    jit::direct::set_callout_segment_resume_for_test(None);
 }
 
 /// The three illegal reg fields stay refused, from the side that can see them.
@@ -5376,6 +5400,7 @@ fn a_block_that_resumes_past_the_sti_breaks_the_run_where_the_interpreter_does()
 ))]
 #[test]
 fn segment_writing_callout_block_publishes_no_successors() {
+    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov ax,0x1111; mov fs,ax; inc ax; hlt -- the HLT is the barrier, so the block would
     // otherwise publish its fallthrough.
     let (code, starts) = row_program(&[0x8E, 0xE0]);
@@ -5402,6 +5427,7 @@ fn segment_writing_callout_block_publishes_no_successors() {
         1,
         "control: and it must queue its fallthrough"
     );
+    jit::direct::set_callout_segment_resume_for_test(None);
 }
 
 /// The chained shape, which is the one the bar exists for.
@@ -5421,6 +5447,7 @@ fn segment_writing_callout_block_publishes_no_successors() {
 ))]
 #[test]
 fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
+    jit::direct::set_callout_segment_resume_for_test(Some(true));
     const CODE: &[u8] = &[
         0x40, 0x40, 0x40, // A: inc eax x3                    +0 +1 +2
         0xEB, 0x00, // jmp +0, static link into B             +3
@@ -5503,6 +5530,7 @@ fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
             .expect("C must not stop the machine")
     );
     assert_eq!(cpu.registers.eip, ENTRY + 15);
+    jit::direct::set_callout_segment_resume_for_test(None);
 }
 
 /// SS is in the mask ALWAYS, however empty the suffix is.
@@ -5520,10 +5548,12 @@ fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
 ))]
 #[test]
 fn a_stack_width_change_resyncs_even_with_an_empty_suffix() {
+    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov eax,0x1111; mov ss,dx; inc eax; hlt
     const CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xD2, 0x40, 0xF4];
     const STARTS: &[u32] = &[0, 5, 7];
     let mut legs = run_both_protected_program(CODE, STARTS, SEL_SS16, no_perturb);
+    jit::direct::set_callout_segment_resume_for_test(None);
     assert_eq!(
         legs.exit_reason,
         Some(jit::direct::SideExitReason::CallOutResync as u32),

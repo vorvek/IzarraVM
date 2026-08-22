@@ -1070,7 +1070,14 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     // The SECOND producer of a segment write, added with S4f: an `InterpretOne` row whose
     // `may_write_segment` says yes. `mov fs,ax` is a call-out in every mode, so it reaches the bar
     // through `callout_segment_writes` rather than through the `LoadSegReal` lowering above --
-    // and the bar is what pays for the suffix-used relaxation of R2.
+    // and the bar is what pays for the whole-block segment mask.
+    //
+    // It runs on BOTH arms of `IZARRAVM_CALLOUT_SEGMENT_RESUME` and gets OPPOSITE answers, which is
+    // what the knob means at this level: on the ON arm the row bars the block's successors, and on
+    // the OFF arm -- the shipped one since the 2026-08-22 refutation -- nothing feeds
+    // `callout_segment_writes` and the block publishes its fallthrough like any other. The three
+    // rows around it are arm-independent, because a `LoadSegReal` lowering reaches
+    // `segment_writes` and never the call-out accumulator.
     let callout = [0x40, 0x41, 0x8e, 0xe0, DIRECT_BARRIER, 0x43, 0x44];
     let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x43, 0x44, 0x45];
     // The OTHER arm that publishes `[None, None]`: a terminal whose successor is dynamic. It is
@@ -1078,32 +1085,44 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     // `successors == [None, None]` alone would count this block and be wrong.
     let ret = [0x40, 0x41, 0x42, 0xc3, 0x43, 0x44, 0x45];
 
-    for (label, code, offsets, expected) in [
+    for (label, code, offsets, expected, segment_resume) in [
         (
             "segment write",
             writes.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
+            false,
         ),
         (
-            "segment-writing call-out",
+            "segment-writing call-out, knob on",
             callout.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
+            true,
+        ),
+        (
+            "segment-writing call-out, knob off",
+            callout.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            0,
+            false,
         ),
         (
             "fallthrough control",
             control.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
+            false,
         ),
         (
             "dynamic terminal control",
             ret.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
+            false,
         ),
     ] {
+        jit::direct::set_callout_segment_resume_for_test(Some(segment_resume));
         let (mut cpu, mut bus) = fixture(code);
         cpu.registers.set_esp(0x1000);
         let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
@@ -1149,6 +1168,7 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
                 "{label}: control must not deposit into the instruction lane"
             );
         }
+        jit::direct::set_callout_segment_resume_for_test(None);
     }
 }
 
@@ -3656,8 +3676,11 @@ fn barrier_census_closure_dormant_heat_histogram_closes_on_its_class() {
             .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY, None);
     }
     for _ in 0..2 {
-        cpu.jit_direct
-            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x40, None);
+        cpu.jit_direct.note_unbound_target(
+            jit::direct::UnboundTarget::DormantHeat,
+            ENTRY + 0x40,
+            None,
+        );
     }
     cpu.jit_direct
         .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80, None);
@@ -3667,8 +3690,11 @@ fn barrier_census_closure_dormant_heat_histogram_closes_on_its_class() {
     }
     cpu.jit_direct
         .note_dynamic_miss_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80);
-    cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantOther, ENTRY + 0xc0, None);
+    cpu.jit_direct.note_unbound_target(
+        jit::direct::UnboundTarget::DormantOther,
+        ENTRY + 0xc0,
+        None,
+    );
 
     let snapshot = cpu
         .direct_barrier_census_snapshot()
