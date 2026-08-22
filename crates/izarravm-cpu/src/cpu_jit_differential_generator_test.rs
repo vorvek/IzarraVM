@@ -2071,6 +2071,14 @@ fn policy_inc_byte_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
     vec![0xFE, 0x45, 0x00]
 }
 
+/// `66 FF /6` with mod 01, r/m 101, disp8 0: `push word [ebp+0]`, the only admitted row whose
+/// store lands on the STACK. It moves the pointer the slots after it address through, which is the
+/// property `emit_store_homes` plus the unconditional reload has to carry.
+fn policy_push_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x66, 0xFF, 0x75, 0x00]
+}
+
 /// The rows a 32-bit protected-mode case can carry.
 const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_mov_sreg_memory_32,
@@ -2082,6 +2090,7 @@ const POLICY_ROWS_32: &[PolicyRow] = &[
     policy_group3_register_16bit_operand,
     policy_group3_multiply_16bit_operand,
     policy_inc_byte_memory_32,
+    policy_push_memory_32,
 ];
 
 /// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
@@ -2098,7 +2107,14 @@ const POLICY_ROWS_16: &[PolicyRow] = &[
     policy_group3_register,
     policy_group3_multiply,
     policy_inc_byte_memory_16,
+    policy_push_memory_16,
 ];
+
+/// `FF /6` with mod 01, r/m 110, disp8 0: `push word [bp+0]`, unprefixed on a 16-bit stack.
+fn policy_push_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0xFF, 0x76, 0x00]
+}
 
 /// `FE /0` with mod 01, r/m 110, disp8 0: `inc byte [bp+0]`.
 fn policy_inc_byte_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {

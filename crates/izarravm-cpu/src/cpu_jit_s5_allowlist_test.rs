@@ -1252,16 +1252,22 @@ fn a_word_near_jmp_above_the_wrap_is_refused_while_the_same_block_below_it_compi
 
 /// A 66-prefixed `FF /6` must stay REFUSED, and nothing else in the crate can catch it.
 ///
-/// `0xff` is in the Word allowlist, so this form reaches the classifier and produces a `PushMem`.
-/// What refuses it is the stack-width admission matrix, which is consulted only for kinds whose
-/// `uses_stack()` is true. Admitting it would push two bytes while decrementing ESP by four,
-/// which is a miscompile rather than a missed lowering.
+/// `0xff` is in the Word allowlist, so this form reaches the classifier. Until the S3 policy
+/// widening it produced a `PushMem` there and was refused one step later by the stack-width
+/// admission matrix, which is consulted only for kinds whose `uses_stack()` is true; admitting it
+/// as `PushMem` would push two bytes while decrementing ESP by four, which is a miscompile rather
+/// than a missed lowering.
 ///
-/// The assertion is an EXACT count, and it is paired against a POSITIVE CONTROL: the unprefixed
-/// `FF /6` at the same entry, on the same stack width, must lower and grow the block to four
-/// instructions. Without the control, "the block is three instructions" is satisfied identically
-/// by the Word form being correctly refused OR by `PushMem` never reaching the classifier at all,
-/// and the fixture cannot tell those apart.
+/// It now joins the block as an `InterpretOne` call-out instead, decided in the classifier arm
+/// rather than in the matrix. The claim this fixture makes is unchanged in substance and moves
+/// from a count to a SLOT CLASS: the Word form must not be lowered as `PushMem`, and the way to
+/// say so now that it compiles is that its slot is a call-out and the block declares no static
+/// stack access for it.
+///
+/// The POSITIVE CONTROL stays and does more work than before: the unprefixed `FF /6` at the same
+/// entry, on the same stack width, must lower through `PushMem` with no call-out slot at all. The
+/// two cases now differ in HOW they join rather than in whether they do, which is a sharper pairing
+/// than the old one.
 ///
 /// Both cases widen SS to a 32-bit stack explicitly. `flat_fixture` widens the CS and SS LIMITS
 /// but leaves `SS.default_size_32` alone, and the stack-width admission matrix refuses `PushMem`
@@ -1270,22 +1276,22 @@ fn a_word_near_jmp_above_the_wrap_is_refused_while_the_same_block_below_it_compi
 /// the pairing would prove nothing. Widening SS here makes the prefix the ONLY difference between
 /// the two cases.
 #[test]
-fn word_size_push_through_memory_stays_refused() {
+fn word_size_push_through_memory_calls_out_rather_than_lowering() {
     let cases: &[(&str, &[u8], u8)] = &[
         (
             "unprefixed control",
             &[0xff, 0x35, 0x00, 0x08, 0x00, 0x00],
-            4,
+            0,
         ),
         (
             // 66 ff 35 00 08 00 00: push word [0x800] at Word operand size.
             "0x66-prefixed",
             &[0x66, 0xff, 0x35, 0x00, 0x08, 0x00, 0x00],
-            3,
+            1,
         ),
     ];
 
-    for &(label, form, expected_instructions) in cases {
+    for &(label, form, expected_call_outs) in cases {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(form);
         let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
@@ -1301,8 +1307,12 @@ fn word_size_push_through_memory_stays_refused() {
 
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
         assert_eq!(
-            compilation.span.instructions, expected_instructions,
-            "{label}: the Dword form must lower and the Word form must stay refused"
+            compilation.span.instructions, 4,
+            "{label}: both forms must carry the whole four-slot block"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, expected_call_outs,
+            "{label}: the Dword form must lower through PushMem and the Word form must call out"
         );
     }
 }
@@ -1316,7 +1326,7 @@ fn word_size_push_through_memory_stays_refused() {
 /// `SS.B`, the same PushMem precedent.
 ///
 /// Both cases widen SS to a 32-bit stack explicitly, for the same reason
-/// `word_size_push_through_memory_stays_refused` does: `flat_fixture` leaves `SS.default_size_32`
+/// `word_size_push_through_memory_calls_out_rather_than_lowering` does: `flat_fixture` leaves `SS.default_size_32`
 /// alone, and on a 16-bit stack (`SS.B` = 0) even the UNPREFIXED Dword control has no matrix arm
 /// (the `(false, Dword)` cell is a stop, four bytes on a 16-bit SP not being built yet) and would
 /// also come out refused, for a reason that has nothing to do with the 0x66 prefix. Widening SS

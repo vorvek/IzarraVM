@@ -2071,3 +2071,71 @@ fn inc_dec_rm8_core_clocks_is_what_the_interpreter_charges() {
         assert_row_charges(row, crate::INC_DEC_RM8_CORE_CLOCKS, |_, _| {});
     }
 }
+
+/// Row 6: PUSH r/m16 through memory.
+///
+/// The first admitted row whose store goes to the STACK rather than to an address the block can
+/// see, so the resume has to survive a moved pointer: `emit_store_homes` hands the helper the live
+/// (E)SP and the unconditional reload picks up the decremented one, which is what lets the slot
+/// after it address the stack correctly. Nothing bakes an SP value.
+///
+/// MUTATION: return `PushMem` for the Word form as well and the block shape assertion fails,
+/// because `PushMem` is a stack kind and the compile loop's stack-width matrix has no Word cell
+/// for it in either stack width.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_push_rm16_memory_resumes() {
+    // FF /6 with mod 00 r/m 111: push word [bx].
+    let legs = assert_row_resumes(&[0xFF, 0x37], no_perturb);
+    assert_eq!(
+        legs.native.registers.esp() & 0xffff,
+        STACK_TOP - 2,
+        "the push must have moved the stack pointer"
+    );
+    assert_eq!(
+        u16::from_le_bytes(
+            legs.native_bus.memory[STACK_TOP as usize - 2..STACK_TOP as usize]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "the pushed word is the zero the fixture seeded at [bx]"
+    );
+}
+
+/// The row is WORD only: the Dword form keeps `PushMem` and is decided by the stack-width matrix,
+/// not here.
+///
+/// In this 16-bit fixture the 66-prefixed form has no cell in that matrix (a four-byte push on a
+/// 16-bit pointer is not built), so it ends the block. What the assertion pins is that it did NOT
+/// become a call-out, which is the half this slice could have got wrong.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn push_rm_memory_takes_the_call_out_at_word_size_only() {
+    let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+    // 66 FF /6 with mod 00 r/m 111: push dword [bx].
+    code.extend_from_slice(&[0x66, 0xFF, 0x37]);
+    code.extend_from_slice(&[0x40, 0xF4]);
+    let starts = vec![0, 3, 4, 5, 8];
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        3,
+        "the Dword form must stay with PushMem and its stack-width matrix"
+    );
+    assert_eq!(block.callout_interpret_one_slots(), 0);
+}
+
+/// `PUSH_RM_CORE_CLOCKS` is what the interpreter charges.
+#[test]
+fn push_rm_core_clocks_is_what_the_interpreter_charges() {
+    assert_row_charges(&[0xFF, 0x37], crate::PUSH_RM_CORE_CLOCKS, |_, _| {});
+}

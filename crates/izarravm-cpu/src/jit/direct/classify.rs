@@ -2103,6 +2103,24 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     let DecodedOperand::Mem(addr) = insn.operand? else {
                         return None;
                     };
+                    // WORD is an `InterpretOne` call-out, the S3 policy widening's sixth row;
+                    // Dword keeps `PushMem`.
+                    //
+                    // The split is the stack, not the read. `PushMem` is a `uses_stack()` kind, so
+                    // the Word form already reached the compile loop's stack-width matrix, which
+                    // has no `PushMem16` cell and refuses it in BOTH stack widths -- a Word push
+                    // moves two bytes and decrements the pointer by two, and no emitter builds
+                    // that. Deciding it here rather than there is what keeps the matrix's arms
+                    // about emitters: a call-out is not a stack kind and never reaches it.
+                    //
+                    // The operand size and the STACK width are independent, and only the first is
+                    // in scope here. That is enough: the call-out is correct for either stack
+                    // width because the interpreter's own `push` reads SS.B for itself.
+                    if insn.operand_size != OperandSize::Dword {
+                        return Some(DirectKind::CallOut {
+                            helper: CallOutHelper::InterpretOne,
+                        });
+                    }
                     return Some(DirectKind::PushMem {
                         addr: direct_addr(addr)?,
                     });

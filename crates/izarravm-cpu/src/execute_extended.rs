@@ -939,7 +939,9 @@ impl CpuGsw {
                     6 => {
                         let value = self.read_operand_sized(bus, operand, operand_size)?;
                         self.push(bus, value, operand_size)?;
-                        Ok(clocks(2))
+                        // Named because the Word memory form is an `InterpretOne` call-out row:
+                        // its budget bound and this arm must charge the same number.
+                        Ok(clocks(PUSH_RM_CORE_CLOCKS))
                     }
                     3 | 5 => {
                         // Far CALL (/3) and far JMP (/5) via memory. The operand must be memory;
