@@ -1335,7 +1335,28 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                     _ => return None,
                 };
                 let DecodedOperand::Reg(dst) = insn.operand? else {
-                    return None;
+                    // The MEMORY form, an `InterpretOne` call-out and the first row of the S3
+                    // policy widening. It tops the post-S2 loader census at 2.20 M block-stopping
+                    // hits (12.4%), and it is a call-out rather than a lowering for the same
+                    // reason 0x8F is: a two-byte store of a selector is not worth an emitter, an
+                    // address computation, a fast-map probe, a code-watch guard and a side-exit
+                    // stub set, and until this row was lifted it ended the block instead.
+                    //
+                    // ALL FOUR Sreg values the census measures ride the arm together, and so do
+                    // the other two of 0..=5: the helper runs the decode line, so there is no
+                    // per-segment lowering to get wrong and refusing four of six would be the
+                    // arbitrariness this file's header rules out. `/6` and `/7` stay refused by
+                    // the match above, on the same ground the register form refuses them --
+                    // `segment_from_reg_field` folds them into GS through a catch-all rather
+                    // than by intent, and a block compiled around an accident is worse than a
+                    // boundary.
+                    //
+                    // No width question. The interpreter writes `OperandSize::Word` whatever the
+                    // operand size, which is what already lets `0x8c` sit on the Word allowlist,
+                    // and the call-out inherits that by running the interpreter's own arm.
+                    return Some(DirectKind::CallOut {
+                        helper: CallOutHelper::InterpretOne,
+                    });
                 };
                 return Some(DirectKind::MovSegToReg { dst, segment });
             }

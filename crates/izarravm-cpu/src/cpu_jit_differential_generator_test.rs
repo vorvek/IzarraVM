@@ -1902,3 +1902,204 @@ fn generated_interpret_one_blocks_match_the_interpreter() {
         false,
     );
 }
+
+// ---------------------------------------------------------------------------
+// The S3 policy widening: one generated row per admitted opcode.
+// ---------------------------------------------------------------------------
+
+/// Instructions the policy block retires natively: the MOV, the row under test, the ALU slot, the
+/// TEST and the terminal Jcc. The leading NOP is the starter and is not among them, for the reason
+/// `WIDTH_LIFT_NATIVE_INSTRUCTIONS` states.
+///
+/// It is an EQUALITY and it is the whole anti-vacuity gate for this sweep. A row that lost its
+/// classifier arm ends the block where it used to and retires two; a row that RESYNCs instead of
+/// resuming retires two as well. Neither shows up in the state comparison, because both leave the
+/// interpreter to finish the same program.
+const POLICY_NATIVE_INSTRUCTIONS: u64 = 5;
+
+/// Where the memory-form rows read and write in a 32-bit case: the frame `interpret_one_case`
+/// already uses, above the stack pointer and clear of the code.
+const POLICY_FRAME_32: u32 = INTERPRET_ONE_FRAME;
+
+/// The same for a 16-bit case, where the address size is Word and the frame has to fit in it.
+const POLICY_FRAME_16: u32 = 0x4000;
+
+/// One S3 row as bytes for a 32-bit protected-mode case, and the register seeding it needs.
+///
+/// A TABLE of builders rather than a `match` on a row number, so a commit that admits a row adds
+/// one entry and the sweep's coverage grows by construction. The seeding travels with the bytes
+/// because several rows need a register set to a value that keeps them fault-free: a row that
+/// faults takes the RESYNC-after-fault stub, which is correct behaviour and has its own execution
+/// test, but it retires fewer instructions than the equality above admits and would turn this
+/// sweep into a test of the fault path under a misleading name.
+type PolicyRow = fn(&mut [u32; 8]) -> Vec<u8>;
+
+/// `8C /0` with mod 01, r/m 101, disp8 0: `mov [ebp+0], es`, the memory form of MOV r/m16, Sreg.
+fn policy_mov_sreg_memory_32(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_32;
+    vec![0x8C, 0x45, 0x00]
+}
+
+/// `8C /0` with mod 01, r/m 110, disp8 0: `mov [bp+0], es`.
+fn policy_mov_sreg_memory_16(gpr: &mut [u32; 8]) -> Vec<u8> {
+    gpr[5] = POLICY_FRAME_16;
+    vec![0x8C, 0x46, 0x00]
+}
+
+/// The rows a 32-bit protected-mode case can carry.
+const POLICY_ROWS_32: &[PolicyRow] = &[policy_mov_sreg_memory_32];
+
+/// The rows a 16-bit real-mode case can carry. A separate table rather than the same one behind a
+/// width parameter, because the two machines do not admit the same set: a protected-mode segment
+/// load reads a descriptor out of a GDT this harness does not build, so the rows that load a
+/// segment register live on the 16-bit side alone and the split says so.
+const POLICY_ROWS_16: &[PolicyRow] = &[policy_mov_sreg_memory_16];
+
+/// A 32-bit block whose middle slot is one S3 row.
+///
+/// The row is neither first nor last: the compile walk refuses a block whose leading slot is a
+/// call-out, and a row at the tail would pass with a broken EIP restore. The Jcc at the end reads
+/// the flag shadow the helper republished, so a row that left EFLAGS wrong sends the two roles to
+/// different addresses.
+fn policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_80f3_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32();
+    }
+    gpr[4] = WIDTH_LIFT_STACK;
+
+    let mut bytes = Vec::with_capacity(32);
+    bytes.push(0x90);
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    push_u32(&mut bytes, rng.u32());
+    let row = POLICY_ROWS_32[(index + mode_offset) as usize % POLICY_ROWS_32.len()];
+    bytes.extend_from_slice(&row(&mut gpr));
+    let op = ((index + mode_offset) & 7) as u8;
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+    bytes.extend_from_slice(&[0x85, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// The 16-bit half: the same shape unprefixed in a 16-bit code segment on a 16-bit stack, which is
+/// the machine the loader census measured every one of these rows on.
+fn sixteen_bit_policy_case(index: u32, mode_offset: u32) -> GeneratedCase {
+    let seed = 0x5715_80f4_0000_0001u64
+        ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(seed);
+    let entry = 0x1000 + index * 0x100;
+    let mut gpr = [0; 8];
+    for value in &mut gpr {
+        *value = rng.u32() & 0xffff;
+    }
+    // EVEN, always: a misaligned Word stack access side-exits at the wide-access guard, and the
+    // retirement pin is an equality.
+    gpr[4] = match index % 4 {
+        0 => 0x8000 + (rng.u32() % 0x400) * 2,
+        1 => 0xfffc,
+        2 => 0x0004,
+        _ => 0xe000 + (rng.u32() % 0x400) * 2,
+    };
+
+    let mut bytes = Vec::with_capacity(32);
+    bytes.push(0x90);
+    let dst = non_stack_reg(&mut rng);
+    bytes.push(0xb8 + dst);
+    bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
+    let row = POLICY_ROWS_16[(index + mode_offset) as usize % POLICY_ROWS_16.len()];
+    bytes.extend_from_slice(&row(&mut gpr));
+    // ADC and SBB have no Word lane and are refused by the classifier, so the op set is the other
+    // six; the same choice `sixteen_bit_interpret_one_case` makes.
+    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    bytes.extend_from_slice(&[
+        (op << 3) | 1,
+        0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
+    ]);
+    // The BYTE test form: `0x85` at Word sits behind IZARRAVM_TEST_WORD_ROWS and a fixture that
+    // inherited that knob would lose a retirement.
+    bytes.extend_from_slice(&[0x84, 0xc0]);
+    let condition = ((index + mode_offset) & 15) as u8;
+    bytes.extend_from_slice(&[0x70 | condition, 1]);
+    bytes.extend_from_slice(&[0xf4, 0xf4]);
+
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    let eflags = 0x202 | (rng.u32() & arithmetic_flags);
+
+    GeneratedCase {
+        seed,
+        entry,
+        bytes,
+        gpr,
+        eflags,
+        cap: 256 + u64::from(rng.u32() & 3) * 128,
+        memory_slot_exits: false,
+    }
+}
+
+/// Randomized whole-block differential for the S3 policy widening, on both Approximate personas
+/// and on both machines.
+///
+/// Gate G2 for the S3 slice. A SEPARATE sweep rather than rows added to the S2 block, for the
+/// reason the plan gives about the main generated block: a block pinned at a retirement count has
+/// no room for a new slot without moving the pin, and a moved pin is not a regression test.
+#[test]
+fn generated_policy_widening_blocks_match_the_interpreter() {
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw486,
+        0,
+        generated_cpu,
+        policy_case,
+        POLICY_NATIVE_INSTRUCTIONS,
+        false,
+    );
+    run_generated_sweep(
+        "flat, SS.B=1",
+        GswMode::Gsw586,
+        WIDTH_LIFT_CASES,
+        generated_cpu,
+        policy_case,
+        POLICY_NATIVE_INSTRUCTIONS,
+        false,
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw486,
+        2 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_policy_case,
+        POLICY_NATIVE_INSTRUCTIONS,
+        false,
+    );
+    run_generated_sweep(
+        "16-bit code, SS.B=0",
+        GswMode::Gsw586,
+        3 * WIDTH_LIFT_CASES,
+        generated_sixteen_bit_cpu,
+        sixteen_bit_policy_case,
+        POLICY_NATIVE_INSTRUCTIONS,
+        false,
+    );
+}

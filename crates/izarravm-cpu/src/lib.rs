@@ -4581,15 +4581,37 @@ pub(crate) const MAX_DEFERRED_CODE_WRITES: usize = 16;
 /// and the interpreter must charge the SAME number, so there is one definition of it.
 pub(crate) const POP_RM_CORE_CLOCKS: u32 = 5;
 
+/// What MOV r/m16, Sreg charges (execute.rs `0x8c`). The S3 policy widening's first row, and the
+/// register form's charge as much as the memory form's: the arm returns one `clocks(2)` for both.
+pub(crate) const MOV_RM_SREG_CORE_CLOCKS: u32 = 2;
+
+/// The two-argument `max` the constant below folds with. A `const fn` rather than
+/// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
+/// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
+/// and this one folds the whole `InterpretOne` allowlist, one term per admitted row.
+const fn larger(a: u32, b: u32) -> u32 {
+    if a > b { a } else { b }
+}
+
 /// The largest core charge an `InterpretOne` slot can return on its RESUME or RESYNC-RETIRED
 /// status: the maximum, over the `InterpretOne` allowlist, of the interpreter's own charge for
-/// those rows. S2's allowlist is 0x8F alone.
+/// those rows.
+///
+/// ONE TERM PER ROW, folded rather than written down as a number, so that admitting a row without
+/// pricing it is a missing term a reader can see rather than a silently stale literal. The rows
+/// and their `execute.rs` arms:
+///
+/// | row | arm | charge |
+/// |---|---|---|
+/// | 0x8F POP r/m | execute.rs `0x8f` | `POP_RM_CORE_CLOCKS` |
+/// | 0x8C MOV r/m16,Sreg memory | execute.rs `0x8c` | `MOV_RM_SREG_CORE_CLOCKS` |
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
 /// instruction that faults at a block boundary, and the helper returns zero -- so nothing on that
 /// path reaches the lane this constant bounds. Widening the allowlist means widening this.
-pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = POP_RM_CORE_CLOCKS;
+pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 =
+    larger(POP_RM_CORE_CLOCKS, MOV_RM_SREG_CORE_CLOCKS);
 
 /// The largest core charge any admitted call-out helper can return, and the term
 /// `compute_iteration_upper` / `compute_global_block_upper` must price a slot at when they cannot

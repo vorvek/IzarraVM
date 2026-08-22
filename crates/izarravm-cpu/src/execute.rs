@@ -346,7 +346,10 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = u32::from(self.segment_from_reg_field(modrm.reg).selector);
                 self.write_operand_sized(bus, operand, OperandSize::Word, value)?;
-                Ok(clocks(2))
+                // Named rather than a literal for the reason the `0x8f` arm's charge is: the
+                // memory form is an `InterpretOne` call-out row, and its budget bound
+                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same number.
+                Ok(clocks(MOV_RM_SREG_CORE_CLOCKS))
             }
             0x8d => {
                 // LEA reg, m: load the effective address, not the memory it points at. mod=3 (a

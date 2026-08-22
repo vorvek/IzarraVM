@@ -1340,3 +1340,193 @@ fn compile_fixture(code: &[u8], starts: &[u32]) -> jit::direct::Compilation {
     warm_sixteen_bit(&mut cpu, &mut bus, &linears);
     jit::direct::compile(&mut cpu, ENTRY, false).expect("the fixture must compile as a block")
 }
+
+// ---------------------------------------------------------------------------
+// 5. The S3 policy widening: one row per commit, each with its own resume fixture.
+// ---------------------------------------------------------------------------
+
+/// `mov ax,0x1111; <row>; inc ax; hlt`, plus the instruction starts the decode warm-up needs.
+///
+/// The same shape as `CODE` and for the same reason: the row under test sits in the MIDDLE, so a
+/// resume that does not resume loses `inc ax`, and an EIP restore that does not restore lands the
+/// final exit somewhere else. Every S3 row is dropped into this one program rather than getting a
+/// fixture of its own, which is what makes the anti-vacuity gate below a shared assertion instead
+/// of eight bespoke ones that can each be wrong in their own way.
+fn row_program(row: &[u8]) -> (Vec<u8>, Vec<u32>) {
+    let mut code = vec![0xB8, 0x11, 0x11];
+    code.extend_from_slice(row);
+    code.push(0x40);
+    code.push(0xF4);
+    let starts = vec![0, 3, 3 + row.len() as u32];
+    (code, starts)
+}
+
+/// The anti-vacuity gate every S3 row owes: the row compiles into an `InterpretOne` slot with a
+/// native slot on each side, rather than ending the block where it used to.
+///
+/// Without it every state comparison below would pass with the row still a hard boundary, because
+/// a one-instruction block that stops at the row produces identical architectural state.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn assert_row_is_a_call_out(row: &[u8]) {
+    let (code, starts) = row_program(row);
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        BLOCK_INSTRUCTIONS,
+        "the block stopped early, so row {row:02x?} is still a boundary"
+    );
+    assert_eq!(
+        block.callout_interpret_one_slots(),
+        1,
+        "row {row:02x?} must be an InterpretOne slot"
+    );
+    assert_eq!(block.callout_port_slots(), 0);
+    assert_eq!(block.callout_memory_slots(), 0);
+}
+
+/// Run a row interpreted and again with the block installed, and assert the two worlds agree AND
+/// that the block carried on past the row.
+///
+/// The retirement equality is the resume proof and it is stronger than any register check: a
+/// RESYNC reports two instructions where a resume reports three, whatever the row did to the
+/// register file. That matters because several S3 rows write AX, so "AX ended at 0x1112" is not a
+/// claim this helper can make for all of them.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn assert_row_resumes(row: &[u8], perturb: fn(&mut CpuGsw, &mut TestBus)) -> Legs {
+    assert_row_is_a_call_out(row);
+    let (code, starts) = row_program(row);
+    let mut legs = run_both(&code, &starts, perturb);
+    assert_legs_agree(&mut legs);
+    assert_eq!(
+        legs.exit_reason, None,
+        "row {row:02x?} should have completed the block"
+    );
+    assert_eq!(
+        legs.native_insns,
+        u64::from(BLOCK_INSTRUCTIONS),
+        "the block did not resume past row {row:02x?}"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_executed, 1);
+    assert_eq!(stalls.callout_interpret_one_resync, 0);
+    assert_eq!(stalls.callout_interpret_one_resync_fault, 0);
+    assert_eq!(stalls.callout_interpret_one_abnormal, 0);
+    legs
+}
+
+/// Distinct real-mode selectors in the three segments nothing in the fixture addresses through.
+///
+/// CS, SS and DS keep selector 0: the code, the stack and the `[bx]` operand all resolve through
+/// them, so moving their bases would move the fixture rather than the thing under test. ES, FS and
+/// GS are free, and giving them three different values is what makes the stored selector
+/// observable at all -- with every segment at zero the `0x8c` store writes the zero the fixture
+/// already seeded and could not be told from no store at all.
+fn spread_segment_selectors(cpu: &mut CpuGsw, _: &mut TestBus) {
+    cpu.load_segment_real(SegmentIndex::Es, 0x1234);
+    cpu.load_segment_real(SegmentIndex::Fs, 0x5678);
+    cpu.load_segment_real(SegmentIndex::Gs, 0x9abc);
+}
+
+/// Row 1: `MOV r/m16, Sreg` memory form, every Sreg the arm names.
+///
+/// All six of `0..=5` in one test, because they are one classifier arm and one interpreter arm:
+/// the helper runs the decode line, so there is no per-segment lowering that could be right for
+/// four values and wrong for two. Three of them (ES, FS, GS) carry an observable selector; the
+/// other three resolve the fixture's own addressing and stay at zero, where the store is proved by
+/// the RAM comparison against the interpreted leg rather than by a literal.
+///
+/// MUTATION: return `None` instead of the call-out for the memory form (the pre-slice behaviour)
+/// and `assert_row_is_a_call_out` fails on the block shape for all six.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_mov_rm16_sreg_memory_resumes_for_every_segment() {
+    for (reg, expected) in [
+        (0u8, 0x1234u16),
+        (1, 0x0000),
+        (2, 0x0000),
+        (3, 0x0000),
+        (4, 0x5678),
+        (5, 0x9abc),
+    ] {
+        // `8C /r` with mod 00 and r/m 111: `mov [bx], <sreg>`.
+        let row = [0x8C, 0x07 | (reg << 3)];
+        let legs = assert_row_resumes(&row, spread_segment_selectors);
+        assert_eq!(
+            u16::from_le_bytes(
+                legs.native_bus.memory[POP_TARGET as usize..POP_TARGET as usize + 2]
+                    .try_into()
+                    .unwrap()
+            ),
+            expected,
+            "reg {reg} stored the wrong selector"
+        );
+    }
+}
+
+/// `/6` and `/7` stay refused, so the block still ends there.
+///
+/// They are not a segment at all: `segment_from_reg_field` answers them with a catch-all that
+/// happens to say GS, and a block compiled around an accident is worse than the boundary it
+/// replaced. This is the same refusal the register form already makes, restated from the memory
+/// side because the memory arm is new.
+///
+/// The row sits AFTER three native slots rather than in the middle of `row_program`, because a
+/// block that stops at the row would otherwise be one instruction long and `compile` refuses
+/// anything under three. The `/0` control on the same program is what says the shape can hold a
+/// call-out at that position, so the refusal is a refusal and not the fixture running out of
+/// block.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn mov_rm16_sreg_memory_refuses_the_unnamed_reg_fields() {
+    /// `mov ax,0x1111; inc ax; inc cx; <row>; inc ax; hlt`.
+    fn padded(reg: u8) -> (Vec<u8>, Vec<u32>) {
+        let code = vec![
+            0xB8,
+            0x11,
+            0x11,
+            0x40,
+            0x41,
+            0x8C,
+            0x07 | (reg << 3),
+            0x40,
+            0xF4,
+        ];
+        (code, vec![0, 3, 4, 5, 7])
+    }
+
+    let (code, starts) = padded(0);
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        5,
+        "the control must carry the call-out and everything after it"
+    );
+    assert_eq!(block.callout_interpret_one_slots(), 1);
+
+    for reg in [6u8, 7] {
+        let (code, starts) = padded(reg);
+        let (_, _, block) = build_native(&code, &starts);
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "0x8c /{reg} must still end the block after the three native slots"
+        );
+        assert_eq!(block.callout_interpret_one_slots(), 0);
+    }
+}
