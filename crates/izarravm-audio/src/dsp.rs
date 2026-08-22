@@ -188,6 +188,20 @@ pub struct SbDsp {
     direct_dac_byte: Option<u8>,
     test_reg: u8,
     speaker_on: bool,
+    // MIDI UART mode (0x34..=0x37): every later command-port byte is MIDI
+    // data until a DSP reset. Limit: the SB-MIDI port is not wired to a
+    // synth, so the bytes are counted and dropped.
+    uart_midi: bool,
+    midi_bytes_out: u64,
+    // Write-buffer status read counter. The DSP 4.xx reports busy on two of
+    // every four 0x22C reads (86Box `busy_count`); a ready-poll sees bit 7
+    // clear within two reads, and a probe that expects the bit to move sees
+    // it move.
+    busy_count: u8,
+    // The DSP's 8051 scratch RAM as 0xF9/0xFA expose it. Only the cells the
+    // firmware is known to publish are maintained: 0x13/0x14 the sample rate,
+    // 0x20 the last command, and the three fixed defaults set at power-on.
+    ram_8051: [u8; 256],
     // 8-bit DMA playback state.
     rate_hz: u32,
     // Whether rate_hz was programmed as an interleaved BYTE rate (the 0x40 time
@@ -258,6 +272,14 @@ struct PendingCommand {
     args: Vec<u8>,
 }
 
+fn ram_8051_defaults() -> [u8; 256] {
+    let mut ram = [0u8; 256];
+    ram[0x0E] = 0xFF;
+    ram[0x0F] = 0x07;
+    ram[0x37] = 0x38;
+    ram
+}
+
 impl Default for SbDsp {
     fn default() -> Self {
         Self {
@@ -269,6 +291,10 @@ impl Default for SbDsp {
             direct_dac_byte: None,
             test_reg: 0,
             speaker_on: false,
+            uart_midi: false,
+            midi_bytes_out: 0,
+            busy_count: 0,
+            ram_8051: ram_8051_defaults(),
             rate_hz: 22_050,
             rate_is_byte_rate: true,
             block_size: 0,
@@ -359,9 +385,18 @@ impl SbDsp {
             0x10 | 0xE4 => 1, // direct DAC / test-register write
             0xE0 => 1,        // DSP identification: one byte in, its complement out
             0x40 => 1,        // set time constant
-            0x41 => 2,        // set sample rate
+            0x41 | 0x42 => 2, // set output / input sample rate
             0x14 => 2,        // 8-bit single-cycle DMA output, length low/high
+            0x24 | 0x2C => 2, // 8-bit DMA input single / auto-init, length low/high
             0x80 => 2,        // pause DAC for a duration, low/high
+            0x38 => 1,        // one MIDI byte out
+            0xE2 => 1,        // DMA identification: one byte in, reply via DMA
+            0xF9 => 1,        // 8051 RAM read: index
+            0xFA => 2,        // 8051 RAM write: index, value
+            // CSP/ASP register access (SB16 with the ASP chip): modeled as
+            // argument sinks so the bytes never reach the command stream.
+            0x04 | 0x0F => 1,
+            0x05 | 0x0E => 2,
             // Single-cycle Creative ADPCM output: mode byte set by the opcode,
             // 2-byte length inline (like 0x14). Auto-init ADPCM (0x1F/0x7D/0x7F)
             // takes no args -- it uses the 0x48 block size.
@@ -414,6 +449,10 @@ impl SbDsp {
     }
 
     fn write_command_byte(&mut self, byte: u8) {
+        if self.uart_midi {
+            self.midi_bytes_out += 1;
+            return;
+        }
         if let Some(mut pending) = self.pending.take() {
             pending.args.push(byte);
             if pending.args.len() >= Self::command_arity(pending.command) {
@@ -437,8 +476,13 @@ impl SbDsp {
     /// Execute a fully-assembled command with its argument bytes.
     fn dispatch(&mut self, command: u8, args: &[u8]) {
         self.trace_command(command, args);
+        self.ram_8051[0x20] = command;
         match command {
             0x10 => self.direct_dac_byte = args.first().copied(),
+            // Direct 8-bit input: one ADC sample. No line-in is modeled, so
+            // the sample is unsigned silence; what matters is that the byte
+            // arrives, because the caller polls 0x22E for it.
+            0x20 => self.queue_read(0x80),
             0xE4 => self.test_reg = args.first().copied().unwrap_or(0),
             0xE1 => {
                 self.queue_read(DSP_VERSION_HI);
@@ -458,8 +502,9 @@ impl SbDsp {
             0xD1 => self.speaker_on = true,
             0xD3 => self.speaker_on = false,
             0xE3 => {
-                // The CT1747 copyright string, NUL-terminated, as the DSP returns it.
-                for &b in b"Copyright (C) Creative Technology Ltd. 1992-94\0" {
+                // The DSP 4.xx copyright string, NUL-terminated, as the DSP
+                // returns it (DOSBox-X and 86Box agree on the text).
+                for &b in b"COPYRIGHT (C) CREATIVE TECHNOLOGY LTD, 1992.\0" {
                     self.queue_read(b);
                 }
             }
@@ -482,8 +527,21 @@ impl SbDsp {
                 // rate and must not be halved for SB Pro stereo.
                 self.rate_hz = (u32::from(args[0]) << 8) | u32::from(args[1]);
                 self.rate_is_byte_rate = false;
+                self.ram_8051[0x13] = args[1];
+                self.ram_8051[0x14] = args[0];
             }
             0x41 => {}
+            // Set input sample rate. Recording is not modeled; the firmware
+            // still publishes the rate in its RAM.
+            0x42 if args.len() >= 2 => {
+                self.ram_8051[0x13] = args[1];
+                self.ram_8051[0x14] = args[0];
+            }
+            0x42 => {}
+            // MIDI UART modes (polling / interrupt, with and without time
+            // stamps): the command port becomes a MIDI data port until reset.
+            0x34..=0x37 => self.uart_midi = true,
+            0x38 => self.midi_bytes_out += 1,
             0x48 if args.len() >= 2 => {
                 // Set DSP block transfer size, low byte then high byte (n+1 bytes).
                 let count = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
@@ -527,9 +585,17 @@ impl SbDsp {
             0x91 => self.arm_dma(false), // 8-bit single, high-speed
             0xB0..=0xBF => self.arm_16bit(command, args),
             0xC0..=0xCF => self.arm_8bit_sb16(command, args),
-            0xD0 => self.playing = false,   // halt DMA (position kept)
-            0xD4 => self.playing = true,    // continue DMA
-            0xDA => self.auto_init = false, // exit auto-init: stop at next TC
+            // Halt / continue. The 8-bit (0xD0/0xD4) and 16-bit (0xD5/0xD6)
+            // pairs act on the one DMA engine this model runs, as they do in
+            // 86Box; the position is kept across the halt.
+            0xD0 | 0xD5 => self.playing = false,
+            0xD4 | 0xD6 => self.playing = true,
+            0xD8 => self.queue_read(if self.speaker_on { 0xFF } else { 0x00 }),
+            // Exit auto-init: stop at the next terminal count. 0xD9 is the
+            // 16-bit form and leaves an 8-bit transfer alone.
+            0xD9 if self.dma_16bit => self.auto_init = false,
+            0xD9 => {}
+            0xDA => self.auto_init = false,
             0x80 if args.len() >= 2 => {
                 // Pause DAC for a duration: wait (count + 1) sampling periods at
                 // the current time constant, then raise the 8-bit interrupt.
@@ -551,6 +617,19 @@ impl SbDsp {
                 // reading port 0x22E.
                 self.raise_irq(DspIrqSource::Dma8);
             }
+            // The 16-bit twin, acknowledged by reading 0x22F.
+            0xF3 => self.raise_irq(DspIrqSource::Dma16),
+            0xF9 => {
+                if let Some(&index) = args.first() {
+                    self.queue_read(self.ram_8051[usize::from(index)]);
+                }
+            }
+            0xFA if args.len() >= 2 => self.ram_8051[usize::from(args[0])] = args[1],
+            0xFA => {}
+            // 0xE2 DMA identification: the reply byte goes out through DMA.
+            // Not modeled (the reply sequence is undocumented); the argument
+            // is consumed so it cannot become a command.
+            0xE2 => {}
             _ => {}
         }
     }
@@ -783,6 +862,11 @@ impl SbDsp {
         B: FnMut() -> Option<u8>,
         W: FnMut() -> Option<u16>,
     {
+        // A 0x80 pause holds the DAC: no DMA unit moves and no frame is
+        // produced until the duration elapses. Direct DAC is not affected.
+        if self.pause_micros.is_some() && self.needs_output_tick() {
+            return None;
+        }
         // Creative ADPCM (mono, 8-bit path) decodes one sample per frame,
         // pulling an encoded byte only when its decoded-sample FIFO runs dry.
         if self.adpcm.is_some() {
@@ -998,6 +1082,12 @@ impl SbDsp {
         }
     }
 
+    /// MIDI bytes the guest sent through the DSP (UART mode or 0x38).
+    /// Diagnostic: the SB-MIDI port has no synth behind it.
+    pub fn midi_bytes_out(&self) -> u64 {
+        self.midi_bytes_out
+    }
+
     /// Last byte written by a direct 8-bit DAC command (0x10).
     pub fn direct_dac_byte(&self) -> Option<u8> {
         self.direct_dac_byte
@@ -1054,15 +1144,23 @@ impl SbDsp {
                 Some(byte)
             }
             // 0x22C reads the write-buffer status; bit 7 clear means ready.
-            // Commands dispatch synchronously in this model, so it is never busy.
-            0x22C => Some(0x00),
+            // Commands dispatch synchronously in this model, so the busy bit
+            // is the DSP 4.xx read-counter pattern rather than a real queue
+            // state: busy on reads 2 and 3 of every 4. The low bits read
+            // high, as on the part.
+            0x22C => {
+                self.busy_count = (self.busy_count + 1) & 3;
+                Some(if self.busy_count & 2 != 0 { 0xFF } else { 0x7F })
+            }
             // 0x22E is the 8-bit read-buffer status port and the 8-bit DMA
             // interrupt-acknowledge port; 0x22F is its 16-bit counterpart. Only
             // one DMA mode runs at a time, so a read of either status port clears
             // the pending block-completion IRQ.
             0x22E | 0x22F => {
                 self.irq_pending = false;
-                Some(if self.data_available { 0x80 } else { 0x00 })
+                // Bit 7 is the documented data-available bit; the DSP 4.xx
+                // drives the other seven high.
+                Some(if self.data_available { 0xFF } else { 0x7F })
             }
             _ => None,
         }
@@ -1100,6 +1198,7 @@ impl SbDsp {
                     self.pause_micros = None;
                     self.pause_fold_armed = false;
                     self.pending = None;
+                    self.uart_midi = false;
                     // The mode latches must clear too, or the idle 16-bit
                     // guard in render_frame keeps direct DAC dead after any
                     // 16-bit session.

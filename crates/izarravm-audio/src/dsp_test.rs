@@ -9,10 +9,10 @@ fn reset_handshake_yields_0xaa() {
     dsp.write_port(0x226, 0x01);
     dsp.write_port(0x226, 0x00);
     dsp.advance_micros(120); // > the ~100us the DSP needs to respond
-    // 0x22E bit7 = data available.
-    assert_eq!(dsp.read_port(0x22E), Some(0x80));
+    // 0x22E bit7 = data available; the DSP 4.xx drives the low bits high.
+    assert_eq!(dsp.read_port(0x22E), Some(0xFF));
     assert_eq!(dsp.read_port(0x22A), Some(0xAA));
-    assert_eq!(dsp.read_port(0x22E), Some(0x00), "data consumed");
+    assert_eq!(dsp.read_port(0x22E), Some(0x7F), "data consumed");
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn write_status_port_reports_ready() {
     let mut dsp = SbDsp::default();
     assert_eq!(
         dsp.read_port(0x22C),
-        Some(0x00),
+        Some(0x7F),
         "bit 7 clear means command/data writes may proceed"
     );
 }
@@ -902,4 +902,192 @@ fn arm_pause_at_folds_only_the_arming_write() {
         Some(1_500),
         "a later unrelated command write does not re-fold"
     );
+}
+
+fn drain_read_data(dsp: &mut SbDsp) {
+    while dsp.data_available() {
+        let _ = dsp.read_port(0x22A);
+    }
+}
+
+#[test]
+fn documented_commands_consume_their_argument_bytes() {
+    // Every argument byte is 0x14: leaked into the command stream it would
+    // start a 2-byte DMA command that eats the 0xE1 probe and arms playback.
+    // Lengths follow the DSP 4.xx command set (86Box `sb_commands`).
+    for (command, arity) in [
+        (0x04u8, 1usize),
+        (0x05, 2),
+        (0x0E, 2),
+        (0x0F, 1),
+        (0x24, 2),
+        (0x2C, 2),
+        (0x38, 1),
+        (0x42, 2),
+        (0xE2, 1),
+        (0xF9, 1),
+        (0xFA, 2),
+    ] {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[command]);
+        for _ in 0..arity {
+            write_cmd(&mut dsp, &[0x14]);
+        }
+        drain_read_data(&mut dsp);
+        write_cmd(&mut dsp, &[0xE1]);
+        assert_eq!(
+            dsp.read_port(0x22A),
+            Some(DSP_VERSION_HI),
+            "command {command:#04x} must consume {arity} argument byte(s)"
+        );
+        assert!(
+            !dsp.is_playing(),
+            "command {command:#04x} leaked an argument"
+        );
+    }
+}
+
+#[test]
+fn command_f3_raises_the_16bit_irq() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xF3]);
+    assert_eq!(dsp.take_irq_source(), Some(DspIrqSource::Dma16));
+}
+
+#[test]
+fn d5_pauses_and_d6_continues_dma() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x48, 0x07, 0x00, 0x1C]);
+    assert!(dsp.is_playing());
+    write_cmd(&mut dsp, &[0xD5]);
+    assert!(!dsp.is_playing(), "0xD5 pauses");
+    write_cmd(&mut dsp, &[0xD6]);
+    assert!(dsp.is_playing(), "0xD6 continues");
+}
+
+#[test]
+fn d9_exits_16bit_auto_init_and_leaves_8bit_auto_init_alone() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xB6, 0x10, 0x07, 0x00]); // 16-bit auto-init
+    assert!(dsp.is_auto_init() && dsp.is_16bit());
+    write_cmd(&mut dsp, &[0xD9]);
+    assert!(!dsp.is_auto_init(), "0xD9 exits 16-bit auto-init");
+
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x48, 0x07, 0x00, 0x1C]); // 8-bit auto-init
+    write_cmd(&mut dsp, &[0xD9]);
+    assert!(dsp.is_auto_init(), "0xD9 does not touch the 8-bit mode");
+    write_cmd(&mut dsp, &[0xDA]);
+    assert!(!dsp.is_auto_init());
+}
+
+#[test]
+fn d8_reports_the_speaker_state() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xD3, 0xD8]);
+    assert_eq!(dsp.read_port(0x22A), Some(0x00), "speaker off");
+    write_cmd(&mut dsp, &[0xD1, 0xD8]);
+    assert_eq!(dsp.read_port(0x22A), Some(0xFF), "speaker on");
+}
+
+#[test]
+fn direct_input_0x20_returns_a_silent_sample() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x20]);
+    assert!(dsp.data_available());
+    assert_eq!(dsp.read_port(0x22A), Some(0x80), "unsigned 8-bit silence");
+}
+
+#[test]
+fn f9_and_fa_access_the_8051_ram() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xFA, 0x50, 0xAB, 0xF9, 0x50]);
+    assert_eq!(dsp.read_port(0x22A), Some(0xAB), "write then read back");
+    for (index, expected) in [(0x0Eu8, 0xFFu8), (0x0F, 0x07), (0x37, 0x38)] {
+        write_cmd(&mut dsp, &[0xF9, index]);
+        assert_eq!(
+            dsp.read_port(0x22A),
+            Some(expected),
+            "default at {index:#04x}"
+        );
+    }
+    write_cmd(&mut dsp, &[0xF9, 0x20]);
+    assert_eq!(
+        dsp.read_port(0x22A),
+        Some(0xF9),
+        "0x20 holds the last command"
+    );
+    write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0xF9, 0x13]);
+    assert_eq!(dsp.read_port(0x22A), Some(0x11), "0x13 = rate low");
+    write_cmd(&mut dsp, &[0xF9, 0x14]);
+    assert_eq!(dsp.read_port(0x22A), Some(0x2B), "0x14 = rate high");
+}
+
+#[test]
+fn uart_midi_mode_takes_every_following_byte_as_midi_until_reset() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x35]); // MIDI UART, interrupt mode
+    write_cmd(&mut dsp, &[0x90, 0x3C, 0x7F, 0x14, 0x00, 0x00]);
+    assert!(
+        !dsp.is_playing(),
+        "0x14 0x00 0x00 are MIDI bytes, not a command"
+    );
+    assert_eq!(dsp.midi_bytes_out(), 6);
+    dsp.write_port(0x226, 0x01);
+    dsp.write_port(0x226, 0x00);
+    dsp.advance_micros(120);
+    let _ = dsp.read_port(0x22A);
+    write_cmd(&mut dsp, &[0xE1]);
+    assert_eq!(
+        dsp.read_port(0x22A),
+        Some(DSP_VERSION_HI),
+        "reset leaves UART mode"
+    );
+}
+
+#[test]
+fn one_byte_midi_0x38_consumes_exactly_one_byte() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x38, 0xF8, 0xE1]);
+    assert_eq!(dsp.midi_bytes_out(), 1);
+    assert_eq!(dsp.read_port(0x22A), Some(DSP_VERSION_HI));
+}
+
+#[test]
+fn pause_dac_holds_dma_output_until_the_duration_elapses() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x27, 0x10]); // 10000 Hz
+    write_cmd(&mut dsp, &[0x14, 0x03, 0x00]); // block 4, single
+    write_cmd(&mut dsp, &[0x80, 0x01, 0x00]); // 2 periods = 200 us
+    assert!(dsp.is_playing(), "the transfer stays armed");
+    assert_eq!(
+        dsp.render_sample(|| Some(0x40)),
+        None,
+        "no DMA unit during the pause"
+    );
+    assert_eq!(dsp.block_remaining(), 4);
+    dsp.advance_micros(200);
+    assert!(dsp.take_irq(), "pause interrupt");
+    assert!(dsp.render_sample(|| Some(0x40)).is_some(), "output resumes");
+    assert_eq!(dsp.block_remaining(), 3);
+}
+
+#[test]
+fn write_status_0x22c_reports_busy_on_two_of_every_four_reads() {
+    // DSP 4.xx: the busy bit cycles with a 2-bit read counter (86Box
+    // `busy_count`); a ready-poll therefore sees bit 7 clear within two reads.
+    let mut dsp = SbDsp::default();
+    let reads: Vec<u8> = (0..8).map(|_| dsp.read_port(0x22C).unwrap()).collect();
+    assert_eq!(reads, [0x7F, 0xFF, 0xFF, 0x7F, 0x7F, 0xFF, 0xFF, 0x7F]);
+}
+
+#[test]
+fn copyright_string_is_the_dsp_4_05_reply() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xE3]);
+    let mut bytes = Vec::new();
+    while dsp.data_available() {
+        bytes.push(dsp.read_port(0x22A).unwrap());
+    }
+    assert_eq!(bytes, b"COPYRIGHT (C) CREATIVE TECHNOLOGY LTD, 1992.\0");
 }
