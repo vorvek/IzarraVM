@@ -671,6 +671,51 @@ pub(crate) struct DirectStallTally {
     /// though both register at `IMM8_LANE_WIDTH`: the two arms are independent knobs, so a
     /// combined leg has to be able to attribute an accepts movement to one of them.
     pub count_lane_registrations: u64,
+    /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
+    /// charged to the family that would otherwise have taken the slot. The registration counters
+    /// above say how many lanes those same blocks installed; these say how many more they would
+    /// have held with a larger budget, which is the only number that can tell a lane-CLASS answer
+    /// apart from a lane-BUDGET answer when a widening ladder reads its registrations flat.
+    ///
+    /// SAME DENOMINATOR AS THE REGISTRATIONS, and that is a property of where they are folded in
+    /// rather than of where they are counted. Each walk accumulates its own `LaneCapRefusals` and
+    /// `JitState::install` folds them here on its success arm, so a walk that ends in a `Retry` or
+    /// a `StructuralReject` contributes nothing, and the prefixes `compile_with_page_len`'s
+    /// recovery search re-walks after a page overflow are counted once, through the one prefix
+    /// that installs, instead of once per walk.
+    ///
+    /// Charged on the CAP arm alone. Each lane CLASS knob (`IZARRAVM_IMM8_LANES`,
+    /// `IZARRAVM_COUNT_LANES`, `IZARRAVM_DISP_LANES`) is tested first and returns before the cap is
+    /// consulted, so its off arm reads zero here rather than reporting the family's whole
+    /// population as budget pressure. `IZARRAVM_LANE_FAMILY` is NOT such a knob and is not covered
+    /// by that sentence: it narrows `imm_lane_for`'s admission set to `/0 ADD` instead of switching
+    /// the class off, so on its narrow arm the `/0` shapes still reach the cap and still charge
+    /// while the widened `0x81 /r` shapes charge nothing. A leg that moves that knob is comparing
+    /// two admission sets, not an on arm against an off one.
+    ///
+    /// The cap test sits UNDER its family's shape bars rather than over them, which is what makes
+    /// the split per-family: a slot the cap refuses has already passed its family's kind, opcode,
+    /// prefix and length tests, so exactly one counter moves per refused slot instead of all four.
+    /// The bars each family puts above the cap are listed on its matcher.
+    ///
+    /// WHERE THE PAGE GUARD SITS, and it is NOT the same in all four, so the four numbers are not
+    /// quite the same measurement. `imm_lane_cap_refusals`, `imm8_lane_cap_refusals` and
+    /// `count_lane_cap_refusals` test the cap ABOVE `direct_host_bytes`, so a capped block stops
+    /// paying the fetch-cache scan per slot and those three counters INCLUDE slots the page guard
+    /// would have refused anyway. Read them as "lane-shaped slots the budget turned away", an upper
+    /// bound on what a larger budget could actually have laned. `disp_lane_cap_refusals` keeps the
+    /// cap below both its `has_record_range` heat gate (required: without it doom's never-patched
+    /// `0x8A` loads would all read as budget pressure) and that scan, so it is the tighter number:
+    /// every slot it counts had a host pointer waiting. On a corpus whose code pages are all
+    /// fetch-cached the two definitions coincide, which is why the cheaper ordering was taken.
+    ///
+    /// Compile path only, and unconditional there: a heat-coupled counter that is armed on one
+    /// leg and absent on the other confounds the policy with an epoch re-phasing, so the cost is
+    /// paid on both arms or not at all.
+    pub imm_lane_cap_refusals: u64,
+    pub imm8_lane_cap_refusals: u64,
+    pub count_lane_cap_refusals: u64,
+    pub disp_lane_cap_refusals: u64,
     /// Interpreted continuations whose decode line had died between the packed first touch and
     /// the deferred full-view fetch (`IZARRAVM_DECODE_PACK`). The staleness argument in
     /// `run_budgeted_inner` says admission cannot invalidate the slot it screened, so this is the
@@ -2214,6 +2259,10 @@ impl crate::jit::JitState {
             disp_lane_registrations: self.stalls.disp_lane_registrations,
             imm8_lane_registrations: self.stalls.imm8_lane_registrations,
             count_lane_registrations: self.stalls.count_lane_registrations,
+            imm_lane_cap_refusals: self.stalls.imm_lane_cap_refusals,
+            imm8_lane_cap_refusals: self.stalls.imm8_lane_cap_refusals,
+            count_lane_cap_refusals: self.stalls.count_lane_cap_refusals,
+            disp_lane_cap_refusals: self.stalls.disp_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,

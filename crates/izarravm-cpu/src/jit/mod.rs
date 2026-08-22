@@ -356,11 +356,20 @@ impl JitState {
     // that matters — INV-W, "no native code runs while edges are pending" — is enforced by the
     // backstop DRAIN at the dispatch boundary (`run_direct_block` sweeps both watches on entry).
     pub(crate) fn install(&mut self, compilation: &direct::Compilation) -> Option<direct::BlockId> {
-        self.direct.install(
+        let id = self.direct.install(
             &mut self.code_watch,
             &mut self.pending_watch_edges,
             compilation,
-        )
+        )?;
+        // The ONE fold of the walk's lane-budget refusals into the census tally, on the success
+        // arm so the counters count refused slots in INSTALLED blocks. It lives here rather than
+        // beside the lane REGISTRATIONS in `run.rs` for one reason: `install` returning `Some` is
+        // exactly the condition those registrations are charged under, and stating it once at the
+        // gate keeps a second install site (a fixture, a future recompile path) from silently
+        // acquiring a different denominator. See `DirectStallTally::imm_lane_cap_refusals`.
+        self.direct
+            .note_lane_cap_refusals(compilation.lane_cap_refusals());
+        Some(id)
     }
 
     pub(crate) fn reject(&mut self, span: direct::RejectedSpan) {

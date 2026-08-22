@@ -270,6 +270,27 @@ pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
 /// families), so a block spanning such a region needs the larger budget for its lanes to absorb
 /// the whole burst — one uncovered patched slot is enough to keep killing the block.
 pub(crate) const MAX_BLOCK_IMM_LANES: usize = 12;
+/// The four lane families that draw on `MAX_BLOCK_IMM_LANES`, indexed in the order the compile
+/// walk tries their matchers. A walk carries one `u16` per family beside its `disp_lane_count`
+/// and the count travels with the `Compilation` to the install site; see `LaneCapRefusals`.
+pub(crate) const LANE_CAP_FAMILIES: usize = 4;
+pub(crate) const LANE_CAP_IMM: usize = 0;
+pub(crate) const LANE_CAP_IMM8: usize = 1;
+pub(crate) const LANE_CAP_COUNT: usize = 2;
+pub(crate) const LANE_CAP_DISP: usize = 3;
+/// How many slots the shared lane budget refused ON THIS WALK, per family.
+///
+/// PER WALK rather than per matcher call, and that is the whole point of the type. The compile
+/// path walks a block more than once: `compile_with_page_len`'s recovery search re-walks prefixes
+/// of a block whose emission overran the arena page, and a walk can end in `Retry` or
+/// `StructuralReject` and install nothing at all. A counter charged inside the matcher would
+/// count all of those, while the registration counters it is read against
+/// (`disp_lane_registrations` and its two siblings) are charged once per INSTALLED block. Carrying
+/// the count on the walk and folding it in at install is what makes the two share a denominator.
+///
+/// `u16` because a walk slots at most `MAX_BLOCK_INSTRUCTIONS` instructions, so a family can be
+/// refused at most that many times; the adds saturate anyway rather than trusting that bound.
+pub(crate) type LaneCapRefusals = [u16; LANE_CAP_FAMILIES];
 /// The store width a DWORD lane accepts. The dword field is patched whole or not at all; a byte
 /// or word patch of it takes the normal invalidation path.
 ///
@@ -1727,6 +1748,20 @@ impl BlockCache {
     /// class moved.
     pub(crate) fn note_count_lane_registrations(&mut self, lanes: u64) {
         self.stalls.count_lane_registrations += lanes;
+    }
+
+    /// Fold ONE INSTALLED block's per-walk lane-budget refusals into the tally, per family.
+    ///
+    /// Called from `JitState::install` on the success arm and from nowhere else, which is what
+    /// gives the four counters the same denominator as the three registration counters above:
+    /// both say "in blocks this run installed". Charging inside the matchers instead would count
+    /// every prefix `compile_with_page_len`'s recovery search walks and every walk that ends in a
+    /// `Retry` the caller throws away, and the ratio to registrations would then be meaningless.
+    pub(crate) fn note_lane_cap_refusals(&mut self, refusals: LaneCapRefusals) {
+        self.stalls.imm_lane_cap_refusals += u64::from(refusals[LANE_CAP_IMM]);
+        self.stalls.imm8_lane_cap_refusals += u64::from(refusals[LANE_CAP_IMM8]);
+        self.stalls.count_lane_cap_refusals += u64::from(refusals[LANE_CAP_COUNT]);
+        self.stalls.disp_lane_cap_refusals += u64::from(refusals[LANE_CAP_DISP]);
     }
 
     /// The packed first touch screened a slot that no longer had a line by the time the
@@ -3596,6 +3631,12 @@ pub(crate) struct Compilation {
     /// classes are selected by independent knobs, so a `smc_lane_accepts` movement on a combined
     /// ladder leg has to be attributable to one of them.
     count_lanes: u8,
+    /// How many slots the shared `MAX_BLOCK_IMM_LANES` budget refused on the walk that produced
+    /// this compilation, per family. Charged into the tally by `JitState::install` and nowhere
+    /// else, so a walk that never installs (a `Retry`, a `StructuralReject`, or one of the
+    /// prefixes `compile_with_page_len`'s recovery search discards) contributes nothing. See
+    /// `LaneCapRefusals`.
+    lane_cap_refusals: LaneCapRefusals,
     pub code: Vec<u8>,
 }
 
@@ -3617,6 +3658,10 @@ impl Compilation {
 
     pub(crate) fn count_lane_count(&self) -> usize {
         usize::from(self.count_lanes)
+    }
+
+    pub(crate) fn lane_cap_refusals(&self) -> LaneCapRefusals {
+        self.lane_cap_refusals
     }
 }
 
@@ -5875,18 +5920,25 @@ fn stack_width_kind(
 ///
 /// The lane is refused (and the slot keeps its baked immediate, correct as ever) when the block
 /// already holds `MAX_BLOCK_IMM_LANES`, or when no direct page can supply a host pointer for the
-/// immediate's bytes. The second is the page-kind guard: only a page the bus hands out as a direct
-/// mapping can be read this way, so device apertures and unmapped pages never produce a lane.
+/// immediate's bytes. The second is the page-kind guard: only a page the bus hands out as a
+/// direct mapping can be read this way, so device apertures and unmapped pages never produce a
+/// lane.
+///
+/// THE BARS THAT PRECEDE THE CAP HERE, in order: the `IZARRAVM_LANE_FAMILY` arm, the `AluImm`
+/// kind match, the opcode / operand-size / prefix / length compares, and the lane address. The
+/// cap is tested after those and BEFORE `direct_host_bytes`, which is a scan of the fetch-page
+/// cache: the bars above are field compares that cost nothing, so testing the cap under them
+/// buys the per-family attribution below, while a block sitting at the cap does not pay the scan
+/// for every remaining slot. The budget refusal is recorded in the walk's `LaneCapRefusals` and
+/// reaches `imm_lane_cap_refusals` only if this walk's block installs.
 fn imm_lane_for(
     cpu: &CpuGsw,
     insn: &DecodedInsn,
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
+    cap_refusals: &mut LaneCapRefusals,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES {
-        return None;
-    }
     // The family A/B arm: `op != 0` shapes are the 2026-08-08 widening, refusable at runtime so
     // one binary measures both arms (see `lane_family_enabled`).
     if !lane_family_enabled()
@@ -5935,6 +5987,14 @@ fn imm_lane_for(
         return None;
     }
     let lane = physical.checked_add(2)?;
+    // THE CAP, and it is under the shape bars rather than over them on purpose. Every test above
+    // narrows the slot to one this family would have laned, so a refusal here is a lane the shared
+    // budget cost and the counter is per-family instead of four copies of the same number. See
+    // `DirectStallTally::imm_lane_cap_refusals`.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cap_refusals[LANE_CAP_IMM] = cap_refusals[LANE_CAP_IMM].saturating_add(1);
+        return None;
+    }
     // The instruction is already known page-local in physical (`physical_page_local` in the
     // compile loop), so its immediate cannot straddle a page and one host pointer covers all four
     // bytes.
@@ -5997,7 +6057,11 @@ fn imm_lane_for(
 ///   and unmapped pages never produce one. The instruction is already page-local in physical
 ///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
 /// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
-///   baked immediate, which is a missed optimisation and never a correctness question.
+///   baked immediate, which is a missed optimisation and never a correctness question. Split out
+///   of the knob's disjunction and counted: see `imm8_lane_cap_refusals`. THE BARS THAT PRECEDE
+///   IT are the `IZARRAVM_IMM8_LANES` arm, the `AluByteImm` kind match, the opcode / prefix /
+///   length compares and the lane address; it is tested before `direct_host_bytes`, for
+///   `imm_lane_for`'s reason.
 ///
 /// NO HEAT GATE, unlike `disp_lane_for`. The two are not the same trade: a disp lane costs two
 /// host instructions on every EXECUTION of a load that may never be patched, which is what made
@@ -6012,8 +6076,9 @@ fn imm8_lane_for(
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
+    cap_refusals: &mut LaneCapRefusals,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES || !imm8_lanes_enabled() {
+    if !imm8_lanes_enabled() {
         return None;
     }
     let DirectKind::AluByteImm {
@@ -6034,6 +6099,12 @@ fn imm8_lane_for(
         return None;
     }
     let lane = physical.checked_add(2)?;
+    // The cap, split off the knob above and tested under the shape bars, for `imm_lane_for`'s
+    // reason and in the same position: after the field compares, before the fetch-cache scan.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cap_refusals[LANE_CAP_IMM8] = cap_refusals[LANE_CAP_IMM8].saturating_add(1);
+        return None;
+    }
     let host = cpu.direct_host_bytes(lane, IMM8_LANE_WIDTH)?;
     let lane = ImmLane {
         physical: lane,
@@ -6116,7 +6187,11 @@ fn imm8_lane_for(
 ///   and unmapped pages never produce one. The instruction is already page-local in physical
 ///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
 /// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
-///   baked count, which is a missed optimisation and never a correctness question.
+///   baked count, which is a missed optimisation and never a correctness question. Split out of
+///   the knob's disjunction and counted: see `count_lane_cap_refusals`. THE BARS THAT PRECEDE IT
+///   are the `IZARRAVM_COUNT_LANES` arm, the `RotateReg` / `Shift` kind match, the opcode /
+///   prefix / length compares and the lane address; it is tested before `direct_host_bytes`, for
+///   `imm_lane_for`'s reason.
 ///
 /// NO HEAT GATE, for `imm8_lane_for`'s reason and with one measurement on top of it: the L1
 /// `heat_gated` arm gated this very row on heat and LOST (+1.6% wall), because only 11.4% of the
@@ -6138,8 +6213,9 @@ fn count_lane_for(
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
+    cap_refusals: &mut LaneCapRefusals,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES || !count_lanes_enabled() {
+    if !count_lanes_enabled() {
         return None;
     }
     if !matches!(
@@ -6162,6 +6238,12 @@ fn count_lane_for(
         return None;
     }
     let lane = physical.checked_add(2)?;
+    // The cap, split off the knob above and tested under the shape bars, for `imm_lane_for`'s
+    // reason and in the same position: after the field compares, before the fetch-cache scan.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cap_refusals[LANE_CAP_COUNT] = cap_refusals[LANE_CAP_COUNT].saturating_add(1);
+        return None;
+    }
     let host = cpu.direct_host_bytes(lane, IMM8_LANE_WIDTH)?;
     let lane = ImmLane {
         physical: lane,
@@ -6218,8 +6300,8 @@ fn count_lane_for(
 /// kill, one more recompile.
 ///
 /// The probe reads the heat accelerator WITHOUT `sync_smc_heat` (this is a `&CpuGsw` path); a
-/// stale read across a cache reset can at worst bake one block that a later recompile lanes,
-/// or lane one block that did not need it — admission tuning, never correctness.
+/// stale read across a cache reset can at worst bake one block that a later recompile lanes, or
+/// lane one block that did not need it — admission tuning, never correctness.
 ///
 /// `disp_len == 4` plus the default-prefix test confines this to 32-bit addressing: a CS.D=0
 /// segment cannot reach a four-byte displacement without a `0x67` prefix, so a lane and
@@ -6239,8 +6321,9 @@ fn disp_lane_for(
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
+    cap_refusals: &mut LaneCapRefusals,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES || !disp_lanes_enabled() {
+    if !disp_lanes_enabled() {
         return None;
     }
     let DirectKind::Load {
@@ -6270,6 +6353,19 @@ fn disp_lane_for(
     // Page-local in physical for the same reason as `imm_lane_for`: the compile loop only
     // reaches this after `physical_page_local`, so one host pointer covers all four bytes.
     let host = cpu.direct_host_bytes(lane, IMM_LANE_WIDTH)?;
+    // The cap, split off the knob above and tested LAST, which is where this family differs from
+    // the other three. The bar it must stay under is the heat gate: that is what separates a
+    // patched load from doom's never-patched texture reads, so a cap test placed above it would
+    // report the whole `0x8A` population as budget pressure. It stays under `direct_host_bytes`
+    // as well, unlike the other three, because the gate above it is the expensive bar here (a
+    // `has_record_range` hash lookup) and hoisting over the handful-of-entries fetch-cache scan
+    // under it would buy nothing measurable. That leaves one family in which the page guard is
+    // pinned ABOVE the cap, which is what
+    // `a_disp_slot_whose_lane_bytes_are_not_direct_mapped_charges_no_cap_refusal` holds.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cap_refusals[LANE_CAP_DISP] = cap_refusals[LANE_CAP_DISP].saturating_add(1);
+        return None;
+    }
     let lane = ImmLane {
         physical: lane,
         host,
@@ -6466,6 +6562,11 @@ fn compile_with_budget(
     let mut disp_lane_count = 0u8;
     let mut imm8_lane_count = 0u8;
     let mut count_lane_count = 0u8;
+    // Refusals THIS WALK charged to the shared lane budget, one cell per family. Carried here and
+    // handed to the install site with the `Compilation` rather than charged into the tally inside
+    // the matchers: see `LaneCapRefusals` for the denominator argument, and `JitState::install`
+    // for the fold.
+    let mut lane_cap_refusals: LaneCapRefusals = [0; LANE_CAP_FAMILIES];
     let mut stop = CompileStop::Boundary;
     // Running estimate of what this block will emit, against `byte_budget` (the arena page).
     // See `EMITTED_BLOCK_FIXED_BYTES` for why the walk carries this at all.
@@ -7110,7 +7211,14 @@ fn compile_with_budget(
         // dword lane in the same block cannot absorb each other's stores.
         #[cfg(feature = "barrier-census-closure")]
         let mut lane_probe_bits = 0u8;
-        let kind = match imm_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+        let kind = match imm_lane_for(
+            cpu,
+            &insn,
+            kind,
+            expected_phys,
+            imm_lane_count,
+            &mut lane_cap_refusals,
+        ) {
             Some((kind, lane)) => {
                 imm_lanes[imm_lane_count] = lane.physical;
                 imm_lane_widths[imm_lane_count] = lane.width;
@@ -7121,7 +7229,14 @@ fn compile_with_budget(
                 }
                 kind
             }
-            None => match imm8_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+            None => match imm8_lane_for(
+                cpu,
+                &insn,
+                kind,
+                expected_phys,
+                imm_lane_count,
+                &mut lane_cap_refusals,
+            ) {
                 Some((kind, lane)) => {
                     imm_lanes[imm_lane_count] = lane.physical;
                     imm_lane_widths[imm_lane_count] = lane.width;
@@ -7143,7 +7258,14 @@ fn compile_with_budget(
                 // first"; the four are mutually exclusive by KIND (`AluImm` vs `AluByteImm` vs
                 // `RotateReg`/`Shift` vs `Load`), so at most one can fire per slot whatever the
                 // order, and all four draw on the one `MAX_BLOCK_IMM_LANES` budget.
-                None => match count_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+                None => match count_lane_for(
+                    cpu,
+                    &insn,
+                    kind,
+                    expected_phys,
+                    imm_lane_count,
+                    &mut lane_cap_refusals,
+                ) {
                     Some((kind, lane)) => {
                         imm_lanes[imm_lane_count] = lane.physical;
                         imm_lane_widths[imm_lane_count] = lane.width;
@@ -7159,7 +7281,14 @@ fn compile_with_budget(
                         }
                         kind
                     }
-                    None => match disp_lane_for(cpu, &insn, kind, expected_phys, imm_lane_count) {
+                    None => match disp_lane_for(
+                        cpu,
+                        &insn,
+                        kind,
+                        expected_phys,
+                        imm_lane_count,
+                        &mut lane_cap_refusals,
+                    ) {
                         Some((kind, lane)) => {
                             imm_lanes[imm_lane_count] = lane.physical;
                             imm_lane_widths[imm_lane_count] = lane.width;
@@ -7722,6 +7851,7 @@ fn compile_with_budget(
         disp_lanes: disp_lane_count,
         imm8_lanes: imm8_lane_count,
         count_lanes: count_lane_count,
+        lane_cap_refusals,
         code: emitted.code,
     })
 }

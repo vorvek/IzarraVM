@@ -95,8 +95,35 @@ pub(crate) fn sixteen_bit_admission_level() -> u8 {
 /// exists for one-binary A/B measurement, the same contract as the JIT16 pair: both arms ship
 /// in one executable so a comparison carries no build-to-build variance.
 pub(crate) fn lane_family_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = LANE_FAMILY_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_LANE_FAMILY").as_deref(), Ok("0")))
+}
+
+// The per-thread arm override, the same shape `IMM8_LANES_OVERRIDE`, `COUNT_LANES_OVERRIDE` and
+// `DISP_LANES_OVERRIDE` carry, and added for the same reason: the lane-cap fixtures have to pin
+// this knob's arm apart from the shared budget's cap arm, and a process-wide `OnceLock` cannot say
+// what an off arm counts without an env write the harness cannot order. `None` leaves every
+// existing fixture reading the ambient knob exactly as before.
+//
+// The knob keeps its bare `!= "0"` reading rather than gaining a spelling table with this
+// override: it selects an admission WIDTH inside one family (`/0 ADD` only, against the whole
+// `0x81 /r` group) rather than a lane class on or off, no ladder leg outside this crate names it,
+// and giving it a table would be an untested behaviour change on a knob nothing was asking about.
+#[cfg(test)]
+thread_local! {
+    static LANE_FAMILY_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the `0x81 /r` family-widening arm on this thread for the length of a fixture; `None`
+/// restores the ambient `IZARRAVM_LANE_FAMILY` reading.
+#[cfg(test)]
+pub(crate) fn set_lane_family_for_test(forced: Option<bool>) {
+    LANE_FAMILY_OVERRIDE.with(|cell| cell.set(forced));
 }
 
 pub(crate) fn lane_trial_enabled() -> bool {
@@ -104,12 +131,91 @@ pub(crate) fn lane_trial_enabled() -> bool {
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_SMC_LANE_TRIAL").as_deref(), Ok("0")))
 }
 
-/// Whether `disp_lane_for` admits the `0x8A` displacement-lane family (`IZARRAVM_DISP_LANES`,
-/// on for every value except exactly "0"). The off arm exists for one-binary A/B measurement,
-/// the same contract as `IZARRAVM_LANE_FAMILY`.
+/// Whether `disp_lane_for` admits the `0x8A` displacement-lane family (`IZARRAVM_DISP_LANES`).
+/// DEFAULT ON. The off arm exists for one-binary A/B measurement, the same contract as
+/// `IZARRAVM_LANE_FAMILY`.
+///
+/// # THE SPELLING TABLE
+///
+/// Trimmed and case-folded on the way in, the same table `IZARRAVM_IMM8_LANES` and
+/// `IZARRAVM_COUNT_LANES` carry, and it is a table rather than a bare `!= "0"` since the lane-cap
+/// fix. The bare form read `IZARRAVM_DISP_LANES=off` as ON: a ladder leg spelling the escape the
+/// way every other lane knob accepts it ran the DEFAULT and reported the arm as inert, which is
+/// the one wrong conclusion an arm ladder exists to avoid. The Option D ladder reads this leg.
+///
+/// * **unset** or `1` / `on` -> ON. The shipped default.
+/// * `` (empty), `0` or `off` -> OFF. The escape and the A/B base. **The empty string is OFF while
+///   unset is ON**, which is the whole family's convention and the reason for it: nulling a
+///   variable in PowerShell leaves it PRESENT and EMPTY, so a leg that meant to unset the knob
+///   gets the off arm and a leg that meant the off arm gets it too. `Remove-Item Env:` is the only
+///   true unset. This is a CHANGE for this knob alone -- the bare form read the empty string as ON
+///   -- and it is made deliberately, so that all four lane knobs answer a nulled variable the same
+///   way rather than one of them silently disagreeing.
+/// * **anything else PANICS**, for `parse_imm8_lanes_arm`'s reason.
 pub(crate) fn disp_lanes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = DISP_LANES_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_DISP_LANES").as_deref(), Ok("0")))
+    *ENABLED.get_or_init(|| parse_disp_lanes_arm(std::env::var("IZARRAVM_DISP_LANES")))
+}
+
+/// The `IZARRAVM_DISP_LANES` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `disp_lanes_enabled` for the contract.
+fn parse_disp_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset is the shipped default and the overwhelmingly common case: the displacement lane
+        // class is ON, heat-gated by `has_record_range`. `0` / `off` is the escape.
+        Err(std::env::VarError::NotPresent) => return true,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_DISP_LANES is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `1` / `on` (the shipped default, the `0x8A` \
+                 displacement-lane class), and `0` or `off` (the escape, under which every \
+                 `0x8A` slot bakes its displacement)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_DISP_LANES={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default, the `0x8A` displacement-lane class), and `0` or `off` \
+             (the escape, under which every `0x8A` slot bakes its displacement). Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm \
+             it named doing nothing"
+        ),
+    }
+}
+
+// The per-thread arm override, the same shape `IMM8_LANES_OVERRIDE` and `COUNT_LANES_OVERRIDE`
+// carry. Added for the lane-cap fixtures, which have to pin the knob arm and the cap arm apart: a
+// process-wide `OnceLock` cannot say what an off arm counts without an env write the harness
+// cannot order. `None` leaves the existing fixtures reading the ambient knob exactly as before.
+#[cfg(test)]
+thread_local! {
+    static DISP_LANES_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the displacement-lane arm on this thread for the length of a fixture; `None` restores
+/// the ambient `IZARRAVM_DISP_LANES` reading.
+#[cfg(test)]
+pub(crate) fn set_disp_lanes_for_test(forced: Option<bool>) {
+    DISP_LANES_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `disp_lanes_enabled` caches its env reading in
+/// a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
+/// never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_disp_lanes_arm(value)
 }
 
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class
