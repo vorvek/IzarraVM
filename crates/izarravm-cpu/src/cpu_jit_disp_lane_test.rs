@@ -545,3 +545,64 @@ fn a_prefixed_form_takes_no_lane() {
     assert_eq!(compilation.span.instructions, 3, "fixture shape changed");
     assert_eq!(compilation.disp_lane_count(), 0, "prefixes bar the lane");
 }
+
+/// The `IZARRAVM_DISP_LANES` spelling table, and THE DEFAULT PIN, TWO-SIDED.
+///
+/// `disp_lanes_enabled` caches its env reading in a process-wide `OnceLock`, so the contract is
+/// otherwise assertable exactly once per process and never in an order the harness controls --
+/// hence the parse function is exercised directly.
+///
+/// THE BUG THIS PINS. Until the lane-cap fix this knob read `!= "0"` with no table at all, so
+/// `IZARRAVM_DISP_LANES=off` selected ON: a ladder leg spelling the escape the way the other three
+/// lane knobs accept it ran the DEFAULT and reported the arm as inert. Restoring the bare form
+/// fails the `off` entries below.
+///
+/// The EMPTY STRING is OFF while unset is ON, which is a deliberate change for this knob and the
+/// convention every other lane knob already follows: nulling a variable in PowerShell leaves it
+/// present and empty, and reading that as ON is how three earlier evidence directories came to run
+/// their default-ON knobs on the wrong arm.
+#[test]
+fn disp_lanes_spelling_table() {
+    use std::env::VarError;
+    let parse = jit::direct::parse_disp_lanes_arm_for_test;
+    assert!(
+        parse(Err(VarError::NotPresent)),
+        "unset must select ON -- the shipped default"
+    );
+    for off in ["", "0", "off", "OFF", " off ", "Off"] {
+        assert!(
+            !parse(Ok(off.to_string())),
+            "{off:?} must select the baked-displacement world; it is the escape and the A/B base"
+        );
+    }
+    for on in ["1", "on", "ON", " On "] {
+        assert!(
+            parse(Ok(on.to_string())),
+            "{on:?} must select the lane class"
+        );
+    }
+}
+
+/// THE SHIPPED DEFAULT, asserted through the live reader rather than the parse table, for
+/// `the_shipped_count_lanes_default_is_the_on_arm`'s reason: nothing else here would notice
+/// `disp_lanes_enabled` growing a different default from the one `parse_disp_lanes_arm` spells.
+///
+/// Reads the AMBIENT arm, with the thread-local override explicitly cleared first.
+#[test]
+fn the_shipped_disp_lanes_default_is_the_on_arm() {
+    jit::direct::set_disp_lanes_for_test(None);
+    assert!(
+        jit::direct::disp_lanes_enabled(),
+        "the shipped default must be ON; the heat gate, not this knob, is what keeps doom's \
+         never-patched loads baked"
+    );
+}
+
+/// A typo must not silently run the default. See `parse_disp_lanes_arm` for why guessing is worse
+/// than failing: a leg that quietly fell through would run exactly what an unset environment runs,
+/// and be read as the arm it named doing nothing.
+#[test]
+#[should_panic(expected = "names no arm")]
+fn an_unrecognised_disp_lanes_spelling_panics() {
+    jit::direct::parse_disp_lanes_arm_for_test(Ok("true".to_string()));
+}

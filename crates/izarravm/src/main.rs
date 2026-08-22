@@ -3072,11 +3072,12 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_disp_lane_registrations": snapshot.disp_lane_registrations,
         "smc_imm8_lane_registrations": snapshot.imm8_lane_registrations,
         "smc_count_lane_registrations": snapshot.count_lane_registrations,
-        // The lane-budget split. Registrations say what a run installed; these say what the
-        // shared `MAX_BLOCK_IMM_LANES` budget turned away, per family and on the cap arm only.
-        // A widening ladder that reads its registrations flat while these are large has a budget
-        // result rather than a lane-class one, which is the pair of readings the two numbers
-        // exist to separate.
+        // The lane-budget split. Registrations say what lanes a run's installed blocks took;
+        // these say what the shared `MAX_BLOCK_IMM_LANES` budget turned away IN THOSE SAME
+        // BLOCKS, per family and on the cap arm only. Both are folded in at install, so the two
+        // share a denominator and their ratio means something. A widening ladder that reads its
+        // registrations flat while these are large has a budget result rather than a lane-class
+        // one, which is the pair of readings the two numbers exist to separate.
         "smc_imm_lane_cap_refusals": snapshot.imm_lane_cap_refusals,
         "smc_imm8_lane_cap_refusals": snapshot.imm8_lane_cap_refusals,
         "smc_count_lane_cap_refusals": snapshot.count_lane_cap_refusals,

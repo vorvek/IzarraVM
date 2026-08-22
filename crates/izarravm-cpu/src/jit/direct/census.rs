@@ -671,18 +671,29 @@ pub(crate) struct DirectStallTally {
     /// though both register at `IMM8_LANE_WIDTH`: the two arms are independent knobs, so a
     /// combined leg has to be able to attribute an accepts movement to one of them.
     pub count_lane_registrations: u64,
-    /// Lanes the shared `MAX_BLOCK_IMM_LANES` budget refused, charged to the family that would
-    /// otherwise have taken the slot. The registration counters above say how many lanes a run
-    /// installed; these say how many more it would have installed with a larger budget, which is
-    /// the only number that can tell a lane-CLASS answer apart from a lane-BUDGET answer when a
-    /// widening ladder reads its registrations flat.
+    /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
+    /// charged to the family that would otherwise have taken the slot. The registration counters
+    /// above say how many lanes those same blocks installed; these say how many more they would
+    /// have held with a larger budget, which is the only number that can tell a lane-CLASS answer
+    /// apart from a lane-BUDGET answer when a widening ladder reads its registrations flat.
+    ///
+    /// SAME DENOMINATOR AS THE REGISTRATIONS, and that is a property of where they are folded in
+    /// rather than of where they are counted. Each walk accumulates its own `LaneCapRefusals` and
+    /// `JitState::install` folds them here on its success arm, so a walk that ends in a `Retry` or
+    /// a `StructuralReject` contributes nothing, and the prefixes `compile_with_page_len`'s
+    /// recovery search re-walks after a page overflow are counted once, through the one prefix
+    /// that installs, instead of once per walk.
     ///
     /// Charged on the CAP arm alone. Every family's knob is tested first and returns before the
     /// cap is consulted, so an off arm reads zero here rather than reporting its whole population
-    /// as budget pressure. The cap test is also the LAST bar in each matcher rather than the
-    /// first, which is what makes the split per-family: a slot the cap refuses has already passed
-    /// its family's shape, prefix, page and (for `disp_lane_cap_refusals`) patch-history tests, so
-    /// exactly one counter moves per refused slot instead of all four.
+    /// as budget pressure. The cap test also sits UNDER its family's shape bars rather than over
+    /// them, which is what makes the split per-family: a slot the cap refuses has already passed
+    /// its family's kind, opcode, prefix and length tests, so exactly one counter moves per
+    /// refused slot instead of all four. The bars each family puts above the cap are listed on its
+    /// matcher; in three of the four the cap sits above `direct_host_bytes` so a capped block
+    /// stops paying the fetch-cache scan, and in `disp_lane_cap_refusals` it stays below both the
+    /// `has_record_range` heat gate (required: without it doom's never-patched `0x8A` loads would
+    /// all read as budget pressure) and that scan.
     ///
     /// Compile path only, and unconditional there: a heat-coupled counter that is armed on one
     /// leg and absent on the other confounds the policy with an epoch re-phasing, so the cost is
@@ -2349,26 +2360,6 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_callout_slot_cap_hit(&mut self) {
         self.stalls.callout_slot_cap_hits += 1;
-    }
-
-    /// The `MAX_BLOCK_IMM_LANES` budget refused a slot that had cleared every other bar of its
-    /// family. One method per family rather than one method with a family argument, because the
-    /// call sites are four distinct matchers and an enum in between would only move the match.
-    /// See the four fields for why the cap arm is tested last and separately from the knob arm.
-    pub(crate) fn note_imm_lane_cap_refusal(&mut self) {
-        self.stalls.imm_lane_cap_refusals += 1;
-    }
-
-    pub(crate) fn note_imm8_lane_cap_refusal(&mut self) {
-        self.stalls.imm8_lane_cap_refusals += 1;
-    }
-
-    pub(crate) fn note_count_lane_cap_refusal(&mut self) {
-        self.stalls.count_lane_cap_refusals += 1;
-    }
-
-    pub(crate) fn note_disp_lane_cap_refusal(&mut self) {
-        self.stalls.disp_lane_cap_refusals += 1;
     }
 
     /// A full-length walk whose emission did not fit one host page, and each candidate the

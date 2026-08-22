@@ -2017,10 +2017,11 @@ pub struct DirectStallSnapshot {
     /// Group-2 count lanes (`0xC1`/`0xC0` count byte) registered at install, the L2 arm-2 share
     /// of the aggregate `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
     pub count_lane_registrations: u64,
-    /// Lanes refused by the shared `MAX_BLOCK_IMM_LANES` budget, one counter per family and
-    /// charged on the CAP arm alone. Read beside the registration counters above: registrations
-    /// flat while these are large says the budget is binding, not that the family is unlaneable.
-    /// See `DirectStallTally`.
+    /// Slots refused by the shared `MAX_BLOCK_IMM_LANES` budget in the blocks this run INSTALLED,
+    /// one counter per family and charged on the CAP arm alone. Same denominator as the
+    /// registration counters above, which is what makes the pair readable: registrations flat
+    /// while these are large says the budget is binding, not that the family is unlaneable. See
+    /// `DirectStallTally`.
     pub imm_lane_cap_refusals: u64,
     pub imm8_lane_cap_refusals: u64,
     pub count_lane_cap_refusals: u64,

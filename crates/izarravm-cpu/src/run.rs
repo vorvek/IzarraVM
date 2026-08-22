@@ -1598,6 +1598,11 @@ impl CpuGsw {
                 if lane_trial {
                     self.jit_direct.direct.note_lane_trial_install();
                 }
+                // The three per-family lane REGISTRATIONS below are charged here, on the success
+                // arm of `install`. Their counterparts, the per-family lane-budget REFUSALS, are
+                // folded in by `install` itself under exactly the same condition, so the two sets
+                // share a denominator and their ratio is readable; see
+                // `DirectStallTally::imm_lane_cap_refusals`.
                 self.perf.smc_lane_registrations += compilation.imm_lane_count() as u64;
                 if compilation.disp_lane_count() != 0 {
                     self.jit_direct

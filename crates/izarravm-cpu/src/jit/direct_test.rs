@@ -85,6 +85,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         disp_lanes: 0,
         imm8_lanes: 0,
         count_lanes: 0,
+        lane_cap_refusals: [0; LANE_CAP_FAMILIES],
         code: vec![0xc3],
     }
 }
