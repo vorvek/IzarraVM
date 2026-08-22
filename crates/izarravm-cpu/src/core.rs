@@ -1446,6 +1446,29 @@ impl CpuGsw {
         self.data_write_pages.set_mapping_epoch_for_test(epoch);
     }
 
+    /// Whether the SS-load shape measurement is being taken at all.
+    ///
+    /// GATED with the barrier census since the S4 review round. The pair of counters behind it
+    /// sits in two INTERPRETER arms and is read on census legs only, which is the same bargain
+    /// every other diagnostic on a hot path takes here; before the gate, `0x8e` paid a segment
+    /// compare and `0x17` an unconditional record read on every execution, in every build.
+    ///
+    /// The measurement itself is answered: the tombraid loader phase split 484,385 same-record
+    /// against 488,498 record-moving, which is what design review 10.1 M5 asked for and what the
+    /// two SS call-out rows were built on. It stays because the ladder still reads it, not
+    /// because anything is waiting on it.
+    #[inline]
+    pub(crate) fn ss_load_census_active(&self) -> bool {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_direct.barrier_census_active()
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            false
+        }
+    }
+
     /// One interpreted SS load, classified for the S4d M5 measurement by whether the record
     /// moved. `before` is the SS record as it stood at the top of the arm.
     ///

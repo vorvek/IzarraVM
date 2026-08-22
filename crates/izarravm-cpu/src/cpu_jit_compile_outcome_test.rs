@@ -4022,6 +4022,68 @@ fn retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block() {
     );
 }
 
+/// A walk that ends with NO slots is a BUDGET refusal, not the min-length rule.
+///
+/// The two were one cause until the S4 review round (finding F7). `TooShort` is the post-walk
+/// rule that a block of fewer than three non-terminal slots does not install, and it is the cause
+/// a retry policy most wants to trust as deterministic; a walk that never formed a slot at all
+/// never reached that rule, and filing it there made one label mean two things.
+///
+/// The instruction limit is the same shape the block-page budget produces when it refuses the
+/// very first instruction, and it is the one a fixture can reach on demand.
+///
+/// MUTATION: fold the arm back into `TooShort` and this reads `too_short`.
+#[test]
+fn a_walk_with_no_slots_reports_the_budget_and_not_the_length_rule() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    let outcome =
+        jit::direct::compile_outcome_with_instruction_limit_for_test(&mut cpu, ENTRY, true, 0);
+    assert_eq!(
+        retry_cause(outcome),
+        jit::direct::RetryCause::BudgetFirstSlot
+    );
+    // And the length rule still owns the case it was written for.
+    let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+    assert_eq!(
+        retry_cause(jit::direct::compile(&mut cpu, ENTRY, true)),
+        jit::direct::RetryCause::TooShort
+    );
+}
+
+/// Every retry cause has a distinct label and an explicit answer to "could a re-walk decide this
+/// differently", including the two the review round split out.
+///
+/// `SearchStructural` has no fixture and is not expected to have one: a search step walks a
+/// PREFIX of a block the full walk already compiled, so every per-slot gate it meets has already
+/// answered yes. It exists because the arm exists, and because it wore the `HostPageLen` label
+/// while having nothing to do with the arena page. The counter is how its reachability gets
+/// answered on a workload rather than argued about here.
+#[test]
+fn every_retry_cause_has_a_distinct_label_and_a_stated_clearability() {
+    let mut labels: Vec<&str> = jit::direct::RetryCause::ALL
+        .iter()
+        .map(|cause| cause.label())
+        .collect();
+    labels.sort_unstable();
+    let distinct = labels.len();
+    labels.dedup();
+    assert_eq!(distinct, labels.len(), "cause labels must be unique");
+    assert_eq!(labels.len(), jit::direct::RetryCause::COUNT);
+
+    let clearable: Vec<&str> = jit::direct::RetryCause::ALL
+        .iter()
+        .filter(|cause| cause.clearable_by_retry())
+        .map(|cause| cause.label())
+        .collect();
+    assert_eq!(
+        clearable,
+        vec!["decode_miss", "translation_mismatch"],
+        "the retry lift's admitted set is these two and nothing else"
+    );
+}
+
 /// The retry lift end to end: a `DecodeMiss` key whose line has come back compiles again, and the
 /// sticky-decline memo is what paces it.
 ///
@@ -4271,6 +4333,13 @@ fn retry_cause_counts(cpu: &CpuGsw, cause: jit::direct::RetryCause) -> (u64, u64
 /// The two columns are different questions. `count` is attempts and rises on every park;
 /// `keys` counts the distinct keys the park moved out of `Seen`, so a second attempt on a key
 /// that is already Dormant raises the first and not the second.
+///
+/// The "sums exactly" assertion inside `retry_cause_counts` is a REFACTOR GUARD and nothing more,
+/// and the review round asked for that to be said out loud. Both sides of it are incremented by
+/// the same statement in `BlockCache::dormant`, so it cannot fail for any reason a reader would
+/// call a bug in the attribution; what it catches is a future edit that counts one of them
+/// somewhere else, which is exactly how the per-site version of this instrument would have
+/// multiplied one failed compile by the recovery search's depth.
 #[test]
 fn retry_causes_are_counted_once_per_attempt_and_once_per_key() {
     let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);

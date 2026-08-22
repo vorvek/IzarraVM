@@ -389,11 +389,12 @@ impl CpuGsw {
                         });
                     }
                 };
-                // Design review 10.1 M5: does a real guest's MOV SS leave the record alone? The
-                // snapshot is taken only when SS is the target, so every other segment pays one
-                // compare against an enum.
-                let ss_before =
-                    (segment == SegmentIndex::Ss).then(|| self.registers.segment(SegmentIndex::Ss));
+                // Design review 10.1 M5: does a real guest's MOV SS leave the record alone?
+                // Behind the barrier-census gate since the S4 review round, so a plain build pays
+                // one predicate on an already-loaded flag rather than a segment compare and a
+                // record read on every execution of this arm.
+                let ss_before = (self.ss_load_census_active() && segment == SegmentIndex::Ss)
+                    .then(|| self.registers.segment(SegmentIndex::Ss));
                 self.load_segment_arming_ss_shadow(bus, segment, value as u16)?;
                 if let Some(before) = ss_before {
                     self.note_ss_load_record(before);
@@ -558,10 +559,14 @@ impl CpuGsw {
                 // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
                 // Same 386 PRM operand-size rule as POP ES above.
                 let value = self.pop(bus, operand_size)? as u16;
-                // The M5 measurement's other half. See the `0x8e` arm.
-                let before = self.registers.segment(SegmentIndex::Ss);
+                // The M5 measurement's other half, behind the same gate. See the `0x8e` arm.
+                let before = self
+                    .ss_load_census_active()
+                    .then(|| self.registers.segment(SegmentIndex::Ss));
                 self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
-                self.note_ss_load_record(before);
+                if let Some(before) = before {
+                    self.note_ss_load_record(before);
+                }
                 Ok(clocks(7))
             }
             0x1e => {

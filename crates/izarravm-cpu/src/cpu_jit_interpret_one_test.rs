@@ -4251,12 +4251,16 @@ fn the_sti_row_resyncs_while_an_interrupt_is_pending() {
 ///
 /// Without the split, a block entered under a shadow would resume and the reprieve would be spent
 /// on an instruction that never consumed it.
+///
+/// The clause reads the shadow `run_direct_block` PUBLISHED at the entry rather than the live
+/// flag, which is review finding F2: read live it would also refuse every call-out sitting behind
+/// an arming one in the same block, and the governor would demote those slots for it.
 #[test]
 fn an_entry_interrupt_shadow_refuses_resume_for_every_row() {
     let mut cpu = sixteen_bit_code_cpu(ENTRY);
     cpu.registers.eflags = 0x202;
     cpu.set_eip(ENTRY + 5);
-    cpu.interrupt_shadow = true;
+    cpu.jit_direct.set_block_entry_interrupt_shadow(true);
     let snapshot = jit::direct::ResumeSnapshot::capture(&cpu);
     for row in jit::direct::InterpretOneRow::ALL {
         assert!(
@@ -4350,6 +4354,8 @@ fn the_ss_load_measurement_splits_same_record_from_changed_record() {
         program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
         let mut bus = sixteen_bit_bus(program);
         let mut cpu = sixteen_bit_code_cpu(ENTRY);
+        // The measurement is barrier-census gated since the S4 review round.
+        cpu.enable_direct_barrier_census(true);
         cpu.registers.set_esp(STACK_TOP);
         while !cpu.halted {
             cpu.cycle(&mut bus).expect("the fixture must run");
@@ -4374,6 +4380,7 @@ fn the_ss_load_measurement_ignores_the_other_segments() {
     program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
     let mut bus = sixteen_bit_bus(program);
     let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    cpu.enable_direct_barrier_census(true);
     while !cpu.halted {
         cpu.cycle(&mut bus).expect("the fixture must run");
     }
@@ -4381,6 +4388,35 @@ fn the_ss_load_measurement_ignores_the_other_segments() {
     assert_eq!(
         (stalls.ss_load_same_record, stalls.ss_load_changed_record),
         (0, 0)
+    );
+}
+
+/// The measurement costs a plain build nothing: with the census off both columns stay at zero
+/// however many SS loads the guest runs.
+///
+/// The counters live in two interpreter arms, which is why the gate exists at all. Without it the
+/// `0x8e` arm pays a segment compare and the `0x17` arm an unconditional record read on every
+/// execution, in every build, for a number that is read on census legs only.
+///
+/// MUTATION: delete the `ss_load_census_active` term from either arm and this reads one instead
+/// of zero.
+#[test]
+fn the_ss_load_measurement_is_off_without_the_census() {
+    // mov ax, 0; mov ss, ax; push ax; pop ss; hlt
+    let code = [0xB8, 0x00, 0x00, 0x8E, 0xD0, 0x50, 0x17, 0xF4];
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    cpu.registers.set_esp(STACK_TOP);
+    while !cpu.halted {
+        cpu.cycle(&mut bus).expect("the fixture must run");
+    }
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        (stalls.ss_load_same_record, stalls.ss_load_changed_record),
+        (0, 0),
+        "the measurement must be silent on a plain build"
     );
 }
 
@@ -4803,4 +4839,222 @@ fn interpret_one_protected_mode_ss_faults_take_the_fault_stub() {
             "{label}: a faulting load must leave the old segment in place"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 12. The S4 review round. Three findings about the shadow, each with the fixture that would
+// have caught it.
+// ---------------------------------------------------------------------------
+
+/// F1: the LAST arming slot owns the latch, on every path it can leave by.
+///
+/// Two arming slots in one run, and the second RESYNCS. `mov ss,cx` reloads the record SS already
+/// holds and resumes, latching its end; `mov ss,ax` then loads a different selector, so R2 refuses
+/// and the block ends there with a shadow that slot has just armed and nothing has consumed. The
+/// `cmc` behind it is unclassifiable, which is what makes the second SS load the block's last
+/// slot, and it is also the one instruction the reprieve is spent on.
+///
+/// Latched on the resume path alone, the boundary compares the block's final EIP against the
+/// FIRST slot's address, finds them different, and clears that fresh shadow: the interrupt is
+/// delivered one instruction EARLY, which is outside the caveat the owner approved. With the latch
+/// written by whichever arming slot ran last, the address matches and the flag survives for the
+/// interpreter.
+///
+/// MUTATION: move the latch back below the `if !resume` return and this fails on
+/// `interrupt_shadow`, and the boundary's `debug_assert` on the arm count fires as well.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn the_last_arming_slot_owns_the_shadow_latch() {
+    // mov ax,0x0010; mov ss,cx; nop; mov ss,ax; cmc; hlt
+    //
+    // Selector 0x0010 rather than the shared program's 0x1111: the record has to MOVE, and it
+    // also has to leave a stack the interrupt frame below can be pushed onto.
+    let code = [0xB8, 0x10, 0x00, 0x8E, 0xD1, 0x90, 0x8E, 0xD0, 0xF5, 0xF4];
+    let starts = [0, 3, 5, 6, 8];
+    // IF stays SET (the shared arm's 0x202): neither SS load writes it, and the delivery below
+    // needs it. `clear_if` belongs to the STI fixtures, which are about the 0-to-1 edge.
+    let (mut cpu, mut bus, native_insns, _) = run_block_to_boundary(&code, &starts, no_perturb);
+    assert_eq!(
+        native_insns, 4,
+        "three native slots plus the SS load that retired and then resynced"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        (
+            stalls.callout_interpret_one_executed,
+            stalls.callout_interpret_one_resync
+        ),
+        (2, 1),
+        "the first SS load must resume and the second must resync"
+    );
+    assert!(
+        cpu.interrupt_shadow,
+        "the LAST SS load armed a reprieve nothing has consumed"
+    );
+
+    // And it is spent on exactly one instruction, not on none.
+    bus.pending_irq = Some(0x08);
+    assert!(
+        cpu.service_pending_interrupt(&mut bus)
+            .expect("the shadow must defer rather than fault")
+            .is_none(),
+        "the reprieve must defer the interrupt by one instruction"
+    );
+    cpu.cycle_no_interrupt_check(&mut bus)
+        .expect("the shadowed instruction runs");
+    assert!(!cpu.interrupt_shadow, "the cmc consumed the reprieve");
+    assert!(
+        cpu.service_pending_interrupt(&mut bus)
+            .expect("delivery must not fault")
+            .is_some()
+    );
+    assert_eq!(cpu.registers.eip, 0, "delivery jumped through the IVT");
+}
+
+/// The same claim for two STI slots, which is the shape the review named.
+///
+/// Both resume here -- nothing is pending and neither moves a record -- so the latch is written
+/// twice and the second write is the one that counts. The block ends AT the second STI (the `cmc`
+/// behind it is unclassifiable), so nothing retired after it and the flag survives.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn two_sti_slots_leave_the_second_ones_shadow_armed() {
+    // mov ax,0x1111; sti; inc ax; sti; cmc; hlt
+    let code = [0xB8, 0x11, 0x11, 0xFB, 0x40, 0xFB, 0xF5, 0xF4];
+    let starts = [0, 3, 4, 5, 6];
+    let (mut cpu, mut bus, native_insns, _) = run_block_to_boundary(&code, &starts, clear_if);
+    assert_eq!(native_insns, 4, "the block must end AT the second STI");
+    assert!(cpu.interrupt_shadow, "nothing retired after the second STI");
+    assert!(!cpu.can_take_interrupt());
+
+    bus.pending_irq = Some(0x08);
+    assert!(
+        cpu.service_pending_interrupt(&mut bus)
+            .expect("deferral must not fault")
+            .is_none()
+    );
+    cpu.cycle_no_interrupt_check(&mut bus)
+        .expect("the cmc runs");
+    assert!(
+        cpu.service_pending_interrupt(&mut bus)
+            .expect("delivery must not fault")
+            .is_some(),
+        "the interrupt lands on the instruction after the shadowed one"
+    );
+}
+
+/// F2: a shadow an EARLIER slot armed must not refuse the call-outs behind it.
+///
+/// `sti; pop word [bx]; cli` is three call-out slots in one block, and only the first arms
+/// anything. Read live, R3's entry-shadow clause is true for the two behind it -- the helper never
+/// clears the flag and no native slot consumes it -- so both would resync, and three resyncs in
+/// the governor's first eight executions would demote a slot that did nothing wrong. The clause
+/// reads the shadow the BLOCK was entered with instead.
+///
+/// MUTATION: capture `cpu.interrupt_shadow` instead of the published block-entry value and the
+/// block reports two instructions instead of four.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_call_out_behind_an_arming_slot_still_resumes() {
+    // mov ax,0x1111; sti; pop word [bx]; cli; hlt
+    let code = [0xB8, 0x11, 0x11, 0xFB, 0x8F, 0x07, 0xFA, 0xF4];
+    let starts = [0, 3, 4, 6];
+    let mut legs = run_both(&code, &starts, clear_if);
+    assert_eq!(legs.exit_reason, None, "the block should have completed");
+    assert_eq!(
+        legs.native_insns, 4,
+        "all four slots must retire natively; a resync at the POP reports two"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_executed, 3);
+    assert_eq!(stalls.callout_interpret_one_resync, 0);
+    assert_eq!(stalls.callout_interpret_one_demoted, 0);
+    assert_legs_agree(&mut legs);
+}
+
+/// F3: `perf.brk_interrupt` is PRESERVED by this slice, not lowered by it.
+///
+/// The exit-path re-check in `run_budgeted_inner` fires on every block that resumes past an arming
+/// row: `can_take_interrupt` never consults the bus, so the break is about the TRANSITION, and
+/// interpreted that transition happens on the instruction after the arming one. The comment at
+/// that site used to claim the fold could not fire in production, and design section 10.1 M6
+/// pre-registered the counter as FALLING. Both were wrong, and this is the equality that says so.
+///
+/// The block is entered through the run loop rather than the direct seam, because the counter
+/// lives in the loop: a NOP one byte below the entry makes the block a CONTINUATION, which is the
+/// only way the dispatcher reaches it.
+///
+/// IF is already SET at the entry, which is the REDUNDANT-STI shape and the only one where the
+/// fold does any work. With IF clear the iteration that runs the block already answers
+/// `can_take_interrupt` false before it starts, so the break fires from the ordinary transition
+/// test and the fixture would pass with the fold deleted.
+///
+/// MUTATION: delete the `take_interrupt_shadow_consumed` fold and the native leg reports zero
+/// against the interpreter's one.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_block_that_resumes_past_the_sti_breaks_the_run_where_the_interpreter_does() {
+    fn breaks(mut cpu: CpuGsw, mut bus: TestBus, native: bool) -> u64 {
+        // A NOP below the entry, so the block is reached as a continuation. The dispatcher only
+        // takes a block on a CONTINUATION, so a run that starts AT the entry interprets it.
+        bus.memory[(ENTRY - 1) as usize] = 0x90;
+        // The oracle leg must stay interpreted; the other has to have the dispatcher armed, which
+        // `build_native` does not do because every other fixture in this file enters its block
+        // through the direct seam instead.
+        cpu.set_jit_auto_admit(native);
+        cpu.set_eip(ENTRY - 1);
+        let before = cpu.perf_counters().brk_interrupt;
+        for _ in 0..64 {
+            if cpu
+                .run_budgeted(&mut bus, 4_096)
+                .expect("the fixture must not stop the machine")
+                .halted
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            cpu.perf_counters().jit_direct_entries > 0,
+            native,
+            "the native leg must enter its block and the oracle must not"
+        );
+        cpu.perf_counters().brk_interrupt - before
+    }
+
+    let (code, starts) = row_program(&[0xFB]);
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    seed_fault_handler(&mut program);
+    let mut interp_bus = sixteen_bit_bus(program);
+    let mut interp = sixteen_bit_code_cpu(ENTRY);
+    arm_fixture(&mut interp, &mut interp_bus);
+    let interpreted = breaks(interp, interp_bus, false);
+    assert_eq!(
+        interpreted, 1,
+        "the interpreted leg is the oracle and it must break once"
+    );
+
+    let (mut native, mut native_bus, _) = build_native(&code, &starts);
+    arm_fixture(&mut native, &mut native_bus);
+    let native_breaks = breaks(native, native_bus, true);
+    assert_eq!(
+        native_breaks, interpreted,
+        "the block must end the run at the same transition the interpreter breaks on"
+    );
 }

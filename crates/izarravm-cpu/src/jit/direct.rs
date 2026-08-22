@@ -861,7 +861,18 @@ pub(crate) struct BlockCache {
     ///
     /// At most one is ever live, for `callout_retire_pending`'s reason: the entry that set it
     /// returns before another can start.
-    interrupt_shadow_armed_at: Option<u32>,
+    interrupt_shadow_armed_at: Option<(u32, u32)>,
+    /// How many arming call-out steps in this run left the shadow set. The latch above carries the
+    /// value this counter had when it was written, and the boundary asserts the two agree, which
+    /// is the invariant review finding F1 broke: a latch from an EARLIER arming slot than the last
+    /// one is exactly the state in which the boundary clears a shadow it should have left alone.
+    interrupt_shadow_arms: u32,
+    /// `interrupt_shadow` as it stood when the running block was ENTERED, published here for
+    /// `ResumeSnapshot::capture` and cleared after the native return.
+    ///
+    /// On `BlockCache` for the reason the latch above is: `DirectRuntimeState` is inline in
+    /// `CpuGsw` ahead of `registers` and `pending_flags`, whose offsets emitted code bakes.
+    block_entry_interrupt_shadow: bool,
     /// Set when the boundary above CLEARED the shadow, i.e. the block consumed an STI's
     /// one-instruction reprieve inside itself. `run_budgeted_inner` reads it to run the
     /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
@@ -1041,6 +1052,8 @@ impl BlockCache {
             callout_retire_pending: None,
             retry_lift_spent: HashMap::default(),
             interrupt_shadow_armed_at: None,
+            interrupt_shadow_arms: 0,
+            block_entry_interrupt_shadow: false,
             interrupt_shadow_consumed: false,
             lane_trial_override: None,
             block_portals: Vec::new(),
@@ -1823,16 +1836,40 @@ impl BlockCache {
         self.callout_retire_pending.take()
     }
 
-    /// Latch the EIP an arming call-out slot left behind. See the field.
-    pub(crate) fn note_interrupt_shadow_armed(&mut self, end_eip: u32) {
-        self.interrupt_shadow_armed_at = Some(end_eip);
+    /// Count one call-out step that ARMED the shadow, whatever row it was and whichever status it
+    /// returned. Deliberately separate from the latch below: the two are written from the same
+    /// place today, and a future edit that guards the latch on one status while leaving this
+    /// count on every step makes the boundary's assertion fire instead of silently comparing
+    /// against a stale address. That is the shape review finding F1 found.
+    pub(crate) fn note_interrupt_shadow_arm(&mut self) {
+        self.interrupt_shadow_arms = self.interrupt_shadow_arms.wrapping_add(1);
     }
 
-    /// Take the arming slot's EIP, clearing it. Both the native return and the dispatcher entry
-    /// call this, for the reason `take_callout_retire_pending` gives: a latch left behind would be
-    /// read by an entry that did not set it.
-    pub(crate) fn take_interrupt_shadow_armed(&mut self) -> Option<u32> {
+    /// Latch the EIP an arming call-out slot left behind, stamped with the arm count as it stands
+    /// now. See the fields.
+    pub(crate) fn note_interrupt_shadow_armed(&mut self, end_eip: u32) {
+        self.interrupt_shadow_armed_at = Some((end_eip, self.interrupt_shadow_arms));
+    }
+
+    /// Take the arming slot's EIP and its arm count, clearing the latch. Both the native return
+    /// and the dispatcher entry call this, for the reason `take_callout_retire_pending` gives: a
+    /// latch left behind would be read by an entry that did not set it.
+    pub(crate) fn take_interrupt_shadow_armed(&mut self) -> Option<(u32, u32)> {
         self.interrupt_shadow_armed_at.take()
+    }
+
+    /// How many arming steps have left the shadow set. Read by the boundary's debug assertion.
+    pub(crate) fn interrupt_shadow_arms(&self) -> u32 {
+        self.interrupt_shadow_arms
+    }
+
+    /// Publish the shadow the block is being entered with, for `ResumeSnapshot::capture`.
+    pub(crate) fn set_block_entry_interrupt_shadow(&mut self, armed: bool) {
+        self.block_entry_interrupt_shadow = armed;
+    }
+
+    pub(crate) fn block_entry_interrupt_shadow(&self) -> bool {
+        self.block_entry_interrupt_shadow
     }
 
     /// The M5 measurement: one interpreted SS load, classified by whether it moved the record.
@@ -2899,6 +2936,14 @@ impl BlockCache {
         self.top_mismatch_retires.clear();
         self.demoted_callout_sites.clear();
         self.callout_retire_pending = None;
+        self.retry_lift_spent.clear();
+        // The three interrupt-shadow latches. A reset drops every block, so a latch surviving it
+        // would be read at the next boundary by an entry that did not set it -- the reason
+        // `callout_retire_pending` is cleared on the line above (review finding F5).
+        self.interrupt_shadow_armed_at = None;
+        self.interrupt_shadow_arms = 0;
+        self.interrupt_shadow_consumed = false;
+        self.block_entry_interrupt_shadow = false;
         self.link_cells.clear();
         self.interpret_one_cells.clear();
         self.link_sources.clear();
@@ -5578,8 +5623,13 @@ fn compile_with_page_len(
             // Retry today. It is written to carry the cause anyway so that a future gate which
             // does depend on the block's length reports itself instead of the host page.
             CompileOutcome::Retry(cause) => return CompileOutcome::Retry(cause),
+            // A structural barrier the SEARCH found and the full walk did not, which is not a
+            // host-page failure however it arrives here. It was reported as `HostPageLen` until
+            // review finding F7, which mislabelled the one arm on this path that has nothing to
+            // do with the arena page. It is its own cause; whether it is reachable at all is a
+            // question the counter now answers instead of the label pre-judging it.
             CompileOutcome::StructuralReject(_) => {
-                return CompileOutcome::Retry(RetryCause::HostPageLen);
+                return CompileOutcome::Retry(RetryCause::SearchStructural);
             }
         };
         if candidate.code.len() <= page_len {
@@ -7074,10 +7124,18 @@ fn compile_with_budget(
             CompileStop::Structural(span) => CompileOutcome::StructuralReject(span),
             // The inner cause wins whenever the walk had already given up: the min-length rule
             // did not decide anything there, it would only re-report the same failure.
-            // `Boundary` is the case the rule OWNS -- the walk ended cleanly on a terminal slot,
-            // the page budget or the dirty-segment rule, and the block is short only because the
-            // rule says three.
             CompileStop::Retry(cause) => CompileOutcome::Retry(cause),
+            // `Boundary` with NO slots at all is not the min-length rule. The walk ended cleanly
+            // before it could form a single slot -- the block-page budget or the instruction
+            // limit refusing the first instruction -- and calling that `TooShort` files a budget
+            // refusal under a rule that never looked at it. Review finding F7; a cause of its own
+            // so the two can be told apart in a census that is used to price a retry policy.
+            CompileStop::Boundary if slots.is_empty() => {
+                CompileOutcome::Retry(RetryCause::BudgetFirstSlot)
+            }
+            // The case the min-length rule OWNS: the walk ended cleanly on a terminal slot, the
+            // page budget or the dirty-segment rule, and the block is short only because the rule
+            // says three.
             CompileStop::Boundary => CompileOutcome::Retry(RetryCause::TooShort),
         };
     }
@@ -7490,6 +7548,18 @@ pub(crate) fn compile_with_instruction_limit_for_test(
         CompileOutcome::Compiled(compilation) => Some(compilation),
         CompileOutcome::StructuralReject(_) | CompileOutcome::Retry(_) => None,
     }
+}
+
+/// The same seam, keeping the whole outcome. The one caller is the fixture for the walk ending
+/// with NO slots, which is a `Retry` and so invisible through the `Option` above.
+#[cfg(test)]
+pub(crate) fn compile_outcome_with_instruction_limit_for_test(
+    cpu: &mut CpuGsw,
+    entry_lin: u32,
+    d: bool,
+    instruction_limit: usize,
+) -> CompileOutcome {
+    compile_with_instruction_limit(cpu, entry_lin, d, instruction_limit)
 }
 
 /// The limit a static control target must satisfy, given the branch's operand size.

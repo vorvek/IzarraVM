@@ -652,12 +652,17 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         {
             self.direct_runtime.skip_direct_once = false;
-            // Same reason, same scope: an STI call-out's latch belongs to the entry that set it,
-            // and `run_direct_block` takes it at the boundary. This clear is the backstop for the
-            // test seams that call that function directly. It lives on the block cache rather than
-            // here beside `skip_direct_once`, because this struct sits ahead of the CPU offsets
-            // emitted code bakes.
+            // Same reason, same scope: an arming call-out's latch belongs to the entry that set
+            // it, and `run_direct_block` takes it at the boundary. This clear is the backstop for
+            // the test seams that call that function directly. It lives on the block cache rather
+            // than here beside `skip_direct_once`, because this struct sits ahead of the CPU
+            // offsets emitted code bakes.
+            //
+            // BOTH latches, since review finding F5. The consumed flag is read once per iteration
+            // below and taken there, but a run that ends between the set and the take would
+            // otherwise hand the next run a transition that happened inside the previous one.
             self.jit_direct.take_interrupt_shadow_armed();
+            self.jit_direct.take_interrupt_shadow_consumed();
         }
         #[cfg(feature = "jit")]
         let native_continuations_active = {
@@ -855,17 +860,26 @@ impl CpuGsw {
                     }
                 }
             };
-            // The exit-path re-check design section 10 asks for. An STI call-out that resumed
+            // The exit-path re-check design section 10 asks for. An arming call-out that resumed
             // left the shadow for `run_direct_block` to clear at the boundary, so as far as the
             // interrupt-transition test below is concerned this iteration IS the shadowed
-            // instruction: the state it must compare against is the one BEFORE the STI ran, where
-            // no interrupt could be taken. Without this the block's own entry state would be used
-            // and a transition the interpreter breaks on would be missed.
+            // instruction: the state it must compare against is the one BEFORE the arming row
+            // ran, where no interrupt could be taken. Without this the block's own entry state
+            // would be used and a transition the interpreter breaks on would be missed.
             //
-            // Under the pendency rule the row enforces (`interpret_one_step`) nothing can be
-            // pending here, so this cannot fire in production. It is written anyway because the
-            // rule is a premise about the batch and this is the place that would otherwise have to
-            // trust it.
+            // THIS FIRES ON EVERY BLOCK THAT RESUMES PAST AN ARMING ROW, and the comment that
+            // used to stand here said the opposite (review finding F3). `can_take_interrupt`
+            // never consults the bus, so the break below is about the TRANSITION and not about
+            // pendency: interpreted, the instruction after the arming one consumes the shadow and
+            // ends the run there; natively, this fold is the only thing that reproduces it. The
+            // counter it moves, `perf.brk_interrupt`, is therefore PRESERVED across the slice
+            // rather than lowered by it, which corrects design section 10.1 M6.
+            //
+            // It also bounds the one hazard the row's own pendency rule does not cover. That rule
+            // is a premise about PORTS -- devices advance after the batch and no admitted row
+            // writes one -- and an `InterpretOne` row whose operand read lands on an MMIO aperture
+            // is outside it. Such a read could make an interrupt pending inside the block; this
+            // re-check is what still ends the run at the transition when it does.
             #[cfg(feature = "jit")]
             if self.jit_direct.take_interrupt_shadow_consumed() {
                 can_take_before = false;
@@ -2569,6 +2583,12 @@ impl CpuGsw {
         // without returning here, so an entry block with no call-out can reach a chained block
         // that has one. The entry block's own slot count says nothing about the chain.
         self.native_callout = jit::direct::CallOutTable::publish(bus);
+        // R3's entry-shadow clause reads THIS, not the live flag (review finding F2). Published
+        // once per entry and cleared after the return, so a shadow an arming slot leaves behind
+        // mid-block does not refuse every call-out sitting behind it. The refusal above means it
+        // is always false in production; the clause exists so that it does not have to be.
+        self.jit_direct
+            .set_block_entry_interrupt_shadow(self.interrupt_shadow);
         unsafe {
             entry(
                 self as *mut CpuGsw,
@@ -2577,6 +2597,7 @@ impl CpuGsw {
                 &mut exit as *mut jit::direct::NativeExit,
             );
         }
+        self.jit_direct.set_block_entry_interrupt_shadow(false);
         self.native_callout = jit::direct::CallOutTable::default();
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
         debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
@@ -2642,12 +2663,22 @@ impl CpuGsw {
         // back at `armed_at` having run the body -- and that shape resolves to LEAVING THE FLAG
         // ARMED, which costs at most one instruction of extra interrupt latency and one refused
         // native entry. The opposite error would deliver early, which is the thing B1 bars.
-        if let Some(armed_at) = self.jit_direct.take_interrupt_shadow_armed()
+        if let Some((armed_at, arms)) = self.jit_direct.take_interrupt_shadow_armed()
             && self.interrupt_shadow
-            && final_eip != armed_at
         {
-            self.interrupt_shadow = false;
-            self.jit_direct.note_interrupt_shadow_consumed();
+            // The latch must be the LAST arming slot's, or the comparison below is against the
+            // wrong address and can clear a shadow a later slot armed. The helper writes it on
+            // every path an arming row can leave by, so the counts always agree; they did not
+            // before review finding F1, and this is what says so.
+            debug_assert_eq!(
+                arms,
+                self.jit_direct.interrupt_shadow_arms(),
+                "the boundary is comparing against a stale arming latch"
+            );
+            if final_eip != armed_at {
+                self.interrupt_shadow = false;
+                self.jit_direct.note_interrupt_shadow_consumed();
+            }
         }
         let cs_base = self.registers.cs().base;
         if exit.dynamic_link_cell != 0 {

@@ -729,6 +729,9 @@ pub(crate) struct DirectStallTally {
     /// which would also catch LSS: LSS was dropped from the slice at M4 (five data accesses
     /// against a bound of four) and is not a candidate row, so folding it in would bias the
     /// number the decision is made on.
+    ///
+    /// GATED with the barrier census since the S4 review round: both arms are interpreter hot
+    /// paths and this is read on census legs only. A plain build reports zeroes.
     pub ss_load_same_record: u64,
     pub ss_load_changed_record: u64,
 }
@@ -840,10 +843,22 @@ pub(crate) enum RetryCause {
     /// fits one arena page. Clearable in principle (the size model and the page length are host
     /// state) but expected to be near zero since the walk gained its own page budget.
     HostPageLen,
+    /// A search step in `compile_with_page_len` hit a STRUCTURAL barrier the full walk did not,
+    /// so the prefix cannot be compiled and cannot be parked as a rejected span either.
+    /// Deterministic. Split out of `HostPageLen` at review finding F7, which is the label it wore
+    /// while having nothing to do with the arena page; whether the arm is reachable at all is now
+    /// a question the counter answers rather than one the label pre-judges.
+    SearchStructural,
+    /// The walk ended cleanly with NO slots at all: the block-page budget or the instruction
+    /// limit refused the very first instruction. Deterministic in the key. Split out of
+    /// `TooShort` at review finding F7 -- the min-length rule never looked at this block, so
+    /// filing a budget refusal under it made the one cause a retry policy most wants to trust
+    /// mean two different things.
+    BudgetFirstSlot,
 }
 
 impl RetryCause {
-    pub(crate) const COUNT: usize = 15;
+    pub(crate) const COUNT: usize = 17;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::NoKey,
         Self::DecodeMiss,
@@ -860,6 +875,8 @@ impl RetryCause {
         Self::TooShort,
         Self::PostWalk,
         Self::HostPageLen,
+        Self::SearchStructural,
+        Self::BudgetFirstSlot,
     ];
 
     /// Whether a re-walk of the SAME key could ever reach a different answer, which is the whole
@@ -896,7 +913,9 @@ impl RetryCause {
             | Self::AccumulatorOverflow
             | Self::TooShort
             | Self::PostWalk
-            | Self::HostPageLen => false,
+            | Self::HostPageLen
+            | Self::SearchStructural
+            | Self::BudgetFirstSlot => false,
         }
     }
 
@@ -917,6 +936,8 @@ impl RetryCause {
             Self::TooShort => "too_short",
             Self::PostWalk => "post_walk",
             Self::HostPageLen => "host_page_len",
+            Self::SearchStructural => "search_structural",
+            Self::BudgetFirstSlot => "budget_first_slot",
         }
     }
 }
