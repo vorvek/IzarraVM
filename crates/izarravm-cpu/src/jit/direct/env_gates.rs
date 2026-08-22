@@ -108,8 +108,29 @@ pub(crate) fn lane_trial_enabled() -> bool {
 /// on for every value except exactly "0"). The off arm exists for one-binary A/B measurement,
 /// the same contract as `IZARRAVM_LANE_FAMILY`.
 pub(crate) fn disp_lanes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = DISP_LANES_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_DISP_LANES").as_deref(), Ok("0")))
+}
+
+// The per-thread arm override, the same shape `IMM8_LANES_OVERRIDE` and `COUNT_LANES_OVERRIDE`
+// carry. Added for the lane-cap fixtures, which have to pin the knob arm and the cap arm apart: a
+// process-wide `OnceLock` cannot say what an off arm counts without an env write the harness
+// cannot order. `None` leaves the existing fixtures reading the ambient knob exactly as before.
+#[cfg(test)]
+thread_local! {
+    static DISP_LANES_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the displacement-lane arm on this thread for the length of a fixture; `None` restores
+/// the ambient `IZARRAVM_DISP_LANES` reading.
+#[cfg(test)]
+pub(crate) fn set_disp_lanes_for_test(forced: Option<bool>) {
+    DISP_LANES_OVERRIDE.with(|cell| cell.set(forced));
 }
 
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class

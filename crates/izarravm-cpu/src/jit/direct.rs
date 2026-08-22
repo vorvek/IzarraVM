@@ -5875,18 +5875,17 @@ fn stack_width_kind(
 ///
 /// The lane is refused (and the slot keeps its baked immediate, correct as ever) when the block
 /// already holds `MAX_BLOCK_IMM_LANES`, or when no direct page can supply a host pointer for the
-/// immediate's bytes. The second is the page-kind guard: only a page the bus hands out as a direct
+/// immediate's bytes. The budget refusal is counted (`imm_lane_cap_refusals`) and is tested after
+/// every other bar, so what it counts is lanes this family lost to the budget rather than slots
+/// that were never lane-shaped. The second is the page-kind guard: only a page the bus hands out as a direct
 /// mapping can be read this way, so device apertures and unmapped pages never produce a lane.
 fn imm_lane_for(
-    cpu: &CpuGsw,
+    cpu: &mut CpuGsw,
     insn: &DecodedInsn,
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES {
-        return None;
-    }
     // The family A/B arm: `op != 0` shapes are the 2026-08-08 widening, refusable at runtime so
     // one binary measures both arms (see `lane_family_enabled`).
     if !lane_family_enabled()
@@ -5939,6 +5938,14 @@ fn imm_lane_for(
     // compile loop), so its immediate cannot straddle a page and one host pointer covers all four
     // bytes.
     let host = cpu.direct_host_bytes(lane, IMM_LANE_WIDTH)?;
+    // THE CAP, and it is the LAST bar rather than the first on purpose. Every test above narrows
+    // the slot to one this family would have laned, so a refusal here is a lane the shared budget
+    // cost and the counter is per-family instead of four copies of the same number. See
+    // `DirectStallTally::imm_lane_cap_refusals`.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cpu.jit_direct.note_imm_lane_cap_refusal();
+        return None;
+    }
     let lane = ImmLane {
         physical: lane,
         host,
@@ -5997,7 +6004,8 @@ fn imm_lane_for(
 ///   and unmapped pages never produce one. The instruction is already page-local in physical
 ///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
 /// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
-///   baked immediate, which is a missed optimisation and never a correctness question.
+///   baked immediate, which is a missed optimisation and never a correctness question. Tested
+///   LAST rather than in the knob's disjunction, and counted: see `imm8_lane_cap_refusals`.
 ///
 /// NO HEAT GATE, unlike `disp_lane_for`. The two are not the same trade: a disp lane costs two
 /// host instructions on every EXECUTION of a load that may never be patched, which is what made
@@ -6007,13 +6015,13 @@ fn imm_lane_for(
 /// (`has_record_range(lane, IMM8_LANE_WIDTH)`) is the ready-made second arm — but gating on
 /// unmeasured suspicion would ship two mechanisms as one A/B.
 fn imm8_lane_for(
-    cpu: &CpuGsw,
+    cpu: &mut CpuGsw,
     insn: &DecodedInsn,
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES || !imm8_lanes_enabled() {
+    if !imm8_lanes_enabled() {
         return None;
     }
     let DirectKind::AluByteImm {
@@ -6035,6 +6043,11 @@ fn imm8_lane_for(
     }
     let lane = physical.checked_add(2)?;
     let host = cpu.direct_host_bytes(lane, IMM8_LANE_WIDTH)?;
+    // The cap, split off the knob above and tested last, for `imm_lane_for`'s reason.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cpu.jit_direct.note_imm8_lane_cap_refusal();
+        return None;
+    }
     let lane = ImmLane {
         physical: lane,
         host,
@@ -6116,7 +6129,8 @@ fn imm8_lane_for(
 ///   and unmapped pages never produce one. The instruction is already page-local in physical
 ///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
 /// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
-///   baked count, which is a missed optimisation and never a correctness question.
+///   baked count, which is a missed optimisation and never a correctness question. Tested LAST
+///   rather than in the knob's disjunction, and counted: see `count_lane_cap_refusals`.
 ///
 /// NO HEAT GATE, for `imm8_lane_for`'s reason and with one measurement on top of it: the L1
 /// `heat_gated` arm gated this very row on heat and LOST (+1.6% wall), because only 11.4% of the
@@ -6133,13 +6147,13 @@ fn imm8_lane_for(
 /// answer; this is not an admission rule at all. The suffix scan therefore stops exactly where the
 /// compile walk stops on both arms of this knob.
 fn count_lane_for(
-    cpu: &CpuGsw,
+    cpu: &mut CpuGsw,
     insn: &DecodedInsn,
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES || !count_lanes_enabled() {
+    if !count_lanes_enabled() {
         return None;
     }
     if !matches!(
@@ -6163,6 +6177,11 @@ fn count_lane_for(
     }
     let lane = physical.checked_add(2)?;
     let host = cpu.direct_host_bytes(lane, IMM8_LANE_WIDTH)?;
+    // The cap, split off the knob above and tested last, for `imm_lane_for`'s reason.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cpu.jit_direct.note_count_lane_cap_refusal();
+        return None;
+    }
     let lane = ImmLane {
         physical: lane,
         host,
@@ -6217,8 +6236,11 @@ fn count_lane_for(
 /// and a record consumed by `lift_cold_smc_dormant` recovery self-heals the same way: one more
 /// kill, one more recompile.
 ///
-/// The probe reads the heat accelerator WITHOUT `sync_smc_heat` (this is a `&CpuGsw` path); a
-/// stale read across a cache reset can at worst bake one block that a later recompile lanes,
+/// The probe reads the heat accelerator WITHOUT `sync_smc_heat`. The `&mut CpuGsw` this now
+/// takes is for the cap counter and nothing else; it does not license a sync here, because the
+/// walk is mid-block and folding pending charges in would move an admission the rest of the walk
+/// cannot see. A stale read across a cache reset can at worst bake one block that a later
+/// recompile lanes,
 /// or lane one block that did not need it — admission tuning, never correctness.
 ///
 /// `disp_len == 4` plus the default-prefix test confines this to 32-bit addressing: a CS.D=0
@@ -6234,13 +6256,13 @@ fn count_lane_for(
 /// address AFTER staging other live state would still deserve its own review — and its own
 /// census row, per the standing rule against unmeasured admissions.
 fn disp_lane_for(
-    cpu: &CpuGsw,
+    cpu: &mut CpuGsw,
     insn: &DecodedInsn,
     kind: DirectKind,
     physical: u32,
     lanes_used: usize,
 ) -> Option<(DirectKind, ImmLane)> {
-    if lanes_used >= MAX_BLOCK_IMM_LANES || !disp_lanes_enabled() {
+    if !disp_lanes_enabled() {
         return None;
     }
     let DirectKind::Load {
@@ -6270,6 +6292,13 @@ fn disp_lane_for(
     // Page-local in physical for the same reason as `imm_lane_for`: the compile loop only
     // reaches this after `physical_page_local`, so one host pointer covers all four bytes.
     let host = cpu.direct_host_bytes(lane, IMM_LANE_WIDTH)?;
+    // The cap, split off the knob above and tested last. Last matters most here: the heat gate
+    // above is what separates a patched load from doom's never-patched texture reads, so a cap
+    // test placed before it would report the whole `0x8A` population as budget pressure.
+    if lanes_used >= MAX_BLOCK_IMM_LANES {
+        cpu.jit_direct.note_disp_lane_cap_refusal();
+        return None;
+    }
     let lane = ImmLane {
         physical: lane,
         host,

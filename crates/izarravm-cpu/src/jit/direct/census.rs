@@ -671,6 +671,26 @@ pub(crate) struct DirectStallTally {
     /// though both register at `IMM8_LANE_WIDTH`: the two arms are independent knobs, so a
     /// combined leg has to be able to attribute an accepts movement to one of them.
     pub count_lane_registrations: u64,
+    /// Lanes the shared `MAX_BLOCK_IMM_LANES` budget refused, charged to the family that would
+    /// otherwise have taken the slot. The registration counters above say how many lanes a run
+    /// installed; these say how many more it would have installed with a larger budget, which is
+    /// the only number that can tell a lane-CLASS answer apart from a lane-BUDGET answer when a
+    /// widening ladder reads its registrations flat.
+    ///
+    /// Charged on the CAP arm alone. Every family's knob is tested first and returns before the
+    /// cap is consulted, so an off arm reads zero here rather than reporting its whole population
+    /// as budget pressure. The cap test is also the LAST bar in each matcher rather than the
+    /// first, which is what makes the split per-family: a slot the cap refuses has already passed
+    /// its family's shape, prefix, page and (for `disp_lane_cap_refusals`) patch-history tests, so
+    /// exactly one counter moves per refused slot instead of all four.
+    ///
+    /// Compile path only, and unconditional there: a heat-coupled counter that is armed on one
+    /// leg and absent on the other confounds the policy with an epoch re-phasing, so the cost is
+    /// paid on both arms or not at all.
+    pub imm_lane_cap_refusals: u64,
+    pub imm8_lane_cap_refusals: u64,
+    pub count_lane_cap_refusals: u64,
+    pub disp_lane_cap_refusals: u64,
     /// Interpreted continuations whose decode line had died between the packed first touch and
     /// the deferred full-view fetch (`IZARRAVM_DECODE_PACK`). The staleness argument in
     /// `run_budgeted_inner` says admission cannot invalidate the slot it screened, so this is the
@@ -2214,6 +2234,10 @@ impl crate::jit::JitState {
             disp_lane_registrations: self.stalls.disp_lane_registrations,
             imm8_lane_registrations: self.stalls.imm8_lane_registrations,
             count_lane_registrations: self.stalls.count_lane_registrations,
+            imm_lane_cap_refusals: self.stalls.imm_lane_cap_refusals,
+            imm8_lane_cap_refusals: self.stalls.imm8_lane_cap_refusals,
+            count_lane_cap_refusals: self.stalls.count_lane_cap_refusals,
+            disp_lane_cap_refusals: self.stalls.disp_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
@@ -2325,6 +2349,26 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_callout_slot_cap_hit(&mut self) {
         self.stalls.callout_slot_cap_hits += 1;
+    }
+
+    /// The `MAX_BLOCK_IMM_LANES` budget refused a slot that had cleared every other bar of its
+    /// family. One method per family rather than one method with a family argument, because the
+    /// call sites are four distinct matchers and an enum in between would only move the match.
+    /// See the four fields for why the cap arm is tested last and separately from the knob arm.
+    pub(crate) fn note_imm_lane_cap_refusal(&mut self) {
+        self.stalls.imm_lane_cap_refusals += 1;
+    }
+
+    pub(crate) fn note_imm8_lane_cap_refusal(&mut self) {
+        self.stalls.imm8_lane_cap_refusals += 1;
+    }
+
+    pub(crate) fn note_count_lane_cap_refusal(&mut self) {
+        self.stalls.count_lane_cap_refusals += 1;
+    }
+
+    pub(crate) fn note_disp_lane_cap_refusal(&mut self) {
+        self.stalls.disp_lane_cap_refusals += 1;
     }
 
     /// A full-length walk whose emission did not fit one host page, and each candidate the

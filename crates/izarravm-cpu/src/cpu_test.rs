@@ -3984,6 +3984,14 @@ mod jit_disp_lane;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_lane_cap_test.rs"]
+mod jit_lane_cap;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_callout_test.rs"]
 mod jit_callout;
 
