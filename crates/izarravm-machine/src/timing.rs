@@ -802,6 +802,13 @@ impl Machine {
                 None
             }
         });
+        // A 0x80 "pause DAC" countdown raises the 8-bit interrupt on the same
+        // line; it counts microseconds, so it is a separate term.
+        let dsp_pause_wake = self.sb16.pause_irq_deadline().and_then(|(line, ticks)| {
+            self.pic
+                .deliverable(line)
+                .then(|| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
+        });
         // The AD1848 / WSS terminal-count wake, on the codec's own (config) IRQ
         // line. The codec drains one Current Count per output frame, so its IRQ
         // estimator is fed the frame rate directly (no byte/word-counter scaling
@@ -897,6 +904,7 @@ impl Machine {
         let wake = [
             pit_wake,
             dsp_wake,
+            dsp_pause_wake,
             wss_wake,
             ata_wake,
             atapi_wake,
@@ -1318,7 +1326,9 @@ impl Machine {
         } else {
             None
         };
+        let dsp_pause = self.sb16.pause_irq_deadline().map(|(_, ticks)| ticks);
         pit.chain(dsp)
+            .chain(dsp_pause)
             .chain(wss)
             .chain(self.next_ata_deadline())
             .chain(self.next_rtc_irq_deadline())

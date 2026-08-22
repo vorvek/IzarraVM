@@ -14,7 +14,7 @@ mod resample;
 mod soundfont;
 mod wss;
 
-pub use dsp::SbDsp;
+pub use dsp::{DspIrqSource, SbDsp};
 pub use midi::MidiEngine;
 pub use mixer::SbMixer;
 pub use mpu401::{Mpu401, TimedMidiMessage};
