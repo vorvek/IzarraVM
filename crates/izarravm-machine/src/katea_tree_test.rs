@@ -428,6 +428,121 @@ fn truncate_and_fragmented_growth_reach_the_host_at_command_boundaries() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Re-point an existing directory entry at a new first cluster and size, the
+/// way a guest publishes a replacement chain after it wrote the payload.
+fn repoint_file_entry(
+    vol: &mut KateaTreeVolume,
+    dir_cluster: u32,
+    name: &[u8; 11],
+    first_cluster: u32,
+    size: u32,
+) {
+    let lba = vol.cluster_to_lba(dir_cluster);
+    let mut directory = vol.read_sector(lba);
+    let slot = (0..16)
+        .map(|index| index * 32)
+        .find(|&offset| &directory[offset..offset + 11] == name)
+        .expect("existing file entry");
+    directory[slot + 20..slot + 22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+    directory[slot + 26..slot + 28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+    directory[slot + 28..slot + 32].copy_from_slice(&size.to_le_bytes());
+    vol.write_sector(lba, &directory);
+}
+
+/// Mount a host folder holding a three-cluster OLD.BIN (`0x11`, `0x22`, `0x33`)
+/// and return the volume, the folder, and the file's old chain.
+fn seeded_three_cluster_file(tag: &str) -> (KateaTreeVolume, std::path::PathBuf, Vec<u32>) {
+    let root = scratch(tag);
+    // Three 4 KiB clusters; the chain length is asserted below rather than
+    // assumed, because the cluster size derives from the folder.
+    let mut seed = vec![0x11u8; 4096];
+    seed.extend(vec![0x22u8; 4096]);
+    seed.extend(vec![0x33u8; 4096]);
+    std::fs::write(root.join("OLD.BIN"), &seed).unwrap();
+    let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+    let img = izarravm_firmware::tokados_hdd_img();
+    let mut mbr = [0u8; 512];
+    mbr.copy_from_slice(&img[0..512]);
+    let mut vbr = [0u8; 512];
+    vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+    let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+    let old_fc = vol
+        .tree()
+        .root
+        .files
+        .iter()
+        .find(|f| &f.name == b"OLD     BIN")
+        .unwrap()
+        .first_cluster;
+    let chain = vol.chain_of(old_fc).expect("OLD.BIN chain");
+    assert_eq!(chain.len(), 3, "OLD.BIN spans three clusters");
+    (vol, root, chain)
+}
+
+/// The replacement payload lands in clusters the old projection still owns
+/// (old index 1 and 2) and is committed before the directory entry moves the
+/// head to the old second cluster. Issue #729: the fast path acknowledged the
+/// payload at the old offsets, and the re-point then found nothing to write.
+#[test]
+fn repointing_the_head_after_payload_keeps_the_replacement_bytes() {
+    let (mut vol, root, chain) = seeded_three_cluster_file("repoint_after_payload");
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    let (old_head, new_head, tail) = (chain[0], chain[1], chain[2]);
+    let mut expected = vec![0xA1u8; cluster_bytes];
+    expected.extend(vec![0xB2u8; cluster_bytes]);
+
+    write_cluster_bytes(&mut vol, new_head, &expected[..cluster_bytes]);
+    write_cluster_bytes(&mut vol, tail, &expected[cluster_bytes..]);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+
+    write_fat_link(&mut vol, old_head, 0);
+    repoint_file_entry(&mut vol, 2, b"OLD     BIN", new_head, expected.len() as u32);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(std::fs::read(root.join("OLD.BIN")).unwrap(), expected);
+
+    // The guest view agrees with the host after the re-point.
+    for sector in 0..u32::from(vol.geo.spc) {
+        assert_eq!(
+            vol.read_sector(vol.cluster_to_lba(new_head) + sector),
+            [0xA1u8; SECTOR]
+        );
+        assert_eq!(
+            vol.read_sector(vol.cluster_to_lba(tail) + sector),
+            [0xB2u8; SECTOR]
+        );
+    }
+
+    vol.reconcile();
+    assert_eq!(std::fs::read(root.join("OLD.BIN")).unwrap(), expected);
+    assert_eq!(vol.unmapped_sectors, 0, "no stranded pending sector");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The reverse ordering: the directory entry moves the head first, then the
+/// payload arrives. This must stay correct alongside the payload-first case.
+#[test]
+fn repointing_the_head_before_payload_keeps_the_replacement_bytes() {
+    let (mut vol, root, chain) = seeded_three_cluster_file("repoint_before_payload");
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    let (old_head, new_head, tail) = (chain[0], chain[1], chain[2]);
+    let mut expected = vec![0xA1u8; cluster_bytes];
+    expected.extend(vec![0xB2u8; cluster_bytes]);
+
+    write_fat_link(&mut vol, old_head, 0);
+    repoint_file_entry(&mut vol, 2, b"OLD     BIN", new_head, expected.len() as u32);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+
+    write_cluster_bytes(&mut vol, new_head, &expected[..cluster_bytes]);
+    write_cluster_bytes(&mut vol, tail, &expected[cluster_bytes..]);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(std::fs::read(root.join("OLD.BIN")).unwrap(), expected);
+
+    vol.reconcile();
+    assert_eq!(std::fs::read(root.join("OLD.BIN")).unwrap(), expected);
+    assert_eq!(vol.unmapped_sectors, 0, "no stranded pending sector");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 #[ignore = "host performance acceptance; run alone with --release"]
 fn sequential_17_3_mib_install_projects_without_spill_at_udma2_rate() {
