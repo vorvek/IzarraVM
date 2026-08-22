@@ -2207,6 +2207,25 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 // rejected row), and the clock charge is not a guess -- `execute_extended.rs`
                 // group-5 arm 4 returns `clocks(7)` unconditionally, reading its target through
                 // `read_operand_sized`, which serves the register and memory operands alike.
+                // NOT ON THE `InterpretOne` ALLOWLIST, and the reason is structural rather than
+                // a matter of census weight. The S3 policy widening was asked to consider the
+                // Word memory form (510 k block-stopping hits on the post-S2 loader census, with
+                // a segment override) and REFUTED it.
+                //
+                // An `InterpretOne` slot resumes only when `ResumeSnapshot::allows_resume`'s R1
+                // holds, and R1 demands `cpu.registers.eip == slot_start + insn_len`. A JMP sets
+                // EIP to its TARGET. The two are equal only for a jump to the next instruction,
+                // so the slot resyncs on every real execution, and the governor demotes it after
+                // three of the first eight -- back to the boundary it replaced, having paid a
+                // spill, a call, a run, a reload and a side exit three times over to get there.
+                //
+                // The compile walk makes the same point from the other side. `DirectKind::JmpMem`
+                // is `is_terminal()` and a `CallOut` is not, so admitting the row would let the
+                // walk keep appending slots AFTER the jump: slots the resync guarantees can never
+                // retire, carried in the block's static accounting and its budget bound.
+                //
+                // A native `JmpMem16` is the shape that would serve this row, and it is an S4
+                // question about an emitter rather than an S3 question about policy.
                 if m.reg == 4 {
                     if insn.operand_size != OperandSize::Dword {
                         return None;
