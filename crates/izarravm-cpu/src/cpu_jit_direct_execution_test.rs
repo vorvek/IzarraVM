@@ -2905,6 +2905,37 @@ fn the_page_budget_ends_the_walk_before_the_recovery_search_runs() {
         budgeted.span.instructions,
         unbudgeted.span.instructions
     );
+    // 4. how far the model's answer sits from the longest prefix that actually fits, which is the
+    //    claim that separates a working size model from a merely conservative one. An EQUALITY is
+    //    what one would want here and it is not true, deliberately: the constants are calibrated
+    //    on the tombraid loader, whose memory slots average 341 emitted bytes, and this fixture's
+    //    `mov eax,[disp32]` is the cheapest memory shape there is at 250. The model therefore ends
+    //    the block early on it, and this pins BY HOW MUCH -- three slots of a thirteen-slot
+    //    maximum. Re-calibrating the constants moves this number; a broken budget moves it a lot.
+    let n = usize::from(budgeted.span.instructions);
+    let mut longest = 0usize;
+    for k in 3..=usize::from(unbudgeted.span.instructions) {
+        let candidate = jit::direct::compile_with_instruction_limit_for_test(
+            &mut native,
+            ALU_MEM_ENTRY,
+            true,
+            k,
+        )
+        .expect("every prefix of this fixture compiles unbudgeted");
+        if candidate.code.len() <= page {
+            longest = k;
+        }
+    }
+    assert!(
+        n <= longest,
+        "the budget must never admit MORE than fits: {n} slots against a {longest}-slot maximum"
+    );
+    assert!(
+        longest - n <= 3,
+        "the model gave up {} slots of {longest}, which is past the slack this fixture measured          (3). Either the constants moved or the estimate stopped tracking the emitter",
+        longest - n
+    );
+
     let after = native.direct_stall_snapshot();
     assert_eq!(
         after.compile_page_overflows - before.compile_page_overflows,

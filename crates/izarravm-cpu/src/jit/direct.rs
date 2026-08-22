@@ -125,7 +125,10 @@ pub(crate) const MAX_BLOCK_INSTRUCTIONS: usize = 32;
 /// the loader carries none of either, and both classes already have their own instruction caps
 /// (`MAX_X87_BLOCK_INSTRUCTIONS`, `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`) sized to keep such a block
 /// inside its page. Pricing them low leaves those blocks forming exactly as they do today; pricing
-/// them high would shorten blocks whose length is already governed elsewhere.
+/// them high would shorten blocks whose length is already governed elsewhere. A memory-ALU slot
+/// reaches that rate through its own accesses; an x87 slot declares none, so
+/// `emitted_bytes_estimate` names it, and the four register-operand kinds that emit a side exit
+/// are named beside it for the same reason.
 pub(super) const EMITTED_BLOCK_FIXED_BYTES: u32 = 576;
 pub(super) const EMITTED_REGISTER_SLOT_BYTES: u32 = 40;
 pub(super) const EMITTED_MEMORY_SLOT_BYTES: u32 = 352;
@@ -5055,21 +5058,43 @@ impl DirectKind {
     /// This slot's contribution to the block's emitted host bytes, for the walk's page budget.
     /// Derivation and the measurement behind the constants: `EMITTED_BLOCK_FIXED_BYTES`.
     ///
-    /// Three classes and one adder, all read off methods this walk already calls, so a new
+    /// Three classes and one adder, mostly read off methods this walk already calls, so a new
     /// `DirectKind` variant is priced the moment it declares its accesses rather than needing a
     /// new arm here. A slot that names no access is register-only; every other non-call-out slot
     /// carries an address computation, a fast-map probe and a watched/device fallback, which is
     /// what the memory rate pays for.
+    ///
+    /// Two groups need naming because their size is not in their accesses:
+    ///
+    /// * x87 slots. They declare no GPR access, so the accessor test would price them at the
+    ///   register rate, and the constants' doc says they are priced at the MEMORY rate. That is
+    ///   deliberately low rather than measured -- `MAX_X87_BLOCK_INSTRUCTIONS` already keeps such
+    ///   a block inside its page -- but low is not the same as forty bytes, and the doc has to be
+    ///   true of the code.
+    /// * the four register-operand kinds that still emit a SIDE EXIT: the two divide guards and
+    ///   the two dynamic transfers. A stub plus its shared accounting block is worth far more than
+    ///   a register slot, so pricing them as one under-predicts a block full of them.
+    ///
+    /// Both are COST corrections, not correctness ones: the recovery search is the net, and the
+    /// worst an over-price does is end a block one slot early.
     pub(super) fn emitted_bytes_estimate(self) -> u32 {
         let body = if self.is_call_out() {
             EMITTED_CALL_OUT_SLOT_BYTES
-        } else if self.byte_reads()
-            | self.word_reads()
-            | self.dword_reads()
-            | self.byte_stores()
-            | self.word_stores()
-            | self.dword_stores()
-            != 0
+        } else if self.is_x87()
+            || matches!(
+                self,
+                Self::DivReg { .. }
+                    | Self::MulReg { .. }
+                    | Self::JmpReg { .. }
+                    | Self::CallReg { .. }
+            )
+            || self.byte_reads()
+                | self.word_reads()
+                | self.dword_reads()
+                | self.byte_stores()
+                | self.word_stores()
+                | self.dword_stores()
+                != 0
         {
             EMITTED_MEMORY_SLOT_BYTES
         } else {
@@ -7703,10 +7728,21 @@ fn compile_with_budget(
         }
         // The page budget. A BOUNDARY, not a Retry: the block simply ends here and its successor
         // starts at this instruction, which is the same shape the walk takes at a terminal slot.
-        // Held below the three-instruction floor `compile_with_instruction_limit`'s tail applies,
-        // so the budget can never be the reason a block is too short to install -- at the rates in
-        // `EMITTED_BLOCK_FIXED_BYTES` the cheapest three slots that could trip it are three
-        // call-outs, which come to less than half a page.
+        //
+        // Held above the three-instruction floor `compile_with_instruction_limit`'s tail applies,
+        // so the budget can never be the reason a block is too short to install. The MOST
+        // EXPENSIVE three slots the rates in `EMITTED_BLOCK_FIXED_BYTES` can price are three
+        // call-outs, and 576 + 3 * 592 = 2,352 bytes against a 4,096-byte page: even that shape
+        // cannot trip the budget before the floor is cleared.
+        //
+        // The instruction that ENDS the block here has already been counted by the mechanism
+        // counters above (`jit_direct_word_address_slots` and the two Word-control ones). That is
+        // deliberate and matches every other cap in this walk -- the stack-access, memory-ALU,
+        // call-out-slot and x87 caps all sit below those counters too, and all of them refuse an
+        // instruction the counters have already seen. Those columns count instructions the walk
+        // CONSIDERED, which is what makes "zero on a corpus with no 16-bit code" the inertness
+        // claim they exist for; moving one cap above them would make that population mean
+        // something different for one cap than for the other four.
         let next_estimated_bytes = estimated_bytes.saturating_add(kind.emitted_bytes_estimate());
         if slots.len() >= 3
             && usize::try_from(next_estimated_bytes).unwrap_or(usize::MAX) > byte_budget

@@ -1901,6 +1901,15 @@ impl crate::jit::JitState {
             // being LEARNED once per site or re-learned -- the two are within a rounding error of
             // each other when the demoted-site map is doing its job, and orders apart when it is
             // not, which is how the misplaced site check was found.
+            //
+            // THE BAR, for any gate that reads this pair out of the probe JSON as
+            // `jit_direct_demoted_callout_sites` and `..._refused`: the gauge must stay strictly
+            // below `DEMOTED_CALLOUT_SITE_CAP` and the refusal count must be ZERO. Either one
+            // failing says the cap is binding on a real workload, which is the one condition under
+            // which the mechanism degrades to the emitted prologue test it exists to remove, and
+            // it is a cap value question rather than a defect. The tombraid loader reads 64 and 0.
+            // Stated here because the loader gate's runner is not in this repository, so a doc on
+            // the counter is the only place the bar can live where it cannot be lost.
             demoted_callout_sites: self.demoted_callout_sites_len() as u64,
             reject_callout_privileged: self.stalls.reject_callout_privileged,
             callout_governor_trials: self.stalls.callout_governor_trials,
