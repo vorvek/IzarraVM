@@ -207,6 +207,12 @@ apply_mode:
     mov es, ax
     mov al, [es:0x49]                  ; current video mode
     and al, 0x7F                       ; drop the no-clear flag bit
+    ; A VBE mode set leaves the BDA byte stale (this BIOS does not rewrite
+    ; 40:49 on 4F02h), so the recorded VBE state wins over the table: otherwise
+    ; an SVGA mode would classify as the text mode it replaced and the cursor
+    ; would be drawn into B800.
+    cmp byte [cs:vesa_active], 0
+    jne .unknown
     mov si, mode_table
 .scan:
     mov ah, [cs:si]
@@ -1619,6 +1625,14 @@ vga_enter:
     push bx
     push dx
     push si
+    ; The index ports first: the interrupted code may sit between selecting a
+    ; register and touching its data port, so the selection must come back too.
+    mov dx, 0x3CE
+    in al, dx
+    mov [cs:vga_gc_index], al
+    mov dx, 0x3C4
+    in al, dx
+    mov [cs:vga_seq_index], al
     mov si, vga_save
     mov dx, 0x3CE
     mov bx, gc_saved_regs
@@ -1689,6 +1703,13 @@ vga_leave:
     inc dx
     mov al, [cs:si]
     out dx, al
+    ; The index selections last, so the interrupted code finds them as left.
+    mov dx, 0x3C4
+    mov al, [cs:vga_seq_index]
+    out dx, al
+    mov dx, 0x3CE
+    mov al, [cs:vga_gc_index]
+    out dx, al
     pop si
     pop dx
     pop bx
@@ -1696,6 +1717,8 @@ vga_leave:
     ret
 
 gc_saved_regs   db 0, 1, 3, 4, 5, 8, 0xFF
+vga_gc_index    db 0                 ; 3CEh index as the interrupted code left it
+vga_seq_index   db 0                 ; 3C4h index likewise
 
 ; ---- INT 10h hook ----
 ; A mode set (AH=00h, or VBE AX=4F02h) takes the cursor off the screen first

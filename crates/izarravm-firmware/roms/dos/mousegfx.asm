@@ -226,6 +226,35 @@ start:
     cmp al, 2
     jne exit_ah
 
+    ; ---- VBE 640x480x256 (mode 101h): the BDA mode byte stays stale, so the
+    ; driver must take the size from the VBE mode info; a reset then gives a
+    ; 0..479 range and draws nothing (the program draws its own cursor).
+    mov ax, 0x4F02
+    mov bx, 0x0101
+    int 0x10
+    cmp ax, 0x004F
+    mov ah, 23                        ; mov keeps the flags of the compare
+    jne exit_ah
+    xor ax, ax
+    int 0x33
+    mov ax, 0x0004
+    mov cx, 100
+    mov dx, 400
+    int 0x33
+    mov ax, 0x0003
+    int 0x33
+    mov ah, 24
+    cmp dx, 400
+    jne exit_ah
+    mov ax, 0xB800                    ; the stale text mode must not be drawn into
+    mov es, ax
+    mov word [es:0x0000], 0x1234
+    mov ax, 0x0001
+    int 0x33
+    mov ah, 25
+    cmp word [es:0x0000], 0x1234
+    jne exit_ah
+
     xor al, al
     jmp exit
 exit_ah:
