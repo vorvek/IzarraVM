@@ -87,3 +87,12 @@ fn capture_requires_an_enabled_mouse_click_outside_capture() {
     let disabled = policy(true, false, false);
     assert!(!disabled.mouse_capture_requested(true, false));
 }
+
+#[test]
+fn sensitivity_scale_follows_the_dosbox_x_curve() {
+    // DOSBox-X: senv = sensitivity^2 / 3600 + 1/3.
+    assert!((mouse_sensitivity_scale(100) - 3.1111).abs() < 0.001);
+    assert!((mouse_sensitivity_scale(60) - 1.3333).abs() < 0.001);
+    assert!((mouse_sensitivity_scale(10) - 0.3611).abs() < 0.001);
+    assert!(mouse_sensitivity_scale(200) > mouse_sensitivity_scale(100));
+}

@@ -193,6 +193,12 @@ impl CrtStyle {
     }
 }
 
+/// Mouse sensitivity bounds and default, in percent. 100 is DOSBox-X's default
+/// and gives its cursor speed; the bounds are the ends of the slider.
+pub const DEFAULT_MOUSE_SENSITIVITY: u16 = 100;
+pub const MIN_MOUSE_SENSITIVITY: u16 = 10;
+pub const MAX_MOUSE_SENSITIVITY: u16 = 400;
+
 /// Host-side GUI preferences. Fields are optional where a "not set yet" state is
 /// meaningful, so an older or hand-edited file with missing keys still loads.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -207,6 +213,9 @@ pub struct GuiPrefs {
     pub crt_style: CrtStyle,
     /// Whether a new GUI window starts in borderless full screen.
     pub start_fullscreen: bool,
+    /// Mouse sensitivity in percent, the DOSBox-X `sensitivity` scale (default
+    /// 100). See `host_input::mouse_sensitivity_scale` for the curve.
+    pub mouse_sensitivity: u16,
     /// Hotkey that releases captured input. Default Super+F2.
     pub input_release: KeyBinding,
     /// Hotkey that toggles fullscreen. Default Super+F4.
@@ -241,6 +250,7 @@ impl Default for GuiPrefs {
             master_volume: DEFAULT_VOLUME,
             crt_style: CrtStyle::Subtle,
             start_fullscreen: false,
+            mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
             input_release: default_input_release(),
             fullscreen: default_fullscreen(),
             screenshot: default_screenshot(),
@@ -261,6 +271,7 @@ struct GuiPrefsWire {
     master_volume: f32,
     crt_style: CrtStyle,
     start_fullscreen: bool,
+    mouse_sensitivity: u16,
     input_release: KeyBinding,
     fullscreen: KeyBinding,
     screenshot: KeyBinding,
@@ -281,6 +292,7 @@ impl Default for GuiPrefsWire {
             master_volume: prefs.master_volume,
             crt_style: prefs.crt_style,
             start_fullscreen: prefs.start_fullscreen,
+            mouse_sensitivity: prefs.mouse_sensitivity,
             input_release: prefs.input_release,
             fullscreen: prefs.fullscreen,
             screenshot: prefs.screenshot,
@@ -306,6 +318,9 @@ impl<'de> Deserialize<'de> for GuiPrefs {
             master_volume: wire.master_volume,
             crt_style: wire.crt_style,
             start_fullscreen: wire.start_fullscreen,
+            mouse_sensitivity: wire
+                .mouse_sensitivity
+                .clamp(MIN_MOUSE_SENSITIVITY, MAX_MOUSE_SENSITIVITY),
             input_release: wire.input_release,
             fullscreen: wire.fullscreen,
             screenshot: wire.screenshot,

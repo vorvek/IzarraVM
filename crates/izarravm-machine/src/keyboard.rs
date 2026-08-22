@@ -44,6 +44,10 @@ pub struct Keyboard8042 {
     input_ticks: u64,
     device_byte_ticks: Option<u64>,
     device_byte_ready: bool,
+    // Ticks until the mouse next samples its host-fed accumulators into a
+    // packet. Armed only while the mouse has state to report (see
+    // `Ps2Mouse::sample`), so an idle mouse costs no deadline.
+    mouse_sample_ticks: Option<u64>,
 }
 
 impl Default for Keyboard8042 {
@@ -66,6 +70,7 @@ impl Default for Keyboard8042 {
             input_ticks: 0,
             device_byte_ticks: None,
             device_byte_ready: false,
+            mouse_sample_ticks: None,
         }
     }
 }
@@ -78,21 +83,42 @@ impl Keyboard8042 {
     }
 
     /// Feed host mouse movement to the aux device: a relative delta plus the
-    /// button mask. Queues a PS/2 packet for the serial-byte deadline when data
-    /// reporting is enabled. Returns true only if IRQ12 was already armed.
+    /// button mask. The motion accumulates in the device; a packet goes onto the
+    /// serial-byte deadline at the mouse's sample rate when data reporting is
+    /// enabled (see `Ps2Mouse::sample`). Returns true only if IRQ12 was already
+    /// armed.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) -> bool {
-        let reporting = self.mouse.queue_movement(dx, dy, buttons, 0);
-        self.schedule_device_byte();
-        reporting && self.irq12_armed
+        self.mouse.host_update(dx, dy, 0, buttons);
+        self.kick_mouse_sample();
+        self.mouse.reporting && self.irq12_armed
     }
 
-    /// Inject a wheel detent: a Z-only PS/2 packet (no motion, buttons unchanged).
-    /// Returns true only if IRQ12 was already armed.
+    /// Inject a wheel detent (no motion, buttons unchanged). Returns true only if
+    /// IRQ12 was already armed.
     pub fn inject_mouse_wheel(&mut self, dz: i32) -> bool {
-        let buttons = self.mouse.current_buttons();
-        let reporting = self.mouse.queue_movement(0, 0, buttons, dz);
-        self.schedule_device_byte();
-        reporting && self.irq12_armed
+        let buttons = self.mouse.host_buttons();
+        self.mouse.host_update(0, 0, dz, buttons);
+        self.kick_mouse_sample();
+        self.mouse.reporting && self.irq12_armed
+    }
+
+    /// Sample the accumulated host state into a packet now if the mouse is idle
+    /// (no sample deadline armed), then keep sampling at the sample rate for as
+    /// long as there is state left to report. The first packet of a burst goes
+    /// out at once; everything the host feeds inside the next sample period
+    /// coalesces into the following packet, so the aux queue never holds more
+    /// than one packet however fast the host flushes or however slowly the
+    /// guest drains.
+    fn kick_mouse_sample(&mut self) {
+        if self.mouse_sample_ticks.is_some() {
+            return;
+        }
+        if self.mouse.sample() {
+            self.schedule_device_byte();
+        }
+        if self.mouse.state_pending() {
+            self.mouse_sample_ticks = Some(self.mouse.sample_period_ticks());
+        }
     }
 
     /// Enable or disable PS/2 aux data reporting directly, the seam the BIOS
@@ -100,7 +126,8 @@ impl Keyboard8042 {
     /// 0xD4-routed 0xF4/0xF5 commands set, without queuing an ACK into the aux
     /// stream. It does not clear the queue or re-centre; that is the driver's job.
     pub fn set_mouse_reporting(&mut self, on: bool) {
-        self.mouse.reporting = on;
+        self.mouse.set_reporting(on);
+        self.kick_mouse_sample();
     }
 
     /// Put the aux device into IntelliMouse 4-byte mode (the platform enables wheel
@@ -299,7 +326,11 @@ impl Keyboard8042 {
                     self.command_byte = value;
                     self.arm_current_output();
                 }
-                0xD4 => self.mouse.write_byte(value),
+                0xD4 => {
+                    self.mouse.write_byte(value);
+                    // 0xF4 (enable reporting) may release accumulated state.
+                    self.kick_mouse_sample();
+                }
                 0xD1 => self.output_port = value,
                 _ => {}
             }
@@ -330,6 +361,7 @@ impl Keyboard8042 {
             .map(|_| self.input_ticks)
             .into_iter()
             .chain(self.device_byte_ticks)
+            .chain(self.mouse_sample_ticks)
             .min()
     }
 
@@ -366,6 +398,9 @@ impl Keyboard8042 {
                 if let Some(serial) = self.device_byte_ticks.as_mut() {
                     *serial -= remaining;
                 }
+                if let Some(sample) = self.mouse_sample_ticks.as_mut() {
+                    *sample -= remaining;
+                }
                 break;
             }
 
@@ -374,6 +409,9 @@ impl Keyboard8042 {
             }
             if let Some(serial) = self.device_byte_ticks.as_mut() {
                 *serial -= next;
+            }
+            if let Some(sample) = self.mouse_sample_ticks.as_mut() {
+                *sample -= next;
             }
             remaining -= next;
 
@@ -386,6 +424,15 @@ impl Keyboard8042 {
                 self.device_byte_ticks = None;
                 self.device_byte_ready = true;
                 self.latch_ready_device_byte();
+            }
+            if self.mouse_sample_ticks == Some(0) {
+                // Sample tick: report what the host fed since the last packet,
+                // then keep the clock running only while state remains.
+                self.mouse_sample_ticks = None;
+                self.mouse.sample();
+                if self.mouse.state_pending() {
+                    self.mouse_sample_ticks = Some(self.mouse.sample_period_ticks());
+                }
             }
             self.schedule_device_byte();
         }

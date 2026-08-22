@@ -569,6 +569,11 @@ show and hide of the cursor, the position and the button state, the motion
 callbacks, and the wheel functions. Software finds the wheel functions with
 the CuteMouse `AX=0x11` detection call.
 
+The driver draws the cursor in the 80-column text mode and in the 320x200
+256-colour VGA mode (mode 13h). A program changes the cursor shape with
+`AX=0x09`. In the other graphics modes the program draws its own cursor. A
+video mode change hides the cursor until the program shows it again.
+
 `/T` (or `-T`) puts the tree connector of the Toka-DOS boot screen in front of
 the sign-on line:
 

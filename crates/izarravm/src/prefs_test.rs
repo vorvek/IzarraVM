@@ -12,6 +12,7 @@ fn round_trips_through_toml() {
         master_volume: 0.65,
         crt_style: CrtStyle::YeOlde,
         start_fullscreen: true,
+        mouse_sensitivity: 150,
         input_release: KeyBinding::new(true, true, false, true, "F4"),
         fullscreen: KeyBinding::new(false, false, true, false, "Enter"),
         screenshot: KeyBinding::new(false, true, false, true, "F10"),
@@ -64,8 +65,20 @@ fn missing_keys_fall_back_to_defaults() {
     assert_eq!(parsed.controller, None);
     assert_eq!(parsed.controller_profile, None);
     assert!(!parsed.start_fullscreen);
+    assert_eq!(
+        parsed.mouse_sensitivity, DEFAULT_MOUSE_SENSITIVITY,
+        "older files get the DOSBox-X default sensitivity"
+    );
     assert!(parsed.panel_open, "panel defaults to open for older files");
     assert_eq!(parsed.midi, MidiConfig::default());
+}
+
+#[test]
+fn out_of_range_mouse_sensitivity_is_clamped_on_load() {
+    let low: GuiPrefs = toml::from_str("mouse_sensitivity = 0").expect("deserialize");
+    assert_eq!(low.mouse_sensitivity, MIN_MOUSE_SENSITIVITY);
+    let high: GuiPrefs = toml::from_str("mouse_sensitivity = 9000").expect("deserialize");
+    assert_eq!(high.mouse_sensitivity, MAX_MOUSE_SENSITIVITY);
 }
 
 #[test]

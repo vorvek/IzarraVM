@@ -86,6 +86,7 @@ This is a TOML file with the GUI preferences that must stay between runs:
 - The master volume
 - The **Start in Full Screen** setting
 - The CRT emulation style (below)
+- The mouse sensitivity
 - The hotkeys that you set for input release, full screen, and screenshots
 - The name of the selected controller profile
 - The last floppy image, the last CD image, and the last CD folder that you
@@ -123,6 +124,11 @@ these controls:
   This option is off by default.
 - **CRT emulation**: selects the display effect. The table below gives the
   available values.
+- **Mouse sensitivity**: sets how far the guest cursor moves for a given host
+  mouse movement, from 10% to 400%. The default is 100%, which gives the same
+  cursor speed as DOSBox-X at its default setting. The guest mouse driver
+  applies its own ratio after this factor, so a game that changes the ratio
+  still works as it does on a real machine.
 
 Three buttons open separate settings windows:
 

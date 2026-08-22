@@ -89,17 +89,10 @@ fn volume_percent_to_fraction(text: &str) -> Option<f64> {
 
 /// Ceiling on how often accumulated mouse motion is flushed into the guest,
 /// independent of (and generally faster than) the video refresh rate that
-/// paces rendering. A real PS/2 mouse samples at well under this; it just
-/// keeps a violent host flick's motion arriving in small, frequent packets
-/// rather than one huge coalesced delta that the guest can only convey as a
-/// long train of catch-up packets (see `Machine::inject_mouse_relative`).
-///
-/// Must stay below the keyboard controller's own drain rate or the aux queue
-/// grows without bound under sustained motion even though no single flush is
-/// ever large: `AUX_BYTE_SETTLE_US` (keyboard.rs) paces aux bytes out of the
-/// 8042 at 1/ms, and a TOKAMOUS-driven IntelliMouse packet is 4 bytes, so the
-/// guest can never drain faster than 250 packets/s. 200 Hz matches the highest
-/// standard PS/2 sample rate while leaving room for the aux byte pacing.
+/// paces rendering. The PS/2 device accumulates what it is fed and samples it
+/// into packets at its own rate (`Ps2Mouse::sample`), so a flush is never a
+/// packet by itself; this cadence only bounds the cross-thread traffic from an
+/// 8000 Hz host mouse. 200 Hz matches the highest standard PS/2 sample rate.
 const MOUSE_FLUSH_HZ: f64 = 200.0;
 const JOYSTICK_POLL_HZ: f64 = 120.0;
 
@@ -664,6 +657,9 @@ pub struct GuiApp {
     // ratio, so the host only forwards these counts, coalesced once per frame.
     mouse_rel_x: f32,
     mouse_rel_y: f32,
+    // Host counts -> guest mickeys factor from the sensitivity preference, the
+    // DOSBox-X curve (host_input::mouse_sensitivity_scale).
+    mouse_scale: f32,
     // Set on motion, cleared by the once-per-frame flush in about_to_wait.
     // An 8000 Hz mouse fires ~130 events per frame; sending one guest packet each
     // floods the emulation thread with guest IRQ12s and stalls the UI thread.
@@ -754,6 +750,7 @@ enum ConfigPage {
 struct ConfigDialog {
     page: ConfigPage,
     start_fullscreen: bool,
+    mouse_sensitivity: u16,
     input_release: KeyBinding,
     fullscreen: KeyBinding,
     screenshot: KeyBinding,
@@ -1193,6 +1190,7 @@ impl GuiApp {
             screen_rect: None,
             mouse_rel_x: 0.0,
             mouse_rel_y: 0.0,
+            mouse_scale: crate::host_input::mouse_sensitivity_scale(prefs.mouse_sensitivity),
             mouse_dirty: false,
             wheel_accum: 0.0,
             audio,
@@ -1561,14 +1559,22 @@ impl GuiApp {
         } else {
             self.last_buttons &= !bit;
         }
-        let dx = self.mouse_rel_x as i32;
-        let dy = self.mouse_rel_y as i32;
-        self.mouse_rel_x = 0.0;
-        self.mouse_rel_y = 0.0;
+        let (dx, dy) = self.take_whole_mickeys();
         self.mouse_dirty = false;
         let _ = self
             .session
             .send_input(GuestInput::MouseRelative(dx, dy, self.last_buttons));
+    }
+
+    /// Take the whole mickeys accumulated so far and keep the fraction for the
+    /// next flush, so slow motion at a low sensitivity is not truncated away
+    /// (DOSBox-X keeps the same remainder in `mickey_accum_x/y`).
+    fn take_whole_mickeys(&mut self) -> (i32, i32) {
+        let dx = self.mouse_rel_x.trunc();
+        let dy = self.mouse_rel_y.trunc();
+        self.mouse_rel_x -= dx;
+        self.mouse_rel_y -= dy;
+        (dx as i32, dy as i32)
     }
 
     /// Forward host scroll-wheel motion to the guest. `lines` is signed notches
@@ -1590,9 +1596,12 @@ impl GuiApp {
         }
     }
 
-    /// Accumulate raw relative mouse motion (mickeys) for the next per-frame flush.
-    /// The guest driver applies its ratio and clamps to the video mode's range, so
-    /// the host forwards the raw counts unscaled and unclamped.
+    /// Accumulate relative host motion as guest mickeys for the next flush. The
+    /// guest driver applies its ratio and clamps to the video mode's range; the
+    /// host only scales the counts by the sensitivity, the way DOSBox-X's
+    /// `Mouse_CursorMoved` does: a one-count event passes unscaled unless the
+    /// factor is below 1, so slow precise motion keeps its resolution while
+    /// ordinary motion gets the full factor.
     fn accumulate_guest_motion(&mut self, dx: f32, dy: f32) {
         if !self.guest_mouse_active() {
             self.mouse_rel_x = 0.0;
@@ -1600,8 +1609,16 @@ impl GuiApp {
             self.mouse_dirty = false;
             return;
         }
-        self.mouse_rel_x += dx;
-        self.mouse_rel_y += dy;
+        let scale = self.mouse_scale;
+        let scaled = |rel: f32| {
+            if rel.abs() > 1.0 || scale < 1.0 {
+                rel * scale
+            } else {
+                rel
+            }
+        };
+        self.mouse_rel_x += scaled(dx);
+        self.mouse_rel_y += scaled(dy);
         self.mouse_dirty = true;
     }
 
@@ -1619,10 +1636,11 @@ impl GuiApp {
             return;
         }
         self.mouse_dirty = false;
-        let dx = self.mouse_rel_x as i32;
-        let dy = self.mouse_rel_y as i32;
-        self.mouse_rel_x = 0.0;
-        self.mouse_rel_y = 0.0;
+        let (dx, dy) = self.take_whole_mickeys();
+        if dx == 0 && dy == 0 {
+            self.mouse_dirty = true; // only a fraction so far: wait for more
+            return;
+        }
         let _ = self
             .session
             .send_input(GuestInput::MouseRelative(dx, dy, self.last_buttons));
