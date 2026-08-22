@@ -2582,14 +2582,18 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
     );
 }
 
-/// The other half of the split (S4f): a changed record the SUFFIX DOES NOT USE resumes.
+/// The other half of the split (S4f): a changed record NO OTHER SLOT IN THE BLOCK USES resumes.
 ///
-/// Same row, same moved record, and the only difference is what follows it. `inc ax` bakes no
-/// segment, so FS is not in the slot's suffix mask, R2 does not compare it, and the block carries
-/// on. That is 2.23 M of the S4 loader's remaining barrier hits: DS and ES far-pointer reloads
-/// whose new record nothing downstream reads.
+/// Same row, same moved record, and the only difference is what surrounds it. `mov ax, 0x1111` in
+/// front and `inc ax` behind bake no segment, so FS is in neither half of the slot's mask, R2 does
+/// not compare it, and the block carries on. That is 2.23 M of the S4 loader's remaining barrier
+/// hits: DS and ES far-pointer reloads whose new record nothing in the block reads.
 ///
-/// MUTATION: drop `suffix_used` from the mask (compare all six) and this resyncs, reporting two
+/// NO EARLIER SLOT either, which the first loader gate is the reason for. A mask built from the
+/// suffix alone let a block that bakes FS in its PREFIX resume, and the block then failed its own
+/// `data_matches` at the next entry and recompiled every visit. The sibling below is that shape.
+///
+/// MUTATION: drop `used_by_others` from the mask (compare all six) and this resyncs, reporting two
 /// instructions instead of three.
 #[cfg(all(
     feature = "jit",
@@ -2597,7 +2601,7 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_later_slot_uses() {
+fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
     // mov ax,0x1111 | mov fs,ax | inc ax | hlt
     let (code, starts) = row_program(&[0x8E, 0xE0]);
     let mut legs = run_both(&code, &starts, no_perturb);
@@ -2618,7 +2622,125 @@ fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_later_slot_uses() {
     );
 }
 
+/// An EARLIER slot using the segment refuses the resume, and the counter says what that cost.
+///
+/// `mov ax, fs` in front of `mov fs, bx` is the shape the first loader gate measured as
+/// `jit_direct_reject_data_segment` 307,714 -> 514,327: the suffix behind the load bakes nothing,
+/// so a suffix-only mask resumed -- and then the block failed its own entry check on the next
+/// visit, because `used` is the BLOCK-WIDE pinned set and the prefix put FS in it. Retire,
+/// recompile, every visit.
+///
+/// `callout_interpret_one_resume_refused_prefix_use` is the other side of that trade, and it is
+/// asserted here rather than merely exported: it is the number the `IZARRAVM_CALLOUT_SEGMENT_RESUME`
+/// A/B is read against, so a counter that never fired would make the two arms look free.
+///
+/// MUTATION: mask with `suffix_used` instead of `used_by_others` and this resumes, reporting three
+/// instructions and leaving the counter at zero.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_mov_sreg_resyncs_when_an_earlier_slot_uses_the_segment() {
+    // mov ax,fs | mov fs,bx | inc ax | hlt -- the user is slot 0 and the call-out is slot 1.
+    let code = [0x8C, 0xE0, 0x8E, 0xE3, 0x40, 0xF4];
+    let starts = [0, 2, 4];
+    let mut legs = run_both(&code, &starts, no_perturb);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "the block bakes FS in its prefix, so the moved record must RESYNC"
+    );
+    assert_eq!(
+        legs.native_insns, 2,
+        "the prefix slot plus the retired load"
+    );
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert_eq!(
+        stalls.callout_interpret_one_resume_refused_prefix_use, 1,
+        "the suffix-only mask would have carried this one, and the ladder needs to know"
+    );
+    let counts = row_counts(&legs.native, "0x8e_mov_sreg");
+    assert_eq!(counts.resume_refused_prefix_use, 1, "and on its own row");
+    assert_legs_agree(&mut legs);
+}
+
+/// The knob's OFF arm is the pre-S4f behaviour, both halves of it.
+///
+/// The same fixture that resumes on the ON arm resyncs here, and the block that publishes no
+/// successors on the ON arm publishes its fallthrough again. Those are the two things S4f changed,
+/// and an escape that restored one without the other would be an arm nobody measured.
+///
+/// The arm is read ONCE PER COMPILE, so the override has to be set before `build_native` runs, not
+/// before the entry.
+///
+/// MUTATION: read the knob at resume time instead of baking it into the cell and the first
+/// assertion still passes while the successor one does not, which is the split this test exists to
+/// catch.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn the_segment_resume_knob_restores_the_strict_rule_and_the_successors() {
+    let (code, starts) = row_program(&[0x8E, 0xE0]);
+
+    jit::direct::set_callout_segment_resume_for_test(Some(false));
+    let (cpu, _, block) = build_native(&code, &starts);
+    assert!(
+        !block.is_segment_write_block(),
+        "off arm: the block must publish its successors again"
+    );
+    assert_eq!(
+        cpu.jit_direct.waiting_len_for_test(),
+        1,
+        "off arm: and queue its fallthrough"
+    );
+    let mut legs = run_both(&code, &starts, no_perturb);
+    jit::direct::set_callout_segment_resume_for_test(None);
+
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "off arm: any changed record must RESYNC"
+    );
+    assert_eq!(legs.native_insns, 2, "off arm");
+    assert_eq!(
+        legs.native
+            .direct_stall_snapshot()
+            .callout_interpret_one_resume_refused_prefix_use,
+        0,
+        "off arm: the prefix counter is about the ON arm's mask and must stay silent"
+    );
+    assert_legs_agree(&mut legs);
+
+    // Control: the SAME program on the ON arm resumes and bars the successors.
+    let (cpu, _, block) = build_native(&code, &starts);
+    assert!(block.is_segment_write_block());
+    assert_eq!(cpu.jit_direct.waiting_len_for_test(), 0);
+    let legs = run_both(&code, &starts, no_perturb);
+    assert_eq!(legs.exit_reason, None);
+    assert_eq!(legs.native_insns, u64::from(BLOCK_INSTRUCTIONS));
+}
+
+/// The knob's spelling table, unset included. Default ON, and `0` / `off` / empty are the escape.
+#[test]
+fn the_segment_resume_knob_spellings() {
+    use jit::direct::parse_callout_segment_resume_arm_for_test as parse;
+    assert!(parse(Err(std::env::VarError::NotPresent)), "unset is ON");
+    for on in ["1", "on", "ON", " on "] {
+        assert!(parse(Ok(on.to_string())), "{on}");
+    }
+    for off in ["0", "off", "OFF", "", "  "] {
+        assert!(!parse(Ok(off.to_string())), "{off}");
+    }
+}
+
 /// The mask is built by SLOT INDEX and covers the whole suffix, not just the next slot.
+///
 ///
 /// The call-out sits at index 0 of three, which is the case an off-by-one gets wrong in the
 /// direction that matters: a union started at `i + 2` would leave FS out of the first slot's mask
@@ -4544,6 +4666,7 @@ fn the_ss_load_measurement_ignores_the_other_segments() {
 ///
 /// MUTATION: delete the `ss_load_census_active` term from either arm and this reads one instead
 /// of zero.
+#[cfg(feature = "jit")]
 #[test]
 fn the_ss_load_measurement_is_off_without_the_census() {
     // mov ax, 0; mov ss, ax; push ax; pop ss; hlt

@@ -1135,6 +1135,93 @@ pub(crate) fn word_at_486_default() -> bool {
     *LEVEL.get_or_init(|| !matches!(std::env::var("IZARRAVM_JIT16_486").as_deref(), Ok("0")))
 }
 
+/// Whether a segment-loading `InterpretOne` call-out may RESUME its block when the record it moved
+/// is one no other slot in the block uses (design section 11, S4f).
+///
+/// **DEFAULT ON.** `IZARRAVM_CALLOUT_SEGMENT_RESUME` unset admits the relaxation; `0` or `off` is
+/// the escape back to the pre-S4f behaviour, which still ships whole: R2 compares all six records
+/// for these rows, so any change resyncs, and the block publishes its successors as before because
+/// nothing feeds `callout_segment_writes`.
+///
+/// WHY IT HAS A KNOB AT ALL, when the S3 rows did not. The first loader gate measured the slice at
+/// -9% wall and it moved two counters in the wrong direction at the same time:
+/// `jit_direct_reject_data_segment` 307,714 -> 514,327 with compile attempts up by the same
+/// 206,000, and `segment_write_block_head_entries` at 1,959,263 from the absorbed tails losing
+/// their chaining (design review 11.1 M3). The first of those is fixed here by widening the mask
+/// from the suffix to the whole block; the second is inherent to the successor bar and is a real
+/// trade. A knob is what lets the ladder read the two arms from ONE binary rather than inferring
+/// the split from two builds.
+///
+/// Read ONCE PER COMPILE and baked into the slot's cell, not read at run time. A block therefore
+/// keeps the arm it was compiled under for its whole life, which is what makes an interleaved A/B
+/// mean anything: flipping the knob under a live cache would leave blocks from both arms running
+/// and the counters unattributable.
+pub(crate) fn callout_segment_resume_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = CALLOUT_SEGMENT_RESUME_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_callout_segment_resume_arm(std::env::var("IZARRAVM_CALLOUT_SEGMENT_RESUME"))
+    })
+}
+
+/// The `IZARRAVM_CALLOUT_SEGMENT_RESUME` spelling table. See `callout_segment_resume_enabled`.
+fn parse_callout_segment_resume_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset = ON. Same shape and the same trap as `IZARRAVM_V86_LOOP_ROWS`: an off leg must
+        // EXPORT `0`, and NULLING the variable is not unsetting it -- PowerShell leaves it present
+        // and empty, and the empty string is spelled OFF two arms down.
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_CALLOUT_SEGMENT_RESUME is set to a value that is not valid UTF-8; \
+                 accepted spellings are unset or `1` / `on` (the shipped default: a segment-loading \
+                 call-out resumes when no other slot in the block uses the record it moved), and \
+                 `0` / `off` (the escape, under which any change resyncs and the block keeps its \
+                 successors)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_CALLOUT_SEGMENT_RESUME={other:?} names no arm; accepted spellings are unset \
+             or `1` / `on` (the shipped default: the suffix-and-prefix segment mask, and the \
+             successor bar that pays for it), and `0` / `off` (the escape, under which R2 compares \
+             all six records for these rows and the block publishes its successors). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
+// `OnceLock` and the fixtures have to run both arms in one process.
+#[cfg(test)]
+thread_local! {
+    static CALLOUT_SEGMENT_RESUME_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the segment-resume arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_CALLOUT_SEGMENT_RESUME` reading.
+#[cfg(test)]
+pub(crate) fn set_callout_segment_resume_for_test(forced: Option<bool>) {
+    CALLOUT_SEGMENT_RESUME_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_test_word_rows_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_callout_segment_resume_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_callout_segment_resume_arm(value)
+}
+
 /// Whether the Direct backend lowers `OperandSize::Word` operands on this CPU.
 ///
 /// ONE predicate for what used to be three copies of `persona != I586`: the compile walk's Word

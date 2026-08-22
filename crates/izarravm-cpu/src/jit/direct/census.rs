@@ -448,6 +448,9 @@ pub(crate) struct InterpretOneRowTally {
     pub(crate) resync: u64,
     pub(crate) resync_fault: u64,
     pub(crate) demoted: u64,
+    /// The subset of `resync` that the SUFFIX-only segment mask would have carried. See
+    /// `DirectStallTally::callout_interpret_one_resume_refused_prefix_use`.
+    pub(crate) resume_refused_prefix_use: u64,
 }
 
 /// The stall tallies, deliberately NOT part of `BlockCacheStats`.
@@ -585,6 +588,18 @@ pub(crate) struct DirectStallTally {
     /// acceptance ratio the slice is graded on is `resync / executed`.
     pub callout_interpret_one_executed: u64,
     pub callout_interpret_one_resync: u64,
+    /// Resyncs a segment-writing call-out took because the record it moved is baked by a slot
+    /// BEFORE it, which the suffix-only mask would have let through.
+    ///
+    /// The price of the prefix half of the mask, and the number the `IZARRAVM_CALLOUT_SEGMENT_RESUME`
+    /// A/B is read against. Without the prefix, those slots resume and the block then fails its own
+    /// `data_matches` on the next entry, retires and recompiles: the first loader gate measured
+    /// that as `reject_data_segment` 307,714 -> 514,327 and 206,000 extra compile attempts. This
+    /// counter is the other side of that trade, in the currency the ladder can subtract.
+    ///
+    /// A SUBSET of `callout_interpret_one_resync`, never a separate lane: the resync happened and
+    /// is counted there too.
+    pub callout_interpret_one_resume_refused_prefix_use: u64,
     pub callout_interpret_one_resync_fault: u64,
     pub callout_interpret_one_abnormal: u64,
     pub callout_interpret_one_demoted: u64,
@@ -2144,6 +2159,10 @@ impl crate::jit::JitState {
             callout_port_v86_served: self.stalls.callout_port_v86_served,
             callout_interpret_one_executed: self.stalls.callout_interpret_one_executed,
             callout_interpret_one_resync: self.stalls.callout_interpret_one_resync,
+            callout_interpret_one_resume_refused_prefix_use: self
+                .stalls
+                .callout_interpret_one_resume_refused_prefix_use,
+            callout_segment_resume_enabled: super::callout_segment_resume_enabled(),
             callout_interpret_one_resync_fault: self.stalls.callout_interpret_one_resync_fault,
             callout_interpret_one_abnormal: self.stalls.callout_interpret_one_abnormal,
             callout_interpret_one_demoted: self.stalls.callout_interpret_one_demoted,
@@ -2157,6 +2176,7 @@ impl crate::jit::JitState {
                         resync: tally.resync,
                         resync_fault: tally.resync_fault,
                         demoted: tally.demoted,
+                        resume_refused_prefix_use: tally.resume_refused_prefix_use,
                     }
                 })
                 .collect(),
@@ -2271,6 +2291,14 @@ impl crate::jit::JitState {
     pub(crate) fn note_interpret_one_resync(&mut self, row: InterpretOneRow) {
         self.stalls.callout_interpret_one_resync += 1;
         self.stalls.callout_interpret_one_rows[row.index()].resync += 1;
+    }
+
+    /// A resync the suffix-only mask would have carried. Counted BESIDE the resync above, not
+    /// instead of it: it is a subset, and a lane that replaced the resync would break the sum the
+    /// per-row pin checks.
+    pub(crate) fn note_interpret_one_resume_refused_prefix_use(&mut self, row: InterpretOneRow) {
+        self.stalls.callout_interpret_one_resume_refused_prefix_use += 1;
+        self.stalls.callout_interpret_one_rows[row.index()].resume_refused_prefix_use += 1;
     }
 
     pub(crate) fn note_interpret_one_resync_fault(&mut self, row: InterpretOneRow) {

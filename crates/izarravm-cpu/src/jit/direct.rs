@@ -6420,10 +6420,16 @@ fn compile_with_budget(
     //
     // Feeds `segment_write_block` and NOTHING ELSE -- in particular not `dirty_segments`, which
     // would end the block at the next slot that uses the segment and take the whole relaxation
-    // with it. What makes that safe is R2: a resumed slot has already compared every record the
-    // remaining slots depend on, so a later slot only ever runs against records the step left
-    // alone.
+    // with it. What makes that safe is R2: a resumed slot has already compared every record any
+    // OTHER slot in the block depends on, so nothing in the block ever runs against a record the
+    // step moved.
+    //
+    // Zero when the knob is off, which is the whole of the off arm's successor behaviour: the
+    // block publishes its successors exactly as it did before S4f.
     let mut callout_segment_writes = 0usize;
+    // Read ONCE per walk and baked into the cells below, never at run time. A block keeps the arm
+    // it was compiled under for its whole life, which is what makes an interleaved A/B readable.
+    let segment_resume = callout_segment_resume_enabled();
     let x87_entry_top = cpu.fpu.top();
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
@@ -7011,7 +7017,7 @@ fn compile_with_budget(
                 let row = helper
                     .interpret_one_row()
                     .expect("an InterpretOne helper names its census row");
-                callout_segment_writes += usize::from(row.may_write_segment());
+                callout_segment_writes += usize::from(segment_resume && row.may_write_segment());
                 // `slots.len()` IS the index this instruction is about to take: the push happens
                 // further down the same iteration and nothing between here and it can `break`.
                 // The assertion after the walk is what keeps that true.
@@ -7185,20 +7191,32 @@ fn compile_with_budget(
             CompileStop::Boundary => CompileOutcome::Retry(RetryCause::TooShort),
         };
     }
-    // THE SUFFIX MASK (design section 11). One backward pass, after the walk, because the answer
-    // for a slot is a fact about everything behind it and the walk does not know that while it is
-    // still growing.
+    // THE SEGMENT MASKS (design section 11). Two passes, after the walk, because the answer for a
+    // slot is a fact about the rest of the block and the walk does not know that while it is still
+    // growing.
     //
     // The union is `pinned_segments`, which is read union write union selector, and it is that
-    // definition rather than "the segments a later slot reads": `MovSegToReg` bakes a SELECTOR as
+    // definition rather than "the segments another slot reads": `MovSegToReg` bakes a SELECTOR as
     // a compile-time constant and reports through neither read nor write, so a mask built from the
     // access accessors alone would let a resumed `mov ds, ax` leave a stale selector baked into a
-    // `mov ax, ds` behind it.
+    // `mov ax, ds` beside it.
     //
-    // STRICTLY after: a slot's own pinned set is not in its mask. The slot has already run by the
-    // time R2 is asked, and its own operand was resolved against the records as they stood before
-    // the step.
-    {
+    // EVERY OTHER SLOT, before as well as after. The suffix half is the obvious one -- a later
+    // slot would run against a record the step moved. The PREFIX half looks redundant, since those
+    // slots have already run, and the first loader gate is what showed it is not: `used` is the
+    // block-wide pinned set and `data_matches` compares all of it at every entry, so a block that
+    // resumes having moved a record its own prefix bakes fails its own entry check next visit and
+    // recompiles every time (`reject_data_segment` 307,714 -> 514,327).
+    //
+    // STRICTLY other: a slot's own pinned set is in neither of its masks. It has already run by
+    // the time R2 is asked, and its own operand was resolved against the records as they stood
+    // before the step. In practice the distinction is inert -- a `CallOut` kind pins nothing at
+    // all -- and it is written this way because the rule is about the OTHER slots, not because the
+    // arithmetic needs it.
+    //
+    // Skipped entirely when the knob is off: the cells keep their `u8::MAX` defaults, R2 compares
+    // all six records, and the block published its successors above.
+    if segment_resume {
         debug_assert_eq!(
             interpret_one_cells.len(),
             slots
@@ -7210,21 +7228,51 @@ fn compile_with_budget(
                 .count(),
             "an InterpretOne cell was allocated for an instruction that did not become a slot"
         );
+        // TWO passes and two masks. The forward one is the block's PREFIX at each slot, which is
+        // what stops a resumed segment write from moving a record the block itself bakes and so
+        // failing its own entry check on the next visit. The backward one is the SUFFIX, which is
+        // kept on its own so the resync path can price what the prefix half costs.
+        //
+        // Index-driven rather than iterator-driven because the cells carry their slot index and
+        // are pushed in ascending order: `next` and `back` walk that order once each, and the two
+        // assertions afterwards are what say the cells really did line up with the slots.
+        let mut prefix_masks = vec![0u8; interpret_one_cells.len()];
+        let mut suffix_masks = vec![0u8; interpret_one_cells.len()];
+        let mut prefix = 0u8;
+        let mut next = 0usize;
+        for (index, slot) in slots.iter().enumerate() {
+            while interpret_one_cells
+                .get(next)
+                .is_some_and(|(at, _)| *at == index)
+            {
+                prefix_masks[next] = prefix;
+                next += 1;
+            }
+            prefix |= slot.kind.pinned_segments();
+        }
+        debug_assert_eq!(
+            next,
+            interpret_one_cells.len(),
+            "a cell named a slot index off the end"
+        );
         let mut suffix = 0u8;
-        let mut cells = interpret_one_cells.iter_mut().rev().peekable();
+        let mut back = interpret_one_cells.len();
         for index in (0..slots.len()).rev() {
-            while cells.peek().is_some_and(|(at, _)| *at == index) {
-                let (_, cell) = cells.next().expect("peeked");
-                let cell = Arc::get_mut(cell)
-                    .expect("the compile walk owns its cells until install clones them");
-                cell.set_suffix_used(suffix);
+            while back > 0 && interpret_one_cells[back - 1].0 == index {
+                back -= 1;
+                suffix_masks[back] = suffix;
             }
             suffix |= slots[index].kind.pinned_segments();
         }
-        debug_assert!(
-            cells.next().is_none(),
-            "a cell named a slot index off the end"
-        );
+        debug_assert_eq!(back, 0, "a cell named a slot index below the block");
+        for (position, (_, cell)) in interpret_one_cells.iter_mut().enumerate() {
+            let cell = Arc::get_mut(cell)
+                .expect("the compile walk owns its cells until install clones them");
+            cell.set_segment_masks(
+                prefix_masks[position] | suffix_masks[position],
+                suffix_masks[position],
+            );
+        }
         // `used` IS `pinned_segments` (SegmentLayout::capture), and the mask is a union over a
         // SUBSET of the slots that produced it, so this is a subset by construction. Asserted
         // because the entry check leans on it: `data_matches` compares the block-wide `used`, and
@@ -7232,10 +7280,10 @@ fn compile_with_budget(
         debug_assert_eq!(
             interpret_one_cells
                 .iter()
-                .fold(0u8, |mask, (_, cell)| mask | cell.suffix_used())
+                .fold(0u8, |mask, (_, cell)| mask | cell.used_by_others())
                 & !pinned_segments,
             0,
-            "a suffix mask named a segment the block does not pin"
+            "a segment mask named a segment the block does not pin"
         );
     }
     let interpret_one_cells: Vec<Arc<InterpretOneCell>> = interpret_one_cells

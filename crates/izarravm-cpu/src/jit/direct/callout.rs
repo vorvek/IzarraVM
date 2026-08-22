@@ -1184,19 +1184,35 @@ pub(crate) struct InterpretOneCell {
     /// fields the helper reads on every execution: `state` must stay first because the emitted
     /// prologue tests byte 0 directly, and this one is read only on the four counter paths.
     row: InterpretOneRow,
-    /// The segments the slots STRICTLY AFTER this one in the block depend on: the union of their
-    /// `DirectKind::pinned_segments`, which is read union write union selector.
+    /// The segments EVERY OTHER SLOT in the block depends on: the union of
+    /// `DirectKind::pinned_segments` (read union write union selector) over the slots before this
+    /// one and the slots after it.
     ///
     /// This is what R2 compares for a row that can write a segment register, in place of all six
-    /// records. A `mov ds, ax` that moves DS's record cannot reach anything the block goes on to
-    /// do when no later slot bakes DS, and the S4 census says that is the common shape: 2.23 M
+    /// records. A `mov ds, ax` that moves DS's record cannot reach anything this block does when
+    /// no other slot in it bakes DS, and the S4 census says that is the common shape: 2.23 M
     /// block-stopping hits on `0x8E` are DS and ES reloads with changed records, the extender
     /// far-pointer pattern, which resynced and then demoted every time.
     ///
-    /// Filled AFTER the walk, by slot index, because it is a fact about the block's tail that the
-    /// walk does not know while it is still growing. Zero until then, which is the conservative
-    /// value only in the sense that it compares fewer segments -- the mask is useless without CS
-    /// and SS, which `allows_resume` adds unconditionally rather than storing here.
+    /// THE PREFIX HALF IS NOT DECORATION, and the first loader gate is what proved it. A mask
+    /// built from the SUFFIX alone let a block that bakes DS in its prefix resume having moved DS,
+    /// and the block then failed its own `data_matches` on the NEXT entry -- `used` is the
+    /// block-wide pinned set -- so it retired and recompiled on every visit:
+    /// `jit_direct_reject_data_segment` 307,714 -> 514,327 with compile attempts up by the same
+    /// 206,000. Including the prefix makes the block never bake the segment it changes, so its own
+    /// write can no longer fail its own entry check.
+    ///
+    /// Filled AFTER the walk, by slot index, because it is a fact about the rest of the block that
+    /// the walk does not know while it is still growing. `u8::MAX` when
+    /// `callout_segment_resume_enabled` is off, which makes R2 compare everything and is exactly
+    /// the pre-S4f rule.
+    used_by_others: u8,
+    /// The SUFFIX half on its own, kept for one purpose: pricing what the prefix half costs.
+    ///
+    /// A resync where this mask would have allowed the resume is a slot the suffix-only rule would
+    /// have carried, and `callout_interpret_one_resume_refused_prefix_use` counts exactly those.
+    /// Without it the ladder can see that the wider mask resyncs more but not by how much, and the
+    /// two arms of that trade are one env flip apart.
     suffix_used: u8,
     /// The key of the block this cell was compiled INTO, baked at the compile walk.
     ///
@@ -1240,18 +1256,27 @@ impl InterpretOneCell {
             insn_len,
             slot_delta,
             row,
-            suffix_used: 0,
+            used_by_others: u8::MAX,
+            suffix_used: u8::MAX,
             key,
         }
     }
 
-    /// Fill in the suffix mask once the walk knows what follows this slot. See the field.
+    /// Fill in the two segment masks once the walk knows the whole block. See the fields.
     ///
     /// `&mut self` rather than interior mutability, and the compile walk reaches it through
     /// `Arc::get_mut`: the cell is not shared with anything until `install` clones the vector, so
     /// the uniqueness the call needs is a fact about the phase rather than a lock.
-    pub(crate) fn set_suffix_used(&mut self, mask: u8) {
-        self.suffix_used = mask;
+    ///
+    /// NEW starts at `u8::MAX` for both, so a cell the walk never reaches compares every record.
+    /// Failing closed matters here: a zero default would be the widest possible RELAXATION.
+    pub(crate) fn set_segment_masks(&mut self, used_by_others: u8, suffix_used: u8) {
+        self.used_by_others = used_by_others;
+        self.suffix_used = suffix_used;
+    }
+
+    pub(crate) fn used_by_others(&self) -> u8 {
+        self.used_by_others
     }
 
     pub(crate) fn suffix_used(&self) -> u8 {
@@ -1379,7 +1404,8 @@ impl ResumeSnapshot {
     ///
     /// R2 compares all six records for every row that cannot write a segment register, and a
     /// MASK for the three that can (`InterpretOneRow::may_write_segment`). The mask is the
-    /// segments the slots strictly after this one depend on, plus CS and SS unconditionally.
+    /// segments EVERY OTHER SLOT in the block depends on -- before it as well as after it -- plus
+    /// CS and SS unconditionally.
     ///
     /// The relaxation is design section 11 and the census is what asked for it: 2.23 M of the S4
     /// loader's remaining block-stopping hits are `0x8E` DS and ES reloads with CHANGED records,
@@ -1392,13 +1418,17 @@ impl ResumeSnapshot {
     /// itself against; SS carries the stack width that `jit_mode_key` bit 3 keys the whole block
     /// on, and every stack slot bakes its base.
     ///
-    /// WHAT IT COSTS AT THE NEXT ENTRY, stated because the mask does not mention it. `used` is the
-    /// BLOCK-WIDE pinned set and `data_matches` still compares all of it at every entry, so a slot
-    /// that resumes having moved a record an EARLIER slot bakes leaves the block failing its own
-    /// entry check next time round. That is the ordinary "the guest moved a segment this block
-    /// bakes" path and it is correct; it is also why `reject_data_segment` is pre-registered as a
-    /// counter this slice can move. The shape is `mov ax, ds` in front of `mov ds, bx`, which the
-    /// census does not rank.
+    /// WHY THE PREFIX IS IN THE MASK, which a first reading makes look redundant: the slots before
+    /// this one have already run, so nothing they do can be affected by a record moved now. What
+    /// they leave behind is the BLOCK'S OWN ENTRY CHECK. `used` is the block-wide pinned set and
+    /// `data_matches` compares all of it at every entry, so a slot that resumed having moved a
+    /// record an earlier slot bakes leaves the block failing its own check on the next visit,
+    /// retiring and recompiling every time. The first loader gate measured that as
+    /// `jit_direct_reject_data_segment` 307,714 -> 514,327 and 206,000 extra compile attempts.
+    /// With the prefix in the mask the block never bakes the segment it changes.
+    ///
+    /// The cost of that is counted rather than argued: a resync the SUFFIX-only mask would have
+    /// allowed lands in `callout_interpret_one_resume_refused_prefix_use`.
     ///
     /// WHAT PAYS FOR IT is the successor bar rather than anything in this predicate. A block
     /// holding such a slot publishes no static successor and no dynamic one, so a chained
@@ -1455,7 +1485,7 @@ impl ResumeSnapshot {
         cpu: &CpuGsw,
         end_eip: u32,
         row: InterpretOneRow,
-        suffix_used: u8,
+        segment_mask: u8,
     ) -> bool {
         // R1.
         if cpu.registers.eip != end_eip || cpu.registers.cs() != self.cs {
@@ -1465,7 +1495,7 @@ impl ResumeSnapshot {
         // because the extra two are bits no `segment_bit` produces and `SEGMENT_ORDER` never
         // indexes: widening the mask to "everything" is the same set as widening it to "all six".
         let compare = if row.may_write_segment() {
-            suffix_used
+            segment_mask
                 | super::segment_bit(SegmentIndex::Cs)
                 | super::segment_bit(SegmentIndex::Ss)
         } else {
@@ -1761,7 +1791,7 @@ fn interpret_one_step<B: CpuBus>(
     //
     // Asked AFTER the step rather than before it because the step runs on either answer -- the row
     // retires whatever this returns -- and executing it cannot change what is pending.
-    let resume = snapshot.allows_resume(cpu, end_eip, cell.row(), cell.suffix_used())
+    let resume = snapshot.allows_resume(cpu, end_eip, cell.row(), cell.used_by_others())
         && !(cell.row().arms_interrupt_shadow()
             && cpu.registers.eflags & FLAG_IF != 0
             && bus.interrupt_pending());
@@ -1803,6 +1833,18 @@ fn interpret_one_step<B: CpuBus>(
 
     let clocks = i64::from(outcome.core_clocks);
     if !resume {
+        // WHAT THE PREFIX HALF OF THE MASK COST, asked only on the resync path and only for a row
+        // that carries a mask at all. Re-running the predicate with the SUFFIX-only mask is what
+        // makes the answer exact instead of a guess: the two calls differ in nothing but the mask,
+        // so a true here and a false above means this resync is one the narrower rule would have
+        // carried. The ladder reads it against the `reject_data_segment` and compile-attempt
+        // counts the narrow rule cost, which is the trade the knob exists to price.
+        if cell.row().may_write_segment()
+            && snapshot.allows_resume(cpu, end_eip, cell.row(), cell.suffix_used())
+        {
+            cpu.jit_direct
+                .note_interpret_one_resume_refused_prefix_use(cell.row());
+        }
         cpu.jit_direct.note_interpret_one_resync(cell.row());
         // EIP is left EXACTLY where the interpreter put it and the stub advances it by zero: the
         // instruction retired, so the architectural next address is already correct, and it is not

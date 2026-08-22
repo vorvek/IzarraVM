@@ -3024,6 +3024,13 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_callout_port_v86_served": snapshot.callout_port_v86_served,
         "jit_direct_callout_interpret_one_executed": snapshot.callout_interpret_one_executed,
         "jit_direct_callout_interpret_one_resync": snapshot.callout_interpret_one_resync,
+        // The price of the PREFIX half of the segment mask: resyncs the suffix-only rule would
+        // have carried. A subset of the resync count above, not a separate lane.
+        "jit_direct_callout_interpret_one_resume_refused_prefix_use":
+            snapshot.callout_interpret_one_resume_refused_prefix_use,
+        // Which arm of the knob this run compiled under. Reported so a ladder leg cannot be read
+        // as the arm it named while having run the other one.
+        "jit_direct_callout_segment_resume": snapshot.callout_segment_resume_enabled,
         "jit_direct_callout_interpret_one_resync_fault": snapshot.callout_interpret_one_resync_fault,
         "jit_direct_callout_interpret_one_abnormal": snapshot.callout_interpret_one_abnormal,
         "jit_direct_callout_interpret_one_demoted": snapshot.callout_interpret_one_demoted,
@@ -3041,6 +3048,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
                     "resync": counts.resync,
                     "resync_fault": counts.resync_fault,
                     "demoted": counts.demoted,
+                    "resume_refused_prefix_use": counts.resume_refused_prefix_use,
                 })
             })
             .collect::<Vec<_>>(),

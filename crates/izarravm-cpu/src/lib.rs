@@ -1904,6 +1904,8 @@ pub struct InterpretOneRowCounts {
     pub resync: u64,
     pub resync_fault: u64,
     pub demoted: u64,
+    /// The subset of `resync` the suffix-only segment mask would have carried.
+    pub resume_refused_prefix_use: u64,
 }
 
 /// One compile-walk retry cause, named by its census label.
@@ -1962,6 +1964,13 @@ pub struct DirectStallSnapshot {
     /// The `InterpretOne` call-out family; see `DirectStallTally` for what each one denominates.
     pub callout_interpret_one_executed: u64,
     pub callout_interpret_one_resync: u64,
+    /// The subset of `callout_interpret_one_resync` that the SUFFIX-only segment mask would have
+    /// carried: the price of including the block's PREFIX in R2's mask. See the tally field.
+    pub callout_interpret_one_resume_refused_prefix_use: u64,
+    /// Which arm of `IZARRAVM_CALLOUT_SEGMENT_RESUME` this run compiled under. Reported so a
+    /// ladder leg cannot be read as the arm it named while having run the other one, which is the
+    /// trap every default-ON knob in this backend has already sprung once.
+    pub callout_segment_resume_enabled: bool,
     pub callout_interpret_one_resync_fault: u64,
     pub callout_interpret_one_abnormal: u64,
     pub callout_interpret_one_demoted: u64,
