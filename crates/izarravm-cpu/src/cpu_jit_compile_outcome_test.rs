@@ -3505,7 +3505,7 @@ fn barrier_census_closure_counts_rejected_exits_the_map_cannot_attribute() {
     cpu.jit_direct
         .note_unbound_target(jit::direct::UnboundTarget::Rejected, ENTRY, None);
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::Rejected, UNMAPPED);
+        .note_unbound_target(jit::direct::UnboundTarget::Rejected, UNMAPPED, None);
     cpu.jit_direct
         .note_dynamic_miss_target(jit::direct::UnboundTarget::Rejected, ENTRY);
     cpu.jit_direct
@@ -3599,7 +3599,7 @@ fn barrier_census_closure_totals_match_the_class_arrays_and_the_perf_counters() 
         jit::direct::UnboundTarget::Seen,
         jit::direct::UnboundTarget::Seen,
     ] {
-        cpu.jit_direct.note_unbound_target(kind, ENTRY);
+        cpu.jit_direct.note_unbound_target(kind, ENTRY, None);
     }
     cpu.jit_direct
         .note_dynamic_miss_target(jit::direct::UnboundTarget::Compiled, ENTRY);
@@ -3653,14 +3653,14 @@ fn barrier_census_closure_dormant_heat_histogram_closes_on_its_class() {
     // rather than by class.
     for _ in 0..5 {
         cpu.jit_direct
-            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY, None);
     }
     for _ in 0..2 {
         cpu.jit_direct
-            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x40);
+            .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x40, None);
     }
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80, None);
     for _ in 0..3 {
         cpu.jit_direct
             .note_dynamic_miss_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
@@ -3668,7 +3668,7 @@ fn barrier_census_closure_dormant_heat_histogram_closes_on_its_class() {
     cpu.jit_direct
         .note_dynamic_miss_target(jit::direct::UnboundTarget::DormantHeat, ENTRY + 0x80);
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantOther, ENTRY + 0xc0);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantOther, ENTRY + 0xc0, None);
 
     let snapshot = cpu
         .direct_barrier_census_snapshot()
@@ -3745,6 +3745,7 @@ fn barrier_census_closure_dormant_heat_histogram_carries_its_truncated_tail() {
             cpu.jit_direct.note_unbound_target(
                 jit::direct::UnboundTarget::DormantHeat,
                 ENTRY + (index as u32) * 0x10,
+                None,
             );
         }
     }
@@ -3815,9 +3816,9 @@ fn barrier_census_closure_dormant_heat_site_reports_whether_a_walk_ever_reached_
 
     const NEVER_WALKED: u32 = ENTRY + 0x4000;
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, ENTRY, None);
     cpu.jit_direct
-        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, NEVER_WALKED);
+        .note_unbound_target(jit::direct::UnboundTarget::DormantHeat, NEVER_WALKED, None);
 
     let snapshot = cpu
         .direct_barrier_census_snapshot()

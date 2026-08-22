@@ -567,7 +567,10 @@ impl CpuGsw {
                 if let Some(before) = before {
                     self.note_ss_load_record(before);
                 }
-                Ok(clocks(7))
+                // NAMED, because `POP_SS_CORE_CLOCKS` is what the block budget bound
+                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) folds for this row: a literal here and a
+                // constant there are two numbers that can drift apart silently.
+                Ok(clocks(POP_SS_CORE_CLOCKS))
             }
             0x1e => {
                 // PUSH DS. Same 386 PRM operand-size rule as PUSH ES above.

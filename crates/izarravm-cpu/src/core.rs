@@ -1532,7 +1532,10 @@ impl CpuGsw {
         if dynamic {
             self.jit_direct.note_dynamic_miss_target(kind, linear);
         } else {
-            self.jit_direct.note_unbound_target(kind, linear);
+            // No key: this seam names a class and an address, and the per-cause split of
+            // `dormant_other` is about a key the caller does not have. It reads as zero here,
+            // which is the honest answer for a synthesised exit.
+            self.jit_direct.note_unbound_target(kind, linear, None);
         }
     }
 

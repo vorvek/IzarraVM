@@ -5079,6 +5079,12 @@ fn interpret_one_protected_mode_ss_faults_take_the_fault_stub() {
     for (label, selector) in [
         ("#GP bad selector", SEL_BAD),
         ("#SS not present", SEL_NOT_PRESENT),
+        // The NULL selector, which is the third vector and the one that is a rule rather than a
+        // table lookup: `load_protected_segment` short-circuits index 0 into a legal unusable
+        // segment for ES/DS/FS/GS and carves SS out of that with CS, so SS gets #GP(0) where every
+        // data segment would have been loaded without a fault. It reaches the same fault stub with
+        // the code-write window open, and the two legs agree on the delivery.
+        ("#GP null selector", 0x0000),
     ] {
         let mut legs = run_both_protected_program(
             PROTECTED_MOV_SS,
@@ -5128,7 +5134,10 @@ fn interpret_one_protected_mode_ss_faults_take_the_fault_stub() {
 /// interpreter.
 ///
 /// MUTATION: move the latch back below the `if !resume` return and this fails on
-/// `interrupt_shadow`, and the boundary's `debug_assert` on the arm count fires as well.
+/// `interrupt_shadow`; in a debug build the boundary's `debug_assert` on the arm count fires
+/// first, because the stamp is guarded by the SAME predicate as the latch and so still moves for
+/// the second slot. Guarded on "this step armed it" instead -- which is how it was written first
+/// -- the stamp went missing along with the latch and the assertion agreed with itself.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -5268,6 +5277,12 @@ fn a_call_out_behind_an_arming_slot_still_resumes() {
 /// `can_take_interrupt` false before it starts, so the break fires from the ordinary transition
 /// test and the fixture would pass with the fold deleted.
 ///
+/// The `mov ss, cx` leg is the same claim without the flag write: that row changes no flag at all,
+/// so IF is set before the block and set after it, and the consumed-shadow fold is the only thing
+/// in the loop that can make the transition test fire. Nothing is pending on either leg -- the
+/// break is about the TRANSITION and never consults the bus, which is the half of the finding the
+/// old comment at this site had backwards.
+///
 /// MUTATION: delete the `take_interrupt_shadow_consumed` fold and the native leg reports zero
 /// against the interpreter's one.
 #[cfg(all(
@@ -5304,26 +5319,34 @@ fn a_block_that_resumes_past_the_sti_breaks_the_run_where_the_interpreter_does()
         cpu.perf_counters().brk_interrupt - before
     }
 
-    let (code, starts) = row_program(&[0xFB]);
-    let mut program = vec![0u8; 0x2000];
-    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
-    seed_fault_handler(&mut program);
-    let mut interp_bus = sixteen_bit_bus(program);
-    let mut interp = sixteen_bit_code_cpu(ENTRY);
-    arm_fixture(&mut interp, &mut interp_bus);
-    let interpreted = breaks(interp, interp_bus, false);
-    assert_eq!(
-        interpreted, 1,
-        "the interpreted leg is the oracle and it must break once"
-    );
+    // BOTH arming shapes. STI is the row the finding was written against; `mov ss, cx` is the one
+    // that makes the fixture discriminating on its own terms, because it changes no flag at all --
+    // IF is already set at the entry and stays set, so the ONLY thing that can end the run at the
+    // block boundary is the consumed-shadow fold.
+    // The SS leg FIRST, so a failure names the discriminating one: it writes no flag, so the fold
+    // is the only thing in the loop that can end the run at the block boundary.
+    for (label, row) in [("mov ss,cx", &[0x8Eu8, 0xD1][..]), ("sti", &[0xFB])] {
+        let (code, starts) = row_program(row);
+        let mut program = vec![0u8; 0x2000];
+        program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        seed_fault_handler(&mut program);
+        let mut interp_bus = sixteen_bit_bus(program);
+        let mut interp = sixteen_bit_code_cpu(ENTRY);
+        arm_fixture(&mut interp, &mut interp_bus);
+        let interpreted = breaks(interp, interp_bus, false);
+        assert_eq!(
+            interpreted, 1,
+            "{label}: the interpreted leg is the oracle and it must break once"
+        );
 
-    let (mut native, mut native_bus, _) = build_native(&code, &starts);
-    arm_fixture(&mut native, &mut native_bus);
-    let native_breaks = breaks(native, native_bus, true);
-    assert_eq!(
-        native_breaks, interpreted,
-        "the block must end the run at the same transition the interpreter breaks on"
-    );
+        let (mut native, mut native_bus, _) = build_native(&code, &starts);
+        arm_fixture(&mut native, &mut native_bus);
+        let native_breaks = breaks(native, native_bus, true);
+        assert_eq!(
+            native_breaks, interpreted,
+            "{label}: the block must end the run at the same transition the interpreter breaks on"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

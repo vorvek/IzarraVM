@@ -1345,20 +1345,25 @@ pub(crate) struct ResumeSnapshot {
     /// carries the six arithmetic bits and nothing else.
     interrupt_enable: bool,
     virtual_mode: bool,
-    /// The shadow as it stood when the BLOCK was entered, read from the block cache rather than
-    /// from the live CPU.
+    /// The shadow as it stood when the native RUN was entered, read from the block cache rather
+    /// than from the live CPU.
     ///
-    /// R3 refuses an entry shadow unconditionally, for every row: a block entered with a reprieve
+    /// R3 refuses a run-entry shadow unconditionally, for every row: a run entered with a reprieve
     /// already owed has one it did not earn. The dispatcher does not hand out blocks in that state
     /// (`run_direct_block` refuses on `interrupt_shadow`), so the clause costs nothing and does
     /// not depend on that refusal staying put, which is design review 10.1 B3.
     ///
-    /// PER BLOCK ENTRY and not per slot, and the difference is the whole of review finding F2.
-    /// Read live, this field would be true for every call-out slot BEHIND an arming one -- the
-    /// helper does not clear the shadow and no native slot consumes it -- so `sti; pop word [bx]`
-    /// would resync at the POP, and three of those in the governor's first eight executions would
-    /// demote a slot that did nothing wrong. The question the clause asks is about the block's
-    /// entry, and the block's entry is where it is now answered.
+    /// PER RUN and not per slot, and the difference is the whole of review finding F2. Read live,
+    /// this field would be true for every call-out slot BEHIND an arming one -- the helper does
+    /// not clear the shadow and no native slot consumes it -- so `sti; pop word [bx]` would resync
+    /// at the POP, and three of those in the governor's first eight executions would demote a slot
+    /// that did nothing wrong.
+    ///
+    /// PER RUN rather than per BLOCK, precisely: `run_direct_block` publishes it once before the
+    /// native entry and clears it after the return, and a CHAINED successor is entered without
+    /// coming back here, so it inherits the head block's value. That is the right scope rather
+    /// than an approximation of a narrower one -- the question is whether the reprieve the run
+    /// began with has been spent, and a chained transfer does not spend it.
     block_entry_shadow: bool,
     /// The shadow as it stood before THIS step, which is what turns "the flag is set" into "this
     /// step set it". Only an arming row may leave a step-armed shadow behind; a shadow an earlier
@@ -1813,7 +1818,16 @@ fn interpret_one_step<B: CpuBus>(
     // `cpu.registers.eip` rather than `end_eip`: the resume path restores the entry value a few
     // lines below and the resync path leaves EIP exactly where the interpreter put it, which is
     // not necessarily `start_eip + len` for every row this list may grow to hold.
-    if cpu.interrupt_shadow && !snapshot.shadow_before_step {
+    // The stamp and the latch take the SAME predicate, deliberately, and it is not the one that
+    // stood here first. Guarding the stamp on "this step armed it" (`!shadow_before_step`) left a
+    // SECOND arming slot in the same run rewriting the latch without moving the stamp, so the
+    // boundary's equality held on exactly the F1 shape it was added to catch.
+    //
+    // Two statements rather than one, and that is the whole of the guard's value: a future edit
+    // that re-narrows the latch to one status leaves the stamp on every arming step, and the
+    // boundary then finds a count it does not recognise instead of comparing against a stale
+    // address.
+    if cpu.interrupt_shadow && cell.row().arms_interrupt_shadow() {
         cpu.jit_direct.note_interrupt_shadow_arm();
     }
     if cpu.interrupt_shadow && cell.row().arms_interrupt_shadow() {

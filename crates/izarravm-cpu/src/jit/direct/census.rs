@@ -807,7 +807,10 @@ impl DormantReason {
 /// three separate `record_structural_barrier` arms share `SpanUnformable` because what they have
 /// in common (the walk found a real barrier but could not name a span for it) is the whole
 /// content of the answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Hash` because `BlockCache::retry_lift_spent` is a set of `(BlockKey, RetryCause)` pairs: one
+/// lift per key PER CAUSE, which a map from key to cause could not express -- it remembered only
+/// the last one, and a key alternating two clearable causes lifted for ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RetryCause {
     /// `key_for` could not canonicalize the entry: no translation, or a key the cache cannot
     /// form. Clearable.

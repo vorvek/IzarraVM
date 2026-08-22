@@ -3805,11 +3805,13 @@ fn a_deterministic_retry_cause_is_never_lifted() {
 /// `note_demoted_callout_site` exists to avoid one level down.
 ///
 /// A DIFFERENT cause is a different question and gets its own window, which is the boundary this
-/// also pins. It is bounded: each cause is spendable once, and each spend costs
-/// `RETRY_LIFT_VISITS` probes, so the worst case is one compile attempt per window rather than a
-/// loop.
+/// also pins -- and the THIRD leg is what makes the bound real: the key comes back to the first
+/// cause, and that is a repark too. `clearable_by_retry` names two causes, so a key can spend at
+/// most two lifts, and an alternating key runs out rather than looping. That leg fails against a
+/// per-key record, which remembers only the last cause.
 ///
-/// MUTATION: drop the `retry_lift_spent` read from `dormant` and the second window fires.
+/// MUTATION: drop the `retry_lift_spent` read from `dormant` and the second window fires; make it
+/// a `HashMap<BlockKey, RetryCause>` again and the third leg lifts for ever.
 #[cfg(any(
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")
@@ -3854,5 +3856,28 @@ fn a_lifted_key_that_reparks_with_the_same_cause_is_never_lifted_again() {
     );
     cache.set_dormant_visits_for_test(other, RETRY_LIFT_VISITS - 1);
     assert!(cache.lift_clearable_retry_dormant(other));
+    assert_eq!(cache.stall_snapshot().retry_lifts, 3);
+
+    // THE THIRD LEG, and the one the bound actually rests on: back to the FIRST cause. Both
+    // `DecodeMiss` and `TranslationMismatch` are clearable, so a key that alternates them was the
+    // one shape a per-key record could not stop -- it remembered only the last cause and was
+    // overwritten every time, which is a lift every window for ever. The record is a set of
+    // (key, cause) PAIRS, so this key has now spent both of the two causes there are.
+    cache.dormant(
+        other,
+        DormantReason::CompileRetry,
+        Some(RetryCause::DecodeMiss),
+    );
+    assert_eq!(
+        cache.stall_snapshot().retry_lift_reparks,
+        2,
+        "coming back to a cause it already spent IS a repark"
+    );
+    for _ in 0..(u32::from(RETRY_LIFT_VISITS) * 3) {
+        assert!(
+            !cache.lift_clearable_retry_dormant(other),
+            "an alternating key must run out of causes, not lift for ever"
+        );
+    }
     assert_eq!(cache.stall_snapshot().retry_lifts, 3);
 }

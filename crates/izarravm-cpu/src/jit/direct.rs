@@ -179,11 +179,12 @@ const DEMOTED_CALLOUT_SITE_CAP: usize = 4_096;
 /// compile time.
 pub(crate) const RETRY_LIFT_VISITS: u8 = 64;
 
-/// How many keys may hold a spent-lift record. The map grows by at most one entry per lift and a
-/// lift needs `RETRY_LIFT_VISITS` probes, so this is far above what any measured workload reaches
-/// (the loader parks 466 keys in total). Full means no further key is lifted, which fails closed
-/// to the pre-slice behaviour rather than to an eviction policy that could hand one key an endless
-/// supply of lifts.
+/// How many spent-lift records the set may hold. It grows by at most one entry per lift, a lift
+/// needs `RETRY_LIFT_VISITS` probes, and a key can contribute at most one entry per clearable
+/// cause (two), so this is far above what any measured workload reaches -- the loader parks 466
+/// keys in total. Full means no further key is lifted, which fails closed to the pre-slice
+/// behaviour rather than to an eviction policy that could hand one key an endless supply of
+/// lifts.
 const RETRY_LIFT_SPENT_CAP: usize = 4_096;
 
 /// Untried entries a call-out block may spend at trial quota before the governor gives up on
@@ -872,6 +873,11 @@ pub(crate) struct BlockCache {
     /// value this counter had when it was written, and the boundary asserts the two agree, which
     /// is the invariant review finding F1 broke: a latch from an EARLIER arming slot than the last
     /// one is exactly the state in which the boundary clears a shadow it should have left alone.
+    ///
+    /// The stamp and the latch take the SAME predicate at the one site that writes them
+    /// (`interpret_one_step`), and that is load-bearing rather than tidy. Stamped on "this step
+    /// armed it" instead, a second arming slot rewrote the latch without moving the count and the
+    /// assertion held on exactly the shape it exists for.
     interrupt_shadow_arms: u32,
     /// `interrupt_shadow` as it stood when the running block was ENTERED, published here for
     /// `ResumeSnapshot::capture` and cleared after the native return.
@@ -884,12 +890,18 @@ pub(crate) struct BlockCache {
     /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
     /// beside `can_take_before`.
     interrupt_shadow_consumed: bool,
-    /// Keys that have already spent a retry lift, and the cause they spent it on.
+    /// Every (key, cause) pair that has already spent a retry lift.
     ///
     /// Read by `dormant` to mark a same-cause re-park PERMANENT, which is what stops a key that
     /// the walk refuses deterministically-but-for-a-clearable-looking-reason from buying a lift
     /// every `RETRY_LIFT_VISITS` probes for ever. Capped at `RETRY_LIFT_SPENT_CAP`.
-    retry_lift_spent: HashMap<BlockKey, RetryCause>,
+    ///
+    /// A SET OF PAIRS and not a map from key to cause. The map remembered only the LAST cause, so
+    /// a key alternating `DecodeMiss` and `TranslationMismatch` found its record overwritten every
+    /// time and lifted for ever -- the exact treadmill the rule exists to stop, reached by a key
+    /// whose two causes are both clearable. As a set the bound is what it says: at most one lift
+    /// per key per cause, and `clearable_by_retry` names two causes, so at most two lifts per key.
+    retry_lift_spent: HashSet<(BlockKey, RetryCause)>,
     /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
     lane_trial_override: Option<bool>,
@@ -1056,7 +1068,7 @@ impl BlockCache {
             top_mismatch_retires: HashMap::default(),
             demoted_callout_sites: HashSet::default(),
             callout_retire_pending: None,
-            retry_lift_spent: HashMap::default(),
+            retry_lift_spent: HashSet::default(),
             interrupt_shadow_armed_at: None,
             interrupt_shadow_arms: 0,
             block_entry_interrupt_shadow: false,
@@ -1465,7 +1477,7 @@ impl BlockCache {
             // answer is the evidence that re-walking does not help; without this the key would
             // buy another 64 visits and another compile for ever.
             let permanent =
-                retry_cause.is_some_and(|cause| self.retry_lift_spent.get(&key) == Some(&cause));
+                retry_cause.is_some_and(|cause| self.retry_lift_spent.contains(&(key, cause)));
             if permanent {
                 self.stalls.retry_lift_reparks += 1;
             }
@@ -1525,7 +1537,7 @@ impl BlockCache {
         if self.retry_lift_spent.len() >= RETRY_LIFT_SPENT_CAP {
             return false;
         }
-        self.retry_lift_spent.insert(key, cause);
+        self.retry_lift_spent.insert((key, cause));
         self.entries.insert(key, BlockState::Seen);
         self.stalls.retry_lifts += 1;
         true
