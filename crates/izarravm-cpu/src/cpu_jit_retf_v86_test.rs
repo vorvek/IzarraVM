@@ -1575,3 +1575,77 @@ fn a_fault_on_the_second_far_pop_leaves_the_instruction_unstarted() {
     );
     jit::direct::set_direct_retf_v86_for_test(None);
 }
+
+/// The CS record's ACCESS and `default_size_32` fields, made observable.
+///
+/// A mutation that deleted the access / `default_size_32` store SURVIVED every fixture above, for
+/// exactly the reason `cpu_jit_v86_loop_rows_test.rs` records for its own segment rows: both roles
+/// start from a descriptor that is ALREADY real, so "write 0x93 and false" and "write nothing"
+/// produce the same bytes. Nothing was fixed by adding an assertion; what closes it is changing
+/// the STATE the assertions run against.
+///
+/// The stale descriptor is an UNREAL CS -- a code-segment access byte, `default_size_32` true and
+/// a 4 GB limit -- which is what a real machine's CS cache holds after a protected-mode excursion
+/// that returned through a real-mode far transfer. The interpreter's `load_segment_real` writes
+/// the whole record unconditionally, so the far return must canonicalise all of it.
+///
+/// Catches: M3, and it is the only fixture here that can.
+#[test]
+fn a_far_return_canonicalises_a_stale_cs_descriptor() {
+    select_retf(jit::direct::RetfArm::On);
+    // The stale record has to be live BEFORE the compile, not after it: the block bakes its CS
+    // snapshot and `cs_matches` refuses an entry whose live record differs, so a CPU poisoned
+    // after the fact never enters the block at all and the fixture would test the refusal.
+    fn stale_cs_cpu() -> CpuGsw {
+        let mut cpu = real_cpu();
+        let mut stale = cpu.registers.cs();
+        stale.access = 0x9b;
+        stale.limit = 0xffff_ffff;
+        // `default_size_32` is deliberately NOT poisoned: it IS CS.D, so setting it makes the
+        // block a 32-bit one and the fixture would compile at the wrong width. The emitter writes
+        // it with the access byte in one 16-bit store, so poisoning the access byte alone is
+        // enough to make that store observable.
+        cpu.registers.set_segment(SegmentIndex::Cs, stale);
+        cpu
+    }
+    let mut roles = build(
+        stale_cs_cpu,
+        &retf(None),
+        TARGET_SELECTOR,
+        TARGET_OFFSET,
+        STACK_ESP,
+    );
+    let before = roles.native.perf_counters().jit_direct_insns;
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - before,
+        FILL.len() as u64 + 1,
+        "every slot including the RETF must retire natively"
+    );
+    for _ in 0..=FILL.len() {
+        roles.interp.cycle(&mut roles.interp_bus).unwrap();
+    }
+    compare_state(&roles, "far return over a stale CS descriptor");
+    assert_eq!(
+        roles.native.registers.cs().access,
+        0x93,
+        "the access byte must be canonicalised, not inherited"
+    );
+    assert!(
+        !roles.native.registers.cs().default_size_32,
+        "and so must default_size_32, which rides the same 16-bit store"
+    );
+    assert_eq!(
+        roles.native.registers.cs().limit,
+        0xffff,
+        "and the limit, which is why the limit store is kept even though it is provably \
+         redundant on a machine that never left real mode"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
