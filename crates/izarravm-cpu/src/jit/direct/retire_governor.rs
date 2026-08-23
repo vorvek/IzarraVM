@@ -33,16 +33,25 @@ use crate::SegmentRegister;
 /// table and why unset must read as `Off`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SegmentRetireGovernor {
-    /// The shipped default: every data-segment reject retires its key, as `main` does. Nothing in
-    /// this file writes a map or reads a set on this arm, so an OFF leg is a reproduction of main
-    /// and not merely a close relative of one.
+    /// The ESCAPE, and the A/B base: every data-segment reject retires its key, as pre-slice
+    /// `main` did. Nothing in this file writes a map or reads a set on this arm, and
+    /// `run_direct_block` does not even build the two inputs the governor needs, so an OFF leg is
+    /// a reproduction of pre-slice `main` at this site and not merely a close relative of one.
+    /// Reached by `""`, `0` or `off` -- NOT by leaving the variable unset, which is `Cap`.
     Off,
-    /// Stage 1: the per-key retire cap. After the cap the entry still REFUSES (interprets), and
-    /// the block stays installed and specialized for whatever layout it froze on.
+    /// Stage 1, and **the shipped default since the 2026-08-23 ladder** (loader phase +27.1%,
+    /// lower95 1.263; duke3d-586 short +4.3%; every pin identical). The per-key retire cap: after
+    /// the cap the entry still REFUSES (interprets), and the block stays installed and specialized
+    /// for whatever layout it froze on.
     Cap,
     /// Stage 1 + stage 2: a suppressed reject that took the STRICT arm also cuts the key's
     /// outbound edges and marks the key link-declined, so the block drops to the check it would
     /// have had if it had never linked.
+    ///
+    /// OPT-IN, and it stays that way. It beats `Cap` on the loader (+28.8% against +27.1%) and
+    /// LOSES to it on duke (+3.5% against +4.3%) -- which is exactly the shape §5's refutation
+    /// criterion 2 pre-registered for stage 2, a declined key trading chaining for dispatcher
+    /// entries. Ship the arm that never loses; keep this one behind the knob.
     On,
 }
 

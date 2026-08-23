@@ -15,9 +15,15 @@
 //! new layout is the steady one. Under a record that alternates it never is, and the block
 //! recompiles forever while running natively never.
 //!
-//! Arms are forced through `set_segment_retire_governor_for_test`, which is per-thread, and every
-//! fixture that forces one holds an `ArmGuard` so a panicking assertion still restores the ambient
-//! reading for the next test on that thread.
+//! **The default arm is `cap` as of the 2026-08-23 ladder** (loader phase +27.1%, lower95 1.263;
+//! duke3d-586 short +4.3%). `off` is the escape and the A/B base; `on` is opt-in, because it beats
+//! `cap` on the loader and LOSES to it on duke. EVERY fixture in this file forces its arm
+//! explicitly through `set_segment_retire_governor_for_test` and none reads the ambient default,
+//! which is what kept the whole file valid across the flip -- a fixture that had relied on "unset
+//! means off" would have started measuring `cap` and passing for the wrong reason.
+//!
+//! The override is per-thread, and every fixture that forces an arm holds an `ArmGuard` so a
+//! panicking assertion still restores the ambient reading for the next test on that thread.
 
 use super::*;
 
@@ -295,8 +301,23 @@ fn data_segment_reject_still_refuses_after_the_retire_cap() {
     );
 }
 
-/// The OFF arm is `main`: it touches neither governor structure, and it pays for neither of the
-/// governor's two inputs.
+/// The OFF arm is pre-slice `main`: it touches neither governor structure, and it pays for neither
+/// of the governor's two inputs.
+///
+/// **This fixture got MORE load-bearing when the default flipped to `cap`, not less.** OFF is no
+/// longer what everybody runs by accident -- it is the ESCAPE and the A/B BASE, the leg every
+/// future ladder on this mechanism subtracts from. A base that has quietly acquired a map write or
+/// an extra six-descriptor compare is a base that hides the thing it is supposed to isolate, and
+/// nothing else in the suite would notice.
+///
+/// EMITTED CODE is untouched by every arm of this knob, and that is a property of WHERE the
+/// governor lives rather than something a fixture re-proves per arm: nothing in this slice is
+/// reachable from `jit/direct/emit*`, the governor is read only on the dispatcher's reject path,
+/// and the block bytes come out of the same compile walk on all three arms. What the arms change
+/// is WHICH blocks exist and for how long. The executable half of that claim is
+/// `section_two_refusal_fixtures_hold_on_every_governor_arm`, which runs the two shipped refusal
+/// fixtures -- both of which compare native execution against the interpreter instruction for
+/// instruction -- unmodified on all three arms.
 ///
 /// The first half is assertable directly -- the cap map and the declined set stay empty, and all
 /// three stall counters read zero, through more rejects than the cap would ever allow. The second
@@ -308,8 +329,8 @@ fn data_segment_reject_still_refuses_after_the_retire_cap() {
 /// routes the OFF arm through the governor after all, and this fixture is the one that would then
 /// trip it.
 ///
-/// The ARM SPLIT deliberately still counts here. It is the instrument the shipped-arm split has
-/// never been measured with, and the OFF leg is where it first reads.
+/// The ARM SPLIT deliberately still counts here. It is the instrument the shipped-arm split had
+/// never been measured with, and the OFF leg is where it reads.
 #[test]
 fn the_off_arm_touches_no_governor_state() {
     let _guard = force_arm(SegmentRetireGovernor::Off);
@@ -342,7 +363,16 @@ fn the_off_arm_touches_no_governor_state() {
     assert_eq!(
         cpu.perf_counters().jit_direct_reject_data_segment,
         u64::from(turns),
-        "and every reject still retires, so this is main's treadmill unchanged"
+        "and every reject still retires, so this is pre-slice main's treadmill unchanged"
+    );
+    // The counter-identity half, stated as the identity rather than as a list: on the OFF arm the
+    // key leaves `Compiled` after EVERY reject. That is what "every reject retires" means, and it
+    // is the single fact that separates this arm from the shipped `cap` one.
+    assert!(
+        !cpu.jit_direct
+            .direct
+            .key_is_compiled_for_test(key_at(&cpu, ENTRY)),
+        "the last reject must have retired the key: on the OFF arm nothing is ever suppressed"
     );
 }
 
@@ -902,11 +932,16 @@ fn data_segment_retire_map_is_empty_when_entries_is() {
     assert!(cpu.jit_direct.direct.data_segment_state_is_empty());
 }
 
-/// FIXTURE 9. The knob's spelling table, both directions.
+/// FIXTURE 9. The knob's spelling table, both directions, with **unset and `""` on DIFFERENT
+/// arms**.
 ///
-/// Kills a silently inert ladder leg. Mirrors `parse_retry_lift_arm_for_test`: unset and the empty
-/// string are OFF (the PowerShell nulling trap), `cap` is stage 1, `1` and `on` are both stages,
-/// and case and surrounding whitespace do not matter.
+/// Kills a silently inert ladder leg, and one thing more since the 2026-08-23 ladder flipped the
+/// default to `cap`: the nulling trap is INVERTED for this knob. Everywhere else in `env_gates.rs`
+/// unset means OFF and `env-null-empty-is-off-trap` bites the ON leg. Here unset means `cap` and
+/// `""` means OFF, so PowerShell's `SetEnvironmentVariable($null)` DISARMS the shipped default
+/// instead of failing to arm an opt-in one. The two cases are asserted apart, deliberately, with
+/// that in the message: collapsing them is the mutation that would make a "default" leg silently
+/// measure the escape.
 #[test]
 fn segment_retire_governor_knob_spellings() {
     let parse =
@@ -915,10 +950,16 @@ fn segment_retire_governor_knob_spellings() {
         jit::direct::parse_segment_retire_governor_arm_for_test(Err(
             std::env::VarError::NotPresent
         )),
-        SegmentRetireGovernor::Off,
-        "unset must be OFF, or an ON leg that merely nulls the variable measures the default"
+        SegmentRetireGovernor::Cap,
+        "UNSET is the shipped default `cap` since the 2026-08-23 ladder"
     );
-    for raw in ["", "0", "off", "OFF", "  off  "] {
+    assert_eq!(
+        parse(""),
+        SegmentRetireGovernor::Off,
+        "and the EMPTY STRING is the escape, NOT the default: a leg that nulls this variable is \
+         measuring `off`, which is the one place this knob's nulling trap runs backwards"
+    );
+    for raw in ["0", "off", "OFF", "  off  "] {
         assert_eq!(parse(raw), SegmentRetireGovernor::Off, "{raw:?}");
     }
     for raw in ["cap", "CAP", " cap "] {
@@ -930,7 +971,9 @@ fn segment_retire_governor_knob_spellings() {
 }
 
 /// The other direction: a spelling the table does not name must PANIC rather than fall back to the
-/// default, which would run a ladder leg as OFF while its report named an arm.
+/// default. That got worse, not better, when the default became an ARMED arm: a typo used to run
+/// a leg as `off` while its report named an arm, and now it runs the leg as `cap` while its report
+/// names `on` -- a wrong number that looks like a plausible one.
 #[test]
 #[should_panic(expected = "names no arm")]
 fn segment_retire_governor_refuses_an_unknown_spelling() {

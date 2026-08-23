@@ -1459,21 +1459,47 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
 
 /// Which arm of the data-segment reject governor this process runs.
 ///
-/// **DEFAULT OFF.** Unset, `""`, `0` or `off` all give today's behaviour: every data-segment
-/// reject retires its key for a fresh re-specialization. `cap` arms stage 1 (the per-key retire
-/// cap, `DATA_SEGMENT_RETIRE_CAP`); `1` or `on` arms stage 1 and stage 2 (the cap plus the link
-/// decline). Three arms rather than a bool so the ladder can isolate stage 2 — stage 1 alone is
-/// the only ordering that can clear the pre-registered compile-attempt bar, and stage 2 is what
-/// recovers the native coverage stage 1 freezes out on strict-arm keys.
+/// **DEFAULT `cap` SINCE THE 2026-08-23 LADDER.** The spelling table, and note that unset and the
+/// EMPTY STRING are deliberately NOT the same arm:
 ///
-/// WHY IT SHIPS DISABLED. It is a measured slice with no measurement yet: the design's bars are
-/// pre-registered and unread, and a governor that stops a re-specialization is exactly the class
-/// of lever that can look free on counters while costing wall through lost chaining. The OFF arm
-/// touches no map and reads no set, so an OFF leg is a reproduction of `main` and not merely a
-/// close relative of one — which is what makes the A/A pre-bar readable.
+/// | spelling | arm |
+/// |---|---|
+/// | **unset** | **`cap`** — the shipped default: the per-key retire cap (`DATA_SEGMENT_RETIRE_CAP`) |
+/// | `""`, `0`, `off` | `Off` — pre-slice behaviour, every data-segment reject retires its key |
+/// | `cap` | `Cap`, stated explicitly; identical to unset |
+/// | `1`, `on` | `On` — the cap PLUS the stage 2 link decline |
+/// | anything else | panics |
 ///
-/// Unset = OFF, so an armed leg must EXPORT the value. `env-null-empty-is-off-trap`: PowerShell's
-/// `SetEnvironmentVariable($null)` leaves `""` behind, which reads as OFF here on purpose.
+/// WHY IT SHIPS ARMED. The pre-registered ladder on `2d126c5e`, one binary, ABBA interleaved:
+/// **tombraid loader phase `cap` +27.1% (lower95 1.263), `on` +28.8%; duke3d-586 short `cap`
+/// +4.3%, `on` +3.5%**, every pin identical on every leg. The mechanism is not subtle -- the
+/// loader was paying 0.94 s of a 7.09 s phase to recompile blocks it then refused to run, 97.9%
+/// of its compile attempts, and the cap takes `jit_direct_compile_attempts` from 314,318 to 9,695.
+///
+/// WHY `on` IS **NOT** THE DEFAULT even though it wins the loader by 1.7 points more. It LOSES to
+/// `cap` on duke (+3.5% against +4.3%), which is the shape the design predicted for it (a declined
+/// key trades chaining for dispatcher entries) and is the refutation criterion §5 wrote down for
+/// stage 2 in advance. Two fixtures disagreeing is a reason to ship the arm that never loses and
+/// keep the other behind the knob, not a reason to average them. `on` stays OPT-IN.
+///
+/// WHAT `cap` COSTS, stated because it is not free. Corpus, OFF against `cap`: doom +0.6%,
+/// quake -1.3%, wolf3d -1.2%, tombraid +2.7%. The two dips are the residual §3(c) named: a key
+/// that is frozen on one layout INTERPRETS every entry that carries another, forever, where the
+/// pre-slice retire would have re-specialized it and run. On a guest whose record settles after a
+/// few moves the retire was the right bet and the cap now refuses to take it. The answer is not a
+/// bigger cap -- it is slice (a), per-layout block VARIANTS, whose go/no-go census this slice
+/// ships and whose `cap`-leg reading is in the design's §R rev 5.
+///
+/// THE ESCAPE, AND THE A/B BASE, IS NOW `off`. It touches no map, reads no set, and does not even
+/// build the governor's two inputs (`run_direct_block` tests this knob before it builds them), so
+/// an OFF leg is a reproduction of pre-slice `main` at this site rather than a close relative of
+/// one. `the_off_arm_touches_no_governor_state` pins that.
+///
+/// **THE NULLING TRAP IS INVERTED HERE, AND IT MATTERS.** Everywhere else in this file unset means
+/// OFF, so `env-null-empty-is-off-trap` bites the ON leg. Here unset means `cap`, and `""` means
+/// OFF -- so PowerShell's `SetEnvironmentVariable($null)`, which leaves `""` behind, silently
+/// DISARMS the shipped default. A leg that means to measure the default must leave the variable
+/// genuinely unset or EXPORT `cap`; a leg that nulls it is measuring the escape.
 pub(crate) fn segment_retire_governor() -> super::SegmentRetireGovernor {
     #[cfg(test)]
     if let Some(forced) = SEGMENT_RETIRE_GOVERNOR_OVERRIDE.with(std::cell::Cell::get) {
@@ -1491,13 +1517,15 @@ fn parse_segment_retire_governor_arm(
 ) -> super::SegmentRetireGovernor {
     use super::SegmentRetireGovernor;
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return SegmentRetireGovernor::Off,
+        // UNSET IS `cap`, and `""` below is OFF. The two are deliberately different arms: see the
+        // inverted nulling trap in `segment_retire_governor`'s doc.
+        Err(std::env::VarError::NotPresent) => return SegmentRetireGovernor::Cap,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_SEGMENT_RETIRE_GOVERNOR is set to a value that is not valid UTF-8; \
-                 accepted spellings are unset, `0` or `off` (the shipped default: every \
-                 data-segment reject retires), `cap` (the per-key retire cap alone) and `1` or \
-                 `on` (the cap plus the link decline)"
+                 accepted spellings are unset or `cap` (the shipped default: the per-key retire \
+                 cap), `\"\"`, `0` or `off` (the escape: every data-segment reject retires, as \
+                 before the slice) and `1` or `on` (the cap plus the link decline)"
             )
         }
         Ok(raw) => raw,
@@ -1508,10 +1536,10 @@ fn parse_segment_retire_governor_arm(
         "1" | "on" => SegmentRetireGovernor::On,
         other => panic!(
             "IZARRAVM_SEGMENT_RETIRE_GOVERNOR={other:?} names no arm; accepted spellings are \
-             unset, `0` or `off` (the shipped default), `cap` (stage 1, the per-key retire cap) \
-             and `1` or `on` (stage 1 plus the link decline). \
-             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
-             as the arm it named doing nothing"
+             unset or `cap` (the shipped default, stage 1's per-key retire cap), `\"\"`, `0` or \
+             `off` (the escape and the A/B base) and `1` or `on` (stage 1 plus the link decline). \
+             Refusing to guess: a mistyped leg would silently run the DEFAULT, which is now an \
+             ARMED arm, and be read as the arm it named doing nothing"
         ),
     }
 }
