@@ -97,10 +97,14 @@ pub(crate) struct DataSegmentRetireRecord {
     /// A 32-bit FNV-1a fold of the masked descriptors rather than the raw 24-byte tuple the
     /// design named. The reason is the memory bound: this map's key set is contained in
     /// `entries`, whose cap is `DEFAULT_ENTRY_CAP` (131,072), and eight raw tuples per key would
-    /// be 25 MB of worst case for a census. Eight `u32` is 4.7 MB of the same worst case. A
-    /// collision UNDER-reports the distinct count; at eight samples in a 2^32 space that is about
-    /// one run in 10^8, and it is reported as a fold rather than as an exact tuple count so
-    /// nobody grades a variant slice on it believing otherwise.
+    /// be 25 MB of worst case for a census. Eight `u32` is 4.7 MB of the same worst case.
+    ///
+    /// A collision UNDER-reports the distinct count, and the rate is stated per RUN rather than
+    /// per key, because per-run is the number a reader of the histogram actually needs. Eight
+    /// samples in a 2^32 space is 28 pairs, so ~6.5e-9 per key -- but the loader carries ~14,205
+    /// keys, which is **~1e-4 that some key in a run under-reports by one**, not the ~1e-8 the
+    /// per-key figure invites. Small enough to grade a go/no-go on, large enough that this is a
+    /// fold and not a tuple count.
     layouts: [u32; DATA_SEGMENT_LAYOUT_CENSUS_CAP],
 }
 
@@ -189,8 +193,17 @@ impl BlockCache {
         live: &[SegmentRegister; 6],
     ) -> bool {
         let governor = segment_retire_governor();
+        // The caller has already tested this and taken `retire_key_for_recompile` directly on the
+        // OFF arm, so that it never builds the two inputs this function needs. The test is
+        // repeated here because a second production caller must not be able to acquire the
+        // governor by accident, and the fallback is kept rather than made a hard panic because
+        // being wrong here costs a re-specialization, not correctness.
+        debug_assert!(
+            governor.cap_armed(),
+            "the OFF arm reaches `retire_key_for_recompile` directly, without paying for the \
+             governor's inputs",
+        );
         if !governor.cap_armed() {
-            // The OFF arm is `main`, statement for statement: no map is touched, no set is read.
             return self.retire_key_for_recompile(watch, key);
         }
         let Some(BlockState::Compiled(id)) = self.entries.get(&key).copied() else {
@@ -316,8 +329,19 @@ impl BlockCache {
         self.data_segment_retires.is_empty() && self.data_segment_link_declined.is_empty()
     }
 
-    /// The distinct-layout histogram over the keys the cap map currently holds, index = distinct
-    /// masked layouts seen, plus a saturation count in the last cell.
+    /// The distinct-layout histogram over the keys the cap map currently holds.
+    ///
+    /// A PARTITION, deliberately: cell `n` for `n` in `0..=8` counts keys that saw EXACTLY `n`
+    /// distinct masked layouts and stopped there, and the LAST cell counts keys whose census
+    /// SATURATED -- eight recorded and at least one more seen. A saturated key is counted ONLY in
+    /// the last cell. The first draft counted it in both, which made the cells sum to more than
+    /// the map's length and left "how many keys alternate between exactly two layouts" -- the one
+    /// question this census exists to answer -- unreadable without knowing that.
+    ///
+    /// READ IT OFF THE `cap` LEG. The fingerprint folds the REJECTING ARM'S MASK into itself, and
+    /// the `on` arm converts strict-arm keys into masked-arm ones part-way through a run, so a
+    /// key that rejected under both masks reports the union of two censuses as one number. The
+    /// `cap` leg leaves every key on the arm it started on.
     ///
     /// Read off the LIVE map rather than accumulated, so a key dropped by an invalidation takes
     /// its census with it. On a fixture whose `jit_direct_cache_resets` is 0 and whose loader
@@ -328,10 +352,12 @@ impl BlockCache {
     ) -> [u64; DATA_SEGMENT_LAYOUT_CENSUS_CAP + 2] {
         let mut histogram = [0u64; DATA_SEGMENT_LAYOUT_CENSUS_CAP + 2];
         for record in self.data_segment_retires.values() {
-            histogram[usize::from(record.distinct_layouts())] += 1;
-            if record.layouts_saturated() {
-                histogram[DATA_SEGMENT_LAYOUT_CENSUS_CAP + 1] += 1;
-            }
+            let cell = if record.layouts_saturated() {
+                DATA_SEGMENT_LAYOUT_CENSUS_CAP + 1
+            } else {
+                usize::from(record.distinct_layouts())
+            };
+            histogram[cell] += 1;
         }
         histogram
     }

@@ -295,6 +295,57 @@ fn data_segment_reject_still_refuses_after_the_retire_cap() {
     );
 }
 
+/// The OFF arm is `main`: it touches neither governor structure, and it pays for neither of the
+/// governor's two inputs.
+///
+/// The first half is assertable directly -- the cap map and the declined set stay empty, and all
+/// three stall counters read zero, through more rejects than the cap would ever allow. The second
+/// half is the reason `run_direct_block` tests the knob at the reject site rather than inside
+/// `retire_key_for_data_segment`: the second `data_matches` (a six-descriptor compare) and the
+/// 96-byte `live` copy are work `main` does not do, and building them above the branch would have
+/// charged every OFF leg for a governor it is not running. That is pinned from the other side, by
+/// the `debug_assert` at the top of `retire_key_for_data_segment` -- reachable only if some caller
+/// routes the OFF arm through the governor after all, and this fixture is the one that would then
+/// trip it.
+///
+/// The ARM SPLIT deliberately still counts here. It is the instrument the shipped-arm split has
+/// never been measured with, and the OFF leg is where it first reads.
+#[test]
+fn the_off_arm_touches_no_governor_state() {
+    let _guard = force_arm(SegmentRetireGovernor::Off);
+    let (mut cpu, mut bus) = masked_fixture();
+    let turns = u32::from(DATA_SEGMENT_RETIRE_CAP) + 5;
+    for turn in 0..turns {
+        assert!(
+            !masked_turn(&mut cpu, &mut bus, 0),
+            "turn {turn}: the refusal is ungoverned, so it fires on the OFF arm too"
+        );
+    }
+    assert!(
+        cpu.jit_direct.direct.data_segment_state_is_empty(),
+        "the OFF arm must write neither the cap map nor the declined set"
+    );
+    let stalls = cpu.jit_direct.stall_snapshot();
+    assert_eq!(stalls.data_segment_retires_suppressed, 0);
+    assert_eq!(stalls.data_segment_sticky_crossings, 0);
+    assert_eq!(stalls.data_segment_link_declines, 0);
+    assert_eq!(
+        stalls.data_segment_distinct_layouts,
+        [0; jit::direct::DATA_SEGMENT_LAYOUT_CENSUS_CAP + 2],
+        "and the census is empty with it"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment_masked,
+        u64::from(turns),
+        "the ARM SPLIT is not governed: the OFF leg is where it first reads"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment,
+        u64::from(turns),
+        "and every reject still retires, so this is main's treadmill unchanged"
+    );
+}
+
 /// FIXTURE 2. The capped block is not a dead block: it runs natively on the layout it froze on.
 ///
 /// Kills "a cap that also kills the block" -- a governor that stopped the recompile by leaving the
@@ -528,7 +579,8 @@ fn link_declined_block_is_never_relinked_and_is_never_re_parked() {
         cpu.jit_direct
             .direct
             .waiting_holds_source_for_test(parked_id),
-        "non-vacuity for the unpark half: the head's second successor slot never resolves, so it          must be PARKED at the moment the decline fires"
+        "non-vacuity for the unpark half: the head's second successor slot never resolves, \
+         so it must be PARKED at the moment the decline fires"
     );
     assert!(
         cpu.jit_direct.has_linked_successor(parked_id),
@@ -554,7 +606,8 @@ fn link_declined_block_is_never_relinked_and_is_never_re_parked() {
     };
     assert!(
         !cpu.jit_direct.direct.waiting_holds_source_for_test(head_id),
-        "the decline must also UNPARK the source: its second successor slot never resolves, so          without this every later install at that LinkTarget re-tries and re-refuses it"
+        "the decline must also UNPARK the source: its second successor slot never resolves, \
+         so without this every later install at that LinkTarget re-tries and re-refuses it"
     );
 
     let refused_before = refusal_count(&cpu, "declined");
@@ -1049,8 +1102,35 @@ fn governor_on_is_state_identical_to_the_interpreter_over_a_segment_moving_sweep
             native.registers.eflags, interp.registers.eflags,
             "round {round}"
         );
-        assert_eq!(native_bus.memory, interp_bus.memory, "round {round}");
+        assert_eq!(
+            native.registers.edx(),
+            interp.registers.edx(),
+            "round {round}: the ES read, which is the only value in this sweep a wrong baked base \
+             could corrupt"
+        );
+        // NOT a memory compare. Neither shape in this file writes a byte of guest memory, so
+        // `native_bus.memory == interp_bus.memory` is true for every implementation of everything
+        // and cannot fail. The register comparisons above are what carry the differential.
+
+        // The split identity, on a sweep that takes BOTH arms: `has_link` is the only thing
+        // separating the two counters, and this pins that neither one can be double-charged or
+        // dropped. Non-vacuous because the sweep starts at `HEAD_PRED` and at `ENTRY` at random
+        // and declines edges as it goes, so both arms are genuinely populated.
+        let perf = native.perf_counters();
+        assert_eq!(
+            perf.jit_direct_reject_data_segment_strict + perf.jit_direct_reject_data_segment_masked,
+            perf.jit_direct_reject_data_segment,
+            "round {round}: the arm split must partition the reject counter"
+        );
     }
+    let perf = native.perf_counters().clone();
+    assert!(
+        perf.jit_direct_reject_data_segment_strict > 0
+            && perf.jit_direct_reject_data_segment_masked > 0,
+        "non-vacuity for the split: the sweep must have taken BOTH arms, got strict={} masked={}",
+        perf.jit_direct_reject_data_segment_strict,
+        perf.jit_direct_reject_data_segment_masked
+    );
     assert!(
         native.perf_counters().jit_direct_insns > 0,
         "non-vacuity: the native side must actually have run guest code"

@@ -2409,14 +2409,25 @@ impl CpuGsw {
                 self.perf.jit_direct_reject_data_segment_masked += 1;
                 jit::direct::DataSegmentRejectArm::Masked
             };
-            // Only on the strict arm, and only on this cold path. It separates "rejected BECAUSE
-            // it is linked" -- the block's own masked check would have passed, so cutting its
-            // edges lets it run -- from "rejected on a record it uses itself", where cutting the
-            // edges buys nothing because the masked check refuses too.
-            let own_mask_matches = has_link && segments.data_matches(self);
-            let live = jit::direct::SEGMENT_ORDER.map(|segment| self.registers.segment(segment));
-            self.jit_direct
-                .retire_key_for_data_segment(span.key, arm, own_mask_matches, &live);
+            // The OFF arm takes main's statement, unchanged and unaugmented. Both governor
+            // inputs are built INSIDE this branch rather than above it: the second
+            // `data_matches` is a six-descriptor compare and `live` is a 96-byte copy, and
+            // neither is work `main` does at this site. The knob read is a `OnceLock` load, so
+            // an OFF leg pays one load and one branch here and nothing else -- which is what
+            // makes it a reproduction of `main` rather than a close relative of one.
+            if jit::direct::segment_retire_governor().cap_armed() {
+                // Only on the strict arm, and only on this cold path. It separates "rejected
+                // BECAUSE it is linked" -- the block's own masked check would have passed, so
+                // cutting its edges lets it run -- from "rejected on a record it uses itself",
+                // where cutting the edges buys nothing because the masked check refuses too.
+                let own_mask_matches = has_link && segments.data_matches(self);
+                let live =
+                    jit::direct::SEGMENT_ORDER.map(|segment| self.registers.segment(segment));
+                self.jit_direct
+                    .retire_key_for_data_segment(span.key, arm, own_mask_matches, &live);
+            } else {
+                self.jit_direct.retire_key_for_recompile(span.key);
+            }
             return Ok(DirectBlockOutcome::NotRun);
         }
         if block.has_wide_accesses() && self.alignment_armed && self.current_privilege_level() == 3
