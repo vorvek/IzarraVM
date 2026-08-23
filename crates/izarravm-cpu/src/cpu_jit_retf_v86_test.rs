@@ -1649,3 +1649,199 @@ fn a_far_return_canonicalises_a_stale_cs_descriptor() {
     );
     jit::direct::set_direct_retf_v86_for_test(None);
 }
+
+/// The bind-time fetch-limit compare is FAR-ONLY, and a near bind keeps main's exact refusal
+/// accounting (code review M-1).
+///
+/// The compare is outcome-inert for a near edge in the normal path -- `link_merge` refuses any
+/// near edge whose two chain layouts disagree on `cs`, and the compile walk's own limit test
+/// already bounds a linkable near target. It is NOT inert in ATTRIBUTION: ungated, the one case
+/// where it can fire (the two CS records differ) returns before `try_link_inner` is reached, and a
+/// refusal main counted as `link_refusals[SegmentLayout]` vanishes with no counter at all, because
+/// `far_link_refused_limit` is far-only.
+///
+/// The shape is F17's, one segment over and with a NEAR `ret`: the target block lives at linear
+/// 0x1000A and was compiled under CS 0x1000 at offset 0x000A, while the source runs under CS
+/// 0x0001 and returns to offset 0xFFFA -- the same linear, an offset near the wrap, and an
+/// eight-byte block that runs one byte past a 0xFFFF limit.
+///
+/// Catches: M25, the `if far` gate dropped.
+#[test]
+fn a_near_bind_past_the_segment_limit_still_refuses_through_try_link_inner() {
+    // The knob is irrelevant here and is forced OFF deliberately: this is an OFF-ARM property.
+    select_retf(jit::direct::RetfArm::Off);
+    const SOURCE_CS: u16 = 0x0001;
+    const TARGET_CS: u16 = 0x1000;
+    const RETURN_OFFSET: u16 = 0xfffa;
+    const NEAR_TARGET_LINEAR: u32 = 0x1_000a;
+
+    let source_lin = (u32::from(SOURCE_CS) << 4) + 0x00f0;
+    let mut memory = memory_fill();
+    let code = [filler(), vec![0xc3]].concat();
+    memory[source_lin as usize..source_lin as usize + code.len()].copy_from_slice(&code);
+    // Four two-byte fillers: an EIGHT-byte block, so 0xFFFA + 8 - 1 = 0x10001 is past the limit.
+    let target_code = [filler(), FILL[0].to_vec()].concat();
+    memory[NEAR_TARGET_LINEAR as usize..NEAR_TARGET_LINEAR as usize + target_code.len()]
+        .copy_from_slice(&target_code);
+    memory[(STACK_SP as usize)..(STACK_SP as usize) + 2]
+        .copy_from_slice(&RETURN_OFFSET.to_le_bytes());
+
+    let mut cpu = real_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.set_fast_map_enabled_for_test(true);
+    cpu.jit_direct.set_defer_short_for_test(false);
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
+        map_direct_page(&mut cpu, &mut bus, page);
+    }
+
+    // The target, under the CS it was compiled with.
+    cpu.load_segment_real(SegmentIndex::Cs, TARGET_CS);
+    let mut at = NEAR_TARGET_LINEAR;
+    while at < NEAR_TARGET_LINEAR + target_code.len() as u32 {
+        cpu.set_eip(at - (u32::from(TARGET_CS) << 4));
+        cpu.begin_instruction();
+        let d = cpu.fetch_decoded(&mut bus, at).expect("target decode");
+        at += u32::from(d.len);
+    }
+    cpu.set_eip(NEAR_TARGET_LINEAR - (u32::from(TARGET_CS) << 4));
+    let _ = install_at(&mut cpu, NEAR_TARGET_LINEAR);
+
+    // The source, under a DIFFERENT CS.
+    cpu.load_segment_real(SegmentIndex::Cs, SOURCE_CS);
+    let mut at = source_lin;
+    while at < source_lin + code.len() as u32 {
+        cpu.set_eip(at - (u32::from(SOURCE_CS) << 4));
+        cpu.begin_instruction();
+        let d = cpu.fetch_decoded(&mut bus, at).expect("source decode");
+        at += u32::from(d.len);
+    }
+    cpu.set_eip(source_lin - (u32::from(SOURCE_CS) << 4));
+    let source = install_at(&mut cpu, source_lin);
+    assert!(
+        source.dynamic_successor(),
+        "the source must be a near-RET terminal with a dynamic successor"
+    );
+
+    fn segment_layout_refusals(cpu: &CpuGsw) -> u64 {
+        cpu.direct_stall_snapshot()
+            .link_refusals
+            .iter()
+            .find(|(label, _)| *label == "segment_layout")
+            .map(|(_, count)| *count)
+            .expect("the SegmentLayout refusal row exists")
+    }
+
+    cpu.set_eip(source_lin - (u32::from(SOURCE_CS) << 4));
+    cpu.registers.set_esp(STACK_ESP);
+    cpu.halted = false;
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
+        map_direct_page(&mut cpu, &mut bus, page);
+    }
+    let before = segment_layout_refusals(&cpu);
+    let far_limit_before = cpu.direct_stall_snapshot().far_link_refused_limit;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, source).unwrap(),
+        "the near-RET source must run natively"
+    );
+    assert_eq!(
+        cpu.registers.eip,
+        u32::from(RETURN_OFFSET),
+        "the near return must have landed on the aliased offset, or the bind never resolved a \
+         target and this fixture cannot fail"
+    );
+    assert_eq!(
+        segment_layout_refusals(&cpu) - before,
+        1,
+        "the near bind must reach `try_link_inner` and be refused there as a SegmentLayout \
+         conflict, exactly as main counts it; an ungated fetch-limit compare swallows it silently"
+    );
+    assert_eq!(
+        cpu.direct_stall_snapshot().far_link_refused_limit,
+        far_limit_before,
+        "and the FAR-only limit counter must not move on a near bind"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// The barrier census's COUNTERFACTUAL SUFFIX SCAN mirrors the compile walk's RETF admission
+/// (code review M-2).
+///
+/// `census_native_suffix` exists to answer "how far would the walk have got past this barrier",
+/// and it does that by re-deciding admission itself rather than by watching the walk. The compile
+/// walk gained a third disjunct with this slice; the mirror had to gain it too. Without it the
+/// scan stops dead at every RETF on the ARMED arm while the walk carries on, so the
+/// counterfactual suffix is truncated for exactly the 274 M-execution population the slice
+/// creates -- and the armed and base censuses stop being comparable on the rows the ladder will
+/// be read against.
+///
+/// Guest-invisible and OFF-arm-inert, which is precisely why it needs a fixture: nothing else in
+/// the suite can see it.
+///
+/// Catches: M26, the `retf_admitted_here` disjunct deleted from the scan.
+#[test]
+fn the_barrier_census_suffix_scan_walks_through_an_admitted_retf() {
+    // `0xEE` OUT DX,AL is the barrier: non-continuable, unlowered, and a census row of its own.
+    // After it: one filler, the RETF, then two more fillers. The scan's answer is how many of
+    // those four it would have admitted.
+    let code = [
+        filler(),
+        vec![0xee],
+        FILL[0].to_vec(),
+        retf(None),
+        FILL[1].to_vec(),
+        FILL[2].to_vec(),
+    ]
+    .concat();
+
+    let suffix = |arm: jit::direct::RetfArm| -> u64 {
+        select_retf(arm);
+        let mut memory = memory_fill();
+        memory[(ENTRY - 1) as usize] = 0x90;
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = v86_cpu();
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        cpu.set_fast_map_enabled_for_test(true);
+        cpu.jit_direct.set_defer_short_for_test(false);
+        cpu.enable_direct_barrier_census(true);
+        for page in (0..MEMORY_LEN).step_by(0x1000) {
+            map_direct_page(&mut cpu, &mut bus, page);
+        }
+        let mut at = ENTRY;
+        while at < ENTRY + code.len() as u32 {
+            cpu.set_eip(at);
+            cpu.begin_instruction();
+            let d = cpu.fetch_decoded(&mut bus, at).expect("fixture decode");
+            at += u32::from(d.len);
+        }
+        cpu.set_eip(ENTRY);
+        let _ = jit::direct::compile(&mut cpu, ENTRY, false);
+        let snapshot = cpu
+            .direct_barrier_census_snapshot()
+            .expect("the census must be armed");
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.opcode == 0xee)
+            .expect("the OUT barrier must have recorded a census row");
+        assert_eq!(row.hits, 1, "exactly one barrier hit");
+        row.native_suffix_instructions
+    };
+
+    let off = suffix(jit::direct::RetfArm::Off);
+    let armed = suffix(jit::direct::RetfArm::V86);
+    assert_eq!(
+        off, 1,
+        "on the OFF arm the scan admits the one filler after the barrier and stops at the RETF, \
+         exactly as the compile walk would"
+    );
+    assert!(
+        armed > off,
+        "on the armed arm the scan must walk THROUGH the RETF, as the compile walk now does; it \
+         read {armed} against the OFF arm's {off}"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}

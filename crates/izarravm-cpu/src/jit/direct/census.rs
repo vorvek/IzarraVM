@@ -321,7 +321,15 @@ fn census_native_suffix(
             .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
             || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
             || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
-            || !(insn.continuable || jit_admits_non_continuable(insn.opcode))
+            // THE THIRD DISJUNCT MIRRORS THE COMPILE WALK, and it has to (code review M-2). This
+            // scan exists to answer "how far would the walk have got", so an admission the walk
+            // has and this does not truncates the counterfactual suffix at every RETF on the
+            // armed arm -- for exactly the 274 M-execution population the slice creates, which is
+            // the population the ladder will be read against. Inert on the OFF arm, where
+            // `retf_admitted_here` returns after one `OnceLock` load.
+            || !(insn.continuable
+                || jit_admits_non_continuable(insn.opcode)
+                || retf_admitted_here(cpu, &insn))
             || (insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu))
         {
             break;
@@ -757,6 +765,11 @@ pub(crate) struct DirectStallTally {
     /// count, and the pre-registered identity is `decode_inval_cs_load(armed) +
     /// far_ret_native(armed) == decode_inval_cs_load(base)`. A gap means far returns are being
     /// served that the base did not count, or vice versa.
+    ///
+    /// **IT SHIPS AS `direct_stalls.far_ret_native`, NOT as a `PerfCounters` key** (code review
+    /// L-2). The design's bar 3 writes the identity with `jit_direct_far_ret_native`, which is
+    /// the name it would have had in `PerfCounters`; a ladder leg that greps the `perf_counters`
+    /// block for that spelling finds nothing and reads zero.
     ///
     /// HERE AND NOT IN `PerfCounters`, and that is this file's own rule rather than a preference:
     /// growing `PerfCounters` shifts the pinned `pending_flags` offset, which emitted code bakes.

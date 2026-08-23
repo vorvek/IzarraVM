@@ -71,6 +71,13 @@ pub(crate) use smc_census::{SmcCensus, smc_census_default};
 #[cfg(feature = "retf-arity-census")]
 pub(crate) use retf_census::{RETF_TARGET_CENSUS_CAP, RetfArityCensus, retf_arity_census_default};
 
+// FILE-SIZE HEADROOM, recorded 2026-08-24 (code review L-4). This file sits at roughly 4,700 of
+// the 5,000 CODE lines `scripts/check_file_policy.py` allows, and the far-return slice spent about
+// 200 of what was left -- it had to move `retf_admitted_here` into `env_gates.rs` mid-slice to get
+// back under the ceiling. Nothing here is over, and the child modules (`callout`, `census`,
+// `classify`, `emit`, `env_gates`, `retire_governor`, `segment_layout`, `smc_census`) are already
+// the split this file has been taking. The next slice that adds to it should PLAN which unit moves
+// out rather than discover the limit at CI time.
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -2842,12 +2849,27 @@ impl BlockCache {
             return false;
         };
         let far = self.blocks[source_index].far_dynamic();
-        if let Some(target_index) = self.active_index(target) {
+        // FAR EDGES ONLY, and the gate is about ACCOUNTING rather than about outcome (code review
+        // M-1). For a NEAR bind the compare is outcome-inert in the normal path -- `link_merge`
+        // refuses any near edge whose two chain layouts disagree on `cs`, `merge_chain` preserves
+        // `self.cs`, so a linkable near target was compiled under the LIVE CS record and the
+        // compile walk's own limit test already bounds `eip + guest_len - 1` by that CS's limit.
+        // It is NOT inert in attribution: when the two CS records do differ, an ungated compare
+        // returns before `try_link_inner` is reached, and a refusal main counted as
+        // `link_refusals[SegmentLayout]` vanishes with no counter at all, because
+        // `far_link_refused_limit` is far-only. That is a silent OFF-arm change to a refusal
+        // census the campaign ranks and closes on. If the near arm is ever wanted as a FIDELITY
+        // improvement it is a separate decision, with its own counter and its own line in the
+        // OFF-arm delta list; it must not ride this slice.
+        //
+        // Written as `+ guest_len > limit + 1` rather than `+ guest_len - 1 > limit` so a
+        // `guest_len` of 0 cannot underflow (code review L-3). Unreachable today -- a compiled
+        // block has at least one byte -- but the value comes out of a struct field, and the two
+        // forms cost the same.
+        if far && let Some(target_index) = self.active_index(target) {
             let guest_len = u64::from(self.blocks[target_index].span.guest_len);
-            if u64::from(target_eip) + guest_len - 1 > u64::from(cs_limit) {
-                if far {
-                    self.stalls.far_link_refused_limit += 1;
-                }
+            if u64::from(target_eip) + guest_len > u64::from(cs_limit) + 1 {
+                self.stalls.far_link_refused_limit += 1;
                 return false;
             }
         }
@@ -3365,6 +3387,15 @@ impl BlockCache {
             // Beside the increment it rides, and NOT inside `SegmentLayout::far_merge`, which is a
             // pure method on a `Copy` struct with access to neither the tally nor `PerfCounters`.
             // No new `LinkRefusal` variant either, so the refusal-census indices stay stable.
+            //
+            // IT UNDER-REPORTS, DELIBERATELY, AND BAR 7 MUST BE READ AS A LOWER BOUND (code
+            // review L-1). The credit lands only when `SegmentLayout` is the BINDING refusal, so a
+            // far edge that also trips an earlier arm of the chain above -- `StaleEpoch` most
+            // plausibly, since the chain short-circuits in its original order -- is
+            // INV-FAR-CS-refused and silent here. Moving the counter above the chain would cost
+            // the short-circuit the ordering comment protects and would start pricing a
+            // six-segment merge on a high-frequency refusal. The honest denominator for the
+            // static half is `blocks_installed_baking_cs`.
             if far_cs_refusal && matches!(refusal, LinkRefusal::SegmentLayout) {
                 self.stalls.far_link_refused_cs += 1;
             }
