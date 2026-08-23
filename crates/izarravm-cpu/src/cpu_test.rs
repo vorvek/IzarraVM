@@ -4019,6 +4019,15 @@ mod decode_pack;
 #[path = "cpu_decline_memo_test.rs"]
 mod decline_memo;
 
+#[cfg(all(
+    feature = "jit",
+    feature = "direct-entry-attribution",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_entry_attribution_test.rs"]
+mod entry_attribution;
+
 /// C1e: `DecodedInsn`'s recorded `{disp_len, imm_len}` pair (design section 1.2, review
 /// finding M3) did NOT fit the struct's padding: the size grew 36 -> 40 and is pinned
 /// here so the DecodeCache L2 sizing note (updated to ~52 bytes/line, ~208 KB at 4096

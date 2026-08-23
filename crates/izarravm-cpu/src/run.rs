@@ -3,6 +3,13 @@
 
 use super::*;
 
+// The entry-attribution observer's phase, population and site names. The `ea_*!` macros
+// themselves are `#[macro_use]`-imported from `crate::entry_attribution_macros`, which is compiled
+// in EVERY build: three of the call sites below are outside the `jit` gate.
+// See `dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md` section 4b.
+#[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
+use crate::jit::direct::entry_attribution::{FallbackTag, Phase, Population, compile_site, site};
+
 /// Gate for the differential-oracle per-instruction trace prototype
 /// (`IZARRAVM_DIFF_TRACE`). Separate env var from `IZARRAVM_FAULT_TRACE`
 /// deliberately: that one fires on a handful of cold fault paths, this one
@@ -803,6 +810,9 @@ impl CpuGsw {
                 // of the interpreted continuation, occupying one loop iteration; the loop's own
                 // break checks below then fire at exactly the boundary the block stopped at.
                 // One call answers the whole question (see `dispatch_continuation`).
+                // The entry-attribution cursor (design section 4): anchored BEFORE anything else on
+                // the traversal, accumulating nothing, so the inter-entry gap never lands in P0.
+                ea_begin!(cs.default_size_32, self.is_v86_mode());
                 #[cfg(feature = "jit")]
                 let direct_outcome = match self.dispatch_continuation(
                     bus,
@@ -819,9 +829,13 @@ impl CpuGsw {
                     ContinuationDispatch::Native(outcome) => Some(outcome),
                     ContinuationDispatch::Declined => {
                         seam_declines += 1;
+                        ea_fallback_tag!(FallbackTag::Declined);
                         None
                     }
-                    ContinuationDispatch::Skipped => None,
+                    ContinuationDispatch::Skipped => {
+                        ea_fallback_tag!(FallbackTag::Skipped);
+                        None
+                    }
                 };
                 #[cfg(not(feature = "jit"))]
                 let direct_outcome: Option<CycleOutcome> = None;
@@ -852,11 +866,17 @@ impl CpuGsw {
                         // total is exactly the prior instructions' charge in this run, not
                         // including the continuation about to execute.
                         self.core_clocks_so_far = total;
-                        if view.insn.prefixes.rep.is_some() {
+                        let ea_outcome = if view.insn.prefixes.rep.is_some() {
                             self.run_one_cached_budgeted(bus, &view, lin, rep_budget)?
                         } else {
                             self.run_one_cached(bus, &view, lin)?
-                        }
+                        };
+                        // H3-R: the `None` arm is reached by `Declined` AND `Skipped`, and
+                        // both fall into this same block, so this is the traversal's only
+                        // P13 mark.
+                        ea_mark!(Phase::InterpretFallback);
+                        ea_end!(Population::Fallback);
+                        ea_outcome
                     }
                 }
             };
@@ -1238,14 +1258,23 @@ impl CpuGsw {
         // Hoisted by the caller and passed in: it is run-invariant, and re-reading it per
         // continuation is exactly the per-iteration cost this task is removing.
         if !native_continuations_active {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::SKIP_NATIVE_CONTINUATIONS_INACTIVE);
+            ea_end!(Population::Refused);
             return Ok(ContinuationDispatch::Skipped);
         }
         if !self.jit_direct.backend_enabled()
             || std::mem::take(&mut self.direct_runtime.skip_direct_once)
         {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::SKIP_BACKEND_OR_SKIP_ONCE);
+            ea_end!(Population::Refused);
             return Ok(ContinuationDispatch::Skipped);
         }
         if !self.mode().uses_approximate_timing() {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::SKIP_APPROXIMATE_TIMING);
+            ea_end!(Population::Refused);
             return Ok(ContinuationDispatch::Skipped);
         }
         match self.try_direct_continuation(bus, screen, lin, d, budget)? {
@@ -1368,9 +1397,15 @@ impl CpuGsw {
         // NEITHER 486 nor 586 by default, only the 386 class -- and `jit_mode_key` bit 0 is CS.D,
         // so a 16-bit block and a 32-bit block at one linear address can never collide on a key.
         if !d && self.jit_direct.sixteen_bit_level == 0 {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::JIT16_LEVEL_ZERO);
+            ea_end!(Population::Refused);
             return Ok(DirectContinuation::Interpret);
         }
         if !self.mode().uses_approximate_timing() {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::APPROXIMATE_TIMING);
+            ea_end!(Population::Refused);
             return Ok(DirectContinuation::Interpret);
         }
         // Emission-shape synchronisation, BEFORE the probe so a compile below emits what this
@@ -1379,6 +1414,9 @@ impl CpuGsw {
         // dependent loads per completed path AND per chain hop inside every emitted block.
         self.sync_native_fetch_trace(bus);
         if !self.jit_direct.auto_admit() {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::AUTO_ADMIT);
+            ea_end!(Population::Refused);
             return Ok(DirectContinuation::Interpret);
         }
         if !self
@@ -1390,6 +1428,9 @@ impl CpuGsw {
                 self.jit_direct
                     .note_admission_decline(jit::direct::AdmissionDecline::HeatRefusal);
             }
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::DIRECT_HOT_AT);
+            ea_end!(Population::Refused);
             return Ok(DirectContinuation::Interpret);
         }
         // Sticky-decline memo (`dev_docs/sticky-decline-memo-design.md`). Exactly where §1.3 puts
@@ -1413,19 +1454,36 @@ impl CpuGsw {
                     .note_admission_decline(jit::direct::AdmissionDecline::DormantProbe);
             }
             self.jit_direct.direct.note_decline_memo_hit();
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::DECLINE_MEMO_HIT);
+            ea_end!(Population::Refused);
             return Ok(DirectContinuation::Interpret);
         }
+        ea_mark!(Phase::DispatchGates);
         let Some(key) = jit::direct::key_for_phys(self, lin, d, screen.phys_start) else {
             #[cfg(feature = "direct-admission-census")]
             if self.jit_direct.barrier_census_active() {
                 self.jit_direct
                     .note_admission_decline(jit::direct::AdmissionDecline::KeyFailure);
             }
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::KEY_FOR_PHYS_NONE);
+            ea_end!(Population::Refused);
             return Ok(DirectContinuation::Interpret);
         };
+        ea_mark!(Phase::Key);
         let probe = self.jit_direct.probe(key);
+        // Which arm the probe took decides who owes the mark at the `1633` fall-through:
+        // `Ready` still owes `mark(P2)`, `Compile` took it at the arm head and owes P14 instead.
+        #[cfg(feature = "direct-entry-attribution")]
+        let ea_from_compile = matches!(probe, jit::direct::BlockProbe::Compile);
         let block = match probe {
-            jit::direct::BlockProbe::Interpret => return Ok(DirectContinuation::Interpret),
+            jit::direct::BlockProbe::Interpret => {
+                ea_mark!(Phase::Refused);
+                ea_refusal!(site::PROBE_INTERPRET);
+                ea_end!(Population::Refused);
+                return Ok(DirectContinuation::Interpret);
+            }
             jit::direct::BlockProbe::Rejected => {
                 #[cfg(feature = "direct-admission-census")]
                 if self.jit_direct.barrier_census_active()
@@ -1478,6 +1536,9 @@ impl CpuGsw {
                         self.decode_cache.set_decline_memo_at(screen.slot, live);
                     }
                 }
+                ea_mark!(Phase::Refused);
+                ea_refusal!(site::PROBE_REJECTED);
+                ea_end!(Population::Refused);
                 return Ok(DirectContinuation::Interpret);
             }
             jit::direct::BlockProbe::Ready(id) => self
@@ -1485,6 +1546,11 @@ impl CpuGsw {
                 .block(id)
                 .expect("ready direct block must remain live"),
             jit::direct::BlockProbe::Compile => {
+                // COARSE-inclusive, unlike the other `mark(P2)`: it is what BOUNDS P14, and P14
+                // has to be subtractable from `total_entered` in both arms (B3). It fires on the
+                // compile arm alone -- 2.5% of traversals on the loader -- so the four-mark
+                // COARSE shape is unchanged for the other 97.5%.
+                ea_mark_coarse!(Phase::Probe);
                 // G1 pre-compile gate (cheap, entry chunk only): if the block's first 16-byte
                 // chunk is churning this heat epoch, park it Dormant and interpret without paying a
                 // compile. Dormant (not Rejected) because Rejected would acquire watch ranges and
@@ -1509,6 +1575,9 @@ impl CpuGsw {
                         lane_trial = true;
                     } else {
                         self.smc_heat_demote(key, heat_epoch);
+                        ea_mark_coarse!(Phase::Compile);
+                        ea_compile_site!(compile_site::HEAT_DEMOTE);
+                        ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
                     }
                 }
@@ -1525,6 +1594,9 @@ impl CpuGsw {
                         // reject just acquired the span's watch, and a fast-map entry filled
                         // before it must not keep a clear PAGE_WATCHED bit.
                         self.sweep_block_watch_edges();
+                        ea_mark_coarse!(Phase::Compile);
+                        ea_compile_site!(compile_site::STRUCTURAL_REJECT);
+                        ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
                     }
                     jit::direct::CompileOutcome::Retry(cause) => {
@@ -1533,6 +1605,9 @@ impl CpuGsw {
                             jit::direct::DormantReason::CompileRetry,
                             Some(cause),
                         );
+                        ea_mark_coarse!(Phase::Compile);
+                        ea_compile_site!(compile_site::COMPILE_RETRY);
+                        ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
                     }
                 };
@@ -1554,6 +1629,9 @@ impl CpuGsw {
                 if !code_page_covers_block {
                     self.jit_direct
                         .dormant(key, jit::direct::DormantReason::PageCoverFailed, None);
+                    ea_mark_coarse!(Phase::Compile);
+                    ea_compile_site!(compile_site::PAGE_COVER_FAILED);
+                    ea_end!(Population::Compile);
                     return Ok(DirectContinuation::Interpret);
                 }
                 // G1 pre-install gate (full span): the compiled block may cover chunks past its
@@ -1579,6 +1657,9 @@ impl CpuGsw {
                     };
                     if !lane_install {
                         self.smc_heat_demote(key, heat_epoch);
+                        ea_mark_coarse!(Phase::Compile);
+                        ea_compile_site!(compile_site::LANE_INSTALL_DEMOTE);
+                        ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
                     }
                     lane_trial = true;
@@ -1586,6 +1667,9 @@ impl CpuGsw {
                 let Some(id) = self.jit_direct.install(&compilation) else {
                     self.jit_direct
                         .dormant(key, jit::direct::DormantReason::InstallFailed, None);
+                    ea_mark_coarse!(Phase::Compile);
+                    ea_compile_site!(compile_site::INSTALL_FAILED);
+                    ea_end!(Population::Compile);
                     return Ok(DirectContinuation::Interpret);
                 };
                 // E2 sweep before this or any block runs (watched-page-bit design D4): the
@@ -1630,6 +1714,7 @@ impl CpuGsw {
                     .expect("installed direct block must be live")
             }
         };
+        ea_mark_probe_tail!(ea_from_compile);
         if self.decode_cache.line_count() != self.jit_direct.decode_slot_count() {
             self.jit_direct.invalidate_translation();
         }
@@ -1642,9 +1727,15 @@ impl CpuGsw {
                 slot_lin = slot_lin.wrapping_add(u32::from(len));
                 !live
             }) {
+                ea_mark!(Phase::Refused);
+                ea_refusal!(site::LINK_LINE_NOT_LIVE);
+                ea_end!(Population::Refused);
                 return Ok(DirectContinuation::Interpret);
             }
             let Some(block) = self.jit_direct.revalidate_translation(block.span().key) else {
+                ea_mark!(Phase::Refused);
+                ea_refusal!(site::REVALIDATE_NONE);
+                ea_end!(Population::Refused);
                 return Ok(DirectContinuation::Interpret);
             };
             block
@@ -1658,6 +1749,9 @@ impl CpuGsw {
             && !self.jit_direct.has_linked_successor(block.id())
         {
             self.perf.jit_direct_deferred_short += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::DISPATCH_DEFERRED_SHORT);
+            ea_end!(Population::Refused);
             return Ok(DirectContinuation::Interpret);
         }
         match self.run_direct_block(bus, block, budget.total, budget.bus_at_entry, budget.cap)? {
@@ -2251,14 +2345,23 @@ impl CpuGsw {
         self.sweep_sticky_watch_edges();
         if self.profile.enabled || diff_trace_enabled() {
             self.perf.jit_direct_reject_observer += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::OBSERVER_OR_DIFF_TRACE);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         if self.interrupt_shadow {
             self.perf.jit_direct_reject_interrupt_shadow += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::INTERRUPT_SHADOW);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         if !bus.native_aggregate_accounting_allowed() {
             self.perf.jit_direct_reject_aggregate_accounting += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::AGGREGATE_ACCOUNTING);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         // Emission-shape backstop, guarding the ONE unsafe combination: a trace-elided block
@@ -2270,11 +2373,17 @@ impl CpuGsw {
         // hazard and is not checked: `trace_ptr` is 0, so the preamble jumps over itself.
         if !self.jit_direct.native_fetch_trace && !bus.native_fetches_are_uniform() {
             self.sync_native_fetch_trace(bus);
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::NATIVE_FETCH_TRACE);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         let span = block.span();
         if span.key.mode_key != self.jit_mode_key() {
             self.perf.jit_direct_reject_mode_key += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::MODE_KEY);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         if block
@@ -2286,21 +2395,34 @@ impl CpuGsw {
             // `physical(top, logical)` as constant XMM numbers, so entering at the wrong TOP reads
             // the wrong registers. Only the RE-SPECIALIZATION bet is capped, and per key.
             self.jit_direct.retire_key_for_top_mismatch(span.key);
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::X87_TOP);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         // Fetched once and held in a local across all three descriptor checks. It used to ride
         // every `CompiledBlock` copy at 116 bytes a piece; the checks only ever read it.
+        ea_mark!(Phase::EntryGuards);
         let Some(segments) = self.jit_direct.segment_layout(block.id()) else {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::SEGMENT_LAYOUT_NONE);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         };
         if !segments.cs_matches(self) {
             self.perf.jit_direct_reject_cs_layout += 1;
             self.jit_direct.retire_key_for_recompile(span.key);
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::CS_LAYOUT);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         if block.memory_cpl3() != (self.current_privilege_level() == 3) {
             self.perf.jit_direct_reject_cpl += 1;
             self.jit_direct.retire_key_for_recompile(span.key);
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::CPL);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         // A block carrying an interpreter call-out slot does not run in the privilege state whose
@@ -2363,6 +2485,7 @@ impl CpuGsw {
         //
         // The epoch read stays INSIDE the slot test, so a block with no port call-out still pays
         // exactly the one compare it paid before.
+        ea_mark!(Phase::SegmentLayout);
         let mut callout_trial = false;
         let mut callout_lazy_entry = false;
         if block.callout_port_slots() != 0
@@ -2378,6 +2501,9 @@ impl CpuGsw {
                 | jit::direct::CallOutAdmission::Denied
                 | jit::direct::CallOutAdmission::Unclassified => {
                     self.jit_direct.note_reject_callout_privileged();
+                    ea_mark!(Phase::Refused);
+                    ea_refusal!(site::CALLOUT_PRIVILEGED);
+                    ea_end!(Population::Refused);
                     return Ok(DirectBlockOutcome::NotRun);
                 }
             }
@@ -2391,6 +2517,7 @@ impl CpuGsw {
         // would validate the root's pinned set and not the CHAIN's -- a wrong-base miscompile.
         // Reading `chain_layout` here instead is the class-C adoption slice, and it must REPLACE
         // the 116-byte layout fetch above rather than add a second one.
+        ea_mark!(Phase::BlockFields);
         let data_descriptors_match = if has_link {
             segments.all_data_matches(self)
         } else {
@@ -2428,11 +2555,25 @@ impl CpuGsw {
             } else {
                 self.jit_direct.retire_key_for_recompile(span.key);
             }
+            // P12 closes AFTER the governor, deliberately. Everything in this branch is
+            // entry-check refusal work -- the second six-descriptor `data_matches`, the 96-byte
+            // `live` copy and `retire_key_for_data_segment` -- and it is work only a refusal
+            // pays. Marking above the governor would leave its cost inside `total_refused` with
+            // no phase holding it, which is an A1 closure hole; marking below charges it to the
+            // bucket section 8's P12(b) lever is aimed at, which is where a reader looking to
+            // cut refusal cost needs to see it.
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::DATA_SEGMENT);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
+        ea_mark!(Phase::SegmentLayout);
         if block.has_wide_accesses() && self.alignment_armed && self.current_privilege_level() == 3
         {
             self.perf.jit_direct_reject_alignment += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::ALIGNMENT);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         let eip = self.registers.eip;
@@ -2445,6 +2586,9 @@ impl CpuGsw {
             .is_none_or(|last_start| eip > last_start)
         {
             self.perf.jit_direct_reject_fetch_limit += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::FETCH_LIMIT);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
 
@@ -2456,9 +2600,13 @@ impl CpuGsw {
             && !chain_eligible
         {
             self.perf.jit_direct_deferred_short += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::ENTRY_DEFERRED_SHORT);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
 
+        ea_mark!(Phase::BlockFields);
         let (num, den) = level_timing(self.persona());
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
@@ -2560,6 +2708,9 @@ impl CpuGsw {
         let quota = if callout_trial { quota.min(1) } else { quota };
         if quota == 0 {
             self.perf.jit_direct_reject_zero_budget += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::ZERO_BUDGET);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         // Read either side of the entry below: a block whose call-out sits behind an untaken
@@ -2571,6 +2722,7 @@ impl CpuGsw {
         };
 
         let uniform_fetches = bus.native_fetches_are_uniform();
+        ea_mark!(Phase::Budget);
         let trace_capacity = if uniform_fetches {
             0
         } else if block.is_self_loop() {
@@ -2592,6 +2744,9 @@ impl CpuGsw {
         // Arena compaction can relocate code while callers still hold a copied block descriptor.
         // Resolve its generational ID at the last safe point before entering native code.
         let Some(current_block) = self.jit_direct.block(block.id()) else {
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::BLOCK_REGENERATED_NONE);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         };
         // BELOW the last refusal, so the counter counts trials RUN and not trials gated. Section
@@ -2600,6 +2755,7 @@ impl CpuGsw {
         if callout_trial {
             self.jit_direct.note_callout_governor_trial();
         }
+        ea_mark!(Phase::TraceAlloc);
         self.begin_instruction();
         self.core_clocks_so_far = total;
         let flags = self.materialized_eflags();
@@ -2623,6 +2779,10 @@ impl CpuGsw {
         // is always false in production; the clause exists so that it does not have to be.
         self.jit_direct
             .set_block_entry_interrupt_shadow(self.interrupt_shadow);
+        // H9's pin, taken at the P8 mark: `run_direct_block` has no `d`, so the block's own
+        // mode-key bit 0 is the term available here.
+        ea_pin_lane_bit0!(span.key.mode_key & 1);
+        ea_mark_coarse!(Phase::NativePreamble);
         unsafe {
             entry(
                 self as *mut CpuGsw,
@@ -2631,8 +2791,17 @@ impl CpuGsw {
                 &mut exit as *mut jit::direct::NativeExit,
             );
         }
+        ea_mark_coarse!(Phase::NativeBody);
+        // Section 6's regression sample, taken against the charge the P9 mark just booked. Its
+        // own cost lands in P8 (FULL arm only), which is why COARSE does not take it.
+        ea_native_sample!(
+            exit.instructions,
+            exit.linked_transfers,
+            block.is_self_loop()
+        );
         self.jit_direct.set_block_entry_interrupt_shadow(false);
         self.native_callout = jit::direct::CallOutTable::default();
+        ea_mark!(Phase::NativePreamble);
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
         debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
         debug_assert!(u64::from(exit.linked_transfers) < quota);
@@ -2834,6 +3003,10 @@ impl CpuGsw {
             "a call-out window outlived the native entry that opened it"
         );
 
+        // Closes P10 (T0-T4) and opens P11 (T5-T8). The design cites `run.rs:2810`, which is the
+        // head of the mode-13 assert trio; the mark sits above the trio rather than inside it
+        // because the asserts compile out in release and splitting them buys nothing.
+        ea_mark!(Phase::TailFetch);
         debug_assert!(mode13_byte_reads <= byte_reads);
         debug_assert!(mode13_word_reads <= word_reads);
         debug_assert!(exit.mode13_dword_reads <= dword_reads);
@@ -3091,8 +3264,14 @@ impl CpuGsw {
         // the demotion retire, so a stopping run accounts for the work it actually did and leaves
         // behind the same block cache a non-stopping one would have.
         if let Some(error) = self.direct_runtime.callout_error.take() {
+            ea_mark!(Phase::TailClocks);
+            ea_end!(Population::Entered);
             return Err(error);
         }
+        // The `Prefix` (3068) and `Complete` (3070) returns are the two arms of the `if` below
+        // and take the same terminal mark, so it is written once above them.
+        ea_mark!(Phase::TailClocks);
+        ea_end!(Population::Entered);
         if side_exit {
             Ok(DirectBlockOutcome::Prefix(outcome))
         } else {

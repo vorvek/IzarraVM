@@ -9,6 +9,9 @@ mod callout_attribution;
 pub(crate) mod census;
 mod classify;
 mod emit;
+// Always compiled: the module body is feature-gated, but the `ea_*!` macros must exist in the
+// plain build so `run.rs` can name them and have them expand to nothing.
+pub(crate) mod entry_attribution;
 mod env_gates;
 mod native_exit;
 mod retire_governor;

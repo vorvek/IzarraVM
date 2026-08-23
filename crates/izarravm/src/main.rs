@@ -2097,6 +2097,20 @@ fn write_hdd_profile_json(
     {
         report["smc_census"] = smc_census_json(machine.cpu().direct_smc_census_snapshot(), perf);
     }
+    // Census precedent, deliberately (design H7): a SIBLING top-level object, emitted OUTSIDE
+    // `perf_counters_json`, so that function's signature and ordered key list stay identical
+    // between the plain and the observer build and
+    // `perf_counter_json_exposes_the_complete_counter_surface` passes in both.
+    #[cfg(feature = "direct-entry-attribution")]
+    {
+        report["direct_entry_attribution"] = direct_entry_attribution_json(
+            machine.cpu().direct_entry_attribution_snapshot(),
+            machine
+                .cpu()
+                .direct_stall_snapshot()
+                .decode_pack_late_view_miss,
+        );
+    }
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
 }
@@ -2171,6 +2185,174 @@ fn vga_wipe_census_json(
                 "min_instructions": 1u64 << bucket,
                 "count": count,
             })).collect::<Vec<_>>(),
+    })
+}
+
+/// The entry-attribution observer's sibling object.
+///
+/// Every phase carries BOTH `ticks_raw` (no subtraction of any kind) and `ticks_corrected`
+/// (`ticks_raw - overhead x marks`, allowed to go NEGATIVE and reported as such), because the
+/// aggregate subtraction is a modelling step and the reader has to be able to undo it. A phase
+/// whose corrected value lands within one `resolution_floor_ns` per mark of zero is reported
+/// `below_resolution: true` and never as "0" — design section 4 prices two phases at or under the
+/// floor, and the instrument must say so rather than report them free.
+///
+/// The section 6 fit is NOT computed here: the bins are exported and
+/// `.bench/scripts/entry-attribution-report.py` does the weighted least squares, the CIs and the
+/// condition number. One implementation of the numerics, in the place that also prints the
+/// pre-registered verdict.
+#[cfg(feature = "direct-entry-attribution")]
+fn direct_entry_attribution_json(
+    snapshot: Option<izarravm_cpu::DirectEntryAttributionSnapshot>,
+    decode_pack_late_view_miss: u64,
+) -> serde_json::Value {
+    use izarravm_cpu::{
+        COMPILE_SITES, FALLBACK_TAG_NAMES, LANE_NAMES, OUTLIER_TICKS, P0_MARK_LINE, PHASE_NAMES,
+        POPULATION_NAMES, PRE_P0_REFUSAL_SITES, REFUSAL_SITES, native_bin_parts,
+    };
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    let tsc_hz = snapshot.tsc_hz as f64;
+    // `tsc_hz` is derived from an `Instant` pair across the run and is zero only if the run was
+    // too short to measure or the TSC did not advance. `serde_json` cannot encode a NaN -- it
+    // serialises as `null` and every downstream ratio becomes unreadable -- so an unusable clock
+    // yields 0.0 and the `tsc_hz: 0` field is what tells the reader the ns columns are void.
+    let ns_of = |ticks: f64| {
+        if tsc_hz > 0.0 {
+            ticks / tsc_hz * 1e9
+        } else {
+            0.0
+        }
+    };
+    let floor_ns = ns_of(snapshot.overhead_ticks as f64);
+    let lanes = LANE_NAMES
+        .iter()
+        .enumerate()
+        .map(|(lane, name)| {
+            let phases = PHASE_NAMES
+                .iter()
+                .enumerate()
+                .map(|(phase, phase_name)| {
+                    let raw = snapshot.ticks_raw[lane][phase];
+                    let marks = snapshot.marks[lane][phase];
+                    let corrected =
+                        raw as i128 - (snapshot.overhead_ticks as i128) * (marks as i128);
+                    let ns = ns_of(corrected as f64);
+                    let per_mark_ns = if marks == 0 { 0.0 } else { ns / marks as f64 };
+                    json!({
+                        "phase": phase_name,
+                        "ticks_raw": raw,
+                        "marks": marks,
+                        "ticks_corrected": corrected as f64,
+                        "ns": ns,
+                        "ns_per_mark": per_mark_ns,
+                        "below_resolution": marks > 0 && per_mark_ns.abs() <= floor_ns,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let totals = POPULATION_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, population)| {
+                    json!({
+                        "population": population,
+                        "ticks": snapshot.totals[lane][index],
+                        "ns": ns_of(snapshot.totals[lane][index] as f64),
+                        "ends": snapshot.totals_count[lane][index],
+                    })
+                })
+                .collect::<Vec<_>>();
+            let refusal_site = REFUSAL_SITES
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| snapshot.refusal_site[lane][index] != 0)
+                .map(|(index, (label, line))| {
+                    json!({
+                        "index": index,
+                        "site": label,
+                        "run_rs_line": line,
+                        "count": snapshot.refusal_site[lane][index],
+                        "above_p0_mark": PRE_P0_REFUSAL_SITES.contains(&index),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let compile_site = COMPILE_SITES
+                .iter()
+                .enumerate()
+                .map(|(index, (label, line))| {
+                    json!({
+                        "index": index,
+                        "site": label,
+                        "run_rs_line": line,
+                        "count": snapshot.compile_site[lane][index],
+                    })
+                })
+                .collect::<Vec<_>>();
+            let fallback_tags = FALLBACK_TAG_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    json!({ "tag": label, "count": snapshot.fallback_tags[lane][index] })
+                })
+                .collect::<Vec<_>>();
+            let native_bins = snapshot.native_bins[lane]
+                .iter()
+                .enumerate()
+                .filter(|&(_, row)| row[0] != 0)
+                .map(|(bin, row)| {
+                    // The instrument's own inverse, never a second copy of the packing.
+                    let (instructions, hop_bin, self_loop) = native_bin_parts(bin);
+                    json!({
+                        "bin": bin,
+                        "instructions": instructions,
+                        "linked_transfers_class": hop_bin,
+                        "self_loop": self_loop,
+                        "count": row[0],
+                        "ticks": row[1],
+                        "instructions_sum": row[2],
+                        "linked_transfers_sum": row[3],
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "lane": name,
+                "lane_index": lane,
+                "phases": phases,
+                "totals": totals,
+                "refusal_site": refusal_site,
+                "compile_site": compile_site,
+                "fallback_tags": fallback_tags,
+                "native_bins": native_bins,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "arm": snapshot.arm,
+        "sample_n": snapshot.sample_n,
+        "overhead_ticks": snapshot.overhead_ticks,
+        "calibration_bracket_ticks": snapshot.calibration_bracket_ticks,
+        "calibration_mark_ticks": snapshot.calibration_mark_ticks,
+        "resolution_floor_ns": floor_ns,
+        "tsc_hz": snapshot.tsc_hz,
+        "outlier_clamp_ticks": OUTLIER_TICKS,
+        "outlier_ticks": snapshot.outlier_ticks,
+        "outlier_marks": snapshot.outlier_marks,
+        "lane_pin_mismatches": snapshot.lane_pin_mismatches,
+        // A3's `marks(P0) == decode_probes` identity needs every traversal that counted a probe
+        // and never reached the P0 mark. Four decode-screen breaks sit ABOVE `begin()`
+        // (run.rs:791-812) and are the three `brk_cont_*` keys; a FIFTH `brk_cont_decode_miss`
+        // site sits BELOW it (run.rs:857-862, the late view miss) and must be subtracted back
+        // out, or the identity over-counts by exactly this many. Emitted here so the report does
+        // not have to reach into another object for it.
+        "decode_pack_late_view_miss": decode_pack_late_view_miss,
+        // The `run.rs` line the P0 mark sits on -- the line `above_p0_mark` partitions the
+        // refusal sites by, published so the reader is not left inferring it.
+        "p0_mark_line": P0_MARK_LINE,
+        "phase_names": PHASE_NAMES,
+        "lane_names": LANE_NAMES,
+        "population_names": POPULATION_NAMES,
+        "lanes": lanes,
     })
 }
 
