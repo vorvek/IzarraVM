@@ -505,7 +505,7 @@ impl CpuGsw {
         // window. That trades a cost confined to one probe per InterpretOne store for a cost on
         // the shipped byte-store path, which is the wrong direction. Revisit only if the loader
         // ladder puts `code_write_watched` in the profile.
-        // `jit`-gated with the field it reads (`lib.rs:2385-2386`). Without the backend there are
+        // `jit`-gated with the field it reads (`lib.rs:2414-2415`). Without the backend there are
         // no native blocks, so no call-out window can be open and this branch is dead -- but it
         // was not gated, and `cargo check --no-default-features` did not compile because of it.
         #[cfg(feature = "jit")]

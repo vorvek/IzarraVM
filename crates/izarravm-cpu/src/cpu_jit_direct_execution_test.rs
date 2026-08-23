@@ -2738,7 +2738,7 @@ fn direct_chain_links_across_a_segment_descriptor_neither_block_uses() {
 /// differs from the one the successor baked, and the entry must be REFUSED -- relaxing the linked
 /// arm to the root's own mask would let the chain run and read the wrong address, silently.
 #[test]
-fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
+pub(super) fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
     const ENTRY: u32 = 0x200;
     const SECOND: u32 = 0x220;
     const DONE: u32 = 0x240;

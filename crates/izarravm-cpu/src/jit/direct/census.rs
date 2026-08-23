@@ -767,6 +767,21 @@ pub(crate) struct DirectStallTally {
     /// again. Exact on a guest with no SMC and one cache generation; an over-report on an
     /// SMC-heavy one. Named for what it counts.
     pub x87_top_sticky_crossings: u64,
+    /// The data-segment retire cap (`retire_key_for_data_segment`), the same three instruments
+    /// the x87 pair carries above plus one stage 2 needs.
+    ///
+    /// `suppressed` counts every retire the cap refused -- one per data-segment reject on an
+    /// already-capped key, so on a churning guest it approaches `jit_direct_reject_data_segment`.
+    /// `sticky_crossings` counts CAP CROSSINGS, not live keys. `link_declines` counts stage 2
+    /// TRIPS and not crossings: the decline is re-asserted on every suppressed strict-arm reject,
+    /// idempotently, because the crossing entry may have been a masked-arm reject and a key whose
+    /// crossing landed there would otherwise never decline at all.
+    ///
+    /// All three read ZERO on the OFF arm, which is the cheapest check that a ladder leg named
+    /// the arm it meant to.
+    pub data_segment_retires_suppressed: u64,
+    pub data_segment_sticky_crossings: u64,
+    pub data_segment_link_declines: u64,
     /// Sticky-decline memo instruments, always on. Here for this struct's stated reason:
     /// `PerfCounters` sits ahead of `pending_flags` in `CpuGsw` at an offset emitted code bakes,
     /// and `BlockCacheStats` is drained per dispatcher exit — these have to accumulate for the
@@ -1005,7 +1020,10 @@ impl RetryCause {
     }
 }
 
-/// The six ways `try_link_inner` can refuse. Ordered as the function tests them.
+/// The eight ways `try_link_inner` can refuse. Ordered as the function tests them.
+///
+/// The count in this sentence has been wrong before (it read "six" at seven variants), so: it is
+/// `COUNT` below, and `link_refusal_count_matches_the_variant_list` pins the two together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkRefusal {
     /// Source or target is no longer an active index.
@@ -1017,6 +1035,15 @@ pub(crate) enum LinkRefusal {
     /// (`SegmentLayout::link_merge`). A descriptor no block in either chain pins is not a reason
     /// to refuse -- that admission is the whole of the 2026-08-18 chain-used mask slice.
     SegmentLayout,
+    /// The SOURCE key is data-segment link-declined: stage 2 of the reject governor cut its
+    /// outbound edges after the retire cap was spent on a strict-arm reject, and nothing may
+    /// rebind them. Reads ZERO on every arm but `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=on`.
+    ///
+    /// Its own variant rather than a fold into `SegmentLayout`: the two are the same FAMILY of
+    /// cause and nothing else about them is alike -- one is a per-edge descriptor conflict that a
+    /// later install can resolve, the other is a standing judgement about a block, and reading
+    /// the second inside the first's bucket would make stage 2 invisible on a ladder leg.
+    Declined,
     /// `CompiledBlock::link_compatible` refused.
     BlockShape,
     /// The RET-PIC-only strict `has_x87` equality, INTEGER source into a FLOAT target. RETIRED,
@@ -1036,11 +1063,12 @@ pub(crate) enum LinkRefusal {
 }
 
 impl LinkRefusal {
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Inactive,
         Self::StaleEpoch,
         Self::SegmentLayout,
+        Self::Declined,
         Self::BlockShape,
         Self::DynamicIntegerToFloat,
         Self::DynamicFloatToInteger,
@@ -1052,6 +1080,7 @@ impl LinkRefusal {
             Self::Inactive => "inactive",
             Self::StaleEpoch => "stale_epoch",
             Self::SegmentLayout => "segment_layout",
+            Self::Declined => "declined",
             Self::BlockShape => "block_shape",
             Self::DynamicIntegerToFloat => "dynamic_integer_to_float",
             Self::DynamicFloatToInteger => "dynamic_float_to_integer",
@@ -1113,6 +1142,7 @@ fn link_refusal_bucket_label(reason: LinkRefusal) -> &'static str {
         LinkRefusal::Inactive => "refused_inactive",
         LinkRefusal::StaleEpoch => "refused_stale_epoch",
         LinkRefusal::SegmentLayout => "refused_segment_layout",
+        LinkRefusal::Declined => "refused_declined",
         LinkRefusal::BlockShape => "refused_block_shape",
         LinkRefusal::DynamicIntegerToFloat => "refused_dynamic_integer_to_float",
         LinkRefusal::DynamicFloatToInteger => "refused_dynamic_float_to_integer",
@@ -1128,6 +1158,7 @@ fn link_clear_bucket_label(cause: LinkClearCause) -> &'static str {
         LinkClearCause::Flushed => "cleared_flushed",
         LinkClearCause::Reset => "cleared_reset",
         LinkClearCause::ChainWiden => "cleared_chain_widen",
+        LinkClearCause::DataSegmentDecline => "cleared_data_segment_decline",
     }
 }
 
@@ -1396,16 +1427,25 @@ pub(crate) enum LinkClearCause {
     /// NOT re-parked in `waiting`, because the widen is monotone and a retry could only re-derive
     /// the same conflict. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
     ChainWiden,
+    /// Stage 2 of the data-segment reject governor cut this source's outbound edges after its
+    /// retire cap was spent on a strict-arm reject. Both blocks stay compiled and the cell
+    /// reverts to the zero portal, so the source's exits report `StaticUnbound` and its next
+    /// entry takes the check it would have had unlinked. Like `ChainWiden`, the edge is NOT
+    /// re-parked in `waiting`: the decline is a standing judgement and a retry could only
+    /// re-derive the same refusal. Reads ZERO on every arm but
+    /// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=on`.
+    DataSegmentDecline,
 }
 
 impl LinkClearCause {
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 6;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Replaced,
         Self::Retired,
         Self::Flushed,
         Self::Reset,
         Self::ChainWiden,
+        Self::DataSegmentDecline,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -1415,6 +1455,7 @@ impl LinkClearCause {
             Self::Flushed => "flushed",
             Self::Reset => "reset",
             Self::ChainWiden => "chain_widen",
+            Self::DataSegmentDecline => "data_segment_decline",
         }
     }
 }
@@ -2266,6 +2307,10 @@ impl crate::jit::JitState {
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
+            data_segment_retires_suppressed: self.stalls.data_segment_retires_suppressed,
+            data_segment_sticky_crossings: self.stalls.data_segment_sticky_crossings,
+            data_segment_link_declines: self.stalls.data_segment_link_declines,
+            data_segment_distinct_layouts: self.data_segment_layout_histogram(),
             ss_load_same_record: self.stalls.ss_load_same_record,
             ss_load_changed_record: self.stalls.ss_load_changed_record,
             decline_memo_hits: self.stalls.decline_memo_hits,

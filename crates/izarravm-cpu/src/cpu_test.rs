@@ -1895,7 +1895,15 @@ fn pending_flags_offset() {
     // measured off a failing-test readout, not derived. None of it is guest state: the flag and
     // the list are host-side window bookkeeping with an always-equal `PartialEq`, exactly like
     // `native_callout` beside them.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4536);
+    // The data-segment reject governor adds two PerfCounters fields
+    // (jit_direct_reject_data_segment_strict / _masked; 16 bytes), moving this pin 4536 -> 4552 --
+    // measured off a failing-test readout, not derived. They belong in PerfCounters rather than in
+    // the stall tally for one reason: the phase-mark series carries `PerfCounters` BY VALUE, and
+    // the per-phase export carried no data-segment reject column at all, so a whole-run-only split
+    // would leave the slice's phase-scoped bar ungradeable. This IS a cache-line reshuffle of the
+    // hot region, so it is a wall confound between this binary and `main` -- which is why the
+    // slice's ladder takes its base from the OFF leg of the SAME binary and opens with an A/A.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4552);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

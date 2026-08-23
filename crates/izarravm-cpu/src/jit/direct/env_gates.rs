@@ -1457,6 +1457,114 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
     }
 }
 
+/// Which arm of the data-segment reject governor this process runs.
+///
+/// **DEFAULT `cap` SINCE THE 2026-08-23 LADDER.** The spelling table, and note that unset and the
+/// EMPTY STRING are deliberately NOT the same arm:
+///
+/// | spelling | arm |
+/// |---|---|
+/// | **unset** | **`cap`** — the shipped default: the per-key retire cap (`DATA_SEGMENT_RETIRE_CAP`) |
+/// | `""`, `0`, `off` | `Off` — pre-slice behaviour, every data-segment reject retires its key |
+/// | `cap` | `Cap`, stated explicitly; identical to unset |
+/// | `1`, `on` | `On` — the cap PLUS the stage 2 link decline |
+/// | anything else | panics |
+///
+/// WHY IT SHIPS ARMED. The pre-registered ladder on `2d126c5e`, one binary, ABBA interleaved:
+/// **tombraid loader phase `cap` +27.1% (lower95 1.263), `on` +28.8%; duke3d-586 short `cap`
+/// +4.3%, `on` +3.5%**, every pin identical on every leg. The mechanism is not subtle -- the
+/// loader was paying 0.94 s of a 7.09 s phase to recompile blocks it then refused to run, 97.9%
+/// of its compile attempts, and the cap takes `jit_direct_compile_attempts` from 314,318 to 9,695.
+///
+/// WHY `on` IS **NOT** THE DEFAULT even though it wins the loader by 1.7 points more. It LOSES to
+/// `cap` on duke (+3.5% against +4.3%), which is the shape the design predicted for it (a declined
+/// key trades chaining for dispatcher entries) and is the refutation criterion §5 wrote down for
+/// stage 2 in advance. Two fixtures disagreeing is a reason to ship the arm that never loses and
+/// keep the other behind the knob, not a reason to average them. `on` stays OPT-IN.
+///
+/// WHAT `cap` COSTS, stated because it is not free. Corpus, OFF against `cap`: doom +0.6%,
+/// quake -1.3%, wolf3d -1.2%, tombraid +2.7%. The two dips are the residual §3(c) named: a key
+/// that is frozen on one layout INTERPRETS every entry that carries another, forever, where the
+/// pre-slice retire would have re-specialized it and run. On a guest whose record settles after a
+/// few moves the retire was the right bet and the cap now refuses to take it. The answer is not a
+/// bigger cap -- it is slice (a), per-layout block VARIANTS, whose go/no-go census this slice
+/// ships and whose `cap`-leg reading is in the design's §R rev 5.
+///
+/// THE ESCAPE, AND THE A/B BASE, IS NOW `off`. It touches no map, reads no set, and does not even
+/// build the governor's two inputs (`run_direct_block` tests this knob before it builds them), so
+/// an OFF leg is a reproduction of pre-slice `main` at this site rather than a close relative of
+/// one. `the_off_arm_touches_no_governor_state` pins that.
+///
+/// **THE NULLING TRAP IS INVERTED HERE, AND IT MATTERS.** Everywhere else in this file unset means
+/// OFF, so `env-null-empty-is-off-trap` bites the ON leg. Here unset means `cap`, and `""` means
+/// OFF -- so PowerShell's `SetEnvironmentVariable($null)`, which leaves `""` behind, silently
+/// DISARMS the shipped default. A leg that means to measure the default must leave the variable
+/// genuinely unset or EXPORT `cap`; a leg that nulls it is measuring the escape.
+pub(crate) fn segment_retire_governor() -> super::SegmentRetireGovernor {
+    #[cfg(test)]
+    if let Some(forced) = SEGMENT_RETIRE_GOVERNOR_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ARM: std::sync::OnceLock<super::SegmentRetireGovernor> = std::sync::OnceLock::new();
+    *ARM.get_or_init(|| {
+        parse_segment_retire_governor_arm(std::env::var("IZARRAVM_SEGMENT_RETIRE_GOVERNOR"))
+    })
+}
+
+/// The `IZARRAVM_SEGMENT_RETIRE_GOVERNOR` spelling table. See `segment_retire_governor`.
+fn parse_segment_retire_governor_arm(
+    value: Result<String, std::env::VarError>,
+) -> super::SegmentRetireGovernor {
+    use super::SegmentRetireGovernor;
+    let raw = match value {
+        // UNSET IS `cap`, and `""` below is OFF. The two are deliberately different arms: see the
+        // inverted nulling trap in `segment_retire_governor`'s doc.
+        Err(std::env::VarError::NotPresent) => return SegmentRetireGovernor::Cap,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_SEGMENT_RETIRE_GOVERNOR is set to a value that is not valid UTF-8; \
+                 accepted spellings are unset or `cap` (the shipped default: the per-key retire \
+                 cap), `\"\"`, `0` or `off` (the escape: every data-segment reject retires, as \
+                 before the slice) and `1` or `on` (the cap plus the link decline)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => SegmentRetireGovernor::Off,
+        "cap" => SegmentRetireGovernor::Cap,
+        "1" | "on" => SegmentRetireGovernor::On,
+        other => panic!(
+            "IZARRAVM_SEGMENT_RETIRE_GOVERNOR={other:?} names no arm; accepted spellings are \
+             unset or `cap` (the shipped default, stage 1's per-key retire cap), `\"\"`, `0` or \
+             `off` (the escape and the A/B base) and `1` or `on` (stage 1 plus the link decline). \
+             Refusing to guess: a mistyped leg would silently run the DEFAULT, which is now an \
+             ARMED arm, and be read as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason.
+#[cfg(test)]
+thread_local! {
+    static SEGMENT_RETIRE_GOVERNOR_OVERRIDE: std::cell::Cell<Option<super::SegmentRetireGovernor>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the governor arm on this thread for the length of a fixture; `None` restores the ambient
+/// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR` reading.
+#[cfg(test)]
+pub(crate) fn set_segment_retire_governor_for_test(forced: Option<super::SegmentRetireGovernor>) {
+    SEGMENT_RETIRE_GOVERNOR_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_retry_lift_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_segment_retire_governor_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> super::SegmentRetireGovernor {
+    parse_segment_retire_governor_arm(value)
+}
 /// Arm for the entry-attribution observer (`IZARRAVM_DIRECT_ENTRY_ATTRIBUTION`).
 ///
 /// The instrument itself is compiled out entirely without the `direct-entry-attribution` feature,

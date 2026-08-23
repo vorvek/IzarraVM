@@ -15,7 +15,7 @@
 //! State lives in a `thread_local!` `UnsafeCell` with a `const` initialiser and no `Drop`, so a
 //! mark is a segment-relative load and a few adds — deliberately NOT a `CpuGsw` or `JitState`
 //! field, because `DirectStallTally` sits ahead of `pending_flags` at an offset emitted code bakes
-//! (`run.rs:2898-2901`) and a cfg'd field there would move baked offsets in the observer build
+//! (`run.rs:3100-3103`) and a cfg'd field there would move baked offsets in the observer build
 //! only.
 
 #[cfg(feature = "direct-entry-attribution")]

@@ -2525,7 +2525,43 @@ impl CpuGsw {
         };
         if !data_descriptors_match {
             self.perf.jit_direct_reject_data_segment += 1;
-            self.jit_direct.retire_key_for_recompile(span.key);
+            // The ARM split, promoted from the 2026-08-23 throwaway instrument. It is the only
+            // way the strict/masked share is readable on the shipped arm -- one counter served
+            // both arms before this, and the design could bound the strict half at <=32% from
+            // `links_cleared[retired]` but not measure it.
+            let arm = if has_link {
+                self.perf.jit_direct_reject_data_segment_strict += 1;
+                jit::direct::DataSegmentRejectArm::Strict
+            } else {
+                self.perf.jit_direct_reject_data_segment_masked += 1;
+                jit::direct::DataSegmentRejectArm::Masked
+            };
+            // The OFF arm takes main's statement, unchanged and unaugmented. Both governor
+            // inputs are built INSIDE this branch rather than above it: the second
+            // `data_matches` is a six-descriptor compare and `live` is a 96-byte copy, and
+            // neither is work `main` does at this site. The knob read is a `OnceLock` load, so
+            // an OFF leg pays one load and one branch here and nothing else -- which is what
+            // makes it a reproduction of `main` rather than a close relative of one.
+            if jit::direct::segment_retire_governor().cap_armed() {
+                // Only on the strict arm, and only on this cold path. It separates "rejected
+                // BECAUSE it is linked" -- the block's own masked check would have passed, so
+                // cutting its edges lets it run -- from "rejected on a record it uses itself",
+                // where cutting the edges buys nothing because the masked check refuses too.
+                let own_mask_matches = has_link && segments.data_matches(self);
+                let live =
+                    jit::direct::SEGMENT_ORDER.map(|segment| self.registers.segment(segment));
+                self.jit_direct
+                    .retire_key_for_data_segment(span.key, arm, own_mask_matches, &live);
+            } else {
+                self.jit_direct.retire_key_for_recompile(span.key);
+            }
+            // P12 closes AFTER the governor, deliberately. Everything in this branch is
+            // entry-check refusal work -- the second six-descriptor `data_matches`, the 96-byte
+            // `live` copy and `retire_key_for_data_segment` -- and it is work only a refusal
+            // pays. Marking above the governor would leave its cost inside `total_refused` with
+            // no phase holding it, which is an A1 closure hole; marking below charges it to the
+            // bucket section 8's P12(b) lever is aimed at, which is where a reader looking to
+            // cut refusal cost needs to see it.
             ea_mark!(Phase::Refused);
             ea_refusal!(site::DATA_SEGMENT);
             ea_end!(Population::Refused);

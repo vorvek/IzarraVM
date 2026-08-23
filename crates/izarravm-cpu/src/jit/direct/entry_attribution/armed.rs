@@ -155,12 +155,12 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("cs_layout", 2418),
     ("cpl", 2426),
     ("callout_privileged", 2507),
-    ("data_segment", 2532),
-    ("alignment", 2541),
-    ("fetch_limit", 2556),
-    ("entry_deferred_short", 2570),
-    ("zero_budget", 2678),
-    ("block_regenerated_none", 2714),
+    ("data_segment", 2568),
+    ("alignment", 2577),
+    ("fetch_limit", 2592),
+    ("entry_deferred_short", 2606),
+    ("zero_budget", 2714),
+    ("block_regenerated_none", 2750),
 ];
 
 /// Index constants for `REFUSAL_SITES`, named at the call sites in `run.rs`.

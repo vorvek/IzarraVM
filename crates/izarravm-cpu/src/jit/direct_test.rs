@@ -2462,6 +2462,7 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
             "refused_inactive",
             "refused_stale_epoch",
             "refused_segment_layout",
+            "refused_declined",
             "refused_block_shape",
             "refused_dynamic_integer_to_float",
             "refused_dynamic_float_to_integer",
@@ -2471,6 +2472,7 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
             "cleared_flushed",
             "cleared_reset",
             "cleared_chain_widen",
+            "cleared_data_segment_decline",
             "unexpected_linked",
             "closed",
         ]
@@ -2954,7 +2956,7 @@ fn admission_census_rejected_probe_classifier_covers_every_cache_state_and_disab
     assert_eq!(cache.classify_rejected_probe(rejected), None);
 }
 
-/// The five link-clear causes account for every cleared link: their sum equals the aggregate
+/// The six link-clear causes account for every cleared link: their sum equals the aggregate
 /// `BlockCacheStats::unlinks` that feeds `jit_direct_links_cleared`. The aggregate is fed
 /// independently rather than derived, so this is the cross-check that they have not drifted --
 /// a new unlink site that forgets its cause would show up here as a shortfall.
@@ -3059,7 +3061,44 @@ fn link_clear_causes_close_on_the_aggregate() {
         1
     );
 
-    // All FIVE sites: deleting any single increment above must break the sum.
+    // DataSegmentDecline: stage 2 of the data-segment reject governor cuts a source's outbound
+    // edges once its retire cap is spent on a strict-arm reject. Re-installed and re-linked
+    // between turns because the first `DATA_SEGMENT_RETIRE_CAP` of them still retire, and a
+    // retired key has nothing left to decline.
+    let declined_source = key(0x1900);
+    let declined_target = key(0x1a00);
+    let declined_target_id = install_trivial(&mut cache, declined_target, 1);
+    let declined_span =
+        BlockSpan::new(declined_source, 1, 1).expect("declined source span must be page local");
+    let live = [crate::SegmentRegister::real(0); 6];
+    super::set_segment_retire_governor_for_test(Some(SegmentRetireGovernor::On));
+    for _ in 0..=DATA_SEGMENT_RETIRE_CAP {
+        // `install_trivial`'s probe ladder, inline: a fresh key needs Interpret then Compile, and
+        // a key just returned to `Seen` by a retire needs one more probe to be offered again.
+        for _ in 0..4 {
+            if matches!(cache.probe(declined_source), BlockProbe::Compile) {
+                break;
+            }
+        }
+        let source_id = cache
+            .install(&trivial_compilation(declined_span))
+            .expect("the declined source must install");
+        assert!(cache.try_link(source_id, 0, declined_target_id));
+        cache.retire_key_for_data_segment(
+            declined_source,
+            DataSegmentRejectArm::Strict,
+            true,
+            &live,
+        );
+    }
+    super::set_segment_retire_governor_for_test(None);
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::DataSegmentDecline as usize],
+        1,
+        "the decline cuts exactly the one live outbound cell, under its own cause"
+    );
+
+    // All SIX sites: deleting any single increment above must break the sum.
     let causes = cache.stalls.links_cleared;
     assert!(
         causes.iter().all(|&n| n > 0),
