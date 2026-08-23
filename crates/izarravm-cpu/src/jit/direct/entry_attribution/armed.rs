@@ -131,36 +131,36 @@ pub const N_REFUSAL_SITES: usize = 30;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1266),
-    ("skip_backend_or_skip_once", 1274),
-    ("skip_approximate_timing", 1280),
-    ("jit16_level_zero", 1405),
-    ("approximate_timing", 1411),
-    ("auto_admit", 1422),
-    ("direct_hot_at", 1436),
-    ("decline_memo_hit", 1462),
-    ("key_for_phys_none", 1474),
-    ("probe_interpret", 1487),
-    ("probe_rejected", 1544),
-    ("link_line_not_live", 1735),
-    ("revalidate_none", 1741),
-    ("dispatch_deferred_short", 1757),
-    ("observer_or_diff_trace", 2353),
-    ("interrupt_shadow", 2360),
-    ("aggregate_accounting", 2367),
-    ("native_fetch_trace", 2381),
-    ("mode_key", 2389),
-    ("x87_top", 2403),
-    ("segment_layout_none", 2412),
-    ("cs_layout", 2420),
-    ("cpl", 2428),
-    ("callout_privileged", 2509),
-    ("data_segment", 2534),
-    ("alignment", 2543),
-    ("fetch_limit", 2558),
-    ("entry_deferred_short", 2572),
-    ("zero_budget", 2680),
-    ("block_regenerated_none", 2716),
+    ("skip_native_continuations_inactive", 1264),
+    ("skip_backend_or_skip_once", 1272),
+    ("skip_approximate_timing", 1278),
+    ("jit16_level_zero", 1403),
+    ("approximate_timing", 1409),
+    ("auto_admit", 1420),
+    ("direct_hot_at", 1434),
+    ("decline_memo_hit", 1460),
+    ("key_for_phys_none", 1472),
+    ("probe_interpret", 1485),
+    ("probe_rejected", 1542),
+    ("link_line_not_live", 1733),
+    ("revalidate_none", 1739),
+    ("dispatch_deferred_short", 1755),
+    ("observer_or_diff_trace", 2351),
+    ("interrupt_shadow", 2358),
+    ("aggregate_accounting", 2365),
+    ("native_fetch_trace", 2379),
+    ("mode_key", 2387),
+    ("x87_top", 2401),
+    ("segment_layout_none", 2410),
+    ("cs_layout", 2418),
+    ("cpl", 2426),
+    ("callout_privileged", 2507),
+    ("data_segment", 2532),
+    ("alignment", 2541),
+    ("fetch_limit", 2556),
+    ("entry_deferred_short", 2570),
+    ("zero_budget", 2678),
+    ("block_regenerated_none", 2714),
 ];
 
 /// Index constants for `REFUSAL_SITES`, named at the call sites in `run.rs`.
@@ -199,7 +199,7 @@ pub(crate) mod site {
 
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1464;
+pub const P0_MARK_LINE: u32 = 1462;
 
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
 /// identity holds only once these are added back, because a traversal refused at, say,
@@ -222,13 +222,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 /// `mark(P12)`; `compile_site` is what separates them.
 pub const N_COMPILE_SITES: usize = 7;
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1583),
-    ("structural_reject", 1602),
-    ("compile_retry", 1613),
-    ("page_cover_failed", 1637),
-    ("lane_install_demote", 1665),
-    ("install_failed", 1675),
-    ("installed_fall_through", 1720),
+    ("heat_demote", 1581),
+    ("structural_reject", 1600),
+    ("compile_retry", 1611),
+    ("page_cover_failed", 1635),
+    ("lane_install_demote", 1663),
+    ("install_failed", 1673),
+    ("installed_fall_through", 1718),
 ];
 pub(crate) mod compile_site {
     pub(crate) const HEAT_DEMOTE: usize = 0;
