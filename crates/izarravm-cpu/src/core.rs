@@ -1539,6 +1539,24 @@ impl CpuGsw {
         }
     }
 
+    /// The entry-attribution observer's snapshot, or `None` when it was never armed.
+    ///
+    /// The tally is THREAD-LOCAL, so this must be called on the thread that ran the guest. The
+    /// headless runner the design's protocol uses drives the machine and writes the profile JSON
+    /// on one thread, which is the only configuration this instrument is claimed for; a caller on
+    /// another thread gets an all-zero snapshot rather than a merged one, and `marks` reading zero
+    /// against a non-zero `jit_direct_entries` is what makes that visible rather than silent.
+    ///
+    /// It hangs off `CpuGsw` for the same reason the census snapshot does: this is the seam that
+    /// owns both the instrument and `PerfCounters`, and the exporter receives a snapshot and no
+    /// CPU.
+    #[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
+    pub fn direct_entry_attribution_snapshot(
+        &self,
+    ) -> Option<crate::DirectEntryAttributionSnapshot> {
+        crate::jit::direct::entry_attribution::snapshot()
+    }
+
     /// The census snapshot, JOINED with the two perf counters its classes are designed to close
     /// on. This is the only seam where that join can happen: the census lives on `JitState` and
     /// cannot see `PerfCounters`, and `direct_barrier_census_json` receives a snapshot and no CPU.

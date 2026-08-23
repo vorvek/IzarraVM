@@ -2097,6 +2097,15 @@ fn write_hdd_profile_json(
     {
         report["smc_census"] = smc_census_json(machine.cpu().direct_smc_census_snapshot(), perf);
     }
+    // Census precedent, deliberately (design H7): a SIBLING top-level object, emitted OUTSIDE
+    // `perf_counters_json`, so that function's signature and ordered key list stay identical
+    // between the plain and the observer build and
+    // `perf_counter_json_exposes_the_complete_counter_surface` passes in both.
+    #[cfg(feature = "direct-entry-attribution")]
+    {
+        report["direct_entry_attribution"] =
+            direct_entry_attribution_json(machine.cpu().direct_entry_attribution_snapshot());
+    }
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
 }
@@ -2171,6 +2180,159 @@ fn vga_wipe_census_json(
                 "min_instructions": 1u64 << bucket,
                 "count": count,
             })).collect::<Vec<_>>(),
+    })
+}
+
+/// The entry-attribution observer's sibling object.
+///
+/// Every phase carries BOTH `ticks_raw` (no subtraction of any kind) and `ticks_corrected`
+/// (`ticks_raw - overhead x marks`, allowed to go NEGATIVE and reported as such), because the
+/// aggregate subtraction is a modelling step and the reader has to be able to undo it. A phase
+/// whose corrected value lands within one `resolution_floor_ns` per mark of zero is reported
+/// `below_resolution: true` and never as "0" — design section 4 prices two phases at or under the
+/// floor, and the instrument must say so rather than report them free.
+///
+/// The section 6 fit is NOT computed here: the bins are exported and
+/// `.bench/scripts/entry-attribution-report.py` does the weighted least squares, the CIs and the
+/// condition number. One implementation of the numerics, in the place that also prints the
+/// pre-registered verdict.
+#[cfg(feature = "direct-entry-attribution")]
+fn direct_entry_attribution_json(
+    snapshot: Option<izarravm_cpu::DirectEntryAttributionSnapshot>,
+) -> serde_json::Value {
+    use izarravm_cpu::{
+        COMPILE_SITES, FALLBACK_TAG_NAMES, LANE_NAMES, N_HOP_BINS, N_INSN_BINS, OUTLIER_TICKS,
+        PHASE_NAMES, POPULATION_NAMES, PRE_P0_REFUSAL_SITES, REFUSAL_SITES,
+    };
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    let tsc_hz = snapshot.tsc_hz as f64;
+    let ns_of = |ticks: f64| {
+        if tsc_hz > 0.0 {
+            ticks / tsc_hz * 1e9
+        } else {
+            f64::NAN
+        }
+    };
+    let floor_ns = ns_of(snapshot.overhead_ticks as f64);
+    let lanes = LANE_NAMES
+        .iter()
+        .enumerate()
+        .map(|(lane, name)| {
+            let phases = PHASE_NAMES
+                .iter()
+                .enumerate()
+                .map(|(phase, phase_name)| {
+                    let raw = snapshot.ticks_raw[lane][phase];
+                    let marks = snapshot.marks[lane][phase];
+                    let corrected =
+                        raw as i128 - (snapshot.overhead_ticks as i128) * (marks as i128);
+                    let ns = ns_of(corrected as f64);
+                    let per_mark_ns = if marks == 0 { 0.0 } else { ns / marks as f64 };
+                    json!({
+                        "phase": phase_name,
+                        "ticks_raw": raw,
+                        "marks": marks,
+                        "ticks_corrected": corrected as f64,
+                        "ns": ns,
+                        "ns_per_mark": per_mark_ns,
+                        "below_resolution": marks > 0 && per_mark_ns.abs() <= floor_ns,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let totals = POPULATION_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, population)| {
+                    json!({
+                        "population": population,
+                        "ticks": snapshot.totals[lane][index],
+                        "ns": ns_of(snapshot.totals[lane][index] as f64),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let refusal_site = REFUSAL_SITES
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| snapshot.refusal_site[lane][index] != 0)
+                .map(|(index, (label, line))| {
+                    json!({
+                        "index": index,
+                        "site": label,
+                        "run_rs_line": line,
+                        "count": snapshot.refusal_site[lane][index],
+                        "above_p0_mark": PRE_P0_REFUSAL_SITES.contains(&index),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let compile_site = COMPILE_SITES
+                .iter()
+                .enumerate()
+                .map(|(index, (label, line))| {
+                    json!({
+                        "index": index,
+                        "site": label,
+                        "run_rs_line": line,
+                        "count": snapshot.compile_site[lane][index],
+                    })
+                })
+                .collect::<Vec<_>>();
+            let fallback_tags = FALLBACK_TAG_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    json!({ "tag": label, "count": snapshot.fallback_tags[lane][index] })
+                })
+                .collect::<Vec<_>>();
+            let native_bins = snapshot.native_bins[lane]
+                .iter()
+                .enumerate()
+                .filter(|&(_, row)| row[0] != 0)
+                .map(|(bin, row)| {
+                    let insn_bin = bin % N_INSN_BINS;
+                    let hop_bin = (bin / N_INSN_BINS) % N_HOP_BINS;
+                    let self_loop = bin / (N_INSN_BINS * N_HOP_BINS) != 0;
+                    json!({
+                        "bin": bin,
+                        "instructions": insn_bin + 1,
+                        "linked_transfers_class": hop_bin,
+                        "self_loop": self_loop,
+                        "count": row[0],
+                        "ticks": row[1],
+                        "instructions_sum": row[2],
+                        "linked_transfers_sum": row[3],
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "lane": name,
+                "lane_index": lane,
+                "phases": phases,
+                "totals": totals,
+                "refusal_site": refusal_site,
+                "compile_site": compile_site,
+                "fallback_tags": fallback_tags,
+                "native_bins": native_bins,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "arm": snapshot.arm,
+        "sample_n": snapshot.sample_n,
+        "overhead_ticks": snapshot.overhead_ticks,
+        "resolution_floor_ns": floor_ns,
+        "tsc_hz": snapshot.tsc_hz,
+        "outlier_clamp_ticks": OUTLIER_TICKS,
+        "outlier_ticks": snapshot.outlier_ticks,
+        "outlier_marks": snapshot.outlier_marks,
+        "lane_pin_mismatches": snapshot.lane_pin_mismatches,
+        "insn_bins": N_INSN_BINS,
+        "hop_bin_classes": N_HOP_BINS,
+        "phase_names": PHASE_NAMES,
+        "lane_names": LANE_NAMES,
+        "population_names": POPULATION_NAMES,
+        "lanes": lanes,
     })
 }
 

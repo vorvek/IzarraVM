@@ -24,6 +24,15 @@ mod ipe_entry_tally;
 pub use ipe_entry_tally::IpeEntryTargets;
 #[cfg(feature = "jit")]
 mod jit;
+/// The entry-attribution observer's snapshot and the tables that name its buckets. Present only
+/// in the observer build (`direct-entry-attribution`); the plain build has no such symbol, which
+/// is half of why its profile-JSON key set is unchanged.
+#[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
+pub use jit::direct::entry_attribution::{
+    BIN_FIELDS, COMPILE_SITES, DirectEntryAttributionSnapshot, FALLBACK_TAG_NAMES, LANE_NAMES,
+    N_BINS, N_HOP_BINS, N_INSN_BINS, N_LOOP_BINS, OUTLIER_TICKS, PHASE_NAMES, POPULATION_NAMES,
+    PRE_P0_REFUSAL_SITES, REFUSAL_SITES,
+};
 /// The unit simulator's headline report, returned by `CpuGsw::take_unit_sim_report` (a diagnostic
 /// measurement aid; see `jit::unit_sim`).
 #[cfg(feature = "jit")]
