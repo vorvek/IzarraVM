@@ -671,6 +671,25 @@ pub(crate) struct DirectStallTally {
     /// though both register at `IMM8_LANE_WIDTH`: the two arms are independent knobs, so a
     /// combined leg has to be able to attribute an accepts movement to one of them.
     pub count_lane_registrations: u64,
+    /// Option D STORE lanes registered at install: the `0x89 MOV r/m32, r32` and
+    /// `0x88 MOV r/m8, r8` displacement fields behind `IZARRAVM_DISP_STORE_LANES`. Kept apart
+    /// from `disp_lane_registrations` even though both register at `IMM_LANE_WIDTH` and share the
+    /// `0x8A` family's write-choke rule, because the arms are independently knobbed: the store
+    /// arm alone reads 11.460% capture against the pre-registered 11.9% line and the pair reads
+    /// 12.797%, so a leg has to be able to attribute movement to one of them.
+    ///
+    /// **NON-ZERO on a shipped binary since the 2026-08-23 flip**, and that reading is small:
+    /// the counter smoke read 115 registrations on `duke3d-586-short` for a −24.5% min-wall,
+    /// because the prize arrives through the heat equilibrium rather than through lane volume.
+    /// Zero here on a plain leg now means the ESCAPE was exported (`IZARRAVM_DISP_STORE_LANES=0`)
+    /// or the workload patches no store displacements at all -- the corpus rows read zero and are
+    /// inert, which is the heat gate doing its job.
+    pub disp_store_lane_registrations: u64,
+    /// The `0x8B` load-widening half of Option D (`IZARRAVM_DISP_LOAD_WIDEN`), still DEFAULT OFF
+    /// and so still zero on a shipped binary: at `MAX_BLOCK_IMM_LANES` = 12 it competes with the
+    /// store arm for the budget rather than adding capture (`imm_lane_cap_refusals` 3,775 ->
+    /// 11,369), and it is blocked on the cap re-price. See `disp_load_widen_enabled`.
+    pub disp_load_widen_lane_registrations: u64,
     /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
     /// charged to the family that would otherwise have taken the slot. The registration counters
     /// above say how many lanes those same blocks installed; these say how many more they would
@@ -716,6 +735,14 @@ pub(crate) struct DirectStallTally {
     pub imm8_lane_cap_refusals: u64,
     pub count_lane_cap_refusals: u64,
     pub disp_lane_cap_refusals: u64,
+    /// The two Option D arms' cap cells. Both keep `disp_lane_cap_refusals`' TIGHTER definition
+    /// -- the budget is tested below the `has_record_range` heat gate and below
+    /// `direct_host_bytes` -- so every slot they count had a heat record and a host pointer
+    /// waiting. `disp_store_lane_cap_refusals` is live on a shipped binary since the 2026-08-23
+    /// flip (14 on the counter smoke); `disp_load_widen_lane_cap_refusals` reads zero unless that
+    /// still-default-OFF knob is exported on.
+    pub disp_store_lane_cap_refusals: u64,
+    pub disp_load_widen_lane_cap_refusals: u64,
     /// Interpreted continuations whose decode line had died between the packed first touch and
     /// the deferred full-view fetch (`IZARRAVM_DECODE_PACK`). The staleness argument in
     /// `run_budgeted_inner` says admission cannot invalidate the slot it screened, so this is the
@@ -2300,10 +2327,14 @@ impl crate::jit::JitState {
             disp_lane_registrations: self.stalls.disp_lane_registrations,
             imm8_lane_registrations: self.stalls.imm8_lane_registrations,
             count_lane_registrations: self.stalls.count_lane_registrations,
+            disp_store_lane_registrations: self.stalls.disp_store_lane_registrations,
+            disp_load_widen_lane_registrations: self.stalls.disp_load_widen_lane_registrations,
             imm_lane_cap_refusals: self.stalls.imm_lane_cap_refusals,
             imm8_lane_cap_refusals: self.stalls.imm8_lane_cap_refusals,
             count_lane_cap_refusals: self.stalls.count_lane_cap_refusals,
             disp_lane_cap_refusals: self.stalls.disp_lane_cap_refusals,
+            disp_store_lane_cap_refusals: self.stalls.disp_store_lane_cap_refusals,
+            disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,

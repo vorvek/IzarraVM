@@ -8,6 +8,7 @@ mod callout;
 mod callout_attribution;
 pub(crate) mod census;
 mod classify;
+mod disp_lanes;
 mod emit;
 // Always compiled: the module body is feature-gated, but the `ea_*!` macros must exist in the
 // plain build so `run.rs` can name them and have them expand to nothing.
@@ -38,6 +39,10 @@ pub(crate) use retire_governor::{DATA_SEGMENT_LAYOUT_CENSUS_CAP, DATA_SEGMENT_RE
 /// module for the same reason `segment_layout` and `env_gates` do -- this file is inside 130 code
 /// lines of the 5,000-line ceiling -- and its callers name it `jit::direct::X` all the same.
 pub(crate) use retire_governor::{DataSegmentRejectArm, SegmentRetireGovernor};
+
+/// The three displacement lane matchers, moved/added in `disp_lanes` for the same layout
+/// reason. `disp_lane_for` is pure motion; the two Option D arms beside it are new.
+pub(crate) use disp_lanes::{OptionDArm, disp_lane_for, option_d_lane_for};
 
 /// And the same again for the environment gates, which moved out to keep this file under the
 /// layout limit. Every knob is still `jit::direct::X` to its callers.
@@ -283,14 +288,21 @@ pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
 /// families), so a block spanning such a region needs the larger budget for its lanes to absorb
 /// the whole burst — one uncovered patched slot is enough to keep killing the block.
 pub(crate) const MAX_BLOCK_IMM_LANES: usize = 12;
-/// The four lane families that draw on `MAX_BLOCK_IMM_LANES`, indexed in the order the compile
+/// The six lane families that draw on `MAX_BLOCK_IMM_LANES`, indexed in the order the compile
 /// walk tries their matchers. A walk carries one `u16` per family beside its `disp_lane_count`
 /// and the count travels with the `Compilation` to the install site; see `LaneCapRefusals`.
-pub(crate) const LANE_CAP_FAMILIES: usize = 4;
+///
+/// The last two are the Option D arms. `LANE_CAP_DISP_STORE` is LIVE on a shipped binary since
+/// the 2026-08-23 flip; `LANE_CAP_DISP_LOAD_WIDEN` stays zero while its knob is default OFF, for
+/// the reason every off arm's cap cell does -- each arm tests its knob before it reaches the
+/// budget. The store cell is now one of the numbers the lane-cap re-price is graded on.
+pub(crate) const LANE_CAP_FAMILIES: usize = 6;
 pub(crate) const LANE_CAP_IMM: usize = 0;
 pub(crate) const LANE_CAP_IMM8: usize = 1;
 pub(crate) const LANE_CAP_COUNT: usize = 2;
 pub(crate) const LANE_CAP_DISP: usize = 3;
+pub(crate) const LANE_CAP_DISP_STORE: usize = 4;
+pub(crate) const LANE_CAP_DISP_LOAD_WIDEN: usize = 5;
 /// How many slots the shared lane budget refused ON THIS WALK, per family.
 ///
 /// PER WALK rather than per matcher call, and that is the whole point of the type. The compile
@@ -1783,6 +1795,20 @@ impl BlockCache {
         self.stalls.count_lane_registrations += lanes;
     }
 
+    /// Option D STORE lanes registered by an install (`0x89` / `0x88`), and the `0x8B` load
+    /// widening beside it. Separate counters rather than a fold into `disp_lane_registrations`,
+    /// so the two arms share the `0x8A` family's denominator without being hidden inside it: a
+    /// ladder leg has to be able to say that a `smc_lane_accepts` movement came from the store
+    /// arm rather than from `0x8A` shifting under it.
+    pub(crate) fn note_disp_store_lane_registrations(&mut self, lanes: u64) {
+        self.stalls.disp_store_lane_registrations += lanes;
+    }
+
+    /// The `0x8B` half. See `note_disp_store_lane_registrations`.
+    pub(crate) fn note_disp_load_widen_lane_registrations(&mut self, lanes: u64) {
+        self.stalls.disp_load_widen_lane_registrations += lanes;
+    }
+
     /// Fold ONE INSTALLED block's per-walk lane-budget refusals into the tally, per family.
     ///
     /// Called from `JitState::install` on the success arm and from nowhere else, which is what
@@ -1795,6 +1821,9 @@ impl BlockCache {
         self.stalls.imm8_lane_cap_refusals += u64::from(refusals[LANE_CAP_IMM8]);
         self.stalls.count_lane_cap_refusals += u64::from(refusals[LANE_CAP_COUNT]);
         self.stalls.disp_lane_cap_refusals += u64::from(refusals[LANE_CAP_DISP]);
+        self.stalls.disp_store_lane_cap_refusals += u64::from(refusals[LANE_CAP_DISP_STORE]);
+        self.stalls.disp_load_widen_lane_cap_refusals +=
+            u64::from(refusals[LANE_CAP_DISP_LOAD_WIDEN]);
     }
 
     /// The packed first touch screened a slot that no longer had a line by the time the
@@ -3708,6 +3737,13 @@ pub(crate) struct Compilation {
     /// classes are selected by independent knobs, so a `smc_lane_accepts` movement on a combined
     /// ladder leg has to be attributable to one of them.
     count_lanes: u8,
+    /// How many of `imm_lanes` are Option D STORE lanes (`disp_store_lane_for`) and how many are
+    /// `0x8B` LOAD-WIDENING lanes (`disp_load_widen_lane_for`). Both are displacement lanes and
+    /// both are indistinguishable from `disp_lanes` at the write choke; the split exists for the
+    /// same reason `imm8_lanes` and `count_lanes` are not one field, which is that the two arms
+    /// are separately knobbed and a ladder has to attribute an accepts movement to one of them.
+    disp_store_lanes: u8,
+    disp_load_widen_lanes: u8,
     /// How many slots the shared `MAX_BLOCK_IMM_LANES` budget refused on the walk that produced
     /// this compilation, per family. Charged into the tally by `JitState::install` and nowhere
     /// else, so a walk that never installs (a `Retry`, a `StructuralReject`, or one of the
@@ -3735,6 +3771,14 @@ impl Compilation {
 
     pub(crate) fn count_lane_count(&self) -> usize {
         usize::from(self.count_lanes)
+    }
+
+    pub(crate) fn disp_store_lane_count(&self) -> usize {
+        usize::from(self.disp_store_lanes)
+    }
+
+    pub(crate) fn disp_load_widen_lane_count(&self) -> usize {
+        usize::from(self.disp_load_widen_lanes)
     }
 
     pub(crate) fn lane_cap_refusals(&self) -> LaneCapRefusals {
@@ -4915,18 +4959,33 @@ pub(crate) struct DirectAddr {
     pub(crate) index: Option<u8>,
     pub(crate) scale: u8,
     pub(crate) disp: u32,
-    /// Present only for the shapes `disp_lane_for` admits (the `0x8A MOV r8, [..disp32..]`
-    /// family). When present the emitted effective address IGNORES `disp` and loads the four
-    /// displacement bytes out of guest RAM on every execution, so a guest patch of those bytes
-    /// needs no recompile. `disp` still carries the value decoded at compile time and is what
-    /// the non-lane form bakes.
+    /// Present only for the shapes the THREE displacement-lane matchers in `jit::direct::disp_lanes`
+    /// admit, and they are no longer one family:
+    ///
+    /// * `disp_lane_for` — `0x8A MOV r8, [..disp32..]`, default ON;
+    /// * `disp_load_widen_lane_for` — `0x8B MOV r32, [..disp32..]`, `IZARRAVM_DISP_LOAD_WIDEN`,
+    ///   default OFF;
+    /// * `disp_store_lane_for` — `0x89 MOV [..disp32..], r32` and `0x88 MOV [..disp32..], r8`,
+    ///   `IZARRAVM_DISP_STORE_LANES`, default OFF. **So a lane can now ride a `Store`.**
+    ///
+    /// When present the emitted effective address IGNORES `disp` and loads the four displacement
+    /// bytes out of guest RAM on every execution, so a guest patch of those bytes needs no
+    /// recompile. `disp` still carries the value decoded at compile time and is what the non-lane
+    /// form bakes.
     ///
     /// It rides on the ADDRESS rather than on `DirectKind::Load` because the displacement's one
     /// consumer is `emit_effective_address` and every memory emitter reaches it through
     /// `emit_segmented_linear_address` — including the one-lookup fast paths — so a single seam
-    /// serves them all, and a later Store/AluMemSource admission is a `disp_lane_for` widening
-    /// rather than new plumbing. The lane arm forms the address through EAX alone, so it is
-    /// safe whatever a caller has staged in the other scratch registers.
+    /// serves them all. That is what made the Store admission a matcher widening rather than new
+    /// plumbing, and it is why the segment-limit compare and the base add downstream of the lane
+    /// arm run on the PATCHED address: a store whose patched displacement walks past the limit
+    /// takes the same `segment_limit` side exit the baked form would.
+    ///
+    /// The lane arm forms the address through EAX alone, so it is safe whatever a caller has
+    /// staged in the other scratch registers — and, for the Store admission, both store emitters
+    /// were checked to stage NOTHING across it (`emit_store` and `emit_store_fast` both form the
+    /// address first). An `AluMemSource` / `RmwIncDec` / x87 admission is still unmeasured and
+    /// still owes its own review and census row.
     pub(crate) disp_lane: Option<ImmLane>,
 }
 
@@ -6355,113 +6414,6 @@ fn count_lane_for(
     Some((kind, lane))
 }
 
-/// The displacement twin of `imm_lane_for`: `0x8A MOV r8, [..disp32..]`, every ModRM memory
-/// form, no prefixes — GATED ON MEASURED PATCH HISTORY. The admitted field is the
-/// instruction's disp32, which duke3d-586's SMC trace measured at 17M of its 19.3M disp-patch
-/// events (dev_docs/2026-08-09-disp-lanes-design.md); each one today either kills the covering
-/// block or keeps its chunk's G1 heat stamped.
-///
-/// THE HEAT GATE IS THE SLICE'S LOAD-BEARING DECISION, and it was reached by refutation twice
-/// over. The lane form costs two host instructions per EXECUTION whether or not the field is
-/// ever patched. Iteration 1 admitted the whole family unconditionally: duke +8.2%, but the
-/// 2026-08-09 formal gate FAILED — doom-486 paired RTF 0.978, doom-586 0.975 — because doom's
-/// renderer executes `[base+disp32]` texture/colormap byte loads constantly and patches none
-/// of them. Iteration 2 tried the shape cut (bare `[disp32]` only): doom recovered but duke's
-/// win VANISHED (rt 0.2706 vs 0.2697, 3.4k lanes vs 233k) — Build patches the indexed forms
-/// too, so no static shape separates the populations. What separates them is BEHAVIOR:
-/// `SmcHeatMap::has_record_range` over the disp field's bytes is true only after the field
-/// took a heat-charged kill, so a never-patched load compiles baked and untaxed forever, and a
-/// patched one converges to the lane form one kill after its first patch (the kill bumps the
-/// record, the recompile sees it). Lane-absorbed patches deliberately do not refresh records,
-/// and a record consumed by `lift_cold_smc_dormant` recovery self-heals the same way: one more
-/// kill, one more recompile.
-///
-/// The probe reads the heat accelerator WITHOUT `sync_smc_heat` (this is a `&CpuGsw` path); a
-/// stale read across a cache reset can at worst bake one block that a later recompile lanes, or
-/// lane one block that did not need it — admission tuning, never correctness.
-///
-/// `disp_len == 4` plus the default-prefix test confines this to 32-bit addressing: a CS.D=0
-/// segment cannot reach a four-byte displacement without a `0x67` prefix, so a lane and
-/// `AddressWrap::Word` can never co-occur and the loaded field needs no sign-extension — the
-/// four guest bytes ARE the architectural displacement. With `imm_len == 0` those bytes are
-/// the instruction's last four, so the lane start is `physical + len - 4` (offset 2 on the
-/// mod-0 rm-5 form, 3 on the SIB forms, more under mod 2 — the SIB fixture pins this).
-///
-/// Only `DirectKind::Load` may carry a lane, and that is a REGISTER-PRESSURE contract, not
-/// taste: the lane arm of `emit_effective_address` stages the displacement through EAX alone,
-/// which is safe for every caller, but widening admission to a kind whose emitter resolves the
-/// address AFTER staging other live state would still deserve its own review — and its own
-/// census row, per the standing rule against unmeasured admissions.
-fn disp_lane_for(
-    cpu: &CpuGsw,
-    insn: &DecodedInsn,
-    kind: DirectKind,
-    physical: u32,
-    lanes_used: usize,
-    cap_refusals: &mut LaneCapRefusals,
-) -> Option<(DirectKind, ImmLane)> {
-    if !disp_lanes_enabled() {
-        return None;
-    }
-    let DirectKind::Load {
-        dst,
-        width,
-        addr,
-        raw_clocks,
-    } = kind
-    else {
-        return None;
-    };
-    if insn.opcode != 0x8a
-        || insn.prefixes != Prefixes::default()
-        || insn.disp_len != 4
-        || insn.imm_len != 0
-    {
-        return None;
-    }
-    let lane = physical.checked_add(u32::from(insn.len).checked_sub(4)?)?;
-    if !cpu
-        .jit_direct
-        .smc_heat
-        .has_record_range(lane, IMM_LANE_WIDTH)
-    {
-        return None;
-    }
-    // Page-local in physical for the same reason as `imm_lane_for`: the compile loop only
-    // reaches this after `physical_page_local`, so one host pointer covers all four bytes.
-    let host = cpu.direct_host_bytes(lane, IMM_LANE_WIDTH)?;
-    // The cap, split off the knob above and tested LAST, which is where this family differs from
-    // the other three. The bar it must stay under is the heat gate: that is what separates a
-    // patched load from doom's never-patched texture reads, so a cap test placed above it would
-    // report the whole `0x8A` population as budget pressure. It stays under `direct_host_bytes`
-    // as well, unlike the other three, because the gate above it is the expensive bar here (a
-    // `has_record_range` hash lookup) and hoisting over the handful-of-entries fetch-cache scan
-    // under it would buy nothing measurable. That leaves one family in which the page guard is
-    // pinned ABOVE the cap, which is what
-    // `a_disp_slot_whose_lane_bytes_are_not_direct_mapped_charges_no_cap_refusal` holds.
-    if lanes_used >= MAX_BLOCK_IMM_LANES {
-        cap_refusals[LANE_CAP_DISP] = cap_refusals[LANE_CAP_DISP].saturating_add(1);
-        return None;
-    }
-    let lane = ImmLane {
-        physical: lane,
-        host,
-        width: IMM_LANE_WIDTH as u8,
-    };
-    Some((
-        DirectKind::Load {
-            dst,
-            width,
-            addr: DirectAddr {
-                disp_lane: Some(lane),
-                ..addr
-            },
-            raw_clocks,
-        },
-        lane,
-    ))
-}
-
 /// The physical address of the byte that encodes the COUNT for the two rows `IZARRAVM_ROTATE_ROWS`
 /// gates -- `0xC1`/`0xD1` `/0` ROL and `0xC0 /4` SHL r8 -- or `None` for anything else, including
 /// the rows that were lowered before the 2026-08-09 slice (`/1` ROR, `/4..=7` at Dword) and which
@@ -6639,6 +6591,8 @@ fn compile_with_budget(
     let mut disp_lane_count = 0u8;
     let mut imm8_lane_count = 0u8;
     let mut count_lane_count = 0u8;
+    let mut disp_store_lane_count = 0u8;
+    let mut disp_load_widen_lane_count = 0u8;
     // Refusals THIS WALK charged to the shared lane budget, one cell per family. Carried here and
     // handed to the install site with the `Compilation` rather than charged into the tally inside
     // the matchers: see `LaneCapRefusals` for the denominator argument, and `JitState::install`
@@ -7377,7 +7331,51 @@ fn compile_with_budget(
                             }
                             kind
                         }
-                        None => kind,
+                        // The two Option D arms, LAST. The position was chosen when both were
+                        // default OFF; since the 2026-08-23 flip the STORE arm is on by default
+                        // and it is kept here anyway, because the ordering is cost and never
+                        // admission -- all six matchers are mutually exclusive by KIND and
+                        // OPCODE, so no ordering can change which one fires.
+                        //
+                        // THE PRICE ON A SHIPPED BINARY, stated exactly rather than waved at.
+                        // Each arm tests its own knob first, so a slot that reaches here pays TWO
+                        // `OnceLock` reads and their two branches -- not one, and not a shared
+                        // test, because the arms are separately knobbed and `option_d_lane_for`
+                        // calls them in turn. Each `OnceLock` is resolved once per process, so a
+                        // read is a relaxed load of an initialised cell plus a branch. Since the
+                        // flip the store branch is PREDICTED TAKEN into its kind and opcode bars
+                        // rather than returning at the knob; the load-widen one still returns
+                        // there. The slots that reach here at all are the ones all four shipped
+                        // matchers refused.
+                        None => match option_d_lane_for(
+                            cpu,
+                            &insn,
+                            kind,
+                            expected_phys,
+                            imm_lane_count,
+                            &mut lane_cap_refusals,
+                        ) {
+                            Some((kind, lane, arm)) => {
+                                imm_lanes[imm_lane_count] = lane.physical;
+                                imm_lane_widths[imm_lane_count] = lane.width;
+                                imm_lane_count += 1;
+                                match arm {
+                                    OptionDArm::Store => disp_store_lane_count += 1,
+                                    OptionDArm::LoadWiden => disp_load_widen_lane_count += 1,
+                                }
+                                // The DISP bit, shared with `0x8A` rather than given a fifth:
+                                // B.3's export answers "did a mutable-DISPLACEMENT lane attach on
+                                // a walk from this entry", and all three families are that. The
+                                // census split that says which arm did the work is the
+                                // registration counter pair.
+                                #[cfg(feature = "barrier-census-closure")]
+                                {
+                                    lane_probe_bits |= census::lane_probe::DISP;
+                                }
+                                kind
+                            }
+                            None => kind,
+                        },
                     },
                 },
             },
@@ -7928,6 +7926,8 @@ fn compile_with_budget(
         disp_lanes: disp_lane_count,
         imm8_lanes: imm8_lane_count,
         count_lanes: count_lane_count,
+        disp_store_lanes: disp_store_lane_count,
+        disp_load_widen_lanes: disp_load_widen_lane_count,
         lane_cap_refusals,
         code: emitted.code,
     })

@@ -3277,6 +3277,15 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_disp_lane_registrations": snapshot.disp_lane_registrations,
         "smc_imm8_lane_registrations": snapshot.imm8_lane_registrations,
         "smc_count_lane_registrations": snapshot.count_lane_registrations,
+        // The two Option D arms: `IZARRAVM_DISP_STORE_LANES` is DEFAULT ON since the
+        // 2026-08-23 ladder, `IZARRAVM_DISP_LOAD_WIDEN` is still default OFF and is blocked on
+        // the lane-cap re-price. Unconditional here, like their four neighbours: a heat-coupled
+        // counter
+        // that is present on one leg and absent on the other confounds the arm with a counter
+        // surface change, and these ship in PLAIN builds precisely so the ladder needs no census
+        // binary to prove which arm a leg ran.
+        "smc_disp_store_lane_registrations": snapshot.disp_store_lane_registrations,
+        "smc_disp_load_widen_lane_registrations": snapshot.disp_load_widen_lane_registrations,
         // The lane-budget split. Registrations say what lanes a run's installed blocks took;
         // these say what the shared `MAX_BLOCK_IMM_LANES` budget turned away IN THOSE SAME
         // BLOCKS, per family and on the cap arm only. Both are folded in at install, so the two
@@ -3287,6 +3296,8 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_imm8_lane_cap_refusals": snapshot.imm8_lane_cap_refusals,
         "smc_count_lane_cap_refusals": snapshot.count_lane_cap_refusals,
         "smc_disp_lane_cap_refusals": snapshot.disp_lane_cap_refusals,
+        "smc_disp_store_lane_cap_refusals": snapshot.disp_store_lane_cap_refusals,
+        "smc_disp_load_widen_lane_cap_refusals": snapshot.disp_load_widen_lane_cap_refusals,
         "decode_pack_late_view_miss": snapshot.decode_pack_late_view_miss,
         "x87_top_retires_suppressed": snapshot.x87_top_retires_suppressed,
         "x87_top_sticky_crossings": snapshot.x87_top_sticky_crossings,

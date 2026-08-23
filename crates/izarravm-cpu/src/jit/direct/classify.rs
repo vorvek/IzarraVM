@@ -2442,8 +2442,11 @@ pub(super) fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
         scale: addr.scale,
         disp: addr.disp as u32,
         // `classify` has no `&CpuGsw` and no physical address, and a lane needs both. The
-        // compile loop attaches one through `disp_lane_for` for the single shape that
-        // qualifies, exactly as `imm_lane_for` does for `AluImm`.
+        // compile loop attaches one through the `disp_lanes` matchers, exactly as `imm_lane_for`
+        // does for `AluImm`. Three shapes qualify now, not one: `0x8A` loads (default ON), `0x8B`
+        // loads (default OFF) and `0x89` / `0x88` STORES (default ON since the 2026-08-23
+        // Option D ladder) -- so the `DirectAddr`
+        // this function builds for a `DirectKind::Store` can come back carrying a lane.
         disp_lane: None,
     })
 }

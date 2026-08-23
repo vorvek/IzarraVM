@@ -2047,6 +2047,13 @@ pub struct DirectStallSnapshot {
     /// Group-2 count lanes (`0xC1`/`0xC0` count byte) registered at install, the L2 arm-2 share
     /// of the aggregate `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
     pub count_lane_registrations: u64,
+    /// The two Option D arms, kept apart from `disp_lane_registrations` so a leg can attribute
+    /// an accepts movement to one arm. `0x89`/`0x88` store displacement lanes
+    /// (`IZARRAVM_DISP_STORE_LANES`) are **DEFAULT ON since the 2026-08-23 ladder** and read
+    /// non-zero on a shipped duke leg; the `0x8B` load widening (`IZARRAVM_DISP_LOAD_WIDEN`) is
+    /// still default OFF, blocked on the lane-cap re-price. See `DirectStallTally`.
+    pub disp_store_lane_registrations: u64,
+    pub disp_load_widen_lane_registrations: u64,
     /// Slots refused by the shared `MAX_BLOCK_IMM_LANES` budget in the blocks this run INSTALLED,
     /// one counter per family and charged on the CAP arm alone. Same denominator as the
     /// registration counters above, which is what makes the pair readable: registrations flat
@@ -2056,6 +2063,8 @@ pub struct DirectStallSnapshot {
     pub imm8_lane_cap_refusals: u64,
     pub count_lane_cap_refusals: u64,
     pub disp_lane_cap_refusals: u64,
+    pub disp_store_lane_cap_refusals: u64,
+    pub disp_load_widen_lane_cap_refusals: u64,
     /// Continuations the packed decode first touch screened and then could not materialise a line
     /// for. Expected identically zero; see `DirectStallTally`.
     pub decode_pack_late_view_miss: u64,
