@@ -117,7 +117,8 @@ macro_rules! ea_mark_probe_tail {
         #[cfg(feature = "direct-entry-attribution")]
         {
             if $from_compile {
-                $crate::jit::direct::entry_attribution::mark(
+                // COARSE-inclusive: see the `mark(P2)` at the arm head.
+                $crate::jit::direct::entry_attribution::mark_coarse(
                     $crate::jit::direct::entry_attribution::Phase::Compile,
                 );
                 $crate::jit::direct::entry_attribution::note_compile_site(

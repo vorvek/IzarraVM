@@ -224,7 +224,6 @@ fn the_coarse_arm_takes_exactly_the_two_native_marks() {
     for phase in [
         Phase::DispatchGates,
         Phase::Key,
-        Phase::Probe,
         Phase::EntryGuards,
         Phase::SegmentLayout,
         Phase::BlockFields,
@@ -234,7 +233,6 @@ fn the_coarse_arm_takes_exactly_the_two_native_marks() {
         Phase::TailClocks,
         Phase::Refused,
         Phase::InterpretFallback,
-        Phase::Compile,
     ] {
         assert_eq!(
             marks(&snap, phase),
@@ -242,6 +240,17 @@ fn the_coarse_arm_takes_exactly_the_two_native_marks() {
             "{phase:?} must not be stamped in the COARSE arm"
         );
     }
+    // P2 and P14 are the two COARSE-inclusive exceptions, and they fire on the COMPILE ARM ONLY.
+    // They exist because B3 takes P14 out of `total_entered`, and COARSE cannot subtract a term it
+    // never measured. Both must therefore equal the number of compile-arm traversals exactly: a
+    // leak into the non-compiling path would show here as an excess.
+    let compiles: u64 = snap.compile_site.iter().flatten().sum();
+    assert!(
+        compiles > 0,
+        "no compile ran, so the two exceptions are untested"
+    );
+    assert_eq!(marks(&snap, Phase::Compile), compiles);
+    assert_eq!(marks(&snap, Phase::Probe), compiles);
     // `end()` still fires, which is what makes COARSE's totals comparable with FULL's.
     assert!(population(&snap, Population::Entered) > 0);
 }

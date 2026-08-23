@@ -1550,7 +1550,11 @@ impl CpuGsw {
                 .block(id)
                 .expect("ready direct block must remain live"),
             jit::direct::BlockProbe::Compile => {
-                ea_mark!(Phase::Probe);
+                // COARSE-inclusive, unlike the other `mark(P2)`: it is what BOUNDS P14, and P14
+                // has to be subtractable from `total_entered` in both arms (B3). It fires on the
+                // compile arm alone -- 2.5% of traversals on the loader -- so the four-mark
+                // COARSE shape is unchanged for the other 97.5%.
+                ea_mark_coarse!(Phase::Probe);
                 // G1 pre-compile gate (cheap, entry chunk only): if the block's first 16-byte
                 // chunk is churning this heat epoch, park it Dormant and interpret without paying a
                 // compile. Dormant (not Rejected) because Rejected would acquire watch ranges and
@@ -1575,7 +1579,7 @@ impl CpuGsw {
                         lane_trial = true;
                     } else {
                         self.smc_heat_demote(key, heat_epoch);
-                        ea_mark!(Phase::Compile);
+                        ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::HEAT_DEMOTE);
                         ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
@@ -1594,7 +1598,7 @@ impl CpuGsw {
                         // reject just acquired the span's watch, and a fast-map entry filled
                         // before it must not keep a clear PAGE_WATCHED bit.
                         self.sweep_block_watch_edges();
-                        ea_mark!(Phase::Compile);
+                        ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::STRUCTURAL_REJECT);
                         ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
@@ -1605,7 +1609,7 @@ impl CpuGsw {
                             jit::direct::DormantReason::CompileRetry,
                             Some(cause),
                         );
-                        ea_mark!(Phase::Compile);
+                        ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::COMPILE_RETRY);
                         ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
@@ -1629,7 +1633,7 @@ impl CpuGsw {
                 if !code_page_covers_block {
                     self.jit_direct
                         .dormant(key, jit::direct::DormantReason::PageCoverFailed, None);
-                    ea_mark!(Phase::Compile);
+                    ea_mark_coarse!(Phase::Compile);
                     ea_compile_site!(compile_site::PAGE_COVER_FAILED);
                     ea_end!(Population::Compile);
                     return Ok(DirectContinuation::Interpret);
@@ -1657,7 +1661,7 @@ impl CpuGsw {
                     };
                     if !lane_install {
                         self.smc_heat_demote(key, heat_epoch);
-                        ea_mark!(Phase::Compile);
+                        ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::LANE_INSTALL_DEMOTE);
                         ea_end!(Population::Compile);
                         return Ok(DirectContinuation::Interpret);
@@ -1667,7 +1671,7 @@ impl CpuGsw {
                 let Some(id) = self.jit_direct.install(&compilation) else {
                     self.jit_direct
                         .dormant(key, jit::direct::DormantReason::InstallFailed, None);
-                    ea_mark!(Phase::Compile);
+                    ea_mark_coarse!(Phase::Compile);
                     ea_compile_site!(compile_site::INSTALL_FAILED);
                     ea_end!(Population::Compile);
                     return Ok(DirectContinuation::Interpret);

@@ -242,6 +242,12 @@ struct Tally {
     last: u64,
     begin_stamp: u64,
     last_charge: u64,
+    /// Ticks this traversal spent inside P14. B3 excludes the compile from `total_entered` and
+    /// from `total_fallback`, and a `Compile`-arm traversal that INSTALLS goes on to enter the
+    /// block it just built, so the compile's microseconds sit inside that entered traversal's
+    /// span unless they are subtracted back out here. Measured: leaving them in put A1's entered
+    /// closure at 0.66 and inflated E by ~48%.
+    compile_ticks: u64,
     sampling: bool,
     seq: u64,
     lane: usize,
@@ -264,6 +270,7 @@ impl Tally {
             last: 0,
             begin_stamp: 0,
             last_charge: 0,
+            compile_ticks: 0,
             sampling: false,
             seq: 0,
             lane: 0,
@@ -416,6 +423,7 @@ pub(crate) fn begin(d: bool, v86: bool) {
         t.last = now;
         t.begin_stamp = now;
         t.last_charge = 0;
+        t.compile_ticks = 0;
         t.fallback_tag = FallbackTag::Neither as u8;
     });
 }
@@ -441,6 +449,9 @@ fn accumulate(t: &mut Tally, phase: Phase) {
         OUTLIER_TICKS
     };
     t.last_charge = charged;
+    if index == Phase::Compile as usize {
+        t.compile_ticks = t.compile_ticks.saturating_add(charged);
+    }
     t.ticks[t.lane][index] = t.ticks[t.lane][index].saturating_add(charged);
     t.marks[t.lane][index] += 1;
 }
@@ -482,7 +493,14 @@ pub(crate) fn end(population: Population) {
         if !t.sampling {
             return;
         }
-        let span = rdtsc().wrapping_sub(t.begin_stamp);
+        let raw_span = rdtsc().wrapping_sub(t.begin_stamp);
+        // B3: P14 is outside `total_entered` and `total_fallback`. `total_compile` is its own
+        // denominator and keeps the whole span.
+        let span = if population as usize == Population::Compile as usize {
+            raw_span
+        } else {
+            raw_span.saturating_sub(t.compile_ticks)
+        };
         let slot = &mut t.totals[t.lane][population as usize];
         *slot = slot.saturating_add(span);
         // The site tag is committed HERE rather than where it is written, so the histogram counts
