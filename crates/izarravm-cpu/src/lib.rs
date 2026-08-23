@@ -821,6 +821,20 @@ pub struct PerfCounters {
     pub jit_direct_reject_cs_layout: u64,
     pub jit_direct_reject_cpl: u64,
     pub jit_direct_reject_data_segment: u64,
+    /// `jit_direct_reject_data_segment`, split by WHICH ARM of the entry check refused.
+    ///
+    /// `_strict` is the linked arm (`has_linked_successor`), which compares all six of the
+    /// block's own descriptors because a chained transfer runs successor bodies without
+    /// re-entering the dispatcher; `_masked` is the unlinked arm, which compares only the
+    /// block's own pinned set. The two sum to `jit_direct_reject_data_segment` exactly.
+    ///
+    /// In `PerfCounters` rather than in the stall tally, and that is the point of them: the
+    /// per-phase export is built from `PhaseMark::perf`, and the phase block carried no reject
+    /// column at all, so a whole-run-only split would leave the loader-phase bars unreadable.
+    /// Counted on EVERY governor arm including OFF -- the split is unmeasured on the shipped arm
+    /// and the OFF leg is where it first reads.
+    pub jit_direct_reject_data_segment_strict: u64,
+    pub jit_direct_reject_data_segment_masked: u64,
     pub jit_direct_reject_alignment: u64,
     pub jit_direct_reject_fetch_limit: u64,
     pub jit_direct_reject_zero_budget: u64,
@@ -2033,6 +2047,21 @@ pub struct DirectStallSnapshot {
     /// that cap. See `DirectStallTally`.
     pub x87_top_retires_suppressed: u64,
     pub x87_top_sticky_crossings: u64,
+    /// Data-segment retire-cap instruments: retires the cap refused, cap crossings, and stage 2
+    /// link-decline TRIPS. All zero on the OFF arm. See `DirectStallTally`.
+    pub data_segment_retires_suppressed: u64,
+    pub data_segment_sticky_crossings: u64,
+    pub data_segment_link_declines: u64,
+    /// Slice (a)'s missing census: how many DISTINCT live descriptor tuples -- masked by the
+    /// rejecting arm's own mask -- each key in the cap map has been rejected against. Index is
+    /// the distinct count; the last cell counts keys whose census SATURATED and must be read as
+    /// "at least 8" rather than exactly 8. Read off the live map, so a key dropped by an
+    /// invalidation takes its census with it.
+    ///
+    /// This is the go/no-go input for the per-layout block VARIANT slice, not a bar: a hot key
+    /// that alternates between exactly two layouts is what makes variants worth their surgery,
+    /// and nobody has ever counted it.
+    pub data_segment_distinct_layouts: [u64; 10],
     /// Sticky-decline memo (`dev_docs/sticky-decline-memo-design.md`), always on. `hits` is the
     /// number of declines the memo answered without running the admission chain; `advances` and
     /// `sweeps` are era-stamp advances and the 63-wrap sweeps among them. The design predicts

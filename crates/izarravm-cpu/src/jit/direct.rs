@@ -11,6 +11,7 @@ mod classify;
 mod emit;
 mod env_gates;
 mod native_exit;
+mod retire_governor;
 mod segment_layout;
 #[cfg(feature = "smc-census")]
 mod smc_census;
@@ -25,6 +26,15 @@ pub(crate) use native_exit::{
 /// Same reason as the `native_exit` re-export above: the extraction is pure motion, so every
 /// `jit::direct::X` path that named a segment-layout item keeps naming it here.
 pub(crate) use segment_layout::*;
+
+/// The cap and the census bound are read only by the fixtures that pin them; production code
+/// reaches them through `retire_governor`'s own path.
+#[cfg(test)]
+pub(crate) use retire_governor::{DATA_SEGMENT_LAYOUT_CENSUS_CAP, DATA_SEGMENT_RETIRE_CAP};
+/// The data-segment reject governor. New code rather than moved text, but it lives in a child
+/// module for the same reason `segment_layout` and `env_gates` do -- this file is inside 130 code
+/// lines of the 5,000-line ceiling -- and its callers name it `jit::direct::X` all the same.
+pub(crate) use retire_governor::{DataSegmentRejectArm, SegmentRetireGovernor};
 
 /// And the same again for the environment gates, which moved out to keep this file under the
 /// layout limit. Every knob is still `jit::direct::X` to its callers.
@@ -827,6 +837,24 @@ pub(crate) struct BlockCache {
     /// `DEFAULT_ENTRY_CAP` without an eviction policy, and it is why a rewritten page hands the
     /// new code at that address a fresh budget instead of its predecessor's stickiness.
     top_mismatch_retires: HashMap<BlockKey, u8, PodKeyBuildHasher>,
+    /// Per-key data-segment retire budget and layout census, capped at
+    /// `DATA_SEGMENT_RETIRE_CAP`. Empty on the OFF arm of `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`,
+    /// which is what makes an OFF leg a reproduction of `main` rather than a close relative.
+    ///
+    /// Containment: same discipline as `top_mismatch_retires` above, and for the same reason --
+    /// the row is only ever written on the `Compiled` path, and both sites that drop a key from
+    /// `entries` (`invalidate_physical_range`, `reset_storage`) drop it here too. It deliberately
+    /// SURVIVES `invalidate_translation`: see `forget_data_segment_decline` for the asymmetry.
+    data_segment_retires:
+        HashMap<BlockKey, retire_governor::DataSegmentRetireRecord, PodKeyBuildHasher>,
+    /// Keys whose outbound edges stage 2 of the governor cut, and which must not re-link.
+    ///
+    /// FOUR lifetime hooks, one more than the budget map: the two above, plus
+    /// `invalidate_translation` (which erases every chain requirement a decline could have been
+    /// earned against) and `retire_key_for_recompile` (so a recompile is not born declined).
+    /// Keyed on `BlockKey` and not `BlockId` because block slots are recycled and a recycled slot
+    /// would inherit a stranger's decline.
+    data_segment_link_declined: HashSet<BlockKey, PodKeyBuildHasher>,
     /// Code sites, by `(physical, mode_key)`, whose `InterpretOne` call-out the governor demoted.
     /// The compile walk reads it and ends the block BEFORE such a slot, so the recompile produces
     /// the hard boundary the row had before it was admitted.
@@ -1087,6 +1115,8 @@ impl BlockCache {
             block_imm_lane_widths: Vec::new(),
             lane_trial_epochs: HashMap::default(),
             top_mismatch_retires: HashMap::default(),
+            data_segment_retires: HashMap::default(),
+            data_segment_link_declined: HashSet::default(),
             demoted_callout_sites: HashSet::default(),
             callout_retire_pending: None,
             retry_lift_spent: HashSet::default(),
@@ -2060,6 +2090,11 @@ impl BlockCache {
             self.hot[hot_index] = None;
         }
         self.entries.insert(key, BlockState::Seen);
+        // The block's live edges do not survive its retire, and the decline is a statement about
+        // exactly those. Without this the recompile is BORN declined: `make_link_visible` calls
+        // `resolve_successors`, every edge refuses, and a block that would have chained perfectly
+        // is permanently unchained for its predecessor incarnation's judgement.
+        self.forget_data_segment_decline(key);
         self.retire_block(watch, id);
         true
     }
@@ -2128,6 +2163,10 @@ impl BlockCache {
                 self.top_mismatch_retires.is_empty(),
                 "TOP-mismatch budgets outlived their entries"
             );
+            debug_assert!(
+                self.data_segment_state_is_empty(),
+                "data-segment governor state outlived its entries"
+            );
             if watch.has_resident_pages() {
                 watch.clear();
             }
@@ -2179,6 +2218,11 @@ impl BlockCache {
         // mask exists to admit. Wholesale SMC and paging flushes make that the common case, not a
         // corner. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
         self.chain_layouts.copy_from_slice(&self.segment_layouts);
+        // BESIDE the line above, and for one level up of its own argument: a decline earned
+        // against a chain requirement this flush just ERASED would bar re-linking for the rest of
+        // the cache's life -- the same permanently-over-strict failure. The BUDGET survives; see
+        // `forget_data_segment_decline`.
+        self.data_segment_link_declined.clear();
         self.waiting.clear();
         self.linear_blocks.clear();
         self.stats.unlinks += links;
@@ -2435,6 +2479,7 @@ impl BlockCache {
                     // `range_hits_compiled_code` is what gates the call. `forget_demoted_sites_in`
                     // is called from the code-write door instead.
                     self.top_mismatch_retires.remove(&key);
+                    self.forget_data_segment_state_for_key(key);
                     let hot_index = key.hot_index();
                     if self.hot[hot_index].is_some_and(|hot| hot.key == key) {
                         self.hot[hot_index] = None;
@@ -3009,6 +3054,7 @@ impl BlockCache {
         self.block_imm_lane_widths.clear();
         self.lane_trial_epochs.clear();
         self.top_mismatch_retires.clear();
+        self.clear_data_segment_state();
         self.demoted_callout_sites.clear();
         self.callout_retire_pending = None;
         self.retry_lift_spent.clear();
@@ -3064,6 +3110,15 @@ impl BlockCache {
             {
                 continue;
             }
+            // The do-not-park contract. A declined source is refused by `try_link_inner` on every
+            // attempt, so parking it would have every later install at this `LinkTarget` re-try
+            // and re-refuse it -- bounded in size, unbounded in count, and `link_refusals`'
+            // `declined` bucket would stop meaning "stage 2 trips". The written precedent is
+            // `LinkClearCause::ChainWiden`, which is not re-parked for the same reason: a retry
+            // could only re-derive the same refusal.
+            if self.link_source_declined(source) {
+                continue;
+            }
             self.waiting.entry(successor).or_default().push(LinkSource {
                 block: source,
                 slot: slot as u8,
@@ -3079,6 +3134,9 @@ impl BlockCache {
         for source in waiting {
             if !self.try_link(source.block, source.slot, target)
                 && self.active_index(source.block).is_some()
+                // The other half of the do-not-park contract: an entry parked before the decline
+                // must not be put back.
+                && !self.link_source_declined(source.block)
             {
                 unresolved.push(source);
             }
@@ -3134,6 +3192,22 @@ impl BlockCache {
             .flatten();
         let refusal = if stale_epoch {
             Some(LinkRefusal::StaleEpoch)
+        }
+        // ABOVE `SegmentLayout` -- and therefore above the outbound fast path below, so even a
+        // re-assert of an existing edge is caught. It needs a valid `source_index`, which is why
+        // it cannot sit above `Inactive`. `link_source_declined` returns on an emptiness test
+        // whenever the governor is not on its `on` arm, so the OFF and `cap` arms pay one
+        // compare here and nothing else.
+        //
+        // The placement is DEFENCE IN DEPTH and is recorded as such rather than claimed to be
+        // load-bearing: a mutant that moves this check below the fast path SURVIVES the fixtures,
+        // and provably has to, because the decline's own `unlink_outbound` clears BOTH outbound
+        // cells, so `outbound[source][slot] == Some(target)` cannot hold for a declined source
+        // while it is declined. Kept up here anyway -- the fast path's precondition is a fact
+        // about today's decline implementation, and a refusal that depends on one is a refusal
+        // waiting to be silently deleted.
+        else if self.link_source_declined(source) {
+            Some(LinkRefusal::Declined)
         } else if chain_merge.is_none() {
             Some(LinkRefusal::SegmentLayout)
         } else if !source_block.link_compatible(&target_block) {

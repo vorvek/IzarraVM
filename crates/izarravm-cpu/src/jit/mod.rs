@@ -397,6 +397,22 @@ impl JitState {
             .retire_key_for_top_mismatch(&mut self.code_watch, key)
     }
 
+    pub(crate) fn retire_key_for_data_segment(
+        &mut self,
+        key: direct::BlockKey,
+        arm: direct::DataSegmentRejectArm,
+        own_mask_matches: bool,
+        live: &[crate::SegmentRegister; 6],
+    ) -> bool {
+        self.direct.retire_key_for_data_segment(
+            &mut self.code_watch,
+            key,
+            arm,
+            own_mask_matches,
+            live,
+        )
+    }
+
     pub(crate) fn clear(&mut self) {
         self.direct.clear(&mut self.code_watch);
     }

@@ -879,8 +879,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The JIT arena-size slice adds one PerfCounters field (jit_direct_arena_compaction_ns;
     // 8 bytes), moving the pin 4480 -> 4488 -- measured, not derived. Host wall nanoseconds are
     // not architectural state, so both canonical payloads are unchanged by it.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4536);
+    // The data-segment reject governor adds two PerfCounters fields
+    // (jit_direct_reject_data_segment_strict / _masked; 16 bytes), moving the pin 4536 -> 4552 --
+    // measured, not derived. Reject counts are host bookkeeping, so both canonical payloads are
+    // unchanged by it; see cpu_test.rs's twin comment for why they have to sit in PerfCounters.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4552);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4536);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4552);
 }

@@ -1094,6 +1094,8 @@ pub(super) fn perf_counters_json(
         "jit_direct_reject_cs_layout": perf.jit_direct_reject_cs_layout,
         "jit_direct_reject_cpl": perf.jit_direct_reject_cpl,
         "jit_direct_reject_data_segment": perf.jit_direct_reject_data_segment,
+        "jit_direct_reject_data_segment_strict": perf.jit_direct_reject_data_segment_strict,
+        "jit_direct_reject_data_segment_masked": perf.jit_direct_reject_data_segment_masked,
         "jit_direct_reject_alignment": perf.jit_direct_reject_alignment,
         "jit_direct_reject_fetch_limit": perf.jit_direct_reject_fetch_limit,
         "jit_direct_reject_zero_budget": perf.jit_direct_reject_zero_budget,
