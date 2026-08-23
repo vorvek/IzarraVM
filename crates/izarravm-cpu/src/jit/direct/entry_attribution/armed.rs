@@ -88,6 +88,30 @@ pub const N_BINS: usize = N_INSN_BINS * N_HOP_BINS * N_LOOP_BINS;
 /// counts, and a weight the export cannot see is a weight the fit cannot use.
 pub const BIN_FIELDS: usize = 4;
 
+/// The bin one native window falls in: `exit.instructions` 1..=32 (saturating) crossed with
+/// `linked_transfers` in {0, 1, 2+} crossed with self-loop.
+///
+/// A free function, and the exporter's decoder is its inverse below, because the packing used to
+/// live inline in `note_native` while `main.rs` unpacked it by hand from three constants -- two
+/// expressions of one layout with nothing tying them together.
+#[inline(always)]
+pub fn native_bin_index(insns: u64, hops: u32, self_loop: bool) -> usize {
+    let insn_bin = (insns.clamp(1, N_INSN_BINS as u64) - 1) as usize;
+    let hop_bin = hops.min(2) as usize;
+    let loop_bin = usize::from(self_loop);
+    (loop_bin * N_HOP_BINS + hop_bin) * N_INSN_BINS + insn_bin
+}
+
+/// The inverse of `native_bin_index`: `(instructions, linked_transfers_class, self_loop)`, with
+/// `instructions` the bin's LOWER edge (bin 31 means "32 or more").
+pub fn native_bin_parts(bin: usize) -> (usize, usize, bool) {
+    (
+        bin % N_INSN_BINS + 1,
+        (bin / N_INSN_BINS) % N_HOP_BINS,
+        bin / (N_INSN_BINS * N_HOP_BINS) != 0,
+    )
+}
+
 /// The interpreted-fallback site tag (H3-R). `run.rs:820` and `run.rs:824` write it and nothing
 /// else; the single `mark(P13)` inside the `None` arm is what counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,36 +131,36 @@ pub const N_REFUSAL_SITES: usize = 30;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1241),
-    ("skip_backend_or_skip_once", 1246),
-    ("skip_approximate_timing", 1249),
-    ("jit16_level_zero", 1371),
-    ("approximate_timing", 1374),
-    ("auto_admit", 1382),
-    ("direct_hot_at", 1393),
-    ("decline_memo_hit", 1416),
-    ("key_for_phys_none", 1424),
-    ("probe_interpret", 1428),
-    ("probe_rejected", 1481),
-    ("link_line_not_live", 1645),
-    ("revalidate_none", 1648),
-    ("dispatch_deferred_short", 1661),
-    ("observer_or_diff_trace", 2254),
-    ("interrupt_shadow", 2258),
-    ("aggregate_accounting", 2262),
-    ("native_fetch_trace", 2273),
-    ("mode_key", 2278),
-    ("x87_top", 2289),
-    ("segment_layout_none", 2294),
-    ("cs_layout", 2299),
-    ("cpl", 2304),
-    ("callout_privileged", 2381),
-    ("data_segment", 2402),
-    ("alignment", 2407),
-    ("fetch_limit", 2419),
-    ("entry_deferred_short", 2430),
-    ("zero_budget", 2534),
-    ("block_regenerated_none", 2566),
+    ("skip_native_continuations_inactive", 1266),
+    ("skip_backend_or_skip_once", 1274),
+    ("skip_approximate_timing", 1280),
+    ("jit16_level_zero", 1405),
+    ("approximate_timing", 1411),
+    ("auto_admit", 1422),
+    ("direct_hot_at", 1436),
+    ("decline_memo_hit", 1462),
+    ("key_for_phys_none", 1474),
+    ("probe_interpret", 1487),
+    ("probe_rejected", 1544),
+    ("link_line_not_live", 1735),
+    ("revalidate_none", 1741),
+    ("dispatch_deferred_short", 1757),
+    ("observer_or_diff_trace", 2353),
+    ("interrupt_shadow", 2360),
+    ("aggregate_accounting", 2367),
+    ("native_fetch_trace", 2381),
+    ("mode_key", 2389),
+    ("x87_top", 2403),
+    ("segment_layout_none", 2412),
+    ("cs_layout", 2420),
+    ("cpl", 2428),
+    ("callout_privileged", 2509),
+    ("data_segment", 2534),
+    ("alignment", 2543),
+    ("fetch_limit", 2558),
+    ("entry_deferred_short", 2572),
+    ("zero_budget", 2680),
+    ("block_regenerated_none", 2716),
 ];
 
 /// Index constants for `REFUSAL_SITES`, named at the call sites in `run.rs`.
@@ -173,10 +197,17 @@ pub(crate) mod site {
     pub(crate) const BLOCK_REGENERATED_NONE: usize = 29;
 }
 
-/// The refusal sites that sit BEFORE `mark(P0)` at `run.rs:1418`. A3 states
-/// `marks(P0) = decode_probes`; that identity holds only once these are added back, because a
-/// traversal refused at, say, `run.rs:1241` bumped `seam_probes` and never reached the P0 mark.
-/// The report prints both the literal A3 form and this exact one.
+/// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
+/// "above" it. Kept beside the tables it partitions so all three move together.
+pub const P0_MARK_LINE: u32 = 1464;
+
+/// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
+/// identity holds only once these are added back, because a traversal refused at, say,
+/// `run.rs:1266` bumped `seam_probes` and never reached the P0 mark. The report prints both the
+/// literal A3 form and the exact one.
+///
+/// `pre_p0_sites_are_exactly_the_returns_above_the_p0_mark` derives this set from
+/// `P0_MARK_LINE` and fails if the list and the line numbers disagree.
 pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
     site::SKIP_NATIVE_CONTINUATIONS_INACTIVE,
     site::SKIP_BACKEND_OR_SKIP_ONCE,
@@ -187,18 +218,17 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
     site::DIRECT_HOT_AT,
     site::DECLINE_MEMO_HIT,
 ];
-
 /// The seven exits of the `BlockProbe::Compile` arm (B3-R). All seven take `mark(P14)`, never
 /// `mark(P12)`; `compile_site` is what separates them.
 pub const N_COMPILE_SITES: usize = 7;
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1512),
-    ("structural_reject", 1528),
-    ("compile_retry", 1536),
-    ("page_cover_failed", 1557),
-    ("lane_install_demote", 1582),
-    ("install_failed", 1589),
-    ("installed_fall_through", 1633),
+    ("heat_demote", 1583),
+    ("structural_reject", 1602),
+    ("compile_retry", 1613),
+    ("page_cover_failed", 1637),
+    ("lane_install_demote", 1665),
+    ("install_failed", 1675),
+    ("installed_fall_through", 1720),
 ];
 pub(crate) mod compile_site {
     pub(crate) const HEAT_DEMOTE: usize = 0;
@@ -256,6 +286,10 @@ struct Tally {
     marks: [[u64; N_PHASES]; N_LANES],
     native: [[[u64; BIN_FIELDS]; N_BINS]; N_LANES],
     totals: [[u64; N_POPULATIONS]; N_LANES],
+    /// How many times `end()` fired for each population. `totals` is a sum of spans and cannot
+    /// answer "did every entered traversal call `end()` exactly once"; this can, and A1's
+    /// denominators are only trustworthy if it does.
+    totals_count: [[u64; N_POPULATIONS]; N_LANES],
     refusal_site: [[u64; N_REFUSAL_SITES]; N_LANES],
     compile_site: [[u64; N_COMPILE_SITES]; N_LANES],
     fallback_tags: [[u64; N_FALLBACK_TAGS]; N_LANES],
@@ -279,6 +313,7 @@ impl Tally {
             marks: [[0; N_PHASES]; N_LANES],
             native: [[[0; BIN_FIELDS]; N_BINS]; N_LANES],
             totals: [[0; N_POPULATIONS]; N_LANES],
+            totals_count: [[0; N_POPULATIONS]; N_LANES],
             refusal_site: [[0; N_REFUSAL_SITES]; N_LANES],
             compile_site: [[0; N_COMPILE_SITES]; N_LANES],
             fallback_tags: [[0; N_FALLBACK_TAGS]; N_LANES],
@@ -323,8 +358,12 @@ fn rdtsc() -> u64 {
 struct Calibration {
     arm: Arm,
     sample_n: u64,
-    /// Median of 1e5 back-to-back mark-shaped `rdtsc` pairs — the resolution floor.
+    /// `median(bracketed real mark) - median(empty bracket)` -- the resolution floor.
     overhead_ticks: u64,
+    /// The two halves of that difference, carried so the floor can be audited rather than
+    /// trusted. The first calibration timed a `Vec::push` and over-stated the floor 2.6x.
+    calibration_bracket_ticks: u64,
+    calibration_mark_ticks: u64,
     tsc_at_arm: u64,
     instant_at_arm: Instant,
 }
@@ -373,8 +412,8 @@ fn calibration() -> &'static Calibration {
         // A disarmed observer leg must not pay the 1e5-iteration calibration; under `cargo test`
         // it must, because the fixtures override the arm per thread and would otherwise read a
         // zero resolution floor.
-        let overhead_ticks = if arm == Arm::Off && !cfg!(test) {
-            0
+        let (bracket, mark, overhead_ticks) = if arm == Arm::Off && !cfg!(test) {
+            (0, 0, 0)
         } else {
             calibrate()
         };
@@ -382,25 +421,64 @@ fn calibration() -> &'static Calibration {
             arm,
             sample_n,
             overhead_ticks,
+            calibration_bracket_ticks: bracket,
+            calibration_mark_ticks: mark,
             tsc_at_arm: rdtsc(),
             instant_at_arm: Instant::now(),
         }
     })
 }
 
-/// The resolution floor: the median cost of one `mark`, spent the way a `mark` spends it.
-fn calibrate() -> u64 {
-    const N: usize = 100_000;
-    let mut deltas = Vec::with_capacity(N);
-    let mut last = rdtsc();
-    for _ in 0..N {
-        let now = rdtsc();
-        deltas.push(now.wrapping_sub(last));
-        last = now;
+/// The resolution floor, measured with REAL marks.
+///
+/// Returns `(bracket, mark, overhead)`, all in ticks and all reported, because the number that
+/// matters is a difference and a reader has to be able to see both halves.
+///
+/// Two passes of `CALIBRATION_SAMPLES`, each sample bracketed by a pair of `rdtsc` reads:
+///
+///   * pass 1 times an EMPTY bracket -- the cost of the measurement itself;
+///   * pass 2 times one real `accumulate()` against a scratch `Tally`, which is the same code the
+///     hot path runs: an `rdtsc`, a subtract, the clamp compare and two array accumulations.
+///
+/// `overhead = median(pass 2) - median(pass 1)`. The first version of this function timed
+/// `rdtsc`-to-`rdtsc` with a `Vec::push` between the reads, so it measured neither a mark nor an
+/// empty bracket -- it measured a push. It returned 42 ticks against an in-situ mark cost the
+/// loader put near 16, and the resulting aggregate subtraction drove ten of twelve phases
+/// negative. Medians, not means, because one host preemption in 1e5 samples otherwise owns the
+/// answer.
+///
+/// The sample buffers are allocated BEFORE either pass and written by index, so no allocator work
+/// can land inside a bracket.
+fn calibrate() -> (u64, u64, u64) {
+    const N: usize = CALIBRATION_SAMPLES;
+    let mut bracket = vec![0u64; N];
+    let mut marked = vec![0u64; N];
+    let mut scratch = Tally::new();
+    scratch.sampling = true;
+    for slot in bracket.iter_mut() {
+        let before = rdtsc();
+        let after = rdtsc();
+        *slot = after.wrapping_sub(before);
     }
-    deltas.sort_unstable();
-    deltas[N / 2]
+    for slot in marked.iter_mut() {
+        let before = rdtsc();
+        accumulate(&mut scratch, Phase::DispatchGates);
+        let after = rdtsc();
+        *slot = after.wrapping_sub(before);
+    }
+    bracket.sort_unstable();
+    marked.sort_unstable();
+    let bracket_median = bracket[N / 2];
+    let mark_median = marked[N / 2];
+    (
+        bracket_median,
+        mark_median,
+        mark_median.saturating_sub(bracket_median),
+    )
 }
+
+/// Samples per calibration pass.
+const CALIBRATION_SAMPLES: usize = 100_000;
 
 /// D0 (`run.rs:807`). Takes the sample decision for this traversal, latches the lane and writes
 /// the cursor. **Accumulates nothing** (B1): the inter-entry gap — interpreted continuations,
@@ -503,6 +581,7 @@ pub(crate) fn end(population: Population) {
         };
         let slot = &mut t.totals[t.lane][population as usize];
         *slot = slot.saturating_add(span);
+        t.totals_count[t.lane][population as usize] += 1;
         // The site tag is committed HERE rather than where it is written, so the histogram counts
         // TRAVERSALS that reached the interpreted arm and can never drift from `marks(P13)`. A
         // traversal that reaches the arm without the dispatcher having produced either outcome
@@ -565,10 +644,7 @@ pub(crate) fn note_native(insns: u64, hops: u32, self_loop: bool) {
         if !t.sampling {
             return;
         }
-        let insn_bin = (insns.clamp(1, N_INSN_BINS as u64) - 1) as usize;
-        let hop_bin = hops.min(2) as usize;
-        let loop_bin = usize::from(self_loop);
-        let bin = (loop_bin * N_HOP_BINS + hop_bin) * N_INSN_BINS + insn_bin;
+        let bin = native_bin_index(insns, hops, self_loop);
         let ticks = t.last_charge;
         let lane = t.lane;
         let row = &mut t.native[lane][bin];
@@ -611,11 +687,16 @@ pub struct DirectEntryAttributionSnapshot {
     pub arm: &'static str,
     pub sample_n: u64,
     pub overhead_ticks: u64,
+    /// The two halves `overhead_ticks` is the difference of.
+    pub calibration_bracket_ticks: u64,
+    pub calibration_mark_ticks: u64,
     pub tsc_hz: u64,
     /// `ticks[lane][phase]`, raw — no per-mark subtraction, no clamp beyond `OUTLIER_TICKS`.
     pub ticks_raw: Vec<Vec<u64>>,
     pub marks: Vec<Vec<u64>>,
     pub totals: Vec<Vec<u64>>,
+    /// `end()` calls per population -- the count `totals` is the sum over.
+    pub totals_count: Vec<Vec<u64>>,
     pub refusal_site: Vec<Vec<u64>>,
     pub compile_site: Vec<Vec<u64>>,
     pub fallback_tags: Vec<Vec<u64>>,
@@ -645,10 +726,13 @@ pub(crate) fn snapshot() -> Option<DirectEntryAttributionSnapshot> {
         arm: live_arm.label(),
         sample_n: sample_n(),
         overhead_ticks: cal.overhead_ticks,
+        calibration_bracket_ticks: cal.calibration_bracket_ticks,
+        calibration_mark_ticks: cal.calibration_mark_ticks,
         tsc_hz,
         ticks_raw: t.ticks.iter().map(|row| row.to_vec()).collect(),
         marks: t.marks.iter().map(|row| row.to_vec()).collect(),
         totals: t.totals.iter().map(|row| row.to_vec()).collect(),
+        totals_count: t.totals_count.iter().map(|row| row.to_vec()).collect(),
         refusal_site: t.refusal_site.iter().map(|row| row.to_vec()).collect(),
         compile_site: t.compile_site.iter().map(|row| row.to_vec()).collect(),
         fallback_tags: t.fallback_tags.iter().map(|row| row.to_vec()).collect(),
@@ -671,77 +755,210 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
+    /// The tables are indexed by enum discriminant, so a phase added without a name -- or named
+    /// out of order -- mis-labels every export from then on. Checking `len()` against the constant
+    /// beside it proves nothing (the arrays are DECLARED at that length); checking that each name
+    /// carries its own index does.
     #[test]
-    fn phase_and_site_tables_are_the_stated_size() {
-        assert_eq!(PHASE_NAMES.len(), N_PHASES);
-        assert_eq!(LANE_NAMES.len(), N_LANES);
-        assert_eq!(POPULATION_NAMES.len(), N_POPULATIONS);
-        assert_eq!(REFUSAL_SITES.len(), N_REFUSAL_SITES);
-        assert_eq!(COMPILE_SITES.len(), N_COMPILE_SITES);
-        assert_eq!(N_BINS, N_INSN_BINS * N_HOP_BINS * N_LOOP_BINS);
+    fn phase_names_are_in_discriminant_order() {
+        for (index, name) in PHASE_NAMES.iter().enumerate() {
+            let prefix = name
+                .split('_')
+                .next()
+                .expect("a phase name has a P<n> prefix");
+            assert_eq!(prefix, format!("P{index}"), "{name} sits at index {index}");
+        }
+        // And the enum agrees with the table it is used to index.
+        assert_eq!(Phase::DispatchGates as usize, 0);
+        assert_eq!(Phase::NativePreamble as usize, 8);
+        assert_eq!(Phase::NativeBody as usize, 9);
+        assert_eq!(Phase::Compile as usize, 14);
+        assert_eq!(Phase::Outliers as usize, N_PHASES - 1);
+        assert_eq!(Population::Compile as usize, N_POPULATIONS - 1);
+        assert_eq!(FallbackTag::Skipped as usize, N_FALLBACK_TAGS - 1);
     }
 
+    /// Every refusal and compile site must name a DISTINCT `run.rs` line, and the lines must be
+    /// non-decreasing down each table -- the tables are read as source order by the report and by
+    /// `PRE_P0_REFUSAL_SITES`.
     #[test]
-    fn refusal_site_indices_name_their_own_rows() {
-        // The index constants are hand-written positions into `REFUSAL_SITES`; this is the check
-        // that a table edit which forgets one is caught rather than silently mis-attributed.
-        assert_eq!(
-            REFUSAL_SITES[site::SKIP_NATIVE_CONTINUATIONS_INACTIVE].1,
-            1241
-        );
-        assert_eq!(REFUSAL_SITES[site::DECLINE_MEMO_HIT].1, 1416);
-        assert_eq!(REFUSAL_SITES[site::KEY_FOR_PHYS_NONE].1, 1424);
-        assert_eq!(REFUSAL_SITES[site::PROBE_REJECTED].1, 1481);
-        assert_eq!(REFUSAL_SITES[site::SEGMENT_LAYOUT_NONE].1, 2294);
-        assert_eq!(REFUSAL_SITES[site::CALLOUT_PRIVILEGED].1, 2381);
-        assert_eq!(REFUSAL_SITES[site::ENTRY_DEFERRED_SHORT].1, 2430);
-        assert_eq!(REFUSAL_SITES[site::BLOCK_REGENERATED_NONE].1, 2566);
-        assert_eq!(COMPILE_SITES[compile_site::HEAT_DEMOTE].1, 1512);
-        assert_eq!(COMPILE_SITES[compile_site::INSTALLED_FALL_THROUGH].1, 1633);
+    fn site_tables_are_distinct_and_in_source_order() {
+        let mut previous = 0;
+        for (label, line) in REFUSAL_SITES {
+            assert!(line > previous, "{label} at {line} is out of source order");
+            previous = line;
+        }
+        let mut previous = 0;
+        for (label, line) in COMPILE_SITES {
+            assert!(line > previous, "{label} at {line} is out of source order");
+            previous = line;
+        }
     }
 
+    /// `run.rs` as the test harness sees it. The tables below quote line numbers in it, and a
+    /// line number is the one kind of citation that rots silently: every edit above a site moves
+    /// it, nothing fails, and the export goes on labelling refusals with lines that now hold
+    /// something else. This is the fixture that makes that impossible.
+    const RUN_RS: &str = include_str!("../../../run.rs");
+
+    fn run_rs_line(line: u32) -> &'static str {
+        RUN_RS
+            .lines()
+            .nth(line as usize - 1)
+            .unwrap_or_else(|| panic!("run.rs has no line {line}"))
+    }
+
+    /// Every cited line must really carry the return it claims, AND the macro call naming that
+    /// site must sit immediately above it. Both halves matter: the first catches a table that
+    /// drifted off its site, the second catches two sites that swapped labels while both still
+    /// pointed at some `return`.
     #[test]
-    fn pre_p0_sites_are_exactly_the_returns_above_the_p0_mark() {
-        // `mark(P0)` is at `run.rs:1418`. Every refusal site with a smaller line number must be
-        // in the pre-P0 set, and no site at or after it may be.
+    fn the_refusal_and_compile_tables_name_the_lines_they_claim() {
         for (index, (label, line)) in REFUSAL_SITES.iter().enumerate() {
-            let listed = PRE_P0_REFUSAL_SITES.contains(&index);
-            assert_eq!(
-                listed,
-                *line < 1418,
-                "{label} at {line} is on the wrong side"
+            let text = run_rs_line(*line);
+            assert!(
+                text.contains("return "),
+                "refusal site {label} cites run.rs:{line}, which reads {text:?}"
+            );
+            let call = format!("ea_refusal!(site::{})", label.to_ascii_uppercase());
+            let window: String = RUN_RS
+                .lines()
+                .skip(*line as usize - 5)
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            assert!(
+                window.contains(&call),
+                "refusal site {index} ({label}) cites run.rs:{line}, but {call} is not above it"
+            );
+        }
+        for (label, line) in COMPILE_SITES {
+            if label == "installed_fall_through" {
+                // The seventh exit is a fall-through, not a return: `ea_mark_probe_tail!` decides
+                // between P2 and P14 there.
+                let window: String = RUN_RS
+                    .lines()
+                    .skip(line as usize - 3)
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    );
+                assert!(
+                    window.contains("ea_mark_probe_tail!"),
+                    "compile site {label} cites run.rs:{line} without the tail macro above it"
+                );
+                continue;
+            }
+            let text = run_rs_line(line);
+            assert!(
+                text.contains("return "),
+                "compile site {label} cites run.rs:{line}, which reads {text:?}"
+            );
+            let call = format!(
+                "ea_compile_site!(compile_site::{})",
+                label.to_ascii_uppercase()
+            );
+            let window: String = RUN_RS
+                .lines()
+                .skip(line as usize - 5)
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            assert!(
+                window.contains(&call),
+                "compile site {label} cites run.rs:{line}, but {call} is not above it"
             );
         }
     }
 
+    /// `P0_MARK_LINE` partitions the refusal table, so it has to be the line the P0 mark is on.
     #[test]
-    fn native_bin_index_is_a_bijection_on_its_three_terms() {
+    fn the_p0_mark_line_is_where_the_p0_mark_is() {
+        assert!(
+            run_rs_line(P0_MARK_LINE).contains("ea_mark!(Phase::DispatchGates)"),
+            "P0_MARK_LINE = {P0_MARK_LINE} reads {:?}",
+            run_rs_line(P0_MARK_LINE)
+        );
+    }
+
+    #[test]
+    fn pre_p0_sites_are_exactly_the_returns_above_the_p0_mark() {
+        // Every refusal site with a line below `P0_MARK_LINE` must be in the pre-P0 set, and no
+        // site at or after it may be.
+        for (index, (label, line)) in REFUSAL_SITES.iter().enumerate() {
+            let listed = PRE_P0_REFUSAL_SITES.contains(&index);
+            assert_eq!(
+                listed,
+                *line < P0_MARK_LINE,
+                "{label} at {line} is on the wrong side of the P0 mark"
+            );
+        }
+    }
+
+    /// `native_bin_index` and `native_bin_parts` must be exact inverses over the whole domain,
+    /// and the index must stay inside the array it addresses. The exporter decodes with
+    /// `native_bin_parts`, so a packing change that misses one of the two silently re-labels every
+    /// bin in the JSON.
+    #[test]
+    fn the_native_bin_index_and_its_inverse_round_trip() {
         let mut seen = std::collections::HashSet::new();
-        for loop_bin in 0..N_LOOP_BINS {
-            for hop_bin in 0..N_HOP_BINS {
-                for insn_bin in 0..N_INSN_BINS {
-                    let bin = (loop_bin * N_HOP_BINS + hop_bin) * N_INSN_BINS + insn_bin;
+        for self_loop in [false, true] {
+            for hops in 0..3u32 {
+                for insns in 1..=N_INSN_BINS as u64 {
+                    let bin = native_bin_index(insns, hops, self_loop);
                     assert!(bin < N_BINS);
-                    assert!(seen.insert(bin));
+                    assert!(seen.insert(bin), "bin {bin} was produced twice");
+                    assert_eq!(
+                        native_bin_parts(bin),
+                        (insns as usize, hops as usize, self_loop)
+                    );
                 }
             }
         }
         assert_eq!(seen.len(), N_BINS);
     }
 
+    /// The saturating edges: zero instructions folds up into bin 1, anything past 32 folds down
+    /// into bin 32, and three-or-more hops folds into the `2+` class. Without this a 100-insn
+    /// chain would index out of the array.
     #[test]
-    fn calibration_median_is_a_plausible_mark_cost() {
-        // Sanity, not a pin: one back-to-back `rdtsc` pair is tens of ticks on every host this
-        // runs on. Zero would mean the timer is not advancing; a huge value would mean the median
-        // picked up a preemption, which a median of 1e5 is chosen to prevent.
-        let median = calibrate();
-        assert!(
-            median > 0,
-            "rdtsc did not advance across 1e5 back-to-back reads"
+    fn the_native_bin_index_saturates_at_both_edges() {
+        assert_eq!(native_bin_index(0, 0, false), native_bin_index(1, 0, false));
+        assert_eq!(
+            native_bin_index(1_000_000, 0, false),
+            native_bin_index(N_INSN_BINS as u64, 0, false)
         );
+        assert_eq!(
+            native_bin_index(4, 99, false),
+            native_bin_index(4, 2, false)
+        );
+        assert!(native_bin_index(u64::MAX, u32::MAX, true) < N_BINS);
+    }
+
+    /// The calibration must measure a MARK, not the measurement. Both halves are asserted: an
+    /// empty bracket is a couple of `rdtsc` latencies, a bracketed real mark is strictly more, and
+    /// the difference is the resolution floor. The first version timed a `Vec::push` and returned
+    /// 42 ticks against an in-situ cost near 16, which drove ten of twelve phases negative.
+    #[test]
+    fn calibration_measures_a_mark_and_not_the_bracket() {
+        let (bracket, mark, overhead) = calibrate();
+        assert!(bracket > 0, "rdtsc did not advance across an empty bracket");
         assert!(
-            median < 10_000,
-            "calibration median {median} is not a mark cost"
+            mark > bracket,
+            "a bracketed real mark ({mark}) must cost more than an empty bracket ({bracket})"
+        );
+        assert_eq!(overhead, mark - bracket);
+        assert!(
+            overhead < 10_000,
+            "calibration difference {overhead} is not a mark cost"
         );
     }
 }

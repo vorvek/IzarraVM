@@ -6,16 +6,26 @@
 //!
 //! What each one is able to FAIL on, which is the only reason to write it:
 //!
-//! | fixture | what it pins | what it does if the property is broken |
-//! |---|---|---|
-//! | `armed_and_disarmed_runs_leave_identical_guest_state` | A4 | any stamp that touched guest state, the guest clock or a perf counter shows up as a diff |
-//! | `marks_per_entry_are_the_published_factors` | A3 / section 4b | a mark placed on the wrong side of a branch, or a P4/P5/P8 pair reduced to one |
-//! | `every_traversal_that_enters_takes_one_p11_and_one_end` | the cursor's well-definedness | an exit path that forgets `end()` leaves `total_entered` short of `marks(P11)` |
-//! | `refusal_sites_close_against_the_marks_that_reached_them` | H3 | a refusal without a `refusal_site` bump, or a site bumped without a mark |
-//! | `the_sampled_arm_stamps_end_to_end` | B1 | a stride that inflates a phase, or a sampled traversal marked without a `begin()` |
-//! | `the_coarse_arm_takes_exactly_the_two_native_marks` | A6's premise | a `mark_coarse` that leaked into the FULL-only set, or the reverse |
-//! | `the_disarmed_arm_accumulates_nothing` | the default | a stamp that runs before the arm is read |
-//! | `p14_is_exempt_from_the_outlier_clamp` | M-R4 | a clamp on P14 that would manufacture A3's negative-gap falsifier |
+//! * `armed_and_disarmed_runs_leave_identical_guest_state` -- A4. Any stamp that touched guest
+//!   state, the guest clock or a perf counter shows up as a diff.
+//! * `marks_per_entry_are_the_published_factors` -- P8 twice per entry, P9/P7/P6 once. A mark
+//!   placed on the wrong side of a branch, or a P4/P5/P8 pair reduced to one, breaks it, and A3
+//!   rests on it.
+//! * `every_traversal_that_enters_takes_one_p11_and_one_end` -- an exit path that forgets `end()`
+//!   leaves the entered population short of `marks(P11)`.
+//! * `entered_totals_exclude_the_compile_span` -- B3's denominator clause. Leaving the compile
+//!   inside `total_entered` put A1 at 0.66 and inflated E by 48% on the loader.
+//! * `refusal_sites_close_against_the_marks_that_reached_them` -- a refusal without a
+//!   `refusal_site` bump, or a site bumped without a mark.
+//! * `the_refusal_and_compile_tables_name_the_lines_they_claim` -- parses `run.rs` and checks
+//!   every cited line really carries the named return, so the tables cannot go stale in silence.
+//! * `the_sampled_arm_stamps_end_to_end` -- a stride that inflates a phase, or a sampled
+//!   traversal marked without a `begin()`.
+//! * `the_coarse_arm_takes_exactly_the_two_native_marks` -- a `mark_coarse` that leaked into the
+//!   FULL-only set, or the reverse.
+//! * `the_disarmed_arm_accumulates_nothing` -- a stamp that runs before the arm is read.
+//! * `p14_is_exempt_from_the_outlier_clamp` -- drives a REAL over-clamp interval and checks P14
+//!   keeps it while another phase sheds it.
 //!
 //! The arm is overridden per THREAD (`arm_for_test`), never through the process-global env gate:
 //! `cargo test` runs these in one process alongside every other battery, and a `OnceLock` resolved
@@ -23,7 +33,9 @@
 
 use super::*;
 
-use crate::jit::direct::entry_attribution::{Arm, Phase, Population, arm_for_test, snapshot};
+use crate::jit::direct::entry_attribution::{
+    Arm, OUTLIER_TICKS, Phase, Population, arm_for_test, begin, end, mark, snapshot,
+};
 
 use super::jit_direct::{drive, fresh};
 
@@ -73,6 +85,23 @@ fn population(snap: &crate::DirectEntryAttributionSnapshot, population: Populati
         .iter()
         .map(|lane| lane[population as usize])
         .sum()
+}
+
+fn population_ends(snap: &crate::DirectEntryAttributionSnapshot, population: Population) -> u64 {
+    snap.totals_count
+        .iter()
+        .map(|lane| lane[population as usize])
+        .sum()
+}
+
+/// Burn at least `target` TSC ticks. The fixtures that exercise the clamp and the compile-span
+/// subtraction need an interval big enough to be unambiguous, and a guest compile is microseconds.
+fn spin_ticks(target: u64) {
+    // SAFETY: `rdtsc` is unprivileged, reads no memory and has no side effects.
+    let start = unsafe { core::arch::x86_64::_rdtsc() };
+    while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) < target {
+        std::hint::spin_loop();
+    }
 }
 
 /// A4 on the SAME binary: arming the observer must not move one bit of guest-visible state.
@@ -148,10 +177,50 @@ fn marks_per_entry_are_the_published_factors() {
 fn every_traversal_that_enters_takes_one_p11_and_one_end() {
     let (cpu, snap) = run_under(Arm::Full, 1);
     let entries = cpu.perf_counters().jit_direct_entries;
+    assert!(entries > 0, "no native entry ran");
     assert_eq!(marks(&snap, Phase::TailClocks), entries);
+    // The real check, and the reason `totals_count` exists: `totals` is a SUM of spans, so a
+    // return that forgot `end()` is invisible in it -- the sum just comes out smaller, which is
+    // indistinguishable from a faster run. The COUNT is not: one `end(Entered)` per terminal
+    // mark, exactly.
+    assert_eq!(
+        population_ends(&snap, Population::Entered),
+        entries,
+        "every entered traversal must call end() exactly once"
+    );
     assert!(population(&snap, Population::Entered) > 0);
-    // The terminal mark closes the tail, so it must carry ticks whenever it fired.
-    assert!(ticks(&snap, Phase::TailClocks) > 0);
+}
+
+/// M7 / B3: `total_entered` must NOT contain the compile span.
+///
+/// Driven through the instrument's own primitives rather than a guest run, because a guest
+/// compile is microseconds and the property needs a span big enough to see unambiguously. A
+/// traversal that spends `spin` inside P14 and then a short tail must record a total that is
+/// SMALLER than the compile it just paid for -- if the subtraction is dropped, the total is
+/// larger than `spin` instead, which is the exact defect the loader measurement found (A1 at
+/// 0.66, E inflated 48%).
+#[test]
+fn entered_totals_exclude_the_compile_span() {
+    arm_for_test(Some(Arm::Full), Some(1));
+    begin(false, false);
+    spin_ticks(OUTLIER_TICKS / 4);
+    mark(Phase::Compile);
+    mark(Phase::TailClocks);
+    end(Population::Entered);
+    let snap = snapshot().expect("armed");
+    arm_for_test(None, None);
+
+    let compile = ticks(&snap, Phase::Compile);
+    let entered = snap.totals[0][Population::Entered as usize];
+    assert!(
+        compile >= OUTLIER_TICKS / 4,
+        "the spin did not land in P14 ({compile} ticks)"
+    );
+    assert!(
+        entered < compile,
+        "total_entered ({entered}) still carries the compile span ({compile})"
+    );
+    assert_eq!(snap.totals_count[0][Population::Entered as usize], 1);
 }
 
 /// H3: every early return is both marked and named. The refusal histogram's total must equal the
@@ -268,33 +337,68 @@ fn the_disarmed_arm_accumulates_nothing() {
     arm_for_test(None, None);
 }
 
-/// M-R4: P14 is exempt from the outlier clamp, so a compile whose true cost exceeds the clamp
-/// keeps its ticks and `ticks(P14) >= jit_direct_compile_ns` cannot be falsified by the clamp.
+/// M-R4: P14 is exempt from the outlier clamp, and every other phase is not.
 ///
-/// Checked structurally rather than by manufacturing a 0.3 ms compile: the run's P14 ticks must
-/// be at least the compile time the production counter measured, and the outlier bucket must not
-/// have absorbed anything from it.
+/// Drives a REAL interval past `OUTLIER_TICKS` twice -- once closed by P14, once by P2 -- and
+/// checks the two are treated differently. The previous version of this fixture asserted
+/// `marks(P15) == outlier_marks` on a guest run where nothing took 0.3 ms, so both sides were
+/// zero and it could not fail. Without the exemption a cold compile that also pays `install` and
+/// an arena compaction sheds ticks `jit_direct_compile_ns` keeps, manufacturing the negative
+/// `P14 - compile_ns` gap A3 declares a falsifier.
 #[test]
 fn p14_is_exempt_from_the_outlier_clamp() {
+    let over = OUTLIER_TICKS + OUTLIER_TICKS / 2;
+
+    arm_for_test(Some(Arm::Full), Some(1));
+    begin(false, false);
+    spin_ticks(over);
+    mark(Phase::Compile);
+    end(Population::Compile);
+    let exempt = snapshot().expect("armed");
+    arm_for_test(None, None);
+
+    arm_for_test(Some(Arm::Full), Some(1));
+    begin(false, false);
+    spin_ticks(over);
+    mark(Phase::Probe);
+    end(Population::Refused);
+    let clamped = snapshot().expect("armed");
+    arm_for_test(None, None);
+
+    // P14 keeps the whole interval and sheds nothing.
+    assert!(
+        ticks(&exempt, Phase::Compile) > OUTLIER_TICKS,
+        "P14 was clamped: {} ticks",
+        ticks(&exempt, Phase::Compile)
+    );
+    assert_eq!(
+        exempt.outlier_marks, 0,
+        "P14 must not register as an outlier"
+    );
+    assert_eq!(marks(&exempt, Phase::Outliers), 0);
+
+    // P2, over the same interval, is clamped and its excess is REPORTED in P15 rather than lost.
+    assert_eq!(ticks(&clamped, Phase::Probe), OUTLIER_TICKS);
+    assert_eq!(clamped.outlier_marks, 1);
+    assert_eq!(marks(&clamped, Phase::Outliers), 1);
+    assert!(
+        ticks(&clamped, Phase::Outliers) >= over - OUTLIER_TICKS,
+        "the shed excess must land in P15"
+    );
+}
+
+/// A3's P14 identity, checked on a real guest run: one compile-arm exit per attempt, plus the one
+/// heat-demote return that precedes the attempt counter's bump at `run.rs:1517`.
+#[test]
+fn the_p14_mark_count_matches_the_compile_attempt_counter() {
     let (cpu, snap) = run_under(Arm::Full, 1);
     let perf = cpu.perf_counters();
     assert!(perf.jit_direct_compile_attempts > 0, "no compile ran");
-    assert!(
-        marks(&snap, Phase::Compile) > 0,
-        "the compile arm was never marked"
-    );
-    // The clamp writes its shed excess into P15; a P14 that had been clamped would be the only
-    // way this run produces a P15 mark, since nothing else here takes 0.3 ms.
-    assert_eq!(
-        marks(&snap, Phase::Outliers),
-        snap.outlier_marks,
-        "P15 must hold exactly the clamped marks"
-    );
     assert_eq!(
         marks(&snap, Phase::Compile),
         perf.jit_direct_compile_attempts
             + snap.compile_site.iter().map(|lane| lane[0]).sum::<u64>(),
-        "A3: marks(P14) = jit_direct_compile_attempts + compile_site[1512]"
+        "A3: marks(P14) = jit_direct_compile_attempts + compile_site[heat_demote]"
     );
 }
 

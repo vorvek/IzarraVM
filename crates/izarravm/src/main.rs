@@ -2103,8 +2103,13 @@ fn write_hdd_profile_json(
     // `perf_counter_json_exposes_the_complete_counter_surface` passes in both.
     #[cfg(feature = "direct-entry-attribution")]
     {
-        report["direct_entry_attribution"] =
-            direct_entry_attribution_json(machine.cpu().direct_entry_attribution_snapshot());
+        report["direct_entry_attribution"] = direct_entry_attribution_json(
+            machine.cpu().direct_entry_attribution_snapshot(),
+            machine
+                .cpu()
+                .direct_stall_snapshot()
+                .decode_pack_late_view_miss,
+        );
     }
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
@@ -2199,20 +2204,25 @@ fn vga_wipe_census_json(
 #[cfg(feature = "direct-entry-attribution")]
 fn direct_entry_attribution_json(
     snapshot: Option<izarravm_cpu::DirectEntryAttributionSnapshot>,
+    decode_pack_late_view_miss: u64,
 ) -> serde_json::Value {
     use izarravm_cpu::{
-        COMPILE_SITES, FALLBACK_TAG_NAMES, LANE_NAMES, N_HOP_BINS, N_INSN_BINS, OUTLIER_TICKS,
-        PHASE_NAMES, POPULATION_NAMES, PRE_P0_REFUSAL_SITES, REFUSAL_SITES,
+        COMPILE_SITES, FALLBACK_TAG_NAMES, LANE_NAMES, OUTLIER_TICKS, P0_MARK_LINE, PHASE_NAMES,
+        POPULATION_NAMES, PRE_P0_REFUSAL_SITES, REFUSAL_SITES, native_bin_parts,
     };
     let Some(snapshot) = snapshot else {
         return serde_json::Value::Null;
     };
     let tsc_hz = snapshot.tsc_hz as f64;
+    // `tsc_hz` is derived from an `Instant` pair across the run and is zero only if the run was
+    // too short to measure or the TSC did not advance. `serde_json` cannot encode a NaN -- it
+    // serialises as `null` and every downstream ratio becomes unreadable -- so an unusable clock
+    // yields 0.0 and the `tsc_hz: 0` field is what tells the reader the ns columns are void.
     let ns_of = |ticks: f64| {
         if tsc_hz > 0.0 {
             ticks / tsc_hz * 1e9
         } else {
-            f64::NAN
+            0.0
         }
     };
     let floor_ns = ns_of(snapshot.overhead_ticks as f64);
@@ -2249,6 +2259,7 @@ fn direct_entry_attribution_json(
                         "population": population,
                         "ticks": snapshot.totals[lane][index],
                         "ns": ns_of(snapshot.totals[lane][index] as f64),
+                        "ends": snapshot.totals_count[lane][index],
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2290,12 +2301,11 @@ fn direct_entry_attribution_json(
                 .enumerate()
                 .filter(|&(_, row)| row[0] != 0)
                 .map(|(bin, row)| {
-                    let insn_bin = bin % N_INSN_BINS;
-                    let hop_bin = (bin / N_INSN_BINS) % N_HOP_BINS;
-                    let self_loop = bin / (N_INSN_BINS * N_HOP_BINS) != 0;
+                    // The instrument's own inverse, never a second copy of the packing.
+                    let (instructions, hop_bin, self_loop) = native_bin_parts(bin);
                     json!({
                         "bin": bin,
-                        "instructions": insn_bin + 1,
+                        "instructions": instructions,
                         "linked_transfers_class": hop_bin,
                         "self_loop": self_loop,
                         "count": row[0],
@@ -2321,14 +2331,24 @@ fn direct_entry_attribution_json(
         "arm": snapshot.arm,
         "sample_n": snapshot.sample_n,
         "overhead_ticks": snapshot.overhead_ticks,
+        "calibration_bracket_ticks": snapshot.calibration_bracket_ticks,
+        "calibration_mark_ticks": snapshot.calibration_mark_ticks,
         "resolution_floor_ns": floor_ns,
         "tsc_hz": snapshot.tsc_hz,
         "outlier_clamp_ticks": OUTLIER_TICKS,
         "outlier_ticks": snapshot.outlier_ticks,
         "outlier_marks": snapshot.outlier_marks,
         "lane_pin_mismatches": snapshot.lane_pin_mismatches,
-        "insn_bins": N_INSN_BINS,
-        "hop_bin_classes": N_HOP_BINS,
+        // A3's `marks(P0) == decode_probes` identity needs every traversal that counted a probe
+        // and never reached the P0 mark. Four decode-screen breaks sit ABOVE `begin()`
+        // (run.rs:791-812) and are the three `brk_cont_*` keys; a FIFTH `brk_cont_decode_miss`
+        // site sits BELOW it (run.rs:857-862, the late view miss) and must be subtracted back
+        // out, or the identity over-counts by exactly this many. Emitted here so the report does
+        // not have to reach into another object for it.
+        "decode_pack_late_view_miss": decode_pack_late_view_miss,
+        // The `run.rs` line the P0 mark sits on -- the line `above_p0_mark` partitions the
+        // refusal sites by, published so the reader is not left inferring it.
+        "p0_mark_line": P0_MARK_LINE,
         "phase_names": PHASE_NAMES,
         "lane_names": LANE_NAMES,
         "population_names": POPULATION_NAMES,
