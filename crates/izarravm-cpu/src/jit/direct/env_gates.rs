@@ -1456,3 +1456,99 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
         CpuPersona::I386 => false,
     }
 }
+
+/// Arm for the entry-attribution observer (`IZARRAVM_DIRECT_ENTRY_ATTRIBUTION`).
+///
+/// The instrument itself is compiled out entirely without the `direct-entry-attribution` feature,
+/// so the plain build carries no such symbol at all; this gate exists only inside the observer
+/// build, and its default is still OFF.
+///
+/// * **unset**, `` (empty), `0` or `off` -> OFF. The default, and the disarmed leg A4 compares
+///   against on the SAME observer binary. **The empty string is OFF and so is unset**, unlike the
+///   lane family where unset is the shipped ON default: nulling a variable in PowerShell leaves it
+///   PRESENT and EMPTY, and this knob's default arm is the off arm, so both spellings agree.
+/// * `1` / `on` / `full` -> FULL. All sixteen phases, >= 16 marks per entry.
+/// * `2` / `coarse` -> COARSE. Four marks — `begin`, the native window in, the native window out,
+///   `end` — whose totals must agree with FULL's to within 5% (A6).
+/// * **anything else PANICS**, for `parse_disp_lanes_arm`'s reason: a mistyped ladder leg would
+///   silently run the DEFAULT and be read as the arm it named doing nothing.
+#[cfg(feature = "direct-entry-attribution")]
+pub(crate) fn entry_attribution_arm() -> crate::jit::direct::entry_attribution::Arm {
+    static ARM: std::sync::OnceLock<crate::jit::direct::entry_attribution::Arm> =
+        std::sync::OnceLock::new();
+    *ARM.get_or_init(|| {
+        parse_entry_attribution_arm(std::env::var("IZARRAVM_DIRECT_ENTRY_ATTRIBUTION"))
+    })
+}
+
+/// The `IZARRAVM_DIRECT_ENTRY_ATTRIBUTION` spelling table, lifted out of the `OnceLock` closure so
+/// it can be unit-tested without a process-global env write. See `entry_attribution_arm`.
+#[cfg(feature = "direct-entry-attribution")]
+pub(crate) fn parse_entry_attribution_arm(
+    value: Result<String, std::env::VarError>,
+) -> crate::jit::direct::entry_attribution::Arm {
+    use crate::jit::direct::entry_attribution::Arm;
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the default, the \
+                            instrument disarmed), `1` / `on` / `full` (all sixteen phases), and \
+                            `2` / `coarse` (four marks)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return Arm::Off,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_DIRECT_ENTRY_ATTRIBUTION is set to a value that is not valid UTF-8; \
+             {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => Arm::Off,
+        "1" | "on" | "full" => Arm::Full,
+        "2" | "coarse" => Arm::Coarse,
+        other => panic!(
+            "IZARRAVM_DIRECT_ENTRY_ATTRIBUTION={other:?} names no arm; {ACCEPTED}. Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm \
+             it named doing nothing"
+        ),
+    }
+}
+
+/// Sampling stride for the entry-attribution observer
+/// (`IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE`). The decision is taken at `begin()`, so a sampled
+/// traversal is stamped end to end and the stride does not inflate any phase.
+///
+/// * **unset** or `` (empty) -> 1, every traversal.
+/// * a positive integer -> that stride.
+/// * **anything else, including `0`, PANICS.**
+#[cfg(feature = "direct-entry-attribution")]
+pub(crate) fn entry_attribution_sample() -> u64 {
+    static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SAMPLE.get_or_init(|| {
+        parse_entry_attribution_sample(std::env::var("IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE"))
+    })
+}
+
+/// The `IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE` spelling table. See `entry_attribution_sample`.
+#[cfg(feature = "direct-entry-attribution")]
+pub(crate) fn parse_entry_attribution_sample(value: Result<String, std::env::VarError>) -> u64 {
+    const ACCEPTED: &str = "accepted spellings are unset or `` (every traversal) and a positive \
+                            integer stride";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return 1,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE is set to a value that is not valid UTF-8; \
+             {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return 1;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(stride) if stride >= 1 => stride,
+        _ => panic!(
+            "IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE={trimmed:?} names no stride; {ACCEPTED}. \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}

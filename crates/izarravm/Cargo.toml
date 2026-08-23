@@ -17,6 +17,9 @@ default = ["jit"]
 jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
 # Passthrough for the compile-time Direct admission census; see izarravm-cpu.
 direct-admission-census = ["jit", "izarravm-cpu/direct-admission-census"]
+# Per-entry Direct attribution observer. Excluded from `default` and from any `--all-features`
+# path used for perf grading; see the izarravm-cpu feature of the same name.
+direct-entry-attribution = ["jit", "izarravm-cpu/direct-entry-attribution"]
 # Passthrough for the per-cell Direct link refusal census; see izarravm-cpu.
 direct-link-refusal-census = ["jit", "izarravm-cpu/direct-link-refusal-census"]
 # Passthrough for the barrier census closure accounting; see izarravm-cpu. No izarravm-machine
