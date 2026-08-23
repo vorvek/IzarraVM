@@ -1907,6 +1907,71 @@ fn run_boot_hdd_folder(
     Ok(())
 }
 
+/// The Katea counter surface, as one JSON object.
+///
+/// Factored out of `write_hdd_profile_json` so the key list is reachable from a
+/// test: `main_test.rs` pins it against `KATEA_COUNTER_KEYS`, which is the only
+/// thing that makes "a counter was added but never exported" a test failure
+/// rather than a silence.
+fn katea_counters_json(k: &izarravm_machine::KateaStorageCounters) -> serde_json::Value {
+    json!({
+        "sector_reads": k.sector_reads,
+        "host_file_reads": k.host_file_reads,
+        "host_bytes": k.host_bytes,
+        "host_read_operations": k.host_read_operations,
+        "host_read_bytes": k.host_read_bytes,
+        "host_wall_ns": k.host_wall_ns,
+        "host_read_max_ns": k.host_read_max_ns,
+        "host_readahead_hits": k.host_readahead_hits,
+        "host_readahead_fills": k.host_readahead_fills,
+        "host_file_opens": k.host_file_opens,
+        "run_scan_steps": k.run_scan_steps,
+        "fat_sector_reads": k.fat_sector_reads,
+        "dir_or_free_sector_reads": k.dir_or_free_sector_reads,
+        "sector_writes": k.sector_writes,
+        "int13_read_commands": k.int13_read_commands,
+        "int13_read_sectors": k.int13_read_sectors,
+        "int13_read_wait_ticks": k.int13_read_wait_ticks,
+        "int13_write_commands": k.int13_write_commands,
+        "int13_write_sectors": k.int13_write_sectors,
+        "int13_write_wait_ticks": k.int13_write_wait_ticks,
+        "pio_read_commands": k.pio_read_commands,
+        "pio_read_sectors": k.pio_read_sectors,
+        "pio_read_wait_ticks": k.pio_read_wait_ticks,
+        "pio_write_commands": k.pio_write_commands,
+        "pio_write_sectors": k.pio_write_sectors,
+        "pio_write_wait_ticks": k.pio_write_wait_ticks,
+        "dma_read_commands": k.dma_read_commands,
+        "dma_read_sectors": k.dma_read_sectors,
+        "dma_read_wait_ticks": k.dma_read_wait_ticks,
+        "dma_write_commands": k.dma_write_commands,
+        "dma_write_sectors": k.dma_write_sectors,
+        "dma_write_wait_ticks": k.dma_write_wait_ticks,
+        "overlay_resident_sectors": k.overlay_resident_sectors,
+        "overlay_pending_sectors": k.overlay_pending_sectors,
+        "pending_unmapped_sectors": k.pending_unmapped_sectors,
+        "spill_operations": k.spill_operations,
+        "spill_bytes": k.spill_bytes,
+        "spill_wall_ns": k.spill_wall_ns,
+        "projection_operations": k.projection_operations,
+        "projection_bytes": k.projection_bytes,
+        "projection_wall_ns": k.projection_wall_ns,
+        "projection_max_ns": k.projection_max_ns,
+        "metadata_projection_passes": k.metadata_projection_passes,
+        "host_write_failures": k.host_write_failures,
+        // A gauge: entries the anti-clobber guard is holding right now. A
+        // non-zero reading at the end of a run means a file never reached
+        // the host folder, which is a criterion that has to be readable.
+        "blocked_projection_keys": k.blocked_projection_keys,
+        // The mount instrument. Levels, written once before the guest ran, so
+        // unlike everything above them they are not a function of this session's
+        // guest activity at all -- they price the folder.
+        "mount_prime_ns": k.mount_prime_ns,
+        "mount_seed_ns": k.mount_seed_ns,
+        "mount_total_ns": k.mount_total_ns,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_hdd_profile_json(
     path: &Path,
@@ -2017,56 +2082,7 @@ fn write_hdd_profile_json(
         "cd_accesses": machine.cd_access_count(),
         "atapi_packet_commands": machine.atapi_packet_command_count(),
         "ata_poll_skip": ata_poll_skip_json(machine),
-        "katea": machine.katea_storage_counters().map(|k| json!({
-            "sector_reads": k.sector_reads,
-            "host_file_reads": k.host_file_reads,
-            "host_bytes": k.host_bytes,
-            "host_read_operations": k.host_read_operations,
-            "host_read_bytes": k.host_read_bytes,
-            "host_wall_ns": k.host_wall_ns,
-            "host_read_max_ns": k.host_read_max_ns,
-            "host_readahead_hits": k.host_readahead_hits,
-            "host_readahead_fills": k.host_readahead_fills,
-            "host_file_opens": k.host_file_opens,
-            "run_scan_steps": k.run_scan_steps,
-            "fat_sector_reads": k.fat_sector_reads,
-            "dir_or_free_sector_reads": k.dir_or_free_sector_reads,
-            "sector_writes": k.sector_writes,
-            "int13_read_commands": k.int13_read_commands,
-            "int13_read_sectors": k.int13_read_sectors,
-            "int13_read_wait_ticks": k.int13_read_wait_ticks,
-            "int13_write_commands": k.int13_write_commands,
-            "int13_write_sectors": k.int13_write_sectors,
-            "int13_write_wait_ticks": k.int13_write_wait_ticks,
-            "pio_read_commands": k.pio_read_commands,
-            "pio_read_sectors": k.pio_read_sectors,
-            "pio_read_wait_ticks": k.pio_read_wait_ticks,
-            "pio_write_commands": k.pio_write_commands,
-            "pio_write_sectors": k.pio_write_sectors,
-            "pio_write_wait_ticks": k.pio_write_wait_ticks,
-            "dma_read_commands": k.dma_read_commands,
-            "dma_read_sectors": k.dma_read_sectors,
-            "dma_read_wait_ticks": k.dma_read_wait_ticks,
-            "dma_write_commands": k.dma_write_commands,
-            "dma_write_sectors": k.dma_write_sectors,
-            "dma_write_wait_ticks": k.dma_write_wait_ticks,
-            "overlay_resident_sectors": k.overlay_resident_sectors,
-            "overlay_pending_sectors": k.overlay_pending_sectors,
-            "pending_unmapped_sectors": k.pending_unmapped_sectors,
-            "spill_operations": k.spill_operations,
-            "spill_bytes": k.spill_bytes,
-            "spill_wall_ns": k.spill_wall_ns,
-            "projection_operations": k.projection_operations,
-            "projection_bytes": k.projection_bytes,
-            "projection_wall_ns": k.projection_wall_ns,
-            "projection_max_ns": k.projection_max_ns,
-            "metadata_projection_passes": k.metadata_projection_passes,
-            "host_write_failures": k.host_write_failures,
-            // A gauge: entries the anti-clobber guard is holding right now. A
-            // non-zero reading at the end of a run means a file never reached
-            // the host folder, which is a criterion that has to be readable.
-            "blocked_projection_keys": k.blocked_projection_keys,
-        })),
+        "katea": machine.katea_storage_counters().as_ref().map(katea_counters_json),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
