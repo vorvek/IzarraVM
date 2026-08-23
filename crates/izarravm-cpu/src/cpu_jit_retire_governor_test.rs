@@ -67,9 +67,17 @@ fn strict_memory() -> Vec<u8> {
         0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax,2
         0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x200
     ]);
-    memory[ENTRY as usize..ENTRY as usize + 10].copy_from_slice(&[
-        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
-        0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x220
+    // TWO successors, deliberately. `xor eax,eax` sets ZF, so the branch is always taken and the
+    // executed path is exactly what an unconditional jump would give -- but the block now carries
+    // a SECOND successor slot, the fallthrough at 0x204, that nothing ever installs. That is what
+    // makes the head simultaneously LINKED (slot 0, into the ES-baking successor, so it is entered
+    // on the strict arm) and PARKED in `waiting` (slot 1, unresolved), which is the only state in
+    // which the decline's `remove_waiting_sources` is observable. With a single-successor head the
+    // do-not-park contract's second half cannot be reached and asserting on it is vacuous.
+    memory[ENTRY as usize..ENTRY as usize + 9].copy_from_slice(&[
+        0x31, 0xc0, // xor eax,eax   (sets ZF)
+        0x74, 0x1c, // jz 0x220
+        0xe9, 0x37, 0x00, 0x00, 0x00, // jmp 0x240 -- the fallthrough, never executed
     ]);
     memory[SECOND as usize..SECOND as usize + 12].copy_from_slice(&[
         0x26, 0x8b, 0x15, 0x00, 0x30, 0x00, 0x00, // mov edx,[es:0x3000]
@@ -122,7 +130,8 @@ fn strict_fixture() -> (CpuGsw, TestBus) {
             HEAD_PRED,
             HEAD_PRED + 5,
             ENTRY,
-            ENTRY + 5,
+            ENTRY + 2,
+            ENTRY + 4,
             SECOND,
             SECOND + 7,
         ],
@@ -504,10 +513,30 @@ fn link_declined_block_is_never_relinked_and_is_never_re_parked() {
     ensure_compiled(&mut cpu, ENTRY);
     ensure_compiled(&mut cpu, SECOND);
 
-    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) {
         assert!(!strict_turn(&mut cpu, &mut bus, 0));
     }
+    // The cap-th turn retired the key, so put it back the way the next turn would.
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    ensure_compiled(&mut cpu, ENTRY);
     let key = key_at(&cpu, ENTRY);
+    let parked_id = match cpu.jit_direct.probe(key) {
+        jit::direct::BlockProbe::Ready(id) => id,
+        other => panic!("the head must be compiled at the cap, got {other:?}"),
+    };
+    assert!(
+        cpu.jit_direct
+            .direct
+            .waiting_holds_source_for_test(parked_id),
+        "non-vacuity for the unpark half: the head's second successor slot never resolves, so it          must be PARKED at the moment the decline fires"
+    );
+    assert!(
+        cpu.jit_direct.has_linked_successor(parked_id),
+        "non-vacuity for the strict arm: and it must be linked on the other slot"
+    );
+
+    // The turn that crosses into suppression, and therefore declines.
+    assert!(!strict_turn(&mut cpu, &mut bus, 0));
     assert!(
         cpu.jit_direct
             .direct
@@ -525,7 +554,7 @@ fn link_declined_block_is_never_relinked_and_is_never_re_parked() {
     };
     assert!(
         !cpu.jit_direct.direct.waiting_holds_source_for_test(head_id),
-        "the decline must also unpark the source"
+        "the decline must also UNPARK the source: its second successor slot never resolves, so          without this every later install at that LinkTarget re-tries and re-refuses it"
     );
 
     let refused_before = refusal_count(&cpu, "declined");

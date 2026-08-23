@@ -3198,6 +3198,14 @@ impl BlockCache {
         // it cannot sit above `Inactive`. `link_source_declined` returns on an emptiness test
         // whenever the governor is not on its `on` arm, so the OFF and `cap` arms pay one
         // compare here and nothing else.
+        //
+        // The placement is DEFENCE IN DEPTH and is recorded as such rather than claimed to be
+        // load-bearing: a mutant that moves this check below the fast path SURVIVES the fixtures,
+        // and provably has to, because the decline's own `unlink_outbound` clears BOTH outbound
+        // cells, so `outbound[source][slot] == Some(target)` cannot hold for a declined source
+        // while it is declined. Kept up here anyway -- the fast path's precondition is a fact
+        // about today's decline implementation, and a refusal that depends on one is a refusal
+        // waiting to be silently deleted.
         else if self.link_source_declined(source) {
             Some(LinkRefusal::Declined)
         } else if chain_merge.is_none() {
