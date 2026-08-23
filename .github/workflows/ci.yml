@@ -70,6 +70,16 @@ jobs:
           cargo test -p izarravm --no-default-features --features direct-callout-attribution direct_callout_attribution_json
           cargo test -p izarravm --no-default-features --features direct-callout-attribution hdd_profile_json_reports_fixed_time_and_native_metrics
           cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-callout-attribution -- -D warnings
+          # The entry-attribution observer. Same trio as the censuses above: the check proves the
+          # feature still wires through izarravm, the targeted test proves the module and its
+          # fixtures still compile and pass (the workspace test step below builds NEITHER, since
+          # the feature is off by default), and clippy proves the armed arm is warning-clean. The
+          # `run.rs`-parsing fixture in the cpu test is the one that matters most here: it is what
+          # stops the refusal/compile line-number tables going stale behind a green CI.
+          cargo check -p izarravm --no-default-features --features direct-entry-attribution
+          cargo test -p izarravm-cpu --no-default-features --features direct-entry-attribution entry_attribution
+          cargo test -p izarravm --no-default-features --features direct-entry-attribution hdd_profile_json_reports_fixed_time_and_native_metrics
+          cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-entry-attribution -- -D warnings
           cargo check -p izarravm --no-default-features --features smc-census
           cargo test -p izarravm-cpu --no-default-features --features smc-census smc_census
           cargo test -p izarravm --no-default-features --features smc-census hdd_profile_json_reports_fixed_time_and_native_metrics
