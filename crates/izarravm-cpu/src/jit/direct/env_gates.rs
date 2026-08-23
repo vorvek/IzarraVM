@@ -13,6 +13,7 @@
 //! Moved out of `direct.rs` unchanged, to keep that file under the layout limit. No gate, no
 //! default and no doc comment changed in the move.
 
+use super::{DecodedInsn, OperandSize, Prefixes};
 use crate::{CpuGsw, CpuPersona};
 
 /// Admission level for 16-bit code segments. **DEFAULT 1 since the 486 measurement**; it used to
@@ -569,6 +570,36 @@ pub(crate) fn parse_direct_retf_v86_arm_for_test(
     value: Result<String, std::env::VarError>,
 ) -> RetfArm {
     parse_direct_retf_v86_arm(value)
+}
+
+/// Whether the compile walk may carry on THROUGH this `0xCA`/`0xCB` RETF and lower it natively.
+///
+/// The mode-dependent half of `jit_admits_non_continuable`, which stays a pure `const fn` on the
+/// opcode. It lives here rather than there for `stack_width_kind`'s reason: the question needs a
+/// `&CpuGsw` and `classify` has none.
+///
+/// THE ARM IS TESTED FIRST, and that ordering is load-bearing rather than stylistic. On the OFF
+/// arm this returns after one `OnceLock` load and one compare, having read no CPU state, on every
+/// walked instruction of every block in the tree -- which is what makes the OFF arm's compile walk
+/// main's walk rather than an equivalent of it.
+///
+/// Every other term is a REFUSAL that must leave the block stopping exactly where main stops it,
+/// with `BarrierStop::NonContinuable` unchanged. That is why the operand size, the prefixes and
+/// the stack width are tested HERE and not left to `stack_width_kind`: a RETF admitted into the
+/// walk and then refused a kind would end the block on a different reason and move a census row.
+pub(crate) fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
+    let arm = direct_retf_v86();
+    arm != RetfArm::Off
+        && matches!(insn.opcode, 0xca | 0xcb)
+        // CS.D = 0 and no 0x66. `operand_size` is `default_32 XOR override`, so Word in a 16-bit
+        // segment means no prefix, and the prefix test below is what keeps a segment override or
+        // an address-size override out.
+        && insn.operand_size == OperandSize::Word
+        && insn.prefixes == Prefixes::default()
+        // SS.B = 0. The emitted pointer arithmetic is 16-bit throughout.
+        && !cpu.stack_is_32bit()
+        // LAST: the two CR0/EFLAGS reads.
+        && arm.admits(cpu)
 }
 
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class

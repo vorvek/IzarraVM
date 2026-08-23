@@ -51,6 +51,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
     let mut fetch_lens = [0; MAX_BLOCK_INSTRUCTIONS];
     fetch_lens[0] = u8::try_from(span.guest_len).expect("test instruction length must fit");
     Compilation {
+        far_dynamic: false,
         span,
         fetch_lens,
         raw_clocks: 1,
@@ -346,8 +347,20 @@ fn dynamic_ret_pic_keeps_two_targets_and_unlinks_replaced_or_retired_blocks() {
     let cells = cache.link_cells[source_id.index()].clone();
     let site_cell = cells[0].address();
 
-    assert!(cache.bind_dynamic_successor(site_cell, first.linear, first.linear, first.mode_key));
-    assert!(cache.bind_dynamic_successor(site_cell, second.linear, second.linear, second.mode_key));
+    assert!(cache.bind_dynamic_successor(
+        site_cell,
+        first.linear,
+        first.linear,
+        first.mode_key,
+        u32::MAX
+    ));
+    assert!(cache.bind_dynamic_successor(
+        site_cell,
+        second.linear,
+        second.linear,
+        second.mode_key,
+        u32::MAX
+    ));
     assert!(cells[0].linked());
     assert!(cells[1].linked());
     assert_eq!(cells[0].target_eip.load(Ordering::Acquire), first.linear);
@@ -360,7 +373,13 @@ fn dynamic_ret_pic_keeps_two_targets_and_unlinks_replaced_or_retired_blocks() {
     assert_eq!(cells[0].target_eip.load(Ordering::Acquire), first.linear);
     assert_eq!(cells[1].target_eip.load(Ordering::Acquire), second.linear);
 
-    assert!(cache.bind_dynamic_successor(site_cell, third.linear, third.linear, third.mode_key));
+    assert!(cache.bind_dynamic_successor(
+        site_cell,
+        third.linear,
+        third.linear,
+        third.mode_key,
+        u32::MAX
+    ));
     assert_eq!(cells[0].target_eip.load(Ordering::Acquire), third.linear);
     assert_eq!(cells[1].target_eip.load(Ordering::Acquire), second.linear);
     assert!(cells[0].linked());
@@ -376,7 +395,13 @@ fn dynamic_ret_pic_keeps_two_targets_and_unlinks_replaced_or_retired_blocks() {
     assert!(!cells[0].linked());
 
     assert_eq!(cache.retire_physical_range_for_test(source.physical, 1), 1);
-    assert!(!cache.bind_dynamic_successor(site_cell, first.linear, first.linear, first.mode_key));
+    assert!(!cache.bind_dynamic_successor(
+        site_cell,
+        first.linear,
+        first.linear,
+        first.mode_key,
+        u32::MAX
+    ));
     let stats = cache.take_stats();
     assert_eq!(stats.links, 3);
     assert_eq!(stats.unlinks, 3);
@@ -400,7 +425,8 @@ fn dynamic_ret_does_not_rebind_when_a_target_portal_slot_is_reused() {
         site_cell,
         old_target.linear,
         old_target.linear,
-        old_target.mode_key
+        old_target.mode_key,
+        u32::MAX,
     ));
     let old_portal = cache.block_portals[old_target_id.index()].address();
     assert!(cell.linked());
@@ -426,7 +452,8 @@ fn dynamic_ret_does_not_rebind_when_a_target_portal_slot_is_reused() {
         site_cell,
         replacement.linear,
         replacement.linear,
-        replacement.mode_key
+        replacement.mode_key,
+        u32::MAX,
     ));
     assert!(cell.linked());
 }
@@ -448,7 +475,8 @@ fn retained_link_cell_is_unlinked_when_its_cache_drops() {
             cell.address(),
             target.linear,
             target.linear,
-            target.mode_key
+            target.mode_key,
+            u32::MAX,
         ));
         assert!(cell.linked());
         cell
@@ -499,7 +527,8 @@ fn dynamic_ret_pic_requires_a_matching_x87_top_and_spills_into_an_integer_target
         site_cell,
         wrong_top.linear,
         wrong_top.linear,
-        wrong_top.mode_key
+        wrong_top.mode_key,
+        u32::MAX,
     ));
     // A FLOAT source into an INTEGER target now binds on the dynamic path, and carries the same
     // spilling mark the static path uses: `emit_completed_dynamic_path` emits the boundary spill
@@ -508,7 +537,8 @@ fn dynamic_ret_pic_requires_a_matching_x87_top_and_spills_into_an_integer_target
         site_cell,
         integer.linear,
         integer.linear,
-        integer.mode_key
+        integer.mode_key,
+        u32::MAX,
     ));
     assert!(cache.link_cells[source_id.index()][0].is_spilling());
 
@@ -526,7 +556,8 @@ fn dynamic_ret_pic_requires_a_matching_x87_top_and_spills_into_an_integer_target
         site_cell,
         matching_top.linear,
         matching_top.linear,
-        matching_top.mode_key
+        matching_top.mode_key,
+        u32::MAX,
     ));
     assert!(cache.link_cells[source_id.index()][0].linked());
 }
@@ -713,7 +744,13 @@ fn dynamic_ret_pic_stays_unlinked_until_both_translation_epochs_are_current() {
     install_trivial(&mut cache, target, 1);
     let cell = cache.link_cells[source_id.index()][0].clone();
     let site_cell = cell.address();
-    assert!(cache.bind_dynamic_successor(site_cell, target.linear, target.linear, target.mode_key));
+    assert!(cache.bind_dynamic_successor(
+        site_cell,
+        target.linear,
+        target.linear,
+        target.mode_key,
+        u32::MAX
+    ));
     assert!(cell.linked());
 
     cache.invalidate_translation();
@@ -723,7 +760,8 @@ fn dynamic_ret_pic_stays_unlinked_until_both_translation_epochs_are_current() {
         site_cell,
         target.linear,
         target.linear,
-        target.mode_key
+        target.mode_key,
+        u32::MAX,
     ));
 
     cache
@@ -733,12 +771,19 @@ fn dynamic_ret_pic_stays_unlinked_until_both_translation_epochs_are_current() {
         site_cell,
         target.linear,
         target.linear,
-        target.mode_key
+        target.mode_key,
+        u32::MAX,
     ));
     cache
         .revalidate_translation(target)
         .expect("target revalidation");
-    assert!(cache.bind_dynamic_successor(site_cell, target.linear, target.linear, target.mode_key));
+    assert!(cache.bind_dynamic_successor(
+        site_cell,
+        target.linear,
+        target.linear,
+        target.mode_key,
+        u32::MAX
+    ));
     assert!(cell.linked());
 }
 

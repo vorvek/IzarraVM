@@ -58,10 +58,16 @@ const STACK_SP: u32 = 0x0700;
 /// `add r32` clears them, and with a ZERO high half the two are indistinguishable.
 const STACK_ESP: u32 = 0xdead_0000 | STACK_SP;
 
+/// How much guest RAM every fixture here stages. See `memory_fill`.
+const MEMORY_LEN: u32 = 0x2_0000;
+
 /// A distinct byte at every address, so a read of the wrong WIDTH or through the wrong SEGMENT
 /// differs from the interpreter even when the intended bytes happen to match.
 fn memory_fill() -> Vec<u8> {
-    let mut memory = vec![0u8; 0x1_0000];
+    // 128 K, not 64 K. The fetch-limit fixture needs a target block whose linear sits ABOVE the
+    // first 64 K wrap while its OFFSET under the returning CS sits just below it, which is the
+    // only shape that can overrun a 0xFFFF limit and still be page-local enough to compile.
+    let mut memory = vec![0u8; MEMORY_LEN as usize];
     for (i, byte) in memory.iter_mut().enumerate() {
         *byte = (i.wrapping_mul(37).wrapping_add(11) & 0xff) as u8;
     }
@@ -256,7 +262,7 @@ fn stage_with(
         cpu.begin_instruction();
         cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
     }
-    for page in (0..0x1_0000u32).step_by(0x1000) {
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
         map_direct_page(&mut cpu, &mut bus, page);
     }
     cpu.set_eip(ENTRY);
@@ -914,4 +920,599 @@ fn a_far_block_registers_no_static_fallthrough_census_row() {
         "and no successor either"
     );
     jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+// -------------------------------------------------------------------------------------------
+// The far PIC
+// -------------------------------------------------------------------------------------------
+
+/// One far target: the selector and offset the RETF pops, and the code that lives at their linear.
+#[derive(Clone)]
+struct Target {
+    selector: u16,
+    offset: u16,
+    code: Vec<u8>,
+}
+
+impl Target {
+    fn plain(selector: u16, offset: u16) -> Self {
+        Self {
+            selector,
+            offset,
+            code: [filler(), vec![0xf4]].concat(),
+        }
+    }
+
+    fn with_code(selector: u16, offset: u16, code: Vec<u8>) -> Self {
+        Self {
+            selector,
+            offset,
+            code,
+        }
+    }
+
+    fn linear(&self) -> u32 {
+        (u32::from(self.selector) << 4).wrapping_add(u32::from(self.offset))
+    }
+}
+
+/// Stage a far SOURCE at `ENTRY` plus a set of far TARGETS, compile and install all of them, and
+/// hand back a machine ready to run the source.
+///
+/// The targets are compiled under the CS they will be ENTERED under, which is what a real run
+/// produces: the far return writes CS from the popped selector and the next compile at that EIP
+/// sees it.
+struct Chain {
+    cpu: CpuGsw,
+    bus: TestBus,
+    source: jit::direct::CompiledBlock,
+    esp: u32,
+}
+
+fn far_chain(builder: fn() -> CpuGsw, targets: &[Target]) -> Chain {
+    let source_body = retf(None);
+    let mut code = filler();
+    code.extend_from_slice(&source_body);
+
+    let mut memory = memory_fill();
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    for target in targets {
+        let at = target.linear() as usize;
+        memory[at..at + target.code.len()].copy_from_slice(&target.code);
+    }
+
+    let mut cpu = builder();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.set_fast_map_enabled_for_test(true);
+    cpu.jit_direct.set_defer_short_for_test(false);
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
+        map_direct_page(&mut cpu, &mut bus, page);
+    }
+
+    // The source, under the entry CS.
+    let mut at = ENTRY;
+    for _ in 0..=FILL.len() {
+        cpu.set_eip(at);
+        cpu.begin_instruction();
+        let d = cpu.fetch_decoded(&mut bus, at).expect("fixture decode");
+        at += u32::from(d.len);
+    }
+    cpu.set_eip(ENTRY);
+    let source = install_at(&mut cpu, ENTRY);
+
+    // Each target, under the CS it will be entered with.
+    let entry_cs = cpu.registers.cs().selector;
+    for target in targets {
+        cpu.load_segment_real(SegmentIndex::Cs, target.selector);
+        let mut at = target.linear();
+        let end = target.linear() + target.code.len() as u32;
+        while at < end {
+            cpu.set_eip(at - (u32::from(target.selector) << 4));
+            cpu.begin_instruction();
+            let d = cpu.fetch_decoded(&mut bus, at).expect("target decode");
+            at += u32::from(d.len);
+        }
+        cpu.set_eip(u32::from(target.offset));
+        let _ = install_at(&mut cpu, target.linear());
+    }
+    cpu.load_segment_real(SegmentIndex::Cs, entry_cs);
+    cpu.set_eip(ENTRY);
+
+    Chain {
+        cpu,
+        bus,
+        source,
+        esp: STACK_ESP,
+    }
+}
+
+impl Chain {
+    /// Write one more block's code into guest RAM, warm its decode lines and install it, under the
+    /// CS it will be entered with. Used by the widen fixture, which needs a block to appear AFTER
+    /// a far edge has already been bound.
+    fn write_and_install(&mut self, target: &Target) -> jit::direct::CompiledBlock {
+        let at = target.linear() as usize;
+        self.bus.memory[at..at + target.code.len()].copy_from_slice(&target.code);
+        let entry_cs = self.cpu.registers.cs().selector;
+        self.cpu
+            .load_segment_real(SegmentIndex::Cs, target.selector);
+        let mut at = target.linear();
+        let end = target.linear() + target.code.len() as u32;
+        while at < end {
+            self.cpu.set_eip(at - (u32::from(target.selector) << 4));
+            self.cpu.begin_instruction();
+            let d = self
+                .cpu
+                .fetch_decoded(&mut self.bus, at)
+                .expect("target decode");
+            at += u32::from(d.len);
+        }
+        self.cpu.set_eip(u32::from(target.offset));
+        let block = install_at(&mut self.cpu, target.linear());
+        self.cpu.load_segment_real(SegmentIndex::Cs, entry_cs);
+        self.cpu.set_eip(ENTRY);
+        block
+    }
+}
+
+/// Compile and install at `linear`, panicking with the reason if the walk refused.
+fn install_at(cpu: &mut CpuGsw, linear: u32) -> jit::direct::CompiledBlock {
+    let compilation = match jit::direct::compile(cpu, linear, false) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("{linear:#x}: structurally rejected")
+        }
+        jit::direct::CompileOutcome::Retry(cause) => panic!("{linear:#x}: retry {cause:?}"),
+    };
+    let key = jit::direct::key_for(cpu, linear, false).expect("entry key");
+    let _ = cpu.jit_direct.probe(key);
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .unwrap_or_else(|| panic!("{linear:#x}: block installs"));
+    cpu.jit_direct.block(id).expect("live block")
+}
+
+impl Chain {
+    /// Put the machine back at the source's entry with `target` on the stack, then run the source
+    /// block natively. Returns `(linked_transfers, dynamic_misses)` deltas.
+    fn far_return_to(&mut self, target: &Target) -> (u64, u64) {
+        self.cpu.load_segment_real(SegmentIndex::Cs, 0);
+        self.cpu.set_eip(ENTRY);
+        self.cpu.halted = false;
+        self.cpu.registers.set_esp(self.esp);
+        let sp = (self.esp & 0xffff) as u16;
+        for (i, byte) in target
+            .offset
+            .to_le_bytes()
+            .into_iter()
+            .chain(target.selector.to_le_bytes())
+            .enumerate()
+        {
+            self.bus.memory[usize::from(sp.wrapping_add(i as u16))] = byte;
+        }
+        // Re-populate the fast map on every pass. Installing a block WATCHES its code page, and
+        // a watched page's entry is swept out of the map; the stack shares page 0 with the source
+        // block's code, so without this the far return's first stack read side-exits on
+        // `UnavailableOrKind` and nothing under test ever runs.
+        for page in (0..MEMORY_LEN).step_by(0x1000) {
+            map_direct_page(&mut self.cpu, &mut self.bus, page);
+        }
+        let perf = self.cpu.perf_counters();
+        let (links, misses) = (
+            perf.jit_direct_linked_transfers,
+            perf.jit_direct_unresolved_dynamic_miss_or_unbound,
+        );
+        assert!(
+            self.cpu
+                .try_run_direct_block_for_test(&mut self.bus, self.source)
+                .unwrap(),
+            "the source block must run natively"
+        );
+        let perf = self.cpu.perf_counters();
+        (
+            perf.jit_direct_linked_transfers - links,
+            perf.jit_direct_unresolved_dynamic_miss_or_unbound - misses,
+        )
+    }
+
+    fn refusals(&self) -> (u64, u64, u64) {
+        let snapshot = self.cpu.direct_stall_snapshot();
+        (
+            snapshot.far_link_refused_cs,
+            snapshot.far_link_refused_limit,
+            snapshot.far_link_cut_on_widen,
+        )
+    }
+}
+
+/// F3. The two-way PIC binds two far targets and the third misses -- and still lands correctly.
+///
+/// The first return binds nothing (the cell is bound in the exit tail, so the first pass is always
+/// a miss), the second hits, and with three distinct targets the third displaces one of the two
+/// cells rather than being served.
+///
+/// Catches: the `dynamic_successor` relaxation missing (M12), which leaves `linked_transfers` at
+/// zero forever; and the miss epilogue storing the LINEAR into `dynamic_target_eip` instead of the
+/// EIP, which trips `run.rs`'s `debug_assert_eq!(exit.dynamic_target_eip, final_eip)`.
+#[test]
+fn retf_pic_binds_two_targets_and_the_third_misses() {
+    select_retf(jit::direct::RetfArm::V86);
+    let a = Target::plain(0x0020, 0x0400);
+    let b = Target::plain(0x0030, 0x0500);
+    let c = Target::plain(0x0040, 0x0600);
+    let mut chain = far_chain(v86_cpu, &[a.clone(), b.clone(), c.clone()]);
+
+    // Pass 1: nothing is bound yet, so this is a miss that BINDS.
+    let (links, misses) = chain.far_return_to(&a);
+    assert_eq!(
+        links, 0,
+        "the first far return cannot hit: it binds the cell"
+    );
+    assert_eq!(misses, 1);
+    assert_eq!(chain.cpu.registers.cs().selector, a.selector);
+    assert_eq!(chain.cpu.registers.eip, u32::from(a.offset));
+
+    // Pass 2: the cell is bound, so this one CHAINS.
+    let (links, misses) = chain.far_return_to(&a);
+    assert_eq!(
+        links, 1,
+        "the far cell must hit: this is the whole chain half of the slice"
+    );
+    assert_eq!(misses, 0);
+    assert_eq!(chain.cpu.registers.cs().selector, a.selector);
+
+    // A second distinct target takes the other cell, and then also chains.
+    let _ = chain.far_return_to(&b);
+    let (links, _) = chain.far_return_to(&b);
+    assert_eq!(links, 1, "the second cell must bind and hit too");
+    // ...and the first is still live.
+    let (links, _) = chain.far_return_to(&a);
+    assert_eq!(links, 1, "binding a second target must not evict the first");
+
+    // A third distinct target has no cell of its own: it misses, and it still LANDS.
+    let (links, misses) = chain.far_return_to(&c);
+    assert_eq!(links, 0, "a two-way PIC cannot serve a third target");
+    assert_eq!(misses, 1);
+    assert_eq!(
+        chain.cpu.registers.cs().selector,
+        c.selector,
+        "a PIC miss must still leave the guest at the right CS:IP"
+    );
+    assert_eq!(chain.cpu.registers.eip, u32::from(c.offset));
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F6. INV-FAR-CS's DESCRIPTOR half: a far edge into a target that pins CS's descriptor is
+/// refused, the counter says so, and execution is still correct.
+///
+/// The target carries a CS-override memory operand (`sub ax, cs:[m]`), which is admitted under
+/// `v86_loop_rows_enabled` and puts `segment_bit(Cs)` in `used` through `read_segment`.
+///
+/// Catches: `merge_chain` or `link_merge` used in place of `far_merge` (M10) -- `link_merge`'s
+/// plain `cs` compare would refuse this edge too, but it would refuse EVERY far edge, which F3
+/// catches; what this row adds is that `far_merge` refuses the RIGHT ones.
+#[test]
+fn a_far_edge_into_a_cs_descriptor_pinning_target_is_refused() {
+    select_retf(jit::direct::RetfArm::V86);
+    // `sub ax, cs:[0x220]` then filler then hlt: the CS override is what pins the descriptor.
+    let pinning = Target::with_code(
+        0x0020,
+        0x0400,
+        [
+            vec![0x2e, 0x2b, 0x06, 0x20, 0x02],
+            FILL[0].to_vec(),
+            FILL[1].to_vec(),
+            vec![0xf4],
+        ]
+        .concat(),
+    );
+    let mut chain = far_chain(v86_cpu, std::slice::from_ref(&pinning));
+    let before = chain.refusals();
+    let _ = chain.far_return_to(&pinning);
+    let (links, _) = chain.far_return_to(&pinning);
+    assert_eq!(
+        links, 0,
+        "a target that BAKES CS's base must never be entered through a linear-keyed far cell"
+    );
+    assert!(
+        chain.refusals().0 > before.0,
+        "and the refusal must be counted as INV-FAR-CS rather than lost in the SegmentLayout total"
+    );
+    assert_eq!(
+        chain.cpu.registers.cs().selector,
+        pinning.selector,
+        "the far return still executes correctly through the dispatcher"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F7. INV-FAR-CS's SELECTOR half, and the linear-vs-EIP compare choice, in one fixture.
+///
+/// `0100:0000` and `00FF:0010` are the same linear 0x1000. A far cell keyed on the EIP would hit
+/// on the WRONG one of those two (M8/M9); a cell keyed on the linear names one block for both,
+/// which is correct precisely because the block's emitted arithmetic is CS-invariant -- unless it
+/// bakes CS. The aliased target here bakes it BOTH WAYS -- `push cs` and `mov ax, cs` -- so
+/// `BAKES_CS_BIT` is set and every far edge into it is refused.
+///
+/// Catches: M18, the `BAKES_CS_BIT` term dropped from `far_merge`'s refusal, which would admit the
+/// edge and then serve one of the two aliases the other's baked selector.
+#[test]
+fn two_far_targets_that_alias_one_linear_do_not_swap() {
+    select_retf(jit::direct::RetfArm::V86);
+    // push cs / mov ax,cs / mov si,si / hlt, at linear 0x1000.
+    let baking = [vec![0x0e], vec![0x8c, 0xc8], FILL[0].to_vec(), vec![0xf4]].concat();
+    let high = Target::with_code(0x0100, 0x0000, baking.clone());
+    let low = Target::with_code(0x00ff, 0x0010, baking);
+    assert_eq!(high.linear(), low.linear(), "the two must actually alias");
+
+    let mut chain = far_chain(v86_cpu, std::slice::from_ref(&high));
+    let before = chain.refusals();
+    for _ in 0..3 {
+        let (links, _) = chain.far_return_to(&high);
+        assert_eq!(
+            links, 0,
+            "a target that bakes CS's SELECTOR must never be reached through a far cell"
+        );
+    }
+    assert!(
+        chain.refusals().0 > before.0,
+        "the refusal must be counted: without BAKES_CS_BIT this edge links and the aliases swap"
+    );
+
+    // And both aliases still execute correctly, each baking its OWN live CS. The two
+    // CS-reading instructions are RUN here rather than assumed: with the edge refused the far
+    // return ends at the dispatcher, so the target's `push cs` and `mov ax, cs` need two ordinary
+    // cycles. Under a tree that admitted the edge they would already have run inside the chain,
+    // with the OTHER alias's baked selector, which is what this loop is looking for.
+    for target in [&high, &low] {
+        let (links, _) = chain.far_return_to(target);
+        assert_eq!(links, 0);
+        assert_eq!(chain.cpu.registers.cs().selector, target.selector);
+        for _ in 0..2 {
+            chain.cpu.cycle(&mut chain.bus).unwrap();
+        }
+        assert_eq!(
+            chain.cpu.registers.gpr[0] & 0xffff,
+            u32::from(target.selector),
+            "AX must hold the LIVE CS selector, not the one the other alias compiled under"
+        );
+        let sp = (chain.cpu.registers.esp() & 0xffff) as usize;
+        let pushed = u16::from_le_bytes([chain.bus.memory[sp], chain.bus.memory[sp + 1]]);
+        assert_eq!(
+            pushed, target.selector,
+            "and the pushed word must be the LIVE CS selector too"
+        );
+    }
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F17. A far return whose target block would overrun the segment limit is NOT linked, and the
+/// return still executes through the dispatcher.
+///
+/// The shape is the only one that can happen: the block is COMPILED under a high CS at a low
+/// offset and REACHED under a low CS at an offset near the wrap. `0x1000A` under CS 0x1000 is
+/// offset 0x000A; under CS 0x0001 it is offset 0xFFFA, and a seven-byte block there ends at
+/// 0x10000, one past the 0xFFFF limit a real-mode CS carries.
+///
+/// A CHAINED transfer jumps to `body_offset` and never reaches `run_direct_block`'s fetch-limit
+/// check, so this is closed at BIND time, where it costs one compare that never runs again.
+///
+/// Catches: M22, the bind-time compare dropped.
+#[test]
+fn a_far_return_whose_target_block_overruns_the_segment_limit_is_not_linked() {
+    select_retf(jit::direct::RetfArm::V86);
+    // FOUR two-byte fillers, i.e. an eight-byte BLOCK, at linear 0x1000A. Eight and not seven:
+    // the HLT the other targets end with is non-continuable and never joins the block, so a
+    // `filler + hlt` target is a SIX-byte block and `0xFFFA + 6 - 1` is exactly the limit rather
+    // than past it -- which is how this fixture first went vacuous.
+    let overrunning = Target::with_code(
+        0x1000,
+        0x000a,
+        [filler(), FILL[0].to_vec(), vec![0xf4]].concat(),
+    );
+    assert_eq!(overrunning.linear(), 0x1_000a);
+    let mut chain = far_chain(v86_cpu, std::slice::from_ref(&overrunning));
+
+    // Reached through the ALIAS: CS 0x0001, offset 0xFFFA. 0xFFFA + 8 - 1 = 0x10001 > 0xFFFF.
+    let aliased = Target {
+        selector: 0x0001,
+        offset: 0xfffa,
+        code: Vec::new(),
+    };
+    assert_eq!(aliased.linear(), overrunning.linear());
+    let before = chain.refusals();
+    for _ in 0..3 {
+        let (links, _) = chain.far_return_to(&aliased);
+        assert_eq!(
+            links, 0,
+            "a target whose block runs past the CS limit must never be chained into"
+        );
+    }
+    assert!(
+        chain.refusals().1 > before.1,
+        "and the refusal must be counted as a LIMIT refusal, not lost"
+    );
+    assert_eq!(chain.cpu.registers.cs().selector, aliased.selector);
+    assert_eq!(chain.cpu.registers.eip, u32::from(aliased.offset));
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F8, first half. A write over the far target's page CUTS the cell, exactly as it cuts a near-RET
+/// cell: the far edge is an ordinary outbound link, so `invalidate_physical_range` ->
+/// `retire_block` -> `unlink_block` clears it and `retire_block` removes the `link_sources` entry.
+///
+/// Asserted rather than assumed: this is the SMC door a linear-keyed cell would open if the
+/// teardown were anywhere else.
+#[test]
+fn smc_over_the_far_target_cuts_the_cell() {
+    select_retf(jit::direct::RetfArm::V86);
+    let target = Target::plain(0x0020, 0x0400);
+    let mut chain = far_chain(v86_cpu, std::slice::from_ref(&target));
+    let _ = chain.far_return_to(&target);
+    let (links, _) = chain.far_return_to(&target);
+    assert_eq!(links, 1, "the cell must be live before the write");
+
+    let _ = chain.cpu.note_code_write(target.linear(), 4);
+    let (links, misses) = chain.far_return_to(&target);
+    assert_eq!(links, 0, "the write must have cut the far cell");
+    assert_eq!(misses, 1);
+    assert_eq!(
+        chain.cpu.registers.cs().selector,
+        target.selector,
+        "and the return still lands"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F8, second half. A WIDEN that pushes either CS bit into the far target's chain requirement
+/// CUTS the far edge instead of merging through it, and the cut is counted.
+///
+/// INV-FAR-CS is a property of the target's chain REQUIREMENT, and a requirement grows: the edge
+/// predicate alone is not enough. Here the far target `T` is bound first and only then links
+/// onward to a block that bakes CS's selector, which widens `T`'s requirement with `BAKES_CS_BIT`
+/// and drives the backward propagation into the far predecessor.
+///
+/// Merging instead would compare the predecessor's PRE-RETF `data[1]` against a POST-RETF
+/// requirement -- two unrelated CS records -- which the ordinary `push cs; call; retf` shape would
+/// satisfy BY COINCIDENCE and then be wrong on a later rebind of the same cell.
+///
+/// Catches: M16, the propagation cut dropped.
+#[test]
+fn a_widen_that_pins_cs_cuts_the_far_edge() {
+    select_retf(jit::direct::RetfArm::V86);
+    // T: three fillers then `jmp +0x18` into U, at linear 0x600 under CS 0x0020.
+    let t = Target::with_code(0x0020, 0x0400, [filler(), vec![0xeb, 0x18]].concat());
+    // U: `push cs` then two fillers then HLT, at linear 0x620 under the same CS.
+    let u = Target::with_code(
+        0x0020,
+        0x0420,
+        [vec![0x0e], FILL[0].to_vec(), FILL[1].to_vec(), vec![0xf4]].concat(),
+    );
+    assert_eq!(
+        t.linear() + 8 + 0x18,
+        u.linear(),
+        "the jmp must actually reach U, or this fixture links nothing"
+    );
+
+    let mut chain = far_chain(v86_cpu, std::slice::from_ref(&t));
+    let _ = chain.far_return_to(&t);
+    let (links, _) = chain.far_return_to(&t);
+    assert_eq!(links, 1, "the far edge must be live before the widen");
+
+    let before = chain.refusals();
+    chain.write_and_install(&u);
+    assert!(
+        chain.refusals().2 > before.2,
+        "installing a CS-selector-baking successor of T must CUT the far edge into T, not merge \
+         through it"
+    );
+    let (links, misses) = chain.far_return_to(&t);
+    assert_eq!(links, 0, "and the cell must actually be gone");
+    assert_eq!(misses, 1);
+    assert_eq!(
+        chain.cpu.registers.cs().selector,
+        t.selector,
+        "the far return still executes correctly through the dispatcher"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F12. A far chain leaves CS, SP and EIP RETIRED at whatever boundary it ends on.
+///
+/// That is the whole of what the owner's "interrupt latency is accepted at block boundaries" rule
+/// needs from this slice: what changes is WHERE the boundary is, never what the machine looks like
+/// at one. The far transfer decrements `STACK_QUOTA` and bumps `linked_transfers` through
+/// unchanged code, so a chain that exhausts its quota returns through exactly this state.
+#[test]
+fn a_far_chain_leaves_cs_ip_and_sp_retired_at_the_boundary() {
+    select_retf(jit::direct::RetfArm::V86);
+    let target = Target::plain(0x0020, 0x0400);
+    let mut chain = far_chain(v86_cpu, std::slice::from_ref(&target));
+    let _ = chain.far_return_to(&target);
+    let (links, _) = chain.far_return_to(&target);
+    assert_eq!(links, 1, "the far edge must be live");
+
+    // Run the chain to its own end: source, far transfer, target, and out.
+    chain.cpu.load_segment_real(SegmentIndex::Cs, 0);
+    chain.cpu.set_eip(ENTRY);
+    chain.cpu.halted = false;
+    chain.cpu.registers.set_esp(chain.esp);
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
+        map_direct_page(&mut chain.cpu, &mut chain.bus, page);
+    }
+    assert!(
+        chain
+            .cpu
+            .try_run_direct_block_for_test(&mut chain.bus, chain.source)
+            .unwrap()
+    );
+    assert_eq!(
+        chain.cpu.registers.cs().selector,
+        target.selector,
+        "CS must be the POST-RETF one at the boundary"
+    );
+    assert_eq!(
+        chain.cpu.registers.eip,
+        u32::from(target.offset) + 3 * 2,
+        "and EIP must be past the chained-into target's three slots, i.e. the far transfer really          happened inside one native run"
+    );
+    assert_eq!(
+        chain.cpu.registers.esp(),
+        chain.esp + 4,
+        "and SP must already have been released"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F18's stand-in: a SWEPT differential grid.
+///
+/// The design named `cpu_jit_differential_generator_test.rs` with the knob armed in V86. That
+/// generator emits 32-bit FLAT blocks and has no 16-bit or V86 mode, so arming the knob there
+/// exercises nothing; this sweeps the far return's own parameter space instead -- selector,
+/// offset, release and stack pointer, including the 16-bit wrap in each -- against the interpreter.
+#[test]
+fn far_returns_match_the_interpreter_across_a_swept_grid() {
+    select_retf(jit::direct::RetfArm::V86);
+    for &selector in &[0x0000u16, 0x0001, 0x0020, 0x0fff, 0x1000] {
+        for &offset in &[0x0000u16, 0x0002, 0x0400, 0x0ffe] {
+            for &release in &[None, Some(0u16), Some(2), Some(0xfffe)] {
+                for &esp in &[STACK_ESP, 0xdead_0000 | 0xfffe, 0xdead_0000] {
+                    differential(
+                        v86_cpu,
+                        &retf(release),
+                        selector,
+                        offset,
+                        esp,
+                        &format!(
+                            "sweep sel={selector:#x} off={offset:#x} rel={release:?} esp={esp:#x}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// F10 / M14 are VACUOUS in this tree and the row says so rather than being silently absent.
+///
+/// The design's fallback branch put `far_dynamic` in a parallel `BlockCache` lane, where a
+/// recycled block slot could inherit the retired occupant's bit and a reset site was needed. It
+/// lives in `CompiledBlock`'s packed `dynamic_flags` byte instead, and `install`'s recycled arm
+/// assigns the WHOLE struct, so there is no reset site to forget and no state to inherit.
+///
+/// Asserted structurally, so that a future move to a lane makes this row fail rather than quietly
+/// stop meaning anything.
+#[test]
+fn far_dynamic_cannot_be_inherited_by_a_recycled_block_slot() {
+    assert_eq!(
+        core::mem::size_of::<jit::direct::CompiledBlock>(),
+        120,
+        "the far bit is packed into `dynamic_flags`, which is what keeps this struct at 120 bytes \
+         and keeps `far_dynamic` inside the whole-struct assignment `install`'s recycle arm makes"
+    );
 }

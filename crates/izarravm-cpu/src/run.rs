@@ -2906,6 +2906,10 @@ impl CpuGsw {
                 exit.dynamic_target_eip,
                 cs_base.wrapping_add(exit.dynamic_target_eip),
                 span.key.mode_key,
+                // Read here beside `cs_base`, and for the same reason: after the native run, so a
+                // far exit hands over the POST-RETF descriptor. `bind_dynamic_successor` has no
+                // `&CpuGsw` and the fetch-limit compare it makes needs this.
+                self.registers.cs().limit,
             );
         }
         let instructions = exit.instructions;

@@ -181,6 +181,52 @@ impl SegmentLayout {
         self.merge_chain(target)
     }
 
+    /// `link_merge` for a FAR edge, where the two ends disagree about CS by construction.
+    ///
+    /// A far edge's source snapshot holds the PRE-RETF CS and its target's holds the POST-RETF CS,
+    /// so `link_merge`'s `self.cs != target.cs` test refuses EVERY far edge. What replaces it is
+    /// INV-FAR-CS, and the two are not the same bar:
+    ///
+    /// > A far edge S -> T is admitted only if T's CHAIN REQUIREMENT claims neither the CS
+    /// > descriptor nor the CS selector:
+    /// > `chain_layouts[T].used & (segment_bit(Cs) | BAKES_CS_BIT) == 0`.
+    ///
+    /// Why a CS EQUALITY is the wrong test and this refusal is the right one. The far cell is
+    /// keyed on the target's LINEAR, which is the block-identity quantity, and the emitted slot
+    /// has already written the guest CS register from the popped selector -- so the architectural
+    /// CS is correct on arrival whatever the cell was bound under. The only thing that can go
+    /// wrong is T READING CS: through a baked descriptor (base and limit, `segment_bit(Cs)`) or
+    /// through a baked selector immediate (`BAKES_CS_BIT`). Excluding both is exact, and it admits
+    /// the aliasing case (`1000:0000` and `0FFF:0010` are one linear) instead of pretending it
+    /// cannot happen.
+    ///
+    /// Any CS bit in the RESULT's `used` is `self`'s own, and it stays there: the source block is
+    /// entered through the dispatcher, where `cs_matches` still runs.
+    ///
+    /// THE FIVE DATA SEGMENTS KEEP TODAY'S RULE. A RETF changes none of them, so the transitive
+    /// argument `merge_chain` records carries across the far edge unchanged, and this is
+    /// `merge_chain` with CS excluded from the comparison and nothing else changed.
+    pub(crate) fn far_merge(self, target: Self) -> Option<Self> {
+        if target.used & (segment_bit(SegmentIndex::Cs) | BAKES_CS_BIT) != 0 {
+            return None;
+        }
+        let used = self.used | target.used;
+        for segment in SEGMENT_ORDER {
+            if segment == SegmentIndex::Cs {
+                continue;
+            }
+            let index = segment_index(segment);
+            if used & segment_bit(segment) != 0 && self.data[index] != target.data[index] {
+                return None;
+            }
+        }
+        Some(Self {
+            cs: self.cs,
+            data: self.data,
+            used,
+        })
+    }
+
     /// The pinned selector for `segment`, from whichever of the two snapshots holds it. CS lives
     /// in its own field and is pinned for every block; the other five must be in `used`, which
     /// `DirectKind::selector_segment` is what guarantees for a `MovSegToReg` slot.
