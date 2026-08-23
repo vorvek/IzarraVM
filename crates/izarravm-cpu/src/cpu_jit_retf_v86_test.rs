@@ -1516,3 +1516,62 @@ fn far_dynamic_cannot_be_inherited_by_a_recycled_block_slot() {
          and keeps `far_dynamic` inside the whole-struct assignment `install`'s recycle arm makes"
     );
 }
+
+/// A FAULT on the SECOND far pop leaves the whole instruction UN-STARTED.
+///
+/// Every guest write the slot makes sits after BOTH reads' guards, all of which jump to the shared
+/// side-exit label, so a stack read that leaves the SS limit retires nothing: SP has not moved, CS
+/// still holds its old record and EIP still points at the RETF, and the interpreter re-runs it.
+///
+/// Built in PLAIN REAL MODE with a deliberately short SS limit -- 0x0701, so the offset at
+/// SS:0x0700 is inside it and the selector at SS:0x0702 is not. In V86 SS's limit is always
+/// 0xFFFF and `AddressWrap::Word` masks the effective address, so the fault is unreachable there;
+/// an unreal-mode SS is the one shape that can produce it.
+///
+/// Catches: M7, any guest write hoisted above the second read's guards.
+#[test]
+fn a_fault_on_the_second_far_pop_leaves_the_instruction_unstarted() {
+    select_retf(jit::direct::RetfArm::On);
+    fn short_ss_cpu() -> CpuGsw {
+        let mut cpu = real_cpu();
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.limit = 0x0701;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu
+    }
+    let mut roles = build(
+        short_ss_cpu,
+        &retf(None),
+        TARGET_SELECTOR,
+        TARGET_OFFSET,
+        STACK_ESP,
+    );
+    let before = roles.native.perf_counters().jit_direct_insns;
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap()
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - before,
+        FILL.len() as u64,
+        "the RETF must NOT retire: its second stack read leaves the SS limit"
+    );
+    assert_eq!(
+        roles.native.registers.esp(),
+        STACK_ESP,
+        "SP must not have moved"
+    );
+    assert_eq!(
+        roles.native.registers.cs().selector,
+        0,
+        "CS must still hold its OLD record"
+    );
+    assert_eq!(
+        roles.native.registers.eip,
+        ENTRY + 2 * FILL.len() as u32,
+        "and EIP must still point at the RETF, so the interpreter re-runs it"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
