@@ -167,6 +167,60 @@ fn a_phase_whose_closing_mark_never_fired_reports_not_reached() {
     assert!(rows.iter().all(|row| row.wall_seconds == 0.0));
 }
 
+fn run_with_mount(mount: Option<KateaStorageCounters>) -> BootProfileRun {
+    BootProfileRun {
+        mode: GswMode::Gsw486,
+        rows: Vec::new(),
+        stop: StopReason::CycleLimit { requested: 0 },
+        load_target: None,
+        keystroke_injection_failed: false,
+        screen: String::new(),
+        mount,
+    }
+}
+
+/// The mount summary line is the only place mount cost appears in the human
+/// report -- mount finishes before `RUN_START`, so it can never be a phase row.
+#[test]
+fn the_mount_summary_line_splits_mount_into_its_two_terms() {
+    let line = mount_summary_line(
+        &run_with_mount(Some(KateaStorageCounters {
+            mount_prime_ns: 12_500_000,
+            mount_seed_ns: 3_100_000,
+            mount_total_ns: 19_000_000,
+            ..Default::default()
+        })),
+        std::time::Duration::from_secs(1),
+    );
+    assert_eq!(
+        line,
+        "mount: 19.0 ms host time (1.90% of wall) = prime 12.5 ms + seed 3.1 ms + 3.4 ms other"
+    );
+}
+
+/// A zero wall would divide by zero. The absolute numbers still have to print:
+/// they are the measurement, the share is only the framing.
+#[test]
+fn the_mount_summary_line_declines_the_division_on_a_zero_wall() {
+    let line = mount_summary_line(
+        &run_with_mount(Some(KateaStorageCounters {
+            mount_prime_ns: 1_000_000,
+            mount_seed_ns: 500_000,
+            mount_total_ns: 2_000_000,
+            ..Default::default()
+        })),
+        std::time::Duration::ZERO,
+    );
+    assert!(line.contains("n/a of wall"), "{line}");
+    assert!(line.contains("2.0 ms host time"), "{line}");
+}
+
+#[test]
+fn the_mount_summary_line_says_so_when_nothing_mounted() {
+    let line = mount_summary_line(&run_with_mount(None), std::time::Duration::from_secs(1));
+    assert_eq!(line, "mount: no Katea volume (nothing mounted)");
+}
+
 #[test]
 fn real_time_factor_and_coverage_are_zero_safe() {
     let row = PhaseRow {

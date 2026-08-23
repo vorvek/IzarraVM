@@ -16,6 +16,67 @@ fn munt_test_dir(name: &str) -> PathBuf {
     path
 }
 
+/// The Katea counter surface, sorted, which is the order `serde_json` writes an
+/// object in without `preserve_order`. THE LEDGER: every cell in
+/// `katea_counter_block!` must appear here, and a counter that exists but is
+/// never exported is a counter nobody can grade. The macro makes the cell and
+/// the report impossible to forget; this list is the third leg, the JSON, which
+/// the macro cannot reach.
+///
+/// The last three are the mount instrument (2026-08-23). They are LEVELS, not
+/// per-session totals: mount finishes before the guest runs, so unlike every
+/// key above them they price the folder rather than the session.
+const KATEA_COUNTER_KEYS: &[&str] = &[
+    "blocked_projection_keys",
+    "dir_or_free_sector_reads",
+    "dma_read_commands",
+    "dma_read_sectors",
+    "dma_read_wait_ticks",
+    "dma_write_commands",
+    "dma_write_sectors",
+    "dma_write_wait_ticks",
+    "fat_sector_reads",
+    "host_bytes",
+    "host_file_opens",
+    "host_file_reads",
+    "host_read_bytes",
+    "host_read_max_ns",
+    "host_read_operations",
+    "host_readahead_fills",
+    "host_readahead_hits",
+    "host_wall_ns",
+    "host_write_failures",
+    "int13_read_commands",
+    "int13_read_sectors",
+    "int13_read_wait_ticks",
+    "int13_write_commands",
+    "int13_write_sectors",
+    "int13_write_wait_ticks",
+    "metadata_projection_passes",
+    "mount_prime_ns",
+    "mount_seed_ns",
+    "mount_total_ns",
+    "overlay_pending_sectors",
+    "overlay_resident_sectors",
+    "pending_unmapped_sectors",
+    "pio_read_commands",
+    "pio_read_sectors",
+    "pio_read_wait_ticks",
+    "pio_write_commands",
+    "pio_write_sectors",
+    "pio_write_wait_ticks",
+    "projection_bytes",
+    "projection_max_ns",
+    "projection_operations",
+    "projection_wall_ns",
+    "run_scan_steps",
+    "sector_reads",
+    "sector_writes",
+    "spill_bytes",
+    "spill_operations",
+    "spill_wall_ns",
+];
+
 const PERF_COUNTER_KEYS: &[&str] = &[
     "brk_cap",
     "brk_cont_decode_miss",
@@ -843,6 +904,41 @@ fn direct_callout_attribution_json_rejects_an_open_row() {
             ..Counts::default()
         },
     }));
+}
+
+/// The Katea JSON must expose every counter, in a pinned order.
+///
+/// The mount instrument is the reason this pin exists: `mount_prime_ns` defends
+/// a cost the project knowingly moved into mount, and a defence that quietly
+/// stops being emitted defends nothing.
+#[test]
+fn katea_counters_json_exposes_the_complete_counter_surface() {
+    let counters = izarravm_machine::KateaStorageCounters {
+        mount_prime_ns: 12_500_000,
+        mount_seed_ns: 3_100_000,
+        mount_total_ns: 19_000_000,
+        ..Default::default()
+    };
+    let report = katea_counters_json(&counters);
+    let object = report.as_object().unwrap();
+    let keys: Vec<_> = object.keys().map(String::as_str).collect();
+    assert_eq!(keys, KATEA_COUNTER_KEYS);
+    for (key, expected) in [
+        ("mount_prime_ns", 12_500_000u64),
+        ("mount_seed_ns", 3_100_000),
+        ("mount_total_ns", 19_000_000),
+    ] {
+        assert_eq!(object[key].as_u64(), Some(expected), "{key}");
+    }
+    // Every other key is present and zero, which is what makes the list above a
+    // surface pin rather than a spot check.
+    assert!(
+        KATEA_COUNTER_KEYS
+            .iter()
+            .filter(|k| !k.starts_with("mount_"))
+            .all(|k| object[*k].as_u64() == Some(0)),
+        "a default counter reported non-zero"
+    );
 }
 
 #[test]

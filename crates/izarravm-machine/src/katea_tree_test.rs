@@ -3852,6 +3852,82 @@ fn the_fat_memo_is_byte_identical_to_an_uncached_synthesis() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// The mount instrument has to be non-zero and internally ordered on a real
+/// folder mount, because the number it exists to defend -- the ~12-13 ms
+/// `prime_claim_index` deliberately added to a 498 MB mount -- was previously
+/// only a comment.
+///
+/// The bar is deliberately structural, not a duration: a wall-clock threshold on
+/// a scratch folder would be a flake generator on a loaded CI box. What is
+/// pinned is that the clocks RAN (total > 0), that both parts are inside the
+/// whole, and that the two parts do not exceed it together -- which is what
+/// catches a cell being wired to the wrong `Instant`, the failure this fixture
+/// is actually for.
+#[test]
+fn the_mount_instrument_times_mount_and_its_two_o_folder_terms() {
+    let root = scratch("mount_instrument");
+    // Enough files and clusters that both terms have real work to do: `seed`
+    // inserts per cluster, `prime_claim_index` gathers per live file.
+    fs::create_dir_all(root.join("SUB")).unwrap();
+    for i in 0..24 {
+        fs::write(root.join(format!("F{i:02}.BIN")), vec![0x5Au8; 40_000]).unwrap();
+        fs::write(
+            root.join("SUB").join(format!("G{i:02}.BIN")),
+            vec![0x5Bu8; 9_000],
+        )
+        .unwrap();
+    }
+    let vol = mount(&root);
+    let counters = vol.storage_counters();
+
+    assert!(
+        counters.mount_total_ns > 0,
+        "the mount clock ran: {counters:?}"
+    );
+    assert!(
+        counters.mount_seed_ns > 0,
+        "seeding this many clusters is not free: {counters:?}"
+    );
+    assert!(
+        counters.mount_prime_ns > 0,
+        "the claim index was primed at mount (incremental claims are on by          default; this fixture does not clear the knob): {counters:?}"
+    );
+    assert!(
+        counters.mount_prime_ns <= counters.mount_total_ns,
+        "prime is a part of mount, not more than it: {counters:?}"
+    );
+    assert!(
+        counters.mount_seed_ns <= counters.mount_total_ns,
+        "seed is a part of mount, not more than it: {counters:?}"
+    );
+    assert!(
+        counters.mount_prime_ns + counters.mount_seed_ns <= counters.mount_total_ns,
+        "the two terms are disjoint, so together they still fit: {counters:?}"
+    );
+
+    // Nothing else moved it: the cells are levels, written once at mount, and a
+    // read afterwards must not disturb them.
+    let before = counters;
+    let lba = vol.cluster_to_lba(first_cluster_of(&vol, &root.join("F00.BIN")));
+    read_command(&vol, lba, 8);
+    let after = vol.storage_counters();
+    assert_eq!(
+        (
+            before.mount_prime_ns,
+            before.mount_seed_ns,
+            before.mount_total_ns
+        ),
+        (
+            after.mount_prime_ns,
+            after.mount_seed_ns,
+            after.mount_total_ns
+        ),
+        "the mount cells are levels; guest reads do not touch them"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// The max counters must report the longest SINGLE operation, which is the only
 /// figure that can tell a visible freeze from time spread thin.
 #[test]

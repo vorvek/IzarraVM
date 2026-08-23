@@ -218,6 +218,14 @@ struct BootProfileRun {
     /// The disk phases fail soft: everything before them still reports.
     keystroke_injection_failed: bool,
     screen: String,
+    /// The Katea counters as they stood the instant the folder finished
+    /// mounting, i.e. before a single guest instruction ran. Only the three
+    /// `mount_*` cells are read from it; it is stored whole so a later mount
+    /// question does not need another plumbing change.
+    ///
+    /// `None` when the mount produced no Katea volume, which on this path means
+    /// the mount failed and `run` returned before reaching here.
+    mount: Option<KateaStorageCounters>,
 }
 
 /// Run the whole boot profile for one persona.
@@ -247,6 +255,10 @@ pub fn run(
         izarravm_firmware::izarra_bios(),
     )?;
     machine.mount_hdd_folder_with_user_overrides(dir, overrides)?;
+    // Read the mount instrument HERE, before anything else touches the volume.
+    // Mount is the one phase this profiler cannot express as a phase: it happens
+    // before `RUN_START` below, so there is no mark pair to bracket it with.
+    let mount_counters = machine.katea_storage_counters();
     machine.enable_phase_marks();
 
     // The same optional instruments --hdd-folder honours, so a phase table, a
@@ -374,6 +386,7 @@ pub fn run(
         load_target,
         keystroke_injection_failed,
         screen: machine.screen_text().as_text(),
+        mount: mount_counters,
     };
     print_report(&run, wall, reached_boot, machine_profile);
     if let Some(path) = profile_json {
@@ -721,6 +734,14 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                         .saturating_sub(before.projection_wall_ns),
                     // A level, like `host_read_max_ns` above.
                     projection_max_ns: after.projection_max_ns,
+                    // Levels too, and the strongest case for it: the mount
+                    // instrument is written once, BEFORE `RUN_START`, so no
+                    // phase window contains it and every `after - before` here
+                    // would be exactly zero. Carried unsubtracted so each row
+                    // reports the same mount cost the summary line does.
+                    mount_prime_ns: after.mount_prime_ns,
+                    mount_seed_ns: after.mount_seed_ns,
+                    mount_total_ns: after.mount_total_ns,
                     metadata_projection_passes: after
                         .metadata_projection_passes
                         .saturating_sub(before.metadata_projection_passes),
@@ -856,6 +877,43 @@ fn is_plain_83(name: &str) -> bool {
     }
 }
 
+/// The mount line for the summary block: what mounting the folder cost in host
+/// time, split into its two O(folder) terms, as a share of the run's wall.
+///
+/// Mount is not a phase and cannot become one -- it finishes before `RUN_START`,
+/// so no mark pair brackets it -- which is exactly why it needs a line of its
+/// own here. Without it the profile's phase table sums to less than the wall
+/// clock with no visible reason.
+///
+/// The share is of TOTAL wall, the same denominator the phase table's seconds
+/// are read against, so a reader can compare the number directly against a phase
+/// row. `prime` and `seed` are disjoint parts of `total`, and they do not sum to
+/// it: the FAT build and the flatten sit between them and are deliberately not
+/// broken out.
+fn mount_summary_line(run: &BootProfileRun, wall: std::time::Duration) -> String {
+    let Some(k) = run.mount else {
+        return "mount: no Katea volume (nothing mounted)".to_string();
+    };
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    let wall_ns = wall.as_nanos();
+    // A zero wall is only reachable from a test-shaped duration; report the
+    // absolute numbers and decline the division rather than printing NaN.
+    let share = if wall_ns == 0 {
+        String::from("n/a")
+    } else {
+        format!("{:.2}%", k.mount_total_ns as f64 / wall_ns as f64 * 100.0)
+    };
+    format!(
+        "mount: {:.1} ms host time ({share} of wall) = prime {:.1} ms + seed {:.1} ms + {:.1} ms other",
+        ms(k.mount_total_ns),
+        ms(k.mount_prime_ns),
+        ms(k.mount_seed_ns),
+        ms(k.mount_total_ns
+            .saturating_sub(k.mount_prime_ns)
+            .saturating_sub(k.mount_seed_ns)),
+    )
+}
+
 fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: bool, phases: bool) {
     println!();
     println!("=== boot phase profile: {} ===", run.mode.canonical_name());
@@ -866,6 +924,7 @@ fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: b
     }
     println!("stop: {:?}", run.stop);
     println!("total wall: {:.3}s", wall.as_secs_f64());
+    println!("{}", mount_summary_line(run, wall));
     println!();
     println!(
         "{:<10} {:>9} {:>9} {:>8} {:>10} {:>9} {:>9} {:>10} {:>9}",
@@ -967,6 +1026,15 @@ fn write_json(
         "stop": format!("{:?}", run.stop),
         "load_target": run.load_target,
         "keystroke_injection_failed": run.keystroke_injection_failed,
+        // Mount, as its own object rather than a phase: it completes before
+        // `RUN_START`, so it is not in `phases` and never can be. The same three
+        // cells also ride each phase row as levels; this is where a reader who
+        // wants "what did mounting this folder cost" should look.
+        "mount": run.mount.as_ref().map(|k| json!({
+            "mount_prime_ns": k.mount_prime_ns,
+            "mount_seed_ns": k.mount_seed_ns,
+            "mount_total_ns": k.mount_total_ns,
+        })),
         "phases": run.rows.iter().map(|row| json!({
             "name": row.name,
             "reached": row.reached,
@@ -1020,6 +1088,9 @@ fn write_json(
                 "metadata_projection_passes": row.katea.metadata_projection_passes,
                 "host_write_failures": row.katea.host_write_failures,
                 "blocked_projection_keys": row.katea.blocked_projection_keys,
+                "mount_prime_ns": row.katea.mount_prime_ns,
+                "mount_seed_ns": row.katea.mount_seed_ns,
+                "mount_total_ns": row.katea.mount_total_ns,
             },
             "machine_phases": row.machine_phases.iter().map(|(name, wall_ns, count)| json!({
                 "name": name,

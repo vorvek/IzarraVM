@@ -1464,6 +1464,14 @@ fn bump(cell: &std::cell::Cell<u64>, n: u64) {
     cell.set(cell.get().saturating_add(n));
 }
 
+/// Nanoseconds since `started`, saturated into the `u64` a counter cell holds.
+/// A mount that took 585 years would clamp rather than wrap; the clamp exists so
+/// the cast has no `as`-truncation to reason about.
+#[inline]
+fn elapsed_ns(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 katea_counter_block! {
     /// Sectors the facade RESOLVED, from any source.
     ///
@@ -1564,6 +1572,54 @@ katea_counter_block! {
     projection_max_ns,
     metadata_projection_passes,
     host_write_failures,
+    /// Wall nanoseconds spent in [`KateaTreeVolume::prime_claim_index`] at mount.
+    ///
+    /// The claim index is deliberately built at mount rather than in the first
+    /// projection pass (see that function's comment for why), which means the
+    /// project knowingly moved ~12-13 ms of O(folder) work onto a 498 MB mount.
+    /// Nothing could catch that regressing: mount happens before `RUN_START`, so
+    /// no boot-profile phase covers it, and the number lived only in a comment.
+    /// This cell is that comment made falsifiable -- and the first reading it
+    /// took falsified it: the ~12-13 ms the comment claimed measures 9.1-9.6 ms
+    /// on the same 498 MB folder, which is why that comment now carries a
+    /// measured number and a recorded band miss.
+    ///
+    /// A LEVEL, not a delta: it is written once, at mount, and never moves. The
+    /// boot-profile phase rows therefore carry it unsubtracted, the same way
+    /// `projection_max_ns` and the occupancy gauges do.
+    ///
+    /// Zero when `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` -- `prime_claim_index`
+    /// returns immediately -- and zero on a folder whose directory did not
+    /// gather to completion, which leaves the index cold on purpose.
+    mount_prime_ns,
+    /// Wall nanoseconds spent seeding the write maps at mount.
+    ///
+    /// The `seed` recursion inserts one `projected_clusters` entry per cluster
+    /// and one `mirrored` entry per name, so it is the OTHER O(folder) term in a
+    /// mount -- the one the claim-index comment names as its companion. Counted
+    /// separately from [`Self::mount_prime_ns`] so a slow mount can be attributed
+    /// rather than guessed at.
+    ///
+    /// A level, like the two cells around it.
+    mount_seed_ns,
+    /// Wall nanoseconds for the whole of [`KateaTreeVolume::new`], mount's
+    /// O(folder) body: `build_tree` + `allocate` + `ClusterIndex::build` + the
+    /// boot-sector stamping + `seed` + the flatten + `prime_claim_index`.
+    ///
+    /// The denominator the two cells above are shares of, and the number to watch
+    /// if a mount ever starts feeling slow on a large folder. It does NOT include
+    /// the system-payload extraction its callers do first (that is a fixed cost
+    /// in the committed image, not a function of the folder), so it is the
+    /// folder-scaling part of the mount and nothing else.
+    ///
+    /// Invariants the fixtures pin: `mount_prime_ns <= mount_total_ns` and
+    /// `mount_seed_ns <= mount_total_ns`. The two parts are disjoint, so their
+    /// sum is a lower bound on the total, never an equality -- the flatten and
+    /// the FAT build sit between them.
+    ///
+    /// Cost outside mount: none. Three `Instant::now()` pairs per mount, on a
+    /// path that already walks the whole host tree.
+    mount_total_ns,
     /// Directory entries currently HELD by the anti-clobber guard, as a gauge
     /// rather than a total: the set they live in (`blocked_projection_keys`) is
     /// meant to drain, and a non-zero reading at the end of a run means some file
@@ -1746,6 +1802,11 @@ impl KateaTreeVolume {
         host_root: &Path,
         system_files: &[(String, Vec<u8>)],
     ) -> Result<Self, std::io::Error> {
+        // The mount instrument: three `Instant` pairs, all of them inside this
+        // one function, because this function IS mount's O(folder) body. See
+        // `KateaStorageCounters::mount_total_ns` for the scope and the
+        // invariants; the cells are written just before the `Ok` below.
+        let mount_started = std::time::Instant::now();
         let mut tree = build_tree(host_root, system_files);
         let geo = allocate(&mut tree)?;
         let fat = ClusterIndex::build(&tree, &geo);
@@ -1841,6 +1902,7 @@ impl KateaTreeVolume {
                 );
             }
         }
+        let seed_started = std::time::Instant::now();
         seed(
             &tree.root,
             &mut dir_paths,
@@ -1848,6 +1910,7 @@ impl KateaTreeVolume {
             &mut projected_files,
             &mut projected_clusters,
         );
+        let seed_ns = elapsed_ns(seed_started);
         let mut system_names: HashSet<[u8; 11]> = system_files
             .iter()
             .map(|(name, _)| fold_literal_83(name))
@@ -1952,7 +2015,17 @@ impl KateaTreeVolume {
             amortised_refresh: true,
             region_census: region_census_enabled(),
         };
+        let prime_started = std::time::Instant::now();
         volume.prime_claim_index();
+        volume
+            .counters
+            .mount_prime_ns
+            .set(elapsed_ns(prime_started));
+        volume.counters.mount_seed_ns.set(seed_ns);
+        volume
+            .counters
+            .mount_total_ns
+            .set(elapsed_ns(mount_started));
         Ok(volume)
     }
 
@@ -1983,14 +2056,27 @@ impl KateaTreeVolume {
     /// or the store -- so this addition is immune to the cold-host-filesystem
     /// exposure the disk audit flags for mount generally (§5.8). It is CPU only.
     ///
-    /// WHAT IT ADDS TO MOUNT, as a number, because mount has no instrument and a
-    /// comment is the only thing that will catch this regressing: **~12-13 ms on
-    /// a 498 MB folder** (~128,000 clusters). Derived from the measurement above
-    /// -- the cold build made a whole first pass cost 14.41 ms where the steady
-    /// state is ~1.7 ms, and it is that difference which moved here. It scales
-    /// with the folder's cluster count, so a 1 GB folder should expect ~25 ms.
-    /// If a mount ever starts feeling slow on a large folder, this is one of the
-    /// two O(folder) terms in it, `seed` being the other.
+    /// WHAT IT ADDS TO MOUNT, as a number: **~9.1-9.6 ms on a 498 MB folder**
+    /// (~128,000 clusters), MEASURED, by
+    /// [`KateaStorageCounters::mount_prime_ns`] -- three `--headless-boot-profile`
+    /// runs on 2026-08-23 read 9.59 / 9.10 / 9.50 ms, with `seed` a further
+    /// 5.0-5.3 ms and the whole of `KateaTreeVolume::new` 14.5-15.5 ms.
+    ///
+    /// This number REPLACES an earlier "~12-13 ms", which was never measured: it
+    /// was inferred from the cold build making a whole first projection pass cost
+    /// 14.41 ms against a ~1.7 ms steady state, and that difference turns out to
+    /// have over-attributed the part that moved here by about 25%. The inference
+    /// was the best available at the time -- mount had no instrument, which is the
+    /// debt this commit pays -- and the correction is in the direction that makes
+    /// the stage-3 trade slightly better than the project was told, not worse. The
+    /// 10-16 ms band pre-registered for this measurement is therefore recorded as
+    /// a MISS, low.
+    ///
+    /// It scales with the folder's cluster count, so a 1 GB folder should now
+    /// expect ~19 ms rather than the ~25 ms the old figure implied. If a mount
+    /// ever starts feeling slow on a large folder, this is one of the two
+    /// O(folder) terms in it, `seed` being the other -- and both are now readable
+    /// rather than guessed at.
     fn prime_claim_index(&mut self) {
         if !self.incremental_claims {
             return;
