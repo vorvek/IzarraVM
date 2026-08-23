@@ -22,6 +22,13 @@ mod fpu_exec;
 mod int_trace;
 mod ipe_entry_tally;
 pub use ipe_entry_tally::IpeEntryTargets;
+/// The entry-attribution stamp macros. Compiled in EVERY build -- including
+/// `--no-default-features` -- and a no-op without the feature; see the module for why they cannot
+/// live beside the instrument. Declared ABOVE `mod jit`'s `#[cfg]`, deliberately: the first
+/// attempt sat between that attribute and its module and inherited the gate, which is the bug
+/// this placement exists to prevent.
+#[macro_use]
+mod entry_attribution_macros;
 #[cfg(feature = "jit")]
 mod jit;
 /// The entry-attribution observer's snapshot and the tables that name its buckets. Present only
@@ -30,8 +37,8 @@ mod jit;
 #[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
 pub use jit::direct::entry_attribution::{
     BIN_FIELDS, COMPILE_SITES, DirectEntryAttributionSnapshot, FALLBACK_TAG_NAMES, LANE_NAMES,
-    N_BINS, N_HOP_BINS, N_INSN_BINS, N_LOOP_BINS, OUTLIER_TICKS, PHASE_NAMES, POPULATION_NAMES,
-    PRE_P0_REFUSAL_SITES, REFUSAL_SITES,
+    N_BINS, N_HOP_BINS, N_INSN_BINS, N_LOOP_BINS, OUTLIER_TICKS, P0_MARK_LINE, PHASE_NAMES,
+    POPULATION_NAMES, PRE_P0_REFUSAL_SITES, REFUSAL_SITES, native_bin_index, native_bin_parts,
 };
 /// The unit simulator's headline report, returned by `CpuGsw::take_unit_sim_report` (a diagnostic
 /// measurement aid; see `jit::unit_sim`).

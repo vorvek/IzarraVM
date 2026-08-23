@@ -3,17 +3,12 @@
 
 use super::*;
 
-// The entry-attribution observer's stamp macros. They exist in EVERY build and expand to nothing
-// without `direct-entry-attribution`, which is what makes the plain build byte-identical in
-// behaviour while the call sites stay readable in one place.
+// The entry-attribution observer's phase, population and site names. The `ea_*!` macros
+// themselves are `#[macro_use]`-imported from `crate::entry_attribution_macros`, which is compiled
+// in EVERY build: three of the call sites below are outside the `jit` gate.
 // See `dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md` section 4b.
 #[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
 use crate::jit::direct::entry_attribution::{FallbackTag, Phase, Population, compile_site, site};
-#[cfg(feature = "jit")]
-use crate::jit::direct::entry_attribution::{
-    ea_begin, ea_compile_site, ea_end, ea_fallback_tag, ea_mark, ea_mark_coarse,
-    ea_mark_probe_tail, ea_native_sample, ea_pin_lane_bit0, ea_refusal,
-};
 
 /// Gate for the differential-oracle per-instruction trace prototype
 /// (`IZARRAVM_DIFF_TRACE`). Separate env var from `IZARRAVM_FAULT_TRACE`
@@ -876,8 +871,9 @@ impl CpuGsw {
                         } else {
                             self.run_one_cached(bus, &view, lin)?
                         };
-                        // H3-R: the `None` arm is reached by `Declined` AND `Skipped`, and both fall
-                        // into this same block, so this is the only P13 mark on the traversal.
+                        // H3-R: the `None` arm is reached by `Declined` AND `Skipped`, and
+                        // both fall into this same block, so this is the traversal's only
+                        // P13 mark.
                         ea_mark!(Phase::InterpretFallback);
                         ea_end!(Population::Fallback);
                         ea_outcome

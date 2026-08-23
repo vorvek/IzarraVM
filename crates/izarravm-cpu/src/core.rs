@@ -505,6 +505,10 @@ impl CpuGsw {
         // window. That trades a cost confined to one probe per InterpretOne store for a cost on
         // the shipped byte-store path, which is the wrong direction. Revisit only if the loader
         // ladder puts `code_write_watched` in the profile.
+        // `jit`-gated with the field it reads (`lib.rs:2385-2386`). Without the backend there are
+        // no native blocks, so no call-out window can be open and this branch is dead -- but it
+        // was not gated, and `cargo check --no-default-features` did not compile because of it.
+        #[cfg(feature = "jit")]
         if self.deferred_code_writes.is_open() && self.code_write_watched(physical, width) {
             self.record_deferred_code_write(physical, width, lanes);
             return true;
@@ -677,6 +681,7 @@ impl CpuGsw {
     /// Record one code write taken while an `InterpretOne` call-out held a native block live.
     /// Separate from the branch above and `#[cold]` so the open-window case costs the choke one
     /// not-taken branch and no register pressure.
+    #[cfg(feature = "jit")]
     #[cold]
     #[inline(never)]
     fn record_deferred_code_write(&mut self, physical: u32, width: u32, lanes: bool) {
