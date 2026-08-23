@@ -292,9 +292,10 @@ pub(crate) const MAX_BLOCK_IMM_LANES: usize = 12;
 /// walk tries their matchers. A walk carries one `u16` per family beside its `disp_lane_count`
 /// and the count travels with the `Compilation` to the install site; see `LaneCapRefusals`.
 ///
-/// The last two are the Option D arms and they are DEFAULT OFF, so on a shipped binary their
-/// cells stay zero for the reason every off arm's cap cell does: each arm tests its knob before
-/// it reaches the budget.
+/// The last two are the Option D arms. `LANE_CAP_DISP_STORE` is LIVE on a shipped binary since
+/// the 2026-08-23 flip; `LANE_CAP_DISP_LOAD_WIDEN` stays zero while its knob is default OFF, for
+/// the reason every off arm's cap cell does -- each arm tests its knob before it reaches the
+/// budget. The store cell is now one of the numbers the lane-cap re-price is graded on.
 pub(crate) const LANE_CAP_FAMILIES: usize = 6;
 pub(crate) const LANE_CAP_IMM: usize = 0;
 pub(crate) const LANE_CAP_IMM8: usize = 1;
@@ -7330,17 +7331,22 @@ fn compile_with_budget(
                             }
                             kind
                         }
-                        // The two Option D arms, LAST because they are the only default-OFF
-                        // matchers in the chain. THE OFF-ARM PRICE, stated exactly rather than
-                        // waved at: each arm tests its own knob first and returns there, so a
-                        // shipped binary pays TWO `OnceLock` reads and their two branches per
-                        // slot that reaches here -- not one branch, and not a shared test, because
-                        // the arms are separately knobbed and `option_d_lane_for` calls them in
-                        // turn. The `OnceLock` is resolved once per process, so each read is a
-                        // relaxed load of an initialised cell plus a predicted-not-taken branch;
-                        // the slots that reach here are the ones all four shipped matchers
-                        // refused. The arms are mutually exclusive with everything above by KIND
-                        // and OPCODE, so the position is cost, never admission.
+                        // The two Option D arms, LAST. The position was chosen when both were
+                        // default OFF; since the 2026-08-23 flip the STORE arm is on by default
+                        // and it is kept here anyway, because the ordering is cost and never
+                        // admission -- all six matchers are mutually exclusive by KIND and
+                        // OPCODE, so no ordering can change which one fires.
+                        //
+                        // THE PRICE ON A SHIPPED BINARY, stated exactly rather than waved at.
+                        // Each arm tests its own knob first, so a slot that reaches here pays TWO
+                        // `OnceLock` reads and their two branches -- not one, and not a shared
+                        // test, because the arms are separately knobbed and `option_d_lane_for`
+                        // calls them in turn. Each `OnceLock` is resolved once per process, so a
+                        // read is a relaxed load of an initialised cell plus a branch. Since the
+                        // flip the store branch is PREDICTED TAKEN into its kind and opcode bars
+                        // rather than returning at the knob; the load-widen one still returns
+                        // there. The slots that reach here at all are the ones all four shipped
+                        // matchers refused.
                         None => match option_d_lane_for(
                             cpu,
                             &insn,

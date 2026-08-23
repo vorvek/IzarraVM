@@ -11,7 +11,12 @@
 //! |---|---|---|---|---|
 //! | `disp_lane_for` | `0x8A` mem, disp32 | `IZARRAVM_DISP_LANES` | ON | `smc_disp_lane_*` |
 //! | `disp_load_widen_lane_for` | `0x8B` mem, disp32 | `IZARRAVM_DISP_LOAD_WIDEN` | OFF | `smc_disp_load_widen_lane_*` |
-//! | `disp_store_lane_for` | `0x89` / `0x88` mem, disp32 | `IZARRAVM_DISP_STORE_LANES` | OFF | `smc_disp_store_lane_*` |
+//! | `disp_store_lane_for` | `0x89` / `0x88` mem, disp32 | `IZARRAVM_DISP_STORE_LANES` | **ON** | `smc_disp_store_lane_*` |
+//!
+//! Two of the three ship ON. The store arm flipped on the 2026-08-23 Option D ladder
+//! (`duke3d-586` long 259.6 -> 194.8 s, −25.0%, corpus inert); the `0x8B` widening stays off
+//! because at `MAX_BLOCK_IMM_LANES` = 12 it competes for the budget instead of adding capture,
+//! and it is blocked on the cap re-price rather than refuted. Both knob docs carry the tables.
 //!
 //! `disp_lane_for` moved here from `direct.rs` to keep that file under the layout limit. ONE
 //! TOKEN changed in the move and it is named here so "unchanged" is checkable rather than

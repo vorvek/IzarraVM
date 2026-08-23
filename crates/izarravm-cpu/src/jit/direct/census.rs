@@ -678,12 +678,17 @@ pub(crate) struct DirectStallTally {
     /// arm alone reads 11.460% capture against the pre-registered 11.9% line and the pair reads
     /// 12.797%, so a leg has to be able to attribute movement to one of them.
     ///
-    /// **Zero on a shipped binary.** The knob is default OFF and is tested above everything else
-    /// in `disp_store_lane_for`, so a plain profile reads 0 here and any non-zero value on a leg
-    /// is proof the leg named the arm it meant to.
+    /// **NON-ZERO on a shipped binary since the 2026-08-23 flip**, and that reading is small:
+    /// the counter smoke read 115 registrations on `duke3d-586-short` for a −24.5% min-wall,
+    /// because the prize arrives through the heat equilibrium rather than through lane volume.
+    /// Zero here on a plain leg now means the ESCAPE was exported (`IZARRAVM_DISP_STORE_LANES=0`)
+    /// or the workload patches no store displacements at all -- the corpus rows read zero and are
+    /// inert, which is the heat gate doing its job.
     pub disp_store_lane_registrations: u64,
-    /// The `0x8B` load-widening half of Option D (`IZARRAVM_DISP_LOAD_WIDEN`), default OFF and
-    /// zero on a shipped binary for the same reason. See `disp_store_lane_registrations`.
+    /// The `0x8B` load-widening half of Option D (`IZARRAVM_DISP_LOAD_WIDEN`), still DEFAULT OFF
+    /// and so still zero on a shipped binary: at `MAX_BLOCK_IMM_LANES` = 12 it competes with the
+    /// store arm for the budget rather than adding capture (`imm_lane_cap_refusals` 3,775 ->
+    /// 11,369), and it is blocked on the cap re-price. See `disp_load_widen_enabled`.
     pub disp_load_widen_lane_registrations: u64,
     /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
     /// charged to the family that would otherwise have taken the slot. The registration counters
@@ -733,7 +738,9 @@ pub(crate) struct DirectStallTally {
     /// The two Option D arms' cap cells. Both keep `disp_lane_cap_refusals`' TIGHTER definition
     /// -- the budget is tested below the `has_record_range` heat gate and below
     /// `direct_host_bytes` -- so every slot they count had a heat record and a host pointer
-    /// waiting. Both read zero unless their (default-OFF) knob is exported on.
+    /// waiting. `disp_store_lane_cap_refusals` is live on a shipped binary since the 2026-08-23
+    /// flip (14 on the counter smoke); `disp_load_widen_lane_cap_refusals` reads zero unless that
+    /// still-default-OFF knob is exported on.
     pub disp_store_lane_cap_refusals: u64,
     pub disp_load_widen_lane_cap_refusals: u64,
     /// Interpreted continuations whose decode line had died between the packed first touch and

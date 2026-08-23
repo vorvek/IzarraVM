@@ -221,11 +221,34 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// Whether `disp_store_lane_for` admits the STORE half of Option D — `0x89 MOV r/m32, r32` and
 /// `0x88 MOV r/m8, r8` with a disp32 memory operand (`IZARRAVM_DISP_STORE_LANES`).
 ///
-/// **DEFAULT OFF.** This is a new admission and it ships behind its own arm so the Option D
-/// ladder can price it against a base that is byte-for-byte main. Off, every `0x89`/`0x88` slot
-/// bakes its displacement exactly as it does today and `smc_disp_store_lane_cap_refusals` reads
-/// zero, because the knob is tested ABOVE the shared budget — the rule that keeps an off arm
-/// from reporting a whole family as budget pressure.
+/// **DEFAULT ON SINCE THE 2026-08-23 OPTION D LADDER.** It shipped default OFF for exactly one
+/// commit — the slice that built it — and the ladder that priced it flipped it in the next. On
+/// the OFF arm every `0x89`/`0x88` slot bakes its displacement exactly as it did before the
+/// slice, and `smc_disp_store_lane_registrations` / `_cap_refusals` both read zero, because the
+/// knob is tested ABOVE the shared budget — the rule that keeps an off arm from reporting a whole
+/// family as budget pressure. That arm is the escape AND the A/B base, and it still ships whole.
+///
+/// **WHAT PRICED THE FLIP** (binary `de751809`, governor at its shipped `cap` default, every
+/// other knob pinned identical across the legs, min-wall):
+///
+/// | row | off | store ON | delta |
+/// |---|---:|---:|---:|
+/// | **`duke3d-586` SHORT** | 115.3 s | **87.1 s** | **−24.5%** |
+/// | **`duke3d-586` LONG — decides** | 259.6 s | **194.8 s** (both arms) | **−25.0%** |
+///
+/// `direct_native_coverage` 85.7% -> **91.5%**, and the corpus rows are INERT
+/// (`jit_direct_entries` identical), which is what says this is a duke-shaped admission and not a
+/// policy change: the heat gate keeps a never-patched store baked, so a workload that does not
+/// patch its displacements registers no lane and pays nothing.
+///
+/// **AN ORDER OF MAGNITUDE OVER THE PRE-REGISTRATION, and that is stated rather than smoothed
+/// over.** The floor pre-registered in `dev_docs/duke-heat-gate-design-2026-08-21.md` §13 was
+/// −2.6% and the bar was −2%. The measured −25% does not come from the pre-registered term: the
+/// counter smoke reads **115 store lanes registered** and BLOCK KILLS FLAT (32,261 off against
+/// 32,263 on). The movement is in HEAT — `smc_heat_chunks_hot` −32.7%, `smc_heat_demotions`
+/// −38.2%, total dispatcher asks −43.8%, `smc_lane_accepts` +87% — i.e. the compounding
+/// equilibrium §12.3 describes, arriving through the POOL term rather than the kill term. A
+/// handful of laned stores stop a handful of chunks going hot, and those chunks were very hot.
 ///
 /// WHAT IT IS FOR. `disp_lane_for` covers `0x8A` only; the un-laned displacement family that is
 /// left is 89% `0x89` by events (`dev_docs/duke-heat-gate-design-2026-08-21.md` §12.3), and the
@@ -247,18 +270,23 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 ///
 /// # THE SPELLING TABLE
 ///
-/// Trimmed and case-folded on the way in, and the same table as `IZARRAVM_RETRY_LIFT`'s because
-/// this is a default-OFF arm:
+/// Trimmed and case-folded on the way in, and the same table as `IZARRAVM_IMM8_LANES` and
+/// `IZARRAVM_DISP_LANES` carry, because this is now a default-ON arm:
 ///
-/// * **unset**, `0` or `off` -> OFF, the shipped default.
-/// * `1` / `on` -> ON, the Option D store arm.
+/// * **unset** or `1` / `on` -> ON, the shipped default since the 2026-08-23 flip. Every
+///   "defaults" leg recorded BEFORE that date is the OFF arm and is not comparable with one
+///   recorded after.
+/// * the EMPTY STRING, `0` or `off` -> OFF: the escape, the pre-slice base and the A/B base.
 /// * **anything else PANICS.** A mistyped ladder leg that fell through would run the DEFAULT and
 ///   be read as "the arm I asked for changed nothing", the one wrong conclusion an arm ladder
 ///   exists to avoid.
 ///
-/// THE NULLING TRAP RUNS THE OTHER WAY HERE. Unset is OFF, so an ON leg must EXPORT `1`; a leg
-/// that merely nulls the variable in PowerShell leaves it present and empty, which this table
-/// spells OFF, and measures the default. `Remove-Item Env:` is the only true unset.
+/// **THE NULLING TRAP FLIPPED WITH THE DEFAULT, and every leg script has to flip with it.** The
+/// empty string is OFF while unset is ON, and the two must not be confused: nulling a variable in
+/// PowerShell leaves it PRESENT and EMPTY, which this table spells OFF. Before the flip an ON leg
+/// had to export `1`; now it is the OFF leg that must export `0`, and `Remove-Item Env:` is the
+/// only true unset. Three earlier evidence directories in this repository ran default-ON knobs
+/// off exactly this way.
 pub(crate) fn disp_store_lanes_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = DISP_STORE_LANES_OVERRIDE.with(std::cell::Cell::get) {
@@ -272,14 +300,19 @@ pub(crate) fn disp_store_lanes_enabled() -> bool {
 /// be unit-tested without a process-global env write. See `disp_store_lanes_enabled`.
 fn parse_disp_store_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        // Unset = OFF, so the PowerShell nulling trap damages the ON leg: an ON leg must EXPORT
-        // `1`, and a leg that merely nulls the variable measures the default.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset = ON since the 2026-08-23 flip; `0` / `off` is the escape. The nulling trap now
+        // damages the OFF leg rather than the ON one: an off leg must EXPORT `0`. A leg that
+        // merely nulls the variable leaves it present and empty, which is spelled OFF one arm
+        // down -- so that particular accident happens to land on the arm it named. Do not rely on
+        // it: every other default-ON knob in this file fails the other way, and `Remove-Item
+        // Env:` is the only true unset.
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_DISP_STORE_LANES is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset, `0` or `off` (the shipped default: every `0x89` / `0x88` \
-                 slot bakes its displacement), and `1` or `on` (the Option D store lane arm)"
+                 spellings are unset or `1` / `on` (the shipped default since the 2026-08-23 \
+                 ladder: the `0x89` / `0x88` displacement store-lane class), and `0` / `off` \
+                 (the escape, under which every `0x89` / `0x88` slot bakes its displacement)"
             )
         }
         Ok(raw) => raw,
@@ -288,10 +321,12 @@ fn parse_disp_store_lanes_arm(value: Result<String, std::env::VarError>) -> bool
         "" | "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_DISP_STORE_LANES={other:?} names no arm; accepted spellings are unset, `0` \
-             or `off` (the shipped default) and `1` or `on` (the Option D store lane arm). \
-             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
-             as the arm it named doing nothing"
+            "IZARRAVM_DISP_STORE_LANES={other:?} names no arm; accepted spellings are unset or \
+             `1` / `on` (the shipped default since the 2026-08-23 ladder: the `0x89` / `0x88` \
+             displacement store-lane class is registered), and `0` / `off` (the escape, under \
+             which every `0x89` / `0x88` slot bakes its displacement). Refusing to guess: a \
+             mistyped ladder leg would silently run the DEFAULT and be read as the arm it named \
+             doing nothing"
         ),
     }
 }
@@ -322,12 +357,38 @@ pub(crate) fn parse_disp_store_lanes_arm_for_test(
 /// Whether `disp_load_widen_lane_for` admits the LOAD-widening half of Option D — `0x8B MOV r32,
 /// r/m32` with a disp32 memory operand (`IZARRAVM_DISP_LOAD_WIDEN`).
 ///
-/// **DEFAULT OFF**, and a SEPARATE knob from `IZARRAVM_DISP_STORE_LANES` deliberately: the two
-/// halves are 8.6% and 89% of the un-laned displacement mass respectively, so a single fused arm
-/// could not say which one moved a ladder. The 2026-08-23 settling census then made the pair
-/// load-bearing in the other direction as well — un-laned-disp capture reads 12.797% for the two
-/// arms together against a pre-registered 11.9% kill line, and 11.460% for the store arm alone —
-/// so the arms are separable for MEASUREMENT and shipped together.
+/// **DEFAULT OFF, and it stays off AT THE CURRENT CAP — the one place the 2026-08-23 ladder
+/// contradicted the settling census's packaging advice, so the reasoning is written out here
+/// rather than left to a log.**
+///
+/// The census said ship the pair: un-laned-disp capture reads 12.797% for the two arms together
+/// against a pre-registered 11.9% kill line, and 11.460% for the store arm alone. That argument
+/// is about the CAPTURE FRACTION and it still holds. What it could not see is the shared lane
+/// BUDGET, and the ladder measured it:
+///
+/// | arm | `duke3d-586-short` min-wall | `imm_lane_cap_refusals` | `disp_lane_cap_refusals` |
+/// |---|---:|---:|---:|
+/// | store only | **87.1 s** | 3,775 | 3,372 |
+/// | both, `MAX_BLOCK_IMM_LANES` = 12 | 88.9 s (**+2%**) | **11,369** | **7,635** |
+/// | both, `MAX_BLOCK_IMM_LANES` = 16 | **87.4 s**, tightest spread of the four arms | — | — |
+///
+/// At twelve slots the `0x8B` lanes do not add capture, they COMPETE for a budget the store arm
+/// has just made valuable: the two cap counters roughly triple, which is precisely the
+/// disambiguation §13 step 4 pre-registered — disp registrations flat or low WHILE
+/// `imm_lane_cap_refusals` is non-zero is a CAP result, not a lane-CLASS result, and it points at
+/// raising `MAX_BLOCK_IMM_LANES` rather than at abandoning the lever. At sixteen slots it is the
+/// BEST arm on the row.
+///
+/// **So this knob is not refuted, it is BLOCKED ON THE CAP RE-PRICE**, which is its own slice
+/// with its own ladder and is not this commit. The lane-cap raise 12 -> 14/16 was closed with no
+/// flip on evidence gathered before either Option D arm existed; that closure is now stale, and
+/// the table above is the input that reopens it. Until then the shipped binary takes the store
+/// arm alone, which is the arm the long row was graded on.
+///
+/// It is a SEPARATE knob from `IZARRAVM_DISP_STORE_LANES` for the reason it always was: the two
+/// halves are 8.6% and 89% of the un-laned displacement mass, so a single fused arm could not say
+/// which one moved a ladder — and on this ladder that separation is exactly what produced the
+/// finding above.
 ///
 /// WHAT IS NEWLY ADMITTED, stated exactly, because "widen `0x8B`" is not a shape. Today
 /// `disp_lane_for` admits `insn.opcode == 0x8a` — the BYTE load `MOV r8, [..disp32..]` — and
@@ -347,8 +408,10 @@ pub(crate) fn parse_disp_store_lanes_arm_for_test(
 ///
 /// # THE SPELLING TABLE
 ///
-/// `IZARRAVM_DISP_STORE_LANES`'s exactly: unset / `0` / `off` -> OFF (the default), `1` / `on` ->
-/// ON, anything else panics, and the empty string is OFF, so an ON leg must EXPORT `1`.
+/// unset / `0` / `off` -> OFF (the default), `1` / `on` -> ON, anything else panics. The empty
+/// string is OFF and so is unset, so an ON leg must EXPORT `1` — which is the OPPOSITE of
+/// `IZARRAVM_DISP_STORE_LANES` since that knob's 2026-08-23 flip. The two Option D knobs no
+/// longer share a default, and a leg script must state both explicitly.
 pub(crate) fn disp_load_widen_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = DISP_LOAD_WIDEN_OVERRIDE.with(std::cell::Cell::get) {

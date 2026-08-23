@@ -4,9 +4,13 @@
 //! Option D: mutable disp32 lanes for `0x89 MOV r/m32, r32`, `0x88 MOV r/m8, r8`
 //! (`IZARRAVM_DISP_STORE_LANES`) and `0x8B MOV r32, r/m32` (`IZARRAVM_DISP_LOAD_WIDEN`).
 //!
-//! Both arms are DEFAULT OFF, so every fixture here forces the arm it means, per the
-//! STATE-THE-ARM rule: a fixture that read the ambient knob would be vacuous on a shipped binary
-//! and would pass for the wrong reason the day a default moves.
+//! **The two arms no longer share a default.** `IZARRAVM_DISP_STORE_LANES` is ON since the
+//! 2026-08-23 ladder (`duke3d-586` long −25.0%); `IZARRAVM_DISP_LOAD_WIDEN` is still OFF, blocked
+//! on the lane-cap re-price. Every fixture here forces the arm it means, per the STATE-THE-ARM
+//! rule, and that is now load-bearing in BOTH directions: a fixture reading the ambient store
+//! knob would silently follow the flip, and one reading the ambient widen knob would be vacuous
+//! on a shipped binary. The two default PINS are the only fixtures that read the ambient value,
+//! and they are what catch a default moving without a ladder.
 //!
 //! The fixture frame is `cpu_jit_disp_lane_test.rs`'s, one kind over: `mov esi, esi` /
 //! *the subject* / `mov edi, edi` / `hlt`, with the subject at slot 1 rather than at the entry,
@@ -651,7 +655,13 @@ fn the_off_arms_charge_no_cap_refusal_at_the_thirteenth_slot() {
 /// stray lane moves — the lane arm emits `mov r64, imm64` plus `mov eax, [r64]` where the baked
 /// arm emits one `mov eax, imm32`.
 fn emitted_len_under_arms(middle: &[u8], store: bool, widen: bool) -> usize {
-    emitted_len_on_store_path(middle, store, widen, SHIPPED_STORE_PATH)
+    emitted_len_on_store_path(middle, store, widen, SHIPPED_STORE_PATH, true)
+}
+
+/// The same, with NO heat record seeded — the state main was always in for a store, because main
+/// had no store matcher to consult a record with. Used only by the "the OFF arm is main" claim.
+fn emitted_len_unseeded(middle: &[u8], store: bool, widen: bool) -> usize {
+    emitted_len_on_store_path(middle, store, widen, SHIPPED_STORE_PATH, false)
 }
 
 fn emitted_len_on_store_path(
@@ -659,10 +669,12 @@ fn emitted_len_on_store_path(
     store: bool,
     widen: bool,
     one_lookup_store: bool,
+    seed_history: bool,
 ) -> usize {
     let arms = force_arms(store, widen, one_lookup_store);
     let mut cpu = flat_cpu(&arms);
     let mut memory = vec![0u8; 0x5000];
+
     let mut code = vec![0x89, 0xf6];
     code.extend_from_slice(middle);
     code.extend_from_slice(&[0x89, 0xff, 0xf4]);
@@ -671,9 +683,11 @@ fn emitted_len_on_store_path(
     map_flat_pages(&mut cpu, &mut bus);
     let third = ENTRY + SUBJECT_OFFSET + middle.len() as u32;
     decode_at(&mut cpu, &mut bus, &[ENTRY, ENTRY + SUBJECT_OFFSET, third]);
-    // Seeded unconditionally: the heat gate must never be the reason the two arms agree, or the
-    // fixture would pass with the arms fused.
-    seed_patch_history(&mut cpu, ENTRY + SUBJECT_OFFSET + 2);
+    // Seeded for every caller but the "the OFF arm is main" one: the heat gate must never be the
+    // reason the two arms agree, or the arm comparison would pass with the arms fused.
+    if seed_history {
+        seed_patch_history(&mut cpu, ENTRY + SUBJECT_OFFSET + 2);
+    }
     match jit::direct::compile(&mut cpu, ENTRY, true) {
         jit::direct::CompileOutcome::Compiled(c) => c.code.len(),
         jit::direct::CompileOutcome::Retry(cause) => {
@@ -685,11 +699,22 @@ fn emitted_len_on_store_path(
     }
 }
 
-/// THE OFF ARM PAYS NOTHING, stated as emitted code rather than as an argument.
+/// THE OFF ARM IS MAIN, stated as emitted code rather than as an argument — and since the
+/// 2026-08-23 flip that arm is the ESCAPE rather than the default, which is exactly when this
+/// fixture starts earning its keep.
 ///
-/// The admitted shapes' two arms must differ — otherwise the knob is decorative — and every OTHER
-/// shape must emit the same code under both arms, which is what says the arm is a lane admission
-/// and not a second code path a non-store block also walks through.
+/// Three claims, and the first is the one the flip made load-bearing:
+///
+/// 1. **the OFF arm emits what a build with no store matcher at all would emit.** `main` at
+///    `f6620e6e` had no `disp_store_lane_for`, so it baked every `0x89`/`0x88` displacement
+///    whatever its patch history. This fixture reproduces that build's emission twice over, from
+///    two independent directions: with the arm OFF and a heat record present, and with the arm ON
+///    and no heat record. Both must equal each other, which they can only do by baking. A regression
+///    that made the escape emit lane code — or that made the heat gate admit an unpatched slot —
+///    breaks the equality;
+/// 2. the admitted shapes' two arms must DIFFER, or the escape is decorative;
+/// 3. every OTHER shape must emit the same code under both arms, which is what says the arm is a
+///    lane admission and not a second code path a non-store block also walks through.
 ///
 /// The refusal list is the admission's own boundary, one entry per bar:
 ///
@@ -707,6 +732,22 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
     store.extend_from_slice(&TARGETS[0].to_le_bytes());
     let mut byte_store = STORE_BYTE.to_vec();
     byte_store.extend_from_slice(&TARGETS[0].to_le_bytes());
+    // CLAIM 1: the escape reproduces main's emission. `emitted_len_under_arms` seeds a heat
+    // record, `emitted_len_unseeded` does not; main baked both, so all three must be equal.
+    for admitted in [&store, &byte_store] {
+        let escape_with_history = emitted_len_under_arms(admitted, false, false);
+        assert_eq!(
+            escape_with_history,
+            emitted_len_unseeded(admitted, true, true),
+            "{admitted:02x?}: the escape must emit what a never-patched slot emits under the ON \
+             arm, which is what main emitted for every one of them"
+        );
+        assert_eq!(
+            escape_with_history,
+            emitted_len_unseeded(admitted, false, false),
+            "{admitted:02x?}: and the heat record must make no difference on the escape"
+        );
+    }
     for admitted in [&store, &byte_store] {
         assert_ne!(
             emitted_len_under_arms(admitted, false, false),
@@ -859,8 +900,8 @@ fn the_two_store_paths_emit_different_code_for_a_laned_store() {
     let mut store = STORE_DWORD.to_vec();
     store.extend_from_slice(&TARGETS[0].to_le_bytes());
     assert_ne!(
-        emitted_len_on_store_path(&store, true, false, true),
-        emitted_len_on_store_path(&store, true, false, false),
+        emitted_len_on_store_path(&store, true, false, true, true),
+        emitted_len_on_store_path(&store, true, false, false, true),
         "the two store paths must be different code, or the second leg of every state-identity          fixture is a re-run of the first"
     );
 }
@@ -1057,12 +1098,17 @@ fn disp_store_lanes_spelling_table() {
     use std::env::VarError;
     let parse = jit::direct::parse_disp_store_lanes_arm_for_test;
     assert!(
-        !parse(Err(VarError::NotPresent)),
-        "unset must name the OFF arm: this is a new admission and it ships off"
+        parse(Err(VarError::NotPresent)),
+        "unset must name the ON arm since the 2026-08-23 ladder flipped this default"
     );
-    // THE EMPTY STRING IS OFF AND SO IS UNSET, so the nulling trap damages the ON leg here: an ON
-    // leg must EXPORT `1`. `Remove-Item Env:` is still the only true unset.
-    assert!(!parse(Ok(String::new())));
+    // THE EMPTY STRING IS OFF WHILE UNSET IS ON, and the two must not be confused. The trap
+    // flipped with the default: before it an ON leg had to export `1`, now it is the OFF leg that
+    // must export `0`, because nulling a variable in PowerShell leaves it PRESENT and EMPTY --
+    // which this table spells OFF. `Remove-Item Env:` is the only true unset.
+    assert!(
+        !parse(Ok(String::new())),
+        "the empty string is the OFF arm even though unset is the ON arm"
+    );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
         assert!(!parse(Ok(off.to_string())), "{off:?} must name the off arm");
     }
@@ -1101,43 +1147,61 @@ fn a_mistyped_load_widen_arm_panics() {
     let _ = jit::direct::parse_disp_load_widen_arm_for_test(Ok("true".to_string()));
 }
 
-/// THE DEFAULT PINS. Both arms ship OFF until the Option D ladder prices them, and a default that
-/// moved without one would change every shipped binary's lane registration silently.
+/// THE STORE ARM'S DEFAULT PIN, and it is the one assertion that decides what a shipped binary
+/// does with the `0x89` / `0x88` displacement store-lane class.
 ///
-/// They read the AMBIENT knob deliberately — no override — so the assertion agrees with the
-/// ENVIRONMENT rather than with a constant, which is what lets the suite run on either arm. With
-/// the variables unset each reduces to "the default is OFF", the claim it exists for.
+/// Catches a flip of `parse_disp_store_lanes_arm`'s `NotPresent` arm. The default is ON since the
+/// 2026-08-23 ladder, which priced it at −24.5% min-wall on `duke3d-586-short` and −25.0% on the
+/// deciding long row with the corpus inert; a default that moved back without a ladder would
+/// change every shipped binary's lane registration silently.
+///
+/// It reads the AMBIENT knob deliberately — no override — so the assertion agrees with the
+/// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: a fixture
+/// that hard-asserted "on" would make the OFF-arm suite run impossible by construction. With the
+/// variable unset it reduces to "the default is ON", which is the claim it exists for.
 #[test]
-fn both_option_d_arms_ship_off_by_default() {
+fn the_store_arm_ships_on_by_default() {
     jit::direct::set_disp_store_lanes_for_test(None);
-    jit::direct::set_disp_load_widen_for_test(None);
-    for (name, ambient, live) in [
-        (
-            "IZARRAVM_DISP_STORE_LANES",
-            std::env::var("IZARRAVM_DISP_STORE_LANES"),
-            jit::direct::disp_store_lanes_enabled(),
-        ),
-        (
-            "IZARRAVM_DISP_LOAD_WIDEN",
-            std::env::var("IZARRAVM_DISP_LOAD_WIDEN"),
-            jit::direct::disp_load_widen_enabled(),
-        ),
-    ] {
-        let expected = if name == "IZARRAVM_DISP_STORE_LANES" {
-            jit::direct::parse_disp_store_lanes_arm_for_test(ambient.clone())
-        } else {
-            jit::direct::parse_disp_load_widen_arm_for_test(ambient.clone())
-        };
-        assert_eq!(
-            live, expected,
-            "the process-wide reading must agree with the spelling table applied to \
-             {name}={ambient:?}"
+    let ambient = std::env::var("IZARRAVM_DISP_STORE_LANES");
+    let expected = jit::direct::parse_disp_store_lanes_arm_for_test(ambient.clone());
+    assert_eq!(
+        jit::direct::disp_store_lanes_enabled(),
+        expected,
+        "the process-wide reading must agree with the spelling table applied to \
+         IZARRAVM_DISP_STORE_LANES={ambient:?}"
+    );
+    if ambient.is_err() {
+        assert!(
+            expected,
+            "IZARRAVM_DISP_STORE_LANES must default ON since the 2026-08-23 Option D ladder; see \
+             disp_store_lanes_enabled for the rows that priced it"
         );
-        if ambient.is_err() {
-            assert!(
-                !expected,
-                "{name} must default OFF until the Option D ladder"
-            );
-        }
+    }
+}
+
+/// THE LOAD-WIDENING ARM'S DEFAULT PIN, which says the opposite and for a measured reason.
+///
+/// `0x8B` stays OFF at `MAX_BLOCK_IMM_LANES` = 12: on the same ladder it read 2% WORSE than the
+/// store arm alone and roughly tripled both cap counters (`imm_lane_cap_refusals` 3,775 ->
+/// 11,369, `disp_lane_cap_refusals` 3,372 -> 7,635), which is the pre-registered "cap result, not
+/// lane-class result" signature. At sixteen slots it was the best arm on the row. Flipping this
+/// default belongs to the lane-cap re-price and to no other change, which is what this pin holds.
+#[test]
+fn the_load_widen_arm_ships_off_by_default() {
+    jit::direct::set_disp_load_widen_for_test(None);
+    let ambient = std::env::var("IZARRAVM_DISP_LOAD_WIDEN");
+    let expected = jit::direct::parse_disp_load_widen_arm_for_test(ambient.clone());
+    assert_eq!(
+        jit::direct::disp_load_widen_enabled(),
+        expected,
+        "the process-wide reading must agree with the spelling table applied to \
+         IZARRAVM_DISP_LOAD_WIDEN={ambient:?}"
+    );
+    if ambient.is_err() {
+        assert!(
+            !expected,
+            "IZARRAVM_DISP_LOAD_WIDEN must default OFF until the lane-cap re-price; at cap 12 it \
+             measured 2% worse than the store arm alone"
+        );
     }
 }

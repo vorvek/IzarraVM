@@ -197,6 +197,11 @@ impl Drop for ArmOverride {
 /// this file has a `0x89` / `0x88` / `0x8B` slot, so their only job is to make the two trailing
 /// zeros in every `CapRefusals` assertion mean "the arm was off", per the STATE-THE-ARM rule,
 /// instead of "the ambient default happened to be off today".
+///
+/// SINCE THE 2026-08-23 FLIP the store pin runs AGAINST the shipped default rather than with it,
+/// which makes it load-bearing rather than belt-and-braces: without it these fixtures would read
+/// the ON arm, and a future `0x89`-shaped filler or tail would start charging
+/// `disp_store_lane_cap_refusals` while every assertion here still expected a zero.
 #[must_use]
 fn force_arms(family: bool, imm8: bool, count: bool, disp: bool) -> ArmOverride {
     jit::direct::set_lane_family_for_test(Some(family));

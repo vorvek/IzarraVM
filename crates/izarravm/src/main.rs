@@ -3261,8 +3261,10 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_disp_lane_registrations": snapshot.disp_lane_registrations,
         "smc_imm8_lane_registrations": snapshot.imm8_lane_registrations,
         "smc_count_lane_registrations": snapshot.count_lane_registrations,
-        // The two Option D arms (`IZARRAVM_DISP_STORE_LANES`, `IZARRAVM_DISP_LOAD_WIDEN`), both
-        // DEFAULT OFF. Unconditional here, like their four neighbours: a heat-coupled counter
+        // The two Option D arms: `IZARRAVM_DISP_STORE_LANES` is DEFAULT ON since the
+        // 2026-08-23 ladder, `IZARRAVM_DISP_LOAD_WIDEN` is still default OFF and is blocked on
+        // the lane-cap re-price. Unconditional here, like their four neighbours: a heat-coupled
+        // counter
         // that is present on one leg and absent on the other confounds the arm with a counter
         // surface change, and these ship in PLAIN builds precisely so the ladder needs no census
         // binary to prove which arm a leg ran.
