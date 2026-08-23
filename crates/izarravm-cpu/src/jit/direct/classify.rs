@@ -285,6 +285,15 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                 | 0xc8
                 | 0xc9
                 | 0xc3
+                // RETF (0xcb) and RETF imm16 (0xca), the V86/real-mode far-return slice. On
+                // wolf3d-586 with TOKAEMM resident, 0xcb alone is 99.70% of every block-stopping
+                // non-continuable break -- 274.34 M executions per run, 80.4% of the whole
+                // interpreted residue. Admission is decided by `retf_admitted_here` in the compile
+                // walk, which is where the CPU mode is in hand; this entry only lets the Word form
+                // reach the classifier arm at all, and the stack-width matrix then builds the one
+                // (SS.B = 0, Word) cell that has an emitter and refuses the rest.
+                | 0xca
+                | 0xcb
                 | 0xc6
                 | 0xc7
                 // The BIT-STRING family, admitted to the S3 `InterpretOne` allowlist. In a 16-bit
@@ -2180,6 +2189,16 @@ pub(super) fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<D
                         })
                     }
                 };
+            }
+            // RETF and RETF imm16. Mode-independent here, exactly like `0xc2`/`0xc3` above: the
+            // compile walk's `retf_admitted_here` has already decided that this instruction may
+            // join a block at all -- it is non-continuable, so an unadmitted one never reaches
+            // `classify` -- and the stack-width matrix rewrites the admitted cell into
+            // `RetFar16`. `classify` has no CPU, so the mode question cannot be asked here.
+            0xca | 0xcb => {
+                return Some(DirectKind::RetFar {
+                    release: if opcode == 0xca { insn.imm as u16 } else { 0 },
+                });
             }
             0xc2 | 0xc3 => {
                 // No width gate here. `OperandSize` has exactly two variants, so the only widths

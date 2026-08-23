@@ -109,8 +109,13 @@ pub(super) const STACK_BYTE_READS: i8 = 112;
 /// `jit_data_cost_clocks(Byte)` as `ram_byte_reads`, so one shared pool of extra
 /// byte cycles is the right shape; and it is free because this high half was
 /// already zeroed by the prologue, already copied out by `emit_return` as part of
-/// a full 64-bit lane, and had no consumer at all. `STACK_RAM_DWORD_WRITES` has
-/// an equally free high half if a future reader would rather split the pools.
+/// a full 64-bit lane, and had no consumer at all.
+///
+/// `STACK_RAM_DWORD_WRITES`'s high half USED to be free in the same way and this
+/// comment used to offer it to the next reader. **It is taken.** Since the
+/// V86/real-mode far-return slice it carries the far-return ledger, deposited by
+/// `RetFar16` through `emit_dynamic_word_increment` and unpacked in `run.rs` into
+/// `jit_direct_far_ret_native`. Do not double-allocate it.
 pub(super) const STACK_DWORD_READS: i8 = 120;
 pub(super) const STACK_ALU_ADDRESS_KIND: i32 = 128;
 pub(super) const STACK_ALU_OLD_RESULT: i32 = 136;
@@ -126,6 +131,21 @@ pub(super) const STACK_ALU_OLD_RESULT: i32 = 136;
 ///
 /// 136 is outside disp8 range, so this slot is reached with the disp32 load and store forms.
 pub(super) const STACK_PUSH_MEM_VALUE: i32 = STACK_ALU_OLD_RESULT;
+/// Where `RetFar16` parks the offset it popped first, across the SECOND stack read's address,
+/// guard and pointer path, which clobbers RAX, RCX, RDX and RDI.
+///
+/// Aliased onto the ALU slot by `STACK_PUSH_MEM_VALUE`'s argument, and it needs all three parts of
+/// it: `RetFar16` is not an ALU kind, it is not `PushMem` (the two can never appear in one slot's
+/// emission -- both are terminal or, in `PushMem`'s case, never co-emitted with a far return in
+/// the same slot), and both the write and the read happen inside a single slot's emission. It must
+/// NOT be `STACK_READ_KIND` (80): `emit_code_watch_branch` writes `STACK_WATCH_PAGE`, the same
+/// slot, on a read's path -- and this value has to survive exactly such a path. Nor
+/// `STACK_STUB_RETURN` (= `STACK_ALU_FLAGS` = 144), which the shared read stub uses across its
+/// CALL.
+///
+/// 136 is outside `STACK_ZERO_FILL_LEN` = 128, so the prologue does not clear it. Irrelevant: the
+/// write precedes the read inside one slot, and no path reads it without having written it.
+pub(super) const STACK_RET_FAR_OFFSET: i32 = STACK_ALU_OLD_RESULT;
 pub(super) const STACK_ALU_FLAGS: i32 = 144;
 /// Where a shared stub (store OR read pad, designs D4 of each) parks its CALL's return
 /// address: the stub's `pop qword [rsp+..]` prologue moves the return address here and

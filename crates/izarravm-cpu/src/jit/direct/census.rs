@@ -749,6 +749,44 @@ pub(crate) struct DirectStallTally {
     /// counter that makes that a measurement instead of a claim: any nonzero value on a real run
     /// falsifies it, and the packed arm loses continuations the unpacked arm would have run.
     pub decode_pack_late_view_miss: u64,
+    /// RETFs served natively by `DirectKind::RetFar16`, read out of the HIGH half of the
+    /// `STACK_RAM_DWORD_WRITES` frame lane. ZERO on the shipped default arm.
+    ///
+    /// A LEDGER rather than a rate. A native far return does not call
+    /// `invalidate_code_caches_for_cs_load`, so `decode_inval_cs_load` falls by exactly this
+    /// count, and the pre-registered identity is `decode_inval_cs_load(armed) +
+    /// far_ret_native(armed) == decode_inval_cs_load(base)`. A gap means far returns are being
+    /// served that the base did not count, or vice versa.
+    ///
+    /// HERE AND NOT IN `PerfCounters`, and that is this file's own rule rather than a preference:
+    /// growing `PerfCounters` shifts the pinned `pending_flags` offset, which emitted code bakes.
+    /// The design named `PerfCounters`; the two pin tests (`cpu_test.rs`,
+    /// `canonical_state_test.rs`) say what that costs -- a cache-line reshuffle of the hot region
+    /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
+    pub far_ret_native: u64,
+    /// The three ways a FAR edge is refused or cut (`IZARRAVM_DIRECT_RETF_V86`). All zero on the
+    /// shipped default arm, because no far edge is ever offered.
+    ///
+    /// They are counted at THREE DIFFERENT SITES, because the three events fire at three
+    /// different places and a counter parked where its event cannot reach is worse than no
+    /// counter at all:
+    ///
+    ///   * `far_link_refused_cs` -- INV-FAR-CS. `SegmentLayout::far_merge` returned `None`
+    ///     because the target's chain requirement claims CS's descriptor or CS's selector.
+    ///     Bumped in `try_link_inner`, beside the `link_refusals[SegmentLayout]` increment it
+    ///     rides (`far_merge` is a pure method on a `Copy` struct and can reach neither the
+    ///     tally nor `PerfCounters`). A LARGE reading means the chain half is unavailable and the
+    ///     win is the ender removal alone -- `PUSH CS` is a 158 M block-stopping row on wolf3d,
+    ///     so this is a live possibility rather than a theoretical one.
+    ///   * `far_link_refused_limit` -- the target block's `eip + guest_len - 1` overruns the live
+    ///     CS limit. Bumped in `bind_dynamic_successor`, which is where the compare is, BEFORE
+    ///     `try_link_inner` is reached.
+    ///   * `far_link_cut_on_widen` -- a far edge cut by the backward chain-requirement
+    ///     propagation because the widened requirement reached it carrying either CS bit. Bumped
+    ///     in `widen_chain_requirement`'s cut arm; `try_link_inner` never sees this event.
+    pub far_link_refused_cs: u64,
+    pub far_link_refused_limit: u64,
+    pub far_link_cut_on_widen: u64,
     /// Entries refused because a call-out-bearing block met the privilege state whose port reads
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
@@ -2336,6 +2374,10 @@ impl crate::jit::JitState {
             disp_store_lane_cap_refusals: self.stalls.disp_store_lane_cap_refusals,
             disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
+            far_ret_native: self.stalls.far_ret_native,
+            far_link_refused_cs: self.stalls.far_link_refused_cs,
+            far_link_refused_limit: self.stalls.far_link_refused_limit,
+            far_link_cut_on_widen: self.stalls.far_link_cut_on_widen,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
             data_segment_retires_suppressed: self.stalls.data_segment_retires_suppressed,

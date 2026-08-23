@@ -1800,6 +1800,17 @@ impl BlockCache {
     /// so the two arms share the `0x8A` family's denominator without being hidden inside it: a
     /// ladder leg has to be able to say that a `smc_lane_accepts` movement came from the store
     /// arm rather than from `0x8A` shifting under it.
+    /// Fold one native block exit's far-return count into the ledger. See
+    /// `DirectStallTally::far_ret_native`.
+    pub(crate) fn note_far_returns(&mut self, far_returns: u64) {
+        self.stalls.far_ret_native += far_returns;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn far_ret_native_for_test(&self) -> u64 {
+        self.stalls.far_ret_native
+    }
+
     pub(crate) fn note_disp_store_lane_registrations(&mut self, lanes: u64) {
         self.stalls.disp_store_lane_registrations += lanes;
     }
@@ -4587,6 +4598,29 @@ pub(crate) enum DirectKind {
     Ret16 {
         release: u16,
     },
+    /// RETF (`0xCB`) and RETF imm16 (`0xCA`), MODE-INDEPENDENT. Produced by `classify`; it never
+    /// reaches the emitter, because `stack_width_kind` admits exactly one cell -- 16-bit stack,
+    /// Word operand -- and rewrites it into `RetFar16`. Every other cell is refused explicitly.
+    RetFar {
+        release: u16,
+    },
+    /// RET far on a 16-bit stack at Word operand size, in REAL MODE or V86 only.
+    ///
+    /// Two word pops (the offset at `SP & 0xFFFF`, the selector at `(SP + 2) & 0xFFFF`), then
+    /// `SP += 4 + release` as one 16-bit add, then the CS record written as exactly
+    /// `SegmentRegister::real(selector)`, then EIP and the far arm of the RET PIC.
+    ///
+    /// Scoped to real mode and V86 by `retf_admitted_here`, and the scope is a LEMMA rather than
+    /// a convenience: in those two modes `load_segment_checked` routes CS to `load_segment_real`,
+    /// so the whole CS record is a pure function of the popped selector and the emitted stores
+    /// can reproduce it without reading a descriptor table. In protected mode that is false.
+    ///
+    /// A terminal that WRITES A SEGMENT and still owns a dynamic successor -- the one shape the
+    /// backend had no room for before this slice, and the reason `is_segment_write_block`'s
+    /// derivation and `dynamic_successor`'s `!segment_write_block` term both had to move.
+    RetFar16 {
+        release: u16,
+    },
     Jcc {
         condition: u8,
         taken_delta: u32,
@@ -5025,6 +5059,12 @@ impl DirectKind {
             // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
             // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
             Self::Ret { .. } | Self::Ret16 { .. } => 10,
+            // And the FAR forms charge 17, also irrespective of operand size
+            // (`execute_extended.rs`, the 0xca and 0xcb arms). Riding `Ret`'s 10 would
+            // undercharge by 7 and riding the `_ => 2` default by 15; this is a PIN against the
+            // interpreter, not an approximation, because `elapsed_clocks` and `raw_bus_clocks`
+            // feed the cycle budget the fixtures stop on.
+            Self::RetFar { .. } | Self::RetFar16 { .. } => 17,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
             // PUSHFD is clocks(3) where PUSH r32 is clocks(2), so it cannot ride the `_ => 2`
             // default the other push forms use.
@@ -5155,7 +5195,7 @@ impl DirectKind {
                         ..
                     }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Word),
-        )
+        ) + 2 * u8::from(matches!(self, Self::RetFar16 { .. }))
     }
 
     pub(crate) fn dword_reads(self) -> u8 {
@@ -5386,7 +5426,13 @@ impl DirectKind {
             | Self::Leave
             | Self::Leave16 { .. }
             | Self::Ret { .. }
-            | Self::Ret16 { .. } => Some(SegmentIndex::Ss),
+            | Self::Ret16 { .. }
+            // MANDATORY, not bookkeeping. Without it SS is absent from `used`, and
+            // `MemorySideExits::new`'s `memory.segments.descriptor(Ss)` trips
+            // `SegmentLayout::descriptor`'s `debug_assert_ne!` on the first emitted far block.
+            // The segment WRITTEN is CS and is reported by `written_segment`, which is a
+            // different question and must not be folded in here.
+            | Self::RetFar16 { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -5494,6 +5540,13 @@ impl DirectKind {
     fn written_segment(self) -> Option<SegmentIndex> {
         match self {
             Self::LoadSegReal { segment, .. } | Self::PopSegReal { segment } => Some(segment),
+            // LOAD-BEARING, and the temptation to drop it is real: relaxing
+            // `dynamic_successor`'s `!segment_write_block` term (the one structural change this
+            // slice makes) invites an implementer to stop reporting the write instead. Do not.
+            // This report is what sets `segment_writes` and therefore `segment_write_block`,
+            // which is what masks the `successors` catch-alls -- and a far block that published a
+            // static fallthrough would put a LINEAR-keyed cell on a static edge.
+            Self::RetFar16 { .. } => Some(SegmentIndex::Cs),
             _ => None,
         }
     }
@@ -5573,6 +5626,12 @@ impl DirectKind {
                 | Self::Call16 { .. }
                 | Self::Ret { .. }
                 | Self::Ret16 { .. }
+                // Both far forms, for the load-bearing reason `PushMem` and `PopSegReal` are
+                // here: the stack-width matrix is only consulted for kinds this predicate
+                // accepts, and it is what refuses every (SS.B, operand size) cell but the one
+                // with an emitter.
+                | Self::RetFar { .. }
+                | Self::RetFar16 { .. }
                 | Self::PushMem { .. }
                 | Self::CallReg { .. }
                 | Self::CallMem { .. }
@@ -5589,6 +5648,8 @@ impl DirectKind {
                 | Self::JmpReg { .. }
                 | Self::Ret { .. }
                 | Self::Ret16 { .. }
+                | Self::RetFar { .. }
+                | Self::RetFar16 { .. }
                 | Self::Jcc { .. }
                 | Self::CallReg { .. }
                 | Self::CallMem { .. }
@@ -6046,6 +6107,19 @@ fn stack_width_kind(
             Some(DirectKind::Enter16 { alloc, stack32 })
         }
         (DirectKind::Enter16 { .. }, _, _) => None,
+        // RETF, real mode and V86 only (`retf_admitted_here` already decided that). ONE cell has
+        // an emitter: a 16-bit stack at Word operand size, which is two word pops and a 16-bit
+        // `SP += 4 + release`.
+        (DirectKind::RetFar { release }, false, OperandSize::Word) => {
+            Some(DirectKind::RetFar16 { release })
+        }
+        // Spelled out ABOVE the blanket 32-bit-stack arm below, for the reason `PopSegReal` and
+        // `Enter16` state: nothing can reach that arm today, because `retf_admitted_here` refuses
+        // every operand size but Word and every stack width but 16-bit, so an unadmitted RETF
+        // never becomes a slot. But a future admission of the Dword form would otherwise be waved
+        // through to an emitter that only knows the 16-bit shape -- four bytes popped with a
+        // 16-bit pointer, and a 32-bit offset written into a segment whose limit is 0xFFFF.
+        (DirectKind::RetFar { .. }, _, _) => None,
         // LEAVE's Word cells, both stack widths. The Dword cell on a 32-bit stack is the blanket
         // arm below.
         (DirectKind::Leave, stack32, OperandSize::Word) => Some(DirectKind::Leave16 { stack32 }),
@@ -6709,7 +6783,9 @@ fn compile_with_budget(
         // what the classifier could lower. That is why this has to be fixed before any of the
         // 16-bit admission work can produce a single native instruction.
         let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
-        let continuable = insn.continuable || jit_admits_non_continuable(insn.opcode);
+        let continuable = insn.continuable
+            || jit_admits_non_continuable(insn.opcode)
+            || retf_admitted_here(cpu, &insn);
         if !prefixes_supported || !continuable {
             // Attributed since the completeness slice. The two conditions are split rather than
             // folded, because they are different work: a prefix refusal names a prefix the
@@ -7831,9 +7907,15 @@ fn compile_with_budget(
             successor_mask: [true, false],
             emitted_mask: [true, false],
         },
+        // `RetFar16` is EXPLICIT here rather than left to the catch-all, and it is the one arm
+        // in this match that is load-bearing on its own. `emitted_static_targets` is built from
+        // `emitted_mask` and is NOT masked by `segment_write_block`, so a far block riding the
+        // catch-all would register a phantom static-fallthrough refusal-census row on SLOT 0 --
+        // the far cell -- and the campaign ranks and closes on censuses.
         Some(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
+            | DirectKind::RetFar16 { .. }
             | DirectKind::JmpMem { .. }
             | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
@@ -7883,9 +7965,13 @@ fn compile_with_budget(
             }),
             None,
         ],
+        // Explicit, not inherited. Today `segment_write_block` is true for every far block and
+        // the guard arm above already answers, but that is a COINCIDENCE of two independent
+        // decisions; the explicit arm makes `[None, None]` a decision about the kind.
         Some(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
+            | DirectKind::RetFar16 { .. }
             | DirectKind::JmpMem { .. }
             | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
@@ -8092,6 +8178,36 @@ fn certainly_exits_on_alignment(cpu: &CpuGsw, kind: DirectKind, d: bool) -> bool
         .base
         .wrapping_add(offset);
     linear & width.alignment_mask() != 0
+}
+
+/// Whether the compile walk may carry on THROUGH this `0xCA`/`0xCB` RETF and lower it natively.
+///
+/// The mode-dependent half of `jit_admits_non_continuable`, which stays a pure `const fn` on the
+/// opcode. It lives here rather than there for `stack_width_kind`'s reason: the question needs a
+/// `&CpuGsw` and `classify` has none.
+///
+/// THE ARM IS TESTED FIRST, and that ordering is load-bearing rather than stylistic. On the OFF
+/// arm this returns after one `OnceLock` load and one compare, having read no CPU state, on every
+/// walked instruction of every block in the tree -- which is what makes the OFF arm's compile walk
+/// main's walk rather than an equivalent of it.
+///
+/// Every other term is a REFUSAL that must leave the block stopping exactly where main stops it,
+/// with `BarrierStop::NonContinuable` unchanged. That is why the operand size, the prefixes and
+/// the stack width are tested HERE and not left to `stack_width_kind`: a RETF admitted into the
+/// walk and then refused a kind would end the block on a different reason and move a census row.
+fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
+    let arm = direct_retf_v86();
+    arm != RetfArm::Off
+        && matches!(insn.opcode, 0xca | 0xcb)
+        // CS.D = 0 and no 0x66. `operand_size` is `default_32 XOR override`, so Word in a 16-bit
+        // segment means no prefix, and the prefix test below is what keeps a segment override or
+        // an address-size override out.
+        && insn.operand_size == OperandSize::Word
+        && insn.prefixes == Prefixes::default()
+        // SS.B = 0. The emitted pointer arithmetic is 16-bit throughout.
+        && !cpu.stack_is_32bit()
+        // LAST: the two CR0/EFLAGS reads.
+        && arm.admits(cpu)
 }
 
 fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {

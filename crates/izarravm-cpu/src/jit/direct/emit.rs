@@ -1284,9 +1284,141 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    false,
                 );
                 terminal = true;
                 break;
+            }
+            // RET FAR on a 16-bit stack, REAL MODE or V86 only. `Ret16`'s pops with
+            // `PopSegReal`'s segment write between them and the FAR arm of the RET PIC at the end.
+            //
+            // TWO WORD READS, NOT ONE DWORD. SP = 0xFFFE puts the offset at SS:0xFFFE and the
+            // selector at SS:0x0000. `AddressWrap::Word` masks the effective address AFTER the
+            // displacement add and the SS limit compare runs on the masked EA, so `stack_addr(2)`
+            // at that SP is SS:0x0000 and clears `max_start`. One 32-bit read would be wrong
+            // there, and would also change the bus transaction count the interpreter charges.
+            //
+            // ONE `MemorySideExits` serves both reads: the labels are the same four side exits and
+            // the segment-limit label exists iff SS's cached limit is finite. That is ALWAYS true
+            // in V86 (`load_segment_real` canonicalises to 0xFFFF) but NOT guaranteed in plain
+            // real mode, where `load_segment_real_mode` PRESERVES an unreal-mode SS limit of
+            // `u32::MAX`; `MemorySideExits::new` handles both by emitting no compare. Do not
+            // assume 0xFFFF.
+            //
+            // Every guest write below is AFTER both reads' guards, all of which jump to `side`,
+            // so a memory exit leaves the whole instruction UN-STARTED: SP has not moved, CS still
+            // holds its old record and EIP still points at the RETF.
+            //
+            // NO CS-LIMIT EXIT, and that is a decision rather than an omission. `Ret16` compares
+            // the popped offset against the CURRENT CS limit; here the limit that matters is the
+            // NEW CS's, which in both admitted modes is 0xFFFF (`SegmentRegister::real`), and the
+            // offset is a `movzx` of a word. The check is vacuous by construction.
+            DirectKind::RetFar16 { release } => {
+                const REAL: SegmentRegister = SegmentRegister::real(0);
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
+                // (a) the offset, at SS:(SP & 0xFFFF), parked across the second read. The wrapper
+                // form is used rather than `_inner` plus an explicit completion, for
+                // `PopSegReal`'s reason: there is no side exit to interleave between the two, so
+                // the completion (which clobbers RDX) runs BEFORE the `movzx` and no reload is
+                // needed. `Ret16` needs the split form only because its CS-limit exit sits there.
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    stack_addr(0),
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                e.store_r64_disp32(Reg::RSP, STACK_RET_FAR_OFFSET, Reg::RDX);
+                // (b) the selector, at SS:((SP + 2) & 0xFFFF).
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    stack_addr(2),
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                // (c) SP += 4 + release, 16-bit and wrapping. The interpreter does `pop` (+2),
+                // `pop` (+2) and `release_stack(release)`, all three 16-bit adds that preserve
+                // ESP[31:16]; one add of `release.wrapping_add(4)` is congruent mod 2^16 with all
+                // three, which is `Ret16`'s own argument one word wider. `wrapping_add` is what
+                // makes that true for a release of 0xFFFD or more.
+                e.alu_r16_imm16(0, home(4), release.wrapping_add(4));
+                // (d) the CS record: EXACTLY `SegmentRegister::real(selector)`, which is what
+                // `load_segment_real` writes and therefore what `load_segment_checked` writes for
+                // CS in both admitted modes. It is a pure function of the popped selector, and
+                // that lemma is what lets the far PIC key on linear with no runtime CS compare.
+                // In protected mode the lemma is false, which is the deepest reason for the scope.
+                let cs = segment_field_base(SegmentIndex::Cs);
+                e.mov_r32_r32(Reg::RAX, Reg::RDX);
+                // The selector is stored BEFORE the shift turns RAX into the base.
+                e.store_r16_disp32(Reg::R15, cs + selector_offset(), Reg::RAX);
+                e.mov_r32_imm32(
+                    Reg::RDX,
+                    u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
+                );
+                e.store_r16_disp32(Reg::R15, cs + access_offset(), Reg::RDX);
+                e.mov_r32_imm32(Reg::RDX, REAL.limit);
+                e.store_r32_disp32(Reg::R15, cs + limit_offset(), Reg::RDX);
+                e.shift_r32_imm8(4, Reg::RAX, 4);
+                e.store_r32_disp32(Reg::R15, cs + base_offset(), Reg::RAX);
+                // (e) the far-return LEDGER, into the free HIGH half of `STACK_RAM_DWORD_WRITES`.
+                // `invalidate_code_caches_for_cs_load` is not called natively, so
+                // `decode_inval_cs_load` falls by exactly this count; the ledger is what keeps
+                // that an identity rather than a hole. `run.rs` masks the low half at BOTH of that
+                // lane's readers and shifts this out.
+                //
+                // ITS PLACEMENT IS LOAD-BEARING. `emit_dynamic_word_increment` stages its addend
+                // in RDX -- every deposit primitive in this file does, and
+                // `emit_dynamic_split_extra`'s doc comment states the contract. Between (d) and
+                // (f) RDX is dead: its last use is the limit store above and (f) reloads it from
+                // `STACK_RET_FAR_OFFSET`. Moved UP beside the pops "to keep the writes together",
+                // this destroys the popped selector, which is live in RDX and not yet written to
+                // the CS record.
+                emit_dynamic_word_increment(&mut e, STACK_RAM_DWORD_WRITES);
+                // (f) EIP <- the popped offset, then the far PIC.
+                e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_RET_FAR_OFFSET);
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                side_exits.push((
+                    side,
+                    slot.lin.wrapping_sub(span.key.linear),
+                    side_exit(
+                        completed,
+                        completed_raw,
+                        completed_byte_reads,
+                        completed_word_reads,
+                        completed_dword_reads,
+                        completed_weighted_fp_clocks,
+                    ),
+                ));
+                completed += 1;
+                completed_raw += slot.kind.raw_clocks() as u16;
+                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
+                completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
+                completed_dword_reads += slot.kind.dword_reads();
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                    x87_entry_top.is_some(),
+                    fetch_trace,
+                    true,
+                );
+                terminal = true;
+                break;
+            }
+            // `RetFar` never reaches the emitter: `stack_width_kind` admits exactly one cell and
+            // rewrites it into `RetFar16`, and refuses every other cell explicitly.
+            DirectKind::RetFar { .. } => {
+                unreachable!("RetFar is rewritten into RetFar16 by the stack-width matrix")
             }
             DirectKind::Leave => {
                 // ESP <- EBP, then POP EBP. The guard runs first, against SS:EBP, which is the
@@ -1816,6 +1948,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    false,
                 );
                 terminal = true;
                 break;
@@ -1877,6 +2010,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    false,
                 );
                 terminal = true;
                 break;
@@ -1935,6 +2069,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    false,
                 );
                 terminal = true;
                 break;
@@ -2003,6 +2138,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    false,
                 );
                 terminal = true;
                 break;
@@ -2082,6 +2218,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    false,
                 );
                 terminal = true;
                 break;
@@ -2590,6 +2727,7 @@ fn emit_completed_dynamic_path(
     accounting: StaticAccounting,
     x87_source: bool,
     fetch_trace: bool,
+    far: bool,
 ) {
     e.store_r32_disp32(Reg::R15, eip_offset(), target);
     emit_accounting(
@@ -2602,13 +2740,42 @@ fn emit_completed_dynamic_path(
         fetch_trace,
     );
     e.load_r32_disp32(Reg::RDX, Reg::R15, eip_offset());
+    // THE FAR ARM. A far cell is keyed on the target's LINEAR rather than its EIP, because a far
+    // return moves CS and the two ends of the edge therefore disagree about the EIP split of one
+    // address. Linear is the block-identity quantity (`BlockKey.linear`, `LinkTarget.linear`,
+    // `linear_blocks`), so one compare covers both halves of the far target, and a (selector, EIP)
+    // pair would be STRICTER than identity -- it would miss on an aliased split naming the same
+    // block.
+    //
+    // CS's base is read from the CPU rather than baked, because the `RetFar16` slot has already
+    // written it from the popped selector three instructions earlier. Two host instructions per
+    // BLOCK, not per iteration.
+    //
+    // RDI is free here. Inside the loop it is touched only by the `STACK_QUOTA` load, which is
+    // AFTER the body test's `jz`; a compare MISS branches to `next` before any of that. Its two
+    // other uses (the `STACK_ITERATIONS` zeroing and the hidden epilogue's `zero_portal`) are on
+    // paths that have left the loop. `SAVED_HOST_REGS` includes RDI, so the epilogue restores it.
+    //
+    // RDX still holds the EIP, so the unresolved epilogue's `dynamic_target_eip` store is
+    // unchanged and `run.rs`'s `debug_assert_eq!(exit.dynamic_target_eip, final_eip)` still holds.
+    let compare = if far {
+        e.load_r32_disp32(
+            Reg::RDI,
+            Reg::R15,
+            segment_field_base(SegmentIndex::Cs) + base_offset(),
+        );
+        e.add_r32_r32(Reg::RDI, Reg::RDX);
+        Reg::RDI
+    } else {
+        Reg::RDX
+    };
     let dynamic_hidden_or_unbound = e.label();
     let unresolved_done = e.label();
     for link_cell in link_cells {
         let next = e.label();
         e.mov_r64_imm64(Reg::RCX, link_cell as u64);
         e.cmp_r32_disp8(
-            Reg::RDX,
+            compare,
             Reg::RCX,
             core::mem::offset_of!(LinkCell, target_eip) as i8,
         );
@@ -4322,9 +4489,14 @@ fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
 /// `run.rs` prices `ram_byte_writes` through the same `jit_data_cost_clocks(Byte)` as
 /// `ram_byte_reads`, so one shared pool of extra byte cycles is exact -- and it costs nothing:
 /// the high half was already copied out by `emit_return` as part of a full 64-bit lane, already
-/// zeroed by the prologue's vector fill, and had no consumer. `STACK_RAM_DWORD_WRITES` has an
-/// equally free high half if a future reader would rather split reads from stores; the single
-/// pool is chosen because it is one deposit helper and one clock term.
+/// zeroed by the prologue's vector fill, and had no consumer. The single pool is chosen because it
+/// is one deposit helper and one clock term.
+///
+/// This comment used to offer `STACK_RAM_DWORD_WRITES`'s equally free high half to a future
+/// reader who would rather split reads from stores. **It is taken.** Since the V86/real-mode
+/// far-return slice it carries the far-return ledger -- `RetFar16` deposits into it with
+/// `emit_dynamic_word_increment` and `run.rs` unpacks it into `jit_direct_far_ret_native`, having
+/// first MASKED the low half at both of that lane's readers. Do not double-allocate it.
 ///
 /// Scratch: RDX, like both increment primitives above. Every caller is a STUB tail past the point
 /// where the access is committed, so RDX is dead there.
@@ -4417,6 +4589,16 @@ fn selector_offset() -> i32 {
 
 fn base_offset() -> i32 {
     core::mem::offset_of!(SegmentRegister, base) as i32
+}
+
+/// The CS limit `RetFar16` stores. `PopSegReal` and `LoadSegReal` deliberately omit their limit
+/// store, and their argument -- a real-mode load PRESERVES the cached limit, and a V86 entry has
+/// already canonicalised all six -- is about the five DATA segments. The interpreter's CS path
+/// writes 0xFFFF unconditionally through `SegmentRegister::real`, and the difference between "the
+/// interpreter writes it" and "we can prove it was already there" is one 10-byte store on a path
+/// that runs once per block. Store it.
+fn limit_offset() -> i32 {
+    core::mem::offset_of!(SegmentRegister, limit) as i32
 }
 
 /// `access` and `default_size_32` are adjacent, and the emitter writes both with one 16-bit

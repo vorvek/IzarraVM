@@ -3976,6 +3976,14 @@ mod jit_v86_loop_rows;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_retf_v86_test.rs"]
+mod jit_retf_v86;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_test_word_row_test.rs"]
 mod jit_test_word_row;
 

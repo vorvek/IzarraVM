@@ -469,6 +469,108 @@ pub(crate) fn parse_disp_load_widen_arm_for_test(
     parse_disp_load_widen_arm(value)
 }
 
+/// The three arms of `IZARRAVM_DIRECT_RETF_V86`: which CPU modes may serve `0xCA`/`0xCB` RETF
+/// natively.
+///
+/// `Off` is the shipped default and reproduces pre-slice `main` at this site: the compile walk
+/// stops at the non-continuable RETF exactly where it always did, no `RetFar16` kind is ever
+/// produced, and no arm of the emitter, the far PIC or the far merge is reachable.
+///
+/// `V86` is the BLAST-RADIUS control, not a half-measure. wolf3d runs in V86 once TOKAEMM is
+/// resident, so it captures that fixture's whole RETF population while leaving BIOS POST and
+/// pre-CONFIG.SYS DOS byte-identical -- which makes it a layout A/A for any corpus row that never
+/// enters V86. `On` adds plain real mode (PE = 0), which is where a shared real-mode boot phase is
+/// exposed.
+///
+/// PROTECTED MODE IS NOT AN ARM AND CANNOT BECOME ONE. A protected-mode RETF loads a descriptor,
+/// runs the RPL/DPL checks and can pop SS:eSP for an inter-privilege return; the lemma this slice
+/// rests on -- the CS record is a pure function of the popped selector -- is false there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub(crate) enum RetfArm {
+    /// The DEFAULT and the A/B base. Reached by unset, `""`, `0` or `off`.
+    Off,
+    /// Admit only when `cpu.is_v86_mode()`. Reached by `v86`.
+    V86,
+    /// Admit in V86 and in plain real mode (PE = 0). Reached by `1` or `on`.
+    On,
+}
+
+impl RetfArm {
+    /// Whether this arm admits a native RETF in the CPU's CURRENT mode.
+    ///
+    /// The caller tests `self != Off` FIRST and only then calls this, so the OFF arm reads no CPU
+    /// state per walked instruction. That ordering is the whole of what makes the OFF arm's
+    /// compile walk identical to main's rather than merely equivalent to it.
+    pub(crate) fn admits(self, cpu: &CpuGsw) -> bool {
+        match self {
+            Self::Off => false,
+            Self::V86 => cpu.is_v86_mode(),
+            Self::On => cpu.is_v86_mode() || !cpu.is_protected_mode(),
+        }
+    }
+}
+
+/// Which modes serve RETF natively (`IZARRAVM_DIRECT_RETF_V86`). See `RetfArm`.
+///
+/// # THE SPELLING TABLE
+///
+/// unset / `""` / `0` / `off` -> OFF (the default), `v86` -> V86 only, `1` / `on` -> V86 and plain
+/// real mode, anything else PANICS. Unset is OFF, so an armed leg must EXPORT its value. The
+/// direction matches `IZARRAVM_DISP_LOAD_WIDEN` and is the OPPOSITE of
+/// `IZARRAVM_DISP_STORE_LANES`; a leg script must state every knob explicitly.
+pub(crate) fn direct_retf_v86() -> RetfArm {
+    #[cfg(test)]
+    if let Some(forced) = DIRECT_RETF_V86_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ARM: std::sync::OnceLock<RetfArm> = std::sync::OnceLock::new();
+    *ARM.get_or_init(|| parse_direct_retf_v86_arm(std::env::var("IZARRAVM_DIRECT_RETF_V86")))
+}
+
+/// The `IZARRAVM_DIRECT_RETF_V86` spelling table. See `direct_retf_v86`.
+fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfArm {
+    let raw = match value {
+        // Unset = OFF; an armed leg must EXPORT its arm, for `parse_disp_load_widen_arm`'s reason.
+        Err(std::env::VarError::NotPresent) => return RetfArm::Off,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_DIRECT_RETF_V86 is set to a value that is not valid UTF-8; accepted                  spellings are unset, `0` or `off` (the shipped default: RETF stops the block and                  the interpreter serves it), `v86` (native RETF in V86 only) and `1` or `on`                  (native RETF in V86 and plain real mode)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => RetfArm::Off,
+        "v86" => RetfArm::V86,
+        "1" | "on" => RetfArm::On,
+        other => panic!(
+            "IZARRAVM_DIRECT_RETF_V86={other:?} names no arm; accepted spellings are unset, `0`              or `off` (the shipped default), `v86` (V86 only) and `1` or `on` (V86 and plain real              mode). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and              be read as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `DISP_STORE_LANES_OVERRIDE`'s reason.
+#[cfg(test)]
+thread_local! {
+    static DIRECT_RETF_V86_OVERRIDE: std::cell::Cell<Option<RetfArm>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the RETF arm on this thread for the length of a fixture; `None` restores the ambient
+/// `IZARRAVM_DIRECT_RETF_V86` reading.
+#[cfg(test)]
+pub(crate) fn set_direct_retf_v86_for_test(forced: Option<RetfArm>) {
+    DIRECT_RETF_V86_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_disp_lanes_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_direct_retf_v86_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> RetfArm {
+    parse_direct_retf_v86_arm(value)
+}
+
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class
 /// (`IZARRAVM_IMM8_LANES`). See `imm8_lane_for` for what qualifies and why this family alone.
 ///

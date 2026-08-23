@@ -2068,6 +2068,13 @@ pub struct DirectStallSnapshot {
     /// Continuations the packed decode first touch screened and then could not materialise a line
     /// for. Expected identically zero; see `DirectStallTally`.
     pub decode_pack_late_view_miss: u64,
+    /// The far-return ledger and the three far-edge refusal cells. See `DirectStallTally` for
+    /// what each one counts, which of the three sites bumps it, and why the ledger is here rather
+    /// than in `PerfCounters`.
+    pub far_ret_native: u64,
+    pub far_link_refused_cs: u64,
+    pub far_link_refused_limit: u64,
+    pub far_link_cut_on_widen: u64,
     /// x87 TOP-mismatch retires refused by the per-key cap, and the number of times a key crossed
     /// that cap. See `DirectStallTally`.
     pub x87_top_retires_suppressed: u64,
