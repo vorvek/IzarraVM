@@ -671,6 +671,20 @@ pub(crate) struct DirectStallTally {
     /// though both register at `IMM8_LANE_WIDTH`: the two arms are independent knobs, so a
     /// combined leg has to be able to attribute an accepts movement to one of them.
     pub count_lane_registrations: u64,
+    /// Option D STORE lanes registered at install: the `0x89 MOV r/m32, r32` and
+    /// `0x88 MOV r/m8, r8` displacement fields behind `IZARRAVM_DISP_STORE_LANES`. Kept apart
+    /// from `disp_lane_registrations` even though both register at `IMM_LANE_WIDTH` and share the
+    /// `0x8A` family's write-choke rule, because the arms are independently knobbed: the store
+    /// arm alone reads 11.460% capture against the pre-registered 11.9% line and the pair reads
+    /// 12.797%, so a leg has to be able to attribute movement to one of them.
+    ///
+    /// **Zero on a shipped binary.** The knob is default OFF and is tested above everything else
+    /// in `disp_store_lane_for`, so a plain profile reads 0 here and any non-zero value on a leg
+    /// is proof the leg named the arm it meant to.
+    pub disp_store_lane_registrations: u64,
+    /// The `0x8B` load-widening half of Option D (`IZARRAVM_DISP_LOAD_WIDEN`), default OFF and
+    /// zero on a shipped binary for the same reason. See `disp_store_lane_registrations`.
+    pub disp_load_widen_lane_registrations: u64,
     /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
     /// charged to the family that would otherwise have taken the slot. The registration counters
     /// above say how many lanes those same blocks installed; these say how many more they would
@@ -716,6 +730,12 @@ pub(crate) struct DirectStallTally {
     pub imm8_lane_cap_refusals: u64,
     pub count_lane_cap_refusals: u64,
     pub disp_lane_cap_refusals: u64,
+    /// The two Option D arms' cap cells. Both keep `disp_lane_cap_refusals`' TIGHTER definition
+    /// -- the budget is tested below the `has_record_range` heat gate and below
+    /// `direct_host_bytes` -- so every slot they count had a heat record and a host pointer
+    /// waiting. Both read zero unless their (default-OFF) knob is exported on.
+    pub disp_store_lane_cap_refusals: u64,
+    pub disp_load_widen_lane_cap_refusals: u64,
     /// Interpreted continuations whose decode line had died between the packed first touch and
     /// the deferred full-view fetch (`IZARRAVM_DECODE_PACK`). The staleness argument in
     /// `run_budgeted_inner` says admission cannot invalidate the slot it screened, so this is the
@@ -2300,10 +2320,14 @@ impl crate::jit::JitState {
             disp_lane_registrations: self.stalls.disp_lane_registrations,
             imm8_lane_registrations: self.stalls.imm8_lane_registrations,
             count_lane_registrations: self.stalls.count_lane_registrations,
+            disp_store_lane_registrations: self.stalls.disp_store_lane_registrations,
+            disp_load_widen_lane_registrations: self.stalls.disp_load_widen_lane_registrations,
             imm_lane_cap_refusals: self.stalls.imm_lane_cap_refusals,
             imm8_lane_cap_refusals: self.stalls.imm8_lane_cap_refusals,
             count_lane_cap_refusals: self.stalls.count_lane_cap_refusals,
             disp_lane_cap_refusals: self.stalls.disp_lane_cap_refusals,
+            disp_store_lane_cap_refusals: self.stalls.disp_store_lane_cap_refusals,
+            disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,

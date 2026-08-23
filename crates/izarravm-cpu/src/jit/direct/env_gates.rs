@@ -218,6 +218,194 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
     parse_disp_lanes_arm(value)
 }
 
+/// Whether `disp_store_lane_for` admits the STORE half of Option D — `0x89 MOV r/m32, r32` and
+/// `0x88 MOV r/m8, r8` with a disp32 memory operand (`IZARRAVM_DISP_STORE_LANES`).
+///
+/// **DEFAULT OFF.** This is a new admission and it ships behind its own arm so the Option D
+/// ladder can price it against a base that is byte-for-byte main. Off, every `0x89`/`0x88` slot
+/// bakes its displacement exactly as it does today and `smc_disp_store_lane_cap_refusals` reads
+/// zero, because the knob is tested ABOVE the shared budget — the rule that keeps an off arm
+/// from reporting a whole family as budget pressure.
+///
+/// WHAT IT IS FOR. `disp_lane_for` covers `0x8A` only; the un-laned displacement family that is
+/// left is 89% `0x89` by events (`dev_docs/duke-heat-gate-design-2026-08-21.md` §12.3), and the
+/// 2026-08-23 settling census measured that family's block kills still rising at flat event
+/// volume (un-laned `0x89` block kills 15,634 -> 21,178 on duke3d-586-short, 96.8% of all joined
+/// un-laned-disp block kills). The mechanism is `disp_lane_for`'s, one KIND over: a laned write
+/// takes the `lane_only` door, charges no heat and kills no block.
+///
+/// WHY A STORE MAY CARRY A LANE AT ALL, and this is the one thing the design left as a review
+/// obligation rather than a fact (the register-pressure contract quoted on `disp_lane_for`). The
+/// lane arm of `emit_effective_address` stages the displacement through RAX and nothing else, so
+/// a kind whose emitter resolves the address AFTER staging other live state could not carry one.
+/// `Store` is not such a kind, and it is checked at the line rather than assumed: BOTH store
+/// emitters — `emit_store` and, under `IZARRAVM_ONE_LOOKUP_STORE`, `emit_store_fast` — call
+/// `emit_segmented_linear_address` as their FIRST emission, before `emit_read_store_value`
+/// materialises anything into RDX and before the bias probe touches RCX or RDI. Nothing is live
+/// across the address form, so the lane arm's RAX write and the baked arm's RAX write present
+/// the identical contract at both sites.
+///
+/// # THE SPELLING TABLE
+///
+/// Trimmed and case-folded on the way in, and the same table as `IZARRAVM_RETRY_LIFT`'s because
+/// this is a default-OFF arm:
+///
+/// * **unset**, `0` or `off` -> OFF, the shipped default.
+/// * `1` / `on` -> ON, the Option D store arm.
+/// * **anything else PANICS.** A mistyped ladder leg that fell through would run the DEFAULT and
+///   be read as "the arm I asked for changed nothing", the one wrong conclusion an arm ladder
+///   exists to avoid.
+///
+/// THE NULLING TRAP RUNS THE OTHER WAY HERE. Unset is OFF, so an ON leg must EXPORT `1`; a leg
+/// that merely nulls the variable in PowerShell leaves it present and empty, which this table
+/// spells OFF, and measures the default. `Remove-Item Env:` is the only true unset.
+pub(crate) fn disp_store_lanes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = DISP_STORE_LANES_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_disp_store_lanes_arm(std::env::var("IZARRAVM_DISP_STORE_LANES")))
+}
+
+/// The `IZARRAVM_DISP_STORE_LANES` spelling table, lifted out of the `OnceLock` closure so it can
+/// be unit-tested without a process-global env write. See `disp_store_lanes_enabled`.
+fn parse_disp_store_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset = OFF, so the PowerShell nulling trap damages the ON leg: an ON leg must EXPORT
+        // `1`, and a leg that merely nulls the variable measures the default.
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_DISP_STORE_LANES is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset, `0` or `off` (the shipped default: every `0x89` / `0x88` \
+                 slot bakes its displacement), and `1` or `on` (the Option D store lane arm)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_DISP_STORE_LANES={other:?} names no arm; accepted spellings are unset, `0` \
+             or `off` (the shipped default) and `1` or `on` (the Option D store lane arm). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `DISP_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and a fixture cannot order an env write against it.
+#[cfg(test)]
+thread_local! {
+    static DISP_STORE_LANES_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the store-lane arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_DISP_STORE_LANES` reading.
+#[cfg(test)]
+pub(crate) fn set_disp_store_lanes_for_test(forced: Option<bool>) {
+    DISP_STORE_LANES_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_disp_lanes_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_disp_store_lanes_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_disp_store_lanes_arm(value)
+}
+
+/// Whether `disp_load_widen_lane_for` admits the LOAD-widening half of Option D — `0x8B MOV r32,
+/// r/m32` with a disp32 memory operand (`IZARRAVM_DISP_LOAD_WIDEN`).
+///
+/// **DEFAULT OFF**, and a SEPARATE knob from `IZARRAVM_DISP_STORE_LANES` deliberately: the two
+/// halves are 8.6% and 89% of the un-laned displacement mass respectively, so a single fused arm
+/// could not say which one moved a ladder. The 2026-08-23 settling census then made the pair
+/// load-bearing in the other direction as well — un-laned-disp capture reads 12.797% for the two
+/// arms together against a pre-registered 11.9% kill line, and 11.460% for the store arm alone —
+/// so the arms are separable for MEASUREMENT and shipped together.
+///
+/// WHAT IS NEWLY ADMITTED, stated exactly, because "widen `0x8B`" is not a shape. Today
+/// `disp_lane_for` admits `insn.opcode == 0x8a` — the BYTE load `MOV r8, [..disp32..]` — and
+/// nothing else; `0x8A`'s register form is not a `Load` at all (classify lowers `mod == 3` to
+/// `MovRegByte`), so the admitted set is exactly "the `0x8A` ModRM MEMORY forms with a disp32,
+/// no prefixes, no immediate". This arm adds `insn.opcode == 0x8b` under the identical bars:
+/// every `0x8B` ModRM memory form (mod 0 rm 5 absolute, mod 0 with a SIB carrying a disp32, mod 2
+/// base+disp32, and the mod 2 SIB forms), `disp_len == 4`, `imm_len == 0`,
+/// `prefixes == Prefixes::default()`. The prefix bar is what pins the WIDTH: with no `0x66` and
+/// no `0x67` the operand size is the code segment's, and a disp32 requires CS.D = 1, so an
+/// admitted `0x8B` is always a DWORD load and `AddressWrap::Word` can never co-occur with a lane.
+/// `0x8B`'s register form (`MovReg`) and the disp8 / disp16 forms are NOT admitted: the lane is
+/// `IMM_LANE_WIDTH` wide and the write choke matches a patch at exactly that width, and a
+/// sub-4-byte displacement would need sign-extension at load time and a choke rule of its own. No
+/// measured population asks for one (`dev_docs/2026-08-09-disp-lanes-design.md`, "Deliberate
+/// scope cuts").
+///
+/// # THE SPELLING TABLE
+///
+/// `IZARRAVM_DISP_STORE_LANES`'s exactly: unset / `0` / `off` -> OFF (the default), `1` / `on` ->
+/// ON, anything else panics, and the empty string is OFF, so an ON leg must EXPORT `1`.
+pub(crate) fn disp_load_widen_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = DISP_LOAD_WIDEN_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_disp_load_widen_arm(std::env::var("IZARRAVM_DISP_LOAD_WIDEN")))
+}
+
+/// The `IZARRAVM_DISP_LOAD_WIDEN` spelling table. See `disp_load_widen_enabled`.
+fn parse_disp_load_widen_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset = OFF; an ON leg must EXPORT `1`, for `parse_disp_store_lanes_arm`'s reason.
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_DISP_LOAD_WIDEN is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset, `0` or `off` (the shipped default: every `0x8B` slot bakes \
+                 its displacement), and `1` or `on` (the Option D load-widening arm)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_DISP_LOAD_WIDEN={other:?} names no arm; accepted spellings are unset, `0` \
+             or `off` (the shipped default) and `1` or `on` (the Option D load-widening arm). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `DISP_STORE_LANES_OVERRIDE`'s reason.
+#[cfg(test)]
+thread_local! {
+    static DISP_LOAD_WIDEN_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the load-widening arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_DISP_LOAD_WIDEN` reading.
+#[cfg(test)]
+pub(crate) fn set_disp_load_widen_for_test(forced: Option<bool>) {
+    DISP_LOAD_WIDEN_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_disp_lanes_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_disp_load_widen_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_disp_load_widen_arm(value)
+}
+
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class
 /// (`IZARRAVM_IMM8_LANES`). See `imm8_lane_for` for what qualifies and why this family alone.
 ///

@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! The per-family lane-BUDGET counters: `imm_lane_cap_refusals`, `imm8_lane_cap_refusals`,
-//! `count_lane_cap_refusals` and `disp_lane_cap_refusals`.
+//! `count_lane_cap_refusals` and `disp_lane_cap_refusals`. The two Option D arms
+//! (`disp_store_lane_cap_refusals`, `disp_load_widen_lane_cap_refusals`) draw on the SAME budget
+//! and are pinned OFF here; their own fixtures live in `cpu_jit_disp_store_lane_test.rs`.
 //!
-//! Four lane matchers draw on one `MAX_BLOCK_IMM_LANES` budget, and until these counters existed a
+//! Six lane matchers draw on one `MAX_BLOCK_IMM_LANES` budget, and until these counters existed a
 //! block that ran out of lanes and a family that had no lane-shaped slots produced the same
 //! reading: registrations, and nothing else. That is the blindness this file pins. A widening
 //! ladder that reads its registrations flat needs to know whether the family was unlaneable or
@@ -14,9 +16,9 @@
 //!
 //! **The cap arm is charged to ONE family.** Each matcher tests the cap UNDER its own kind,
 //! opcode, prefix and length bars, so the slot that trips the budget has already been narrowed to
-//! one family. Every fixture therefore asserts all four counters, not just its own: a cap test
-//! hoisted to the head of the matchers would move all four on the same slot and the three zeros
-//! are what catches it.
+//! one family. Every fixture therefore asserts all six counters, not just its own: a cap test
+//! hoisted to the head of the matchers would move all six on the same slot and the five zeros are
+//! what catches it.
 //!
 //! **The cap arm is NOT the knob arm.** Three of the four matchers used to read
 //! `lanes_used >= MAX_BLOCK_IMM_LANES || !<knob>_enabled()` as one disjunction, and a counter on
@@ -165,10 +167,15 @@ const DISP_SLOT: [u8; 6] = [0x8a, 0x1d, 0x00, 0x20, 0x00, 0x00];
 /// rather than silently testing a block that never reaches the cap.
 const LANES: usize = jit::direct::MAX_BLOCK_IMM_LANES;
 
-/// The four counters in the order this file always reports them: imm, imm8, count, disp.
+/// The SIX counters in the order this file always reports them: imm, imm8, count, disp, and the
+/// two DEFAULT-OFF Option D arms (`disp_store`, `disp_load_widen`). The last two are asserted
+/// zero on every fixture here for the same reason the other four are asserted on every fixture
+/// that is not their own: a cap test hoisted above a family's shape bars would move a counter
+/// that has no business moving, and the zeros are what catches it. Their own fixtures live in
+/// `cpu_jit_disp_store_lane_test.rs`.
 type CapRefusals = [u64; jit::direct::LANE_CAP_FAMILIES];
 
-/// All four overridable lane arms, restored on drop. `Drop` rather than a trailing statement for
+/// All six overridable lane arms, restored on drop. `Drop` rather than a trailing statement for
 /// `cpu_jit_count_lane_test`'s reason: an assertion failure is the normal way a fixture here ends
 /// when something is wrong, and a panic skips trailing statements.
 struct ArmOverride;
@@ -179,16 +186,25 @@ impl Drop for ArmOverride {
         jit::direct::set_imm8_lanes_for_test(None);
         jit::direct::set_count_lanes_for_test(None);
         jit::direct::set_disp_lanes_for_test(None);
+        jit::direct::set_disp_store_lanes_for_test(None);
+        jit::direct::set_disp_load_widen_for_test(None);
     }
 }
 
 /// State every arm this file can force. Bind the result for the fixture's lifetime.
+///
+/// The two Option D arms are pinned OFF here rather than exposed as parameters: no fixture in
+/// this file has a `0x89` / `0x88` / `0x8B` slot, so their only job is to make the two trailing
+/// zeros in every `CapRefusals` assertion mean "the arm was off", per the STATE-THE-ARM rule,
+/// instead of "the ambient default happened to be off today".
 #[must_use]
 fn force_arms(family: bool, imm8: bool, count: bool, disp: bool) -> ArmOverride {
     jit::direct::set_lane_family_for_test(Some(family));
     jit::direct::set_imm8_lanes_for_test(Some(imm8));
     jit::direct::set_count_lanes_for_test(Some(count));
     jit::direct::set_disp_lanes_for_test(Some(disp));
+    jit::direct::set_disp_store_lanes_for_test(Some(false));
+    jit::direct::set_disp_load_widen_for_test(Some(false));
     ArmOverride
 }
 
@@ -305,6 +321,8 @@ fn cap_refusals(cpu: &CpuGsw) -> CapRefusals {
         stalls.imm8_lane_cap_refusals,
         stalls.count_lane_cap_refusals,
         stalls.disp_lane_cap_refusals,
+        stalls.disp_store_lane_cap_refusals,
+        stalls.disp_load_widen_lane_cap_refusals,
     ]
 }
 
@@ -327,7 +345,7 @@ fn fixture(fillers: usize, tail: &[u8], seed_disp: bool) -> (CpuGsw, TestBus, Ve
     }
     assert_eq!(
         cap_refusals(&cpu),
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "the fixture charged a cap refusal before it compiled anything"
     );
     // `install` only accepts a key the cache has already SEEN, so every fixture here has to walk
@@ -371,7 +389,7 @@ fn compile_block(fillers: usize, tail: &[u8], seed_disp: bool) -> (CapRefusals, 
     let walked = walk_refusals(&compilation);
     assert_eq!(
         cap_refusals(&cpu),
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "the walk charged the tally before its block installed"
     );
     cpu.jit_direct
@@ -397,7 +415,7 @@ fn imm_lane_cap_refusal_is_charged_at_the_thirteenth_slot() {
     );
     assert_eq!(
         refusals,
-        [1, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0],
         "the thirteenth imm slot must charge the imm family exactly once"
     );
 }
@@ -411,7 +429,7 @@ fn a_block_that_fits_the_budget_charges_no_refusal() {
     assert_eq!(lanes, LANES, "the fixture did not fill the budget");
     assert_eq!(
         refusals,
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "a block that fits the budget must charge no family"
     );
 }
@@ -430,7 +448,7 @@ fn imm_lane_cap_counter_stays_zero_on_the_lane_family_off_arm() {
     );
     assert_eq!(
         refusals,
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "an off knob is not budget pressure and must charge nothing"
     );
 }
@@ -444,7 +462,7 @@ fn the_widened_imm_tail_charges_the_imm_family_on_the_lane_family_on_arm() {
     assert_eq!(lanes, LANES, "the budget did not bind on the tail slot");
     assert_eq!(
         refusals,
-        [1, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0],
         "a capped `0x81 /5` slot belongs to the imm family alone"
     );
 }
@@ -458,7 +476,7 @@ fn imm8_lane_cap_refusal_is_charged_to_the_imm8_family() {
     assert_eq!(lanes, LANES, "the budget did not bind on the tail slot");
     assert_eq!(
         refusals,
-        [0, 1, 0, 0],
+        [0, 1, 0, 0, 0, 0],
         "a capped `0x80` slot belongs to the imm8 family alone"
     );
 }
@@ -475,7 +493,7 @@ fn imm8_lane_cap_counter_stays_zero_on_the_off_arm() {
     );
     assert_eq!(
         refusals,
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "an off knob is not budget pressure and must charge nothing"
     );
 }
@@ -488,7 +506,7 @@ fn count_lane_cap_refusal_is_charged_to_the_count_family() {
     assert_eq!(lanes, LANES, "the budget did not bind on the tail slot");
     assert_eq!(
         refusals,
-        [0, 0, 1, 0],
+        [0, 0, 1, 0, 0, 0],
         "a capped `0xC1` slot belongs to the count family alone"
     );
 }
@@ -504,7 +522,7 @@ fn count_lane_cap_counter_stays_zero_on_the_off_arm() {
     );
     assert_eq!(
         refusals,
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "an off knob is not budget pressure and must charge nothing"
     );
 }
@@ -518,7 +536,7 @@ fn disp_lane_cap_refusal_is_charged_to_the_disp_family() {
     assert_eq!(lanes, LANES, "the budget did not bind on the tail slot");
     assert_eq!(
         refusals,
-        [0, 0, 0, 1],
+        [0, 0, 0, 1, 0, 0],
         "a capped `0x8A` slot belongs to the disp family alone"
     );
 }
@@ -534,7 +552,7 @@ fn disp_lane_cap_counter_stays_zero_on_the_off_arm() {
     );
     assert_eq!(
         refusals,
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "an off knob is not budget pressure and must charge nothing"
     );
 }
@@ -550,7 +568,7 @@ fn an_ungated_disp_slot_charges_no_cap_refusal() {
     assert_eq!(lanes, LANES, "the fillers must still spend the budget");
     assert_eq!(
         refusals,
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "a load with no patch history was never a lane the budget cost"
     );
 }
@@ -610,7 +628,7 @@ fn a_disp_slot_whose_lane_bytes_are_not_direct_mapped_charges_no_cap_refusal() {
         .expect("the fixture block installs");
     assert_eq!(
         cap_refusals(&cpu),
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "a disp slot whose lane bytes no direct page covers was never a lane the budget cost"
     );
 }
@@ -629,12 +647,12 @@ fn a_walk_that_does_not_install_charges_nothing() {
     let compilation = compile_checked(&mut cpu, &starts);
     assert_eq!(
         walk_refusals(&compilation),
-        [1, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0],
         "the walk must record the thirteenth slot's refusal on the compilation"
     );
     assert_eq!(
         cap_refusals(&cpu),
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "a compilation nobody installed must leave the tally alone"
     );
     // AND THE FAILED INSTALL, forged the way `failed_install_consumes_seen_without_a_code_watch`
@@ -650,7 +668,7 @@ fn a_walk_that_does_not_install_charges_nothing() {
     );
     assert_eq!(
         cap_refusals(&cpu),
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "an install that failed is not an installed block and must charge nothing"
     );
 }
@@ -669,9 +687,9 @@ fn a_walk_that_does_not_install_charges_nothing() {
 fn a_capped_slot_whose_lane_bytes_are_not_direct_mapped_still_charges_its_family() {
     let _arms = force_arms(true, true, true, true);
     for (family, tail, expected) in [
-        ("imm", IMM_SLOT.as_slice(), [1, 0, 0, 0]),
-        ("imm8", IMM8_SLOT.as_slice(), [0, 1, 0, 0]),
-        ("count", COUNT_SLOT.as_slice(), [0, 0, 1, 0]),
+        ("imm", IMM_SLOT.as_slice(), [1, 0, 0, 0, 0, 0]),
+        ("imm8", IMM8_SLOT.as_slice(), [0, 1, 0, 0, 0, 0]),
+        ("count", COUNT_SLOT.as_slice(), [0, 0, 1, 0, 0, 0]),
     ] {
         let (mut cpu, _bus, starts) = fixture(LANES, tail, false);
         let tail_start = *starts.last().expect("the image has a tail slot");
@@ -721,9 +739,9 @@ fn re_walking_the_same_bytes_charges_only_the_walk_that_installs() {
     // carries its own answer, which is what makes "the prefix that installs is the one that
     // counts" a statement with content.
     for (limit, expected) in [
-        (starts.len(), [1, 0, 0, 0]),
-        (LANES, [0, 0, 0, 0]),
-        (starts.len(), [1, 0, 0, 0]),
+        (starts.len(), [1, 0, 0, 0, 0, 0]),
+        (LANES, [0, 0, 0, 0, 0, 0]),
+        (starts.len(), [1, 0, 0, 0, 0, 0]),
     ] {
         let candidate =
             jit::direct::compile_with_instruction_limit_for_test(&mut cpu, ENTRY, true, limit)
@@ -736,7 +754,7 @@ fn re_walking_the_same_bytes_charges_only_the_walk_that_installs() {
     }
     assert_eq!(
         cap_refusals(&cpu),
-        [0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
         "three discarded walks must have charged nothing"
     );
     let compilation = compile_checked(&mut cpu, &starts);
@@ -745,7 +763,7 @@ fn re_walking_the_same_bytes_charges_only_the_walk_that_installs() {
         .expect("the fixture block installs");
     assert_eq!(
         cap_refusals(&cpu),
-        [1, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0],
         "the refused slot must be counted once, by the walk whose block installed"
     );
 }

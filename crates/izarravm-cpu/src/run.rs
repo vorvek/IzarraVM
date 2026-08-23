@@ -1703,6 +1703,21 @@ impl CpuGsw {
                         .direct
                         .note_count_lane_registrations(compilation.count_lane_count() as u64);
                 }
+                // The two Option D arms, charged here for the same reason and under the same
+                // condition as the three above, so all five registration counters and the six
+                // cap counters share one denominator: blocks this run installed.
+                if compilation.disp_store_lane_count() != 0 {
+                    self.jit_direct.direct.note_disp_store_lane_registrations(
+                        compilation.disp_store_lane_count() as u64,
+                    );
+                }
+                if compilation.disp_load_widen_lane_count() != 0 {
+                    self.jit_direct
+                        .direct
+                        .note_disp_load_widen_lane_registrations(
+                            compilation.disp_load_widen_lane_count() as u64,
+                        );
+                }
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the
                 // block-entry site are written branchlessly.

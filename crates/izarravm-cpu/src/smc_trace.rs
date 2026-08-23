@@ -165,6 +165,47 @@ pub(crate) struct SmcTrace {
     /// Keyed per event, this table is complete the way the class totals are. The key packs
     /// (class, opcode, modrm reg or 0xFF, insn len, imm_len, disp_len, operand bytes).
     shape_events: HashMap<u64, u64>,
+    /// THE `disp_store` CENSUS ROW, owed by the register-pressure contract's standing rule
+    /// against unmeasured admissions and by the 2026-08-23 settling census §6.3.
+    ///
+    /// One row per (opcode, modrm reg) over the four MOV displacement opcodes -- `0x88`, `0x89`,
+    /// `0x8A`, `0x8B` -- inside the `disp` class, carrying `events`, `blocks_killed`,
+    /// `narrow_kills` and, decisively, `newly_hot`. Complete per event the way the class totals
+    /// are, and joinable to `smc_shape` on `opcode` + `modrm_reg`.
+    ///
+    /// WHY `newly_hot` PER OPCODE IS THE POINT. Option D's capture fraction has until now been
+    /// estimated as joined un-laned-disp crossings over the whole run's `smc_heat_chunks_hot`.
+    /// That denominator is inflated by every other family: between the P1 and the settling census
+    /// legs it rose 22.05% entirely inside the ALREADY-LANED `0x8A` population, dropping the
+    /// measured capture from 15.634% to 12.797% while the numerator stayed flat to 0.1%. With
+    /// crossings attributed per opcode the ratio no longer has to be estimated through a
+    /// whole-run number a family Option D does not touch can move.
+    ///
+    /// The other three opcodes ride with the two Option D ones deliberately: `0x8A` is the
+    /// SHIPPED lane class, and its kill rate is the control the store arm's admission has to be
+    /// compared against (0.0026% of joined block kills against un-laned disp's 1.409%). A row
+    /// that could only see the new arms could not make that comparison.
+    disp_store_rows: HashMap<u32, DispStoreRow>,
+}
+
+/// One `disp_store` census row: a (opcode, modrm reg) cell of the `disp` class.
+#[derive(Debug, Clone, Copy, Default)]
+struct DispStoreRow {
+    events: u64,
+    blocks_killed: u64,
+    narrow_kills: u64,
+    newly_hot: u64,
+}
+
+/// Which Option D arm an opcode belongs to, reported beside every `disp_store` row so a reader
+/// does not have to carry the mapping. `0x8A` is the shipped control, not an arm.
+fn disp_store_arm(opcode: u16) -> Option<&'static str> {
+    match opcode {
+        0x88 | 0x89 => Some("store"),
+        0x8b => Some("load_widen"),
+        0x8a => Some("laned_8a"),
+        _ => None,
+    }
 }
 
 impl SmcTrace {
@@ -233,6 +274,20 @@ impl SmcTrace {
                 | (u64::from(identity.disp_len) << 8)
                 | u64::from(identity.operand_bytes as u8);
             *self.shape_events.entry(key).or_insert(0) += 1;
+        }
+        // The `disp_store` row, charged on the same event and from the same `action` as the class
+        // totals beside it, so the two can never disagree about one write.
+        if class == SmcFieldClass::DisplacementOnly
+            && let Some(identity) = identity
+            && disp_store_arm(identity.opcode).is_some()
+        {
+            let key = (u32::from(identity.opcode) << 8)
+                | u32::from(identity.modrm.map_or(0xFF, |(_, reg, _)| reg));
+            let row = self.disp_store_rows.entry(key).or_default();
+            row.events += 1;
+            row.blocks_killed += u64::from(action.blocks_killed);
+            row.narrow_kills += u64::from(action.narrow_kills);
+            row.newly_hot += u64::from(action.newly_hot);
         }
         self.class_blocks_killed[index] += u64::from(action.blocks_killed);
         self.class_narrow_kills[index] += u64::from(action.narrow_kills);
@@ -327,6 +382,31 @@ impl SmcTrace {
                 (key >> 16) & 0xFF,
                 (key >> 8) & 0xFF,
                 key & 0xFF,
+            ));
+        }
+        let mut disp_store: Vec<(&u32, &DispStoreRow)> = self.disp_store_rows.iter().collect();
+        // Events first, then the packed key, so the ranking is stable across runs -- the
+        // `smc_shape` convention one table up.
+        disp_store.sort_by(|a, b| b.1.events.cmp(&a.1.events).then(a.0.cmp(b.0)));
+        lines.push(
+            "smc_disp_store rank arm opcode modrm_reg events blocks_killed narrow_kills newly_hot"
+                .to_string(),
+        );
+        for (rank, (key, row)) in disp_store.iter().enumerate() {
+            let opcode = (*key >> 8) as u16;
+            let modrm_reg = *key & 0xFF;
+            lines.push(format!(
+                "smc_disp_store {rank} {} {opcode:#06x} {} {} {} {} {}",
+                disp_store_arm(opcode).unwrap_or("-"),
+                if modrm_reg == 0xFF {
+                    "-".to_string()
+                } else {
+                    modrm_reg.to_string()
+                },
+                row.events,
+                row.blocks_killed,
+                row.narrow_kills,
+                row.newly_hot,
             ));
         }
         let mut ranked: Vec<&Site> = self.sites.values().collect();
