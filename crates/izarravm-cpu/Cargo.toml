@@ -18,12 +18,19 @@ jit = []
 # Partial Direct admission attribution. The dispatcher hooks are compiled out unless this
 # diagnostic feature is selected, then armed with IZARRAVM_DIRECT_BARRIER_CENSUS=1.
 direct-admission-census = ["jit"]
-# Per-entry Direct attribution observer (dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-# design.md). Compiled out unless selected -- the `ea_*!` macros expand to nothing -- then armed
-# with IZARRAVM_DIRECT_ENTRY_ATTRIBUTION=1 (full) or =2 (coarse), strided by
+# Per-entry Direct attribution observer
+# (dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md). Compiled out unless
+# selected -- the `ea_*!` macros expand to nothing -- then armed with
+# IZARRAVM_DIRECT_ENTRY_ATTRIBUTION=1 (full) or =2 (coarse), strided by
 # IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE=N.
 #
-# EXCLUDED FROM `default` AND FROM ANY `--all-features` PATH USED FOR PERF GRADING (design L5):
-# it stamps rdtsc >=16 times per dispatcher entry, so a graded build must not carry it.
+# NOT in `default`. It IS in `--all-features`, because cargo has no way for a feature to opt out
+# of that flag, and the design's claim that it is "excluded from --all-features" was therefore
+# never enforceable. Stating the truth instead: a `--all-features` build CARRIES this instrument,
+# and that is acceptable because the instrument is zero-cost while DISARMED -- the knob defaults
+# to off, and a disarmed traversal pays one `OnceLock` load and a not-taken branch per stamp site
+# rather than an rdtsc. What must never happen is GRADING a wall number on an ARMED build: the
+# full arm measured +24.5% on the loader. Grade on plain builds, per the standing rule.
 direct-entry-attribution = ["jit"]
 # Per-static-cell Direct link refusal census. Compiled out unless selected, then armed with
 # IZARRAVM_DIRECT_LINK_REFUSAL_CENSUS=1.
