@@ -17,7 +17,7 @@
 
 use crate::{CpuGsw, SegmentIndex, SegmentRegister};
 
-pub(super) const SEGMENT_ORDER: [SegmentIndex; 6] = [
+pub(crate) const SEGMENT_ORDER: [SegmentIndex; 6] = [
     SegmentIndex::Es,
     SegmentIndex::Cs,
     SegmentIndex::Ss,
@@ -88,6 +88,13 @@ impl SegmentLayout {
             data,
             used,
         })
+    }
+
+    /// One baked data-segment base, for the fixtures that have to say WHICH layout a capped
+    /// block froze on before they can assert that it runs on that one and refuses the other.
+    #[cfg(test)]
+    pub(crate) fn data_segment_base_for_test(self, segment: SegmentIndex) -> u32 {
+        self.data[segment_index(segment)].base
     }
 
     pub(crate) fn cs_matches(self, cpu: &CpuGsw) -> bool {

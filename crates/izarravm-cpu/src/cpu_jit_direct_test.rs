@@ -3388,6 +3388,9 @@ fn arm_stack_fixture(cpu: &mut CpuGsw, entry: u32, esp: u32) {
 #[path = "cpu_jit_direct_execution_test.rs"]
 mod execution;
 
+#[path = "cpu_jit_retire_governor_test.rs"]
+mod retire_governor;
+
 #[path = "cpu_jit_sixteen_bit_test.rs"]
 mod sixteen_bit;
 

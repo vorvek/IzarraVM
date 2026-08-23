@@ -2908,6 +2908,13 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "jit_direct_compile_attempts": mark.perf.jit_direct_compile_attempts,
                 "jit_direct_blocks_installed": mark.perf.jit_direct_blocks_installed,
                 "jit_direct_compile_ns": mark.perf.jit_direct_compile_ns,
+                // The reject column this block never had. Whole-run rejects were readable from
+                // the profile's `perf` block and the phase block carried none at all, so a
+                // phase-scoped bar on the data-segment treadmill could not be graded. Split by
+                // ARM at the source, because the strict half is the only one stage 2 can reach.
+                "jit_direct_reject_data_segment": mark.perf.jit_direct_reject_data_segment,
+                "jit_direct_reject_data_segment_strict": mark.perf.jit_direct_reject_data_segment_strict,
+                "jit_direct_reject_data_segment_masked": mark.perf.jit_direct_reject_data_segment_masked,
                 "jit_direct_cache_resets": mark.perf.jit_direct_cache_resets,
                 "jit_direct_arena_compactions": mark.perf.jit_direct_arena_compactions,
                 // The wall the compaction rebuild actually cost, measured rather than
@@ -3085,6 +3092,13 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "decode_pack_late_view_miss": snapshot.decode_pack_late_view_miss,
         "x87_top_retires_suppressed": snapshot.x87_top_retires_suppressed,
         "x87_top_sticky_crossings": snapshot.x87_top_sticky_crossings,
+        // The data-segment reject governor. All zero on the OFF arm, which is the cheapest
+        // check that a ladder leg named the arm it meant to. `distinct_layouts` is the go/no-go
+        // input for the per-layout variant slice and is not a bar.
+        "data_segment_retires_suppressed": snapshot.data_segment_retires_suppressed,
+        "data_segment_sticky_crossings": snapshot.data_segment_sticky_crossings,
+        "data_segment_link_declines": snapshot.data_segment_link_declines,
+        "data_segment_distinct_layouts": snapshot.data_segment_distinct_layouts.to_vec(),
         // Sticky-decline memo, always on. `decline_memo_hits / admission_declines[dormant_probe]`
         // is the acceptance instrument; a census-gated counter would leave the wall build unable
         // to say whether the memo fired.

@@ -2398,7 +2398,25 @@ impl CpuGsw {
         };
         if !data_descriptors_match {
             self.perf.jit_direct_reject_data_segment += 1;
-            self.jit_direct.retire_key_for_recompile(span.key);
+            // The ARM split, promoted from the 2026-08-23 throwaway instrument. It is the only
+            // way the strict/masked share is readable on the shipped arm -- one counter served
+            // both arms before this, and the design could bound the strict half at <=32% from
+            // `links_cleared[retired]` but not measure it.
+            let arm = if has_link {
+                self.perf.jit_direct_reject_data_segment_strict += 1;
+                jit::direct::DataSegmentRejectArm::Strict
+            } else {
+                self.perf.jit_direct_reject_data_segment_masked += 1;
+                jit::direct::DataSegmentRejectArm::Masked
+            };
+            // Only on the strict arm, and only on this cold path. It separates "rejected BECAUSE
+            // it is linked" -- the block's own masked check would have passed, so cutting its
+            // edges lets it run -- from "rejected on a record it uses itself", where cutting the
+            // edges buys nothing because the masked check refuses too.
+            let own_mask_matches = has_link && segments.data_matches(self);
+            let live = jit::direct::SEGMENT_ORDER.map(|segment| self.registers.segment(segment));
+            self.jit_direct
+                .retire_key_for_data_segment(span.key, arm, own_mask_matches, &live);
             return Ok(DirectBlockOutcome::NotRun);
         }
         if block.has_wide_accesses() && self.alignment_armed && self.current_privilege_level() == 3

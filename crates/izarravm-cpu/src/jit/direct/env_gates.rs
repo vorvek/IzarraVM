@@ -1456,3 +1456,84 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
         CpuPersona::I386 => false,
     }
 }
+
+/// Which arm of the data-segment reject governor this process runs.
+///
+/// **DEFAULT OFF.** Unset, `""`, `0` or `off` all give today's behaviour: every data-segment
+/// reject retires its key for a fresh re-specialization. `cap` arms stage 1 (the per-key retire
+/// cap, `DATA_SEGMENT_RETIRE_CAP`); `1` or `on` arms stage 1 and stage 2 (the cap plus the link
+/// decline). Three arms rather than a bool so the ladder can isolate stage 2 — stage 1 alone is
+/// the only ordering that can clear the pre-registered compile-attempt bar, and stage 2 is what
+/// recovers the native coverage stage 1 freezes out on strict-arm keys.
+///
+/// WHY IT SHIPS DISABLED. It is a measured slice with no measurement yet: the design's bars are
+/// pre-registered and unread, and a governor that stops a re-specialization is exactly the class
+/// of lever that can look free on counters while costing wall through lost chaining. The OFF arm
+/// touches no map and reads no set, so an OFF leg is a reproduction of `main` and not merely a
+/// close relative of one — which is what makes the A/A pre-bar readable.
+///
+/// Unset = OFF, so an armed leg must EXPORT the value. `env-null-empty-is-off-trap`: PowerShell's
+/// `SetEnvironmentVariable($null)` leaves `""` behind, which reads as OFF here on purpose.
+pub(crate) fn segment_retire_governor() -> super::SegmentRetireGovernor {
+    #[cfg(test)]
+    if let Some(forced) = SEGMENT_RETIRE_GOVERNOR_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ARM: std::sync::OnceLock<super::SegmentRetireGovernor> = std::sync::OnceLock::new();
+    *ARM.get_or_init(|| {
+        parse_segment_retire_governor_arm(std::env::var("IZARRAVM_SEGMENT_RETIRE_GOVERNOR"))
+    })
+}
+
+/// The `IZARRAVM_SEGMENT_RETIRE_GOVERNOR` spelling table. See `segment_retire_governor`.
+fn parse_segment_retire_governor_arm(
+    value: Result<String, std::env::VarError>,
+) -> super::SegmentRetireGovernor {
+    use super::SegmentRetireGovernor;
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return SegmentRetireGovernor::Off,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_SEGMENT_RETIRE_GOVERNOR is set to a value that is not valid UTF-8; \
+                 accepted spellings are unset, `0` or `off` (the shipped default: every \
+                 data-segment reject retires), `cap` (the per-key retire cap alone) and `1` or \
+                 `on` (the cap plus the link decline)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => SegmentRetireGovernor::Off,
+        "cap" => SegmentRetireGovernor::Cap,
+        "1" | "on" => SegmentRetireGovernor::On,
+        other => panic!(
+            "IZARRAVM_SEGMENT_RETIRE_GOVERNOR={other:?} names no arm; accepted spellings are \
+             unset, `0` or `off` (the shipped default), `cap` (stage 1, the per-key retire cap) \
+             and `1` or `on` (stage 1 plus the link decline). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason.
+#[cfg(test)]
+thread_local! {
+    static SEGMENT_RETIRE_GOVERNOR_OVERRIDE: std::cell::Cell<Option<super::SegmentRetireGovernor>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the governor arm on this thread for the length of a fixture; `None` restores the ambient
+/// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR` reading.
+#[cfg(test)]
+pub(crate) fn set_segment_retire_governor_for_test(forced: Option<super::SegmentRetireGovernor>) {
+    SEGMENT_RETIRE_GOVERNOR_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_retry_lift_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_segment_retire_governor_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> super::SegmentRetireGovernor {
+    parse_segment_retire_governor_arm(value)
+}
