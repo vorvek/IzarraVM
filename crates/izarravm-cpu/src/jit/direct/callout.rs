@@ -1497,8 +1497,16 @@ impl ResumeSnapshot {
             return false;
         }
         // R2. See the mask note above. The `!` arm is `u8::MAX` rather than the six live bits
-        // because the extra two are bits no `segment_bit` produces and `SEGMENT_ORDER` never
-        // indexes: widening the mask to "everything" is the same set as widening it to "all six".
+        // because the extra two are bits `SEGMENT_ORDER` never indexes: widening the mask to
+        // "everything" is the same set as widening it to "all six".
+        //
+        // `segment_bit` still produces only bits 0..5, but ONE of the extra two is now producible
+        // by `pinned_segments`, which is where `segment_mask` comes from: `BAKES_CS_BIT` (bit 6)
+        // says the slot bakes CS's SELECTOR as an immediate. The loop below tests
+        // `compare & segment_bit(*segment)` over `SEGMENT_ORDER` and cannot select it, so an
+        // incoming mask carrying bit 6 compares exactly the six segments it always did -- and
+        // `used_by_others` has defaulted to `u8::MAX` since this path shipped, so a mask with
+        // bits above 5 set was already a production value here.
         let compare = if row.may_write_segment() {
             segment_mask
                 | super::segment_bit(SegmentIndex::Cs)

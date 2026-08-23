@@ -3330,7 +3330,8 @@ impl BlockCache {
     /// of the target pins ES with a different descriptor.
     ///
     /// Termination: a requirement bit, once set, is never cleared while the block lives, and
-    /// there are six of them, so each block is pushed at most six times per generation.
+    /// there are seven of them -- the six segments plus `BAKES_CS_BIT` -- so each block is pushed
+    /// at most seven times per generation.
     fn widen_chain_requirement(&mut self, source: BlockId, merged: SegmentLayout) {
         let Some(source_index) = self.active_index(source) else {
             return;
@@ -5400,7 +5401,11 @@ impl DirectKind {
         match self {
             // CS is excluded on purpose rather than by omission: it is not in `SegmentLayout.data`
             // at all, it rides the separate `cs` field, and `cs_matches` pins it for every block
-            // unconditionally. Putting it in the mask would be inert at best.
+            // unconditionally. Putting it in the DESCRIPTOR mask would be inert at best -- there
+            // is no `data[1]` for `data_matches` to compare. The selector bake is reported instead
+            // by `bakes_cs_selector` below as `BAKES_CS_BIT`, which is a different bit answering a
+            // different question, and which exists because a chained far transfer skips
+            // `cs_matches`.
             Self::MovSegToReg { segment, .. } if segment != SegmentIndex::Cs => Some(segment),
             // `PUSH Sreg`. Reporting it here is what makes the lowering safe, not bookkeeping: the
             // emitted code bakes the selector as a constant, so without this a block whose only
@@ -5409,7 +5414,8 @@ impl DirectKind {
             // `PUSH CS` (admitted 2026-08-08) is deliberately EXCLUDED by the guard, exactly like
             // `MovSegToReg` above: CS is not in `SegmentLayout.data`, `SegmentLayout::selector`
             // reads the separate `cs` field, and `cs_matches` pins it for every block
-            // unconditionally, so reporting it here would be inert at best.
+            // unconditionally, so reporting it HERE would be inert at best. It is reported by
+            // `bakes_cs_selector` instead, as `BAKES_CS_BIT`.
             Self::Push {
                 source: StoreSource::Selector(segment),
             }
@@ -5420,8 +5426,36 @@ impl DirectKind {
         }
     }
 
+    /// Whether this kind bakes CS's SELECTOR as a compile-time immediate.
+    ///
+    /// A sibling of `selector_segment` rather than an arm inside it, because the answer is not a
+    /// `SegmentIndex`: CS is not in `SegmentLayout.data` at all, so there is no descriptor slot to
+    /// name and no `data_matches` comparison to add. What it produces is `BAKES_CS_BIT`, a bit of
+    /// `used` that names no segment.
+    ///
+    /// Why it has to exist. Both shapes below turn a segment register into an immediate at emit
+    /// time -- `emit_store` rewrites `StoreSource::Selector(Cs)` into `StoreSource::Imm` and the
+    /// `MovSegToReg` arm emits `mov_r32_imm32` -- reading it through `SegmentLayout::selector`'s
+    /// separate `cs` field. Until far returns, that was pinned for every block by `cs_matches` at
+    /// the dispatcher entry check and needed no mask bit. A chained far transfer enters a
+    /// successor's body without returning to the dispatcher, so `cs_matches` never runs for it,
+    /// and INV-FAR-CS refuses any far edge whose target's chain requirement carries this bit.
+    fn bakes_cs_selector(self) -> bool {
+        matches!(
+            self,
+            Self::Push {
+                source: StoreSource::Selector(SegmentIndex::Cs),
+            } | Self::Push16 {
+                source: StoreSource::Selector(SegmentIndex::Cs),
+            } | Self::MovSegToReg {
+                segment: SegmentIndex::Cs,
+                ..
+            }
+        )
+    }
+
     /// Every segment whose descriptor this kind BAKES, as a bitmask: the union of the three
-    /// accessors above.
+    /// accessors above, plus `BAKES_CS_BIT` for the two shapes that bake CS's selector.
     ///
     /// One definition, because the question has three answers and the next reader will only
     /// remember two. `MovSegToReg` is the case that proves it: it bakes DS's selector as a
@@ -5436,7 +5470,14 @@ impl DirectKind {
     /// `mov ax, fs` whenever FS is null, which is a legal instruction with a legal answer.
     fn pinned_segments(self) -> u8 {
         let bit = |segment: Option<SegmentIndex>| segment.map_or(0, segment_bit);
-        bit(self.read_segment()) | bit(self.write_segment()) | bit(self.selector_segment())
+        bit(self.read_segment())
+            | bit(self.write_segment())
+            | bit(self.selector_segment())
+            | if self.bakes_cs_selector() {
+                BAKES_CS_BIT
+            } else {
+                0
+            }
     }
 
     /// The segment REGISTER this kind overwrites, which is a different question from all three
@@ -7213,6 +7254,12 @@ fn compile_with_budget(
         // pins the segment it addresses through, because the mask is built out of exactly that
         // answer. A kind that touched guest memory while pinning nothing would let a resumed
         // segment write leave a stale base under it and R2 would compare nothing about it.
+        // WEAKER since `BAKES_CS_BIT`, and worth naming before the next slice leans on it:
+        // `MovSegToReg { segment: Cs }` and `Push*{ Selector(Cs) }` now satisfy the first
+        // disjunct through a bit that names NO segment. Inert here -- those kinds still touch no
+        // memory, so they satisfy the second disjunct as well and the assertion's purpose (a
+        // memory-touching kind must pin the segment it addresses through) is undamaged. But the
+        // message is no longer literally what the predicate tests.
         debug_assert!(
             kind.pinned_segments() != 0
                 || (kind.byte_reads() == 0

@@ -23,8 +23,8 @@
 use std::collections::hash_map::Entry;
 
 use super::{
-    BlockCache, BlockId, BlockKey, BlockState, LinkClearCause, NativeCodeWatch, SEGMENT_ORDER,
-    segment_bit, segment_index, segment_retire_governor,
+    BlockCache, BlockId, BlockKey, BlockState, LinkClearCause, NativeCodeWatch, SEGMENT_MASK_BITS,
+    SEGMENT_ORDER, segment_bit, segment_index, segment_retire_governor,
 };
 use crate::SegmentRegister;
 
@@ -147,6 +147,21 @@ impl DataSegmentRetireRecord {
 /// genuinely a different requirement. Segments outside the mask contribute nothing, which is the
 /// whole point — an unmasked census on this loader saturates within a few hundred rejects on
 /// records nothing in the chain pins, producing a false no-go for the variant slice.
+/// Reduce a block's `used` byte to the six bits that name a SEGMENT, before it reaches the fold.
+///
+/// One line, extracted so that the mask the reject site applies is the mask the fixture tests.
+///
+/// LOAD-BEARING rather than tidy. `layout_fingerprint` folds the mask BYTE unconditionally, and
+/// `used` carries `BAKES_CS_BIT` in bit 6 for every block that bakes CS's selector -- `PUSH CS`
+/// alone is a 158 M block-stopping row on wolf3d. Without this, every such block's fingerprint
+/// changes value, shifting `distinct_layouts` and the `data_segment_layout_histogram` bucket on a
+/// census the campaign ranks and closes on, and shifting it on the OFF arm of a slice that
+/// changes nothing else about the governor. The bit is inert here BY CONSTRUCTION rather than by
+/// argument.
+fn census_mask(used: u8) -> u8 {
+    used & SEGMENT_MASK_BITS
+}
+
 fn layout_fingerprint(mask: u8, live: &[SegmentRegister; 6]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     let mut fold = |byte: u8| {
@@ -224,10 +239,10 @@ impl BlockCache {
         // The arm's OWN mask, per review H3. The strict arm rejected against the CHAIN's
         // requirement, so that is the mask its census must be taken under; the masked arm
         // rejected against the block's own pinned set.
-        let mask = match arm {
+        let mask = census_mask(match arm {
             DataSegmentRejectArm::Strict => self.chain_layouts[index].used,
             DataSegmentRejectArm::Masked => self.segment_layouts[index].used,
-        };
+        });
         let fingerprint = layout_fingerprint(mask, live);
         let spent = {
             let record = match self.data_segment_retires.entry(key) {
@@ -399,3 +414,7 @@ impl BlockCache {
             .any(|sources| sources.iter().any(|entry| entry.block == source))
     }
 }
+
+#[cfg(test)]
+#[path = "retire_governor_test.rs"]
+mod tests;

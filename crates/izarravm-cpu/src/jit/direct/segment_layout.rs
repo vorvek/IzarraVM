@@ -26,9 +26,33 @@ pub(crate) const SEGMENT_ORDER: [SegmentIndex; 6] = [
     SegmentIndex::Gs,
 ];
 
+/// The six bits of `used` that name a SEGMENT, i.e. everything `segment_bit` can produce.
+///
+/// `used` is a bitmask over `SEGMENT_ORDER` in bits 0..5 plus `BAKES_CS_BIT` in bit 6, and the
+/// two are different questions. Any consumer that treats `used` as a SEGMENT SET must mask with
+/// this first; the consumers that walk `SEGMENT_ORDER` (`data_matches`, `all_data_matches`,
+/// `merge_chain`) cannot see bit 6 and need no mask. The one consumer that folds the raw byte is
+/// `retire_governor::layout_fingerprint`, whose census the campaign grades on, and it masks.
+pub(crate) const SEGMENT_MASK_BITS: u8 = 0x3F;
+
+/// Bit 6 of `used`: this block bakes CS's SELECTOR as an immediate.
+///
+/// It names no segment and `segment_bit` never produces it. It exists because a block can depend
+/// on CS in two genuinely different ways and the far-RETF invariant (INV-FAR-CS) has to refuse
+/// both: it can bake CS's DESCRIPTOR (a CS-override memory operand, which puts
+/// `segment_bit(Cs)` in `used` through `read_segment`/`write_segment`), or it can bake CS's
+/// SELECTOR as a 16-bit immediate (`PUSH CS`, `MOV r16, CS`), which puts nothing in `used` at all
+/// and rests entirely on `cs_matches` at the dispatcher entry check. A chained far transfer
+/// bypasses `cs_matches`, so the selector bake needs a home in the mask the chain requirement
+/// carries.
+///
+/// It rides `pinned_segments`, `capture`, `merge_chain`'s union and the chain-requirement
+/// propagation for free, and is invisible to every predicate that reads `used` as a segment set.
+pub(crate) const BAKES_CS_BIT: u8 = 1 << 6;
+
 /// Segment state baked into one direct translation, frozen at compile time. `used` is the PINNED
 /// set: the segments this block's emitted code depends on, whether through a baked base or a
-/// baked selector.
+/// baked selector, plus `BAKES_CS_BIT` when it bakes CS's selector as an immediate.
 ///
 /// A linked target does NOT have to carry an identical snapshot -- it used to, and that rule cost
 /// prince-586 its whole wall. What it must do is AGREE on every segment that some block in the
@@ -162,6 +186,12 @@ impl SegmentLayout {
     /// `DirectKind::selector_segment` is what guarantees for a `MovSegToReg` slot.
     pub(crate) fn selector(self, segment: SegmentIndex) -> u16 {
         if segment == SegmentIndex::Cs {
+            // The CS arm asserted NOTHING until `BAKES_CS_BIT` existed, because `cs_matches`
+            // pinned CS for every block unconditionally and there was no mask bit to check. It
+            // is a real tightening rather than symmetry: a chained far transfer skips
+            // `cs_matches`, so a block that bakes this selector must say so in `used` or
+            // INV-FAR-CS has nothing to refuse on.
+            debug_assert_ne!(self.used & BAKES_CS_BIT, 0);
             return self.cs.selector;
         }
         debug_assert_ne!(self.used & segment_bit(segment), 0);
