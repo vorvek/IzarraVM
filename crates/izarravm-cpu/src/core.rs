@@ -1600,6 +1600,15 @@ impl CpuGsw {
         self.jit_direct.smc_census_snapshot()
     }
 
+    /// `(execution-weighted arity histogram, distinct sites)` from the THROWAWAY stage-0 RETF
+    /// census, or `None` when it is disarmed. See `jit::direct::retf_census`.
+    #[cfg(feature = "retf-arity-census")]
+    pub fn retf_arity_snapshot(
+        &self,
+    ) -> Option<([u64; crate::jit::direct::RETF_TARGET_CENSUS_CAP + 2], u64)> {
+        self.jit_direct.retf_arity_snapshot()
+    }
+
     pub fn is_paging_enabled(&self) -> bool {
         self.control.cr0 & CR0_PG != 0
     }

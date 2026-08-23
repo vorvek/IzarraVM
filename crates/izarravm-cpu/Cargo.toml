@@ -47,6 +47,12 @@ direct-callout-attribution = ["jit"]
 # counters of the invalidation choke. Compiled out unless selected, then armed with
 # IZARRAVM_SMC_CENSUS=1 (window pinned by IZARRAVM_SMC_CENSUS_WINDOW=<start>,<end>).
 smc-census = ["jit"]
+# Stage 0 of the V86/real-mode far-return slice: the RETF TARGET-ARITY census
+# (dev_docs/specs/2026-08-24-v86-retf-pic-design.md, §5.0a). THROWAWAY -- it exists to
+# pre-register the two-cell PIC's yield before the ladder and does not ship. Compiled out unless
+# selected, then armed with IZARRAVM_RETF_ARITY_CENSUS=1. It sits on the interpreter's 0xCA/0xCB
+# arm, which is 274 M executions per wolf3d run, so both gates are load-bearing.
+retf-arity-census = ["jit"]
 # Read-only tally of what the poll-loop classifier WOULD answer at each straight-line run
 # boundary while the Direct backend owns execution and the real classifier is gated off.
 # Compiled out unless selected.

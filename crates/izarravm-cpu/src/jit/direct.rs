@@ -15,6 +15,8 @@ mod emit;
 pub(crate) mod entry_attribution;
 mod env_gates;
 mod native_exit;
+#[cfg(feature = "retf-arity-census")]
+mod retf_census;
 mod retire_governor;
 mod segment_layout;
 #[cfg(feature = "smc-census")]
@@ -65,6 +67,9 @@ pub(crate) use callout_attribution::{
 };
 #[cfg(feature = "smc-census")]
 pub(crate) use smc_census::{SmcCensus, smc_census_default};
+
+#[cfg(feature = "retf-arity-census")]
+pub(crate) use retf_census::{RETF_TARGET_CENSUS_CAP, RetfArityCensus, retf_arity_census_default};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -1128,6 +1133,9 @@ pub(crate) struct BlockCache {
     /// the link-refusal census above does: a lockstep clone must not double-count its parent.
     #[cfg(feature = "smc-census")]
     smc_census: Option<Box<SmcCensus>>,
+    /// The stage-0 RETF arity census (§5.0a). THROWAWAY; see `retf_census`.
+    #[cfg(feature = "retf-arity-census")]
+    retf_arity_census: Option<Box<RetfArityCensus>>,
     #[cfg(test)]
     defer_short_for_test: bool,
     #[cfg(test)]
@@ -1223,6 +1231,8 @@ impl BlockCache {
             direct_link_refusal_census: direct_link_refusal_census_default(),
             #[cfg(feature = "smc-census")]
             smc_census: smc_census_default(),
+            #[cfg(feature = "retf-arity-census")]
+            retf_arity_census: retf_arity_census_default(),
             #[cfg(test)]
             defer_short_for_test: false,
             #[cfg(test)]
@@ -1484,6 +1494,11 @@ impl BlockCache {
             self.link_sources
                 .insert(cell.address(), LinkSource { block: id, slot: 0 });
         }
+        // Stage 0 §5.0c, counted here rather than at compile so it shares
+        // `jit_direct_blocks_installed`'s denominator exactly.
+        self.stalls.blocks_installed_baking_cs += u64::from(
+            compilation.segment_layout.used & (segment_bit(SegmentIndex::Cs) | BAKES_CS_BIT) != 0,
+        );
         self.live_blocks += 1;
         self.entries.insert(span.key, BlockState::Compiled(id));
         self.note_page_span(span.key, u32::from(span.guest_len));
@@ -1839,17 +1854,6 @@ impl BlockCache {
     /// so the two arms share the `0x8A` family's denominator without being hidden inside it: a
     /// ladder leg has to be able to say that a `smc_lane_accepts` movement came from the store
     /// arm rather than from `0x8A` shifting under it.
-    /// Fold one native block exit's far-return count into the ledger. See
-    /// `DirectStallTally::far_ret_native`.
-    pub(crate) fn note_far_returns(&mut self, far_returns: u64) {
-        self.stalls.far_ret_native += far_returns;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn far_ret_native_for_test(&self) -> u64 {
-        self.stalls.far_ret_native
-    }
-
     pub(crate) fn note_disp_store_lane_registrations(&mut self, lanes: u64) {
         self.stalls.disp_store_lane_registrations += lanes;
     }

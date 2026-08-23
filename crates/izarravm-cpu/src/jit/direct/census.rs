@@ -764,6 +764,21 @@ pub(crate) struct DirectStallTally {
     /// `canonical_state_test.rs`) say what that costs -- a cache-line reshuffle of the hot region
     /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
     pub far_ret_native: u64,
+    /// Stage 0 §5.0c: installed blocks whose OWN snapshot claims CS in either way -- the
+    /// descriptor (`segment_bit(Cs)`, a CS-override memory operand) or the selector
+    /// (`BAKES_CS_BIT`, `PUSH CS` / `MOV r16, CS`).
+    ///
+    /// Read against `jit_direct_blocks_installed`. It is the STATIC half of the far-return
+    /// slice's bar-7 prediction: a far edge into any of these blocks is refused by INV-FAR-CS, so
+    /// a large fraction here says the chain half may be largely unavailable and the ladder should
+    /// be read as grading the ender removal alone. The execution-weighted half needs the arity
+    /// census's target set intersected with this population, which is an offline fold over the
+    /// two exports rather than a third counter.
+    ///
+    /// Compile path, unconditional there: 49,023 compile attempts on a whole wolf3d run, and a
+    /// heat-coupled counter that is armed on one leg and absent on the other confounds the arm
+    /// with an epoch re-phasing.
+    pub blocks_installed_baking_cs: u64,
     /// The three ways a FAR edge is refused or cut (`IZARRAVM_DIRECT_RETF_V86`). All zero on the
     /// shipped default arm, because no far edge is ever offered.
     ///
@@ -2276,6 +2291,17 @@ impl crate::jit::JitState {
 
     /// Unlike the census snapshot this is ALWAYS available: none of its three groups is census
     /// gated, because each is a single increment on a path that has already left native code.
+    /// Fold one native block exit's far-return count into the ledger. See
+    /// `DirectStallTally::far_ret_native`.
+    pub(crate) fn note_far_returns(&mut self, far_returns: u64) {
+        self.stalls.far_ret_native += far_returns;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn far_ret_native_for_test(&self) -> u64 {
+        self.stalls.far_ret_native
+    }
+
     pub(crate) fn stall_snapshot(&self) -> crate::DirectStallSnapshot {
         crate::DirectStallSnapshot {
             dormant: DormantReason::ALL
@@ -2375,6 +2401,7 @@ impl crate::jit::JitState {
             disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             far_ret_native: self.stalls.far_ret_native,
+            blocks_installed_baking_cs: self.stalls.blocks_installed_baking_cs,
             far_link_refused_cs: self.stalls.far_link_refused_cs,
             far_link_refused_limit: self.stalls.far_link_refused_limit,
             far_link_cut_on_widen: self.stalls.far_link_cut_on_widen,

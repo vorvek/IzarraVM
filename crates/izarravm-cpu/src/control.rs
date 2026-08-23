@@ -1257,6 +1257,33 @@ impl CpuGsw {
     /// before popping SS:eSP (386 PRM RET, outer level: "Increment eSP by 8
     /// plus the immediate offset" -- the parameter block copied by the call
     /// gate sits between CS:IP and the saved SS:eSP).
+    /// The stage-0 arity census's SITE key, sampled before the return (§5.0a). THROWAWAY.
+    ///
+    /// The linear just PAST the RETF rather than the RETF's own start: `eip` has already been
+    /// advanced by `decode` when the arm runs, and the two differ by the instruction's own length,
+    /// so it is the same per-site key one byte along. What matters is that it keys the RETF
+    /// INSTRUCTION and not the preceding block, which is why the census sits here and not at
+    /// `run_budgeted_inner`'s `!continuable` break.
+    #[cfg(feature = "retf-arity-census")]
+    pub(super) fn retf_census_site(&self) -> Option<(u32, bool)> {
+        self.jit_direct.retf_arity_census_active().then(|| {
+            (
+                self.registers.cs().base.wrapping_add(self.registers.eip),
+                self.is_v86_mode(),
+            )
+        })
+    }
+
+    /// Record the far return that has just completed. `site` is `None` on a disarmed build, which
+    /// is the whole cost a disarmed census pays at this 274 M-execution site.
+    #[cfg(feature = "retf-arity-census")]
+    pub(super) fn note_retf_target(&mut self, site: Option<(u32, bool)>) {
+        if let Some((site, v86)) = site {
+            let target = self.registers.cs().base.wrapping_add(self.registers.eip);
+            self.jit_direct.note_retf_target(site, v86, target);
+        }
+    }
+
     pub(super) fn return_far<B: CpuBus>(
         &mut self,
         bus: &mut B,
