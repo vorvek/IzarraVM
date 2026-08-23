@@ -75,7 +75,16 @@ type CapRefusals = [u64; jit::direct::LANE_CAP_FAMILIES];
 /// because an assertion failure is the normal way a fixture ends when something is wrong, and a
 /// panic skips trailing statements — the thread is reused by the harness and a leaked override
 /// would corrupt an unrelated test.
-struct ArmOverride;
+struct ArmOverride {
+    /// The STORE-PATH arm, which is not an environment knob but a per-`JitState` field
+    /// (`IZARRAVM_ONE_LOOKUP_STORE` only seeds its default). It rides on this struct rather than
+    /// being set ad hoc so that `flat_cpu` CANNOT build a CPU without a fixture having stated it:
+    /// the two store emitters are different code (`emit_store` classifies the page kind itself,
+    /// `emit_store_fast` goes through the bias table), they both consume the lane through
+    /// `emit_segmented_linear_address`, and a fixture that only ever compiled one of them would
+    /// leave half the Option D store admission untested.
+    one_lookup_store: bool,
+}
 
 impl Drop for ArmOverride {
     fn drop(&mut self) {
@@ -95,18 +104,27 @@ impl Drop for ArmOverride {
 /// without it, and so the four leading zeros in a `CapRefusals` assertion mean "that family had
 /// no slot" rather than "that family's knob happened to be off".
 #[must_use]
-fn force_arms(store: bool, load_widen: bool) -> ArmOverride {
+fn force_arms(store: bool, load_widen: bool, one_lookup_store: bool) -> ArmOverride {
     jit::direct::set_lane_family_for_test(Some(true));
     jit::direct::set_imm8_lanes_for_test(Some(true));
     jit::direct::set_count_lanes_for_test(Some(true));
     jit::direct::set_disp_lanes_for_test(Some(true));
     jit::direct::set_disp_store_lanes_for_test(Some(store));
     jit::direct::set_disp_load_widen_for_test(Some(load_widen));
-    ArmOverride
+    ArmOverride { one_lookup_store }
 }
 
-fn flat_cpu() -> CpuGsw {
+/// The store path the fixtures that are not about the store path itself run on: the SHIPPED
+/// default (`one_lookup_store` seeds ON from `IZARRAVM_ONE_LOOKUP_STORE`). Named rather than
+/// spelled `true` at twelve call sites so a reader can see at a glance which fixtures state an
+/// arm and which take the shipped one.
+const SHIPPED_STORE_PATH: bool = true;
+
+fn flat_cpu(arms: &ArmOverride) -> CpuGsw {
     let mut cpu = CpuGsw::default();
+    // Pinned rather than left at `one_lookup_store_default()`, so a suite run with
+    // `IZARRAVM_ONE_LOOKUP_STORE=0` exported reads the same as one without it.
+    cpu.jit_direct.one_lookup_store = arms.one_lookup_store;
     cpu.set_fast_map_enabled_for_test(true);
     cpu.set_mode(GswMode::Gsw486);
     cpu.control.cr0 |= CR0_PE;
@@ -250,10 +268,16 @@ fn arm_cpu(cpu: &mut CpuGsw, ebx: u32) {
     cpu.core_clocks_so_far = 0;
 }
 
+/// A guest patch of four bytes at a LINEAR address.
+///
+/// Through ES, not DS, and that is load-bearing rather than arbitrary: the finite-segment fixture
+/// gives DS a non-zero base, so a DS-relative patch of `LANE` would land 0x1000 bytes away and
+/// silently never patch the lane at all. ES stays flat in every fixture here, so `linear` means
+/// linear at every call site.
 fn guest_store(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, value: u32) {
     cpu.write_memory_bus_width(
         bus,
-        SegmentIndex::Ds,
+        SegmentIndex::Es,
         linear,
         BusWidth::Dword,
         value,
@@ -275,8 +299,12 @@ fn cap_refusals(cpu: &CpuGsw) -> CapRefusals {
 }
 
 /// Compile and install the frame with `subject`, and hand back everything a patch-then-run needs.
-fn lane_fixture(subject: [u8; 2], disp: u32) -> (CpuGsw, TestBus, jit::direct::BlockId) {
-    let mut cpu = flat_cpu();
+fn lane_fixture(
+    arms: &ArmOverride,
+    subject: [u8; 2],
+    disp: u32,
+) -> (CpuGsw, TestBus, jit::direct::BlockId) {
+    let mut cpu = flat_cpu(arms);
     let mut bus = test_bus(image(subject, disp));
     map_flat_pages(&mut cpu, &mut bus);
     decode_at(&mut cpu, &mut bus, &block_starts());
@@ -297,11 +325,11 @@ fn lane_fixture(subject: [u8; 2], disp: u32) -> (CpuGsw, TestBus, jit::direct::B
 /// after every round, patching the displacement between rounds. The interpreter re-decodes the
 /// patched instruction, so it is the reference by construction, and comparing whole memory rather
 /// than one address is what makes a store that landed at the OLD displacement a failure.
-fn state_identity(subject: [u8; 2], store: bool, widen: bool) {
-    let _arms = force_arms(store, widen);
+fn state_identity(subject: [u8; 2], store: bool, widen: bool, one_lookup_store: bool) {
+    let arms = force_arms(store, widen, one_lookup_store);
     let patches = [TARGETS[0], TARGETS[1], TARGETS[2], TARGETS[3], TARGETS[1]];
 
-    let mut native = flat_cpu();
+    let mut native = flat_cpu(&arms);
     let mut native_bus = test_bus(image(subject, patches[0]));
     map_flat_pages(&mut native, &mut native_bus);
     decode_at(&mut native, &mut native_bus, &block_starts());
@@ -310,10 +338,10 @@ fn state_identity(subject: [u8; 2], store: bool, widen: bool) {
     assert_eq!(
         native.perf_counters().smc_lane_registrations,
         1,
-        "{subject:02x?} did not take a lane; the comparison below would be vacuous"
+        "{subject:02x?} (one_lookup_store={one_lookup_store}) did not take a lane; the \n             comparison below would be vacuous"
     );
 
-    let mut interpreter = flat_cpu();
+    let mut interpreter = flat_cpu(&arms);
     let mut interpreter_bus = test_bus(image(subject, patches[0]));
     decode_at(&mut interpreter, &mut interpreter_bus, &block_starts());
 
@@ -344,20 +372,20 @@ fn state_identity(subject: [u8; 2], store: bool, widen: bool) {
 
         assert_eq!(
             native.registers, interpreter.registers,
-            "registers differ after patch {disp:#010x}"
+            "registers differ after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
         );
         assert_eq!(
             native.eflags(),
             interpreter.eflags(),
-            "EFLAGS differ after patch {disp:#010x}"
+            "EFLAGS differ after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
         );
         assert_eq!(
             native.pending_flags, interpreter.pending_flags,
-            "lazy flags differ after patch {disp:#010x}"
+            "lazy flags differ after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
         );
         assert_eq!(
             native_bus.memory, interpreter_bus.memory,
-            "guest memory differs after patch {disp:#010x}"
+            "guest memory differs after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
         );
     }
 }
@@ -366,7 +394,9 @@ fn state_identity(subject: [u8; 2], store: bool, widen: bool) {
 /// 96.8% of its joined block kills.
 #[test]
 fn dword_store_lane_matches_the_interpreter_across_patches() {
-    state_identity(STORE_DWORD, true, false);
+    for one_lookup_store in [true, false] {
+        state_identity(STORE_DWORD, true, false, one_lookup_store);
+    }
 }
 
 /// `0x88 MOV [disp32], r8` — the same instruction one width down, and the second width the
@@ -374,14 +404,21 @@ fn dword_store_lane_matches_the_interpreter_across_patches() {
 /// lane arm shows here and not above.
 #[test]
 fn byte_store_lane_matches_the_interpreter_across_patches() {
-    state_identity(STORE_BYTE, true, false);
+    for one_lookup_store in [true, false] {
+        state_identity(STORE_BYTE, true, false, one_lookup_store);
+    }
 }
 
 /// `0x8B MOV r32, [disp32]` — the load widening, which is a different KIND and a different
 /// emitter from the two above and is separately knobbed.
 #[test]
 fn dword_load_widen_lane_matches_the_interpreter_across_patches() {
-    state_identity(LOAD_DWORD, false, true);
+    // The load arm too, and its second leg is NOT vacuous: `one_lookup_store` gates the store
+    // STUB PAD, which `compile` builds for any store-bearing block, so a widened load compiled
+    // beside stores would meet a different emission budget under the two arms.
+    for one_lookup_store in [true, false] {
+        state_identity(LOAD_DWORD, false, true, one_lookup_store);
+    }
 }
 
 /// THE MID-BLOCK PATCH: the store lane's own record is rewritten while the block is installed.
@@ -392,8 +429,8 @@ fn dword_load_widen_lane_matches_the_interpreter_across_patches() {
 /// correctly.
 #[test]
 fn a_store_lane_write_preserves_the_owning_block_and_its_native_entry() {
-    let _arms = force_arms(true, false);
-    let (mut cpu, mut bus, id) = lane_fixture(STORE_DWORD, TARGETS[0]);
+    let arms = force_arms(true, false, SHIPPED_STORE_PATH);
+    let (mut cpu, mut bus, id) = lane_fixture(&arms, STORE_DWORD, TARGETS[0]);
     assert_eq!(
         cpu.direct_stall_snapshot().disp_store_lane_registrations,
         1,
@@ -444,8 +481,8 @@ fn a_store_lane_write_preserves_the_owning_block_and_its_native_entry() {
 /// kills on duke3d-586-short to `0x89` alone).
 #[test]
 fn store_lane_writes_contribute_no_smc_heat() {
-    let _arms = force_arms(true, false);
-    let (mut cpu, mut bus, id) = lane_fixture(STORE_DWORD, TARGETS[0]);
+    let arms = force_arms(true, false, SHIPPED_STORE_PATH);
+    let (mut cpu, mut bus, id) = lane_fixture(&arms, STORE_DWORD, TARGETS[0]);
     for round in 0..64u32 {
         // Every value distinct from the last and none equal to the compiled displacement, so G2
         // same-value elision never hides a round from the choke. Page 1 throughout, which is
@@ -489,12 +526,13 @@ fn capped_image(fillers: usize, tail: &[u8]) -> (Vec<u8>, Vec<u32>) {
 /// Compile (and install) a `fillers` + `tail` block, optionally seeding the tail's disp record.
 /// The bus is returned so it outlives the compilation: the lanes hold host pointers into it.
 fn capped_fixture(
+    arms: &ArmOverride,
     fillers: usize,
     tail: &[u8],
     seed_tail: bool,
 ) -> (CpuGsw, TestBus, jit::direct::Compilation) {
     let (memory, starts) = capped_image(fillers, tail);
-    let mut cpu = flat_cpu();
+    let mut cpu = flat_cpu(arms);
     let mut bus = test_bus(memory);
     map_flat_pages(&mut cpu, &mut bus);
     decode_at(&mut cpu, &mut bus, &starts);
@@ -534,10 +572,10 @@ fn capped_fixture(
 /// the five zeros are what catches it.
 #[test]
 fn the_thirteenth_store_slot_charges_exactly_one_store_cap_refusal() {
-    let _arms = force_arms(true, false);
+    let arms = force_arms(true, false, SHIPPED_STORE_PATH);
     let mut tail = STORE_DWORD.to_vec();
     tail.extend_from_slice(&TARGETS[0].to_le_bytes());
-    let (cpu, _bus, compilation) = capped_fixture(LANES, &tail, true);
+    let (cpu, _bus, compilation) = capped_fixture(&arms, LANES, &tail, true);
     assert_eq!(
         compilation.imm_lane_count(),
         LANES,
@@ -559,10 +597,10 @@ fn the_thirteenth_store_slot_charges_exactly_one_store_cap_refusal() {
 /// which is the whole `0x89` population being reported as budget pressure on any real workload.
 #[test]
 fn a_store_slot_the_heat_gate_refuses_charges_no_cap_refusal() {
-    let _arms = force_arms(true, false);
+    let arms = force_arms(true, false, SHIPPED_STORE_PATH);
     let mut tail = STORE_DWORD.to_vec();
     tail.extend_from_slice(&TARGETS[0].to_le_bytes());
-    let (cpu, _bus, compilation) = capped_fixture(LANES, &tail, false);
+    let (cpu, _bus, compilation) = capped_fixture(&arms, LANES, &tail, false);
     assert_eq!(compilation.imm_lane_count(), LANES);
     assert_eq!(compilation.disp_store_lane_count(), 0);
     assert_eq!(cap_refusals(&cpu), [0; jit::direct::LANE_CAP_FAMILIES]);
@@ -571,10 +609,10 @@ fn a_store_slot_the_heat_gate_refuses_charges_no_cap_refusal() {
 /// The same pair for the load-widening arm, so neither arm can inherit the other's cap cell.
 #[test]
 fn the_thirteenth_load_widen_slot_charges_exactly_one_widen_cap_refusal() {
-    let _arms = force_arms(false, true);
+    let arms = force_arms(false, true, SHIPPED_STORE_PATH);
     let mut tail = LOAD_DWORD.to_vec();
     tail.extend_from_slice(&TARGETS[0].to_le_bytes());
-    let (cpu, _bus, compilation) = capped_fixture(LANES, &tail, true);
+    let (cpu, _bus, compilation) = capped_fixture(&arms, LANES, &tail, true);
     assert_eq!(compilation.imm_lane_count(), LANES);
     assert_eq!(compilation.disp_load_widen_lane_count(), 0);
     assert_eq!(cap_refusals(&cpu), [0, 0, 0, 0, 0, 1]);
@@ -589,10 +627,10 @@ fn the_thirteenth_load_widen_slot_charges_exactly_one_widen_cap_refusal() {
 #[test]
 fn the_off_arms_charge_no_cap_refusal_at_the_thirteenth_slot() {
     for subject in [STORE_DWORD, LOAD_DWORD] {
-        let _arms = force_arms(false, false);
+        let arms = force_arms(false, false, SHIPPED_STORE_PATH);
         let mut tail = subject.to_vec();
         tail.extend_from_slice(&TARGETS[0].to_le_bytes());
-        let (cpu, _bus, compilation) = capped_fixture(LANES, &tail, true);
+        let (cpu, _bus, compilation) = capped_fixture(&arms, LANES, &tail, true);
         assert_eq!(compilation.disp_store_lane_count(), 0);
         assert_eq!(compilation.disp_load_widen_lane_count(), 0);
         assert_eq!(
@@ -613,8 +651,17 @@ fn the_off_arms_charge_no_cap_refusal_at_the_thirteenth_slot() {
 /// stray lane moves — the lane arm emits `mov r64, imm64` plus `mov eax, [r64]` where the baked
 /// arm emits one `mov eax, imm32`.
 fn emitted_len_under_arms(middle: &[u8], store: bool, widen: bool) -> usize {
-    let _arms = force_arms(store, widen);
-    let mut cpu = flat_cpu();
+    emitted_len_on_store_path(middle, store, widen, SHIPPED_STORE_PATH)
+}
+
+fn emitted_len_on_store_path(
+    middle: &[u8],
+    store: bool,
+    widen: bool,
+    one_lookup_store: bool,
+) -> usize {
+    let arms = force_arms(store, widen, one_lookup_store);
+    let mut cpu = flat_cpu(&arms);
     let mut memory = vec![0u8; 0x5000];
     let mut code = vec![0x89, 0xf6];
     code.extend_from_slice(middle);
@@ -711,7 +758,7 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
 /// reason a three-byte disp8 form is NOT in this list. Each is named on its own line.
 #[test]
 fn the_store_arm_refuses_every_shape_outside_its_bars() {
-    let _arms = force_arms(true, true);
+    let arms = force_arms(true, true, SHIPPED_STORE_PATH);
     // `mov word [disp32], bx`. SEVEN bytes with the displacement still last, so with the prefix
     // term deleted `len - 4` lands on a real disp byte and the slot takes a lane at a WORD store.
     let mut prefixed = vec![0x66, 0x89, 0x1d];
@@ -749,7 +796,7 @@ fn the_store_arm_refuses_every_shape_outside_its_bars() {
         &[0x89, 0xd8][..],
         &[0x8b, 0xd8][..],
     ] {
-        let mut cpu = flat_cpu();
+        let mut cpu = flat_cpu(&arms);
         let mut memory = vec![0u8; 0x5000];
         let mut code = vec![0x89, 0xf6];
         code.extend_from_slice(middle);
@@ -785,8 +832,8 @@ fn the_store_arm_refuses_every_shape_outside_its_bars() {
 #[test]
 fn the_shipped_8a_lane_is_unchanged_by_both_arms() {
     for (store, widen) in [(false, false), (true, false), (false, true), (true, true)] {
-        let _arms = force_arms(store, widen);
-        let mut cpu = flat_cpu();
+        let arms = force_arms(store, widen, SHIPPED_STORE_PATH);
+        let mut cpu = flat_cpu(&arms);
         let mut bus = test_bus(image([0x8a, 0x1d], TARGETS[0]));
         map_flat_pages(&mut cpu, &mut bus);
         decode_at(&mut cpu, &mut bus, &block_starts());
@@ -803,6 +850,149 @@ fn the_shipped_8a_lane_is_unchanged_by_both_arms() {
     }
 }
 
+/// ANTI-VACUITY FOR THE STORE-PATH ARM. The two legs of every `state_identity` fixture are only
+/// worth running if they compile DIFFERENT code, and that is asserted rather than assumed: with
+/// `one_lookup_store` on, `emit_store_fast` emits the bias-probe shape; off, `emit_store`
+/// classifies the page kind itself. Both reach the lane through `emit_segmented_linear_address`.
+#[test]
+fn the_two_store_paths_emit_different_code_for_a_laned_store() {
+    let mut store = STORE_DWORD.to_vec();
+    store.extend_from_slice(&TARGETS[0].to_le_bytes());
+    assert_ne!(
+        emitted_len_on_store_path(&store, true, false, true),
+        emitted_len_on_store_path(&store, true, false, false),
+        "the two store paths must be different code, or the second leg of every state-identity          fixture is a re-run of the first"
+    );
+}
+
+/// The DS base for the finite-limit fixture. Non-zero deliberately: `emit_segmented_linear_address`
+/// emits the base add ONLY when `descriptor.base != 0`, so with a flat DS that instruction does
+/// not exist and no other fixture in this file compiles it downstream of a lane.
+const LIMITED_DS_BASE: u32 = 0x1000;
+/// ...and the limit, likewise emitted ONLY when `limit != u32::MAX`. `max_start` for a dword store
+/// is `limit - 3 = 0x2ffc`.
+const LIMITED_DS_LIMIT: u32 = 0x2fff;
+/// Displacements for the finite-limit fixture, as SEGMENT OFFSETS. The first three are inside the
+/// limit (the third is exactly `max_start`, the boundary the compare is written against); the
+/// last is past it, and its linear address `0x4000` is a mapped, writable page, so a missing
+/// limit check lands a real store there instead of faulting.
+const LIMITED_OFFSETS: [u32; 4] = [0x1000, 0x1ffc, 0x2ffc, 0x3000];
+
+fn limited_ds_cpu(arms: &ArmOverride) -> CpuGsw {
+    let mut cpu = flat_cpu(arms);
+    let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+    ds.base = LIMITED_DS_BASE;
+    ds.limit = LIMITED_DS_LIMIT;
+    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+    cpu
+}
+
+/// THE LANE UNDER A FINITE SEGMENT, which is the one emission shape no other fixture here
+/// compiles: `emit_segmented_linear_address` emits its limit compare only when
+/// `limit != u32::MAX` and its base add only when `base != 0`, and both sit DOWNSTREAM of
+/// `emit_effective_address` — so with a lane they run on the PATCHED displacement.
+///
+/// Two claims, and the second is the one that would be a miscompile:
+///
+/// 1. inside the limit, a laned store lands at `base + patched_disp` and the whole architectural
+///    state matches an interpreter running the same bytes with no block;
+/// 2. patched PAST the limit, the native block takes the `SegmentLimit` side exit — one exit,
+///    that guard and no other — leaves EIP on the store with no effect, and writes nothing at the
+///    linear address the store would otherwise have reached.
+///
+/// Claim 2 is what a lane arm that formed the address after the compare, or that skipped the
+/// compare because the compile-time `disp` was in range, would fail. Both store paths are run.
+#[test]
+fn a_laned_store_under_a_finite_segment_limit_matches_the_interpreter_and_exits() {
+    for one_lookup_store in [true, false] {
+        let arms = force_arms(true, false, one_lookup_store);
+        let mut native = limited_ds_cpu(&arms);
+        let mut native_bus = test_bus(image(STORE_DWORD, LIMITED_OFFSETS[0]));
+        map_flat_pages(&mut native, &mut native_bus);
+        decode_at(&mut native, &mut native_bus, &block_starts());
+        seed_patch_history(&mut native, LANE);
+        let id = install(&mut native, 3);
+        assert_eq!(
+            native.direct_stall_snapshot().disp_store_lane_registrations,
+            1,
+            "the finite-segment store must still take a lane (one_lookup_store={one_lookup_store})"
+        );
+
+        let mut interpreter = limited_ds_cpu(&arms);
+        let mut interpreter_bus = test_bus(image(STORE_DWORD, LIMITED_OFFSETS[0]));
+        decode_at(&mut interpreter, &mut interpreter_bus, &block_starts());
+
+        for (round, &offset) in LIMITED_OFFSETS.iter().enumerate() {
+            if round != 0 {
+                guest_store(&mut native, &mut native_bus, LANE, offset);
+                guest_store(&mut interpreter, &mut interpreter_bus, LANE, offset);
+            }
+            let ebx = 0x7071_7200u32.wrapping_add(round as u32 + 1);
+            arm_cpu(&mut native, ebx);
+            arm_cpu(&mut interpreter, ebx);
+
+            let block = native
+                .jit_direct
+                .block(id)
+                .expect("a lane write must not retire the block");
+            let side_exits = native.perf_counters().jit_direct_side_exits;
+            let limit_exits = native.direct_stall_snapshot().side_exit_segment_limit;
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap(),
+                "native block did not run in round {round}"
+            );
+
+            let past_limit = offset > LIMITED_DS_LIMIT - 3;
+            // The interpreter runs the whole block inside the limit, and stops BEFORE the store
+            // on the last round -- the native leg side-exits there, so one cycle is the state the
+            // two are compared at. The fault itself is the interpreter's on the re-run and is not
+            // this fixture's subject.
+            for _ in 0..if past_limit { 1 } else { 3 } {
+                interpreter.cycle(&mut interpreter_bus).unwrap();
+            }
+
+            assert_eq!(
+                native.registers, interpreter.registers,
+                "registers differ at offset {offset:#x} (one_lookup_store={one_lookup_store})"
+            );
+            assert_eq!(
+                native_bus.memory, interpreter_bus.memory,
+                "guest memory differs at offset {offset:#x}                  (one_lookup_store={one_lookup_store})"
+            );
+            let exits = native.perf_counters().jit_direct_side_exits - side_exits;
+            let limits = native.direct_stall_snapshot().side_exit_segment_limit - limit_exits;
+            if past_limit {
+                assert_eq!(exits, 1, "exactly one side exit at offset {offset:#x}");
+                assert_eq!(
+                    limits, 1,
+                    "and it must be the SegmentLimit guard, not some other one"
+                );
+                assert_eq!(
+                    native.registers.eip,
+                    ENTRY + SUBJECT_OFFSET,
+                    "the side exit must leave EIP on the store, before any effect"
+                );
+                let linear = (LIMITED_DS_BASE + offset) as usize;
+                assert_eq!(
+                    &native_bus.memory[linear..linear + 4],
+                    &[0u8; 4],
+                    "a store past the limit must write NOTHING at the address it would reach"
+                );
+            } else {
+                assert_eq!(limits, 0, "no limit exit inside the limit");
+                let linear = (LIMITED_DS_BASE + offset) as usize;
+                assert_eq!(
+                    &native_bus.memory[linear..linear + 4],
+                    &ebx.to_le_bytes(),
+                    "the store must land at base + PATCHED displacement ({linear:#x})"
+                );
+            }
+        }
+    }
+}
+
 /// THE SIB disp32 STORE (`89 1c 85 dd dd dd dd`, `MOV [EAX*4 + disp32], EBX`) — SEVEN bytes with
 /// the displacement at offset 3, the one admitted encoding whose disp is NOT two bytes in.
 ///
@@ -816,8 +1006,8 @@ fn the_shipped_8a_lane_is_unchanged_by_both_arms() {
 /// keeps a never-patched indexed store untaxed is the heat gate, not a shape cut.
 #[test]
 fn a_sib_disp32_store_lanes_at_the_right_offset() {
-    let _arms = force_arms(true, false);
-    let mut cpu = flat_cpu();
+    let arms = force_arms(true, false, SHIPPED_STORE_PATH);
+    let mut cpu = flat_cpu(&arms);
     let mut memory = vec![0u8; 0x5000];
     let mut code = vec![0x89, 0xf6, 0x89, 0x1c, 0x85];
     code.extend_from_slice(&TARGETS[0].to_le_bytes());

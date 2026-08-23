@@ -239,23 +239,108 @@ fn disp_store_rows_attribute_crossings_per_opcode() {
     // different class and must not have produced one.
     assert_eq!(rows.len(), 3, "{lines:?}");
     assert!(rows[0].contains("rank arm opcode"), "{rows:?}");
-    // smc_disp_store rank arm opcode modrm_reg events blocks_killed narrow_kills newly_hot
+    // smc_disp_store rank arm opcode modrm_reg disp_len prefixes admissible events
+    // blocks_killed narrow_kills newly_hot
     let first: Vec<&str> = rows[1].split_whitespace().collect();
     assert_eq!(first[2], "store", "the 0x89 row names the store arm");
     assert_eq!(first[3], "0x0089", "opcode");
     assert_eq!(first[4], "3", "modrm_reg, the smc_shape join key");
-    assert_eq!(first[5], "2", "events");
-    assert_eq!(first[6], "2", "blocks_killed");
-    assert_eq!(first[7], "4", "narrow_kills");
     assert_eq!(
-        first[8], "6",
+        first[5], "4",
+        "disp_len, in the key so disp8 gets its own cell"
+    );
+    assert_eq!(first[6], "none", "prefixes");
+    assert_eq!(first[7], "yes", "admissible");
+    assert_eq!(first[8], "2", "events");
+    assert_eq!(first[9], "2", "blocks_killed");
+    assert_eq!(first[10], "4", "narrow_kills");
+    assert_eq!(
+        first[11], "6",
         "newly_hot, the capture numerator, PER OPCODE"
     );
     let second: Vec<&str> = rows[2].split_whitespace().collect();
     assert_eq!(second[2], "load_widen");
     assert_eq!(second[3], "0x008b");
-    assert_eq!(second[5], "1", "events");
-    assert_eq!(second[8], "3", "newly_hot");
+    assert_eq!(second[8], "1", "events");
+    assert_eq!(second[11], "3", "newly_hot");
+}
+
+/// THE SUPERSET TRAP the key exists to close: a `0x89 /3` the store arm CANNOT admit — a disp8
+/// form, and a `0x66`-prefixed disp32 one — must land in their own cells, marked inadmissible,
+/// rather than inflating the disp32 cell's `newly_hot`.
+///
+/// Keyed on (opcode, modrm reg) alone all three writes below share one row and its capture
+/// numerator reads 9 instead of the 3 the arm can actually take.
+#[test]
+fn inadmissible_disp_shapes_do_not_share_a_cell_with_the_admitted_one() {
+    let mut trace = SmcTrace::default();
+    let action = SmcTraceAction {
+        blocks_killed: 0,
+        narrow_kills: 0,
+        wholesale: false,
+        newly_hot: 3,
+    };
+    // The admitted shape.
+    trace.record(
+        0x5_0002,
+        4,
+        SmcTracePre::new(Some((0x5_0000, mov_disp32(0x89))), 1_000),
+        action,
+    );
+    // Same opcode and same modrm reg, disp8: three bytes, the displacement last.
+    let mut disp8 = mov_disp32(0x89);
+    disp8.len = 3;
+    disp8.disp_len = 1;
+    disp8.modrm = Some(ModRm {
+        mode: 1,
+        reg: 3,
+        rm: 5,
+    });
+    trace.record(
+        0x5_0102,
+        1,
+        SmcTracePre::new(Some((0x5_0100, disp8)), 1_000),
+        action,
+    );
+    // Same opcode, same modrm reg, disp32 — but behind a `0x66`.
+    let mut prefixed = mov_disp32(0x89);
+    prefixed.len = 7;
+    prefixed.prefixes = Prefixes {
+        operand_size_override: true,
+        ..Prefixes::default()
+    };
+    trace.record(
+        0x5_0203,
+        4,
+        SmcTracePre::new(Some((0x5_0200, prefixed)), 1_000),
+        action,
+    );
+    let lines = trace.report_lines();
+    let rows: Vec<Vec<&str>> = lines
+        .iter()
+        .filter(|line| line.starts_with("smc_disp_store ") && !line.contains("rank arm"))
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(rows.len(), 3, "three cells, not one: {lines:?}");
+    let admitted: Vec<&Vec<&str>> = rows.iter().filter(|r| r[7] == "yes").collect();
+    assert_eq!(
+        admitted.len(),
+        1,
+        "exactly one cell is admissible: {rows:?}"
+    );
+    assert_eq!(admitted[0][5], "4", "the admissible cell is the disp32 one");
+    assert_eq!(admitted[0][6], "none");
+    assert_eq!(
+        admitted[0][11], "3",
+        "the capture numerator counts ONLY the shape the arm can take"
+    );
+    for row in rows.iter().filter(|r| r[7] == "no") {
+        assert!(
+            row[5] == "1" || row[6] == "other",
+            "an inadmissible cell is the disp8 one or the prefixed one: {row:?}"
+        );
+        assert_eq!(row[11], "3");
+    }
 }
 
 /// The shipped `0x8A` lane class rides in the same table as its own row, because its kill rate is
@@ -274,7 +359,7 @@ fn the_shipped_8a_lane_class_has_its_own_disp_store_row() {
         trace
             .report_lines()
             .iter()
-            .any(|line| line.starts_with("smc_disp_store 0 laned_8a 0x008a 3 1 ")),
+            .any(|line| line.starts_with("smc_disp_store 0 laned_8a 0x008a 3 4 none yes 1 ")),
         "{:?}",
         trace.report_lines()
     );

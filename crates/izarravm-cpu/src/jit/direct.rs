@@ -4958,18 +4958,33 @@ pub(crate) struct DirectAddr {
     pub(crate) index: Option<u8>,
     pub(crate) scale: u8,
     pub(crate) disp: u32,
-    /// Present only for the shapes `disp_lane_for` admits (the `0x8A MOV r8, [..disp32..]`
-    /// family). When present the emitted effective address IGNORES `disp` and loads the four
-    /// displacement bytes out of guest RAM on every execution, so a guest patch of those bytes
-    /// needs no recompile. `disp` still carries the value decoded at compile time and is what
-    /// the non-lane form bakes.
+    /// Present only for the shapes the THREE displacement-lane matchers in `jit::direct::disp_lanes`
+    /// admit, and they are no longer one family:
+    ///
+    /// * `disp_lane_for` — `0x8A MOV r8, [..disp32..]`, default ON;
+    /// * `disp_load_widen_lane_for` — `0x8B MOV r32, [..disp32..]`, `IZARRAVM_DISP_LOAD_WIDEN`,
+    ///   default OFF;
+    /// * `disp_store_lane_for` — `0x89 MOV [..disp32..], r32` and `0x88 MOV [..disp32..], r8`,
+    ///   `IZARRAVM_DISP_STORE_LANES`, default OFF. **So a lane can now ride a `Store`.**
+    ///
+    /// When present the emitted effective address IGNORES `disp` and loads the four displacement
+    /// bytes out of guest RAM on every execution, so a guest patch of those bytes needs no
+    /// recompile. `disp` still carries the value decoded at compile time and is what the non-lane
+    /// form bakes.
     ///
     /// It rides on the ADDRESS rather than on `DirectKind::Load` because the displacement's one
     /// consumer is `emit_effective_address` and every memory emitter reaches it through
     /// `emit_segmented_linear_address` — including the one-lookup fast paths — so a single seam
-    /// serves them all, and a later Store/AluMemSource admission is a `disp_lane_for` widening
-    /// rather than new plumbing. The lane arm forms the address through EAX alone, so it is
-    /// safe whatever a caller has staged in the other scratch registers.
+    /// serves them all. That is what made the Store admission a matcher widening rather than new
+    /// plumbing, and it is why the segment-limit compare and the base add downstream of the lane
+    /// arm run on the PATCHED address: a store whose patched displacement walks past the limit
+    /// takes the same `segment_limit` side exit the baked form would.
+    ///
+    /// The lane arm forms the address through EAX alone, so it is safe whatever a caller has
+    /// staged in the other scratch registers — and, for the Store admission, both store emitters
+    /// were checked to stage NOTHING across it (`emit_store` and `emit_store_fast` both form the
+    /// address first). An `AluMemSource` / `RmwIncDec` / x87 admission is still unmeasured and
+    /// still owes its own review and census row.
     pub(crate) disp_lane: Option<ImmLane>,
 }
 
@@ -7316,11 +7331,16 @@ fn compile_with_budget(
                             kind
                         }
                         // The two Option D arms, LAST because they are the only default-OFF
-                        // matchers in the chain: on a shipped binary both return on their knob
-                        // and the walk pays two predicted-not-taken branches per slot that
-                        // reached here, which is every slot the four shipped matchers refused.
-                        // They are mutually exclusive with everything above by KIND and OPCODE,
-                        // so the position is cost, never admission.
+                        // matchers in the chain. THE OFF-ARM PRICE, stated exactly rather than
+                        // waved at: each arm tests its own knob first and returns there, so a
+                        // shipped binary pays TWO `OnceLock` reads and their two branches per
+                        // slot that reaches here -- not one branch, and not a shared test, because
+                        // the arms are separately knobbed and `option_d_lane_for` calls them in
+                        // turn. The `OnceLock` is resolved once per process, so each read is a
+                        // relaxed load of an initialised cell plus a predicted-not-taken branch;
+                        // the slots that reach here are the ones all four shipped matchers
+                        // refused. The arms are mutually exclusive with everything above by KIND
+                        // and OPCODE, so the position is cost, never admission.
                         None => match option_d_lane_for(
                             cpu,
                             &insn,

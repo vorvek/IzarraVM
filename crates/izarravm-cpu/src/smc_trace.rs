@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 
-use crate::DecodedInsn;
+use crate::{DecodedInsn, Prefixes};
 
 /// How the write landed inside the instruction it overwrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +115,11 @@ struct InsnIdentity {
     imm_len: u8,
     disp_len: u8,
     operand_bytes: u32,
+    /// Whether the overwritten instruction carried NO prefixes at all. It is a bool rather than
+    /// the `Prefixes` value because that is the only distinction any lane matcher makes
+    /// (`prefixes == Prefixes::default()` is a bar on all three), and it is what keeps a
+    /// `0x66`-prefixed store out of the same `disp_store` cell as the shapes the arm admits.
+    default_prefixes: bool,
 }
 
 /// One traced write address. Sites are keyed by the write's physical address and width, so a
@@ -168,10 +173,16 @@ pub(crate) struct SmcTrace {
     /// THE `disp_store` CENSUS ROW, owed by the register-pressure contract's standing rule
     /// against unmeasured admissions and by the 2026-08-23 settling census §6.3.
     ///
-    /// One row per (opcode, modrm reg) over the four MOV displacement opcodes -- `0x88`, `0x89`,
-    /// `0x8A`, `0x8B` -- inside the `disp` class, carrying `events`, `blocks_killed`,
-    /// `narrow_kills` and, decisively, `newly_hot`. Complete per event the way the class totals
-    /// are, and joinable to `smc_shape` on `opcode` + `modrm_reg`.
+    /// One row per (opcode, modrm reg, `disp_len`, prefix state) over the four MOV displacement
+    /// opcodes -- `0x88`, `0x89`, `0x8A`, `0x8B` -- inside the `disp` class, carrying `events`,
+    /// `blocks_killed`, `narrow_kills` and, decisively, `newly_hot`. Complete per event the way
+    /// the class totals are, and joinable to `smc_shape` on `opcode` + `modrm_reg` by summing the
+    /// cells that share those two fields.
+    ///
+    /// `disp_len` and the prefix state are IN THE KEY because the matchers bar on them. A row
+    /// keyed on (opcode, modrm reg) alone is a SUPERSET of what any arm can admit -- it sums the
+    /// disp8 and `0x66`-prefixed forms into the same cell -- and its `newly_hot` would then
+    /// overstate the capture numerator. The `admissible` column reports the two bars per row.
     ///
     /// WHY `newly_hot` PER OPCODE IS THE POINT. Option D's capture fraction has until now been
     /// estimated as joined un-laned-disp crossings over the whole run's `smc_heat_chunks_hot`.
@@ -253,6 +264,7 @@ impl SmcTrace {
                     imm_len: insn.imm_len,
                     disp_len: insn.disp_len,
                     operand_bytes: insn.operand_size.bytes(),
+                    default_prefixes: insn.prefixes == Prefixes::default(),
                 }),
                 physical.wrapping_sub(start),
             ),
@@ -277,12 +289,22 @@ impl SmcTrace {
         }
         // The `disp_store` row, charged on the same event and from the same `action` as the class
         // totals beside it, so the two can never disagree about one write.
+        //
+        // THE KEY CARRIES `disp_len` AND THE PREFIX STATE, not just (opcode, modrm reg), because
+        // the matchers do: a `0x89 /1` with a disp8, or one behind a `0x66`, is REFUSED by
+        // `disp_store_lane_for` and would otherwise be summed into the same cell as the disp32
+        // forms the arm actually admits. Keyed on (opcode, modrm reg) alone the row is a superset
+        // of the admissible population and its capture numerator reads high. Keyed this way each
+        // cell is either entirely admissible or entirely not, and the (opcode, modrm reg) join to
+        // `smc_shape` still works by summing the cells that share those two fields.
         if class == SmcFieldClass::DisplacementOnly
             && let Some(identity) = identity
             && disp_store_arm(identity.opcode).is_some()
         {
-            let key = (u32::from(identity.opcode) << 8)
-                | u32::from(identity.modrm.map_or(0xFF, |(_, reg, _)| reg));
+            let key = (u32::from(identity.opcode) << 16)
+                | (u32::from(identity.modrm.map_or(0xFF, |(_, reg, _)| reg)) << 8)
+                | (u32::from(identity.disp_len) << 1)
+                | u32::from(identity.default_prefixes);
             let row = self.disp_store_rows.entry(key).or_default();
             row.events += 1;
             row.blocks_killed += u64::from(action.blocks_killed);
@@ -389,20 +411,30 @@ impl SmcTrace {
         // `smc_shape` convention one table up.
         disp_store.sort_by(|a, b| b.1.events.cmp(&a.1.events).then(a.0.cmp(b.0)));
         lines.push(
-            "smc_disp_store rank arm opcode modrm_reg events blocks_killed narrow_kills newly_hot"
+            "smc_disp_store rank arm opcode modrm_reg disp_len prefixes admissible events blocks_killed narrow_kills newly_hot"
                 .to_string(),
         );
         for (rank, (key, row)) in disp_store.iter().enumerate() {
-            let opcode = (*key >> 8) as u16;
-            let modrm_reg = *key & 0xFF;
+            let opcode = (*key >> 16) as u16;
+            let modrm_reg = (*key >> 8) & 0xFF;
+            let disp_len = (*key >> 1) & 0x7F;
+            let default_prefixes = *key & 1 != 0;
+            // The matchers' two static bars, restated as a column so a reader does not have to
+            // recompute them: a cell is admissible to its arm only at disp32 with no prefixes.
+            // (`imm_len == 0` and the memory-form test are implied -- no `0x88`/`0x89`/`0x8B`
+            // encoding carries an immediate, and a register form has no displacement field to
+            // classify as one.) The arm's KNOB is a separate question and is not in this table.
+            let admissible = disp_len == 4 && default_prefixes;
             lines.push(format!(
-                "smc_disp_store {rank} {} {opcode:#06x} {} {} {} {} {}",
+                "smc_disp_store {rank} {} {opcode:#06x} {} {disp_len} {} {} {} {} {} {}",
                 disp_store_arm(opcode).unwrap_or("-"),
                 if modrm_reg == 0xFF {
                     "-".to_string()
                 } else {
                     modrm_reg.to_string()
                 },
+                if default_prefixes { "none" } else { "other" },
+                if admissible { "yes" } else { "no" },
                 row.events,
                 row.blocks_killed,
                 row.narrow_kills,

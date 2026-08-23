@@ -13,8 +13,15 @@
 //! | `disp_load_widen_lane_for` | `0x8B` mem, disp32 | `IZARRAVM_DISP_LOAD_WIDEN` | OFF | `smc_disp_load_widen_lane_*` |
 //! | `disp_store_lane_for` | `0x89` / `0x88` mem, disp32 | `IZARRAVM_DISP_STORE_LANES` | OFF | `smc_disp_store_lane_*` |
 //!
-//! `disp_lane_for` moved here from `direct.rs` UNCHANGED, to keep that file under the layout
-//! limit. Not a line of it, and none of its doc comment, changed in the move.
+//! `disp_lane_for` moved here from `direct.rs` to keep that file under the layout limit. ONE
+//! TOKEN changed in the move and it is named here so "unchanged" is checkable rather than
+//! asserted: `fn disp_lane_for` became `pub(crate) fn disp_lane_for`, because the compile walk
+//! that calls it is now in the parent module. Its body, its bars, its ordering and every line of
+//! its doc comment are byte-identical to `f6620e6e`.
+//!
+//! The two new arms are PRIVATE. Only `disp_lane_for` (the walk calls it directly, ahead of these
+//! two) and `option_d_lane_for` (the walk's one entry to both new arms) leave this module, so the
+//! two knob tests and the arm selection cannot be reached from anywhere that could skip one.
 //!
 //! # The shape of the two new arms, and what is deliberately NOT in them
 //!
@@ -270,7 +277,7 @@ fn shared_disp32_lane(
 /// `AluMemDest` and the x87 stores. Those are unmeasured admissions with emitters this arm's
 /// review did not cover, and they wait for a census row of their own — the standing rule the
 /// register-pressure contract states.
-pub(crate) fn disp_store_lane_for(
+fn disp_store_lane_for(
     cpu: &CpuGsw,
     insn: &DecodedInsn,
     kind: DirectKind,
@@ -330,7 +337,7 @@ pub(crate) fn disp_store_lane_for(
 /// movement to the arm that caused it. It also keeps the shipped `0x8A` matcher byte-identical
 /// under this change, which is what makes the OFF-arm identity claim checkable rather than
 /// argued.
-pub(crate) fn disp_load_widen_lane_for(
+fn disp_load_widen_lane_for(
     cpu: &CpuGsw,
     insn: &DecodedInsn,
     kind: DirectKind,
