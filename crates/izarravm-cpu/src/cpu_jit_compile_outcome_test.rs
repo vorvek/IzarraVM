@@ -3760,7 +3760,7 @@ fn barrier_census_closure_dormant_heat_histogram_closes_on_its_class() {
 #[cfg(feature = "barrier-census-closure")]
 #[test]
 fn barrier_census_closure_dormant_heat_histogram_carries_its_truncated_tail() {
-    const SITES: usize = jit::direct::census::DORMANT_HEAT_SITES + 20;
+    const SITES: usize = jit::direct::DORMANT_HEAT_SITES + 20;
     let mut cpu = CpuGsw::default();
     cpu.enable_direct_barrier_census(true);
 
@@ -3781,7 +3781,7 @@ fn barrier_census_closure_dormant_heat_histogram_carries_its_truncated_tail() {
         .expect("enabled census snapshot");
     assert_eq!(
         snapshot.dormant_heat_sites.len(),
-        jit::direct::census::DORMANT_HEAT_SITES,
+        jit::direct::DORMANT_HEAT_SITES,
         "the published head is limited"
     );
     assert_eq!(snapshot.dormant_heat_distinct_sites, SITES as u64);
@@ -3808,8 +3808,8 @@ fn barrier_census_closure_dormant_heat_histogram_carries_its_truncated_tail() {
     // The head really is the LARGEST sites, not the first ones the map happened to yield.
     assert_eq!(snapshot.dormant_heat_sites[0].static_exits, SITES as u64);
     assert_eq!(
-        snapshot.dormant_heat_sites[jit::direct::census::DORMANT_HEAT_SITES - 1].static_exits,
-        (SITES - jit::direct::census::DORMANT_HEAT_SITES + 1) as u64
+        snapshot.dormant_heat_sites[jit::direct::DORMANT_HEAT_SITES - 1].static_exits,
+        (SITES - jit::direct::DORMANT_HEAT_SITES + 1) as u64
     );
 }
 

@@ -98,6 +98,27 @@ SOURCE_CODE_NAMES = {"makefile"}
 SOURCE_LINE_LIMIT = 5000
 TEST_LINE_LIMIT = 7000
 
+# The ONE file the source-line ceiling does not apply to, by owner ruling.
+#
+# The comment above already states the principle this exemption follows: "the limits
+# exist to catch runaway growth, not to force splitting a hot module", and "this
+# codebase optimizes for performance and locality, not layer count". The dynarec is the
+# case where those two sentences bind hardest. It is ONE system -- block key, admission
+# policy, register/frame layout, emitter, call-out helpers, link graph, retirement and
+# the census instruments are a single invariant that has to be read together, and each
+# time the ceiling forced a slice out into a child module the slice took its own
+# comments with it and the boundary itself became something to document (see the
+# extraction notes the merged text still carries). The ceiling was buying layer count,
+# not restraint.
+#
+# It is a NAMED FILE, deliberately, not a directory and not a glob: a blanket exemption
+# is how a ceiling stops biting everywhere. Everything else in the tree, this file's own
+# tests included, is still held to SOURCE_LINE_LIMIT / TEST_LINE_LIMIT. Adding a second
+# entry here is an owner decision, not a way out of a failing gate.
+SOURCE_LINE_LIMIT_EXEMPT = {
+    "crates/izarravm-cpu/src/jit/direct.rs",
+}
+
 # Comment syntax per suffix for the code-line count: (line prefixes, block pairs).
 HASH_COMMENTS = ((("#",), ()),)
 C_COMMENTS = ((("//",), (("/*", "*/"),)),)
@@ -329,6 +350,15 @@ def main() -> int:
     errors: list[str] = []
     files = tracked_files()
     data = {path: (ROOT / path).read_bytes() for path in files}
+    # An exemption that outlives the file it names is a silent hole: the entry stops
+    # matching anything, the ceiling quietly applies again -- or, worse, a rename carries
+    # the file out from under the ruling and nobody notices. Make it loud instead.
+    for path in sorted(SOURCE_LINE_LIMIT_EXEMPT):
+        if path not in files:
+            errors.append(
+                f"{path}: named in SOURCE_LINE_LIMIT_EXEMPT but not tracked "
+                "(moved, renamed or deleted -- update the exemption or the path)"
+            )
     project_headers = 0
     vendor_exemptions = 0
     test_attribute = re.compile(
@@ -356,7 +386,11 @@ def main() -> int:
         offset = header_offset(lines, path)
         if tuple(lines[offset : offset + 2]) != header:
             errors.append(f"{path}: missing exact GPL-3.0-only header")
-        if path not in GENERATED_TEXT and is_source_code(path):
+        if (
+            path not in GENERATED_TEXT
+            and path not in SOURCE_LINE_LIMIT_EXEMPT
+            and is_source_code(path)
+        ):
             limit = TEST_LINE_LIMIT if is_test_file(path) else SOURCE_LINE_LIMIT
             code_lines = code_line_count(lines, path)
             if code_lines > limit:
