@@ -11,6 +11,7 @@
 //! are exposed through channel_out; the nanosecond AC timing is out of scope.
 
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+use std::sync::OnceLock;
 
 /// One 8254 counter. The counting element `count` decrements on each input CLK;
 /// `reload` is the programmed count (0 means 65536). All six modes are modeled.
@@ -875,6 +876,408 @@ impl Counter {
             _ => false,
         }
     }
+
+    // -- Analytic bulk advance (`IZARRAVM_PIT_BULK_ADVANCE`) ------------------
+    //
+    // `advance` and `out_transitions_in` below are the closed forms of `step`
+    // and of the per-CLK observer loop in `Pit::tick_with_observer`. They mirror
+    // `step_counting` arm for arm rather than composing the read-only peeks
+    // (`out_after` / `count_after`), for two reasons that both bite:
+    //
+    //   * the peeks return a 16-bit READ view, and the counting element can
+    //     legitimately hold 0x10000 (a raw reload of 0) at the instant it
+    //     reloads. A masked write-back would be a real state divergence.
+    //   * the peeks do not apply `step_counting`'s lazy GATE-low mode-2/3 OUT
+    //     force. That is harmless while they only READ; a bulk advance WRITES
+    //     the field. See `advance_counting`.
+
+    /// Store a counting-element value computed in the 32-bit domain `wrap32` and
+    /// `effective_reload` work in. Never masked to 16 bits: `count` really does
+    /// hold 0x10000 for one CLK after a raw-zero reload, and `Counter` derives
+    /// `PartialEq`, so a mask here would show up as a state divergence.
+    fn set_count(&mut self, value: u64) {
+        self.count = (value & 0xffff_ffff) as u32;
+    }
+
+    /// Why this counter cannot be advanced analytically, or `None` when it can.
+    ///
+    /// The whole chip is screened through this BEFORE any counter is mutated: a
+    /// decline discovered halfway through would leave a partly advanced chip
+    /// that the per-CLK fallback would then advance a second time.
+    fn bulk_decline(&self) -> Option<BulkDecline> {
+        if self.bcd {
+            // Same ground as `out_after` / `count_after` / `clocks_until_out_rise`:
+            // no PC software clocks the PIT in BCD, so decimal half-cycles are
+            // not modeled analytically. Not the knob -- a BCD counter takes the
+            // loop on both arms.
+            return Some(BulkDecline::Bcd);
+        }
+        let live = matches!(self.state, CounterState::LoadDelay | CounterState::Counting);
+        if live && matches!(self.mode, 2 | 3) && self.effective_reload() <= 1 {
+            // The datasheet's illegal input (count 2 is the minimum for modes 2
+            // and 3). `step_counting` handles it loosely -- it reloads on every
+            // CLK -- which leaves no period for the analytic form to fold, and
+            // in mode 3 no half-period either. Declining is exact by
+            // construction; guessing would not be.
+            return Some(BulkDecline::IllegalReload);
+        }
+        None
+    }
+
+    /// Apply `clocks` input CLKs and return the number of OUT RISING edges in
+    /// `(0, clocks]`. The post-state is what `clocks` calls to `step` produce,
+    /// field for field -- `Counter` derives `PartialEq`, so the differential
+    /// test asserts exactly that and does not spot-check fields.
+    ///
+    /// The caller has already screened the chip through `bulk_decline`, so this
+    /// cannot fail: binary radix, and modes 2/3 have a foldable period.
+    fn advance(&mut self, clocks: u64) -> u64 {
+        if clocks == 0 {
+            return 0;
+        }
+        match self.state {
+            // No live count: `step` returns false and mutates nothing.
+            CounterState::Inactive | CounterState::WaitGate => 0,
+            CounterState::LoadDelay => {
+                // `step`'s LoadDelay arm, verbatim and UNCONDITIONAL -- the load
+                // does not consult GATE. It is also the ONLY place `null_count`
+                // is cleared; the mode-2/3 reload inside `step_counting` does
+                // not clear it.
+                self.count = self.effective_reload();
+                self.null_count = false;
+                self.state = CounterState::Counting;
+                self.advance_counting(clocks - 1)
+            }
+            CounterState::Counting => self.advance_counting(clocks),
+        }
+    }
+
+    /// `advance`'s Counting core: `clocks` CLKs of `step_counting`, closed form.
+    fn advance_counting(&mut self, clocks: u64) -> u64 {
+        if clocks == 0 {
+            return 0;
+        }
+        if !self.gate {
+            // `step_counting`'s lazy GATE-low force, reproduced deliberately.
+            //
+            // The read-only peeks do NOT do this: `out_after`'s Counting +
+            // !gate arm returns the STORED level. Today that divergence is
+            // unreachable -- the only two ways into a GATE-low mode-2/3 state
+            // are `set_gate`'s falling edge and `write_control`, and both set
+            // `out = true` on the way in -- so the peeks and the tick path
+            // agree. This must not LEAN on that: it writes the field, and a
+            // latent disagreement written back is a real state divergence.
+            if matches!(self.mode, 2 | 3) {
+                self.out = true;
+            }
+            return 0;
+        }
+        let v = u64::from(self.count);
+        let r = u64::from(self.effective_reload());
+        match self.mode {
+            0 | 1 => {
+                // The CE decrements every CLK; OUT rises exactly once, on the
+                // CLK that takes it to zero, and only from a low OUT. A `v == 0`
+                // entry wraps rather than edging (the decrement runs before the
+                // zero test), which is `counting_out_after`'s `out || value == 0`
+                // guard; `clocks` is capped below 2^32 by `Pit::bulk_decline`, so
+                // the wrap cannot come back round to zero inside one advance.
+                let rose = !self.out && v != 0 && clocks >= v;
+                if rose {
+                    self.out = true;
+                    if self.mode != 0 {
+                        // Mode 1's one-shot ENDS at terminal count, parking the
+                        // CE at 0; mode 0 keeps decrementing with OUT high.
+                        self.state = CounterState::Inactive;
+                        self.count = 0;
+                        return 1;
+                    }
+                }
+                self.set_count(wrap32(v, clocks));
+                u64::from(rose)
+            }
+            2 => {
+                // The CE walks down to 1 (OUT drops on that CLK) and the NEXT
+                // CLK reloads and raises OUT. So from v >= 2 the first reload
+                // lands on CLK v; from v <= 1 it lands on CLK 1. `rose` at that
+                // first reload is `!out`, which v >= 2 forces true because the
+                // preceding CLK just drove OUT low. `r >= 2` here (bulk_decline).
+                let (first_reload, rose_first) = if v >= 2 { (v, true) } else { (1, !self.out) };
+                if clocks < first_reload {
+                    // Still inside the initial run-down, so v >= 2 and the CE is
+                    // v - clocks; OUT is low only on the single CLK where it is 1.
+                    let count = v - clocks;
+                    self.set_count(count);
+                    if count == 1 {
+                        self.out = false;
+                    }
+                    return 0;
+                }
+                let past = clocks - first_reload;
+                let phase = past % r;
+                self.set_count(r - phase);
+                self.out = phase != r - 1;
+                u64::from(rose_first) + past / r
+            }
+            3 => {
+                // The CE steps by two and an odd count is trimmed on the FIRST
+                // CLK of a half (by one with OUT high, by three with OUT low),
+                // which `mode3_half` / `mode3_value_in_half` already encode. The
+                // two halves sum to exactly `reload`
+                // (`mode3_odd_count_period_is_exact`), so one modulo folds the
+                // remainder into a single period. `r >= 2` here (bulk_decline).
+                let to_toggle = Self::mode3_half(v, self.out);
+                if clocks < to_toggle {
+                    self.set_count(Self::mode3_value_in_half(v, self.out, clocks));
+                    return 0;
+                }
+                let level0 = !self.out; // the level the FIRST toggle lands on
+                let half0 = Self::mode3_half(r, level0);
+                let rem = clocks - to_toggle;
+                let phase = rem % r;
+                let (level, count) = if phase < half0 {
+                    (level0, Self::mode3_value_in_half(r, level0, phase))
+                } else {
+                    (
+                        !level0,
+                        Self::mode3_value_in_half(r, !level0, phase - half0),
+                    )
+                };
+                self.out = level;
+                self.set_count(count);
+                // Toggles after the first land at rem == k*r (back onto level0)
+                // and at rem == k*r + half0 (onto !level0). A rise is a toggle
+                // onto true, so only one of those two families ever counts.
+                if level0 {
+                    1 + rem / r
+                } else if rem >= half0 {
+                    (rem - half0) / r + 1
+                } else {
+                    0
+                }
+            }
+            4 | 5 => {
+                if !self.out {
+                    // Mid-strobe: the very next CLK raises OUT and ends the
+                    // one-shot. The CE does not move.
+                    self.out = true;
+                    self.state = CounterState::Inactive;
+                    return 1;
+                }
+                if v == 0 {
+                    // Degenerate entry: the CE wraps instead of strobing (the
+                    // decrement runs before the zero test), mirroring
+                    // `rise_from`'s None. The sub-2^32 cap on `clocks` keeps the
+                    // wrap from coming back round to zero.
+                    self.set_count(wrap32(v, clocks));
+                    return 0;
+                }
+                if clocks <= v {
+                    self.set_count(v - clocks);
+                    if clocks == v {
+                        self.out = false; // the one strobe CLK
+                    }
+                    return 0;
+                }
+                self.count = 0;
+                self.state = CounterState::Inactive;
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    /// Emit this counter's OUT transitions over the next `clocks` input CLKs as
+    /// 1-based tick numbers, WITHOUT advancing it.
+    ///
+    /// O(transitions), never O(clocks). The observer loop it replaces emits at
+    /// tick `t` when `channel_out(channel)` differs from its value at `t - 1`,
+    /// and a channel's OUT depends on nothing but that channel, so the emitted
+    /// set is exactly this counter's own transitions. It must therefore be read
+    /// off the PRE-advance state -- the caller enumerates before it advances.
+    fn out_transitions_in<F: FnMut(u64, bool)>(&self, clocks: u64, emit: &mut F) {
+        if clocks == 0 {
+            return;
+        }
+        match self.state {
+            CounterState::Inactive | CounterState::WaitGate => {}
+            CounterState::LoadDelay => {
+                // The load CLK moves the CE, never OUT; counting resumes on the
+                // CLK after it, from the reload value.
+                let reload = u64::from(self.effective_reload());
+                self.counting_transitions(reload, clocks - 1, 1, emit);
+            }
+            CounterState::Counting => {
+                self.counting_transitions(u64::from(self.count), clocks, 0, emit)
+            }
+        }
+    }
+
+    /// `out_transitions_in`'s Counting core. `offset` shifts every emitted tick,
+    /// for the LoadDelay entry whose first CLK is the load.
+    fn counting_transitions<F: FnMut(u64, bool)>(
+        &self,
+        v: u64,
+        clocks: u64,
+        offset: u64,
+        emit: &mut F,
+    ) {
+        if clocks == 0 {
+            return;
+        }
+        if !self.gate {
+            // The lazy GATE-low force is an OUT change like any other, and the
+            // observer loop would report it on the first paused CLK.
+            if matches!(self.mode, 2 | 3) && !self.out {
+                emit(offset + 1, true);
+            }
+            return;
+        }
+        let r = u64::from(self.effective_reload());
+        match self.mode {
+            0 | 1 => {
+                if !self.out && v != 0 && v <= clocks {
+                    emit(offset + v, true);
+                }
+            }
+            2 => {
+                // OUT is high except for the single CLK before each reload, when
+                // the CE sits at 1. From v >= 2 that low CLK is v - 1 and the
+                // reload is v; from v <= 1 the reload is CLK 1 with no low CLK
+                // ahead of it. Both edges are emitted only when the level really
+                // moves, so an entry already at the target level emits nothing.
+                let mut level = self.out;
+                let (mut low, mut high) = if v >= 2 { (v - 1, v) } else { (0, 1) };
+                loop {
+                    if low >= 1 {
+                        if low > clocks {
+                            break;
+                        }
+                        if level {
+                            emit(offset + low, false);
+                            level = false;
+                        }
+                    }
+                    if high > clocks {
+                        break;
+                    }
+                    if !level {
+                        emit(offset + high, true);
+                        level = true;
+                    }
+                    low = high + r - 1;
+                    high += r;
+                }
+            }
+            3 => {
+                let mut level = self.out;
+                let mut tick = Self::mode3_half(v, level);
+                while tick <= clocks {
+                    level = !level;
+                    emit(offset + tick, level);
+                    tick += Self::mode3_half(r, level);
+                }
+            }
+            4 | 5 => {
+                if !self.out {
+                    emit(offset + 1, true);
+                } else if v != 0 {
+                    if v <= clocks {
+                        emit(offset + v, false);
+                    }
+                    if v < clocks {
+                        // i.e. the strobe-return CLK `v + 1` is within range.
+                        emit(offset + v + 1, true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Why one bulk advance fell back to the per-CLK loop. Not the knob: these three
+/// are properties of the programmed chip (or of the span), and each takes the
+/// loop on BOTH arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkDecline {
+    Bcd,
+    IllegalReload,
+    SpanTooWide,
+}
+
+/// `IZARRAVM_PIT_BULK_ADVANCE`, the analytic PIT advance arm. **DEFAULT ON since
+/// the 2026-08-25 flip.**
+///
+/// NULLING SEMANTICS, stated because this campaign has been bitten by them
+/// twice (`env-null-empty-is-off-trap`, and `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`
+/// whose empty string is the ESCAPE while unset is the default):
+///
+/// * **unset** -> the default, which is now **ON** (the analytic bulk advance)
+/// * **`""` (empty)** -> **the same as unset**, i.e. the default, i.e. now ON
+/// * `"0"` / `"off"` -> OFF (the per-CLK loop: the ESCAPE and the A/B base)
+/// * `"1"` / `"on"` -> ON, stated
+/// * anything else, or non-UTF-8 -> **panic**, naming the accepted spellings
+///
+/// Empty means DEFAULT, not "the OFF arm on purpose". **They coincided before
+/// this flip and they DO NOT COINCIDE NOW**: an empty variable selects ON. That
+/// is precisely why the rule was written as "empty == unset" rather than
+/// "empty == off" while the default was still OFF -- so the flip moved the
+/// default without moving the rule. **Every OFF leg must EXPORT `0`; clearing
+/// the variable runs the ON arm.** `[Environment]::SetEnvironmentVariable(
+/// $name, $null, "Process")` -- how every harness in this tree clears a variable
+/// -- leaves the variable PRESENT AND EMPTY on Windows, and a leg that cleared
+/// the variable means "the default", never "the escape".
+///
+/// This follows `run::parse_ata_poll_skip_arm` (`run.rs`), which is the
+/// well-behaved knob in this crate: same spellings, same panic-on-typo, same
+/// "empty is unset" rule. It differs from it in the DEFAULT only, because this
+/// is a new slice and flipped only after a ladder. It now matches that knob in
+/// default as well: doom-486 min-wall ratio 1.0596 against a 1.03 bar with 12 of
+/// 12 A/B pairs ON-faster, doom-586 1.0140 against 1.01 with the sign agreeing,
+/// zero contaminated legs, and guest_seconds / perf.instructions /
+/// raw_bus_clocks / realtics / gametics identical across arms over 48 legs.
+///
+/// The panic on a typo is the point: a mistyped ladder leg that fell through to
+/// the default would be read as "the arm I named changed nothing".
+///
+/// Resolved ONCE into a `OnceLock` and read at machine construction, never
+/// inside the advance and never per CLK (`default-off-instruments-tax-hot-path`).
+/// Both arms are reachable in ONE binary through
+/// `Machine::set_pit_bulk_advance_enabled`.
+pub(crate) fn bulk_advance_default() -> bool {
+    static ARM: OnceLock<bool> = OnceLock::new();
+    *ARM.get_or_init(|| parse_bulk_advance_arm(std::env::var("IZARRAVM_PIT_BULK_ADVANCE")))
+}
+
+const BULK_ADVANCE_SPELLINGS: &str = "accepted spellings are unset or `` (both the default, \
+     which is OFF: the per-input-CLK loop), `0` / `off` (the same OFF arm, stated), and `1` / \
+     `on` (the analytic bulk advance)";
+
+fn parse_bulk_advance_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return true,
+        // Not-UTF-8 is not a spelling of either arm: someone set the variable
+        // and meant something by it, so it reaches the typo panic rather than
+        // the silence of "unset".
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_PIT_BULK_ADVANCE is set to a value that is not valid UTF-8; \
+             {BULK_ADVANCE_SPELLINGS}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Empty is the DEFAULT, which is now ON. It is deliberately NOT grouped
+        // with the escape spellings: see the nulling note above.
+        "" => true,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_PIT_BULK_ADVANCE={other:?} names no arm; {BULK_ADVANCE_SPELLINGS}. \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be \
+             read as the arm it named doing nothing"
+        ),
+    }
 }
 
 /// The AT DRAM-refresh divisor: channel 1 runs mode 2 with this count so its OUT
@@ -1075,15 +1478,88 @@ impl Pit {
         self.read_port_at(port, 0)
     }
 
+    /// Why the whole chip cannot take one analytic advance of `clocks` CLKs.
+    ///
+    /// Chip-wide, and checked before ANY counter moves: a per-counter decision
+    /// would leave a half-advanced chip that the fallback then advanced again.
+    fn bulk_decline(&self, clocks: u64) -> Option<BulkDecline> {
+        if clocks >= 1u64 << 32 {
+            // Past 2^32 CLKs the counting element's own 32-bit wrap stops being
+            // one subtraction, and modes 0/1/4/5 would need the wrap-round
+            // terminal count the peeks already decline to model. Unreachable in
+            // practice: 2^32 PIT CLKs is an hour of guest time in one device
+            // advance, and the per-CLK fallback would take four billion
+            // iterations to serve it, so this changes nothing that could run.
+            return Some(BulkDecline::SpanTooWide);
+        }
+        self.counters.iter().find_map(Counter::bulk_decline)
+    }
+
+    /// One analytic advance of the whole chip. Returns the channel-0 OUT rising
+    /// edge count, exactly as the per-CLK loop would.
+    fn bulk_advance<F>(
+        &mut self,
+        clocks: u64,
+        watch_channel: Option<usize>,
+        out_changed: &mut F,
+        counters: &mut crate::PitBulkAdvanceCounters,
+    ) -> u32
+    where
+        F: FnMut(u64, bool),
+    {
+        // BEFORE anything moves. The transition list is expressed relative to
+        // the watched counter's PRE-advance state, and the watched counter is
+        // always one of the three advanced below (production watches channel 2).
+        if let Some(counter) = watch_channel.and_then(|channel| self.counters.get(channel)) {
+            let mut emitted = 0u64;
+            counter.out_transitions_in(clocks, &mut |tick, level| {
+                emitted += 1;
+                out_changed(tick, level);
+            });
+            counters.transitions += emitted;
+        }
+        let mut edges = 0u64;
+        for (i, counter) in self.counters.iter_mut().enumerate() {
+            let rises = counter.advance(clocks);
+            if i == 0 {
+                edges = rises;
+            }
+        }
+        u32::try_from(edges).unwrap_or(u32::MAX)
+    }
+
     fn tick_with_observer<F>(
         &mut self,
         clocks: u64,
         watch_channel: Option<usize>,
         mut out_changed: F,
+        bulk: bool,
+        counters: &mut crate::PitBulkAdvanceCounters,
     ) -> u32
     where
         F: FnMut(u64, bool),
     {
+        if clocks == 0 {
+            // Not an advance at all; the loop below would do nothing either.
+            return 0;
+        }
+        // The arm is read ONCE per device advance, never inside the loop.
+        if bulk {
+            match self.bulk_decline(clocks) {
+                None => {
+                    counters.advances += 1;
+                    counters.advance_clocks += clocks;
+                    return self.bulk_advance(clocks, watch_channel, &mut out_changed, counters);
+                }
+                Some(BulkDecline::Bcd) => counters.declines_bcd += 1,
+                Some(BulkDecline::IllegalReload) => counters.declines_illegal_reload += 1,
+                Some(BulkDecline::SpanTooWide) => counters.declines_span_too_wide += 1,
+            }
+        } else {
+            counters.declines_knob_off += 1;
+        }
+        counters.loop_advances += 1;
+        counters.loop_clocks += clocks;
         let mut edges = 0u32;
         let mut watched = watch_channel.map(|channel| self.channel_out(channel));
         for tick in 1..=clocks {
@@ -1104,11 +1580,28 @@ impl Pit {
         edges
     }
 
-    /// Advance every counter by `clocks` input CLK pulses. Returns the number of
-    /// channel-0 OUT rising edges, which the machine turns into IRQ0 requests.
+    /// Advance every counter by `clocks` input CLK pulses on the PER-CLK LOOP.
+    /// Returns the number of channel-0 OUT rising edges, which the machine turns
+    /// into IRQ0 requests.
+    ///
+    /// Deliberately pinned to the loop arm: this is the reference the analytic
+    /// advance is differentiated against, and every pre-existing test that drives
+    /// the chip through it keeps meaning what it meant.
     #[cfg(test)]
     pub(crate) fn tick(&mut self, clocks: u64) -> u32 {
-        self.tick_with_observer(clocks, None, |_, _| {})
+        let mut counters = crate::PitBulkAdvanceCounters::default();
+        self.tick_with_observer(clocks, None, |_, _| {}, false, &mut counters)
+    }
+
+    /// `tick` on a STATED arm, for the differential tests.
+    #[cfg(test)]
+    pub(crate) fn tick_arm(
+        &mut self,
+        clocks: u64,
+        bulk: bool,
+        counters: &mut crate::PitBulkAdvanceCounters,
+    ) -> u32 {
+        self.tick_with_observer(clocks, None, |_, _| {}, bulk, counters)
     }
 
     /// Advance every counter and append channel OUT transitions with the PIT input
@@ -1118,10 +1611,18 @@ impl Pit {
         clocks: u64,
         channel: usize,
         transitions: &mut Vec<OutTransition>,
+        bulk: bool,
+        counters: &mut crate::PitBulkAdvanceCounters,
     ) -> u32 {
-        self.tick_with_observer(clocks, Some(channel), |tick, level| {
-            transitions.push(OutTransition { tick, level });
-        })
+        self.tick_with_observer(
+            clocks,
+            Some(channel),
+            |tick, level| {
+                transitions.push(OutTransition { tick, level });
+            },
+            bulk,
+            counters,
+        )
     }
 
     /// Input CLK pulses until channel 0 produces its next OUT rising edge, or None

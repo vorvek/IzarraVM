@@ -60,8 +60,14 @@ pub(crate) const BAKES_CS_BIT: u8 = 1 << 6;
 /// `used`, plus the union of the masks of everything reachable through live links), and
 /// `link_merge` below is the edge predicate over it. Because the merge is NON-ADOPTING -- a bit
 /// set on either side demands descriptor EQUALITY -- a chain requirement never names a descriptor
-/// its holder's own snapshot does not have, so validating the root's six descriptors
-/// (`all_data_matches`, run.rs) still validates every body reached through its successor cells.
+/// its holder's own snapshot does not have.
+///
+/// TWO CHECKS DISCHARGE THE ROOT'S OBLIGATION, selected by `IZARRAVM_CHAIN_ENTRY_CHECK`.
+/// `all_data_matches` proves all six of the root's own descriptors: sound by the non-adoption
+/// property above, and far stronger than the obligation. `data_matches` over
+/// `chain_layouts[root]` proves exactly the obligation and nothing more -- every segment some
+/// block in the LIVE cone pins. The second is why the requirement must be narrowed when a block's
+/// last outbound edge dies; see `BlockCache::narrow_chain_requirement_if_leaf`.
 /// dev_docs/plans/2026-08-18-chain-used-link-mask.md has the invariant and its proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentLayout {

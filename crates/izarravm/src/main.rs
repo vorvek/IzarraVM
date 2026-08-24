@@ -2071,6 +2071,7 @@ fn write_hdd_profile_json(
         })),
         "io_stall_ticks": machine.io_stall_ticks(),
         "halted_ticks": machine.halted_ticks(),
+        "pit_bulk_advance": pit_bulk_advance_json(machine),
         // The CD columns. `cd_pio_bytes` is the byte sum out of the ATAPI data
         // phases and is invariant to batch geometry, so it is the fidelity
         // falsifier for anything that changes how the host slices a CD read.
@@ -2957,6 +2958,30 @@ fn assert_callout_counts_closed(counts: izarravm_cpu::DirectCallOutOutcomeCounts
 /// `enabled` is emitted alongside because unset does not mean the same thing on
 /// both sides of the default flip; a leg that recorded zeros without recording
 /// its arm is not evidence.
+/// PIT bulk-advance mechanism counters (`IZARRAVM_PIT_BULK_ADVANCE`).
+///
+/// `advance_clocks + loop_clocks` is `guest_seconds * 1,193,182` by
+/// construction, whatever the guest did, so the split between the two is the
+/// whole reading: it is the fraction of the per-input-CLK loop the lever
+/// actually removed. `enabled=false` with `advances=0` and
+/// `declines_knob_off == loop_advances` is the inert OFF arm, stated rather
+/// than assumed.
+fn pit_bulk_advance_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
+    let c = machine.pit_bulk_advance_counters();
+    json!({
+        "enabled": machine.pit_bulk_advance_enabled(),
+        "advances": c.advances,
+        "advance_clocks": c.advance_clocks,
+        "loop_advances": c.loop_advances,
+        "loop_clocks": c.loop_clocks,
+        "declines_knob_off": c.declines_knob_off,
+        "declines_bcd": c.declines_bcd,
+        "declines_illegal_reload": c.declines_illegal_reload,
+        "declines_span_too_wide": c.declines_span_too_wide,
+        "transitions": c.transitions,
+    })
+}
+
 fn ata_poll_skip_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
     let c = machine.ata_poll_skip_counters();
     json!({
@@ -3236,6 +3261,14 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
             .iter()
             .map(|(label, count)| json!({ "cause": label, "count": count }))
             .collect::<Vec<_>>(),
+        "chain_requirement_narrowed": snapshot
+            .chain_requirement_narrowed
+            .iter()
+            .map(|(label, count)| json!({ "cause": label, "count": count }))
+            .collect::<Vec<_>>(),
+        "entry_chain_reject_own_pass": snapshot.entry_chain_reject_own_pass,
+        "entry_chain_admitted": snapshot.entry_chain_admitted,
+        "entry_chain_masked_reject": snapshot.entry_chain_masked_reject,
         "side_exit_segment_limit": snapshot.side_exit_segment_limit,
         "side_exit_x87_eligibility": snapshot.side_exit_x87_eligibility,
         "side_exit_divide_guard": snapshot.side_exit_divide_guard,

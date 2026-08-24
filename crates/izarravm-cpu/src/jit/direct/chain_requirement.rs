@@ -17,6 +17,179 @@ use super::segment_layout::{BAKES_CS_BIT, segment_bit};
 use super::{BlockCache, BlockId, LinkClearCause, SegmentIndex, SegmentLayout};
 
 impl BlockCache {
+    /// The layout the DISPATCHER ENTRY CHECK compares against, and the one place the
+    /// `IZARRAVM_CHAIN_ENTRY_CHECK` arm selects an array.
+    ///
+    /// * ARMED: `chain_layouts[i]` -- this block's own pinned set plus the union of the masks of
+    ///   everything reachable through live links. The caller compares it MASKED (`data_matches`),
+    ///   which is exactly INV-ENTRY's statement: every segment some block in the live cone pins
+    ///   holds the descriptor that cone baked.
+    /// * OFF: `segment_layouts[i]`, and the caller keeps `main`'s two-arm expression verbatim.
+    ///
+    /// **ONE indexed 116-byte copy either way.** It REPLACES `segment_layout`'s fetch on the entry
+    /// path rather than adding to it; the 2026-08-18 plan pinned that requirement and a second
+    /// copy is mutant M14, which the `#[cfg(test)]` fetch counter below exists to kill. The
+    /// counter is bumped by the ONE accessor both arms go through, so a mutant that reads a `Vec`
+    /// directly instead of calling it is not caught here -- that shape is a review kill, and the
+    /// mutant sweep records it as one.
+    ///
+    /// `cs_matches` shares this fetch and is unaffected: `chain.cs == own.cs` always, because
+    /// every merge constructs `cs: self.cs` and `link_merge` refuses a near edge whose ends
+    /// disagree on `cs` before the merge runs.
+    pub(crate) fn entry_layout(&self, id: BlockId) -> Option<SegmentLayout> {
+        let index = id.index();
+        if self.chain_entry_check_armed {
+            self.fetch_entry_layout(&self.chain_layouts, index)
+        } else {
+            self.fetch_entry_layout(&self.segment_layouts, index)
+        }
+    }
+
+    /// The single counted read behind `entry_layout`. See its doc comment for what the counter is
+    /// for; in a non-test build this is `Vec::get(..).copied()` and nothing else.
+    fn fetch_entry_layout(&self, from: &[SegmentLayout], index: usize) -> Option<SegmentLayout> {
+        #[cfg(test)]
+        self.entry_layout_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        from.get(index).copied()
+    }
+
+    /// Whether the entry check reads the chain requirement. Read once per cache, in
+    /// `with_entry_cap_and_decode_slots`; see the field and `env_gates::chain_entry_check_armed`.
+    pub(crate) fn chain_entry_check_armed(&self) -> bool {
+        self.chain_entry_check_armed
+    }
+
+    /// Reset `index`'s chain requirement to its own layout when the cut that just ran took its
+    /// LAST live outbound edge.
+    ///
+    /// A requirement is a statement about a LIVE link graph. With `outbound` empty the cone is
+    /// this block alone, and `segment_layouts[index].used` is exactly what this block pins --
+    /// the same argument `invalidate_translation` makes wholesale, applied per block. Without it
+    /// a block that has ever linked keeps a stale-too-WIDE requirement forever, which under the
+    /// chain entry check is a REJECT the block's own mask would have passed: up to 2.80% of all
+    /// entries on wolf3d-486, measured.
+    ///
+    /// # KEYED ON `outbound`, NEVER ON `has_linked_successor`
+    ///
+    /// `LinkCell::linked()` is a VISIBILITY predicate (`links.rs`): it loads the cell's portal and
+    /// defers to `BlockPortal::visible`. `suspend_decode_slot` and `compact_arena` clear and
+    /// REPUBLISH portals without touching `outbound` and without re-running `try_link_inner`, so
+    /// `has_linked_successor` reverts to true with no merge and no widen behind it. Narrowing on
+    /// that state gives: hide the successor -> narrow the root -> re-show the successor -> enter
+    /// the root under the narrowed mask -> chain into a body against a base nobody validated. A
+    /// wrong-base MISCOMPILE, and the census says the hidden state is reached on 12 of 14
+    /// row-arms, so it is not theoretical.
+    ///
+    /// `outbound[..] = Some(..)` has exactly ONE writer, in `try_link_inner`, two statements above
+    /// the widen. An edge cannot come back without re-running the merge and the propagation. That
+    /// is what makes this predicate safe and the visibility one unsafe.
+    ///
+    /// # AND NO `debug_assert!(!cell.linked())` HERE, FOR THE SAME REASON
+    ///
+    /// It would read false for a live-but-hidden edge and true for a cleared-but-republished one,
+    /// so it is unsound as a check and a standing invitation to re-key the predicate on it. The
+    /// assert below reads `LinkCell::is_cleared`, which is the cell's OWN state and says nothing
+    /// about visibility.
+    pub(super) fn narrow_chain_requirement_if_leaf(&mut self, index: usize, cause: LinkClearCause) {
+        if self.outbound[index] != [None, None] {
+            return;
+        }
+        // THE ORDERING PIN. The two cut sites disagree about the order of their two writes --
+        // `unlink_outbound` empties `outbound` (its `.take()`) BEFORE clearing the cell, and
+        // `unlink_block`'s inbound walk clears the cell BEFORE emptying `outbound` -- so only
+        // TAIL placement is correct at both. Move this call up beside either site's `outbound`
+        // write and the narrowing can run while that slot's own cell is still armed, which is a
+        // wrong-base miscompile and not merely a lying counter. This assert is what makes that
+        // edit fail instead of shipping. `outbound[j] == None` implies cell `j` is cleared at
+        // every site that writes the pair, which is why checking BOTH slots is meaningful.
+        debug_assert!(
+            self.link_cells[index].iter().all(|cell| cell.is_cleared()),
+            "the chain requirement may only be narrowed after every outbound cell is cleared",
+        );
+        self.chain_layouts[index] = self.segment_layouts[index];
+        self.stalls.chain_requirement_narrowed[cause as usize] += 1;
+    }
+
+    /// Clear one block's PORTAL, leaving the link graph untouched -- the state
+    /// `suspend_decode_slot` and `compact_arena` produce, and the one the narrowing predicate must
+    /// refuse to act on. Fixtures outside this module cannot reach `block_portals` directly.
+    #[cfg(test)]
+    pub(crate) fn hide_block_portal_for_test(&self, id: BlockId) {
+        if let Some(index) = self.active_index(id) {
+            self.block_portals[index].clear();
+        }
+    }
+
+    /// The block's live outbound edges, for fixtures that must tell "no edge" from "edge whose
+    /// target is merely hidden" -- the distinction the whole narrowing predicate turns on.
+    #[cfg(test)]
+    pub(crate) fn outbound_targets_for_test(&self, id: BlockId) -> [Option<BlockId>; 2] {
+        self.active_index(id)
+            .map_or([None, None], |index| self.outbound[index])
+    }
+
+    /// The block's chain requirement mask, for fixtures asserting the narrowing moved it.
+    #[cfg(test)]
+    pub(crate) fn chain_requirement_used_for_test(&self, id: BlockId) -> u8 {
+        self.active_index(id)
+            .map_or(0, |index| self.chain_layouts[index].used)
+    }
+
+    /// The precondition of a WHOLESALE requirement reset: no edge is left to be violated.
+    ///
+    /// `invalidate_translation` drops every edge and then resets every requirement, and the ORDER
+    /// is load-bearing. Reset first and a still-armed cell could reach a body under a requirement
+    /// that no longer names the segment that body's cone pins -- stale-too-NARROW, which is the
+    /// miscompile direction, and which `main` was insulated from only because its entry check
+    /// never read this array. The quantifier can range over ALL slots because an inactive one's
+    /// `outbound` is already empty: `retire_block` runs `unlink_block` before it clears
+    /// `block_active`.
+    pub(super) fn assert_no_live_edge_before_wholesale_reset(&self) {
+        debug_assert!(
+            self.outbound.iter().all(|slots| *slots == [None, None]),
+            "every edge must be dropped before a wholesale chain-requirement reset",
+        );
+    }
+
+    /// Absorb a freshly published edge `source -> target` into `source`'s chain requirement.
+    ///
+    /// **The merge is recomputed HERE rather than reused from the refusal decision, and that is
+    /// the whole point of this function** (review round 2, R2-1). `try_link_inner` snapshots
+    /// `chain_layouts[source]` before its refusal chain and, on the relink-replace path, calls
+    /// `unlink_outbound` afterwards -- which may narrow that very entry. Writing the pre-cut
+    /// snapshot back would silently undo the narrowing and hand `source` a requirement carrying
+    /// bits contributed by the edge that was just cut. Nothing asserts against it: the
+    /// monotonicity test below passes, because the pre-cut value contains the narrowed one.
+    ///
+    /// Recomputing changes NO edge admission. The refusal decision was already taken, above, from
+    /// the pre-cut value; this runs only on the admitted path. And the post-cut source can differ
+    /// from the pre-cut one only by having a NARROWER `used` -- non-adoption keeps `data` and `cs`
+    /// identical to `segment_layouts[source]`'s at all times -- so the recomputed merge is `Some`
+    /// wherever the original was, and the `expect` below cannot fire.
+    ///
+    /// It is not behind `IZARRAVM_CHAIN_ENTRY_CHECK`: it is the other half of the un-gated
+    /// narrowing, and gating one without the other would leave the two arms with different link
+    /// graphs. See that knob's doc comment for the OFF-arm consequence, which is one-directional.
+    pub(super) fn absorb_published_edge(&mut self, source: BlockId, target: BlockId, far: bool) {
+        let (Some(source_index), Some(target_index)) =
+            (self.active_index(source), self.active_index(target))
+        else {
+            return;
+        };
+        let source_layout = self.chain_layouts[source_index];
+        let target_layout = self.chain_layouts[target_index];
+        let merged = if far {
+            source_layout.far_merge(target_layout)
+        } else {
+            source_layout.link_merge(target_layout)
+        };
+        let merged = merged.expect(
+            "the pre-cut merge was admitted and narrowing the source can only remove mask bits",
+        );
+        self.widen_chain_requirement(source, merged);
+    }
+
     /// Absorb `merged` as `source`'s chain requirement and push the widening backwards until it
     /// settles. Called only from `try_link_inner`, only after the edge is published.
     ///

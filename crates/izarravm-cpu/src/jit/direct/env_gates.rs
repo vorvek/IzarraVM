@@ -2110,6 +2110,111 @@ pub(crate) fn parse_entry_attribution_sample(value: Result<String, std::env::Var
     }
 }
 
+/// Whether the dispatcher entry check compares the block's CHAIN REQUIREMENT
+/// (`BlockCache::chain_layouts`, MASKED) instead of all six of its own frozen descriptors.
+///
+/// **DEFAULT OFF.** The OFF arm is `main`'s entry check verbatim: `all_data_matches` for a linked
+/// root, `data_matches` for an unlinked one. The ON arm runs one `data_matches` over the chain
+/// requirement for both, which is exactly the statement INV-ENTRY needs and nothing more. Design:
+/// `dev_docs/specs/2026-08-25-chain-requirement-entry-check-design.md`.
+///
+/// # THE NULLING SEMANTICS, STATED PLAINLY, BECAUSE THE NEIGHBOURING KNOB'S ARE INVERTED
+///
+/// This knob has the ORDINARY shape, `parse_rotate_rows_arm`'s:
+///
+/// * **unset -> OFF**, `""` -> OFF, `0` / `off` -> OFF. Unset and nulled are the SAME arm, so a
+///   PowerShell leg that computes the value and produces `""` gets what an unset environment gets.
+/// * `1` / `on` / `chain` -> ON.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
+///   silently ran the default would be read as the slice under test doing nothing.
+///
+/// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR` IS THE ODD ONE OUT, and it is the variable every leg of this
+/// slice's ladder also sets: its **unset** arm is `Cap` (the shipped default) while its `""` arm is
+/// `Off`, so nulling THAT variable silently disarms the shipped default and nulling THIS one does
+/// not. Export both explicitly in every leg (`env-null-empty-is-off-trap`).
+///
+/// # WHAT THE KNOB DOES AND DOES NOT GATE
+///
+/// It gates the entry check's predicate, the layout array `BlockCache::entry_layout` selects, and
+/// the two governor mask inputs that follow from them. It does **NOT** gate the narrowing in
+/// `narrow_chain_requirement_if_leaf`: that is a correctness prerequisite of the armed arm and, on
+/// the OFF arm, a strictly more accurate statement about a live link graph. Gating it would hand
+/// the two arms different link graphs to reason about. The honest consequence is that the OFF arm
+/// is **not** a bit-for-bit reproduction of `main` on the COMPILE side -- some later edges are
+/// admitted which `main` refused against a stale-wide requirement -- while it is behaviourally
+/// identical at the entry check itself. `link_refusals[segment_layout]` is where that shows, in one
+/// direction only.
+pub(crate) fn chain_entry_check_armed() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = CHAIN_ENTRY_CHECK_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| parse_chain_entry_check_arm(std::env::var("IZARRAVM_CHAIN_ENTRY_CHECK")))
+}
+
+/// The `IZARRAVM_CHAIN_ENTRY_CHECK` spelling table, lifted out of the `OnceLock` closure so it can
+/// be unit-tested without a process-global env write. See `chain_entry_check_armed`.
+fn parse_chain_entry_check_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped default: \
+                            the entry check compares all six of the block's own descriptors) and \
+                            `1` / `on` / `chain` (the entry check compares the block's masked \
+                            CHAIN requirement)";
+    let raw = match value {
+        // Unset is the shipped default and it is OFF. `""` follows it below rather than here and
+        // reaches the same arm -- see `chain_entry_check_armed` on why this knob deliberately does
+        // NOT copy `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`'s inverted shape.
+        Err(std::env::VarError::NotPresent) => return false,
+        // Not-UTF-8 is not a spelling of any arm. Someone set the variable and meant something by
+        // it, so it reaches the panic rather than the silence "unset" gets.
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_CHAIN_ENTRY_CHECK is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        // `chain` rides beside `1` / `on` because it is the name the design gives the arm, and a
+        // leg written from the design must reach the same arm as a leg written from the shell.
+        "1" | "on" | "chain" => true,
+        other => panic!(
+            "IZARRAVM_CHAIN_ENTRY_CHECK={other:?} names no arm; {ACCEPTED}. Refusing to guess: a \
+             mistyped ladder leg that silently ran the default would be read as the slice under \
+             test doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `ROTATE_ROWS_OVERRIDE`'s reason: the shipped knob caches its env reading in a
+// process-wide `OnceLock`, and the fixtures have to run both arms in one process.
+//
+// The arm is read ONCE per `BlockCache`, in `with_entry_cap_and_decode_slots`, so a fixture must
+// set this BEFORE it builds the cache it means to test. That is deliberate: it keeps the read off
+// the entry path, and a fixture that forgets fails on its own assertions rather than silently
+// measuring the ambient arm halfway through.
+#[cfg(test)]
+thread_local! {
+    static CHAIN_ENTRY_CHECK_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the entry-check arm on this thread; `None` restores the ambient reading. Set it BEFORE
+/// constructing the `BlockCache` under test.
+#[cfg(test)]
+pub(crate) fn set_chain_entry_check_for_test(forced: Option<bool>) {
+    CHAIN_ENTRY_CHECK_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `chain_entry_check_armed` caches its env
+/// reading in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per
+/// process and never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_chain_entry_check_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_chain_entry_check_arm(value)
+}
+
 /// Whether `DirectKind::Jcc` computes its branch predicate by TESTING the RBP EFLAGS shadow
 /// directly, instead of round-tripping that shadow through the host flags word
 /// (`IZARRAVM_JCC_SHADOW`).

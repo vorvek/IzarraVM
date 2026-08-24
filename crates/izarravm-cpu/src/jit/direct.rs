@@ -864,13 +864,26 @@ pub(crate) struct BlockCache {
     /// through currently live links. Only `used` ever differs from `segment_layouts[i]`, because
     /// the merge is non-adopting (`SegmentLayout::merge_chain`).
     ///
-    /// MONOTONE for the whole life of the block in slot `i`: written by `install` (reset to the
-    /// block's own layout, in the same statement that writes `segment_layouts[i]`, so the two can
-    /// never come apart) and by `widen_chain_requirement`, which only ever adds bits. Nothing
-    /// else -- not unlink, not retire, not the link-epoch bump -- touches it. A stale-too-WIDE
-    /// requirement costs an over-strict edge refusal; a stale-too-NARROW one is a wrong-base
-    /// miscompile, so narrowing is made unrepresentable rather than merely unlikely.
+    /// MONOTONE WHILE THE BLOCK HAS A LIVE OUTBOUND EDGE, and reset to the block's own layout the
+    /// moment it has none. The requirement is a statement about a LIVE link graph, so the writers
+    /// are: `install` (reset, in the same statement that writes `segment_layouts[i]`, so the two
+    /// can never come apart), `widen_chain_requirement` (only ever adds bits),
+    /// `invalidate_translation` and `reset_storage` (wholesale, after every edge is dropped), and
+    /// `narrow_chain_requirement_if_leaf` (per block, when a cut takes its last outbound edge).
+    /// A stale-too-WIDE requirement costs an over-strict refusal -- and, once the entry check
+    /// reads this array, an over-strict ENTRY; a stale-too-NARROW one is a wrong-base miscompile,
+    /// which is why the narrowing keys on `outbound` emptiness and never on link VISIBILITY.
     chain_layouts: Vec<SegmentLayout>,
+    /// `IZARRAVM_CHAIN_ENTRY_CHECK`, read ONCE here rather than on the entry path. See
+    /// `chain_entry_check_armed` in `env_gates.rs` for the arm table and the nulling semantics,
+    /// and `BlockCache::entry_layout` for what it selects.
+    chain_entry_check_armed: bool,
+    /// How many indexed layout copies `entry_layout` has taken. Mutant M14's only witness: the
+    /// entry check must REPLACE the 116-byte fetch, never add a second one, and "this accessor
+    /// reads one `Vec`" is not otherwise assertable in Rust. Atomic rather than `Cell` because
+    /// `entry_layout` takes `&self` on a struct the harness shares across threads.
+    #[cfg(test)]
+    entry_layout_fetches: std::sync::atomic::AtomicU32,
     /// Parallel to `blocks`, same `BlockId::index()`: the physical start of each mutable imm32
     /// lane the block's emitted code reads through, `NO_IMM_LANE` for an unused slot. Out of
     /// `CompiledBlock` for the reason its size pin states — nothing here is read on a block entry,
@@ -1180,6 +1193,9 @@ impl BlockCache {
             blocks: Vec::new(),
             segment_layouts: Vec::new(),
             chain_layouts: Vec::new(),
+            chain_entry_check_armed: chain_entry_check_armed(),
+            #[cfg(test)]
+            entry_layout_fetches: std::sync::atomic::AtomicU32::new(0),
             block_imm_lanes: Vec::new(),
             block_imm_lane_widths: Vec::new(),
             lane_trial_epochs: HashMap::default(),
@@ -2322,6 +2338,14 @@ impl BlockCache {
         // safe, but permanently over-strict, and it would refuse precisely the class-B edges this
         // mask exists to admit. Wholesale SMC and paging flushes make that the common case, not a
         // corner. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
+        //
+        // ORDER IS LOAD-BEARING, and it is a MISCOMPILE and not merely a cost once the entry check
+        // reads this array: reset first and a still-armed cell could reach a body under a
+        // requirement that no longer names the segment that body's cone pins. The clearing loop
+        // above visits every live edge through `inbound`, which is why an inactive slot's
+        // `outbound` is already empty -- `retire_block` runs `unlink_block` before it clears
+        // `block_active`. That is the whole reason this assert can quantify over ALL slots.
+        self.assert_no_live_edge_before_wholesale_reset();
         self.chain_layouts.copy_from_slice(&self.segment_layouts);
         // BESIDE the line above, and for one level up of its own argument: a decline earned
         // against a chain requirement this flush just ERASED would bar re-linking for the rest of
@@ -3453,9 +3477,10 @@ impl BlockCache {
         self.note_direct_link_linked(source_index, slot_index, target);
         // AFTER the edge is visible: the propagation walks `inbound`, and this edge's own source
         // may itself be someone's target. `chain_merge` was proved `Some` by the refusal chain
-        // above.
-        if let Some(merged) = chain_merge {
-            self.widen_chain_requirement(source, merged);
+        // above, and that is ALL it is used for here -- the merged VALUE is recomputed inside,
+        // from the source's post-cut requirement. See `absorb_published_edge`.
+        if chain_merge.is_some() {
+            self.absorb_published_edge(source, target, far);
         }
         true
     }
@@ -3463,6 +3488,16 @@ impl BlockCache {
     /// `cause` is passed by the caller rather than inferred: the same helper serves the
     /// relink-replace path in `try_link_inner` and the retirement walk in `unlink_block`, and
     /// nothing inside the helper can tell those apart.
+    ///
+    /// CUT SITE A of the two that narrow the chain requirement. The narrowing call is at the TAIL
+    /// of this function and the placement is load-bearing: this site empties `outbound` FIRST
+    /// (the `.take()` below) and clears the cell four lines later, while cut site B in
+    /// `unlink_block` does the two in the opposite order. Only tail placement is correct at both.
+    /// See `narrow_chain_requirement_if_leaf`, which asserts the order rather than trusting it.
+    ///
+    /// The `else` arm above the tail returns EARLY and deliberately does not narrow: `outbound`
+    /// did not change on that path, so there is nothing for the narrowing to be a consequence of
+    /// and a counter bumped there would be reporting an event that did not happen.
     fn unlink_outbound(&mut self, source: BlockId, slot: u8, cause: LinkClearCause) {
         let Some(source_index) = self.active_index(source) else {
             return;
@@ -3483,6 +3518,7 @@ impl BlockCache {
         self.stalls.links_cleared[cause as usize] += 1;
         #[cfg(feature = "direct-link-refusal-census")]
         self.note_direct_link_cleared(source_index, slot_index, cause, target);
+        self.narrow_chain_requirement_if_leaf(source_index, cause);
     }
 
     fn unlink_block(&mut self, id: BlockId) {
@@ -3529,6 +3565,10 @@ impl BlockCache {
                     self.stalls.links_cleared[LinkClearCause::Retired as usize] += 1;
                     #[cfg(feature = "direct-link-refusal-census")]
                     self.note_direct_link_cleared(source_index, slot, LinkClearCause::Retired, id);
+                    // CUT SITE B, and the LARGEST narrowing population on every row: this walk
+                    // clears each predecessor's cell INLINE and never reaches `unlink_outbound`.
+                    // At the tail of the per-edge body for the reason site A's doc comment gives.
+                    self.narrow_chain_requirement_if_leaf(source_index, LinkClearCause::Retired);
                 }
             }
         }

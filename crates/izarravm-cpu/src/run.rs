@@ -2427,8 +2427,14 @@ impl CpuGsw {
         }
         // Fetched once and held in a local across all three descriptor checks. It used to ride
         // every `CompiledBlock` copy at 116 bytes a piece; the checks only ever read it.
+        //
+        // WHICH layout this is depends on `IZARRAVM_CHAIN_ENTRY_CHECK`: the block's own frozen
+        // snapshot on the OFF arm, its transitive CHAIN REQUIREMENT on the armed one. One indexed
+        // copy either way -- `entry_layout` REPLACES the old `segment_layout` fetch here rather
+        // than adding a second, which the 2026-08-18 plan pinned as a requirement. `cs_matches`
+        // below shares it and is unaffected, because `chain.cs == own.cs` always.
         ea_mark!(Phase::EntryGuards);
-        let Some(segments) = self.jit_direct.segment_layout(block.id()) else {
+        let Some(segments) = self.jit_direct.entry_layout(block.id()) else {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::SEGMENT_LAYOUT_NONE);
             ea_end!(Population::Refused);
@@ -2534,31 +2540,67 @@ impl CpuGsw {
             }
         }
         let has_link = self.jit_direct.has_linked_successor(block.id());
-        // The STRICT arm stays strict, deliberately. The 2026-08-18 chain-used link mask narrowed
-        // the EDGE predicate to the segments some block in the chain actually pins, and it is
-        // sound precisely because this check still proves all six of the root's own descriptors:
-        // the non-adopting merge never puts a descriptor into a chain requirement that its
-        // holder's own snapshot does not hold. Relaxing this to the block's own `data_matches`
-        // would validate the root's pinned set and not the CHAIN's -- a wrong-base miscompile.
-        // Reading `chain_layout` here instead is the class-C adoption slice, and it must REPLACE
-        // the 116-byte layout fetch above rather than add a second one.
+        // TWO ARMS, and they answer the same obligation two different ways.
+        //
+        // OFF (`main`, verbatim): the strict arm proves all six of the ROOT's own descriptors.
+        // That is sound but far stronger than needed -- it is a proxy for the chain's requirement,
+        // chosen because the requirement was not readable here. It is also where prince-486's
+        // 12,791x reject amplification lives.
+        //
+        // ARMED: one masked compare against the block's CHAIN REQUIREMENT, which is exactly
+        // INV-ENTRY -- every segment pinned by any block reachable through a live link holds the
+        // descriptor that block baked. Both `has_link` states take the same predicate, because a
+        // block with no live outbound edge carries its own layout as its requirement (the
+        // narrowing in `narrow_chain_requirement_if_leaf` is what makes that true, and it is a
+        // prerequisite of this arm rather than an optimisation of it).
+        //
+        // `has_link` is still computed on both arms: `chain_eligible` below needs it.
         ea_mark!(Phase::BlockFields);
-        let data_descriptors_match = if has_link {
+        let chain_entry_check = self.jit_direct.chain_entry_check_armed();
+        let data_descriptors_match = if chain_entry_check {
+            segments.data_matches(self)
+        } else if has_link {
             segments.all_data_matches(self)
         } else {
             segments.data_matches(self)
         };
+        // Census-only, and on the SUCCESS path, which is why it is gated at the call site rather
+        // than merely defaulting to zero: a second six-descriptor compare per admitted entry is
+        // 10^8 compares a fixture. It is the engagement proof -- entries the chain arm admitted
+        // that `main`'s strict arm would have refused.
+        #[cfg(feature = "direct-link-refusal-census")]
+        if chain_entry_check && data_descriptors_match && !segments.all_data_matches(self) {
+            self.jit_direct.note_entry_chain_admitted();
+        }
         if !data_descriptors_match {
             self.perf.jit_direct_reject_data_segment += 1;
             // The ARM split, promoted from the 2026-08-23 throwaway instrument. It is the only
             // way the strict/masked share is readable on the shipped arm -- one counter served
             // both arms before this, and the design could bound the strict half at <=32% from
             // `links_cleared[retired]` but not measure it.
+            //
+            // ON THE ARMED ARM BOTH NAMES MEAN SOMETHING NEW, and neither is a renaming.
+            // `_strict` becomes "linked root, CHAIN mask failed" -- the population (A) is here to
+            // remove. `_masked` becomes "unlinked root, CHAIN mask failed", which is a genuinely
+            // NEW population and CAN RISE: a block whose successor is merely portal-hidden keeps
+            // its wide requirement, and narrowing on that state would be a miscompile. The census
+            // sizes that residual at 168-1,529 entries a row.
             let arm = if has_link {
                 self.perf.jit_direct_reject_data_segment_strict += 1;
                 jit::direct::DataSegmentRejectArm::Strict
             } else {
                 self.perf.jit_direct_reject_data_segment_masked += 1;
+                // Census-only, for the success-path counter's reason plus one of its own: the
+                // `data_matches` it needs is the block's OWN, a second six-descriptor compare and
+                // a second indexed layout copy that the reject path does not otherwise take on
+                // this arm. It watches the hidden residual directly.
+                #[cfg(feature = "direct-link-refusal-census")]
+                {
+                    let own = self.jit_direct.segment_layout(block.id());
+                    if chain_entry_check && own.is_some_and(|own| own.data_matches(self)) {
+                        self.jit_direct.note_entry_chain_masked_reject();
+                    }
+                }
                 jit::direct::DataSegmentRejectArm::Masked
             };
             // The OFF arm takes main's statement, unchanged and unaugmented. Both governor
@@ -2572,7 +2614,28 @@ impl CpuGsw {
                 // BECAUSE it is linked" -- the block's own masked check would have passed, so
                 // cutting its edges lets it run -- from "rejected on a record it uses itself",
                 // where cutting the edges buys nothing because the masked check refuses too.
-                let own_mask_matches = has_link && segments.data_matches(self);
+                //
+                // IT MUST READ THE BLOCK'S OWN MASK, so the armed arm fetches `segment_layouts`
+                // explicitly: `segments` is the CHAIN layout there, and asking it would ask
+                // "would the chain check have passed?" -- which is the question this reject just
+                // answered NO to. `own_mask_matches` would be identically false, the governor's
+                // `on`-arm decline would never fire at all, and the decline is the only shipped
+                // mechanism that reaches the `own_pass - chain_pass` residual. The extra 116-byte
+                // copy is cold-path and armed-arm only; the OFF arm keeps `main`'s expression.
+                let own_mask_matches = has_link
+                    && if chain_entry_check {
+                        self.jit_direct
+                            .segment_layout(block.id())
+                            .is_some_and(|own| own.data_matches(self))
+                    } else {
+                        segments.data_matches(self)
+                    };
+                // The `own_pass - chain_pass` residual, free: it reuses the value just built. It
+                // therefore reads ZERO whenever the governor is on its OFF arm, which never
+                // builds that value, and zero on every arm while the entry check is OFF.
+                if chain_entry_check && own_mask_matches {
+                    self.jit_direct.note_entry_chain_reject_own_pass();
+                }
                 let live =
                     jit::direct::SEGMENT_ORDER.map(|segment| self.registers.segment(segment));
                 self.jit_direct

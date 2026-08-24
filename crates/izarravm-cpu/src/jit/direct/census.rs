@@ -539,6 +539,48 @@ pub(crate) struct DirectStallTally {
     /// each is one increment beside an increment that already happens, on paths that are already
     /// doing map work.
     pub links_cleared: [u64; LinkClearCause::COUNT],
+    /// How often `narrow_chain_requirement_if_leaf` reset a block's chain requirement to its own
+    /// layout because that cut took its LAST live outbound edge, indexed by the `LinkClearCause`
+    /// of the cut that did it. A strict subset of `links_cleared`, same index space.
+    ///
+    /// SPLIT BY CAUSE, and that is the point rather than a convenience (review round 2, R2-1).
+    /// `Retired` is the largest bucket and fires on every eviction, so a single scalar reads
+    /// non-zero on every row whatever the other causes do -- a witness that cannot fail. The
+    /// buckets say which cut sites the narrowing actually reaches:
+    ///
+    /// * `Retired` -- `unlink_block`'s inbound walk, the successor-evicted / SMC-flushed case.
+    /// * `ChainWiden`, `DataSegmentDecline`, `Replaced` -- the three `unlink_outbound` callers.
+    /// * `Flushed` / `Reset` read **ZERO by construction**: those paths reset `chain_layouts`
+    ///   wholesale and never call the helper.
+    ///
+    /// `Replaced` counts a narrowing that `try_link_inner` then legitimately re-widens with the
+    /// REPLACEMENT edge's own merge -- and only with that one, since the merge handed to
+    /// `widen_chain_requirement` is recomputed from the POST-cut requirement. Before that fix the
+    /// pre-cut snapshot was written back and the narrowing was silently undone.
+    pub chain_requirement_narrowed: [u64; LinkClearCause::COUNT],
+    /// Entries the CHAIN entry check refused where the block's OWN mask would have passed: the
+    /// `own_pass - chain_pass` residual that only the retire governor's link decline can reach.
+    ///
+    /// Costs nothing: it reuses the `own_mask_matches` value the governor's cold path already
+    /// builds. It therefore reads **zero whenever the governor is on its OFF arm**, because that
+    /// arm never builds the input -- and zero on every arm while `IZARRAVM_CHAIN_ENTRY_CHECK` is
+    /// OFF, because there is no chain arm to reject on.
+    pub entry_chain_reject_own_pass: u64,
+    /// Entries that PASSED the chain check and would have FAILED `all_data_matches` -- the
+    /// engagement proof for the armed arm, and the direct counterpart of the census build's
+    /// `chain_pass` column.
+    ///
+    /// GATED with the link-refusal census (`direct-link-refusal-census`), because unlike every
+    /// other counter in this family it needs work on the entry SUCCESS path: a second six-
+    /// descriptor compare per admitted entry, on a path that runs 10^8 times a fixture. Reads all
+    /// zeroes on a plain build.
+    pub entry_chain_admitted: u64,
+    /// Entries with no live successor where the block's own mask PASSES and the chain mask FAILS:
+    /// the shipped counterpart of the design's B1 column, and the residual the narrowing cannot
+    /// remove (a successor that is merely portal-HIDDEN keeps its predecessor's requirement wide,
+    /// and narrowing on that state would be a miscompile -- see
+    /// `narrow_chain_requirement_if_leaf`). Census-gated for `entry_chain_admitted`'s reason.
+    pub entry_chain_masked_reject: u64,
     /// The two halves the old `SideExitReason::Other` counter conflated.
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
@@ -2370,6 +2412,18 @@ impl crate::jit::JitState {
                 .iter()
                 .map(|c| (c.label(), self.stalls.links_cleared[*c as usize]))
                 .collect(),
+            chain_requirement_narrowed: LinkClearCause::ALL
+                .iter()
+                .map(|c| {
+                    (
+                        c.label(),
+                        self.stalls.chain_requirement_narrowed[*c as usize],
+                    )
+                })
+                .collect(),
+            entry_chain_reject_own_pass: self.stalls.entry_chain_reject_own_pass,
+            entry_chain_admitted: self.stalls.entry_chain_admitted,
+            entry_chain_masked_reject: self.stalls.entry_chain_masked_reject,
             side_exit_segment_limit: self.stalls.side_exit_segment_limit,
             side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
             side_exit_divide_guard: self.stalls.side_exit_divide_guard,
@@ -2577,6 +2631,22 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_reject_callout_privileged(&mut self) {
         self.stalls.reject_callout_privileged += 1;
+    }
+
+    /// The chain entry check's three counters. See `DirectStallTally` for what each denominates
+    /// and which builds can make it non-zero.
+    pub(crate) fn note_entry_chain_reject_own_pass(&mut self) {
+        self.stalls.entry_chain_reject_own_pass += 1;
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn note_entry_chain_admitted(&mut self) {
+        self.stalls.entry_chain_admitted += 1;
+    }
+
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn note_entry_chain_masked_reject(&mut self) {
+        self.stalls.entry_chain_masked_reject += 1;
     }
 
     /// The admission governor's three counters. Here rather than beside the governor's storage in
