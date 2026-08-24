@@ -9,6 +9,17 @@
 //! restored below and `--all-features` is a build gate from now on -- a feature nobody builds is a
 //! feature that rots, and this one is the attribution instrument the call-out campaign reaches for
 //! whenever a helper's outcome mix is in question.
+//!
+//! AND THE ARMS WERE NOT THE WHOLE REPAIR. Restoring them made the feature COMPILE; it did not
+//! make it RUN. Every one of `callout.rs`'s twelve `note_callout_attribution` call sites still
+//! passed one of the three ORIGINAL helpers, so the fourth row stayed at zero while
+//! `note_callout_executed` counted its calls, and `direct_callout_attribution_snapshot`'s
+//! `attempts == callout_executed` assertion aborted the run instead of reporting anything. GP2
+//! aborted on it, short by 152,816,855 -- exactly `callout_interpret_one_executed`. The lesson is
+//! that a compile gate is not a behaviour gate: the closure this file asserts at runtime is now
+//! asserted by a test that ARMS the instrument and takes a real `InterpretOne` call-out
+//! (`interpret_one_closes_the_callout_attribution_ledger`), so the next helper added without a
+//! call site fails in CI rather than in a census.
 
 use super::{CallOutHelper, InterpretOneRow};
 use crate::{
@@ -232,13 +243,41 @@ impl crate::jit::JitState {
         let snapshot = self.direct_callout_attribution.as_ref()?.snapshot();
         let DirectStallSnapshot {
             callout_executed,
+            callout_interpret_one_executed,
+            callout_interpret_one_abnormal,
             side_exit_callout_abnormal,
             side_exit_callout_step_break,
             ..
         } = self.stall_snapshot();
         assert_eq!(snapshot.totals.attempts, callout_executed);
-        assert_eq!(snapshot.totals.abnormal, side_exit_callout_abnormal);
         assert_eq!(snapshot.totals.step_break, side_exit_callout_step_break);
+
+        // ABNORMAL IS AN INEQUALITY, and the gap is a real population rather than slack. A slot the
+        // governor has DEMOTED leaves through the abnormal stub from the emitted prologue --
+        // `emit_call_out`'s `test byte [cell], STATE_DEMOTED; jnz abnormal` -- without calling any
+        // helper, so it reaches `side_exit_callout_abnormal` and can reach no counter in here. The
+        // same is true of the fail-closed return a null published bus takes, which is above
+        // `note_callout_executed` in every helper. Census `callout_interpret_one_*` documents that
+        // gap as the way to price a demotion; this assertion is the same statement from the other
+        // side, and writing it as an equality is what would be wrong.
+        assert!(snapshot.totals.abnormal <= side_exit_callout_abnormal);
+
+        // What keeps the inequality above from being vacuous: the `InterpretOne` row is tied
+        // EXACTLY to the two ungated counters that see the same events, so a call site that stops
+        // noting -- which is the bug this whole module owes its fourth row to -- still fails here.
+        let interpret_one = snapshot
+            .helpers
+            .iter()
+            .find(|row| row.helper == "interpret_one")
+            .expect("the InterpretOne helper row is always present");
+        assert_eq!(
+            interpret_one.counts.attempts,
+            callout_interpret_one_executed
+        );
+        assert_eq!(
+            interpret_one.counts.abnormal,
+            callout_interpret_one_abnormal
+        );
         Some(snapshot)
     }
 }

@@ -1697,6 +1697,8 @@ fn interpret_one_step<B: CpuBus>(
     let lin = snapshot.cs.base.wrapping_add(start_eip);
     let Some(view) = cpu.decode_cache.get_view(lin, snapshot.cs.default_size_32) else {
         cpu.jit_direct.note_interpret_one_abnormal();
+        #[cfg(feature = "direct-callout-attribution")]
+        note_interpret_one_attribution(cpu, cell, CallOutOutcome::Abnormal);
         return STATUS_ABNORMAL;
     };
     debug_assert_eq!(
@@ -1759,6 +1761,15 @@ fn interpret_one_step<B: CpuBus>(
             note_demotion(cpu, cell);
         }
         cpu.jit_direct.note_interpret_one_resync_fault(cell.row());
+        // RESYNC-FAULT is `Continued` on the attribution axis, and the axis is the reason: these
+        // three outcomes name WHICH SIDE-EXIT STUB the emitted slot left through, because that is
+        // the only thing the two runtime counters the snapshot closes against can see. This arm
+        // leaves through the `resync_fault` stub, which is neither `CallOutAbnormal` nor
+        // `CallOutStepBreak`, so it belongs in the residual bucket with every other continuation.
+        // The resync split itself is not lost -- `callout_interpret_one_rows` carries `resync`,
+        // `resync_fault`, `demoted` and `resume_refused_prefix_use` per row, ungated.
+        #[cfg(feature = "direct-callout-attribution")]
+        note_interpret_one_attribution(cpu, cell, CallOutOutcome::Continued);
         return 1i64 << STATUS_RESYNC_FAULT_BIT;
     };
     cpu.deferred_code_writes.close();
@@ -1868,6 +1879,10 @@ fn interpret_one_step<B: CpuBus>(
                 .note_interpret_one_resume_refused_prefix_use(cell.row());
         }
         cpu.jit_direct.note_interpret_one_resync(cell.row());
+        // `Continued` for the reason the fault arm above states: the axis is the stub, and the
+        // `resync` stub is neither of the two the snapshot closes against.
+        #[cfg(feature = "direct-callout-attribution")]
+        note_interpret_one_attribution(cpu, cell, CallOutOutcome::Continued);
         // EIP is left EXACTLY where the interpreter put it and the stub advances it by zero: the
         // instruction retired, so the architectural next address is already correct, and it is not
         // necessarily `start_eip + len` once S3 admits a row that can move it.
@@ -1886,7 +1901,44 @@ fn interpret_one_step<B: CpuBus>(
         "a non-arming row resumed with a shadow no earlier slot had armed"
     );
     cpu.registers.eip = entry_eip;
-    clocks | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+    let step_break = bus.requires_step_break();
+    // The RESUME arm, split exactly as `port_read_al_dx`'s tail splits: the step-break stub or no
+    // stub at all. Read into a local first so the attribution and the status word cannot disagree
+    // about what the bus said.
+    #[cfg(feature = "direct-callout-attribution")]
+    note_interpret_one_attribution(
+        cpu,
+        cell,
+        if step_break {
+            CallOutOutcome::StepBreak
+        } else {
+            CallOutOutcome::Continued
+        },
+    );
+    clocks | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+}
+
+/// Attribute one `InterpretOne` call-out, on the FOUR paths that can follow `note_callout_executed`.
+///
+/// This exists because its absence was a live bug: `CallOutHelper` grew its fourth variant with
+/// the generic call-out (merge 4b6b1554) and `callout_attribution.rs` grew its fourth `match` arm
+/// and its fourth snapshot row, but no CALL SITE ever passed the new variant. The snapshot's
+/// `attempts == callout_executed` closure then failed by exactly the `InterpretOne` volume and
+/// `IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION=1` aborted any run that took one -- GP2 by 152,816,855.
+///
+/// `None` for the port: no `InterpretOne` row reaches a port, which is the same claim
+/// `CallOutAttribution::note`'s no-port arm makes and `debug_assert`s.
+#[cfg(feature = "direct-callout-attribution")]
+fn note_interpret_one_attribution(
+    cpu: &mut CpuGsw,
+    cell: &InterpretOneCell,
+    outcome: CallOutOutcome,
+) {
+    cpu.jit_direct.note_callout_attribution(
+        CallOutHelper::InterpretOne { row: cell.row() },
+        None,
+        outcome,
+    );
 }
 
 /// R4's comparison, with the one case that is a FILL rather than a MOVE excluded.
