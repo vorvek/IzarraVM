@@ -27,7 +27,7 @@ macro_rules! ea_mark {
     ($phase:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::mark($phase);
+            $crate::jit::direct::mark($phase);
         }
     };
 }
@@ -39,7 +39,7 @@ macro_rules! ea_mark_coarse {
     ($phase:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::mark_coarse($phase);
+            $crate::jit::direct::mark_coarse($phase);
         }
     };
 }
@@ -49,7 +49,7 @@ macro_rules! ea_begin {
     ($d:expr, $v86:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::begin($d, $v86);
+            $crate::jit::direct::begin($d, $v86);
         }
     };
 }
@@ -59,7 +59,7 @@ macro_rules! ea_end {
     ($population:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::end($population);
+            $crate::jit::direct::end($population);
         }
     };
 }
@@ -72,7 +72,7 @@ macro_rules! ea_refusal {
     ($site:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::note_refusal($site);
+            $crate::jit::direct::note_refusal($site);
         }
     };
 }
@@ -82,7 +82,7 @@ macro_rules! ea_compile_site {
     ($site:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::note_compile_site($site);
+            $crate::jit::direct::note_compile_site($site);
         }
     };
 }
@@ -92,7 +92,7 @@ macro_rules! ea_fallback_tag {
     ($tag:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::set_fallback_tag($tag);
+            $crate::jit::direct::set_fallback_tag($tag);
         }
     };
 }
@@ -102,7 +102,7 @@ macro_rules! ea_native_sample {
     ($insns:expr, $hops:expr, $self_loop:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::note_native($insns, $hops, $self_loop);
+            $crate::jit::direct::note_native($insns, $hops, $self_loop);
         }
     };
 }
@@ -119,16 +119,12 @@ macro_rules! ea_mark_probe_tail {
         {
             if $from_compile {
                 // COARSE-inclusive: see the `mark(P2)` at the arm head.
-                $crate::jit::direct::entry_attribution::mark_coarse(
-                    $crate::jit::direct::entry_attribution::Phase::Compile,
-                );
-                $crate::jit::direct::entry_attribution::note_compile_site(
-                    $crate::jit::direct::entry_attribution::compile_site::INSTALLED_FALL_THROUGH,
+                $crate::jit::direct::mark_coarse($crate::jit::direct::Phase::Compile);
+                $crate::jit::direct::note_compile_site(
+                    $crate::jit::direct::compile_site::INSTALLED_FALL_THROUGH,
                 );
             } else {
-                $crate::jit::direct::entry_attribution::mark(
-                    $crate::jit::direct::entry_attribution::Phase::Probe,
-                );
+                $crate::jit::direct::mark($crate::jit::direct::Phase::Probe);
             }
         }
     };
@@ -139,7 +135,7 @@ macro_rules! ea_pin_lane_bit0 {
     ($bit:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
         {
-            $crate::jit::direct::entry_attribution::pin_lane_bit0($bit);
+            $crate::jit::direct::pin_lane_bit0($bit);
         }
     };
 }

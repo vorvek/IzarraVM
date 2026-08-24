@@ -2307,8 +2307,8 @@ fn sixteen_bit_addressing_modes_classify_with_the_interpreter_shape() {
         (Some(3), None, SegmentIndex::Ds),    // bx
     ];
     for (base, index, segment) in cases {
-        let lowered = classify::direct_addr(word_addr(base, index, segment, -2))
-            .expect("every 16-bit mode must lower");
+        let lowered =
+            direct_addr(word_addr(base, index, segment, -2)).expect("every 16-bit mode must lower");
         assert_eq!(lowered.base, base);
         assert_eq!(lowered.index, index);
         assert_eq!(lowered.scale, 1);
@@ -2322,7 +2322,7 @@ fn sixteen_bit_addressing_modes_classify_with_the_interpreter_shape() {
     }
 
     // The disp16-only form, and a Dword address for contrast.
-    let disp_only = classify::direct_addr(word_addr(None, None, SegmentIndex::Ds, 0x1234))
+    let disp_only = direct_addr(word_addr(None, None, SegmentIndex::Ds, 0x1234))
         .expect("disp16-only must lower");
     assert_eq!(disp_only.base, None);
     assert_eq!(disp_only.index, None);
@@ -2331,7 +2331,7 @@ fn sixteen_bit_addressing_modes_classify_with_the_interpreter_shape() {
     // A scale other than 1, 2, 4 or 8 is still refused, at either address size.
     let mut bad_scale = word_addr(Some(3), Some(6), SegmentIndex::Ds, 0);
     bad_scale.scale = 3;
-    assert!(classify::direct_addr(bad_scale).is_none());
+    assert!(direct_addr(bad_scale).is_none());
 }
 
 /// The emitter masks a ModRM-derived effective address at 64K when the block's address size is
@@ -2360,11 +2360,11 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
     };
 
     let mut unmasked = Encoder::new();
-    emit::emit_effective_address(&mut unmasked, addr, emit::AddressWrap::None);
+    emit_effective_address(&mut unmasked, addr, AddressWrap::None);
     let unmasked = unmasked.finish();
 
     let mut masked = Encoder::new();
-    emit::emit_effective_address(&mut masked, addr, emit::AddressWrap::Word);
+    emit_effective_address(&mut masked, addr, AddressWrap::Word);
     let masked = masked.finish();
 
     let mut probe = Encoder::new();

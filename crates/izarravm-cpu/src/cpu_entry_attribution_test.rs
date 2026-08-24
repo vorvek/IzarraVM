@@ -33,7 +33,7 @@
 
 use super::*;
 
-use crate::jit::direct::entry_attribution::{
+use crate::jit::direct::{
     Arm, OUTLIER_TICKS, Phase, Population, arm_for_test, begin, end, mark, snapshot,
 };
 

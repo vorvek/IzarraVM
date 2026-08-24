@@ -35,7 +35,7 @@ mod jit;
 /// in the observer build (`direct-entry-attribution`); the plain build has no such symbol, which
 /// is half of why its profile-JSON key set is unchanged.
 #[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
-pub use jit::direct::entry_attribution::{
+pub use jit::direct::{
     BIN_FIELDS, COMPILE_SITES, DirectEntryAttributionSnapshot, FALLBACK_TAG_NAMES, LANE_NAMES,
     N_BINS, N_HOP_BINS, N_INSN_BINS, N_LOOP_BINS, OUTLIER_TICKS, P0_MARK_LINE, PHASE_NAMES,
     POPULATION_NAMES, PRE_P0_REFUSAL_SITES, REFUSAL_SITES, native_bin_index, native_bin_parts,

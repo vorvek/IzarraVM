@@ -1559,7 +1559,7 @@ impl CpuGsw {
     pub fn direct_entry_attribution_snapshot(
         &self,
     ) -> Option<crate::DirectEntryAttributionSnapshot> {
-        crate::jit::direct::entry_attribution::snapshot()
+        crate::jit::direct::snapshot()
     }
 
     /// The census snapshot, JOINED with the two perf counters its classes are designed to close

@@ -8,7 +8,7 @@ use super::*;
 // in EVERY build: three of the call sites below are outside the `jit` gate.
 // See `dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md` section 4b.
 #[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
-use crate::jit::direct::entry_attribution::{FallbackTag, Phase, Population, compile_site, site};
+use crate::jit::direct::{FallbackTag, Phase, Population, compile_site, site};
 
 /// Gate for the differential-oracle per-instruction trace prototype
 /// (`IZARRAVM_DIFF_TRACE`). Separate env var from `IZARRAVM_FAULT_TRACE`
