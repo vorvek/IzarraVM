@@ -2856,7 +2856,11 @@ fn direct_callout_attribution_json(
     let Some(snapshot) = snapshot else {
         return serde_json::Value::Null;
     };
-    let expected_helpers = ["in_al_dx", "pushad", "popad"];
+    // FOUR since the generic call-out landed. This list was the second half of the same bug the
+    // CPU-side module header records: the attribution's `match` arms were repaired when
+    // `--all-features` went red, but this pin -- which the JSON writer asserts against -- was left
+    // at three, so an armed run that survived the CPU closure would have aborted here instead.
+    let expected_helpers = ["in_al_dx", "pushad", "popad", "interpret_one"];
     assert_eq!(snapshot.helpers.len(), expected_helpers.len());
     for (row, expected) in snapshot.helpers.iter().zip(expected_helpers) {
         assert_eq!(row.helper, expected);

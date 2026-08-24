@@ -831,6 +831,17 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
                     abnormal: 1,
                 },
             },
+            // The fourth row, and it carries a nonzero count on purpose: a zero here would let the
+            // schema pin pass against the writer that dropped `interpret_one` from its totals.
+            HelperRow {
+                helper: "interpret_one",
+                counts: Counts {
+                    attempts: 4,
+                    continued: 3,
+                    step_break: 0,
+                    abnormal: 1,
+                },
+            },
         ],
         ports: vec![
             PortRow {
@@ -853,10 +864,10 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
             },
         ],
         totals: Counts {
-            attempts: 6,
-            continued: 3,
+            attempts: 10,
+            continued: 6,
             step_break: 1,
-            abnormal: 2,
+            abnormal: 3,
         },
     };
 
@@ -868,12 +879,13 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
                 { "helper": "in_al_dx", "attempts": 3, "continued": 1, "step_break": 1, "abnormal": 1 },
                 { "helper": "pushad", "attempts": 2, "continued": 2, "step_break": 0, "abnormal": 0 },
                 { "helper": "popad", "attempts": 1, "continued": 0, "step_break": 0, "abnormal": 1 },
+                { "helper": "interpret_one", "attempts": 4, "continued": 3, "step_break": 0, "abnormal": 1 },
             ],
             "ports": [
                 { "port": 0x0201, "attempts": 1, "continued": 1, "step_break": 0, "abnormal": 0 },
                 { "port": 0x03da, "attempts": 2, "continued": 0, "step_break": 1, "abnormal": 1 },
             ],
-            "totals": { "attempts": 6, "continued": 3, "step_break": 1, "abnormal": 2 },
+            "totals": { "attempts": 10, "continued": 6, "step_break": 1, "abnormal": 3 },
         })
     );
 }
@@ -891,7 +903,9 @@ fn direct_callout_attribution_json_rejects_an_open_row() {
         ..Counts::default()
     };
     let _ = direct_callout_attribution_json(Some(Snapshot {
-        helpers: ["in_al_dx", "pushad", "popad"]
+        // All FOUR rows, so this case panics on the OPEN ROW it is named for rather than on the
+        // helper-count pin -- a `should_panic` that trips on the wrong assertion tests nothing.
+        helpers: ["in_al_dx", "pushad", "popad", "interpret_one"]
             .into_iter()
             .map(|helper| HelperRow {
                 helper,
@@ -900,7 +914,7 @@ fn direct_callout_attribution_json_rejects_an_open_row() {
             .collect(),
         ports: Vec::new(),
         totals: Counts {
-            attempts: 3,
+            attempts: 4,
             ..Counts::default()
         },
     }));

@@ -5687,3 +5687,117 @@ fn a_stack_width_change_resyncs_even_with_an_empty_suffix() {
         "the load itself must have happened, and taken the 16-bit stack"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The attribution ledger.
+// ---------------------------------------------------------------------------
+
+/// The `InterpretOne` call-out is ATTRIBUTED, so the opt-in attribution snapshot still closes.
+///
+/// THIS TEST OWES ITS EXISTENCE TO A BUG, and to the shape of the repair that missed it. When
+/// `CallOutHelper` grew its `InterpretOne` variant with the generic call-out, `--all-features`
+/// went red and the `match` arms in `callout_attribution.rs` were repaired to four. The CALL
+/// SITES were not: every `note_callout_attribution` in `callout.rs` still named one of the three
+/// original helpers, so the fourth row stayed at zero while `note_callout_executed` counted its
+/// calls. `direct_callout_attribution_snapshot`'s `attempts == callout_executed` assertion then
+/// ABORTED any armed run that took an `InterpretOne` call-out -- GP2 short by 152,816,855, which
+/// is exactly `callout_interpret_one_executed`.
+///
+/// Nothing caught it because the whole feature was a COMPILE gate and never a behaviour one: the
+/// tests that armed the instrument drove the port and stack helpers only, and asserted the new row
+/// was SILENT. So this test arms the instrument and takes a REAL `InterpretOne` call-out, once per
+/// status the helper can return, and asserts the closure the runtime asserts -- the four helper
+/// rows summing to `callout_executed`. Add a fifth helper without a call site and this fails in
+/// CI, which is the only place a census instrument's bugs are cheap.
+///
+/// The three legs cover both attribution outcomes an `InterpretOne` slot reaches on this fixture:
+/// `Continued` -- the resume, and RESYNC-FAULT, which leaves through its own stub and therefore
+/// belongs in the residual bucket rather than in either counter the snapshot closes against (see
+/// `interpret_one_step`) -- and `Abnormal`.
+#[cfg(all(
+    feature = "jit",
+    feature = "direct-callout-attribution",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_closes_the_callout_attribution_ledger() {
+    fn aim_past_the_limit(cpu: &mut CpuGsw, _: &mut TestBus) {
+        cpu.registers.set_ebx(0xffff);
+    }
+    fn drop_the_decode_lines(cpu: &mut CpuGsw, _: &mut TestBus) {
+        cpu.decode_cache.invalidate_and_clear_code_marks();
+    }
+
+    /// The three legs differ only in how the fixture is perturbed, and every one must close.
+    fn armed_leg(
+        perturb: fn(&mut CpuGsw, &mut TestBus),
+    ) -> (DirectCallOutAttributionSnapshot, DirectStallSnapshot) {
+        let (mut native, mut native_bus, block) = build_native(CODE, STARTS);
+        arm_fixture(&mut native, &mut native_bus);
+        perturb(&mut native, &mut native_bus);
+        native.enable_direct_callout_attribution_for_test();
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .expect("the fixture block must not stop the machine"),
+            "the installed block must actually run"
+        );
+        // This call IS the runtime closure, and it PANICS rather than reporting when the ledger is
+        // short -- which is what the bug looked like from a census.
+        let snapshot = native
+            .direct_callout_attribution_snapshot()
+            .expect("the instrument was armed");
+        (snapshot, native.direct_stall_snapshot())
+    }
+
+    let resumed = DirectCallOutOutcomeCounts {
+        attempts: 1,
+        continued: 1,
+        step_break: 0,
+        abnormal: 0,
+    };
+    for (name, perturb, expected) in [
+        (
+            "resume",
+            no_perturb as fn(&mut CpuGsw, &mut TestBus),
+            resumed,
+        ),
+        ("resync_fault", aim_past_the_limit, resumed),
+        (
+            "abnormal",
+            drop_the_decode_lines,
+            DirectCallOutOutcomeCounts {
+                attempts: 1,
+                continued: 0,
+                step_break: 0,
+                abnormal: 1,
+            },
+        ),
+    ] {
+        let (snapshot, stalls) = armed_leg(perturb);
+
+        // ANTI-VACUITY FIRST: a leg whose call-out never happened would close trivially.
+        assert_eq!(stalls.callout_interpret_one_executed, 1, "{name}");
+        let row = snapshot
+            .helpers
+            .iter()
+            .find(|row| row.helper == "interpret_one")
+            .unwrap_or_else(|| panic!("{name}: no interpret_one row"));
+        assert_eq!(row.counts, expected, "{name}");
+
+        // THE CLOSURE THE BUG BROKE, spelled out here rather than left to the snapshot's own
+        // assertion, so a future edit that relaxes that assertion still has to face this one.
+        assert_eq!(snapshot.helpers.len(), 4, "{name}");
+        let summed: u64 = snapshot.helpers.iter().map(|row| row.counts.attempts).sum();
+        assert_eq!(summed, stalls.callout_executed, "{name}");
+        assert_eq!(snapshot.totals.attempts, stalls.callout_executed, "{name}");
+        assert_eq!(
+            snapshot.totals.continued + snapshot.totals.step_break + snapshot.totals.abnormal,
+            stalls.callout_executed,
+            "{name}"
+        );
+        // No `InterpretOne` row reaches a port, so the port axis stays the port helper's alone.
+        assert!(snapshot.ports.is_empty(), "{name}");
+    }
+}
