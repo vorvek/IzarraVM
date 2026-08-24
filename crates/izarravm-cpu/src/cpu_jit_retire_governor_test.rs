@@ -1188,3 +1188,184 @@ fn governor_on_is_state_identical_to_the_interpreter_over_a_segment_moving_sweep
         "non-vacuity: the sweep must actually have exercised stage 2"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The governor's two inputs under `IZARRAVM_CHAIN_ENTRY_CHECK`. Repair 1 (the decline's EFFECT)
+// and Repair 2 (its TRIGGER, and the census mask that round 2's R2-3 found one site short of).
+// ---------------------------------------------------------------------------------------------
+
+/// Restores the ambient entry-check arm. Forced BEFORE the fixture builds its CPU, because the
+/// arm is read once per `BlockCache`.
+struct EntryCheckGuard;
+
+#[must_use]
+fn force_chain_entry_check() -> EntryCheckGuard {
+    jit::direct::set_chain_entry_check_for_test(Some(true));
+    EntryCheckGuard
+}
+
+impl Drop for EntryCheckGuard {
+    fn drop(&mut self) {
+        jit::direct::set_chain_entry_check_for_test(None);
+    }
+}
+
+/// REPAIR 2, the decline's TRIGGER. `own_mask_matches` must be built from the block's OWN mask.
+///
+/// `ENTRY` pins nothing at all and `SECOND` bakes ES, so on the armed arm the head rejects
+/// against the CHAIN's `{ES}` while its own (empty) mask passes everything. Compute
+/// `own_mask_matches` from the layout the entry check just used -- the chain one -- and it asks
+/// "would the chain check have passed?", which is what the reject answered NO to. It would be
+/// identically false, `decline_links_for_data_segment` would never fire on ANY row, and the
+/// decline is the only shipped mechanism that reaches the own_pass - chain_pass residual.
+///
+/// REPAIR 1, the decline's EFFECT, rides the same row. The decline's promise is "the next entry
+/// takes the check this block would have had if it had never linked". Under the chain entry check
+/// that is only true if cutting the last cell also narrows the requirement -- otherwise the
+/// declined block is re-checked against its stale-wide `{ES}` and rejects again, and the decline
+/// buys nothing. The final third of this fixture is that claim, stated as a run.
+#[test]
+fn governor_own_mask_input_is_the_blocks_own_mask() {
+    let _knob = force_chain_entry_check();
+    let _guard = force_arm(SegmentRetireGovernor::On);
+    let (mut cpu, mut bus) = strict_fixture();
+    assert!(cpu.jit_direct.chain_entry_check_armed());
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    ensure_compiled(&mut cpu, ENTRY);
+    ensure_compiled(&mut cpu, SECOND);
+
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) {
+        assert!(!strict_turn(&mut cpu, &mut bus, 0));
+    }
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    ensure_compiled(&mut cpu, ENTRY);
+    let key = key_at(&cpu, ENTRY);
+    let head_id = match cpu.jit_direct.probe(key) {
+        jit::direct::BlockProbe::Ready(id) => id,
+        other => panic!("the head must be compiled at the cap, got {other:?}"),
+    };
+    assert!(
+        cpu.jit_direct.has_linked_successor(head_id),
+        "non-vacuity: the head must be LINKED, or the reject lands on the masked arm"
+    );
+    assert_ne!(
+        cpu.jit_direct.chain_requirement_used_for_test(head_id),
+        0,
+        "non-vacuity: the head pins NOTHING itself, so a non-empty requirement can only be the          ES its successor pins"
+    );
+
+    // The turn that crosses into suppression, and therefore declines.
+    assert!(!strict_turn(&mut cpu, &mut bus, 0));
+    assert!(
+        cpu.jit_direct
+            .direct
+            .data_segment_link_declined_for_test(key),
+        "the decline must fire: the head's OWN mask is empty, so it passes, so the reject is the \
+         `linked` kind stage 2 exists for"
+    );
+    assert_eq!(clears_by_cause(&cpu, "data_segment_decline"), 1);
+    assert!(
+        cpu.jit_direct.stall_snapshot().entry_chain_reject_own_pass > 0,
+        "and the own_pass - chain_pass residual counter must have seen the same event"
+    );
+
+    // REPAIR 1. The decline cut both cells, so the narrowing reset the requirement, so the next
+    // entry is the one the block would have had unlinked -- which for a block that pins nothing
+    // is unconditional. A stale-wide requirement here would reject again.
+    let head_id = match cpu.jit_direct.probe(key) {
+        jit::direct::BlockProbe::Ready(id) => id,
+        other => panic!("a declined key stays compiled, got {other:?}"),
+    };
+    assert_eq!(
+        cpu.jit_direct.outbound_targets_for_test(head_id),
+        [None, None],
+        "the decline cuts BOTH cells; that is what makes the block a leaf"
+    );
+    assert_eq!(
+        cpu.jit_direct.chain_requirement_used_for_test(head_id),
+        0,
+        "and a leaf's requirement is its own layout, which for this block pins nothing"
+    );
+    let block = cpu.jit_direct.block(head_id).expect("the block is live");
+    set_base(&mut cpu, SegmentIndex::Es, SHIFT);
+    cpu.set_eip(ENTRY);
+    let before = cpu.perf_counters().clone();
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+        "the declined block must now RUN under the moved ES; if it rejects again the decline \
+         bought nothing and the governor's whole keep argument collapses"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment - before.jit_direct_reject_data_segment,
+        0
+    );
+}
+
+/// R2-3: the census mask the BUDGET is fingerprinted under must be the mask the reject was taken
+/// under, and on the armed arm that is the chain requirement on BOTH arms of the reject.
+///
+/// The shape is the residual the narrowing deliberately cannot remove. `SECOND`'s portal is
+/// cleared while the edge itself stays in the link graph -- what `suspend_decode_slot` and
+/// `compact_arena` do -- so the head is entered with `has_link == false` and rejects on the MASKED
+/// arm while still carrying its successor's `{ES}`. Leave that arm reading `segment_layouts` and
+/// the mask is EMPTY, so every live ES folds to the same fingerprint and the per-key census
+/// collapses to one layout. Two entries under two different ES bases separate the two readings.
+#[test]
+fn the_masked_arm_census_mask_follows_the_entry_check() {
+    let _knob = force_chain_entry_check();
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = strict_fixture();
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    ensure_compiled(&mut cpu, ENTRY);
+    ensure_compiled(&mut cpu, SECOND);
+
+    for live_es in [SHIFT, SHIFT * 2] {
+        // Compile the head under the base `SECOND` baked, or the edge cannot form at all and the
+        // head's requirement stays empty.
+        set_base(&mut cpu, SegmentIndex::Es, 0);
+        let block = ensure_compiled(&mut cpu, ENTRY);
+        let second_id = match cpu.jit_direct.probe(key_at(&cpu, SECOND)) {
+            jit::direct::BlockProbe::Ready(id) => id,
+            other => panic!("the successor must stay compiled, got {other:?}"),
+        };
+        assert_ne!(
+            cpu.jit_direct.chain_requirement_used_for_test(block.id()),
+            0,
+            "non-vacuity: the head must carry the successor's ES before the portal is hidden"
+        );
+
+        cpu.jit_direct.hide_block_portal_for_test(second_id);
+        assert!(
+            !cpu.jit_direct.has_linked_successor(block.id()),
+            "non-vacuity: hiding the portal must make the VISIBILITY predicate read false"
+        );
+        assert_ne!(
+            cpu.jit_direct.outbound_targets_for_test(block.id()),
+            [None, None],
+            "and the LINK GRAPH must still hold the edge -- this is the residual, not a leaf"
+        );
+
+        set_base(&mut cpu, SegmentIndex::Es, live_es);
+        cpu.set_eip(ENTRY);
+        let before = cpu.perf_counters().clone();
+        assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(
+            cpu.perf_counters().jit_direct_reject_data_segment_masked
+                - before.jit_direct_reject_data_segment_masked,
+            1,
+            "the hidden successor puts this reject on the MASKED arm, against the CHAIN's mask"
+        );
+    }
+
+    let record = cpu
+        .jit_direct
+        .direct
+        .data_segment_retire_record_for_test(key_at(&cpu, ENTRY))
+        .expect("the rejecting key must carry its census");
+    assert_eq!(
+        record.distinct_layouts(),
+        2,
+        "the two entries moved ES, and ES is in the mask the reject was taken under; a census \
+         taken under the block's own (empty) mask folds both to one fingerprint"
+    );
+}

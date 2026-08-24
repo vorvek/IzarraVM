@@ -254,6 +254,19 @@ impl LinkCell {
         // every cell to the permanent sentinel before releasing that storage.
         unsafe { &*(portal as *const BlockPortal) }.visible()
     }
+
+    /// Whether this cell is CLEARED: its portal is the shared zero sentinel, which is where `new`
+    /// starts it and where `clear` returns it.
+    ///
+    /// **This is not `linked()` and it must never be confused with it.** `linked()` is a
+    /// VISIBILITY predicate: it defers to `BlockPortal::visible`, which a decode-slot suspension
+    /// or an arena compaction flips without touching the cell or the link graph, so it reads
+    /// false for an edge that is still logically there and will become usable again with no
+    /// merge. This one reads only the cell's own state, which is what an ordering argument about
+    /// the unlink paths needs.
+    pub(crate) fn is_cleared(&self) -> bool {
+        self.portal.load(Ordering::Acquire) == zero_portal().address()
+    }
 }
 
 /// One inbound reference: the source unit and which of its (at most two) outbound slots points

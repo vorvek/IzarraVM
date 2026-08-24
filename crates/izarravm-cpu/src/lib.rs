@@ -1980,6 +1980,16 @@ pub struct DirectStallSnapshot {
     /// `PerfCounters::jit_direct_links_cleared`, which is fed independently and must equal the
     /// sum of these three.
     pub links_cleared: Vec<(&'static str, u64)>,
+    /// (label, count) per `LinkClearCause`: the subset of `links_cleared` where the cut took the
+    /// source's LAST live outbound edge and its chain requirement was reset to its own layout.
+    /// `flushed` and `reset` are zero by construction. See `DirectStallTally`.
+    pub chain_requirement_narrowed: Vec<(&'static str, u64)>,
+    /// The chain entry check's residual and its two census-gated engagement counters. All three
+    /// read zero while `IZARRAVM_CHAIN_ENTRY_CHECK` is OFF; the last two also read zero on a
+    /// build without `direct-link-refusal-census`. See `DirectStallTally`.
+    pub entry_chain_reject_own_pass: u64,
+    pub entry_chain_admitted: u64,
+    pub entry_chain_masked_reject: u64,
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
     /// Lowered DIV/IDIV guard refusals. See `BlockCacheStats`.
