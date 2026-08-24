@@ -3162,8 +3162,9 @@ impl CpuGsw {
             tally.note_entry(span.key.linear);
         }
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
-        // The far-return ledger, out of the high half of the RAM dword-write lane. Zero on the
-        // shipped default arm.
+        // The far-return ledger, out of the high half of the RAM dword-write lane. NON-ZERO on a
+        // shipped binary since the 2026-08-24 flip -- 273.4 M on the wolf3d-586 ladder row; zero
+        // only on the `0` escape.
         self.jit_direct.note_far_returns(far_returns);
         match exit.unresolved_reason {
             jit::direct::UnresolvedReason::None => {}

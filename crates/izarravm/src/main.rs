@@ -3311,10 +3311,12 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_disp_store_lane_cap_refusals": snapshot.disp_store_lane_cap_refusals,
         "smc_disp_load_widen_lane_cap_refusals": snapshot.disp_load_widen_lane_cap_refusals,
         "decode_pack_late_view_miss": snapshot.decode_pack_late_view_miss,
-        // The far-return slice's three refusal cells (`IZARRAVM_DIRECT_RETF_V86`). All zero on
-        // the shipped default arm, which is the cheapest check that a ladder leg named the arm it
-        // meant to. Unconditional here for the reason its neighbours are: a counter present on
-        // one leg and absent on the other confounds the arm with a counter-surface change.
+        // The far-return slice's ledger and its three refusal cells
+        // (`IZARRAVM_DIRECT_RETF_V86`, default `v86` since the 2026-08-24 ladder). All zero on the
+        // `0` ESCAPE, which is the cheapest check that a ladder leg named the arm it meant to, and
+        // all live on a default binary. Unconditional here for the reason its neighbours are: a
+        // counter present on one leg and absent on the other confounds the arm with a
+        // counter-surface change.
         "far_ret_native": snapshot.far_ret_native,
         "blocks_installed_baking_cs": snapshot.blocks_installed_baking_cs,
         "far_link_refused_cs": snapshot.far_link_refused_cs,

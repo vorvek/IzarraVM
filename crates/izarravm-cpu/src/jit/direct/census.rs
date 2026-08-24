@@ -758,7 +758,9 @@ pub(crate) struct DirectStallTally {
     /// falsifies it, and the packed arm loses continuations the unpacked arm would have run.
     pub decode_pack_late_view_miss: u64,
     /// RETFs served natively by `DirectKind::RetFar16`, read out of the HIGH half of the
-    /// `STACK_RAM_DWORD_WRITES` frame lane. ZERO on the shipped default arm.
+    /// `STACK_RAM_DWORD_WRITES` frame lane. **NON-ZERO on a shipped binary since the 2026-08-24
+    /// flip** (273,380,624 on the wolf3d-586 ladder row); zero on the `0` escape, which is the
+    /// cheapest check that a leg named the arm it meant to.
     ///
     /// A LEDGER rather than a rate. A native far return does not call
     /// `invalidate_code_caches_for_cs_load`, so `decode_inval_cs_load` falls by exactly this
@@ -793,7 +795,9 @@ pub(crate) struct DirectStallTally {
     /// with an epoch re-phasing.
     pub blocks_installed_baking_cs: u64,
     /// The three ways a FAR edge is refused or cut (`IZARRAVM_DIRECT_RETF_V86`). All zero on the
-    /// shipped default arm, because no far edge is ever offered.
+    /// `0` ESCAPE, because no far edge is ever offered there; live on a shipped binary since the
+    /// 2026-08-24 flip, and `far_link_refused_cs` in particular reads 136.6 M on the wolf3d-586
+    /// ladder row -- see its bullet below for what that means and what it opens.
     ///
     /// They are counted at THREE DIFFERENT SITES, because the three events fire at three
     /// different places and a counter parked where its event cannot reach is worse than no

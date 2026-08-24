@@ -420,11 +420,21 @@ fn differential(
 // The knob
 // -------------------------------------------------------------------------------------------
 
-/// THE DEFAULT PIN. Reads the AMBIENT knob deliberately, so the suite is green on both arms: it
-/// asserts the spelling table applied to the real environment, which with the variable unset
-/// reduces to "the default is OFF".
+/// THE DEFAULT PIN, and it is the one assertion that decides what a shipped binary admits.
+///
+/// Catches: a flip of `parse_direct_retf_v86_arm`'s `NotPresent` arm. The default is `v86` since
+/// the 2026-08-24 ladder, which priced it at a wolf3d-586 min-wall ratio of **1.359** (89.737 s
+/// against 66.015 s) with `decode_inval_cs_load` 274.0 M -> 0.60 M, an EXACT ledger identity, an
+/// inert doom/quake/tombraid corpus and duke inside its own leg spread. A default that moved back
+/// without a ladder would change every shipped binary's admission silently.
+///
+/// It reads the AMBIENT knob deliberately -- no override -- and must therefore agree with the
+/// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: a fixture that
+/// hard-asserted one arm would make the other leg red by construction. So the assertion is the
+/// spelling table applied to the real environment, which with the variable unset reduces to "the
+/// default is `v86`", which is the claim this fixture exists for.
 #[test]
-fn direct_retf_v86_ships_off_by_default() {
+fn direct_retf_v86_ships_v86_by_default() {
     jit::direct::set_direct_retf_v86_for_test(None);
     let ambient = std::env::var("IZARRAVM_DIRECT_RETF_V86");
     let expected = jit::direct::parse_direct_retf_v86_arm_for_test(ambient.clone());
@@ -437,8 +447,8 @@ fn direct_retf_v86_ships_off_by_default() {
     if ambient.is_err() {
         assert_eq!(
             expected,
-            jit::direct::RetfArm::Off,
-            "IZARRAVM_DIRECT_RETF_V86 must default OFF"
+            jit::direct::RetfArm::V86,
+            "IZARRAVM_DIRECT_RETF_V86 must default to the `v86` arm since the 2026-08-24 ladder; see `direct_retf_v86` for the numbers that priced the flip"
         );
     }
 }
@@ -449,16 +459,27 @@ fn direct_retf_v86_ships_off_by_default() {
 /// Catches: a `_ => Off` fallthrough replacing the panic. A mistyped ladder leg
 /// (`IZARRAVM_DIRECT_RETF_V86=yes`) that fell through would run exactly what an unset environment
 /// runs and be read as "the arm I asked for changed nothing", which is the single wrong conclusion
-/// an arm ladder exists to avoid. And the EMPTY string is a spelling of OFF while unset is also
-/// OFF -- the two agree here, but they must agree by the table rather than by accident, because
-/// nulling an environment variable in PowerShell leaves it PRESENT and EMPTY.
+/// an arm ladder exists to avoid.
+///
+/// **THE EMPTY STRING IS THE ESCAPE AND UNSET IS THE DEFAULT, AND SINCE THE 2026-08-24 FLIP THEY
+/// ARE DIFFERENT ARMS.** That is not a hypothetical distinction: nulling an environment variable
+/// in PowerShell leaves it PRESENT and EMPTY, so a leg that nulls this variable gets `Off` where
+/// it may have meant the default. It happens to land on the arm such a leg usually wants -- the
+/// escape -- but three earlier evidence directories in this repository ran default-ON knobs off
+/// exactly this way, and the only true unset is `Remove-Item Env:`.
 #[test]
 fn direct_retf_v86_knob_spellings() {
     use jit::direct::RetfArm;
     use std::env::VarError;
     assert_eq!(
         jit::direct::parse_direct_retf_v86_arm_for_test(Err(VarError::NotPresent)),
-        RetfArm::Off
+        RetfArm::V86,
+        "unset must name the `v86` arm since the 2026-08-24 flip"
+    );
+    assert_eq!(
+        jit::direct::parse_direct_retf_v86_arm_for_test(Ok(String::new())),
+        RetfArm::Off,
+        "and the EMPTY STRING must still be the ESCAPE, even though unset is no longer"
     );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
         assert_eq!(
@@ -516,17 +537,30 @@ fn direct_retf_v86_knob_spellings() {
     jit::direct::set_direct_retf_v86_for_test(None);
 }
 
-/// F14. The OFF arm reproduces main's span and break reason exactly.
+/// F14. The ESCAPE arm reproduces main's span and break reason exactly.
+///
+/// Since the 2026-08-24 flip the escape is no longer the default, so this fixture is driven from
+/// the `0` SPELLING rather than from the enum: the arm it selects is whatever
+/// `IZARRAVM_DIRECT_RETF_V86=0` resolves to, which is the thing an A/B leg actually exports. If
+/// the spelling table ever stopped mapping `0` to the escape, this fixture would then be pinning
+/// the wrong arm's behaviour, and the assertion below is what stops that silently.
 ///
 /// Catches: an admission that forgot its arm test, i.e. a RETF lowered while the knob says off --
-/// which would make the OFF leg disagree with `main` and destroy the A/B base for the whole
-/// ladder.
+/// which would make the escape leg disagree with `main` and destroy the A/B base every future
+/// measurement on this mechanism is read against.
 ///
 /// The control row is a plain `mov ax,cx` tail, which must extend the block on BOTH arms: it
 /// proves the harness is not simply refusing everything, which is how this test would go vacuous.
 #[test]
-fn off_arm_stops_before_the_retf() {
-    select_retf(jit::direct::RetfArm::Off);
+fn the_escape_arm_stops_before_the_retf() {
+    // Driven by the SPELLING, not by the enum: `0` is what an escape leg exports.
+    let escape = jit::direct::parse_direct_retf_v86_arm_for_test(Ok("0".to_string()));
+    assert_eq!(
+        escape,
+        jit::direct::RetfArm::Off,
+        "`IZARRAVM_DIRECT_RETF_V86=0` must still name the escape, or every A/B base in the campaign's evidence directories is measuring a different arm than it says"
+    );
+    select_retf(escape);
     for (name, builder) in [
         ("real mode", real_cpu as fn() -> CpuGsw),
         ("V86", v86_cpu as fn() -> CpuGsw),

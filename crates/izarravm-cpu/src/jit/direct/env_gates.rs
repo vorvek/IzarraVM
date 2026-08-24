@@ -473,26 +473,37 @@ pub(crate) fn parse_disp_load_widen_arm_for_test(
 /// The three arms of `IZARRAVM_DIRECT_RETF_V86`: which CPU modes may serve `0xCA`/`0xCB` RETF
 /// natively.
 ///
-/// `Off` is the shipped default and reproduces pre-slice `main` at this site: the compile walk
-/// stops at the non-continuable RETF exactly where it always did, no `RetFar16` kind is ever
-/// produced, and no arm of the emitter, the far PIC or the far merge is reachable.
+/// **`V86` IS THE SHIPPED DEFAULT SINCE THE 2026-08-24 LADDER.** It shipped `Off` for exactly the
+/// commits that built it, and the ladder that priced it flipped it in the next -- the same
+/// sequence `IZARRAVM_DISP_STORE_LANES` took on 2026-08-23. See `direct_retf_v86` for the numbers.
+///
+/// `Off` is the ESCAPE and the A/B BASE, and it still ships whole: the compile walk stops at the
+/// non-continuable RETF exactly where it always did, no `RetFar16` kind is ever produced, and no
+/// arm of the emitter, the far PIC or the far merge is reachable. Every far counter reads zero on
+/// it, which is the cheapest check that a leg named the arm it meant to.
 ///
 /// `V86` is the BLAST-RADIUS control, not a half-measure. wolf3d runs in V86 once TOKAEMM is
 /// resident, so it captures that fixture's whole RETF population while leaving BIOS POST and
-/// pre-CONFIG.SYS DOS byte-identical -- which makes it a layout A/A for any corpus row that never
-/// enters V86. `On` adds plain real mode (PE = 0), which is where a shared real-mode boot phase is
-/// exposed.
+/// pre-CONFIG.SYS DOS byte-identical -- which is what made the corpus rows a layout A/A on the
+/// ladder and is why this and not `On` is the arm that flipped.
+///
+/// `On` adds plain real mode (PE = 0) and **STAYS OPT-IN**, pending a real-mode-only fixture
+/// ladder. It is where every fixture's shared real-mode boot phase is exposed, and duke's SMC
+/// heat regime is the thing that would notice first: the heat clock is `perf.instructions`, so a
+/// real-mode admission shifts the epochs, which is the mechanism that moved duke's coverage 4.5
+/// points across the SB16 DSP merge. Nothing about `On` is believed wrong; it is unpriced.
 ///
 /// PROTECTED MODE IS NOT AN ARM AND CANNOT BECOME ONE. A protected-mode RETF loads a descriptor,
 /// runs the RPL/DPL checks and can pop SS:eSP for an inter-privilege return; the lemma this slice
 /// rests on -- the CS record is a pure function of the popped selector -- is false there.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub(crate) enum RetfArm {
-    /// The DEFAULT and the A/B base. Reached by unset, `""`, `0` or `off`.
+    /// The ESCAPE and the A/B base. Reached by the EMPTY STRING, `0` or `off` -- **NOT by leaving
+    /// the variable unset**, which is `V86` since the 2026-08-24 flip.
     Off,
-    /// Admit only when `cpu.is_v86_mode()`. Reached by `v86`.
+    /// Admit only when `cpu.is_v86_mode()`. **The shipped default**, reached by unset or `v86`.
     V86,
-    /// Admit in V86 and in plain real mode (PE = 0). Reached by `1` or `on`.
+    /// Admit in V86 and in plain real mode (PE = 0). Reached by `1` or `on`; opt-in, unpriced.
     On,
 }
 
@@ -500,8 +511,10 @@ impl RetfArm {
     /// Whether this arm admits a native RETF in the CPU's CURRENT mode.
     ///
     /// The caller tests `self != Off` FIRST and only then calls this, so the OFF arm reads no CPU
-    /// state per walked instruction. That ordering is the whole of what makes the OFF arm's
-    /// compile walk identical to main's rather than merely equivalent to it.
+    /// state per walked instruction. That ordering is the whole of what makes the ESCAPE arm's
+    /// compile walk identical to main's rather than merely equivalent to it -- and the escape is
+    /// the A/B base every future measurement on this mechanism is read against, so it has to stay
+    /// identical rather than equivalent even though it is no longer the default.
     pub(crate) fn admits(self, cpu: &CpuGsw) -> bool {
         match self {
             Self::Off => false,
@@ -513,12 +526,57 @@ impl RetfArm {
 
 /// Which modes serve RETF natively (`IZARRAVM_DIRECT_RETF_V86`). See `RetfArm`.
 ///
+/// **DEFAULT `v86` SINCE THE 2026-08-24 LADDER.**
+///
+/// # WHAT PRICED THE FLIP
+///
+/// `.bench/results/retf-ladder-20260824/`, plain builds, ABBA-interleaved, processor 8, min-wall,
+/// every other knob pinned identical across the legs:
+///
+/// | row | off (the escape) | `v86` | verdict |
+/// |---|---:|---:|---|
+/// | **`wolf3d-586` min-wall — DECIDES** | 89.737 s | **66.015 s** | **ratio 1.359** against a
+///   pre-registered bar of 1.15, and above the design's own priced-floor bracket |
+/// | `doom-586`, `quake-586`, `tombraid-586` | — | — | **INERT**: counters IDENTICAL, which is
+///   what the `v86` arm predicted for a row that never enters V86 |
+/// | `duke3d-586` short | 87.8 s | 88.8 s | inside its own 3.8% leg spread |
+///
+/// The mechanism counters say the population was actually served rather than merely reshaped:
+/// `decode_inval_cs_load` **274.0 M -> 0.60 M**, and the §3.6 ledger identity closed EXACTLY --
+/// `600,071 + 273,380,624 = 273,980,695`, the base's own reading to the unit.
+///
+/// **`guest_seconds`, `perf.instructions` and `raw_bus_clocks` came out IDENTICAL per row on both
+/// arms.** That is better than the design promised: §6.6 pre-registered all three as BANDS rather
+/// than pins, because the slice moves run boundaries and therefore interrupt-delivery phase. It
+/// did not move them here, and the pins are recorded as measured rather than smoothed into the
+/// band they were allowed.
+///
+/// **`far_link_refused_cs` reads 136.6 M on the full run**, i.e. INV-FAR-CS is refusing a large
+/// share of far edges on real code, exactly as bar 7 warned it might (`PUSH CS` is a 158 M
+/// block-stopping row on this fixture). The win banked here is therefore substantially the ENDER
+/// REMOVAL, and that number is the pre-registered target for the follow-on: a runtime selector
+/// compare in the far PIC, a separate slice with its own invariant.
+///
 /// # THE SPELLING TABLE
 ///
-/// unset / `""` / `0` / `off` -> OFF (the default), `v86` -> V86 only, `1` / `on` -> V86 and plain
-/// real mode, anything else PANICS. Unset is OFF, so an armed leg must EXPORT its value. The
-/// direction matches `IZARRAVM_DISP_LOAD_WIDEN` and is the OPPOSITE of
-/// `IZARRAVM_DISP_STORE_LANES`; a leg script must state every knob explicitly.
+/// Trimmed and case-folded on the way in:
+///
+/// * **unset** or `v86` -> V86 only, the shipped default since the 2026-08-24 flip. Every
+///   "defaults" leg recorded BEFORE that date is the escape arm and is not comparable with one
+///   recorded after.
+/// * the EMPTY STRING, `0` or `off` -> OFF: the escape, the pre-slice base and the A/B base.
+/// * `1` / `on` -> V86 **and** plain real mode. Opt-in and unpriced; see `RetfArm::On`.
+/// * **anything else PANICS.** A mistyped ladder leg that fell through would run the DEFAULT and
+///   be read as "the arm I asked for changed nothing", the one wrong conclusion an arm ladder
+///   exists to avoid.
+///
+/// **THE NULLING TRAP FLIPPED WITH THE DEFAULT, and every leg script has to flip with it.** The
+/// empty string is OFF while unset is now `v86`, and the two must not be confused: nulling a
+/// variable in PowerShell leaves it PRESENT and EMPTY, which this table spells OFF. Before the
+/// flip an armed leg had to EXPORT its arm; now it is the ESCAPE leg that must export `0`, and
+/// `Remove-Item Env:` is the only true unset. The direction now matches
+/// `IZARRAVM_DISP_STORE_LANES` and is the OPPOSITE of `IZARRAVM_DISP_LOAD_WIDEN`; a leg script
+/// must state every knob explicitly.
 pub(crate) fn direct_retf_v86() -> RetfArm {
     #[cfg(test)]
     if let Some(forced) = DIRECT_RETF_V86_OVERRIDE.with(std::cell::Cell::get) {
@@ -531,11 +589,16 @@ pub(crate) fn direct_retf_v86() -> RetfArm {
 /// The `IZARRAVM_DIRECT_RETF_V86` spelling table. See `direct_retf_v86`.
 fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfArm {
     let raw = match value {
-        // Unset = OFF; an armed leg must EXPORT its arm, for `parse_disp_load_widen_arm`'s reason.
-        Err(std::env::VarError::NotPresent) => return RetfArm::Off,
+        // Unset = `v86` since the 2026-08-24 flip; `0` / `off` is the escape. The nulling trap
+        // flipped with it and now damages the ESCAPE leg: an off leg must EXPORT `0`. A leg that
+        // merely nulls the variable leaves it present and empty, which is spelled OFF one arm
+        // down -- so that particular accident happens to land on the arm it named. Do not rely on
+        // it: `Remove-Item Env:` is the only true unset, and this file's default-OFF knobs fail
+        // the other way.
+        Err(std::env::VarError::NotPresent) => return RetfArm::V86,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
-                "IZARRAVM_DIRECT_RETF_V86 is set to a value that is not valid UTF-8; accepted                  spellings are unset, `0` or `off` (the shipped default: RETF stops the block and                  the interpreter serves it), `v86` (native RETF in V86 only) and `1` or `on`                  (native RETF in V86 and plain real mode)"
+                "IZARRAVM_DIRECT_RETF_V86 is set to a value that is not valid UTF-8; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder: native RETF in V86), `0` or `off` (the escape and the A/B base, under which the RETF stops the block and the interpreter serves it) and `1` or `on` (native RETF in V86 and plain real mode, opt-in and unpriced)"
             )
         }
         Ok(raw) => raw,
@@ -545,7 +608,7 @@ fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfA
         "v86" => RetfArm::V86,
         "1" | "on" => RetfArm::On,
         other => panic!(
-            "IZARRAVM_DIRECT_RETF_V86={other:?} names no arm; accepted spellings are unset, `0`              or `off` (the shipped default), `v86` (V86 only) and `1` or `on` (V86 and plain real              mode). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and              be read as the arm it named doing nothing"
+            "IZARRAVM_DIRECT_RETF_V86={other:?} names no arm; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder), `0` or `off` (the escape and the A/B base) and `1` or `on` (V86 and plain real mode, opt-in). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm it named doing nothing"
         ),
     }
 }
@@ -578,10 +641,12 @@ pub(crate) fn parse_direct_retf_v86_arm_for_test(
 /// opcode. It lives here rather than there for `stack_width_kind`'s reason: the question needs a
 /// `&CpuGsw` and `classify` has none.
 ///
-/// THE ARM IS TESTED FIRST, and that ordering is load-bearing rather than stylistic. On the OFF
-/// arm this returns after one `OnceLock` load and one compare, having read no CPU state, on every
-/// walked instruction of every block in the tree -- which is what makes the OFF arm's compile walk
-/// main's walk rather than an equivalent of it.
+/// THE ARM IS TESTED FIRST, and that ordering is load-bearing rather than stylistic. On the `0`
+/// ESCAPE this returns after one `OnceLock` load and one compare, having read no CPU state, on
+/// every walked instruction of every block in the tree -- which is what makes the escape's compile
+/// walk main's walk rather than an equivalent of it. That still matters after the 2026-08-24
+/// default flip: the escape is the A/B base every future measurement on this mechanism is read
+/// against.
 ///
 /// Every other term is a REFUSAL that must leave the block stopping exactly where main stops it,
 /// with `BarrierStop::NonContinuable` unchanged. That is why the operand size, the prefixes and
