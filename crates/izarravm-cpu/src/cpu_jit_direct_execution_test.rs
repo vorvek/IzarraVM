@@ -2825,6 +2825,88 @@ pub(super) fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
     );
 }
 
+/// **M-PRE, and it is a statement about `main`, not about the chain entry check.**
+///
+/// Every `DirectKind` that bakes a stack access must report SS in `pinned_segments`, or the
+/// MASKED arm -- which `main` has always taken for an unlinked root -- lets a block run against a
+/// stack descriptor its snapshot does not match. The chain entry check inherits that dependency
+/// and does not create it, which is why a failure here opens a shipped-defect report against
+/// `main` rather than stopping this slice (review round 1, M4).
+///
+/// Stated end to end rather than by inspecting the mask: each row is compiled, installed with no
+/// successor -- so its entry takes exactly the masked check -- and then entered with SS's BASE
+/// moved. A row that runs is a row whose stack segment is not pinned.
+///
+/// `ENTER` is absent because there is no 32-bit `Enter` kind to test: `0xC8` in a 32-bit segment
+/// is not admitted at all (the compile refuses it), and `Enter16` needs a 16-bit code segment,
+/// which this harness does not build. `LEAVE` covers the other half of that pair here.
+///
+/// **RESULT ON THIS TREE: GREEN, all five rows.** No shipped-defect report is owed.
+#[test]
+fn entry_mask_pins_ss_for_every_stack_baking_kind() {
+    const ROW: u32 = 0x200;
+    const ROW_DONE: u32 = 0x260;
+    for (name, body) in [
+        ("push r32", vec![0x50]),
+        ("pop r32", vec![0x58]),
+        ("push imm32", vec![0x68, 0x11, 0x22, 0x33, 0x44]),
+        ("leave", vec![0xc9]),
+        (
+            "ss: override",
+            vec![0x36, 0x8b, 0x15, 0x00, 0x30, 0x00, 0x00],
+        ),
+    ] {
+        let len = u32::try_from(body.len()).expect("a short row");
+        let mut memory = vec![0; 0x5000];
+        memory[ROW as usize..ROW as usize + body.len()].copy_from_slice(&body);
+        let jump = ROW + len;
+        memory[jump as usize] = 0xe9;
+        memory[jump as usize + 1..jump as usize + 5]
+            .copy_from_slice(&(ROW_DONE - (jump + 5)).to_le_bytes());
+        memory[ROW_DONE as usize] = 0xf4;
+
+        let mut cpu = flat_stack_cpu(ROW);
+        cpu.registers.set_esp(0x2800);
+        cpu.registers.set_ebp(0x2800);
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        decode_fixture(&mut cpu, &mut bus, &[ROW, jump]);
+        for page in [0x2000, 0x3000] {
+            map_direct_page(
+                &mut cpu,
+                &mut bus,
+                page,
+                page,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                true,
+            );
+        }
+        let block = install_fixture_block(&mut cpu, ROW);
+        assert!(
+            !cpu.jit_direct.has_linked_successor(block.id()),
+            "{name}: the row must be UNLINKED, or it takes the strict arm and proves nothing \
+             about the pinned set"
+        );
+
+        shift_segment_base(&mut cpu, SegmentIndex::Ss, 0x100);
+        cpu.set_eip(ROW);
+        let before = cpu.perf_counters().clone();
+        assert!(
+            !cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+            "{name}: the masked entry check must refuse a moved SS, or this kind is missing SS \
+             from `pinned_segments` and `main` runs it against a stale stack base"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_reject_data_segment_masked
+                - before.jit_direct_reject_data_segment_masked,
+            1,
+            "{name}: and the refusal must be the MASKED arm's, over the block's own pinned set"
+        );
+    }
+}
+
 /// Restores the ambient `IZARRAVM_CHAIN_ENTRY_CHECK` arm when it drops. The arm is read once per
 /// `BlockCache`, so it must be forced BEFORE the fixture builds its CPU.
 struct ChainEntryCheckArm;
