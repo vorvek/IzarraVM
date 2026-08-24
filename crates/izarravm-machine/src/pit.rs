@@ -270,7 +270,11 @@ impl Counter {
             CounterState::Inactive | CounterState::WaitGate => Some(self.out),
             CounterState::LoadDelay => {
                 if !self.gate {
-                    return Some(self.out);
+                    // The load itself does not touch OUT, but the CLK after it
+                    // enters `step_counting`, which forces OUT high in modes 2
+                    // and 3 while the GATE is low. Two CLKs are needed: one to
+                    // load, one to reach the force.
+                    return Some(self.gate_low_out(clocks >= 2));
                 }
                 if clocks == 0 {
                     return Some(self.out);
@@ -290,7 +294,9 @@ impl Counter {
             }
             CounterState::Counting => {
                 if !self.gate {
-                    return Some(self.out);
+                    // `step_counting`'s first act with the GATE low is the
+                    // mode-2/3 OUT force, so a single CLK is enough.
+                    return Some(self.gate_low_out(clocks >= 1));
                 }
                 Some(Self::counting_out_after(
                     self.mode,
@@ -303,6 +309,22 @@ impl Counter {
         }
     }
 
+    /// `step_counting`'s lazy GATE-low OUT force, as a peek. With the GATE low the
+    /// counting element is frozen, but modes 2 and 3 still drive OUT high (the
+    /// datasheet's GATE-low behaviour; `set_gate` applies it eagerly on the falling
+    /// edge and `step_counting` keeps it as a safety net). The peeks must apply it
+    /// too: `latch_status` WRITES `out_after`'s answer into the status latch the
+    /// guest then reads back, so a peek that skipped the force would hand the guest
+    /// a level the chip does not hold. `forced` is whether the queried span reaches
+    /// a CLK that runs `step_counting` at all.
+    fn gate_low_out(&self, forced: bool) -> bool {
+        if forced && matches!(self.mode, 2 | 3) {
+            true
+        } else {
+            self.out
+        }
+    }
+
     /// OUT level `clocks` CLKs after a Counting state with counting element
     /// `value` at level `out`, per mode. Binary radix, GATE already high (the
     /// caller handles Inactive/WaitGate/GATE-low/BCD). Mirrors `rise_from`'s case
@@ -311,16 +333,16 @@ impl Counter {
     /// high) because the level itself, not a distance to the next edge, is being
     /// asked for -- once OUT settles it just holds at that level.
     ///
-    /// Relies on the state-machine invariant (true for every state `step_counting`
-    /// actually produces, verified against the oracle): `value <= 1` at a Counting
-    /// state boundary implies `out == false` in modes 2 and 3. The chip only sets
-    /// `out = false` in the same step that decrements the counting element to 1
-    /// (mode 2) or trims it into the `<= 1` range on an OUT-low half-clock (mode
-    /// 3), so a stored state never has both `value <= 1` and `out == true`
-    /// together; an out-of-spec reload of 0 or 1 still falls out of these
-    /// equations without a panic (reload 0 is impossible, `effective_reload`
-    /// always returns 0x10000 for a raw 0; reload 1 is the datasheet's own
-    /// "illegal" case, handled explicitly below).
+    /// Relies on NO reachability invariant: every combination of `value`, `reload`
+    /// and `out` is answered exactly as `step_counting` would, whether or not the
+    /// write paths can produce it. An earlier version leaned on "`value <= 1` at a
+    /// Counting boundary implies `out == false` in modes 2 and 3" and, next to a
+    /// hoisted `reload <= 1` check, that reasoning went wrong on a state the guest
+    /// really does reach -- a periodic counter whose reload register is rewritten
+    /// while its counting element is still large (`arm` deliberately does not reset
+    /// the CE for modes 2 and 3). The differential test in `pit_test` now pins this
+    /// against clone-and-step over CONSTRUCTED states, not only reachable ones, so
+    /// no invariant has to be re-argued when a write path changes.
     fn counting_out_after(mode: u8, value: u64, reload: u64, out: bool, clocks: u64) -> bool {
         if clocks == 0 {
             return out;
@@ -338,23 +360,33 @@ impl Counter {
                 }
             }
             2 => {
+                // `step_counting` walks the CE down from `value` and only reloads
+                // when it is already <= 1, so the periodic regime does not begin
+                // until the FIRST reload CLK. From value >= 2 the CE reaches 1
+                // after value-1 CLKs (the one low CLK) and reloads on the next;
+                // from value <= 1 the very first CLK reloads.
+                let first_reload_at = if value >= 2 { value } else { 1 };
+                if clocks < first_reload_at {
+                    // Before that reload nothing touches OUT except the single CLK
+                    // that lands the CE on 1.
+                    return if clocks + 1 == first_reload_at {
+                        false
+                    } else {
+                        out
+                    };
+                }
                 if reload <= 1 {
                     // The datasheet's illegal input (reload 0 is impossible via
-                    // effective_reload; reload 1 reloads every CLK): OUT never
-                    // drops, mirroring rise_from's own "Illegal reload 1" branch.
+                    // effective_reload; reload 1 reloads every CLK once the CE is
+                    // in the reload regime, so the CE never lands on 1 again and
+                    // OUT never drops). This can only be answered AFTER the walk
+                    // above: a live CE larger than the rewritten reload still has
+                    // its own low CLK to serve, which a hoisted check would miss.
                     return true;
                 }
-                // Invariant: value <= 1 at a stored Counting state implies out ==
-                // false (see the doc comment above). So out == true here means
-                // value > 1: find the CLK where the counting element reaches 1
-                // (the one low CLK per period), then fold the remainder into one
-                // period of length `reload`.
-                let next_low_at = if out { value - 1 } else { reload };
-                if clocks < next_low_at {
-                    return true;
-                }
-                let phase = (clocks - next_low_at) % reload;
-                phase != 0
+                let phase = (clocks - first_reload_at) % reload;
+                // The CE lands on 1 on the last CLK of every period.
+                phase + 1 != reload
             }
             3 => {
                 // CLKs until the current half-cycle's toggle, then fold the rest
@@ -437,10 +469,12 @@ impl Counter {
                 // GATE-gated, so a low GATE still loads on the first CLK and then
                 // pauses AT the reload value (`clocks_until_out_rise` states the
                 // same rule: "a low GATE still loads but then pauses"). The
-                // mirrored gate-low arm in `out_after` returns the stored level
-                // because OUT genuinely does not move on the load; the CE does,
-                // and returning the pre-load field here would report a stale count
-                // for a guest that drops GATE2 (0x61 bit 0) and then reads 0x42.
+                // mirrored gate-low arm in `out_after` holds the stored level for
+                // that first CLK (the load does not move OUT) and only applies the
+                // mode-2/3 force from the second CLK on; the CE, by contrast, moves
+                // on the load itself, and returning the pre-load field here would
+                // report a stale count for a guest that drops GATE2 (0x61 bit 0)
+                // and then reads 0x42.
                 if !self.gate {
                     return Some(mask16(u64::from(reload)));
                 }
@@ -499,13 +533,13 @@ impl Counter {
                 }
             }
             2 => {
-                // Illegal reload <= 1 reloads on every CLK (see step_counting).
-                if r <= 1 {
-                    return mask16(r);
-                }
                 // From v >= 2 the CE walks down to 1 (v-1 CLKs, OUT drops there) and
                 // the next CLK reloads to r; from v <= 1 the very first CLK reloads.
-                // After that it is periodic with period r.
+                // After that it is periodic with period r. An illegal reload of 1
+                // needs NO special case here -- `r - (clocks - at) % r` is 1 for
+                // r == 1 -- but the walk down from a larger live CE must come
+                // first, or a reload rewritten to 1 mid-period would report the
+                // reload while the CE is still counting down to it.
                 let (base, at) = if v >= 2 { (v, v) } else { (v, 1) };
                 if clocks < at {
                     return mask16(base - clocks);
@@ -882,14 +916,15 @@ impl Counter {
     // `advance` and `out_transitions_in` below are the closed forms of `step`
     // and of the per-CLK observer loop in `Pit::tick_with_observer`. They mirror
     // `step_counting` arm for arm rather than composing the read-only peeks
-    // (`out_after` / `count_after`), for two reasons that both bite:
+    // (`out_after` / `count_after`), because the peeks return a 16-bit READ
+    // view, and the counting element can legitimately hold 0x10000 (a raw reload
+    // of 0) at the instant it reloads. A masked write-back would be a real state
+    // divergence.
     //
-    //   * the peeks return a 16-bit READ view, and the counting element can
-    //     legitimately hold 0x10000 (a raw reload of 0) at the instant it
-    //     reloads. A masked write-back would be a real state divergence.
-    //   * the peeks do not apply `step_counting`'s lazy GATE-low mode-2/3 OUT
-    //     force. That is harmless while they only READ; a bulk advance WRITES
-    //     the field. See `advance_counting`.
+    // The GATE-low mode-2/3 OUT force is no longer a second reason: `out_after`
+    // applies it through `gate_low_out`, since `latch_status` writes that answer
+    // into a latch the guest reads back. `advance_counting` still applies it in
+    // its own arm, on the field itself.
 
     /// Store a counting-element value computed in the 32-bit domain `wrap32` and
     /// `effective_reload` work in. Never masked to 16 bits: `count` really does

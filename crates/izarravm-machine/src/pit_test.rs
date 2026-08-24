@@ -1015,6 +1015,233 @@ fn analytic_count_after_holds_while_gate_is_low() {
     }
 }
 
+/// Collect every way the analytic peeks disagree with clone-and-step for one
+/// counter state across a sweep of queried distances. The oracle is `step` /
+/// `step_counting`: where the two differ, the PEEK is what is wrong.
+fn peek_divergences(counter: &Counter, label: &str, clockses: &[u64]) -> Vec<String> {
+    let mut found = Vec::new();
+    for &clocks in clockses {
+        let expected_count = simulated_count_after(counter, clocks);
+        let expected_out = simulated_out_after(counter, clocks);
+        if counter.count_after(clocks) != Some(expected_count) {
+            found.push(format!(
+                "{label}: count_after({clocks}) = {:?}, clone-and-step = {expected_count}",
+                counter.count_after(clocks)
+            ));
+        }
+        if counter.out_after(clocks) != Some(expected_out) {
+            found.push(format!(
+                "{label}: out_after({clocks}) = {:?}, clone-and-step = {expected_out}",
+                counter.out_after(clocks)
+            ));
+        }
+    }
+    found
+}
+
+/// A one-line description of a counter state, so a divergence report names the
+/// exact inputs rather than only the scenario that reached them.
+fn counter_label(prefix: &str, counter: &Counter) -> String {
+    format!(
+        "{prefix} [mode {} count {} reload {} out {} gate {} state {:?}]",
+        counter.mode, counter.count, counter.reload, counter.out, counter.gate, counter.state
+    )
+}
+
+fn report_divergences(found: &[String], total_states: usize) {
+    if found.is_empty() {
+        return;
+    }
+    let shown = found.iter().take(12).cloned().collect::<Vec<_>>();
+    panic!(
+        "{} analytic-peek divergences from clone-and-step over {total_states} counter states \
+         (first {} shown):\n{}",
+        found.len(),
+        shown.len(),
+        shown.join("\n")
+    );
+}
+
+#[test]
+fn analytic_peeks_match_the_step_simulation_after_a_reload_rewrite() {
+    // The gap the mode/reload/phase sweeps above never reach: a count REWRITTEN
+    // while the counter is already running. `arm` deliberately does not reset the
+    // counting element for modes 2 and 3 (a guest that rewrites faster than one
+    // period -- Prince of Persia's speaker driver -- must still complete cycles),
+    // so the CE and the reload register legitimately come apart. Every state below
+    // is produced by the real port path, so every one of them is reachable.
+    let clockses = [0u64, 1, 2, 3, 4, 5, 88, 89, 90, 91, 92, 200, 1000];
+    let mut found = Vec::new();
+    let mut states = 0usize;
+    for mode in 0..=5u8 {
+        for reload0 in [2u16, 3, 5, 7, 18, 100, 101, 0] {
+            for rewrite in [1u16, 2, 3, 7, 100, 0] {
+                for warm in [1u64, 2, 3, 10, 37] {
+                    let mut pit = Pit::default();
+                    if matches!(mode, 1 | 5) {
+                        pit.set_gate(0, false); // arm the trigger edge below
+                    }
+                    program_channel(&mut pit, 0, mode, reload0, false);
+                    if matches!(mode, 1 | 5) {
+                        pit.set_gate(0, true); // rising edge starts the one-shot
+                    }
+                    pit.tick(warm);
+                    pit.write_port(0x40, (rewrite & 0xff) as u8);
+                    pit.write_port(0x40, (rewrite >> 8) as u8);
+                    for phase in 0..4u64 {
+                        let label = counter_label(
+                            &format!(
+                                "mode {mode} reload {reload0} rewritten to {rewrite} \
+                                 after {warm} CLKs, phase {phase}"
+                            ),
+                            &pit.counters[0],
+                        );
+                        found.extend(peek_divergences(&pit.counters[0], &label, &clockses));
+                        states += 1;
+                        pit.tick(1);
+                    }
+                }
+            }
+        }
+    }
+    report_divergences(&found, states);
+}
+
+#[test]
+fn analytic_out_rise_matches_the_step_simulation_after_a_reload_rewrite() {
+    // The third analytic reader of the same state machine, on the same reachable
+    // states the peeks above get: `clocks_until_out_rise` reaches its "illegal
+    // reload 1" branch only after the `value >= 2` walk, so it was already right
+    // here. Pinned so a later edit cannot hoist that check the way the peeks had
+    // it. Modes 2 and 3 only, so the oracle's edge scan always terminates early.
+    for mode in [2u8, 3] {
+        for reload0 in [2u16, 3, 5, 7, 18, 100, 101, 0] {
+            for rewrite in [1u16, 2, 3, 7, 100, 0] {
+                for warm in [1u64, 2, 3, 10, 37] {
+                    let mut pit = Pit::default();
+                    program_channel(&mut pit, 0, mode, reload0, false);
+                    pit.tick(warm);
+                    pit.write_port(0x40, (rewrite & 0xff) as u8);
+                    pit.write_port(0x40, (rewrite >> 8) as u8);
+                    for phase in 0..4u64 {
+                        assert_eq!(
+                            pit.counters[0].clocks_until_out_rise(),
+                            simulated_rise(&pit.counters[0]),
+                            "{}",
+                            counter_label(
+                                &format!(
+                                    "mode {mode} reload {reload0} rewritten to {rewrite} \
+                                     after {warm} CLKs, phase {phase}"
+                                ),
+                                &pit.counters[0],
+                            )
+                        );
+                        pit.tick(1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn analytic_peeks_match_the_step_simulation_for_the_prince_of_persia_rewrite() {
+    // The single named case, spelled out: mode 2, CE 91, reload rewritten to the
+    // datasheet's illegal 1 while running, OUT high. The counter walks the CE down
+    // from 91 and only THEN enters the every-CLK reload regime, so a peek that
+    // jumps straight to the reload is off by the whole remaining walk.
+    let mut pit = Pit::default();
+    program_channel(&mut pit, 0, 2, 100, false);
+    pit.tick(10);
+    pit.write_port(0x40, 1);
+    pit.write_port(0x40, 0);
+    let counter = &pit.counters[0];
+    assert_eq!(counter.count, 91, "CE survives the rewrite");
+    assert_eq!(counter.reload, 1, "reload register took the new value");
+    assert!(counter.out, "OUT is still high mid-period");
+
+    assert_eq!(
+        counter.count_after(88),
+        Some(simulated_count_after(counter, 88)),
+        "count_after(88): analytic {:?} vs clone-and-step {}",
+        counter.count_after(88),
+        simulated_count_after(counter, 88)
+    );
+    assert_eq!(counter.count_after(88), Some(3), "the CE is 91 - 88");
+    assert_eq!(
+        counter.out_after(90),
+        Some(simulated_out_after(counter, 90)),
+        "out_after(90): analytic {:?} vs clone-and-step {}",
+        counter.out_after(90),
+        simulated_out_after(counter, 90)
+    );
+    assert_eq!(
+        counter.out_after(90),
+        Some(false),
+        "the CE reaches 1 on CLK 90, which is the one low CLK of the period"
+    );
+    assert_eq!(counter.out_after(89), Some(true), "still high on CLK 89");
+    assert_eq!(
+        counter.out_after(91),
+        Some(true),
+        "the reload CLK raises OUT"
+    );
+}
+
+#[test]
+fn analytic_peeks_match_the_step_simulation_across_constructed_counter_states() {
+    // The port-driven sweeps only reach states the current write paths happen to
+    // produce. This one constructs the counter fields directly and crosses every
+    // mode x CE x reload x OUT x GATE x state, so the peeks are pinned to the
+    // oracle as TOTAL functions rather than as functions that happen to be right
+    // on today's reachable set. A cross-function reachability invariant is exactly
+    // what hid the mode-2 defect, so the peeks carry none.
+    let counts: [u32; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 91, 100, 101, 0x10000];
+    let reloads: [u16; 9] = [0, 1, 2, 3, 4, 5, 7, 100, 101];
+    let clockses = [
+        0u64, 1, 2, 3, 4, 5, 6, 7, 8, 88, 89, 90, 91, 92, 99, 100, 101, 102, 200, 1000,
+    ];
+    let states = [
+        CounterState::Inactive,
+        CounterState::LoadDelay,
+        CounterState::Counting,
+        CounterState::WaitGate,
+    ];
+    let mut found = Vec::new();
+    let mut visited = 0usize;
+    for mode in 0..=5u8 {
+        for &count in &counts {
+            for &reload in &reloads {
+                for &out in &[false, true] {
+                    for &gate in &[false, true] {
+                        for &state in &states {
+                            let counter = Counter {
+                                mode,
+                                rw: RwMode::LsbThenMsb,
+                                bcd: false,
+                                count,
+                                reload,
+                                out,
+                                gate,
+                                state,
+                                null_count: false,
+                                latch: None,
+                                status_latch: None,
+                                write_msb_next: false,
+                                read_msb_next: false,
+                            };
+                            let label = counter_label("constructed", &counter);
+                            found.extend(peek_divergences(&counter, &label, &clockses));
+                            visited += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    report_divergences(&found, visited);
+}
+
 /// Brute-force oracle for the mid-batch status byte: clone, step `clocks` times,
 /// then latch at zero offset. The same shape as `simulated_count_after`.
 fn simulated_status_after(counter: &Counter, clocks: u64) -> u8 {
@@ -1710,11 +1937,15 @@ fn pit_bulk_advance_declines_an_illegal_mode_2_or_3_reload() {
             assert_eq!(counters.advances, 0, "{label}");
         }
 
-        // The reachable form of the same input, and the one the read-only peeks
-        // get WRONG (`counting_count_after` returns the reload outright for
-        // `r <= 1`): a live counter whose RELOAD is rewritten to 1 while its
-        // counting element is still large. `arm` deliberately does not reset the
-        // live count for modes 2 and 3, so this state really does occur.
+        // The reachable form of the same input: a live counter whose RELOAD is
+        // rewritten to 1 while its counting element is still large. `arm`
+        // deliberately does not reset the live count for modes 2 and 3, so this
+        // state really does occur -- it is the state the read-only peeks used to
+        // get wrong (they jumped straight to the reload for `r <= 1`, skipping the
+        // walk down from the live CE); see
+        // `analytic_peeks_match_the_step_simulation_for_the_prince_of_persia_rewrite`.
+        // The bulk arm still DECLINES it, which is exact by construction; whether
+        // the decline can now be relaxed is a separate question from the peek fix.
         let mut running = Pit::default();
         program_channel(&mut running, 0, mode, 100, false);
         running.tick(10);
