@@ -49,6 +49,17 @@ pub(super) struct EmitInput<'a> {
 pub(super) struct EmittedCode {
     pub(super) code: Vec<u8>,
     pub(super) body_offset: usize,
+    /// Jcc terminators this emission lowered through `emit_jcc_shadow`, indexed by
+    /// `JccShadowClass`. A `u16` per class because a block carries at most one Jcc terminator
+    /// today and the walk's slot cap bounds it regardless.
+    ///
+    /// It is a COMPILE-TIME site ledger and it is not a measurement of executed volume -- a
+    /// chained transfer runs a successor's terminator without any entry, and a self-loop Jcc runs
+    /// arbitrarily many times per entry, so `sites x entries` converts to nothing. Its two jobs
+    /// are the arena BYTE delta (each class has its own ON-minus-OFF byte cost) and the ARM
+    /// VACUITY check: all four lanes read zero on the OFF arm, so a ladder leg whose ON arm also
+    /// reads zero is vacuous and void.
+    pub(super) jcc_shadow_sites: [u16; 4],
 }
 
 #[derive(Clone, Copy)]

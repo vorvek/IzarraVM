@@ -79,8 +79,24 @@ fn loop_program() -> Vec<u8> {
     memory
 }
 
+/// Both Jcc lowering arms, and the SELF-LOOP shape: the `jnz` at 0x10d branches back into its own
+/// block, so its terminator runs once per iteration and its taken arm is the one that clobbers RAX
+/// with the quota load two instructions later. The shadow arm's signed folds also write RAX, so
+/// "RAX is dead across the terminator" is a property this shape exercises rather than asserts.
+///
+/// It is ALSO the only fixture that drives the REAL `run.rs` install site (`set_jit_auto_admit` +
+/// `run_straight_line`) rather than a fixture-side mirror of it, which is what pins the
+/// `note_jcc_shadow_sites` fold actually being wired into a shipped run.
 #[test]
 fn direct_block_matches_taken_and_fallthrough_jcc_timing() {
+    for on in [false, true] {
+        jit::direct::set_jcc_shadow_for_test(Some(on));
+        taken_and_fallthrough_jcc_timing_arm(on);
+    }
+    jit::direct::set_jcc_shadow_for_test(None);
+}
+
+fn taken_and_fallthrough_jcc_timing_arm(on: bool) {
     let mut interp = fresh();
     let mut native = fresh();
     interp.registers.set_eax(1);
@@ -124,6 +140,33 @@ fn direct_block_matches_taken_and_fallthrough_jcc_timing() {
         native.jit_direct.len()
     );
     assert_eq!(native.perf_counters().jit_direct_side_exits, 0);
+    // The `run.rs` install fold, read through the accessor a leg reads. The loop's terminator is
+    // `0x75` (JNZ), which is the `simple` class; the other three lanes stay empty either way. A
+    // zero here on the ON arm would mean the shipped fold is missing and every ladder leg's
+    // vacuity check would silently read as "the arm did nothing".
+    let sites = native.direct_stall_snapshot();
+    let lanes = [
+        sites.jcc_sites_simple,
+        sites.jcc_sites_overflow,
+        sites.jcc_sites_signed_xor,
+        sites.jcc_sites_signed_xor_zf,
+    ];
+    if on {
+        assert!(
+            lanes[0] > 0,
+            "the ON arm must register simple Jcc sites through the real install site: {lanes:?}"
+        );
+        assert_eq!(
+            lanes[1..],
+            [0, 0, 0],
+            "only the simple class is reachable here"
+        );
+    } else {
+        assert_eq!(
+            lanes, [0; 4],
+            "the OFF arm never calls emit_jcc_shadow, so every lane stays empty"
+        );
+    }
 }
 
 #[test]
@@ -3424,6 +3467,17 @@ fn word_jcc_loop_program() -> Vec<u8> {
 /// high-entry fixtures in `cpu_jit_compile_outcome_test.rs`.
 #[test]
 fn direct_block_matches_the_interpreter_across_a_word_operand_size_jcc() {
+    // Both Jcc lowering arms. The Word block shape is `AddressWrap::Word`, whose terminator sits
+    // downstream of a 16-bit producer -- the one place where the shadow's upper bits and the
+    // guest's operand size could be confused with each other.
+    for on in [false, true] {
+        jit::direct::set_jcc_shadow_for_test(Some(on));
+        word_operand_size_jcc_arm();
+    }
+    jit::direct::set_jcc_shadow_for_test(None);
+}
+
+fn word_operand_size_jcc_arm() {
     let mut interp = fresh();
     let mut native = fresh();
     interp.registers.set_eax(1);

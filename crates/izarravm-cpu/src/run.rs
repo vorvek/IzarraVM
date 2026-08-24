@@ -1718,6 +1718,16 @@ impl CpuGsw {
                             compilation.disp_load_widen_lane_count() as u64,
                         );
                 }
+                // The `IZARRAVM_JCC_SHADOW` site classes, charged HERE and not at compile for the
+                // reason every counter above is: a walk that never installs -- a `Retry`, a
+                // `StructuralReject`, or one of the prefixes the recovery search discards --
+                // contributes nothing, so the denominator stays "blocks this run installed".
+                let jcc_shadow_sites = compilation.jcc_shadow_sites();
+                if jcc_shadow_sites != [0; 4] {
+                    self.jit_direct
+                        .direct
+                        .note_jcc_shadow_sites(jcc_shadow_sites);
+                }
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the
                 // block-entry site are written branchlessly.

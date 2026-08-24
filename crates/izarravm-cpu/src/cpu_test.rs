@@ -4016,6 +4016,14 @@ mod jit_disp_store_lane;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_jcc_shadow_test.rs"]
+mod jit_jcc_shadow;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_callout_test.rs"]
 mod jit_callout;
 

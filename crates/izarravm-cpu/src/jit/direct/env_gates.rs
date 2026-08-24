@@ -2214,3 +2214,117 @@ pub(crate) fn parse_chain_entry_check_arm_for_test(
 ) -> bool {
     parse_chain_entry_check_arm(value)
 }
+
+/// Whether `DirectKind::Jcc` computes its branch predicate by TESTING the RBP EFLAGS shadow
+/// directly, instead of round-tripping that shadow through the host flags word
+/// (`IZARRAVM_JCC_SHADOW`).
+///
+/// # THE MECHANISM
+///
+/// The Direct backend keeps a materialised EFLAGS shadow resident in RBP for a whole native
+/// block (the prologue loads it from `materialized_eflags()`; every producer merges into it
+/// through `emit_capture_flags`). Today's Jcc terminator calls `emit_load_host_flags`, which is
+/// `mov`/`and`/`push`/`popfq` -- and POPFQ is roughly 19-20 uops with a matching reciprocal
+/// throughput, sitting on the CRITICAL PATH of the branch that consumes it. The shadow arm
+/// replaces the whole round trip with `test`/`jz` or `test`/`jnz` against the same RBP bits: the
+/// twelve simple and overflow conditions in two host instructions, the four signed ones
+/// (`SF^OF`, `ZF|(SF^OF)`) in five and seven.
+///
+/// It is an EQUIVALENCE and not an approximation. `emit_load_host_flags` derives the entire host
+/// flags word from `RBP & (ARITH_FLAGS | 0x2)` and from nothing else; every Jcc condition reads
+/// only CF/PF/ZF/SF/OF, all of which survive that mask, and no Jcc condition reads AF. So both
+/// arms compute the identical predicate from the identical bits, whatever RBP happens to hold.
+///
+/// Scope is the TERMINATOR alone. `SetCc` and `SetCcMem` keep `emit_load_host_flags` because
+/// `e.setcc` needs a real host flags word, and the three `adc`/`sbb` sites keep it because they
+/// load host CF to FEED the host adder -- no test on a shadow bit can replace an architectural
+/// carry-in. See `emit_jcc_shadow`.
+///
+/// # THE SPELLING TABLE, AND WHICH WAY ITS NULLING TRAP POINTS
+///
+/// This is a **DEFAULT-OFF** knob, the `IZARRAVM_DISP_STORE_LANES` construction with the polarity
+/// inverted, so unset and the empty string AGREE:
+///
+/// * **unset**, the EMPTY STRING, `0` or `off` -> OFF: the shipped default and the A/B base, under
+///   which every Jcc terminator keeps its `push`/`popfq`.
+/// * `1` / `on` -> ON: the shadow test.
+/// * **anything else PANICS.** A mistyped ladder leg that fell through would run the DEFAULT and
+///   be read as "the arm I asked for changed nothing", the one wrong conclusion an arm ladder
+///   exists to avoid.
+///
+/// **The nulling trap points at the ON leg here, which is the OPPOSITE of the default-ON knobs in
+/// this file.** Nulling a variable in PowerShell leaves it PRESENT and EMPTY; this table spells
+/// that OFF, the same arm as unset, so the trap cannot silently disarm a leg that meant to run
+/// the base. The cost is the mirror image: **an ON leg must EXPORT `1`**, and a leg that merely
+/// fails to set the variable runs the base arm. Contrast `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`,
+/// whose direction is inverted from this one (unset = `cap`, the empty string = OFF).
+///
+/// # READ AT THE EMISSION SITE, NOT CACHED ON `JitState`
+///
+/// `emit`'s Jcc arm calls this directly. A `JitState` field would buy nothing -- the thread-local
+/// override below covers every fixture, which is the only reason the other emission arms are
+/// fields -- and it would add a second layout perturbation on top of the one `jcc_shadow_sites`
+/// already spends inside `repr(Rust)` `BlockCache`. The consequence is a PROTOCOL requirement and
+/// it is the reason this knob exists at all: **the ladder's ON and OFF legs must share ONE
+/// binary**, so the layout term is carried by both arms and subtracts out. A
+/// candidate-versus-pinned-main WALL comparison is not licensed for this slice at any point.
+///
+/// Mixed arms across one process are sound: each block's terminator computes its own predicate
+/// from RBP, RBP's contract is unchanged, and a block compiled on one arm chains correctly into a
+/// block compiled on the other.
+pub(crate) fn jcc_shadow_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = JCC_SHADOW_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_jcc_shadow_arm(std::env::var("IZARRAVM_JCC_SHADOW")))
+}
+
+/// The `IZARRAVM_JCC_SHADOW` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `jcc_shadow_enabled`.
+fn parse_jcc_shadow_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
+                            default: every Jcc terminator loads the host flags word with \
+                            push/popfq), and `1` / `on` (the shadow arm: the branch predicate is \
+                            tested directly out of the RBP EFLAGS shadow)";
+    let raw = match value {
+        // Unset = OFF, and so is the empty string one arm down: this knob's nulling trap points
+        // at the ON leg, which must EXPORT `1`. See `jcc_shadow_enabled`.
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("IZARRAVM_JCC_SHADOW is set to a value that is not valid UTF-8; {ACCEPTED}")
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_JCC_SHADOW={other:?} names no arm; {ACCEPTED}. Refusing to guess: a \
+             mistyped ladder leg would silently run the DEFAULT and be read as the arm it named \
+             doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `DISP_STORE_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide
+// `OnceLock` and a fixture cannot order an env write against it.
+#[cfg(test)]
+thread_local! {
+    static JCC_SHADOW_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the Jcc shadow arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_JCC_SHADOW` reading.
+#[cfg(test)]
+pub(crate) fn set_jcc_shadow_for_test(forced: Option<bool>) {
+    JCC_SHADOW_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_disp_store_lanes_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_jcc_shadow_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_jcc_shadow_arm(value)
+}
