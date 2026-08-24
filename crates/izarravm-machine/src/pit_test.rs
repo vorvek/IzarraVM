@@ -2060,9 +2060,12 @@ fn pit_bulk_advance_knob_reads_unset_and_empty_as_the_default() {
     // DEFAULT OFF, and empty means DEFAULT rather than "the OFF arm on purpose".
     // Those coincide only while the default is off; the rule is written as
     // "empty == unset" so it survives the flip.
-    assert!(!parse_bulk_advance_arm(Err(VarError::NotPresent)));
-    assert!(!parse_bulk_advance_arm(Ok(String::new())));
-    assert!(!parse_bulk_advance_arm(Ok("   ".to_string())));
+    // DEFAULT ON since the 2026-08-25 flip. Unset and empty BOTH select the
+    // default, and they no longer coincide with the escape: an OFF leg must
+    // EXPORT `0`, because clearing the variable now runs the bulk advance.
+    assert!(parse_bulk_advance_arm(Err(VarError::NotPresent)));
+    assert!(parse_bulk_advance_arm(Ok(String::new())));
+    assert!(parse_bulk_advance_arm(Ok("   ".to_string())));
     assert!(!parse_bulk_advance_arm(Ok("0".to_string())));
     assert!(!parse_bulk_advance_arm(Ok("off".to_string())));
     assert!(!parse_bulk_advance_arm(Ok(" OFF ".to_string())));

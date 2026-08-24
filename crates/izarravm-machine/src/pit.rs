@@ -1206,22 +1206,25 @@ enum BulkDecline {
     SpanTooWide,
 }
 
-/// `IZARRAVM_PIT_BULK_ADVANCE`, the analytic PIT advance arm. **DEFAULT OFF.**
+/// `IZARRAVM_PIT_BULK_ADVANCE`, the analytic PIT advance arm. **DEFAULT ON since
+/// the 2026-08-25 flip.**
 ///
 /// NULLING SEMANTICS, stated because this campaign has been bitten by them
 /// twice (`env-null-empty-is-off-trap`, and `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`
 /// whose empty string is the ESCAPE while unset is the default):
 ///
-/// * **unset** -> the default, which is **OFF** (the per-CLK loop)
-/// * **`""` (empty)** -> **the same as unset**, i.e. the default, i.e. OFF
-/// * `"0"` / `"off"` -> OFF
-/// * `"1"` / `"on"` -> ON (the analytic bulk advance)
+/// * **unset** -> the default, which is now **ON** (the analytic bulk advance)
+/// * **`""` (empty)** -> **the same as unset**, i.e. the default, i.e. now ON
+/// * `"0"` / `"off"` -> OFF (the per-CLK loop: the ESCAPE and the A/B base)
+/// * `"1"` / `"on"` -> ON, stated
 /// * anything else, or non-UTF-8 -> **panic**, naming the accepted spellings
 ///
-/// Empty means DEFAULT, not "the OFF arm on purpose". Those coincide today
-/// because the default is OFF, and they will STOP coinciding the day this flips
-/// after a ladder -- which is exactly why the rule is written down as "empty ==
-/// unset" rather than "empty == off". `[Environment]::SetEnvironmentVariable(
+/// Empty means DEFAULT, not "the OFF arm on purpose". **They coincided before
+/// this flip and they DO NOT COINCIDE NOW**: an empty variable selects ON. That
+/// is precisely why the rule was written as "empty == unset" rather than
+/// "empty == off" while the default was still OFF -- so the flip moved the
+/// default without moving the rule. **Every OFF leg must EXPORT `0`; clearing
+/// the variable runs the ON arm.** `[Environment]::SetEnvironmentVariable(
 /// $name, $null, "Process")` -- how every harness in this tree clears a variable
 /// -- leaves the variable PRESENT AND EMPTY on Windows, and a leg that cleared
 /// the variable means "the default", never "the escape".
@@ -1229,7 +1232,11 @@ enum BulkDecline {
 /// This follows `run::parse_ata_poll_skip_arm` (`run.rs`), which is the
 /// well-behaved knob in this crate: same spellings, same panic-on-typo, same
 /// "empty is unset" rule. It differs from it in the DEFAULT only, because this
-/// is a new slice and flips only after a ladder.
+/// is a new slice and flipped only after a ladder. It now matches that knob in
+/// default as well: doom-486 min-wall ratio 1.0596 against a 1.03 bar with 12 of
+/// 12 A/B pairs ON-faster, doom-586 1.0140 against 1.01 with the sign agreeing,
+/// zero contaminated legs, and guest_seconds / perf.instructions /
+/// raw_bus_clocks / realtics / gametics identical across arms over 48 legs.
 ///
 /// The panic on a typo is the point: a mistyped ladder leg that fell through to
 /// the default would be read as "the arm I named changed nothing".
@@ -1249,7 +1256,7 @@ const BULK_ADVANCE_SPELLINGS: &str = "accepted spellings are unset or `` (both t
 
 fn parse_bulk_advance_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm: someone set the variable
         // and meant something by it, so it reaches the typo panic rather than
         // the silence of "unset".
@@ -1260,7 +1267,10 @@ fn parse_bulk_advance_arm(value: Result<String, std::env::VarError>) -> bool {
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" => false,
+        // Empty is the DEFAULT, which is now ON. It is deliberately NOT grouped
+        // with the escape spellings: see the nulling note above.
+        "" => true,
+        "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_PIT_BULK_ADVANCE={other:?} names no arm; {BULK_ADVANCE_SPELLINGS}. \
