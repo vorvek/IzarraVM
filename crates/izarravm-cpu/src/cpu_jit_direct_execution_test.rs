@@ -2825,6 +2825,208 @@ pub(super) fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
     );
 }
 
+/// Restores the ambient `IZARRAVM_CHAIN_ENTRY_CHECK` arm when it drops. The arm is read once per
+/// `BlockCache`, so it must be forced BEFORE the fixture builds its CPU.
+struct ChainEntryCheckArm;
+
+impl ChainEntryCheckArm {
+    fn forced(armed: bool) -> Self {
+        jit::direct::set_chain_entry_check_for_test(Some(armed));
+        Self
+    }
+}
+
+impl Drop for ChainEntryCheckArm {
+    fn drop(&mut self) {
+        jit::direct::set_chain_entry_check_for_test(None);
+    }
+}
+
+const CHAIN_ENTRY_ROOT: u32 = 0x200;
+const CHAIN_ENTRY_SECOND: u32 = 0x220;
+const CHAIN_ENTRY_DONE: u32 = 0x240;
+const CHAIN_ENTRY_BAKED: u32 = 0x3000;
+
+/// The shape all three entry-check rows below run on, and the shape that discriminates the two
+/// arms: a root that pins NOTHING at all, chained to a successor that reads through ES.
+///
+/// * The root's OWN mask is empty, so `data_matches` on it proves nothing.
+/// * The root's CHAIN REQUIREMENT is `{ES}`, because the successor pins ES.
+/// * `all_data_matches` on the root proves all six, ES included -- sound, and far stronger.
+///
+/// So moving ES must refuse on BOTH arms (the chain needs it) and moving a segment neither block
+/// pins must refuse on the OFF arm and be ADMITTED on the armed one. Returned already run once,
+/// with the chain formed and asserted live, because every row below is vacuous without that.
+fn chain_entry_check_fixture() -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
+    let mut memory = vec![0; 0x5000];
+    memory[CHAIN_ENTRY_ROOT as usize..CHAIN_ENTRY_ROOT as usize + 10].copy_from_slice(&[
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x220
+    ]);
+    memory[CHAIN_ENTRY_SECOND as usize..CHAIN_ENTRY_SECOND as usize + 12].copy_from_slice(&[
+        0x26, 0x8b, 0x15, 0x00, 0x30, 0x00, 0x00, // mov edx,[es:0x3000]
+        0xe9, 0x14, 0x00, 0x00, 0x00, // jmp 0x240
+    ]);
+    memory[CHAIN_ENTRY_DONE as usize] = 0xf4;
+    memory[CHAIN_ENTRY_BAKED as usize..CHAIN_ENTRY_BAKED as usize + 4]
+        .copy_from_slice(&0xdead_beefu32.to_le_bytes());
+
+    let mut cpu = flat_stack_cpu(CHAIN_ENTRY_ROOT);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(
+        &mut cpu,
+        &mut bus,
+        &[
+            CHAIN_ENTRY_ROOT,
+            CHAIN_ENTRY_ROOT + 5,
+            CHAIN_ENTRY_SECOND,
+            CHAIN_ENTRY_SECOND + 7,
+        ],
+    );
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        CHAIN_ENTRY_BAKED,
+        CHAIN_ENTRY_BAKED,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        true,
+    );
+
+    let root = install_fixture_block(&mut cpu, CHAIN_ENTRY_ROOT);
+    install_fixture_block(&mut cpu, CHAIN_ENTRY_SECOND);
+
+    cpu.set_eip(CHAIN_ENTRY_ROOT);
+    let before = cpu.perf_counters().clone();
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, root).unwrap());
+    assert_eq!(cpu.registers.eip, CHAIN_ENTRY_DONE);
+    assert_eq!(cpu.registers.edx(), 0xdead_beef);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        1,
+        "the successor must be reached natively, or no row here proves anything about chains"
+    );
+    // THE PRECONDITION EVERY ROW BELOW NEEDS, asserted rather than assumed: with no live edge
+    // both arms take `data_matches` and every row is green for the wrong reason.
+    assert!(
+        cpu.jit_direct.has_linked_successor(root.id()),
+        "the root must still hold a LIVE outbound edge at the instant of the next entry"
+    );
+    (cpu, bus, root)
+}
+
+fn shift_segment_base(cpu: &mut CpuGsw, segment: SegmentIndex, delta: u32) {
+    let mut record = cpu.registers.segment(segment);
+    record.base = record.base.wrapping_add(delta);
+    cpu.registers.set_segment(segment, record);
+}
+
+/// ARMED: the root pins nothing and the chain needs ES, so moving ES must REFUSE.
+///
+/// This is the soundness row for the armed arm. A mutant that reads `segment_layouts` here instead
+/// of `chain_layouts` sees an EMPTY mask, admits the entry, and lets the successor's chained body
+/// read through a base nobody validated -- the miscompile the strict arm existed to prevent.
+#[test]
+fn chain_entry_check_refuses_a_root_whose_successor_pins_a_moved_segment() {
+    let _arm = ChainEntryCheckArm::forced(true);
+    let (mut cpu, mut bus, root) = chain_entry_check_fixture();
+    assert!(cpu.jit_direct.chain_entry_check_armed());
+
+    shift_segment_base(&mut cpu, SegmentIndex::Es, 0x100);
+    cpu.set_eip(CHAIN_ENTRY_ROOT);
+    cpu.registers.set_edx(0);
+    let before = cpu.perf_counters().clone();
+
+    assert!(
+        !cpu.try_run_direct_block_for_test(&mut bus, root).unwrap(),
+        "the chain requirement names ES even though the root itself pins nothing"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment - before.jit_direct_reject_data_segment,
+        1
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment_strict
+            - before.jit_direct_reject_data_segment_strict,
+        1,
+        "a linked root's reject stays on the STRICT arm; the name's MEANING moved, not the arm"
+    );
+    assert_eq!(cpu.registers.eip, CHAIN_ENTRY_ROOT);
+    assert_eq!(
+        cpu.registers.edx(),
+        0,
+        "nothing may have run: a chained read here would have used the baked base"
+    );
+}
+
+/// ARMED: moving a segment NEITHER block pins must be ADMITTED, and the chain must still run.
+///
+/// This is the whole point of the slice, and it is the row `all_data_matches` cannot pass: on the
+/// OFF arm the identical state refuses (see the row below). A mutant that calls
+/// `all_data_matches` on the chain layout -- keeping the array swap and dropping the mask -- is
+/// green everywhere else and red here.
+#[test]
+fn chain_entry_check_admits_a_root_whose_chain_pins_nothing_on_the_moved_segment() {
+    let _arm = ChainEntryCheckArm::forced(true);
+    let (mut cpu, mut bus, root) = chain_entry_check_fixture();
+
+    shift_segment_base(&mut cpu, SegmentIndex::Gs, 0x100);
+    cpu.set_eip(CHAIN_ENTRY_ROOT);
+    cpu.registers.set_edx(0);
+    let before = cpu.perf_counters().clone();
+
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, root).unwrap(),
+        "GS is in no block's pinned set, so the chain requirement says nothing about it"
+    );
+    assert_eq!(cpu.registers.eip, CHAIN_ENTRY_DONE);
+    assert_eq!(
+        cpu.registers.edx(),
+        0xdead_beef,
+        "and the chain must still read through the ES base it was validated against"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment - before.jit_direct_reject_data_segment,
+        0
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        1,
+        "the admitted entry must still CHAIN, not fall out to the dispatcher"
+    );
+}
+
+/// OFF: the same state the row above admits must REFUSE, because the OFF arm is `main` verbatim
+/// and a linked root there proves all six of its own descriptors.
+///
+/// Two mutants die here. Dropping the OFF arm's `has_link` branch leaves both arms on
+/// `data_matches`, and the root's own mask is empty, so the entry would be admitted. Arming the
+/// chain check unconditionally does the same. The `has_linked_successor` precondition inside the
+/// fixture is what stops this row passing because the edge quietly failed to form.
+#[test]
+fn chain_entry_check_off_arm_reproduces_all_data_matches() {
+    let _arm = ChainEntryCheckArm::forced(false);
+    let (mut cpu, mut bus, root) = chain_entry_check_fixture();
+    assert!(!cpu.jit_direct.chain_entry_check_armed());
+
+    shift_segment_base(&mut cpu, SegmentIndex::Gs, 0x100);
+    cpu.set_eip(CHAIN_ENTRY_ROOT);
+    let before = cpu.perf_counters().clone();
+
+    assert!(
+        !cpu.try_run_direct_block_for_test(&mut bus, root).unwrap(),
+        "main's strict arm compares all six descriptors, GS included"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment_strict
+            - before.jit_direct_reject_data_segment_strict,
+        1
+    );
+    assert_eq!(cpu.registers.eip, CHAIN_ENTRY_ROOT);
+}
+
 /// The compile walk's page budget: a block long enough to overflow one host page must come out of
 /// the walk already inside it, without `compile_with_page_len`'s recovery search running at all.
 ///

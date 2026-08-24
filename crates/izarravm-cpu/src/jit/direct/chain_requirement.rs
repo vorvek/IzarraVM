@@ -111,6 +111,31 @@ impl BlockCache {
         self.stalls.chain_requirement_narrowed[cause as usize] += 1;
     }
 
+    /// Clear one block's PORTAL, leaving the link graph untouched -- the state
+    /// `suspend_decode_slot` and `compact_arena` produce, and the one the narrowing predicate must
+    /// refuse to act on. Fixtures outside this module cannot reach `block_portals` directly.
+    #[cfg(test)]
+    pub(crate) fn hide_block_portal_for_test(&self, id: BlockId) {
+        if let Some(index) = self.active_index(id) {
+            self.block_portals[index].clear();
+        }
+    }
+
+    /// The block's live outbound edges, for fixtures that must tell "no edge" from "edge whose
+    /// target is merely hidden" -- the distinction the whole narrowing predicate turns on.
+    #[cfg(test)]
+    pub(crate) fn outbound_targets_for_test(&self, id: BlockId) -> [Option<BlockId>; 2] {
+        self.active_index(id)
+            .map_or([None, None], |index| self.outbound[index])
+    }
+
+    /// The block's chain requirement mask, for fixtures asserting the narrowing moved it.
+    #[cfg(test)]
+    pub(crate) fn chain_requirement_used_for_test(&self, id: BlockId) -> u8 {
+        self.active_index(id)
+            .map_or(0, |index| self.chain_layouts[index].used)
+    }
+
     /// The precondition of a WHOLESALE requirement reset: no edge is left to be violated.
     ///
     /// `invalidate_translation` drops every edge and then resets every requirement, and the ORDER
