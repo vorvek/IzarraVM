@@ -3,13 +3,20 @@
 
 //! Admission and storage for page-local direct-code blocks.
 
-// FILE-SIZE HEADROOM, recorded 2026-08-24 (code review L-4). This file sits at roughly 4,700 of
-// the 5,000 CODE lines `scripts/check_file_policy.py` allows, and the far-return slice spent about
-// 200 of what was left -- it had to move `retf_admitted_here` into `env_gates.rs` mid-slice to get
-// back under the ceiling. Nothing here is over, and the child modules (`callout`, `census`,
-// `classify`, `emit`, `env_gates`, `retire_governor`, `segment_layout`, `smc_census`) are already
-// the split this file has been taking. The next slice that adds to it should PLAN which unit moves
-// out rather than discover the limit at CI time.
+// FILE SIZE. By owner ruling the dynarec is ONE file and is exempt from the source-line ceiling
+// `scripts/check_file_policy.py` enforces on everything else. The exemption is the literal path
+// `crates/izarravm-cpu/src/jit/direct.rs` in that script's `SOURCE_LINE_LIMIT_EXEMPT` set -- a
+// NAMED FILE, not a glob, so a rename or a split has to update the set (the script errors when a
+// named path is no longer tracked). Do not split this file to chase headroom; there is no ceiling
+// here to stay under.
+//
+// HOW TO NAVIGATE IT. Six `MERGED:` banners divide the file into top-level sections; inside them,
+// `---- from jit/direct/<name>.rs ----` sub-banners open each run of text. Those paths are
+// PROVENANCE, not live paths -- they name the child module a section was before the single-file
+// merge, so history and older reviews stay findable. None of those files exists now, and nothing
+// in this file is reached through them. Prose elsewhere in the file names SYMBOLS rather than
+// files or line numbers, deliberately: cross-file line citations here have drifted in every
+// session of this campaign, and several were wrong the day they were written.
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -545,7 +552,7 @@ impl CompiledBlock {
     /// Call-out slots whose helper can reach `check_io_permission`, i.e. the port class. The
     /// dispatch-time privilege refusal keys on this rather than on `callout_slots` so a PUSHAD
     /// block still runs for a CPL-3 or V86 guest: PUSHAD probes no TSS, so the reason the port
-    /// class is refused there does not apply to it. See the class table in `jit/direct/callout.rs`.
+    /// class is refused there does not apply to it. See the class table in the call-out section.
     pub(crate) fn callout_port_slots(&self) -> u32 {
         self.callout_slots.port()
     }
@@ -817,7 +824,7 @@ pub(crate) struct BlockCache {
     /// which is why the narrowing keys on `outbound` emptiness and never on link VISIBILITY.
     chain_layouts: Vec<SegmentLayout>,
     /// `IZARRAVM_CHAIN_ENTRY_CHECK`, read ONCE here rather than on the entry path. See
-    /// `chain_entry_check_armed` in `env_gates.rs` for the arm table and the nulling semantics,
+    /// `chain_entry_check_armed` for the arm table and the nulling semantics,
     /// and `BlockCache::entry_layout` for what it selects.
     chain_entry_check_armed: bool,
     /// How many indexed layout copies `entry_layout` has taken. Mutant M14's only witness: the
@@ -1963,7 +1970,7 @@ impl BlockCache {
     /// remaining behaviour is the abnormal exit.
     ///
     /// Answers whether the site IS RECORDED afterwards, which is what the caller's retire has to
-    /// be gated on. See `note_demotion` in `jit/direct/callout.rs` for why: a retire whose
+    /// be gated on. See `note_demotion` for why: a retire whose
     /// recompile will put the slot back is a demote/retire/recompile treadmill, and the one thing
     /// that stops the recompile re-admitting is this map holding the site.
     ///
@@ -4107,7 +4114,7 @@ pub(crate) enum DirectKind {
     /// A SEPARATE variant rather than a width field on `Push`, because `Push`'s emitter
     /// hard-codes `MemoryWidth::Dword` and `iadd_imm(esp, -4)`. The two widths it stands for are
     /// ORTHOGONAL: SS.B picks the stack-pointer width and `operand_size` picks how many bytes
-    /// move (386 PRM 16.2, restated at `memory.rs:1218`). This variant is the (SS.B = 0, Word)
+    /// move (386 PRM 16.2, restated in the interpreter's `push` in `memory.rs`). This variant is the (SS.B = 0, Word)
     /// cell only; the compile loop refuses the other two new cells.
     Push16 {
         source: StoreSource,
@@ -4417,7 +4424,7 @@ pub(crate) enum MemoryWidth {
     Word,
     Dword,
     /// An x87 m64 access. NOT twice a Dword in the way it is guarded: the interpreter's
-    /// `read_qword`/`write_qword` (`fpu_exec.rs:720-740`) issue two independently 4-aligned
+    /// `read_qword`/`write_qword` in `fpu_exec.rs` issue two independently 4-aligned
     /// dword bus transactions rather than one 8-aligned qword transaction, so native must
     /// require only 4-alignment (plus a no-page-cross check) to admit the same population the
     /// interpreter admits. See `alignment_bytes` below, which is why `bytes()` (8, the size)
@@ -4500,7 +4507,7 @@ impl MemoryWidth {
     /// byte-identical guard.
     ///
     /// For the two wide widths they diverge on purpose: the interpreter reads an m64 as two
-    /// independently 4-aligned dword transactions (`fpu_exec.rs:720-740`), not one 8-aligned
+    /// independently 4-aligned dword transactions (`fpu_exec.rs`'s `read_qword`), not one 8-aligned
     /// qword transaction, so requiring 8-byte alignment natively would refuse a large population
     /// of legitimately-4-aligned doubles that DOS compilers emit. Tbyte's first eight bytes ARE
     /// those two transactions, so it inherits the same 4, and the divergence is wider still
@@ -4539,7 +4546,8 @@ impl MemoryWidth {
     ///
     /// NOT the alignment mask, which it happens to equal for the three self-aligning widths.
     /// `split_extra_bytes` is the name this quantity already carries at the lane that receives it
-    /// (`frame.rs`, `native_exit.rs`, `run.rs`), so it keeps that name here rather than gaining a
+    /// (the frame layout, the `NativeExit` ABI, and `run.rs`), so it keeps that name here rather
+    /// than gaining a
     /// fourth one.
     pub(crate) const fn split_extra_bytes(self) -> u32 {
         self.bytes() - 1
@@ -4801,7 +4809,7 @@ impl DirectKind {
 
     pub(crate) fn dword_reads(self) -> u8 {
         // An x87 Qword read is TWO dword bus transactions, not one (`read_qword` issues two
-        // independent 4-aligned dword reads: fpu_exec.rs:720-740), so it adds 2 here rather than
+        // independent 4-aligned dword reads: `fpu_exec.rs`'s `read_qword`), so it adds 2 here rather than
         // matching alongside the Dword arm below, which would undercount by half. The two terms
         // are mutually exclusive (a kind is never both a Dword and a Qword access), so plain
         // addition cannot double count.
@@ -4943,7 +4951,7 @@ impl DirectKind {
     ///
     /// | kind | site |
     /// |---|---|
-    /// | `RmwIncDec` | `emit_rmw_inc_dec` / `_dword` (`emit/mem.rs`) |
+    /// | `RmwIncDec` | `emit_rmw_inc_dec` / `_dword` |
     /// | `AluMemDest` with `op != 7` | `emit_alu_mem_dest`'s writing branch |
     /// | `DoubleShiftMem` | `emit_double_shift_mem` |
     /// | `PushMem` | `emit_push_mem`, the SOURCE read |
@@ -5201,7 +5209,7 @@ impl DirectKind {
     }
 
     /// `PushMem` being here is LOAD-BEARING rather than bookkeeping. `0xff` is in the
-    /// `OperandSize::Word` allowlist in `classify.rs`, so a 66-prefixed `FF /6` in 32-bit code
+    /// `OperandSize::Word` allowlist in `classify`, so a 66-prefixed `FF /6` in 32-bit code
     /// decodes as Word and reaches the classifier arm. Pushing two bytes while decrementing ESP
     /// by four is a miscompile. What refuses it is the stack-width admission matrix in the
     /// compile loop, and that matrix is only consulted for kinds this predicate accepts.
@@ -5332,7 +5340,11 @@ impl DirectKind {
     }
 }
 
-// The compile-walk -> emitter handoff structs, moved out for the source-line ceiling.
+// THE COMPILE WALK. From here to the `MERGED:` banner below: the prefix and admission predicates
+// the walk screens each instruction with, `compile` and its budget/limit variants, the four lane
+// matchers (`imm_lane_for`, `imm8_lane_for`, `count_lane_for`, and the rotate-row pair), and the
+// static control-target helpers the terminator uses. Everything here runs at COMPILE time; nothing
+// in it is reached while emitted code is running.
 
 /// Whether this backend supports `prefixes` for an instruction decoded at `operand_size` in a
 /// code segment whose default size is `d`.
@@ -5452,7 +5464,7 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 ///  * **Device-visible.** The port forms. A write always sets `io_touched`, so the run must end at
 ///    the boundary after it; the IN forms are admitted by `block_continuable` itself on the
 ///    Approximate personas and reach this backend through a call-out slot that reproduces that
-///    boundary (`jit/direct/callout.rs`). OUT is a genuine policy refusal and NOT admitted here —
+///    boundary (see the call-out section). OUT is a genuine policy refusal and NOT admitted here —
 ///    see the audit note at the end.
 ///  * **Classification artifact.** `route_group` sorts three-operand IMUL (0x69/0x6B) into
 ///    `DecodeGroup::Misc`, the "heterogeneous one-off single-byte block", purely because of the
@@ -6600,7 +6612,7 @@ fn compile_with_budget(
         // pre-mapping kind would silently account the wrong width.
         //
         // SS.B picks the STACK POINTER width and `operand_size` picks how many bytes move; the
-        // two are orthogonal (386 PRM 16.2, restated at `memory.rs:1218`). Four cells:
+        // two are orthogonal (386 PRM 16.2, restated in the interpreter's `push` in `memory.rs`). Four cells:
         //
         //   SS.B=1 + Dword  admit as `Push`   the shipped 32-bit form
         //   SS.B=1 + Word   STOP              a 2-byte push with a 32-bit SP. `Push` would move
@@ -6785,7 +6797,7 @@ fn compile_with_budget(
         }
         // x87 and call-out slots do not share a block, in either order. The call-out hands the
         // helper the block's raw-clock prefix so the device sees the right guest-time offset
-        // (jit/direct/callout.rs), and an x87 slot's contribution to that prefix is not raw
+        // (see the call-out section), and an x87 slot's contribution to that prefix is not raw
         // clocks at all: it is `weighted_fp_clocks`, which only becomes clocks through
         // `scale_weighted_fp_clocks` and its own `fp_rem` carry. Mixing them would need a second
         // carry previewed across the call for no fixture that wants it. Refusing is a missed
@@ -7811,10 +7823,6 @@ fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
 // The ABI between emitted code and the run loop: how a block is ENTERED, what it writes on the
 // way OUT, and the two reason codes that explain why it left.
 //
-// Extracted from `jit/direct.rs` as pure code motion. Nothing here changed in the move -- the
-// types, their `repr`s, their derives, their discriminants and their doc comments are the text
-// that file carried, and `direct.rs` re-exports every name so no caller's path changed.
-//
 // It is a coherent unit rather than an arbitrary slice, and the shape is worth stating because
 // it is what decides whether a future type belongs here: `DirectEntryFn` is the entry signature,
 // `NativeExit` is the single out-parameter it fills, `NativeBlockTrace` is the optional buffer
@@ -7828,11 +7836,11 @@ fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
 // silently remaps what a stale compiled block reports. `SideExitReason::MAX` exists so `run.rs`
 // can bound-assert what it reads rather than trusting it.
 //
-// What deliberately did NOT come along: `dynamic_counter_fields`, which names `NativeExit` field
-// offsets but pairs each one with a slot in the emitter's own stack layout (`STACK_*`). It is
-// emitter shape, not exit ABI, and moving it would have made this commit something other than
-// pure motion. (It once sat beside a family of `COUNTER_*` bit masks naming the same lanes; those
-// were deleted when the per-kind mask they fed turned out never to reach the emitter.)
+// What deliberately does NOT belong to this group: `dynamic_counter_fields`, which names
+// `NativeExit` field offsets but pairs each one with a slot in the emitter's own stack layout
+// (`STACK_*`). It is emitter shape, not exit ABI. (It once sat beside a family of `COUNTER_*` bit
+// masks naming the same lanes; those were deleted when the per-kind mask they fed turned out never
+// to reach the emitter.)
 
 pub(crate) type DirectEntryFn = unsafe extern "C" fn(*mut CpuGsw, u32, u32, *mut NativeExit);
 
@@ -7933,7 +7941,7 @@ pub(crate) struct NativeExit {
     /// served natively, `bytes() - 1` apiece, and fed by STORES as well as reads. The lane's name
     /// covers only its low half; `run.rs` masks before every consumer and prices the high half
     /// through `jit_data_cost_clocks(Byte)`, the same dial `ram_byte_writes` and `ram_byte_reads`
-    /// both take. See `frame.rs`'s `STACK_DWORD_READS` for why one shared pool is exact.
+    /// both take. See `STACK_DWORD_READS` for why one shared pool is exact.
     pub(crate) dword_reads: u64,
     pub(crate) weighted_fp_clocks: u64,
     pub(crate) mode13_byte_reads: u64,
@@ -7958,9 +7966,6 @@ pub(crate) struct NativeExit {
 // ---- from jit/direct/block_key.rs --------------------------------------------------------------
 // The Direct backend's block key, and the two screens that decide whether an address may have one
 // at all.
-//
-// Moved out of `jit/direct.rs` verbatim for that file's source-line ceiling. No behaviour change:
-// the only edits are the visibility widenings the module boundary forces and the imports.
 
 /// Everything that can change the meaning of bytes at a linear entry point.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -8047,7 +8052,7 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     //     interpreter unexecuted. `run_direct_block`'s entry refusal is UNCHANGED and still
     //     refuses dispatcher entries into a call-out-bearing block in that state; a CHAINED
     //     entry bypasses it by construction, which is the mechanism the slice is for. See
-    //     `jit/direct/callout.rs` and the note on `classify`'s `0xec` arm.
+    //     the call-out section and the note on `classify`'s `0xec` arm.
     //   * PUSHF: its PUSHFD arm is refused by `stack_width_kind` in V86 (`StoreSource::Flags`,
     //     IOPL check), and its Word form is off the allowlist.
     //   * POPF, STI, INT, IRET: no `classify` arm at any size. That absence is PINNED by
@@ -8085,17 +8090,12 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
 // ---- from jit/direct/segment_layout.rs ---------------------------------------------------------
 // The segment snapshot a direct block bakes in, and the two index helpers that address it.
 //
-// Extracted from `jit/direct.rs` as pure code motion for the source-line ceiling. Nothing here
-// changed in the move: the const, the struct, its impl, the free predicate and the two index
-// helpers are the text that file carried, and `direct.rs` re-exports every name, so no caller's
-// path moved with the text.
-//
 // It is a coherent unit rather than an arbitrary slice: `SegmentLayout` is the whole of what a
 // block remembers about the six segment registers, `segment_access_supported` is the one
 // predicate that decides whether a descriptor may be reached at compile time, and `segment_bit`
 // and `segment_index` are the only two ways anything addresses the layout's parallel arrays.
-// A future segment-shaped compile-time question belongs here; a run-time one does not, because
-// nothing in this file is read while emitted code is running.
+// A future segment-shaped compile-time question belongs with them; a run-time one does not,
+// because nothing in this group is read while emitted code is running.
 
 pub(crate) const SEGMENT_ORDER: [SegmentIndex; 6] = [
     SegmentIndex::Es,
@@ -8384,15 +8384,10 @@ const fn segment_index(segment: SegmentIndex) -> usize {
 // how large the native frame is, what occupies each slot in it, and which slots are the dynamic
 // counter lanes copied out on exit.
 //
-// Moved verbatim out of `direct.rs` to keep that file under the source-line ceiling; nothing
-// here changed but the module boundary. `direct.rs` re-exports this module's contents
-// (`use frame::*`), so `emit`'s `use super::*` continues to see every name unqualified exactly
-// as before.
-//
-// Keeping the whole layout in ONE file is the point rather than an accident: the slot constants,
-// the frame length they must fit inside, the const-asserts that check that, and the counter-lane
-// table are a single invariant spread across four declarations. Separating any of them from the
-// others is how a slot silently starts overlapping another -- see the STACK_PUSH_MEM_VALUE and
+// Keeping the whole layout TOGETHER is the point rather than an accident: the slot constants, the
+// frame length they must fit inside, the const-asserts that check that, and the counter-lane table
+// are a single invariant spread across four declarations. Separating any of them from the others
+// is how a slot silently starts overlapping another -- see the STACK_PUSH_MEM_VALUE and
 // STACK_SAVED_RSI notes below, both of which exist because that nearly happened.
 
 const GUEST_HOMES: [Reg; 8] = [
@@ -8688,10 +8683,7 @@ fn dynamic_counter_fields() -> [(i8, usize); 7] {
 }
 
 // ---- from jit/direct/table_slots.rs ------------------------------------------------------------
-// The write-once table-base slots emitted code loads R15-relative. Moved
-// verbatim out of `direct.rs` to keep that file under the source-line ceiling; nothing here
-// changed but the module boundary. `direct.rs` re-exports this module's contents
-// (`use table_slots::*`), the `frame` precedent.
+// The write-once table-base slots emitted code loads R15-relative.
 
 /// The write-once table bases emitted code loads R15-relative when
 /// `JitState::r15_tables` is on: the four fast-map SoA arrays
@@ -8861,11 +8853,8 @@ impl Eq for NativeTableSlots {}
 // Every knob here is a `OnceLock` resolved once per process from a `IZARRAVM_*` variable, so a
 // gate is a load and a branch on the compile path rather than a `getenv`. They live together
 // because they are read together: `classify` asks four of them per instruction, and keeping the
-// whole family in one file is what makes "which rows does this build admit" answerable by
-// reading one place.
-//
-// Moved out of `direct.rs` unchanged, to keep that file under the layout limit. No gate, no
-// default and no doc comment changed in the move.
+// whole family in one run of text is what makes "which rows does this build admit" answerable by
+// reading one place. Keep new knobs in this block rather than beside their call sites.
 
 /// Admission level for 16-bit code segments. **DEFAULT 1 since the 486 measurement**; it used to
 /// be 0, and the doc comment used to say "this exists to price a lever, not to ship".
@@ -11202,15 +11191,14 @@ pub(crate) fn parse_jcc_shadow_arm_for_test(value: Result<String, std::env::VarE
 // because at `MAX_BLOCK_IMM_LANES` = 12 it competes for the budget instead of adding capture,
 // and it is blocked on the cap re-price rather than refuted. Both knob docs carry the tables.
 //
-// `disp_lane_for` moved here from `direct.rs` to keep that file under the layout limit. ONE
-// TOKEN changed in the move and it is named here so "unchanged" is checkable rather than
-// asserted: `fn disp_lane_for` became `pub(crate) fn disp_lane_for`, because the compile walk
-// that calls it is now in the parent module. Its body, its bars, its ordering and every line of
-// its doc comment are byte-identical to `f6620e6e`.
+// `disp_lane_for`'s body, its bars, its ordering and every line of its doc comment are
+// byte-identical to `f6620e6e` -- a checkable pin, kept so "unchanged" does not have to be taken
+// on trust.
 //
-// The two new arms are PRIVATE. Only `disp_lane_for` (the walk calls it directly, ahead of these
-// two) and `option_d_lane_for` (the walk's one entry to both new arms) leave this module, so the
-// two knob tests and the arm selection cannot be reached from anywhere that could skip one.
+// The two new arms, `disp_store_lane_for` and `disp_load_widen_lane_for`, are PRIVATE. The only
+// two entry points are `disp_lane_for` (the walk calls it directly, ahead of those two) and
+// `option_d_lane_for` (the walk's one entry to both new arms), so the two knob tests and the arm
+// selection cannot be reached from anywhere that could skip one.
 //
 // # The shape of the two new arms, and what is deliberately NOT in them
 //
@@ -12491,7 +12479,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // A CALL-OUT rather than a lowering, and for a SIZE reason rather than a reachability
             // one -- emitted code can reach guest memory perfectly well; eight guarded accesses per
-            // instruction is what does not fit a one-host-page block. `jit/direct/callout.rs`
+            // instruction is what does not fit a one-host-page block. The call-out section
             // carries the class table, the two-phase resident-then-move design, and a note on the
             // single-wide-guard shape that would beat this if the family is ever worth more wall.
             //
@@ -12580,7 +12568,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // IN AL, DX -- the FIRST and, this phase, the ONLY interpreter call-out slot. Not a
             // native lowering: the block spills, routes this one instruction through the
             // interpreter's port path (which needs the bus, and the bus is not reachable from
-            // emitted code), reloads, and keeps running. See `jit/direct/callout.rs` for the
+            // emitted code), reloads, and keeps running. See the call-out section for the
             // helper contract and the abnormal-set enumeration.
             //
             // Ranked here by the Phase 3 class table: exits to blocks rejected at this opcode's
@@ -14066,10 +14054,8 @@ fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
 // ================================================================================================
 
 // ---- from jit/direct/emit_input.rs -------------------------------------------------------------
-// The compile-walk -> emitter handoff structs, moved verbatim out of `direct.rs` to keep that
-// file under the source-line ceiling; nothing here changed but the module boundary and the
-// `pub(super)` visibility the move requires. `direct.rs` re-exports this module's contents
-// (`use emit_input::*`), the `table_slots` precedent.
+// The compile-walk -> emitter handoff structs: everything the walk has decided, packaged for the
+// emitter in one argument.
 
 struct EmitInput<'a> {
     slots: &'a [DirectInsn],
@@ -15200,8 +15186,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             //
             // The store still PRECEDES the pointer update, which is the invariant the 32-bit arm
             // already carries: a faulting push must leave SP at its pre-instruction value, or a
-            // lazy-commit host that retries the instruction double-decrements it
-            // (`memory.rs:1208-1216`, traced to a real Quake crt1 crash). The side exit is
+            // lazy-commit host that retries the instruction double-decrements it (see the
+            // interpreter's `push` in `memory.rs`, traced to a real Quake crt1 crash). The side
+            // exit is
             // published between the two for the same reason.
             DirectKind::Push16 { source } => {
                 let side = e.label();
@@ -15782,7 +15769,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             }
             // The interpreter call-out slot. Two exits, both through the ordinary side-exit
             // machinery so nothing about EIP advance, fetch tracing or prefix accounting is
-            // reinvented here (`jit/direct/callout.rs` carries the helper contract):
+            // reinvented here (the call-out section carries the helper contract):
             //
             //   abnormal   EIP at the call-out, prefix = the slots BEFORE it. Byte-for-byte the
             //              state the run loop sees today when a block ends at an IN barrier.
@@ -18384,7 +18371,7 @@ fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, cross: Label) {
 ///
 /// * `Reg::RDX` at twelve of the thirteen sites -- the eleven refusing sites plus the lean READ
 ///   site, where the guard precedes `emit_load_bias_probe` and that pad's contract is "RDX is
-///   untouched" (`emit/load_fast.rs`).
+///   untouched" (see `emit_load_bias_probe`).
 /// * `Reg::RCX` at the lean STORE site, and ONLY there, and only because the alignment half is
 ///   emitted AFTER `emit_read_store_value` has put the store value in RDX. RCX is free by the
 ///   store pad's own rule: the page index is not part of the stub contract, and every stub that
@@ -20449,10 +20436,7 @@ fn emit_return(e: &mut Encoder) {
 }
 
 // ---- from jit/direct/emit/mem.rs ---------------------------------------------------------------
-// The read-modify-write and push-through-memory emitters, moved verbatim out of `emit.rs` to keep
-// that file under the source-line ceiling. Nothing here changed but the module boundary; every
-// item stays private to `emit`, which reaches them through `use mem::*`, and `use super::*` gives
-// this module the same view of `emit`'s private helpers it had as part of that file.
+// The read-modify-write and push-through-memory emitters.
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -21055,9 +21039,7 @@ fn emit_call_mem(
     unreachable!("direct memory lowering is x86-64-only")
 }
 
-// The table-base and code-watch emission helpers, moved verbatim from emit.rs for the same
-// source-line-ceiling reason as the rest of this file; so emit.rs keeps reaching
-// them through use mem::*.
+// The table-base and code-watch emission helpers.
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -21623,8 +21605,9 @@ fn emit_x87_store_pointer_fast(
     e.place(done);
 }
 
-/// Park `kind << 32 | linear` into `STACK_READ_KIND` — the same pack today's shared tail
-/// builds from a flags re-read (emit.rs:2417-2430), built here from the statically-known kind.
+/// Park `kind << 32 | linear` into `STACK_READ_KIND` — the same pack the shared tail of
+/// `emit_x87_memory_pointer` builds from a flags-table re-read, built here from the
+/// statically-known kind instead.
 /// Clobbers RCX and RDX; RAX and RDI (the resolved pointer) survive.
 #[cfg(all(
     target_arch = "x86_64",
@@ -22072,7 +22055,7 @@ fn emit_x87_resolve_stub(
 // two x87 pack stubs, ten against the store pad's seventeen because reads have no code-watch
 // guard.
 //
-// The counter identity this file exists to preserve (design §2, the run.rs subtraction): RAM
+// The counter identity this load path exists to preserve (design §2, the run.rs subtraction): RAM
 // reads are counted STATICALLY at compile, only mode13 reads move dynamic lanes — and a
 // MISALIGNED RAM access deposits its extra byte cycles, which is a CLOCK quantity in
 // `STACK_DWORD_READS`'s high half and not a read count, so the static identity survives it: one
@@ -22615,7 +22598,7 @@ fn emit_read_stub_classify(e: &mut Encoder, map: NativeMapBases, status_unavaila
 }
 
 /// The trio's PARK-ONLY read stub: classify, park the BARE kind in `STACK_READ_KIND` (the
-/// classic front's convention at emit.rs — what `emit_mode13_read_completion` compares),
+/// classic front's convention — what `emit_mode13_read_completion` compares),
 /// permission (cpl3 variant only), read-bias resolve. NO store, NO value spill (loads carry no
 /// value — the store slice's F1 hazard class is structurally absent) and NO counter: the
 /// trio's own deferred completion moves the lane after the CS-limit check. Unlike the store
@@ -22698,7 +22681,7 @@ fn emit_x87_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
 // native block, then resuming the same block.
 //
 // Three opcodes live here: `0xEC` (IN AL,DX), `0x60` (PUSHAD) and `0x61` (POPAD). Every other
-// barrier opcode still ends its block; this module is the mechanism, `classify`'s three arms are
+// barrier opcode still ends its block; this section is the mechanism, `classify`'s three arms are
 // the policy.
 //
 // The three fall into TWO CLASSES with different reachable sets, and almost every design decision
@@ -23632,7 +23615,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     );
 
     // The SAME constant the interpreter's `0xec` arm charges, shared rather than copied, so the
-    // exact-clocks claim cannot drift out from under this module.
+    // exact-clocks claim cannot drift out from under this call-out path.
     #[cfg(feature = "direct-callout-attribution")]
     {
         let step_break = bus.requires_step_break();
@@ -23743,7 +23726,7 @@ unsafe extern "C" fn push_all_dword<B: CpuBus>(
 
     // The SAME constant the interpreter's `0x60` arm charges, and the same step-break question
     // `run_straight_line` asks after every interpreted instruction. Both are shared rather than
-    // restated so the exact-clocks claim cannot drift out from under this module.
+    // restated so the exact-clocks claim cannot drift out from under this call-out path.
     #[cfg(feature = "direct-callout-attribution")]
     {
         let step_break = bus.requires_step_break();
@@ -24844,12 +24827,8 @@ fn emit_call_out(
 // `remove_waiting_sources` / `retire_block` are the teardown side, and the chain-requirement cut
 // sites they carry are documented in place.
 //
-// `track_physical_key` and `note_page_span` ride along because they sat inside this contiguous
-// run of the `impl` block; they are physical-key bookkeeping rather than link-graph code.
-//
-// This file is a child module of `jit::direct` rather than more text in `direct.rs`, which sat at
-// 4,969 of the 5,000-line source ceiling before the extraction. Being a descendant of the
-// defining module is what lets it reach `BlockCache`'s private fields.
+// `track_physical_key` and `note_page_span` sit inside this contiguous run of the `impl` block but
+// are physical-key bookkeeping rather than link-graph code.
 
 impl BlockCache {
     fn try_link(&mut self, source: BlockId, slot: u8, target: BlockId) -> bool {
@@ -25317,10 +25296,6 @@ impl BlockCache {
 // that GROWS a requirement, and it restores the obligation backwards over `inbound` until the
 // graph settles. The invariant and its proof live in
 // `dev_docs/plans/2026-08-18-chain-used-link-mask.md`.
-//
-// This file is a child module of `jit::direct` rather than more text in `direct.rs`, which sat at
-// 4,998 of the 5,000-line source ceiling before the extraction. Being a descendant of the
-// defining module is what lets it reach `BlockCache`'s private fields.
 
 impl BlockCache {
     /// The layout the DISPATCHER ENTRY CHECK compares against, and the one place the
@@ -25600,14 +25575,10 @@ impl BlockCache {
 //
 // The refusal is the correctness half and is untouched here. Only the RE-SPECIALIZATION BET is
 // governed, exactly as `retire_key_for_top_mismatch` governs the identical x87 failure.
-//
-// This file is a child module of `jit::direct` rather than more text in `direct.rs`, which is
-// within 130 code lines of the 5,000-line source ceiling. Being a descendant of the defining
-// module is what lets it reach `BlockCache`'s private fields.
 
-/// The three arms of `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`. Parsed in `env_gates.rs` on
-/// `parse_retry_lift_arm`'s conventions; see `segment_retire_governor` there for the spelling
-/// table and why unset must read as `Off`.
+/// The three arms of `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`. Parsed on `parse_retry_lift_arm`'s
+/// conventions; see `segment_retire_governor` for the spelling table and why unset must read as
+/// `Off`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SegmentRetireGovernor {
     /// The ESCAPE, and the A/B base: every data-segment reject retires its key, as pre-slice
@@ -25650,6 +25621,10 @@ impl SegmentRetireGovernor {
 pub(crate) const DATA_SEGMENT_RETIRE_CAP: u8 = 3;
 
 /// How many distinct masked layouts one key's census will remember. Bounds the cap map's value.
+///
+/// This bound and `DATA_SEGMENT_RETIRE_CAP` above are `pub(crate)` only for the fixtures that pin
+/// them (`cpu_jit_retire_governor_test.rs`); production code reaches both through the governor's
+/// own path and never names either constant from outside it.
 pub(crate) const DATA_SEGMENT_LAYOUT_CENSUS_CAP: usize = 8;
 
 /// Which arm of `run_direct_block`'s data-segment check produced the reject.
@@ -26018,7 +25993,7 @@ impl BlockCache {
 // ---- from jit/direct/census.rs -----------------------------------------------------------------
 // The Direct backend's structural-stop census and the diagnostic reporting surface on
 // `JitState`: the per-barrier rows, the unbound-exit and dynamic-miss class tallies, and the
-// stall snapshot. Split out of `direct.rs` to keep that file under the source-line ceiling.
+// stall snapshot.
 
 #[cfg(feature = "direct-admission-census")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26051,9 +26026,8 @@ impl AdmissionDecline {
 
 // ---------------------------------------------------------------------------------------
 // The compile-walk side of the census: the structural-stop recorder and the forward scan that
-// prices what a barrier costs the block behind it. Moved out of `direct.rs` when the
-// attribution-completeness slice gave the recorder two more call sites, so the file that is
-// near its source-line ceiling carries only the three call sites and none of the machinery.
+// prices what a barrier costs the block behind it. The recorder has three call sites on the walk;
+// all of the machinery lives here rather than beside them.
 // ---------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -26436,9 +26410,8 @@ fn census_native_suffix(
 }
 
 // ---------------------------------------------------------------------------------------
-// The stall/census taxonomy. Moved VERBATIM out of `direct.rs` (source-line ceiling) to sit
-// beside `stall_snapshot` and `snapshot`, the two builders that already read every one of
-// these. `direct.rs` re-exports the whole set, so no path outside this module changed.
+// The stall/census taxonomy, kept beside `stall_snapshot` and `snapshot` -- the two builders that
+// read every one of these.
 // ---------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -27546,10 +27519,9 @@ pub(crate) enum UnboundTarget {
 }
 
 impl UnboundTarget {
-    // `pub(crate)` where the pre-move copy was private: the module boundary this extraction
-    // introduced puts `direct_test.rs` outside it, and that file's
+    // `pub(crate)` rather than private because `direct_test.rs` is a separate module and its
     // `unbound_target_classes_are_exhaustive` reads the constant. Matches `DormantReason::COUNT`
-    // and `LinkRefusal::COUNT`, which were already `pub(crate)` for the same reason.
+    // and `LinkRefusal::COUNT`, which are `pub(crate)` for the same reason.
     pub(crate) const COUNT: usize = 8;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::NoKey,
@@ -29421,7 +29393,8 @@ impl BlockCache {
 // ---- from jit/direct/callout_attribution.rs ----------------------------------------------------
 // Cold, opt-in attribution for the interpreter call-out helpers.
 //
-// FOUR of them since S2, and this file did not learn about the fourth until the S4 review round:
+// FOUR of them since S2, and this instrument did not learn about the fourth until the S4 review
+// round:
 // `CallOutHelper::InterpretOne` was added with the generic call-out and every `match` here kept
 // its three arms, so `cargo build --all-features` had not compiled since. The four-arm shape is
 // restored below and `--all-features` is a build gate from now on -- a feature nobody builds is a
@@ -29429,12 +29402,13 @@ impl BlockCache {
 // whenever a helper's outcome mix is in question.
 //
 // AND THE ARMS WERE NOT THE WHOLE REPAIR. Restoring them made the feature COMPILE; it did not
-// make it RUN. Every one of `callout.rs`'s twelve `note_callout_attribution` call sites still
+// make it RUN. Every one of the twelve `note_callout_attribution` call sites still
 // passed one of the three ORIGINAL helpers, so the fourth row stayed at zero while
 // `note_callout_executed` counted its calls, and `direct_callout_attribution_snapshot`'s
 // `attempts == callout_executed` assertion aborted the run instead of reporting anything. GP2
 // aborted on it, short by 152,816,855 -- exactly `callout_interpret_one_executed`. The lesson is
-// that a compile gate is not a behaviour gate: the closure this file asserts at runtime is now
+// that a compile gate is not a behaviour gate: the closure this instrument asserts at runtime is
+// now
 // asserted by a test that ARMS the instrument and takes a real `InterpretOne` call-out
 // (`interpret_one_closes_the_callout_attribution_ledger`), so the next helper added without a
 // call site fails in CI rather than in a census.
@@ -29704,25 +29678,32 @@ impl crate::jit::JitState {
 //
 // Implements `dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md` (rev 3, plus the
 // third review pass's M-R4 / M-R5 / M-R6 corrections). The whole instrument is behind the
-// `direct-entry-attribution` feature, which is excluded from `default` and from any
-// `--all-features` path used for perf grading: without the feature the `ea_*!` macros below
-// expand to NOTHING, so the plain build is byte-identical in behaviour and carries no symbol.
+// `direct-entry-attribution` feature, which is excluded from `default`: without the feature the
+// `ea_*!` macros expand to NOTHING, so the plain build is byte-identical in behaviour and carries
+// no symbol. Those macros are NOT in this file -- they live at the crate root in
+// `crate::entry_attribution_macros`, because `run.rs` invokes some of them outside any `jit` gate.
+// See that module for the full reason.
+//
+// It IS in `--all-features`, and the Cargo.toml entry carries why: cargo gives a feature no way to
+// opt out of that flag, so the design's "excluded from --all-features" claim was never
+// enforceable. That is acceptable only because the instrument is zero-cost while DISARMED. NEVER
+// grade a wall number on an ARMED build -- the full arm measured +24.5% on the loader.
 //
 // Shape: `begin()` at the dispatcher seam anchors a cursor and takes the sample decision;
 // `mark(phase)` closes one phase against that cursor with a raw `rdtsc` delta and no per-mark
 // subtraction; `end(population)` records the whole traversal against one of four populations.
 // State lives in a `thread_local!` `UnsafeCell` with a `const` initialiser and no `Drop`, so a
 // mark is a segment-relative load and a few adds — deliberately NOT a `CpuGsw` or `JitState`
-// field, because `DirectStallTally` sits ahead of `pending_flags` at an offset emitted code bakes
-// (`run.rs:3100-3103`) and a cfg'd field there would move baked offsets in the observer build
-// only.
+// field, because `CpuGsw` carries `perf: PerfCounters` INLINE and ahead of `pending_flags`, whose
+// offset emitted code bakes (`pending_offset()`), so a cfg'd field there would move baked offsets
+// in the observer build only. This is the same layout hazard `run_direct_block` cites where it
+// routes the segment-write entry split into `DirectStallTally` rather than `PerfCounters`.
 
 // ---- from jit/direct/entry_attribution/armed.rs ------------------------------------------------
 // The armed half of the entry-attribution observer: the thread-local tally, the three stamp
-// operations, the histograms and the snapshot the exporter reads.
-//
-// Compiled only under `direct-entry-attribution`. See the parent module for why the state is
-// thread-local rather than a `CpuGsw` field.
+// operations, the histograms and the snapshot the exporter reads. Compiled only under
+// `direct-entry-attribution`; the paragraph above is why the state is thread-local rather than a
+// `CpuGsw` field.
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The sixteen buckets of design §3, in source order. `Outliers` is never marked directly: it
@@ -29842,8 +29823,9 @@ pub fn native_bin_parts(bin: usize) -> (usize, usize, bool) {
 }
 
 #[cfg(feature = "direct-entry-attribution")]
-/// The interpreted-fallback site tag (H3-R). `run.rs:820` and `run.rs:824` write it and nothing
-/// else; the single `mark(P13)` inside the `None` arm is what counts.
+/// The interpreted-fallback site tag (H3-R). The only writers are the two `ea_fallback_tag!` call
+/// sites in `run_budgeted_inner`, one per variant below; the single `mark(P13)` inside the `None`
+/// arm is what counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum FallbackTag {
@@ -29940,8 +29922,9 @@ pub const P0_MARK_LINE: u32 = 1462;
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
 /// identity holds only once these are added back, because a traversal refused at, say,
-/// `run.rs:1266` bumped `seam_probes` and never reached the P0 mark. The report prints both the
-/// literal A3 form and the exact one.
+/// `site::SKIP_NATIVE_CONTINUATIONS_INACTIVE` had already bumped `seam_probes` in
+/// `run_budgeted_inner` and never reached the P0 mark. The report prints both the literal A3 form
+/// and the exact one.
 ///
 /// `pre_p0_sites_are_exactly_the_returns_above_the_p0_mark` derives this set from
 /// `P0_MARK_LINE` and fails if the list and the line numbers disagree.
@@ -30118,7 +30101,7 @@ struct Calibration {
 }
 
 #[cfg(feature = "direct-entry-attribution")]
-// The per-thread arm override, the same shape `DISP_LANES_OVERRIDE` carries in `env_gates.rs`.
+// The per-thread arm override, the same shape `DISP_LANES_OVERRIDE` carries.
 // A process-global `OnceLock` cannot say what an arm counts without an env write the harness
 // cannot order, and the fixtures have to pin the arm and the stride apart.
 #[cfg(test)]
@@ -30237,7 +30220,9 @@ fn calibrate() -> (u64, u64, u64) {
 const CALIBRATION_SAMPLES: usize = 100_000;
 
 #[cfg(feature = "direct-entry-attribution")]
-/// D0 (`run.rs:807`). Takes the sample decision for this traversal, latches the lane and writes
+/// D0, invoked as `ea_begin!` at the dispatcher seam in `run_budgeted_inner`, anchored before
+/// anything else on the traversal. Takes the sample decision for this traversal, latches the lane
+/// and writes
 /// the cursor. **Accumulates nothing** (B1): the inter-entry gap — interpreted continuations,
 /// run-loop break checks, device work — never lands in P0, and re-anchoring on the first sampled
 /// traversal after an unsampled stretch is what keeps `SAMPLE=64` from being 64x inflated.
@@ -30395,8 +30380,9 @@ pub(crate) fn set_fallback_tag(tag: FallbackTag) {
 }
 
 #[cfg(feature = "direct-entry-attribution")]
-/// One native window into the §6 bins. `insns` is `exit.instructions` (`run.rs:2698`), `hops` is
-/// `exit.linked_transfers` (`run.rs:2609`).
+/// One native window into the §6 bins. Both arguments come off the `NativeExit` the window just
+/// filled, at the `ea_native_sample!` call that follows the native return in `run_direct_block`:
+/// `insns` is `exit.instructions` and `hops` is `exit.linked_transfers`.
 ///
 /// The tick charged is the P9 mark's own charge, read back out of the tally rather than
 /// re-sampled, so the bin and the phase can never disagree and this call is not itself timed.
@@ -30422,7 +30408,7 @@ pub(crate) fn note_native(insns: u64, hops: u32, self_loop: bool) {
 
 #[cfg(feature = "direct-entry-attribution")]
 /// H9's pin. `run_direct_block` has no `d` parameter, so the block's own `mode_key` bit 0 is the
-/// only term available there; the mode-key refusal at `run.rs:2278` already enforces the equality
+/// only term available there; the mode-key refusal (`site::MODE_KEY`) already enforces the equality
 /// against the live CPU for free, so a mismatch here means the LANE latched at `begin()`
 /// disagrees — which is the failure H9 is about.
 #[inline(always)]

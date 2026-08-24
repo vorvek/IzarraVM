@@ -3,16 +3,16 @@
 
 //! The entry-attribution observer's stamp macros, and nothing else.
 //!
-//! They live at the CRATE ROOT rather than beside the instrument
-//! (`jit::direct::entry_attribution`) for one reason: that module is inside `jit::direct`, which
-//! is compiled only under `feature = "jit"`, while the call sites in `run.rs` are not all inside a
-//! `jit` gate -- `ea_begin!` at `run.rs:820` and the P13 pair at `881-882` sit in
+//! They live at the CRATE ROOT rather than beside the instrument (`jit::direct`) for one reason:
+//! `jit::direct` is compiled only under `feature = "jit"`, while the call sites in `run.rs` are
+//! not all inside a `jit` gate -- the `ea_begin!` that opens a traversal and the P13 pair
+//! (`ea_mark!(Phase::InterpretFallback)` + `ea_end!(Population::Fallback)`) sit in
 //! `run_budgeted_inner`'s interpreted arm, which every build compiles. With the macros defined
 //! down there, `--no-default-features` could not resolve them and the crate did not build.
 //!
 //! Defined here they are always in scope and always expand to NOTHING unless
 //! `direct-entry-attribution` is selected -- which implies `jit`, so the armed bodies can name
-//! `jit::direct::entry_attribution` freely.
+//! `jit::direct` freely.
 //!
 //! `unused_macros` is allowed for the module: most of the call sites are inside `run.rs`'s own
 //! `jit` gates, so a `--no-default-features` build defines all ten and invokes three.
@@ -32,9 +32,17 @@ macro_rules! ea_mark {
     };
 }
 
-/// Close one phase against the cursor in BOTH armed modes. Only the two native-window boundaries
-/// (`run.rs:2597` in, `run.rs:2605` out) use this: they are what makes COARSE's four-mark total
-/// comparable with FULL's (A6).
+/// Close one phase against the cursor in BOTH armed modes.
+///
+/// The two native-window boundaries in `run_direct_block` use this -- `Phase::NativePreamble`
+/// immediately before the `entry(..)` call and `Phase::NativeBody` immediately after it. They are
+/// what makes COARSE's four-mark total comparable with FULL's (A6): on an entered traversal COARSE
+/// stamps exactly `ea_begin!`, those two, and `ea_end!`.
+///
+/// The `BlockProbe::Compile` arm in `try_direct_continuation` is COARSE-inclusive too (B3, see the
+/// comment at its `ea_mark_coarse!(Phase::Probe)`), because P2 is what BOUNDS P14 and P14 has to be
+/// subtractable from `total_entered` in both arms. That arm is ~2.5% of traversals on the loader,
+/// so the four-mark COARSE shape holds for the other ~97.5%.
 macro_rules! ea_mark_coarse {
     ($phase:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
@@ -65,9 +73,20 @@ macro_rules! ea_end {
 }
 
 /// Bump the `refusal_site` histogram. Every early return in the measured path carries one, which
-/// is what makes the four refusals production counts nowhere (`run.rs:2294`, `run.rs:2566`,
-/// `jit_direct_deferred_short`, `note_reject_callout_privileged`) countable without touching a
-/// production counter.
+/// is what makes refusals no `perf` key counts countable without adding a production counter.
+///
+/// In `run_direct_block` exactly four refusals have no `self.perf` bump at all:
+/// `site::NATIVE_FETCH_TRACE`, `site::SEGMENT_LAYOUT_NONE`, `site::DATA_SEGMENT` and
+/// `site::BLOCK_REGENERATED_NONE`. Two more are counted but not DISTINGUISHED:
+/// `jit_direct_deferred_short` is bumped from two different sites, which the histogram separates as
+/// `site::DISPATCH_DEFERRED_SHORT` vs `site::ENTRY_DEFERRED_SHORT`, and
+/// `note_reject_callout_privileged` lands in `DirectStallTally`, not in `perf`, so it is absent
+/// from the perf JSON the boards are graded on.
+///
+/// (The two `run.rs` LINE citations this note used to carry were wrong when they were written --
+/// at the commit that added them one pointed into a doc comment and the other at the
+/// `jit_direct_deferred_short` bump itself. Named sites cannot drift; do not reintroduce line
+/// numbers here.)
 macro_rules! ea_refusal {
     ($site:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
@@ -107,12 +126,14 @@ macro_rules! ea_native_sample {
     };
 }
 
-/// The `run.rs:1633` fall-through, which two arms reach.
+/// The fall-through at the end of `try_direct_continuation`'s `BlockProbe` match, which two arms
+/// reach.
 ///
-/// `BlockProbe::Ready` arrives here having taken no mark since `mark(P1)` at `run.rs:1426`, so it
-/// owes `mark(P2)`. `BlockProbe::Compile` took `mark(P2)` at `run.rs:1487` and owes the seventh of
-/// the arm's exits, `mark(P14)` with `compile_site = installed_fall_through` (B3-R). One macro so
-/// the two cannot drift apart.
+/// `BlockProbe::Ready` arrives here having taken no mark since `mark(P1)` (`Phase::Key`, stamped
+/// just before the probe), so it owes `mark(P2)` (`Phase::Probe`). `BlockProbe::Compile` already
+/// took `mark(P2)` at its arm head and owes the seventh of that arm's exits, `mark(P14)`
+/// (`Phase::Compile`) with `compile_site = INSTALLED_FALL_THROUGH` (B3-R). One macro so the two
+/// cannot drift apart.
 macro_rules! ea_mark_probe_tail {
     ($from_compile:expr) => {
         #[cfg(feature = "direct-entry-attribution")]
