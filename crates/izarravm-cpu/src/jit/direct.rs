@@ -1871,6 +1871,17 @@ impl BlockCache {
         self.stalls.disp_load_widen_lane_registrations += lanes;
     }
 
+    /// Jcc terminators an INSTALLED block lowered against the RBP flag shadow, by class. Charged
+    /// at the same install site and under the same condition as the lane registrations above, so
+    /// all of them share one denominator: blocks this run installed. See
+    /// `DirectStallTally::jcc_sites_simple`.
+    pub(crate) fn note_jcc_shadow_sites(&mut self, sites: [u16; 4]) {
+        self.stalls.jcc_sites_simple += u64::from(sites[0]);
+        self.stalls.jcc_sites_overflow += u64::from(sites[1]);
+        self.stalls.jcc_sites_signed_xor += u64::from(sites[2]);
+        self.stalls.jcc_sites_signed_xor_zf += u64::from(sites[3]);
+    }
+
     /// Fold ONE INSTALLED block's per-walk lane-budget refusals into the tally, per family.
     ///
     /// Called from `JitState::install` on the success arm and from nowhere else, which is what
@@ -3820,6 +3831,9 @@ pub(crate) struct Compilation {
     /// prefixes `compile_with_page_len`'s recovery search discards) contributes nothing. See
     /// `LaneCapRefusals`.
     lane_cap_refusals: LaneCapRefusals,
+    /// Jcc terminators this block lowered through `emit_jcc_shadow`, by `JccShadowClass`. See
+    /// `EmittedCode::jcc_shadow_sites` for what it does and does not measure.
+    jcc_shadow_sites: [u16; 4],
     pub code: Vec<u8>,
 }
 
@@ -3853,6 +3867,10 @@ impl Compilation {
 
     pub(crate) fn lane_cap_refusals(&self) -> LaneCapRefusals {
         self.lane_cap_refusals
+    }
+
+    pub(crate) fn jcc_shadow_sites(&self) -> [u16; 4] {
+        self.jcc_shadow_sites
     }
 }
 
@@ -8138,6 +8156,7 @@ fn compile_with_budget(
         disp_store_lanes: disp_store_lane_count,
         disp_load_widen_lanes: disp_load_widen_lane_count,
         lane_cap_refusals,
+        jcc_shadow_sites: emitted.jcc_shadow_sites,
         code: emitted.code,
     })
 }

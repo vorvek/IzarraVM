@@ -2054,6 +2054,16 @@ pub struct DirectStallSnapshot {
     /// still default OFF, blocked on the lane-cap re-price. See `DirectStallTally`.
     pub disp_store_lane_registrations: u64,
     pub disp_load_widen_lane_registrations: u64,
+    /// Jcc terminators lowered against the RBP EFLAGS shadow in the blocks this run INSTALLED, by
+    /// emission class (`IZARRAVM_JCC_SHADOW`, DEFAULT OFF, so all four are zero on a shipped
+    /// binary). Their job on a ladder leg is the ARM VACUITY check -- a zero ON arm means the leg
+    /// never exported the knob -- and the arena byte delta, which weights the four classes at
+    /// -6 / -4 / 0 / +5 bytes each. They say NOTHING about executed volume. See
+    /// `DirectStallTally::jcc_sites_simple`.
+    pub jcc_sites_simple: u64,
+    pub jcc_sites_overflow: u64,
+    pub jcc_sites_signed_xor: u64,
+    pub jcc_sites_signed_xor_zf: u64,
     /// Slots refused by the shared `MAX_BLOCK_IMM_LANES` budget in the blocks this run INSTALLED,
     /// one counter per family and charged on the CAP arm alone. Same denominator as the
     /// registration counters above, which is what makes the pair readable: registrations flat

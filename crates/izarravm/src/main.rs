@@ -3302,6 +3302,15 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         // binary to prove which arm a leg ran.
         "smc_disp_store_lane_registrations": snapshot.disp_store_lane_registrations,
         "smc_disp_load_widen_lane_registrations": snapshot.disp_load_widen_lane_registrations,
+        // The `IZARRAVM_JCC_SHADOW` arm's four site classes, shipped in PLAIN builds for the same
+        // reason the six lane counters above are: the ON and OFF legs of that slice share ONE
+        // binary, so the ARM has to be readable out of the run's own JSON rather than out of which
+        // binary ran. All four are zero on the OFF arm by construction, which makes a zero ON
+        // reading a VACUOUS leg -- the knob was not exported -- and not an inert result.
+        "jcc_sites_simple": snapshot.jcc_sites_simple,
+        "jcc_sites_overflow": snapshot.jcc_sites_overflow,
+        "jcc_sites_signed_xor": snapshot.jcc_sites_signed_xor,
+        "jcc_sites_signed_xor_zf": snapshot.jcc_sites_signed_xor_zf,
         // The lane-budget split. Registrations say what lanes a run's installed blocks took;
         // these say what the shared `MAX_BLOCK_IMM_LANES` budget turned away IN THOSE SAME
         // BLOCKS, per family and on the cap arm only. Both are folded in at install, so the two

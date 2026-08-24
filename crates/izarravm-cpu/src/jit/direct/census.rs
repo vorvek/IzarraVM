@@ -698,6 +698,29 @@ pub(crate) struct DirectStallTally {
     /// store arm for the budget rather than adding capture (`imm_lane_cap_refusals` 3,775 ->
     /// 11,369), and it is blocked on the cap re-price. See `disp_load_widen_enabled`.
     pub disp_load_widen_lane_registrations: u64,
+    /// Jcc terminators lowered against the RBP EFLAGS shadow IN THE BLOCKS THIS RUN INSTALLED,
+    /// by emission class (`IZARRAVM_JCC_SHADOW`, DEFAULT OFF). The classes are kept apart because
+    /// each carries a different ON-minus-OFF byte cost -- simple -6, overflow -4, signed-xor 0,
+    /// signed-xor-zf +5 -- and the arena BYTE delta the slice's occupancy risk is priced on is a
+    /// weighted sum of exactly these four.
+    ///
+    /// **ZERO on a shipped binary**, because the knob is default OFF and the OFF arm never calls
+    /// `emit_jcc_shadow`. That is the point: on an ON leg a zero here means the leg did not arm
+    /// the knob (`IZARRAVM_JCC_SHADOW=1` must be EXPORTED -- unset and the empty string both spell
+    /// OFF) and the leg is vacuous, not inert.
+    ///
+    /// **NOT a measure of executed volume, and it must never be quoted as one.** A chained
+    /// transfer jumps into a successor's body and runs its terminator without incrementing any
+    /// entry counter, and a self-loop Jcc runs many times per entry, so this population converts
+    /// to executions by nothing. The executed-Jcc premise was measured separately and read
+    /// 837,656,197 on `duke3d-586-short` (58.24% of terminators).
+    pub jcc_sites_simple: u64,
+    /// The 0x0 / 0x1 (JO / JNO) class. See `jcc_sites_simple`.
+    pub jcc_sites_overflow: u64,
+    /// The 0xC / 0xD (JL / JGE) class, the `SF^OF` fold. See `jcc_sites_simple`.
+    pub jcc_sites_signed_xor: u64,
+    /// The 0xE / 0xF (JLE / JG) class, the `ZF|(SF^OF)` fold. See `jcc_sites_simple`.
+    pub jcc_sites_signed_xor_zf: u64,
     /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
     /// charged to the family that would otherwise have taken the slot. The registration counters
     /// above say how many lanes those same blocks installed; these say how many more they would
@@ -2410,6 +2433,10 @@ impl crate::jit::JitState {
             count_lane_registrations: self.stalls.count_lane_registrations,
             disp_store_lane_registrations: self.stalls.disp_store_lane_registrations,
             disp_load_widen_lane_registrations: self.stalls.disp_load_widen_lane_registrations,
+            jcc_sites_simple: self.stalls.jcc_sites_simple,
+            jcc_sites_overflow: self.stalls.jcc_sites_overflow,
+            jcc_sites_signed_xor: self.stalls.jcc_sites_signed_xor,
+            jcc_sites_signed_xor_zf: self.stalls.jcc_sites_signed_xor_zf,
             imm_lane_cap_refusals: self.stalls.imm_lane_cap_refusals,
             imm8_lane_cap_refusals: self.stalls.imm8_lane_cap_refusals,
             count_lane_cap_refusals: self.stalls.count_lane_cap_refusals,

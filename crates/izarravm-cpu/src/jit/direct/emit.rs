@@ -198,6 +198,9 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     let mut completed_dword_reads = 0u8;
     let mut side_exits = Vec::new();
     let mut side_exit_reason_stubs = Vec::new();
+    // Jcc terminators lowered through `emit_jcc_shadow`, by `JccShadowClass`. Zero on the OFF arm
+    // by construction, which is what makes the install-side counter a VACUITY check on the arm.
+    let mut jcc_shadow_sites = [0u16; 4];
     let shared_return = e.label();
     let self_loop_return = self_loop.then(|| e.label());
     let mut terminal = false;
@@ -2233,9 +2236,16 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
                 completed_byte_reads += slot.kind.byte_reads();
                 completed_word_reads += slot.kind.word_reads();
                 completed_dword_reads += slot.kind.dword_reads();
-                emit_load_host_flags(&mut e);
                 let taken = e.label();
-                e.jcc(condition, taken);
+                // The one arm switch of the `IZARRAVM_JCC_SHADOW` slice, read at the emission
+                // site so both arms live in ONE binary and a ladder needs no rebuild. The OFF
+                // arm is byte-for-byte the pre-slice emission.
+                if jcc_shadow_enabled() {
+                    jcc_shadow_sites[emit_jcc_shadow(&mut e, condition, taken) as usize] += 1;
+                } else {
+                    emit_load_host_flags(&mut e);
+                    e.jcc(condition, taken);
+                }
                 if self_loop {
                     emit_dynamic_increment(&mut e, STACK_ITERATIONS);
                     emit_advance_eip(&mut e, u32::from(span.guest_len));
@@ -2410,6 +2420,7 @@ pub(super) fn emit(input: EmitInput<'_>) -> EmittedCode {
     EmittedCode {
         code: e.finish(),
         body_offset,
+        jcc_shadow_sites,
     }
 }
 
@@ -5962,6 +5973,141 @@ fn emit_capture_flags(e: &mut Encoder, defined: u32) {
     e.and_r32_imm32(Reg::RBP, !defined);
     e.and_r32_imm32(Reg::RDI, defined);
     e.or_r32_r32(Reg::RBP, Reg::RDI);
+}
+
+/// One `test` against a mask of the RBP EFLAGS shadow, in the SHORTEST form the mask admits.
+///
+/// `test bpl, imm8` is four bytes and `test ebp, imm32` is six, and the two set ZF identically for
+/// any mask that fits a byte -- so **a mutation of this rule is semantically INERT** and cannot be
+/// caught by any differential fixture. It is pinned by the byte-delta ledger
+/// (`jcc_shadow_emission_delta_matches_the_ledger`) instead, which is also the ledger the arena
+/// occupancy risk is read on. `reg` is RBP for the twelve direct predicates and RAX for the two
+/// folded signed ones.
+fn emit_shadow_test(e: &mut Encoder, reg: Reg, mask: u32) {
+    debug_assert_ne!(mask, 0, "a Jcc predicate tests at least one flag bit");
+    if mask <= 0xff {
+        e.test_r8_low_imm8(reg, mask as u8);
+    } else {
+        e.test_r32_imm32(reg, mask);
+    }
+}
+
+/// Which of the four emission shapes a condition takes, in the order the `jcc_shadow_sites` lanes
+/// count them. The classes exist for the byte ledger -- each has its own ON-minus-OFF delta -- and
+/// they double as the ARM VACUITY check a ladder leg is read on: all four read zero on the OFF arm.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum JccShadowClass {
+    /// 0x2..=0xB: one flag bit, or CF|ZF, tested straight out of BPL. Ten conditions, -6 bytes.
+    Simple = 0,
+    /// 0x0 / 0x1: OF alone, whose 0x800 mask needs the 32-bit form. -4 bytes.
+    Overflow = 1,
+    /// 0xC / 0xD: `SF^OF`, the XOR7 fold. Byte-neutral.
+    SignedXor = 2,
+    /// 0xE / 0xF: `ZF|(SF^OF)`, the XOR6 fold. +5 bytes.
+    SignedXorZf = 3,
+}
+
+/// The `IZARRAVM_JCC_SHADOW` lowering of one Jcc terminator: compute the guest's branch predicate
+/// directly out of the RBP EFLAGS shadow and branch on the host ZF the `test` leaves, instead of
+/// materialising a host flags word with `push`/`popfq` and branching on it. See
+/// `jcc_shadow_enabled` for why the two are equivalent rather than merely similar.
+///
+/// # THE CONDITION TABLE IS COMPLETE, AND IT IS A RAW GUEST NIBBLE
+///
+/// `classify` hands the guest's own four-bit condition code through untranslated from both forms
+/// that produce a `DirectKind::Jcc` -- the short `0x70..=0x7f` and the near `0x0f80..=0x0f8f` --
+/// so all sixteen are reachable and all sixteen are lowered here. The nibble's LOW BIT is the
+/// negation in every pair, which is why the branch below is a single `jnz`-or-`jz` choice and the
+/// mask table is indexed by `condition >> 1`: a pair shares its predicate and differs only in
+/// polarity.
+///
+/// # WHAT THESE SEQUENCES WRITE, AND WHY IT IS A SUBSET OF WHAT THEY REPLACE
+///
+/// RAX (the two signed folds only) and the host flags. The OFF arm writes BOTH at every condition
+/// -- `emit_load_host_flags` clobbers RAX and `popfq` writes the entire flags register -- so the
+/// replacement's footprint is a strict subset and twelve of the sixteen conditions touch no
+/// general register at all. Nothing else is live across a terminator to disturb: `GUEST_HOMES` is
+/// R8-R14 plus RBX, R15 is the CPU pointer, RBP is the shadow itself, and RSI is the x87 tag-cache
+/// scratch. The host flags being SCRATCH here is stated rather than implied because `shr`, `shl`,
+/// `xor` and `or` each define CF/OF/SF/ZF/PF and the terminating `test` defines them again: a
+/// later reader adding a fifth instruction to one of these chains needs to know that.
+///
+/// RAX is dead across the terminator on every reachable continuation, at the four sites that
+/// actually touch it -- `emit_fetch_trace`, the link-cell quota load, the self-loop quota load and
+/// `emit_return` all WRITE RAX before any read, and `emit_advance_eip` loads into it first.
+///
+/// # NO `| 0x2`
+///
+/// `emit_load_host_flags` ORs the reserved bit into the word it pushes, which is cosmetic there
+/// (bit 1 of RFLAGS reads as 1 on real hardware whatever POPFQ popped). Under this lowering it
+/// would be actively WRONG: the shadow's own bit 1 is set, so a mask carrying `0x2` makes its
+/// condition unconditionally taken.
+fn emit_jcc_shadow(e: &mut Encoder, condition: u8, taken: Label) -> JccShadowClass {
+    debug_assert!(condition < 16, "condition code must fit four bits");
+    // Even nibbles branch when the predicate HOLDS, odd nibbles when it does not.
+    let taken_when_set = condition & 1 == 0;
+    let class = match condition >> 1 {
+        // JO / JNO. OF alone, and the only predicate whose mask does not fit a byte.
+        0 => {
+            emit_shadow_test(e, Reg::RBP, crate::FLAG_OF);
+            JccShadowClass::Overflow
+        }
+        // JB/JC / JAE/JNC.
+        1 => {
+            emit_shadow_test(e, Reg::RBP, crate::FLAG_CF);
+            JccShadowClass::Simple
+        }
+        // JZ / JNZ.
+        2 => {
+            emit_shadow_test(e, Reg::RBP, crate::FLAG_ZF);
+            JccShadowClass::Simple
+        }
+        // JBE / JA: CF | ZF, which is one `test` because both bits live in the low byte.
+        3 => {
+            emit_shadow_test(e, Reg::RBP, crate::FLAG_CF | crate::FLAG_ZF);
+            JccShadowClass::Simple
+        }
+        // JS / JNS.
+        4 => {
+            emit_shadow_test(e, Reg::RBP, crate::FLAG_SF);
+            JccShadowClass::Simple
+        }
+        // JP / JNP.
+        5 => {
+            emit_shadow_test(e, Reg::RBP, crate::FLAG_PF);
+            JccShadowClass::Simple
+        }
+        // JL / JGE: SF ^ OF. XOR7 aligns OF (shadow bit 11) DOWN onto SF's bit 7 and folds, so
+        // RAX bit 7 is SF^OF and one byte-lane `test` reads it. The shift is 4 because 11 - 7 = 4;
+        // any other count reads an unrelated shadow bit and agrees with the truth on exactly the
+        // (SF=1, OF=0) half of the input space, which is why the fixture enumerates (SF=0, OF=1).
+        6 => {
+            e.mov_r32_r32(Reg::RAX, Reg::RBP);
+            e.shr_r32_imm8(Reg::RAX, 4);
+            e.alu_r32_r32(6, Reg::RAX, Reg::RBP);
+            emit_shadow_test(e, Reg::RAX, 0x80);
+            JccShadowClass::SignedXor
+        }
+        // JLE / JG: ZF | (SF ^ OF). XOR6 goes the other way -- align SF UP onto OF's bit 11 and
+        // fold, so RAX bit 11 is SF^OF; shift that DOWN by 5 onto ZF's bit 6 (11 - 6 = 5); OR the
+        // shadow back in so bit 6 becomes (SF^OF) | ZF; test bit 6. The final `or` is the whole
+        // ZF term: delete it and the lowering computes JL where it should compute JLE.
+        _ => {
+            e.mov_r32_r32(Reg::RAX, Reg::RBP);
+            e.shl_r32_imm8(Reg::RAX, 4);
+            e.alu_r32_r32(6, Reg::RAX, Reg::RBP);
+            e.shr_r32_imm8(Reg::RAX, 5);
+            e.or_r32_r32(Reg::RAX, Reg::RBP);
+            emit_shadow_test(e, Reg::RAX, 0x40);
+            JccShadowClass::SignedXorZf
+        }
+    };
+    if taken_when_set {
+        e.jnz(taken);
+    } else {
+        e.jz(taken);
+    }
+    class
 }
 
 // The push/popfq below moves RSP by 8 for one instruction: the same accepted unwind gap as
