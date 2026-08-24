@@ -4042,3 +4042,511 @@ fn the_block_state_payload_stayed_the_same_width() {
     );
     assert!(std::mem::size_of::<DormantEntry>() <= std::mem::size_of::<RejectedSpan>());
 }
+
+// ---------------------------------------------------------------------------------------------
+// The chain-requirement entry check: the knob, the narrowing, and the two arms of `entry_layout`.
+// dev_docs/specs/2026-08-25-chain-requirement-entry-check-design.md
+// ---------------------------------------------------------------------------------------------
+
+/// Restores the ambient `IZARRAVM_CHAIN_ENTRY_CHECK` arm when it drops, so a fixture that asserts
+/// its way out of the middle of a row cannot leave the override set for whatever runs next on the
+/// same thread.
+struct ChainEntryCheckArm;
+
+impl ChainEntryCheckArm {
+    fn forced(armed: bool) -> Self {
+        set_chain_entry_check_for_test(Some(armed));
+        Self
+    }
+}
+
+impl Drop for ChainEntryCheckArm {
+    fn drop(&mut self) {
+        set_chain_entry_check_for_test(None);
+    }
+}
+
+/// The spelling table, tested without touching the process environment: the shipped reading is
+/// cached in a `OnceLock`, so the env itself is assertable exactly once per process and never in
+/// an order the harness controls.
+///
+/// **UNSET AND `""` REACH THE SAME ARM HERE**, unlike `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`, whose
+/// unset arm is `cap` and whose `""` arm is off. That difference is the whole reason this row
+/// exists: the two variables are set together in every leg of this slice's ladder, and a reader
+/// who assumes they null alike disarms the shipped governor default without noticing.
+#[test]
+fn the_chain_entry_check_spelling_table_is_exact() {
+    use parse_chain_entry_check_arm_for_test as parse;
+    assert!(
+        !parse(Err(std::env::VarError::NotPresent)),
+        "unset must name the shipped default, which is OFF"
+    );
+    for spelling in ["", "0", "off", "OFF", "  0  ", " off \n"] {
+        assert!(
+            !parse(Ok(spelling.to_string())),
+            "{spelling:?} must name the OFF arm -- `` follows unset here, deliberately"
+        );
+    }
+    for spelling in ["1", "on", "ON", "chain", "Chain", " chain "] {
+        assert!(
+            parse(Ok(spelling.to_string())),
+            "{spelling:?} must name the chain-requirement arm"
+        );
+    }
+}
+
+/// A MISSPELLED LADDER LEG MUST FAIL LOUDLY rather than silently running the default, which for
+/// this knob is also the base arm of the A/B -- so a typo would be read as "the slice I asked for
+/// changed nothing", the one wrong conclusion an arm ladder exists to avoid.
+#[test]
+fn an_unrecognised_chain_entry_check_spelling_refuses_to_guess() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcomes: Vec<_> = ["chained", "cap", "2", "true", "yes", "chain_layout"]
+        .into_iter()
+        .map(|spelling| {
+            let panicked = std::panic::catch_unwind(|| {
+                parse_chain_entry_check_arm_for_test(Ok(spelling.to_string()))
+            })
+            .is_err();
+            (spelling, panicked)
+        })
+        .collect();
+    std::panic::set_hook(previous);
+
+    for (spelling, panicked) in outcomes {
+        assert!(
+            panicked,
+            "IZARRAVM_CHAIN_ENTRY_CHECK={spelling:?} names no arm and must panic rather than \
+             silently falling through to the default"
+        );
+    }
+}
+
+/// `P` links to `A`, whose requirement pins ES, so `chain(P)` widens to carry ES. Retiring `A`
+/// takes `P`'s last outbound edge, and `P`'s requirement must fall back to its OWN layout: with
+/// no live edge the cone is `P` alone.
+///
+/// **THE CUT SITE THIS ROW GUARDS IS NOT `unlink_outbound`.** `unlink_block`'s inbound walk clears
+/// each predecessor's cell INLINE and never calls that helper, and it is the `Retired` cause --
+/// the largest cut population on every row. A narrowing wired only into `unlink_outbound` passes
+/// every other row in this file and fails here.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn chain_requirement_narrows_when_a_retired_successor_cuts_the_edge() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1310);
+    let tail = key(0x4_1320);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    let tail_compilation = chain_mask_compilation(
+        BlockSpan::new(tail, 1, 1).expect("tail span"),
+        &[SegmentIndex::Ds, SegmentIndex::Es],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    install_chain_block(&mut cache, &tail_compilation);
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "the row is vacuous unless the requirement really widened first"
+    );
+
+    assert_eq!(cache.retire_physical_range_for_test(tail.physical, 1), 1);
+
+    assert_eq!(
+        cache.outbound[root_id.index()],
+        [None, None],
+        "retiring the only successor must leave the root with no outbound edge"
+    );
+    assert_eq!(
+        cache.chain_layouts[root_id.index()],
+        cache.segment_layouts[root_id.index()],
+        "with no live edge the cone is this block alone, so its requirement is its own layout"
+    );
+    assert_eq!(
+        cache.stalls.chain_requirement_narrowed[LinkClearCause::Retired as usize],
+        1,
+        "the narrowing must be attributed to the RETIRED cut site, not to a replace or a widen"
+    );
+}
+
+/// The narrowing is NOT behind `IZARRAVM_CHAIN_ENTRY_CHECK`, and this row is what says so. It is a
+/// correctness prerequisite of the armed arm and, on the OFF arm, a strictly more accurate
+/// statement about a live link graph; gating it would hand the two arms different link graphs to
+/// reason about, and the OFF arm would then stop being the base the ladder needs.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn chain_requirement_narrows_on_both_arms() {
+    for armed in [false, true] {
+        let _arm = ChainEntryCheckArm::forced(armed);
+        let mut cache = BlockCache::default();
+        assert_eq!(
+            cache.chain_entry_check_armed(),
+            armed,
+            "the arm is read once, at construction; a fixture that sets it later tests nothing"
+        );
+        let root = key(0x4_1410);
+        let tail = key(0x4_1420);
+
+        let mut root_compilation = chain_mask_compilation(
+            BlockSpan::new(root, 1, 1).expect("root span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x2222)],
+        );
+        root_compilation.successors[0] = Some(link_target_of(tail));
+        let root_id = install_chain_block(&mut cache, &root_compilation);
+        install_chain_block(
+            &mut cache,
+            &chain_mask_compilation(
+                BlockSpan::new(tail, 1, 1).expect("tail span"),
+                &[SegmentIndex::Ds, SegmentIndex::Es],
+                &[(SegmentIndex::Es, 0x2222)],
+            ),
+        );
+        assert_ne!(
+            cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+            0
+        );
+
+        assert_eq!(cache.retire_physical_range_for_test(tail.physical, 1), 1);
+
+        assert_eq!(
+            cache.chain_layouts[root_id.index()],
+            cache.segment_layouts[root_id.index()],
+            "the narrowing must fire on the {armed} arm too -- it is not gated"
+        );
+    }
+}
+
+/// **THE MISCOMPILE ROW.** The narrowing predicate must be `outbound == [None, None]` and must
+/// NEVER be `!has_linked_successor(..)`.
+///
+/// `LinkCell::linked()` reads the target PORTAL's visibility, and a decode-slot suspension or an
+/// arena compaction clears and later REPUBLISHES portals without touching `outbound` and without
+/// re-running `try_link_inner`. So `has_linked_successor` reverts to true with no merge and no
+/// widen behind it. Narrow on that state and the sequence is: hide the successor, narrow the
+/// root, re-show the successor, enter the root under the narrowed mask, chain into a body against
+/// a base nobody validated.
+///
+/// The row builds exactly that window -- both successors portal-hidden while both `outbound` slots
+/// are still `Some` -- and then runs a cut on the OTHER slot, which is what calls the helper. The
+/// requirement must not move.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn hiding_a_successor_does_not_narrow_the_chain_requirement() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1510);
+    let pinning = key(0x4_1520);
+    let plain = key(0x4_1530);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(pinning));
+    root_compilation.successors[1] = Some(link_target_of(plain));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    let pinning_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(pinning, 1, 1).expect("pinning span"),
+            &[SegmentIndex::Ds, SegmentIndex::Es],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    let plain_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(plain, 1, 1).expect("plain span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    assert_eq!(cache.outbound[root_id.index()][0], Some(pinning_id));
+    assert_eq!(cache.outbound[root_id.index()][1], Some(plain_id));
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "the row is vacuous unless the requirement really carries the successor's ES"
+    );
+
+    // The window: portals cleared, `outbound` untouched. This is what `suspend_decode_slot` and
+    // `compact_arena` do, and neither of them re-runs a merge on the way back.
+    cache.block_portals[pinning_id.index()].clear();
+    cache.block_portals[plain_id.index()].clear();
+    assert!(
+        !cache.has_linked_successor(root_id),
+        "the row is vacuous unless the VISIBILITY predicate really reads false here"
+    );
+    assert_ne!(
+        cache.outbound[root_id.index()],
+        [None, None],
+        "and unless the LINK GRAPH still says both edges exist"
+    );
+
+    cache.unlink_outbound(root_id, 1, LinkClearCause::ChainWiden);
+
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "a hidden successor is still a successor: narrowing here is a wrong-base miscompile the \
+         moment root dispatch republishes its portal"
+    );
+    assert_eq!(
+        cache.stalls.chain_requirement_narrowed.iter().sum::<u64>(),
+        0,
+        "and the counter must not claim a narrowing that did not happen"
+    );
+}
+
+/// **R2-1, the round-2 finding, and the row that fails on the unfixed code.**
+///
+/// `try_link_inner` snapshots the source's chain requirement BEFORE its refusal chain, then calls
+/// `unlink_outbound` on the relink-replace path -- which narrows -- and then hands the merge to
+/// `widen_chain_requirement`. Handing it the PRE-CUT snapshot writes the cut edge's bits straight
+/// back and silently undoes the narrowing, and nothing asserts against it: the monotonicity check
+/// passes because the pre-cut value contains the narrowed one, and the non-adoption check compares
+/// `data`, which the narrowing does not touch.
+///
+/// Here `P` links to a successor that pins ES, then relinks the same slot to one that does not.
+/// After the relink `P`'s only live edge is to a block that pins nothing beyond DS, so ES has no
+/// business in `P`'s requirement. Recomputing the merge from the post-cut requirement is what
+/// makes that true, and it changes no edge admission: the refusal decision was already taken from
+/// the pre-cut value, and a narrower source can only make a merge succeed where it already did.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn a_replaced_edge_does_not_restore_the_cut_successors_requirement() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1610);
+    let pinning = key(0x4_1620);
+    let plain = key(0x4_1630);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(pinning));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    let pinning_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(pinning, 1, 1).expect("pinning span"),
+            &[SegmentIndex::Ds, SegmentIndex::Es],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    let plain_id = install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(plain, 1, 1).expect("plain span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    assert_eq!(cache.outbound[root_id.index()][0], Some(pinning_id));
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "the row is vacuous unless the requirement really carries the first successor's ES"
+    );
+
+    assert!(
+        cache.try_link(root_id, 0, plain_id),
+        "the replacement edge must be admitted, or the row proves nothing about the replace path"
+    );
+
+    assert_eq!(cache.outbound[root_id.index()], [Some(plain_id), None]);
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::Replaced as usize],
+        1
+    );
+    assert_eq!(
+        cache.stalls.chain_requirement_narrowed[LinkClearCause::Replaced as usize],
+        1,
+        "the replace emptied the last slot, so the cut must have narrowed"
+    );
+    assert_eq!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "the cut successor's ES must NOT come back: the merge handed to the propagation has to be \
+         recomputed from the POST-cut requirement, not from the snapshot taken before the cut"
+    );
+    assert_eq!(
+        cache.chain_layouts[root_id.index()],
+        cache.segment_layouts[root_id.index()],
+        "and the replacement pins nothing beyond what the root pins itself"
+    );
+}
+
+/// A wholesale flush resets every requirement, and it may only do that once every edge is gone.
+/// Resetting first would leave an armed cell able to reach a body under a requirement that no
+/// longer names the segment that body's cone pins -- stale-too-NARROW, the miscompile direction.
+/// The `debug_assert!` in `invalidate_translation` is what makes the reordering fail; this row is
+/// what makes the assert run on a shape that has edges to drop.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn chain_requirement_narrows_only_after_every_edge_is_dropped() {
+    let mut cache = BlockCache::default();
+    let root = key(0x4_1710);
+    let tail = key(0x4_1720);
+
+    let mut root_compilation = chain_mask_compilation(
+        BlockSpan::new(root, 1, 1).expect("root span"),
+        &[SegmentIndex::Ds],
+        &[(SegmentIndex::Es, 0x2222)],
+    );
+    root_compilation.successors[0] = Some(link_target_of(tail));
+    let root_id = install_chain_block(&mut cache, &root_compilation);
+    install_chain_block(
+        &mut cache,
+        &chain_mask_compilation(
+            BlockSpan::new(tail, 1, 1).expect("tail span"),
+            &[SegmentIndex::Ds, SegmentIndex::Es],
+            &[(SegmentIndex::Es, 0x2222)],
+        ),
+    );
+    assert_ne!(
+        cache.chain_layouts[root_id.index()].used & segment_bit(SegmentIndex::Es),
+        0,
+        "the row is vacuous unless there is a widened requirement for the flush to drop"
+    );
+
+    cache.invalidate_translation();
+
+    assert!(cache.outbound.iter().all(|slots| *slots == [None, None]));
+    assert_eq!(
+        cache.chain_layouts[root_id.index()],
+        cache.segment_layouts[root_id.index()]
+    );
+    assert_eq!(
+        cache.stalls.chain_requirement_narrowed.iter().sum::<u64>(),
+        0,
+        "the wholesale reset is not the per-block helper and must not be counted as one"
+    );
+}
+
+/// `entry_layout` selects an ARRAY, and it takes exactly ONE indexed copy either way.
+///
+/// The one-copy half is mutant M14: the 2026-08-18 plan pinned that the entry check must REPLACE
+/// the 116-byte fetch rather than add a second, and "this accessor reads one `Vec`" is not
+/// otherwise assertable in Rust. The counter is bumped by the single accessor both arms go
+/// through, so it catches a second array read that goes through that accessor; a mutant that
+/// indexes a `Vec` directly instead is a review kill and the sweep records it as one.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn entry_layout_selects_one_array_and_fetches_it_once() {
+    for armed in [false, true] {
+        let _arm = ChainEntryCheckArm::forced(armed);
+        let mut cache = BlockCache::default();
+        let root = key(0x4_1810);
+        let tail = key(0x4_1820);
+
+        let mut root_compilation = chain_mask_compilation(
+            BlockSpan::new(root, 1, 1).expect("root span"),
+            &[SegmentIndex::Ds],
+            &[(SegmentIndex::Es, 0x2222)],
+        );
+        root_compilation.successors[0] = Some(link_target_of(tail));
+        let root_id = install_chain_block(&mut cache, &root_compilation);
+        install_chain_block(
+            &mut cache,
+            &chain_mask_compilation(
+                BlockSpan::new(tail, 1, 1).expect("tail span"),
+                &[SegmentIndex::Ds, SegmentIndex::Es],
+                &[(SegmentIndex::Es, 0x2222)],
+            ),
+        );
+        // The two arrays must actually DIFFER here, or neither half of this row means anything.
+        assert_ne!(
+            cache.chain_layouts[root_id.index()],
+            cache.segment_layouts[root_id.index()]
+        );
+
+        cache.entry_layout_fetches.store(0, Ordering::Relaxed);
+        let fetched = cache.entry_layout(root_id).expect("the block is live");
+        assert_eq!(
+            cache.entry_layout_fetches.load(Ordering::Relaxed),
+            1,
+            "the entry check takes ONE 116-byte copy; a second is the cost regression M14 names"
+        );
+        let expected = if armed {
+            cache.chain_layouts[root_id.index()]
+        } else {
+            cache.segment_layouts[root_id.index()]
+        };
+        assert_eq!(
+            fetched, expected,
+            "the {armed} arm must read the array its contract names"
+        );
+        // `cs_matches` shares this fetch on both arms, so the two layouts must agree about CS or
+        // routing it through the chain requirement would change what CS the entry check proves.
+        assert_eq!(
+            cache.chain_layouts[root_id.index()].cs,
+            cache.segment_layouts[root_id.index()].cs,
+            "a merge constructs `cs: self.cs`, so chain.cs == own.cs always"
+        );
+    }
+}
+
+/// `BAKES_CS_BIT` names no segment and the masked compare cannot see it. **Do not add
+/// `& SEGMENT_MASK_BITS` at the entry check**: it would be inert today, and an inert mask migrates
+/// to a consumer where it is not inert.
+#[test]
+fn bakes_cs_bit_is_invisible_to_the_entry_mask() {
+    let cpu = CpuGsw::default();
+    let mut layout = SegmentLayout::capture(&cpu, 0, 0, 0).expect("default layout");
+    layout.used = BAKES_CS_BIT;
+    // Move every descriptor the mask could name. Bit 6 names none of them, so the compare passes.
+    let mut moved = cpu;
+    for segment in SEGMENT_ORDER {
+        let mut record = moved.registers.segment(segment);
+        record.base = record.base.wrapping_add(0x1000);
+        moved.registers.set_segment(segment, record);
+    }
+    assert!(
+        layout.data_matches(&moved),
+        "bit 6 is not a segment: `segment_bit` cannot produce it and `data_matches` walks \
+         SEGMENT_ORDER only"
+    );
+    assert!(
+        !layout.all_data_matches(&moved),
+        "the row is vacuous unless the descriptors really moved"
+    );
+    for segment in SEGMENT_ORDER {
+        assert_ne!(
+            segment_bit(segment),
+            BAKES_CS_BIT,
+            "no segment may ever be given bit 6"
+        );
+        assert_eq!(
+            segment_bit(segment) & SEGMENT_MASK_BITS,
+            segment_bit(segment)
+        );
+    }
+}
