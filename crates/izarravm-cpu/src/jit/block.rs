@@ -340,7 +340,15 @@ pub(crate) enum PollScanOutcome {
 /// restamp replace the descriptor rather than reusing stale bytes or addresses.
 /// Slot opcodes here are mirrored in poll_head_possible's set; extending the
 /// shapes requires extending that set.
-fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
+///
+/// `current` is the scan's ORIGIN -- the instruction start every `at_head` computed
+/// here is measured against -- and it is a caller-supplied value rather than a fresh
+/// `cpu.linear_eip()` read so `build_poll_loop_from` can call this with the same
+/// origin for every `entry` candidate it tries walking backward from `current`. The
+/// interpreter's own caller (`build_poll_loop`) passes `cpu.linear_eip()`, so its
+/// `at_head` reads exactly as before; a call-out helper passes the slot's own linear
+/// EIP instead (GP2 poll-skip design, obligation 1).
+fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome {
     let d = cpu.registers.cs().default_size_32;
     let Some((slots, is_loop)) = build_block(cpu, entry, d) else {
         return PollScanOutcome::NegativeCacheable;
@@ -375,7 +383,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
             status_mask: mask,
             branch_when_zero,
             raw_core_clocks: 17,
-            at_head: cpu.linear_eip() == entry,
+            at_head: current == entry,
             memory: None,
         });
     }
@@ -428,7 +436,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
             status_mask: 0,
             branch_when_zero: false,
             raw_core_clocks: MEMORY_POLL_RAW_CORE_CLOCKS,
-            at_head: cpu.linear_eip() == entry,
+            at_head: current == entry,
             memory: Some(PollMemoryFields {
                 linear,
                 width: 4,
@@ -490,7 +498,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
             status_mask: mask,
             branch_when_zero,
             raw_core_clocks: 21,
-            at_head: cpu.linear_eip() == entry,
+            at_head: current == entry,
             memory: None,
         });
     }
@@ -538,18 +546,27 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
         status_mask: mask,
         branch_when_zero,
         raw_core_clocks: 28,
-        at_head: cpu.linear_eip() == entry,
+        at_head: current == entry,
         memory: None,
     })
 }
 
-/// Find an exact poll shape containing the current instruction start. The bounded
-/// backward scan stays in the current code page and accepts only captured slot starts.
-/// A negative aggregates the per-entry outcomes: cacheable only when every probe
-/// on the page rejected for code-byte reasons, volatile if any probe hit a
-/// register or segment gate.
-pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
-    let current = cpu.linear_eip();
+/// Find an exact poll shape containing `current`. The bounded backward scan stays in
+/// `current`'s code page and accepts only captured slot starts. A negative aggregates
+/// the per-entry outcomes: cacheable only when every probe on the page rejected for
+/// code-byte reasons, volatile if any probe hit a register or segment gate.
+///
+/// EXTRACTED FOR THE CALL-OUT-SITE POLL SKIP, and the parameter is the whole point.
+/// Inside a Direct block `registers.eip` is the BLOCK-ENTRY value throughout (side
+/// exits install the slot's EIP from a compiled delta; nothing updates `registers.eip`
+/// per slot), so a classifier that read `cpu.linear_eip()` from inside a call-out
+/// helper would scan around the wrong address and certify nothing. The slot's own
+/// guest linear EIP is a compile-time constant the emitter hands the helper, and THAT
+/// is what must drive both the scan origin and every `at_head` computed against it.
+///
+/// `build_poll_loop(cpu)` is this with `cpu.linear_eip()`, so the interpreter path is
+/// byte-for-byte unchanged.
+pub(crate) fn build_poll_loop_from(cpu: &CpuGsw, current: u32) -> PollScanOutcome {
     let page = current & !0x0fff;
     let mut volatile_seen = false;
     for back in 0..=9u32 {
@@ -559,7 +576,7 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
         if entry & !0x0fff != page {
             break;
         }
-        match build_poll_loop_at(cpu, entry) {
+        match build_poll_loop_at(cpu, entry, current) {
             PollScanOutcome::Found(poll) => {
                 if (0..poll.fetch_count()).any(|index| {
                     poll.fetch(index)
@@ -580,6 +597,13 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
     } else {
         PollScanOutcome::NegativeCacheable
     }
+}
+
+/// Find an exact poll shape containing the current instruction start.
+/// `build_poll_loop_from(cpu, cpu.linear_eip())` -- see that function's doc for why the
+/// origin is a parameter rather than an internal read.
+pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
+    build_poll_loop_from(cpu, cpu.linear_eip())
 }
 
 /// Loop-head prefilter: whether the current boundary could possibly be

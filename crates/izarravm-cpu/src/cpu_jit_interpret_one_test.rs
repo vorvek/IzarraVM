@@ -1667,12 +1667,19 @@ fn interpret_one_resync_stub_leaves_eip_delta_zero() {
     );
 }
 
-/// The three pre-existing call-out arms emit exactly the bytes they emitted before this slice.
+/// `PushAllDword` / `PopAllDword` emit exactly the bytes they emitted before this slice, and the
+/// `PortReadAlDx` (`0xEC`) slot's STATUS-BRANCH TAIL -- the part shared with every call-out class
+/// -- is unchanged, even though the slot as a whole is not byte-identical any more.
 ///
-/// `emit_call_out` grew two optional arguments and a whole status-branch tail. `None` has to emit
-/// NOTHING, not a zero and not a skipped branch, or the port and stack-frame slots change shape on
-/// a slice that is supposed to leave them alone. The pin is the `0xEC` slot's whole sequence from
-/// the call through the step-break test.
+/// **Rewritten, not deleted, for the GP2 call-out-site poll-skip design.** Every `0xEC` slot now
+/// carries a fourth argument (`slot_delta`, a plain compile-time immediate, not a cell pointer --
+/// see `CallOutSlotFn`'s doc), so the port slot's emitted bytes DO change from what this test used
+/// to pin: it gains the `mov r64, imm64` that loads `EXIT_ARG`, and it loses NOTHING, because a
+/// port slot was never given the governor prologue (`carries_a_cell()` is true for it, but the
+/// governor byte test is gated on `helper.interprets_one()`, which is false for it -- BLOCKER B4's
+/// fix). What the port slot still may NOT gain is the two RESYNC `bt` tests, which stay
+/// `InterpretOne`-only. `PushAllDword` / `PopAllDword` get neither the governor prologue nor a
+/// fourth argument and are still pinned BYTE-IDENTICAL below.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -1687,6 +1694,24 @@ fn interpret_one_leaves_the_port_slot_bytes_unchanged() {
     assert_eq!(compilation.callout_port_slots, 1);
     assert_eq!(compilation.callout_interpret_one_slots, 0);
     let code = compilation.code;
+    // The new fourth argument: `mov EXIT_ARG, imm64 1` (`slot_delta` is 1, the `0xEC` byte's own
+    // offset from the block's entry `inc ax`). `EXIT_ARG` is RCX on SysV, R9 on Windows.
+    #[cfg(target_os = "windows")]
+    const EXIT_ARG_LOAD: [u8; 10] = [0x49, 0xB9, 1, 0, 0, 0, 0, 0, 0, 0];
+    #[cfg(not(target_os = "windows"))]
+    const EXIT_ARG_LOAD: [u8; 10] = [0x48, 0xB9, 1, 0, 0, 0, 0, 0, 0, 0];
+    assert!(
+        position(&code, &EXIT_ARG_LOAD).is_some(),
+        "the port slot must carry its slot_delta as a fourth-argument immediate: code={code:02x?}"
+    );
+    // No governor prologue: `test byte [rax], 0x80` (`test_byte_disp8_imm8(RAX, 0,
+    // STATE_DEMOTED)`, F6 /0 with mod=01/disp8=0) never precedes the call for a helper that does
+    // not `interprets_one()`.
+    const GOVERNOR_TEST: [u8; 4] = [0xF6, 0x40, 0x00, 0x80];
+    assert!(
+        position(&code, &GOVERNOR_TEST).is_none(),
+        "a port call-out slot must never emit the InterpretOne governor's demoted-bit test"
+    );
     // `call rax` (FF D0), `add rsp, CALLOUT_CALL_FRAME`, the eight home reloads, `cmp rax, 0`,
     // `js`, `mov edx, eax`, `add [rsp+104], rdx`, `shr rax, 32`, `jnz`. The tail from `cmp` on is
     // what the new status bits sit in the middle of, so it is the part that must be contiguous.

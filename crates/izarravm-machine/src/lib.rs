@@ -8,8 +8,10 @@ pub use fat32::{
 pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, TimedMidiMessage};
 use izarravm_bus::{
-    BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CompiledBusDelta, CompiledBusWindow,
-    CpuBus, DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, TracingMode,
+    BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CalloutPollDecline,
+    CalloutPollSkipOutcome, CalloutPollSkipRequest, CompiledBusDelta, CompiledBusWindow, CpuBus,
+    DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, TracingMode,
+    scale_core_clocks,
 };
 use izarravm_core::{
     CpuPersona, GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard,
@@ -3687,6 +3689,15 @@ const BIOS_BASE_MEMORY_KIB: u16 = 640;
 #[cfg(test)]
 #[path = "machine_code_write_coherence_test.rs"]
 mod code_write_coherence_tests;
+
+#[cfg(all(
+    test,
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "machine_direct_poll_skip_test.rs"]
+mod direct_poll_skip_tests;
 
 #[cfg(test)]
 #[path = "machine_fault_site_test.rs"]

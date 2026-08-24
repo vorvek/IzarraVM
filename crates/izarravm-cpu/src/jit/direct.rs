@@ -40,9 +40,11 @@ use super::x87_avx2_emit::{
 use crate::{
     AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, DirectBarrierCensusRow,
     DirectBarrierCensusSnapshot, FLAG_IF, FLAG_TF, FLAG_VM, IN_AL_DX_CORE_CLOCKS, OperandSize,
-    POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags, PodKeyBuildHasher, Prefixes,
-    Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
+    POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags, PodKeyBuildHasher, PollFamily,
+    Prefixes, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
 };
+
+use super::block::{PollScanOutcome, build_poll_loop_from};
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -77,7 +79,7 @@ use crate::{
     DirectSmcCensusSnapshot, DirectSmcCensusUnits,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
-use izarravm_bus::{BusAccessKind, BusWidth, CpuBus};
+use izarravm_bus::{BusAccessKind, BusWidth, CalloutPollSkipRequest, CpuBus};
 #[cfg(feature = "direct-entry-attribution")]
 use std::cell::UnsafeCell;
 use std::collections::hash_map::Entry;
@@ -961,6 +963,24 @@ pub(crate) struct BlockCache {
     /// On `BlockCache` for the reason the latch above is: `DirectRuntimeState` is inline in
     /// `CpuGsw` ahead of `registers` and `pending_flags`, whose offsets emitted code bakes.
     block_entry_interrupt_shadow: bool,
+    /// The batch's published guest-clock budget (`run_direct_block`'s own `cap` parameter),
+    /// published beside `block_entry_interrupt_shadow` on the exact matched-pair model: set at
+    /// native entry, read by the GP2 poll-skip seam's admissibility bound, cleared after the
+    /// native return. Zero means "no cap published", which the seam reads as "admit nothing" --
+    /// `run_direct_block` always publishes a nonzero `cap` on a normal entry, so zero is reachable
+    /// only through the unpublished window a test seam that calls `run_direct_block` directly must
+    /// not skip past.
+    block_batch_cap: u64,
+    /// Per-CPU override of `direct_poll_skip_armed()`'s ambient (env-cached) reading, `None`
+    /// meaning "use the ambient reading". A FIELD rather than a thread-local, deliberately: the
+    /// mechanism runs from `izarravm-cpu`'s `port_read_al_dx`, but its cross-executor
+    /// acceptance fixture (`a_port_callout_preserves_the_blocks_eflags_shadow`,
+    /// `direct_poll_skip_engages_through_the_real_bus`) has to drive it from an
+    /// `izarravm-machine` integration test, and `#[cfg(test)]` items are compiled ONLY into the
+    /// crate whose OWN test harness set `--cfg test` -- they do not exist in the rlib
+    /// `izarravm-machine` links against. `set_native_backend_enabled` and `set_jit_auto_admit`
+    /// are the precedent for a plain `pub` per-CPU setter crossing this exact boundary.
+    direct_poll_skip_override: Option<bool>,
     /// Set when the boundary above CLEARED the shadow, i.e. the block consumed an STI's
     /// one-instruction reprieve inside itself. `run_budgeted_inner` reads it to run the
     /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
@@ -1156,6 +1176,8 @@ impl BlockCache {
             interrupt_shadow_armed_at: None,
             interrupt_shadow_arms: 0,
             block_entry_interrupt_shadow: false,
+            block_batch_cap: 0,
+            direct_poll_skip_override: None,
             interrupt_shadow_consumed: false,
             lane_trial_override: None,
             block_portals: Vec::new(),
@@ -2040,6 +2062,29 @@ impl BlockCache {
     /// Publish the shadow the block is being entered with, for `ResumeSnapshot::capture`.
     pub(crate) fn set_block_entry_interrupt_shadow(&mut self, armed: bool) {
         self.block_entry_interrupt_shadow = armed;
+    }
+
+    /// Publish the batch's guest-clock budget for the GP2 poll-skip seam's admissibility bound.
+    /// Matched pair with `set_block_entry_interrupt_shadow`: `run_direct_block` calls this beside
+    /// the shadow publish at entry and clears it (`0`) beside the shadow clear after the native
+    /// return, on the same "no cap published refuses every skip" convention.
+    pub(crate) fn set_block_batch_cap(&mut self, cap: u64) {
+        self.block_batch_cap = cap;
+    }
+
+    pub(crate) fn block_batch_cap(&self) -> u64 {
+        self.block_batch_cap
+    }
+
+    /// `direct_poll_skip_armed()`'s ambient reading, unless this CPU's `direct_poll_skip_override`
+    /// says otherwise. See the field's doc for why a per-CPU override rather than a thread-local.
+    pub(crate) fn direct_poll_skip_armed_for(&self) -> bool {
+        self.direct_poll_skip_override
+            .unwrap_or_else(direct_poll_skip_armed)
+    }
+
+    pub(crate) fn set_direct_poll_skip_override(&mut self, forced: Option<bool>) {
+        self.direct_poll_skip_override = forced;
     }
 
     pub(crate) fn block_entry_interrupt_shadow(&self) -> bool {
@@ -11059,6 +11104,113 @@ pub(crate) fn parse_chain_entry_check_arm_for_test(
     parse_chain_entry_check_arm(value)
 }
 
+/// Whether the `PortReadAlDx` call-out attempts the GP2 call-out-site poll skip before falling
+/// through to the ordinary `IN AL,DX` read (`IZARRAVM_DIRECT_POLL_SKIP`, GP2 poll-skip design §6).
+///
+/// **THE CONVENTION IS `IZARRAVM_CHAIN_ENTRY_CHECK` / `IZARRAVM_JCC_SHADOW`'s, NOT
+/// `IZARRAVM_ATA_POLL_SKIP`'s: unset and `""` name the SAME arm, and that arm is THE DEFAULT.**
+/// The design's own §6 checked this against the tree and found rev 1 had it backwards: ATA's `""`
+/// is spelled OFF on purpose (`machine/run.rs`'s own doc: "Empty is spelled OFF here on purpose,
+/// because OFF is a real arm for this gate"), which is the SAME shape as
+/// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`'s inverted spelling, not its opposite. Copying it here would
+/// have shipped a THIRD knob on this campaign whose `""` disagrees with its unset.
+///
+/// Default is OFF while under evaluation. A later flip to ON changes exactly the two `return`
+/// arms below the `NotPresent` and `""` matches, and every ladder leg that exported the arm
+/// explicitly (the standing rule) keeps working across the flip.
+///
+/// **No thread-local test override here** (unlike `chain_entry_check_armed`): the fixture that
+/// needs to flip this arm per-run is an `izarravm-machine` integration test, which cannot reach a
+/// `#[cfg(test)]` item in this crate at all -- `#[cfg(test)]` compiles only into the crate whose
+/// OWN harness set `--cfg test`, not into the rlib a dependent crate links against. The override
+/// that DOES cross the boundary is the per-CPU `CpuGsw::set_direct_poll_skip_override` /
+/// `BlockCache::direct_poll_skip_armed_for`, on the `set_native_backend_enabled` precedent; every
+/// call site in `port_read_al_dx` goes through that, never through this function directly except
+/// as its fallback.
+pub(crate) fn direct_poll_skip_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| parse_direct_poll_skip_arm(std::env::var("IZARRAVM_DIRECT_POLL_SKIP")))
+}
+
+/// The `IZARRAVM_DIRECT_POLL_SKIP` spelling table, lifted out of the `OnceLock` closure so it can
+/// be unit-tested without a process-global env write. See `direct_poll_skip_armed`.
+fn parse_direct_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` (the shipped default: OFF, while \
+                            under evaluation) and `0` / `off` (the same OFF arm, stated) or `1` / \
+                            `on` / `poll` (armed: the call-out attempts the analytic poll skip \
+                            before its ordinary read)";
+    let raw = match value {
+        // Unset is the default, and the default is OFF while under evaluation.
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_DIRECT_POLL_SKIP is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        "" => false,
+        "0" | "off" => false,
+        // `poll` rides beside `1` / `on` so a leg written from the design reaches the same arm as
+        // a leg written from the shell.
+        "1" | "on" | "poll" => true,
+        other => panic!(
+            "IZARRAVM_DIRECT_POLL_SKIP={other:?} names no arm; {ACCEPTED}. Refusing to guess: a \
+             mistyped ladder leg that silently ran the default would be read as the slice under \
+             test doing nothing"
+        ),
+    }
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_chain_entry_check_arm_for_test`
+/// for why this is a thin pass-through rather than driving the process env directly.
+#[cfg(test)]
+pub(crate) fn parse_direct_poll_skip_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_direct_poll_skip_arm(value)
+}
+
+/// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`: the binary search's floor, default 2 -- matching the
+/// interpreter's `try_poll_skip` (`machine/run.rs`, `low = 2`). Unset and `""` both mean the
+/// default: a threshold has no "off" value, the same convention `sweep_knob`-style numeric knobs
+/// on this campaign use.
+pub(crate) fn direct_poll_skip_min_iterations() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(
+        || match std::env::var("IZARRAVM_DIRECT_POLL_MIN_ITERATIONS") {
+            Err(std::env::VarError::NotPresent) => 2,
+            Ok(raw) if raw.trim().is_empty() => 2,
+            Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
+                panic!("IZARRAVM_DIRECT_POLL_MIN_ITERATIONS={raw:?} is not a u64")
+            }),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("IZARRAVM_DIRECT_POLL_MIN_ITERATIONS is not valid UTF-8")
+            }
+        },
+    )
+}
+
+/// `IZARRAVM_DIRECT_POLL_MAX_RAW`: the 32-bit return-lane bound (GP2 poll-skip design obligation
+/// 4). Default `u32::MAX - IN_AL_DX_CORE_CLOCKS`, so `IN_AL_DX_CORE_CLOCKS + raw_core_clocks *
+/// best` cannot reach bit 32 (`STATUS_STEP_BREAK_BIT`) on the default arm.
+pub(crate) fn direct_poll_skip_max_raw() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| match std::env::var("IZARRAVM_DIRECT_POLL_MAX_RAW") {
+        Err(std::env::VarError::NotPresent) => {
+            u64::from(u32::MAX) - u64::from(IN_AL_DX_CORE_CLOCKS)
+        }
+        Ok(raw) if raw.trim().is_empty() => u64::from(u32::MAX) - u64::from(IN_AL_DX_CORE_CLOCKS),
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("IZARRAVM_DIRECT_POLL_MAX_RAW={raw:?} is not a u64")),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("IZARRAVM_DIRECT_POLL_MAX_RAW is not valid UTF-8")
+        }
+    })
+}
+
 /// Whether `DirectKind::Jcc` computes its branch predicate by TESTING the RBP EFLAGS shadow
 /// directly, instead of round-tripping that shadow through the host flags word
 /// (`IZARRAVM_JCC_SHADOW`).
@@ -15782,10 +15934,14 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let abnormal_stub = e.label();
                 let step_break_common = e.label();
                 let step_break_stub = e.label();
-                // The `InterpretOne` class needs its slot cell (the fourth argument and the
-                // governor byte) and the two RESYNC stubs; the other three classes need neither
-                // and emit neither, which is what keeps their bytes identical.
-                let slot_cell = helper.interprets_one().then(|| {
+                // The `InterpretOne` class's fourth argument is its slot cell's ADDRESS (also the
+                // governor byte's home) plus the two RESYNC stubs. The `PortReadAlDx` class's
+                // fourth argument is its `slot_delta` VALUE -- no cell, no governor, no RESYNC
+                // (GP2 poll-skip design obligation 1/4): the classifier's backward scan re-derives
+                // the certified shape fresh on every call-out attempt instead of caching a
+                // negative in a heap cell. `PushAllDword` / `PopAllDword` need neither and emit
+                // neither, which is what keeps their bytes identical across this slice.
+                let interpret_one_cell = helper.interprets_one().then(|| {
                     let cell = interpret_one_cells
                         .get(interpret_one_index)
                         .copied()
@@ -15793,15 +15949,18 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     interpret_one_index += 1;
                     cell
                 });
+                let slot_delta = matches!(helper, CallOutHelper::PortReadAlDx)
+                    .then(|| u64::from(slot.lin.wrapping_sub(span.key.linear)));
+                let exit_arg = interpret_one_cell.map(|cell| cell as u64).or(slot_delta);
                 let resync_labels =
-                    slot_cell.map(|_| ((e.label(), e.label()), (e.label(), e.label())));
+                    interpret_one_cell.map(|_| ((e.label(), e.label()), (e.label(), e.label())));
                 emit_call_out(
                     &mut e,
                     helper,
                     completed_raw,
                     abnormal_stub,
                     step_break_stub,
-                    slot_cell,
+                    exit_arg,
                     resync_labels.map(|((stub, _), (fault_stub, _))| (stub, fault_stub)),
                 );
                 side_exit_reason_stubs.push((
@@ -22958,12 +23117,21 @@ pub(crate) const CALL_OUT_STACK_FRAME_DWORDS: u32 = 8;
 /// describe `CALLOUT_CALL_FRAME`.
 pub(crate) type CallOutFn = unsafe extern "C" fn(*mut CpuGsw, u64, u64) -> i64;
 
-/// The ABI of a helper that needs its SLOT identified, which the three fixed-opcode helpers do
-/// not: they know what they are, `interpret_one` does not. The fourth argument is the address of
-/// this slot's `InterpretOneCell`, which carries both the slot's guest offset and its governor
-/// state. One pointer rather than an offset immediate plus a cell immediate, because the cell has
-/// to exist anyway and a two-field read out of it is cheaper than a second argument register on
-/// every execution.
+/// The ABI of a helper that needs its SLOT identified. Two helpers use it, for two different
+/// reasons the fourth argument means two different things for:
+///
+/// * `interpret_one` does not know what instruction it is; its fourth argument is the ADDRESS of
+///   this slot's `InterpretOneCell`, which carries both the slot's guest offset and its governor
+///   state. One pointer rather than an offset immediate plus a cell immediate, because the cell
+///   has to exist anyway and a two-field read out of it is cheaper than a second argument
+///   register on every execution.
+/// * `port_read_al_dx` knows exactly what it is (`0xEC`) but not WHERE, because the emitter never
+///   allocates it a cell (the GP2 call-out-site poll-skip design deliberately spends no heap
+///   allocation on a port slot -- the classifier's backward scan re-derives the certified shape
+///   fresh on every attempt instead of caching a negative in a cell, which trades a small,
+///   measured-negligible re-scan cost on the rare `NegativeCacheable` site for one fewer moving
+///   part). Its fourth argument is therefore the slot's `slot_delta` VALUE directly, a plain
+///   compile-time immediate, not a pointer.
 pub(crate) type CallOutSlotFn = unsafe extern "C" fn(*mut CpuGsw, u64, u64, u64) -> i64;
 
 /// The live bus and the monomorphised helpers for it, published by `run_direct_block` for the
@@ -23027,7 +23195,10 @@ impl CallOutTable {
     pub(crate) fn publish<B: CpuBus>(bus: &mut B) -> Self {
         Self {
             bus: (bus as *mut B).cast::<()>(),
-            port_read_al_dx: port_read_al_dx::<B> as CallOutFn as usize,
+            // `CallOutSlotFn`, not `CallOutFn`: the GP2 poll-skip design gives every `IN AL,DX`
+            // slot a fourth argument (`slot_delta`), the same ABI shape `interpret_one` already
+            // uses.
+            port_read_al_dx: port_read_al_dx::<B> as CallOutSlotFn as usize,
             push_all_dword: push_all_dword::<B> as CallOutFn as usize,
             pop_all_dword: pop_all_dword::<B> as CallOutFn as usize,
             interpret_one: interpret_one::<B> as CallOutSlotFn as usize,
@@ -23264,6 +23435,35 @@ impl CallOutHelper {
             Self::InterpretOne { .. } => true,
         }
     }
+
+    /// True for every helper whose slot is allocated a `PortSlotCell` -- the governor's per-site
+    /// kill switch. `InterpretOne` needs one for `republish_flags`'s reason (below) as well as the
+    /// governor; `PortReadAlDx` needs one PURELY as a `slot_delta` data channel for the poll-skip
+    /// scan's origin (GP2 poll-skip design, obligation 4) and NEVER for the RBP reload
+    /// `republishes_flags` gates. Deliberately a SEPARATE predicate from `republishes_flags`: the
+    /// two drove the same one bool before the poll-skip design split them, and that conflation was
+    /// exactly the miscompile B4 found (a port call-out that never republishes flags, emitting the
+    /// unconditional RBP reload anyway because it "carried a cell").
+    pub(crate) fn carries_a_cell(self) -> bool {
+        match self {
+            Self::PortReadAlDx | Self::InterpretOne { .. } => true,
+            Self::PushAllDword | Self::PopAllDword => false,
+        }
+    }
+
+    /// True only for the ONE helper that republishes the architectural EFLAGS into memory before
+    /// returning -- `InterpretOne`'s STEP 2 (`materialize_flags`), the precondition
+    /// `emit_call_out`'s RBP reload depends on. `PortReadAlDx` carries a cell (`carries_a_cell`)
+    /// but never republishes: RBP is callee-saved and stays the block's live EFLAGS shadow across
+    /// the call, and reloading it from memory here would clobber that shadow with a stale value a
+    /// LATER slot in the same block still depends on (GP2 poll-skip design, obligation 4; the
+    /// concrete witness is `emit_carry_alu_preloaded`'s direct RBP read, below).
+    pub(crate) fn republishes_flags(self) -> bool {
+        match self {
+            Self::InterpretOne { .. } => true,
+            Self::PortReadAlDx | Self::PushAllDword | Self::PopAllDword => false,
+        }
+    }
 }
 
 /// The per-class interpreter call-out slot counts, packed into ONE byte.
@@ -23418,7 +23618,15 @@ fn port_permission_resident<B: CpuBus>(
     })
 }
 
-/// `0xEC` IN AL,DX through the interpreter's own port path.
+/// `0xEC` IN AL,DX through the interpreter's own port path, with the GP2 call-out-site poll skip
+/// attempted first on a ring-0, non-V86 read.
+///
+/// `slot_delta` is this slot's guest offset from the block's ENTRY eip, baked as a compile-time
+/// immediate exactly the way `InterpretOneCell::slot_delta` is (`emit.rs`'s one caller has both
+/// `slot.lin` and `span.key.linear` in scope). It is what lets the poll-skip classifier scan from
+/// the SLOT's own linear EIP rather than `cpu.linear_eip()`, which inside a native block is the
+/// block-ENTRY value throughout (see `build_poll_loop_from`'s doc) -- GP2 poll-skip design
+/// obligation 1.
 ///
 /// # Safety
 ///
@@ -23429,6 +23637,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     cpu: *mut CpuGsw,
     prefix_raw_clocks: u64,
     prefix_weighted_fp_clocks: u64,
+    slot_delta: u64,
 ) -> i64 {
     // SAFETY: by the contract above, `cpu` is the live CPU and no other reference to it is alive
     // across the call (emitted code holds only its ADDRESS, in R15).
@@ -23513,9 +23722,109 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // the block's single batch call.
     let fp =
         crate::jit::native_x87::scale_weighted_fp_clocks(prefix_weighted_fp_clocks, cpu.fp_rem);
-    let now = cpu
+    let mut now = cpu
         .core_clocks_so_far
         .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks.saturating_add(fp.clocks)));
+
+    // GP2 CALL-OUT-SITE POLL SKIP (IZARRAVM_DIRECT_POLL_SKIP). `permission.is_none()` is exactly
+    // `poll_skip_eligible`'s privilege term (`block.rs`'s `poll_skip_eligible`: not V86, CPL <=
+    // IOPL) restated from the value Phase P already computed -- a ring-0/non-V86 read is precisely
+    // the state that reached here without a TSS probe. `extra_raw_clocks` and `forced_step_break`
+    // fold into the ordinary return at the bottom, so the current iteration's own read below
+    // (whether or not a skip preceded it) is completely unaffected -- M-26's pin.
+    let mut extra_raw_clocks: u64 = 0;
+    let mut forced_step_break = false;
+    if permission.is_none() {
+        cpu.jit_direct.note_poll_attempt();
+        if port != 0x03da {
+            cpu.jit_direct.note_poll_declined_port();
+        } else if !cpu.jit_direct.direct_poll_skip_armed_for() {
+            cpu.jit_direct.note_poll_declined_knob();
+        } else if !(matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586)
+            && !cpu.interrupt_shadow
+            && !cpu.profile.enabled
+            && !crate::run::diff_trace_enabled())
+        {
+            cpu.jit_direct.note_poll_declined_eligibility();
+        } else {
+            let slot_linear = cpu
+                .registers
+                .cs()
+                .base
+                .wrapping_add(cpu.registers.eip.wrapping_add(slot_delta as u32));
+            match build_poll_loop_from(cpu, slot_linear) {
+                PollScanOutcome::NegativeCacheable | PollScanOutcome::NegativeVolatile => {
+                    cpu.jit_direct.note_poll_declined_shape();
+                }
+                PollScanOutcome::Found(poll) => {
+                    // Unreachable by construction (review MEDIUM 7 on the GP2 poll-skip design: a
+                    // backward scan containing an `IN` slot cannot return a memory-family shape,
+                    // which has no `0xEC` fetch start). `debug_assert!` rather than a counted
+                    // decline lane the review found could never be non-zero.
+                    debug_assert_eq!(
+                        poll.family(),
+                        PollFamily::Io,
+                        "a port call-out's backward scan certified a non-Io shape"
+                    );
+                    // Positional: the slot the scan was told to contain must be the shape's OWN
+                    // `IN` fetch, one byte long. `build_poll_loop_from`'s containment test already
+                    // guarantees SOME fetch matches `slot_linear`; this pins it to the right one.
+                    debug_assert!(
+                        (0..poll.fetch_count()).any(|index| poll
+                            .fetch(index)
+                            .is_some_and(|(linear, _, len)| linear == slot_linear && len == 1)),
+                        "the certified shape does not contain this call-out's own IN slot"
+                    );
+                    if poll.family() != PollFamily::Io || poll.resolved_port(cpu) != 0x03da {
+                        cpu.jit_direct.note_poll_declined_port_source();
+                    } else {
+                        bus.publish_core_clocks(now);
+                        let mut fetches = [(0u32, 0u32, 0u8); 6];
+                        for (slot, index) in fetches.iter_mut().zip(0..poll.fetch_count()) {
+                            if let Some(fetch) = poll.fetch(index) {
+                                *slot = fetch;
+                            }
+                        }
+                        let (core_num, core_den) = crate::level_timing(cpu.persona());
+                        let request = CalloutPollSkipRequest {
+                            fetches,
+                            fetch_count: poll.fetch_count() as u8,
+                            status_mask: poll.status_mask(),
+                            spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
+                            raw_core_clocks: poll.raw_core_clocks(),
+                            core_clocks_at_block_entry: cpu.core_clocks_so_far,
+                            prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
+                            core_num,
+                            core_den,
+                            timing_rem: cpu.poll_skip_timing_remainder(),
+                            cap: cpu.jit_direct.block_batch_cap(),
+                            min_iterations: direct_poll_skip_min_iterations(),
+                            max_skipped_raw: direct_poll_skip_max_raw(),
+                        };
+                        match bus.callout_poll_skip(&request) {
+                            Ok(outcome) => {
+                                extra_raw_clocks = outcome.skipped_raw_core_clocks;
+                                now = outcome.now_after;
+                                bus.publish_core_clocks(now);
+                                forced_step_break = true;
+                                let head = poll.fetch(0).map_or(slot_linear, |(l, _, _)| l);
+                                cpu.jit_direct.note_poll_skip_span(
+                                    poll.diagnostic_class(),
+                                    outcome.iterations,
+                                    outcome.skipped_raw_core_clocks,
+                                    outcome.committed_raw_bus_clocks,
+                                    head,
+                                );
+                            }
+                            Err(_) => {
+                                cpu.jit_direct.note_poll_declined_seam();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let ring0 = cpu.is_ring0_protected();
     // PHASE C. Committed: the charges happen here, in the interpreter's own order, and nothing
@@ -23615,10 +23924,17 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     );
 
     // The SAME constant the interpreter's `0xec` arm charges, shared rather than copied, so the
-    // exact-clocks claim cannot drift out from under this call-out path.
+    // exact-clocks claim cannot drift out from under this call-out path. `extra_raw_clocks` is the
+    // GP2 poll-skip's own raw core-clock total, added through this SAME lane so the block's one
+    // end-of-block batch call scales it exactly once (design mechanism item 3); `forced_step_break`
+    // is set ONLY on a committed span and makes the skip BLOCK-TERMINATING (design BLOCKER A fix
+    // 2): the block takes its ordinary step-break exit at THIS slot's next EIP, and the batch loop
+    // re-budgets exactly as it does for the interpreter, so no running block can ever overshoot
+    // `cap` by more than one native re-entry -- the overshoot is zero by construction, not by
+    // owner ruling, and there is no counter to prove that because there is nothing left to prove.
     #[cfg(feature = "direct-callout-attribution")]
     {
-        let step_break = bus.requires_step_break();
+        let step_break = bus.requires_step_break() || forced_step_break;
         cpu.jit_direct.note_callout_attribution(
             CallOutHelper::PortReadAlDx,
             Some(original_port),
@@ -23628,12 +23944,13 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                 CallOutOutcome::Continued
             },
         );
-        i64::from(IN_AL_DX_CORE_CLOCKS) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+        i64::from(IN_AL_DX_CORE_CLOCKS).saturating_add(extra_raw_clocks as i64)
+            | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
     }
     #[cfg(not(feature = "direct-callout-attribution"))]
     {
-        i64::from(IN_AL_DX_CORE_CLOCKS)
-            | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
+        i64::from(IN_AL_DX_CORE_CLOCKS).saturating_add(extra_raw_clocks as i64)
+            | (i64::from(bus.requires_step_break() || forced_step_break) << STATUS_STEP_BREAK_BIT)
     }
 }
 
@@ -24658,6 +24975,7 @@ pub(crate) fn port_read_al_dx_for_test<B: CpuBus>(
     bus: &mut B,
     prefix_raw_clocks: u64,
     prefix_weighted_fp_clocks: u64,
+    slot_delta: u64,
 ) -> i64 {
     cpu.native_callout = CallOutTable::publish(bus);
     // SAFETY: the table was just published for this exact `B`, and `cpu` is not otherwise
@@ -24667,6 +24985,7 @@ pub(crate) fn port_read_al_dx_for_test<B: CpuBus>(
             cpu as *mut CpuGsw,
             prefix_raw_clocks,
             prefix_weighted_fp_clocks,
+            slot_delta,
         )
     };
     cpu.native_callout = CallOutTable::default();
@@ -24696,14 +25015,25 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 /// added to the runtime lane so the helper sees the whole prefix (the lane alone carries only
 /// what earlier chained blocks and exits deposited).
 ///
-/// `slot_cell` is the fourth argument, present for the `InterpretOne` class and absent for the
-/// three fixed-opcode helpers. `None` emits nothing at all rather than a zero, which is what keeps
-/// those three arms BYTE-IDENTICAL across this slice: `interpret_one_leaves_the_port_slot_bytes_
-/// unchanged` is the pin.
+/// `exit_arg` is the fourth argument, present for every class `CallOutHelper::carries_a_cell`
+/// says has one, absent otherwise. `None` emits nothing at all rather than a zero, which is what
+/// keeps the `PushAllDword` / `PopAllDword` arms BYTE-IDENTICAL across this slice:
+/// `interpret_one_leaves_the_port_slot_bytes_unchanged` is the pin, rewritten by the GP2 poll-skip
+/// slice to also pin the NEW `PortReadAlDx` sequence -- see that test's doc for why the port
+/// slot's own bytes must change and the other two must not.
+///
+/// **Two different values ride the same argument slot, for two different reasons.** For
+/// `InterpretOne`, `exit_arg` is a CELL POINTER (`InterpretOneCell`'s address), and it ALSO drives
+/// the governor prologue below -- `helper.interprets_one()` gates that test, deliberately NOT
+/// `exit_arg.is_some()`, because `PortReadAlDx` carries an `exit_arg` too but it is a plain
+/// `slot_delta` VALUE, not a cell pointer, and testing byte 0 of an arbitrary small integer for
+/// the demoted bit would be nonsense (GP2 poll-skip design BLOCKER B4's fix, restated as two
+/// independent predicates rather than one conflated `slot_cell` -- `carries_a_cell()` for "gets a
+/// fourth argument" and `republishes_flags()`, consulted further down, for "gets the RBP reload").
 ///
 /// `resync` and `resync_fault` are likewise `Some` only for the `InterpretOne` class. A helper
-/// that cannot return the two RESYNC statuses emits no test for them, so the port and stack-frame
-/// slots keep their exact instruction sequence.
+/// that cannot return the two RESYNC statuses emits no test for them, so the stack-frame slots
+/// keep their exact instruction sequence.
 ///
 /// `abnormal` and `step_break` are side-exit reason stubs the caller has already registered; this
 /// function only branches to them.
@@ -24713,13 +25043,13 @@ fn emit_call_out(
     static_prefix_raw: u16,
     abnormal: Label,
     step_break: Label,
-    slot_cell: Option<usize>,
+    exit_arg: Option<u64>,
     resync: Option<(Label, Label)>,
 ) {
     debug_assert_eq!(
-        helper.interprets_one(),
-        slot_cell.is_some(),
-        "the fourth argument and the InterpretOne class are the same question"
+        helper.carries_a_cell(),
+        exit_arg.is_some(),
+        "the fourth argument and CallOutHelper::carries_a_cell are the same question"
     );
     debug_assert_eq!(
         helper.interprets_one(),
@@ -24734,8 +25064,16 @@ fn emit_call_out(
     // Bit 7 rather than a compare against zero (which is what the plan sketched): the cell's low
     // bits are the execution and RESYNC counts, so a zero test would refuse the slot from its
     // second execution onwards.
-    if let Some(cell) = slot_cell {
-        e.mov_r64_imm64(Reg::RAX, cell as u64);
+    //
+    // Gated on `helper.interprets_one()`, NOT on `exit_arg.is_some()`: `PortReadAlDx` also carries
+    // an `exit_arg`, but it is a `slot_delta` value, not a cell address, and nothing ever sets a
+    // demoted bit on it (there is no port-slot governor -- review MEDIUM 8 on the GP2 design found
+    // no code path that would ever set one, so this slice does not emit a test that can never
+    // fire).
+    if helper.interprets_one()
+        && let Some(cell) = exit_arg
+    {
+        e.mov_r64_imm64(Reg::RAX, cell);
         e.test_byte_disp8_imm8(Reg::RAX, 0, STATE_DEMOTED);
         e.jnz(abnormal);
     }
@@ -24760,8 +25098,8 @@ fn emit_call_out(
     // Argument 4, and only for the class that has one. `EXIT_ARG` is R9 on Windows and RCX on
     // SysV: neither is a `GUEST_HOMES` register, so nothing live is destroyed and the reload after
     // the call does not have to cover it.
-    if let Some(cell) = slot_cell {
-        e.mov_r64_imm64(EXIT_ARG, cell as u64);
+    if let Some(value) = exit_arg {
+        e.mov_r64_imm64(EXIT_ARG, value);
     }
     e.load_r64_disp32(Reg::RAX, Reg::R15, helper_offset(helper));
     e.call_r64(Reg::RAX);
@@ -24805,8 +25143,20 @@ fn emit_call_out(
     // value into memory, so the RESUME path -- and only it -- reloads the register from there.
     // Every other path leaves through `shared_return`, which does NOT store RBP back, so a reload
     // on those would be dead work and a reload BEFORE the status branch would have to be undone.
-    // Design review B4.
-    if slot_cell.is_some() {
+    //
+    // Gated on `helper.republishes_flags()`, NOT on `exit_arg.is_some()` (design review BLOCKER
+    // B4/M-24, and the miscompile it fixes): `PortReadAlDx` carries an `exit_arg` too (its
+    // `slot_delta`) but NEVER republishes flags into memory -- `publish_flags` has exactly two
+    // call sites and both are on the `InterpretOne` path. RBP is callee-saved and survives the
+    // Rust call intact and correct on its own; reloading it here for a port slot would clobber the
+    // block's live EFLAGS shadow with a STALE value whenever an earlier slot in the same block
+    // produced flags that only live in RBP so far (`emit_capture_flags` updates RBP alone; the
+    // lazy ALU arms that follow it do not also store to memory). The concrete witness:
+    // `emit_carry_alu_preloaded` reads CF straight out of RBP, so an `ADD` / `IN AL,DX` (0x3DA) /
+    // `ADC` block would take the wrong branch of that read with a stale RBP -- and `IN` sets no
+    // flags, so nothing on the port path would ever report it. `a_port_callout_preserves_the_
+    // blocks_eflags_shadow` is the killer.
+    if helper.republishes_flags() {
         e.load_r32_disp32(Reg::RBP, Reg::R15, eflags_offset());
     }
 }
@@ -26957,6 +27307,36 @@ pub(crate) struct DirectStallTally {
     /// paths and this is read on census legs only. A plain build reports zeroes.
     pub ss_load_same_record: u64,
     pub ss_load_changed_record: u64,
+    /// GP2 call-out-site poll skip (`IZARRAVM_DIRECT_POLL_SKIP`). Always-on: every counter must be
+    /// able to read RED on a broken input (design §8), so none of these is census-gated.
+    ///
+    /// `poll_attempts` is the denominator: every `IN AL,DX` call-out that reached the port screen.
+    /// The `_declined_*` lanes are named by which screen refused, in the order the helper runs
+    /// them, and two or more screens are deliberately folded into ONE lane where the design's own
+    /// review found their separate killers unsatisfiable in this implementation's shape (see the
+    /// GP2 implementation report): `poll_declined_shape` covers `NegativeCacheable` AND
+    /// `NegativeVolatile`; `poll_declined_seam` covers every decline the machine-side
+    /// `CpuBus::callout_poll_skip` seam itself can return (`PortInactive`, `BusCertificate`,
+    /// `NotSpinning`, `NoEdge`, `Cap`).
+    ///
+    /// `poll_skip_spans` / `poll_skip_iterations` are PER `PollLoop::diagnostic_class()` (0 = 3-slot
+    /// CurrentDx/Direct, 1 = 5-slot Ebx|Ecx/Direct, 2 = paired 6-slot) -- what makes the I9 residual
+    /// identity evaluable. `poll_skip_raw_core_clocks` / `poll_skip_raw_bus_clocks` are the totals
+    /// I1/I2 grade against. `poll_skip_max_span` is the largest single committed span, and
+    /// `poll_skip_last_head` the certified shape's head linear address of the last committed span.
+    pub poll_attempts: u64,
+    pub poll_declined_port: u64,
+    pub poll_declined_port_source: u64,
+    pub poll_declined_knob: u64,
+    pub poll_declined_eligibility: u64,
+    pub poll_declined_shape: u64,
+    pub poll_declined_seam: u64,
+    pub poll_skip_spans: [u64; 3],
+    pub poll_skip_iterations: [u64; 3],
+    pub poll_skip_raw_core_clocks: u64,
+    pub poll_skip_raw_bus_clocks: u64,
+    pub poll_skip_max_span: u64,
+    pub poll_skip_last_head: u32,
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -28499,6 +28879,19 @@ impl crate::jit::JitState {
             decline_memo_hits: self.stalls.decline_memo_hits,
             decline_memo_advances: self.stalls.decline_memo_advances,
             decline_memo_sweeps: self.stalls.decline_memo_sweeps,
+            poll_attempts: self.stalls.poll_attempts,
+            poll_declined_port: self.stalls.poll_declined_port,
+            poll_declined_port_source: self.stalls.poll_declined_port_source,
+            poll_declined_knob: self.stalls.poll_declined_knob,
+            poll_declined_eligibility: self.stalls.poll_declined_eligibility,
+            poll_declined_shape: self.stalls.poll_declined_shape,
+            poll_declined_seam: self.stalls.poll_declined_seam,
+            poll_skip_spans: self.stalls.poll_skip_spans,
+            poll_skip_iterations: self.stalls.poll_skip_iterations,
+            poll_skip_raw_core_clocks: self.stalls.poll_skip_raw_core_clocks,
+            poll_skip_raw_bus_clocks: self.stalls.poll_skip_raw_bus_clocks,
+            poll_skip_max_span: self.stalls.poll_skip_max_span,
+            poll_skip_last_head: self.stalls.poll_skip_last_head,
         }
     }
 
@@ -28554,6 +28947,55 @@ impl crate::jit::JitState {
     /// `note_callout_executed` is ungated: the gate would cost as much as the work.
     pub(crate) fn note_callout_port_v86_served(&mut self) {
         self.stalls.callout_port_v86_served += 1;
+    }
+
+    /// GP2 call-out-site poll skip. All on the port call-out's already-off-native path, for the
+    /// same reason `note_callout_executed` is ungated.
+    pub(crate) fn note_poll_attempt(&mut self) {
+        self.stalls.poll_attempts += 1;
+    }
+
+    pub(crate) fn note_poll_declined_port(&mut self) {
+        self.stalls.poll_declined_port += 1;
+    }
+
+    pub(crate) fn note_poll_declined_port_source(&mut self) {
+        self.stalls.poll_declined_port_source += 1;
+    }
+
+    pub(crate) fn note_poll_declined_knob(&mut self) {
+        self.stalls.poll_declined_knob += 1;
+    }
+
+    pub(crate) fn note_poll_declined_eligibility(&mut self) {
+        self.stalls.poll_declined_eligibility += 1;
+    }
+
+    pub(crate) fn note_poll_declined_shape(&mut self) {
+        self.stalls.poll_declined_shape += 1;
+    }
+
+    pub(crate) fn note_poll_declined_seam(&mut self) {
+        self.stalls.poll_declined_seam += 1;
+    }
+
+    /// One committed span. `class` is `PollLoop::diagnostic_class()`; the whole reason I9 (the
+    /// residual identity) is evaluable is that these are per-class from this one call site.
+    pub(crate) fn note_poll_skip_span(
+        &mut self,
+        class: u8,
+        iterations: u64,
+        raw_core_clocks: u64,
+        raw_bus_clocks: u64,
+        head: u32,
+    ) {
+        let index = usize::from(class).min(2);
+        self.stalls.poll_skip_spans[index] += 1;
+        self.stalls.poll_skip_iterations[index] += iterations;
+        self.stalls.poll_skip_raw_core_clocks += raw_core_clocks;
+        self.stalls.poll_skip_raw_bus_clocks += raw_bus_clocks;
+        self.stalls.poll_skip_max_span = self.stalls.poll_skip_max_span.max(iterations);
+        self.stalls.poll_skip_last_head = head;
     }
 
     /// The `InterpretOne` family's five increments, all on the helper's already-off-native path
@@ -29847,36 +30289,36 @@ pub const N_REFUSAL_SITES: usize = 30;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1264),
-    ("skip_backend_or_skip_once", 1272),
-    ("skip_approximate_timing", 1278),
-    ("jit16_level_zero", 1403),
-    ("approximate_timing", 1409),
-    ("auto_admit", 1420),
-    ("direct_hot_at", 1434),
-    ("decline_memo_hit", 1460),
-    ("key_for_phys_none", 1472),
-    ("probe_interpret", 1485),
-    ("probe_rejected", 1542),
-    ("link_line_not_live", 1758),
-    ("revalidate_none", 1764),
-    ("dispatch_deferred_short", 1780),
-    ("observer_or_diff_trace", 2376),
-    ("interrupt_shadow", 2383),
-    ("aggregate_accounting", 2390),
-    ("native_fetch_trace", 2404),
-    ("mode_key", 2412),
-    ("x87_top", 2426),
-    ("segment_layout_none", 2441),
-    ("cs_layout", 2449),
-    ("cpl", 2457),
-    ("callout_privileged", 2538),
-    ("data_segment", 2656),
-    ("alignment", 2665),
-    ("fetch_limit", 2680),
-    ("entry_deferred_short", 2694),
-    ("zero_budget", 2802),
-    ("block_regenerated_none", 2838),
+    ("skip_native_continuations_inactive", 1274),
+    ("skip_backend_or_skip_once", 1282),
+    ("skip_approximate_timing", 1288),
+    ("jit16_level_zero", 1413),
+    ("approximate_timing", 1419),
+    ("auto_admit", 1430),
+    ("direct_hot_at", 1444),
+    ("decline_memo_hit", 1470),
+    ("key_for_phys_none", 1482),
+    ("probe_interpret", 1495),
+    ("probe_rejected", 1552),
+    ("link_line_not_live", 1768),
+    ("revalidate_none", 1774),
+    ("dispatch_deferred_short", 1790),
+    ("observer_or_diff_trace", 2386),
+    ("interrupt_shadow", 2393),
+    ("aggregate_accounting", 2400),
+    ("native_fetch_trace", 2414),
+    ("mode_key", 2422),
+    ("x87_top", 2436),
+    ("segment_layout_none", 2451),
+    ("cs_layout", 2459),
+    ("cpl", 2467),
+    ("callout_privileged", 2548),
+    ("data_segment", 2666),
+    ("alignment", 2675),
+    ("fetch_limit", 2690),
+    ("entry_deferred_short", 2704),
+    ("zero_budget", 2812),
+    ("block_regenerated_none", 2848),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -29917,7 +30359,7 @@ pub(crate) mod site {
 #[cfg(feature = "direct-entry-attribution")]
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1462;
+pub const P0_MARK_LINE: u32 = 1472;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
@@ -29944,13 +30386,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1581),
-    ("structural_reject", 1600),
-    ("compile_retry", 1611),
-    ("page_cover_failed", 1635),
-    ("lane_install_demote", 1663),
-    ("install_failed", 1673),
-    ("installed_fall_through", 1743),
+    ("heat_demote", 1591),
+    ("structural_reject", 1610),
+    ("compile_retry", 1621),
+    ("page_cover_failed", 1645),
+    ("lane_install_demote", 1673),
+    ("install_failed", 1683),
+    ("installed_fall_through", 1753),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {

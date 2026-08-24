@@ -11,6 +11,13 @@ pub(super) struct PollBusCertificate {
     raw_clocks_per_iteration: u64,
 }
 
+#[cfg(all(test, feature = "jit"))]
+impl PollBusCertificate {
+    pub(super) fn raw_clocks_per_iteration(self) -> u64 {
+        self.raw_clocks_per_iteration
+    }
+}
+
 #[cfg(feature = "jit")]
 fn ranges_overlap(start: u32, len: u32, observed_start: u32, observed_len: u32) -> bool {
     let Some(end) = start.checked_add(len) else {
@@ -553,13 +560,20 @@ impl MachineBus<'_> {
     /// alias or any device-window byte) and sum the per-byte fetch cost.
     /// Callers add their own family-specific addend (the io wait-state read or
     /// the memory family's data-read cost) on top.
+    /// The fetch-byte certification loop's real body, over a plain SLICE rather than a
+    /// `PollLoop` -- so it can be shared by the interpreter's `poll_bus_certificate`
+    /// (which has a real `PollLoop`) and the call-out-site seam's
+    /// `poll_bus_certificate_from_fetches` (which only ever has the POD's `fetches` /
+    /// `fetch_count`, because `PollLoop`'s fields are private to `izarravm-cpu` and
+    /// cannot cross the seam -- GP2 poll-skip design, BLOCKER B). One derivation, two
+    /// callers with two different shapes of input, so a mutant that certifies one
+    /// wrong cannot leave the other looking right.
     #[cfg(feature = "jit")]
     #[cold]
     #[inline(never)]
-    fn poll_fetch_certificate_raw(&self, poll: PollLoop) -> Option<u64> {
+    fn poll_fetch_certificate_raw_from(&self, fetches: &[(u32, u32, u8)]) -> Option<u64> {
         let mut raw = 0u64;
-        for index in 0..poll.fetch_count() {
-            let (linear, physical, len) = poll.fetch(index)?;
+        for &(linear, physical, len) in fetches {
             let len = u32::from(len);
             if len == 0
                 || ranges_overlap(linear, len, BIOS32_DIRECTORY_LINEAR, 1)
@@ -590,17 +604,29 @@ impl MachineBus<'_> {
         Some(raw)
     }
 
-    /// Certify exact warm-RAM fetch and I/O costs for the classified io-family
-    /// poll loop. BYTE-IDENTICAL to the pre-memory-poll-shape behavior: this
-    /// function is never called for a memory-family `PollLoop` (the executor
-    /// dispatches on `family()` before certification), so its own logic and
-    /// order are unchanged.
+    /// `poll_fetch_certificate_raw_from` over a certified `PollLoop`'s own fetch set.
+    /// Byte-identical to the pre-split behaviour: this just builds the slice
+    /// `poll_fetch_certificate_raw_from` now certifies.
     #[cfg(feature = "jit")]
-    pub(super) fn poll_bus_certificate(&self, poll: PollLoop) -> Option<PollBusCertificate> {
+    fn poll_fetch_certificate_raw(&self, poll: PollLoop) -> Option<u64> {
+        let mut fetches = [(0u32, 0u32, 0u8); 6];
+        for (slot, entry) in fetches.iter_mut().zip(0..poll.fetch_count()) {
+            *slot = poll.fetch(entry)?;
+        }
+        self.poll_fetch_certificate_raw_from(&fetches[..poll.fetch_count()])
+    }
+
+    /// Certify exact warm-RAM fetch and I/O costs for the classified io-family poll
+    /// loop, from the POD's own `fetches`/`fetch_count` rather than a `PollLoop` --
+    /// the call-out-site seam's entry point (BLOCKER B), sharing
+    /// `poll_fetch_certificate_raw_from` with the interpreter's `poll_bus_certificate`
+    /// below so the two can never certify the same shape differently.
+    #[cfg(feature = "jit")]
+    fn poll_bus_certificate_from(&self, fetches: &[(u32, u32, u8)]) -> Option<PollBusCertificate> {
         if self.trace.tracing_mode() != TracingMode::Off || !self.lazy_port_reads {
             return None;
         }
-        let mut raw = self.poll_fetch_certificate_raw(poll)?;
+        let mut raw = self.poll_fetch_certificate_raw_from(fetches)?;
         raw = raw.checked_add(u64::from(BusCycle::clocks_for(
             BusWidth::Byte,
             self.wait_states.io,
@@ -608,6 +634,20 @@ impl MachineBus<'_> {
         Some(PollBusCertificate {
             raw_clocks_per_iteration: raw,
         })
+    }
+
+    /// Certify exact warm-RAM fetch and I/O costs for the classified io-family
+    /// poll loop. BYTE-IDENTICAL to the pre-memory-poll-shape behavior: this
+    /// function is never called for a memory-family `PollLoop` (the executor
+    /// dispatches on `family()` before certification), so its own logic and
+    /// order are unchanged. Delegates to `poll_bus_certificate_from` (BLOCKER B).
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_bus_certificate(&self, poll: PollLoop) -> Option<PollBusCertificate> {
+        let mut fetches = [(0u32, 0u32, 0u8); 6];
+        for (slot, entry) in fetches.iter_mut().zip(0..poll.fetch_count()) {
+            *slot = poll.fetch(entry)?;
+        }
+        self.poll_bus_certificate_from(&fetches[..poll.fetch_count()])
     }
 
     /// Certify exact warm-RAM fetch and data-read costs for the classified
@@ -2785,6 +2825,161 @@ impl CpuBus for MachineBus<'_> {
     #[inline]
     fn requires_step_break(&self) -> bool {
         *self.io_touched || self.pending_soft_int.is_some()
+    }
+
+    /// `prior_runs_core_clocks = 0; core_clocks_so_far = now` -- the same combined
+    /// instant `read_io`'s own first statement publishes (`core_clocks_so_far =
+    /// core_clocks_so_far;` a few lines below), just reachable before a lazy
+    /// prediction rather than only inside the read itself. Idempotent with that
+    /// statement: publishing `now` here and then calling `read_io(.., now, ..)`
+    /// writes the same field the same value twice.
+    #[cfg(feature = "jit")]
+    fn publish_core_clocks(&mut self, now: u64) {
+        self.prior_runs_core_clocks = 0;
+        self.core_clocks_so_far = now;
+    }
+
+    /// The call-out-site poll-skip seam (GP2 design §4.2/§4.7h). Runs
+    /// `try_poll_skip`'s io path (`run::try_poll_skip`, `machine/run.rs`) against the
+    /// POD request instead of a real `PollLoop`, with three deliberate departures from
+    /// that function, each forced by running mid-block rather than at a batch's run
+    /// boundary:
+    ///
+    /// 1. **No `at_head` gate and no family dispatch.** The caller already proved both
+    ///    (screens (d)-(g) in the design): `build_poll_loop_from` was called AT the
+    ///    call-out's own slot, so containment stands in for `at_head`, and the request
+    ///    only exists for an `Io`-family shape because only that family ever emits an
+    ///    `IN` slot.
+    /// 2. **No `poll_skip_backedge_housekeeping` call.** That call clears
+    ///    `rep_resume_active` / `rep_execution.resume` and belongs to the
+    ///    interpreter's own back-edge; a mid-block call-out has no REP resume state to
+    ///    clear and must not touch `izarravm-cpu`-side fields it cannot even name
+    ///    (BLOCKER C). `poll_commit_bus` -- the bus half of the SAME mechanism -- IS
+    ///    called, a few lines below where the interpreter calls it.
+    /// 3. **The core-clock instant is `now_at(n)` (`core_clocks_at_block_entry +
+    ///    scale_core_clocks(prefix_raw + raw*n, ..)`), never
+    ///    `commit_poll_skip_core`.** The interpreter's commit consumes `timing_rem` and
+    ///    bumps `perf.poll_skip_spans`; a Direct block's own single end-of-block batch
+    ///    call will scale this span's raw clocks exactly once, so committing here too
+    ///    would double both (identity I7, obligation 4 item 3). The caller receives the
+    ///    RAW clock total back and returns it through the block's existing raw clock
+    ///    lane; this method commits only the BUS half, which has no such second charge.
+    #[cfg(feature = "jit")]
+    fn callout_poll_skip(
+        &mut self,
+        req: &CalloutPollSkipRequest,
+    ) -> Result<CalloutPollSkipOutcome, CalloutPollDecline> {
+        if !self.vega.poll_skip_status1_port_active() {
+            return Err(CalloutPollDecline::PortInactive);
+        }
+        let fetches = &req.fetches[..usize::from(req.fetch_count)];
+        let Some(certificate) = self.poll_bus_certificate_from(fetches) else {
+            return Err(CalloutPollDecline::BusCertificate);
+        };
+        let beam = self.predicted_beam();
+        let status = self.vega.status1_bits(beam);
+        let bit_set = status & req.status_mask != 0;
+        if bit_set != req.spins_when_bit_set {
+            return Err(CalloutPollDecline::NotSpinning);
+        }
+        let bit = req.status_mask.trailing_zeros() as u8;
+        let Some(edge_dots) = self
+            .vega
+            .dots_until_status1_bit_change_from(beam, bit, !bit_set)
+        else {
+            return Err(CalloutPollDecline::NoEdge);
+        };
+
+        // `now_at(n)`, exactly the composition obligation 2c derives: ONE scaling of
+        // (prefix + raw*n), never a sum of two separately-scaled terms. `now_at(0)` is
+        // byte-for-byte the un-skipped call-out's own `now` (M-26's pin).
+        let now_at = |iterations: u64| -> Option<u64> {
+            let raw_total = req
+                .raw_core_clocks
+                .checked_mul(iterations)?
+                .checked_add(req.prefix_raw)?;
+            let scaled = scale_core_clocks(raw_total, req.core_num, req.core_den, req.timing_rem)?;
+            req.core_clocks_at_block_entry.checked_add(scaled)
+        };
+        let candidate_total = |iterations: u64| -> Option<u64> {
+            let core = now_at(iterations)?;
+            let bus = self.poll_project_scaled_bus_clocks(certificate, iterations)?;
+            core.checked_add(bus)
+        };
+        let reserved_total =
+            |iterations: u64| -> Option<u64> { candidate_total(iterations.checked_add(1)?) };
+
+        let Some(spent) = candidate_total(0) else {
+            return Err(CalloutPollDecline::Cap);
+        };
+        // The 32-bit return-lane bound (design obligation 4), enforced with a hardcoded ceiling
+        // INDEPENDENT of `req.max_skipped_raw`: the caller's clock lane takes the LOW 32 BITS of
+        // an `i64`, and bit 32 is the step-break status bit, so nothing this method admits may let
+        // `raw_core_clocks * iterations` reach it -- whatever a misconfigured
+        // `IZARRAVM_DIRECT_POLL_MAX_RAW` claims. `req.max_skipped_raw` can still tune the bound
+        // DOWN (a smaller request always wins the `.min`); it can never tune it up past this
+        // ceiling. The 64-clock margin comfortably covers `IN_AL_DX_CORE_CLOCKS` (12) plus any
+        // other small additive term the caller folds in on top of this method's own return.
+        const LANE_SAFETY_CEILING: u64 = u32::MAX as u64 - 64;
+        let upper = req
+            .cap
+            .saturating_sub(spent)
+            .min(u64::from(u32::MAX))
+            .saturating_sub(1)
+            .min(req.max_skipped_raw.min(LANE_SAFETY_CEILING) / req.raw_core_clocks.max(1));
+        let min_iterations = req.min_iterations.max(1);
+        if upper < min_iterations {
+            return Err(CalloutPollDecline::Cap);
+        }
+
+        let admissible = |iterations: u64| -> bool {
+            let Some(reserved) = reserved_total(iterations) else {
+                return false;
+            };
+            if reserved > req.cap {
+                return false;
+            }
+            let Some(candidate) = candidate_total(iterations) else {
+                return false;
+            };
+            self.poll_project_dot_advance(candidate)
+                .is_some_and(|dots| dots < edge_dots)
+        };
+
+        let mut low = min_iterations;
+        let mut high = upper;
+        let mut best = 0u64;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            if admissible(mid) {
+                best = mid;
+                low = mid.saturating_add(1);
+            } else {
+                high = mid.saturating_sub(1);
+            }
+        }
+        if best < min_iterations {
+            return Err(CalloutPollDecline::Cap);
+        }
+
+        let Some(now_after) = now_at(best) else {
+            return Err(CalloutPollDecline::Cap);
+        };
+        let Some(skipped_raw_core_clocks) = req.raw_core_clocks.checked_mul(best) else {
+            return Err(CalloutPollDecline::Cap);
+        };
+        // Commit the BUS half only (obligation 4 item 3's forbidden-call list): the raw
+        // core clocks are handed back to the caller, which returns them through the
+        // block's ordinary raw clock lane instead.
+        self.poll_commit_bus(certificate, best);
+        let committed_raw_bus_clocks = certificate.raw_clocks_per_iteration.saturating_mul(best);
+
+        Ok(CalloutPollSkipOutcome {
+            iterations: best,
+            skipped_raw_core_clocks,
+            committed_raw_bus_clocks,
+            now_after,
+        })
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {

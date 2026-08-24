@@ -3383,6 +3383,22 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "decline_memo_hits": snapshot.decline_memo_hits,
         "decline_memo_advances": snapshot.decline_memo_advances,
         "decline_memo_sweeps": snapshot.decline_memo_sweeps,
+        // GP2 call-out-site poll skip (`IZARRAVM_DIRECT_POLL_SKIP`). `poll_skip_spans` /
+        // `poll_skip_iterations` are indexed by `PollLoop::diagnostic_class()` (0 = 3-slot, 1 =
+        // 5-slot, 2 = paired 6-slot).
+        "jit_direct_poll_attempts": snapshot.poll_attempts,
+        "jit_direct_poll_decline_port": snapshot.poll_declined_port,
+        "jit_direct_poll_decline_port_source": snapshot.poll_declined_port_source,
+        "jit_direct_poll_decline_knob": snapshot.poll_declined_knob,
+        "jit_direct_poll_decline_eligibility": snapshot.poll_declined_eligibility,
+        "jit_direct_poll_decline_shape": snapshot.poll_declined_shape,
+        "jit_direct_poll_decline_seam": snapshot.poll_declined_seam,
+        "jit_direct_poll_skip_spans": snapshot.poll_skip_spans.to_vec(),
+        "jit_direct_poll_skip_iterations": snapshot.poll_skip_iterations.to_vec(),
+        "jit_direct_poll_skip_raw_core_clocks": snapshot.poll_skip_raw_core_clocks,
+        "jit_direct_poll_skip_raw_bus_clocks": snapshot.poll_skip_raw_bus_clocks,
+        "jit_direct_poll_skip_max_span": snapshot.poll_skip_max_span,
+        "jit_direct_poll_skip_last_head": snapshot.poll_skip_last_head,
     })
 }
 

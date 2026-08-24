@@ -4032,6 +4032,14 @@ mod jit_callout;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_poll_skip_test.rs"]
+mod jit_poll_skip;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_decode_pack_test.rs"]
 mod decode_pack;
 
