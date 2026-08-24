@@ -699,6 +699,57 @@ pub struct PhaseMark {
     pub cpu_profile: Option<izarravm_cpu::CpuProfileSnapshot>,
 }
 
+/// Mechanism counters for the PIT bulk advance (`IZARRAVM_PIT_BULK_ADVANCE`).
+///
+/// The lever replaces `Pit::tick_with_observer`'s per-input-CLK loop with a
+/// per-counter analytic advance. The loop runs `PIT_INPUT_HZ` = 1,193,182
+/// iterations, and three `Counter::step()` calls each, per GUEST second --
+/// always, whatever the guest is doing -- so "did it engage" cannot be read off
+/// a wall number: a row that declines every advance and a row that barely
+/// advanced look the same. Every decline therefore names its own cause.
+///
+/// Inertness with the knob OFF is `advances == 0 && declines_knob_off ==
+/// loop_advances`, which is a fact about the run rather than an argument about
+/// the code.
+///
+/// Like `AtaPollSkipCounters` these live outside `PERF_COUNTER_KEYS` (that list
+/// enumerates CPU perf counters), so adding them moves no CPU-side pin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PitBulkAdvanceCounters {
+    /// Device advances served analytically, with no per-CLK loop at all.
+    pub advances: u64,
+    /// PIT input CLKs those advances covered: the loop iterations the lever did
+    /// NOT run. Multiply by three for the `Counter::step()` calls removed.
+    pub advance_clocks: u64,
+    /// Device advances that ran the per-CLK loop, for any reason including the
+    /// knob being off. `advances + loop_advances` is every non-empty advance.
+    pub loop_advances: u64,
+    /// PIT input CLKs the loop covered.
+    pub loop_clocks: u64,
+    /// Declines because `IZARRAVM_PIT_BULK_ADVANCE` is off. That is the whole
+    /// OFF arm: with the knob off this equals `loop_advances` exactly.
+    pub declines_knob_off: u64,
+    /// Declines because a counter is programmed BCD. The analytic peeks all
+    /// refuse decimal counting (`Counter::out_after` and friends return `None`)
+    /// on the stated ground that no PC software clocks the PIT in BCD, and the
+    /// bulk advance refuses on the same ground. NOT the knob: a BCD counter
+    /// takes the loop on both arms.
+    pub declines_bcd: u64,
+    /// Declines because a live mode-2 or mode-3 counter holds the datasheet's
+    /// illegal reload of 1, where "reload on every CLK" leaves no period for the
+    /// analytic form to fold. Also not the knob.
+    pub declines_illegal_reload: u64,
+    /// Declines because the advance spans 2^32 or more input CLKs, past which
+    /// the counting element's own 32-bit wrap stops being one subtraction.
+    /// Unreachable in practice (2^32 PIT CLKs is an hour of guest time inside a
+    /// single device advance); it declines to the loop rather than guess.
+    pub declines_span_too_wide: u64,
+    /// OUT transitions the analytic enumeration emitted for the watched channel.
+    /// The loop arm's count is not recorded separately -- the differential test
+    /// compares the two lists element for element, which is stronger.
+    pub transitions: u64,
+}
+
 /// Mechanism counters for the device-armed ATA/ATAPI clock skip.
 ///
 /// ALWAYS ON, machine-side, and every decline names its own cause, so a
@@ -1362,6 +1413,14 @@ pub struct Machine {
     open_bus: bus::OpenBusPorts,
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
+    // The PIT bulk-advance arm, resolved once from IZARRAVM_PIT_BULK_ADVANCE and
+    // held per MACHINE rather than inside `Pit`. `Pit` derives `PartialEq` and
+    // several tests compare two machines' PITs field for field; an arm stored in
+    // the device would make two arms' state compare unequal for a reason that is
+    // not guest state, which is exactly the comparison the differential test
+    // needs to be able to make.
+    pit_bulk_advance: bool,
+    pit_bulk: PitBulkAdvanceCounters,
     keyboard: keyboard::Keyboard8042,
     gameport: gameport::GamePort,
     speaker: speaker::Speaker,
@@ -1780,6 +1839,8 @@ impl Machine {
             open_bus: bus::OpenBusPorts::from_env(),
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
+            pit_bulk_advance: pit::bulk_advance_default(),
+            pit_bulk: PitBulkAdvanceCounters::default(),
             keyboard: keyboard::Keyboard8042::default(),
             gameport: gameport::GamePort::default(),
             speaker: speaker::Speaker::default(),
