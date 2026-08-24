@@ -26,9 +26,33 @@ pub(crate) const SEGMENT_ORDER: [SegmentIndex; 6] = [
     SegmentIndex::Gs,
 ];
 
+/// The six bits of `used` that name a SEGMENT, i.e. everything `segment_bit` can produce.
+///
+/// `used` is a bitmask over `SEGMENT_ORDER` in bits 0..5 plus `BAKES_CS_BIT` in bit 6, and the
+/// two are different questions. Any consumer that treats `used` as a SEGMENT SET must mask with
+/// this first; the consumers that walk `SEGMENT_ORDER` (`data_matches`, `all_data_matches`,
+/// `merge_chain`) cannot see bit 6 and need no mask. The one consumer that folds the raw byte is
+/// `retire_governor::layout_fingerprint`, whose census the campaign grades on, and it masks.
+pub(crate) const SEGMENT_MASK_BITS: u8 = 0x3F;
+
+/// Bit 6 of `used`: this block bakes CS's SELECTOR as an immediate.
+///
+/// It names no segment and `segment_bit` never produces it. It exists because a block can depend
+/// on CS in two genuinely different ways and the far-RETF invariant (INV-FAR-CS) has to refuse
+/// both: it can bake CS's DESCRIPTOR (a CS-override memory operand, which puts
+/// `segment_bit(Cs)` in `used` through `read_segment`/`write_segment`), or it can bake CS's
+/// SELECTOR as a 16-bit immediate (`PUSH CS`, `MOV r16, CS`), which puts nothing in `used` at all
+/// and rests entirely on `cs_matches` at the dispatcher entry check. A chained far transfer
+/// bypasses `cs_matches`, so the selector bake needs a home in the mask the chain requirement
+/// carries.
+///
+/// It rides `pinned_segments`, `capture`, `merge_chain`'s union and the chain-requirement
+/// propagation for free, and is invisible to every predicate that reads `used` as a segment set.
+pub(crate) const BAKES_CS_BIT: u8 = 1 << 6;
+
 /// Segment state baked into one direct translation, frozen at compile time. `used` is the PINNED
 /// set: the segments this block's emitted code depends on, whether through a baked base or a
-/// baked selector.
+/// baked selector, plus `BAKES_CS_BIT` when it bakes CS's selector as an immediate.
 ///
 /// A linked target does NOT have to carry an identical snapshot -- it used to, and that rule cost
 /// prince-586 its whole wall. What it must do is AGREE on every segment that some block in the
@@ -157,11 +181,63 @@ impl SegmentLayout {
         self.merge_chain(target)
     }
 
+    /// `link_merge` for a FAR edge, where the two ends disagree about CS by construction.
+    ///
+    /// A far edge's source snapshot holds the PRE-RETF CS and its target's holds the POST-RETF CS,
+    /// so `link_merge`'s `self.cs != target.cs` test refuses EVERY far edge. What replaces it is
+    /// INV-FAR-CS, and the two are not the same bar:
+    ///
+    /// > A far edge S -> T is admitted only if T's CHAIN REQUIREMENT claims neither the CS
+    /// > descriptor nor the CS selector:
+    /// > `chain_layouts[T].used & (segment_bit(Cs) | BAKES_CS_BIT) == 0`.
+    ///
+    /// Why a CS EQUALITY is the wrong test and this refusal is the right one. The far cell is
+    /// keyed on the target's LINEAR, which is the block-identity quantity, and the emitted slot
+    /// has already written the guest CS register from the popped selector -- so the architectural
+    /// CS is correct on arrival whatever the cell was bound under. The only thing that can go
+    /// wrong is T READING CS: through a baked descriptor (base and limit, `segment_bit(Cs)`) or
+    /// through a baked selector immediate (`BAKES_CS_BIT`). Excluding both is exact, and it admits
+    /// the aliasing case (`1000:0000` and `0FFF:0010` are one linear) instead of pretending it
+    /// cannot happen.
+    ///
+    /// Any CS bit in the RESULT's `used` is `self`'s own, and it stays there: the source block is
+    /// entered through the dispatcher, where `cs_matches` still runs.
+    ///
+    /// THE FIVE DATA SEGMENTS KEEP TODAY'S RULE. A RETF changes none of them, so the transitive
+    /// argument `merge_chain` records carries across the far edge unchanged, and this is
+    /// `merge_chain` with CS excluded from the comparison and nothing else changed.
+    pub(crate) fn far_merge(self, target: Self) -> Option<Self> {
+        if target.used & (segment_bit(SegmentIndex::Cs) | BAKES_CS_BIT) != 0 {
+            return None;
+        }
+        let used = self.used | target.used;
+        for segment in SEGMENT_ORDER {
+            if segment == SegmentIndex::Cs {
+                continue;
+            }
+            let index = segment_index(segment);
+            if used & segment_bit(segment) != 0 && self.data[index] != target.data[index] {
+                return None;
+            }
+        }
+        Some(Self {
+            cs: self.cs,
+            data: self.data,
+            used,
+        })
+    }
+
     /// The pinned selector for `segment`, from whichever of the two snapshots holds it. CS lives
     /// in its own field and is pinned for every block; the other five must be in `used`, which
     /// `DirectKind::selector_segment` is what guarantees for a `MovSegToReg` slot.
     pub(crate) fn selector(self, segment: SegmentIndex) -> u16 {
         if segment == SegmentIndex::Cs {
+            // The CS arm asserted NOTHING until `BAKES_CS_BIT` existed, because `cs_matches`
+            // pinned CS for every block unconditionally and there was no mask bit to check. It
+            // is a real tightening rather than symmetry: a chained far transfer skips
+            // `cs_matches`, so a block that bakes this selector must say so in `used` or
+            // INV-FAR-CS has nothing to refuse on.
+            debug_assert_ne!(self.used & BAKES_CS_BIT, 0);
             return self.cs.selector;
         }
         debug_assert_ne!(self.used & segment_bit(segment), 0);

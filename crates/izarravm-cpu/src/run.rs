@@ -2906,6 +2906,10 @@ impl CpuGsw {
                 exit.dynamic_target_eip,
                 cs_base.wrapping_add(exit.dynamic_target_eip),
                 span.key.mode_key,
+                // Read here beside `cs_base`, and for the same reason: after the native run, so a
+                // far exit hands over the POST-RETF descriptor. `bind_dynamic_successor` has no
+                // `&CpuGsw` and the fetch-limit compare it makes needs this.
+                self.registers.cs().limit,
             );
         }
         let instructions = exit.instructions;
@@ -2944,6 +2948,30 @@ impl CpuGsw {
         let mode13_word_reads = exit.mode13_byte_reads >> 32;
         let ram_byte_writes = exit.ram_byte_writes & u64::from(u32::MAX);
         let ram_word_writes = exit.ram_byte_writes >> 32;
+        // The same carry guard the `dword_reads` lane carries above, for the same reason: the
+        // block's dynamic RAM dword-write count must not reach the half a second quantity now
+        // lives in. It cannot -- both halves are bounded by the chain bounds `NativeExit`'s own
+        // comment relies on, `MAX_CHAIN_BLOCKS` = 256 for the far returns and the per-block store
+        // counts for the writes -- and this is what makes that checkable rather than argued.
+        debug_assert!(
+            exit.ram_dword_writes & u64::from(u32::MAX) <= u64::from(u32::MAX) / 2,
+            "RAM dword writes must not carry into the far-return half"
+        );
+        // MASKED, and the mask must precede BOTH consumers of this lane. `STACK_RAM_DWORD_WRITES`'s
+        // high half now carries the FAR-RETURN LEDGER: one per `RetFar16` slot that retired, which
+        // is the count `decode_inval_cs_load` no longer sees because a native far return does not
+        // call `invalidate_code_caches_for_cs_load`.
+        //
+        // The two failures are different, and the guest-visible one is the LOUD one. Leaving the
+        // lane unmasked in the `writes` sum below is QUIET: `jit_native_store_hits`,
+        // `data_direct_writes` and `direct_data_pointer_writes` inflate by 2^32 per far return,
+        // PLAUSIBLY, and read as the slice working. Leaving it unmasked in the Dword bus-clock
+        // charge is loud and guest-visible: every far return would add
+        // `2^32 * jit_data_cost_clocks(Dword)` to `raw_bus_clocks`, `scaled_bus_clocks` and
+        // `elapsed_clocks` -- landing in exactly the quantities this slice already declines to pin
+        // as equalities, so it would be MISREAD as the timing change the slice admits to.
+        let ram_dword_writes = exit.ram_dword_writes & u64::from(u32::MAX);
+        let far_returns = exit.ram_dword_writes >> 32;
         let mode13_byte_writes = exit.mode13_byte_writes & u64::from(u32::MAX);
         let mode13_word_writes = exit.mode13_byte_writes >> 32;
         if uniform_fetches {
@@ -3062,7 +3090,7 @@ impl CpuGsw {
             )
             .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Dword)
-                    .saturating_mul(exit.ram_dword_writes),
+                    .saturating_mul(ram_dword_writes),
             )
             // The misaligned split's EXTRA byte cycles, beyond the one wide cycle each access has
             // already been charged above. Priced at the RAM byte dial for both reads and stores,
@@ -3091,7 +3119,7 @@ impl CpuGsw {
         let reads = byte_reads + word_reads + dword_reads;
         let writes = ram_byte_writes
             + ram_word_writes
-            + exit.ram_dword_writes
+            + ram_dword_writes
             + mode13_byte_writes
             + mode13_word_writes
             + exit.mode13_dword_writes;
@@ -3134,6 +3162,10 @@ impl CpuGsw {
             tally.note_entry(span.key.linear);
         }
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
+        // The far-return ledger, out of the high half of the RAM dword-write lane. NON-ZERO on a
+        // shipped binary since the 2026-08-24 flip -- 273.4 M on the wolf3d-586 ladder row; zero
+        // only on the `0` escape.
+        self.jit_direct.note_far_returns(far_returns);
         match exit.unresolved_reason {
             jit::direct::UnresolvedReason::None => {}
             jit::direct::UnresolvedReason::StaticUnbound => {

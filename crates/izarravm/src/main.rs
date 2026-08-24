@@ -2113,6 +2113,18 @@ fn write_hdd_profile_json(
     {
         report["smc_census"] = smc_census_json(machine.cpu().direct_smc_census_snapshot(), perf);
     }
+    // Stage 0 of the far-return slice (design §5.0a). A SIBLING top-level object for the same
+    // reason the entry-attribution block below is one: `perf_counters_json`'s ordered key list
+    // must stay identical between the plain and the instrumented build.
+    #[cfg(feature = "retf-arity-census")]
+    if let Some((histogram, sites)) = machine.cpu().retf_arity_snapshot() {
+        report["retf_arity_census"] = serde_json::json!({
+            // Cell n = RETF EXECUTIONS taken at sites with exactly n distinct targets; the last
+            // cell is the saturated sites. Execution-weighted, never site-weighted.
+            "executions_by_distinct_targets": histogram.to_vec(),
+            "sites": sites,
+        });
+    }
     // Census precedent, deliberately (design H7): a SIBLING top-level object, emitted OUTSIDE
     // `perf_counters_json`, so that function's signature and ordered key list stay identical
     // between the plain and the observer build and
@@ -3299,6 +3311,17 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_disp_store_lane_cap_refusals": snapshot.disp_store_lane_cap_refusals,
         "smc_disp_load_widen_lane_cap_refusals": snapshot.disp_load_widen_lane_cap_refusals,
         "decode_pack_late_view_miss": snapshot.decode_pack_late_view_miss,
+        // The far-return slice's ledger and its three refusal cells
+        // (`IZARRAVM_DIRECT_RETF_V86`, default `v86` since the 2026-08-24 ladder). All zero on the
+        // `0` ESCAPE, which is the cheapest check that a ladder leg named the arm it meant to, and
+        // all live on a default binary. Unconditional here for the reason its neighbours are: a
+        // counter present on one leg and absent on the other confounds the arm with a
+        // counter-surface change.
+        "far_ret_native": snapshot.far_ret_native,
+        "blocks_installed_baking_cs": snapshot.blocks_installed_baking_cs,
+        "far_link_refused_cs": snapshot.far_link_refused_cs,
+        "far_link_refused_limit": snapshot.far_link_refused_limit,
+        "far_link_cut_on_widen": snapshot.far_link_cut_on_widen,
         "x87_top_retires_suppressed": snapshot.x87_top_retires_suppressed,
         "x87_top_sticky_crossings": snapshot.x87_top_sticky_crossings,
         // The data-segment reject governor. All zero on the OFF arm, which is the cheapest

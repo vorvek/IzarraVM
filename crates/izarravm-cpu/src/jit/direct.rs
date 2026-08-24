@@ -15,6 +15,8 @@ mod emit;
 pub(crate) mod entry_attribution;
 mod env_gates;
 mod native_exit;
+#[cfg(feature = "retf-arity-census")]
+mod retf_census;
 mod retire_governor;
 mod segment_layout;
 #[cfg(feature = "smc-census")]
@@ -66,6 +68,16 @@ pub(crate) use callout_attribution::{
 #[cfg(feature = "smc-census")]
 pub(crate) use smc_census::{SmcCensus, smc_census_default};
 
+#[cfg(feature = "retf-arity-census")]
+pub(crate) use retf_census::{RETF_TARGET_CENSUS_CAP, RetfArityCensus, retf_arity_census_default};
+
+// FILE-SIZE HEADROOM, recorded 2026-08-24 (code review L-4). This file sits at roughly 4,700 of
+// the 5,000 CODE lines `scripts/check_file_policy.py` allows, and the far-return slice spent about
+// 200 of what was left -- it had to move `retf_admitted_here` into `env_gates.rs` mid-slice to get
+// back under the ceiling. Nothing here is over, and the child modules (`callout`, `census`,
+// `classify`, `emit`, `env_gates`, `retire_governor`, `segment_layout`, `smc_census`) are already
+// the split this file has been taking. The next slice that adds to it should PLAN which unit moves
+// out rather than discover the limit at CI time.
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -469,11 +481,39 @@ pub(crate) struct CompiledBlock {
     callout_slots: CallOutSlotCounts,
     x87_entry_top: u8,
     x87_exit_top: u8,
-    dynamic_successor: bool,
+    /// `DYNAMIC_SUCCESSOR` and `FAR_DYNAMIC`, packed into one byte.
+    ///
+    /// BIT-PACKED rather than two `bool`s, and that is a size decision measured rather than
+    /// assumed: `compiled_block_stays_small_enough_to_copy_per_entry` pins this struct at 120
+    /// bytes, the budget is exactly full, and adding a second `bool` rounds it to 128 -- eight
+    /// bytes on each of the three per-entry memcpys, on a row with 283 M entries. `CallOutSlotCounts`
+    /// beside it is bit-packed for the same reason. The alternative the design named -- a parallel
+    /// `BlockCache::far_dynamic` lane -- would grow `BlockCache`, therefore `JitState`, therefore
+    /// shift every `CpuGsw` field after `jit_direct` including the offsets emitted code bakes, and
+    /// would additionally need an `active_index` lookup at the per-entry reader below, which has a
+    /// `CompiledBlock` by value and no index. Packing costs neither.
+    dynamic_flags: u8,
     successors: [Option<LinkTarget>; 2],
 }
 
+/// This block's terminal resolves its target at RUNTIME, through the two-cell RET PIC.
+pub(crate) const DYNAMIC_SUCCESSOR: u8 = 1 << 0;
+/// ...and it is a FAR terminal: `RetFar16`. Its cell is keyed on the target's LINEAR rather than
+/// on its EIP, it merges through `SegmentLayout::far_merge` rather than `link_merge`, and the
+/// backward chain propagation CUTS it rather than merging through it when either CS bit arrives.
+pub(crate) const FAR_DYNAMIC: u8 = 1 << 1;
+
 impl CompiledBlock {
+    pub(crate) fn dynamic_successor(&self) -> bool {
+        self.dynamic_flags & DYNAMIC_SUCCESSOR != 0
+    }
+
+    /// Whether this block's dynamic terminal is a FAR return. Implies `dynamic_successor`.
+    pub(crate) fn far_dynamic(&self) -> bool {
+        debug_assert!(self.dynamic_flags & FAR_DYNAMIC == 0 || self.dynamic_successor());
+        self.dynamic_flags & FAR_DYNAMIC != 0
+    }
+
     pub(crate) fn id(&self) -> BlockId {
         self.id
     }
@@ -499,6 +539,16 @@ impl CompiledBlock {
     /// second conjunct is what separates them, and nothing else in the function can produce the
     /// pair.
     ///
+    /// **THE FAR RETURN IS A THIRD ARM AND IT BREAKS THAT EXCLUSIVITY**, which is why the
+    /// derivation carries a `|| far_dynamic()` disjunct. A `RetFar16` block reaches `[None, None]`
+    /// through the SEGMENT-WRITE arm -- it writes CS, so `segment_write_block` is true -- while
+    /// `dynamic_successor` is ALSO true, because the relaxation this slice makes is exactly to let
+    /// a segment-write block own a dynamic successor. Without the disjunct this predicate would
+    /// answer "no" for every far block and silently under-count the segment-write population by
+    /// 274 M on wolf3d. Nothing correctness-load-bearing reads it -- a `DirectStallTally`
+    /// diagnostic and the refusal census -- but a quietly-false counter is the exact failure this
+    /// campaign has been burned by.
+    ///
     /// `segment_write_block` itself has TWO PRODUCERS since S4f and the proof above is unchanged
     /// by that: it is a proof about the two `successors` arms, not about what sets the flag. The
     /// producers are the `LoadSegReal`/`PopSegReal` lowerings and the `InterpretOne` rows whose
@@ -510,7 +560,7 @@ impl CompiledBlock {
     /// chain and its quota is clamped to 1: every entry runs this block alone and returns through
     /// the full prologue and epilogue.
     pub(crate) fn is_segment_write_block(&self) -> bool {
-        self.successors == [None, None] && !self.dynamic_successor
+        self.successors == [None, None] && (!self.dynamic_successor() || self.far_dynamic())
     }
 
     pub(crate) fn entry_ptr(&self) -> *const u8 {
@@ -1090,6 +1140,9 @@ pub(crate) struct BlockCache {
     /// the link-refusal census above does: a lockstep clone must not double-count its parent.
     #[cfg(feature = "smc-census")]
     smc_census: Option<Box<SmcCensus>>,
+    /// The stage-0 RETF arity census (§5.0a). THROWAWAY; see `retf_census`.
+    #[cfg(feature = "retf-arity-census")]
+    retf_arity_census: Option<Box<RetfArityCensus>>,
     #[cfg(test)]
     defer_short_for_test: bool,
     #[cfg(test)]
@@ -1185,6 +1238,8 @@ impl BlockCache {
             direct_link_refusal_census: direct_link_refusal_census_default(),
             #[cfg(feature = "smc-census")]
             smc_census: smc_census_default(),
+            #[cfg(feature = "retf-arity-census")]
+            retf_arity_census: retf_arity_census_default(),
             #[cfg(test)]
             defer_short_for_test: false,
             #[cfg(test)]
@@ -1380,7 +1435,8 @@ impl BlockCache {
             ),
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
-            dynamic_successor: compilation.dynamic_successor,
+            dynamic_flags: (u8::from(compilation.dynamic_successor) * DYNAMIC_SUCCESSOR)
+                | (u8::from(compilation.far_dynamic) * FAR_DYNAMIC),
             successors: compilation.successors,
         };
         pending_watch_edges.extend(
@@ -1445,6 +1501,11 @@ impl BlockCache {
             self.link_sources
                 .insert(cell.address(), LinkSource { block: id, slot: 0 });
         }
+        // Stage 0 §5.0c, counted here rather than at compile so it shares
+        // `jit_direct_blocks_installed`'s denominator exactly.
+        self.stalls.blocks_installed_baking_cs += u64::from(
+            compilation.segment_layout.used & (segment_bit(SegmentIndex::Cs) | BAKES_CS_BIT) != 0,
+        );
         self.live_blocks += 1;
         self.entries.insert(span.key, BlockState::Compiled(id));
         self.note_page_span(span.key, u32::from(span.guest_len));
@@ -2752,12 +2813,21 @@ impl BlockCache {
     /// Bind one observed near-RET target to a target-checked successor cell. Dynamic targets are
     /// deliberately not added to `waiting`: if the target is not link-visible yet, a later RET
     /// observation retries after normal admission has had a chance to compile it.
+    /// `cs_limit` is the LIVE CS limit, read by the caller after the native run and therefore
+    /// already the POST-RETF one for a far exit. It closes a hole a chained far entry would
+    /// otherwise walk into: `run_direct_block`'s dispatcher entry refuses a block whose
+    /// `eip + guest_len - 1` exceeds `cs.limit`, and a CHAINED transfer jumps to `body_offset` and
+    /// never reaches that check. That gap is pre-existing for the near PIC and this slice does not
+    /// open it -- but the far edge multiplies the population by ~274 M on wolf3d and moves it into
+    /// the 64 K-wrap region, where a return to `F000:FFxx` is an ordinary BIOS shape. Closed HERE,
+    /// at bind time, where it is one compare that never runs again.
     pub(crate) fn bind_dynamic_successor(
         &mut self,
         site_cell: usize,
         target_eip: u32,
         target_linear: u32,
         mode_key: u32,
+        cs_limit: u32,
     ) -> bool {
         let Some(source) = self.link_sources.get(&site_cell).copied() else {
             return false;
@@ -2768,7 +2838,7 @@ impl BlockCache {
         let Some(source_index) = self.active_index(source.block) else {
             return false;
         };
-        if !self.blocks[source_index].dynamic_successor {
+        if !self.blocks[source_index].dynamic_successor() {
             return false;
         }
         let target_key = LinkTarget {
@@ -2778,18 +2848,47 @@ impl BlockCache {
         let Some(target) = self.linear_blocks.get(&target_key).copied() else {
             return false;
         };
+        let far = self.blocks[source_index].far_dynamic();
+        // FAR EDGES ONLY, and the gate is about ACCOUNTING rather than about outcome (code review
+        // M-1). For a NEAR bind the compare is outcome-inert in the normal path -- `link_merge`
+        // refuses any near edge whose two chain layouts disagree on `cs`, `merge_chain` preserves
+        // `self.cs`, so a linkable near target was compiled under the LIVE CS record and the
+        // compile walk's own limit test already bounds `eip + guest_len - 1` by that CS's limit.
+        // It is NOT inert in attribution: when the two CS records do differ, an ungated compare
+        // returns before `try_link_inner` is reached, and a refusal main counted as
+        // `link_refusals[SegmentLayout]` vanishes with no counter at all, because
+        // `far_link_refused_limit` is far-only. That is a silent OFF-arm change to a refusal
+        // census the campaign ranks and closes on. If the near arm is ever wanted as a FIDELITY
+        // improvement it is a separate decision, with its own counter and its own line in the
+        // OFF-arm delta list; it must not ride this slice.
+        //
+        // Written as `+ guest_len > limit + 1` rather than `+ guest_len - 1 > limit` so a
+        // `guest_len` of 0 cannot underflow (code review L-3). Unreachable today -- a compiled
+        // block has at least one byte -- but the value comes out of a struct field, and the two
+        // forms cost the same.
+        if far && let Some(target_index) = self.active_index(target) {
+            let guest_len = u64::from(self.blocks[target_index].span.guest_len);
+            if u64::from(target_eip) + guest_len > u64::from(cs_limit) + 1 {
+                self.stalls.far_link_refused_limit += 1;
+                return false;
+            }
+        }
+        // A FAR cell holds a LINEAR, not an EIP: the emitted compare adds the live CS base to the
+        // popped offset before it reads the cell. `target_linear` is already the post-RETF one --
+        // the caller reads `cs().base` AFTER the native run.
+        let cell_key = if far { target_linear } else { target_eip };
         if let Some(slot) = self.outbound[source_index]
             .iter()
             .position(|outbound| *outbound == Some(target))
         {
-            return self.try_link_inner(source.block, slot as u8, target, Some(target_eip));
+            return self.try_link_inner(source.block, slot as u8, target, Some(cell_key));
         }
         let slot = self.outbound[source_index]
             .iter()
             .position(Option::is_none)
             .unwrap_or_else(|| usize::from(self.dynamic_next_slots[source_index] & 1));
         self.dynamic_next_slots[source_index] = ((slot + 1) & 1) as u8;
-        self.try_link_inner(source.block, slot as u8, target, Some(target_eip))
+        self.try_link_inner(source.block, slot as u8, target, Some(cell_key))
     }
 
     pub(crate) fn defer_short_enabled(&self) -> bool {
@@ -3219,9 +3318,30 @@ impl BlockCache {
         let stale_epoch = self.block_link_epochs.get(source_index).copied()
             != Some(self.link_epoch)
             || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch);
+        // A FAR source merges through `far_merge` instead: its snapshot holds the PRE-RETF CS
+        // and the target's holds the POST-RETF one, so `link_merge`'s plain `cs` compare refuses
+        // every far edge. `far_merge` replaces that compare with INV-FAR-CS, which is a refusal on
+        // the TARGET's side and is what makes the linear-keyed cell sound.
+        let far = source_block.far_dynamic();
         let chain_merge = (!stale_epoch)
-            .then(|| self.chain_layouts[source_index].link_merge(self.chain_layouts[target_index]))
+            .then(|| {
+                let source_layout = self.chain_layouts[source_index];
+                let target_layout = self.chain_layouts[target_index];
+                if far {
+                    source_layout.far_merge(target_layout)
+                } else {
+                    source_layout.link_merge(target_layout)
+                }
+            })
             .flatten();
+        // WHICH HALF of `far_merge` refused, computed here so the counter names the invariant
+        // rather than the enum variant. A far edge can also lose on an ordinary data-segment
+        // conflict, which is the same event `LinkRefusal::SegmentLayout` has always counted; only
+        // the CS half is INV-FAR-CS biting, and bar 7 reads exactly that number.
+        let far_cs_refusal = far
+            && self.chain_layouts[target_index].used
+                & (segment_bit(SegmentIndex::Cs) | BAKES_CS_BIT)
+                != 0;
         let refusal = if stale_epoch {
             Some(LinkRefusal::StaleEpoch)
         }
@@ -3264,6 +3384,21 @@ impl BlockCache {
         };
         if let Some(refusal) = refusal {
             self.stalls.link_refusals[refusal as usize] += 1;
+            // Beside the increment it rides, and NOT inside `SegmentLayout::far_merge`, which is a
+            // pure method on a `Copy` struct with access to neither the tally nor `PerfCounters`.
+            // No new `LinkRefusal` variant either, so the refusal-census indices stay stable.
+            //
+            // IT UNDER-REPORTS, DELIBERATELY, AND BAR 7 MUST BE READ AS A LOWER BOUND (code
+            // review L-1). The credit lands only when `SegmentLayout` is the BINDING refusal, so a
+            // far edge that also trips an earlier arm of the chain above -- `StaleEpoch` most
+            // plausibly, since the chain short-circuits in its original order -- is
+            // INV-FAR-CS-refused and silent here. Moving the counter above the chain would cost
+            // the short-circuit the ordering comment protects and would start pricing a
+            // six-segment merge on a high-frequency refusal. The honest denominator for the
+            // static half is `blocks_installed_baking_cs`.
+            if far_cs_refusal && matches!(refusal, LinkRefusal::SegmentLayout) {
+                self.stalls.far_link_refused_cs += 1;
+            }
             #[cfg(feature = "direct-link-refusal-census")]
             self.note_direct_link_refused(source_index, slot_index, refusal, target);
             return false;
@@ -3330,7 +3465,8 @@ impl BlockCache {
     /// of the target pins ES with a different descriptor.
     ///
     /// Termination: a requirement bit, once set, is never cleared while the block lives, and
-    /// there are six of them, so each block is pushed at most six times per generation.
+    /// there are seven of them -- the six segments plus `BAKES_CS_BIT` -- so each block is pushed
+    /// at most seven times per generation.
     fn widen_chain_requirement(&mut self, source: BlockId, merged: SegmentLayout) {
         let Some(source_index) = self.active_index(source) else {
             return;
@@ -3369,6 +3505,22 @@ impl BlockCache {
                 let Some(predecessor_index) = self.active_index(link.block) else {
                     continue;
                 };
+                // THE FAR CUT. A far predecessor whose incoming requirement carries either CS
+                // bit is UNLINKED rather than merged through.
+                //
+                // Merging would compare the predecessor's PRE-RETF `data[1]` against a POST-RETF
+                // requirement -- two unrelated CS records -- and the ordinary `push cs; call; retf`
+                // shape would satisfy that comparison BY COINCIDENCE and then be wrong on a later
+                // rebind of the same cell. INV-FAR-CS is a property of the target's requirement,
+                // and a requirement GROWS, so the edge predicate alone is not enough: this is what
+                // keeps the invariant true after the edge is published.
+                if self.blocks[predecessor_index].far_dynamic()
+                    && requirement.used & (segment_bit(SegmentIndex::Cs) | BAKES_CS_BIT) != 0
+                {
+                    self.stalls.far_link_cut_on_widen += 1;
+                    self.unlink_outbound(link.block, link.slot, LinkClearCause::ChainWiden);
+                    continue;
+                }
                 match self.chain_layouts[predecessor_index].merge_chain(requirement) {
                     Some(predecessor_merged) => {
                         if predecessor_merged.used != self.chain_layouts[predecessor_index].used {
@@ -3502,7 +3654,7 @@ impl BlockCache {
         self.block_portals[index].clear();
         self.block_link_epochs[index] = 0;
         self.unregister_decode_dependencies(id, index);
-        if self.blocks[index].dynamic_successor {
+        if self.blocks[index].dynamic_successor() {
             self.link_sources
                 .remove(&self.link_cells[index][0].address());
         }
@@ -3705,6 +3857,11 @@ pub(crate) struct Compilation {
     /// omits it stays correct in guest state and in block shape while never linking, which no
     /// other assertion can see.
     pub(crate) dynamic_successor: bool,
+    /// Whether that dynamic successor is a FAR one. Readable outside this module for
+    /// `dynamic_successor`'s reason: a `RetFar16` block that reported a NEAR dynamic successor
+    /// would bind its cell with an EIP where the emitted compare reads a LINEAR, and nothing in
+    /// guest state or in the block's shape shows it -- the cell would simply never hit.
+    pub(crate) far_dynamic: bool,
     /// Readable outside this module so a fixture can pin a terminal's LINK EDGE. A kind missing
     /// from the successor match falls to the fall-through arm, which is a wrong edge rather than
     /// a missing one, and nothing observable in guest state or in the block's shape shows it.
@@ -4586,6 +4743,29 @@ pub(crate) enum DirectKind {
     Ret16 {
         release: u16,
     },
+    /// RETF (`0xCB`) and RETF imm16 (`0xCA`), MODE-INDEPENDENT. Produced by `classify`; it never
+    /// reaches the emitter, because `stack_width_kind` admits exactly one cell -- 16-bit stack,
+    /// Word operand -- and rewrites it into `RetFar16`. Every other cell is refused explicitly.
+    RetFar {
+        release: u16,
+    },
+    /// RET far on a 16-bit stack at Word operand size, in REAL MODE or V86 only.
+    ///
+    /// Two word pops (the offset at `SP & 0xFFFF`, the selector at `(SP + 2) & 0xFFFF`), then
+    /// `SP += 4 + release` as one 16-bit add, then the CS record written as exactly
+    /// `SegmentRegister::real(selector)`, then EIP and the far arm of the RET PIC.
+    ///
+    /// Scoped to real mode and V86 by `retf_admitted_here`, and the scope is a LEMMA rather than
+    /// a convenience: in those two modes `load_segment_checked` routes CS to `load_segment_real`,
+    /// so the whole CS record is a pure function of the popped selector and the emitted stores
+    /// can reproduce it without reading a descriptor table. In protected mode that is false.
+    ///
+    /// A terminal that WRITES A SEGMENT and still owns a dynamic successor -- the one shape the
+    /// backend had no room for before this slice, and the reason `is_segment_write_block`'s
+    /// derivation and `dynamic_successor`'s `!segment_write_block` term both had to move.
+    RetFar16 {
+        release: u16,
+    },
     Jcc {
         condition: u8,
         taken_delta: u32,
@@ -5024,6 +5204,12 @@ impl DirectKind {
             // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
             // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
             Self::Ret { .. } | Self::Ret16 { .. } => 10,
+            // And the FAR forms charge 17, also irrespective of operand size
+            // (`execute_extended.rs`, the 0xca and 0xcb arms). Riding `Ret`'s 10 would
+            // undercharge by 7 and riding the `_ => 2` default by 15; this is a PIN against the
+            // interpreter, not an approximation, because `elapsed_clocks` and `raw_bus_clocks`
+            // feed the cycle budget the fixtures stop on.
+            Self::RetFar { .. } | Self::RetFar16 { .. } => 17,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
             // PUSHFD is clocks(3) where PUSH r32 is clocks(2), so it cannot ride the `_ => 2`
             // default the other push forms use.
@@ -5154,7 +5340,7 @@ impl DirectKind {
                         ..
                     }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Word),
-        )
+        ) + 2 * u8::from(matches!(self, Self::RetFar16 { .. }))
     }
 
     pub(crate) fn dword_reads(self) -> u8 {
@@ -5385,7 +5571,13 @@ impl DirectKind {
             | Self::Leave
             | Self::Leave16 { .. }
             | Self::Ret { .. }
-            | Self::Ret16 { .. } => Some(SegmentIndex::Ss),
+            | Self::Ret16 { .. }
+            // MANDATORY, not bookkeeping. Without it SS is absent from `used`, and
+            // `MemorySideExits::new`'s `memory.segments.descriptor(Ss)` trips
+            // `SegmentLayout::descriptor`'s `debug_assert_ne!` on the first emitted far block.
+            // The segment WRITTEN is CS and is reported by `written_segment`, which is a
+            // different question and must not be folded in here.
+            | Self::RetFar16 { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -5400,7 +5592,11 @@ impl DirectKind {
         match self {
             // CS is excluded on purpose rather than by omission: it is not in `SegmentLayout.data`
             // at all, it rides the separate `cs` field, and `cs_matches` pins it for every block
-            // unconditionally. Putting it in the mask would be inert at best.
+            // unconditionally. Putting it in the DESCRIPTOR mask would be inert at best -- there
+            // is no `data[1]` for `data_matches` to compare. The selector bake is reported instead
+            // by `bakes_cs_selector` below as `BAKES_CS_BIT`, which is a different bit answering a
+            // different question, and which exists because a chained far transfer skips
+            // `cs_matches`.
             Self::MovSegToReg { segment, .. } if segment != SegmentIndex::Cs => Some(segment),
             // `PUSH Sreg`. Reporting it here is what makes the lowering safe, not bookkeeping: the
             // emitted code bakes the selector as a constant, so without this a block whose only
@@ -5409,7 +5605,8 @@ impl DirectKind {
             // `PUSH CS` (admitted 2026-08-08) is deliberately EXCLUDED by the guard, exactly like
             // `MovSegToReg` above: CS is not in `SegmentLayout.data`, `SegmentLayout::selector`
             // reads the separate `cs` field, and `cs_matches` pins it for every block
-            // unconditionally, so reporting it here would be inert at best.
+            // unconditionally, so reporting it HERE would be inert at best. It is reported by
+            // `bakes_cs_selector` instead, as `BAKES_CS_BIT`.
             Self::Push {
                 source: StoreSource::Selector(segment),
             }
@@ -5420,8 +5617,36 @@ impl DirectKind {
         }
     }
 
+    /// Whether this kind bakes CS's SELECTOR as a compile-time immediate.
+    ///
+    /// A sibling of `selector_segment` rather than an arm inside it, because the answer is not a
+    /// `SegmentIndex`: CS is not in `SegmentLayout.data` at all, so there is no descriptor slot to
+    /// name and no `data_matches` comparison to add. What it produces is `BAKES_CS_BIT`, a bit of
+    /// `used` that names no segment.
+    ///
+    /// Why it has to exist. Both shapes below turn a segment register into an immediate at emit
+    /// time -- `emit_store` rewrites `StoreSource::Selector(Cs)` into `StoreSource::Imm` and the
+    /// `MovSegToReg` arm emits `mov_r32_imm32` -- reading it through `SegmentLayout::selector`'s
+    /// separate `cs` field. Until far returns, that was pinned for every block by `cs_matches` at
+    /// the dispatcher entry check and needed no mask bit. A chained far transfer enters a
+    /// successor's body without returning to the dispatcher, so `cs_matches` never runs for it,
+    /// and INV-FAR-CS refuses any far edge whose target's chain requirement carries this bit.
+    fn bakes_cs_selector(self) -> bool {
+        matches!(
+            self,
+            Self::Push {
+                source: StoreSource::Selector(SegmentIndex::Cs),
+            } | Self::Push16 {
+                source: StoreSource::Selector(SegmentIndex::Cs),
+            } | Self::MovSegToReg {
+                segment: SegmentIndex::Cs,
+                ..
+            }
+        )
+    }
+
     /// Every segment whose descriptor this kind BAKES, as a bitmask: the union of the three
-    /// accessors above.
+    /// accessors above, plus `BAKES_CS_BIT` for the two shapes that bake CS's selector.
     ///
     /// One definition, because the question has three answers and the next reader will only
     /// remember two. `MovSegToReg` is the case that proves it: it bakes DS's selector as a
@@ -5436,7 +5661,14 @@ impl DirectKind {
     /// `mov ax, fs` whenever FS is null, which is a legal instruction with a legal answer.
     fn pinned_segments(self) -> u8 {
         let bit = |segment: Option<SegmentIndex>| segment.map_or(0, segment_bit);
-        bit(self.read_segment()) | bit(self.write_segment()) | bit(self.selector_segment())
+        bit(self.read_segment())
+            | bit(self.write_segment())
+            | bit(self.selector_segment())
+            | if self.bakes_cs_selector() {
+                BAKES_CS_BIT
+            } else {
+                0
+            }
     }
 
     /// The segment REGISTER this kind overwrites, which is a different question from all three
@@ -5453,6 +5685,13 @@ impl DirectKind {
     fn written_segment(self) -> Option<SegmentIndex> {
         match self {
             Self::LoadSegReal { segment, .. } | Self::PopSegReal { segment } => Some(segment),
+            // LOAD-BEARING, and the temptation to drop it is real: relaxing
+            // `dynamic_successor`'s `!segment_write_block` term (the one structural change this
+            // slice makes) invites an implementer to stop reporting the write instead. Do not.
+            // This report is what sets `segment_writes` and therefore `segment_write_block`,
+            // which is what masks the `successors` catch-alls -- and a far block that published a
+            // static fallthrough would put a LINEAR-keyed cell on a static edge.
+            Self::RetFar16 { .. } => Some(SegmentIndex::Cs),
             _ => None,
         }
     }
@@ -5532,6 +5771,12 @@ impl DirectKind {
                 | Self::Call16 { .. }
                 | Self::Ret { .. }
                 | Self::Ret16 { .. }
+                // Both far forms, for the load-bearing reason `PushMem` and `PopSegReal` are
+                // here: the stack-width matrix is only consulted for kinds this predicate
+                // accepts, and it is what refuses every (SS.B, operand size) cell but the one
+                // with an emitter.
+                | Self::RetFar { .. }
+                | Self::RetFar16 { .. }
                 | Self::PushMem { .. }
                 | Self::CallReg { .. }
                 | Self::CallMem { .. }
@@ -5548,6 +5793,8 @@ impl DirectKind {
                 | Self::JmpReg { .. }
                 | Self::Ret { .. }
                 | Self::Ret16 { .. }
+                | Self::RetFar { .. }
+                | Self::RetFar16 { .. }
                 | Self::Jcc { .. }
                 | Self::CallReg { .. }
                 | Self::CallMem { .. }
@@ -6005,6 +6252,19 @@ fn stack_width_kind(
             Some(DirectKind::Enter16 { alloc, stack32 })
         }
         (DirectKind::Enter16 { .. }, _, _) => None,
+        // RETF, real mode and V86 only (`retf_admitted_here` already decided that). ONE cell has
+        // an emitter: a 16-bit stack at Word operand size, which is two word pops and a 16-bit
+        // `SP += 4 + release`.
+        (DirectKind::RetFar { release }, false, OperandSize::Word) => {
+            Some(DirectKind::RetFar16 { release })
+        }
+        // Spelled out ABOVE the blanket 32-bit-stack arm below, for the reason `PopSegReal` and
+        // `Enter16` state: nothing can reach that arm today, because `retf_admitted_here` refuses
+        // every operand size but Word and every stack width but 16-bit, so an unadmitted RETF
+        // never becomes a slot. But a future admission of the Dword form would otherwise be waved
+        // through to an emitter that only knows the 16-bit shape -- four bytes popped with a
+        // 16-bit pointer, and a 32-bit offset written into a segment whose limit is 0xFFFF.
+        (DirectKind::RetFar { .. }, _, _) => None,
         // LEAVE's Word cells, both stack widths. The Dword cell on a 32-bit stack is the blanket
         // arm below.
         (DirectKind::Leave, stack32, OperandSize::Word) => Some(DirectKind::Leave16 { stack32 }),
@@ -6668,7 +6928,9 @@ fn compile_with_budget(
         // what the classifier could lower. That is why this has to be fixed before any of the
         // 16-bit admission work can produce a single native instruction.
         let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
-        let continuable = insn.continuable || jit_admits_non_continuable(insn.opcode);
+        let continuable = insn.continuable
+            || jit_admits_non_continuable(insn.opcode)
+            || retf_admitted_here(cpu, &insn);
         if !prefixes_supported || !continuable {
             // Attributed since the completeness slice. The two conditions are split rather than
             // folded, because they are different work: a prefix refusal names a prefix the
@@ -7213,6 +7475,12 @@ fn compile_with_budget(
         // pins the segment it addresses through, because the mask is built out of exactly that
         // answer. A kind that touched guest memory while pinning nothing would let a resumed
         // segment write leave a stale base under it and R2 would compare nothing about it.
+        // WEAKER since `BAKES_CS_BIT`, and worth naming before the next slice leans on it:
+        // `MovSegToReg { segment: Cs }` and `Push*{ Selector(Cs) }` now satisfy the first
+        // disjunct through a bit that names NO segment. Inert here -- those kinds still touch no
+        // memory, so they satisfy the second disjunct as well and the assertion's purpose (a
+        // memory-touching kind must pin the segment it addresses through) is undamaged. But the
+        // message is no longer literally what the predicate tests.
         debug_assert!(
             kind.pinned_segments() != 0
                 || (kind.byte_reads() == 0
@@ -7738,18 +8006,35 @@ fn compile_with_budget(
     // successor is not a later slot in this block, and nothing in the mask says anything about
     // what it bakes.
     let segment_write_block = segment_writes != 0 || callout_segment_writes != 0;
-    let dynamic_successor = !segment_write_block
-        && matches!(
-            slots.last().map(|slot| slot.kind),
-            Some(
-                DirectKind::Ret { .. }
-                    | DirectKind::Ret16 { .. }
-                    | DirectKind::JmpMem { .. }
-                    | DirectKind::JmpReg { .. }
-                    | DirectKind::CallReg { .. }
-                    | DirectKind::CallMem { .. }
-            )
-        );
+    // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
+    // segment-write block -- it writes CS, which is the whole point -- so the `!segment_write_block`
+    // term above would make the far cell unreachable and the slice inert.
+    //
+    // What the term protects is stated at `:7720` and is untouched for every other kind: a chained
+    // transfer jumps into a successor's body without returning to `run_direct_block`, so its
+    // `data_matches` never runs, and a block that can overwrite a segment register must be where
+    // the chain ENDS. A far return is the one case where that can be discharged instead of
+    // assumed, because the segment it writes is CS, the record it writes is a pure function of the
+    // popped selector in real mode and V86, and INV-FAR-CS refuses any far edge whose target's
+    // chain requirement claims CS's descriptor or CS's selector. `far_merge` is the edge predicate
+    // and `widen_chain_requirement`'s cut arm is what keeps it true as requirements grow.
+    let far_dynamic = matches!(
+        slots.last().map(|slot| slot.kind),
+        Some(DirectKind::RetFar16 { .. })
+    );
+    let dynamic_successor = far_dynamic
+        || (!segment_write_block
+            && matches!(
+                slots.last().map(|slot| slot.kind),
+                Some(
+                    DirectKind::Ret { .. }
+                        | DirectKind::Ret16 { .. }
+                        | DirectKind::JmpMem { .. }
+                        | DirectKind::JmpReg { .. }
+                        | DirectKind::CallReg { .. }
+                        | DirectKind::CallMem { .. }
+                )
+            ));
     #[cfg(feature = "direct-link-refusal-census")]
     struct TerminalLinks {
         targets: [Option<LinkTarget>; 2],
@@ -7784,9 +8069,15 @@ fn compile_with_budget(
             successor_mask: [true, false],
             emitted_mask: [true, false],
         },
+        // `RetFar16` is EXPLICIT here rather than left to the catch-all, and it is the one arm
+        // in this match that is load-bearing on its own. `emitted_static_targets` is built from
+        // `emitted_mask` and is NOT masked by `segment_write_block`, so a far block riding the
+        // catch-all would register a phantom static-fallthrough refusal-census row on SLOT 0 --
+        // the far cell -- and the campaign ranks and closes on censuses.
         Some(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
+            | DirectKind::RetFar16 { .. }
             | DirectKind::JmpMem { .. }
             | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
@@ -7836,9 +8127,13 @@ fn compile_with_budget(
             }),
             None,
         ],
+        // Explicit, not inherited. Today `segment_write_block` is true for every far block and
+        // the guard arm above already answers, but that is a COINCIDENCE of two independent
+        // decisions; the explicit arm makes `[None, None]` a decision about the kind.
         Some(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
+            | DirectKind::RetFar16 { .. }
             | DirectKind::JmpMem { .. }
             | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
@@ -7915,6 +8210,7 @@ fn compile_with_budget(
         x87_entry_top,
         x87_exit_top,
         dynamic_successor,
+        far_dynamic,
         successors,
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets,

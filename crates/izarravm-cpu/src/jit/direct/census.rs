@@ -321,7 +321,15 @@ fn census_native_suffix(
             .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
             || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
             || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
-            || !(insn.continuable || jit_admits_non_continuable(insn.opcode))
+            // THE THIRD DISJUNCT MIRRORS THE COMPILE WALK, and it has to (code review M-2). This
+            // scan exists to answer "how far would the walk have got", so an admission the walk
+            // has and this does not truncates the counterfactual suffix at every RETF on the
+            // armed arm -- for exactly the 274 M-execution population the slice creates, which is
+            // the population the ladder will be read against. Inert on the OFF arm, where
+            // `retf_admitted_here` returns after one `OnceLock` load.
+            || !(insn.continuable
+                || jit_admits_non_continuable(insn.opcode)
+                || retf_admitted_here(cpu, &insn))
             || (insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu))
         {
             break;
@@ -749,6 +757,68 @@ pub(crate) struct DirectStallTally {
     /// counter that makes that a measurement instead of a claim: any nonzero value on a real run
     /// falsifies it, and the packed arm loses continuations the unpacked arm would have run.
     pub decode_pack_late_view_miss: u64,
+    /// RETFs served natively by `DirectKind::RetFar16`, read out of the HIGH half of the
+    /// `STACK_RAM_DWORD_WRITES` frame lane. **NON-ZERO on a shipped binary since the 2026-08-24
+    /// flip** (273,380,624 on the wolf3d-586 ladder row); zero on the `0` escape, which is the
+    /// cheapest check that a leg named the arm it meant to.
+    ///
+    /// A LEDGER rather than a rate. A native far return does not call
+    /// `invalidate_code_caches_for_cs_load`, so `decode_inval_cs_load` falls by exactly this
+    /// count, and the pre-registered identity is `decode_inval_cs_load(armed) +
+    /// far_ret_native(armed) == decode_inval_cs_load(base)`. A gap means far returns are being
+    /// served that the base did not count, or vice versa.
+    ///
+    /// **IT SHIPS AS `direct_stalls.far_ret_native`, NOT as a `PerfCounters` key** (code review
+    /// L-2). The design's bar 3 writes the identity with `jit_direct_far_ret_native`, which is
+    /// the name it would have had in `PerfCounters`; a ladder leg that greps the `perf_counters`
+    /// block for that spelling finds nothing and reads zero.
+    ///
+    /// HERE AND NOT IN `PerfCounters`, and that is this file's own rule rather than a preference:
+    /// growing `PerfCounters` shifts the pinned `pending_flags` offset, which emitted code bakes.
+    /// The design named `PerfCounters`; the two pin tests (`cpu_test.rs`,
+    /// `canonical_state_test.rs`) say what that costs -- a cache-line reshuffle of the hot region
+    /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
+    pub far_ret_native: u64,
+    /// Stage 0 §5.0c: installed blocks whose OWN snapshot claims CS in either way -- the
+    /// descriptor (`segment_bit(Cs)`, a CS-override memory operand) or the selector
+    /// (`BAKES_CS_BIT`, `PUSH CS` / `MOV r16, CS`).
+    ///
+    /// Read against `jit_direct_blocks_installed`. It is the STATIC half of the far-return
+    /// slice's bar-7 prediction: a far edge into any of these blocks is refused by INV-FAR-CS, so
+    /// a large fraction here says the chain half may be largely unavailable and the ladder should
+    /// be read as grading the ender removal alone. The execution-weighted half needs the arity
+    /// census's target set intersected with this population, which is an offline fold over the
+    /// two exports rather than a third counter.
+    ///
+    /// Compile path, unconditional there: 49,023 compile attempts on a whole wolf3d run, and a
+    /// heat-coupled counter that is armed on one leg and absent on the other confounds the arm
+    /// with an epoch re-phasing.
+    pub blocks_installed_baking_cs: u64,
+    /// The three ways a FAR edge is refused or cut (`IZARRAVM_DIRECT_RETF_V86`). All zero on the
+    /// `0` ESCAPE, because no far edge is ever offered there; live on a shipped binary since the
+    /// 2026-08-24 flip, and `far_link_refused_cs` in particular reads 136.6 M on the wolf3d-586
+    /// ladder row -- see its bullet below for what that means and what it opens.
+    ///
+    /// They are counted at THREE DIFFERENT SITES, because the three events fire at three
+    /// different places and a counter parked where its event cannot reach is worse than no
+    /// counter at all:
+    ///
+    ///   * `far_link_refused_cs` -- INV-FAR-CS. `SegmentLayout::far_merge` returned `None`
+    ///     because the target's chain requirement claims CS's descriptor or CS's selector.
+    ///     Bumped in `try_link_inner`, beside the `link_refusals[SegmentLayout]` increment it
+    ///     rides (`far_merge` is a pure method on a `Copy` struct and can reach neither the
+    ///     tally nor `PerfCounters`). A LARGE reading means the chain half is unavailable and the
+    ///     win is the ender removal alone -- `PUSH CS` is a 158 M block-stopping row on wolf3d,
+    ///     so this is a live possibility rather than a theoretical one.
+    ///   * `far_link_refused_limit` -- the target block's `eip + guest_len - 1` overruns the live
+    ///     CS limit. Bumped in `bind_dynamic_successor`, which is where the compare is, BEFORE
+    ///     `try_link_inner` is reached.
+    ///   * `far_link_cut_on_widen` -- a far edge cut by the backward chain-requirement
+    ///     propagation because the widened requirement reached it carrying either CS bit. Bumped
+    ///     in `widen_chain_requirement`'s cut arm; `try_link_inner` never sees this event.
+    pub far_link_refused_cs: u64,
+    pub far_link_refused_limit: u64,
+    pub far_link_cut_on_widen: u64,
     /// Entries refused because a call-out-bearing block met the privilege state whose port reads
     /// consult the TSS bitmap. Zero on a guest that never runs a compiled IN at CPL>IOPL or in
     /// V86, which is the isolation claim for the whole call-out slice on the shipped fixtures.
@@ -2238,6 +2308,17 @@ impl crate::jit::JitState {
 
     /// Unlike the census snapshot this is ALWAYS available: none of its three groups is census
     /// gated, because each is a single increment on a path that has already left native code.
+    /// Fold one native block exit's far-return count into the ledger. See
+    /// `DirectStallTally::far_ret_native`.
+    pub(crate) fn note_far_returns(&mut self, far_returns: u64) {
+        self.stalls.far_ret_native += far_returns;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn far_ret_native_for_test(&self) -> u64 {
+        self.stalls.far_ret_native
+    }
+
     pub(crate) fn stall_snapshot(&self) -> crate::DirectStallSnapshot {
         crate::DirectStallSnapshot {
             dormant: DormantReason::ALL
@@ -2336,6 +2417,11 @@ impl crate::jit::JitState {
             disp_store_lane_cap_refusals: self.stalls.disp_store_lane_cap_refusals,
             disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
+            far_ret_native: self.stalls.far_ret_native,
+            blocks_installed_baking_cs: self.stalls.blocks_installed_baking_cs,
+            far_link_refused_cs: self.stalls.far_link_refused_cs,
+            far_link_refused_limit: self.stalls.far_link_refused_limit,
+            far_link_cut_on_widen: self.stalls.far_link_cut_on_widen,
             x87_top_retires_suppressed: self.stalls.x87_top_retires_suppressed,
             x87_top_sticky_crossings: self.stalls.x87_top_sticky_crossings,
             data_segment_retires_suppressed: self.stalls.data_segment_retires_suppressed,
