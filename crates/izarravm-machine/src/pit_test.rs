@@ -1456,3 +1456,633 @@ fn channel1_mode2_refresh_out_toggles_at_its_period() {
     }
     assert_eq!(low_clocks, 1, "refresh OUT keeps pulsing every period");
 }
+
+// -- IZARRAVM_PIT_BULK_ADVANCE: the analytic advance vs the per-CLK loop -------
+//
+// The bar for this slice is IDENTITY, not plausibility: the guest state after a
+// bulk advance must be what `clocks` calls to `Counter::step` produce, field for
+// field, and the caller's two observables -- the channel-0 rising-edge COUNT and
+// the watched channel's OUT transition LIST -- must match element for element.
+// `Pit` and `OutTransition` both derive `PartialEq`, so every assertion below is
+// a whole-value comparison rather than a field spot-check.
+
+/// Control word for `channel` in `mode`, LSB-then-MSB, binary or BCD.
+fn control_word(channel: usize, mode: u8, bcd: bool) -> u8 {
+    ((channel as u8) << 6) | 0x30 | (mode << 1) | u8::from(bcd)
+}
+
+fn program_channel(pit: &mut Pit, channel: usize, mode: u8, count: u16, bcd: bool) {
+    pit.write_port(0x43, control_word(channel, mode, bcd));
+    let port = 0x40 + channel as u16;
+    pit.write_port(port, (count & 0xff) as u8);
+    pit.write_port(port, (count >> 8) as u8);
+}
+
+fn fresh_counters() -> crate::PitBulkAdvanceCounters {
+    crate::PitBulkAdvanceCounters::default()
+}
+
+/// Run ONE advance of `clocks` CLKs on both arms from the same start state and
+/// assert the edge count, the watched channel's transition list and the whole
+/// post-advance chip agree. Returns whether the bulk arm actually engaged, so a
+/// sweep can prove it is not passing by declining everything.
+fn assert_arms_agree(base: &Pit, clocks: u64, channel: usize, label: &str) -> bool {
+    let mut loop_pit = base.clone();
+    let mut loop_transitions = Vec::new();
+    let mut loop_counters = fresh_counters();
+    let loop_edges = loop_pit.tick_recording_out_transitions(
+        clocks,
+        channel,
+        &mut loop_transitions,
+        false,
+        &mut loop_counters,
+    );
+
+    let mut bulk_pit = base.clone();
+    let mut bulk_transitions = Vec::new();
+    let mut bulk_counters = fresh_counters();
+    let bulk_edges = bulk_pit.tick_recording_out_transitions(
+        clocks,
+        channel,
+        &mut bulk_transitions,
+        true,
+        &mut bulk_counters,
+    );
+
+    assert_eq!(
+        bulk_edges, loop_edges,
+        "{label}: channel-0 rising-edge count"
+    );
+    assert_eq!(
+        bulk_transitions, loop_transitions,
+        "{label}: channel-{channel} OUT transitions"
+    );
+    assert_eq!(bulk_pit, loop_pit, "{label}: post-advance chip state");
+    if bulk_counters.advances > 0 {
+        assert_eq!(
+            bulk_counters.transitions,
+            bulk_transitions.len() as u64,
+            "{label}: the transition counter must count what was emitted"
+        );
+    }
+    bulk_counters.advances > 0
+}
+
+#[test]
+fn pit_bulk_advance_matches_the_step_loop_across_modes_reloads_phases_and_spans() {
+    // Every mode x a spread of reloads (even, odd, minimum legal, the
+    // datasheet's illegal 1, the full-range 0) x every phase across two-plus
+    // periods, walked through the REAL tick path so both OUT phases and the
+    // post-reload states are visited x spans shorter than, equal to and longer
+    // than the period, including zero.
+    //
+    // Channel 1 stays the default AT refresh timer (mode 2, count 18) and
+    // channel 2 runs a second live counter, so a bulk form that advanced only
+    // the channels it is asked about fails on whole-chip equality.
+    let mut engaged = 0u64;
+    let mut declined = 0u64;
+    for mode in 0..=5u8 {
+        for reload in [2u16, 3, 4, 5, 6, 7, 18, 100, 101, 255, 1, 0] {
+            let mut pit = Pit::default();
+            program_channel(&mut pit, 2, 3, 7, false);
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, false); // arm the trigger edge below
+            }
+            program_channel(&mut pit, 0, mode, reload, false);
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, true); // rising edge starts the one-shot
+            }
+            let period = if reload == 0 {
+                65536u64
+            } else {
+                u64::from(reload)
+            };
+            // The full-range reload's oracle costs 65536 steps per span, so it
+            // gets fewer phases and stops one period past the boundary.
+            let wide = period >= 1000;
+            let phases = if wide { 2 } else { (2 * period + 4).min(40) };
+            let spans: Vec<u64> = if wide {
+                vec![0, 1, 2, period - 1, period, period + 1]
+            } else {
+                vec![
+                    0,
+                    1,
+                    2,
+                    period - 1,
+                    period,
+                    period + 1,
+                    2 * period,
+                    2 * period + 1,
+                    3 * period + 5,
+                ]
+            };
+            for phase in 0..phases {
+                for &clocks in &spans {
+                    for channel in [0usize, 2] {
+                        let label = format!(
+                            "mode {mode} reload {reload} phase {phase} clocks {clocks} \
+                             watch channel {channel}"
+                        );
+                        if assert_arms_agree(&pit, clocks, channel, &label) {
+                            engaged += 1;
+                        } else {
+                            declined += 1;
+                        }
+                    }
+                }
+                pit.tick(1); // walk the phase on the reference arm
+            }
+        }
+    }
+    assert!(
+        engaged > 0,
+        "the sweep must actually exercise the analytic path"
+    );
+    assert!(
+        declined > 0,
+        "the sweep must also reach the declines (reload 1 in modes 2 and 3, \
+         and the empty advance)"
+    );
+}
+
+#[test]
+fn pit_bulk_advance_of_zero_clocks_moves_nothing() {
+    // `Counter::advance` and `Counter::out_transitions_in` are asserted DIRECTLY
+    // here, not through `tick_with_observer`. The chip-level entry point already
+    // returns early on an empty advance, so the zero-CLK guards inside these two
+    // are unreachable from production -- and an unreachable guard is exactly
+    // what rots into a landmine the day a second caller appears. The contract is
+    // pinned at the functions that state it. (Both guards SURVIVED the first
+    // mutation round for precisely this reason; this test is what kills them.)
+    for mode in 0..=5u8 {
+        for reload in [2u16, 7, 100, 0] {
+            let mut pit = Pit::default();
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, false);
+            }
+            program_channel(&mut pit, 0, mode, reload, false);
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, true);
+            }
+            // Every state a counter can be in: LoadDelay / WaitGate straight off
+            // the write, Counting a few CLKs later, and Inactive once a one-shot
+            // has finished.
+            for warmup in [0u64, 3, 300] {
+                pit.tick(warmup);
+                let before = pit.counters[0].clone();
+                let mut probe = before.clone();
+                assert_eq!(
+                    probe.advance(0),
+                    0,
+                    "mode {mode} reload {reload} warmup {warmup}: no CLK, no edge"
+                );
+                assert_eq!(
+                    probe, before,
+                    "mode {mode} reload {reload} warmup {warmup}: no CLK, no state change"
+                );
+                let mut emitted = 0u32;
+                before.out_transitions_in(0, &mut |_, _| emitted += 1);
+                assert_eq!(
+                    emitted, 0,
+                    "mode {mode} reload {reload} warmup {warmup}: no CLK, no transition"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pit_bulk_advance_declines_bcd_counters_and_still_matches_the_loop() {
+    // BCD is declined on the same ground as every analytic peek in this file: no
+    // PC software clocks the PIT in BCD, so decimal half-cycles are not modeled.
+    // The decline is NOT the knob -- a BCD counter takes the loop on both arms --
+    // and the two arms must still land in the same place.
+    for mode in 0..=5u8 {
+        for reload in [0x02u16, 0x07, 0x18, 0x99, 0x0100] {
+            let mut pit = Pit::default();
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, false);
+            }
+            program_channel(&mut pit, 0, mode, reload, true);
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, true);
+            }
+            for phase in 0..4 {
+                for clocks in [0u64, 1, 2, 5, 50, 300] {
+                    let label =
+                        format!("bcd mode {mode} reload {reload:#x} phase {phase} clocks {clocks}");
+                    assert!(
+                        !assert_arms_agree(&pit, clocks, 0, &label),
+                        "{label}: a BCD counter must decline the analytic advance"
+                    );
+                    let mut probe = pit.clone();
+                    let mut counters = fresh_counters();
+                    probe.tick_arm(clocks, true, &mut counters);
+                    if clocks > 0 {
+                        assert_eq!(counters.declines_bcd, 1, "{label}");
+                        assert_eq!(counters.advances, 0, "{label}");
+                    }
+                }
+                pit.tick(1);
+            }
+        }
+    }
+}
+
+#[test]
+fn pit_bulk_advance_declines_an_illegal_mode_2_or_3_reload() {
+    // Reload 1 is the datasheet's illegal input for modes 2 and 3 (count 2 is
+    // the minimum). `step_counting` handles it loosely -- it reloads on EVERY
+    // CLK -- which leaves the analytic form no period to fold and, in mode 3, no
+    // half-period. It declines rather than guessing, and the decline names
+    // itself so a row that lost the lever to an illegal count is diagnosable.
+    for mode in [2u8, 3] {
+        let mut pit = Pit::default();
+        program_channel(&mut pit, 0, mode, 1, false);
+        for clocks in [1u64, 2, 5, 40] {
+            let label = format!("mode {mode} reload 1 clocks {clocks}");
+            assert!(!assert_arms_agree(&pit, clocks, 0, &label), "{label}");
+            let mut probe = pit.clone();
+            let mut counters = fresh_counters();
+            probe.tick_arm(clocks, true, &mut counters);
+            assert_eq!(counters.declines_illegal_reload, 1, "{label}");
+            assert_eq!(counters.declines_bcd, 0, "{label}");
+            assert_eq!(counters.advances, 0, "{label}");
+        }
+
+        // The reachable form of the same input, and the one the read-only peeks
+        // get WRONG (`counting_count_after` returns the reload outright for
+        // `r <= 1`): a live counter whose RELOAD is rewritten to 1 while its
+        // counting element is still large. `arm` deliberately does not reset the
+        // live count for modes 2 and 3, so this state really does occur.
+        let mut running = Pit::default();
+        program_channel(&mut running, 0, mode, 100, false);
+        running.tick(10);
+        running.write_port(0x40, 1);
+        running.write_port(0x40, 0);
+        assert!(running.counters[0].count > 1, "mode {mode}: CE still large");
+        for clocks in [1u64, 50, 89, 90, 91, 200] {
+            let label = format!("mode {mode} reload rewritten to 1, clocks {clocks}");
+            assert!(!assert_arms_agree(&running, clocks, 0, &label), "{label}");
+        }
+    }
+}
+
+#[test]
+fn pit_bulk_advance_matches_the_step_loop_with_the_gate_low() {
+    for mode in 0..=5u8 {
+        for from_load_delay in [false, true] {
+            let mut pit = Pit::default();
+            program_channel(&mut pit, 0, mode, 50, false);
+            if !from_load_delay {
+                pit.tick(3); // past the load, into Counting
+            }
+            pit.set_gate(0, false);
+            for clocks in [0u64, 1, 2, 3, 10, 120] {
+                let label =
+                    format!("mode {mode} load_delay {from_load_delay} gate low clocks {clocks}");
+                assert_arms_agree(&pit, clocks, 0, &label);
+            }
+        }
+    }
+}
+
+#[test]
+fn pit_bulk_advance_reproduces_the_gate_low_mode_2_and_3_out_force() {
+    // `step_counting` forces OUT high on the first paused CLK in modes 2 and 3.
+    // The read-only peeks do NOT: `out_after`'s Counting + !gate arm returns the
+    // STORED level. Today the two agree, because the only two ways into a
+    // GATE-low mode-2/3 state (`set_gate`'s falling edge and `write_control`)
+    // both set OUT high on the way in -- so this state is CONSTRUCTED, not
+    // programmed. A bulk advance writes the field, and writing back the peeks'
+    // answer here would be a real state divergence.
+    for mode in [2u8, 3] {
+        let counter = Counter {
+            mode,
+            rw: RwMode::LsbThenMsb,
+            reload: 50,
+            count: 20,
+            out: false,
+            gate: false,
+            state: CounterState::Counting,
+            ..Counter::default()
+        };
+        let base = pit_with_counter(0, counter);
+        assert!(
+            !base.counters[0].out,
+            "mode {mode}: the premise of this test"
+        );
+
+        // Zero CLKs is not an advance: nothing may move.
+        let mut idle = base.clone();
+        let mut counters = fresh_counters();
+        idle.tick_arm(0, true, &mut counters);
+        assert!(!idle.counters[0].out, "mode {mode}: no CLK, no force");
+        assert_eq!(idle, base, "mode {mode}: no CLK, no state change");
+
+        for clocks in [1u64, 2, 7, 400] {
+            let label = format!("constructed gate-low mode {mode} clocks {clocks}");
+            assert!(assert_arms_agree(&base, clocks, 0, &label), "{label}");
+            let mut probe = base.clone();
+            let mut counters = fresh_counters();
+            probe.tick_arm(clocks, true, &mut counters);
+            assert!(
+                probe.counters[0].out,
+                "{label}: the GATE-low force must drive OUT high"
+            );
+        }
+
+        // From LoadDelay the FIRST CLK is the unconditional load, so the force
+        // needs two CLKs, not one.
+        let load_delay = pit_with_counter(
+            0,
+            Counter {
+                state: CounterState::LoadDelay,
+                ..base.counters[0].clone()
+            },
+        );
+        for clocks in [1u64, 2, 3] {
+            let label = format!("constructed gate-low LoadDelay mode {mode} clocks {clocks}");
+            assert!(assert_arms_agree(&load_delay, clocks, 0, &label), "{label}");
+            let mut probe = load_delay.clone();
+            let mut counters = fresh_counters();
+            probe.tick_arm(clocks, true, &mut counters);
+            assert_eq!(
+                probe.counters[0].out,
+                clocks >= 2,
+                "{label}: the load CLK cannot force OUT"
+            );
+        }
+    }
+}
+
+#[test]
+fn pit_bulk_advance_clears_null_count_only_on_the_load_clk() {
+    // `null_count` is cleared in exactly one place -- `step`'s LoadDelay arm --
+    // and the mode-2/3 reload inside `step_counting` does NOT clear it. Modes 1
+    // and 5 park in WaitGate and load on the GATE edge instead, so they have no
+    // LoadDelay CLK to test here.
+    for mode in [0u8, 2, 3, 4] {
+        let mut pit = Pit::default();
+        program_channel(&mut pit, 0, mode, 40, false);
+        assert!(
+            pit.counters[0].null_count,
+            "mode {mode}: armed by the write"
+        );
+        assert_eq!(pit.counters[0].state, CounterState::LoadDelay);
+        for (clocks, still_armed) in [(0u64, true), (1, false), (2, false), (90, false)] {
+            let mut bulk = pit.clone();
+            let mut bulk_counters = fresh_counters();
+            bulk.tick_arm(clocks, true, &mut bulk_counters);
+            let mut reference = pit.clone();
+            let mut loop_counters = fresh_counters();
+            reference.tick_arm(clocks, false, &mut loop_counters);
+            assert_eq!(
+                bulk.counters[0].null_count, still_armed,
+                "mode {mode} clocks {clocks}"
+            );
+            assert_eq!(bulk, reference, "mode {mode} clocks {clocks}");
+        }
+    }
+
+    // A mode-2/3 count rewritten while the counter is already Counting re-arms
+    // `null_count` but stays in Counting, so nothing ever clears it again. A
+    // bulk advance must not clear it either.
+    for mode in [2u8, 3] {
+        let mut pit = Pit::default();
+        program_channel(&mut pit, 0, mode, 40, false);
+        pit.tick(5);
+        assert!(!pit.counters[0].null_count);
+        pit.write_port(0x40, 30);
+        pit.write_port(0x40, 0);
+        assert_eq!(pit.counters[0].state, CounterState::Counting);
+        assert!(pit.counters[0].null_count, "mode {mode}: re-armed in place");
+        for clocks in [1u64, 2, 39, 40, 100] {
+            let mut probe = pit.clone();
+            let mut counters = fresh_counters();
+            probe.tick_arm(clocks, true, &mut counters);
+            assert!(
+                probe.counters[0].null_count,
+                "mode {mode} clocks {clocks}: a reload is not a load"
+            );
+            assert_arms_agree(
+                &pit,
+                clocks,
+                0,
+                &format!("mode {mode} re-armed clocks {clocks}"),
+            );
+        }
+    }
+}
+
+/// One scripted operation against the chip, applied to both arms in lockstep.
+#[derive(Debug, Clone, Copy)]
+enum PitOp {
+    Advance(u64),
+    Gate(usize, bool),
+    Write(u16, u8),
+    Read(u16),
+}
+
+/// Drive both arms through the same script, comparing after EVERY step. This is
+/// where the mid-run events live: a GATE edge and a count rewrite cannot happen
+/// inside one advance (both are only reachable from a port write, which already
+/// ends the CPU batch), so "mid-advance" really means "between two advances",
+/// and the script interleaves them at several phases of the period.
+fn assert_script_agrees(script: &[PitOp], watch: usize, label: &str) {
+    let mut bulk = Pit::default();
+    let mut reference = Pit::default();
+    let mut bulk_counters = fresh_counters();
+    let mut loop_counters = fresh_counters();
+    let mut engaged = false;
+    for (index, op) in script.iter().enumerate() {
+        match *op {
+            PitOp::Advance(clocks) => {
+                let mut bulk_transitions = Vec::new();
+                let mut loop_transitions = Vec::new();
+                let before = bulk_counters.advances;
+                let bulk_edges = bulk.tick_recording_out_transitions(
+                    clocks,
+                    watch,
+                    &mut bulk_transitions,
+                    true,
+                    &mut bulk_counters,
+                );
+                let loop_edges = reference.tick_recording_out_transitions(
+                    clocks,
+                    watch,
+                    &mut loop_transitions,
+                    false,
+                    &mut loop_counters,
+                );
+                engaged |= bulk_counters.advances > before;
+                assert_eq!(bulk_edges, loop_edges, "{label} step {index}: edges");
+                assert_eq!(
+                    bulk_transitions, loop_transitions,
+                    "{label} step {index}: transitions"
+                );
+            }
+            PitOp::Gate(channel, level) => {
+                bulk.set_gate(channel, level);
+                reference.set_gate(channel, level);
+            }
+            PitOp::Write(port, value) => {
+                bulk.write_port(port, value);
+                reference.write_port(port, value);
+            }
+            PitOp::Read(port) => {
+                assert_eq!(
+                    bulk.read_port(port),
+                    reference.read_port(port),
+                    "{label} step {index}: port {port:#x} read"
+                );
+            }
+        }
+        assert_eq!(
+            bulk, reference,
+            "{label} step {index}: chip state after {op:?}"
+        );
+    }
+    assert!(engaged, "{label}: the analytic path never engaged");
+}
+
+#[test]
+fn pit_bulk_advance_matches_the_step_loop_across_gate_edges_and_count_rewrites() {
+    for mode in 0..=5u8 {
+        let script = vec![
+            PitOp::Write(0x43, control_word(0, mode, false)),
+            PitOp::Write(0x40, 100),
+            PitOp::Write(0x40, 0),
+            PitOp::Advance(3),
+            PitOp::Gate(0, false),
+            PitOp::Advance(5),
+            PitOp::Gate(0, true),
+            PitOp::Advance(7),
+            PitOp::Read(0x40),
+            PitOp::Advance(97),
+            PitOp::Write(0x40, 10),
+            PitOp::Advance(1),
+            PitOp::Write(0x40, 0),
+            PitOp::Advance(250),
+            PitOp::Write(0x43, 0x00), // counter-0 latch command
+            PitOp::Advance(9),
+            PitOp::Read(0x40),
+            PitOp::Read(0x40),
+            PitOp::Gate(0, false),
+            PitOp::Advance(11),
+            PitOp::Gate(0, true),
+            PitOp::Advance(65540),
+            // Channel 2's own gate, the one port 0x61 bit 0 drives.
+            PitOp::Write(0x43, control_word(2, 3, false)),
+            PitOp::Write(0x42, 9),
+            PitOp::Write(0x42, 0),
+            PitOp::Advance(4),
+            PitOp::Gate(2, false),
+            PitOp::Advance(6),
+            PitOp::Gate(2, true),
+            PitOp::Advance(40),
+            PitOp::Advance(0),
+            PitOp::Advance(1),
+        ];
+        assert_script_agrees(&script, 2, &format!("mode {mode} watching channel 2"));
+        assert_script_agrees(&script, 0, &format!("mode {mode} watching channel 0"));
+    }
+}
+
+#[test]
+fn pit_bulk_advance_both_arms_are_reachable_in_one_binary() {
+    // The ladder drives both arms from ONE binary, so both must be reachable
+    // without a rebuild -- and the OFF arm must be provably the loop, not the
+    // bulk path wearing the loop's label.
+    let mut pit = Pit::default();
+    program_channel(&mut pit, 0, 2, 100, false);
+    let mut off_arm = pit.clone();
+    let mut on_arm = pit.clone();
+    let mut off = fresh_counters();
+    let mut on = fresh_counters();
+    let off_edges = off_arm.tick_arm(500, false, &mut off);
+    let on_edges = on_arm.tick_arm(500, true, &mut on);
+
+    assert_eq!(
+        off_edges, on_edges,
+        "the two arms must count the same edges"
+    );
+    assert_eq!(off_arm, on_arm, "the two arms must land in the same state");
+    assert!(off_edges > 0, "the advance must have produced edges at all");
+
+    // OFF: nothing analytic, and the decline names the knob rather than a
+    // property of the chip.
+    assert_eq!(off.advances, 0);
+    assert_eq!(off.advance_clocks, 0);
+    assert_eq!(off.declines_knob_off, 1);
+    assert_eq!(off.loop_advances, 1);
+    assert_eq!(off.loop_clocks, 500);
+    assert_eq!(off.declines_bcd, 0);
+    assert_eq!(off.declines_illegal_reload, 0);
+    assert_eq!(off.declines_span_too_wide, 0);
+
+    // ON: analytic, with no per-CLK loop at all.
+    assert_eq!(on.advances, 1);
+    assert_eq!(on.advance_clocks, 500);
+    assert_eq!(on.loop_advances, 0);
+    assert_eq!(on.loop_clocks, 0);
+    assert_eq!(on.declines_knob_off, 0);
+}
+
+#[test]
+fn pit_bulk_advance_declines_a_span_wider_than_the_counting_element() {
+    // 2^32 CLKs is an hour of guest time inside one device advance and the
+    // fallback would need four billion iterations to serve it, so this is a
+    // guard rather than a path. It is asserted anyway: the mode-0/1/4/5 wrap
+    // arithmetic below it is only exact under this cap.
+    //
+    // The predicate is checked directly rather than through `tick_arm`, because
+    // taking the fallback here means running the four-billion-iteration loop the
+    // guard exists to stay away from -- that costs two minutes of test time and
+    // proves nothing the predicate does not.
+    let mut pit = Pit::default();
+    program_channel(&mut pit, 0, 2, 100, false);
+    assert_eq!(pit.bulk_decline((1u64 << 32) - 1), None);
+    assert_eq!(pit.bulk_decline(1u64 << 32), Some(BulkDecline::SpanTooWide));
+    assert_eq!(pit.bulk_decline(u64::MAX), Some(BulkDecline::SpanTooWide));
+
+    // And the counter really is the one that moves on that path.
+    let mut counters = fresh_counters();
+    let mut probe = pit.clone();
+    probe.tick_arm(1_000, true, &mut counters);
+    assert_eq!(counters.declines_span_too_wide, 0);
+    assert_eq!(counters.advances, 1);
+}
+
+#[test]
+fn pit_bulk_advance_knob_reads_unset_and_empty_as_the_default() {
+    use std::env::VarError;
+    // DEFAULT OFF, and empty means DEFAULT rather than "the OFF arm on purpose".
+    // Those coincide only while the default is off; the rule is written as
+    // "empty == unset" so it survives the flip.
+    assert!(!parse_bulk_advance_arm(Err(VarError::NotPresent)));
+    assert!(!parse_bulk_advance_arm(Ok(String::new())));
+    assert!(!parse_bulk_advance_arm(Ok("   ".to_string())));
+    assert!(!parse_bulk_advance_arm(Ok("0".to_string())));
+    assert!(!parse_bulk_advance_arm(Ok("off".to_string())));
+    assert!(!parse_bulk_advance_arm(Ok(" OFF ".to_string())));
+    assert!(parse_bulk_advance_arm(Ok("1".to_string())));
+    assert!(parse_bulk_advance_arm(Ok("on".to_string())));
+    assert!(parse_bulk_advance_arm(Ok(" On ".to_string())));
+}
+
+#[test]
+#[should_panic(expected = "names no arm")]
+fn pit_bulk_advance_knob_refuses_a_typo() {
+    // A mistyped ladder leg that fell through to the default would be read as
+    // "the arm I named changed nothing".
+    let _ = parse_bulk_advance_arm(Ok("yes".to_string()));
+}
+
+#[test]
+#[should_panic(expected = "not valid UTF-8")]
+fn pit_bulk_advance_knob_refuses_a_non_utf8_value() {
+    let _ = parse_bulk_advance_arm(Err(std::env::VarError::NotUnicode(
+        std::ffi::OsString::from("on"),
+    )));
+}

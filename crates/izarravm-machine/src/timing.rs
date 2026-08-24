@@ -181,6 +181,30 @@ impl Machine {
         self.halted_ticks
     }
 
+    /// Mechanism counters for the PIT bulk advance. With the knob OFF,
+    /// `advances` is 0 and `declines_knob_off` equals `loop_advances`.
+    pub fn pit_bulk_advance_counters(&self) -> crate::PitBulkAdvanceCounters {
+        self.pit_bulk
+    }
+
+    /// Whether `IZARRAVM_PIT_BULK_ADVANCE` armed this machine.
+    pub fn pit_bulk_advance_enabled(&self) -> bool {
+        self.pit_bulk_advance
+    }
+
+    /// Force the PIT bulk-advance arm for one machine, in either direction.
+    ///
+    /// The knob is resolved once per process into a `OnceLock`, so a fixture
+    /// that wants the other arm cannot get it from the environment inside a
+    /// running test binary. The arm is per-MACHINE state for exactly that
+    /// reason, and the differential tests state it in BOTH directions rather
+    /// than inheriting the ambient default -- so they keep meaning what they say
+    /// the day the default moves.
+    #[doc(hidden)]
+    pub fn set_pit_bulk_advance_enabled(&mut self, enabled: bool) {
+        self.pit_bulk_advance = enabled;
+    }
+
     /// Scale a step's raw bus clocks by the active level's `bus_timing` factor,
     /// carrying the fractional remainder so a cheap access in a fast mode is not
     /// rounded to zero. This is the THIRD timing lever (B-T10): it scales the whole
@@ -318,6 +342,8 @@ impl Machine {
             advance.pit_clocks,
             2,
             &mut self.speaker_transitions,
+            self.pit_bulk_advance,
+            &mut self.pit_bulk,
         );
         // Per-edge forwarding, same multi-edge contract as the DSP loop above:
         // N channel-0 edges in one step issue N requests and the PIC's IRR

@@ -261,6 +261,78 @@ fn live_mode_switches_keep_one_master_deadline_and_device_phase() {
 }
 
 #[test]
+fn pit_bulk_advance_arms_are_identical_through_the_device_advance() {
+    // The pit-level differential tests pin the MECHANISM. This pins the WIRING:
+    // that `apply_device_advance` passes the machine's arm through at all, that
+    // the channel-0 rising-edge count still reaches the PIC, and that the
+    // channel-2 transition list still reaches the speaker model. Those two are
+    // the only things the caller of `tick_recording_out_transitions` observes,
+    // so a bulk form that is right in isolation and mis-wired here would
+    // otherwise pass everything.
+    let build = |bulk: bool| {
+        let mut machine = test_machine();
+        machine.set_pit_bulk_advance_enabled(bulk);
+        with_bus(&mut machine, |bus| {
+            // Channel 0 mode 3 at the BIOS divisor's neighbourhood (IRQ0), and
+            // channel 2 mode 3 with the speaker gated on through 0x61 bits 0/1.
+            bus.write_io(0x43, BusWidth::Byte, 0x36, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x34, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x12, false).unwrap();
+            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x20, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
+        });
+        for _ in 0..40 {
+            machine.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ / 1000);
+        }
+        machine
+    };
+    let mut off = build(false);
+    let mut on = build(true);
+
+    assert!(on.pit_bulk_advance_enabled());
+    assert!(!off.pit_bulk_advance_enabled());
+    assert_eq!(on.pit, off.pit, "chip state after 40 ms of device advance");
+    assert_eq!(on.master_ticks(), off.master_ticks());
+    assert_eq!(
+        on.pic.deliverable(0),
+        off.pic.deliverable(0),
+        "IRQ0 must reach the PIC the same way on both arms"
+    );
+    assert_eq!(
+        on.speaker.drain(4410),
+        off.speaker.drain(4410),
+        "the channel-2 transition list must reach the speaker unchanged"
+    );
+
+    let on_counters = on.pit_bulk_advance_counters();
+    let off_counters = off.pit_bulk_advance_counters();
+    assert!(
+        on_counters.advances > 0,
+        "the arm must actually reach the device advance"
+    );
+    assert_eq!(
+        on_counters.loop_advances, 0,
+        "the ON arm ran no per-CLK loop"
+    );
+    assert_eq!(off_counters.advances, 0, "the OFF arm stays on the loop");
+    assert_eq!(
+        off_counters.declines_knob_off, off_counters.loop_advances,
+        "with the knob off, every loop advance is the knob's decline"
+    );
+    assert_eq!(
+        on_counters.advance_clocks, off_counters.loop_clocks,
+        "the same input CLKs, served analytically"
+    );
+    assert!(
+        on_counters.advance_clocks > 40_000,
+        "40 ms is ~47,700 PIT input CLKs; got {}",
+        on_counters.advance_clocks
+    );
+}
+
+#[test]
 fn device_only_advance_moves_global_time_not_cpu_work() {
     let mut machine = test_machine();
     let work_before = machine.elapsed_clocks();
