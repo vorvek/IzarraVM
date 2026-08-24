@@ -236,12 +236,26 @@ impl BlockCache {
         let Some(index) = self.active_index(id) else {
             return false;
         };
-        // The arm's OWN mask, per review H3. The strict arm rejected against the CHAIN's
-        // requirement, so that is the mask its census must be taken under; the masked arm
-        // rejected against the block's own pinned set.
-        let mask = census_mask(match arm {
-            DataSegmentRejectArm::Strict => self.chain_layouts[index].used,
-            DataSegmentRejectArm::Masked => self.segment_layouts[index].used,
+        // THE MASK THE REJECT WAS ACTUALLY TAKEN UNDER, per review H3 -- and the answer moves with
+        // `IZARRAVM_CHAIN_ENTRY_CHECK`, which is why this is a logic change and not only prose.
+        //
+        // OFF: the strict arm rejected against the CHAIN's requirement and the masked arm against
+        // the block's own pinned set, so the two arms read different arrays. (The strict half of
+        // that sentence has been true only since this slice; on `main` the strict arm compared all
+        // six descriptors and this line was already reaching for the better mask.)
+        //
+        // ARMED: BOTH arms reject against the chain requirement, so the `match` collapses. Leaving
+        // the `Masked` arm on `segment_layouts` would fingerprint the budget under a mask the
+        // reject was not taken under. With the narrowing the two coincide for a true leaf, but NOT
+        // for a block whose successor is merely portal-hidden -- 168-1,529 entries a row-arm,
+        // non-zero on 12 of 14. Budget accounting only; no soundness consequence.
+        let mask = census_mask(if self.chain_entry_check_armed() {
+            self.chain_layouts[index].used
+        } else {
+            match arm {
+                DataSegmentRejectArm::Strict => self.chain_layouts[index].used,
+                DataSegmentRejectArm::Masked => self.segment_layouts[index].used,
+            }
         });
         let fingerprint = layout_fingerprint(mask, live);
         let spent = {
@@ -290,9 +304,14 @@ impl BlockCache {
     /// descriptors, which — by the non-adopting merge — are the ones this block and its cone
     /// baked. Cutting P's edge would only cost chaining.
     ///
-    /// `chain_layouts` is left alone: it is MONOTONE and is not read by the entry check at all,
-    /// so a declined block keeps a stale-too-WIDE chain requirement, which is the direction its
-    /// own field comment names as safe.
+    /// `chain_layouts` IS NARROWED HERE, and it has to be. The second `unlink_outbound` below
+    /// empties `outbound`, and `narrow_chain_requirement_if_leaf` then resets the requirement to
+    /// the block's own layout -- which IS "the exact check this block would have had if it had
+    /// never linked", the promise the paragraph above makes. Without it, and once the entry check
+    /// reads the chain requirement, the declined block would be checked against its stale-wide
+    /// requirement and reject again: the decline would buy nothing at all. (Before this slice the
+    /// requirement was left alone, on the true-at-the-time ground that the entry check never read
+    /// it. That sentence is no longer true.)
     fn decline_links_for_data_segment(&mut self, key: BlockKey, id: BlockId) {
         for slot in 0..2 {
             self.unlink_outbound(id, slot, LinkClearCause::DataSegmentDecline);
