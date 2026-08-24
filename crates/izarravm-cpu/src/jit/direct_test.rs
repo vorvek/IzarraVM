@@ -4078,14 +4078,21 @@ impl Drop for ChainEntryCheckArm {
 #[test]
 fn the_chain_entry_check_spelling_table_is_exact() {
     use parse_chain_entry_check_arm_for_test as parse;
+    // DEFAULT ON since the 2026-08-25 flip. Unset and `` still reach the SAME arm as each other
+    // -- the flip moved the default, not the rule -- but that arm is now the ARMED one, so an
+    // OFF leg must EXPORT `0`.
     assert!(
-        !parse(Err(std::env::VarError::NotPresent)),
-        "unset must name the shipped default, which is OFF"
+        parse(Err(std::env::VarError::NotPresent)),
+        "unset must name the shipped default, which is ON since the flip"
     );
-    for spelling in ["", "0", "off", "OFF", "  0  ", " off \n"] {
+    assert!(
+        parse(Ok(String::new())),
+        "`` follows unset here, deliberately -- and unset is now ON"
+    );
+    for spelling in ["0", "off", "OFF", "  0  ", " off \n"] {
         assert!(
             !parse(Ok(spelling.to_string())),
-            "{spelling:?} must name the OFF arm -- `` follows unset here, deliberately"
+            "{spelling:?} must name the OFF arm: the escape and the A/B base"
         );
     }
     for spelling in ["1", "on", "ON", "chain", "Chain", " chain "] {

@@ -2113,18 +2113,22 @@ pub(crate) fn parse_entry_attribution_sample(value: Result<String, std::env::Var
 /// Whether the dispatcher entry check compares the block's CHAIN REQUIREMENT
 /// (`BlockCache::chain_layouts`, MASKED) instead of all six of its own frozen descriptors.
 ///
-/// **DEFAULT OFF.** The OFF arm is `main`'s entry check verbatim: `all_data_matches` for a linked
-/// root, `data_matches` for an unlinked one. The ON arm runs one `data_matches` over the chain
+/// **DEFAULT ON since the 2026-08-25 flip.** The OFF arm is `main`-before-the-slice's entry check
+/// verbatim: `all_data_matches` for a linked root, `data_matches` for an unlinked one; it is the
+/// ESCAPE and the A/B base. The ON arm runs one `data_matches` over the chain
 /// requirement for both, which is exactly the statement INV-ENTRY needs and nothing more. Design:
 /// `dev_docs/specs/2026-08-25-chain-requirement-entry-check-design.md`.
 ///
 /// # THE NULLING SEMANTICS, STATED PLAINLY, BECAUSE THE NEIGHBOURING KNOB'S ARE INVERTED
 ///
-/// This knob has the ORDINARY shape, `parse_rotate_rows_arm`'s:
+/// This knob has the ORDINARY shape, `parse_rotate_rows_arm`'s. **The flip moved the DEFAULT, not
+/// the rule**: unset and `""` still name the same arm as each other, and that arm is now ON.
 ///
-/// * **unset -> OFF**, `""` -> OFF, `0` / `off` -> OFF. Unset and nulled are the SAME arm, so a
-///   PowerShell leg that computes the value and produces `""` gets what an unset environment gets.
-/// * `1` / `on` / `chain` -> ON.
+/// * **unset -> ON**, `""` -> ON. Unset and nulled are the SAME arm, so a PowerShell leg that
+///   computes the value and produces `""` gets what an unset environment gets.
+/// * `0` / `off` -> OFF, the escape and the A/B base. **An OFF leg must EXPORT `0`**; clearing
+///   the variable now runs the armed arm.
+/// * `1` / `on` / `chain` -> ON, stated.
 /// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
 ///   silently ran the default would be read as the slice under test doing nothing.
 ///
@@ -2161,10 +2165,10 @@ fn parse_chain_entry_check_arm(value: Result<String, std::env::VarError>) -> boo
                             `1` / `on` / `chain` (the entry check compares the block's masked \
                             CHAIN requirement)";
     let raw = match value {
-        // Unset is the shipped default and it is OFF. `""` follows it below rather than here and
-        // reaches the same arm -- see `chain_entry_check_armed` on why this knob deliberately does
-        // NOT copy `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`'s inverted shape.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the shipped default and it is ON since the 2026-08-25 flip. `""` follows it
+        // below rather than here and reaches the same arm -- see `chain_entry_check_armed` on why
+        // this knob deliberately does NOT copy `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`'s inverted shape.
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of any arm. Someone set the variable and meant something by
         // it, so it reaches the panic rather than the silence "unset" gets.
         Err(std::env::VarError::NotUnicode(_)) => panic!(
@@ -2173,7 +2177,9 @@ fn parse_chain_entry_check_arm(value: Result<String, std::env::VarError>) -> boo
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" => false,
+        // Empty is the DEFAULT, which is now ON, and is deliberately NOT grouped with the escape.
+        "" => true,
+        "0" | "off" => false,
         // `chain` rides beside `1` / `on` because it is the name the design gives the arm, and a
         // leg written from the design must reach the same arm as a leg written from the shell.
         "1" | "on" | "chain" => true,
