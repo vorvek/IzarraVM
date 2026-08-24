@@ -1606,6 +1606,52 @@ fn pit_bulk_advance_matches_the_step_loop_across_modes_reloads_phases_and_spans(
 }
 
 #[test]
+fn pit_bulk_advance_of_zero_clocks_moves_nothing() {
+    // `Counter::advance` and `Counter::out_transitions_in` are asserted DIRECTLY
+    // here, not through `tick_with_observer`. The chip-level entry point already
+    // returns early on an empty advance, so the zero-CLK guards inside these two
+    // are unreachable from production -- and an unreachable guard is exactly
+    // what rots into a landmine the day a second caller appears. The contract is
+    // pinned at the functions that state it. (Both guards SURVIVED the first
+    // mutation round for precisely this reason; this test is what kills them.)
+    for mode in 0..=5u8 {
+        for reload in [2u16, 7, 100, 0] {
+            let mut pit = Pit::default();
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, false);
+            }
+            program_channel(&mut pit, 0, mode, reload, false);
+            if matches!(mode, 1 | 5) {
+                pit.set_gate(0, true);
+            }
+            // Every state a counter can be in: LoadDelay / WaitGate straight off
+            // the write, Counting a few CLKs later, and Inactive once a one-shot
+            // has finished.
+            for warmup in [0u64, 3, 300] {
+                pit.tick(warmup);
+                let before = pit.counters[0].clone();
+                let mut probe = before.clone();
+                assert_eq!(
+                    probe.advance(0),
+                    0,
+                    "mode {mode} reload {reload} warmup {warmup}: no CLK, no edge"
+                );
+                assert_eq!(
+                    probe, before,
+                    "mode {mode} reload {reload} warmup {warmup}: no CLK, no state change"
+                );
+                let mut emitted = 0u32;
+                before.out_transitions_in(0, &mut |_, _| emitted += 1);
+                assert_eq!(
+                    emitted, 0,
+                    "mode {mode} reload {reload} warmup {warmup}: no CLK, no transition"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn pit_bulk_advance_declines_bcd_counters_and_still_matches_the_loop() {
     // BCD is declined on the same ground as every analytic peek in this file: no
     // PC software clocks the PIT in BCD, so decimal half-cycles are not modeled.
