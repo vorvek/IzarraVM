@@ -841,6 +841,22 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
+    /// `test r32, imm32` (F7 /0 id, no REX.W) -- a NON-DESTRUCTIVE bit test, the `81`-family shape
+    /// of `cmp_r32_imm32` one ModRM `/n` over (test is /0, cmp is /7).
+    ///
+    /// Exists for the OF-bearing Jcc predicates of the `IZARRAVM_JCC_SHADOW` lowering, whose mask
+    /// (`FLAG_OF` = 0x800) does not fit `test_r8_low_imm8`'s byte lane. Every other shadow
+    /// predicate masks a bit below 8 and takes the shorter byte form; see `emit_shadow_test`,
+    /// which picks between the two purely on the mask.
+    pub(crate) fn test_r32_imm32(&mut self, r: Reg, imm: u32) {
+        if r.ext() {
+            self.rex(false, false, false, r.ext());
+        }
+        self.bytes.push(0xF7);
+        self.modrm(0b11, 0, r.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `or r32, r32` (09 /r, no REX.W) -- dst |= src. Byte-exact tested for the paged probe's
     /// physical = (entry.phys | (linear & 0xfff)).
     #[allow(dead_code)]

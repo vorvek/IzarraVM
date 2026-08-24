@@ -1301,6 +1301,30 @@ fn test_r8_low_imm8_known_bytes() {
     assert_eq!(e.finish(), vec![0xF6, 0xC0, 0x01]);
 }
 
+/// The `IZARRAVM_JCC_SHADOW` lowering's OF-bearing form. Also pins the two RBP encodings side by
+/// side, because they are the pair the whole size ledger of that slice rests on: `test ebp, 0x800`
+/// is SIX bytes and `test bpl, 0x40` is FOUR, and a lowering that reached for the 32-bit form on a
+/// byte-sized mask would be semantically INERT while costing two bytes at every simple condition.
+#[test]
+fn test_r32_imm32_known_bytes() {
+    // test ebp, 0x800 (FLAG_OF) -- no REX, F7 /0 id. ModRM mod=11,reg=0(/0),rm=5(ebp) = 0xC5.
+    // At DWORD width rm=5 names EBP with no prefix; the empty REX that `test_r8_low_imm8` needs
+    // exists only because BYTE-width rm=5 would otherwise name CH.
+    let mut e = Encoder::new();
+    e.test_r32_imm32(Reg::RBP, 0x800);
+    assert_eq!(e.finish(), vec![0xF7, 0xC5, 0x00, 0x08, 0x00, 0x00]);
+
+    // test r12d, 0x800 -- REX.B (r12 extended). ModRM rm=r12&7=4 -> 0xC4.
+    let mut e = Encoder::new();
+    e.test_r32_imm32(Reg::R12, 0x800);
+    assert_eq!(e.finish(), vec![0x41, 0xF7, 0xC4, 0x00, 0x08, 0x00, 0x00]);
+
+    // The byte-lane counterpart at the same register, for the size comparison above.
+    let mut e = Encoder::new();
+    e.test_r8_low_imm8(Reg::RBP, 0x40);
+    assert_eq!(e.finish(), vec![0x40, 0xF6, 0xC5, 0x40]);
+}
+
 #[test]
 fn test_al_al_known_bytes() {
     let mut e = Encoder::new();
