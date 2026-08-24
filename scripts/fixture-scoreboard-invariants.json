@@ -1,0 +1,49 @@
+{
+  "duke3d-486": {
+    "dukemark_samples": 921,
+    "dukemark_samples_tolerance": 0.02
+  },
+  "duke3d-586": {
+    "dukemark_samples": 1026,
+    "dukemark_samples_tolerance": 0.02
+  },
+  "duke3d-586-short": {
+    "dukemark_samples_tolerance": 0.02,
+    "dukemark_samples": 404
+  },
+  "gp2-586": {
+    "frame_sha256": "ac11e66ab796551bcddc8c9108b9e804faa6ccd62dc105611bb64a6cbfe77fe0"
+  },
+  "nascar-586": {
+    "anchor_frame_sha256": [
+      "383cfebd4a68a669ab4908764205232b4e02c8d0976ab2cc575f032184d529d5"
+    ],
+    "final_nonblack_percent_min": 84.0,
+    "final_nonblack_percent_max": 100.0,
+    "final_distinct_colors_min": 45,
+    "final_distinct_colors_max": 256,
+    "final_instructions": 6337150214,
+    "final_instructions_tolerance": 0.05
+  },
+  "prince-486": {
+    "frame_sha256": "6cc0d3549968b72031469eb7894f7465fe727919d5a7926d499188526ed4479c"
+  },
+  "tombraid-586": {
+    "anchor_frame_sha256": [
+      "2c55fef04eeb555d02790b336a36fff2a7ce04245a40b810ea3bea83d9061403",
+      "30abcde0d496b5e275704c0dcf270f0ea15a3e7171cf9f1d04d7468074b259dd"
+    ],
+    "final_nonblack_percent_min": 89.0,
+    "final_nonblack_percent_max": 100.0,
+    "final_distinct_colors_min": 79,
+    "final_distinct_colors_max": 256,
+    "final_instructions": 16822094052,
+    "final_instructions_tolerance": 0.05
+  },
+  "wolf3d-486": {
+    "frame_sha256": "6101c4f39ee50cdee2fa3bc12c8ca3c678d82c9c22fee3275f5d22379dfbee04"
+  },
+  "wolf3d-586": {
+    "frame_sha256": "e33418bbd34c13ad9c99e23c3d1cddb68df08beecec8676378557a4cc102f963"
+  }
+}

@@ -2,7 +2,20 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 /target/
-/.bench/
+# Benchmark workspace. The fixture data, build trees and results are LOCAL ONLY:
+# ~115 GB across ~450,000 files, and the game fixtures are commercial installs that
+# cannot be redistributed. The measurement HARNESS is tracked, because it is code
+# that gets reviewed and breaks when the tree changes.
+#
+# Note the shape: `/.bench/*` ignores the CONTENTS while still letting git descend
+# into the directory, which is what makes the negations below work. `/.bench/` with
+# a trailing slash would exclude the directory itself and no negation could re-include
+# anything under it.
+/.bench/*
+!/.bench/scripts/
+!/.bench/PROTOCOL.md
+!/.bench/HARNESS.md
+!/.bench/README.md
 /.local/
 /izarravm-output/
 /compatibility-output/
