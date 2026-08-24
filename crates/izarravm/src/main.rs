@@ -3232,6 +3232,14 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
             .iter()
             .map(|(label, count)| json!({ "cause": label, "count": count }))
             .collect::<Vec<_>>(),
+        "chain_requirement_narrowed": snapshot
+            .chain_requirement_narrowed
+            .iter()
+            .map(|(label, count)| json!({ "cause": label, "count": count }))
+            .collect::<Vec<_>>(),
+        "entry_chain_reject_own_pass": snapshot.entry_chain_reject_own_pass,
+        "entry_chain_admitted": snapshot.entry_chain_admitted,
+        "entry_chain_masked_reject": snapshot.entry_chain_masked_reject,
         "side_exit_segment_limit": snapshot.side_exit_segment_limit,
         "side_exit_x87_eligibility": snapshot.side_exit_x87_eligibility,
         "side_exit_divide_guard": snapshot.side_exit_divide_guard,
