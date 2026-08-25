@@ -347,7 +347,8 @@ fn build(builder: fn() -> CpuGsw, body: &[u8], selector: u16, offset: u16, esp: 
 
 fn compare_state(roles: &Roles, context: &str) {
     assert_eq!(
-        roles.native.registers, roles.interp.registers,
+        crate::tests::settled_registers(&roles.native),
+        crate::tests::settled_registers(&roles.interp),
         "{context}: registers (segment registers and EIP included)"
     );
     assert_eq!(

@@ -761,7 +761,8 @@ fn a_sixteen_bit_block_ending_at_the_segment_top_wraps_identically() {
     drive(&mut interp, &mut interp_bus);
     drive(&mut native, &mut native_bus);
     assert_eq!(
-        native.registers, interp.registers,
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
         "a block ending at the segment top must fault identically on both paths"
     );
     assert_eq!(native.halted, interp.halted);
@@ -937,7 +938,8 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
     assert_eq!(
-        cpu.registers, interpreter.registers,
+        crate::tests::settled_registers(&cpu),
+        crate::tests::settled_registers(&interpreter),
         "the baked Word lowering must still match the interpreter"
     );
     assert_eq!(cpu.eflags(), interpreter.eflags());

@@ -401,7 +401,8 @@ fn run_row(
         );
     }
     assert_eq!(
-        prepared.native.registers, prepared.interpreter.registers,
+        crate::tests::settled_registers(&prepared.native),
+        crate::tests::settled_registers(&prepared.interpreter),
         "{context}: registers"
     );
     assert_eq!(

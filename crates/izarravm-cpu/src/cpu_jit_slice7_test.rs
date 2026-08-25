@@ -207,7 +207,8 @@ fn run_and_compare(mut roles: Roles, context: &str) {
         roles.interp.cycle(&mut roles.interp_bus).unwrap();
     }
     assert_eq!(
-        roles.native.registers, roles.interp.registers,
+        crate::tests::settled_registers(&roles.native),
+        crate::tests::settled_registers(&roles.interp),
         "{context}: registers"
     );
     assert_eq!(

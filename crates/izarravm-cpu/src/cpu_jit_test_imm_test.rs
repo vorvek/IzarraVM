@@ -241,8 +241,7 @@ fn prepare_flat(
 }
 
 fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
-    let registers = fixture.native.registers.clone();
-    let pending = fixture.native.pending_flags;
+    let registers = crate::tests::settled_registers(&fixture.native);
     let pending_eflags = fixture.native.eflags();
     let memory = fixture.native_bus.memory.clone();
     assert!(
@@ -252,7 +251,11 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
             .unwrap(),
         "tight event cap admitted {context}"
     );
-    assert_eq!(fixture.native.registers, registers, "cap changed {context}");
+    assert_eq!(
+        crate::tests::settled_registers(&fixture.native),
+        registers,
+        "cap changed {context}"
+    );
     assert_eq!(
         fixture.native.eflags(),
         pending_eflags,
@@ -276,7 +279,8 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     }
 
     assert_eq!(
-        fixture.native.registers, fixture.interpreter.registers,
+        crate::tests::settled_registers(&fixture.native),
+        crate::tests::settled_registers(&fixture.interpreter),
         "registers differ: {context}"
     );
     assert_eq!(
@@ -1097,8 +1101,7 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
         ),
     ] {
         let mut fixture = prepare_paged_case(target, target_pte, permissions);
-        let registers = fixture.native.registers.clone();
-        let pending = fixture.native.pending_flags;
+        let registers = crate::tests::settled_registers(&fixture.native);
         let pending_eflags = fixture.native.eflags();
         let memory = fixture.native_bus.memory.clone();
         let cross_exits = fixture
@@ -1113,7 +1116,7 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
                 .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
                 .unwrap()
         );
-        assert_eq!(fixture.native.registers, registers);
+        assert_eq!(crate::tests::settled_registers(&fixture.native), registers);
         assert_eq!(fixture.native.eflags(), pending_eflags);
         assert_eq!(fixture.native_bus.memory, memory);
         assert_eq!(
@@ -1143,7 +1146,10 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
             result_signature(interpreter_result),
             "target={target:#x}"
         );
-        assert_eq!(fixture.native.registers, fixture.interpreter.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&fixture.native),
+            crate::tests::settled_registers(&fixture.interpreter)
+        );
         assert_eq!(fixture.native.eflags(), fixture.interpreter.eflags());
         assert_eq!(fixture.native.control.cr2, fixture.interpreter.control.cr2);
         assert_eq!(fixture.native_bus.memory, fixture.interpreter_bus.memory);
@@ -1676,18 +1682,12 @@ fn rotate_register_form_count_zero_touches_nothing_at_all() {
                 let fixture =
                     prepare_rotate_reg(op, GswMode::Gsw586, 3, count, 0x1234_5678, 0x203, pending);
                 let before_gpr = fixture.native.registers.gpr;
-                let before_eflags = fixture.native.registers.eflags;
-                let before_pending = fixture.native.pending_flags;
                 let before_arch_eflags = fixture.native.eflags();
                 let context = format!("op={op} count={count} pending={pending:?}");
                 let after = finish_and_compare(fixture, &context);
                 assert_eq!(
                     after.native.registers.gpr[3], before_gpr[3],
                     "{context}: a zero count must not touch the destination"
-                );
-                assert_eq!(
-                    after.native.registers.eflags, before_eflags,
-                    "{context}: a zero count must not touch eflags"
                 );
                 assert_eq!(
                     after.native.eflags(),
@@ -2038,18 +2038,12 @@ fn byte_shl_register_form_count_zero_touches_nothing_at_all() {
                 let fixture =
                     prepare_shl_reg8(GswMode::Gsw586, dst, count, 0x1234_5678, 0x203, pending);
                 let before_gpr = fixture.native.registers.gpr;
-                let before_eflags = fixture.native.registers.eflags;
-                let before_pending = fixture.native.pending_flags;
                 let before_arch_eflags = fixture.native.eflags();
                 let context = format!("dst={dst} count={count} pending={pending:?}");
                 let after = finish_and_compare(fixture, &context);
                 assert_eq!(
                     after.native.registers.gpr, before_gpr,
                     "{context}: a zero count must not touch any register"
-                );
-                assert_eq!(
-                    after.native.registers.eflags, before_eflags,
-                    "{context}: a zero count must not touch eflags"
                 );
                 assert_eq!(
                     after.native.eflags(),

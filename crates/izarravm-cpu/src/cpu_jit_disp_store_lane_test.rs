@@ -375,7 +375,8 @@ fn state_identity(subject: [u8; 2], store: bool, widen: bool, one_lookup_store: 
         }
 
         assert_eq!(
-            native.registers, interpreter.registers,
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interpreter),
             "registers differ after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
         );
         assert_eq!(
@@ -991,7 +992,8 @@ fn a_laned_store_under_a_finite_segment_limit_matches_the_interpreter_and_exits(
             }
 
             assert_eq!(
-                native.registers, interpreter.registers,
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interpreter),
                 "registers differ at offset {offset:#x} (one_lookup_store={one_lookup_store})"
             );
             assert_eq!(

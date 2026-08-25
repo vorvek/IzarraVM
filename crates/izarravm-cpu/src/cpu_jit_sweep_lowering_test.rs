@@ -193,7 +193,8 @@ fn differential_full(
         "{context}: all three slots must retire natively"
     );
     assert_eq!(
-        native.registers, interpreter.registers,
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter),
         "{context}: registers"
     );
     assert_eq!(native.eflags(), interpreter.eflags(), "{context}: EFLAGS");

@@ -2862,7 +2862,37 @@ impl CpuGsw {
         ea_mark!(Phase::TraceAlloc);
         self.begin_instruction();
         self.core_clocks_so_far = total;
-        let flags = self.materialized_eflags();
+        // E1, THE ENTRY CLEAR. This used to be a bare `let flags = self.materialized_eflags();`
+        // -- a PURE read (`core.rs:18-22` returns `registers.eflags` untouched when no descriptor
+        // is live, and recomputes without clearing when one is). A descriptor the interpreter
+        // left standing therefore SURVIVED into native execution, and every later reader
+        // recomputed the six arithmetic bits from it over whatever emitted code had published in
+        // the meantime.
+        //
+        // That was harmless while emitted code maintained the descriptor itself. It is the single
+        // most dangerous line in the eager-flags slice, because an eager publish writes the
+        // architectural word and a stale descriptor OUTRANKS it at the next `materialized_eflags`.
+        // So the entry settles the flags into the memory copy the same way every `InterpretOne`
+        // call-out already does on the way in (`jit/direct.rs`'s STEP 2), and tears the descriptor
+        // down.
+        //
+        // WRITTEN AS THE TWO STATEMENTS rather than `materialize_flags()`, which is
+        // `publish_flags`' verbatim reason: so a no-op publish moves no counter. The interpreter
+        // does not materialise after every instruction either, and `flag_materializations` is a
+        // measure of the interpreter's settling, not of this boundary's.
+        //
+        // NOT UNDER A KNOB. It is architecturally invisible -- it changes the REPRESENTATION of
+        // the flags and never `eflags()`, because `registers.eflags = materialized_eflags()` is
+        // precisely what a later `materialized_eflags()` would have computed. Arming it would make
+        // the two eager-flags arms differ in Rust as well as in emitted code, doubling the surface
+        // a bisect has to search.
+        //
+        // POSITION IS LOAD-BEARING: this sits BELOW every refusal return in this function, so a
+        // REFUSED entry still leaves the interpreter's descriptor exactly as it found it. The
+        // fixtures that assert "a refused entry changed nothing" depend on that and are untouched.
+        self.registers.eflags = self.materialized_eflags();
+        self.pending_flags = PendingFlags::default();
+        let flags = self.registers.eflags;
         // SAFETY: direct::emit produced this page using the exact four-argument ABI, the arena
         // sealed it executable, and the current generational lookup keeps that arena entry live.
         let entry: jit::direct::DirectEntryFn =

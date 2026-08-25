@@ -7,6 +7,49 @@ use izarravm_bus::{
 };
 use izarravm_bus::{DirectMemoryRead, DirectMemoryWrite};
 
+/// A role's `Registers` with the lazy flags SETTLED, for a CROSS-ROLE comparison.
+///
+/// `registers.eflags` together with `pending_flags` is a REPRESENTATION of the architectural
+/// flags, not the architectural value itself: while a descriptor is live the six arithmetic bits
+/// in that word are stale by definition, and two roles at the same architectural state are free to
+/// carry different (base, descriptor) pairs for it.
+///
+/// **They now routinely do, on every native role.** `run_direct_block` settles the flags into the
+/// memory copy at the last point before entering emitted code (E1), because emitted code reloads
+/// its RBP shadow from that word and a descriptor left standing by the interpreter would outrank
+/// every publish the block performs. The interpreter role does no such thing -- it keeps its lazy
+/// flags, which is the whole point of having them. So the two roles reach the same architectural
+/// flags through different pairs, and comparing the raw pair compares exactly the noise the
+/// lazy-flag optimisation exists to create.
+///
+/// **What this does NOT weaken**, which is the same clause `run_generated_case`'s settled-clone
+/// block carries: a WRONG flag value still fails, because materialising is exactly what turns a
+/// descriptor into flags. Every non-flag field of `Registers` is still compared byte for byte, and
+/// so is every bit of EFLAGS outside the six arithmetic ones -- including bit 1, whose `| 0x2`
+/// reproductions in `emit_sahf` and `emit_set_cf_only` therefore keep their gate:
+/// `materialized_eflags` ORs nothing on the `is_none()` path, so a lowering that dropped the OR
+/// still differs here.
+#[cfg(test)]
+pub(crate) fn settled_registers(cpu: &CpuGsw) -> Registers {
+    let mut registers = cpu.registers.clone();
+    registers.eflags = cpu.eflags();
+    registers
+}
+
+/// The whole `CpuGsw` with the lazy flags SETTLED. `settled_registers`' argument, for the
+/// assertions that compare the entire structure rather than just the register file.
+///
+/// A CLONE rather than the role itself, so nothing this comparison does is visible to the caller:
+/// a fixture that silently settled the CPU under test would be deciding what its own later
+/// assertions see. Cloning is faithful because every field `CpuGsw::clone` resets carries an
+/// always-equal `PartialEq`.
+#[cfg(test)]
+pub(crate) fn settled_state(cpu: &CpuGsw) -> CpuGsw {
+    let mut settled = cpu.clone();
+    settled.materialize_flags();
+    settled
+}
+
 /// The JIT's emitted native code addresses `gpr[i]` as `[regs_ptr + 4*i]`, relying on
 /// `Registers` being `repr(C)` with `gpr` as the first field. A rustc or field reorder that broke
 /// this offset would silently corrupt guest state through wrong native loads/stores, so this

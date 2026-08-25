@@ -139,7 +139,10 @@ fn direct_quake_loop_runs_four_iterations_with_memory_source_alu() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
@@ -319,7 +322,10 @@ fn direct_doom_drawcolumn_runs_four_iterations_with_dec_rmw() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
@@ -387,7 +393,10 @@ fn direct_self_loop_quota_stops_only_after_complete_iterations() {
     let chained_insns = native.perf_counters().jit_direct_insns - direct_insns;
 
     assert_eq!(native_outcome, interp_outcome);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert!(chained_insns >= 4);
     assert_eq!(chained_insns % 4, 0, "a quota exit split a loop iteration");
@@ -438,7 +447,10 @@ fn direct_large_self_loop_keeps_the_generic_fetch_fallback_exact() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.registers.eax(), ITERATIONS * 3);
     assert_eq!(
@@ -553,7 +565,10 @@ fn direct_self_loop_reports_a_later_iteration_memory_side_exit() {
             .sum::<u64>()
     );
     assert!(native_outcomes.last().is_some_and(|outcome| outcome.2));
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -641,7 +656,10 @@ fn direct_self_loop_aggregates_mode13_dirty_timing_past_packed_counter_width() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -679,7 +697,7 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
     let block = cpu.jit_direct.block(id).expect("ready block must be live");
 
     arm_quake_loop(&mut cpu);
-    let registers = cpu.registers.clone();
+    let registers = crate::tests::settled_registers(&cpu);
     let pending = cpu.pending_flags;
     let pending_eflags = cpu.eflags();
 
@@ -708,8 +726,14 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
         cpu.perf_counters().jit_direct_reject_interrupt_shadow - shadow_rejects,
         1
     );
-    assert_eq!(cpu.registers, registers);
+    assert_eq!(crate::tests::settled_registers(&cpu), registers);
     assert_eq!(cpu.eflags(), pending_eflags);
+    // THE RAW DESCRIPTOR, and this is the one fixture class where that is still the right oracle.
+    // These entries are REFUSED BEFORE ENTRY, and `run_direct_block`'s entry clear (E1) sits below
+    // every refusal return, so a refused entry must leave the interpreter's lazy flags exactly as
+    // it found them -- untouched, not settled. An E1 that drifted above a refusal return would
+    // move the descriptor on a path that ran no guest code, and this is what would catch it.
+    assert_eq!(cpu.pending_flags, pending);
 
     cpu.interrupt_shadow = false;
     let flat_ss = cpu.registers.segment(SegmentIndex::Ss);
@@ -825,14 +849,14 @@ fn direct_stack_call_jump_and_return_chain_matches_interpreter() {
     native_bus.trace = BusTrace::default();
     interp_bus.trace = BusTrace::default();
 
-    let registers = native.registers.clone();
+    let registers = crate::tests::settled_registers(&native);
     let memory = native_bus.memory.clone();
     assert!(
         !native
             .try_run_direct_block_with_cap_for_test(&mut native_bus, entry_block, 1)
             .unwrap()
     );
-    assert_eq!(native.registers, registers);
+    assert_eq!(crate::tests::settled_registers(&native), registers);
     assert_eq!(native_bus.memory, memory);
 
     let entries = native.perf_counters().jit_direct_entries;
@@ -853,7 +877,10 @@ fn direct_stack_call_jump_and_return_chain_matches_interpreter() {
         interp.cycle(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(native_bus.memory, interp_bus.memory);
@@ -891,7 +918,10 @@ fn direct_stack_call_jump_and_return_chain_matches_interpreter() {
         interp.cycle(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(native_bus.memory, interp_bus.memory);
@@ -1007,7 +1037,10 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
             interp.cycle(&mut interp_bus).unwrap();
         }
 
-        assert_eq!(native.registers, interp.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
         assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
         assert_eq!(native_bus.memory, interp_bus.memory);
@@ -1087,7 +1120,10 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
     );
     interp.cycle(&mut interp_bus).unwrap();
 
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(native_bus.memory, interp_bus.memory);
@@ -1280,7 +1316,10 @@ fn direct_cross_page_push_exits_before_esp_commit() {
     );
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.registers.eip, PUSH);
     assert_eq!(native.registers.esp(), INITIAL_ESP);
     assert_eq!(&native_bus.memory[..], &pristine[..]);
@@ -1294,7 +1333,10 @@ fn direct_cross_page_push_exits_before_esp_commit() {
 
     native.cycle(&mut native_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
@@ -1376,7 +1418,10 @@ fn direct_user_stack_permission_exit_preserves_fault_restart_state() {
     );
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.registers.eip, PUSH);
     assert_eq!(native.registers.esp(), INITIAL_ESP);
     assert_eq!(native.perf_counters().jit_direct_exit_permission - exits, 1);
@@ -1511,7 +1556,11 @@ fn run_memory_alu_differential(op: u8, form: u8, target: u32, old: u32, source: 
         interp.cycle(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers, "op={op} form={form}");
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "op={op} form={form}"
+    );
     assert_eq!(native.eflags(), interp.eflags(), "op={op} form={form}");
     assert_eq!(
         native.elapsed_clocks, interp.elapsed_clocks,
@@ -1600,8 +1649,7 @@ fn run_watched_memory_alu(form: u8, same_value: bool) {
         cpu.timing_rem = 0;
         cpu.core_clocks_so_far = 0;
     }
-    let registers = native.registers.clone();
-    let pending = native.pending_flags;
+    let registers = crate::tests::settled_registers(&native);
     let pending_eflags = native.eflags();
     let memory = native_bus.memory.clone();
     let exits = native.perf_counters().jit_direct_exit_code_watch;
@@ -1611,7 +1659,7 @@ fn run_watched_memory_alu(form: u8, same_value: bool) {
             .try_run_direct_block_for_test(&mut native_bus, block)
             .unwrap()
     );
-    assert_eq!(native.registers, registers);
+    assert_eq!(crate::tests::settled_registers(&native), registers);
     assert_eq!(native.eflags(), pending_eflags);
     assert_eq!(native_bus.memory, memory);
     assert_eq!(native.perf_counters().jit_direct_exit_code_watch - exits, 1);
@@ -1623,7 +1671,8 @@ fn run_watched_memory_alu(form: u8, same_value: bool) {
     }
 
     assert_eq!(
-        native.registers, interp.registers,
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
         "form={form} same={same_value}"
     );
     assert_eq!(native.eflags(), interp.eflags());
@@ -1791,8 +1840,7 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
             cpu.timing_rem = 0;
             cpu.core_clocks_so_far = 0;
         }
-        let registers = native.registers.clone();
-        let pending = native.pending_flags;
+        let registers = crate::tests::settled_registers(&native);
         let pending_eflags = native.eflags();
         let target_range = target as usize..target as usize + 4;
         let target_bytes = native_bus.memory[target_range.clone()].to_vec();
@@ -1807,7 +1855,7 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
                 .try_run_direct_block_for_test(&mut native_bus, block)
                 .unwrap()
         );
-        assert_eq!(native.registers, registers);
+        assert_eq!(crate::tests::settled_registers(&native), registers);
         assert_eq!(native.eflags(), pending_eflags);
         assert_eq!(&native_bus.memory[target_range.clone()], target_bytes);
         assert_eq!(
@@ -1847,7 +1895,10 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
             if expected_cross_page { 0x9000 } else { target }
         );
         assert_eq!(native.control.cr2, interp.control.cr2);
-        assert_eq!(native.registers, interp.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
         assert_eq!(native.eflags(), pending_eflags);
         assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(native_bus.memory, interp_bus.memory);
@@ -1909,7 +1960,8 @@ fn assert_native_matches_interpreter(code: &[u8], starts: &[u32], arm: impl Fn(&
     }
 
     assert_eq!(
-        native.registers, interp.registers,
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
         "architectural registers"
     );
     assert_eq!(native.eflags(), interp.eflags(), "materialized eflags");
@@ -2706,7 +2758,10 @@ fn direct_chain_links_across_a_segment_descriptor_neither_block_uses() {
     }
 
     assert_eq!(native.registers.eip, DONE);
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     let after = native.perf_counters().clone();
     assert_eq!(

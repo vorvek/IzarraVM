@@ -522,7 +522,8 @@ fn assert_agrees(
         interpreter.cycle(interpreter_bus).unwrap();
     }
     assert_eq!(
-        native.registers, interpreter.registers,
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter),
         "{label}: registers differ"
     );
     assert_eq!(
@@ -726,7 +727,8 @@ fn a_zero_count_preserves_the_live_descriptor() {
         );
         assert_eq!(native.eflags(), interpreter.eflags(), "count {count:#04x}");
         assert_eq!(
-            native.registers, interpreter.registers,
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interpreter),
             "count {count:#04x}"
         );
         assert_eq!(

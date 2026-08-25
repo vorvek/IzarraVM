@@ -120,7 +120,10 @@ fn mode13_read_self_loop_respects_the_tight_native_deadline() {
         interp.cycle(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.registers.eip, ENTRY);
     assert_eq!(native.registers.ecx(), 1);
@@ -311,7 +314,11 @@ fn movzx_memory_forms_match_the_interpreter_and_its_bus_clocks() {
                     interp.cycle(&mut interp_bus).unwrap();
                 }
 
-                assert_eq!(native.registers, interp.registers, "{label}: registers");
+                assert_eq!(
+                    crate::tests::settled_registers(&native),
+                    crate::tests::settled_registers(&interp),
+                    "{label}: registers"
+                );
                 assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
                 assert_eq!(
                     native.elapsed_clocks, interp.elapsed_clocks,
@@ -710,7 +717,11 @@ fn control_word_forms_match_the_interpreter_in_ram_and_in_the_aperture() {
             }
 
             assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
-            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp),
+                "{label}: registers"
+            );
             assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
             assert_eq!(
                 native.elapsed_clocks, interp.elapsed_clocks,
@@ -825,7 +836,11 @@ fn int_binary_memory_matches_the_interpreter_in_ram_and_in_the_aperture() {
         }
 
         assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
-        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,
@@ -933,7 +948,11 @@ fn imul_memory_form_matches_the_interpreter_and_its_bus_clocks() {
                 interp.cycle(&mut interp_bus).unwrap();
             }
 
-            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp),
+                "{label}: registers"
+            );
             assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
             assert_eq!(
                 native.elapsed_clocks, interp.elapsed_clocks,
@@ -1029,7 +1048,11 @@ fn imul_memory_form_handles_the_destination_as_its_own_address_base() {
     for _ in 0..3 {
         interp.cycle(&mut interp_bus).unwrap();
     }
-    assert_eq!(native.registers, interp.registers, "aliased dst/base");
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "aliased dst/base"
+    );
     assert_eq!(
         native.registers.esi(),
         TARGET.wrapping_mul(7),
@@ -1114,7 +1137,11 @@ fn imul_memory_form_materializes_a_live_descriptor_first() {
         for _ in 0..3 {
             interp.cycle(&mut interp_bus).unwrap();
         }
-        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
         // The ARCHITECTURAL flags. A tail that skipped `emit_clear_pending` and left a stale
         // descriptor owning the six arithmetic bits diverges here; a tail that materialized
         // eagerly and agrees on every architectural bit does not, and is not meant to.
@@ -1361,7 +1388,11 @@ fn grp3_imul_memory_form_matches_the_interpreter_and_its_bus_clocks() {
                 interp.cycle(&mut interp_bus).unwrap();
             }
 
-            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp),
+                "{label}: registers"
+            );
             assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
             assert_eq!(
                 native.elapsed_clocks, interp.elapsed_clocks,
@@ -1462,7 +1493,11 @@ fn grp3_imul_memory_form_handles_an_address_built_from_its_own_destinations() {
     for _ in 0..3 {
         interp.cycle(&mut interp_bus).unwrap();
     }
-    assert_eq!(native.registers, interp.registers, "aliased base and index");
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "aliased base and index"
+    );
     assert_eq!(
         native.registers.eax(),
         BASE.wrapping_mul(7),
@@ -1544,7 +1579,11 @@ fn grp3_imul_memory_form_materializes_a_live_descriptor_first() {
         for _ in 0..3 {
             interp.cycle(&mut interp_bus).unwrap();
         }
-        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
         assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,
@@ -2194,7 +2233,8 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
         case.name
     );
     assert_eq!(
-        direct.registers, interpreter.registers,
+        crate::tests::settled_registers(&direct),
+        crate::tests::settled_registers(&interpreter),
         "{} {mode:?}",
         case.name
     );
@@ -2335,7 +2375,10 @@ fn quake_descriptors_admit_a_finite_cs_register_loop_natively() {
         interp.cycle(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(native.perf_counters().jit_direct_entries - entries, 1);
@@ -2406,7 +2449,10 @@ fn paged_quake_ds_ss_bases_match_load_store_and_call() {
         interp.cycle(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.registers.eip, TARGET);
     assert_eq!(native.registers.esp(), 0x2000);
@@ -2488,7 +2534,10 @@ fn finite_cs_near_returns_run_directly_and_match_interpreter() {
             interp.cycle(&mut interp_bus).unwrap();
         }
 
-        assert_eq!(native.registers, interp.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
         assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
         assert_eq!(
@@ -2561,7 +2610,10 @@ fn finite_cs_ret_limit_exit_case(stack_physical: u32) {
     );
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.registers.eip, RET);
     assert_eq!(native.registers.esp(), INITIAL_ESP);
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
@@ -2594,7 +2646,10 @@ fn finite_cs_ret_limit_exit_case(stack_physical: u32) {
             })
         ));
     }
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.registers.eip, RET);
     assert_eq!(native.registers.esp(), INITIAL_ESP);
     assert_eq!(native_bus.memory, interp_bus.memory);
@@ -2671,7 +2726,10 @@ fn nonflat_segment_limit_and_permission_fallbacks_are_transactional() {
         for _ in 0..3 {
             interp.cycle(&mut interp_bus).unwrap();
         }
-        assert_eq!(native.registers, interp.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
         assert_eq!(native.registers.eip, STORE);
         assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(&native_bus.memory[TARGET..TARGET + 4], &[0; 4]);
@@ -2693,7 +2751,10 @@ fn nonflat_segment_limit_and_permission_fallbacks_are_transactional() {
                 })
             ));
         }
-        assert_eq!(native.registers, interp.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
         assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(&native_bus.memory[TARGET..TARGET + 4], &[0; 4]);
         assert_eq!(&interp_bus.memory[TARGET..TARGET + 4], &[0; 4]);
@@ -2944,7 +3005,10 @@ fn quake_word_renderer_families_match_interpreter_state_flags_memory_and_timing(
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
 
-    assert_eq!(direct.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&direct),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(direct.eflags(), interpreter.eflags());
     assert_eq!(direct_bus.memory, interpreter_bus.memory);
     assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
@@ -3282,7 +3346,11 @@ fn movzx_register_forms_read_the_right_byte_lane() {
             for _ in 0..3 {
                 interp.cycle(&mut interp_bus).unwrap();
             }
-            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp),
+                "{label}: registers"
+            );
             assert_eq!(
                 native.eflags(),
                 interp.eflags(),
@@ -3363,7 +3431,11 @@ fn movzx_register_forms_cover_widths_polarity_and_aliasing() {
             for _ in 0..3 {
                 interp.cycle(&mut interp_bus).unwrap();
             }
-            assert_eq!(native.registers, interp.registers, "{label}: registers");
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp),
+                "{label}: registers"
+            );
             assert_eq!(
                 native.eflags(),
                 interp.eflags(),
@@ -3523,7 +3595,10 @@ fn finite_cs_ret_valid_target_case(stack_physical: u32) {
         native.registers.eip, RETURN_TO,
         "the RET must return to the popped address, not to a counter constant"
     );
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.registers.esp(), INITIAL_ESP + 4);
     // No clock comparison here. A COMPLETED block and three interpreter cycles do not present
     // the same accounting boundary (the block charges its own total, the interpreter charges
@@ -3609,7 +3684,10 @@ fn word_ret_through_a_mode13_stack_page_returns_to_the_popped_address() {
         native.registers.eip, RETURN_TO,
         "the 16-bit RET must return to the popped word, not to a cleared register"
     );
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.registers.esp(), INITIAL_ESP + 2);
 }
 
@@ -3890,7 +3968,10 @@ fn a_jmp_through_memory_whose_source_is_the_mode13_aperture_lowers_and_matches_t
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -3969,7 +4050,10 @@ fn finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_pr
     );
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(
         native.registers.eip, JMP,
         "the side exit must leave EIP at the jump itself: JmpMem writes EIP only after every \
@@ -4022,7 +4106,10 @@ fn finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_pr
             })
         ));
     }
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
 }
 
@@ -4118,7 +4205,11 @@ fn fld_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
         }
 
         assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
-        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,
@@ -4224,7 +4315,11 @@ fn fstp_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
         }
 
         assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
-        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,
@@ -4337,7 +4432,11 @@ fn fild_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
         }
 
         assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
-        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,
@@ -4456,7 +4555,11 @@ fn fild_m64_above_2_32_and_2_53_matches_the_interpreter_mid_block() {
         }
 
         assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
-        assert_eq!(native.registers, interp.registers, "{label}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,

@@ -387,7 +387,11 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) -> u64 {
         let native = run_to_halt(&mut direct, &mut direct_bus, case);
 
         assert_eq!(native, interpreted, "run outcome differs: {case:#?}");
-        assert_eq!(direct.registers, interpreter.registers, "{case:#?}");
+        assert_eq!(
+            crate::tests::settled_registers(&direct),
+            crate::tests::settled_registers(&interpreter),
+            "{case:#?}"
+        );
         assert_eq!(direct.registers.eip, interpreter.registers.eip, "{case:#?}");
         assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
         assert_eq!(direct.fpu, expected_fpu, "direct x87 changed: {case:#?}");

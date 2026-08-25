@@ -308,7 +308,8 @@ fn imm8_lane_matches_the_interpreter_across_patches_for_every_alu_op() {
 
                 let label = format!("op {op} dst {dst} patch {imm:#04x}");
                 assert_eq!(
-                    native.registers, interpreter.registers,
+                    crate::tests::settled_registers(&native),
+                    crate::tests::settled_registers(&interpreter),
                     "{label}: registers differ"
                 );
                 assert_eq!(

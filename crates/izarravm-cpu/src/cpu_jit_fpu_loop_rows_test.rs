@@ -695,7 +695,8 @@ fn finish(mut fixture: Fixture, expect_retired: u8, context: &str) -> Fixture {
         assert_eq!(side_exits, 1, "expected exactly one side exit: {context}");
     }
     assert_eq!(
-        fixture.native.registers, fixture.interpreter.registers,
+        crate::tests::settled_registers(&fixture.native),
+        crate::tests::settled_registers(&fixture.interpreter),
         "registers differ: {context}"
     );
     assert_eq!(

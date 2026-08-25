@@ -322,7 +322,8 @@ fn compare_state(roles: &Roles, context: &str) {
 /// than merely stored.
 fn compare_observable(roles: &Roles, context: &str) {
     assert_eq!(
-        roles.native.registers, roles.interp.registers,
+        crate::tests::settled_registers(&roles.native),
+        crate::tests::settled_registers(&roles.interp),
         "{context}: registers"
     );
     assert_eq!(
@@ -387,7 +388,8 @@ fn consumed(body: &[u8], seed: Seed, context: &str) {
     // instruction whose job is to prove the width is guest-visible. The full exit comparison for
     // these same rows lives in `..._descriptor_matches_the_interpreter`.
     assert_eq!(
-        roles.native.registers, roles.interp.registers,
+        crate::tests::settled_registers(&roles.native),
+        crate::tests::settled_registers(&roles.interp),
         "{context}: at the exit: registers"
     );
     assert_eq!(
