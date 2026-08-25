@@ -155,6 +155,12 @@ pub(crate) struct Encoder {
     bytes: Vec<u8>,
     label_positions: Vec<Option<usize>>,
     patches: Vec<Patch>,
+    /// Flag-producing slots this emission lowered through the EAGER arm
+    /// (`IZARRAVM_DIRECT_EAGER_FLAGS`), by `EagerFlagsClass`. See
+    /// `EmittedCode::eager_flags_sites` for what it does and does not measure. Carried on the
+    /// Encoder rather than threaded through the emitters because the sites sit several helper
+    /// frames below the compile walk, where no return value reaches.
+    eager_flags_sites: [u16; crate::jit::direct::EAGER_FLAGS_CLASSES],
 }
 
 impl Encoder {
@@ -163,7 +169,18 @@ impl Encoder {
             bytes: Vec::new(),
             label_positions: Vec::new(),
             patches: Vec::new(),
+            eager_flags_sites: [0; crate::jit::direct::EAGER_FLAGS_CLASSES],
         }
+    }
+
+    /// Charge one EAGER-arm flag publish to its class. Emission-time only: this runs while a
+    /// block is being compiled and never while one executes.
+    pub(crate) fn note_eager_flags_site(&mut self, class: usize) {
+        self.eager_flags_sites[class] = self.eager_flags_sites[class].saturating_add(1);
+    }
+
+    pub(crate) fn eager_flags_sites(&self) -> [u16; crate::jit::direct::EAGER_FLAGS_CLASSES] {
+        self.eager_flags_sites
     }
 
     pub(crate) fn label(&mut self) -> Label {
