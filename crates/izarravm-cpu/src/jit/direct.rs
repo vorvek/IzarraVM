@@ -12928,7 +12928,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // IN AL, imm8 -- gp2's B2 residue, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
             // (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3). The lean sibling
             // of the arm above: same `port_permission_resident` two-phase probe, same shared
-            // `IN_AL_CORE_CLOCKS` charge, no poll-skip scan (rev 3 §1.4).
+            // `IN_PORT_CORE_CLOCKS` charge, no poll-skip scan (rev 3 §1.4).
             //
             // `classify` admits ANY immediate port here, unconditionally (rev 3 §1.1, ROUND-2
             // item 5 correction): the per-port-class safety table the design carries is a PROOF
@@ -23568,7 +23568,7 @@ pub(crate) enum CallOutHelper {
     /// (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3).
     ///
     /// The LEAN sibling of `PortReadAlDx`: same two-phase TSS-bitmap probe
-    /// (`port_permission_resident`), same shared `IN_AL_CORE_CLOCKS` charge, same
+    /// (`port_permission_resident`), same shared `IN_PORT_CORE_CLOCKS` charge, same
     /// `preview_scale_clocks` remainder carry, but no poll-skip scan (rev 3 §1.4 -- the scan's own
     /// shape needs a one-byte IN fetch and this form is two bytes) and no `slot_delta` (nothing to
     /// scan backward from). The port is a compile-time IMMEDIATE rather than a live register, so
@@ -23766,6 +23766,15 @@ fn helper_offset(helper: CallOutHelper) -> i32 {
         CallOutHelper::InterpretOne { .. } => core::mem::offset_of!(CallOutTable, interpret_one),
     };
     (core::mem::offset_of!(CpuGsw, native_callout) + field) as i32
+}
+
+/// Reachable from the fixtures: `helper_offset` itself stays module-private (every real caller is
+/// inside this file), but `call_out_helper_match_exhaustiveness_is_a_compile_time_property`
+/// (`cpu_jit_callout_test.rs`) needs it to give the exhaustiveness claim a runtime body rather than
+/// an empty one (ROUND-3 review m3-4).
+#[cfg(test)]
+pub(crate) fn helper_offset_for_test(helper: CallOutHelper) -> i32 {
+    helper_offset(helper)
 }
 
 /// What phase P learned, and the only thing phase C is allowed to use. Physicals rather than
@@ -24186,7 +24195,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
 /// `IZARRAVM_DIRECT_IN_IMM8_CALLOUT` (gp2 in-imm8 callout design rev 3).
 ///
 /// The LEAN sibling of `port_read_al_dx`: same phase P (`port_permission_resident`), same phase C
-/// charged re-reads, same shared `IN_AL_CORE_CLOCKS` charge and the same `preview_scale_clocks`
+/// charged re-reads, same shared `IN_PORT_CORE_CLOCKS` charge and the same `preview_scale_clocks`
 /// remainder carry -- but with the whole GP2 call-out-site poll-skip block deleted (rev 3 §1.4: the
 /// scan's own `debug_assert` requires a `len == 1` IN fetch, which this form's two-byte encoding
 /// cannot satisfy, and the shape it certifies is wrong for this routine besides), and with no

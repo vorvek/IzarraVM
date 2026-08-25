@@ -2357,6 +2357,13 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
 //
 // Every positive fixture states the knob through `select_in_imm8_callout`, in both directions, for
 // `cpu_jit_test_word_row_test.rs`'s reason: the default is OFF.
+//
+// `select_in_imm8_callout` returns a DROP GUARD rather than leaving the reset to the caller's own
+// last statement (ROUND-3 review m3-6): a panicking assertion partway through a fixture used to
+// skip the trailing `set_direct_in_imm8_callout_for_test(None)`, and under `--test-threads=1`
+// every test shares the main thread, so a leaked `Some(true)` could silently arm a LATER fixture
+// that meant to read the shipped default. `Drop::drop` runs during unwind too, so the guard resets
+// the arm on every exit path, panicking or not, and removes the ordering dependency entirely.
 // =================================================================================================
 
 /// A port that fits the imm8 encoding. Distinct from `PORT` (0x03da, `0xEC`'s fixture port) only
@@ -2365,15 +2372,32 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
 /// enforced by `insn.imm`'s `u8` fetch, and is covered in `cpu_jit_in_imm8_callout_test.rs`).
 const IMM8_PORT: u16 = 0x40;
 
-fn select_in_imm8_callout(enabled: bool) {
+/// Resets `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`'s thread-local override to the ambient reading when
+/// dropped -- including on unwind, which is what closes the m3-6 gap a plain trailing reset left
+/// open.
+#[must_use]
+struct InImm8CalloutGuard;
+
+impl Drop for InImm8CalloutGuard {
+    fn drop(&mut self) {
+        jit::direct::set_direct_in_imm8_callout_for_test(None);
+    }
+}
+
+fn select_in_imm8_callout(enabled: bool) -> InImm8CalloutGuard {
     jit::direct::set_direct_in_imm8_callout_for_test(Some(enabled));
     assert_eq!(jit::direct::direct_in_imm8_callout_armed(), enabled);
+    InImm8CalloutGuard
 }
 
 /// Build the three-slot block `mov esi,esi` / `in al,PORT` / `mov edi,edi`, with the call-out
 /// MID-BLOCK -- `slot_block_with`'s shape, for `0xE4` instead of `0xEC`. Requires the knob ON.
+///
+/// The guard is scoped to THIS function, not held by the caller: `classify` is consulted only
+/// during the `compile` call below, so the arm only has to be live for that long, and the caller's
+/// later `try_run_direct_block_for_test` runs an already-compiled block that never re-reads it.
 fn slot_block_imm8(port: u8, configure: impl Fn(&mut TestBus)) -> (Fixture, CpuGsw, TestBus) {
-    select_in_imm8_callout(true);
+    let _guard = select_in_imm8_callout(true);
     let mut code = vec![0x89, 0xf6];
     let body_at = ENTRY + code.len() as u32;
     code.push(0xe4);
@@ -2647,6 +2671,13 @@ fn imm8_engagement_counter_is_separate_from_the_shared_executed_count() {
         "the ring-0 arm still bumps the engagement counter -- it fires on EVERY served \
          execution, not only the V86/CPL>IOPL bitmap arm (unlike callout_port_v86_served)"
     );
+    // ROUND-3 review m3-5: the non-conflation the helper's own comment states as an invariant
+    // ("bumping it here too would conflate the two opcodes' engagement on a guest that runs both")
+    // was never pinned. `0xEC`'s bitmap-arm counter must stay at zero for an `0xE4` execution.
+    assert_eq!(
+        stalls.callout_port_v86_served, 0,
+        "the imm8 arm must never bump the DX arm's bitmap-serve counter"
+    );
 
     // An ABNORMAL execution must not bump it.
     let mut cpu2 = flat_cpu();
@@ -2700,53 +2731,83 @@ fn imm8_bus_read_io_argument_fidelity() {
     );
 }
 
-/// The mutant/pendency table's "pendency / mid-block visibility" gate.
+/// The mutant/pendency table's "pendency / mid-block visibility" gate, rev 3 §8.1: "a
+/// `brk_interrupt`/pendency fixture shows a divergence from the interpreted path, proving the real
+/// PIT's read-only property is load-bearing" -- REBUILT per ROUND-3 review M3-1.
 ///
-/// The call-out mechanism makes NO check of `bus.interrupt_pending()` anywhere in its own code --
-/// neither phase P, phase C, nor the status it returns consults it. Its correctness rests entirely
-/// EXTERNALLY, on the per-port-class table `classify`'s `0xe4` arm carries: an admitted port class
-/// either sets `io_touched` (self-terminating: `requires_step_break()` ends the block at the slot,
-/// so nothing downstream can see a stale pendency answer) or it is a PURE PEEK that cannot newly
-/// arm the PIC (the PIT counter argument). This fixture proves the first half of that claim by
-/// exhibiting its ABSENCE: even a device that (wrongly, unlike the real PIT) arms `pending_irq` as
-/// a side effect of a lazy read produces a BYTE-IDENTICAL status and BYTE-IDENTICAL step-break
-/// decision to a faithful one -- the helper cannot tell the two apart, which is exactly why the
-/// real PIT's read-only property (never explored inside this crate; it lives in
-/// `izarravm-machine`) is LOAD-BEARING rather than redundant belt-and-braces.
+/// The first version of this fixture ran only the HELPER, in isolation, and asserted that nothing
+/// about its own return value moved when the device wrongly armed `pending_irq`. That is a gate
+/// that CANNOT GO RED if the safety proof it stands behind were violated: it never exercised the
+/// interpreted path, so it had nothing to compare against and nothing that could diverge --
+/// `[[gates-that-cannot-fail-are-systemic]]`.
+///
+/// This version runs the SAME guest instruction, from the SAME seeded state, against the SAME
+/// wrongly-arming device, through BOTH paths -- the native helper and `cycle()` -- and asserts they
+/// AGREE. `run.rs:892`'s `can_take_interrupt` never consults the bus, and `requires_step_break()`
+/// (`run.rs:933`, `TestBus`'s own impl reads `self.io_touched` alone) is false on a lazy read for
+/// the interpreted path too, so agreement is the EXPECTED result -- a STRONGER fact than the
+/// original design row asked for: even against a device that violates the pure-peek assumption,
+/// the two paths reach the same guest state and the same block-continuation decision, because
+/// there is nowhere in EITHER path that a wrongly-armed interrupt could make them diverge. The real
+/// PIT's read-only property is still what the correctness argument rests on for the ADMITTED
+/// classes (an admission that consulted `interrupt_pending()` would need this fixture to fail it,
+/// which is exactly what the mutation below does).
 #[test]
-fn imm8_the_call_out_mechanism_is_blind_to_a_wrongly_arming_device() {
+fn imm8_the_call_out_mechanism_agrees_with_the_interpreter_against_a_wrongly_arming_device() {
     for arms_pending in [false, true] {
-        let mut cpu = flat_cpu();
-        cpu.registers.set_eax(0xdead_beef);
-        let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
-        bus.lazy_io_reads = true;
-        bus.io_read_value = Some(0x5a);
-        bus.io_read_arms_pending_irq = arms_pending;
+        // The native leg: the helper alone.
+        let mut native = flat_cpu();
+        native.registers.set_eax(0xdead_beef);
+        let mut native_bus = TestBus::with_memory(vec![0u8; 0x5000]);
+        native_bus.lazy_io_reads = true;
+        native_bus.io_read_value = Some(0x5a);
+        native_bus.io_read_arms_pending_irq = arms_pending;
 
-        let status = jit::direct::port_read_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, IMM8_PORT);
-
+        let status =
+            jit::direct::port_read_al_imm8_for_test(&mut native, &mut native_bus, 0, 0, IMM8_PORT);
         assert!(status >= 0, "arms_pending={arms_pending}");
+        let native_step_break = status >> jit::direct::STATUS_STEP_BREAK_BIT != 0;
+
+        // The interpreted leg: the SAME instruction, from the SAME seed, against the SAME
+        // wrongly-arming device shape, through the real per-instruction path -- the oracle this
+        // fixture was missing.
+        let mut interp = flat_cpu();
+        interp.registers.set_eax(0xdead_beef);
+        let mut interp_bus = TestBus::with_memory(vec![0u8; 0x5000]);
+        interp_bus.lazy_io_reads = true;
+        interp_bus.io_read_value = Some(0x5a);
+        interp_bus.io_read_arms_pending_irq = arms_pending;
+        interp_bus.memory[ENTRY as usize] = 0xe4;
+        interp_bus.memory[ENTRY as usize + 1] = IMM8_PORT as u8;
+        interp.set_eip(ENTRY);
+        interp
+            .cycle(&mut interp_bus)
+            .expect("the interpreted IN must retire");
+
+        // AGREEMENT, not blindness: the whole claim this fixture stands behind. Charge parity
+        // between the two paths is `imm8_the_helper_charges_exactly_what_the_interpreter_charges_
+        // and_reports_the_step_break`'s claim, not this one -- `native.elapsed_clocks` reads 0 by
+        // construction here (the helper charges nothing itself; the caller folds `status`'s raw
+        // clocks into the block's lane), so it is not a fixture that could see this row's hazard
+        // and is deliberately not asserted again here.
         assert_eq!(
-            status & 0xffff_ffff,
-            i64::from(IN_PORT_CORE_CLOCKS),
-            "arms_pending={arms_pending}: the charge must not move"
+            native.registers.eax(),
+            interp.registers.eax(),
+            "arms_pending={arms_pending}: AL must land the same way on both paths"
         );
         assert_eq!(
-            status >> jit::direct::STATUS_STEP_BREAK_BIT,
-            0,
-            "arms_pending={arms_pending}: a lazy, non-touching read must not end the block even \
-             when the device wrongly armed an interrupt -- the mechanism has no check that would \
-             notice"
+            native_step_break,
+            interp_bus.requires_step_break(),
+            "arms_pending={arms_pending}: the block-continuation decision must agree -- neither \
+             path may notice the wrongly-armed interrupt, which is the load-bearing claim behind \
+             run.rs:892 (can_take_interrupt never consults the bus) and run.rs:933 \
+             (requires_step_break, unaffected by pending_irq on a lazy read)"
         );
         assert_eq!(
-            cpu.registers.eax(),
-            0xdead_be5a,
-            "arms_pending={arms_pending}"
-        );
-        assert_eq!(
-            bus.interrupt_pending(),
-            arms_pending,
-            "arms_pending={arms_pending}: sanity -- the stub actually did what it claims"
+            native_bus.interrupt_pending(),
+            interp_bus.interrupt_pending(),
+            "arms_pending={arms_pending}: sanity -- both stubs actually armed as claimed, or this \
+             fixture is vacuous in both directions"
         );
     }
 }
@@ -2800,7 +2861,8 @@ fn imm8_call_out_matches_the_interpreter_mid_block() {
         interpreter_bus.trace.elapsed_clocks(),
         "bus clocks"
     );
-    jit::direct::set_direct_in_imm8_callout_for_test(None);
+    // No trailing reset here: `slot_block_imm8`'s own guard already reset the arm the moment
+    // `compile` returned, well before this point.
 }
 
 #[test]
@@ -2831,7 +2893,6 @@ fn imm8_a_step_breaking_port_ends_the_native_run_after_the_call_out() {
     let stalls = fixture.cpu.direct_stall_snapshot();
     assert_eq!(stalls.side_exit_callout_step_break, 1);
     assert_eq!(stalls.side_exit_callout_abnormal, 0);
-    jit::direct::set_direct_in_imm8_callout_for_test(None);
 }
 
 #[test]
@@ -2860,21 +2921,68 @@ fn imm8_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_eff
     let stalls = fixture.cpu.direct_stall_snapshot();
     assert_eq!(stalls.side_exit_callout_abnormal, 1);
     assert_eq!(stalls.side_exit_callout_step_break, 0);
-    jit::direct::set_direct_in_imm8_callout_for_test(None);
 }
 
 /// `CallOutHelper` exhaustiveness (mutant table gate 11): `helper_offset`, `probes_io_permission`,
 /// `moves_a_stack_frame`, `interprets_one`, `carries_a_cell` and `republishes_flags` are every one
-/// an EXHAUSTIVE `match` over `CallOutHelper` with no catch-all arm. This is a property the Rust
-/// compiler enforces at BUILD time, not at test-run time: `PortReadAlImm8` was added to all six,
-/// and `cargo check --all-features` (which this crate's CI runs, per the `direct-callout-
-/// attribution` module doc's own "a feature nobody builds is a feature that rots" lesson) is the
-/// fixture. Removing any one arm is a compile error, which is the strongest gate available and
-/// stronger than a runtime assertion could be -- there is nothing to unit-test here beyond
-/// confirming the crate builds, which the gate script already does.
+/// an EXHAUSTIVE `match` over `CallOutHelper` with no catch-all arm. The exhaustiveness itself is a
+/// property the Rust compiler enforces at BUILD time -- removing an arm from any of the six is a
+/// compile error, which no runtime assertion can strengthen -- but ROUND-3 review m3-4 is right
+/// that an EMPTY test body is this campaign's own `gates-that-cannot-fail-are-systemic` shape: it
+/// passes on any build that compiles, which says nothing about `PortReadAlImm8` in particular. This
+/// body gives it something that CAN fail: it exercises `helper_offset` (via the test-only
+/// `helper_offset_for_test`, since the real function is module-private) over every variant and
+/// checks the ONE fact the whole call-out ABI depends on -- each helper CLASS loads its function
+/// pointer from a DISTINCT, in-range `CallOutTable` field, so `PortReadAlImm8` cannot silently
+/// alias `PortReadAlDx`'s slot (or any other's) and jump to the wrong helper.
+///
+/// MUTATION that turns this red: change `PortReadAlImm8`'s arm in `helper_offset` from
+/// `offset_of!(CallOutTable, port_read_al_imm8)` to `offset_of!(CallOutTable, port_read_al_dx)` --
+/// the two offsets collapse to the same value and the distinctness assertion fails.
 #[test]
 fn call_out_helper_match_exhaustiveness_is_a_compile_time_property() {
-    // No body: this test exists so the claim above has a named anchor a reader can find from a
-    // test-name search, and so `cargo test`'s own act of compiling this file is one more build
-    // that would fail if the exhaustiveness ever regressed.
+    let cpu_gsw_size = i32::try_from(core::mem::size_of::<CpuGsw>()).unwrap();
+    let variants = [
+        ("PortReadAlDx", jit::direct::CallOutHelper::PortReadAlDx),
+        (
+            "PortReadAlImm8",
+            jit::direct::CallOutHelper::PortReadAlImm8 { port: 0x40 },
+        ),
+        ("PushAllDword", jit::direct::CallOutHelper::PushAllDword),
+        ("PopAllDword", jit::direct::CallOutHelper::PopAllDword),
+        (
+            "InterpretOne",
+            jit::direct::CallOutHelper::InterpretOne {
+                row: jit::direct::InterpretOneRow::PopRm,
+            },
+        ),
+    ];
+    let offsets: Vec<(&str, i32)> = variants
+        .iter()
+        .map(|(name, helper)| (*name, jit::direct::helper_offset_for_test(*helper)))
+        .collect();
+    for (name, offset) in &offsets {
+        assert!(
+            *offset >= 0 && *offset < cpu_gsw_size,
+            "{name}: helper_offset {offset} is out of CpuGsw's bounds"
+        );
+    }
+    for i in 0..offsets.len() {
+        for j in (i + 1)..offsets.len() {
+            assert_ne!(
+                offsets[i].1, offsets[j].1,
+                "{} and {} load their function pointer from the SAME CallOutTable field",
+                offsets[i].0, offsets[j].0
+            );
+        }
+    }
+    // A second `InterpretOneRow` must still land on the SAME field as the first: the row travels
+    // with the kind for the census, not to pick a different function pointer.
+    assert_eq!(
+        jit::direct::helper_offset_for_test(jit::direct::CallOutHelper::InterpretOne {
+            row: jit::direct::InterpretOneRow::Sti,
+        }),
+        offsets[4].1,
+        "every InterpretOneRow must share InterpretOne's one CallOutTable field"
+    );
 }

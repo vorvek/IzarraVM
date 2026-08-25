@@ -43,14 +43,29 @@ fn flat_cpu() -> CpuGsw {
     cpu
 }
 
+/// Resets the thread-local override to the ambient reading when dropped -- including on unwind
+/// (ROUND-3 review m3-6), which is what a plain trailing
+/// `set_direct_in_imm8_callout_for_test(None)` does not do: a panic partway through a fixture used
+/// to skip it, and under `--test-threads=1` a leaked `Some(true)` could silently arm a later
+/// fixture that meant to read the shipped default.
+#[must_use]
+struct InImm8CalloutGuard;
+
+impl Drop for InImm8CalloutGuard {
+    fn drop(&mut self) {
+        jit::direct::set_direct_in_imm8_callout_for_test(None);
+    }
+}
+
 /// Select the arm for this thread and PROVE the selection took.
-fn select_in_imm8_callout(enabled: bool) {
+fn select_in_imm8_callout(enabled: bool) -> InImm8CalloutGuard {
     jit::direct::set_direct_in_imm8_callout_for_test(Some(enabled));
     assert_eq!(
         jit::direct::direct_in_imm8_callout_armed(),
         enabled,
         "the fixture override must decide the arm, not the ambient IZARRAVM_DIRECT_IN_IMM8_CALLOUT"
     );
+    InImm8CalloutGuard
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -160,12 +175,11 @@ fn compile_imm8_block(port: u8) -> Option<jit::direct::Compilation> {
 /// main and destroy the base.
 #[test]
 fn in_imm8_callout_stays_a_barrier_with_the_gate_off() {
-    select_in_imm8_callout(false);
+    let _guard = select_in_imm8_callout(false);
     assert!(
         compile_imm8_block(PORT).is_none(),
         "0xE4 must not compile into a block with the gate off"
     );
-    jit::direct::set_direct_in_imm8_callout_for_test(None);
 }
 
 /// With the knob ON, `0xE4` joins the block as a `PortReadAlImm8` call-out slot carrying the
@@ -178,7 +192,7 @@ fn in_imm8_callout_stays_a_barrier_with_the_gate_off() {
 /// `cpu_jit_callout_test.rs`); and the Word-size allowlist term (exercised separately below).
 #[test]
 fn in_imm8_callout_joins_the_block_with_the_gate_on() {
-    select_in_imm8_callout(true);
+    let _guard = select_in_imm8_callout(true);
     let compilation = compile_imm8_block(PORT).expect("0xE4 must compile with the gate on");
     assert_eq!(
         compilation.span.instructions, 3,
@@ -192,7 +206,6 @@ fn in_imm8_callout_joins_the_block_with_the_gate_on() {
         compilation.callout_port_slots, 1,
         "PortReadAlImm8 is in the PORT class, exactly like PortReadAlDx"
     );
-    jit::direct::set_direct_in_imm8_callout_for_test(None);
 }
 
 /// `classify` admits `0xE4` for ANY immediate port, unconditionally (rev 3 §1.1, ROUND-2 item 5) --
@@ -200,14 +213,13 @@ fn in_imm8_callout_joins_the_block_with_the_gate_on() {
 /// port the design's own port-class table names.
 #[test]
 fn in_imm8_callout_admits_any_port_unconditionally() {
-    select_in_imm8_callout(true);
+    let _guard = select_in_imm8_callout(true);
     for port in [0x00u8, 0x40, 0x61, 0xff] {
         assert!(
             compile_imm8_block(port).is_some(),
             "port {port:#04x} must be admitted -- the arm is not port-gated"
         );
     }
-    jit::direct::set_direct_in_imm8_callout_for_test(None);
 }
 
 /// The Word-size allowlist term: `0xE4` is operand-size-invariant (the interpreter's arm always
@@ -236,13 +248,13 @@ fn in_imm8_callout_joins_a_sixteen_bit_block_with_the_gate_on() {
         cpu.fetch_decoded(&mut bus, linear).unwrap();
     }
 
-    select_in_imm8_callout(false);
+    let _off_guard = select_in_imm8_callout(false);
     assert!(matches!(
         jit::direct::compile(&mut cpu, ENTRY, false),
         jit::direct::CompileOutcome::StructuralReject(_) | jit::direct::CompileOutcome::Retry(_)
     ));
 
-    select_in_imm8_callout(true);
+    let _on_guard = select_in_imm8_callout(true);
     match jit::direct::compile(&mut cpu, ENTRY, false) {
         jit::direct::CompileOutcome::Compiled(compilation) => {
             assert_eq!(compilation.span.instructions, 3);
@@ -255,5 +267,4 @@ fn in_imm8_callout_joins_a_sixteen_bit_block_with_the_gate_on() {
             panic!("0xE4 must compile in a 16-bit segment with the gate on: retry requested")
         }
     }
-    jit::direct::set_direct_in_imm8_callout_for_test(None);
 }

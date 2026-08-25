@@ -4440,6 +4440,18 @@ fn a_dormant_keys_unbound_exits_are_attributed_to_its_retry_cause() {
 /// accident of this fixture, and it is why `RetryCause::CalloutCap` reads zero on every
 /// workload today. Five `pop dword [eax]` slots against `MAX_BLOCK_CALLOUT_SLOTS` of four:
 /// the block installs with four and the cap counter moves.
+///
+/// PRE-EXISTING at the base commit (`218699f8`), predating the gp2 in-imm8 callout design (rev 3)
+/// entirely. It is what satisfies rev 3 §8.1's `CalloutCap` mutant-table row -- (a)
+/// `callout_slot_cap_hits` bumps once, (b) a block installs holding exactly four call-out slots,
+/// (c) no retry cause is filed -- even though it drives the row with `0x8F` (`InterpretOne` class)
+/// rather than the row's own suggested "five `0xE4`s" shape. That transfers by construction: the
+/// cap is CLASS-BLIND -- `callout_slots += u8::from(kind.is_call_out())` (`direct.rs:6971`) sums
+/// every call-out class into ONE local, and the cap trip at `direct.rs:6891` reads that same local
+/// -- so a port-class instance of this row would exercise the identical code path and assert the
+/// identical three facts. ROUND-3 review M3-2: no fixture naming `PortReadAlImm8` or five `0xE4`s
+/// was ever added for this slice; this comment is the citation the review asked for in place of
+/// that fixture, not a claim that one was written.
 #[test]
 fn the_call_out_cap_shortens_the_block_instead_of_parking_the_key() {
     let code = [0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00];
