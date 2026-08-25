@@ -866,7 +866,7 @@ pub struct CalloutPollSkipRequest {
     /// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`, default 2 -- matches `try_poll_skip`'s
     /// own `low = 2` binary-search floor.
     pub min_iterations: u64,
-    /// `IZARRAVM_DIRECT_POLL_MAX_RAW`, default `u32::MAX - IN_AL_DX_CORE_CLOCKS` -- the
+    /// `IZARRAVM_DIRECT_POLL_MAX_RAW`, default `u32::MAX - IN_PORT_CORE_CLOCKS` -- the
     /// 32-bit return-lane bound (obligation 4): `raw_core_clocks * iterations` must fit
     /// under this or the low-32-bit clock lane the emitted call-out returns through
     /// would collide with the step-break / resync status bits above it.

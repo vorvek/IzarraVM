@@ -896,10 +896,14 @@ impl CpuGsw {
             // rather than lowered by it, which corrects design section 10.1 M6.
             //
             // It also bounds the one hazard the row's own pendency rule does not cover. That rule
-            // is a premise about PORTS -- devices advance after the batch and no admitted row
-            // writes one -- and an `InterpretOne` row whose operand read lands on an MMIO aperture
-            // is outside it. Such a read could make an interrupt pending inside the block; this
-            // re-check is what still ends the run at the transition when it does.
+            // is a premise about PORTS -- devices advance after the batch and no admitted
+            // `InterpretOne` row writes one -- and an `InterpretOne` row whose operand read lands
+            // on an MMIO aperture is outside it. Such a read could make an interrupt pending inside
+            // the block; this re-check is what still ends the run at the transition when it does.
+            // (The two DEDICATED port call-outs, `0xEC` and `0xE4` (gp2 in-imm8 callout design),
+            // are a separate case with their own pendency proof -- `jit/direct.rs`'s `classify`
+            // arm for `0xE4` carries the per-port-class table; this clause is about `InterpretOne`
+            // rows only and does not cover them.)
             #[cfg(feature = "jit")]
             if self.jit_direct.take_interrupt_shadow_consumed() {
                 can_take_before = false;
@@ -1927,7 +1931,7 @@ impl CpuGsw {
         // defaults), where the bus terms that normally swamp the core term vanish -- and the
         // chain-pricing `debug_assert` that `per_hop_estimate <= global_block_upper` would trip
         // on a bound that is supposed to dominate by construction.
-        // `MAX_CALL_OUT_CORE_CLOCKS`, not `IN_AL_DX_CORE_CLOCKS`: this bound cannot see which
+        // `MAX_CALL_OUT_CORE_CLOCKS`, not `IN_PORT_CORE_CLOCKS`: this bound cannot see which
         // helper a slot carries, so it prices every slot at the largest charge any admitted helper
         // returns. That is 18 (PUSHAD/POPAD) rather than 12 (IN AL,DX) as of the memory class, and
         // the constant is derived from the three per-opcode constants so a fourth helper raises it
@@ -2089,9 +2093,11 @@ impl CpuGsw {
         // would not cover it.
         //
         // Priced BY CLASS rather than at the worst helper, and that is not an optimisation, it is
-        // exactness. Every port slot charges exactly `IN_AL_DX_CORE_CLOCKS` and every memory slot
-        // exactly `PUSH_ALL_CORE_CLOCKS` (= `POP_ALL_CORE_CLOCKS`); both are the ONLY case for
-        // their class, not a worst case, so the sum is exact. Pricing both classes at the maximum
+        // exactness. Every port slot charges exactly `IN_PORT_CORE_CLOCKS` -- `PortReadAlDx` and
+        // `PortReadAlImm8` alike (gp2 in-imm8 callout design), the whole reason the constant
+        // dropped its `_DX_` -- and every memory slot exactly `PUSH_ALL_CORE_CLOCKS` (=
+        // `POP_ALL_CORE_CLOCKS`); both are the ONLY case for their class, not a worst case, so the
+        // sum is exact. Pricing both classes at the maximum
         // of the two would inflate every port-only block -- which is what doom's 20 M call-outs
         // are -- by six core clocks a slot for traffic it cannot generate, and a budget bound
         // decides admission at the margin.
@@ -2105,7 +2111,7 @@ impl CpuGsw {
         // own charge. Widening the allowlist means widening the constant, which is why the
         // constant is derived beside the per-opcode ones rather than written here.
         let callout_core_upper = u64::from(block.callout_port_slots())
-            .saturating_mul(u64::from(IN_AL_DX_CORE_CLOCKS))
+            .saturating_mul(u64::from(IN_PORT_CORE_CLOCKS))
             .saturating_add(
                 u64::from(block.callout_memory_slots())
                     .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),

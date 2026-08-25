@@ -1903,7 +1903,10 @@ fn pending_flags_offset() {
     // would leave the slice's phase-scoped bar ungradeable. This IS a cache-line reshuffle of the
     // hot region, so it is a wall confound between this binary and `main` -- which is why the
     // slice's ladder takes its base from the OFF leg of the SAME binary and opens with an A/A.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4552);
+    // The gp2 in-imm8 callout design adds `CallOutTable::port_read_al_imm8` (8 bytes), moving this
+    // pin 4552 -> 4560 -- measured off a failing-test readout, not derived. Same shape as the S2
+    // `InterpretOne` growth above: host-side window bookkeeping, not guest state.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4560);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -2759,6 +2762,11 @@ struct TestBus {
     // When true, `read_io` fails with `UnsupportedPort` -- the machine bus's only `read_io` error
     // producer, and the second member of the call-out helper's abnormal set.
     io_read_fails: bool,
+    // When true, `read_io` arms `pending_irq` as a side effect of the READ -- a device that is NOT
+    // a pure peek, the opposite of the PIT/lazy-VGA case the port call-out pendency proof rests on
+    // (gp2 in-imm8 callout design mutant table, "pendency / mid-block visibility"). Default false,
+    // so every existing fixture's device stays a pure peek unless it opts in.
+    io_read_arms_pending_irq: bool,
     // A SEQUENCE of port-read values, one consumed per `read_io`, falling back to `io_read_value`
     // once exhausted. `io_read_value` is a CONSTANT, which cannot separate "the device was read
     // again" from "the first value was cached"; a native block that re-executes must observe the
@@ -2774,6 +2782,10 @@ struct TestBus {
     // Records the `core_clocks_so_far` the CPU threaded into the most recent `read_io` call, so
     // tests can assert on it (see core_clocks_so_far_reflects_prior_instructions_not_the_in_flight).
     last_read_io_core_clocks_so_far: Option<u64>,
+    // Records the `_cpu_is_ring0_pm` argument the most recent `read_io` call threaded through, so
+    // an argument-fidelity fixture can tell a swapped `now`/`ring0` pair apart from a correct one
+    // (gp2 in-imm8 callout design mutant table, "bus.read_io argument fidelity").
+    last_read_io_ring0: Option<bool>,
     last_write_io_core_clocks_so_far: Option<u64>,
     // When true, `direct_page` hands out host-pointer pages into `memory` (mirroring the production
     // MachineBus), so data accesses take the CPU's cached host-pointer deref path instead of the
@@ -2844,10 +2856,12 @@ impl TestBus {
             lazy_io_reads: false,
             io_read_value: None,
             io_read_fails: false,
+            io_read_arms_pending_irq: false,
             io_read_sequence: Vec::new(),
             io_read_cursor: 0,
             io_reads: Vec::new(),
             last_read_io_core_clocks_so_far: None,
+            last_read_io_ring0: None,
             last_write_io_core_clocks_so_far: None,
             direct_pages_enabled: false,
             direct_pages_writable: true,
@@ -3411,7 +3425,7 @@ impl CpuBus for TestBus {
         port: u16,
         width: BusWidth,
         core_clocks_so_far: u64,
-        _cpu_is_ring0_pm: bool,
+        cpu_is_ring0_pm: bool,
     ) -> Result<u32, BusError> {
         if self.io_read_fails {
             return Err(BusError::UnsupportedPort { port });
@@ -3419,7 +3433,11 @@ impl CpuBus for TestBus {
         if !self.lazy_io_reads {
             self.io_touched = true;
         }
+        if self.io_read_arms_pending_irq {
+            self.pending_irq = Some(0);
+        }
         self.last_read_io_core_clocks_so_far = Some(core_clocks_so_far);
+        self.last_read_io_ring0 = Some(cpu_is_ring0_pm);
         self.io_reads.push((port, core_clocks_so_far));
         self.trace.push(BusCycle::new(
             BusAccessKind::IoRead,
@@ -4026,6 +4044,14 @@ mod jit_jcc_shadow;
 ))]
 #[path = "cpu_jit_callout_test.rs"]
 mod jit_callout;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_in_imm8_callout_test.rs"]
+mod jit_in_imm8_callout;
 
 #[cfg(all(
     feature = "jit",

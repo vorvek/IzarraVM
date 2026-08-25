@@ -2001,6 +2001,8 @@ pub struct DirectStallSnapshot {
     pub callout_executed: u64,
     /// Port call-outs served through the TSS-bitmap arm. See `BlockCacheStats`.
     pub callout_port_v86_served: u64,
+    /// The `PortReadAlImm8` (`0xE4`) engagement numerator. See `BlockCacheStats`.
+    pub callout_port_imm8_served: u64,
     /// The `InterpretOne` call-out family; see `DirectStallTally` for what each one denominates.
     pub callout_interpret_one_executed: u64,
     pub callout_interpret_one_resync: u64,
@@ -4619,13 +4621,18 @@ pub fn linear_address(segment: u16, offset: u16) -> usize {
     (usize::from(segment) << 4) + usize::from(offset)
 }
 
-/// What `IN AL, DX` (0xEC) charges. Named because TWO paths must charge it identically: the
-/// interpreter's `execute_port_io_decoded` arm, and the JIT's interpreter call-out slot
-/// (`jit/direct/callout.rs`), whose whole exact-clocks claim is that the two agree. A literal in
-/// each place would let them drift with nothing to notice.
-pub(crate) const IN_AL_DX_CORE_CLOCKS: u32 = 12;
+/// What every `IN` port-read form charges (`0xE4`/`0xE5`/`0xEC`/`0xED`) -- port-class, not
+/// register-class, named per gp2 in-imm8 callout design rev 3 n18: this constant was
+/// `IN_AL_DX_CORE_CLOCKS` before that slice, but `0xE4` IN AL,imm8's own JIT call-out
+/// (`PortReadAlImm8`) charges it too, and a `_DX_`-named constant shared by a helper that never
+/// reads DX would have been the naming smell this rename discharges. THREE paths must charge it
+/// identically: the interpreter's `execute_port_io_decoded` arm, and the JIT's two interpreter
+/// call-out slots (`PortReadAlDx` and `PortReadAlImm8`, `jit/direct.rs`), whose whole exact-clocks
+/// claim is that all three agree. A literal in any one place would let it drift with nothing to
+/// notice.
+pub(crate) const IN_PORT_CORE_CLOCKS: u32 = 12;
 
-/// What `PUSHA`/`PUSHAD` (0x60) charges, named for the same reason `IN_AL_DX_CORE_CLOCKS` is: the
+/// What `PUSHA`/`PUSHAD` (0x60) charges, named for the same reason `IN_PORT_CORE_CLOCKS` is: the
 /// interpreter's `execute_decoded` arm and the JIT's `PushAllDword` call-out slot must charge the
 /// same number, and both read this constant rather than a literal of their own.
 pub(crate) const PUSH_ALL_CORE_CLOCKS: u32 = 18;
@@ -4749,7 +4756,7 @@ pub(crate) const MAX_DEFERRED_CODE_WRITES: usize = 16;
 
 /// What POP r/m16/32 charges (execute.rs `0x8f`), and through `INTERPRET_ONE_MAX_CORE_CLOCKS` the
 /// whole of what an `InterpretOne` slot can deposit in the block's runtime raw lane while the S2
-/// allowlist holds one opcode. Named for the reason `IN_AL_DX_CORE_CLOCKS` is: the budget bound
+/// allowlist holds one opcode. Named for the reason `IN_PORT_CORE_CLOCKS` is: the budget bound
 /// and the interpreter must charge the SAME number, so there is one definition of it.
 pub(crate) const POP_RM_CORE_CLOCKS: u32 = 5;
 
@@ -4896,8 +4903,8 @@ pub(crate) const INTERPRET_ONE_MAX_DATA_ACCESSES: u64 = 4;
 /// fourth helper with a bigger charge raises it by construction instead of silently under-budgeting
 /// the block that carries it.
 pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
-    let a = if IN_AL_DX_CORE_CLOCKS > PUSH_ALL_CORE_CLOCKS {
-        IN_AL_DX_CORE_CLOCKS
+    let a = if IN_PORT_CORE_CLOCKS > PUSH_ALL_CORE_CLOCKS {
+        IN_PORT_CORE_CLOCKS
     } else {
         PUSH_ALL_CORE_CLOCKS
     };

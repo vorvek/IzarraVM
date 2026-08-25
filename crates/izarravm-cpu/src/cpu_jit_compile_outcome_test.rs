@@ -135,6 +135,50 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
     assert_eq!(compilation.span.guest_len, 3);
 }
 
+/// gp2 in-imm8 callout design rev 3 §8.1's `StructuralReject` gate, THE THREE-CASE FORM: a hard
+/// boundary reached at 1, 2 and 5 slots into the walk. `direct.rs:7215-7216`'s min-length guard
+/// (`slots.len() < 3`) is read ONLY below 3 slots -- `stop` is consulted there and there alone --
+/// so 1 and 2 slots must file `StructuralReject` and 5 slots must instead COMPILE, because the
+/// guard is never reached at 5. This is a BETTER gate than a single-case one (which
+/// `structural_rejection_includes_the_complete_short_prefix_and_barrier` and
+/// `three_supported_slots_compile_before_an_unsupported_barrier` already give, separately): it
+/// pins the exact boundary between reject and install in ONE fixture, which is the fact the whole
+/// gp2 in-imm8 callout slice's reachability argument turns on (rev 3 §2.1).
+///
+/// MUTATION that turns this red in EITHER direction: edit the `slots.len() < 3` guard at
+/// `direct.rs:7215-7216` and at least one of the three cases flips.
+#[test]
+fn structural_reject_boundary_sits_at_exactly_three_slots() {
+    // 0x40..=0x44 are INC EAX/ECX/EDX/EBX/ESP: five distinct one-byte, no-ModRM opcodes, so the
+    // prefix can be built to any length from 1 to 5 without repeating an instruction.
+    let prefix = [0x40u8, 0x41, 0x42, 0x43, 0x44];
+    for slots in [1usize, 2, 5] {
+        let mut code = prefix[..slots].to_vec();
+        code.push(DIRECT_BARRIER);
+        let addresses: Vec<u32> = (0..=slots as u32).map(|i| ENTRY + i).collect();
+        let (mut cpu, mut bus) = fixture(&code);
+        warm(&mut cpu, &mut bus, &addresses);
+
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        if slots < 3 {
+            let span = structural(outcome);
+            assert_eq!(
+                span.guest_len(),
+                slots as u16 + 1,
+                "slots={slots}: the rejected span must carry the whole short prefix plus the barrier"
+            );
+        } else {
+            let compilation = compiled(outcome);
+            assert_eq!(
+                usize::from(compilation.span.instructions),
+                slots,
+                "slots={slots}: a hard boundary reached with >=3 slots already collected must \
+                 install exactly what the walk had, not reject it -- `stop` is never read here"
+            );
+        }
+    }
+}
+
 #[test]
 fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
     // Not 0xFC (CLD, natively lowered already) and not 0x99/CDQ (the CHOICE THIS TEST USED TO

@@ -994,7 +994,7 @@ impl MachineBus<'_> {
 /// bit, so nothing this may admit may let `raw_core_clocks * iterations` reach it -- whatever a
 /// misconfigured `IZARRAVM_DIRECT_POLL_MAX_RAW` claims. `max_skipped_raw` can still tune the
 /// bound DOWN (a smaller request always wins the `.min`); it can never tune it up past this
-/// ceiling. The 64-clock margin comfortably covers `IN_AL_DX_CORE_CLOCKS` (12, `izarravm-cpu`,
+/// ceiling. The 64-clock margin comfortably covers `IN_PORT_CORE_CLOCKS` (12, `izarravm-cpu`,
 /// not visible from this crate) plus any other small additive term the caller folds in on top of
 /// this function's own return.
 #[cfg(feature = "jit")]
