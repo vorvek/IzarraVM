@@ -85,6 +85,31 @@ impl CpuGsw {
         self.materialized_eflags()
     }
 
+    /// A CLONE of this CPU with its lazy flags SETTLED — the base carrying the architectural value
+    /// and the descriptor torn down. The public form of what `cpu_test.rs`'s `settled_state` does
+    /// in-crate, exported for the cross-crate fixtures that cannot reach `materialize_flags`.
+    ///
+    /// # Why a cross-role comparison needs this
+    ///
+    /// `registers.eflags` together with `pending_flags` is a REPRESENTATION of the flags, not the
+    /// architectural value. Two roles at the same architectural state are free to carry different
+    /// (base, descriptor) pairs for it, and since `run_direct_block` settles on the way INTO
+    /// emitted code while the interpreter keeps its lazy flags, they routinely do. `CpuGsw` derives
+    /// `PartialEq` over every field, so comparing two roles directly compares that split.
+    ///
+    /// **Settling the base alone is NOT this rule and must not be mistaken for it.** Overwriting
+    /// `registers.eflags` with `eflags()` and leaving `pending_flags` standing still byte-compares
+    /// the descriptor through the derived `PartialEq`, and additionally constructs a state no code
+    /// path produces: a settled base with a live descriptor over it.
+    ///
+    /// **What this does NOT weaken:** a WRONG flag value still fails, because materialising is
+    /// exactly what turns a descriptor into flags. Every other field is compared byte for byte.
+    pub fn settled(&self) -> Self {
+        let mut settled = self.clone();
+        settled.materialize_flags();
+        settled
+    }
+
     pub(super) fn invalidate_code_caches(&mut self) {
         self.perf.decode_inval_other += 1;
         self.perf.code_invalidations += 1;

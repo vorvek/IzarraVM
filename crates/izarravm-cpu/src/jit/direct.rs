@@ -11473,9 +11473,15 @@ pub(crate) const EAGER_FLAGS_CLASSES: usize = 6;
 pub(crate) const EAGER_CLASS_ARITH: usize = 0;
 /// `AND`/`OR`/`XOR`/`TEST` at Word and Dword, register destination.
 pub(crate) const EAGER_CLASS_LOGIC: usize = 1;
-/// The BYTE logic arm of `emit_alu_byte_preloaded`. Its own lane because it is the one that
-/// carried a second emitted reader of the descriptor -- the RDX reload that supplies the guest
-/// byte-ALU RESULT -- and a lane that cannot move independently cannot witness that.
+/// The BYTE logic arm of `emit_alu_byte_preloaded` -- the arm that carried a second emitted reader
+/// of the descriptor, the RDX reload supplying the guest byte-ALU RESULT.
+///
+/// **The lane alone does not witness that reload, and it would be wrong to think it does.** Byte
+/// `TEST` charges this lane too (`emit_test_preloaded` at `MemoryWidth::Byte`), and byte `TEST` has
+/// no write-back and never had the reload -- so a regression that restored the reload in
+/// `emit_alu_byte_preloaded` while leaving byte `TEST` alone would keep the lane non-zero. What
+/// actually witnesses it is the byte ledger's SEPARATE ROWS: `and_al_cl` at -76 against
+/// `test_al_cl` at -69, a difference that is exactly the reload's seven bytes.
 pub(crate) const EAGER_CLASS_BYTE_LOGIC: usize = 2;
 /// `INC`/`DEC` at every width, register and memory.
 pub(crate) const EAGER_CLASS_INC_DEC: usize = 3;

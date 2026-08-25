@@ -1367,18 +1367,21 @@ fn direct_large_self_loop_bulk_fetch_uses_physical_paging_alias_timing() {
     let native_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    // THE ARCHITECTURAL FLAGS, then the rest of the structure with the flag BASES settled.
-    // `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags, and the native
-    // role settles that representation on the way into emitted code (`run_direct_block`'s entry
-    // clear) where the interpreter role keeps its lazy pair. Both reach the same architectural
-    // value; only the split between base and descriptor differs. Every other field, and every bit
-    // of EFLAGS, is still compared.
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are -- before anything settles them, or
+    // the assertion is a tautology -- then the whole structure on SETTLED CLONES.
+    //
+    // `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags, and the native role
+    // settles that representation on the way into emitted code (`run_direct_block`'s entry clear)
+    // where the interpreter role keeps its lazy pair. Both reach the same architectural value; only
+    // the split between base and descriptor differs.
+    //
+    // `CpuGsw::settled` and NOT an inline `registers.eflags = eflags()`: the inline form leaves
+    // `pending_flags` standing, and `CpuGsw` derives `PartialEq` over every field, so it would go on
+    // byte-comparing the raw descriptor -- the exact invariant this campaign released -- surviving
+    // at the only two sites reached across a crate boundary. It would also construct a state no code
+    // path produces: a settled base with a live descriptor over it.
     assert_eq!(native_cpu.eflags(), interp_cpu.eflags());
-    let mut native_settled = native_cpu.clone();
-    let mut interp_settled = interp_cpu.clone();
-    native_settled.registers.eflags = native_cpu.eflags();
-    interp_settled.registers.eflags = interp_cpu.eflags();
-    assert_eq!(native_settled, interp_settled);
+    assert_eq!(native_cpu.settled(), interp_cpu.settled());
     assert_eq!(
         native_machine.trace.elapsed_clocks(),
         interp_machine.trace.elapsed_clocks()
@@ -1602,18 +1605,21 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     let native_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    // THE ARCHITECTURAL FLAGS, then the rest of the structure with the flag BASES settled.
-    // `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags, and the native
-    // role settles that representation on the way into emitted code (`run_direct_block`'s entry
-    // clear) where the interpreter role keeps its lazy pair. Both reach the same architectural
-    // value; only the split between base and descriptor differs. Every other field, and every bit
-    // of EFLAGS, is still compared.
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are -- before anything settles them, or
+    // the assertion is a tautology -- then the whole structure on SETTLED CLONES.
+    //
+    // `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags, and the native role
+    // settles that representation on the way into emitted code (`run_direct_block`'s entry clear)
+    // where the interpreter role keeps its lazy pair. Both reach the same architectural value; only
+    // the split between base and descriptor differs.
+    //
+    // `CpuGsw::settled` and NOT an inline `registers.eflags = eflags()`: the inline form leaves
+    // `pending_flags` standing, and `CpuGsw` derives `PartialEq` over every field, so it would go on
+    // byte-comparing the raw descriptor -- the exact invariant this campaign released -- surviving
+    // at the only two sites reached across a crate boundary. It would also construct a state no code
+    // path produces: a settled base with a live descriptor over it.
     assert_eq!(native_cpu.eflags(), interp_cpu.eflags());
-    let mut native_settled = native_cpu.clone();
-    let mut interp_settled = interp_cpu.clone();
-    native_settled.registers.eflags = native_cpu.eflags();
-    interp_settled.registers.eflags = interp_cpu.eflags();
-    assert_eq!(native_settled, interp_settled);
+    assert_eq!(native_cpu.settled(), interp_cpu.settled());
     let interp_raw = interp_machine.trace.elapsed_clocks();
     let native_raw = native_machine.trace.elapsed_clocks();
     assert_eq!(

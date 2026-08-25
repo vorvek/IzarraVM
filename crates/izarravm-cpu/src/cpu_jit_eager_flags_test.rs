@@ -227,7 +227,15 @@ struct Roles {
 ///
 /// The arm is set BEFORE `compile`, which is the whole of the hazard: it is read at emission time.
 fn build(body: &[u8], seed: Seed, on: bool) -> Roles {
-    jit::direct::set_direct_eager_flags_for_test(Some(on));
+    build_with_arm(body, seed, Some(on))
+}
+
+/// `build`, with the arm given as an OVERRIDE rather than a value: `None` clears the override and
+/// compiles under whatever `IZARRAVM_DIRECT_EAGER_FLAGS` actually reads, which is the only way a
+/// fixture can see the SHIPPED default. Every other row here forces the arm, and forcing it is
+/// exactly what hides a flipped default.
+fn build_with_arm(body: &[u8], seed: Seed, arm: Option<bool>) -> Roles {
+    jit::direct::set_direct_eager_flags_for_test(arm);
 
     let mut code = LEAD.to_vec();
     let mut starts = vec![ENTRY, ENTRY + code.len() as u32];
@@ -475,21 +483,21 @@ fn eager_flags_arm_refuses_to_guess() {
 /// DEFAULT is invisible to all of them. This one clears the override first, so it reads the arm
 /// the binary actually ships, and it is the only gate a default flip can fail.
 ///
-/// It reads the arm through `compile` rather than through `eager_flags_enabled` so that a default
-/// flip which somehow failed to reach emission would fail here too.
+/// It reads the arm TWICE and the two readings are not the same check. `build_with_arm(.., None)`
+/// clears the override and compiles under the ambient reading, so the shipped default is read
+/// THROUGH EMISSION -- a default flip that somehow failed to reach the emitters would still fail
+/// here. The closing `assert!` reads the arm function directly, which is what catches a flip that
+/// reached emission but was masked by some future short-circuit.
 #[test]
 fn the_shipped_default_arm_is_off() {
-    jit::direct::set_direct_eager_flags_for_test(None);
     for shape in SHAPES {
-        // `build` sets the override, so the arm has to be cleared again after it and the block
-        // recompiled. Simpler: compile through `build`'s OFF path and then assert the AMBIENT
-        // reading agrees with it.
-        let off = build(shape.body, Seed::new(), false);
+        // NO override in force: this compiles under whatever the knob actually reads.
+        let ambient = build_with_arm(shape.body, Seed::new(), None);
         finish();
         assert_eq!(
-            off.sites,
+            ambient.sites,
             [0; jit::direct::EAGER_FLAGS_CLASSES],
-            "{}: the OFF arm registers no eager site",
+            "{}: the SHIPPED arm must register no eager site",
             shape.name
         );
     }
