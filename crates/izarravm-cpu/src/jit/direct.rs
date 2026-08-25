@@ -3449,6 +3449,16 @@ pub(crate) struct Compilation {
     /// Jcc terminators this block lowered through `emit_jcc_shadow`, by `JccShadowClass`. See
     /// `EmittedCode::jcc_shadow_sites` for what it does and does not measure.
     jcc_shadow_sites: [u16; 4],
+    /// Flag-producing slots this block lowered through the EAGER arm, by `EAGER_CLASS_*` lane.
+    /// See `EmittedCode::eager_flags_sites` for what it does and does not measure.
+    ///
+    /// Deliberately NOT folded into `DirectStallSnapshot` at install the way `jcc_shadow_sites`
+    /// is: that fold is a run-path counter and this ledger has no run-path job. Its two consumers
+    /// (the byte ledger and the arm vacuity check) both read a `Compilation` directly, and both
+    /// are fixtures -- which is why the field is `dead_code` outside a test build rather than
+    /// silently wired into a counter nobody asked for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    eager_flags_sites: [u16; EAGER_FLAGS_CLASSES],
     pub code: Vec<u8>,
 }
 
@@ -3486,6 +3496,11 @@ impl Compilation {
 
     pub(crate) fn jcc_shadow_sites(&self) -> [u16; 4] {
         self.jcc_shadow_sites
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn eager_flags_sites(&self) -> [u16; EAGER_FLAGS_CLASSES] {
+        self.eager_flags_sites
     }
 }
 
@@ -7771,6 +7786,7 @@ fn compile_with_budget(
         disp_load_widen_lanes: disp_load_widen_lane_count,
         lane_cap_refusals,
         jcc_shadow_sites: emitted.jcc_shadow_sites,
+        eager_flags_sites: emitted.eager_flags_sites,
         code: emitted.code,
     })
 }
@@ -11449,6 +11465,136 @@ pub(crate) fn parse_jcc_shadow_arm_for_test(value: Result<String, std::env::VarE
     parse_jcc_shadow_arm(value)
 }
 
+/// The EAGER-FLAGS classes, in `eager_flags_sites` lane order. One lane per emission SHAPE, not
+/// per emitter function, because the shapes are what the byte ledger prices and what the arm
+/// vacuity check has to see move independently.
+pub(crate) const EAGER_FLAGS_CLASSES: usize = 6;
+/// `ADD`/`SUB`/`CMP`/`ADC`/`SBB` and the Word lane's non-logic arm, register destination.
+pub(crate) const EAGER_CLASS_ARITH: usize = 0;
+/// `AND`/`OR`/`XOR`/`TEST` at Word and Dword, register destination.
+pub(crate) const EAGER_CLASS_LOGIC: usize = 1;
+/// The BYTE logic arm of `emit_alu_byte_preloaded` -- the arm that carried a second emitted reader
+/// of the descriptor, the RDX reload supplying the guest byte-ALU RESULT.
+///
+/// **The lane alone does not witness that reload, and it would be wrong to think it does.** Byte
+/// `TEST` charges this lane too (`emit_test_preloaded` at `MemoryWidth::Byte`), and byte `TEST` has
+/// no write-back and never had the reload -- so a regression that restored the reload in
+/// `emit_alu_byte_preloaded` while leaving byte `TEST` alone would keep the lane non-zero. What
+/// actually witnesses it is the byte ledger's SEPARATE ROWS: `and_al_cl` at -76 against
+/// `test_al_cl` at -69, a difference that is exactly the reload's seven bytes.
+pub(crate) const EAGER_CLASS_BYTE_LOGIC: usize = 2;
+/// `INC`/`DEC` at every width, register and memory.
+pub(crate) const EAGER_CLASS_INC_DEC: usize = 3;
+/// The CF-ONLY writers: `BT`, a rotate above count 1 in both its baked and its count-lane form,
+/// and `CLC`/`STC`.
+pub(crate) const EAGER_CLASS_CF_ONLY: usize = 4;
+/// `emit_commit_alu_candidate`, the ALU with a MEMORY destination.
+pub(crate) const EAGER_CLASS_MEM_COMMIT: usize = 5;
+
+/// Whether flag-producing slots publish the RBP EFLAGS shadow straight to `registers.eflags`
+/// instead of writing a lazy `PendingFlags` descriptor (`IZARRAVM_DIRECT_EAGER_FLAGS`).
+///
+/// **THE CONVENTION IS `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK`'s: unset and `""` name
+/// the SAME arm, and that arm is THE DEFAULT.** It is a BOOLEAN knob, so `0` IS a legal OFF
+/// spelling and is stated as one below -- said explicitly because the
+/// `parameter-knobs-have-no-off-spelling` trap (a `PARAMETER` knob whose `=0` ARMS it) cost a
+/// whole census, and the two conventions now coexist in this file.
+///
+/// **Default OFF.** Both mechanisms therefore exist in the shipped binary, and every claim
+/// elsewhere in this file that a descriptor writer is "dead", "not emitted" or "vacuous" is an
+/// ON-ARM claim. On the default arm the descriptor is still written, every helper is still
+/// emitted, and every argument that depends on a live descriptor is still load-bearing.
+///
+/// # What the arm changes, and what it does NOT
+///
+/// It changes only WHERE the flags of a producing slot are recorded: into the architectural
+/// `registers.eflags` word by a single store of the RBP shadow, instead of into the four-word
+/// descriptor a later reader would have recomputed them from. `emit_capture_flags` is unchanged on
+/// both arms, so which flags the slot DEFINES is identical; only the representation of the answer
+/// moves. `eflags()` agrees bit for bit on both arms, which is what the merge bars assert.
+///
+/// It is NOT a licence to publish where the caller has not captured. Every switched site publishes
+/// immediately after its own `emit_capture_flags`, under that site's own `defined` mask, so the
+/// bits the mask excludes keep their pre-slot values in the shadow and are republished unchanged
+/// -- which is `emit_commit_shift_flags`' argument, in-tree since the shift slice, applied to a
+/// mask narrower than `ARITH_FLAGS`.
+///
+/// The entry clear that makes the arm sound (`run.rs`'s E1) is NOT under this knob: it is correct
+/// on both arms and arming it would make them differ in Rust as well as in emitted code.
+pub(crate) fn eager_flags_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = EAGER_FLAGS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_eager_flags_arm(std::env::var("IZARRAVM_DIRECT_EAGER_FLAGS")))
+}
+
+/// The `IZARRAVM_DIRECT_EAGER_FLAGS` spelling table, lifted out of the `OnceLock` closure so it
+/// can be unit-tested without a process-global env write. See `eager_flags_enabled`.
+fn parse_eager_flags_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
+                            default: flag-producing slots write a lazy PendingFlags descriptor), \
+                            and `1` / `on` / `true` (the eager arm: they publish the RBP EFLAGS \
+                            shadow straight to registers.eflags)";
+    let raw = match value {
+        // Unset = OFF, and so is the empty string one arm down: this knob's nulling trap points
+        // at the ON leg, which must EXPORT `1`. See `eager_flags_enabled`.
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_DIRECT_EAGER_FLAGS is set to a value that is not valid UTF-8; {ACCEPTED}"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" => false,
+        "1" | "on" | "true" => true,
+        other => panic!(
+            "IZARRAVM_DIRECT_EAGER_FLAGS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a \
+             mistyped ladder leg would silently run the DEFAULT and be read as the arm it named \
+             doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `JCC_SHADOW_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and a fixture cannot order an env write against it.
+#[cfg(test)]
+thread_local! {
+    static EAGER_FLAGS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the eager-flags arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_DIRECT_EAGER_FLAGS` reading.
+///
+/// The arm is read at EMISSION time, so a fixture flipping it mid-run must compile its blocks
+/// after the flip -- the same hazard `set_rotate_rows_for_test` carries.
+#[cfg(test)]
+pub(crate) fn set_direct_eager_flags_for_test(forced: Option<bool>) {
+    EAGER_FLAGS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_jcc_shadow_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_eager_flags_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_eager_flags_arm(value)
+}
+
+/// Publish the RBP EFLAGS shadow to `registers.eflags`, the EAGER arm's replacement for a
+/// descriptor write, and charge the site to its class.
+///
+/// The caller must ALREADY have run its own `emit_capture_flags`, because that is what makes RBP
+/// the complete architectural word for this slot: the capture merges only the `defined` bits, so
+/// the bits outside the mask keep their pre-slot values in the shadow and this store republishes
+/// them unchanged. Publishing before the capture would commit the PREVIOUS slot's answer.
+fn emit_eager_publish(e: &mut Encoder, class: usize) {
+    e.note_eager_flags_site(class);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+}
+
 // ---- from jit/direct/disp_lanes.rs -------------------------------------------------------------
 // The three DISPLACEMENT lane matchers: which slots may read their disp32 out of guest RAM on
 // every execution instead of baking it into the emitted address arithmetic.
@@ -14432,6 +14578,16 @@ struct EmittedCode {
     /// VACUITY check: all four lanes read zero on the OFF arm, so a ladder leg whose ON arm also
     /// reads zero is vacuous and void.
     jcc_shadow_sites: [u16; 4],
+    /// Flag-producing slots this emission lowered through the EAGER arm
+    /// (`IZARRAVM_DIRECT_EAGER_FLAGS`), by `EAGER_CLASS_*` lane.
+    ///
+    /// It is a COMPILE-TIME site ledger and it is not a measurement of executed volume -- a
+    /// chained transfer runs a successor's producers without any entry of its own, and a
+    /// self-loop runs its producers arbitrarily many times per entry, so `sites x entries`
+    /// converts to nothing. Its two jobs are the arena BYTE delta (each class has its own
+    /// ON-minus-OFF cost) and the ARM VACUITY check: all six lanes read zero on the OFF arm by
+    /// construction, so a ladder leg whose ON arm also reads zero is vacuous and void.
+    eager_flags_sites: [u16; EAGER_FLAGS_CLASSES],
 }
 
 #[derive(Clone, Copy)]
@@ -16888,10 +17044,13 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             .sum::<u8>(),
         dword_stores
     );
+    // BEFORE `finish`, which consumes the encoder.
+    let eager_flags_sites = e.eager_flags_sites();
     EmittedCode {
         code: e.finish(),
         body_offset,
         jcc_shadow_sites,
+        eager_flags_sites,
     }
 }
 
@@ -19149,6 +19308,28 @@ fn emit_commit_alu_candidate(e: &mut Encoder, op: u8, source: StoreSource, width
         }
     };
 
+    // THE EAGER ARM, taken first because it collapses all three arms below into one shape.
+    //
+    // The ALU RESULT still has to be reloaded: the caller clobbers RDX between `emit_alu_candidate`
+    // and here (the write-pointer resolve, and the watched-page pack reload), which is why the OFF
+    // arm's carry path already reloads it even though nothing on that path writes RDX. What goes
+    // away is the RAX/RCX halves of `load_values` -- they exist only to fill the descriptor's `a`
+    // and `b` -- and, on the carry-bearing ops, the whole three-instruction head test: it selects
+    // between two DESCRIPTOR shapes, and with no descriptor the two arms are the same store.
+    if eager_flags_enabled() {
+        capture(
+            e,
+            if matches!(op, 1 | 4 | 6) {
+                LOGIC_FLAGS
+            } else {
+                ARITH_FLAGS
+            },
+        );
+        e.load_r32_disp32(Reg::RDX, Reg::RSP, STACK_ALU_OLD_RESULT + 4);
+        emit_eager_publish(e, EAGER_CLASS_MEM_COMMIT);
+        return;
+    }
+
     if matches!(op, 2 | 3) {
         e.mov_r32_r32(Reg::RDI, Reg::RBP);
         e.and_r32_imm32(Reg::RDI, crate::FLAG_CF);
@@ -19249,15 +19430,27 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
         if op != 7 {
             e.mov_r16_r16(home(dst), Reg::RDX);
         }
-        // Word tag is 0x100 where Dword's is 0x200; the low byte is the operation class (0 add,
-        // 1 sub, 2 logic), the same encoding `PendingFlags::op`/`width` decode.
-        if logic {
-            emit_pending(e, 0x8000_0102, None, None, Reg::RDX);
-            // Must follow `emit_pending`: it clobbers RDX, which is the result this just stored.
-            emit_logic_live_af(e);
+        if eager_flags_enabled() {
+            emit_eager_publish(
+                e,
+                if logic {
+                    EAGER_CLASS_LOGIC
+                } else {
+                    EAGER_CLASS_ARITH
+                },
+            );
         } else {
-            let tag = if op == 0 { 0x8000_0100 } else { 0x8000_0101 };
-            emit_pending(e, tag, Some(Reg::RAX), Some(Reg::RCX), Reg::RDX);
+            // Word tag is 0x100 where Dword's is 0x200; the low byte is the operation class
+            // (0 add, 1 sub, 2 logic), the same encoding `PendingFlags::op`/`width` decode.
+            if logic {
+                emit_pending(e, 0x8000_0102, None, None, Reg::RDX);
+                // Must follow `emit_pending`: it clobbers RDX, which is the result this just
+                // stored.
+                emit_logic_live_af(e);
+            } else {
+                let tag = if op == 0 { 0x8000_0100 } else { 0x8000_0101 };
+                emit_pending(e, tag, Some(Reg::RAX), Some(Reg::RCX), Reg::RDX);
+            }
         }
         return;
     }
@@ -19278,12 +19471,24 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
 
     if matches!(op, 1 | 4 | 6) {
         emit_capture_flags(e, LOGIC_FLAGS);
-        emit_pending(e, 0x8000_0202, None, None, target);
-        emit_logic_live_af(e);
+        if eager_flags_enabled() {
+            // The EAGER arm. `emit_logic_live_af` exists because `materialized_eflags`' Logic arm
+            // cannot recompute AF and takes it from the memory base instead; with no descriptor
+            // there is nothing to recompute from, and `emit_capture_flags(LOGIC_FLAGS)` leaves
+            // RBP's AF untouched -- which is the SAME value those seven instructions write.
+            emit_eager_publish(e, EAGER_CLASS_LOGIC);
+        } else {
+            emit_pending(e, 0x8000_0202, None, None, target);
+            emit_logic_live_af(e);
+        }
     } else {
         emit_capture_flags(e, ARITH_FLAGS);
-        let tag = if op == 0 { 0x8000_0200 } else { 0x8000_0201 };
-        emit_pending(e, tag, Some(Reg::RAX), Some(Reg::RCX), target);
+        if eager_flags_enabled() {
+            emit_eager_publish(e, EAGER_CLASS_ARITH);
+        } else {
+            let tag = if op == 0 { 0x8000_0200 } else { 0x8000_0201 };
+            emit_pending(e, tag, Some(Reg::RAX), Some(Reg::RCX), target);
+        }
     }
 }
 
@@ -19297,21 +19502,33 @@ fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg) {
 
     e.alu_r32_r32(op, target, Reg::RCX);
     emit_capture_flags(e, ARITH_FLAGS);
-    emit_pending(
-        e,
-        if op == 2 { 0x8000_0200 } else { 0x8000_0201 },
-        Some(Reg::RAX),
-        Some(Reg::RCX),
-        target,
-    );
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_ARITH);
+    } else {
+        emit_pending(
+            e,
+            if op == 2 { 0x8000_0200 } else { 0x8000_0201 },
+            Some(Reg::RAX),
+            Some(Reg::RCX),
+            target,
+        );
+    }
     e.jmp(done);
 
     e.place(carry);
+    // `emit_load_host_flags` MUST SURVIVE on both arms: it feeds the host adder's CARRY-IN, which
+    // is an OPERAND of ADC/SBB and not a flag record. Only the descriptor asymmetry between the
+    // two arms collapses -- the carry arm already published and cleared, so on the eager arm the
+    // two arms end identically and the branch remains only because the two ARITHMETICS differ.
     emit_load_host_flags(e);
     e.alu_r32_r32(op, target, Reg::RCX);
     emit_capture_flags(e, ARITH_FLAGS);
-    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
-    emit_clear_pending(e);
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_ARITH);
+    } else {
+        e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+        emit_clear_pending(e);
+    }
     e.place(done);
 }
 
@@ -19344,6 +19561,15 @@ fn emit_inc_dec_reg(e: &mut Encoder, dst: u8, is_dec: bool, width: MemoryWidth) 
         }
     }
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
+    if eager_flags_enabled() {
+        // The capture mask above already EXCLUDES CF, so the shadow still carries the CF this
+        // instruction architecturally preserves -- the same value `emit_pending_inc_dec` packs
+        // into the descriptor's `cf_override`, reached by one store instead of eight
+        // instructions. The Word lane's three masking instructions go with the descriptor they
+        // fed: nothing else reads RAX or RDX here.
+        emit_eager_publish(e, EAGER_CLASS_INC_DEC);
+        return;
+    }
     if matches!(width, MemoryWidth::Word) {
         e.and_r32_imm32(Reg::RAX, 0xffff);
         e.mov_r32_r32(Reg::RDX, home(dst));
@@ -19374,7 +19600,11 @@ fn emit_inc_dec_reg8(e: &mut Encoder, dst: u8, is_dec: bool) {
     e.mov_r32_imm32(Reg::RCX, 1);
     e.alu_r8_r8(if is_dec { 5 } else { 0 }, Reg::RDX, Reg::RCX);
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
-    emit_pending_inc_dec(e, is_dec, MemoryWidth::Byte, Reg::RAX, Reg::RDX);
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_INC_DEC);
+    } else {
+        emit_pending_inc_dec(e, is_dec, MemoryWidth::Byte, Reg::RAX, Reg::RDX);
+    }
     emit_write_gpr8(e, dst, Reg::RDX);
 }
 
@@ -19437,10 +19667,36 @@ fn emit_alu_byte_preloaded(e: &mut Encoder, op: u8) {
         let host_op = if op == 7 { 5 } else { op };
         e.alu_r8_r8(host_op, Reg::RDX, Reg::RCX);
         if matches!(op, 1 | 4 | 6) {
-            emit_pending(e, 0x8000_0002, None, None, Reg::RDX);
-            emit_capture_flags(e, LOGIC_FLAGS);
-            emit_logic_live_af(e);
-            e.load_r32_disp32(Reg::RDX, Reg::R15, pending_offset() + 12);
+            if eager_flags_enabled() {
+                // THE PAIRED DELETION, and it is the defect that rejected the first revision of
+                // this slice's design. The OFF arm below ends with a RELOAD of RDX from the
+                // descriptor's `result` word -- and RDX is not a flag here, it is the guest BYTE
+                // ALU RESULT that `emit_alu_reg_byte` writes back with `emit_write_gpr8`. The
+                // reload exists for exactly one reason: `emit_logic_live_af` clobbers RDX with
+                // `mov RDX, RBP`.
+                //
+                // So the producer and the reload must be dropped TOGETHER. Dropping the producer
+                // alone would leave the reload reading a cleared or stale word and miscompile the
+                // RESULT of every byte AND/OR/XOR with write-back -- guest-visible corruption of
+                // a common shape, not merely wrong flags.
+                //
+                // With `emit_logic_live_af` gone nothing between the `alu_r8_r8` and the
+                // write-back touches RDX: `emit_capture_flags` writes only RDI and RBP, and the
+                // publish is a store. No replacement value is needed because the correct RDX is
+                // never destroyed. Both entry paths into this arm (`emit_alu_reg_byte`'s register
+                // form and `emit_alu_byte_imm`'s) establish RDX through the shared
+                // `mov RDX, RAX` above and neither touches it afterwards.
+                emit_capture_flags(e, LOGIC_FLAGS);
+                emit_eager_publish(e, EAGER_CLASS_BYTE_LOGIC);
+            } else {
+                emit_pending(e, 0x8000_0002, None, None, Reg::RDX);
+                emit_capture_flags(e, LOGIC_FLAGS);
+                emit_logic_live_af(e);
+                e.load_r32_disp32(Reg::RDX, Reg::R15, pending_offset() + 12);
+            }
+        } else if eager_flags_enabled() {
+            emit_capture_flags(e, ARITH_FLAGS);
+            emit_eager_publish(e, EAGER_CLASS_ARITH);
         } else {
             emit_pending(
                 e,
@@ -19463,22 +19719,33 @@ fn emit_carry_alu_byte(e: &mut Encoder, op: u8) {
     e.jnz(carry);
 
     e.alu_r8_r8(op, Reg::RDX, Reg::RCX);
-    emit_pending(
-        e,
-        if op == 2 { 0x8000_0000 } else { 0x8000_0001 },
-        Some(Reg::RAX),
-        Some(Reg::RCX),
-        Reg::RDX,
-    );
-    emit_capture_flags(e, ARITH_FLAGS);
+    if eager_flags_enabled() {
+        emit_capture_flags(e, ARITH_FLAGS);
+        emit_eager_publish(e, EAGER_CLASS_ARITH);
+    } else {
+        emit_pending(
+            e,
+            if op == 2 { 0x8000_0000 } else { 0x8000_0001 },
+            Some(Reg::RAX),
+            Some(Reg::RCX),
+            Reg::RDX,
+        );
+        emit_capture_flags(e, ARITH_FLAGS);
+    }
     e.jmp(done);
 
     e.place(carry);
+    // `emit_load_host_flags` survives on both arms: the carry-in is an OPERAND. See
+    // `emit_carry_alu_preloaded`.
     emit_load_host_flags(e);
     e.alu_r8_r8(op, Reg::RDX, Reg::RCX);
     emit_capture_flags(e, ARITH_FLAGS);
-    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
-    emit_clear_pending(e);
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_ARITH);
+    } else {
+        e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+        emit_clear_pending(e);
+    }
     e.place(done);
 }
 
@@ -19486,8 +19753,12 @@ fn emit_test(e: &mut Encoder, a: u8, b: u8) {
     e.mov_r32_r32(Reg::RDX, home(a));
     e.alu_r32_r32(4, Reg::RDX, home(b));
     emit_capture_flags(e, LOGIC_FLAGS);
-    emit_pending(e, 0x8000_0202, None, None, Reg::RDX);
-    emit_logic_live_af(e);
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_LOGIC);
+    } else {
+        emit_pending(e, 0x8000_0202, None, None, Reg::RDX);
+        emit_logic_live_af(e);
+    }
 }
 
 fn emit_test_byte(e: &mut Encoder, a: u8, b: u8) {
@@ -19550,7 +19821,11 @@ fn emit_neg_reg(e: &mut Encoder, dst: u8) {
     e.xor_r64_self(home(dst));
     e.alu_r32_r32(5, home(dst), Reg::RCX);
     emit_capture_flags(e, ARITH_FLAGS);
-    emit_pending(e, 0x8000_0201, None, Some(Reg::RCX), home(dst));
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_ARITH);
+    } else {
+        emit_pending(e, 0x8000_0201, None, Some(Reg::RCX), home(dst));
+    }
 }
 
 fn emit_mul_reg(e: &mut Encoder, src: u8) {
@@ -19891,6 +20166,17 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
         }
     }
     emit_capture_flags(e, LOGIC_FLAGS);
+    if eager_flags_enabled() {
+        emit_eager_publish(
+            e,
+            if matches!(width, MemoryWidth::Byte) {
+                EAGER_CLASS_BYTE_LOGIC
+            } else {
+                EAGER_CLASS_LOGIC
+            },
+        );
+        return;
+    }
     emit_pending(
         e,
         match width {
@@ -20052,6 +20338,20 @@ fn emit_commit_shift_flags(e: &mut Encoder, count: u8) {
 /// does NOT materialize on a single-bit CF write, so the two would agree on `eflags()` and differ
 /// on every byte of the raw descriptor, which the campaign compares.
 fn emit_set_cf_only(e: &mut Encoder) {
+    if eager_flags_enabled() {
+        // THE EAGER ARM. The whole function below exists to route CF around a LIVE descriptor,
+        // and under the eager arm there is never one: the has-pending bit is provably zero at
+        // every point in a native block, so the `jz` always takes the no-descriptor arm, and that
+        // arm reduces to "write RBP's CF into eflags, preserving the other five bits". The caller
+        // has already captured CF into RBP and RBP's other bits are its own pre-slot values, so
+        // publishing the whole shadow IS that write.
+        //
+        // Bit 1 comes along for free rather than being reproduced: `set_flag`'s `eflags |= 0x2`
+        // is a no-op against RBP, whose bit 1 is invariantly set -- it is loaded from the entry
+        // flags word and every RBP writer masks by a `defined` set that excludes 0x2.
+        emit_eager_publish(e, EAGER_CLASS_CF_ONLY);
+        return;
+    }
     let no_descriptor = e.label();
     let done = e.label();
     e.load_r32_disp32(Reg::RDI, Reg::R15, pending_offset());
@@ -20617,6 +20917,21 @@ fn emit_pending(e: &mut Encoder, tag: u32, a: Option<Reg>, b: Option<Reg>, resul
 }
 
 fn emit_clear_pending(e: &mut Encoder) {
+    if eager_flags_enabled() {
+        // NOT EMITTED on the eager arm, and it is provably a no-op there rather than merely
+        // usually one. The descriptor is `Default` from the entry clear (`run.rs`'s E1) onwards,
+        // and on this arm NOTHING inside a native block writes it: every producer publishes the
+        // RBP shadow to `registers.eflags` instead, the two emitted READERS both belong to arms
+        // that are not emitted, and the only mid-block path that can install one -- the
+        // interpreter inside an `InterpretOne` call-out -- tears it down again in `publish_flags`
+        // on the way out. So these four stores would write zero over zero.
+        //
+        // Dropping them is the single largest byte saving in the slice (four `disp32` immediate
+        // stores, 44 bytes, at eighteen sites), and it is also the reason the arm-gated
+        // `pending_flags.is_none()` assertion exists: if some future producer is added on this
+        // arm without a publish, there is no longer a clear downstream to hide it.
+        return;
+    }
     let base = pending_offset();
     for offset in [0, 4, 8, 12] {
         e.store_u32_imm_disp32(Reg::R15, base + offset, 0);
@@ -20896,7 +21211,11 @@ fn emit_rmw_inc_dec(
         MemoryWidth::Dword => e.alu_r32_imm32(if is_dec { 5 } else { 0 }, Reg::RAX, 1),
     }
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
-    emit_pending_inc_dec(e, is_dec, width, Reg::RCX, Reg::RAX);
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_INC_DEC);
+    } else {
+        emit_pending_inc_dec(e, is_dec, width, Reg::RCX, Reg::RAX);
+    }
     match width {
         MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
             unreachable!("group 5 INC/DEC is word or dword")
@@ -21030,7 +21349,11 @@ fn emit_rmw_inc_dec_dword(
     e.mov_r32_r32(Reg::RAX, Reg::RCX);
     e.alu_r32_imm32(if is_dec { 5 } else { 0 }, Reg::RAX, 1);
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
-    emit_pending_inc_dec(e, is_dec, MemoryWidth::Dword, Reg::RCX, Reg::RAX);
+    if eager_flags_enabled() {
+        emit_eager_publish(e, EAGER_CLASS_INC_DEC);
+    } else {
+        emit_pending_inc_dec(e, is_dec, MemoryWidth::Dword, Reg::RCX, Reg::RAX);
+    }
     e.store_r32_disp8(Reg::RDX, 0, Reg::RAX);
     emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
 }
@@ -23111,6 +23434,15 @@ fn emit_x87_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
 //    evaluates to the same flags after POPAD has overwritten the registers those values came
 //    from. Had it carried register indices, POPAD would have silently corrupted every lazy flag
 //    in flight and no reload could have fixed it.
+//
+//    **ARM-QUALIFIED, and the qualification is the point rather than a footnote: this clause is
+//    VACUOUS under `IZARRAVM_DIRECT_EAGER_FLAGS` and LIVE UNDER THE DEFAULT ARM.** On the eager
+//    arm no descriptor is ever in flight, so there is nothing to survive. On the shipped default
+//    arm the descriptor is still written by every producing slot, and clause 2 above states that
+//    RBP must NOT be reloaded across the call -- so a descriptor produced by an earlier slot
+//    genuinely IS in flight across a PUSHAD/POPAD, and this argument is still what protects it.
+//    Rewriting the clause as vacuous would delete a correctness argument that still guards the
+//    arm the binary ships.
 // 4. **Stack addressing follows.** Later slots' stack addresses are emitted relative to
 //    `home(4)`, which the reload has just refreshed from `registers.gpr[4]`, so a `push` after a
 //    `PUSHAD` in the same block addresses the post-PUSHAD ESP. Nothing bakes an ESP value.

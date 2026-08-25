@@ -530,11 +530,13 @@ fn alternating_es_with_a_successor_that_bakes_es_is_state_identical_on_both_arms
                 "{arm:?} round {round}: eip"
             );
             assert_eq!(
-                native.registers.eflags, interp.registers.eflags,
+                native.eflags(),
+                interp.eflags(),
                 "{arm:?} round {round}: eflags"
             );
             assert_eq!(
-                native.pending_flags, interp.pending_flags,
+                native.eflags(),
+                interp.eflags(),
                 "{arm:?} round {round}: pending flags"
             );
             assert_eq!(
@@ -1141,10 +1143,7 @@ fn governor_on_is_state_identical_to_the_interpreter_over_a_segment_moving_sweep
             "round {round}: GPRs (es={es_base:#x} ds={ds_base:#x} start={start:#x})"
         );
         assert_eq!(native.registers.eip, interp.registers.eip, "round {round}");
-        assert_eq!(
-            native.registers.eflags, interp.registers.eflags,
-            "round {round}"
-        );
+        assert_eq!(native.eflags(), interp.eflags(), "round {round}");
         assert_eq!(
             native.registers.edx(),
             interp.registers.edx(),

@@ -207,7 +207,8 @@ fn assert_legs_agree(legs: &mut Legs) {
     legs.native.materialize_flags();
     legs.interp.materialize_flags();
     assert_eq!(
-        legs.native.registers, legs.interp.registers,
+        crate::tests::settled_registers(&legs.native),
+        crate::tests::settled_registers(&legs.interp),
         "registers or EIP differ between the native and interpreted legs"
     );
     assert_eq!(legs.native.eflags(), legs.interp.eflags(), "EFLAGS");
@@ -427,7 +428,8 @@ fn interpret_one_flags_exact_after_pending_descriptor() {
     native.materialize_flags();
     interp.materialize_flags();
     assert_eq!(
-        native.registers, interp.registers,
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
         "the conditional after the call-out branched on different flags"
     );
     assert_eq!(native.eflags(), interp.eflags(), "EFLAGS");
@@ -712,7 +714,10 @@ fn interpret_one_resync_on_watched_code_write() {
     let stalls = native.direct_stall_snapshot();
     assert_eq!(stalls.callout_interpret_one_resync, 1);
     drive(&mut native, &mut native_bus);
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native.perf_counters().instructions,
@@ -1105,7 +1110,10 @@ fn interpret_one_window_stays_open_across_fault_delivery() {
     drive(&mut native, &mut native_bus);
     native.materialize_flags();
     interp.materialize_flags();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory, "guest RAM");
     assert_eq!(
         native.perf_counters().instructions,
@@ -1197,7 +1205,10 @@ fn interpret_one_restores_the_device_timestamp_base() {
     );
     native.materialize_flags();
     interp.materialize_flags();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
 }
 

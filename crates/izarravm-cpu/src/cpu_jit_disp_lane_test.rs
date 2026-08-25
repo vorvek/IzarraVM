@@ -268,17 +268,14 @@ fn disp_lane_load_matches_the_interpreter_across_patches() {
         }
 
         assert_eq!(
-            native.registers, interpreter.registers,
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interpreter),
             "registers differ after patch {disp:#010x}"
         );
         assert_eq!(
             native.eflags(),
             interpreter.eflags(),
             "EFLAGS differ after patch {disp:#010x}"
-        );
-        assert_eq!(
-            native.pending_flags, interpreter.pending_flags,
-            "lazy flags differ after patch {disp:#010x}"
         );
         let expected = native_bus.memory[disp as usize];
         assert_eq!(

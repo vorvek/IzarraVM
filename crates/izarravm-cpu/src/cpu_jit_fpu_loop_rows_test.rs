@@ -695,12 +695,9 @@ fn finish(mut fixture: Fixture, expect_retired: u8, context: &str) -> Fixture {
         assert_eq!(side_exits, 1, "expected exactly one side exit: {context}");
     }
     assert_eq!(
-        fixture.native.registers, fixture.interpreter.registers,
+        crate::tests::settled_registers(&fixture.native),
+        crate::tests::settled_registers(&fixture.interpreter),
         "registers differ: {context}"
-    );
-    assert_eq!(
-        fixture.native.pending_flags, fixture.interpreter.pending_flags,
-        "the raw lazy-flags descriptor differs: {context}"
     );
     assert_eq!(
         fixture.native.eflags(),
@@ -761,8 +758,8 @@ fn base_arm(cpu: &mut CpuGsw, eflags: u32, live_descriptor: bool) {
 ///
 /// * **A missing `emit_clear_pending`.** With a live descriptor the five loaded bits would be
 ///   recomputed from the pre-SAHF operand pair at the next reader, silently overwriting what the
-///   guest just loaded. `pending_flags` is compared as a RAW descriptor, not just through
-///   `eflags()`, so this fails even when the materialized word happens to agree.
+///   guest just loaded, which `eflags()` then reads back wrong. The `adc` reader rows below are
+///   what make that observable rather than merely stored.
 /// * **A mask widened to `ARITH_FLAGS`.** That clears OF whenever AH's bit 11 is clear -- and AH
 ///   has no bit 11. The `of` loop is what sees it: the 0x00 and 0xff AH rows both keep OF.
 /// * **A missing publish to `CpuGsw.eflags`.** RBP alone leaves the in-memory word stale for the

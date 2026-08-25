@@ -314,10 +314,10 @@ fn call_out_matches_the_interpreter_mid_block() {
         0x5a,
         "the port byte must land in AL"
     );
-    assert_eq!(fixture.cpu.registers, interpreter.registers, "registers");
     assert_eq!(
-        fixture.cpu.pending_flags, interpreter.pending_flags,
-        "lazy flags"
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter),
+        "registers"
     );
     assert_eq!(fixture.cpu.eflags(), interpreter.eflags(), "EFLAGS");
     assert_eq!(
@@ -360,7 +360,11 @@ fn a_step_breaking_port_ends_the_native_run_after_the_call_out() {
         fixture.cpu.registers.eip, interpreter.registers.eip,
         "EIP must sit AFTER the call-out"
     );
-    assert_eq!(fixture.cpu.registers, interpreter.registers, "registers");
+    assert_eq!(
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter),
+        "registers"
+    );
     assert_eq!(
         fixture.cpu.elapsed_clocks, interpreter.elapsed_clocks,
         "core clocks"
@@ -398,7 +402,8 @@ fn an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_effects(
         "only the prefix may retire"
     );
     assert_eq!(
-        fixture.cpu.registers, interpreter.registers,
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter),
         "the abnormal exit must leave exactly the pre-IN state"
     );
     assert_eq!(
@@ -2846,10 +2851,10 @@ fn imm8_call_out_matches_the_interpreter_mid_block() {
         0x5a,
         "the port byte must land in AL"
     );
-    assert_eq!(fixture.cpu.registers, interpreter.registers, "registers");
     assert_eq!(
-        fixture.cpu.pending_flags, interpreter.pending_flags,
-        "lazy flags"
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter),
+        "registers"
     );
     assert_eq!(fixture.cpu.eflags(), interpreter.eflags(), "EFLAGS");
     assert_eq!(
@@ -2889,7 +2894,10 @@ fn imm8_a_step_breaking_port_ends_the_native_run_after_the_call_out() {
         "the call-out and its prefix retire natively, the tail does not"
     );
     assert_eq!(fixture.cpu.registers.eip, interpreter.registers.eip);
-    assert_eq!(fixture.cpu.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter)
+    );
     let stalls = fixture.cpu.direct_stall_snapshot();
     assert_eq!(stalls.side_exit_callout_step_break, 1);
     assert_eq!(stalls.side_exit_callout_abnormal, 0);
@@ -2912,7 +2920,10 @@ fn imm8_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_eff
     interpreter.cycle(&mut interpreter_bus).unwrap();
 
     assert_eq!(fixture.cpu.perf_counters().jit_direct_insns - retired, 1);
-    assert_eq!(fixture.cpu.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(
         fixture.cpu.registers.eax(),
         0xdead_beef,

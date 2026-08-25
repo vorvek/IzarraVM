@@ -285,12 +285,9 @@ fn build_slots(bodies: &[&[u8]], watch: Option<u32>) -> Roles {
 /// an exact delta instead of an equality here.
 fn compare_state(roles: &Roles, context: &str) {
     assert_eq!(
-        roles.native.registers, roles.interp.registers,
+        crate::tests::settled_registers(&roles.native),
+        crate::tests::settled_registers(&roles.interp),
         "{context}: registers"
-    );
-    assert_eq!(
-        roles.native.pending_flags, roles.interp.pending_flags,
-        "{context}: lazy flags"
     );
     assert_eq!(
         roles.native.eflags(),

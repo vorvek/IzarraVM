@@ -90,6 +90,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         disp_load_widen_lanes: 0,
         lane_cap_refusals: [0; LANE_CAP_FAMILIES],
         jcc_shadow_sites: [0; 4],
+        eager_flags_sites: [0; EAGER_FLAGS_CLASSES],
         code: vec![0xc3],
     }
 }

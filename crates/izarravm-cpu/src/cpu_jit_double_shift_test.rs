@@ -210,8 +210,8 @@ fn prepare_flat(
 }
 
 fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
-    let registers = fixture.native.registers.clone();
-    let pending = fixture.native.pending_flags;
+    let registers = crate::tests::settled_registers(&fixture.native);
+    let pending_eflags = fixture.native.eflags();
     let memory = fixture.native_bus.memory.clone();
     assert!(
         !fixture
@@ -220,9 +220,14 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
             .unwrap(),
         "tight event cap admitted {context}"
     );
-    assert_eq!(fixture.native.registers, registers, "cap changed {context}");
     assert_eq!(
-        fixture.native.pending_flags, pending,
+        crate::tests::settled_registers(&fixture.native),
+        registers,
+        "cap changed {context}"
+    );
+    assert_eq!(
+        fixture.native.eflags(),
+        pending_eflags,
         "cap changed {context}"
     );
     assert_eq!(fixture.native_bus.memory, memory, "cap changed {context}");
@@ -243,12 +248,9 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     }
 
     assert_eq!(
-        fixture.native.registers, fixture.interpreter.registers,
+        crate::tests::settled_registers(&fixture.native),
+        crate::tests::settled_registers(&fixture.interpreter),
         "registers differ: {context}"
-    );
-    assert_eq!(
-        fixture.native.pending_flags, fixture.interpreter.pending_flags,
-        "lazy flags differ: {context}"
     );
     assert_eq!(
         fixture.native.eflags(),
@@ -380,8 +382,8 @@ fn watched_double_shift_writes_exit_transactionally() {
             RAM_TARGET,
             jit::fast_map::PagePermissions::UNPAGED,
         );
-        let registers = fixture.native.registers.clone();
-        let pending = fixture.native.pending_flags;
+        let registers = crate::tests::settled_registers(&fixture.native);
+        let pending_eflags = fixture.native.eflags();
         let memory = fixture.native_bus.memory.clone();
         let exits = fixture.native.perf_counters().jit_direct_exit_code_watch;
 
@@ -391,8 +393,8 @@ fn watched_double_shift_writes_exit_transactionally() {
                 .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
                 .unwrap()
         );
-        assert_eq!(fixture.native.registers, registers);
-        assert_eq!(fixture.native.pending_flags, pending);
+        assert_eq!(crate::tests::settled_registers(&fixture.native), registers);
+        assert_eq!(fixture.native.eflags(), pending_eflags);
         assert_eq!(fixture.native_bus.memory, memory);
         assert_eq!(
             fixture.native.perf_counters().jit_direct_exit_code_watch - exits,
@@ -407,10 +409,9 @@ fn watched_double_shift_writes_exit_transactionally() {
                 .cycle(&mut fixture.interpreter_bus)
                 .unwrap();
         }
-        assert_eq!(fixture.native.registers, fixture.interpreter.registers);
         assert_eq!(
-            fixture.native.pending_flags,
-            fixture.interpreter.pending_flags
+            crate::tests::settled_registers(&fixture.native),
+            crate::tests::settled_registers(&fixture.interpreter)
         );
         assert_eq!(fixture.native.eflags(), fixture.interpreter.eflags());
         assert_eq!(fixture.native_bus.memory, fixture.interpreter_bus.memory);
@@ -517,8 +518,8 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
         let block = install_block(&mut native, ENTRY);
         arm(&mut native, 1);
         arm(&mut interpreter, 1);
-        let registers = native.registers.clone();
-        let pending = native.pending_flags;
+        let registers = crate::tests::settled_registers(&native);
+        let pending_eflags = native.eflags();
         let memory = native_bus.memory.clone();
         let cross_exits = native
             .perf_counters()
@@ -530,8 +531,8 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
                 .try_run_direct_block_for_test(&mut native_bus, block)
                 .unwrap()
         );
-        assert_eq!(native.registers, registers);
-        assert_eq!(native.pending_flags, pending);
+        assert_eq!(crate::tests::settled_registers(&native), registers);
+        assert_eq!(native.eflags(), pending_eflags);
         assert_eq!(native_bus.memory, memory);
         assert_eq!(
             native
@@ -559,8 +560,10 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
             result_signature(interpreter_result),
             "target={target:#x}"
         );
-        assert_eq!(native.registers, interpreter.registers);
-        assert_eq!(native.pending_flags, interpreter.pending_flags);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interpreter)
+        );
         assert_eq!(native.eflags(), interpreter.eflags());
         assert_eq!(native.control.cr2, interpreter.control.cr2);
         assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -575,8 +578,8 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
         ds.limit = RAM_TARGET - 1;
         cpu.registers.set_segment(SegmentIndex::Ds, ds);
     }
-    let registers = fixture.native.registers.clone();
-    let pending = fixture.native.pending_flags;
+    let registers = crate::tests::settled_registers(&fixture.native);
+    let pending_eflags = fixture.native.eflags();
     let memory = fixture.native_bus.memory.clone();
     assert!(
         !fixture
@@ -584,8 +587,8 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
             .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
             .unwrap()
     );
-    assert_eq!(fixture.native.registers, registers);
-    assert_eq!(fixture.native.pending_flags, pending);
+    assert_eq!(crate::tests::settled_registers(&fixture.native), registers);
+    assert_eq!(fixture.native.eflags(), pending_eflags);
     assert_eq!(fixture.native_bus.memory, memory);
 
     let native_decoded = fixture.native.decode_cache.get(ENTRY, true).unwrap();
@@ -600,10 +603,10 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
     let interpreter_result = result_signature(interpreter_result);
     assert_eq!(native_result, interpreter_result);
     assert_eq!(native_result, Err((13, Some(0))));
-    assert_eq!(fixture.native.registers, fixture.interpreter.registers);
     assert_eq!(
-        fixture.native.pending_flags,
-        fixture.interpreter.pending_flags
+        crate::tests::settled_registers(&fixture.native),
+        crate::tests::settled_registers(&fixture.interpreter)
     );
+    assert_eq!(fixture.native.eflags(), fixture.interpreter.eflags());
     assert_eq!(fixture.native_bus.memory, fixture.interpreter_bus.memory);
 }

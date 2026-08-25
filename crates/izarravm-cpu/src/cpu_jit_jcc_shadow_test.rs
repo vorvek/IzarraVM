@@ -401,12 +401,9 @@ fn run_row(
         );
     }
     assert_eq!(
-        prepared.native.registers, prepared.interpreter.registers,
+        crate::tests::settled_registers(&prepared.native),
+        crate::tests::settled_registers(&prepared.interpreter),
         "{context}: registers"
-    );
-    assert_eq!(
-        prepared.native.pending_flags, prepared.interpreter.pending_flags,
-        "{context}: lazy flags"
     );
     assert_eq!(
         prepared.native.eflags(),

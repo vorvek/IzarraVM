@@ -334,7 +334,8 @@ fn run_width_case(case: &WidthCase) -> WidthOutcome {
 
 fn assert_same_state(outcome: &WidthOutcome) {
     assert_eq!(
-        outcome.native.registers, outcome.interp.registers,
+        crate::tests::settled_registers(&outcome.native),
+        crate::tests::settled_registers(&outcome.interp),
         "register or EIP state differs between the native and interpreted legs"
     );
     assert_eq!(outcome.native.eflags(), outcome.interp.eflags(), "EFLAGS");

@@ -387,7 +387,11 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) -> u64 {
         let native = run_to_halt(&mut direct, &mut direct_bus, case);
 
         assert_eq!(native, interpreted, "run outcome differs: {case:#?}");
-        assert_eq!(direct.registers, interpreter.registers, "{case:#?}");
+        assert_eq!(
+            crate::tests::settled_registers(&direct),
+            crate::tests::settled_registers(&interpreter),
+            "{case:#?}"
+        );
         assert_eq!(direct.registers.eip, interpreter.registers.eip, "{case:#?}");
         assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
         assert_eq!(direct.fpu, expected_fpu, "direct x87 changed: {case:#?}");
@@ -395,7 +399,26 @@ fn run_generated_mode(mode: GswMode, mode_offset: u32) -> u64 {
             interpreter.fpu, expected_fpu,
             "interpreter x87 changed: {case:#?}"
         );
-        assert_eq!(direct, interpreter, "full CPU state differs: {case:#?}");
+        // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are, then the whole-CPU comparison on
+        // SETTLED CLONES. `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags and
+        // not the architectural value, and two roles at the same architectural state are free to carry
+        // different (base, descriptor) pairs for it. The long argument is at
+        // `run_generated_case`'s settled-clone block, including why this does NOT weaken the
+        // comparison: a WRONG descriptor still fails, because materialising is exactly what turns it
+        // into flags.
+        assert_eq!(
+            direct.eflags(),
+            interpreter.eflags(),
+            "full CPU state differs: {case:#?}"
+        );
+        let mut direct_settled = direct.clone();
+        let mut interpreter_settled = interpreter.clone();
+        direct_settled.materialize_flags();
+        interpreter_settled.materialize_flags();
+        assert_eq!(
+            direct_settled, interpreter_settled,
+            "full CPU state differs: {case:#?}"
+        );
         assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
         assert_eq!(
             direct.elapsed_clocks, interpreter.elapsed_clocks,
@@ -652,7 +675,19 @@ fn generated_block_rebuilds_after_live_mode_change_and_honors_interrupt_shadow()
     let interpreted = run_to_halt(&mut interpreter, &mut interpreter_bus, &case);
     let native = run_to_halt(&mut direct, &mut direct_bus, &case);
     assert_eq!(native, interpreted, "{case:#?}");
-    assert_eq!(direct, interpreter, "{case:#?}");
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are, then the whole-CPU comparison on
+    // SETTLED CLONES. `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags and
+    // not the architectural value, and two roles at the same architectural state are free to carry
+    // different (base, descriptor) pairs for it. The long argument is at
+    // `run_generated_case`'s settled-clone block, including why this does NOT weaken the
+    // comparison: a WRONG descriptor still fails, because materialising is exactly what turns it
+    // into flags.
+    assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
+    let mut direct_settled = direct.clone();
+    let mut interpreter_settled = interpreter.clone();
+    direct_settled.materialize_flags();
+    interpreter_settled.materialize_flags();
+    assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
     assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
     assert_eq!(
         direct_bus.trace.elapsed_clocks(),
@@ -1066,7 +1101,19 @@ fn generated_native_prefix_preserves_fault_outcome_and_charged_clocks() {
     let interpreted = run_to_error(&mut interpreter, &mut interpreter_bus, &case);
     let native = run_to_error(&mut direct, &mut direct_bus, &case);
     assert_eq!(native, interpreted, "{case:#?}");
-    assert_eq!(direct, interpreter, "{case:#?}");
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are, then the whole-CPU comparison on
+    // SETTLED CLONES. `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags and
+    // not the architectural value, and two roles at the same architectural state are free to carry
+    // different (base, descriptor) pairs for it. The long argument is at
+    // `run_generated_case`'s settled-clone block, including why this does NOT weaken the
+    // comparison: a WRONG descriptor still fails, because materialising is exactly what turns it
+    // into flags.
+    assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
+    let mut direct_settled = direct.clone();
+    let mut interpreter_settled = interpreter.clone();
+    direct_settled.materialize_flags();
+    interpreter_settled.materialize_flags();
+    assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
     assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
     assert_eq!(
         direct_bus.trace.elapsed_clocks(),
@@ -1342,7 +1389,19 @@ fn generated_hma_load_tracks_a20_alias_and_cache_invalidation() {
         let interpreted = run_to_halt(&mut interpreter, &mut interpreter_bus, &case);
         let native = run_to_halt(&mut direct, &mut direct_bus, &case);
         assert_eq!(native, interpreted, "{case:#?}");
-        assert_eq!(direct, interpreter, "{case:#?}");
+        // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are, then the whole-CPU comparison on
+        // SETTLED CLONES. `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags and
+        // not the architectural value, and two roles at the same architectural state are free to carry
+        // different (base, descriptor) pairs for it. The long argument is at
+        // `run_generated_case`'s settled-clone block, including why this does NOT weaken the
+        // comparison: a WRONG descriptor still fails, because materialising is exactly what turns it
+        // into flags.
+        assert_eq!(direct.eflags(), interpreter.eflags(), "{case:#?}");
+        let mut direct_settled = direct.clone();
+        let mut interpreter_settled = interpreter.clone();
+        direct_settled.materialize_flags();
+        interpreter_settled.materialize_flags();
+        assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
         assert_eq!(direct_bus.inner.memory, interpreter_bus.inner.memory);
         assert_eq!(
             direct_bus.inner.trace.elapsed_clocks(),

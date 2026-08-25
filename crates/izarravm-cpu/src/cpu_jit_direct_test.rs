@@ -125,7 +125,11 @@ fn taken_and_fallthrough_jcc_timing_arm(on: bool) {
         native_outcomes, interp_outcomes,
         "run-boundary timing differs"
     );
-    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "architectural or clock state differs"
+    );
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.registers.eax(), 16);
     assert_eq!(native.registers.edx(), 16);
@@ -295,8 +299,11 @@ fn resident_chain_crosses_three_blocks_with_one_root_entry() {
         interp.cycle(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers);
-    assert_eq!(native.pending_flags, interp.pending_flags);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
+    assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -489,7 +496,10 @@ fn direct_block_replays_cold_fetch_after_internal_decode_line_collision() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -627,7 +637,10 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
             .collect::<Vec<_>>(),
         vec![(TARGET, false), (HLT, false), (HLT + 1, true)]
     );
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native.registers.eax(), 3);
     assert_eq!(native.registers.ebx(), 7);
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
@@ -743,7 +756,11 @@ fn direct_shift_keeps_raw_timing_and_flag_state() {
         interp.elapsed_clocks - interp_elapsed,
         "raw clocks were not batched exactly"
     );
-    assert_eq!(native, interp, "shift flags or pending state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "shift flags or pending state differs"
+    );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.registers.eax(), 1);
     assert_eq!(native.registers.edx(), 1);
@@ -816,10 +833,10 @@ fn assert_direct_register_case(case: &DirectRegisterCase) {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes, "{} timing", case.name);
-    assert_eq!(native, interp, "{} CPU state", case.name);
     assert_eq!(
-        native.pending_flags, interp.pending_flags,
-        "{} pending flags",
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "{} CPU state",
         case.name
     );
     assert_eq!(native.eflags(), interp.eflags(), "{} EFLAGS", case.name);
@@ -1066,7 +1083,11 @@ fn direct_mov_reg_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() 
         let native_outcomes = drive(&mut native, &mut native_bus);
 
         assert_eq!(native_outcomes, interp_outcomes, "round {round} timing");
-        assert_eq!(native, interp, "round {round} CPU state");
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp),
+            "round {round} CPU state"
+        );
         assert_eq!(native.registers.gpr, expect(ds), "round {round} GPRs");
         assert_eq!(
             native_bus.trace.elapsed_clocks(),
@@ -1203,7 +1224,11 @@ fn direct_push_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() {
         let native_outcomes = drive(&mut native, &mut native_bus);
 
         assert_eq!(native_outcomes, interp_outcomes, "round {round} timing");
-        assert_eq!(native, interp, "round {round} CPU state");
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp),
+            "round {round} CPU state"
+        );
         assert_eq!(native.registers.gpr, expect(ds), "round {round} GPRs");
         assert_eq!(
             native.registers.esp(),
@@ -1327,7 +1352,11 @@ fn direct_load_segment_real_writes_the_whole_descriptor() {
             native_outcomes, interp_outcomes,
             "selector {selector:#06x} timing"
         );
-        assert_eq!(native, interp, "selector {selector:#06x} CPU state");
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp),
+            "selector {selector:#06x} CPU state"
+        );
         assert_eq!(
             native.registers.segment(SegmentIndex::Ds),
             SegmentRegister {
@@ -1490,7 +1519,11 @@ fn direct_byte_alu_memory_destination_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes, "timing");
-    assert_eq!(native, interp, "CPU state");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "CPU state"
+    );
     assert_eq!(native.eflags(), interp.eflags(), "EFLAGS");
     assert_eq!(native_bus.memory, interp_bus.memory, "memory");
     assert_eq!(
@@ -1657,7 +1690,10 @@ fn a_mid_block_nop_executes_natively_and_changes_nothing() {
     // The whole state, so an emitted NOP that touched ANY register or flag is caught rather than
     // only the ones this fixture happens to name.
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.registers.eax(), 2);
     assert_eq!(native.registers.ebx(), 2);
@@ -1726,7 +1762,10 @@ fn supported_prefix_compiles_before_an_unsupported_barrier() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.registers.eax(), 1);
     assert_eq!(native.registers.ebx(), 3);
@@ -1798,12 +1837,15 @@ fn assert_read_parity(
     native_bus: &TestBus,
 ) {
     assert_eq!(
-        native, interp,
-        "register, EFLAGS, pending flags, or clocks differ"
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "register, architectural EFLAGS, or clock state differs"
     );
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native.eflags(), interp.eflags());
-    assert_eq!(native.pending_flags, interp.pending_flags);
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -2312,7 +2354,10 @@ fn direct_ram_stores_cover_esp_sib_scales_displacements_and_disp_only() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -2400,7 +2445,10 @@ fn direct_c6_c7_register_and_ram_immediates_keep_state_and_timing() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -2524,7 +2572,11 @@ fn immediate_ram_store_watch_and_map_miss_side_exits_are_precise() {
                 "{name}"
             );
         }
-        assert_eq!(native, interp, "{name}");
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp),
+            "{name}"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "{name}");
         assert_eq!(
             native_bus.trace.elapsed_clocks(),
@@ -2803,7 +2855,11 @@ fn adjacent_data_store_outside_watched_chunks_stays_native() {
         let native_outcomes = drive(&mut native, &mut native_bus);
 
         assert_eq!(native_outcomes, interp_outcomes, "same_value={same_value}");
-        assert_eq!(native, interp, "same_value={same_value}");
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp),
+            "same_value={same_value}"
+        );
         assert_eq!(
             native_bus.memory, interp_bus.memory,
             "same_value={same_value}"
@@ -2967,7 +3023,10 @@ fn same_value_watched_dword_store_elides_invalidation_and_replays_warm() {
     let interp_outcomes = drive(&mut interp, &mut interp_bus);
     let native_outcomes = drive(&mut native, &mut native_bus);
 
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -3105,7 +3164,11 @@ fn cross_page_and_unavailable_write_bias_exit_before_the_faulting_store() {
         let native_outcomes = drive(&mut native, &mut native_bus);
 
         assert_eq!(native_outcomes, interp_outcomes, "target={target:#x}");
-        assert_eq!(native, interp, "target={target:#x}");
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp),
+            "target={target:#x}"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "target={target:#x}");
         assert_eq!(
             native_bus.trace.elapsed_clocks(),
@@ -3173,7 +3236,10 @@ fn direct_mode13_stores_return_exact_physical_dirty_mask_and_video_timing() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -3249,7 +3315,10 @@ fn direct_mode13_reads_match_values_and_video_bus_timing() {
             .map(|outcome| u64::from(outcome.0))
             .sum::<u64>(),
     );
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native.registers.eax(), 0x5a);
     assert_eq!(native.registers.ebx(), 0x1234_5678);
     assert_eq!(
@@ -3308,7 +3377,10 @@ fn direct_block_equal_to_deadline_falls_back_before_zero_scaled_suffix() {
     let native_outcome = native.run_straight_line(&mut native_bus, 1).unwrap();
 
     assert_eq!(native_outcome, interp_outcome);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native.registers.eip, 0x10e);
     assert_eq!(native.registers.edi(), 0);
     assert_eq!(native.registers.ebp(), 0);
@@ -3503,7 +3575,11 @@ fn word_operand_size_jcc_arm() {
         native_outcomes, interp_outcomes,
         "run-boundary timing differs"
     );
-    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "architectural or clock state differs"
+    );
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.registers.eax(), 16, "the loop ran five times");
     assert!(
@@ -3619,7 +3695,11 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_stack_push() {
         native_outcomes, interp_outcomes,
         "run-boundary timing differs"
     );
-    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "architectural or clock state differs"
+    );
     assert_eq!(
         native_bus.memory, interp_bus.memory,
         "stack contents differ"
@@ -3744,7 +3824,11 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_stack_pop() {
         native_outcomes, interp_outcomes,
         "run-boundary timing differs"
     );
-    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "architectural or clock state differs"
+    );
 
     // Each destination keeps its seeded high half and takes only the popped word.
     assert_eq!(
@@ -3867,7 +3951,11 @@ fn a_word_pop_into_sp_takes_the_loaded_word_not_the_advanced_pointer() {
     drive(&mut interp, &mut interp_bus);
     drive(&mut native, &mut native_bus);
 
-    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "architectural or clock state differs"
+    );
     // The loaded word wins. Reversing the two writes would leave 0x1234_0000 here.
     // The loaded word wins over the advance. Reversing the two writes would leave 0x1234_6657
     // here, and a discarded advance is exactly why this case cannot also pin the pointer width.
@@ -3960,7 +4048,11 @@ fn direct_block_matches_the_interpreter_across_a_sixteen_bit_call() {
     drive(&mut interp, &mut interp_bus);
     drive(&mut native, &mut native_bus);
 
-    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "architectural or clock state differs"
+    );
     assert_eq!(
         native_bus.memory, interp_bus.memory,
         "stack contents differ"
@@ -4088,7 +4180,11 @@ fn sixteen_bit_ret_case(release: u16) {
     drive(&mut interp, &mut interp_bus);
     drive(&mut native, &mut native_bus);
 
-    assert_eq!(native, interp, "architectural or clock state differs");
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp),
+        "architectural or clock state differs"
+    );
     // The popped word is the return target, and SP advanced by two with the carry staying in
     // the low half.
     assert_eq!(
@@ -4185,7 +4281,10 @@ fn a_mid_block_push_through_memory_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     // The AGGREGATE, not `trace.cycles()`. Native execution batches the whole compiled window and
     // emits no per-access DataRead or DataWrite records, so the two per-cycle LOGS differ by
@@ -4285,7 +4384,10 @@ fn a_mid_block_call_through_a_register_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     // The AGGREGATE, not `trace.cycles()`, for the same reason as the PushMem and JmpMem mid-block
     // fixtures: native execution batches the whole compiled window and emits no per-access log.
@@ -4377,7 +4479,10 @@ fn a_mid_block_call_through_esp_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -4488,7 +4593,10 @@ fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faul
     );
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(
         native.registers.eip, CALL,
         "the side exit must leave EIP at the call itself: CallReg writes EIP, pushes, and adjusts \
@@ -4542,7 +4650,10 @@ fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faul
             })
         ));
     }
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
 }
 
@@ -4627,7 +4738,10 @@ fn a_mid_block_call_through_memory_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     // The AGGREGATE, not `trace.cycles()`, for the same reason as the CallReg, PushMem and JmpMem
     // mid-block fixtures: native execution batches the whole compiled window and emits no
@@ -4748,7 +4862,10 @@ fn a_mid_block_call_through_its_own_stack_slot_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -4840,7 +4957,10 @@ fn a_call_through_memory_whose_source_is_the_mode13_aperture_side_exits() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.registers.esp(), 0x0ffc);
@@ -4948,7 +5068,10 @@ fn finite_cs_call_through_memory_limit_exit_preserves_restart_state_and_faults_p
     );
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(
         native.registers.eip, CALL,
         "the side exit must leave EIP at the call itself"
@@ -5003,7 +5126,10 @@ fn finite_cs_call_through_memory_limit_exit_preserves_restart_state_and_faults_p
             })
         ));
     }
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
 }
 
@@ -5101,7 +5227,10 @@ fn a_call_through_memory_whose_push_lands_on_watched_code_side_exits() {
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
 
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(
         native.registers.eip, CALL,
         "the side exit must leave EIP at the call itself"
@@ -5230,11 +5359,12 @@ fn cpl3_call_through_memory_does_not_panic_and_matches_the_interpreter() {
         interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers, "registers differ");
     assert_eq!(
-        native.pending_flags, interp.pending_flags,
-        "pending flags differ"
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "registers differ"
     );
+    assert_eq!(native.eflags(), interp.eflags(), "pending flags differ");
     assert_eq!(native_bus.memory, interp_bus.memory, "memory differs");
     assert_eq!(native.registers.eip, PHASE1_TARGET);
     assert_eq!(native.registers.esp(), 0x0ffc);
@@ -5411,7 +5541,10 @@ fn a_push_through_memory_of_the_identical_address_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     // The AGGREGATE, not `trace.cycles()`. Native execution batches the whole compiled window and
     // emits no per-access DataRead or DataWrite records, so the two per-cycle LOGS differ by
@@ -5505,7 +5638,10 @@ fn a_push_through_memory_whose_source_is_the_mode13_aperture_side_exits() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.registers.esp(), 0x0ffc);
@@ -5686,11 +5822,12 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
         interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interp.registers, "registers differ");
     assert_eq!(
-        native.pending_flags, interp.pending_flags,
-        "pending flags differ"
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "registers differ"
     );
+    assert_eq!(native.eflags(), interp.eflags(), "pending flags differ");
     assert_eq!(native_bus.memory, interp_bus.memory, "memory differs");
     assert_eq!(native.registers.esp(), 0x0ffc);
     assert_eq!(
@@ -5888,7 +6025,10 @@ fn a_mid_block_jmp_through_memory_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     // The AGGREGATE, not `trace.cycles()`, for the same reason as the PushMem fixtures: native
     // execution batches the whole compiled window and emits no per-access log.
@@ -6483,7 +6623,10 @@ fn finite_cs_jmp_through_a_register_limit_exit_preserves_restart_state() {
     );
     interp.cycle(&mut interp_bus).unwrap();
     interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(native.registers, interp.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp)
+    );
     assert_eq!(
         native.registers.eip, JMP,
         "the side exit must leave EIP at the jump itself: JmpReg writes EIP only after the limit \
@@ -6842,7 +6985,11 @@ fn a_mid_block_access_through_a_segment_override_matches_the_interpreter() {
         let native_outcomes = drive(&mut native, &mut native_bus);
 
         assert_eq!(native_outcomes, interp_outcomes, "{segment:?}: outcomes");
-        assert_eq!(native, interp, "{segment:?}: whole CPU state");
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp),
+            "{segment:?}: whole CPU state"
+        );
         assert_eq!(native_bus.memory, interp_bus.memory, "{segment:?}: RAM");
         assert_eq!(
             native_bus.trace.elapsed_clocks(),
@@ -6966,7 +7113,10 @@ fn a_ds_override_on_a_stack_relative_operand_matches_the_interpreter() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -7070,7 +7220,10 @@ fn a_load_through_an_override_pins_that_segment_against_a_guest_reload() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(
         native.registers.edx(),
         SECOND_PAYLOAD,
@@ -7317,7 +7470,11 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
         interp.cycle(&mut interp_bus).unwrap();
         interp.cycle(&mut interp_bus).unwrap();
 
-        assert_eq!(native.registers, interp.registers, "{segment:?}: registers");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{segment:?}: registers"
+        );
         assert_eq!(
             native.registers.eip, LOAD,
             "{segment:?}: the side exit must leave EIP at the load, before any effect"
@@ -7349,7 +7506,8 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
             "{segment:?}: the re-run must produce the same outcome on both roles"
         );
         assert_eq!(
-            native.registers, interp.registers,
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
             "{segment:?}: post-fault"
         );
         assert_eq!(

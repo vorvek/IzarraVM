@@ -112,9 +112,13 @@ fn assert_program_matches_impl(
     let interpreter_outcomes = run_to_halt(&mut interpreter, &mut interpreter_bus);
 
     assert_eq!(direct_outcomes, interpreter_outcomes, "run timing differs");
-    assert_eq!(direct.registers, interpreter.registers, "registers differ");
+    assert_eq!(
+        crate::tests::settled_registers(&direct),
+        crate::tests::settled_registers(&interpreter),
+        "registers differ"
+    );
     assert_eq!(direct.fpu, interpreter.fpu, "x87 state differs");
-    assert_eq!(direct.pending_flags, interpreter.pending_flags);
+    assert_eq!(direct.eflags(), interpreter.eflags());
     assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(direct.timing_rem, interpreter.timing_rem);
     assert_eq!(direct.fp_rem, interpreter.fp_rem);
@@ -426,9 +430,12 @@ fn linked_x87_blocks_keep_stack_state_resident_and_validate_root_top() {
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(native.fpu, interpreter.fpu);
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -559,12 +566,15 @@ fn linked_float_to_integer_chain_spills_the_boundary_and_matches_the_interpreter
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(
         native.fpu, interpreter.fpu,
         "x87 register file, status and tag words must match: the boundary spill must have run"
     );
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -702,12 +712,15 @@ fn dynamic_float_to_integer_crossing_spills_the_boundary_and_matches_the_interpr
         1,
         "the crossing must go native, not fall back through the dispatcher"
     );
-    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(
         native.fpu, interpreter.fpu,
         "x87 register file, status and tag words must match: the boundary spill must have run"
     );
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -859,12 +872,15 @@ fn dynamic_integer_to_float_crossing_enters_through_the_pad_and_matches_the_inte
         0,
         "a bailing pad would leave fpu correct by never crossing, which is a vacuous pass"
     );
-    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(
         native.fpu, interpreter.fpu,
         "the pad must load the register cache the target's skipped prologue would have loaded"
     );
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -1062,7 +1078,10 @@ fn linked_integer_to_float_chain_is_refused_and_the_float_block_still_runs_corre
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
 
-    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(
         native.fpu, interpreter.fpu,
         "an integer source must never chain into a float target: skipping its prologue leaves \
@@ -2009,7 +2028,10 @@ fn nm_and_mf_gates_match_interpreter_without_touching_x87_or_memory() {
         let direct_result = direct.run_straight_line(&mut direct_bus, u64::MAX);
         let interpreter_result = interpreter.run_straight_line(&mut interpreter_bus, u64::MAX);
         assert_eq!(direct_result, interpreter_result, "pending_mf={pending_mf}");
-        assert_eq!(direct.registers, interpreter.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&direct),
+            crate::tests::settled_registers(&interpreter)
+        );
         assert_eq!(direct.fpu, interpreter.fpu);
         assert_eq!(direct.fpu, direct_fpu);
         assert_eq!(direct_bus.memory, interpreter_bus.memory);
@@ -2218,7 +2240,11 @@ fn an_unmasking_fldcw_rearms_the_mf_gate_for_the_next_slot() {
     let direct_result = direct.run_straight_line(&mut direct_bus, u64::MAX);
     let interpreter_result = interpreter.run_straight_line(&mut interpreter_bus, u64::MAX);
     assert_eq!(direct_result, interpreter_result, "outcome");
-    assert_eq!(direct.registers, interpreter.registers, "registers");
+    assert_eq!(
+        crate::tests::settled_registers(&direct),
+        crate::tests::settled_registers(&interpreter),
+        "registers"
+    );
     assert_eq!(direct.fpu, interpreter.fpu, "x87 state");
     assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(direct.fp_rem, interpreter.fp_rem);
@@ -2308,7 +2334,10 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     for _ in 0..4 {
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
-    assert_eq!(direct.registers, interpreter.registers);
+    assert_eq!(
+        crate::tests::settled_registers(&direct),
+        crate::tests::settled_registers(&interpreter)
+    );
     assert_eq!(direct.fpu, interpreter.fpu);
     assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(direct.timing_rem, interpreter.timing_rem);
@@ -3238,7 +3267,10 @@ fn wait_delivers_the_pending_exception_and_the_task_switch_fault() {
         let direct_result = direct.run_straight_line(&mut direct_bus, u64::MAX);
         let interpreter_result = interpreter.run_straight_line(&mut interpreter_bus, u64::MAX);
         assert_eq!(direct_result, interpreter_result, "pending_mf={pending_mf}");
-        assert_eq!(direct.registers, interpreter.registers);
+        assert_eq!(
+            crate::tests::settled_registers(&direct),
+            crate::tests::settled_registers(&interpreter)
+        );
         assert_eq!(direct.fpu, interpreter.fpu);
         assert_eq!(direct.fpu, fpu_before, "the trap left x87 state moved");
         assert_eq!(direct_bus.memory, interpreter_bus.memory);

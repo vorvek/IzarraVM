@@ -193,12 +193,9 @@ fn differential_full(
         "{context}: all three slots must retire natively"
     );
     assert_eq!(
-        native.registers, interpreter.registers,
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter),
         "{context}: registers"
-    );
-    assert_eq!(
-        native.pending_flags, interpreter.pending_flags,
-        "{context}: lazy flags"
     );
     assert_eq!(native.eflags(), interpreter.eflags(), "{context}: EFLAGS");
     assert_eq!(
@@ -253,6 +250,12 @@ mod word_inc_dec;
 /// fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a seventh copy.
 #[path = "cpu_jit_slice7_test.rs"]
 mod slice7;
+
+/// `IZARRAVM_DIRECT_EAGER_FLAGS`: flag producers publish the RBP shadow instead of writing a lazy
+/// descriptor. Nested here for the reason the six modules above are: it wants this module's
+/// differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than an eighth copy.
+#[path = "cpu_jit_eager_flags_test.rs"]
+mod eager_flags;
 
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {

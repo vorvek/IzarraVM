@@ -251,17 +251,14 @@ fn lane_add_matches_the_interpreter_across_patches() {
         }
 
         assert_eq!(
-            native.registers, interpreter.registers,
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interpreter),
             "registers differ after patch {imm:#010x}"
         );
         assert_eq!(
             native.eflags(),
             interpreter.eflags(),
             "EFLAGS differ after patch {imm:#010x}"
-        );
-        assert_eq!(
-            native.pending_flags, interpreter.pending_flags,
-            "lazy flags differ after patch {imm:#010x}"
         );
         assert_eq!(
             native.registers.ebp(),

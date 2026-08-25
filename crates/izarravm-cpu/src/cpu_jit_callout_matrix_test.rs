@@ -264,12 +264,9 @@ fn run_loop_to_halt(roles: &mut Roles) {
 /// The architectural axes, on every row.
 fn compare_state(roles: &Roles, context: &str) {
     assert_eq!(
-        roles.native.registers, roles.interp.registers,
+        crate::tests::settled_registers(&roles.native),
+        crate::tests::settled_registers(&roles.interp),
         "{context}: registers"
-    );
-    assert_eq!(
-        roles.native.pending_flags, roles.interp.pending_flags,
-        "{context}: lazy flags"
     );
     assert_eq!(
         roles.native.eflags(),
@@ -1074,10 +1071,10 @@ fn a_lane_patch_and_a_call_out_compose_in_one_block() {
             DEVICE_VALUES[round],
             "{context}: the call-out must see the current device value"
         );
-        assert_eq!(native.registers, interp.registers, "{context}: registers");
         assert_eq!(
-            native.pending_flags, interp.pending_flags,
-            "{context}: lazy flags"
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{context}: registers"
         );
         assert_eq!(native.eflags(), interp.eflags(), "{context}: EFLAGS");
         assert_eq!(native_bus.memory, interp_bus.memory, "{context}: guest RAM");

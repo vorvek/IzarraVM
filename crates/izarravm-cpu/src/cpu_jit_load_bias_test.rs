@@ -575,7 +575,10 @@ fn a_word_aperture_load_charges_the_word_lane_through_the_counting_stub() {
     drive(&mut native, &mut native_bus);
 
     assert_eq!(native.registers.eax() & 0xffff, 0x5678);
-    assert_eq!(native, interp);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
         interp_bus.trace.elapsed_clocks(),
