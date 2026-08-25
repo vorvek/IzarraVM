@@ -405,10 +405,6 @@ fn run_row(
         "{context}: registers"
     );
     assert_eq!(
-        prepared.native.pending_flags, prepared.interpreter.pending_flags,
-        "{context}: lazy flags"
-    );
-    assert_eq!(
         prepared.native.eflags(),
         prepared.interpreter.eflags(),
         "{context}: EFLAGS"

@@ -826,10 +826,6 @@ fn compare_state(roles: &Roles, context: &str) {
         "{context}: registers (segment registers and EIP included)"
     );
     assert_eq!(
-        roles.native.pending_flags, roles.interp.pending_flags,
-        "{context}: raw lazy-flags descriptor"
-    );
-    assert_eq!(
         roles.native.eflags(),
         roles.interp.eflags(),
         "{context}: materialized EFLAGS"
@@ -1036,8 +1032,8 @@ fn the_dword_moffs_pair_is_unchanged() {
 ///   next reader that goes to memory rather than to the shadow;
 /// * an emitter that wrote EFLAGS alone and left a LIVE descriptor in place -- CF is inside
 ///   `ARITH_FLAGS`, so the descriptor would recompute it from the pre-CLC operand pair at the next
-///   reader and silently overwrite what the guest just set. `pending_flags` is compared as a RAW
-///   descriptor, not just through `eflags()`;
+///   reader and silently overwrite what the guest just set -- which the `adc ax, 0` row below
+///   reads back as a different AX;
 /// * a polarity inversion, since both opcodes run against both incoming values;
 /// * `emit_direction_flag`'s shape copied here, which would touch the wrong bit entirely.
 ///

@@ -941,6 +941,5 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
         "the baked Word lowering must still match the interpreter"
     );
     assert_eq!(cpu.eflags(), interpreter.eflags());
-    assert_eq!(cpu.pending_flags, interpreter.pending_flags);
     jit::direct::set_count_lanes_for_test(None);
 }

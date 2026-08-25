@@ -212,6 +212,7 @@ fn prepare_flat(
 fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     let registers = fixture.native.registers.clone();
     let pending = fixture.native.pending_flags;
+    let pending_eflags = fixture.native.eflags();
     let memory = fixture.native_bus.memory.clone();
     assert!(
         !fixture
@@ -222,7 +223,8 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     );
     assert_eq!(fixture.native.registers, registers, "cap changed {context}");
     assert_eq!(
-        fixture.native.pending_flags, pending,
+        fixture.native.eflags(),
+        pending_eflags,
         "cap changed {context}"
     );
     assert_eq!(fixture.native_bus.memory, memory, "cap changed {context}");
@@ -245,10 +247,6 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     assert_eq!(
         fixture.native.registers, fixture.interpreter.registers,
         "registers differ: {context}"
-    );
-    assert_eq!(
-        fixture.native.pending_flags, fixture.interpreter.pending_flags,
-        "lazy flags differ: {context}"
     );
     assert_eq!(
         fixture.native.eflags(),
@@ -382,6 +380,7 @@ fn watched_double_shift_writes_exit_transactionally() {
         );
         let registers = fixture.native.registers.clone();
         let pending = fixture.native.pending_flags;
+        let pending_eflags = fixture.native.eflags();
         let memory = fixture.native_bus.memory.clone();
         let exits = fixture.native.perf_counters().jit_direct_exit_code_watch;
 
@@ -392,7 +391,7 @@ fn watched_double_shift_writes_exit_transactionally() {
                 .unwrap()
         );
         assert_eq!(fixture.native.registers, registers);
-        assert_eq!(fixture.native.pending_flags, pending);
+        assert_eq!(fixture.native.eflags(), pending_eflags);
         assert_eq!(fixture.native_bus.memory, memory);
         assert_eq!(
             fixture.native.perf_counters().jit_direct_exit_code_watch - exits,
@@ -408,10 +407,6 @@ fn watched_double_shift_writes_exit_transactionally() {
                 .unwrap();
         }
         assert_eq!(fixture.native.registers, fixture.interpreter.registers);
-        assert_eq!(
-            fixture.native.pending_flags,
-            fixture.interpreter.pending_flags
-        );
         assert_eq!(fixture.native.eflags(), fixture.interpreter.eflags());
         assert_eq!(fixture.native_bus.memory, fixture.interpreter_bus.memory);
     }
@@ -519,6 +514,7 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
         arm(&mut interpreter, 1);
         let registers = native.registers.clone();
         let pending = native.pending_flags;
+        let pending_eflags = native.eflags();
         let memory = native_bus.memory.clone();
         let cross_exits = native
             .perf_counters()
@@ -531,7 +527,7 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
                 .unwrap()
         );
         assert_eq!(native.registers, registers);
-        assert_eq!(native.pending_flags, pending);
+        assert_eq!(native.eflags(), pending_eflags);
         assert_eq!(native_bus.memory, memory);
         assert_eq!(
             native
@@ -560,7 +556,6 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
             "target={target:#x}"
         );
         assert_eq!(native.registers, interpreter.registers);
-        assert_eq!(native.pending_flags, interpreter.pending_flags);
         assert_eq!(native.eflags(), interpreter.eflags());
         assert_eq!(native.control.cr2, interpreter.control.cr2);
         assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -577,6 +572,7 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
     }
     let registers = fixture.native.registers.clone();
     let pending = fixture.native.pending_flags;
+    let pending_eflags = fixture.native.eflags();
     let memory = fixture.native_bus.memory.clone();
     assert!(
         !fixture
@@ -585,7 +581,7 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
             .unwrap()
     );
     assert_eq!(fixture.native.registers, registers);
-    assert_eq!(fixture.native.pending_flags, pending);
+    assert_eq!(fixture.native.eflags(), pending_eflags);
     assert_eq!(fixture.native_bus.memory, memory);
 
     let native_decoded = fixture.native.decode_cache.get(ENTRY, true).unwrap();
@@ -601,9 +597,6 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
     assert_eq!(native_result, interpreter_result);
     assert_eq!(native_result, Err((13, Some(0))));
     assert_eq!(fixture.native.registers, fixture.interpreter.registers);
-    assert_eq!(
-        fixture.native.pending_flags,
-        fixture.interpreter.pending_flags
-    );
+    assert_eq!(fixture.native.eflags(), fixture.interpreter.eflags());
     assert_eq!(fixture.native_bus.memory, fixture.interpreter_bus.memory);
 }

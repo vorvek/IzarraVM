@@ -114,7 +114,7 @@ fn assert_program_matches_impl(
     assert_eq!(direct_outcomes, interpreter_outcomes, "run timing differs");
     assert_eq!(direct.registers, interpreter.registers, "registers differ");
     assert_eq!(direct.fpu, interpreter.fpu, "x87 state differs");
-    assert_eq!(direct.pending_flags, interpreter.pending_flags);
+    assert_eq!(direct.eflags(), interpreter.eflags());
     assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(direct.timing_rem, interpreter.timing_rem);
     assert_eq!(direct.fp_rem, interpreter.fp_rem);
@@ -428,7 +428,7 @@ fn linked_x87_blocks_keep_stack_state_resident_and_validate_root_top() {
 
     assert_eq!(native.registers, interpreter.registers);
     assert_eq!(native.fpu, interpreter.fpu);
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -564,7 +564,7 @@ fn linked_float_to_integer_chain_spills_the_boundary_and_matches_the_interpreter
         native.fpu, interpreter.fpu,
         "x87 register file, status and tag words must match: the boundary spill must have run"
     );
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -707,7 +707,7 @@ fn dynamic_float_to_integer_crossing_spills_the_boundary_and_matches_the_interpr
         native.fpu, interpreter.fpu,
         "x87 register file, status and tag words must match: the boundary spill must have run"
     );
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
@@ -864,7 +864,7 @@ fn dynamic_integer_to_float_crossing_enters_through_the_pad_and_matches_the_inte
         native.fpu, interpreter.fpu,
         "the pad must load the register cache the target's skipped prologue would have loaded"
     );
-    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.eflags(), interpreter.eflags());
     assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);

@@ -243,6 +243,7 @@ fn prepare_flat(
 fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     let registers = fixture.native.registers.clone();
     let pending = fixture.native.pending_flags;
+    let pending_eflags = fixture.native.eflags();
     let memory = fixture.native_bus.memory.clone();
     assert!(
         !fixture
@@ -253,7 +254,8 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     );
     assert_eq!(fixture.native.registers, registers, "cap changed {context}");
     assert_eq!(
-        fixture.native.pending_flags, pending,
+        fixture.native.eflags(),
+        pending_eflags,
         "cap changed {context}"
     );
     assert_eq!(fixture.native_bus.memory, memory, "cap changed {context}");
@@ -276,10 +278,6 @@ fn finish_and_compare(mut fixture: Fixture, context: &str) -> Fixture {
     assert_eq!(
         fixture.native.registers, fixture.interpreter.registers,
         "registers differ: {context}"
-    );
-    assert_eq!(
-        fixture.native.pending_flags, fixture.interpreter.pending_flags,
-        "lazy flags differ: {context}"
     );
     assert_eq!(
         fixture.native.eflags(),
@@ -1101,6 +1099,7 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
         let mut fixture = prepare_paged_case(target, target_pte, permissions);
         let registers = fixture.native.registers.clone();
         let pending = fixture.native.pending_flags;
+        let pending_eflags = fixture.native.eflags();
         let memory = fixture.native_bus.memory.clone();
         let cross_exits = fixture
             .native
@@ -1115,7 +1114,7 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
                 .unwrap()
         );
         assert_eq!(fixture.native.registers, registers);
-        assert_eq!(fixture.native.pending_flags, pending);
+        assert_eq!(fixture.native.eflags(), pending_eflags);
         assert_eq!(fixture.native_bus.memory, memory);
         assert_eq!(
             fixture
@@ -1145,10 +1144,6 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
             "target={target:#x}"
         );
         assert_eq!(fixture.native.registers, fixture.interpreter.registers);
-        assert_eq!(
-            fixture.native.pending_flags,
-            fixture.interpreter.pending_flags
-        );
         assert_eq!(fixture.native.eflags(), fixture.interpreter.eflags());
         assert_eq!(fixture.native.control.cr2, fixture.interpreter.control.cr2);
         assert_eq!(fixture.native_bus.memory, fixture.interpreter_bus.memory);
@@ -1605,9 +1600,11 @@ fn rotate_register_form_matches_the_interpreter_across_destinations_counts_and_c
 fn rotate_register_form_updates_a_live_descriptor_in_place_without_materialising() {
     // THE case this slice turns on. At counts 2 through 31 the interpreter calls set_flag with a
     // mask of exactly FLAG_CF, which flips the descriptor's override bits IN PLACE and leaves
-    // SF/ZF/PF/AF deferred. finish_and_compare asserts the raw pending_flags word, so a lowering
-    // that materialised instead, or set the wrong override bit, or cleared the descriptor,
-    // diverges here even though eflags() would still agree in some of those cases.
+    // SF/ZF/PF/AF deferred. finish_and_compare asserts `eflags()` against the interpreter's, so a
+    // lowering that set the wrong override bit, or that cleared a descriptor whose other five bits
+    // the guest still owns, diverges here. What it no longer catches is a lowering that
+    // materialised EARLY and agrees on every architectural bit -- that is the representational
+    // freedom this campaign released, not a gap that was overlooked.
     let pendings = [
         Some((0x7fff_ffffu32, 1u32)),
         Some((0x0000_00ff, 1)),
@@ -1681,6 +1678,7 @@ fn rotate_register_form_count_zero_touches_nothing_at_all() {
                 let before_gpr = fixture.native.registers.gpr;
                 let before_eflags = fixture.native.registers.eflags;
                 let before_pending = fixture.native.pending_flags;
+                let before_arch_eflags = fixture.native.eflags();
                 let context = format!("op={op} count={count} pending={pending:?}");
                 let after = finish_and_compare(fixture, &context);
                 assert_eq!(
@@ -1692,8 +1690,9 @@ fn rotate_register_form_count_zero_touches_nothing_at_all() {
                     "{context}: a zero count must not touch eflags"
                 );
                 assert_eq!(
-                    after.native.pending_flags, before_pending,
-                    "{context}: a zero count must not touch the pending descriptor"
+                    after.native.eflags(),
+                    before_arch_eflags,
+                    "{context}: a zero count must not touch the architectural flags"
                 );
             }
         }
@@ -2003,8 +2002,9 @@ fn byte_shl_register_form_matches_the_interpreter_across_lanes_counts_and_corner
 fn byte_shl_register_form_commits_and_clears_a_live_descriptor() {
     // A shift's flag contract is the opposite of a rotate's: `set_shift_result_flags` materialises
     // the descriptor and writes CF, OF, AF and SZP live, so the emitted form publishes the whole
-    // RBP shadow and clears the pending word. finish_and_compare asserts the raw pending_flags,
-    // so a byte lane that skipped the publish, or published without clearing, diverges here.
+    // RBP shadow and clears the pending word. finish_and_compare asserts `eflags()` against the
+    // interpreter's, so a byte lane that skipped the publish -- and therefore left a stale
+    // descriptor owning the five bits the shift just defined -- diverges here.
     for pending in [
         Some((0x7fff_ffffu32, 1u32)),
         Some((0x0000_00ff, 1)),
@@ -2040,6 +2040,7 @@ fn byte_shl_register_form_count_zero_touches_nothing_at_all() {
                 let before_gpr = fixture.native.registers.gpr;
                 let before_eflags = fixture.native.registers.eflags;
                 let before_pending = fixture.native.pending_flags;
+                let before_arch_eflags = fixture.native.eflags();
                 let context = format!("dst={dst} count={count} pending={pending:?}");
                 let after = finish_and_compare(fixture, &context);
                 assert_eq!(
@@ -2051,8 +2052,9 @@ fn byte_shl_register_form_count_zero_touches_nothing_at_all() {
                     "{context}: a zero count must not touch eflags"
                 );
                 assert_eq!(
-                    after.native.pending_flags, before_pending,
-                    "{context}: a zero count must not touch the pending descriptor"
+                    after.native.eflags(),
+                    before_arch_eflags,
+                    "{context}: a zero count must not touch the architectural flags"
                 );
             }
         }

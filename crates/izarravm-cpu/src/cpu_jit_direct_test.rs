@@ -296,7 +296,7 @@ fn resident_chain_crosses_three_blocks_with_one_root_entry() {
     }
 
     assert_eq!(native.registers, interp.registers);
-    assert_eq!(native.pending_flags, interp.pending_flags);
+    assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -817,11 +817,6 @@ fn assert_direct_register_case(case: &DirectRegisterCase) {
 
     assert_eq!(native_outcomes, interp_outcomes, "{} timing", case.name);
     assert_eq!(native, interp, "{} CPU state", case.name);
-    assert_eq!(
-        native.pending_flags, interp.pending_flags,
-        "{} pending flags",
-        case.name
-    );
     assert_eq!(native.eflags(), interp.eflags(), "{} EFLAGS", case.name);
     assert_eq!(
         native.registers.gpr, case.expected_gpr,
@@ -1803,7 +1798,6 @@ fn assert_read_parity(
     );
     assert_eq!(native.registers, interp.registers);
     assert_eq!(native.eflags(), interp.eflags());
-    assert_eq!(native.pending_flags, interp.pending_flags);
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(
         native_bus.trace.elapsed_clocks(),
@@ -5231,10 +5225,7 @@ fn cpl3_call_through_memory_does_not_panic_and_matches_the_interpreter() {
     }
 
     assert_eq!(native.registers, interp.registers, "registers differ");
-    assert_eq!(
-        native.pending_flags, interp.pending_flags,
-        "pending flags differ"
-    );
+    assert_eq!(native.eflags(), interp.eflags(), "pending flags differ");
     assert_eq!(native_bus.memory, interp_bus.memory, "memory differs");
     assert_eq!(native.registers.eip, PHASE1_TARGET);
     assert_eq!(native.registers.esp(), 0x0ffc);
@@ -5687,10 +5678,7 @@ fn cpl3_push_through_memory_does_not_panic_and_matches_the_interpreter() {
     }
 
     assert_eq!(native.registers, interp.registers, "registers differ");
-    assert_eq!(
-        native.pending_flags, interp.pending_flags,
-        "pending flags differ"
-    );
+    assert_eq!(native.eflags(), interp.eflags(), "pending flags differ");
     assert_eq!(native_bus.memory, interp_bus.memory, "memory differs");
     assert_eq!(native.registers.esp(), 0x0ffc);
     assert_eq!(

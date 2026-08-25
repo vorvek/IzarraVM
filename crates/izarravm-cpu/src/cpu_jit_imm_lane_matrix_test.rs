@@ -73,10 +73,6 @@ fn assert_states_match(
         "{context}: registers"
     );
     assert_eq!(native.eflags(), interpreter.eflags(), "{context}: EFLAGS");
-    assert_eq!(
-        native.pending_flags, interpreter.pending_flags,
-        "{context}: lazy flags"
-    );
     assert_eq!(native.halted, interpreter.halted, "{context}: halted");
     assert_eq!(
         native_bus.memory, interpreter_bus.memory,

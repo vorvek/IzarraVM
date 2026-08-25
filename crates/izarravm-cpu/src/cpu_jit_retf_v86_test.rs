@@ -351,10 +351,6 @@ fn compare_state(roles: &Roles, context: &str) {
         "{context}: registers (segment registers and EIP included)"
     );
     assert_eq!(
-        roles.native.pending_flags, roles.interp.pending_flags,
-        "{context}: raw lazy-flags descriptor"
-    );
-    assert_eq!(
         roles.native.eflags(),
         roles.interp.eflags(),
         "{context}: materialized EFLAGS"

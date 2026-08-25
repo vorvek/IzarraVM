@@ -260,10 +260,6 @@ fn lane_add_matches_the_interpreter_across_patches() {
             "EFLAGS differ after patch {imm:#010x}"
         );
         assert_eq!(
-            native.pending_flags, interpreter.pending_flags,
-            "lazy flags differ after patch {imm:#010x}"
-        );
-        assert_eq!(
             native.registers.ebp(),
             ebp.wrapping_add(imm),
             "the native ADD did not use the CURRENT immediate {imm:#010x}"

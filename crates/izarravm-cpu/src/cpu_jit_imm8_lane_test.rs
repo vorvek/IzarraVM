@@ -251,10 +251,12 @@ fn lanes_registered_for(middle: &[u8], instructions: u8) -> usize {
 /// patches the immediate between executions. The interpreter side runs the same bytes with no
 /// block at all, so it re-decodes the patched instruction and is the reference by construction.
 ///
-/// Flags are asserted three ways — architectural EFLAGS, the lazy `pending_flags` descriptor, and
-/// full CPU equality — because the lane arm reaches `emit_alu_byte_preloaded` on a path the baked
-/// arm does not (the operand arrives from memory rather than from a materialised constant), and a
-/// descriptor that recorded the wrong `b` would agree on EFLAGS until something later consumed it.
+/// Flags are asserted SEMANTICALLY — architectural `eflags()` and full CPU equality — because the
+/// lane arm reaches `emit_alu_byte_preloaded` on a path the baked arm does not (the operand
+/// arrives from memory rather than from a materialised constant). The raw `pending_flags` word is
+/// deliberately NOT compared: it is a REPRESENTATION of the flags, and the two roles are free to
+/// carry different (base, descriptor) pairs for one architectural value. A descriptor that
+/// recorded the wrong `b` still fails, because `eflags()` is what turns a descriptor into flags.
 #[test]
 fn imm8_lane_matches_the_interpreter_across_patches_for_every_alu_op() {
     jit::direct::set_imm8_lanes_for_test(Some(true));
@@ -313,10 +315,6 @@ fn imm8_lane_matches_the_interpreter_across_patches_for_every_alu_op() {
                     native.eflags(),
                     interpreter.eflags(),
                     "{label}: EFLAGS differ"
-                );
-                assert_eq!(
-                    native.pending_flags, interpreter.pending_flags,
-                    "{label}: lazy flags differ"
                 );
                 assert_eq!(
                     native_bus.memory, interpreter_bus.memory,

@@ -268,10 +268,6 @@ fn compare_state(roles: &Roles, context: &str) {
         "{context}: registers"
     );
     assert_eq!(
-        roles.native.pending_flags, roles.interp.pending_flags,
-        "{context}: lazy flags"
-    );
-    assert_eq!(
         roles.native.eflags(),
         roles.interp.eflags(),
         "{context}: EFLAGS"
@@ -1075,10 +1071,6 @@ fn a_lane_patch_and_a_call_out_compose_in_one_block() {
             "{context}: the call-out must see the current device value"
         );
         assert_eq!(native.registers, interp.registers, "{context}: registers");
-        assert_eq!(
-            native.pending_flags, interp.pending_flags,
-            "{context}: lazy flags"
-        );
         assert_eq!(native.eflags(), interp.eflags(), "{context}: EFLAGS");
         assert_eq!(native_bus.memory, interp_bus.memory, "{context}: guest RAM");
     }

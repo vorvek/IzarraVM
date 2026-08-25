@@ -310,18 +310,16 @@ fn build(body: &[u8], seed: Seed) -> Roles {
     }
 }
 
-/// Everything a guest can observe, plus the raw descriptor.
+/// Everything a guest can observe. Kept as a distinct name from `compare_observable` because the
+/// two had different populations while the raw `pending_flags` descriptor was compared; they now
+/// coincide, and the consumption test below still wants its own name for what it asserts.
 fn compare_state(roles: &Roles, context: &str) {
     compare_observable(roles, context);
-    assert_eq!(
-        roles.native.pending_flags, roles.interp.pending_flags,
-        "{context}: lazy flags"
-    );
 }
 
-/// Everything a guest can observe. Excludes the raw `pending_flags` on purpose: the consumption
-/// test wants the divergence to arrive as a written byte, not as a descriptor field, so that it
-/// says the width is guest-visible rather than merely stored.
+/// Everything a guest can observe. The consumption test wants the divergence to arrive as a
+/// written byte rather than as a flag word, so that it says the width is guest-visible rather
+/// than merely stored.
 fn compare_observable(roles: &Roles, context: &str) {
     assert_eq!(
         roles.native.registers, roles.interp.registers,

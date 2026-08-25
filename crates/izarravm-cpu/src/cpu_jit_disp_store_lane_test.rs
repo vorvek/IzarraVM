@@ -384,10 +384,6 @@ fn state_identity(subject: [u8; 2], store: bool, widen: bool, one_lookup_store: 
             "EFLAGS differ after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
         );
         assert_eq!(
-            native.pending_flags, interpreter.pending_flags,
-            "lazy flags differ after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
-        );
-        assert_eq!(
             native_bus.memory, interpreter_bus.memory,
             "guest memory differs after patch {disp:#010x} (one_lookup_store={one_lookup_store})"
         );

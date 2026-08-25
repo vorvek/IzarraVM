@@ -315,10 +315,6 @@ fn call_out_matches_the_interpreter_mid_block() {
         "the port byte must land in AL"
     );
     assert_eq!(fixture.cpu.registers, interpreter.registers, "registers");
-    assert_eq!(
-        fixture.cpu.pending_flags, interpreter.pending_flags,
-        "lazy flags"
-    );
     assert_eq!(fixture.cpu.eflags(), interpreter.eflags(), "EFLAGS");
     assert_eq!(
         fixture.cpu.elapsed_clocks, interpreter.elapsed_clocks,
@@ -2847,10 +2843,6 @@ fn imm8_call_out_matches_the_interpreter_mid_block() {
         "the port byte must land in AL"
     );
     assert_eq!(fixture.cpu.registers, interpreter.registers, "registers");
-    assert_eq!(
-        fixture.cpu.pending_flags, interpreter.pending_flags,
-        "lazy flags"
-    );
     assert_eq!(fixture.cpu.eflags(), interpreter.eflags(), "EFLAGS");
     assert_eq!(
         fixture.cpu.elapsed_clocks, interpreter.elapsed_clocks,

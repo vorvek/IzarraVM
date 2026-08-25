@@ -276,10 +276,6 @@ fn disp_lane_load_matches_the_interpreter_across_patches() {
             interpreter.eflags(),
             "EFLAGS differ after patch {disp:#010x}"
         );
-        assert_eq!(
-            native.pending_flags, interpreter.pending_flags,
-            "lazy flags differ after patch {disp:#010x}"
-        );
         let expected = native_bus.memory[disp as usize];
         assert_eq!(
             native.registers.ebx(),

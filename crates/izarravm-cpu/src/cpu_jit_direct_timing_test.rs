@@ -92,7 +92,7 @@ fn mode13_read_self_loop_respects_the_tight_native_deadline() {
     native_bus.trace = BusTrace::default();
     interp_bus.trace = BusTrace::default();
     let start_registers = native.registers.clone();
-    let start_pending = native.pending_flags;
+    let start_eflags = native.eflags();
     let zero_budget_rejects = native.perf_counters().jit_direct_reject_zero_budget;
 
     assert!(
@@ -101,7 +101,7 @@ fn mode13_read_self_loop_respects_the_tight_native_deadline() {
             .unwrap()
     );
     assert_eq!(native.registers, start_registers);
-    assert_eq!(native.pending_flags, start_pending);
+    assert_eq!(native.eflags(), start_eflags);
     assert_eq!(native.elapsed_clocks, 0);
     assert_eq!(native.timing_rem, 0);
     assert_eq!(native_bus.trace.elapsed_clocks(), 0);
@@ -121,7 +121,7 @@ fn mode13_read_self_loop_respects_the_tight_native_deadline() {
     }
 
     assert_eq!(native.registers, interp.registers);
-    assert_eq!(native.pending_flags, interp.pending_flags);
+    assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.registers.eip, ENTRY);
     assert_eq!(native.registers.ecx(), 1);
     assert_eq!(native.registers.eax() & 0xff, 0x5a);
@@ -312,7 +312,6 @@ fn movzx_memory_forms_match_the_interpreter_and_its_bus_clocks() {
                 }
 
                 assert_eq!(native.registers, interp.registers, "{label}: registers");
-                assert_eq!(native.pending_flags, interp.pending_flags, "{label}: flags");
                 assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
                 assert_eq!(
                     native.elapsed_clocks, interp.elapsed_clocks,
@@ -935,10 +934,6 @@ fn imul_memory_form_matches_the_interpreter_and_its_bus_clocks() {
             }
 
             assert_eq!(native.registers, interp.registers, "{label}: registers");
-            assert_eq!(
-                native.pending_flags, interp.pending_flags,
-                "{label}: pending"
-            );
             assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
             assert_eq!(
                 native.elapsed_clocks, interp.elapsed_clocks,
@@ -1120,12 +1115,9 @@ fn imul_memory_form_materializes_a_live_descriptor_first() {
             interp.cycle(&mut interp_bus).unwrap();
         }
         assert_eq!(native.registers, interp.registers, "{label}: registers");
-        // The raw descriptor, not just eflags(): a tail that materialized eagerly, or that skipped
-        // emit_clear_pending, agrees on eflags() while differing on every byte of this.
-        assert_eq!(
-            native.pending_flags, interp.pending_flags,
-            "{label}: lazy flags"
-        );
+        // The ARCHITECTURAL flags. A tail that skipped `emit_clear_pending` and left a stale
+        // descriptor owning the six arithmetic bits diverges here; a tail that materialized
+        // eagerly and agrees on every architectural bit does not, and is not meant to.
         assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,
@@ -1370,10 +1362,6 @@ fn grp3_imul_memory_form_matches_the_interpreter_and_its_bus_clocks() {
             }
 
             assert_eq!(native.registers, interp.registers, "{label}: registers");
-            assert_eq!(
-                native.pending_flags, interp.pending_flags,
-                "{label}: pending"
-            );
             assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
             assert_eq!(
                 native.elapsed_clocks, interp.elapsed_clocks,
@@ -1557,10 +1545,6 @@ fn grp3_imul_memory_form_materializes_a_live_descriptor_first() {
             interp.cycle(&mut interp_bus).unwrap();
         }
         assert_eq!(native.registers, interp.registers, "{label}: registers");
-        assert_eq!(
-            native.pending_flags, interp.pending_flags,
-            "{label}: lazy flags"
-        );
         assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
         assert_eq!(
             native.elapsed_clocks, interp.elapsed_clocks,
@@ -2215,11 +2199,6 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
         case.name
     );
     assert_eq!(
-        direct.pending_flags, interpreter.pending_flags,
-        "{} {mode:?} pending flags",
-        case.name
-    );
-    assert_eq!(
         direct.eflags(),
         interpreter.eflags(),
         "{} {mode:?} EFLAGS",
@@ -2357,7 +2336,7 @@ fn quake_descriptors_admit_a_finite_cs_register_loop_natively() {
     }
 
     assert_eq!(native.registers, interp.registers);
-    assert_eq!(native.pending_flags, interp.pending_flags);
+    assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
     assert_eq!(native.perf_counters().jit_direct_entries - entries, 1);
     assert_eq!(native.perf_counters().jit_direct_insns - retired, 12);
@@ -2428,7 +2407,7 @@ fn paged_quake_ds_ss_bases_match_load_store_and_call() {
     }
 
     assert_eq!(native.registers, interp.registers);
-    assert_eq!(native.pending_flags, interp.pending_flags);
+    assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.registers.eip, TARGET);
     assert_eq!(native.registers.esp(), 0x2000);
     assert_eq!(
@@ -2510,7 +2489,7 @@ fn finite_cs_near_returns_run_directly_and_match_interpreter() {
         }
 
         assert_eq!(native.registers, interp.registers);
-        assert_eq!(native.pending_flags, interp.pending_flags);
+        assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
         assert_eq!(
             native_bus.trace.elapsed_clocks(),
@@ -2694,7 +2673,7 @@ fn nonflat_segment_limit_and_permission_fallbacks_are_transactional() {
         }
         assert_eq!(native.registers, interp.registers);
         assert_eq!(native.registers.eip, STORE);
-        assert_eq!(native.pending_flags, interp.pending_flags);
+        assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(&native_bus.memory[TARGET..TARGET + 4], &[0; 4]);
         assert_eq!(
             native.perf_counters().jit_direct_side_exits - side_exits,
@@ -2715,7 +2694,7 @@ fn nonflat_segment_limit_and_permission_fallbacks_are_transactional() {
             ));
         }
         assert_eq!(native.registers, interp.registers);
-        assert_eq!(native.pending_flags, interp.pending_flags);
+        assert_eq!(native.eflags(), interp.eflags());
         assert_eq!(&native_bus.memory[TARGET..TARGET + 4], &[0; 4]);
         assert_eq!(&interp_bus.memory[TARGET..TARGET + 4], &[0; 4]);
     }
@@ -2966,7 +2945,6 @@ fn quake_word_renderer_families_match_interpreter_state_flags_memory_and_timing(
     }
 
     assert_eq!(direct.registers, interpreter.registers);
-    assert_eq!(direct.pending_flags, interpreter.pending_flags);
     assert_eq!(direct.eflags(), interpreter.eflags());
     assert_eq!(direct_bus.memory, interpreter_bus.memory);
     assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);

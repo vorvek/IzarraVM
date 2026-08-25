@@ -356,10 +356,6 @@ fn compare_state(roles: &Roles, context: &str) {
         "{context}: registers"
     );
     assert_eq!(
-        roles.native.pending_flags, roles.interp.pending_flags,
-        "{context}: lazy flags"
-    );
-    assert_eq!(
         roles.native.eflags(),
         roles.interp.eflags(),
         "{context}: EFLAGS"

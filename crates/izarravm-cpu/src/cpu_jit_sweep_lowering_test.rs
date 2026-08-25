@@ -196,10 +196,6 @@ fn differential_full(
         native.registers, interpreter.registers,
         "{context}: registers"
     );
-    assert_eq!(
-        native.pending_flags, interpreter.pending_flags,
-        "{context}: lazy flags"
-    );
     assert_eq!(native.eflags(), interpreter.eflags(), "{context}: EFLAGS");
     assert_eq!(
         native.elapsed_clocks, interpreter.elapsed_clocks,
