@@ -68,7 +68,7 @@ fn the_helper_charges_exactly_what_the_interpreter_charges_and_reports_the_step_
         bus.lazy_io_reads = lazy;
         bus.io_read_value = Some(0x5a);
 
-        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
         assert!(
             status >= 0,
             "lazy={lazy}: a served port read is not abnormal"
@@ -113,7 +113,7 @@ fn the_helper_hands_the_device_the_running_clock_total_not_the_block_entry_total
         let mut probe = flat_cpu();
         probe.scale_clocks_batch(prefix_raw)
     };
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, prefix_raw, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, prefix_raw, 0, 0);
     assert!(status >= 0);
     assert_eq!(
         bus.last_read_io_core_clocks_so_far,
@@ -144,7 +144,7 @@ fn a_denied_port_is_abnormal_with_zero_partial_effects() {
     let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
     bus.lazy_io_reads = true;
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
     assert!(status < 0, "a denied port must be abnormal");
     assert_eq!(before, cpu.registers, "abnormal path wrote a register");
     assert_eq!(before_eflags, cpu.eflags(), "abnormal path wrote EFLAGS");
@@ -166,7 +166,7 @@ fn an_unsupported_port_is_abnormal_with_zero_partial_effects() {
     let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
     bus.io_read_fails = true;
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
     assert!(status < 0);
     assert_eq!(before, cpu.registers);
     assert_eq!(cpu.elapsed_clocks, 0);
@@ -547,7 +547,7 @@ fn a_permission_checked_port_is_refused_before_the_tss_probe_can_touch_memory() 
         let before = cpu.registers.clone();
         let before_cr2 = cpu.control.cr2;
 
-        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
 
         assert!(
             status < 0,
@@ -635,7 +635,7 @@ fn v86_call_out_on_a_cold_tlb_is_refused_before_the_tss_probe() {
     assert_eq!(cpu.iopl(), 3);
     let before = cpu.registers.clone();
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
 
     assert!(status < 0, "a V86 task on a cold TLB must be refused");
     assert_eq!(before, cpu.registers);
@@ -741,7 +741,7 @@ fn a_v86_port_is_served_natively_once_the_tss_pages_are_tlb_resident() {
     assert_eq!(cpu.iopl(), 3, "only the V86 half may select the arm");
     let served_before = cpu.direct_stall_snapshot().callout_port_v86_served;
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
 
     assert!(status >= 0, "a permitted V86 port must be served");
     assert_eq!(
@@ -782,7 +782,7 @@ fn the_cpl0_arm_does_not_count_as_a_bitmap_serve() {
     bus.lazy_io_reads = true;
     bus.io_read_value = Some(0x5a);
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
 
     assert!(status >= 0);
     let stalls = cpu.direct_stall_snapshot();
@@ -831,7 +831,7 @@ fn the_bitmap_arm_charges_exactly_what_the_interpreter_charges() {
             cpu.set_eip(entry);
             cpu.cycle(&mut bus).expect("the interpreted IN must retire");
         } else {
-            let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+            let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
             assert!(status >= 0, "leg {leg}: the helper must serve");
         }
         assert_eq!(
@@ -960,7 +960,7 @@ fn every_phase_p_lane_refuses_with_zero_partial_effects() {
         // the fixture never worked, which is the whole point of proving a guard fires.
         let (mut control, mut control_bus) = warmed_tss_cpu(io_map_offset, limit);
         assert!(
-            jit::direct::port_read_al_dx_for_test(&mut control, &mut control_bus, 0, 0) >= 0,
+            jit::direct::port_read_al_dx_for_test(&mut control, &mut control_bus, 0, 0, 0) >= 0,
             "{lane}: the UNBROKEN fixture must serve, or this lane proves nothing"
         );
 
@@ -969,7 +969,7 @@ fn every_phase_p_lane_refuses_with_zero_partial_effects() {
         let before = cpu.registers.clone();
         let before_cr2 = cpu.control.cr2;
 
-        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0);
+        let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0);
 
         assert_refused_with_zero_partial_effects(lane, status, &cpu, &bus, &before, before_cr2);
         assert_eq!(
@@ -1204,7 +1204,8 @@ fn the_helper_folds_the_chains_float_clocks_into_the_device_timestamp() {
     };
     assert_ne!(expected, raw_only, "the two readings must be separable");
 
-    let status = jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, prefix_raw, prefix_fp);
+    let status =
+        jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, prefix_raw, prefix_fp, 0);
 
     assert!(status >= 0);
     assert_eq!(bus.last_read_io_core_clocks_so_far, Some(100 + expected));
@@ -1529,7 +1530,7 @@ fn callout_attribution_orders_ports_and_survives_unrelated_resets() {
 
     for port in [0x03dau16, 0x0201] {
         cpu.registers.set_edx(u32::from(port));
-        assert!(jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0) >= 0);
+        assert!(jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0) >= 0);
     }
     assert!(jit::direct::push_all_dword_for_test(&mut cpu, &mut bus) >= 0);
     assert!(jit::direct::pop_all_dword_for_test(&mut cpu, &mut bus) >= 0);

@@ -2129,6 +2129,23 @@ pub struct DirectStallSnapshot {
     pub decline_memo_hits: u64,
     pub decline_memo_advances: u64,
     pub decline_memo_sweeps: u64,
+    /// GP2 call-out-site poll skip (`IZARRAVM_DIRECT_POLL_SKIP`). See `DirectStallTally`'s field
+    /// docs for what each lane means and why some of design §8's finer decline lanes are folded
+    /// together here.
+    pub poll_attempts: u64,
+    pub poll_declined_port: u64,
+    pub poll_declined_port_source: u64,
+    pub poll_declined_knob: u64,
+    pub poll_declined_eligibility: u64,
+    pub poll_declined_shape: u64,
+    pub poll_declined_cap: u64,
+    pub poll_declined_seam: u64,
+    pub poll_skip_spans: [u64; 3],
+    pub poll_skip_iterations: [u64; 3],
+    pub poll_skip_raw_core_clocks: u64,
+    pub poll_skip_raw_bus_clocks: u64,
+    pub poll_skip_max_span: u64,
+    pub poll_skip_last_head: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -4925,12 +4942,22 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 /// fp-mandel ratio AND the Dhrystone target needs a separate x87 latency dial (a
 /// deferred Whetstone-payload follow-up); Dhrystone is PRIMARY, so fp-mandel's band
 /// is recentered on the achieved value and the ratio gap recorded.
-const fn level_timing(persona: CpuPersona) -> (u32, u32) {
+pub(crate) const fn level_timing(persona: CpuPersona) -> (u32, u32) {
     match persona {
         CpuPersona::I386 => (2, 5),
         CpuPersona::I486 => (1, 12),
         CpuPersona::I586 => (1, 12),
     }
+}
+
+/// `level_timing`, reachable from `izarravm-machine`'s GP2 poll-skip seam fixtures, which have to
+/// build the exact same `(num, den)` pair `port_read_al_dx` passes through `CalloutPollSkipRequest`
+/// so the seam's `scale_core_clocks` is tested against the real dial rather than a guessed one. A
+/// plain `pub fn` rather than `#[cfg(test)]`, for `set_native_backend_enabled`'s reason: test-only
+/// items compile only into the crate whose own harness set `--cfg test`, never into the rlib a
+/// dependent crate links against.
+pub const fn level_timing_for_test(persona: CpuPersona) -> (u32, u32) {
+    level_timing(persona)
 }
 
 /// x87 op classes for the per-class FP-timing dial. The class is derived at the

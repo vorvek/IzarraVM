@@ -1325,6 +1325,14 @@ impl CpuGsw {
         self.timing_rem
     }
 
+    /// `core_clocks_so_far`, exposed for the GP2 poll-skip seam's `izarravm-machine` fixtures,
+    /// which build the same `CalloutPollSkipRequest` the Direct call-out builds and need this
+    /// exact term (`core_clocks_at_block_entry`) to reproduce `now_at(0)`.
+    #[cfg(feature = "jit")]
+    pub fn core_clocks_so_far_for_test(&self) -> u64 {
+        self.core_clocks_so_far
+    }
+
     /// Commit complete poll-loop iterations through the same remainder-carry scaler
     /// used by normal execution. Retired-instruction and unit-simulator counts stay
     /// unchanged because these instructions did not execute.

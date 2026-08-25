@@ -790,6 +790,131 @@ impl BusTrace {
     }
 }
 
+/// The long-division scaler `izarravm-machine`'s call-out-site poll-skip seam
+/// (`MachineBus::callout_poll_skip`, via its `now_at_run` closure) uses to combine a raw clock
+/// count with a persona's (num, den, carry) core-clock timing dial. Lives here, not in
+/// `izarravm-cpu`, because the machine-side seam has no other legal way to reach it (see
+/// `MachineBus::callout_poll_skip`'s doc).
+///
+/// **Not shared with `izarravm-cpu`'s own callers** (GP2 poll-skip revision review N1):
+/// `CpuGsw::preview_scale_clocks` and `poll_skip_core_projection` each carry their OWN copy of
+/// this same long division rather than calling this function -- `izarravm-cpu` cannot depend on
+/// `izarravm-bus` for it without an actual crate wire-up that does not exist today. The three
+/// copies are identical arithmetic as of this writing (verified by direct comparison, GP2
+/// poll-skip revision review §5), but nothing enforces that identity mechanically: a mutant that
+/// changes one caller's arithmetic and not the others would NOT be caught by anything today. Do
+/// not claim otherwise in this doc without actually wiring the interpreter-side callers through
+/// this function first.
+pub fn scale_core_clocks(raw: u64, num: u32, den: u32, rem: u64) -> Option<u64> {
+    raw.checked_mul(u64::from(num))?
+        .checked_add(rem)?
+        .checked_div(u64::from(den))
+}
+
+/// One certified device-poll span, as `izarravm-cpu`'s call-out helper sees it, in plain
+/// data the `izarravm-bus` POD can carry across the crate boundary that
+/// `CpuBus::callout_poll_skip` cannot cross with the real `PollLoop` (its fields are
+/// private to `izarravm-cpu`; see that method's doc). `fetches` holds
+/// `PollLoop::fetch(0..fetch_count)`, `status_mask` / `spins_when_bit_set` together
+/// reproduce `PollLoop::fresh_iteration_spins`'s sense for a single-bit mask (the only
+/// kind a certified shape ever carries), and the clock-domain fields are exactly the
+/// terms `scale_core_clocks` needs to reconstruct `now_at(n)` on the machine side
+/// without re-deriving the persona's timing dial.
+#[derive(Clone, Copy, Debug)]
+pub struct CalloutPollSkipRequest {
+    /// `PollLoop::fetch(0..fetch_count)`, in order.
+    pub fetches: [(u32, u32, u8); 6],
+    pub fetch_count: u8,
+    /// The one bit the shape's status test reads: `0x01` or `0x08`, never any other
+    /// value (`exact_poll_test_branch` refuses every other mask).
+    pub status_mask: u8,
+    /// `PollLoop::fresh_iteration_spins(status_mask)` -- i.e. "does the shape spin
+    /// while the tested bit is SET". Precomputed on the `izarravm-cpu` side, which
+    /// still holds the shape's real fields; the machine side only ever needs this one
+    /// derived bool plus the live status byte's bit to answer "is this iteration still
+    /// spinning".
+    pub spins_when_bit_set: bool,
+    /// The shape's own certified per-iteration raw core-clock charge (17 / 21 / 28).
+    pub raw_core_clocks: u64,
+    /// `CpuGsw::core_clocks_so_far` as the running block set it at entry -- constant
+    /// for the whole block, and the base `now_at(n)` is computed from.
+    pub core_clocks_at_block_entry: u64,
+    /// This slot's own `prefix_raw_clocks + scale_weighted_fp_clocks(..).clocks`,
+    /// i.e. every raw core clock the block has retired before this call-out, RAW
+    /// (unscaled) and with any chained-hop float charge already folded in by the
+    /// caller.
+    pub prefix_raw: u64,
+    /// The persona's `level_timing()` dial and the carried remainder
+    /// (`CpuGsw::timing_rem`), read-only: the seam previews the scale, it never
+    /// consumes the carry (the block's own single end-of-block batch call does that,
+    /// once, exactly as it does today).
+    pub core_num: u32,
+    pub core_den: u32,
+    pub timing_rem: u64,
+    /// The RUN's remaining guest-clock budget (`BlockCache::block_batch_cap`) -- NOT the
+    /// batch-absolute cap the interpreter's `try_poll_skip` bounds against (BLOCKER 2's fix; see
+    /// `BlockCache::block_batch_cap`'s doc for the derivation). Zero means "no cap published" and
+    /// refuses every skip (obligation 3).
+    pub cap: u64,
+    /// The batch-scoped scaled bus clock total AT THIS RUN'S ENTRY (`BlockCache::
+    /// block_bus_at_entry`). The seam's own bus-clock reads
+    /// (`MachineBus::poll_project_scaled_bus_clocks`) are BATCH-absolute; subtracting this turns
+    /// them into the RUN-scoped growth `cap` actually bounds. Without it the cap test compares a
+    /// run-scoped budget against a batch-absolute spend, silently subtracting the batch's prior
+    /// bus clocks from the budget a second time (BLOCKER 2).
+    pub bus_scaled_at_run_entry: u64,
+    /// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`, default 2 -- matches `try_poll_skip`'s
+    /// own `low = 2` binary-search floor.
+    pub min_iterations: u64,
+    /// `IZARRAVM_DIRECT_POLL_MAX_RAW`, default `u32::MAX - IN_AL_DX_CORE_CLOCKS` -- the
+    /// 32-bit return-lane bound (obligation 4): `raw_core_clocks * iterations` must fit
+    /// under this or the low-32-bit clock lane the emitted call-out returns through
+    /// would collide with the step-break / resync status bits above it.
+    pub max_skipped_raw: u64,
+}
+
+/// Why `CpuBus::callout_poll_skip` declined, so the caller can bump the NAMED counter
+/// its own screen owns (design §8) rather than one shared "it declined" lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalloutPollDecline {
+    /// `Vega::poll_skip_status1_port_active()` refused (tracing armed, or the port's
+    /// lazy path is off).
+    PortInactive,
+    /// `poll_bus_certificate` could not certify the shape's fetch/io bus cost.
+    BusCertificate,
+    /// The live status byte says this iteration was already about to exit the loop.
+    NotSpinning,
+    /// The CRTC oracle (`dots_until_status1_bit_change_from`) has no edge to project
+    /// to (an unprogrammed CRTC, `frame_dots == 0`).
+    NoEdge,
+    /// The published cap, the 32-bit lane bound, or `min_iterations` left no
+    /// admissible span.
+    Cap,
+}
+
+/// What a committed call-out-site poll span cost and where it left the guest's clock,
+/// in the units the caller's own return lane and counters need. `iterations` is always
+/// `>= CalloutPollSkipRequest::min_iterations` on success; `callout_poll_skip` returns
+/// `Err` rather than an `Ok` with zero iterations.
+#[derive(Clone, Copy, Debug)]
+pub struct CalloutPollSkipOutcome {
+    pub iterations: u64,
+    /// `raw_core_clocks * iterations`, RAW: the caller adds this to the same raw clock
+    /// lane the call-out already returns through (`STACK_RAW_CLOCKS`), so the block's
+    /// own single end-of-block batch call scales it exactly once, together with the
+    /// block's other raw clocks. The seam must NEVER scale this itself.
+    pub skipped_raw_core_clocks: u64,
+    /// The bus clocks the commit added to `trace.elapsed_clocks()` -- reported for the
+    /// I2 identity and the `jit_direct_poll_skip_raw_bus_clocks` counter; already
+    /// applied by the seam, not something the caller must apply again.
+    pub committed_raw_bus_clocks: u64,
+    /// `now_at(iterations)`: the recomputed post-skip instant, byte-for-byte what the
+    /// caller must publish (`CpuBus::publish_core_clocks`) before its own fall-through
+    /// `read_io` call, so the returned byte is read at the beam the skip actually left
+    /// (obligation 2b).
+    pub now_after: u64,
+}
+
 pub trait CpuBus {
     fn read_memory(
         &mut self,
@@ -1266,6 +1391,50 @@ pub trait CpuBus {
     /// without devices.
     fn requires_step_break(&self) -> bool {
         false
+    }
+
+    /// Publish the caller's in-run scaled core-clock instant so the bus's lazy,
+    /// time-dependent predictions (the VGA beam, the OPL status peek) are taken at
+    /// THIS instant rather than at whatever the previous `read_io` left behind.
+    /// `read_io` publishes its own `core_clocks_so_far` argument as its first
+    /// statement, so calling this immediately before a `read_io` at the same instant
+    /// is redundant but harmless; a call-out that PROJECTS forward before it reads
+    /// must call this explicitly first, because nothing else will.
+    ///
+    /// Defaulted to a no-op: a bus with no lazy time-dependent device state has
+    /// nothing to publish to.
+    fn publish_core_clocks(&mut self, _now: u64) {}
+
+    /// Certify, binary-search and commit ONE call-out-site device-poll span, entirely
+    /// inside `izarravm-machine` (the only crate with the device/timeline state the
+    /// decision needs). Plain data in (`CalloutPollSkipRequest`), plain data out
+    /// (`Result<CalloutPollSkipOutcome, CalloutPollDecline>`); the DECISION stays
+    /// beside the interpreter's own `try_poll_skip` so the two executors share one
+    /// predicate and cannot drift apart.
+    ///
+    /// **Why this is a method on `CpuBus` at all, and why it cannot take the real
+    /// `PollLoop`.** The certified shape (`izarravm_cpu::PollLoop`) and the executor
+    /// that knows how to certify, project and commit against it
+    /// (`izarravm_machine::run::try_poll_skip`) live on opposite sides of a crate edge
+    /// that only runs one way: `izarravm-cpu` depends on `izarravm-bus`, and
+    /// `izarravm-bus` depends on neither `izarravm-cpu` nor `izarravm-machine`. A
+    /// call-out helper generic over `B: CpuBus` therefore cannot name `PollLoop`, call
+    /// any `izarravm-machine`-side accessor, or receive one back — the only channel
+    /// available is a `Copy` POD declared in THIS crate, which is what
+    /// `CalloutPollSkipRequest` / `CalloutPollSkipOutcome` are.
+    ///
+    /// Defaulted to always decline: a bus with no device-poll machinery (every test
+    /// double in `izarravm-cpu` — `TestBus`, `A20Bus`, `FlatBus`, and any bus a future
+    /// backend adds) inherits this and pays nothing beyond the four screens the caller
+    /// runs before ever reaching here. **`TestBus` must not override this.** Doing so
+    /// would let `jit_direct_poll_skip_spans` rise from a stub that always hits,
+    /// reinstating the vacuity every fixture in the GP2 poll-skip mutant table exists
+    /// to rule out — see that design's BLOCKER D.
+    fn callout_poll_skip(
+        &mut self,
+        _req: &CalloutPollSkipRequest,
+    ) -> Result<CalloutPollSkipOutcome, CalloutPollDecline> {
+        Err(CalloutPollDecline::PortInactive)
     }
 }
 

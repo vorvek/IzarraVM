@@ -1189,6 +1189,16 @@ impl CpuGsw {
         self.finish_direct_execution_transition(was_enabled);
     }
 
+    /// Override the GP2 call-out-site poll skip's `IZARRAVM_DIRECT_POLL_SKIP` reading for this
+    /// CPU (`None` restores the ambient env-cached reading). A per-CPU field rather than a
+    /// process-wide knob so an `izarravm-machine` integration fixture can drive both arms in one
+    /// process without racing the env-backed `OnceLock` -- see `BlockCache::direct_poll_skip_
+    /// override`'s doc for why it has to be reachable from outside `izarravm-cpu` at all.
+    #[cfg(feature = "jit")]
+    pub fn set_direct_poll_skip_override(&mut self, forced: Option<bool>) {
+        self.jit_direct.set_direct_poll_skip_override(forced);
+    }
+
     #[cfg(feature = "jit")]
     fn finish_direct_execution_transition(&mut self, was_enabled: bool) {
         let enabled = self.jit_direct.execution_enabled();
@@ -2867,6 +2877,18 @@ impl CpuGsw {
         // is always false in production; the clause exists so that it does not have to be.
         self.jit_direct
             .set_block_entry_interrupt_shadow(self.interrupt_shadow);
+        // GP2 poll-skip seam (design obligation 3): the RUN's remaining guest-clock budget,
+        // published beside the shadow above on the same matched-pair model, and cleared beside
+        // its clear below. `cap` is this call's own parameter, and it is RUN-remaining (already
+        // net of the batch's core AND scaled-bus clocks so far) -- NOT the same quantity
+        // `run.rs`'s batch loop bounds the interpreter's `try_poll_skip` against, which is the
+        // batch-absolute cap (BLOCKER 2's fix; an earlier revision's comment here claimed the two
+        // were the same quantity, and that misreading was the proximate cause of the defect).
+        // `bus_at_entry` is published alongside it for the same reason: the seam's bus-clock
+        // reads are batch-absolute and need this run-scoped baseline to become the GROWTH the
+        // run-remaining cap actually bounds.
+        self.jit_direct.set_block_batch_cap(cap);
+        self.jit_direct.set_block_bus_at_entry(bus_at_entry);
         // H9's pin, taken at the P8 mark: `run_direct_block` has no `d`, so the block's own
         // mode-key bit 0 is the term available here.
         ea_pin_lane_bit0!(span.key.mode_key & 1);
@@ -2888,6 +2910,8 @@ impl CpuGsw {
             block.is_self_loop()
         );
         self.jit_direct.set_block_entry_interrupt_shadow(false);
+        self.jit_direct.set_block_batch_cap(0);
+        self.jit_direct.set_block_bus_at_entry(0);
         self.native_callout = jit::direct::CallOutTable::default();
         ea_mark!(Phase::NativePreamble);
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
