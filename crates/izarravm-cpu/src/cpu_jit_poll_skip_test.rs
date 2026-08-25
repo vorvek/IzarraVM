@@ -63,7 +63,12 @@ fn direct_poll_skip_ships_off_by_default() {
         "the process-wide reading must agree with the spelling table applied to \
          IZARRAVM_DIRECT_POLL_SKIP={ambient:?}"
     );
-    if ambient.is_err() {
+    // GP2 poll-skip revision review N5: `ambient.is_err()` alone is imprecise here -- it reads as
+    // covering every `VarError`, but `NotUnicode` would already have panicked one line up (inside
+    // `parse_direct_poll_skip_arm_for_test`, pinned by `non_utf8_direct_poll_skip_arm_panics`
+    // above), so this branch is only ever reached for `NotPresent` in practice. Spell that out
+    // instead of the broader, misleading `is_err()`.
+    if matches!(ambient, Err(std::env::VarError::NotPresent)) {
         assert!(
             !expected,
             "IZARRAVM_DIRECT_POLL_SKIP must default OFF until a ladder prices the poll-skip arm"

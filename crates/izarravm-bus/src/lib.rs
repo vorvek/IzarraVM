@@ -790,15 +790,21 @@ impl BusTrace {
     }
 }
 
-/// One shared long-division scaler for a persona's core-clock timing dial, so a raw
-/// clock count and the (num, den, carry) triple it is priced against are combined
-/// EXACTLY THE SAME WAY wherever they meet: `izarravm-cpu`'s
-/// `CpuGsw::preview_scale_clocks` / `poll_skip_core_projection` (the interpreter and
-/// the interpreted-call-out slot) and `izarravm-machine`'s call-out-site poll-skip
-/// seam (`CpuBus::callout_poll_skip`). A mutant that changes one caller's arithmetic
-/// and not the others is then impossible rather than merely discouraged. Lives here,
-/// not in `izarravm-cpu`, because the machine-side seam has no other legal way to
-/// reach it (see `CpuBus::callout_poll_skip`'s doc).
+/// The long-division scaler `izarravm-machine`'s call-out-site poll-skip seam
+/// (`MachineBus::callout_poll_skip`, via its `now_at_run` closure) uses to combine a raw clock
+/// count with a persona's (num, den, carry) core-clock timing dial. Lives here, not in
+/// `izarravm-cpu`, because the machine-side seam has no other legal way to reach it (see
+/// `MachineBus::callout_poll_skip`'s doc).
+///
+/// **Not shared with `izarravm-cpu`'s own callers** (GP2 poll-skip revision review N1):
+/// `CpuGsw::preview_scale_clocks` and `poll_skip_core_projection` each carry their OWN copy of
+/// this same long division rather than calling this function -- `izarravm-cpu` cannot depend on
+/// `izarravm-bus` for it without an actual crate wire-up that does not exist today. The three
+/// copies are identical arithmetic as of this writing (verified by direct comparison, GP2
+/// poll-skip revision review §5), but nothing enforces that identity mechanically: a mutant that
+/// changes one caller's arithmetic and not the others would NOT be caught by anything today. Do
+/// not claim otherwise in this doc without actually wiring the interpreter-side callers through
+/// this function first.
 pub fn scale_core_clocks(raw: u64, num: u32, den: u32, rem: u64) -> Option<u64> {
     raw.checked_mul(u64::from(num))?
         .checked_add(rem)?
@@ -845,10 +851,18 @@ pub struct CalloutPollSkipRequest {
     pub core_num: u32,
     pub core_den: u32,
     pub timing_rem: u64,
-    /// The batch's published guest-clock budget (`BlockCache::block_batch_cap`), the
-    /// same `cap` the interpreter's `try_poll_skip` bounds against. Zero means "no cap
-    /// published" and refuses every skip (obligation 3).
+    /// The RUN's remaining guest-clock budget (`BlockCache::block_batch_cap`) -- NOT the
+    /// batch-absolute cap the interpreter's `try_poll_skip` bounds against (BLOCKER 2's fix; see
+    /// `BlockCache::block_batch_cap`'s doc for the derivation). Zero means "no cap published" and
+    /// refuses every skip (obligation 3).
     pub cap: u64,
+    /// The batch-scoped scaled bus clock total AT THIS RUN'S ENTRY (`BlockCache::
+    /// block_bus_at_entry`). The seam's own bus-clock reads
+    /// (`MachineBus::poll_project_scaled_bus_clocks`) are BATCH-absolute; subtracting this turns
+    /// them into the RUN-scoped growth `cap` actually bounds. Without it the cap test compares a
+    /// run-scoped budget against a batch-absolute spend, silently subtracting the batch's prior
+    /// bus clocks from the budget a second time (BLOCKER 2).
+    pub bus_scaled_at_run_entry: u64,
     /// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`, default 2 -- matches `try_poll_skip`'s
     /// own `low = 2` binary-search floor.
     pub min_iterations: u64,

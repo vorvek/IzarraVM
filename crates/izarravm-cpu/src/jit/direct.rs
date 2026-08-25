@@ -79,7 +79,7 @@ use crate::{
     DirectSmcCensusSnapshot, DirectSmcCensusUnits,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
-use izarravm_bus::{BusAccessKind, BusWidth, CalloutPollSkipRequest, CpuBus};
+use izarravm_bus::{BusAccessKind, BusWidth, CalloutPollDecline, CalloutPollSkipRequest, CpuBus};
 #[cfg(feature = "direct-entry-attribution")]
 use std::cell::UnsafeCell;
 use std::collections::hash_map::Entry;
@@ -963,14 +963,38 @@ pub(crate) struct BlockCache {
     /// On `BlockCache` for the reason the latch above is: `DirectRuntimeState` is inline in
     /// `CpuGsw` ahead of `registers` and `pending_flags`, whose offsets emitted code bakes.
     block_entry_interrupt_shadow: bool,
-    /// The batch's published guest-clock budget (`run_direct_block`'s own `cap` parameter),
+    /// The RUN's remaining guest-clock budget (`run_direct_block`'s own `cap` parameter),
     /// published beside `block_entry_interrupt_shadow` on the exact matched-pair model: set at
     /// native entry, read by the GP2 poll-skip seam's admissibility bound, cleared after the
     /// native return. Zero means "no cap published", which the seam reads as "admit nothing" --
     /// `run_direct_block` always publishes a nonzero `cap` on a normal entry, so zero is reachable
     /// only through the unpublished window a test seam that calls `run_direct_block` directly must
     /// not skip past.
+    ///
+    /// **This is RUN-remaining, not the batch cap.** `run_direct_block`'s `cap` parameter comes
+    /// from `ContinuationBudget::cap`, which is `run_budgeted_inner`'s own `cap` parameter, which
+    /// the machine's batch loop passes as `remaining = cap.saturating_sub(spent)` -- already net
+    /// of the batch's core clocks AND the batch's scaled bus clocks so far
+    /// (`izarravm-machine/src/run.rs`, the `spent`/`remaining` locals ahead of `run_budgeted`).
+    /// The interpreter's own `try_poll_skip` bounds against the DIFFERENT, batch-absolute `cap`
+    /// (`machine/run.rs:1622`'s call site) -- an earlier revision's comment here claimed the two
+    /// were "the same quantity", which is exactly wrong and was the proximate cause of a real
+    /// double-subtraction defect in the seam (GP2 poll-skip revision report, BLOCKER 2). The seam
+    /// must compare THIS field only against a RUN-scoped total (`block_bus_at_entry`, below, is
+    /// what makes that possible for the bus half).
     block_batch_cap: u64,
+    /// The batch-scoped scaled bus clock total AT NATIVE ENTRY (`run_direct_block`'s own
+    /// `bus_at_entry` parameter, itself `run_budgeted_inner`'s `bus.in_batch_scaled_bus_clocks()`
+    /// read once at run entry). Published and cleared in the exact same matched-pair place as
+    /// `block_batch_cap`, for the same reason: the GP2 poll-skip seam's admissibility bound is
+    /// RUN-scoped (`block_batch_cap` above), but `MachineBus::poll_project_scaled_bus_clocks` is
+    /// BATCH-absolute (it reads `trace.elapsed_clocks() - trace_elapsed_at_batch_start`, the same
+    /// term `run_direct_block`'s own `bus_growth = bus.in_batch_scaled_bus_clocks() -
+    /// bus_at_entry` subtracts this field from). Without this field the seam has no way to turn a
+    /// batch-absolute bus reading into the run-scoped GROWTH the cap test needs, and ends up
+    /// comparing a run-scoped budget against a batch-absolute spend -- silently subtracting the
+    /// batch's prior bus clocks from the budget twice.
+    block_bus_at_entry: u64,
     /// Per-CPU override of `direct_poll_skip_armed()`'s ambient (env-cached) reading, `None`
     /// meaning "use the ambient reading". A FIELD rather than a thread-local, deliberately: the
     /// mechanism runs from `izarravm-cpu`'s `port_read_al_dx`, but its cross-executor
@@ -1177,6 +1201,7 @@ impl BlockCache {
             interrupt_shadow_arms: 0,
             block_entry_interrupt_shadow: false,
             block_batch_cap: 0,
+            block_bus_at_entry: 0,
             direct_poll_skip_override: None,
             interrupt_shadow_consumed: false,
             lane_trial_override: None,
@@ -2074,6 +2099,18 @@ impl BlockCache {
 
     pub(crate) fn block_batch_cap(&self) -> u64 {
         self.block_batch_cap
+    }
+
+    /// Publish the batch-scoped scaled bus clock total at native entry, matched pair with
+    /// `set_block_batch_cap` (BLOCKER 2's fix): the seam needs this to turn
+    /// `MachineBus::poll_project_scaled_bus_clocks`'s batch-absolute reading into the run-scoped
+    /// GROWTH its run-remaining cap actually bounds.
+    pub(crate) fn set_block_bus_at_entry(&mut self, bus_at_entry: u64) {
+        self.block_bus_at_entry = bus_at_entry;
+    }
+
+    pub(crate) fn block_bus_at_entry(&self) -> u64 {
+        self.block_bus_at_entry
     }
 
     /// `direct_poll_skip_armed()`'s ambient reading, unless this CPU's `direct_poll_skip_override`
@@ -23726,10 +23763,15 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
         .core_clocks_so_far
         .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks.saturating_add(fp.clocks)));
 
-    // GP2 CALL-OUT-SITE POLL SKIP (IZARRAVM_DIRECT_POLL_SKIP). `permission.is_none()` is exactly
-    // `poll_skip_eligible`'s privilege term (`block.rs`'s `poll_skip_eligible`: not V86, CPL <=
-    // IOPL) restated from the value Phase P already computed -- a ring-0/non-V86 read is precisely
-    // the state that reached here without a TSS probe. `extra_raw_clocks` and `forced_step_break`
+    // GP2 CALL-OUT-SITE POLL SKIP (IZARRAVM_DIRECT_POLL_SKIP). `permission.is_none()` is NOT
+    // exactly `poll_skip_eligible`'s privilege term (GP2 poll-skip revision review N2, correcting
+    // an earlier version of this comment that claimed it was): `poll_skip_eligible` (`block.rs`)
+    // is `!is_protected_mode() || (!is_v86_mode() && cpl <= iopl)`, while `permission.is_none()`
+    // is `!is_v86_mode() && cpl <= iopl` alone, with no real-mode disjunct of its own. The Direct
+    // screen this `if` guards is therefore the NARROWER (more conservative) of the two -- it can
+    // only decline where `poll_skip_eligible` would also decline, never the reverse -- which is
+    // why the difference is safe to leave as is rather than a defect to fix. `extra_raw_clocks`
+    // and `forced_step_break`
     // fold into the ordinary return at the bottom, so the current iteration's own read below
     // (whether or not a skip preceded it) is completely unaffected -- M-26's pin.
     let mut extra_raw_clocks: u64 = 0;
@@ -23798,6 +23840,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                             core_den,
                             timing_rem: cpu.poll_skip_timing_remainder(),
                             cap: cpu.jit_direct.block_batch_cap(),
+                            bus_scaled_at_run_entry: cpu.jit_direct.block_bus_at_entry(),
                             min_iterations: direct_poll_skip_min_iterations(),
                             max_skipped_raw: direct_poll_skip_max_raw(),
                         };
@@ -23815,6 +23858,13 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                                     outcome.committed_raw_bus_clocks,
                                     head,
                                 );
+                            }
+                            // M3: `Cap` is split into its own lane -- it is exactly what BOTH
+                            // BLOCKER 1 and BLOCKER 2 surfaced through before their fixes, so a
+                            // ladder profile needs to tell "the budget genuinely ran out" apart
+                            // from "the other four screens declined" (`poll_declined_seam`).
+                            Err(CalloutPollDecline::Cap) => {
+                                cpu.jit_direct.note_poll_declined_cap();
                             }
                             Err(_) => {
                                 cpu.jit_direct.note_poll_declined_seam();
@@ -27330,6 +27380,15 @@ pub(crate) struct DirectStallTally {
     pub poll_declined_knob: u64,
     pub poll_declined_eligibility: u64,
     pub poll_declined_shape: u64,
+    /// `MachineBus::callout_poll_skip` declining through `CalloutPollDecline::Cap` -- split OUT of
+    /// `poll_declined_seam` (M3, GP2 poll-skip revision report): `Cap` is exactly the lane BOTH
+    /// BLOCKER 1 and BLOCKER 2 surfaced through before their fixes, so folding it in with
+    /// `PortInactive`/`BusCertificate`/`NotSpinning`/`NoEdge` made it impossible for a ladder
+    /// profile to tell "refuted by the workload" apart from "throttled by a unit-mismatch bug".
+    pub poll_declined_cap: u64,
+    /// Every OTHER `MachineBus::callout_poll_skip` decline (`PortInactive`, `BusCertificate`,
+    /// `NotSpinning`, `NoEdge`) folded into one lane. See `poll_declined_cap`'s doc for why `Cap`
+    /// alone was pulled out rather than splitting all five.
     pub poll_declined_seam: u64,
     pub poll_skip_spans: [u64; 3],
     pub poll_skip_iterations: [u64; 3],
@@ -28885,6 +28944,7 @@ impl crate::jit::JitState {
             poll_declined_knob: self.stalls.poll_declined_knob,
             poll_declined_eligibility: self.stalls.poll_declined_eligibility,
             poll_declined_shape: self.stalls.poll_declined_shape,
+            poll_declined_cap: self.stalls.poll_declined_cap,
             poll_declined_seam: self.stalls.poll_declined_seam,
             poll_skip_spans: self.stalls.poll_skip_spans,
             poll_skip_iterations: self.stalls.poll_skip_iterations,
@@ -28977,6 +29037,10 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_poll_declined_seam(&mut self) {
         self.stalls.poll_declined_seam += 1;
+    }
+
+    pub(crate) fn note_poll_declined_cap(&mut self) {
+        self.stalls.poll_declined_cap += 1;
     }
 
     /// One committed span. `class` is `PollLoop::diagnostic_class()`; the whole reason I9 (the

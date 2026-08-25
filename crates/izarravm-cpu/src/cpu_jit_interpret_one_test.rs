@@ -1739,6 +1739,19 @@ fn interpret_one_leaves_the_port_slot_bytes_unchanged() {
         &[0x48, 0xC1, 0xE8, 0x20],
         "shr rax, 32 must follow with no bit test between: code={code:02x?}"
     );
+    // N4 / review §11: the byte-level RBP-reload ABSENCE pin, the port slot's own mirror of
+    // `interpret_one_reloads_the_flag_shadow_on_resume`'s presence pin. `[0x41, 0x8B, 0xAF]` is
+    // `mov ebp, [r15 + disp32]` (REX.B + 8B /r, mod=10) -- the exact three-byte prefix that
+    // reload emits, disp32 aside. `helper.republishes_flags()` gates the emission (BLOCKER
+    // B4/M-24's fix, `direct.rs`'s `emit_call_out_slot` doc), and a `PortReadAlDx` slot's
+    // `republishes_flags()` is `false`, so this pattern must not appear ANYWHERE in this port
+    // slot's compiled code at all -- not just absent from the one tail position the earlier
+    // assertions already pin.
+    assert!(
+        position(&code, &[0x41, 0x8B, 0xAF]).is_none(),
+        "a port call-out slot must never reload RBP from the published eflags (no \
+         `republishes_flags()`, BLOCKER B4/M-24): code={code:02x?}"
+    );
 }
 
 fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {

@@ -3392,6 +3392,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_poll_decline_knob": snapshot.poll_declined_knob,
         "jit_direct_poll_decline_eligibility": snapshot.poll_declined_eligibility,
         "jit_direct_poll_decline_shape": snapshot.poll_declined_shape,
+        "jit_direct_poll_decline_cap": snapshot.poll_declined_cap,
         "jit_direct_poll_decline_seam": snapshot.poll_declined_seam,
         "jit_direct_poll_skip_spans": snapshot.poll_skip_spans.to_vec(),
         "jit_direct_poll_skip_iterations": snapshot.poll_skip_iterations.to_vec(),

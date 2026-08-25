@@ -613,7 +613,12 @@ impl MachineBus<'_> {
         for (slot, entry) in fetches.iter_mut().zip(0..poll.fetch_count()) {
             *slot = poll.fetch(entry)?;
         }
-        self.poll_fetch_certificate_raw_from(&fetches[..poll.fetch_count()])
+        // M1: `poll.fetch_count()` is always <= 6 for every certified shape today, but the old
+        // pre-split code degraded to `None` (via `fetch(entry)?` above) on an out-of-range
+        // `fetch_count()` rather than panicking. `.min(6)` preserves that refusal shape instead of
+        // turning a future shape's arity mistake into an index-out-of-range panic reachable from
+        // guest execution.
+        self.poll_fetch_certificate_raw_from(&fetches[..poll.fetch_count().min(6)])
     }
 
     /// Certify exact warm-RAM fetch and I/O costs for the classified io-family poll
@@ -647,7 +652,8 @@ impl MachineBus<'_> {
         for (slot, entry) in fetches.iter_mut().zip(0..poll.fetch_count()) {
             *slot = poll.fetch(entry)?;
         }
-        self.poll_bus_certificate_from(&fetches[..poll.fetch_count()])
+        // M1: see `poll_fetch_certificate_raw`'s matching comment.
+        self.poll_bus_certificate_from(&fetches[..poll.fetch_count().min(6)])
     }
 
     /// Certify exact warm-RAM fetch and data-read costs for the classified
@@ -977,6 +983,34 @@ impl MachineBus<'_> {
         }
         Ok(())
     }
+}
+
+/// The call-out-site poll skip's 32-bit return-lane bound (GP2 poll-skip design obligation 4),
+/// factored out of `MachineBus::callout_poll_skip` so it is unit-testable on its own (Rank-4
+/// killer, GP2 poll-skip revision review: "no fixture ever produces a span within four orders of
+/// magnitude of the ceiling, so a future edit to `direct_poll_skip_max_raw` or to the clamp
+/// expression would ship silently"). A hardcoded ceiling INDEPENDENT of `max_skipped_raw`: the
+/// caller's clock lane takes the LOW 32 BITS of an `i64`, and bit 32 is the step-break status
+/// bit, so nothing this may admit may let `raw_core_clocks * iterations` reach it -- whatever a
+/// misconfigured `IZARRAVM_DIRECT_POLL_MAX_RAW` claims. `max_skipped_raw` can still tune the
+/// bound DOWN (a smaller request always wins the `.min`); it can never tune it up past this
+/// ceiling. The 64-clock margin comfortably covers `IN_AL_DX_CORE_CLOCKS` (12, `izarravm-cpu`,
+/// not visible from this crate) plus any other small additive term the caller folds in on top of
+/// this function's own return.
+#[cfg(feature = "jit")]
+pub(crate) const LANE_SAFETY_CEILING: u64 = u32::MAX as u64 - 64;
+
+#[cfg(feature = "jit")]
+pub(crate) fn poll_skip_upper_bound(
+    cap: u64,
+    spent: u64,
+    max_skipped_raw: u64,
+    raw_core_clocks: u64,
+) -> u64 {
+    cap.saturating_sub(spent)
+        .min(u64::from(u32::MAX))
+        .saturating_sub(1)
+        .min(max_skipped_raw.min(LANE_SAFETY_CEILING) / raw_core_clocks.max(1))
 }
 
 impl CpuBus for MachineBus<'_> {
@@ -2827,15 +2861,26 @@ impl CpuBus for MachineBus<'_> {
         *self.io_touched || self.pending_soft_int.is_some()
     }
 
-    /// `prior_runs_core_clocks = 0; core_clocks_so_far = now` -- the same combined
-    /// instant `read_io`'s own first statement publishes (`core_clocks_so_far =
-    /// core_clocks_so_far;` a few lines below), just reachable before a lazy
-    /// prediction rather than only inside the read itself. Idempotent with that
-    /// statement: publishing `now` here and then calling `read_io(.., now, ..)`
-    /// writes the same field the same value twice.
+    /// `core_clocks_so_far = now` -- EXACTLY `read_io`'s own first statement
+    /// (`self.core_clocks_so_far = core_clocks_so_far;`, `read_io`, a few lines below),
+    /// just reachable before a lazy prediction rather than only inside the read itself.
+    /// Idempotent with that statement: publishing `now` here and then calling
+    /// `read_io(.., now, ..)` writes the same field the same value twice.
+    ///
+    /// MUST NOT touch `prior_runs_core_clocks`. An earlier revision zeroed it here,
+    /// which corrupted `in_batch_clocks()` (`prior_runs_core_clocks + core_clocks_so_far`
+    /// plus `scaled_bus_clocks`, `timing.rs`) for the rest of the run: every lazy prediction
+    /// after the first call-out attempt in a batch -- `predicted_beam`, the seam's own
+    /// `poll_project_dot_advance`, the lazy PIT/OPL peeks -- read a beam short by the
+    /// whole prior-runs core total. `prior_runs_core_clocks` is published once per RUN by
+    /// the batch loop (`machine/run.rs:1610`/`:1634`) and this method has no business
+    /// resetting a batch-scoped field from a call that fires once per call-out ATTEMPT,
+    /// decline or commit alike. Corroborated by measurement (GP2 poll-skip revision
+    /// diagnostic pair, 2026-08-26): C1 conservation held to 1.1 ppb while the frame hash
+    /// moved -- the charges were right and a prediction INPUT was wrong, which is exactly
+    /// this signature.
     #[cfg(feature = "jit")]
     fn publish_core_clocks(&mut self, now: u64) {
-        self.prior_runs_core_clocks = 0;
         self.core_clocks_so_far = now;
     }
 
@@ -2872,7 +2917,10 @@ impl CpuBus for MachineBus<'_> {
         if !self.vega.poll_skip_status1_port_active() {
             return Err(CalloutPollDecline::PortInactive);
         }
-        let fetches = &req.fetches[..usize::from(req.fetch_count)];
+        // M1's twin: `req.fetch_count` crossed the crate boundary as a plain `u8` with no
+        // compile-time bound, so a caller bug that set it above 6 must refuse here rather than
+        // index-panic on `req.fetches` (a fixed `[(u32, u32, u8); 6]`).
+        let fetches = &req.fetches[..usize::from(req.fetch_count).min(6)];
         let Some(certificate) = self.poll_bus_certificate_from(fetches) else {
             return Err(CalloutPollDecline::BusCertificate);
         };
@@ -2890,10 +2938,12 @@ impl CpuBus for MachineBus<'_> {
             return Err(CalloutPollDecline::NoEdge);
         };
 
-        // `now_at(n)`, exactly the composition obligation 2c derives: ONE scaling of
-        // (prefix + raw*n), never a sum of two separately-scaled terms. `now_at(0)` is
-        // byte-for-byte the un-skipped call-out's own `now` (M-26's pin).
-        let now_at = |iterations: u64| -> Option<u64> {
+        // `now_at_run(n)`, exactly the composition obligation 2c derives: ONE scaling of
+        // (prefix + raw*n), never a sum of two separately-scaled terms. `now_at_run(0)` is
+        // byte-for-byte the un-skipped call-out's own `now` (M-26's pin). RUN-scoped: it starts
+        // from `core_clocks_at_block_entry`, which resets to (near) zero at the top of every run,
+        // not at the top of the batch.
+        let now_at_run = |iterations: u64| -> Option<u64> {
             let raw_total = req
                 .raw_core_clocks
                 .checked_mul(iterations)?
@@ -2901,32 +2951,51 @@ impl CpuBus for MachineBus<'_> {
             let scaled = scale_core_clocks(raw_total, req.core_num, req.core_den, req.timing_rem)?;
             req.core_clocks_at_block_entry.checked_add(scaled)
         };
-        let candidate_total = |iterations: u64| -> Option<u64> {
-            let core = now_at(iterations)?;
+        // BLOCKER 2's fix: two DIFFERENT totals, deliberately never conflated into one.
+        //
+        // `batch_instant(n)` is what `poll_project_dot_advance` needs -- it compares against
+        // `MachineBus::in_batch_clocks()`, which is `prior_runs_core_clocks + core_clocks_so_far +
+        // scaled_bus_clocks`, ALL THREE terms batch-absolute. `now_at_batch` adds the batch's
+        // prior-runs core term (now that `publish_core_clocks` no longer zeroes it -- BLOCKER 1)
+        // and `poll_project_scaled_bus_clocks` is already batch-absolute on its own, so
+        // `batch_instant(0) == in_batch_clocks()` exactly: the same identity `now_at(0) == now`
+        // established for the run-scoped term, now holding for the batch-scoped one too.
+        let now_at_batch = |iterations: u64| -> Option<u64> {
+            self.prior_runs_core_clocks
+                .checked_add(now_at_run(iterations)?)
+        };
+        let batch_instant = |iterations: u64| -> Option<u64> {
+            let core = now_at_batch(iterations)?;
             let bus = self.poll_project_scaled_bus_clocks(certificate, iterations)?;
             core.checked_add(bus)
         };
+        // `run_spent(n)` is what the RUN-remaining `req.cap` actually bounds: RUN-scoped core plus
+        // RUN-scoped bus GROWTH (the batch-absolute bus reading minus the batch-absolute bus total
+        // this run STARTED at, `req.bus_scaled_at_run_entry`) -- algebraically identical to
+        // `run_direct_block`'s own `used = total + (bus.in_batch_scaled_bus_clocks() -
+        // bus_at_entry)`, extended by `n` skipped iterations. Comparing `req.cap` against a
+        // batch-absolute bus reading (the pre-fix defect) subtracted the batch's prior bus clocks
+        // from the budget a second time, because `req.cap` is already net of them.
+        let bus_growth = |iterations: u64| -> Option<u64> {
+            Some(
+                self.poll_project_scaled_bus_clocks(certificate, iterations)?
+                    .saturating_sub(req.bus_scaled_at_run_entry),
+            )
+        };
+        let run_spent = |iterations: u64| -> Option<u64> {
+            now_at_run(iterations)?.checked_add(bus_growth(iterations)?)
+        };
         let reserved_total =
-            |iterations: u64| -> Option<u64> { candidate_total(iterations.checked_add(1)?) };
+            |iterations: u64| -> Option<u64> { run_spent(iterations.checked_add(1)?) };
 
-        let Some(spent) = candidate_total(0) else {
+        let Some(spent) = run_spent(0) else {
             return Err(CalloutPollDecline::Cap);
         };
-        // The 32-bit return-lane bound (design obligation 4), enforced with a hardcoded ceiling
-        // INDEPENDENT of `req.max_skipped_raw`: the caller's clock lane takes the LOW 32 BITS of
-        // an `i64`, and bit 32 is the step-break status bit, so nothing this method admits may let
-        // `raw_core_clocks * iterations` reach it -- whatever a misconfigured
-        // `IZARRAVM_DIRECT_POLL_MAX_RAW` claims. `req.max_skipped_raw` can still tune the bound
-        // DOWN (a smaller request always wins the `.min`); it can never tune it up past this
-        // ceiling. The 64-clock margin comfortably covers `IN_AL_DX_CORE_CLOCKS` (12) plus any
-        // other small additive term the caller folds in on top of this method's own return.
-        const LANE_SAFETY_CEILING: u64 = u32::MAX as u64 - 64;
-        let upper = req
-            .cap
-            .saturating_sub(spent)
-            .min(u64::from(u32::MAX))
-            .saturating_sub(1)
-            .min(req.max_skipped_raw.min(LANE_SAFETY_CEILING) / req.raw_core_clocks.max(1));
+        // The 32-bit return-lane bound (design obligation 4). Factored into `poll_skip_upper_
+        // bound` (Rank-4 killer, GP2 poll-skip revision review): no fixture ever produces a span
+        // within four orders of magnitude of `LANE_SAFETY_CEILING`, so the clamp needed a
+        // standalone unit test that does not depend on a real edge ever getting that far away.
+        let upper = poll_skip_upper_bound(req.cap, spent, req.max_skipped_raw, req.raw_core_clocks);
         let min_iterations = req.min_iterations.max(1);
         if upper < min_iterations {
             return Err(CalloutPollDecline::Cap);
@@ -2939,7 +3008,7 @@ impl CpuBus for MachineBus<'_> {
             if reserved > req.cap {
                 return false;
             }
-            let Some(candidate) = candidate_total(iterations) else {
+            let Some(candidate) = batch_instant(iterations) else {
                 return false;
             };
             self.poll_project_dot_advance(candidate)
@@ -2962,7 +3031,11 @@ impl CpuBus for MachineBus<'_> {
             return Err(CalloutPollDecline::Cap);
         }
 
-        let Some(now_after) = now_at(best) else {
+        // `now_after` stays RUN-scoped: the caller (`port_read_al_dx`) feeds it straight into
+        // `read_io`'s `core_clocks_so_far` argument, which is run-scoped by the whole existing
+        // contract (`read_io`'s own first statement, and `run_budgeted_inner`'s `total` that seeds
+        // it), never batch-scoped.
+        let Some(now_after) = now_at_run(best) else {
             return Err(CalloutPollDecline::Cap);
         };
         let Some(skipped_raw_core_clocks) = req.raw_core_clocks.checked_mul(best) else {

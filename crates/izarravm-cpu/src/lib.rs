@@ -2138,6 +2138,7 @@ pub struct DirectStallSnapshot {
     pub poll_declined_knob: u64,
     pub poll_declined_eligibility: u64,
     pub poll_declined_shape: u64,
+    pub poll_declined_cap: u64,
     pub poll_declined_seam: u64,
     pub poll_skip_spans: [u64; 3],
     pub poll_skip_iterations: [u64; 3],
