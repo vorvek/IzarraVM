@@ -25,11 +25,30 @@
 #define MG_FLAGS       0x0130
 #define MG_COMMAND     0x0150
 
+#define MG_BG_COLOR    0x0124
+#define MG_COLORKEY    0x012c
+#define MG_CLIP_TL     0x0134
+#define MG_CLIP_BR     0x0138
+#define MG_MONO_DATA   0x0160
+
 #define MG_CMD_FILL    0x01
+#define MG_CMD_COPY    0x02
+#define MG_CMD_EXPAND  0x03
 #define MG_ROP_PATCOPY 0xF0
+#define MG_ROP_SRCCOPY 0xCC
+#define MG_FLAG_EXPAND_TRANSPARENT 0x04
+#define MG_FLAG_CLIP_EN            0x01
+
+#define CURSOR_OFF 0x180000UL
 
 void margo_wait(void);
 void margo_fill(int x, int y, int w, int h, unsigned color);
 void margo_cursor_off(void);
+void margo_cursor_on(unsigned fg, unsigned bg);
+void margo_glyph8(int x, int y, unsigned char ch, unsigned fg);
+void margo_text8(int x, int y, const char *s, unsigned fg);
+void margo_outline(int x, int y, int w, int h, unsigned color);
+void margo_raised(int x, int y, int w, int h, unsigned face);
+void margo_recessed(int x, int y, int w, int h, unsigned face);
 
 #endif

@@ -12,6 +12,7 @@ org 0
 
 PAYLOAD_LIN equ 0x200000
 STACK16     equ 0x0400
+BOUNCE_MAX  equ 16384
 
 jmp start
 times 16-($-$$) db 0
@@ -377,7 +378,7 @@ open_self:
 read_payload:
     ; Payload is a few hundred bytes in PR 1 and fits in the 4K bounce.
     mov eax, [hdr_payload]
-    cmp eax, 4096
+    cmp eax, BOUNCE_MAX
     ja fail_open
     mov ah, 0x3F
     mov bx, [file_handle]
@@ -464,6 +465,6 @@ align 16
 stack16:        times STACK16 db 0
 stack16_top:
 
-; 5 pages + 4K slack for alignment (PD, PT0, LFB PT, MMIO PT, bounce)
+; PD, PT0, LFB PT, MMIO PT, 16K bounce, 4K slack
 align 16
-area:           times 6 * 4096 db 0
+area:           times 9 * 4096 db 0

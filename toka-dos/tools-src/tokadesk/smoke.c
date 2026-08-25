@@ -2,6 +2,7 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 
 #include "color.h"
+#include "desktop.h"
 #include "lotura.h"
 #include "margo.h"
 
@@ -18,6 +19,6 @@ void desk_main(void)
     if (width != 1024UL || height != 768UL || bpp != 16UL) {
         ut_exit(0xE6);
     }
-    margo_fill(0, 0, 1024, 768, COL_FIELD);
+    desk_draw();
     ut_exit(0);
 }

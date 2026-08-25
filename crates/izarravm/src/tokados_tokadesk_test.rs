@@ -72,6 +72,11 @@ fn tokadesk_fills_mode_117_and_exits() {
     assert_eq!(display.width, 1024, "width {display:?}");
     assert_eq!(display.height, 768, "height {display:?}");
     assert_eq!(display.bpp, 16, "bpp {display:?}");
-    let crc = machine.screen_crc32(0, 0, 1024, 768);
-    assert_ne!(crc, 0, "cream FILL should hash a non-empty frame");
+    let menu = machine.screen_crc32(0, 0, 1024, 24);
+    let well = machine.screen_crc32(128, 24, 896, 500);
+    assert_ne!(menu, 0, "menu bar should hash a non-empty rectangle");
+    assert_ne!(
+        menu, well,
+        "menu chrome and the Directory well should not be the same fill"
+    );
 }
