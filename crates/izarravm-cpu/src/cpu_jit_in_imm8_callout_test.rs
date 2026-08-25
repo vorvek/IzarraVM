@@ -72,11 +72,14 @@ fn select_in_imm8_callout(enabled: bool) -> InImm8CalloutGuard {
 // The knob
 // ---------------------------------------------------------------------------------------------
 
-/// THE DEFAULT PIN. Catches a flip of `parse_direct_in_imm8_callout_arm`'s `NotPresent` arm: this
-/// row is default-off and a default that moved without a ladder would change every shipped
-/// binary's admission silently.
+/// THE DEFAULT PIN. Catches a flip of `parse_direct_in_imm8_callout_arm`'s `NotPresent` arm:
+/// this row ships default ON since 2026-08-27, when its own ladder priced the flip
+/// (`.bench/results/inimm8-ladder-20260827/`: gp2-586 min-wall +21.1% over five interleaved
+/// pairs, duke3d-586-short 1.001 over six per arm, five inert controls) and the owner approved
+/// it. A default that moved back without the same evidence would change every shipped binary's
+/// admission silently.
 #[test]
-fn in_imm8_callout_ships_off_by_default() {
+fn in_imm8_callout_ships_on_by_default() {
     jit::direct::set_direct_in_imm8_callout_for_test(None);
     let ambient = std::env::var("IZARRAVM_DIRECT_IN_IMM8_CALLOUT");
     let expected = jit::direct::parse_direct_in_imm8_callout_arm_for_test(ambient.clone());
@@ -88,15 +91,16 @@ fn in_imm8_callout_ships_off_by_default() {
     );
     if ambient.is_err() {
         assert!(
-            !expected,
-            "IZARRAVM_DIRECT_IN_IMM8_CALLOUT must default OFF; the row has not been priced on a \
-             wall ladder that authorized a flip"
+            expected,
+            "IZARRAVM_DIRECT_IN_IMM8_CALLOUT must default ON: the inimm8-ladder-20260827 \
+             ladder priced the flip and the owner approved it on 2026-08-27"
         );
     }
 }
 
-/// The spelling table (mutant table gate 1): unset and `""` must BOTH parse `false`, matching
-/// `IZARRAVM_TEST_WORD_ROWS`'s convention rather than `IZARRAVM_ATA_POLL_SKIP`'s inverted one.
+/// The spelling table (mutant table gate 1): unset and `""` must BOTH parse `true` (the
+/// default, ON since the 2026-08-27 flip) -- one convention, not `IZARRAVM_ATA_POLL_SKIP`'s
+/// inverted one where `""` disagrees with unset.
 ///
 /// Catches: a `_ => false` fallthrough replacing the panic (a mistyped ladder leg would silently
 /// run the base and be read as "the slice under test changed nothing"), and a spelling that
@@ -107,8 +111,8 @@ fn in_imm8_callout_spelling_table_names_both_arms() {
     let unset = jit::direct::parse_direct_in_imm8_callout_arm_for_test(Err(VarError::NotPresent));
     let empty = jit::direct::parse_direct_in_imm8_callout_arm_for_test(Ok(String::new()));
     assert!(
-        !unset,
-        "unset must name the OFF arm: this row is default-off"
+        unset,
+        "unset must name the ON arm: this row ships default ON since the 2026-08-27 flip"
     );
     assert_eq!(
         unset, empty,

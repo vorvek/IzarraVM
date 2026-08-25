@@ -10319,13 +10319,15 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
 /// Whether `classify` admits **`0xE4` IN AL,imm8, for ANY immediate port** as a `PortReadAlImm8`
 /// call-out (`IZARRAVM_DIRECT_IN_IMM8_CALLOUT`, gp2 in-imm8 callout design rev 3).
 ///
-/// **DEFAULT OFF**, `IZARRAVM_TEST_WORD_ROWS`'s shape and the opposite of
-/// `IZARRAVM_DIRECT_POLL_SKIP` / `IZARRAVM_V86_LOOP_ROWS` / `IZARRAVM_ROTATE_ROWS` /
-/// `IZARRAVM_COUNT_LANES` / `IZARRAVM_FPU_LOOP_ROWS`, whose unset arm is the shipped slice. An
-/// unset knob is the pre-slice refusal (`0xE4` stays a barrier) and the A/B base every ladder leg
-/// on this row is read against.
+/// **DEFAULT ON since 2026-08-27, on the owner's approval after the row's own ladder**
+/// (`.bench/results/inimm8-ladder-20260827/`): gp2-586 min-wall +21.1% over five interleaved
+/// pairs (bar >= 1.10, passed on every pair); duke3d-586-short 1.001 over six repeats per arm
+/// (no SB16-class regime flip); five controls inert with `jit_direct_callout_port_imm8_served`
+/// = 0, all inside the measured +/-2% floor; gp2's frame hash bit-identical between arms.
+/// `0` / `off` still name the pre-slice refusal (`0xE4` stays a barrier), stated, and remain
+/// the A/B base a ladder leg on this row is read against.
 ///
-/// **THE CONVENTION IS `IZARRAVM_TEST_WORD_ROWS`'s: unset and `""` name the SAME (OFF) arm.** Not
+/// **THE CONVENTION: unset and `""` name the SAME (default) arm.** Not
 /// `IZARRAVM_ATA_POLL_SKIP`'s inverted spelling -- there is no reason to give this knob a third
 /// shape on this campaign.
 pub(crate) fn direct_in_imm8_callout_armed() -> bool {
@@ -10343,35 +10345,38 @@ pub(crate) fn direct_in_imm8_callout_armed() -> bool {
 /// it can be unit-tested without a process-global env write. See `direct_in_imm8_callout_armed`.
 fn parse_direct_in_imm8_callout_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the default, and the default is ON since the 2026-08-27 flip.
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_DIRECT_IN_IMM8_CALLOUT is set to a value that is not valid UTF-8; \
-                 accepted spellings are unset, `0` or `off` (the shipped base, under which \
-                 `0xE4` stays a barrier), and `1` or `on` (the `PortReadAlImm8` admission)"
+                 accepted spellings are unset (the shipped default: ON since 2026-08-27), `0` or \
+                 `off` (the pre-slice base, under which `0xE4` stays a barrier), and `1` or `on` \
+                 (the same ON arm, stated: the `PortReadAlImm8` admission)"
             )
         }
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" => false,
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        "" => true,
+        "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_DIRECT_IN_IMM8_CALLOUT={other:?} names no arm; accepted spellings are \
-             unset, `0` or `off` (the shipped base) and `1` or `on` (the `0xE4` IN AL,imm8 \
-             call-out admission, any immediate port). \
-             Refusing to guess: a mistyped ladder leg that silently ran the base would be read \
-             as the slice failing"
+             unset (the shipped default, ON since 2026-08-27), `0` or `off` (the pre-slice \
+             base) and `1` or `on` (the `0xE4` IN AL,imm8 call-out admission, any immediate \
+             port). Refusing to guess: a mistyped ladder leg that silently ran the default \
+             would be read as the arm it did not run"
         ),
     }
 }
 
 // Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
 // `OnceLock` and the fixtures have to run both arms in one process, so one test's arm selection
-// must not reach another's compile. Since the arm is default-OFF, every positive fixture for this
-// row MUST force it on through here or it would test the refusal and call it a lowering; and every
-// refusal fixture states the off arm rather than inheriting it, so that it keeps meaning what it
-// says the day the default moves.
+// must not reach another's compile. Every positive fixture forces the arm on through here and
+// every refusal fixture states the off arm rather than inheriting it -- which is why both kept
+// meaning what they say across the 2026-08-27 default flip to ON.
 #[cfg(test)]
 thread_local! {
     static DIRECT_IN_IMM8_CALLOUT_OVERRIDE: std::cell::Cell<Option<bool>> =
