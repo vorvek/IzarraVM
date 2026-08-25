@@ -3276,6 +3276,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "side_exit_callout_abnormal": snapshot.side_exit_callout_abnormal,
         "jit_direct_callout_executed": snapshot.callout_executed,
         "jit_direct_callout_port_v86_served": snapshot.callout_port_v86_served,
+        "jit_direct_callout_port_imm8_served": snapshot.callout_port_imm8_served,
         "jit_direct_callout_interpret_one_executed": snapshot.callout_interpret_one_executed,
         "jit_direct_callout_interpret_one_resync": snapshot.callout_interpret_one_resync,
         // The price of the PREFIX half of the segment mask: resyncs the suffix-only rule would

@@ -949,14 +949,14 @@ fn poll_skip_upper_bound_never_lets_the_32_bit_lane_overflow() {
         "raw_core_clocks * upper must stay under 2^32 (bit 32 is the step-break status bit) even \
          with an absurd cap and max_skipped_raw: upper={upper}, product={skipped_raw_core_clocks}"
     );
-    // The margin: `IN_AL_DX_CORE_CLOCKS` (12, `izarravm-cpu`, not visible from this crate) plus
+    // The margin: `IN_PORT_CORE_CLOCKS` (12, `izarravm-cpu`, not visible from this crate) plus
     // this method's own return must still clear 2^32 -- `crate::bus::LANE_SAFETY_CEILING` reserves
     // 64 clocks for exactly this, so 12 fits with headroom to spare.
-    const IN_AL_DX_CORE_CLOCKS_FOR_TEST: u64 = 12;
+    const IN_PORT_CORE_CLOCKS_FOR_TEST: u64 = 12;
     assert!(
-        skipped_raw_core_clocks + IN_AL_DX_CORE_CLOCKS_FOR_TEST < u64::from(u32::MAX),
-        "raw_core_clocks * upper + IN_AL_DX_CORE_CLOCKS must stay under 2^32: got {}",
-        skipped_raw_core_clocks + IN_AL_DX_CORE_CLOCKS_FOR_TEST
+        skipped_raw_core_clocks + IN_PORT_CORE_CLOCKS_FOR_TEST < u64::from(u32::MAX),
+        "raw_core_clocks * upper + IN_PORT_CORE_CLOCKS must stay under 2^32: got {}",
+        skipped_raw_core_clocks + IN_PORT_CORE_CLOCKS_FOR_TEST
     );
     // `raw_core_clocks * upper` must be AT the ceiling (not far under it): a huge cap and a huge
     // max_skipped_raw mean the LANE_SAFETY_CEILING term is the only thing left binding `upper`,

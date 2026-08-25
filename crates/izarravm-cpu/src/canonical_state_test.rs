@@ -883,8 +883,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // (jit_direct_reject_data_segment_strict / _masked; 16 bytes), moving the pin 4536 -> 4552 --
     // measured, not derived. Reject counts are host bookkeeping, so both canonical payloads are
     // unchanged by it; see cpu_test.rs's twin comment for why they have to sit in PerfCounters.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4552);
+    // The gp2 in-imm8 callout design adds `CallOutTable::port_read_al_imm8` (8 bytes), moving the
+    // pin 4552 -> 4560 -- measured, not derived. A host-side function-pointer slot, not
+    // architectural state, so both canonical payloads are unchanged by it; see cpu_test.rs's twin
+    // comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4560);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4552);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4560);
 }

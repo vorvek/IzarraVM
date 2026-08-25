@@ -1338,7 +1338,7 @@ impl CpuGsw {
                     self.is_ring0_protected(),
                 )? as u8;
                 self.write_gpr8(0, value);
-                Ok(clocks(12))
+                Ok(clocks(IN_PORT_CORE_CLOCKS))
             }
             0xe5 => {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
@@ -1390,7 +1390,7 @@ impl CpuGsw {
                     self.is_ring0_protected(),
                 )? as u8;
                 self.write_gpr8(0, value);
-                Ok(clocks(IN_AL_DX_CORE_CLOCKS))
+                Ok(clocks(IN_PORT_CORE_CLOCKS))
             }
             0xed => {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.

@@ -135,6 +135,50 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
     assert_eq!(compilation.span.guest_len, 3);
 }
 
+/// gp2 in-imm8 callout design rev 3 §8.1's `StructuralReject` gate, THE THREE-CASE FORM: a hard
+/// boundary reached at 1, 2 and 5 slots into the walk. `direct.rs:7215-7216`'s min-length guard
+/// (`slots.len() < 3`) is read ONLY below 3 slots -- `stop` is consulted there and there alone --
+/// so 1 and 2 slots must file `StructuralReject` and 5 slots must instead COMPILE, because the
+/// guard is never reached at 5. This is a BETTER gate than a single-case one (which
+/// `structural_rejection_includes_the_complete_short_prefix_and_barrier` and
+/// `three_supported_slots_compile_before_an_unsupported_barrier` already give, separately): it
+/// pins the exact boundary between reject and install in ONE fixture, which is the fact the whole
+/// gp2 in-imm8 callout slice's reachability argument turns on (rev 3 §2.1).
+///
+/// MUTATION that turns this red in EITHER direction: edit the `slots.len() < 3` guard at
+/// `direct.rs:7215-7216` and at least one of the three cases flips.
+#[test]
+fn structural_reject_boundary_sits_at_exactly_three_slots() {
+    // 0x40..=0x44 are INC EAX/ECX/EDX/EBX/ESP: five distinct one-byte, no-ModRM opcodes, so the
+    // prefix can be built to any length from 1 to 5 without repeating an instruction.
+    let prefix = [0x40u8, 0x41, 0x42, 0x43, 0x44];
+    for slots in [1usize, 2, 5] {
+        let mut code = prefix[..slots].to_vec();
+        code.push(DIRECT_BARRIER);
+        let addresses: Vec<u32> = (0..=slots as u32).map(|i| ENTRY + i).collect();
+        let (mut cpu, mut bus) = fixture(&code);
+        warm(&mut cpu, &mut bus, &addresses);
+
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        if slots < 3 {
+            let span = structural(outcome);
+            assert_eq!(
+                span.guest_len(),
+                slots as u16 + 1,
+                "slots={slots}: the rejected span must carry the whole short prefix plus the barrier"
+            );
+        } else {
+            let compilation = compiled(outcome);
+            assert_eq!(
+                usize::from(compilation.span.instructions),
+                slots,
+                "slots={slots}: a hard boundary reached with >=3 slots already collected must \
+                 install exactly what the walk had, not reject it -- `stop` is never read here"
+            );
+        }
+    }
+}
+
 #[test]
 fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
     // Not 0xFC (CLD, natively lowered already) and not 0x99/CDQ (the CHOICE THIS TEST USED TO
@@ -4396,6 +4440,18 @@ fn a_dormant_keys_unbound_exits_are_attributed_to_its_retry_cause() {
 /// accident of this fixture, and it is why `RetryCause::CalloutCap` reads zero on every
 /// workload today. Five `pop dword [eax]` slots against `MAX_BLOCK_CALLOUT_SLOTS` of four:
 /// the block installs with four and the cap counter moves.
+///
+/// PRE-EXISTING at the base commit (`218699f8`), predating the gp2 in-imm8 callout design (rev 3)
+/// entirely. It is what satisfies rev 3 §8.1's `CalloutCap` mutant-table row -- (a)
+/// `callout_slot_cap_hits` bumps once, (b) a block installs holding exactly four call-out slots,
+/// (c) no retry cause is filed -- even though it drives the row with `0x8F` (`InterpretOne` class)
+/// rather than the row's own suggested "five `0xE4`s" shape. That transfers by construction: the
+/// cap is CLASS-BLIND -- `callout_slots += u8::from(kind.is_call_out())` (`direct.rs:6971`) sums
+/// every call-out class into ONE local, and the cap trip at `direct.rs:6891` reads that same local
+/// -- so a port-class instance of this row would exercise the identical code path and assert the
+/// identical three facts. ROUND-3 review M3-2: no fixture naming `PortReadAlImm8` or five `0xE4`s
+/// was ever added for this slice; this comment is the citation the review asked for in place of
+/// that fixture, not a claim that one was written.
 #[test]
 fn the_call_out_cap_shortens_the_block_instead_of_parking_the_key() {
     let code = [0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00, 0x8f, 0x00];
