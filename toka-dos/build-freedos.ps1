@@ -304,6 +304,13 @@ $editExe = Join-Path $editDir 'edit.exe'
 if (-not (Test-Path $editExe)) { throw "edit.exe not produced" }
 Write-Host "EDIT.COM: $((Get-Item $editExe).Length) bytes"
 
+# --- TOKADESK.EXE (32-bit visual workbench; original tools-src, GPL-3) ---
+$tokadeskDir = Join-Path $root 'tools-src\tokadesk'
+& (Join-Path $tokadeskDir 'build.ps1')
+if ($LASTEXITCODE) { throw "TOKADESK build failed" }
+$tokadeskExe = Join-Path $tokadeskDir 'tokadesk.exe'
+if (-not (Test-Path $tokadeskExe)) { throw "TOKADESK.EXE not produced" }
+
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 # A committed binary in the firmware crate, like TOKAEMM.SYS below: the image
 # builder takes it from there on both of its paths, and the driver tests mount

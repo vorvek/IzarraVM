@@ -18,3 +18,5 @@ documented command-line behavior only.
   menus, dialogs, mouse, clipboard. Open Watcom large-model C; the ANSI-clean
   buffer core (`buffer.c`) is self-checked at build time by a native
   `test_buffer.c` harness.
+- `tokadesk/` `TOKADESK.EXE`, the 32-bit visual workbench (Open Watcom `wcc386`
+  payload plus a NASM VCPI stub). Authoring build: `tokadesk/build.ps1`.

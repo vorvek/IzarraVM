@@ -209,3 +209,6 @@ mod bootscreen;
 
 #[path = "tokados_mouse_test.rs"]
 mod mouse;
+
+#[path = "tokados_tokadesk_test.rs"]
+mod tokadesk;
