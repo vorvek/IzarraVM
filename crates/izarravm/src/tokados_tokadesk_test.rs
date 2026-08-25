@@ -3,8 +3,9 @@
 
 //! TOKADESK.EXE smoke: VCPI switch, VBE 0x117, chrome, V86 thunk, Lotura exit.
 //!
-//! `/T` draws once, then probes INT 21h/10h/33h through the stub thunk
-//! (fail codes 0xE7..0xEA) before CMD_EXIT 0.
+//! `/T` draws once, probes INT 21h/10h/33h through the stub thunk
+//! (fail codes 0xE7..0xEA), waits one V86 retrace, then CMD_EXIT 0.
+//! Hardware cursor stays off so the chrome CRC is not composited.
 //!
 //! The EXE is the authoring artifact at `toka-dos/tools-src/tokadesk/tokadesk.exe`.
 //! PR 1 overlays it at `C:\TOKADESK.EXE` (not yet in `DOS_FOLDER_BINARIES`).

@@ -135,8 +135,14 @@ void margo_cursor_on(unsigned fg, unsigned bg)
         and_plane[512 + row * 8 + 0] = (unsigned char)((bits >> 8) & 0xFF);
         and_plane[512 + row * 8 + 1] = (unsigned char)(bits & 0xFF);
     }
-    MARGO_REG(0x002C) = CURSOR_OFF;
-    MARGO_REG(0x0034) = fg;
-    MARGO_REG(0x0038) = bg;
+    MARGO_REG(MG_CURSOR_ADDR) = CURSOR_OFF;
+    MARGO_REG(MG_CURSOR_FG) = fg;
+    MARGO_REG(MG_CURSOR_BG) = bg;
     MARGO_REG(MG_CURSOR_CTRL) = 1;
+}
+
+void margo_cursor_pos(int x, int y)
+{
+    MARGO_REG(MG_CURSOR_POS) =
+        ((unsigned long)(y & 0xFFFF) << 16) | (unsigned long)(x & 0xFFFF);
 }

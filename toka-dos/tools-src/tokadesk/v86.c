@@ -33,3 +33,22 @@ unsigned v86_intx(unsigned vector, unsigned ax, unsigned bx, unsigned cx,
     v86_call();
     return a->ax;
 }
+
+void v86_yield(unsigned ctl)
+{
+    V86Abi *a;
+
+    a = v86_abi();
+    a->vector = 0;
+    a->ax = (unsigned short)ctl;
+    a->bx = 0;
+    a->cx = 0;
+    a->dx = 0;
+    a->si = 0;
+    a->di = 0;
+    a->ds = a->rm_seg;
+    a->es = a->rm_seg;
+    a->flags = 0;
+    a->err = 0;
+    v86_call();
+}

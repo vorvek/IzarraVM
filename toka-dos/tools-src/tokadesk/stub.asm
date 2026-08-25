@@ -42,7 +42,7 @@ abi_ds          dw 0
 abi_es          dw 0
 abi_flags       dw 0
 abi_err         dw 0
-                dw 0
+abi_psp_seg     dw 0
 abi_bounce_lin  dd 0
 abi_bounce_off  dw 0
 abi_rm_seg      dw 0
@@ -189,6 +189,8 @@ align_area:
     mov [abi_bounce_off], ax
     mov ax, [rm_seg]
     mov [abi_rm_seg], ax
+    mov ax, [psp_seg]
+    mov [abi_psp_seg], ax
     ret
 
 build_tables:
@@ -548,9 +550,66 @@ int_site:
     and ax, 1
     mov [abi_err], ax
     jmp v86_after_int
+; vector 0: wait leading retrace with IF=1, sample INT 33h AX=3, peek BDA.
+; abi_ax bit 0 = oneshot (always return), bit 1 = dirty. Test those in
+; memory: INT 33h leaves AX=3. Idle skip stays in V86 (no DE0C).
 v86_skip_int:
     mov word [abi_flags], 0
     mov word [abi_err], 0
+    sti
+    cld
+v86_wait_out:
+    mov dx, 0x3DA
+    in al, dx
+    test al, 8
+    jnz v86_wait_out
+v86_wait_in:
+    mov dx, 0x3DA
+    in al, dx
+    test al, 8
+    jz v86_wait_in
+    mov ax, 3
+    int 0x33
+    push cs
+    pop ds
+    push cs
+    pop es
+    mov [abi_bx], bx
+    mov [abi_cx], cx
+    mov [abi_dx], dx
+    push es
+    mov ax, 0x40
+    mov es, ax
+    mov ax, [es:0x1A]
+    cmp ax, [es:0x1C]
+    pop es
+    mov word [abi_si], 0
+    je v86_nokey
+    mov word [abi_si], 1
+v86_nokey:
+    test word [abi_ax], 1
+    jnz v86_yield_done
+    test word [abi_ax], 2
+    jnz v86_yield_done
+    cmp word [abi_si], 0
+    jne v86_yield_done
+    mov ax, [abi_bx]
+    cmp ax, [yield_last_bx]
+    jne v86_yield_done
+    mov ax, [abi_cx]
+    cmp ax, [yield_last_cx]
+    jne v86_yield_done
+    mov ax, [abi_dx]
+    cmp ax, [yield_last_dx]
+    jne v86_yield_done
+    jmp v86_wait_out
+v86_yield_done:
+    mov ax, [abi_bx]
+    mov [yield_last_bx], ax
+    mov ax, [abi_cx]
+    mov [yield_last_cx], ax
+    mov ax, [abi_dx]
+    mov [yield_last_dx], ax
 v86_after_int:
     cli
     mov ebp, [lin_base]
@@ -608,6 +667,9 @@ entry_off       dd 0
 entry_sel       dw 0
 pm32_off        dd 0
 pm32_cs         dw 0
+yield_last_bx   dw 0xFFFF
+yield_last_cx   dw 0xFFFF
+yield_last_dx   dw 0xFFFF
 
 align 8
 gdt:            times 9 * 8 db 0

@@ -17,7 +17,7 @@ ABI_DS          equ 14
 ABI_ES          equ 16
 ABI_FLAGS       equ 18
 ABI_ERR         equ 20
-ABI_PAD         equ 22
+ABI_PSP_SEG     equ 22
 ABI_BOUNCE_LIN  equ 24
 ABI_BOUNCE_OFF  equ 28
 ABI_RM_SEG      equ 30

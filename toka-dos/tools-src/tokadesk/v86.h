@@ -20,12 +20,15 @@ typedef struct {
     unsigned short es;
     unsigned short flags;
     unsigned short err;
-    unsigned short pad;
+    unsigned short psp_seg;
     unsigned long bounce_lin;
     unsigned short bounce_off;
     unsigned short rm_seg;
 } V86Abi;
 #pragma pack()
+
+#define YIELD_ONESHOT 1u
+#define YIELD_DIRTY   2u
 
 extern unsigned long stub_lin_slot;
 void v86_call(void);
@@ -34,5 +37,6 @@ V86Abi *v86_abi(void);
 void *v86_bounce(void);
 unsigned v86_intx(unsigned vector, unsigned ax, unsigned bx, unsigned cx,
                   unsigned dx);
+void v86_yield(unsigned ctl);
 
 #endif

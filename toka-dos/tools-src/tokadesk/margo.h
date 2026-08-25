@@ -15,6 +15,10 @@
 #define MG_DISP_BPP    0x001C
 #define MG_DISP_PITCH  0x0020
 #define MG_CURSOR_CTRL 0x0028
+#define MG_CURSOR_ADDR 0x002C
+#define MG_CURSOR_POS  0x0030
+#define MG_CURSOR_FG   0x0034
+#define MG_CURSOR_BG   0x0038
 #define MG_DST_BASE    0x0100
 #define MG_DST_PITCH   0x0104
 #define MG_DEPTH       0x0110
@@ -45,6 +49,7 @@ void margo_wait(void);
 void margo_fill(int x, int y, int w, int h, unsigned color);
 void margo_cursor_off(void);
 void margo_cursor_on(unsigned fg, unsigned bg);
+void margo_cursor_pos(int x, int y);
 void margo_glyph8(int x, int y, unsigned char ch, unsigned fg);
 void margo_text8(int x, int y, const char *s, unsigned fg);
 void margo_outline(int x, int y, int w, int h, unsigned color);

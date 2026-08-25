@@ -3,9 +3,29 @@
 
 #include "color.h"
 #include "desktop.h"
+#include "loop.h"
 #include "lotura.h"
 #include "margo.h"
 #include "v86.h"
+
+static int has_switch_t(void)
+{
+    unsigned char *p;
+    unsigned n;
+    unsigned i;
+
+    p = (unsigned char *)(((unsigned long)v86_abi()->psp_seg << 4) + 0x80u);
+    n = p[0];
+    if (n > 126u) {
+        n = 126u;
+    }
+    for (i = 1; i + 1 <= n; i++) {
+        if (p[i] == '/' && (p[i + 1] == 'T' || p[i + 1] == 't')) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 void desk_main(void)
 {
@@ -22,6 +42,9 @@ void desk_main(void)
         ut_exit(0xE6);
     }
     desk_draw();
+    if (!has_switch_t()) {
+        desk_loop();
+    }
 
     /* INT 21h AH=19h: current drive, 0=A so C: is 2. */
     ax = v86_intx(0x21, 0x1900, 0, 0, 0);
@@ -44,6 +67,7 @@ void desk_main(void)
         ut_exit(0xEA);
     }
 
+    v86_yield(YIELD_ONESHOT);
     margo_cursor_off();
     ut_exit(0);
 }
