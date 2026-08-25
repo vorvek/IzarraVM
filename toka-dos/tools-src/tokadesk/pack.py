@@ -5,8 +5,9 @@
 """Pack the 16-bit VCPI stub and the 32-bit payload into TOKADESK.EXE.
 
 The MZ load image is the stub only. The payload sits past that image; the
-stub seeks to it after DE0C lands on copy32. Header fields at stub offset 16
-are patched here.
+stub seeks to it after DE0C lands on pm16. Header fields at stub offset 16
+are patched here. Offset 40 is StubAbi (stubabi.inc); do not grow the header
+into that range.
 """
 import os
 import struct

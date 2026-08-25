@@ -1,17 +1,21 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 ;
-; 16-bit MZ stub for TOKADESK.EXE. VCPI client, VBE 0x4117.
-; The first payload is small enough to read in V86 into the 4K bounce.
+; 16-bit MZ stub for TOKADESK.EXE. VCPI client, VBE 0x4117, V86 thunk.
+; The first payload is small enough to read in V86 into the 16K bounce.
 ; 16-bit protected mode copies it to linear 0x200000, then far-jumps into
 ; the 32-bit code segment. DE0C lands on a 16-bit CS first: a D=1 landing
-; from the monitor is not how vcpisw.asm switches.
+; from the monitor is not how vcpisw.asm switches. 32-bit C never INT 21h
+; from ring-0; it far-jumps here, this file builds the 9-dword DE0C frame
+; on the first-MB stack, and V86 issues the INT with IF=1.
 ; Build: nasm -f bin stub.asm -o stub.bin
 cpu 386
 org 0
 
+%include "stubabi.inc"
+
 PAYLOAD_LIN equ 0x200000
-STACK16     equ 0x0400
+STACK16     equ 0x1000
 BOUNCE_MAX  equ 16384
 
 jmp start
@@ -22,6 +26,37 @@ hdr_bss         dd 0
 hdr_stack       dd 0
 hdr_n           dd 0
 hdr_stub_bytes  dd 0
+
+%if ($-$$) != STUB_ABI_OFF
+%error "header must end at STUB_ABI_OFF so StubAbi is at file offset 40"
+%endif
+stub_abi:
+abi_vector      dw 0
+abi_ax          dw 0
+abi_bx          dw 0
+abi_cx          dw 0
+abi_dx          dw 0
+abi_si          dw 0
+abi_di          dw 0
+abi_ds          dw 0
+abi_es          dw 0
+abi_flags       dw 0
+abi_err         dw 0
+                dw 0
+abi_bounce_lin  dd 0
+abi_bounce_off  dw 0
+abi_rm_seg      dw 0
+abi_saved_esp   dd 0
+abi_ret_eip     dd 0
+abi_ret_cs      dw 0x08
+abi_thunk_out   dd thunk_out
+abi_thunk_cs    dw 0x18
+%if (stub_abi - $$) != STUB_ABI_OFF
+%error "stub_abi is not at STUB_ABI_OFF"
+%endif
+%if ($-stub_abi) != ABI_SIZE
+%error "StubAbi size must match ABI_SIZE"
+%endif
 
 start:
     mov [cs:psp_seg], es
@@ -148,6 +183,12 @@ align_area:
     mov eax, [bounce_phys]
     sub eax, [lin_base]
     mov [bounce_off], ax
+    mov eax, [bounce_phys]
+    mov [abi_bounce_lin], eax
+    mov ax, [bounce_off]
+    mov [abi_bounce_off], ax
+    mov ax, [rm_seg]
+    mov [abi_rm_seg], ax
     ret
 
 build_tables:
@@ -376,7 +417,7 @@ open_self:
     ret
 
 read_payload:
-    ; Payload is a few hundred bytes in PR 1 and fits in the 4K bounce.
+    ; Payload is still under BOUNCE_MAX; read it in V86, copy in pm16.
     mov eax, [hdr_payload]
     cmp eax, BOUNCE_MAX
     ja fail_open
@@ -422,9 +463,123 @@ pm16:
     a32 mov [dword PAYLOAD_LIN + 4], ebx
     mov ax, 0x20
     mov ds, ax
+    mov dword [swst+0x10], thunk_from_v86
+    mov word [swst+0x14], 0x18
     mov dword [pm32_off], PAYLOAD_LIN + 8
     mov word [pm32_cs], 0x08
     jmp dword far [pm32_off]
+
+; 32-bit v86_call far-jumps here (CS=0x18). SS is still the C stack at
+; 0x200000+ until we load SS:ESP. Server CR3 does not map that; the 9-dword
+; frame has to sit on this first-MB stack. Full ESP: B=0 would leave the
+; high half of the incoming ESP, and vcpi_pm_to_v86 writes [esp+0x10].
+thunk_out:
+    mov ax, 0x20
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov esp, stack16_top
+    xor eax, eax
+    mov ax, [rm_seg]
+    push eax                      ; GS
+    push eax                      ; FS
+    push eax                      ; DS
+    push eax                      ; ES
+    push eax                      ; SS
+    movzx eax, word [rm_sp]
+    push eax                      ; ESP
+    push dword 0                  ; EFLAGS slot (server fills)
+    movzx eax, word [rm_seg]
+    push eax                      ; CS
+    mov eax, v86_thunk
+    push eax                      ; EIP (stub offset, not linear)
+    mov ax, 0x38
+    mov ds, ax
+    mov ax, 0xDE0C
+    call far dword [cs:entry_off]
+    mov al, 0xEF
+    jmp pm_die
+
+; V86 landing. EIP in the DE0C frame is this stub offset, CS = rm_seg.
+v86_thunk:
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+    sti
+    cld
+    cmp word [abi_vector], 0
+    je v86_skip_int
+    mov al, [abi_vector]
+    mov [int_site+1], al
+    jmp short v86_int_flush
+v86_int_flush:
+    mov ax, [abi_ax]
+    mov bx, [abi_bx]
+    mov cx, [abi_cx]
+    mov dx, [abi_dx]
+    mov si, [abi_si]
+    mov di, [abi_di]
+    mov es, [abi_es]
+    push word [abi_ds]
+    pop ds
+int_site:
+    int 0x21
+    pushf
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+    mov ax, cs
+    mov ds, ax
+    pop word [abi_es]
+    pop word [abi_ds]
+    pop word [abi_di]
+    pop word [abi_si]
+    pop word [abi_dx]
+    pop word [abi_cx]
+    pop word [abi_bx]
+    pop word [abi_ax]
+    pop ax
+    mov [abi_flags], ax
+    and ax, 1
+    mov [abi_err], ax
+    jmp v86_after_int
+v86_skip_int:
+    mov word [abi_flags], 0
+    mov word [abi_err], 0
+v86_after_int:
+    cli
+    mov ebp, [lin_base]
+    mov esi, ebp
+    add esi, swst
+    mov ax, 0xDE0C
+    int 0x67
+    jmp fail_hang
+
+; V86->PM landing. Monitor SS:ESP is live; do not push first.
+thunk_from_v86:
+    mov ax, 0x20
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov esp, stack16_top
+    mov ebx, [abi_saved_esp]
+    jmp dword far [abi_ret_eip]
+
+pm_die:
+    mov ah, al
+    mov al, 12
+    out 0xE4, al
+    mov al, ah
+    out 0xE5, al
+    mov al, 3
+    out 0xE6, al
+.h:
+    jmp .h
 
 msg_vcpi db 'TokaDESK needs TOKAEMM (VCPI).', 13, 10, '$'
 msg_vbe  db 'TokaDESK: VBE mode 117h failed.', 13, 10, '$'

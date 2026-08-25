@@ -5,12 +5,14 @@
 #include "desktop.h"
 #include "lotura.h"
 #include "margo.h"
+#include "v86.h"
 
 void desk_main(void)
 {
     unsigned long width;
     unsigned long height;
     unsigned long bpp;
+    unsigned ax;
 
     margo_cursor_off();
     width = MARGO_REG(MG_DISP_WIDTH);
@@ -20,5 +22,28 @@ void desk_main(void)
         ut_exit(0xE6);
     }
     desk_draw();
+
+    /* INT 21h AH=19h: current drive, 0=A so C: is 2. */
+    ax = v86_intx(0x21, 0x1900, 0, 0, 0);
+    if ((ax & 0xFFu) != 2u) {
+        ut_exit(0xE7);
+    }
+    /* INT 21h AH=30h: DOS major in AL. */
+    ax = v86_intx(0x21, 0x3000, 0, 0, 0);
+    if ((ax & 0xFFu) == 0u) {
+        ut_exit(0xE8);
+    }
+    /* INT 10h AX=4F03h: current VBE mode. BX keeps LFB bit 14. */
+    ax = v86_intx(0x10, 0x4F03, 0, 0, 0);
+    if (ax != 0x004Fu || (v86_abi()->bx & 0x1FFu) != 0x117u) {
+        ut_exit(0xE9);
+    }
+    /* INT 33h AX=0000h: TOKAMOUS reports installed. */
+    ax = v86_intx(0x33, 0, 0, 0, 0);
+    if (ax != 0xFFFFu) {
+        ut_exit(0xEA);
+    }
+
+    margo_cursor_off();
     ut_exit(0);
 }

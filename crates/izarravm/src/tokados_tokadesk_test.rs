@@ -1,7 +1,10 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! TOKADESK.EXE smoke: VCPI switch, VBE 0x117, cream FILL, Lotura exit.
+//! TOKADESK.EXE smoke: VCPI switch, VBE 0x117, chrome, V86 thunk, Lotura exit.
+//!
+//! `/T` draws once, then probes INT 21h/10h/33h through the stub thunk
+//! (fail codes 0xE7..0xEA) before CMD_EXIT 0.
 //!
 //! The EXE is the authoring artifact at `toka-dos/tools-src/tokadesk/tokadesk.exe`.
 //! PR 1 overlays it at `C:\TOKADESK.EXE` (not yet in `DOS_FOLDER_BINARIES`).
