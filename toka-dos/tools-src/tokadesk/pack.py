@@ -15,6 +15,7 @@ import sys
 
 HDR_OFF = 16
 STACK_BYTES = 16 * 1024
+BSS_BYTES = 16 * 1024
 PAGE = 4096
 
 
@@ -30,14 +31,14 @@ def main():
         sys.exit("stub.bin is too short to hold the overlay header")
 
     payload_size = len(payload)
-    n = (payload_size + STACK_BYTES + PAGE - 1) // PAGE
+    n = (payload_size + BSS_BYTES + STACK_BYTES + PAGE - 1) // PAGE
     if 0x200000 + n * PAGE > 0x400000:
-        sys.exit("payload + stack does not fit in PT0 at 0x200000")
+        sys.exit("payload + bss + stack does not fit in PT0 at 0x200000")
 
     overlay = 32 + ((len(stub) + 15) // 16) * 16
     stub += b"\x00" * (overlay - 32 - len(stub))
 
-    struct.pack_into("<IIIII", stub, HDR_OFF, overlay, payload_size, 0, STACK_BYTES, n)
+    struct.pack_into("<IIIII", stub, HDR_OFF, overlay, payload_size, BSS_BYTES, STACK_BYTES, n)
     struct.pack_into("<I", stub, HDR_OFF + 20, len(stub))
 
     load_size = 32 + len(stub)

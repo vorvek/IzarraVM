@@ -110,6 +110,65 @@ void margo_text8(int x, int y, const char *s, unsigned fg)
     }
 }
 
+void margo_glyph16(int x, int y, unsigned char ch, unsigned fg)
+{
+    const unsigned char *glyph;
+    unsigned row;
+    unsigned long pitch;
+    unsigned long bpp;
+
+    glyph = font16 + ((unsigned)ch * 16);
+    margo_wait();
+    pitch = MARGO_REG(MG_DISP_PITCH);
+    bpp = MARGO_REG(MG_DISP_BPP);
+    MARGO_REG(MG_DST_BASE) = 0;
+    MARGO_REG(MG_DST_PITCH) = pitch;
+    MARGO_REG(MG_DEPTH) = bpp / 8UL;
+    MARGO_REG(MG_DST_XY) = ((unsigned long)y << 16) | (unsigned long)x;
+    MARGO_REG(MG_DIM) = (16UL << 16) | 8UL;
+    MARGO_REG(MG_FG_COLOR) = fg;
+    MARGO_REG(MG_ROP) = MG_ROP_SRCCOPY;
+    MARGO_REG(MG_FLAGS) = MG_FLAG_EXPAND_TRANSPARENT;
+    MARGO_REG(MG_COMMAND) = MG_CMD_EXPAND;
+    for (row = 0; row < 16; row++) {
+        MARGO_REG(MG_MONO_DATA) = (unsigned long)glyph[row] << 24;
+    }
+    margo_wait();
+}
+
+void margo_text16(int x, int y, const char *s, unsigned fg)
+{
+    while (*s) {
+        margo_glyph16(x, y, (unsigned char)*s, fg);
+        x += 8;
+        s++;
+    }
+}
+
+void margo_icon16(int x, int y, const unsigned short *bits, unsigned fg)
+{
+    unsigned row;
+    unsigned long pitch;
+    unsigned long bpp;
+
+    margo_wait();
+    pitch = MARGO_REG(MG_DISP_PITCH);
+    bpp = MARGO_REG(MG_DISP_BPP);
+    MARGO_REG(MG_DST_BASE) = 0;
+    MARGO_REG(MG_DST_PITCH) = pitch;
+    MARGO_REG(MG_DEPTH) = bpp / 8UL;
+    MARGO_REG(MG_DST_XY) = ((unsigned long)y << 16) | (unsigned long)x;
+    MARGO_REG(MG_DIM) = (16UL << 16) | 16UL;
+    MARGO_REG(MG_FG_COLOR) = fg;
+    MARGO_REG(MG_ROP) = MG_ROP_SRCCOPY;
+    MARGO_REG(MG_FLAGS) = MG_FLAG_EXPAND_TRANSPARENT;
+    MARGO_REG(MG_COMMAND) = MG_CMD_EXPAND;
+    for (row = 0; row < 16; row++) {
+        MARGO_REG(MG_MONO_DATA) = (unsigned long)bits[row] << 16;
+    }
+    margo_wait();
+}
+
 void margo_cursor_on(unsigned fg, unsigned bg)
 {
     volatile unsigned char *and_plane;

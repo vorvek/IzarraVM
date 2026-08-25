@@ -21,5 +21,6 @@
 #define COL_WHITE      RGB565(255, 255, 255)
 #define COL_BLACK      RGB565(0, 0, 0)
 #define COL_KEY        RGB565(255, 0, 255)
+#define COL_FOLDER     RGB565(139, 90, 43)
 
 #endif

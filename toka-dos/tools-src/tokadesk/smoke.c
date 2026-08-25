@@ -3,6 +3,7 @@
 
 #include "color.h"
 #include "desktop.h"
+#include "dir.h"
 #include "loop.h"
 #include "lotura.h"
 #include "margo.h"
@@ -41,7 +42,13 @@ void desk_main(void)
     if (width != 1024UL || height != 768UL || bpp != 16UL) {
         ut_exit(0xE6);
     }
+    if (!dir_init()) {
+        if (has_switch_t()) {
+            ut_exit(0xEB);
+        }
+    }
     desk_draw();
+    dir_draw();
     if (!has_switch_t()) {
         desk_loop();
     }

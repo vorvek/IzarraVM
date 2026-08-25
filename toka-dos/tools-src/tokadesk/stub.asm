@@ -16,7 +16,7 @@ org 0
 
 PAYLOAD_LIN equ 0x200000
 STACK16     equ 0x1000
-BOUNCE_MAX  equ 16384
+BOUNCE_MAX  equ 32768
 
 jmp start
 times 16-($-$$) db 0
@@ -71,6 +71,15 @@ start:
     mov [rm_seg], cs
     mov [rm_sp], sp
 
+    ; Fail critical errors (empty A:, no disc) instead of aborting.
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov word [0x24 * 4], int24
+    mov ax, cs
+    mov [0x24 * 4 + 2], ax
+    pop ds
+
     ; Shrink the MCB to PSP + load image.
     mov ax, [psp_seg]
     mov es, ax
@@ -98,6 +107,15 @@ start:
     int 0x10
     cmp ax, 0x004F
     jne fail_vbe
+    ; TOKAMOUS keeps 640x200 across 4F02h; hit-test is 1024x768 chrome.
+    mov ax, 0x0007
+    xor cx, cx
+    mov dx, 1023
+    int 0x33
+    mov ax, 0x0008
+    xor cx, cx
+    mov dx, 767
+    int 0x33
 
     call align_area
     call build_tables
@@ -141,6 +159,10 @@ fail:
     call ut_exit
 .die:
     jmp .die
+
+int24:
+    mov al, 3
+    iret
 
 ; AL = exit code. Lotura CMD_EXIT.
 ut_exit:
@@ -419,18 +441,19 @@ open_self:
     ret
 
 read_payload:
-    ; Payload is still under BOUNCE_MAX; read it in V86, copy in pm16.
-    mov eax, [hdr_payload]
-    cmp eax, BOUNCE_MAX
+    mov ecx, [hdr_payload]
+    cmp ecx, BOUNCE_MAX
     ja fail_open
     mov ah, 0x3F
     mov bx, [file_handle]
-    mov cx, ax
     mov dx, [bounce_off]
     int 0x21
     jc fail_open
     cmp ax, [hdr_payload]
     jne fail_open
+    mov ah, 0x3E
+    mov bx, [file_handle]
+    int 0x21
     ret
 
 switch_to_copy32:
@@ -452,12 +475,16 @@ pm16:
     mov sp, stack16_top
     mov esi, [bounce_phys]
     mov ecx, [hdr_payload]
+    mov edx, [hdr_bss]
     mov ebx, [hdr_n]
     mov edi, PAYLOAD_LIN
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     a32 rep movsb
+    mov ecx, edx
+    xor al, al
+    a32 rep stosb
     mov eax, ebp
     a32 mov [dword PAYLOAD_LIN], eax
     shl ebx, 12
@@ -682,6 +709,9 @@ align 16
 stack16:        times STACK16 db 0
 stack16_top:
 
-; PD, PT0, LFB PT, MMIO PT, 16K bounce, 4K slack
+; PD, PT0, LFB PT, MMIO PT, 32K bounce, 4K slack
 align 16
-area:           times 9 * 4096 db 0
+area:           times 13 * 4096 db 0
+%if ($-$$) > 0x10000
+%error "stub plus bounce exceeds the 16-bit CS"
+%endif

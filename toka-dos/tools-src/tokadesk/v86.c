@@ -52,3 +52,71 @@ void v86_yield(unsigned ctl)
     a->err = 0;
     v86_call();
 }
+
+unsigned v86_bounce_off(void)
+{
+    return v86_abi()->bounce_off;
+}
+
+void bounce_str(unsigned off, const char *s)
+{
+    unsigned char *d;
+
+    d = (unsigned char *)v86_bounce() + off;
+    while (*s) {
+        *d++ = (unsigned char)*s++;
+    }
+    *d = 0;
+}
+
+void bounce_mem(unsigned off, const void *src, unsigned n)
+{
+    unsigned char *d;
+    const unsigned char *s;
+
+    d = (unsigned char *)v86_bounce() + off;
+    s = (const unsigned char *)src;
+    while (n) {
+        *d++ = *s++;
+        n--;
+    }
+}
+
+void bounce_get(unsigned off, void *dst, unsigned n)
+{
+    unsigned char *d;
+    const unsigned char *s;
+
+    d = (unsigned char *)dst;
+    s = (const unsigned char *)v86_bounce() + off;
+    while (n) {
+        *d++ = *s++;
+        n--;
+    }
+}
+
+unsigned dos_call(unsigned ax, unsigned bx, unsigned cx, unsigned dx,
+                  unsigned si, unsigned di)
+{
+    V86Abi *a;
+
+    a = v86_abi();
+    a->vector = 0x21;
+    a->ax = (unsigned short)ax;
+    a->bx = (unsigned short)bx;
+    a->cx = (unsigned short)cx;
+    a->dx = (unsigned short)dx;
+    a->si = (unsigned short)si;
+    a->di = (unsigned short)di;
+    a->ds = a->rm_seg;
+    a->es = a->rm_seg;
+    a->flags = 0;
+    a->err = 0;
+    v86_call();
+    return a->ax;
+}
+
+int dos_err(void)
+{
+    return v86_abi()->err;
+}

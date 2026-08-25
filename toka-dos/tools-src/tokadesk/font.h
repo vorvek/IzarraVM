@@ -5,5 +5,6 @@
 #define TOKADESK_FONT_H
 
 extern const unsigned char font8[256 * 8];
+extern const unsigned char font16[256 * 16];
 
 #endif

@@ -33,9 +33,6 @@ void desk_draw(void)
         ty += 28;
     }
 
-    margo_raised(RAIL_W, TAB_Y, DESK_W - RAIL_W, TAB_H, COL_FIELD);
-    margo_text8(RAIL_W + 16, TAB_Y + 16, "Directory", COL_LABEL);
-
     margo_recessed(0, CONS_Y, DESK_W, CONS_H, COL_FACEPLATE);
     margo_text8(8, CONS_Y + CONS_H - 20, "C:\\>", COL_INK);
 }

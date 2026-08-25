@@ -30,6 +30,12 @@ typedef struct {
 #define YIELD_ONESHOT 1u
 #define YIELD_DIRTY   2u
 
+#define B_DTA     0u
+#define B_PATH    64u
+#define B_PATH2   144u
+#define B_BUF     256u
+#define B_BUF_SZ  4096u
+
 extern unsigned long stub_lin_slot;
 void v86_call(void);
 
@@ -38,5 +44,12 @@ void *v86_bounce(void);
 unsigned v86_intx(unsigned vector, unsigned ax, unsigned bx, unsigned cx,
                   unsigned dx);
 void v86_yield(unsigned ctl);
+unsigned v86_bounce_off(void);
+void bounce_str(unsigned off, const char *s);
+void bounce_mem(unsigned off, const void *src, unsigned n);
+void bounce_get(unsigned off, void *dst, unsigned n);
+unsigned dos_call(unsigned ax, unsigned bx, unsigned cx, unsigned dx,
+                  unsigned si, unsigned di);
+int dos_err(void);
 
 #endif
