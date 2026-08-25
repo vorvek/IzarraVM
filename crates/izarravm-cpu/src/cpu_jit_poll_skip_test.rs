@@ -9,18 +9,18 @@
 use super::*;
 
 /// **M-28.** The `IZARRAVM_DIRECT_POLL_SKIP` spelling table: unset and `""` name the SAME arm
-/// (the default, OFF while under evaluation) -- the `IZARRAVM_CHAIN_ENTRY_CHECK` /
+/// (the default, ON since the 2026-08-27 owner approval) -- the `IZARRAVM_CHAIN_ENTRY_CHECK` /
 /// `IZARRAVM_JCC_SHADOW` shape, deliberately NOT `IZARRAVM_ATA_POLL_SKIP`'s (design §6).
 #[test]
 fn direct_poll_skip_spelling_table() {
     use std::env::VarError;
     let parse = jit::direct::parse_direct_poll_skip_arm_for_test;
     assert!(
-        !parse(Err(VarError::NotPresent)),
-        "unset must name the OFF arm: this knob ships default OFF"
+        parse(Err(VarError::NotPresent)),
+        "unset must name the ON arm: this knob ships default ON since 2026-08-27"
     );
     assert!(
-        !parse(Ok(String::new())),
+        parse(Ok(String::new())),
         "the empty string must name the SAME arm as unset -- the default, deliberately NOT \
          ATA's inverted shape"
     );
@@ -51,10 +51,10 @@ fn non_utf8_direct_poll_skip_arm_panics() {
 
 /// THE DEFAULT PIN: with the ambient env var read exactly as `direct_poll_skip_armed` reads it,
 /// the process-wide OnceLock reading must agree with the spelling table, and with the variable
-/// unset the arm must be OFF. Reads the AMBIENT knob deliberately (on the `jcc_shadow_ships_off_
-/// by_default` model) so the suite stays runnable on either arm.
+/// unset the arm must be ON (the 2026-08-27 flip). Reads the AMBIENT knob deliberately (on the
+/// `jcc_shadow_ships_off_by_default` model) so the suite stays runnable on either arm.
 #[test]
-fn direct_poll_skip_ships_off_by_default() {
+fn direct_poll_skip_ships_on_by_default() {
     let ambient = std::env::var("IZARRAVM_DIRECT_POLL_SKIP");
     let expected = jit::direct::parse_direct_poll_skip_arm_for_test(ambient.clone());
     assert_eq!(
@@ -70,8 +70,9 @@ fn direct_poll_skip_ships_off_by_default() {
     // instead of the broader, misleading `is_err()`.
     if matches!(ambient, Err(std::env::VarError::NotPresent)) {
         assert!(
-            !expected,
-            "IZARRAVM_DIRECT_POLL_SKIP must default OFF until a ladder prices the poll-skip arm"
+            expected,
+            "IZARRAVM_DIRECT_POLL_SKIP must default ON: the L1 ladder priced the arm (gp2-586 \
+             +40.1% min-wall) and the owner approved the flip on 2026-08-27"
         );
     }
 }
