@@ -11152,9 +11152,13 @@ pub(crate) fn parse_chain_entry_check_arm_for_test(
 /// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`'s inverted spelling, not its opposite. Copying it here would
 /// have shipped a THIRD knob on this campaign whose `""` disagrees with its unset.
 ///
-/// Default is OFF while under evaluation. A later flip to ON changes exactly the two `return`
-/// arms below the `NotPresent` and `""` matches, and every ladder leg that exported the arm
-/// explicitly (the standing rule) keeps working across the flip.
+/// **Default is ON since 2026-08-27, on the owner's approval.** The evidence: gp2-586 +40.1%
+/// min-wall over five interleaved pairs, tombraid-586 +5.00% over three, all 26 board rows green
+/// on the L4 hygiene pass, C1 conservation exact to 1.1 ppb; against duke3d-586-short -3.20%,
+/// accepted on the SB16 precedent (a known SMC-regime fragility of that row, not a fault in the
+/// slice). The flip changed exactly the two `return` arms below the `NotPresent` and `""`
+/// matches, and every ladder leg that exported the arm explicitly (the standing rule) kept
+/// working across it. `0` / `off` still name the OFF arm, stated.
 ///
 /// **No thread-local test override here** (unlike `chain_entry_check_armed`): the fixture that
 /// needs to flip this arm per-run is an `izarravm-machine` integration test, which cannot reach a
@@ -11172,13 +11176,13 @@ pub(crate) fn direct_poll_skip_armed() -> bool {
 /// The `IZARRAVM_DIRECT_POLL_SKIP` spelling table, lifted out of the `OnceLock` closure so it can
 /// be unit-tested without a process-global env write. See `direct_poll_skip_armed`.
 fn parse_direct_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
-    const ACCEPTED: &str = "accepted spellings are unset or `` (the shipped default: OFF, while \
-                            under evaluation) and `0` / `off` (the same OFF arm, stated) or `1` / \
-                            `on` / `poll` (armed: the call-out attempts the analytic poll skip \
-                            before its ordinary read)";
+    const ACCEPTED: &str = "accepted spellings are unset or `` (the shipped default: ON since \
+                            the 2026-08-27 owner approval) and `0` / `off` (the OFF arm, stated) \
+                            or `1` / `on` / `poll` (the same ON arm, stated: the call-out \
+                            attempts the analytic poll skip before its ordinary read)";
     let raw = match value {
-        // Unset is the default, and the default is OFF while under evaluation.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the default, and the default is ON since 2026-08-27.
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => panic!(
             "IZARRAVM_DIRECT_POLL_SKIP is set to a value that is not valid UTF-8; {ACCEPTED}"
         ),
@@ -11186,7 +11190,7 @@ fn parse_direct_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
-        "" => false,
+        "" => true,
         "0" | "off" => false,
         // `poll` rides beside `1` / `on` so a leg written from the design reaches the same arm as
         // a leg written from the shell.

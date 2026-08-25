@@ -592,13 +592,15 @@ fn callout_poll_skip_commits_exactly_to_the_edge_boundary() {
     );
 }
 
-/// **M-29, `direct_poll_skip_ships_off_by_default`, through native codegen.** With the knob OFF
-/// the certified shape must not skip and every attempt must land in `decline_knob`; the SAME
-/// fixture with the knob forced ON must engage. The paired positive arm is what stops this being
-/// an absence assertion (design §9's own rule).
+/// **M-29, the OFF arm through native codegen** (the shipped default is ON since the 2026-08-27
+/// flip; this fixture forces both arms through the override, so it is default-independent). With
+/// the knob OFF the certified shape must not skip and every attempt must land in `decline_knob`;
+/// the SAME fixture with the knob forced ON must engage. The paired positive arm is what stops
+/// this being an absence assertion (design §9's own rule). The default itself is pinned by
+/// `direct_poll_skip_ships_on_by_default` in `cpu_jit_poll_skip_test.rs`.
 #[cfg(feature = "jit")]
 #[test]
-fn direct_poll_skip_ships_off_by_default_through_native_codegen() {
+fn direct_poll_skip_off_arm_declines_through_native_codegen() {
     let program = [0xec, 0xa8, 0x08, 0x75, 0xfb];
     let build = |armed: bool| {
         let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
