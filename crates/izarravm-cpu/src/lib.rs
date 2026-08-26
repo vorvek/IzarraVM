@@ -2084,6 +2084,11 @@ pub struct DirectStallSnapshot {
     pub jcc_sites_overflow: u64,
     pub jcc_sites_signed_xor: u64,
     pub jcc_sites_signed_xor_zf: u64,
+    /// RSI-arm load-bias probes in the blocks this run INSTALLED (`IZARRAVM_DIRECT_HOLD_LOAD_BIAS`,
+    /// DEFAULT OFF, so this is zero on a shipped binary). Vacuity check: a zero ON arm means the
+    /// leg compiled no integer load-bias probe. Not a measure of executed volume. See
+    /// `DirectStallTally::hold_load_bias_probes`.
+    pub hold_load_bias_probes: u64,
     /// Slots refused by the shared `MAX_BLOCK_IMM_LANES` budget in the blocks this run INSTALLED,
     /// one counter per family and charged on the CAP arm alone. Same denominator as the
     /// registration counters above, which is what makes the pair readable: registrations flat

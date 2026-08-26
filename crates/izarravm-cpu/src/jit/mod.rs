@@ -417,6 +417,20 @@ impl JitState {
         self.direct.clear(&mut self.code_watch);
     }
 
+    /// Flip `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` on this thread, then clear compiled blocks and drop
+    /// the x87 pad so the next float portal rebuilds it under the new arm. Mixed-arm chains are
+    /// unsound for this knob.
+    #[cfg(test)]
+    pub(crate) fn rebuild_after_hold_load_bias_flip_for_test(&mut self, on: bool) {
+        direct::set_hold_load_bias_for_test(Some(on));
+        self.clear();
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.direct.drop_x87_pad_for_test();
+    }
+
     /// The `SideExitReason` of the last native entry, or `None` when the block completed.
     ///
     /// TEST-ONLY and stored on `JitState` rather than on `CpuGsw` deliberately: `JitState` is

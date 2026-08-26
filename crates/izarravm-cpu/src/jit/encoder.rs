@@ -161,6 +161,9 @@ pub(crate) struct Encoder {
     /// Encoder rather than threaded through the emitters because the sites sit several helper
     /// frames below the compile walk, where no return value reaches.
     eager_flags_sites: [u16; crate::jit::direct::EAGER_FLAGS_CLASSES],
+    /// `emit_load_bias_probe` calls that took the RSI-held table-base arm. Zero on the OFF
+    /// arm by construction. Emission-time only.
+    hold_load_bias_probes: u16,
 }
 
 impl Encoder {
@@ -170,6 +173,7 @@ impl Encoder {
             label_positions: Vec::new(),
             patches: Vec::new(),
             eager_flags_sites: [0; crate::jit::direct::EAGER_FLAGS_CLASSES],
+            hold_load_bias_probes: 0,
         }
     }
 
@@ -181,6 +185,15 @@ impl Encoder {
 
     pub(crate) fn eager_flags_sites(&self) -> [u16; crate::jit::direct::EAGER_FLAGS_CLASSES] {
         self.eager_flags_sites
+    }
+
+    /// Charge one RSI-arm load-bias probe. Emission-time only.
+    pub(crate) fn note_hold_load_bias_probe(&mut self) {
+        self.hold_load_bias_probes = self.hold_load_bias_probes.saturating_add(1);
+    }
+
+    pub(crate) fn hold_load_bias_probes(&self) -> u16 {
+        self.hold_load_bias_probes
     }
 
     pub(crate) fn label(&mut self) -> Label {
