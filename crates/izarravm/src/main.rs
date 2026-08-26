@@ -3368,6 +3368,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jcc_sites_signed_xor": snapshot.jcc_sites_signed_xor,
         "jcc_sites_signed_xor_zf": snapshot.jcc_sites_signed_xor_zf,
         "hold_load_bias_probes": snapshot.hold_load_bias_probes,
+        "align_test_al_sites": snapshot.align_test_al_sites,
         // The lane-budget split. Registrations say what lanes a run's installed blocks took;
         // these say what the shared `MAX_BLOCK_IMM_LANES` budget turned away IN THOSE SAME
         // BLOCKS, per family and on the cap arm only. Both are folded in at install, so the two

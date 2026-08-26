@@ -1756,6 +1756,12 @@ impl CpuGsw {
                         .direct
                         .note_hold_load_bias_probes(hold_load_bias_probes);
                 }
+                let align_test_al_sites = compilation.align_test_al_sites();
+                if align_test_al_sites != 0 {
+                    self.jit_direct
+                        .direct
+                        .note_align_test_al_sites(align_test_al_sites);
+                }
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the
                 // block-entry site are written branchlessly.

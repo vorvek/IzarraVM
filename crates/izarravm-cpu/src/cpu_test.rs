@@ -4099,6 +4099,14 @@ mod jit_hold_load_bias;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_align_test_al_test.rs"]
+mod jit_align_test_al;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_callout_test.rs"]
 mod jit_callout;
 

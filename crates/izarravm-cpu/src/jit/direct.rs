@@ -1901,6 +1901,12 @@ impl BlockCache {
         self.stalls.hold_load_bias_probes += u64::from(probes);
     }
 
+    /// Cheap-form alignment tests in INSTALLED blocks. Charged at the same install site as
+    /// `note_jcc_shadow_sites`. Zero on the OFF arm by construction.
+    pub(crate) fn note_align_test_al_sites(&mut self, sites: u16) {
+        self.stalls.align_test_al_sites += u64::from(sites);
+    }
+
     /// Fold ONE INSTALLED block's per-walk lane-budget refusals into the tally, per family.
     ///
     /// Called from `JitState::install` on the success arm and from nowhere else, which is what
@@ -3485,6 +3491,9 @@ pub(crate) struct Compilation {
     /// `emit_load_bias_probe` calls that took the RSI-held table-base arm. Folded at install
     /// like `jcc_shadow_sites`. Zero on the OFF arm by construction.
     hold_load_bias_probes: u16,
+    /// `emit_alignment_test` calls that took the `test al, mask` arm. Folded at install like
+    /// `jcc_shadow_sites`. Zero on the OFF arm by construction.
+    align_test_al_sites: u16,
     pub code: Vec<u8>,
 }
 
@@ -3531,6 +3540,10 @@ impl Compilation {
 
     pub(crate) fn hold_load_bias_probes(&self) -> u16 {
         self.hold_load_bias_probes
+    }
+
+    pub(crate) fn align_test_al_sites(&self) -> u16 {
+        self.align_test_al_sites
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -7828,6 +7841,7 @@ fn compile_with_budget(
         jcc_shadow_sites: emitted.jcc_shadow_sites,
         eager_flags_sites: emitted.eager_flags_sites,
         hold_load_bias_probes: emitted.hold_load_bias_probes,
+        align_test_al_sites: emitted.align_test_al_sites,
         code: emitted.code,
     })
 }
@@ -11576,6 +11590,70 @@ pub(crate) fn parse_hold_load_bias_arm_for_test(value: Result<String, std::env::
     parse_hold_load_bias_arm(value)
 }
 
+/// Whether `emit_alignment_test` uses `test al, mask; jnz` (`IZARRAVM_DIRECT_ALIGN_TEST_AL`).
+///
+/// DEFAULT OFF. Unset and the empty string name the same arm, which is OFF. `1` / `on` is ON.
+/// Anything else panics rather than silently running the default: a mistyped ladder leg that
+/// fell through would be read as the slice doing nothing.
+///
+/// Mixed arms across one process are **sound**, unlike `IZARRAVM_DIRECT_HOLD_LOAD_BIAS`: this
+/// helper has no ABI register contract. Tests that flip the arm still compile fresh. Production
+/// is one OnceLock per process.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn align_test_al_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ALIGN_TEST_AL_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_align_test_al_arm(std::env::var("IZARRAVM_DIRECT_ALIGN_TEST_AL")))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_align_test_al_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
+                            default: emit_alignment_test is mov/and/cmp/jnz), and `1` / `on` \
+                            (the cheap arm: test al, mask; jnz)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_DIRECT_ALIGN_TEST_AL is set to a value that is not valid UTF-8; \
+                 {ACCEPTED}"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_DIRECT_ALIGN_TEST_AL={other:?} names no arm; {ACCEPTED}. Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the \
+             arm it named doing nothing"
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALIGN_TEST_AL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the cheap alignment-test arm on this thread for the length of a fixture; `None`
+/// restores the ambient `IZARRAVM_DIRECT_ALIGN_TEST_AL` reading. Compile fresh after a flip.
+#[cfg(test)]
+pub(crate) fn set_align_test_al_for_test(forced: Option<bool>) {
+    ALIGN_TEST_AL_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_align_test_al_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_align_test_al_arm(value)
+}
+
 /// The EAGER-FLAGS classes, in `eager_flags_sites` lane order. One lane per emission SHAPE, not
 /// per emitter function, because the shapes are what the byte ledger prices and what the arm
 /// vacuity check has to see move independently.
@@ -14712,6 +14790,10 @@ struct EmittedCode {
     /// arm by construction, so a ladder leg whose ON arm also reads zero compiled no integer
     /// load-bias probe and cannot price the slice.
     hold_load_bias_probes: u16,
+    /// `emit_alignment_test` calls that took the `test al, mask` arm. Zero on the OFF arm by
+    /// construction, so a ladder leg whose ON arm also reads zero compiled no wide alignment
+    /// test and cannot price the slice.
+    align_test_al_sites: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -17190,12 +17272,14 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     // BEFORE `finish`, which consumes the encoder.
     let eager_flags_sites = e.eager_flags_sites();
     let hold_load_bias_probes = e.hold_load_bias_probes();
+    let align_test_al_sites = e.align_test_al_sites();
     EmittedCode {
         code: e.finish(),
         body_offset,
         jcc_shadow_sites,
         eager_flags_sites,
         hold_load_bias_probes,
+        align_test_al_sites,
     }
 }
 
@@ -28098,6 +28182,10 @@ pub(crate) struct DirectStallTally {
     /// DEFAULT OFF, so this is zero on a shipped binary). Vacuity check: a zero ON arm means
     /// the leg compiled no integer load-bias probe. Not a measure of executed volume.
     pub hold_load_bias_probes: u64,
+    /// Cheap-form alignment tests in the blocks this run INSTALLED (`IZARRAVM_DIRECT_ALIGN_TEST_AL`,
+    /// DEFAULT OFF, so this is zero on a shipped binary). Vacuity check: a zero ON arm means
+    /// the leg compiled no wide alignment test. Not a measure of executed volume.
+    pub align_test_al_sites: u64,
     /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
     /// charged to the family that would otherwise have taken the slot. The registration counters
     /// above say how many lanes those same blocks installed; these say how many more they would
@@ -29866,6 +29954,7 @@ impl crate::jit::JitState {
             jcc_sites_signed_xor: self.stalls.jcc_sites_signed_xor,
             jcc_sites_signed_xor_zf: self.stalls.jcc_sites_signed_xor_zf,
             hold_load_bias_probes: self.stalls.hold_load_bias_probes,
+            align_test_al_sites: self.stalls.align_test_al_sites,
             imm_lane_cap_refusals: self.stalls.imm_lane_cap_refusals,
             imm8_lane_cap_refusals: self.stalls.imm8_lane_cap_refusals,
             count_lane_cap_refusals: self.stalls.count_lane_cap_refusals,
