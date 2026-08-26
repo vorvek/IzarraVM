@@ -475,28 +475,24 @@ fn inline_chain_check_in_this_process() {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    // A dev/test build (opt-level 0) never performs the LLVM heuristic
-    // cross-crate inlining this instrument decomposes: `run_budgeted` and
-    // `run_budgeted_inner` are ordinary generic methods, not `#[inline(always)]`,
-    // so only optimization-driven inlining reaches them. Such a build DOES
-    // still carry SOME inline records under `run_until_tick` (LLVM's mandatory
-    // always-inline pass runs even at -O0 for tiny `#[inline(always)]`
-    // std helpers like `Option::unwrap` or `saturating_add`), so "some inline
-    // record exists" is NOT a safe signal to scan for -- verified empirically:
-    // a dev-profile run of this test found 1,325 addresses with nonzero inline
-    // traces and none of them were `run_budgeted`/`run_budgeted_inner`. Key
-    // the skip on `debug_assertions` instead, matching this file's existing
-    // convention in `resolve_extent_in_this_process` for the same class of
-    // build-profile sensitivity.
-    if cfg!(debug_assertions) {
-        eprintln!(
-            "riprofile inline test: dev/test build (opt-level 0) does not perform the \
-             cross-crate inlining this instrument decomposes; skipping -- rerun under \
-             `cargo test --profile release --bin izarravm` to exercise the inline path"
-        );
-        return;
-    }
-
+    // NOTE ON BUILD-PROFILE INDEPENDENCE: this check does NOT depend on the
+    // calling process's own optimization level. It never probes this TEST
+    // binary's own code -- it loads and probes `target/release/izarravm.exe`
+    // as a SEPARATE module below, via `SymLoadModuleExW`. That module's
+    // inlining decisions are fixed at the time `--profile release` built it,
+    // regardless of whether the test harness driving this check was built
+    // `dev` or `release`. An earlier version of this function DID probe the
+    // calling process's own code (before the switch to `SymLoadModuleExW`)
+    // and genuinely needed a skip for dev/test builds (verified: a dev-profile
+    // scan of the test binary's OWN `run_until_tick` found 1,325 addresses
+    // with nonzero inline traces and none of them were
+    // `run_budgeted`/`run_budgeted_inner`, because a dev/test harness binary
+    // never performs the cross-crate heuristic inlining that reaches them).
+    // That justification no longer applies to what this function does today,
+    // so there is NO SKIP here: if `target/release/izarravm.exe` is missing,
+    // the `.expect(...)` below fails loudly rather than passing silently, and
+    // `cargo test --workspace` -- the house gate -- exercises this for real.
+    //
     // Resolve against the actual shipped artifact
     // (`target/release/izarravm.exe`, virtually loaded at an arbitrary base
     // via `SymLoadModuleExW`), not this TEST binary's own code: a `--test`
