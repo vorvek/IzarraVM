@@ -4,6 +4,7 @@
 #include "dir.h"
 #include "color.h"
 #include "desktop.h"
+#include "editor.h"
 #include "margo.h"
 #include "v86.h"
 
@@ -440,7 +441,7 @@ static void draw_pane(int which)
         int bx = x + 4;
         int b;
         for (b = 0; b < 7; b++) {
-            int muted = (b >= 5) || (d_readonly(p) && (b == 0 || b == 2 || b == 4));
+            int muted = (b == 5) || (d_readonly(p) && (b == 0 || b == 2 || b == 4 || b == 6));
             if (muted) {
                 margo_raised(bx, BTN_Y + 4, 60, 24, COL_FACEPLATE);
                 margo_text8(bx + 6, BTN_Y + 12, btns[b], COL_MUTED);
@@ -838,6 +839,21 @@ static void start_mkdir(void)
     modal = MOD_MKDIR;
 }
 
+static void open_edit(void)
+{
+    Pane *p = &panes[active];
+    DirEntry *e = cur_ent(p);
+    char full[80];
+
+    if (!e || e->kind != KIND_FILE || d_readonly(p) || !p->ready) {
+        return;
+    }
+    path_join(full, p->path, e->name);
+    if (editor_open(full)) {
+        desk_set_tab(DESK_TAB_EDIT);
+    }
+}
+
 static void modal_key(unsigned ax)
 {
     unsigned char ah = (unsigned char)(ax >> 8);
@@ -872,7 +888,6 @@ void dir_key(unsigned ax)
 
     if (modal) {
         modal_key(ax);
-        dir_draw();
         return;
     }
     if (ah == 0x0F) {
@@ -915,8 +930,9 @@ void dir_key(unsigned ax)
         start_mkdir();
     } else if (ah == 0x42) {
         start_delete();
+    } else if (ah == 0x3E) {
+        open_edit();
     }
-    dir_draw();
 }
 
 void dir_click(int x, int y)
@@ -943,12 +959,10 @@ void dir_click(int x, int y)
             }
             if (local_x >= dx && local_x < dx + 28) {
                 set_drive(p, d);
-                dir_draw();
                 return;
             }
             dx += 36;
         }
-        dir_draw();
         return;
     }
     if (y < BTN_Y) {
@@ -958,7 +972,11 @@ void dir_click(int x, int y)
             if (idx < p->n) {
                 if (which == last_click_pane && idx == last_click_row &&
                     idx == p->cursor) {
-                    enter_row(p);
+                    if (p->ents[idx].kind == KIND_FILE) {
+                        open_edit();
+                    } else {
+                        enter_row(p);
+                    }
                     last_click_row = -1;
                 } else {
                     p->cursor = idx;
@@ -967,7 +985,6 @@ void dir_click(int x, int y)
                 }
             }
         }
-        dir_draw();
         return;
     }
     b = (local_x - 4) / 63;
@@ -983,6 +1000,7 @@ void dir_click(int x, int y)
         do_paste();
     } else if (b == 4) {
         start_delete();
+    } else if (b == 6) {
+        open_edit();
     }
-    dir_draw();
 }

@@ -13,6 +13,12 @@
 #define CONS_Y 524
 #define CONS_H 244
 
+#define DESK_TAB_DIR  0
+#define DESK_TAB_EDIT 1
+
 void desk_draw(void);
+int desk_tab(void);
+void desk_set_tab(int t);
+int desk_rail_click(int x, int y);
 
 #endif

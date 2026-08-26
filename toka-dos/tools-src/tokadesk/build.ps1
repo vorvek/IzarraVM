@@ -19,7 +19,7 @@ try {
     if ($LASTEXITCODE) { throw "nasm crt0.asm failed" }
 
     $cflags = @('-bt=dos','-s','-oilrt','-zp4','-wx','-we','-zl','-zdp','-3s','-zq')
-    foreach ($src in @('margo.c','lotura.c','font8.c','font16.c','desktop.c','v86.c','loop.c','dir.c','smoke.c')) {
+    foreach ($src in @('margo.c','lotura.c','font8.c','font16.c','desktop.c','v86.c','loop.c','dir.c','editor.c','smoke.c')) {
         & $wcc @cflags $src
         if ($LASTEXITCODE) { throw "wcc386 $src failed" }
     }
@@ -36,6 +36,7 @@ try {
         'file','font16.obj',
         'file','desktop.obj',
         'file','dir.obj',
+        'file','editor.obj',
         'file','v86.obj',
         'file','loop.obj',
         'file','smoke.obj'

@@ -15,8 +15,9 @@ import sys
 
 HDR_OFF = 16
 STACK_BYTES = 16 * 1024
-BSS_BYTES = 16 * 1024
+BSS_BYTES = 96 * 1024
 PAGE = 4096
+BOUNCE_MAX = 32768
 
 
 def main():
@@ -31,6 +32,9 @@ def main():
         sys.exit("stub.bin is too short to hold the overlay header")
 
     payload_size = len(payload)
+    if payload_size > BOUNCE_MAX:
+        sys.exit("payload.bin is %d bytes; stub bounce is %d" % (
+            payload_size, BOUNCE_MAX))
     n = (payload_size + BSS_BYTES + STACK_BYTES + PAGE - 1) // PAGE
     if 0x200000 + n * PAGE > 0x400000:
         sys.exit("payload + bss + stack does not fit in PT0 at 0x200000")
