@@ -388,6 +388,7 @@ static int save_file(void)
 {
     unsigned outh;
     unsigned fill;
+    unsigned wrote;
     int r;
     unsigned k;
 
@@ -401,8 +402,8 @@ static int save_file(void)
         unsigned len = (unsigned)ed_ll[r];
         unsigned src = (unsigned)ed_off[r];
         if (fill + len + 2u > B_BUF_SZ) {
-            dos_call(0x4000, outh, fill, v86_bounce_off() + B_BUF, 0, 0);
-            if (dos_err()) {
+            wrote = dos_call(0x4000, outh, fill, v86_bounce_off() + B_BUF, 0, 0);
+            if (dos_err() || wrote != fill) {
                 dos_call(0x3E00, outh, 0, 0, 0, 0);
                 return 0;
             }
@@ -423,8 +424,8 @@ static int save_file(void)
         }
     }
     if (fill) {
-        dos_call(0x4000, outh, fill, v86_bounce_off() + B_BUF, 0, 0);
-        if (dos_err()) {
+        wrote = dos_call(0x4000, outh, fill, v86_bounce_off() + B_BUF, 0, 0);
+        if (dos_err() || wrote != fill) {
             dos_call(0x3E00, outh, 0, 0, 0, 0);
             return 0;
         }

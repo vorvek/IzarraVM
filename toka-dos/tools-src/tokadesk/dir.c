@@ -569,7 +569,11 @@ static int copy_file(const char *src, const char *dst)
     unsigned inh;
     unsigned outh;
     unsigned n;
+    unsigned wrote;
 
+    if (ci_eq(src, dst)) {
+        return 0;
+    }
     bounce_str(B_PATH, src);
     inh = dos_call(0x3D00, 0, 0, v86_bounce_off() + B_PATH, 0, 0);
     if (dos_err()) {
@@ -591,8 +595,8 @@ static int copy_file(const char *src, const char *dst)
         if (n == 0) {
             break;
         }
-        dos_call(0x4000, outh, n, v86_bounce_off() + B_BUF, 0, 0);
-        if (dos_err()) {
+        wrote = dos_call(0x4000, outh, n, v86_bounce_off() + B_BUF, 0, 0);
+        if (dos_err() || wrote != n) {
             dos_call(0x3E00, inh, 0, 0, 0, 0);
             dos_call(0x3E00, outh, 0, 0, 0, 0);
             return 0;
@@ -641,6 +645,9 @@ static int copy_tree(const char *src, const char *dst, unsigned char attr)
     char child_src[80];
     char child_dst[80];
 
+    if (ci_eq(src, dst)) {
+        return 0;
+    }
     if (!(attr & ATTR_DIR)) {
         return copy_file(src, dst);
     }
@@ -745,6 +752,9 @@ static void do_paste(void)
         slash++;
     }
     path_join(dst, dstp->path, name);
+    if (ci_eq(clip_path, dst)) {
+        return;
+    }
     attr = ATTR_DIR;
     src_kind = 0;
     for (i = 0; i < 2; i++) {
