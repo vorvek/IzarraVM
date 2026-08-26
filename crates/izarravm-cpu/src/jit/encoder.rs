@@ -164,6 +164,9 @@ pub(crate) struct Encoder {
     /// `emit_load_bias_probe` calls that took the RSI-held table-base arm. Zero on the OFF
     /// arm by construction. Emission-time only.
     hold_load_bias_probes: u16,
+    /// `emit_alignment_test` calls that took the `test al, mask` arm. Zero on the OFF arm
+    /// by construction. Emission-time only.
+    align_test_al_sites: u16,
 }
 
 impl Encoder {
@@ -174,6 +177,7 @@ impl Encoder {
             patches: Vec::new(),
             eager_flags_sites: [0; crate::jit::direct::EAGER_FLAGS_CLASSES],
             hold_load_bias_probes: 0,
+            align_test_al_sites: 0,
         }
     }
 
@@ -194,6 +198,15 @@ impl Encoder {
 
     pub(crate) fn hold_load_bias_probes(&self) -> u16 {
         self.hold_load_bias_probes
+    }
+
+    /// Charge one cheap-form alignment test. Emission-time only.
+    pub(crate) fn note_align_test_al_site(&mut self) {
+        self.align_test_al_sites = self.align_test_al_sites.saturating_add(1);
+    }
+
+    pub(crate) fn align_test_al_sites(&self) -> u16 {
+        self.align_test_al_sites
     }
 
     pub(crate) fn label(&mut self) -> Label {

@@ -2089,6 +2089,11 @@ pub struct DirectStallSnapshot {
     /// leg compiled no integer load-bias probe. Not a measure of executed volume. See
     /// `DirectStallTally::hold_load_bias_probes`.
     pub hold_load_bias_probes: u64,
+    /// Cheap-form alignment tests in the blocks this run INSTALLED (`IZARRAVM_DIRECT_ALIGN_TEST_AL`,
+    /// DEFAULT OFF, so this is zero on a shipped binary). Vacuity check: a zero ON arm means the
+    /// leg compiled no wide alignment test. Not a measure of executed volume. See
+    /// `DirectStallTally::align_test_al_sites`.
+    pub align_test_al_sites: u64,
     /// Slots refused by the shared `MAX_BLOCK_IMM_LANES` budget in the blocks this run INSTALLED,
     /// one counter per family and charged on the CAP arm alone. Same denominator as the
     /// registration counters above, which is what makes the pair readable: registrations flat
