@@ -579,17 +579,17 @@ fn eager_flags_sites_are_zero_off_and_charged_on_every_class_lane() {
 /// the two arithmetic arms are mutually exclusive PATHS, not two producers. A ledger that pinned
 /// only bytes could not tell a second publish on a second path from a longer encoding on one.
 const SHAPE_LEDGER: &[(&str, u16, i64)] = &[
-    ("add_eax_ecx", 1, -28),
-    ("sub_eax_ecx", 1, -28),
+    ("add_eax_ecx", 1, -31),
+    ("sub_eax_ecx", 1, -31),
     ("cmp_eax_ecx", 1, -25),
-    ("adc_eax_ecx", 2, -72),
-    ("sbb_eax_ecx", 2, -72),
+    ("adc_eax_ecx", 2, -75),
+    ("sbb_eax_ecx", 2, -75),
     ("add_al_cl", 1, -25),
     ("neg_eax", 1, -29),
     ("add_ax_cx", 1, -25),
-    ("and_eax_ecx", 1, -72),
-    ("or_eax_ecx", 1, -72),
-    ("xor_eax_ecx", 1, -72),
+    ("and_eax_ecx", 1, -75),
+    ("or_eax_ecx", 1, -75),
+    ("xor_eax_ecx", 1, -75),
     ("test_eax_ecx", 1, -69),
     ("and_ax_cx", 1, -69),
     ("and_al_cl", 1, -76),
@@ -639,9 +639,9 @@ fn eager_flags_emission_delta_matches_the_ledger() {
     );
 }
 
-/// D-elision A encoding mutant (review M1). `SHAPE_LEDGER` is a 3-byte ON-minus-OFF pin; bumping
-/// it greens any coincidental 3-byte ON-arm shortening, including skipping the RCX source stage
-/// instead of the dst stage. Match the three-byte `mov eax, r8d` / `mov ecx, r9d` sequences.
+/// D-elision A+B encoding mutant. `SHAPE_LEDGER` is a 3-byte ON-minus-OFF pin; bumping it greens
+/// any coincidental 3-byte ON-arm shortening, including leaving the ALU on leftover RCX after
+/// dropping the src stage. Match the staging movs and the REX ALU (`add r8d, r9d` vs `add r8d, ecx`).
 ///
 /// Scan the BODY only. On Windows the prologue always emits `mov eax, r8d` to spill QUOTA_ARG
 /// (R8), which is the same three bytes as the dst stage, so a whole-block scan cannot go red.
@@ -667,10 +667,24 @@ fn src_stage_ecx_bytes() -> Vec<u8> {
     e.finish()
 }
 
+fn alu_r8d_r9d_bytes(op: u8) -> Vec<u8> {
+    let mut e = jit::encoder::Encoder::new();
+    e.alu_r32_r32(op, jit::encoder::Reg::R8, jit::encoder::Reg::R9);
+    e.finish()
+}
+
+fn alu_r8d_ecx_bytes(op: u8) -> Vec<u8> {
+    let mut e = jit::encoder::Encoder::new();
+    e.alu_r32_r32(op, jit::encoder::Reg::R8, jit::encoder::Reg::RCX);
+    e.finish()
+}
+
 #[test]
-fn eager_dword_non_cmp_skips_the_dst_stage_and_keeps_the_source_stage() {
+fn eager_dword_non_cmp_skips_both_gpr_stages() {
     let dst = dst_stage_eax_bytes();
     let src = src_stage_ecx_bytes();
+    let add_homes = alu_r8d_r9d_bytes(0);
+    let add_rcx = alu_r8d_ecx_bytes(0);
     assert_eq!(
         dst,
         [0x44, 0x89, 0xc0],
@@ -681,6 +695,16 @@ fn eager_dword_non_cmp_skips_the_dst_stage_and_keeps_the_source_stage() {
         [0x44, 0x89, 0xc9],
         "mov ecx, r9d is the src-stage encoding"
     );
+    assert_eq!(
+        add_homes,
+        [0x45, 0x01, 0xc8],
+        "add r8d, r9d is the B ON-arm ALU"
+    );
+    assert_eq!(
+        add_rcx,
+        [0x41, 0x01, 0xc8],
+        "add r8d, ecx is leftover-RCX ALU (M-B1)"
+    );
 
     let on_add = build(&[0x01, 0xc8], Seed::new(), true);
     assert!(
@@ -688,41 +712,74 @@ fn eager_dword_non_cmp_skips_the_dst_stage_and_keeps_the_source_stage() {
         "ON add_eax_ecx must not stage home(dst) into RAX"
     );
     assert!(
-        contains_bytes(body_of(&on_add), &src),
-        "ON add_eax_ecx must still stage home(src) into RCX (Part B is not this PR)"
+        !contains_bytes(body_of(&on_add), &src),
+        "ON add_eax_ecx must not stage home(src) into RCX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_add), &add_homes),
+        "ON add_eax_ecx ALUs home(dst) against home(src)"
+    );
+    assert!(
+        !contains_bytes(body_of(&on_add), &add_rcx),
+        "ON add_eax_ecx must not ALU against leftover RCX"
     );
     finish();
 
     let on_and = build(&[0x21, 0xc8], Seed::new(), true);
+    let and_homes = alu_r8d_r9d_bytes(4);
     assert!(
         !contains_bytes(body_of(&on_and), &dst),
         "ON and_eax_ecx must not stage home(dst) into RAX"
     );
     assert!(
-        contains_bytes(body_of(&on_and), &src),
-        "ON and_eax_ecx must still stage home(src) into RCX"
+        !contains_bytes(body_of(&on_and), &src),
+        "ON and_eax_ecx must not stage home(src) into RCX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_and), &and_homes),
+        "ON and_eax_ecx ALUs home(dst) against home(src)"
     );
     finish();
 
     let on_adc = build(&[0x11, 0xc8], Seed::new(), true);
+    let adc_homes = alu_r8d_r9d_bytes(2);
+    let adc_rcx = alu_r8d_ecx_bytes(2);
     assert!(
         !contains_bytes(body_of(&on_adc), &dst),
         "ON adc_eax_ecx must not stage home(dst) into RAX"
     );
     assert!(
-        contains_bytes(body_of(&on_adc), &src),
-        "ON adc_eax_ecx must still stage home(src) into RCX"
+        !contains_bytes(body_of(&on_adc), &src),
+        "ON adc_eax_ecx must not stage home(src) into RCX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_adc), &adc_homes),
+        "ON adc_eax_ecx ALUs home(dst) against home(src) on both carry arms"
+    );
+    assert!(
+        !contains_bytes(body_of(&on_adc), &adc_rcx),
+        "ON adc_eax_ecx must not ALU against leftover RCX"
     );
     finish();
 
     let on_sbb = build(&[0x19, 0xc8], Seed::new(), true);
+    let sbb_homes = alu_r8d_r9d_bytes(3);
+    let sbb_rcx = alu_r8d_ecx_bytes(3);
     assert!(
         !contains_bytes(body_of(&on_sbb), &dst),
         "ON sbb_eax_ecx must not stage home(dst) into RAX"
     );
     assert!(
-        contains_bytes(body_of(&on_sbb), &src),
-        "ON sbb_eax_ecx must still stage home(src) into RCX"
+        !contains_bytes(body_of(&on_sbb), &src),
+        "ON sbb_eax_ecx must not stage home(src) into RCX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_sbb), &sbb_homes),
+        "ON sbb_eax_ecx ALUs home(dst) against home(src) on both carry arms"
+    );
+    assert!(
+        !contains_bytes(body_of(&on_sbb), &sbb_rcx),
+        "ON sbb_eax_ecx must not ALU against leftover RCX"
     );
     finish();
 
@@ -731,6 +788,10 @@ fn eager_dword_non_cmp_skips_the_dst_stage_and_keeps_the_source_stage() {
         contains_bytes(body_of(&on_cmp), &dst),
         "ON cmp_eax_ecx still does mov edx, eax from the staged dst"
     );
+    assert!(
+        contains_bytes(body_of(&on_cmp), &src),
+        "ON cmp_eax_ecx still stages home(src) into RCX"
+    );
     finish();
 
     let on_word = build(&[0x66, 0x01, 0xc8], Seed::new(), true);
@@ -738,12 +799,20 @@ fn eager_dword_non_cmp_skips_the_dst_stage_and_keeps_the_source_stage() {
         contains_bytes(body_of(&on_word), &dst),
         "ON add_ax_cx still masks the staged dst in RAX"
     );
+    assert!(
+        contains_bytes(body_of(&on_word), &src),
+        "ON add_ax_cx still stages home(src) into RCX"
+    );
     finish();
 
     let off_add = build(&[0x01, 0xc8], Seed::new(), false);
     assert!(
         contains_bytes(body_of(&off_add), &dst),
         "OFF add_eax_ecx still stores the staged dst as descriptor a"
+    );
+    assert!(
+        contains_bytes(body_of(&off_add), &src),
+        "OFF add_eax_ecx still stores the staged src as descriptor b"
     );
     finish();
 }
