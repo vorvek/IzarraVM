@@ -132,11 +132,11 @@ STATIC struct buffer FAR *searchblock(ULONG blkno, COUNT dsk)
   {
     bp = bufptr(uncacheBuf);
   }
-  /* modified by the Toka-DOS project, 2026: keep sixteen FAT sectors, not
-     three. A FAT32 4 KiB-cluster volume of Duke's size has ~521 FAT sectors;
-     three means every GRP seek re-walks the table through INT 13h. Sixteen
-     still leaves data buffers for unaligned file tails. */
-  else if (bp->b_flag & BFR_FAT && fat_count < 16 && lastNonFat)
+  /* modified by the Toka-DOS project, 2026: keep thirty-two FAT sectors, not
+     three. getblk_fat fills a 32-sector run in one INT 13h; the floor has to
+     cover that run or the scatter evicts the sector it just read. Leave the
+     rest of BUFFERS for unaligned file tails. */
+  else if (bp->b_flag & BFR_FAT && fat_count < 32 && lastNonFat)
   {
     bp = bufptr(lastNonFat);
   }
@@ -251,8 +251,10 @@ struct buffer FAR *getblk(ULONG blkno, COUNT dsk, BOOL overwrite)
    A FAT miss used to issue one INT 13h per sector. Duke's GRP seeks walk tens
    of FAT sectors that way, and the guest spends that time inside one INT 21h
    with the last frame held. Fill a run in one BIOS call, then scatter into
-   the existing 512-byte buffer slots. Hits still take searchblock only. */
-#define FAT_PREFETCH_SECS 8
+   the existing 512-byte buffer slots. Hits still take searchblock only.
+   32 sectors is 16 KiB: one fill covers most of a 44 MB GRP cluster-chain
+   walk (88 FAT sectors at 4 KiB clusters). */
+#define FAT_PREFETCH_SECS 32
 static UBYTE fat_span[BUFFERSIZE * FAT_PREFETCH_SECS];
 
 STATIC void mark_fat_buf(struct buffer FAR * bp, ULONG blkno,
@@ -294,6 +296,11 @@ struct buffer FAR *getblk_fat(ULONG blkno, struct dpb FAR * dpbp)
 #endif
   if (blkno < fat_end && (fat_end - blkno) < n)
     n = (unsigned)(fat_end - blkno);
+  /* Never fill more slots than BUFFERS can hold without eating the
+     requested sector. LoL_nbuffers is the live count (HMA fill may be
+     tens; BUFFERS=6 still has to work). */
+  if (LoL_nbuffers > 4 && n > (unsigned)LoL_nbuffers - 4)
+    n = (unsigned)LoL_nbuffers - 4;
   if (n < 1)
     n = 1;
 
