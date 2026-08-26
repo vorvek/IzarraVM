@@ -522,8 +522,8 @@ fn assert_agrees(
         interpreter.cycle(interpreter_bus).unwrap();
     }
     assert_eq!(
-        crate::tests::settled_registers(&native),
-        crate::tests::settled_registers(&interpreter),
+        crate::tests::settled_registers(native),
+        crate::tests::settled_registers(interpreter),
         "{label}: registers differ"
     );
     assert_eq!(

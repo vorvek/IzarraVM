@@ -1837,13 +1837,13 @@ fn assert_read_parity(
     native_bus: &TestBus,
 ) {
     assert_eq!(
-        crate::tests::settled_state(&native),
-        crate::tests::settled_state(&interp),
+        crate::tests::settled_state(native),
+        crate::tests::settled_state(interp),
         "register, architectural EFLAGS, or clock state differs"
     );
     assert_eq!(
-        crate::tests::settled_registers(&native),
-        crate::tests::settled_registers(&interp)
+        crate::tests::settled_registers(native),
+        crate::tests::settled_registers(interp)
     );
     assert_eq!(native.eflags(), interp.eflags());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
