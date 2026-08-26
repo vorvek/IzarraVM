@@ -30,8 +30,12 @@ authors = ["IzarraVM contributors"]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-# Line-table debug info (MSVC: richer PDB, identical codegen) so the
+# Line-table debug info (MSVC: richer PDB; the inlinee name set does not move
+# against `[profile.profiling]` below, so no inlining decision changes) so the
 # IZARRAVM_RIP_PROFILE sampler attributes wall to real functions and lines.
+# NOT byte-identical codegen against `profiling`: `.text` is 12,056,395 bytes
+# here against 12,063,211 there, and `run_until_tick` alone differs by 1,168
+# bytes (2.11%) -- do not compare wall numbers across the two profiles.
 # The publics-only PDB the stripped build produced attributed 25% of a
 # nascar-586 profile to a nearest-public btree drop-glue symbol.
 debug = "line-tables-only"
