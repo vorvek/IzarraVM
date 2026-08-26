@@ -220,6 +220,8 @@ struct Roles {
     slots: usize,
     sites: [u16; jit::direct::EAGER_FLAGS_CLASSES],
     code_len: usize,
+    code: Vec<u8>,
+    body_offset: usize,
 }
 
 /// Compile `mov esi,esi / body / mov edi,edi / hlt` at `ENTRY` on the native role with the arm
@@ -322,6 +324,7 @@ fn build_with_arm(body: &[u8], seed: Seed, arm: Option<bool>) -> Roles {
     );
     let sites = compilation.eager_flags_sites();
     let code_len = compilation.code.len();
+    let body_offset = compilation.body_offset();
     let id = native
         .jit_direct
         .install(&compilation)
@@ -357,6 +360,8 @@ fn build_with_arm(body: &[u8], seed: Seed, arm: Option<bool>) -> Roles {
         slots,
         sites,
         code_len,
+        code: compilation.code,
+        body_offset,
     }
 }
 
@@ -574,17 +579,17 @@ fn eager_flags_sites_are_zero_off_and_charged_on_every_class_lane() {
 /// the two arithmetic arms are mutually exclusive PATHS, not two producers. A ledger that pinned
 /// only bytes could not tell a second publish on a second path from a longer encoding on one.
 const SHAPE_LEDGER: &[(&str, u16, i64)] = &[
-    ("add_eax_ecx", 1, -25),
-    ("sub_eax_ecx", 1, -25),
+    ("add_eax_ecx", 1, -28),
+    ("sub_eax_ecx", 1, -28),
     ("cmp_eax_ecx", 1, -25),
-    ("adc_eax_ecx", 2, -69),
-    ("sbb_eax_ecx", 2, -69),
+    ("adc_eax_ecx", 2, -72),
+    ("sbb_eax_ecx", 2, -72),
     ("add_al_cl", 1, -25),
     ("neg_eax", 1, -29),
     ("add_ax_cx", 1, -25),
-    ("and_eax_ecx", 1, -69),
-    ("or_eax_ecx", 1, -69),
-    ("xor_eax_ecx", 1, -69),
+    ("and_eax_ecx", 1, -72),
+    ("or_eax_ecx", 1, -72),
+    ("xor_eax_ecx", 1, -72),
     ("test_eax_ecx", 1, -69),
     ("and_ax_cx", 1, -69),
     ("and_al_cl", 1, -76),
@@ -632,6 +637,115 @@ fn eager_flags_emission_delta_matches_the_ledger() {
         SHAPE_LEDGER.to_vec(),
         "the per-shape publish count or ON-minus-OFF emitted byte delta moved"
     );
+}
+
+/// D-elision A encoding mutant (review M1). `SHAPE_LEDGER` is a 3-byte ON-minus-OFF pin; bumping
+/// it greens any coincidental 3-byte ON-arm shortening, including skipping the RCX source stage
+/// instead of the dst stage. Match the three-byte `mov eax, r8d` / `mov ecx, r9d` sequences.
+///
+/// Scan the BODY only. On Windows the prologue always emits `mov eax, r8d` to spill QUOTA_ARG
+/// (R8), which is the same three bytes as the dst stage, so a whole-block scan cannot go red.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn body_of(roles: &Roles) -> &[u8] {
+    &roles.code[roles.body_offset..]
+}
+
+fn dst_stage_eax_bytes() -> Vec<u8> {
+    let mut e = jit::encoder::Encoder::new();
+    e.mov_r32_r32(jit::encoder::Reg::RAX, jit::encoder::Reg::R8);
+    e.finish()
+}
+
+fn src_stage_ecx_bytes() -> Vec<u8> {
+    let mut e = jit::encoder::Encoder::new();
+    e.mov_r32_r32(jit::encoder::Reg::RCX, jit::encoder::Reg::R9);
+    e.finish()
+}
+
+#[test]
+fn eager_dword_non_cmp_skips_the_dst_stage_and_keeps_the_source_stage() {
+    let dst = dst_stage_eax_bytes();
+    let src = src_stage_ecx_bytes();
+    assert_eq!(
+        dst,
+        [0x44, 0x89, 0xc0],
+        "mov eax, r8d is the dst-stage encoding"
+    );
+    assert_eq!(
+        src,
+        [0x44, 0x89, 0xc9],
+        "mov ecx, r9d is the src-stage encoding"
+    );
+
+    let on_add = build(&[0x01, 0xc8], Seed::new(), true);
+    assert!(
+        !contains_bytes(body_of(&on_add), &dst),
+        "ON add_eax_ecx must not stage home(dst) into RAX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_add), &src),
+        "ON add_eax_ecx must still stage home(src) into RCX (Part B is not this PR)"
+    );
+    finish();
+
+    let on_and = build(&[0x21, 0xc8], Seed::new(), true);
+    assert!(
+        !contains_bytes(body_of(&on_and), &dst),
+        "ON and_eax_ecx must not stage home(dst) into RAX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_and), &src),
+        "ON and_eax_ecx must still stage home(src) into RCX"
+    );
+    finish();
+
+    let on_adc = build(&[0x11, 0xc8], Seed::new(), true);
+    assert!(
+        !contains_bytes(body_of(&on_adc), &dst),
+        "ON adc_eax_ecx must not stage home(dst) into RAX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_adc), &src),
+        "ON adc_eax_ecx must still stage home(src) into RCX"
+    );
+    finish();
+
+    let on_sbb = build(&[0x19, 0xc8], Seed::new(), true);
+    assert!(
+        !contains_bytes(body_of(&on_sbb), &dst),
+        "ON sbb_eax_ecx must not stage home(dst) into RAX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_sbb), &src),
+        "ON sbb_eax_ecx must still stage home(src) into RCX"
+    );
+    finish();
+
+    let on_cmp = build(&[0x39, 0xc8], Seed::new(), true);
+    assert!(
+        contains_bytes(body_of(&on_cmp), &dst),
+        "ON cmp_eax_ecx still does mov edx, eax from the staged dst"
+    );
+    finish();
+
+    let on_word = build(&[0x66, 0x01, 0xc8], Seed::new(), true);
+    assert!(
+        contains_bytes(body_of(&on_word), &dst),
+        "ON add_ax_cx still masks the staged dst in RAX"
+    );
+    finish();
+
+    let off_add = build(&[0x01, 0xc8], Seed::new(), false);
+    assert!(
+        contains_bytes(body_of(&off_add), &dst),
+        "OFF add_eax_ecx still stores the staged dst as descriptor a"
+    );
+    finish();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -950,6 +1064,7 @@ fn build_multi(bodies: &[&[u8]], seed: Seed, on: bool) -> Roles {
     assert_eq!(usize::from(compilation.span.instructions), slots);
     let sites = compilation.eager_flags_sites();
     let code_len = compilation.code.len();
+    let body_offset = compilation.body_offset();
     let id = native
         .jit_direct
         .install(&compilation)
@@ -981,6 +1096,8 @@ fn build_multi(bodies: &[&[u8]], seed: Seed, on: bool) -> Roles {
         slots,
         sites,
         code_len,
+        code: compilation.code,
+        body_offset,
     }
 }
 
