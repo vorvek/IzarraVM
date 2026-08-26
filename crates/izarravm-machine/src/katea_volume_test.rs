@@ -52,8 +52,9 @@ fn extracts_the_embedded_image_payload() {
     // and searchblock keeps more FAT buffers than the old three.
     // 75531 -> 87851: bounce 8 -> 32 sectors (+12 KiB), floor 16 -> 32,
     // clamp always even when BUFFERS is tiny, return the i==0 slot not a
-    // trailing searchblock.
-    // See toka-dos/freedos/kernel/kernel/blockio.c.
+    // trailing searchblock. See blockio.c.
+    // 87851 -> 88603: map_cluster skips linear FAT[c]==c+1 runs a sector
+    // at a time (fattab.c linear_run_steps, fatfs.c map_cluster).
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
@@ -67,7 +68,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(87851),
+        Some(88603),
         "KERNEL.SYS size"
     );
     assert_eq!(

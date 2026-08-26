@@ -188,6 +188,8 @@ void read_fsinfo(struct dpb FAR * dpbp);
 void write_fsinfo(struct dpb FAR * dpbp);
 CLUSTER link_fat(struct dpb FAR * dpbp, CLUSTER Cluster1,
                  REG CLUSTER Cluster2);
+CLUSTER linear_run_steps(struct dpb FAR * dpbp, CLUSTER start,
+                         CLUSTER max_steps);
 CLUSTER next_cluster(struct dpb FAR * dpbp, REG CLUSTER ClusterNum);
 BOOL is_free_cluster(struct dpb FAR * dpbp, REG CLUSTER ClusterNum);
 
