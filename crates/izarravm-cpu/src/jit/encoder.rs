@@ -188,7 +188,6 @@ impl Encoder {
     }
 
     /// Charge one RSI-arm load-bias probe. Emission-time only.
-    #[allow(dead_code)] // charged from emit_load_bias_probe on the RSI arm
     pub(crate) fn note_hold_load_bias_probe(&mut self) {
         self.hold_load_bias_probes = self.hold_load_bias_probes.saturating_add(1);
     }

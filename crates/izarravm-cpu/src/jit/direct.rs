@@ -673,12 +673,12 @@ impl CompiledBlock {
             //
             // The frame induction this arm used to provide by REFUSING is preserved, not
             // abandoned, and it is what the float-to-integer arm above depends on. That crossing
-            // reloads RSI from STACK_SAVED_RSI and restores XMM6-11 from the frame, slots only an
-            // x87 prologue writes. The pad writes the same slots, so every block that can reach
-            // such a crossing was entered either through a prologue or through the pad. Uniform
-            // frame length alone would not make that read safe. `try_link_inner` refuses this
-            // shape outright when no pad could be built (`LinkRefusal::MissingX87Pad`), which is
-            // what keeps the induction total.
+            // reloads RSI from STACK_SAVED_RSI and restores XMM6-11 from the frame. On the
+            // default (OFF) arm those slots are written only by an x87 prologue or by this pad.
+            // On the IZARRAVM_DIRECT_HOLD_LOAD_BIAS arm the integer prologue also writes
+            // STACK_SAVED_RSI, and the pad must not. Uniform frame length alone would not make
+            // that read safe. `try_link_inner` refuses this shape outright when no pad could be
+            // built (`LinkRefusal::MissingX87Pad`), which is what keeps the induction total.
             (false, true) => true,
         }
     }
@@ -1088,7 +1088,8 @@ pub(crate) struct BlockCache {
     /// Deliberately not a block: `reset_storage` sets `arena = None` and frees it, which would
     /// dangle every `integer_entry` published at a float block, and `compact_arena` relocates
     /// arena contents while portals published at the pad must keep one stable address for the
-    /// life of the cache. Built once, lazily, on the first float install, and never replaced.
+    /// life of the cache. Built once, lazily, on the first float install, and never replaced
+    /// except when the hold-load-bias test override rebuilds it.
     ///
     /// `None` means no pad: on a host where the executable mapping cannot be made (allocation
     /// failure, or any target outside x86-64 Windows/Linux), `try_link_inner` REFUSES the
@@ -2299,6 +2300,21 @@ impl BlockCache {
             self.stalls.x87_top_sticky_crossings += 1;
         }
         self.retire_key_for_recompile(watch, key)
+    }
+
+    /// Drop the shared x87 re-entry pad. Test-only: illegal unless `clear` has just run, because
+    /// float portals' `integer_entry` would otherwise dangle into a freed mapping.
+    #[cfg(all(
+        test,
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn drop_x87_pad_for_test(&mut self) {
+        debug_assert!(
+            self.entries.is_empty() && self.blocks.is_empty(),
+            "drop_x87_pad_for_test without clear would dangle float integer_entry"
+        );
+        self.x87_pad = None;
     }
 
     pub(crate) fn clear(&mut self, watch: &mut NativeCodeWatch) {
@@ -3515,6 +3531,11 @@ impl Compilation {
 
     pub(crate) fn hold_load_bias_probes(&self) -> u16 {
         self.hold_load_bias_probes
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn body_offset(&self) -> usize {
+        self.body_offset
     }
 }
 
@@ -7750,6 +7771,7 @@ fn compile_with_budget(
             watch_page_bit: cpu.jit_direct.watch_page_bit,
             one_lookup_store,
             one_lookup_load,
+            hold_load_bias: hold_load_bias_enabled() && x87_slots == 0 && one_lookup_load,
             segments: segment_layout,
             address_wrap: if d {
                 AddressWrap::None
@@ -11488,10 +11510,9 @@ pub(crate) fn parse_jcc_shadow_arm_for_test(value: Result<String, std::env::VarE
 ///
 /// Mixed arms across one process are **unsound**, unlike `IZARRAVM_JCC_SHADOW`. An integer ON
 /// prologue saves host RSI (Windows) and overwrites RSI with the table pointer; an OFF
-/// epilogue does not restore it. Tests that flip the arm must flush the block cache (and,
-/// once the pad reads this knob, drop `x87_pad` so it rebuilds). Ladder legs export the
-/// arm on a fresh process. Production is one OnceLock per process.
-#[allow(dead_code)] // read at emit time once the RSI-held probe exists
+/// epilogue does not restore it. Tests that flip the arm must call
+/// `JitState::rebuild_after_hold_load_bias_flip_for_test`. Ladder legs export the arm on a
+/// fresh process. Production is one OnceLock per process.
 pub(crate) fn hold_load_bias_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = HOLD_LOAD_BIAS_OVERRIDE.with(std::cell::Cell::get) {
@@ -11504,7 +11525,6 @@ pub(crate) fn hold_load_bias_enabled() -> bool {
 
 /// The `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` spelling table, lifted out of the `OnceLock` closure
 /// so it can be unit-tested without a process-global env write. See `hold_load_bias_enabled`.
-#[allow(dead_code)] // called from hold_load_bias_enabled once emit reads the knob
 fn parse_hold_load_bias_arm(value: Result<String, std::env::VarError>) -> bool {
     const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
                             default: every load-bias probe reloads the table base from \
@@ -11538,8 +11558,9 @@ thread_local! {
 }
 
 /// Force the hold-load-bias arm on this thread for the length of a fixture; `None` restores
-/// the ambient `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` reading. Flipping mid-run without flushing
-/// compiled blocks is unsound.
+/// the ambient `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` reading. Prefer
+/// `JitState::rebuild_after_hold_load_bias_flip_for_test`, which also clears compiled blocks
+/// and drops the x87 pad.
 #[cfg(test)]
 pub(crate) fn set_hold_load_bias_for_test(forced: Option<bool>) {
     HOLD_LOAD_BIAS_OVERRIDE.with(|cell| cell.set(forced));
@@ -14719,6 +14740,9 @@ struct MemoryEmitContext {
     /// independent of `one_lookup_store`: disjoint sites, separate pads, so an A/B of either
     /// slice leaves the other's emission untouched.
     one_lookup_load: bool,
+    /// Whether this integer block holds `load_biases` in RSI (`IZARRAVM_DIRECT_HOLD_LOAD_BIAS`
+    /// AND `one_lookup_load` AND no x87 slots). False on x87 blocks: `CACHE_REG` is RSI.
+    hold_load_bias: bool,
     segments: SegmentLayout,
     /// Whether a ModRM-derived effective address wraps at 64K.
     ///
@@ -14855,6 +14879,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     if x87_entry_top.is_some() {
         e.store_r64_disp32(Reg::RSP, STACK_SAVED_RSI, Reg::RSI);
         emit_save_x87_host_xmms(&mut e);
+    } else if memory.hold_load_bias {
+        e.store_r64_disp32(Reg::RSP, STACK_SAVED_RSI, Reg::RSI);
     }
     // Clear the accumulator window in whole 32-byte stores rather than one 8-byte store per
     // slot: four stores instead of thirteen, per block ENTRY. `STACK_ZERO_FILL_LEN` carries the
@@ -14880,6 +14906,15 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
     for (index, home) in GUEST_HOMES.into_iter().enumerate() {
         e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
+    }
+    // After `mov rbp, FLAGS_ARG` (SysV FLAGS_ARG is RSI) and after R15 is live, before
+    // `body_offset`. Hops skip the prologue and inherit RSI.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    if memory.hold_load_bias {
+        emit_held_load_bias_base(&mut e);
     }
     #[cfg(all(
         target_arch = "x86_64",
@@ -16399,6 +16434,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     step_break_stub,
                     exit_arg,
                     resync_labels.map(|((stub, _), (fault_stub, _))| (stub, fault_stub)),
+                    memory.hold_load_bias,
                 );
                 side_exit_reason_stubs.push((
                     abnormal_stub,
@@ -17116,8 +17152,11 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         emit_x87_spill(&mut e, Reg::R15);
     }
     #[cfg(target_os = "windows")]
-    if x87_entry_top.is_some() {
+    if x87_entry_top.is_some() || memory.hold_load_bias {
         e.load_r64_disp32(Reg::RSI, Reg::RSP, STACK_SAVED_RSI);
+    }
+    #[cfg(target_os = "windows")]
+    if x87_entry_top.is_some() {
         emit_restore_x87_host_xmms(&mut e);
     }
     emit_store_homes(&mut e);
@@ -17420,6 +17459,7 @@ fn emit_completed_path(
                 e.load_r64_disp32(Reg::RSI, Reg::RSP, STACK_SAVED_RSI);
                 emit_restore_x87_host_xmms(e);
             }
+            emit_reload_held_load_bias_if_armed(e);
             e.place(transfer);
         }
         #[cfg(not(all(
@@ -17576,6 +17616,7 @@ fn emit_completed_dynamic_path(
                 e.load_r64_disp32(Reg::RSI, Reg::RSP, STACK_SAVED_RSI);
                 emit_restore_x87_host_xmms(e);
             }
+            emit_reload_held_load_bias_if_armed(e);
             e.place(transfer);
         }
         #[cfg(not(all(
@@ -21058,7 +21099,9 @@ fn emit_clear_pending(e: &mut Encoder) {
 /// prologue's x87 work, which is also what restores the frame induction that
 /// `SpanMeta::link_compatible`'s refusal used to provide: every block that can later reach a
 /// float-to-integer crossing (which reloads RSI and XMM6-11 from the frame) was entered either
-/// through an x87 prologue or through here, and both write those slots.
+/// through an x87 prologue or through here. On the default (OFF) arm both write those slots.
+/// On the IZARRAVM_DIRECT_HOLD_LOAD_BIAS arm the integer prologue also writes STACK_SAVED_RSI,
+/// and this pad must not.
 ///
 /// The TOP guard runs FIRST, before any save, so the bail has nothing to undo and must NOT spill:
 /// the x87 cache is not live on this path (any earlier float segment was flushed at its own
@@ -21069,7 +21112,8 @@ fn emit_clear_pending(e: &mut Encoder) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_x87_reentry_pad() -> Vec<u8> {
+pub(crate) fn emit_x87_reentry_pad() -> Vec<u8> {
+    let hold_load_bias = hold_load_bias_enabled();
     let mut e = Encoder::new();
     let bail = e.label();
 
@@ -21091,10 +21135,13 @@ fn emit_x87_reentry_pad() -> Vec<u8> {
     e.cmp_r64_r64(Reg::RAX, Reg::RDX);
     e.jnz(bail);
 
-    // Exactly the prologue's x87 work, in the prologue's order.
+    // Exactly the prologue's x87 work, in the prologue's order. ON-arm: do not save RSI, the
+    // slot already holds host RSI from the entering integer prologue. Keep the XMM save.
     #[cfg(target_os = "windows")]
     {
-        e.store_r64_disp32(Reg::RSP, STACK_SAVED_RSI, Reg::RSI);
+        if !hold_load_bias {
+            e.store_r64_disp32(Reg::RSP, STACK_SAVED_RSI, Reg::RSI);
+        }
         emit_save_x87_host_xmms(&mut e);
     }
     crate::jit::x87_avx2_emit::emit_enter(&mut e, Reg::R15);
@@ -21116,6 +21163,13 @@ fn emit_x87_reentry_pad() -> Vec<u8> {
 
     e.place(bail);
     emit_store_unresolved_reason(&mut e, UnresolvedReason::X87TopMismatch);
+    // ON-arm Windows: incoming RSI is the table pointer; host RSI is in the slot. Restore
+    // it. OFF-arm: the save has not run, incoming RSI is still host RSI, do not restore.
+    // Never restore XMMs here: the TOP guard is before any XMM save.
+    #[cfg(target_os = "windows")]
+    if hold_load_bias {
+        e.load_r64_disp32(Reg::RSI, Reg::RSP, STACK_SAVED_RSI);
+    }
     emit_store_homes(&mut e);
     // `emit_return` already ends with `add rsp`, the reversed pops of SAVED_HOST_REGS, and `ret`.
     // Guest EFLAGS in RBP needs no store: it is mirrored to `CpuGsw.eflags` at every
@@ -21864,7 +21918,7 @@ fn emit_table_base(e: &mut Encoder, r15_tables: bool, slot: usize, value: usize,
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn table_slot_offset(slot: usize) -> i32 {
+pub(crate) fn table_slot_offset(slot: usize) -> i32 {
     (core::mem::offset_of!(CpuGsw, native_table_slots)
         + core::mem::offset_of!(NativeTableSlots, slots)
         + slot * core::mem::size_of::<usize>()) as i32
@@ -22850,11 +22904,40 @@ fn emit_x87_resolve_stub(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_load_bias_probe(e: &mut Encoder, map: NativeMapBases) {
+fn emit_load_bias_probe(e: &mut Encoder, map: NativeMapBases, hold_load_bias: bool) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(e, true, TABLE_SLOT_LOAD_BIASES, map.load_biases(), Reg::RDI);
-    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
+    if hold_load_bias {
+        e.load_r64_sib_scale8(Reg::RDI, Reg::RSI, Reg::RCX);
+        e.note_hold_load_bias_probe();
+    } else {
+        emit_table_base(e, true, TABLE_SLOT_LOAD_BIASES, map.load_biases(), Reg::RDI);
+        e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
+    }
+}
+
+/// Load `native_table_slots[TABLE_SLOT_LOAD_BIASES]` into RSI. Integer prologue, float-to-integer
+/// spilling reload, and integer call-out continuation.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_held_load_bias_base(e: &mut Encoder) {
+    e.load_r64_disp32(
+        Reg::RSI,
+        Reg::R15,
+        table_slot_offset(TABLE_SLOT_LOAD_BIASES),
+    );
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_reload_held_load_bias_if_armed(e: &mut Encoder) {
+    if hold_load_bias_enabled() {
+        emit_held_load_bias_base(e);
+    }
 }
 
 /// The read-resolve stubs' status dispatch at a call site: ECX carries the verdict, refusals
@@ -22917,7 +23000,7 @@ fn emit_ram_read_pointer_fast(
         // `emit_alignment_test`.
         emit_alignment_test(e, width, Reg::RDX, slow);
     }
-    emit_load_bias_probe(e, map);
+    emit_load_bias_probe(e, map, memory.hold_load_bias);
 
     // Jumping past the probe into `slow` is legal, and neither fact is obvious:
     // `emit_counting_read_stub` never reads incoming RDI -- it recomputes the page index from RAX
@@ -23004,7 +23087,7 @@ fn gpr_read_width_index(width: MemoryWidth) -> usize {
 ))]
 fn emit_read_probe_parking(e: &mut Encoder, memory: MemoryEmitContext, sides: MemorySideExits) {
     let map = memory.map.expect("native read has fast-map bases");
-    emit_load_bias_probe(e, map);
+    emit_load_bias_probe(e, map, memory.hold_load_bias);
 
     let aux = e.label();
     let slow = e.label();
@@ -23071,7 +23154,7 @@ fn emit_read_probe_parking(e: &mut Encoder, memory: MemoryEmitContext, sides: Me
 ))]
 fn emit_x87_read_pointer_fast(e: &mut Encoder, memory: MemoryEmitContext, sides: MemorySideExits) {
     let map = memory.map.expect("x87 memory block has fast-map bases");
-    emit_load_bias_probe(e, map);
+    emit_load_bias_probe(e, map, memory.hold_load_bias);
 
     let slow = e.label();
     let done = e.label();
@@ -25929,6 +26012,7 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 ///
 /// `abnormal` and `step_break` are side-exit reason stubs the caller has already registered; this
 /// function only branches to them.
+#[allow(clippy::too_many_arguments)]
 fn emit_call_out(
     e: &mut Encoder,
     helper: CallOutHelper,
@@ -25937,6 +26021,7 @@ fn emit_call_out(
     step_break: Label,
     exit_arg: Option<u64>,
     resync: Option<(Label, Label)>,
+    hold_load_bias: bool,
 ) {
     debug_assert_eq!(
         helper.carries_a_cell(),
@@ -26001,6 +26086,13 @@ fn emit_call_out(
     // R8-R11 overwrite live guest registers. `mov` writes no flags, so RAX's status survives.
     for (index, home) in GUEST_HOMES.into_iter().enumerate() {
         e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    if hold_load_bias {
+        emit_held_load_bias_base(e);
     }
     e.cmp_r64_imm32(Reg::RAX, 0);
     // 0x8 is the x86 sign condition: `js abnormal`.

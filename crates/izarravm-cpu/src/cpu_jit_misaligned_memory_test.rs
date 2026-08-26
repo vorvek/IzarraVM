@@ -985,3 +985,15 @@ fn a_misaligned_x87_access_still_exits() {
         );
     }
 }
+
+/// Guard 3 on the hold-load-bias ON arm. Alignment still diverts; clocks still match.
+#[test]
+fn hold_load_bias_arm_still_serves_misaligned_word_reads() {
+    jit::direct::set_hold_load_bias_for_test(Some(true));
+    lowered_misaligned(
+        &word_load(OPERAND_PAGE + 1),
+        2,
+        "hold-load-bias ON movzx word [odd]",
+    );
+    jit::direct::set_hold_load_bias_for_test(None);
+}
