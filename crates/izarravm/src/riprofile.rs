@@ -6,7 +6,7 @@
 //! Gated by `IZARRAVM_RIP_PROFILE=<report-path>`. A sampler thread suspends the
 //! emulation (main) thread at ~2 kHz, records the instruction pointer, and at
 //! the end of the run resolves every unique address to a function name and a
-//! file:line via dbghelp (requires an unstripped build with debug info —
+//! file:line via dbghelp (requires an unstripped build with debug info,
 //! `--profile release` already carries line-tables, and `--profile profiling`
 //! carries full debug info; the two are NOT byte-identical, see the root
 //! `Cargo.toml`, and shares of wall must not be compared across them).
@@ -926,7 +926,7 @@ fn sample_rate_line(total: u64, window: Option<Duration>, interval: Option<Durat
             i.as_secs_f64() * 1000.0,
         ),
         _ => format!(
-            "{total} samples, achieved rate unknown — fewer than 2 samples \
+            "{total} samples, achieved rate unknown, fewer than 2 samples \
              ({SAMPLE_INTERVAL:?} requested)"
         ),
     }
