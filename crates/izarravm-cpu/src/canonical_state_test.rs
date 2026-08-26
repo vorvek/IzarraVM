@@ -887,8 +887,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // pin 4552 -> 4560 -- measured, not derived. A host-side function-pointer slot, not
     // architectural state, so both canonical payloads are unchanged by it; see cpu_test.rs's twin
     // comment.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4560);
+    // The run-end ledger fix adds two PerfCounters fields (brk_rep_resume, brk_fatal; 16 bytes),
+    // moving the pin 4560 -> 4576 -- measured, not derived. Host-side run-end diagnostics, not
+    // architectural state, so both canonical payloads are unchanged by it; see cpu_test.rs's twin
+    // comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4560);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
 }

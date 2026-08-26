@@ -521,7 +521,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
         let insns_per_run = perf.instructions as f64 / perf.straight_line_runs.max(1) as f64;
         println!(
             "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
-             brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
+             brk[branch/step/int/cap/halt/rep/fatal]={}/{}/{}/{}/{}/{}/{}  \
              data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
@@ -536,6 +536,8 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.brk_interrupt,
             perf.brk_cap,
             perf.brk_halt,
+            perf.brk_rep_resume,
+            perf.brk_fatal,
             perf.data_direct_reads,
             perf.data_slow_reads,
             perf.data_direct_writes,
@@ -994,6 +996,8 @@ pub(super) fn perf_counters_json(
         "brk_interrupt": perf.brk_interrupt,
         "brk_cap": perf.brk_cap,
         "brk_halt": perf.brk_halt,
+        "brk_rep_resume": perf.brk_rep_resume,
+        "brk_fatal": perf.brk_fatal,
         "decode_inval_cs_load": perf.decode_inval_cs_load,
         "decode_inval_smc": perf.decode_inval_smc,
         "decode_inval_other": perf.decode_inval_other,
@@ -1162,7 +1166,7 @@ pub(super) fn print_perf_counter_row(
     let insns_per_run = perf.instructions as f64 / perf.straight_line_runs.max(1) as f64;
     println!(
         "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
-         brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
+         brk[branch/step/int/cap/halt/rep/fatal]={}/{}/{}/{}/{}/{}/{}  \
          inval[cs/smc/other/all]={}/{}/{}/{} narrow={}  \
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
@@ -1184,6 +1188,8 @@ pub(super) fn print_perf_counter_row(
         perf.brk_interrupt,
         perf.brk_cap,
         perf.brk_halt,
+        perf.brk_rep_resume,
+        perf.brk_fatal,
         perf.decode_inval_cs_load,
         perf.decode_inval_smc,
         perf.decode_inval_other,

@@ -3166,12 +3166,14 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 // rising implicates the SMC/dispatch path instead.
                 //
                 // These are TWO LEVELS, not one flat histogram. The partition of
-                // `straight_line_runs` (bar the rare fatal-error run) is
-                // {brk_decode_or_branch, brk_step, brk_interrupt, brk_cap, brk_halt}; the three
+                // `straight_line_runs` is EXACTLY {brk_decode_or_branch, brk_step,
+                // brk_interrupt, brk_cap, brk_halt, brk_rep_resume, brk_fatal}; the three
                 // `brk_cont_*` counters are the BREAKDOWN of `brk_decode_or_branch` alone, which
-                // is bumped on the same line pair as each of them (run.rs:706, 711, 716, 723,
-                // 770), so brk_decode_or_branch == cont_decode_miss + cont_not_continuable +
-                // cont_page_cross. Summing all eight double-counts every continuation break.
+                // is bumped on the same line pair as each of them, so brk_decode_or_branch ==
+                // cont_decode_miss + cont_not_continuable + cont_page_cross. Summing all ten
+                // double-counts every continuation break. `brk_fatal` is counted in the
+                // `run_budgeted` wrapper, on the `?`-propagation return path the other six never
+                // take.
                 "straight_line_runs": mark.perf.straight_line_runs,
                 "brk_decode_or_branch": mark.perf.brk_decode_or_branch,
                 "brk_cont_decode_miss": mark.perf.brk_cont_decode_miss,
@@ -3181,6 +3183,8 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "brk_interrupt": mark.perf.brk_interrupt,
                 "brk_cap": mark.perf.brk_cap,
                 "brk_halt": mark.perf.brk_halt,
+                "brk_rep_resume": mark.perf.brk_rep_resume,
+                "brk_fatal": mark.perf.brk_fatal,
                 // `smc_scan_keys / smc_scan_calls` is the MEAN OVERLAP-SCAN LENGTH of
                 // `invalidate_physical_range`. Without it a rise in SMC cost cannot be split
                 // into "more events" (calls) and "each event dearer" (keys per call), and the

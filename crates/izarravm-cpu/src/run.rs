@@ -621,6 +621,13 @@ impl CpuGsw {
         cap: u64,
     ) -> Result<BudgetedRunOutcome, CpuError> {
         let result = self.run_budgeted_inner(bus, cap);
+        // The seventh run-end reason: a propagated hard `CpuError` skips every `brk_*` fold
+        // inside the loop (see `straight_line_runs`' identity comment), so it is counted here
+        // instead, on the same `?`-propagation return path the two comments below already
+        // single out.
+        if result.is_err() {
+            self.perf.brk_fatal += 1;
+        }
         // Close the unit simulator's batch on EVERY return path, including the `?` error
         // propagations inside the loop, so an open sim entry never leaks across batches.
         #[cfg(feature = "jit")]
@@ -912,6 +919,7 @@ impl CpuGsw {
             // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
             // machine can service an event or interrupt before any further iteration.
             if self.rep_resume_active {
+                self.perf.brk_rep_resume += 1;
                 break;
             }
             // The post-instruction break checks run in the SAME ORDER the old per-instruction machine

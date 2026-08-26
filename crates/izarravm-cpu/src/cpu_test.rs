@@ -1949,7 +1949,11 @@ fn pending_flags_offset() {
     // The gp2 in-imm8 callout design adds `CallOutTable::port_read_al_imm8` (8 bytes), moving this
     // pin 4552 -> 4560 -- measured off a failing-test readout, not derived. Same shape as the S2
     // `InterpretOne` growth above: host-side window bookkeeping, not guest state.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4560);
+    // The run-end ledger fix adds two PerfCounters fields (brk_rep_resume, brk_fatal; 16 bytes),
+    // moving this pin 4560 -> 4576 -- measured off a failing-test readout, not derived. They
+    // belong in PerfCounters, not at the CpuGsw tail, for the same reason the other brk_* fields
+    // do: the bench and phase-mark JSON emit them alongside their siblings.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -3799,6 +3803,8 @@ mod legacy_system;
 mod misaligned_datapath;
 #[path = "cpu_persona_system_test.rs"]
 mod persona_system;
+#[path = "cpu_run_end_ledger_test.rs"]
+mod run_end_ledger;
 /// The FastMap slot-reject census. Nested here for `TestBus` and for the same reason the
 /// histogram is: it needs a bus that genuinely serves direct pages, so a populated FastMap is
 /// reachable and a refusal is attributable to a clause rather than to a cold map.
