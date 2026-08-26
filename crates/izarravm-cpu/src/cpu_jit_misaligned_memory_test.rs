@@ -997,3 +997,35 @@ fn hold_load_bias_arm_still_serves_misaligned_word_reads() {
     );
     jit::direct::set_hold_load_bias_for_test(None);
 }
+
+/// M5 GREEN: a 4-aligned qword is admitted (mask 3), not refused as if the mask were 7.
+#[test]
+fn a_4_aligned_x87_qword_runs_natively() {
+    lowered_aligned(
+        &disp32(&[0xdd], 0, OPERAND_PAGE + 4),
+        "fld qword [OPERAND_PAGE+4]",
+    );
+}
+
+/// Guard 3 on the cheap-alignment ON arm. Whole suite, not a one-row sample.
+#[test]
+fn align_test_al_arm_still_passes_guard_3() {
+    jit::direct::set_align_test_al_for_test(Some(true));
+    a_misaligned_word_read_runs_natively_and_charges_the_split();
+    a_misaligned_word_read_into_a_sixteen_bit_destination_runs_natively();
+    a_misaligned_word_alu_memory_source_runs_natively();
+    an_aligned_read_through_the_counting_stub_charges_no_split();
+    a_misaligned_dword_read_runs_natively_at_every_sub_alignment();
+    a_page_edge_access_runs_inside_the_page_and_exits_when_it_crosses();
+    a_misaligned_mode13_read_still_exits();
+    a_misaligned_store_runs_natively_and_charges_the_split();
+    a_misaligned_store_writes_its_own_value_not_the_previous_slots();
+    an_aligned_store_through_the_slow_stub_charges_no_split();
+    a_misaligned_mode13_store_still_exits_without_writing();
+    a_page_crossing_store_still_exits();
+    a_straddling_misaligned_store_sees_every_granule_of_its_span();
+    the_non_relaxed_sites_still_refuse_a_misaligned_access();
+    a_misaligned_x87_access_still_exits();
+    a_4_aligned_x87_qword_runs_natively();
+    jit::direct::set_align_test_al_for_test(None);
+}

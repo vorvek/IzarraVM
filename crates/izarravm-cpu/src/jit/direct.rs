@@ -11599,7 +11599,6 @@ pub(crate) fn parse_hold_load_bias_arm_for_test(value: Result<String, std::env::
 /// Mixed arms across one process are **sound**, unlike `IZARRAVM_DIRECT_HOLD_LOAD_BIAS`: this
 /// helper has no ABI register contract. Tests that flip the arm still compile fresh. Production
 /// is one OnceLock per process.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn align_test_al_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = ALIGN_TEST_AL_OVERRIDE.with(std::cell::Cell::get) {
@@ -11609,7 +11608,6 @@ pub(crate) fn align_test_al_enabled() -> bool {
     *ENABLED.get_or_init(|| parse_align_test_al_arm(std::env::var("IZARRAVM_DIRECT_ALIGN_TEST_AL")))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_align_test_al_arm(value: Result<String, std::env::VarError>) -> bool {
     const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
                             default: emit_alignment_test is mov/and/cmp/jnz), and `1` / `on` \
@@ -19093,9 +19091,9 @@ fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, cross: Label) {
     e.jcc(7, cross);
 }
 
-/// The wide guard's ALIGNMENT half. Four instructions, and the only half whose target varies by
-/// call site: eleven sites send it to `cross_page_or_alignment` (through `emit_wide_page_guard`),
-/// the two lean one-lookup sites send it to their own slow stub instead.
+/// The wide guard's ALIGNMENT half. The only half whose target varies by call site: eleven
+/// sites send it to `cross_page_or_alignment` (through `emit_wide_page_guard`), the two lean
+/// one-lookup sites send it to their own slow stub instead.
 ///
 /// **`scratch` has exactly two legal values, and passing the wrong one produces a silent wrong
 /// answer rather than a fault.**
@@ -19106,18 +19104,31 @@ fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, cross: Label) {
 /// * `Reg::RCX` at the lean STORE site, and ONLY there, and only because the alignment half is
 ///   emitted AFTER `emit_read_store_value` has put the store value in RDX. RCX is free by the
 ///   store pad's own rule: the page index is not part of the stub contract, and every stub that
-///   needs it recomputes it from RAX.
+///   needs it recomputes it from RAX. The cheap arm (`IZARRAVM_DIRECT_ALIGN_TEST_AL`) does not
+///   write `scratch`; the store site still passes RCX because the value owns RDX.
 ///
 /// Backwards is undetectable at runtime: RDX at the store site clobbers the value the slow stub
-/// spills and stores, and RCX at any other site clobbers a live page index. `and r32, imm32` is
-/// `81 /4 id` and `mov r32, r32` is `89 /r` at either register, so both spellings are the same
-/// four instructions at the same four encoding lengths.
+/// spills and stores, and RCX at any other site clobbers a live page index.
+///
+/// OFF arm: four instructions (`mov/and/cmp/jnz`), 20 bytes. ON arm: `test al, mask; jnz`,
+/// 9 bytes, and does not write scratch.
 fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misaligned: Label) {
     debug_assert!(
         matches!(scratch, Reg::RDX | Reg::RCX),
         "the alignment test's scratch is RDX everywhere except the lean store site, where the \
          value materialisation owns RDX and the scratch must be RCX"
     );
+    debug_assert!(
+        width.needs_alignment_guard(),
+        "Byte skips the alignment helper; a call here would emit a never-taken test al, 0"
+    );
+    if align_test_al_enabled() {
+        debug_assert!(width.alignment_mask() <= 0xff);
+        e.test_r8_low_imm8(Reg::RAX, width.alignment_mask() as u8);
+        e.jnz(misaligned);
+        e.note_align_test_al_site();
+        return;
+    }
     e.mov_r32_r32(scratch, Reg::RAX);
     e.and_r32_imm32(scratch, width.alignment_mask());
     e.cmp_r32_imm32(scratch, 0);
@@ -19139,11 +19150,10 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 /// so there is one order to reason about, not two.
 ///
 /// **Precondition, stated rather than assumed: no caller may rely on the host flag state this
-/// leaves behind.** The reorder changes it -- ZF/CF now come from the crossing `cmp` rather than
-/// the alignment one. Every consumer at all thirteen sites establishes its own flags before
-/// branching (`emit_load_bias_probe` and `emit_store_bias_probe` both end in a `test`,
-/// `emit_ram_read_pointer_inner`'s next flag setter is a shift), and guest EFLAGS live in RBP,
-/// never in host flags across a memory front.
+/// leaves behind.** Leftover ZF/CF/SF/OF/PF come from the ALIGNMENT half (`cmp scratch, 0` on
+/// the default arm, `test al, mask` on `IZARRAVM_DIRECT_ALIGN_TEST_AL`). AF can differ across
+/// those two spellings. Every consumer at all thirteen sites establishes its own flags before
+/// the next branch, and guest EFLAGS live in RBP, never in host flags across a memory front.
 fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     debug_assert!(width.needs_alignment_guard());
     emit_page_cross_bound(e, width, side);
@@ -22378,9 +22388,10 @@ fn emit_store_fast(
         // nor the aux arm reads RCX after the probe, and `emit_mode13_dirty_bit` recomputes the
         // page index from RAX as its first two instructions.
         //
-        // `and r32, imm32` is `81 /4 id` and `mov r32, r32` is `89 /r` at either register, so this
-        // is the same four instructions at the same four encoding lengths as before the slice:
-        // zero added bytes at the site.
+        // OFF arm: `and r32, imm32` is `81 /4 id` and `mov r32, r32` is `89 /r` at either
+        // register, so this is the same four instructions at the same four encoding lengths as
+        // before the slice. ON arm (`IZARRAVM_DIRECT_ALIGN_TEST_AL`) does not write RCX; the
+        // argument still has to be RCX because RDX holds the store value.
         emit_alignment_test(e, width, Reg::RCX, slow);
     }
 
