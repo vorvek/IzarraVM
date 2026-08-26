@@ -1750,6 +1750,12 @@ impl CpuGsw {
                         .direct
                         .note_jcc_shadow_sites(jcc_shadow_sites);
                 }
+                let hold_load_bias_probes = compilation.hold_load_bias_probes();
+                if hold_load_bias_probes != 0 {
+                    self.jit_direct
+                        .direct
+                        .note_hold_load_bias_probes(hold_load_bias_probes);
+                }
                 // Mode-key bit 0 is CS.D (`jit_mode_key`), so a clear bit is a 16-bit code
                 // segment. Cold path, so a branch is free here; the two hot counterparts at the
                 // block-entry site are written branchlessly.

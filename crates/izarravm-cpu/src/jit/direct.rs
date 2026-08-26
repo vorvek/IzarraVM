@@ -1893,6 +1893,13 @@ impl BlockCache {
         self.stalls.jcc_sites_signed_xor_zf += u64::from(sites[3]);
     }
 
+    /// RSI-arm load-bias probes in INSTALLED blocks. Charged at the same install site as
+    /// `note_jcc_shadow_sites`, so the denominator is "blocks this run installed". Zero on the
+    /// OFF arm by construction.
+    pub(crate) fn note_hold_load_bias_probes(&mut self, probes: u16) {
+        self.stalls.hold_load_bias_probes += u64::from(probes);
+    }
+
     /// Fold ONE INSTALLED block's per-walk lane-budget refusals into the tally, per family.
     ///
     /// Called from `JitState::install` on the success arm and from nowhere else, which is what
@@ -3459,6 +3466,9 @@ pub(crate) struct Compilation {
     /// silently wired into a counter nobody asked for.
     #[cfg_attr(not(test), allow(dead_code))]
     eager_flags_sites: [u16; EAGER_FLAGS_CLASSES],
+    /// `emit_load_bias_probe` calls that took the RSI-held table-base arm. Folded at install
+    /// like `jcc_shadow_sites`. Zero on the OFF arm by construction.
+    hold_load_bias_probes: u16,
     pub code: Vec<u8>,
 }
 
@@ -3501,6 +3511,10 @@ impl Compilation {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn eager_flags_sites(&self) -> [u16; EAGER_FLAGS_CLASSES] {
         self.eager_flags_sites
+    }
+
+    pub(crate) fn hold_load_bias_probes(&self) -> u16 {
+        self.hold_load_bias_probes
     }
 }
 
@@ -7787,6 +7801,7 @@ fn compile_with_budget(
         lane_cap_refusals,
         jcc_shadow_sites: emitted.jcc_shadow_sites,
         eager_flags_sites: emitted.eager_flags_sites,
+        hold_load_bias_probes: emitted.hold_load_bias_probes,
         code: emitted.code,
     })
 }
@@ -11465,6 +11480,77 @@ pub(crate) fn parse_jcc_shadow_arm_for_test(value: Result<String, std::env::VarE
     parse_jcc_shadow_arm(value)
 }
 
+/// Whether integer Direct blocks hold `load_biases` in RSI (`IZARRAVM_DIRECT_HOLD_LOAD_BIAS`).
+///
+/// DEFAULT OFF. Unset and the empty string name the same arm, which is OFF. `1` / `on` is ON.
+/// Anything else panics rather than silently running the default: a mistyped ladder leg that
+/// fell through would be read as the slice doing nothing.
+///
+/// Mixed arms across one process are **unsound**, unlike `IZARRAVM_JCC_SHADOW`. An integer ON
+/// prologue saves host RSI (Windows) and overwrites RSI with the table pointer; an OFF
+/// epilogue does not restore it. Tests that flip the arm must flush the block cache (and,
+/// once the pad reads this knob, drop `x87_pad` so it rebuilds). Ladder legs export the
+/// arm on a fresh process. Production is one OnceLock per process.
+#[allow(dead_code)] // read at emit time once the RSI-held probe exists
+pub(crate) fn hold_load_bias_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = HOLD_LOAD_BIAS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| parse_hold_load_bias_arm(std::env::var("IZARRAVM_DIRECT_HOLD_LOAD_BIAS")))
+}
+
+/// The `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` spelling table, lifted out of the `OnceLock` closure
+/// so it can be unit-tested without a process-global env write. See `hold_load_bias_enabled`.
+#[allow(dead_code)] // called from hold_load_bias_enabled once emit reads the knob
+fn parse_hold_load_bias_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
+                            default: every load-bias probe reloads the table base from \
+                            `[r15+slot]`), and `1` / `on` (the hoist arm: integer blocks hold \
+                            `load_biases` in RSI and each probe is one indexed load)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_DIRECT_HOLD_LOAD_BIAS is set to a value that is not valid UTF-8; \
+                 {ACCEPTED}"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_DIRECT_HOLD_LOAD_BIAS={other:?} names no arm; {ACCEPTED}. Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the \
+             arm it named doing nothing"
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOLD_LOAD_BIAS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the hold-load-bias arm on this thread for the length of a fixture; `None` restores
+/// the ambient `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` reading. Flipping mid-run without flushing
+/// compiled blocks is unsound.
+#[cfg(test)]
+pub(crate) fn set_hold_load_bias_for_test(forced: Option<bool>) {
+    HOLD_LOAD_BIAS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_hold_load_bias_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_hold_load_bias_arm(value)
+}
+
 /// The EAGER-FLAGS classes, in `eager_flags_sites` lane order. One lane per emission SHAPE, not
 /// per emitter function, because the shapes are what the byte ledger prices and what the arm
 /// vacuity check has to see move independently.
@@ -14597,6 +14683,10 @@ struct EmittedCode {
     /// ON-minus-OFF cost) and the ARM VACUITY check: all six lanes read zero on the OFF arm by
     /// construction, so a ladder leg whose ON arm also reads zero is vacuous and void.
     eager_flags_sites: [u16; EAGER_FLAGS_CLASSES],
+    /// `emit_load_bias_probe` calls that took the RSI-held table-base arm. Zero on the OFF
+    /// arm by construction, so a ladder leg whose ON arm also reads zero compiled no integer
+    /// load-bias probe and cannot price the slice.
+    hold_load_bias_probes: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -17055,11 +17145,13 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     );
     // BEFORE `finish`, which consumes the encoder.
     let eager_flags_sites = e.eager_flags_sites();
+    let hold_load_bias_probes = e.hold_load_bias_probes();
     EmittedCode {
         code: e.finish(),
         body_offset,
         jcc_shadow_sites,
         eager_flags_sites,
+        hold_load_bias_probes,
     }
 }
 
@@ -27905,6 +27997,10 @@ pub(crate) struct DirectStallTally {
     pub jcc_sites_signed_xor: u64,
     /// The 0xE / 0xF (JLE / JG) class, the `ZF|(SF^OF)` fold. See `jcc_sites_simple`.
     pub jcc_sites_signed_xor_zf: u64,
+    /// RSI-arm load-bias probes in the blocks this run INSTALLED (`IZARRAVM_DIRECT_HOLD_LOAD_BIAS`,
+    /// DEFAULT OFF, so this is zero on a shipped binary). Vacuity check: a zero ON arm means
+    /// the leg compiled no integer load-bias probe. Not a measure of executed volume.
+    pub hold_load_bias_probes: u64,
     /// Slots the shared `MAX_BLOCK_IMM_LANES` budget refused IN THE BLOCKS THIS RUN INSTALLED,
     /// charged to the family that would otherwise have taken the slot. The registration counters
     /// above say how many lanes those same blocks installed; these say how many more they would
@@ -29672,6 +29768,7 @@ impl crate::jit::JitState {
             jcc_sites_overflow: self.stalls.jcc_sites_overflow,
             jcc_sites_signed_xor: self.stalls.jcc_sites_signed_xor,
             jcc_sites_signed_xor_zf: self.stalls.jcc_sites_signed_xor_zf,
+            hold_load_bias_probes: self.stalls.hold_load_bias_probes,
             imm_lane_cap_refusals: self.stalls.imm_lane_cap_refusals,
             imm8_lane_cap_refusals: self.stalls.imm8_lane_cap_refusals,
             count_lane_cap_refusals: self.stalls.count_lane_cap_refusals,

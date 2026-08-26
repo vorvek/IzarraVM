@@ -4091,6 +4091,14 @@ mod jit_jcc_shadow;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_hold_load_bias_test.rs"]
+mod jit_hold_load_bias;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_callout_test.rs"]
 mod jit_callout;
 
