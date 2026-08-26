@@ -684,12 +684,18 @@ pub struct PerfCounters {
     /// stays large -- the ledger does not close there. Same fold-per-run discipline and
     /// Phase-2 identity role as `decode_probes`.
     pub jit_direct_dispatch_declines: u64,
-    /// Calls to `run_straight_line` (one per machine batch entry). The denominator for
-    /// the average straight-line run length = instructions / straight_line_runs.
+    /// Calls to `run_budgeted` (one straight-line RUN, not one machine batch entry). A batch
+    /// entry drives this in a loop: whenever a run returns `Ok` without halting, without
+    /// touching I/O, and without crossing an interrupt-serviceable edge, all under the clock
+    /// cap (for example a run ending on `brk_cont_decode_miss`), the batch entry calls
+    /// `run_budgeted` again immediately, inside the SAME batch entry. One batch entry can
+    /// therefore contain many runs; this counts runs.
     pub straight_line_runs: u64,
-    /// Why each straight-line run ended (one increment per run). These say what limits
-    /// batch length. They sum to `straight_line_runs` except for the rare run that ends in
-    /// a propagated hard `CpuError` (a fatal error records no break reason).
+    /// Why each straight-line run ended (one increment per run). `brk_decode_or_branch`,
+    /// `brk_step`, `brk_interrupt`, `brk_cap`, `brk_halt`, `brk_rep_resume`, and `brk_fatal`
+    /// sum to EXACTLY `straight_line_runs`. The first six are the run loop's normal-return
+    /// exits; `brk_fatal` is the seventh, incremented in the `run_budgeted` wrapper when the
+    /// inner loop instead propagates a hard `CpuError`.
     pub brk_decode_or_branch: u64, // next insn not cached / not straight-line / page cross
     /// TEMPORARY instrumentation: split brk_decode_or_branch into its three causes.
     pub brk_cont_decode_miss: u64, // continuation: next insn not in the decode cache
@@ -699,6 +705,8 @@ pub struct PerfCounters {
     pub brk_interrupt: u64,            // an instruction made a maskable interrupt serviceable
     pub brk_cap: u64,                  // the run reached the scaled-clock cap
     pub brk_halt: u64,                 // the run executed HLT
+    pub brk_rep_resume: u64, // a budgeted REP exposed its restart EIP after a bounded chunk
+    pub brk_fatal: u64,      // the run propagated a hard CpuError instead of returning Ok
     /// Decode-cache invalidation diagnostics. `decode_inval_cs_load` counts CS LOADS (which no
     /// longer flush the decode cache: the D bit is in the hit condition and the fetch limit is
     /// re-checked per hit); `decode_inval_smc` counts SMC whole-cache flushes
