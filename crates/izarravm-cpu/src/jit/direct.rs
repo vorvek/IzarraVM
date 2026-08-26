@@ -11500,10 +11500,16 @@ pub(crate) const EAGER_CLASS_MEM_COMMIT: usize = 5;
 /// `parameter-knobs-have-no-off-spelling` trap (a `PARAMETER` knob whose `=0` ARMS it) cost a
 /// whole census, and the two conventions now coexist in this file.
 ///
-/// **Default OFF.** Both mechanisms therefore exist in the shipped binary, and every claim
-/// elsewhere in this file that a descriptor writer is "dead", "not emitted" or "vacuous" is an
-/// ON-ARM claim. On the default arm the descriptor is still written, every helper is still
-/// emitted, and every argument that depends on a live descriptor is still load-bearing.
+/// **Default ON since 2026-08-28, on the owner's approval after the slice's own ladder**
+/// (`.bench/results/eflags-ladder-20260828/`): wolf3d-586 +6.3% min-wall over three interleaved
+/// pairs, quake-586 +3.7% (3 of 3), nascar-586 +1.5% (4 of 5), duke3d-586-short neutral at 0.999
+/// over six pairs, prince-486 inert (a 16-bit row; the slice rewrote the 32-bit emitters); the
+/// two-arm 13-row scoreboard passed every invariant on both arms. `flag_materializations`
+/// dropped 5-15x on every ON leg. Both mechanisms still exist in the shipped binary -- `0` /
+/// `off` names the descriptor arm, stated -- and every claim elsewhere in this file that a
+/// descriptor writer is "dead", "not emitted" or "vacuous" is an EAGER-ARM claim; on the
+/// descriptor arm the descriptor is still written, every helper is still emitted, and every
+/// argument that depends on a live descriptor is still load-bearing.
 ///
 /// # What the arm changes, and what it does NOT
 ///
@@ -11533,14 +11539,15 @@ pub(crate) fn eager_flags_enabled() -> bool {
 /// The `IZARRAVM_DIRECT_EAGER_FLAGS` spelling table, lifted out of the `OnceLock` closure so it
 /// can be unit-tested without a process-global env write. See `eager_flags_enabled`.
 fn parse_eager_flags_arm(value: Result<String, std::env::VarError>) -> bool {
-    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
-                            default: flag-producing slots write a lazy PendingFlags descriptor), \
-                            and `1` / `on` / `true` (the eager arm: they publish the RBP EFLAGS \
-                            shadow straight to registers.eflags)";
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `1` / `on` / `true` (the \
+                            shipped default since the 2026-08-28 owner-approved flip: the eager \
+                            arm, flag-producing slots publish the RBP EFLAGS shadow straight to \
+                            registers.eflags) and `0` / `off` / `false` (the descriptor arm, \
+                            stated: they write the lazy PendingFlags descriptor)";
     let raw = match value {
-        // Unset = OFF, and so is the empty string one arm down: this knob's nulling trap points
-        // at the ON leg, which must EXPORT `1`. See `eager_flags_enabled`.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset = the default = the EAGER arm since the 2026-08-28 flip; the empty string names
+        // the same arm one match down. An OFF ladder leg must EXPORT `0` explicitly.
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_DIRECT_EAGER_FLAGS is set to a value that is not valid UTF-8; {ACCEPTED}"
@@ -11549,7 +11556,9 @@ fn parse_eager_flags_arm(value: Result<String, std::env::VarError>) -> bool {
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" | "false" => false,
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        "" => true,
+        "0" | "off" | "false" => false,
         "1" | "on" | "true" => true,
         other => panic!(
             "IZARRAVM_DIRECT_EAGER_FLAGS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a \
@@ -23436,13 +23445,13 @@ fn emit_x87_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
 //    in flight and no reload could have fixed it.
 //
 //    **ARM-QUALIFIED, and the qualification is the point rather than a footnote: this clause is
-//    VACUOUS under `IZARRAVM_DIRECT_EAGER_FLAGS` and LIVE UNDER THE DEFAULT ARM.** On the eager
-//    arm no descriptor is ever in flight, so there is nothing to survive. On the shipped default
-//    arm the descriptor is still written by every producing slot, and clause 2 above states that
-//    RBP must NOT be reloaded across the call -- so a descriptor produced by an earlier slot
-//    genuinely IS in flight across a PUSHAD/POPAD, and this argument is still what protects it.
-//    Rewriting the clause as vacuous would delete a correctness argument that still guards the
-//    arm the binary ships.
+//    VACUOUS on the EAGER arm (the shipped default since the 2026-08-28 flip) and LIVE on the
+//    DESCRIPTOR arm (`IZARRAVM_DIRECT_EAGER_FLAGS=0`).** On the eager arm no descriptor is ever
+//    in flight, so there is nothing to survive. On the descriptor arm it is still written by
+//    every producing slot, and clause 2 above states that RBP must NOT be reloaded across the
+//    call -- so a descriptor produced by an earlier slot genuinely IS in flight across a
+//    PUSHAD/POPAD, and this argument is still what protects it. Rewriting the clause as vacuous
+//    would delete a correctness argument that still guards a reachable, stated arm.
 // 4. **Stack addressing follows.** Later slots' stack addresses are emitted relative to
 //    `home(4)`, which the reload has just refreshed from `registers.gpr[4]`, so a `push` after a
 //    `PUSHAD` in the same block addresses the post-PUSHAD ESP. Nothing bakes an ESP value.

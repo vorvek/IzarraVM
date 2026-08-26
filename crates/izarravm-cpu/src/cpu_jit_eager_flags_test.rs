@@ -457,14 +457,17 @@ fn eager_flags_arm_spelling_table() {
     use std::env::VarError;
     let parse = jit::direct::parse_eager_flags_arm_for_test;
     assert!(
-        !parse(Err(VarError::NotPresent)),
-        "unset is the default arm"
+        parse(Err(VarError::NotPresent)),
+        "unset is the default arm, and the default is the EAGER arm since the 2026-08-28 flip"
     );
-    for off in ["", "0", "off", "OFF", "False", " 0 "] {
+    for off in ["0", "off", "OFF", "False", " 0 "] {
         assert!(!parse(Ok(off.to_string())), "{off:?} must name the OFF arm");
     }
-    for on in ["1", "on", "ON", "true", " TRUE "] {
-        assert!(parse(Ok(on.to_string())), "{on:?} must name the ON arm");
+    for on in ["", "1", "on", "ON", "true", " TRUE "] {
+        assert!(
+            parse(Ok(on.to_string())),
+            "{on:?} must name the ON arm (\"\" names the SAME arm as unset -- the default)"
+        );
     }
 }
 
@@ -476,7 +479,8 @@ fn eager_flags_arm_refuses_to_guess() {
     let _ = jit::direct::parse_eager_flags_arm_for_test(Ok("yes".to_string()));
 }
 
-/// THE SHIPPED DEFAULT IS OFF, read with NO test override in force.
+/// THE SHIPPED DEFAULT IS THE EAGER ARM (ON since the 2026-08-28 owner-approved flip), read with
+/// NO test override in force.
 ///
 /// Every other fixture in this file forces the arm explicitly, which is right for what they test
 /// and is exactly why this row has to exist: with the thread-local override set, a flipped knob
@@ -489,21 +493,23 @@ fn eager_flags_arm_refuses_to_guess() {
 /// here. The closing `assert!` reads the arm function directly, which is what catches a flip that
 /// reached emission but was masked by some future short-circuit.
 #[test]
-fn the_shipped_default_arm_is_off() {
+fn the_shipped_default_arm_is_eager() {
     for shape in SHAPES {
         // NO override in force: this compiles under whatever the knob actually reads.
         let ambient = build_with_arm(shape.body, Seed::new(), None);
         finish();
-        assert_eq!(
-            ambient.sites,
-            [0; jit::direct::EAGER_FLAGS_CLASSES],
-            "{}: the SHIPPED arm must register no eager site",
-            shape.name
+        assert!(
+            ambient.sites[shape.class] > 0,
+            "{}: the SHIPPED arm must charge the {} lane -- the default is the eager arm since \
+             the 2026-08-28 flip (eflags-ladder-20260828 + the two-arm 13-row board)",
+            shape.name,
+            CLASS_NAMES[shape.class]
         );
     }
     assert!(
-        !jit::direct::eager_flags_enabled(),
-        "IZARRAVM_DIRECT_EAGER_FLAGS ships DEFAULT OFF, and flipping that default is an OWNER          DECISION -- not something a slice does on its way past"
+        jit::direct::eager_flags_enabled(),
+        "IZARRAVM_DIRECT_EAGER_FLAGS ships the EAGER arm by default since the owner-approved \
+         2026-08-28 flip; moving it back needs the same class of evidence"
     );
 }
 
