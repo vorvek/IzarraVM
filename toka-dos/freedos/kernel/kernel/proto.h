@@ -35,6 +35,7 @@ static BYTE *Proto_hRcsId =
 
 /* blockio.c */
 struct buffer FAR *getblk(ULONG blkno, COUNT dsk, BOOL overwrite);
+struct buffer FAR *getblk_fat(ULONG blkno, struct dpb FAR * dpbp);
 #define getblock(blkno, dsk) getblk(blkno, dsk, FALSE);
 #define getblockOver(blkno, dsk) getblk(blkno, dsk, TRUE);
 VOID setinvld(REG COUNT dsk);
@@ -187,6 +188,8 @@ void read_fsinfo(struct dpb FAR * dpbp);
 void write_fsinfo(struct dpb FAR * dpbp);
 CLUSTER link_fat(struct dpb FAR * dpbp, CLUSTER Cluster1,
                  REG CLUSTER Cluster2);
+CLUSTER linear_run_steps(struct dpb FAR * dpbp, CLUSTER start,
+                         CLUSTER max_steps);
 CLUSTER next_cluster(struct dpb FAR * dpbp, REG CLUSTER ClusterNum);
 BOOL is_free_cluster(struct dpb FAR * dpbp, REG CLUSTER ClusterNum);
 

@@ -473,6 +473,15 @@ impl AtaDisk {
         }
     }
 
+    /// Region of `lba` on a Katea volume. Image-backed disks have no FAT layout
+    /// the census can name, so they report `Other`.
+    pub(crate) fn lba_region(&self, lba: u32) -> crate::katea_tree::LbaRegion {
+        match &self.backing {
+            Backing::HostFolder(volume) => volume.lba_region(lba),
+            Backing::Image(_) => crate::katea_tree::LbaRegion::Other,
+        }
+    }
+
     pub(crate) fn end_read_command(&self) {
         if let Backing::HostFolder(volume) = &self.backing {
             volume.end_read_command();

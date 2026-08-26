@@ -83,6 +83,49 @@ pub struct Int13Profile {
     /// stall performs, so `host_wall_ns - katea.host_wall_ns` isolates the
     /// stall-advance and copy halves (hypotheses c vs d).
     pub host_wall_ns: u64,
+    /// 1-sector read commands whose start LBA was in a FAT copy. Katea's
+    /// `fat_sector_reads` is the wrong discriminator: it also fires once per
+    /// cluster of an internal projection walk. This one is INT 13h only.
+    pub read1_fat: u64,
+    /// 1-sector read commands whose start LBA was in the data region (files
+    /// and directories). Unaligned GRP lumps and directory getblk land here.
+    pub read1_data: u64,
+    /// 1-sector read commands that were neither: MBR, VBR, FSInfo, or a
+    /// non-Katea (image-backed) disk with no FAT layout to name.
+    pub read1_other: u64,
+    /// 1-sector read commands by the caller's buffer segment: below A000
+    /// (conventional), A000-EFFF (UMA/UMB), F000 and up (HMA). INT 13h sees
+    /// the address after `dskxfer` deblock, so HMA getblk shows up as
+    /// conventional (`DiskTransferBuffer`). A UMB cluster read that still
+    /// bounced would too. Multi-sector commands that did not bounce keep
+    /// their real segment, which is why `read_buf_*` below is on every read
+    /// and not only the 1-sector bucket.
+    pub read1_buf_conv: u64,
+    pub read1_buf_uma: u64,
+    pub read1_buf_hma: u64,
+    /// Every read command, 1-sector or not, by buffer segment. The 5-16
+    /// sector buckets already prove some transfers land below A000; these
+    /// counts say whether the rest ever land in UMB at INT 13h at all.
+    pub read_buf_conv: u64,
+    pub read_buf_uma: u64,
+    pub read_buf_hma: u64,
+}
+
+/// Caller-buffer segment class for the INT 13h census.
+fn int13_buf_class(seg: u16) -> Int13BufClass {
+    if seg < 0xA000 {
+        Int13BufClass::Conv
+    } else if seg < 0xF000 {
+        Int13BufClass::Uma
+    } else {
+        Int13BufClass::Hma
+    }
+}
+
+enum Int13BufClass {
+    Conv,
+    Uma,
+    Hma,
 }
 
 /// Bucket index for a sector count, matching `Int13Profile::read_count_hist`.
@@ -1886,13 +1929,43 @@ impl Machine {
 
     /// Record one fixed-disk data call in the census. Gated at the call site, so
     /// this is never reached on an ordinary run.
-    pub(super) fn note_int13_data(&mut self, kind: Int13DataKind, sectors: u32, hits: u32) {
+    pub(super) fn note_int13_data(
+        &mut self,
+        kind: Int13DataKind,
+        sectors: u32,
+        hits: u32,
+        start_lba: u32,
+        buf_seg: u16,
+    ) {
+        let region = self
+            .ata
+            .as_ref()
+            .map(|disk| disk.lba_region(start_lba))
+            .unwrap_or(crate::katea_tree::LbaRegion::Other);
+        let buf = int13_buf_class(buf_seg);
         let p = &mut self.int13_profile;
         match kind {
             Int13DataKind::Read => {
                 p.read_calls += 1;
                 p.read_sectors += u64::from(sectors);
                 p.read_count_hist[int13_size_bucket(sectors)] += 1;
+                match buf {
+                    Int13BufClass::Conv => p.read_buf_conv += 1,
+                    Int13BufClass::Uma => p.read_buf_uma += 1,
+                    Int13BufClass::Hma => p.read_buf_hma += 1,
+                }
+                if sectors == 1 {
+                    match region {
+                        crate::katea_tree::LbaRegion::Fat => p.read1_fat += 1,
+                        crate::katea_tree::LbaRegion::Data => p.read1_data += 1,
+                        crate::katea_tree::LbaRegion::Other => p.read1_other += 1,
+                    }
+                    match buf {
+                        Int13BufClass::Conv => p.read1_buf_conv += 1,
+                        Int13BufClass::Uma => p.read1_buf_uma += 1,
+                        Int13BufClass::Hma => p.read1_buf_hma += 1,
+                    }
+                }
             }
             Int13DataKind::Write => {
                 p.write_calls += 1;
@@ -1907,6 +1980,11 @@ impl Machine {
         p.stall_ticks = p
             .stall_ticks
             .saturating_add(ata::pio_transfer_ticks_cached(sectors, hits));
+    }
+
+    /// Real-mode paragraph of ES, which is the CHS/long-sector transfer buffer.
+    fn int13_es_seg(&self) -> u16 {
+        (self.cpu.registers.segment(SegmentIndex::Es).base >> 4) as u16
     }
 
     /// The fixed-disk census so far. All zero unless `IZARRAVM_INT13_PROFILE=1`.
@@ -2010,7 +2088,13 @@ impl Machine {
             } else {
                 Int13DataKind::Write
             };
-            self.note_int13_data(kind, u32::from(done), cache_hits);
+            self.note_int13_data(
+                kind,
+                u32::from(done),
+                cache_hits,
+                start_lba,
+                self.int13_es_seg(),
+            );
         }
         let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
@@ -2128,7 +2212,13 @@ impl Machine {
             } else {
                 Int13DataKind::Write
             };
-            self.note_int13_data(kind, u32::from(done), cache_hits);
+            self.note_int13_data(
+                kind,
+                u32::from(done),
+                cache_hits,
+                start_lba,
+                self.int13_es_seg(),
+            );
         }
         let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
@@ -2196,7 +2286,13 @@ impl Machine {
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
         if self.int13_profile_enabled {
-            self.note_int13_data(Int13DataKind::Verify, u32::from(done), cache_hits);
+            self.note_int13_data(
+                Int13DataKind::Verify,
+                u32::from(done),
+                cache_hits,
+                start_lba,
+                self.int13_es_seg(),
+            );
         }
         self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
@@ -2420,7 +2516,13 @@ impl Machine {
                 0x43 => Int13DataKind::Write,
                 _ => Int13DataKind::Verify,
             };
-            self.note_int13_data(kind, u32::from(done), cache_hits);
+            self.note_int13_data(
+                kind,
+                u32::from(done),
+                cache_hits,
+                u32::try_from(lba).expect("validated EDD LBA fits ATA"),
+                buf_seg,
+            );
         }
         let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
@@ -2505,3 +2607,7 @@ impl Machine {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "storage_test.rs"]
+mod tests;

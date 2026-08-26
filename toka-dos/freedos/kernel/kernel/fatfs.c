@@ -960,7 +960,7 @@ STATIC COUNT extend_dir(f_node_ptr fnp)
 
 COUNT map_cluster(REG f_node_ptr fnp, COUNT mode)
 {
-  CLUSTER relcluster, cluster;
+  CLUSTER relcluster, cluster, remain, steps;
 
 #ifdef DISPLAY_GETBLOCK
   printf("map_cluster: current %lu, offset %lu, diff=%lu ",
@@ -1006,8 +1006,24 @@ COUNT map_cluster(REG f_node_ptr fnp, COUNT mode)
   /* up to the relative cluster position where the index falls    */
   /* within the cluster.                                          */
 
+  /* Katea (and most installer-copied files) store each chain as one
+     contiguous run. Walking that with next_cluster is one pair of FAT
+     lookups per cluster, inside a single INT 21h. Take every linear
+     FAT[c]==c+1 hop in the current FAT sector in one go; a fragmented
+     chain returns 0 and falls through to the one-step path. remain is
+     CLUSTER (unsigned long under FAT32), not UCOUNT: a 2 GB file at
+     4 KiB/cluster is 524288 hops. */
   while (fnp->f_cluster_offset != relcluster)
   {
+    remain = relcluster - fnp->f_cluster_offset;
+    steps = linear_run_steps(fnp->f_dpb, fnp->f_cluster, remain);
+    if (steps != 0)
+    {
+      fnp->f_cluster += steps;
+      fnp->f_cluster_offset += steps;
+      continue;
+    }
+
     /* get next cluster in the chain */
     cluster = next_cluster(fnp->f_dpb, fnp->f_cluster);
     if (cluster <= 1) /* 1/error or 0/FREE chain into the void */

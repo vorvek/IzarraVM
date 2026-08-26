@@ -65,25 +65,12 @@ void clusterMessage(const char * msg, CLUSTER clussec)
 struct buffer FAR *getFATblock(struct dpb FAR * dpbp, CLUSTER clussec)
 {
   /* *** why dpbp->dpb_unit? only useful to know in context of the dpbp...? *** */
-  struct buffer FAR *bp = getblock(clussec, dpbp->dpb_unit);
+  /* modified by the Toka-DOS project, 2026: fill through getblk_fat so a miss
+     pulls a run of FAT sectors in one INT 13h instead of one sector. */
+  struct buffer FAR *bp = getblk_fat(clussec, dpbp);
 
-  if (bp)
-  {
-    bp->b_flag &= ~(BFR_DATA | BFR_DIR);
-    bp->b_flag |= BFR_FAT | BFR_VALID;
-    bp->b_dpbp = dpbp;
-    bp->b_copies = dpbp->dpb_fats;
-    bp->b_offset = dpbp->dpb_fatsize; /* 0 for FAT32 but blockio.c knows that */
-#ifdef WITHFAT32
-    if (ISFAT32(dpbp))
-    {
-      if (dpbp->dpb_xflags & FAT_NO_MIRRORING)
-        bp->b_copies = 1;
-    }
-#endif
-  } else {
+  if (bp == 0)
     clusterMessage("I/O: 0x",clussec);
-  }
   return bp;
 }
 
@@ -152,6 +139,87 @@ void write_fsinfo(struct dpb FAR * dpbp)
 /*      12 bytes are compressed to 9 bytes                      */
 /*                                                              */
 
+/* FAT sector and entry index of Cluster1, the same math link_fat uses.
+   FAT12: *idx is the nibble offset, *secdiv is nibbles per sector.
+   FAT16/32: *idx is the entry index, *secdiv is entries per sector.
+   *clussec is the disk sector (dpb_fatstrt already added).
+   Returns 0 if Cluster1 is out of range. */
+STATIC int fat_entry_loc(struct dpb FAR * dpbp, CLUSTER Cluster1,
+                         CLUSTER * clussec, unsigned * idx,
+                         unsigned * secdiv)
+{
+  CLUSTER loc = Cluster1;
+  CLUSTER max_cluster = dpbp->dpb_size;
+  unsigned div;
+
+#ifdef WITHFAT32
+  if (ISFAT32(dpbp))
+    max_cluster = dpbp->dpb_xsize;
+#endif
+  if (loc <= 1 || loc > max_cluster)
+    return 0;
+
+  div = dpbp->dpb_secsize;
+  if (ISFAT12(dpbp))
+  {
+    loc = (unsigned)loc * 3;
+    div *= 2;
+  }
+  else
+  {
+    div /= 2;
+#ifdef WITHFAT32
+    if (ISFAT32(dpbp))
+      div /= 2;
+#endif
+  }
+
+  *idx = (unsigned)(loc % div);
+  loc /= div;
+  loc += dpbp->dpb_fatstrt;
+#ifdef WITHFAT32
+  if (ISFAT32(dpbp) && (dpbp->dpb_xflags & FAT_NO_MIRRORING))
+    loc += (dpbp->dpb_xflags & 0xf) * dpbp->dpb_xfatsize;
+#endif
+  *clussec = loc;
+  *secdiv = div;
+  return 1;
+}
+
+/* Decode one FAT16/FAT32 entry already in a buffer, matching link_fat's
+   READ_CLUSTER return (EOC mapped to LONG_LAST_CLUSTER). */
+STATIC CLUSTER fat_entry_from_buf(struct dpb FAR * dpbp,
+                                  struct buffer FAR * bp, unsigned idx)
+{
+  if (ISFAT16(dpbp))
+  {
+    UWORD res = fgetword(&bp->b_buffer[idx * 2]);
+    if (res >= MASK16)
+      return LONG_LAST_CLUSTER;
+    if (res == BAD16)
+      return LONG_BAD;
+    return res;
+  }
+#ifdef WITHFAT32
+  if (ISFAT32(dpbp))
+  {
+    UDWORD res = fgetlong(&bp->b_buffer[idx * 4]) & LONG_LAST_CLUSTER;
+    if (res > LONG_BAD)
+      return LONG_LAST_CLUSTER;
+    return res;
+  }
+#endif
+  return 1;
+}
+
+/* next_cluster's following-entry predicate: FREE, 1, or out of range
+   below LONG_BAD fail; EOC and BAD are allowed. */
+STATIC BOOL fat_following_ok(CLUSTER following, CLUSTER max_cluster)
+{
+  return !(following < 2
+           || (following < LONG_BAD && following > max_cluster));
+}
+
 /* either read the value at Cluster1 (if Cluster2 is READ_CLUSTER) */
 /* or write the Cluster2 value to the FAT entry at Cluster1        */
 /* Read is always via next_cluster wrapper which has extra checks  */
@@ -165,17 +233,17 @@ CLUSTER link_fat(struct dpb FAR * dpbp, CLUSTER Cluster1,
   unsigned idx;
   unsigned secdiv; /* FAT entries per sector; nibbles for FAT12! */
   unsigned char wasfree;
-  CLUSTER clussec = Cluster1;
+  CLUSTER clussec;
   CLUSTER max_cluster = dpbp->dpb_size;
 
 #ifdef WITHFAT32
   if (ISFAT32(dpbp))
     max_cluster = dpbp->dpb_xsize;
 #endif
- 
-  if (clussec <= 1 || clussec > max_cluster) /* try to read out of range? */
+
+  if (!fat_entry_loc(dpbp, Cluster1, &clussec, &idx, &secdiv))
   {
-    clusterMessage("index: 0x",clussec); /* bad array offset */
+    clusterMessage("index: 0x",Cluster1); /* bad array offset */
     return 1;
   }
 
@@ -186,36 +254,6 @@ CLUSTER link_fat(struct dpb FAR * dpbp, CLUSTER Cluster1,
     clusterMessage("write: 0x",Cluster2); /* refuse to write bad value */
     return 1;
   }
-
-  secdiv = dpbp->dpb_secsize;
-  if (ISFAT12(dpbp))
-  {
-    clussec = (unsigned)clussec * 3;
-    secdiv *= 2;
-  }
-  else /* FAT16 or FAT32 */
-  {
-    secdiv /= 2;
-#ifdef WITHFAT32
-    if (ISFAT32(dpbp))
-      secdiv /= 2;
-#endif
-  }
-
-  /* idx is a pointer to an index which is the nibble offset of the FAT
-     entry within the sector for FAT12, or word offset for FAT16, or
-     dword offset for FAT32 */
-  idx = (unsigned)(clussec % secdiv);
-  clussec /= secdiv;
-  clussec += dpbp->dpb_fatstrt;
-#ifdef WITHFAT32
-  if (ISFAT32(dpbp) && (dpbp->dpb_xflags & FAT_NO_MIRRORING))
-  {
-    /* we must modify the active fat,
-       it's number is in the 0-3 bits of dpb_xflags */
-    clussec += (dpbp->dpb_xflags & 0xf) * dpbp->dpb_xfatsize;
-  }
-#endif
 
   /* Get the block that this cluster is in                */
   bp = getFATblock(dpbp, clussec);
@@ -374,6 +412,84 @@ CLUSTER link_fat(struct dpb FAR * dpbp, CLUSTER Cluster1,
   return SUCCESS;
 }
 
+/* How many linear hops from `start` we can take, at most `max_steps`.
+   A hop is FAT[c] == c+1. Return value is hops, not "clusters including
+   start": from cluster 10, one hop to 11 is 1.
+
+   FAT12 returns 0 (entries straddle sectors; map_cluster keeps the
+   per-cluster loop). FAT16/FAT32 scan every entry in the current FAT
+   sector; first-and-last matching is not a run. Do not call link_fat
+   or next_cluster per cluster, and do not read fat_span (dirty FAT
+   lives in the buffer cache).
+
+   After k hops the landing cluster is start+k. FAT[start+k] is then
+   checked with the same following-entry predicate as next_cluster, so
+   a chain that dangles onto FREE is not readable. If that entry is in
+   the next FAT sector, getFATblock it; if that fails, return k-1 so
+   the last hop uses next_cluster. */
+CLUSTER linear_run_steps(struct dpb FAR * dpbp, CLUSTER start,
+                         CLUSTER max_steps)
+{
+  struct buffer FAR *bp;
+  struct buffer FAR *bp2;
+  CLUSTER max_cluster, clussec, k, following, c, nxt;
+  unsigned idx, secdiv, remaining;
+  CLUSTER entry = 0;
+  int have_following = 0;
+
+  if (max_steps == 0 || ISFAT12(dpbp))
+    return 0;
+
+  max_cluster = dpbp->dpb_size;
+#ifdef WITHFAT32
+  if (ISFAT32(dpbp))
+    max_cluster = dpbp->dpb_xsize;
+#endif
+  if (start <= 1 || start > max_cluster)
+    return 0;
+  if (!fat_entry_loc(dpbp, start, &clussec, &idx, &secdiv))
+    return 0;
+
+  bp = getFATblock(dpbp, clussec);
+  if (bp == 0)
+    return 0;
+
+  remaining = secdiv - idx;
+  k = 0;
+  while (k < max_steps && k < remaining)
+  {
+    c = start + k;
+    nxt = c + 1;
+    if (nxt < c || nxt > max_cluster)
+      break;
+    entry = fat_entry_from_buf(dpbp, bp, idx + (unsigned)k);
+    have_following = 1;
+    if (entry != nxt)
+      break;
+    k++;
+    have_following = 0;
+  }
+
+  if (k == 0)
+    return 0;
+
+  if (have_following)
+    following = entry;
+  else if (k < remaining)
+    following = fat_entry_from_buf(dpbp, bp, idx + (unsigned)k);
+  else
+  {
+    bp2 = getFATblock(dpbp, clussec + 1);
+    if (bp2 == 0)
+      return k - 1;
+    following = fat_entry_from_buf(dpbp, bp2, 0);
+  }
+
+  if (!fat_following_ok(following, max_cluster))
+    return k - 1;
+  return k;
+}
+
 /* Given the disk parameters, and a cluster number, this function */
 /* looks at the FAT, and returns the next cluster in the clain or */
 /* 0 if there is no chain, 1 on error, LONG_LAST_CLUSTER at end.  */
@@ -395,7 +511,7 @@ CLUSTER next_cluster(struct dpb FAR * dpbp, CLUSTER ClusterNum)
 #endif
   /* FAT entry points to a possibly invalid next cluster */
   following = link_fat(dpbp, candidate, READ_CLUSTER);
-  if (following<2 || (following < LONG_BAD && following > max_cluster))
+  if (!fat_following_ok(following, max_cluster))
   {
     /* chain must not contain free or out of range clusters */
     clusterMessage("value: 0x",following); /* read returned bad value */

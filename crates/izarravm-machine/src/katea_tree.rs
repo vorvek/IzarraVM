@@ -747,6 +747,15 @@ pub struct KateaGeometryReport {
     pub count_of_clusters: u32,
 }
 
+/// Which region of the synthesized disk an LBA falls in. `Other` is the MBR,
+/// the reserved boot/FSInfo area, and anything below the partition start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LbaRegion {
+    Fat,
+    Data,
+    Other,
+}
+
 /// The synthesized disk's geometry, derived from the tree's cluster needs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Geometry {
@@ -4478,6 +4487,26 @@ impl KateaTreeVolume {
             self.note_unmapped(lba);
         }
         bump(&self.counters.sector_writes, 1);
+    }
+
+    /// Which on-disk region an absolute LBA falls in. Used by the INT 13h census
+    /// to split 1-sector commands into FAT walks vs data vs boot metadata, which
+    /// Katea's own `fat_sector_reads` cannot do: that counter also fires once per
+    /// cluster of an internal projection walk.
+    pub(crate) fn lba_region(&self, lba: u32) -> LbaRegion {
+        if lba < self.geo.part_start {
+            return LbaRegion::Other;
+        }
+        let rel = lba - self.geo.part_start;
+        let reserved = u32::from(RESERVED_SECTORS);
+        let fat_end = reserved + u32::from(NUM_FATS) * self.geo.fatsz;
+        if (reserved..fat_end).contains(&rel) {
+            LbaRegion::Fat
+        } else if rel >= self.geo.first_data_sector {
+            LbaRegion::Data
+        } else {
+            LbaRegion::Other
+        }
     }
 
     /// The data cluster holding `lba`, or `None` for a sector below the data
