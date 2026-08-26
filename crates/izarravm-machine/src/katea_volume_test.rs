@@ -47,6 +47,11 @@ fn extracts_the_embedded_image_payload() {
     // the latter because a stray unanchored fragment would dangle ahead of
     // the fixed-row tree lines whenever no DOS partition is found.
     //
+    // 71084 -> 75531 (FAT prefetch): KERNEL.SYS grew net +4447 bytes.
+    // getblk_fat pulls eight FAT sectors in one INT 13h, using a 4 KiB bounce
+    // buffer, and searchblock keeps sixteen FAT buffers instead of three.
+    // See toka-dos/freedos/kernel/kernel/blockio.c.
+    //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
     // the styled boot tree owns the screen instead of racing FreeCOM's own
@@ -59,7 +64,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(71084),
+        Some(75531),
         "KERNEL.SYS size"
     );
     assert_eq!(

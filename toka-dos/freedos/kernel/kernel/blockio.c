@@ -132,7 +132,11 @@ STATIC struct buffer FAR *searchblock(ULONG blkno, COUNT dsk)
   {
     bp = bufptr(uncacheBuf);
   }
-  else if (bp->b_flag & BFR_FAT && fat_count < 3 && lastNonFat)
+  /* modified by the Toka-DOS project, 2026: keep sixteen FAT sectors, not
+     three. A FAT32 4 KiB-cluster volume of Duke's size has ~521 FAT sectors;
+     three means every GRP seek re-walks the table through INT 13h. Sixteen
+     still leaves data buffers for unaligned file tails. */
+  else if (bp->b_flag & BFR_FAT && fat_count < 16 && lastNonFat)
   {
     bp = bufptr(lastNonFat);
   }
@@ -240,6 +244,78 @@ struct buffer FAR *getblk(ULONG blkno, COUNT dsk, BOOL overwrite)
   bp->b_unit = dsk;
   bp->b_blkno = blkno;
 
+  return bp;
+}
+
+/* modified by the Toka-DOS project, 2026.
+   A FAT miss used to issue one INT 13h per sector. Duke's GRP seeks walk tens
+   of FAT sectors that way, and the guest spends that time inside one INT 21h
+   with the last frame held. Fill a run in one BIOS call, then scatter into
+   the existing 512-byte buffer slots. Hits still take searchblock only. */
+#define FAT_PREFETCH_SECS 8
+static UBYTE fat_span[BUFFERSIZE * FAT_PREFETCH_SECS];
+
+STATIC void mark_fat_buf(struct buffer FAR * bp, ULONG blkno,
+                         struct dpb FAR * dpbp)
+{
+  bp->b_flag &= ~(BFR_DATA | BFR_DIR | BFR_UNCACHE);
+  bp->b_flag |= BFR_FAT | BFR_VALID;
+  bp->b_unit = dpbp->dpb_unit;
+  bp->b_blkno = blkno;
+  bp->b_dpbp = dpbp;
+  bp->b_copies = dpbp->dpb_fats;
+  bp->b_offset = dpbp->dpb_fatsize;
+#ifdef WITHFAT32
+  if (ISFAT32(dpbp) && (dpbp->dpb_xflags & FAT_NO_MIRRORING))
+    bp->b_copies = 1;
+#endif
+}
+
+struct buffer FAR *getblk_fat(ULONG blkno, struct dpb FAR * dpbp)
+{
+  struct buffer FAR *bp;
+  COUNT dsk = dpbp->dpb_unit;
+  unsigned n = FAT_PREFETCH_SECS;
+  unsigned i;
+  ULONG fat_end;
+
+  bp = searchblock(blkno, dsk);
+  if (!(bp->b_flag & BFR_UNCACHE))
+  {
+    mark_fat_buf(bp, blkno, dpbp);
+    return bp;
+  }
+
+#ifdef WITHFAT32
+  fat_end = (ULONG)dpbp->dpb_fatstrt +
+            (ISFAT32(dpbp) ? dpbp->dpb_xfatsize : (ULONG)dpbp->dpb_fatsize);
+#else
+  fat_end = (ULONG)dpbp->dpb_fatstrt + (ULONG)dpbp->dpb_fatsize;
+#endif
+  if (blkno < fat_end && (fat_end - blkno) < n)
+    n = (unsigned)(fat_end - blkno);
+  if (n < 1)
+    n = 1;
+
+  if (dskxfer(dsk, blkno, (VOID FAR *)fat_span, n, DSKREAD))
+    return NULL;
+
+  for (i = 0; i < n; i++)
+  {
+    struct buffer FAR *b = searchblock(blkno + i, dsk);
+    if (!(b->b_flag & BFR_UNCACHE))
+    {
+      mark_fat_buf(b, blkno + i, dpbp);
+      continue;
+    }
+    if (!flush1(b))
+      return NULL;
+    fmemcpy(b->b_buffer, (VOID FAR *)(fat_span + i * BUFFERSIZE), BUFFERSIZE);
+    mark_fat_buf(b, blkno + i, dpbp);
+  }
+
+  bp = searchblock(blkno, dsk);
+  mark_fat_buf(bp, blkno, dpbp);
   return bp;
 }
 

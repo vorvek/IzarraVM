@@ -65,25 +65,12 @@ void clusterMessage(const char * msg, CLUSTER clussec)
 struct buffer FAR *getFATblock(struct dpb FAR * dpbp, CLUSTER clussec)
 {
   /* *** why dpbp->dpb_unit? only useful to know in context of the dpbp...? *** */
-  struct buffer FAR *bp = getblock(clussec, dpbp->dpb_unit);
+  /* modified by the Toka-DOS project, 2026: fill through getblk_fat so a miss
+     pulls a run of FAT sectors in one INT 13h instead of one sector. */
+  struct buffer FAR *bp = getblk_fat(clussec, dpbp);
 
-  if (bp)
-  {
-    bp->b_flag &= ~(BFR_DATA | BFR_DIR);
-    bp->b_flag |= BFR_FAT | BFR_VALID;
-    bp->b_dpbp = dpbp;
-    bp->b_copies = dpbp->dpb_fats;
-    bp->b_offset = dpbp->dpb_fatsize; /* 0 for FAT32 but blockio.c knows that */
-#ifdef WITHFAT32
-    if (ISFAT32(dpbp))
-    {
-      if (dpbp->dpb_xflags & FAT_NO_MIRRORING)
-        bp->b_copies = 1;
-    }
-#endif
-  } else {
+  if (bp == 0)
     clusterMessage("I/O: 0x",clussec);
-  }
   return bp;
 }
 

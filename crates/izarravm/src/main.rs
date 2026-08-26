@@ -3016,6 +3016,15 @@ fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
         "cache_hits": p.cache_hits,
         "stall_ticks": p.stall_ticks,
         "host_wall_ns": p.host_wall_ns,
+        "read1_fat": p.read1_fat,
+        "read1_data": p.read1_data,
+        "read1_other": p.read1_other,
+        "read1_buf_conv": p.read1_buf_conv,
+        "read1_buf_uma": p.read1_buf_uma,
+        "read1_buf_hma": p.read1_buf_hma,
+        "read_buf_conv": p.read_buf_conv,
+        "read_buf_uma": p.read_buf_uma,
+        "read_buf_hma": p.read_buf_hma,
     })
 }
 
@@ -3126,6 +3135,15 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "int13_cache_hits": mark.int13.cache_hits,
                 "int13_stall_ticks": mark.int13.stall_ticks,
                 "int13_host_wall_ns": mark.int13.host_wall_ns,
+                "int13_read1_fat": mark.int13.read1_fat,
+                "int13_read1_data": mark.int13.read1_data,
+                "int13_read1_other": mark.int13.read1_other,
+                "int13_read1_buf_conv": mark.int13.read1_buf_conv,
+                "int13_read1_buf_uma": mark.int13.read1_buf_uma,
+                "int13_read1_buf_hma": mark.int13.read1_buf_hma,
+                "int13_read_buf_conv": mark.int13.read_buf_conv,
+                "int13_read_buf_uma": mark.int13.read_buf_uma,
+                "int13_read_buf_hma": mark.int13.read_buf_hma,
                 // The JIT / SMC / decode series QUESTION 1 correlates against the
                 // dip window. Absolute, like everything else here.
                 // Bytes written into device (VGA aperture) memory. In Duke's

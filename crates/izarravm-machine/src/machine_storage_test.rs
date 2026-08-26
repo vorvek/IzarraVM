@@ -1574,6 +1574,15 @@ fn int13_census_is_silent_until_armed_and_counts_after() {
     // land in the first and fourth.
     assert_eq!(p.read_count_hist[0], 1, "one single-sector read");
     assert_eq!(p.read_count_hist[3], 1, "one 5-8 sector read");
+    // Image-backed: no FAT layout, so the 1-sector command is Other. ES was
+    // 0x2000, conventional, on both calls.
+    assert_eq!(p.read1_other, 1);
+    assert_eq!(p.read1_fat, 0);
+    assert_eq!(p.read1_data, 0);
+    assert_eq!(p.read1_buf_conv, 1);
+    assert_eq!(p.read_buf_conv, 2);
+    assert_eq!(p.read_buf_uma, 0);
+    assert_eq!(p.read_buf_hma, 0);
     // Both reads start at the same CHS address, so the 8-sector read's first
     // sector is already resident from the 1-sector read: 9 sectors requested,
     // 8 charged, 1 served by the host-side cache. That overlap is deliberate --
@@ -1599,6 +1608,72 @@ fn int13_census_is_silent_until_armed_and_counts_after() {
         p.host_wall_ns > 0,
         "the service was timed, so some host wall was recorded"
     );
+}
+
+/// The 1-sector INT 13h split has to name FAT vs data vs boot, and the buffer
+/// segment, or it cannot tell a FAT getblk walk from a UMB bounce. Mutation:
+/// classify every LBA as Other, or ignore `buf_seg`, and the three calls below
+/// collapse.
+#[test]
+fn int13_census_splits_one_sector_reads_by_region_and_buffer_segment() {
+    let dir = katea_scratch("int13-region");
+    std::fs::write(dir.join("HELLO.TXT"), b"hello from the data region").unwrap();
+    let mut machine = machine_with_hdd_folder(&dir);
+    machine.enable_int13_profile();
+
+    let part_start = crate::katea_volume::PART_START;
+    let vbr = machine.ata.as_ref().unwrap().read_lba(part_start).unwrap();
+    let reserved = u32::from(u16::from_le_bytes([vbr[0x0E], vbr[0x0F]]));
+    let fats = u32::from(vbr[0x10]);
+    let fat_sectors = u32::from_le_bytes([vbr[0x24], vbr[0x25], vbr[0x26], vbr[0x27]]);
+    let fat_lba = part_start + reserved;
+    let data_lba = part_start + reserved + fats * fat_sectors;
+
+    fn edd_read_one(machine: &mut Machine, lba: u32, buf_seg: u16) {
+        let dap = 0x5_0000u32;
+        machine.write_physical_u8(dap, 16);
+        machine.write_physical_u8(dap + 1, 0);
+        machine.write_physical_u8(dap + 2, 1);
+        machine.write_physical_u8(dap + 3, 0);
+        machine.write_physical_u8(dap + 4, 0);
+        machine.write_physical_u8(dap + 5, 0);
+        machine.write_physical_u8(dap + 6, buf_seg as u8);
+        machine.write_physical_u8(dap + 7, (buf_seg >> 8) as u8);
+        write_dap_lba(machine, dap, u64::from(lba));
+        machine.cpu.registers.set_eax(0x4200);
+        machine.cpu.registers.set_edx(0x0080);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x5000));
+        machine.cpu.registers.set_esi(0);
+        machine.handle_int13();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            0,
+            "AH=42 LBA {lba} seg {buf_seg:#x} must succeed"
+        );
+    }
+
+    // Conventional RAM at 2000:0000. FAT, then the MBR.
+    edd_read_one(&mut machine, fat_lba, 0x2000);
+    edd_read_one(&mut machine, 0, 0x2000);
+    // B800:0000 is the text framebuffer, in the UMA, and writable at POST.
+    // D000/FFFF are not: one is empty UMA, the other is HMA/ROM.
+    edd_read_one(&mut machine, data_lba, 0xB800);
+
+    let p = machine.int13_profile();
+    assert_eq!(p.read_calls, 3);
+    assert_eq!(p.read1_fat, 1, "FAT copy 0 sector 0");
+    assert_eq!(p.read1_data, 1, "first data-region sector");
+    assert_eq!(p.read1_other, 1, "LBA 0 is the MBR");
+    assert_eq!(p.read1_buf_conv, 2);
+    assert_eq!(p.read1_buf_uma, 1);
+    assert_eq!(p.read1_buf_hma, 0);
+    assert_eq!(p.read_buf_conv, 2);
+    assert_eq!(p.read_buf_uma, 1);
+    assert_eq!(p.read_buf_hma, 0);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One INT 13h CHS read of `count` sectors starting at LBA `(cyl,head,sector)`
