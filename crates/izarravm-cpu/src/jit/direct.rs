@@ -7771,7 +7771,11 @@ fn compile_with_budget(
             watch_page_bit: cpu.jit_direct.watch_page_bit,
             one_lookup_store,
             one_lookup_load,
-            hold_load_bias: hold_load_bias_enabled() && x87_slots == 0 && one_lookup_load,
+            // Process knob AND integer. Not AND-ed with one_lookup_load: a block that
+            // falls back to the classic front still participates in the RSI ABI, so a
+            // chain hop from a hoist block cannot return to Rust with RSI still holding
+            // the table pointer (wolf3d ON-arm ACCESS_VIOLATION).
+            hold_load_bias: hold_load_bias_enabled() && x87_slots == 0,
             segments: segment_layout,
             address_wrap: if d {
                 AddressWrap::None
@@ -14741,7 +14745,8 @@ struct MemoryEmitContext {
     /// slice leaves the other's emission untouched.
     one_lookup_load: bool,
     /// Whether this integer block holds `load_biases` in RSI (`IZARRAVM_DIRECT_HOLD_LOAD_BIAS`
-    /// AND `one_lookup_load` AND no x87 slots). False on x87 blocks: `CACHE_REG` is RSI.
+    /// and no x87 slots). False on x87 blocks: `CACHE_REG` is RSI. Independent of
+    /// `one_lookup_load` so a classic-front integer block still saves and restores RSI.
     hold_load_bias: bool,
     segments: SegmentLayout,
     /// Whether a ModRM-derived effective address wraps at 64K.
