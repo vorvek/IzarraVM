@@ -91,6 +91,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # riprofile_test walks target/release/izarravm.exe via dbghelp. cargo
+      # test --workspace used to pass that test as a silent no-op; it now
+      # requires the shipped binary. Build it before Test so CI matches the
+      # house gate after a local `cargo build --release -p izarravm`.
+      - name: Release binary
+        run: cargo build --profile release -p izarravm
+
       - name: Test
         run: cargo test --workspace
 
