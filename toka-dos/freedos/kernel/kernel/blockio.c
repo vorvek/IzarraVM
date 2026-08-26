@@ -31,6 +31,10 @@
 #include "portab.h"
 #include "globals.h"
 
+#ifndef FAT_PREFETCH_SECS
+#define FAT_PREFETCH_SECS 32
+#endif
+
 #ifdef VERSION_STRINGS
 static BYTE *blockioRcsId =
     "$Id: blockio.c 1702 2012-02-04 08:46:16Z perditionc $";
@@ -132,11 +136,11 @@ STATIC struct buffer FAR *searchblock(ULONG blkno, COUNT dsk)
   {
     bp = bufptr(uncacheBuf);
   }
-  /* modified by the Toka-DOS project, 2026: keep thirty-two FAT sectors, not
-     three. getblk_fat fills a 32-sector run in one INT 13h; the floor has to
-     cover that run or the scatter evicts the sector it just read. Leave the
-     rest of BUFFERS for unaligned file tails. */
-  else if (bp->b_flag & BFR_FAT && fat_count < 32 && lastNonFat)
+  /* modified by the Toka-DOS project, 2026: keep FAT_PREFETCH_SECS FAT
+     sectors, not three. getblk_fat fills a run of that many in one INT 13h;
+     the floor has to cover the run or the scatter evicts the sector it just
+     read. Leave the rest of BUFFERS for unaligned file tails. */
+  else if (bp->b_flag & BFR_FAT && fat_count < FAT_PREFETCH_SECS && lastNonFat)
   {
     bp = bufptr(lastNonFat);
   }
@@ -254,7 +258,6 @@ struct buffer FAR *getblk(ULONG blkno, COUNT dsk, BOOL overwrite)
    the existing 512-byte buffer slots. Hits still take searchblock only.
    32 sectors is 16 KiB: one fill covers most of a 44 MB GRP cluster-chain
    walk (88 FAT sectors at 4 KiB clusters). */
-#define FAT_PREFETCH_SECS 32
 static UBYTE fat_span[BUFFERSIZE * FAT_PREFETCH_SECS];
 
 STATIC void mark_fat_buf(struct buffer FAR * bp, ULONG blkno,
@@ -276,8 +279,10 @@ STATIC void mark_fat_buf(struct buffer FAR * bp, ULONG blkno,
 struct buffer FAR *getblk_fat(ULONG blkno, struct dpb FAR * dpbp)
 {
   struct buffer FAR *bp;
+  struct buffer FAR *wanted;
   COUNT dsk = dpbp->dpb_unit;
   unsigned n = FAT_PREFETCH_SECS;
+  unsigned maxn;
   unsigned i;
   ULONG fat_end;
 
@@ -298,32 +303,41 @@ struct buffer FAR *getblk_fat(ULONG blkno, struct dpb FAR * dpbp)
     n = (unsigned)(fat_end - blkno);
   /* Never fill more slots than BUFFERS can hold without eating the
      requested sector. LoL_nbuffers is the live count (HMA fill may be
-     tens; BUFFERS=6 still has to work). */
-  if (LoL_nbuffers > 4 && n > (unsigned)LoL_nbuffers - 4)
-    n = (unsigned)LoL_nbuffers - 4;
+     tens; a reclaimed chain of 4 or fewer still has to clamp). */
+  if (LoL_nbuffers > 4)
+    maxn = (unsigned)LoL_nbuffers - 4;
+  else if (LoL_nbuffers > 1)
+    maxn = (unsigned)LoL_nbuffers - 1;
+  else
+    maxn = 1;
+  if (n > maxn)
+    n = maxn;
   if (n < 1)
     n = 1;
 
   if (dskxfer(dsk, blkno, (VOID FAR *)fat_span, n, DSKREAD))
     return NULL;
 
+  wanted = 0;
   for (i = 0; i < n; i++)
   {
     struct buffer FAR *b = searchblock(blkno + i, dsk);
     if (!(b->b_flag & BFR_UNCACHE))
     {
       mark_fat_buf(b, blkno + i, dpbp);
+      if (i == 0)
+        wanted = b;
       continue;
     }
     if (!flush1(b))
       return NULL;
     fmemcpy(b->b_buffer, (VOID FAR *)(fat_span + i * BUFFERSIZE), BUFFERSIZE);
     mark_fat_buf(b, blkno + i, dpbp);
+    if (i == 0)
+      wanted = b;
   }
 
-  bp = searchblock(blkno, dsk);
-  mark_fat_buf(bp, blkno, dpbp);
-  return bp;
+  return wanted;
 }
 
 /*                                                                      */

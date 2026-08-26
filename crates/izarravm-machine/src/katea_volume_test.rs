@@ -50,7 +50,9 @@ fn extracts_the_embedded_image_payload() {
     // 71084 -> 75531 (FAT prefetch): KERNEL.SYS grew net +4447 bytes.
     // getblk_fat pulls FAT sectors in one INT 13h, using a bounce buffer,
     // and searchblock keeps more FAT buffers than the old three.
-    // 75531 -> 87835: bounce 8 -> 32 sectors (+12 KiB), floor 16 -> 32.
+    // 75531 -> 87851: bounce 8 -> 32 sectors (+12 KiB), floor 16 -> 32,
+    // clamp always even when BUFFERS is tiny, return the i==0 slot not a
+    // trailing searchblock.
     // See toka-dos/freedos/kernel/kernel/blockio.c.
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
@@ -65,7 +67,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(87835),
+        Some(87851),
         "KERNEL.SYS size"
     );
     assert_eq!(
