@@ -15227,13 +15227,13 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             } => {
                 emit_alu(&mut e, op, dst, Some(src), None, width);
             }
-            // The lane form differs from the baked form in exactly one instruction: where the
-            // source operand comes from. `emit_alu` would `mov ecx, imm32`; this loads the same
-            // four bytes out of guest RAM instead, so a guest patch of the immediate field takes
-            // effect on the next entry with no recompile. Everything after that -- the old
-            // destination in EAX, the operation, the flag capture, the lazy-flag record -- is the
-            // shared `emit_alu_preloaded`, so a lane slot and a baked slot cannot diverge in
-            // result or in flags.
+            // The lane form differs from the baked form in where the source operand comes from.
+            // `emit_alu` would `mov ecx, imm32`; this loads the same four bytes out of guest RAM
+            // instead, so a guest patch of the immediate field takes effect on the next entry
+            // with no recompile. The operation, flag capture, and flag record still share
+            // `emit_alu_preloaded`, so result and flags cannot diverge. Baked eager Dword non-CMP
+            // no longer moves home(dst) into RAX (D-elision A); the lane arm still does, and that
+            // extra mov is dead on that arm rather than a second contract.
             //
             // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, so
             // no guest register lives in it, and RDX is dead by the time `emit_alu_preloaded`
@@ -19531,7 +19531,14 @@ fn emit_alu(
     imm: Option<u32>,
     width: MemoryWidth,
 ) {
-    e.mov_r32_r32(Reg::RAX, home(dst));
+    // D-elision A. On the eager Dword non-CMP path RAX is unread: the ALU runs in place on
+    // home(dst), capture/publish do not take the old destination, and ADC/SBB feed carry-in
+    // through emit_load_host_flags which overwrites RAX. The three conjuncts are load-bearing
+    // (Word still masks RAX, CMP still does mov edx, eax, the OFF arm still stores RAX as
+    // descriptor a). Do not restyle. Part B (the RCX stage) stays unconditional.
+    if !(eager_flags_enabled() && matches!(width, MemoryWidth::Dword) && op != 7) {
+        e.mov_r32_r32(Reg::RAX, home(dst));
+    }
     if let Some(src) = src {
         e.mov_r32_r32(Reg::RCX, home(src));
     } else {
