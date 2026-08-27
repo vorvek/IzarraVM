@@ -538,6 +538,49 @@ fn katea_run_captures_a_program_exit_code() {
     );
 }
 
+/// The kernel's .EXE relocation loop reads the fixup table in 32-entry spans
+/// (task.c, RELOC_SPAN). RELOCCHK.EXE carries 130 fixups — four full spans
+/// plus a 2-entry remainder — each pointing at a slot the program verifies
+/// against its own load segment, plus an unlisted canary word that must not
+/// move. Exit 42 = every fixup applied exactly once; 1 = a slot is missing
+/// or doubled; 2 = the canary was patched (a span applied one entry too
+/// many).
+#[test]
+#[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
+fn katea_run_applies_exe_relocations_across_spans() {
+    let scratch = TokaScratch::new("katea_run_relocchk");
+    let prog = scratch.path().join("RELOCCHK.EXE");
+    std::fs::write(&prog, izarravm_firmware::relocchk_exe()).unwrap();
+
+    let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
+    assert_eq!(
+        code, 42,
+        "RELOCCHK must see all 130 fixups applied exactly once (1 = missing/doubled, 2 = canary hit)"
+    );
+}
+
+/// The instrument's red path: the same fixture with e_crlc lowered to 129
+/// must exit 1, because the kernel then leaves the last slot unrelocated and
+/// RELOCCHK sees it. This proves the loader applies exactly the declared
+/// count, and it proves the 42-pass above cannot pass vacuously.
+#[test]
+#[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
+fn katea_run_exe_relocation_check_goes_red_on_a_short_count() {
+    let scratch = TokaScratch::new("katea_run_relocred");
+    let mut bytes = izarravm_firmware::relocchk_exe().to_vec();
+    let count = u16::from_le_bytes([bytes[6], bytes[7]]);
+    assert_eq!(count, 130, "fixture shape moved; update this mutant");
+    bytes[6..8].copy_from_slice(&129u16.to_le_bytes());
+    let prog = scratch.path().join("RELOCRED.EXE");
+    std::fs::write(&prog, bytes).unwrap();
+
+    let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
+    assert_eq!(
+        code, 1,
+        "a lying fixup count must leave the last slot unmoved, and RELOCCHK must see it"
+    );
+}
+
 /// The round-1 CRITICAL regression gate: a guest that does `sti; hlt` under the
 /// default TOKAEMM boot must resume and exit cleanly, not crash the host. HLT is
 /// privileged on real 386+ (CPL != 0 -> #GP(0)); a V86 task is always CPL 3, so

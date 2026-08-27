@@ -109,6 +109,8 @@ pub const SNDMIXER_COM_SOURCE: &str = include_str!("../roms/dos/sndmixer.asm");
 pub const GSWMODE_COM_SOURCE: &str = include_str!("../roms/dos/gswmode.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
+pub const RELOCCHK_EXE: &[u8] = include_bytes!("../roms/dos/relocchk.exe");
+pub const RELOCCHK_EXE_SOURCE: &str = include_str!("../roms/dos/relocchk.asm");
 /// A 512-byte boot sector that
 /// enters Virtual-8086 mode under a hand-built monitor and signals success through
 /// the unit-tester exit port. Run via `Machine::new_boot_image`.
@@ -569,6 +571,13 @@ pub fn cdtime_com() -> &'static [u8] {
 
 pub fn exehello_exe() -> &'static [u8] {
     EXEHELLO_EXE
+}
+
+/// Guest fixture for the kernel's .EXE relocation loop: 130 self-checking
+/// fixups (four full 32-entry spans plus a 2-entry remainder) and an
+/// unrelocated canary. Exits 42 when every fixup landed exactly once.
+pub fn relocchk_exe() -> &'static [u8] {
+    RELOCCHK_EXE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
