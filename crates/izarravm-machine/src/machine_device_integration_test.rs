@@ -1981,13 +1981,13 @@ fn cd_redirector_denies_writes_and_reports_lookup_errors() {
 
     // Extended open with write mode (SDA+2E1h bit 0).
     redir_prime_sft(&mut machine);
-    machine.write_guest_linear_block(redir_lin(0x621), &[0x01]);
+    machine.write_guest_linear_block(redir_lin(0x601), &[0x01]);
     machine.write_guest_linear_block(redir_lin(0x5FD), &[0x00]);
     redir_call(&mut machine, 0x112E);
     assert_eq!(machine.cpu.registers.eax() as u16, 0x0005);
 
     // Extended open that would truncate (action bit 1).
-    machine.write_guest_linear_block(redir_lin(0x621), &[0x00]);
+    machine.write_guest_linear_block(redir_lin(0x601), &[0x00]);
     machine.write_guest_linear_block(redir_lin(0x5FD), &[0x02]);
     redir_call(&mut machine, 0x112E);
     assert_eq!(machine.cpu.registers.eax() as u16, 0x0005);
@@ -2087,7 +2087,11 @@ fn cd_redirector_findfirst_findnext_walks_a_directory() {
         }
         names.push(machine.read_guest_linear_block(fdb, 11));
     }
-    assert_eq!(names.len(), 2, "{names:?}");
+    // A subdirectory lists `.` and `..` first, the way DOS and the guest
+    // redirector did; then its children in disc order.
+    assert_eq!(names.len(), 4, "{names:?}");
+    assert_eq!(names[0], b".          ".to_vec());
+    assert_eq!(names[1], b"..         ".to_vec());
     assert!(names.contains(&b"DATA    BIN".to_vec()));
     assert!(names.contains(&b"LEVELS     ".to_vec()));
 
@@ -2188,7 +2192,7 @@ fn izarracd_doorbell_executes_the_mailbox_request() {
     });
     assert!(machine.pending_cd_doorbell.is_some());
     machine.pending_cd_doorbell.take();
-    machine.perform_cd_doorbell();
+    machine.perform_cd_doorbell(1);
 
     with_bus(&mut machine, |bus| {
         assert_eq!(
@@ -2201,4 +2205,35 @@ fn izarracd_doorbell_executes_the_mailbox_request() {
     let status = machine.read_guest_word(0x2060 + 3);
     assert_ne!(status & 0x0100, 0, "done bit");
     assert_eq!(status & 0x8000, 0, "no error");
+}
+
+/// A stray OUT to 0xE8 (wrong command, or no request stored) must stay inert:
+/// the port was open bus before the doorbell existed, so garbage rings must
+/// never decode low memory as a device request.
+#[test]
+fn izarracd_doorbell_refuses_stray_rings() {
+    let mut machine = test_machine();
+    machine.mount_cd(marked_data_cd());
+
+    // Unknown command: status parks at 0xFF, nothing executes.
+    machine.memory.write_u16(0x063C, 0x0060).unwrap();
+    machine.memory.write_u16(0x063E, 0x0200).unwrap();
+    plant_read_long_request(&mut machine, 0x2060, 0x4000, 2, 1);
+    machine.pending_cd_doorbell = Some(0x77);
+    machine.pending_cd_doorbell.take();
+    machine.perform_cd_doorbell(0x77);
+    assert_eq!(machine.read_physical_u8(0x4000), 0, "no transfer happened");
+    assert_eq!(
+        machine.read_guest_word(0x2060 + 3),
+        0,
+        "status word untouched"
+    );
+
+    // Command 1 with a null mailbox: refused, and the INT 0 vector's segment
+    // word (linear 0x0003, where a request-at-0 would land its status) stays.
+    machine.memory.write_u16(0x063C, 0).unwrap();
+    machine.memory.write_u16(0x063E, 0).unwrap();
+    let int0_seg = machine.read_guest_word(0x0002);
+    machine.perform_cd_doorbell(1);
+    assert_eq!(machine.read_guest_word(0x0002), int0_seg);
 }

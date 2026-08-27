@@ -1512,9 +1512,10 @@ pub struct Machine {
     // MSCDEX/IZCDEX volume-descriptor preference. The default selects the primary
     // volume descriptor.
     icdex_vd_preference: u16,
-    // The IZCDEX BL=02h Joliet toggle. Stored and acknowledged only; no
-    // supplementary-descriptor parse exists host-side.
-    icdex_joliet: bool,
+    // The IZCDEX BL=02h Joliet toggle (the raw BH byte, as IZCDEX kept it).
+    // Stored and acknowledged only; no supplementary-descriptor parse exists
+    // host-side.
+    icdex_joliet: u8,
     // The IzarraCD redirector's parsed ISO index, keyed on the ATAPI
     // media-generation counter. `None` inside the pair records a medium with
     // no parseable ISO tree, so it is not re-parsed per call.
@@ -1912,7 +1913,7 @@ impl Machine {
             eltorito_boot: None,
             eltorito_emulation: None,
             icdex_vd_preference: 0x0100,
-            icdex_joliet: false,
+            icdex_joliet: 0,
             cd_iso_index: None,
             cd_redirector_dos_ds: None,
             cd_redirector_read_bytes: 0,

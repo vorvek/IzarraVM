@@ -531,11 +531,12 @@ impl Machine {
                             self.icdex_fail(0x0001);
                         }
                     }
-                    // BL=02h: the IZCDEX/DOSLFN Joliet toggle (BH = on/off).
-                    // No supplementary-descriptor parse exists host-side, so
-                    // the bit is stored and acknowledged only.
+                    // BL=02h: the IZCDEX/DOSLFN Joliet toggle. IZCDEX stored
+                    // and compared the raw BH byte; mirror that. No
+                    // supplementary-descriptor parse exists host-side, so the
+                    // byte is stored and acknowledged only.
                     0x0002 => {
-                        self.icdex_joliet = bx & 0x0100 != 0;
+                        self.icdex_joliet = (bx >> 8) as u8;
                         self.set_int_frame_carry(false);
                     }
                     _ => self.icdex_fail(0x0001),
@@ -732,17 +733,30 @@ impl Machine {
         Ok(None)
     }
 
-    /// Perform the IzarraCD doorbell rung through Lotura port 0xE8: execute the
-    /// CD device request whose far pointer the ROM strategy stub stored in the
-    /// low-RAM mailbox, then drop the status back to 0 so the ROM interrupt
-    /// stub's poll loop completes. The mailbox holds the request's real-mode
-    /// offset word then segment word; both stub and mailbox live in identity-
-    /// mapped low memory, so the physical read is the value the stub wrote.
-    pub(super) fn perform_cd_doorbell(&mut self) {
+    /// Perform the IzarraCD doorbell rung through Lotura port 0xE8. Command 1
+    /// executes the CD device request whose far pointer the ROM strategy stub
+    /// stored in the low-RAM mailbox, then drops the status back to 0 so the
+    /// ROM interrupt stub's poll loop completes. The mailbox holds the
+    /// request's real-mode offset word then segment word; both stub and
+    /// mailbox live in identity-mapped low memory, so the physical read is
+    /// the value the stub wrote.
+    ///
+    /// A ring with any other command, or with a null mailbox, only parks the
+    /// status: port 0xE8 was open bus before this port existed, so a stray
+    /// OUT must stay inert instead of decoding low memory as a request.
+    pub(super) fn perform_cd_doorbell(&mut self, command: u8) {
+        if command != 0x01 {
+            self.cd_doorbell_status = 0xFF; // unknown command
+            return;
+        }
         let off = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
             | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
         let seg = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 2))
             | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 3)) << 8);
+        if seg == 0 && off == 0 {
+            self.cd_doorbell_status = 0xFE; // no request stored
+            return;
+        }
         let header = (seg << 4).wrapping_add(off);
         self.icdex_device_request(header);
         self.cd_doorbell_status = 0;

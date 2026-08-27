@@ -36,6 +36,11 @@ fn index_builds_and_lists_the_tree() {
             .iter()
             .any(|e| e.name == *b"LEVELS     " && e.is_dir())
     );
+    // A subdirectory lists `.` and `..` first; the root lists neither.
+    assert_eq!(game.entries[0].name, *b".          ");
+    assert_eq!(game.entries[1].name, *b"..         ");
+    assert!(game.entries[0].is_dir() && game.entries[0].subdir.is_none());
+    assert!(!names.contains(b".          "), "root has no dot entries");
 }
 
 #[test]

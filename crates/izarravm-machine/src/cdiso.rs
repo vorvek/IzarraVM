@@ -97,18 +97,20 @@ impl IsoIndex {
             dir_by_lba: std::collections::HashMap::new(),
         };
         index.dir_by_lba.insert(root_lba, 0);
-        // Breadth-first over (dir index, extent LBA, extent size). Every
+        // Depth-first over (dir index, extent LBA, extent size). Every
         // directory is entered through exactly one parent record on a valid
-        // disc; the dir_by_lba check stops re-parses on a malformed one.
+        // disc. A directory entry whose extent is already known — `.`, `..`,
+        // or a doubly-referenced extent on a malformed disc — is listed but
+        // not recursed into, which is also what keeps the walk finite.
         let mut queue = vec![(0u32, root_lba, root_size)];
         while let Some((dir_idx, lba, size)) = queue.pop() {
-            let entries = parse_directory(image, lba, size);
+            let entries = parse_directory(image, lba, size, dir_idx != 0);
             let mut parsed = Vec::with_capacity(entries.len());
             for mut entry in entries {
-                if entry.is_dir() {
-                    if index.dirs.len() >= MAX_DIRS || index.dir_by_lba.contains_key(&entry.lba) {
-                        continue;
-                    }
+                if entry.is_dir()
+                    && index.dirs.len() < MAX_DIRS
+                    && !index.dir_by_lba.contains_key(&entry.lba)
+                {
                     let child_idx = index.dirs.len() as u32;
                     index.dirs.push(IsoDir {
                         entries: Vec::new(),
@@ -174,7 +176,11 @@ fn normalized_components(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_directory(image: &CdImage, lba: u32, size: u32) -> Vec<IsoEntry> {
+/// Parse one directory extent. `dot_entries` selects whether the ISO self
+/// and parent records (ids 00h/01h) become `.` and `..` entries — a
+/// subdirectory lists them, the way DOS and the IZCDEX redirector did; the
+/// root does not.
+fn parse_directory(image: &CdImage, lba: u32, size: u32, dot_entries: bool) -> Vec<IsoEntry> {
     let mut entries = Vec::new();
     let sectors = size.div_ceil(DATA_SECTOR as u32);
     for sector_index in 0..sectors {
@@ -199,17 +205,24 @@ fn parse_directory(image: &CdImage, lba: u32, size: u32) -> Vec<IsoEntry> {
                 continue;
             }
             let id = &record[33..33 + id_len];
-            if id == [0x00] || id == [0x01] {
-                continue; // `.` and `..`
-            }
+            let dot_name = match id {
+                [0x00] if dot_entries => *b".          ",
+                [0x01] if dot_entries => *b"..         ",
+                [0x00] | [0x01] => continue, // the root lists neither
+                _ => [0u8; 11],
+            };
             let flags = record[25];
-            let name = split_name(id);
             // DOS attributes the way the IZCDEX redirector mapped them: ISO
             // DIR -> subdirectory, ISO HIDDEN (existence) -> hidden, and every
             // non-directory carries read-only (a CD file cannot be written).
             let is_dir = flags & 0x02 != 0;
+            let name = if dot_name[0] == 0 {
+                fcb_name(split_name(id))
+            } else {
+                dot_name
+            };
             entries.push(IsoEntry {
-                name: fcb_name(name),
+                name,
                 attr: (u8::from(is_dir) << 4)
                     | (u8::from(flags & 0x01 != 0) << 1)
                     | u8::from(!is_dir),

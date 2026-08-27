@@ -19,7 +19,7 @@
 //! | first filename buffer (ASCIZ, fully qualified) | 0x3BE |
 //! | search data block (21 bytes) | 0x4BE |
 //! | search attribute mask | 0x56D |
-//! | extended-open action / mode words | 0x5FD / 0x621 |
+//! | extended-open action / mode words | 0x5FD / 0x601 |
 //!
 //! The redirector arms with that segment (`arm_cd_redirector`); in slice CD-1
 //! only tests arm it, in CD-2 the kernel's boot-time claim does. Errors
@@ -34,7 +34,7 @@ const SDA_FILENAME1: u32 = 0x3BE;
 const SDA_SDB: u32 = 0x4BE;
 const SDA_SEARCH_ATTR: u32 = 0x56D;
 const SDA_EXT_ACTION: u32 = 0x5FD;
-const SDA_EXT_MODE: u32 = 0x621;
+const SDA_EXT_MODE: u32 = 0x601;
 
 // SFT field offsets (undoc.mac `struc SFT`; FreeDOS sft.h agrees).
 const SFT_REFCNT: u32 = 0x00;
@@ -243,9 +243,7 @@ impl Machine {
                 if letter != b'A' + self.redirector_drive() {
                     return false;
                 }
-                let sectors = self
-                    .cd_iso_index()
-                    .map_or(0, |index| index.volume_sectors.saturating_sub(1));
+                let sectors = self.cd_iso_index().map_or(0, |index| index.volume_sectors);
                 self.set_bx(sectors.min(0xFFFF) as u16);
                 self.set_cx(2048);
                 self.set_dx(0);
@@ -496,12 +494,23 @@ impl Machine {
                     name_matches(&entry.name, &cursor.template)
                         && attr_matches(entry.attr, cursor.sattr)
                 })
-                .map(|(ordinal, entry)| (ordinal as u16, entry.clone()))
+                .map(|(ordinal, entry)| (ordinal, entry.clone()))
         });
         match matched {
             Some((ordinal, entry)) => {
-                cursor.entry = ordinal + 1;
-                cursor.remain = 0;
+                // The cursor field is 16-bit; a directory long enough to
+                // overflow it (only a malformed disc) ends the search after
+                // this match instead of wrapping and re-serving entries.
+                match u16::try_from(ordinal + 1) {
+                    Ok(next) => {
+                        cursor.entry = next;
+                        cursor.remain = 0;
+                    }
+                    Err(_) => {
+                        cursor.entry = u16::MAX;
+                        cursor.remain = 0xFFFF;
+                    }
+                }
                 self.write_guest_linear_block(ds + SDA_SDB, &cursor.to_bytes());
                 let dta = self.redirector_dta(ds);
                 let mut head = [0u8; 12];

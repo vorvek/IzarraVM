@@ -1774,9 +1774,9 @@ impl Machine {
                         serviced = true;
                         self.perform_toka_service(cmd); // Repair (cmd 0x01)
                     }
-                    if self.pending_cd_doorbell.take().is_some() {
+                    if let Some(cmd) = self.pending_cd_doorbell.take() {
                         serviced = true;
-                        self.perform_cd_doorbell();
+                        self.perform_cd_doorbell(cmd);
                     }
                     if let Some(cmd) = self.unittester.take_pending() {
                         serviced = true;
