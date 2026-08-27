@@ -54,6 +54,111 @@ fn wrappers_reject_incomplete_midi_and_partial_frames() {
     );
 }
 
+/// FluidSynth's C library prints its diagnostics to stderr by default, so
+/// every test that exercises a SoundFont failure path sprayed
+/// `fluidsynth: error: ...` lines into the suite output. The binding must
+/// route the library's log callback into `tracing` instead: the failure is
+/// already surfaced as a typed `Error`, the GUI's subscriber keeps the
+/// diagnostic, and the raw stderr write disappears.
+///
+/// The callback runs synchronously inside `FluidSynth::new` on this thread,
+/// so a thread-local default subscriber captures it.
+///
+/// The check runs in a SPAWNED CHILD process (the riprofile pattern), not in
+/// this parallel test process. In a parallel suite another test's synth can
+/// hit the router's event callsite first, on a thread with no dispatcher;
+/// tracing then caches never-interested for that callsite, and on CI timing
+/// the cache survived into this test's scoped subscriber — zero events
+/// captured while the callback demonstrably fired (no stderr lines either).
+/// A fresh process makes the scoped subscriber exist before the first
+/// callsite hit, which is also the shape the GUI guarantees in production
+/// (its subscriber is global and installed before any synth).
+#[test]
+fn fluidsynth_diagnostics_reach_tracing_not_stderr() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    if std::env::var_os("IZARRAVM_FLUID_LOG_CHILD").is_none() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "fluidsynth_diagnostics_reach_tracing_not_stderr",
+                "--nocapture",
+            ])
+            .env("IZARRAVM_FLUID_LOG_CHILD", "1")
+            .output()
+            .expect("spawn the log-routing child");
+        assert!(
+            output.status.success(),
+            "log-routing child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Collector(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl tracing::Subscriber for Collector {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    let collector = Collector::default();
+    let events = collector.0.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.sf3");
+
+    tracing::subscriber::with_default(collector, || {
+        let error = FluidSynth::new(&missing).unwrap_err();
+        assert!(
+            matches!(error, Error::NativeCall { .. }),
+            "a missing SoundFont must still fail with the typed error, got {error:?}"
+        );
+    });
+
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(level, text)| *level == tracing::Level::WARN && text.contains("missing.sf3")),
+        "the library's load failure must arrive as a tracing WARN naming the \
+         file; captured events: {events:?}"
+    );
+}
+
 /// The ROM loader must say WHICH requirement failed, and take a set however it
 /// is laid out.
 ///
