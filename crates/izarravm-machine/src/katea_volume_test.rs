@@ -55,6 +55,13 @@ fn extracts_the_embedded_image_payload() {
     // trailing searchblock. See blockio.c.
     // 87851 -> 88603: map_cluster skips linear FAT[c]==c+1 runs a sector
     // at a time (fattab.c linear_run_steps, fatfs.c map_cluster).
+    // 88603 -> 72395, net -16,208: the 16,384-byte fat_span bounce buffer
+    // left the kernel file. It cost every guest 16 KiB of conventional
+    // memory (599K free fell to 583K). PostConfig now allocates the span
+    // from a UMB, guarded by the free-UMB size so KernelAllocPara's
+    // unchecked carve cannot wrap; getblk_fat fills one sector per miss
+    // when no UMB exists. The +176 remainder is the far pointer, the
+    // one-sector fallback and the size guard. See blockio.c and config.c.
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
@@ -68,7 +75,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(88603),
+        Some(72395),
         "KERNEL.SYS size"
     );
     assert_eq!(

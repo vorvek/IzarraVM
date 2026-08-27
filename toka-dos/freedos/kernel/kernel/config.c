@@ -502,6 +502,31 @@ void PostConfig(void)
 
     DebugPrintf(("Stacks allocated at %p\n", stackBase));
   }
+
+  /* modified by the Toka-DOS project, 2026: getblk_fat's FAT-run span
+     buffer (blockio.c). A resident array cost every guest 16 KiB of
+     conventional memory (599K free fell to 583K), so the span lives in
+     a UMB instead. UmbState is final here: DOS=HIGH,UMB set it to 2 in
+     an earlier pass, and the DEVICE=TOKAEMM.SYS load in DoConfig(2) ran
+     umb_init (LoadDevice's tail), which set it to 1. With no UMB the
+     pointer stays NULL and getblk_fat fills one sector per miss.
+
+     The allocation is guarded and comes LAST in PostConfig, on purpose:
+     KernelAllocPara has no bounds check, and at 1025 paragraphs this is
+     by far the largest mode-1 request the kernel makes. On a UMB
+     smaller than the carve, the UWORD remainder in
+     `mcb_init(base + nPara, m_size - nPara, ...)` wraps and the zero
+     fill tramples 16 KiB past the block, so a tight UMB must skip the
+     span, and must starve the span rather than the sft/CDS/stacks
+     allocations above. */
+  if (UmbState == 1)
+  {
+    UWORD need = (BUFFERSIZE * FAT_PREFETCH_SECS) / 16 + 1;
+    if (umb_base_seg == umb_start)
+      need++;                     /* the DOS-data container carve takes one */
+    if (para2far(umb_base_seg)->m_size >= need)
+      fat_span = KernelAlloc(BUFFERSIZE * FAT_PREFETCH_SECS, 'B', 1);
+  }
   DebugPrintf(("Allocation completed: top at 0x%x\n", base_seg));
 
 }
