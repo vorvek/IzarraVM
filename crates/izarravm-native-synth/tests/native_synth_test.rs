@@ -63,9 +63,38 @@ fn wrappers_reject_incomplete_midi_and_partial_frames() {
 ///
 /// The callback runs synchronously inside `FluidSynth::new` on this thread,
 /// so a thread-local default subscriber captures it.
+///
+/// The check runs in a SPAWNED CHILD process (the riprofile pattern), not in
+/// this parallel test process. In a parallel suite another test's synth can
+/// hit the router's event callsite first, on a thread with no dispatcher;
+/// tracing then caches never-interested for that callsite, and on CI timing
+/// the cache survived into this test's scoped subscriber — zero events
+/// captured while the callback demonstrably fired (no stderr lines either).
+/// A fresh process makes the scoped subscriber exist before the first
+/// callsite hit, which is also the shape the GUI guarantees in production
+/// (its subscriber is global and installed before any synth).
 #[test]
 fn fluidsynth_diagnostics_reach_tracing_not_stderr() {
     if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    if std::env::var_os("IZARRAVM_FLUID_LOG_CHILD").is_none() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "fluidsynth_diagnostics_reach_tracing_not_stderr",
+                "--nocapture",
+            ])
+            .env("IZARRAVM_FLUID_LOG_CHILD", "1")
+            .output()
+            .expect("spawn the log-routing child");
+        assert!(
+            output.status.success(),
+            "log-routing child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
         return;
     }
     use std::fmt::Write as _;
