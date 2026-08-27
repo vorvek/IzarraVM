@@ -725,6 +725,98 @@ fn load_r32_sib_known_bytes() {
     assert_eq!(e.finish(), vec![0x8B, 0x04, 0x0E]);
 }
 
+/// The two shapes the effective-address fusion emits on the hot path, byte for byte, against the
+/// design's own hand-encodings. `0x67` is the ADDRESS-SIZE override and it is what makes the sum
+/// mod 2^32 out of the 32-bit register halves; a test that lost it would still assemble, and would
+/// silently start depending on the guest homes' upper halves.
+#[test]
+fn lea_r32_known_bytes() {
+    // lea eax, [r11d + disp32] -- 67; REX.B=1 = 0x41; 8D; ModRM mod=10,reg=eax(0),rm=r11&7=3.
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RAX, Some(Reg::R11), None, 0x1234_5678);
+    assert_eq!(
+        e.finish(),
+        vec![0x67, 0x41, 0x8D, 0x83, 0x78, 0x56, 0x34, 0x12]
+    );
+
+    // lea eax, [r11d + r14d*4 + disp32] -- 67; REX.X=1,B=1 = 0x43; 8D; ModRM mod=10,reg=0,
+    // rm=100(SIB); SIB scale=4(10),index=r14&7=6,base=r11&7=3 = 10_110_011 = 0xB3.
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RAX, Some(Reg::R11), Some((Reg::R14, 4)), 0x1234_5678);
+    assert_eq!(
+        e.finish(),
+        vec![0x67, 0x43, 0x8D, 0x84, 0xB3, 0x78, 0x56, 0x34, 0x12]
+    );
+
+    // lea edx, [ebx + esi*2 + 4] -- no extended register, so no REX at all; disp8.
+    // ModRM mod=01,reg=edx(2),rm=100 = 0x54; SIB scale=2(01),index=esi(6),base=ebx(3) = 0x73.
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RDX, Some(Reg::RBX), Some((Reg::RSI, 2)), 4);
+    assert_eq!(e.finish(), vec![0x67, 0x8D, 0x54, 0x73, 0x04]);
+}
+
+/// The three encoding traps, each of which assembles into a DIFFERENT instruction if it is missed:
+/// R13 as a base under `mod = 00` means "no base", R12 as a base needs a SIB byte, and R12 as an
+/// INDEX is legal and must not be refused the way the `load_r32_sib` family's assert would refuse
+/// it.
+#[test]
+fn lea_r32_encoding_traps() {
+    // R13 base, zero displacement: must be mod=01 with disp8=0, NEVER mod=00 (which would be
+    // "no base" and would swallow the following byte as a disp32).
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RAX, Some(Reg::R13), None, 0);
+    assert_eq!(e.finish(), vec![0x67, 0x41, 0x8D, 0x45, 0x00]);
+
+    // R12 base: ModRM rm=100 is reserved for "a SIB byte follows" at every mod, so the base needs
+    // the no-index SIB 0x24 (scale=0, index=100 none, base=100).
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RAX, Some(Reg::R12), None, 0);
+    assert_eq!(e.finish(), vec![0x67, 0x41, 0x8D, 0x44, 0x24, 0x00]);
+
+    // R12 as an INDEX is legal: REX.X = 1 disambiguates SIB index 100 from "no index".
+    // REX.X=1,B=1 = 0x43; ModRM mod=01,reg=0,rm=100 = 0x44; SIB scale=1(00),index=r12&7=4,
+    // base=r11&7=3 = 00_100_011 = 0x23.
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RAX, Some(Reg::R11), Some((Reg::R12, 1)), 0x10);
+    assert_eq!(e.finish(), vec![0x67, 0x43, 0x8D, 0x44, 0x23, 0x10]);
+
+    // No base: mod=00 with SIB base=101 is "disp32, no base", and the disp32 is MANDATORY.
+    // ModRM mod=00,reg=0,rm=100 = 0x04; SIB scale=8(11),index=esi(6),base=101 = 11_110_101 = 0xF5.
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RAX, None, Some((Reg::RSI, 8)), 0x20);
+    assert_eq!(
+        e.finish(),
+        vec![0x67, 0x8D, 0x04, 0xF5, 0x20, 0x00, 0x00, 0x00]
+    );
+}
+
+/// The disp8 predicate is `disp <= 0x7F || disp >= 0xFFFF_FF80`, exact mod 2^32 -- the only
+/// arithmetic a guest effective address has. Both boundaries and both first values outside them.
+#[test]
+fn lea_r32_disp8_boundaries() {
+    for (disp, expected) in [
+        (0x7Fu32, vec![0x67, 0x8D, 0x43, 0x7F]),
+        (0x80u32, vec![0x67, 0x8D, 0x83, 0x80, 0x00, 0x00, 0x00]),
+        (0xFFFF_FF80u32, vec![0x67, 0x8D, 0x43, 0x80]),
+        (
+            0xFFFF_FF7Fu32,
+            vec![0x67, 0x8D, 0x83, 0x7F, 0xFF, 0xFF, 0xFF],
+        ),
+    ] {
+        let mut e = Encoder::new();
+        e.lea_r32(Reg::RAX, Some(Reg::RBX), None, disp);
+        assert_eq!(e.finish(), expected, "disp {disp:#x}");
+    }
+
+    // A base-less form has no disp8 spelling at all, so even a tiny displacement is a disp32.
+    let mut e = Encoder::new();
+    e.lea_r32(Reg::RAX, None, Some((Reg::RBX, 1)), 4);
+    assert_eq!(
+        e.finish(),
+        vec![0x67, 0x8D, 0x04, 0x1D, 0x04, 0x00, 0x00, 0x00]
+    );
+}
+
 #[test]
 fn load_r64_sib_scale8_known_bytes() {
     let mut e = Encoder::new();

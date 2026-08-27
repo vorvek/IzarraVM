@@ -835,6 +835,94 @@ impl Encoder {
             .push((0b10 << 6) | (index.low3() << 3) | base.low3());
     }
 
+    /// `lea dst32, [base + index*scale + disp]` with a 0x67 ADDRESS-SIZE override, so base and
+    /// index are read as 32-bit registers, the sum is formed mod 2^32, and the 32-bit operand-size
+    /// write zero-extends into the 64-bit destination.
+    ///
+    /// The override is what makes this form need NO invariant about the upper halves of the guest
+    /// homes: it is the whole reason the prefix is here rather than an oversight to be trimmed.
+    /// 86Box emits 0x67 on EVERY EA-forming LEA for the same reason
+    /// (`codegen_ops_x86-64.h:719`, `:733`, `:743` in `FETCH_EA_32`; `:578`, `:593`, `:599`,
+    /// `:610`, `:616` in `FETCH_EA_16`; `:929` and `:1084` in the MEM_* helpers). The forms it
+    /// emits WITHOUT it are the ones that are not LEAs at all (`MOV EAX,imm32` at `:661`, `:765`;
+    /// `MOV EAX,base_reg` at `:665-667`, `:791-793`) -- exactly the split the caller reproduces by
+    /// spelling the base-less, index-less shape as `mov_r32_imm32`.
+    ///
+    /// `scale` is 1, 2, 4 or 8. The index must not be RSP: index 100 with REX.X = 0 means "no
+    /// index", and there is no encoding that names RSP as an index at all. **R12 IS a legal
+    /// index** -- REX.X = 1 disambiguates it -- so the assert is `index != Reg::RSP` and NOT the
+    /// `index.low3() != 0b100` the `load_r32_sib` family spells, which would wrongly reject R12.
+    /// No guest home is RSP.
+    ///
+    /// Three encoding traps, each with its own byte-level test:
+    ///
+    /// * `mod = 00`, `rm = 101`, no SIB is RIP-relative in 64-bit mode. Never produced here: a
+    ///   base always uses `mod = 01`/`10`, and the no-base case always goes through SIB with
+    ///   `base = 101` under `mod = 00`, which is disp32-no-base.
+    /// * **R13/RBP as a base** (`low3() == 101`) under `mod = 00` would mean "no base". Always
+    ///   `mod = 01`/`10` here; a zero displacement is spelled `disp8 = 0`.
+    /// * **R12/RSP as a base** forces a SIB byte (`needs_sib`), with index 100 = "no index".
+    pub(crate) fn lea_r32(
+        &mut self,
+        dst: Reg,
+        base: Option<Reg>,
+        index: Option<(Reg, u8)>,
+        disp: u32,
+    ) {
+        assert!(
+            base.is_some() || index.is_some(),
+            "lea_r32 with neither base nor index is a `mov r32, imm32`, not an LEA"
+        );
+        if let Some((index, scale)) = index {
+            assert!(index != Reg::RSP, "RSP cannot be a SIB index");
+            assert!(
+                matches!(scale, 1 | 2 | 4 | 8),
+                "SIB scale must be 1, 2, 4 or 8"
+            );
+        }
+        self.bytes.push(0x67);
+        self.optional_rex(
+            false,
+            dst.ext(),
+            index.is_some_and(|(index, _)| index.ext()),
+            base.is_some_and(Reg::ext),
+        );
+        self.bytes.push(0x8D);
+        // Both ranges are exact mod 2^32, which is the only arithmetic a guest effective address
+        // has: `disp8` sign-extends into the same 32-bit sum the baked `mov eax, imm32` formed.
+        let disp8 = base.is_some() && (disp <= 0x7F || disp >= 0xFFFF_FF80);
+        let md = if disp8 { 0b01 } else { 0b10 };
+        match (base, index) {
+            (Some(base), None) if !Self::needs_sib(base) => {
+                self.modrm(md, dst.low3(), base.low3());
+            }
+            (Some(_), None) => {
+                self.modrm(md, dst.low3(), 0b100);
+                // scale=00, index=100 (none), base=100 -- RSP/R12 as the base, the only base value
+                // that can reach this branch (see `needs_sib`).
+                self.bytes.push(0x24);
+            }
+            (Some(base), Some((index, scale))) => {
+                self.modrm(md, dst.low3(), 0b100);
+                self.bytes
+                    .push((scale.trailing_zeros() as u8) << 6 | (index.low3() << 3) | base.low3());
+            }
+            (None, Some((index, scale))) => {
+                // mod=00 with SIB base=101 is "disp32, no base", and the disp32 is MANDATORY --
+                // there is no disp8 spelling of a base-less SIB.
+                self.modrm(0b00, dst.low3(), 0b100);
+                self.bytes
+                    .push((scale.trailing_zeros() as u8) << 6 | (index.low3() << 3) | 0b101);
+            }
+            (None, None) => unreachable!("asserted above"),
+        }
+        if disp8 {
+            self.bytes.push(disp as u8);
+        } else {
+            self.bytes.extend_from_slice(&disp.to_le_bytes());
+        }
+    }
+
     /// `add dst32, imm32` (81 /0 id, no REX.W) -- the 32-bit-operand ADD-immmediate form the v2
     /// inline `add r32, imm32` slot uses against a host scratch register holding the guest gpr
     /// value. Sets the host flags, but those are not the guest flags (the guest flag update is a
