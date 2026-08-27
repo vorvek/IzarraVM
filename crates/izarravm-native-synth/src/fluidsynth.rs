@@ -86,6 +86,55 @@ unsafe extern "C" {
         right_offset: c_int,
         right_stride: c_int,
     ) -> c_int;
+    fn fluid_set_log_function(
+        level: c_int,
+        function: Option<FluidLogFunction>,
+        data: *mut c_void,
+    ) -> Option<FluidLogFunction>;
+}
+
+/// `fluid_log_function_t`: the library's log callback shape.
+type FluidLogFunction = extern "C" fn(level: c_int, message: *const c_char, data: *mut c_void);
+
+/// `enum fluid_log_level`: PANIC, ERR, WARN, INFO, DBG.
+const FLUID_LOG_LEVEL_COUNT: c_int = 5;
+
+/// The library's default log handler writes to stderr, so every SoundFont
+/// failure sprayed `fluidsynth: error: ...` lines into test and CLI output.
+/// This routes each message into `tracing` instead. The typed [`Error`] a
+/// caller receives stays the primary signal; the routed message keeps the
+/// library's own wording available to a subscriber.
+extern "C" fn route_fluid_log(level: c_int, message: *const c_char, _data: *mut c_void) {
+    let text = if message.is_null() {
+        std::borrow::Cow::Borrowed("(null message)")
+    } else {
+        // SAFETY: FluidSynth passes a NUL-terminated string that is live for
+        // the duration of the callback; it is read here and never stored.
+        unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy()
+    };
+    let text = text.as_ref();
+    match level {
+        0 => tracing::error!(target: "fluidsynth", "{text}"),
+        1 | 2 => tracing::warn!(target: "fluidsynth", "{text}"),
+        3 => tracing::debug!(target: "fluidsynth", "{text}"),
+        _ => tracing::trace!(target: "fluidsynth", "{text}"),
+    }
+}
+
+/// Install [`route_fluid_log`] for every log level, once per process. The
+/// registration is global library state, so it happens before the first
+/// settings object exists and is never repeated.
+fn install_log_router() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        for level in 0..FLUID_LOG_LEVEL_COUNT {
+            // SAFETY: The callback is a static function with the library's
+            // exact `fluid_log_function_t` shape, the data pointer is unused
+            // and null, and this registration happens before any synth call
+            // that could log.
+            unsafe { fluid_set_log_function(level, Some(route_fluid_log), ptr::null_mut()) };
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -96,6 +145,7 @@ pub struct FluidSynth {
 
 impl FluidSynth {
     pub fn new(soundfont: impl AsRef<Path>) -> Result<Self, Error> {
+        install_log_router();
         let soundfont = path_string(soundfont.as_ref())?;
         // SAFETY: This constructor has no preconditions and its result is checked for null.
         let settings = NonNull::new(unsafe { new_fluid_settings() })
