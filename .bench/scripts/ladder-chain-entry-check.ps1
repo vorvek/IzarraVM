@@ -42,14 +42,29 @@ agent and read four rows 8-16% slow; the PIT ladder of the same night came back
 alive in its window.
 #>
 
+# POSITIONAL BINDING IS OFF for the whole param block. Under `pwsh -File`, a
+# [string[]] parameter takes exactly ONE argument token; a second token becomes
+# a POSITIONAL argument and lands in the next unbound parameter. Measured
+# 2026-08-27 on scripts/run-fixture-scoreboard.ps1: `-Fixtures a b` (the shape
+# an outer PowerShell produces from `-Fixtures @('a','b')`) ran ONE row of a
+# two-row sweep and EXITED 0. With positional binding off, the stray token is a
+# binder error before one line of this script runs. The safe multi-row spelling
+# is the COMMA string: `-Rows doom-486,wolf3d-486`. Resolve-RowSelection splits
+# it and validates every name against the fixture table.
+[CmdletBinding(PositionalBinding = $false, DefaultParameterSetName = "Run")]
 param(
-    [Parameter(Mandatory = $true)][string]$Executable,
-    [Parameter(Mandatory = $true)][string]$OutDir,
+    [Parameter(Mandatory = $true, ParameterSetName = "Run")][string]$Executable,
+    [Parameter(Mandatory = $true, ParameterSetName = "Run")][string]$OutDir,
     [int]$Rounds = 2,
     [string[]]$Rows = @(
         "prince-486", "tombraid-loader-586", "doom-486", "wolf3d-486",
         "wolf3d-586", "duke3d-586-short", "nascar-586", "gp2-586"
-    )
+    ),
+    # Resolve -Rows, print the selection, exit 0. Exists so the self-test's
+    # green control can prove a well-formed invocation binds without running a
+    # leg. Run-set arguments still have to be supplied; dummies are fine.
+    [switch]$BindCheck,
+    [Parameter(Mandatory = $true, ParameterSetName = "SelfTest")][switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -74,10 +89,11 @@ function Resolve-BenchRoot([string]$RepositoryRoot) {
     }
     return $resolved
 }
-$benchRoot = Resolve-BenchRoot $repositoryRoot
-
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-
+# The fixture table sits ABOVE the -SelfTest / -BindCheck dispatch because the
+# row resolver validates against its keys, and the dispatch has to exit before
+# the OutDir side effects below so a self-test child with a dummy -OutDir never
+# creates a stray directory.
+#
 # Arguments and cycle budgets are the scoreboard's, verbatim. The recorded
 # invariants were measured under exactly these, so a changed persona or memory
 # size invalidates them silently instead of failing.
@@ -129,6 +145,150 @@ $fixtures = @{
                 "5976000000:move:-273,181;6474000000:click"))
     }
 }
+
+# Parse -Rows into a validated list of row names. It splits on the comma ITSELF
+# because `pwsh -File ... -Rows a,b` binds ONE string "a,b" to the [string[]]
+# parameter. The two-token shape (`-Rows a b`) never gets here: PositionalBinding
+# is off for the whole script, so the binder rejects the second token first.
+# Copied from scripts/run-fixture-scoreboard.ps1's Resolve-FixtureSelection.
+function Resolve-RowSelection([string[]]$Specification, [string[]]$KnownNames) {
+    $entries = @()
+    foreach ($element in @($Specification)) {
+        if ($null -eq $element) {
+            throw "-Rows contains a null entry. Name each row, comma-separated."
+        }
+        $entries += ([string]$element).Split(',')
+    }
+    $selected = @()
+    foreach ($entry in $entries) {
+        $name = ([string]$entry).Trim()
+        if ($name -eq "") {
+            throw ("-Rows contains an empty entry. A stray comma would silently " +
+                "shrink the sweep, so it is refused instead.")
+        }
+        if (@($KnownNames) -notcontains $name) {
+            throw "Unknown row '$name'. Known: $(@($KnownNames) -join ', ')"
+        }
+        if ($selected -contains $name) {
+            throw ("-Rows names '$name' more than once. The ladder runs each row " +
+                "once, so a repeat would report fewer rows than the caller asked for.")
+        }
+        $selected += $name
+    }
+    return ,$selected
+}
+
+function Assert-BinderSelfTestEqual($Actual, $Expected, [string]$Message) {
+    if ($Actual -ne $Expected) {
+        throw "self-test failed: $Message (expected $Expected, got $Actual)"
+    }
+}
+
+function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
+    [string]$Message) {
+    $failure = $null
+    try { $null = & $Action } catch { $failure = $_.Exception.Message }
+    if ($null -eq $failure) { throw "self-test failed: $Message did not throw" }
+    if (-not $failure.Contains($Expected, [StringComparison]::Ordinal)) {
+        throw "self-test failed: $Message threw '$failure', expected '$Expected'"
+    }
+}
+
+# Half drives Resolve-RowSelection directly. The other half spawns this very
+# script under `pwsh -File` with the mangled two-token shape, because that
+# failure happens in the parameter binder -- before any function here runs --
+# and only a real child invocation can prove the guard fires there. The
+# campaign rule applies: the guard must go RED on the broken input, and a green
+# control must show the child harness works.
+function Invoke-BinderGuardSelfTest {
+    $known = @($fixtures.Keys)
+
+    $split = Resolve-RowSelection @("doom-486,wolf3d-486") $known
+    Assert-BinderSelfTestEqual $split.Count 2 "a comma-joined -Rows string splitting"
+    Assert-BinderSelfTestEqual $split[0] "doom-486" "the first row of a comma string"
+    Assert-BinderSelfTestEqual $split[1] "wolf3d-486" "the second row of a comma string"
+    $padded = Resolve-RowSelection @(" doom-486 , wolf3d-486") $known
+    Assert-BinderSelfTestEqual $padded.Count 2 "whitespace around comma-joined rows"
+    Assert-BinderSelfTestThrows { Resolve-RowSelection @("doom-486,no-such-row") $known } `
+        "Unknown row 'no-such-row'" "an unknown name after the comma split"
+    Assert-BinderSelfTestThrows { Resolve-RowSelection @("doom-486,") $known } `
+        "empty entry" "a stray trailing comma"
+    Assert-BinderSelfTestThrows { Resolve-RowSelection @("doom-486", "doom-486") $known } `
+        "more than once" "a row named twice"
+
+    $pwshExecutable = (Get-Process -Id $PID).Path
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ("izarravm-bindsel-" +
+        [Guid]::NewGuid().ToString("N").Substring(0, 10))
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    try {
+        $outputPath = Join-Path $scratch "stdout.txt"
+        $failurePath = Join-Path $scratch "stderr.txt"
+        $start = @{
+            FilePath               = $pwshExecutable
+            ArgumentList           = @("-NoProfile", "-File", $PSCommandPath,
+                "-Executable", "self-test-dummy", "-OutDir", "self-test-dummy",
+                "-Rows", "doom-486", "wolf3d-486", "-BindCheck")
+            RedirectStandardOutput = $outputPath
+            RedirectStandardError  = $failurePath
+            PassThru               = $true
+            NoNewWindow            = $true
+        }
+        # RED: the two-token shape must be a binder error, never a one-row run.
+        $process = Start-Process @start
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw "self-test failed: the mangled -Rows child never exited"
+        }
+        if ($process.ExitCode -eq 0) {
+            throw ("self-test failed: the mangled two-token -Rows invocation exited 0. " +
+                "The silent-subset hazard is back: the second row bound positionally.")
+        }
+        $failureText = [string](Get-Content -LiteralPath $failurePath -Raw)
+        if ($failureText -notmatch 'wolf3d-486') {
+            throw ("self-test failed: the mangled -Rows child failed, but not on the " +
+                "stray token. stderr: $failureText")
+        }
+
+        # GREEN control: the comma spelling of the same selection must bind and
+        # resolve, or the red row above proves nothing about the guard.
+        $start.ArgumentList = @("-NoProfile", "-File", $PSCommandPath,
+            "-Executable", "self-test-dummy", "-OutDir", "self-test-dummy",
+            "-Rows", "doom-486,wolf3d-486", "-BindCheck")
+        $process = Start-Process @start
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw "self-test failed: the -BindCheck control child never exited"
+        }
+        if ($process.ExitCode -ne 0) {
+            $failureText = [string](Get-Content -LiteralPath $failurePath -Raw)
+            throw ("self-test failed: the well-formed -BindCheck control exited " +
+                "$($process.ExitCode); the red row above is therefore meaningless. " +
+                "stderr: $failureText")
+        }
+        $listing = [string](Get-Content -LiteralPath $outputPath -Raw)
+        if ($listing -notmatch 'wolf3d-486') {
+            throw "self-test failed: the -BindCheck control did not echo the selection"
+        }
+    } finally {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "ladder-chain-entry-check self-test passed"
+}
+
+if ($SelfTest) {
+    Invoke-BinderGuardSelfTest
+    exit 0
+}
+
+$Rows = Resolve-RowSelection $Rows @($fixtures.Keys)
+if ($BindCheck) {
+    Write-Host ("bind-check ok: rows " + ($Rows -join ", "))
+    exit 0
+}
+
+$benchRoot = Resolve-BenchRoot $repositoryRoot
+
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 $cells = @{
     "cap"   = @{ governor = "cap"; chain = "0" }

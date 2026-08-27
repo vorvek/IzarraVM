@@ -29,13 +29,24 @@
 #     monitor, so the watchdog watches the process and the output file's
 #     modification time.
 
+# POSITIONAL BINDING IS OFF for the whole param block. Under `pwsh -File`, a
+# [string[]] parameter takes exactly ONE argument token; a second token becomes
+# a POSITIONAL argument and lands in the next unbound parameter -- here
+# `-Games a b` would bind 'b' to -Corpus and sweep ONE game against the wrong
+# corpus root. Measured 2026-08-27 on scripts/run-fixture-scoreboard.ps1: the
+# same shape ran ONE row of a two-row sweep and EXITED 0. With positional
+# binding off, the stray token is a binder error before one line of this script
+# runs. The safe multi-game spelling is the COMMA string: `-Games alpha,beta`.
+# Resolve-GameSelection splits it; per-short shape and corpus existence are
+# checked later, exactly as before.
+[CmdletBinding(PositionalBinding = $false, DefaultParameterSetName = "Run")]
 param(
     # Corpus root. Read-only.
     [string]$Corpus = "E:\eXo\eXo\eXoDOS",
     # Corpus shorts to run, or a file with one per line.
     [string[]]$Games,
     [string]$GameListFile,
-    [Parameter(Mandatory)][string]$OutDir,
+    [Parameter(Mandatory, ParameterSetName = "Run")][string]$OutDir,
     [string]$Executable = "D:\dev\IzarraVM\target\release\izarravm.exe",
     [string]$Translator = "D:\dev\IzarraVM\target\release\izarravm-exodos.exe",
     # Scratch lives on D:, which has the free space; C: does not.
@@ -66,11 +77,152 @@ param(
     # Refuse a game whose extraction would exceed this, rather than filling the
     # volume. The corpus maximum extracts to about 7 GB.
     [int]$MaxExtractGib = 8,
-    [switch]$KeepScratch
+    [switch]$KeepScratch,
+    # Resolve -Games, print the selection, exit 0. Exists so the self-test's
+    # green control can prove a well-formed invocation binds without running a
+    # sweep. Run-set arguments still have to be supplied; dummies are fine.
+    [switch]$BindCheck,
+    [Parameter(Mandatory, ParameterSetName = "SelfTest")][switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# Parse -Games into a list of corpus shorts. It splits on the comma ITSELF
+# because `pwsh -File ... -Games a,b` binds ONE string "a,b" to the [string[]]
+# parameter. The two-token shape (`-Games a b`) never gets here: PositionalBinding
+# is off for the whole script, so the binder rejects the second token first.
+# There is no static known-name table for the corpus; Test-CorpusShort and the
+# zip lookup keep doing the per-short validation they always did. Copied from
+# scripts/run-fixture-scoreboard.ps1's Resolve-FixtureSelection.
+function Resolve-GameSelection([string[]]$Specification) {
+    $entries = @()
+    foreach ($element in @($Specification)) {
+        if ($null -eq $element) {
+            throw "-Games contains a null entry. Name each short, comma-separated."
+        }
+        $entries += ([string]$element).Split(',')
+    }
+    $selected = @()
+    foreach ($entry in $entries) {
+        $name = ([string]$entry).Trim()
+        if ($name -eq "") {
+            throw ("-Games contains an empty entry. A stray comma would silently " +
+                "shrink the sweep, so it is refused instead.")
+        }
+        if ($selected -contains $name) {
+            throw ("-Games names '$name' more than once. The sweep runs each short " +
+                "once, so a repeat would report fewer rows than the caller asked for.")
+        }
+        $selected += $name
+    }
+    return ,$selected
+}
+
+function Assert-BinderSelfTestEqual($Actual, $Expected, [string]$Message) {
+    if ($Actual -ne $Expected) {
+        throw "self-test failed: $Message (expected $Expected, got $Actual)"
+    }
+}
+
+function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
+    [string]$Message) {
+    $failure = $null
+    try { $null = & $Action } catch { $failure = $_.Exception.Message }
+    if ($null -eq $failure) { throw "self-test failed: $Message did not throw" }
+    if (-not $failure.Contains($Expected, [StringComparison]::Ordinal)) {
+        throw "self-test failed: $Message threw '$failure', expected '$Expected'"
+    }
+}
+
+# Half drives Resolve-GameSelection directly. The other half spawns this very
+# script under `pwsh -File` with the mangled two-token shape, because that
+# failure happens in the parameter binder -- before any function here runs --
+# and only a real child invocation can prove the guard fires there. The
+# campaign rule applies: the guard must go RED on the broken input, and a green
+# control must show the child harness works.
+function Invoke-BinderGuardSelfTest {
+    $split = Resolve-GameSelection @("alpha,beta")
+    Assert-BinderSelfTestEqual $split.Count 2 "a comma-joined -Games string splitting"
+    Assert-BinderSelfTestEqual $split[0] "alpha" "the first short of a comma string"
+    Assert-BinderSelfTestEqual $split[1] "beta" "the second short of a comma string"
+    $padded = Resolve-GameSelection @(" alpha , beta")
+    Assert-BinderSelfTestEqual $padded.Count 2 "whitespace around comma-joined shorts"
+    Assert-BinderSelfTestThrows { Resolve-GameSelection @("alpha,") } `
+        "empty entry" "a stray trailing comma"
+    Assert-BinderSelfTestThrows { Resolve-GameSelection @("alpha", "alpha") } `
+        "more than once" "a short named twice"
+
+    $pwshExecutable = (Get-Process -Id $PID).Path
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ("izarravm-bindsel-" +
+        [Guid]::NewGuid().ToString("N").Substring(0, 10))
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    try {
+        $outputPath = Join-Path $scratch "stdout.txt"
+        $failurePath = Join-Path $scratch "stderr.txt"
+        $start = @{
+            FilePath               = $pwshExecutable
+            ArgumentList           = @("-NoProfile", "-File", $PSCommandPath,
+                "-OutDir", "self-test-dummy",
+                "-Games", "alpha", "beta", "-BindCheck")
+            RedirectStandardOutput = $outputPath
+            RedirectStandardError  = $failurePath
+            PassThru               = $true
+            NoNewWindow            = $true
+        }
+        # RED: the two-token shape must be a binder error, never a one-game sweep.
+        $process = Start-Process @start
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw "self-test failed: the mangled -Games child never exited"
+        }
+        if ($process.ExitCode -eq 0) {
+            throw ("self-test failed: the mangled two-token -Games invocation exited 0. " +
+                "The silent-subset hazard is back: the second short bound positionally.")
+        }
+        $failureText = [string](Get-Content -LiteralPath $failurePath -Raw)
+        if ($failureText -notmatch 'beta') {
+            throw ("self-test failed: the mangled -Games child failed, but not on the " +
+                "stray token. stderr: $failureText")
+        }
+
+        # GREEN control: the comma spelling of the same selection must bind and
+        # resolve, or the red row above proves nothing about the guard.
+        $start.ArgumentList = @("-NoProfile", "-File", $PSCommandPath,
+            "-OutDir", "self-test-dummy",
+            "-Games", "alpha,beta", "-BindCheck")
+        $process = Start-Process @start
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw "self-test failed: the -BindCheck control child never exited"
+        }
+        if ($process.ExitCode -ne 0) {
+            $failureText = [string](Get-Content -LiteralPath $failurePath -Raw)
+            throw ("self-test failed: the well-formed -BindCheck control exited " +
+                "$($process.ExitCode); the red row above is therefore meaningless. " +
+                "stderr: $failureText")
+        }
+        $listing = [string](Get-Content -LiteralPath $outputPath -Raw)
+        if ($listing -notmatch 'beta') {
+            throw "self-test failed: the -BindCheck control did not echo the selection"
+        }
+    } finally {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "sweep-exodos self-test passed"
+}
+
+if ($SelfTest) {
+    Invoke-BinderGuardSelfTest
+    exit 0
+}
+
+if ($Games) { $Games = Resolve-GameSelection $Games }
+if ($BindCheck) {
+    $selection = if ($Games) { $Games -join ", " } else { "(none; -GameListFile path)" }
+    Write-Host "bind-check ok: games $selection"
+    exit 0
+}
 
 # Guest clock per persona, for turning guest seconds into a --cycles budget.
 $personaClockHz = @{ "586" = 166000000; "486" = 66000000; "386" = 22000000 }
