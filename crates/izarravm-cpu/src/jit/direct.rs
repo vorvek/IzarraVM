@@ -18893,8 +18893,10 @@ fn emit_segmented_linear_address(
     wrap: AddressWrap,
 ) {
     // The mask lands inside `emit_effective_address`, which is BEFORE the limit compare below.
-    // That ordering is load-bearing: the compare sits between the effective address and the
-    // segment base, so masking afterwards would compare an address the guest never forms.
+    // That ordering is load-bearing twice over: the compare sits between the effective address
+    // and the segment base, so masking afterwards would compare an address the guest never forms
+    // -- AND the mask is the precondition of the compare's own elision under `AddressWrap::Word`
+    // below. Hoist the mask after the compare and that elision stops being sound.
     emit_effective_address(e, addr, wrap);
     let descriptor = memory.segments.descriptor(addr.segment);
     if descriptor.limit != u32::MAX {
@@ -18909,13 +18911,37 @@ fn emit_segmented_linear_address(
             );
             return;
         };
-        e.cmp_r32_imm32(Reg::RAX, max_start);
-        e.jcc(
-            7,
-            sides
-                .segment_limit
-                .expect("finite native segment has a limit side exit"),
-        );
+        // `emit_effective_address` two lines up ended with `and eax, 0xFFFF` for
+        // `AddressWrap::Word`, and NOTHING between there and here writes RAX, so RAX is at most
+        // 0xFFFF at this compare. `jcc(7, ..)` is unsigned ABOVE, so it cannot be taken when
+        // `max_start` is 0xFFFF or more: the pair is dead code and is not emitted.
+        //
+        // Read the gate off `max_start`, NEVER off `descriptor.limit == 0xFFFF`. A real-mode
+        // segment load preserves a wider protected-mode limit on purpose (see `control.rs`'s
+        // note on why the limit is not re-stamped), so a 16-bit block can carry limit 0x1FFFF,
+        // and there the pair is dead for Dword as well as Byte. The `max_start` form gets that
+        // right without having to know it, and cannot go stale when a new width appears.
+        //
+        // Under a plain real-mode 0xFFFF limit the population is exactly Byte: `max_start` is
+        // 0xFFFF for Byte, 0xFFFE for Word, 0xFFFC for Dword, 0xFFF8 for Qword, 0xFFF6 for
+        // Tbyte, so only Byte's compare goes. This is the dividend of `emit_effective_address`
+        // owning the 64K mask -- the ordering that comment calls load-bearing is this proof's
+        // whole precondition.
+        //
+        // The `segment_limit` label is still allocated and its reason stub still appended: a
+        // Byte-only block can end up with a placed but unreferenced label and a dead stub,
+        // which costs a few cold bytes and nothing else. A wider width in the same block still
+        // emits its own compare, because the gate is per-`width` at each call.
+        let unreachable_under_word_wrap = wrap == AddressWrap::Word && max_start >= 0xFFFF;
+        if !unreachable_under_word_wrap {
+            e.cmp_r32_imm32(Reg::RAX, max_start);
+            e.jcc(
+                7,
+                sides
+                    .segment_limit
+                    .expect("finite native segment has a limit side exit"),
+            );
+        }
     }
     if descriptor.base != 0 {
         e.add_r32_imm32(Reg::RAX, descriptor.base);
