@@ -349,6 +349,13 @@ pub(crate) struct BlockSpan {
 }
 
 impl BlockSpan {
+    /// DOWNSTREAM CONSUMER OF THE PAGE-CROSSING REFUSAL BELOW: `PageKeys`' per-page coverage
+    /// arrays. A span is filed on exactly ONE page's `starts` / `lens` row, and the SMC
+    /// invalidation scan reads that one page's arrays as the complete description of the page's
+    /// coverage. Admitting a page-crossing span here would silently drop the tail half of every
+    /// such block from the invalidation window -- a missed kill, not a slow path. The shape to
+    /// adopt on the day the refusal is relaxed is 86Box's: file the block in BOTH pages' indexes
+    /// (`page->block_2` / `block->page_mask2`), never in one.
     pub(crate) fn new(key: BlockKey, guest_len: usize, instructions: usize) -> Option<Self> {
         if guest_len == 0 || !(1..=MAX_BLOCK_INSTRUCTIONS).contains(&instructions) {
             return None;
@@ -360,6 +367,14 @@ impl BlockSpan {
         if key.linear >> 12 != linear_last >> 12 || key.physical >> 12 != physical_last >> 12 {
             return None;
         }
+        // The tripwire, at the site a relaxation would be WRITTEN rather than at the site that
+        // would then be wrong. It restates what the refusal above just established, which is the
+        // point: delete or widen that refusal and this fires.
+        debug_assert!(
+            (key.physical & ((1u32 << BLOCK_PAGE_SHIFT) - 1)) + u32::from(guest_len)
+                <= (1u32 << BLOCK_PAGE_SHIFT),
+            "a page-crossing BlockSpan would need per-page coverage filed on BOTH pages"
+        );
         Some(Self {
             key,
             guest_len,
@@ -377,6 +392,9 @@ pub(crate) struct RejectedSpan {
 }
 
 impl RejectedSpan {
+    /// Same downstream consumer, same tripwire, as `BlockSpan::new`: `PageKeys`' per-page
+    /// `starts` / `lens` arrays describe ONE page's coverage completely, and only because a span
+    /// cannot cross a page.
     pub(crate) fn new(key: BlockKey, guest_len: usize) -> Option<Self> {
         let guest_len = u16::try_from(guest_len).ok().filter(|len| *len != 0)?;
         let last = u32::from(guest_len) - 1;
@@ -387,6 +405,11 @@ impl RejectedSpan {
         {
             return None;
         }
+        debug_assert!(
+            (key.physical & ((1u32 << BLOCK_PAGE_SHIFT) - 1)) + u32::from(guest_len)
+                <= (1u32 << BLOCK_PAGE_SHIFT),
+            "a page-crossing RejectedSpan would need per-page coverage filed on BOTH pages"
+        );
         Some(Self { key, guest_len })
     }
 
@@ -778,23 +801,89 @@ pub(crate) enum BlockProbe {
     Ready(BlockId),
 }
 
-/// Per-physical-page key index for the SMC invalidation choke. `keys` stays
-/// SORTED ascending by `key.physical` so `invalidate_physical_range` can
-/// binary-search the overlap window instead of walking every key on the page:
-/// nascar-586 held ~950 keys on its hot pages and a RIP-sample profile put
-/// 40% of its wall in that walk (2026-08-08 campaign, lever 1).
+/// Per-physical-page key index for the SMC invalidation choke. Struct of
+/// arrays: one logical ROW per tracked key, `starts` / `lens` / `keys` at the
+/// same index. `starts` stays SORTED ascending so `invalidate_physical_range`
+/// can binary-search the overlap window instead of walking every key on the
+/// page: nascar-586 held ~950 keys on its hot pages and a RIP-sample profile
+/// put 40% of its wall in that walk (2026-08-08 campaign, lever 1).
+///
+/// `lens[i]` is row `i`'s coverage in guest bytes, carried inline so the window
+/// scan can decide overlap WITHOUT probing `entries` for the key's state and
+/// span. That probe was 1.545% of nascar-586's wall and 3.596% of duke3d-586's
+/// (`.bench/results/rip-census-20260826/nascar-rip.txt`,
+/// `dev_docs/specs/2026-08-27-duke-gp2-rip.md`), and the per-state `match`
+/// behind it another 0.754% / 2.660%. The inline test is CONSERVATIVE by
+/// construction and EXACT for point keys; see the three invariants below.
+///
+/// Three invariants, of three different kinds:
+///
+/// * **(ROW)** one row per live key. `starts.len() == lens.len() == keys.len()`
+///   and no two rows on a page carry the same `BlockKey`. Rows are appended
+///   only by `track_physical_key` and are moved or dropped only in index-sync
+///   (the survivor compaction and the drain in `invalidate_physical_range` move
+///   all three vectors together). A row may NEVER lag: a lagged row is not a
+///   conservative approximation, it is a desynchronised index after which
+///   `starts[i]`, `lens[i]` and `keys[i]` name three different keys.
+/// * **(IDX)** `starts[i] == keys[i].physical`. Sound because every state is
+///   filed at its own span key: `Rejected(span)` is inserted at `span.key` and
+///   `Compiled(id)`'s `block.span.key` is the key `install` inserted.
+/// * **(INV)** `lens[i]` is at least the width the authoritative per-state test
+///   in `invalidate_physical_range` would use for `keys[i]` in its CURRENT
+///   state. Coverage grows (`note_page_span`) and is never shrunk, so a key
+///   that downgrades from a span back to a point keeps the wider bound. This is
+///   the ONLY quantity permitted to be conservative-stale, and it is the same
+///   choice `max_span` already makes.
+///
+/// `physical_ranges_overlap` is monotone increasing in the second range's
+/// width, so (INV) gives "authoritative overlap ⇒ inline overlap": a row the
+/// pre-filter skips would have been a survivor anyway. For point keys
+/// (`lens[i] == 1`) the two tests are IDENTICAL, not merely ordered, which is
+/// what carries the win — the widened window is point-dominated.
 ///
 /// `max_span` is the longest guest span (bytes) any Compiled/Rejected state
-/// rooted on this page has carried since the vec was last emptied; a span key
+/// rooted on this page has carried since the vecs were last emptied; a span key
 /// below `write_start - (max_span - 1)` cannot reach the write. Seen/Dormant
 /// keys are points. The bound only grows (a stale-high value is correct, just
-/// less tight) and resets with the vec. Spans never cross a 4 KiB page (the
-/// block builder refuses page-crossing spans), so a page's own window covers
-/// every span its keys can root.
+/// less tight) and resets with the vecs. Spans never cross a 4 KiB page (the
+/// span constructors refuse page-crossing spans -- see `BlockSpan::new`), so a
+/// page's own window covers every span its keys can root and `starts[i] +
+/// lens[i]` never leaves the page the row is filed on.
 #[derive(Default)]
 struct PageKeys {
+    /// SORTED ascending. INVARIANT (IDX): `starts[i] == keys[i].physical`.
+    starts: Vec<u32>,
+    /// Coverage length in guest bytes for row `i`. INVARIANT (INV) above.
+    ///
+    /// `u16` because `guest_len` is already `u16` on both `BlockSpan` and
+    /// `RejectedSpan`, and because it keeps the hot array at 2 B/element.
+    lens: Vec<u16>,
     keys: Vec<BlockKey>,
     max_span: u32,
+}
+
+impl PageKeys {
+    /// The half-open index range of rows rooted at exactly `physical`. Ties are
+    /// possible: two keys differing only in `linear` or `mode_key` share a
+    /// start. Used by both `note_page_span` (which widens every matching row)
+    /// and `track_physical_key`'s (ROW) precondition.
+    fn tie_run(&self, physical: u32) -> core::ops::Range<usize> {
+        let start = self.starts.partition_point(|start| *start < physical);
+        let end = start + self.starts[start..].partition_point(|start| *start == physical);
+        start..end
+    }
+
+    /// Whether this page already holds a row for `key`. Only reached from
+    /// `track_physical_key`'s `debug_assert!`.
+    fn contains_key(&self, key: BlockKey) -> bool {
+        self.tie_run(key.physical)
+            .any(|index| self.keys[index] == key)
+    }
+
+    /// (ROW)'s length half, asserted where the vectors are consumed.
+    fn rows_agree(&self) -> bool {
+        self.starts.len() == self.keys.len() && self.lens.len() == self.keys.len()
+    }
 }
 
 /// Bounded direct-block cache. Hash lookup is authoritative; the direct-mapped table is only a
@@ -1983,8 +2072,34 @@ impl BlockCache {
         reason: DormantReason,
         cause: Option<RetryCause>,
     ) {
+        // Ordered BEFORE the insert and GUARDED, so the bijection `PageKeys` depends on holds for
+        // a key this fixture parks without ever probing. If the key is already in `entries` it
+        // already has a row and must not get a second -- that duplicate is exactly the (ROW)
+        // break `track_physical_key`'s `debug_assert!` names. Idempotent by construction.
+        if !self.entries.contains_key(&key) {
+            self.track_physical_key(key);
+        }
         self.entries.insert(key, BlockState::Seen);
         self.dormant(key, reason, cause);
+    }
+
+    /// Hand-corrupt one page row's coverage, breaking (INV) on purpose so the invalidation scan's
+    /// divergence gate can be PROVEN to go red. A filter whose own instrument cannot fail is
+    /// systemic, and this is the only way to feed the gate an input it must refuse.
+    #[cfg(test)]
+    pub(crate) fn corrupt_page_len_for_test(&mut self, key: BlockKey, len: u16) {
+        let page = self
+            .physical_keys
+            .get_mut(&(key.physical >> BLOCK_PAGE_SHIFT))
+            .expect("the corrupted key's page must be resident");
+        let mut corrupted = false;
+        for index in page.tie_run(key.physical) {
+            if page.keys[index] == key {
+                page.lens[index] = len;
+                corrupted = true;
+            }
+        }
+        assert!(corrupted, "the corrupted key must have a row");
     }
 
     /// Wind a parked key's visit counter forward, so a fixture that needs the lift to fire on its
@@ -2543,18 +2658,31 @@ impl BlockCache {
                 // instead of walking the whole page.
                 let window_low = physical.saturating_sub(page_keys.max_span.saturating_sub(1));
                 let window_high = physical.saturating_add(width);
-                let keys = &mut page_keys.keys;
+                debug_assert!(
+                    page_keys.rows_agree(),
+                    "(ROW): the three vectors came apart"
+                );
+                // Destructured ONCE. `starts[index]`, `lens[index]` and
+                // `keys[survivor_count] = key` are three simultaneous index borrows, so three
+                // `page_keys.field[..]` expressions would not compile. `page_keys` is owned by
+                // value out of the map, so this borrows a local and the loop body keeps its free
+                // access to `self`.
+                let PageKeys {
+                    starts, lens, keys, ..
+                } = &mut page_keys;
                 // Captured BEFORE the drain: this is the page occupancy design §12.6 says nothing
-                // records today, and "24.2 keys/call" is the window length, not this.
+                // records today, and "24.2 keys/call" is the window length, not this. Reads
+                // exactly ONE vector's `len()`, or the `page_keys_len_sum` closure changes meaning.
                 #[cfg(feature = "smc-census")]
                 {
                     census_page.counts.page_visits = 1;
                     census_page.counts.page_keys_len_sum = keys.len() as u64;
                 }
-                let window_start = keys.partition_point(|tracked| tracked.physical < window_low);
+                // Striding `starts` (4 B) rather than `keys` (12 B): the comparison COUNT is
+                // unchanged, so this is a cache effect and not an algorithmic one.
+                let window_start = starts.partition_point(|start| *start < window_low);
                 let window_end = window_start
-                    + keys[window_start..]
-                        .partition_point(|tracked| tracked.physical < window_high);
+                    + starts[window_start..].partition_point(|start| *start < window_high);
                 let mut survivor_count = window_start;
                 result.keys_scanned = result
                     .keys_scanned
@@ -2564,7 +2692,58 @@ impl BlockCache {
                     census_page.counts.keys_scanned = (window_end - window_start) as u64;
                 }
                 for index in window_start..window_end {
+                    debug_assert_eq!(
+                        starts[index], keys[index].physical,
+                        "(IDX): a page row's start and key came apart"
+                    );
+                    // THE PRE-FILTER. Row coverage rides inline in the vectors this scan already
+                    // walks, so the overlap decision costs two sequential reads instead of a
+                    // `HashMap` probe plus a per-state `match`. (INV) makes it conservative --
+                    // `physical_ranges_overlap` is monotone in the second width -- so a skipped row
+                    // is one the authoritative test would have called a survivor too. For a point
+                    // key (`lens[index] == 1`) the two tests are identical, which is the majority
+                    // of the window.
+                    //
+                    // `physical_ranges_overlap` is the SAME primitive the authoritative test uses,
+                    // so the filter and the thing it approximates cannot disagree about wrap.
+                    if !physical_ranges_overlap(
+                        physical,
+                        width,
+                        starts[index],
+                        u32::from(lens[index]),
+                    ) {
+                        let key = keys[index];
+                        debug_assert!(
+                            !self.authoritative_overlap_for_key(key, physical, width),
+                            "(INV): the inline pre-filter skipped a row the authoritative test kills"
+                        );
+                        #[cfg(feature = "smc-census")]
+                        {
+                            census_page.probes_elided += 1;
+                            // Read a second way, from a counter rather than from an assertion, so
+                            // the release census can go RED too. A filter whose own instrument
+                            // cannot fail is systemic.
+                            if self.authoritative_overlap_for_key(key, physical, width) {
+                                census_page.probe_divergences += 1;
+                            }
+                            census_page.survivors_moved += 1;
+                        }
+                        // Survivor: exactly the compaction below, all three vectors in step.
+                        starts[survivor_count] = starts[index];
+                        lens[survivor_count] = lens[index];
+                        keys[survivor_count] = key;
+                        survivor_count += 1;
+                        continue;
+                    }
+                    // Read out of the row BEFORE the body, which shadows `index` with a block
+                    // index inside the lane check.
                     let key = keys[index];
+                    let row_start = starts[index];
+                    let row_len = lens[index];
+                    #[cfg(feature = "smc-census")]
+                    {
+                        census_page.entries_get_calls += 1;
+                    }
                     let Some(state) = self.entries.get(&key).copied() else {
                         #[cfg(feature = "smc-census")]
                         {
@@ -2582,23 +2761,39 @@ impl BlockCache {
                             span.key.physical,
                             u32::from(span.guest_len),
                         ),
-                        BlockState::Compiled(id) => self.block(id).is_none_or(|block| {
-                            physical_ranges_overlap(
-                                physical,
-                                width,
-                                block.span.key.physical,
-                                u32::from(block.span.guest_len),
-                            )
-                        }),
+                        BlockState::Compiled(id) => {
+                            // The `None` branch consults no span, so `lens` cannot bound it and
+                            // the pre-filter above may skip such a row. That is ruled correct
+                            // rather than papered over: the state is unreachable, and `run.rs`
+                            // already `.expect()`s it dead in RELEASE on a hotter path
+                            // (`probe` hands a stale `Compiled` row straight out as
+                            // `BlockProbe::Ready`). Assert the invariant where it is USED.
+                            debug_assert!(
+                                self.block(id).is_some(),
+                                "a live `entries` row named a retired block"
+                            );
+                            self.block(id).is_none_or(|block| {
+                                physical_ranges_overlap(
+                                    physical,
+                                    width,
+                                    block.span.key.physical,
+                                    u32::from(block.span.guest_len),
+                                )
+                            })
+                        }
                     };
                     if !overlaps {
                         // Review finding M7: THIS is the quantity a per-page presence filter would
-                        // elide, and it is the denominator R2's W is defined against.
+                        // elide, and it is the denominator R2's W is defined against. What reaches
+                        // here after the pre-filter is the CONSERVATIVE remainder: a row whose
+                        // `lens` overlapped but whose current state does not.
                         #[cfg(feature = "smc-census")]
                         {
                             census_page.counts.keys_surviving += 1;
                             census_page.survivors_moved += 1;
                         }
+                        starts[survivor_count] = row_start;
+                        lens[survivor_count] = row_len;
                         keys[survivor_count] = key;
                         survivor_count += 1;
                         continue;
@@ -2635,6 +2830,8 @@ impl BlockCache {
                                 census_page.counts.lane_accepts += 1;
                                 census_page.survivors_moved += 1;
                             }
+                            starts[survivor_count] = row_start;
+                            lens[survivor_count] = row_len;
                             keys[survivor_count] = key;
                             survivor_count += 1;
                             continue;
@@ -2701,8 +2898,16 @@ impl BlockCache {
                         census_page.drain_calls += 1;
                         census_page.drain_elements += (window_end - survivor_count) as u64;
                     }
+                    // All three vectors, or (ROW) breaks and every later `starts[i]` / `lens[i]` /
+                    // `keys[i]` on this page names a different key.
+                    starts.drain(survivor_count..window_end);
+                    lens.drain(survivor_count..window_end);
                     keys.drain(survivor_count..window_end);
                 }
+                debug_assert!(
+                    starts.len() == keys.len() && lens.len() == keys.len(),
+                    "(ROW): the three vectors came apart across the drain"
+                );
                 if !keys.is_empty() {
                     #[cfg(feature = "smc-census")]
                     {
@@ -2736,6 +2941,41 @@ impl BlockCache {
             &census_call,
         );
         result
+    }
+
+    /// The authoritative per-state overlap decision `invalidate_physical_range`'s loop body makes,
+    /// factored out so the inline pre-filter can be graded against it. It probes `entries` and
+    /// reads `blocks` -- exactly the work the pre-filter exists to avoid -- so it is reached ONLY
+    /// from the pre-filter's `debug_assert!` and from the `smc-census` `probe_divergences` counter,
+    /// never from a plain release build.
+    ///
+    /// A key missing from `entries` answers FALSE: today's loop takes the miss `continue` without
+    /// compacting the row, so such a row is dropped rather than killed. The pre-filter WEAKENS that
+    /// self-heal (a stale row that is permanently out of the way now persists) but never turns a
+    /// kill into a survivor, which is the only direction (INV) is about.
+    fn authoritative_overlap_for_key(&self, key: BlockKey, physical: u32, width: u32) -> bool {
+        let Some(state) = self.entries.get(&key).copied() else {
+            return false;
+        };
+        match state {
+            BlockState::Seen | BlockState::Dormant(..) => {
+                physical_range_contains(physical, width, key.physical)
+            }
+            BlockState::Rejected(span) => physical_ranges_overlap(
+                physical,
+                width,
+                span.key.physical,
+                u32::from(span.guest_len),
+            ),
+            BlockState::Compiled(id) => self.block(id).is_none_or(|block| {
+                physical_ranges_overlap(
+                    physical,
+                    width,
+                    block.span.key.physical,
+                    u32::from(block.span.guest_len),
+                )
+            }),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -26731,7 +26971,25 @@ impl BlockCache {
         self.note_smc_census_retire(true, u64::from(span.guest_len), census_decode_slots);
     }
 
+    /// The ONLY site that appends a row to a page. Both callers -- `probe`'s
+    /// `None` arm and `install`'s post-`reset_storage` repair -- have already
+    /// established that no row exists for `key`, which is why the append is
+    /// unconditional; the `debug_assert!` below writes that precondition down.
     fn track_physical_key(&mut self, key: BlockKey) {
+        // Stated on the ROW, not on `entries`. `!self.entries.contains_key(&key)`
+        // reads FALSE at both call sites by the time the call is made -- `probe`
+        // inserts immediately before calling and so does `install` -- so it is
+        // not the precondition that actually holds. The row one is: at `probe`
+        // the key was absent from `entries` an instant earlier and therefore, by
+        // the bijection, had no row; at `install` `reset_storage` cleared every
+        // page two statements earlier.
+        debug_assert!(
+            !self
+                .physical_keys
+                .get(&(key.physical >> BLOCK_PAGE_SHIFT))
+                .is_some_and(|page| page.contains_key(key)),
+            "track_physical_key appends unconditionally; a second row for one key breaks (ROW) and (INV)"
+        );
         let page = self
             .physical_keys
             .entry(key.physical >> BLOCK_PAGE_SHIFT)
@@ -26739,22 +26997,52 @@ impl BlockCache {
         // Sorted insert (ties on `physical` may exist across mode/linear keys;
         // their relative order is irrelevant). Insertion is compile/track-time,
         // orders of magnitude rarer than the store-side window scan this order
-        // exists for.
-        let at = page
-            .keys
-            .partition_point(|tracked| tracked.physical <= key.physical);
+        // exists for. All three vectors take the same index, or (ROW) breaks.
+        let at = page.starts.partition_point(|start| *start <= key.physical);
+        page.starts.insert(at, key.physical);
+        // A freshly tracked key is `Seen`, whose authoritative test is the POINT
+        // test, so 1 is the exact coverage and not a conservative one.
+        page.lens.insert(at, 1);
         page.keys.insert(at, key);
+        debug_assert!(page.rows_agree(), "(ROW): the three vectors came apart");
     }
 
-    /// Record that `key`'s page roots a span of `guest_len` bytes, widening the
-    /// page's invalidation window bound. Called when a key becomes
-    /// Compiled/Rejected; `track_physical_key` has always run first.
+    /// Record that `key`'s page roots a span of `guest_len` bytes, widening both
+    /// the page's invalidation window bound and the key's own row coverage.
+    /// Called when a key becomes Compiled/Rejected; `track_physical_key` has
+    /// always run first.
+    ///
+    /// The ONLY site that widens `lens`, and therefore the only site (INV) can
+    /// be broken from. Called once per install or reject -- orders of magnitude
+    /// rarer than the store-side scan the row lookup here pays for.
     fn note_page_span(&mut self, key: BlockKey, guest_len: u32) {
         if let Some(page) = self
             .physical_keys
             .get_mut(&(key.physical >> BLOCK_PAGE_SHIFT))
         {
             page.max_span = page.max_span.max(guest_len);
+            // SATURATING, never `as`. `guest_len` is a `u32` here and `lens` is
+            // `u16`; a truncating conversion is an UNDER-bound and an
+            // under-bound `lens` is exactly the missed kill (INV) exists to
+            // prevent. Today `guest_len <= 4096` by construction (the span
+            // constructors refuse page-crossing spans) so this cannot bite --
+            // but the signature does not say so, and that is the point.
+            let len = u16::try_from(guest_len).unwrap_or(u16::MAX);
+            let mut matched = 0usize;
+            for index in page.tie_run(key.physical) {
+                if page.keys[index] == key {
+                    page.lens[index] = page.lens[index].max(len);
+                    matched += 1;
+                }
+            }
+            // Under (ROW) the match is unique. Every matching row is widened
+            // anyway, so the code is correct under either reading and this
+            // assertion is what says which. Zero matches on a resident page is a
+            // bijection hole: a key reached `entries` without reaching a row.
+            debug_assert_eq!(
+                matched, 1,
+                "(ROW): note_page_span found {matched} rows for one key"
+            );
         }
     }
 
@@ -30644,6 +30932,14 @@ struct SmcCensusPhase {
 pub(crate) struct PageAccum {
     pub(crate) counts: PageCounts,
     pub(crate) entries_get_misses: u64,
+    /// Rows the inline pre-filter skipped: counted in `keys_scanned` and in `survivors_moved`, and
+    /// in NONE of the four per-key exits, which is why both exit closures take this term.
+    pub(crate) probes_elided: u64,
+    /// Rows that actually reached `self.entries.get`.
+    pub(crate) entries_get_calls: u64,
+    /// Skipped rows the authoritative test would have killed. MUST be zero; a non-zero reading is
+    /// (INV) broken and is a STOP, not a tuning input.
+    pub(crate) probe_divergences: u64,
     pub(crate) survivors_moved: u64,
     pub(crate) drain_calls: u64,
     pub(crate) drain_elements: u64,
@@ -30729,6 +31025,9 @@ impl SmcCensus {
             phase.units.page_keys_len_sum += counts.page_keys_len_sum;
             phase.units.window_len_sum += counts.keys_scanned;
             phase.units.entries_get_misses += accum.entries_get_misses;
+            phase.units.probes_elided += accum.probes_elided;
+            phase.units.entries_get_calls += accum.entries_get_calls;
+            phase.units.probe_divergences += accum.probe_divergences;
             phase.units.survivors_moved += accum.survivors_moved;
             phase.units.drain_calls += accum.drain_calls;
             phase.units.drain_elements += accum.drain_elements;
