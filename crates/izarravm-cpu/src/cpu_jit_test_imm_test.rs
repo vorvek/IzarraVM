@@ -1104,10 +1104,10 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
         let registers = crate::tests::settled_registers(&fixture.native);
         let pending_eflags = fixture.native.eflags();
         let memory = fixture.native_bus.memory.clone();
-        let cross_exits = fixture
+        let kind_exits = fixture
             .native
             .perf_counters()
-            .jit_direct_exit_cross_page_or_alignment;
+            .jit_direct_exit_unavailable_or_kind;
         let permission_exits = fixture.native.perf_counters().jit_direct_exit_permission;
 
         assert!(
@@ -1123,8 +1123,8 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
             fixture
                 .native
                 .perf_counters()
-                .jit_direct_exit_cross_page_or_alignment
-                - cross_exits,
+                .jit_direct_exit_unavailable_or_kind
+                - kind_exits,
             u64::from(cross)
         );
         assert_eq!(

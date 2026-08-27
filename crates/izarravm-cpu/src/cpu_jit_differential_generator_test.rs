@@ -950,16 +950,15 @@ fn unaligned_cross_page_case() -> GeneratedCase {
 /// page-CROSSING at `0x18fff`.
 ///
 /// Before guard 3 the last two both side-exited on `emit_wide_page_guard` and this test asserted
-/// two exits. The guard is now two halves and only the CROSSING one still refuses at the lean read
-/// site, so the contract here becomes sharper rather than weaker: exactly ONE exit, and the
-/// misaligned read is asserted to have been served -- by the split bus charge it deposits (one
-/// dword cycle plus three byte cycles, against the interpreted role's single non-split cycle) and
-/// by every architectural comparison in `assert_measured_pair_with_split` still holding.
+/// two exits. The lean site now serves the in-page misaligned read and the stub RAM arm refuses
+/// the crossing one, so the contract here becomes sharper rather than weaker: exactly ONE exit,
+/// and the misaligned read is asserted to have been served -- by the split bus charge it deposits
+/// (one dword cycle plus three byte cycles, against the interpreted role's single non-split
+/// cycle) and by every architectural comparison in `assert_measured_pair_with_split` still
+/// holding.
 ///
-/// This is the shape that would catch the two halves being emitted in the wrong order at scale: an
-/// alignment-first guard sends `0x18fff` into the recovery stub, which would serve four bytes
-/// across a page boundary the FastMap entry does not cover -- guest RAM and the exit count both
-/// move.
+/// Omit the stub bound and `0x18fff` is served across a page boundary the FastMap entry does not
+/// cover -- guest RAM and the exit count both move.
 #[test]
 fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
     let case = unaligned_cross_page_case();
@@ -980,9 +979,7 @@ fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
     arm(&mut interpreter, &case);
     run_to_halt(&mut interpreter, &mut interpreter_bus, &case).unwrap();
     prime_direct(&mut direct, &mut direct_bus, &pristine, &case);
-    let exits = direct
-        .perf_counters()
-        .jit_direct_exit_cross_page_or_alignment;
+    let exits = direct.perf_counters().jit_direct_exit_unavailable_or_kind;
     // The ONE misaligned in-page read, at TestBus's dials. Native charges one dword cycle (5) plus
     // three byte cycles from the split deposit (3*2); the interpreted role charges four byte
     // cycles (4*2), because `FastMap::lookup_access` no longer refuses a misaligned width and the
@@ -1005,9 +1002,7 @@ fn generated_unaligned_and_cross_page_dwords_take_precise_native_exits() {
         ) > 0
     );
     assert_eq!(
-        direct
-            .perf_counters()
-            .jit_direct_exit_cross_page_or_alignment,
+        direct.perf_counters().jit_direct_exit_unavailable_or_kind,
         exits + 1,
         "only the CROSSING dword may exit; the misaligned in-page one is served: {case:#?}, \
          perf={:#?}",
