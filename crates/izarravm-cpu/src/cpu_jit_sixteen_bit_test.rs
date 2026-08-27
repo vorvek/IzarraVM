@@ -945,3 +945,213 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
     assert_eq!(cpu.eflags(), interpreter.eflags());
     jit::direct::set_count_lanes_for_test(None);
 }
+
+// ---------------------------------------------------------------------------
+// 6. S6: under AddressWrap::Word the segment-limit compare can be DEAD CODE.
+// ---------------------------------------------------------------------------
+//
+// `emit_effective_address` ends a Word-wrap address with `and eax, 0xFFFF`, and nothing between
+// there and the limit compare writes RAX. `ja max_start` is unsigned-above, so whenever
+// `max_start >= 0xFFFF` the compare and its branch are unreachable and are not emitted.
+//
+// Under a plain real-mode 0xFFFF limit that is exactly the Byte accesses: max_start is 0xFFFF for
+// Byte, 0xFFFE for Word, 0xFFFC for Dword. The gate is written on `max_start` rather than on the
+// limit, which is what makes an unreal-mode block with a preserved wider limit elide for the
+// wider widths too -- the third row below is that case, and a gate spelled
+// `descriptor.limit == 0xFFFF` fails it.
+
+/// `and eax, 0xFFFF` -- the 64K mask, and the whole precondition of the elision.
+const WORD_WRAP_MASK: [u8; 6] = [0x81, 0xe0, 0xff, 0xff, 0x00, 0x00];
+
+/// `cmp eax, max_start`, the segment-limit compare.
+const fn limit_compare(max_start: u32) -> [u8; 6] {
+    let m = max_start.to_le_bytes();
+    [0x81, 0xf8, m[0], m[1], m[2], m[3]]
+}
+
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// `inc ax / <body> / inc dx / hlt` in a 16-bit segment, with DS carrying `ds_limit`. Returns the
+/// emitted host bytes. Compile only: the rows that use this assert what the front SPELLED, which
+/// is the one thing a run cannot observe about a branch that can never be taken.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn sixteen_bit_front_bytes(body: &[u8], ds_limit: u32) -> Vec<u8> {
+    let mut memory = vec![0u8; 0x2000];
+    let mut code = vec![0x40u8]; // inc ax
+    let body_at = ENTRY + code.len() as u32;
+    code.extend_from_slice(body);
+    let tail_at = ENTRY + code.len() as u32;
+    code.extend_from_slice(&[0x42, 0xf4]); // inc dx; hlt
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[0x200..0x204].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+
+    let mut bus = sixteen_bit_bus(memory);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    let mut descriptor = cpu.registers.segment(SegmentIndex::Ds);
+    descriptor.limit = ds_limit;
+    cpu.registers.set_segment(SegmentIndex::Ds, descriptor);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000]);
+    warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY, body_at, tail_at]);
+
+    match jit::direct::compile(&mut cpu, ENTRY, false) {
+        jit::direct::CompileOutcome::Compiled(compilation) => {
+            assert_eq!(
+                compilation.span.instructions, 3,
+                "the memory slot must be inside the block, or the scan measures nothing"
+            );
+            compilation.code
+        }
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("the 16-bit memory block became a structural rejection")
+        }
+        jit::direct::CompileOutcome::Retry(_) => {
+            panic!("the 16-bit memory block asked for a retry")
+        }
+    }
+}
+
+/// The elision, and the width split that bounds it. Byte's `max_start` under a real-mode limit is
+/// 0xFFFF, which the masked EA can never exceed, so its compare goes; Word's is 0xFFFE, which the
+/// EA reaches at exactly one offset, so its compare stays.
+///
+/// The mask assertion is the anti-vacuity term: without it a row that stopped emitting the whole
+/// front would read as a successful elision.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_word_wrapped_byte_access_elides_the_dead_segment_limit_compare() {
+    // `mov al,[0x200]` -- Byte, DS, 16-bit disp16 addressing.
+    let byte = sixteen_bit_front_bytes(&[0x8a, 0x06, 0x00, 0x02], 0xffff);
+    assert_eq!(
+        occurrences(&byte, &WORD_WRAP_MASK),
+        1,
+        "the 64K mask must still be emitted: it is what makes the compare dead"
+    );
+    assert_eq!(
+        occurrences(&byte, &limit_compare(0xffff)),
+        0,
+        "Byte's max_start is 0xFFFF and the masked EA cannot exceed it -- dead code"
+    );
+
+    // `mov ax,[0x200]` -- Word, same segment. max_start is 0xFFFE, which offset 0xFFFF reaches.
+    let word = sixteen_bit_front_bytes(&[0x8b, 0x06, 0x00, 0x02], 0xffff);
+    assert_eq!(occurrences(&word, &WORD_WRAP_MASK), 1);
+    assert_eq!(
+        occurrences(&word, &limit_compare(0xfffe)),
+        1,
+        "Word's compare is LIVE at offset 0xFFFF and must survive"
+    );
+}
+
+/// The gate reads `max_start`, never `descriptor.limit == 0xFFFF`.
+///
+/// A real-mode segment load preserves a wider protected-mode limit on purpose, so a 16-bit block
+/// can run under limit 0x1FFFF. There a Word access has `max_start = 0x1FFFE`, which the masked EA
+/// still cannot exceed, and its compare is dead for the same reason Byte's was. A gate written on
+/// the limit rather than on `max_start` emits it and this row goes red.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_preserved_wider_limit_elides_the_word_compare_too() {
+    let word = sixteen_bit_front_bytes(&[0x8b, 0x06, 0x00, 0x02], 0x0001_ffff);
+    assert_eq!(occurrences(&word, &WORD_WRAP_MASK), 1);
+    assert_eq!(
+        occurrences(&word, &limit_compare(0x0001_fffe)),
+        0,
+        "max_start 0x1FFFE is above 0xFFFF, so the compare is dead for Word as well"
+    );
+}
+
+/// THE MUTANT ROW for S6. Weaken the gate to `wrap == AddressWrap::Word` alone -- dropping the
+/// `max_start >= 0xFFFF` term -- and a 16-bit access past a SHORT segment limit loses a compare
+/// that is genuinely live. The access is then served natively instead of side-exiting, and the
+/// #GP the interpreter owes the guest never happens.
+///
+/// The fixture is a Word load at offset 0x200 under limit 0x200, so `max_start` is 0x1FF and the
+/// access is refused by one byte. The offset is even and far from a page edge, so neither the
+/// alignment half nor the crossing bound can stand in for the refusal: the segment-limit compare
+/// is the only thing that can stop this access, which is what makes the row a killer rather than
+/// a coincidence.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_sixteen_bit_access_past_a_short_segment_limit_still_side_exits() {
+    const LOAD: u32 = ENTRY + 1;
+    const SHORT_LIMIT: u32 = 0x200;
+
+    let mut memory = vec![0u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + 7].copy_from_slice(&[
+        0x40, // inc ax
+        0x8b, 0x06, 0x00, 0x02, // mov ax,[0x200]
+        0x42, // inc dx
+        0xf4, // hlt
+    ]);
+    // The payload the load WOULD reach. Without it AX reads zero whether the load faulted or
+    // completed and the "the load never happened" assertion would hold vacuously.
+    memory[0x200..0x202].copy_from_slice(&0xbeefu16.to_le_bytes());
+
+    let mut bus = sixteen_bit_bus(memory);
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    let mut descriptor = cpu.registers.segment(SegmentIndex::Ds);
+    descriptor.limit = SHORT_LIMIT;
+    cpu.registers.set_segment(SegmentIndex::Ds, descriptor);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000]);
+    warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY, LOAD, ENTRY + 5]);
+
+    let block = install_sixteen_bit_block(&mut cpu, ENTRY, 3);
+
+    cpu.registers.gpr = [0; 8];
+    cpu.set_eip(ENTRY);
+    let before = counts(&cpu);
+    let limit_exits = cpu.direct_stall_snapshot().side_exit_segment_limit;
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    let after = counts(&cpu);
+
+    assert_eq!(
+        after.insns - before.insns,
+        1,
+        "only the slot BEFORE the load may retire natively"
+    );
+    assert_eq!(
+        after.side_exits - before.side_exits,
+        1,
+        "exactly one side exit"
+    );
+    assert_eq!(
+        cpu.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
+        1,
+        "and it must be the SEGMENT LIMIT guard, not the alignment or crossing one"
+    );
+    assert_eq!(
+        after.alignment_exits - before.alignment_exits,
+        0,
+        "the offset is even and mid-page, so nothing else could have refused it"
+    );
+    assert_eq!(
+        cpu.registers.eip, LOAD,
+        "the side exit must leave EIP at the load, before any effect"
+    );
+    assert_eq!(
+        cpu.registers.eax(),
+        1,
+        "the load must NOT have completed -- the payload is 0xbeef and AX still holds inc ax's 1"
+    );
+}

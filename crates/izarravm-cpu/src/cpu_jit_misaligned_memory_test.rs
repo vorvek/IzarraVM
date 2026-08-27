@@ -118,6 +118,10 @@ struct Roles {
     block: jit::direct::CompiledBlock,
     /// Linear address of the tested opcode, i.e. where a guarded exit must leave EIP.
     body_at: u32,
+    /// The emitted host bytes, kept so a row can assert what the guard SPELLED rather than only
+    /// what it decided. A behavioural row cannot see a guard half that is dead code, which is
+    /// exactly what the page-cross elision below has to pin.
+    code: Vec<u8>,
 }
 
 /// Map one page for read and write on the fast map. A memory-form slot silently never compiles
@@ -248,6 +252,7 @@ fn build_slots(bodies: &[&[u8]], watch: Option<u32>) -> Roles {
         compilation.span.instructions, slots,
         "the block must cover every slot, so the tested opcode really ran natively"
     );
+    let code = compilation.code.clone();
     let id = native
         .jit_direct
         .install(&compilation)
@@ -278,6 +283,7 @@ fn build_slots(bodies: &[&[u8]], watch: Option<u32>) -> Roles {
         interp_bus,
         block,
         body_at,
+        code,
     }
 }
 
@@ -984,6 +990,134 @@ fn a_misaligned_x87_access_still_exits() {
             &format!("fld qword [+{offset}]"),
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// S1: the page-cross bound is DEAD CODE at the eleven refusing sites for a self-aligning width
+// ---------------------------------------------------------------------------------------------
+
+/// `mov edx, eax; and edx, 0xfff` -- the head of `emit_page_cross_bound`, and the half that no
+/// other emission spells. Its absence is the elision; its presence is the bound.
+const PAGE_CROSS_HEAD: [u8; 8] = [0x89, 0xc2, 0x81, 0xe2, 0xff, 0x0f, 0x00, 0x00];
+
+/// `cmp edx, 0x1000 - bytes()`, the bound's verdict, per width.
+const fn page_cross_compare(bytes: u32) -> [u8; 6] {
+    let limit = (0x1000 - bytes).to_le_bytes();
+    [0x81, 0xfa, limit[0], limit[1], limit[2], limit[3]]
+}
+
+/// The alignment test's head in whichever arm's spelling: `test al, mask` on the
+/// `IZARRAVM_DIRECT_ALIGN_TEST_AL` arm, `mov edx, eax; and edx, mask` on the default one.
+fn alignment_half(align_test_al: bool, mask: u32) -> Vec<u8> {
+    if align_test_al {
+        vec![0xf6, 0xc0, mask as u8]
+    } else {
+        let mask = mask.to_le_bytes();
+        vec![0x89, 0xc2, 0x81, 0xe2, mask[0], mask[1], mask[2], mask[3]]
+    }
+}
+
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// The eleven refusing sites send BOTH guard halves to one label, and for a width that
+/// self-aligns the crossing set is a strict subset of the misaligned set -- `N` divides 0x1000, so
+/// the interval `[0x1000 - N + 1, 0xFFF]` holds no multiple of `N`. The bound can therefore only
+/// branch where the alignment test one instruction later branches, to the same place. Emitting it
+/// is dead code, and this row is what says it is not emitted.
+///
+/// It has to be an ENCODING row. A behavioural row cannot see the difference at all: that is the
+/// whole content of the claim.
+///
+/// The alignment half must still be there exactly once, which is what separates "the bound was
+/// elided" from "the whole guard was elided" -- and it is asserted on BOTH alignment arms, in each
+/// arm's own spelling, because the bound is 20 bytes on both and the elision is therefore the same
+/// 20 bytes on both. The ON arm is the one with residual risk: its alignment half does not write
+/// scratch, so after the elision RDX is left untouched rather than holding `RAX & 0xFFF`.
+#[test]
+fn a_self_aligning_width_skips_the_dead_page_cross_bound_at_a_refusing_site() {
+    for on in [false, true] {
+        jit::direct::set_align_test_al_for_test(Some(on));
+        let arm = if on { "align-test-al ON" } else { "OFF" };
+        // `add dword [aligned], 0x01` -- `emit_alu_mem_dest`, a refusing site, Dword.
+        let mut alu = disp32(&[0x83], 0, OPERAND_PAGE + 0x200);
+        alu.push(0x01);
+        let dword = build(&alu);
+        assert_eq!(
+            occurrences(&dword.code, &PAGE_CROSS_HEAD),
+            0,
+            "{arm}: add dword [aligned]: the crossing bound is dead here and must not be emitted"
+        );
+        assert_eq!(
+            occurrences(&dword.code, &alignment_half(on, 3)),
+            1,
+            "{arm}: add dword [aligned]: the ALIGNMENT half must survive -- it decides"
+        );
+
+        // `inc word [aligned]` -- `emit_rmw_inc_dec`, a refusing site, Word.
+        let word = build(&disp32(&[0x66, 0xff], 0, OPERAND_PAGE + 0x200));
+        assert_eq!(
+            occurrences(&word.code, &PAGE_CROSS_HEAD),
+            0,
+            "{arm}: inc word [aligned]: the crossing bound is dead here too"
+        );
+        assert_eq!(
+            occurrences(&word.code, &alignment_half(on, 1)),
+            1,
+            "{arm}: inc word [aligned]: with the Word mask, not the Dword one"
+        );
+    }
+    jit::direct::set_align_test_al_for_test(None);
+}
+
+/// THE MUTANT ROW. Widen the gate to `alignment_bytes() <= bytes()` -- a tautology over the five
+/// widths -- and Qword and Tbyte lose a bound that is genuinely LIVE for them, because their
+/// `alignment_bytes()` is 4, below their size. A 4-aligned Qword may start at 0xFFC and a 4-aligned
+/// Tbyte from 0xFF8 up, and both then reach past the page their FastMap entry was resolved
+/// against. This row goes red on that mutation and the behavioural row below goes red with it.
+#[test]
+fn the_wide_widths_keep_the_page_cross_bound_at_a_refusing_site() {
+    // `fld qword [4-aligned]` -- DD /0, `emit_x87_memory_pointer`, a refusing site.
+    let qword = build(&disp32(&[0xdd], 0, OPERAND_PAGE + 0x300));
+    assert_eq!(
+        occurrences(&qword.code, &PAGE_CROSS_HEAD),
+        1,
+        "fld qword: alignment_bytes() is 4 below bytes() 8, so the bound is LIVE"
+    );
+    assert_eq!(
+        occurrences(&qword.code, &page_cross_compare(8)),
+        1,
+        "fld qword: and the bound must be sized by bytes(), i.e. cmp edx, 0xff8"
+    );
+
+    // `fstp tbyte [4-aligned]` -- DB /7, the widest form and the one whose divergence is widest.
+    let tbyte = build(&disp32(&[0xdb], 7, OPERAND_PAGE + 0x300));
+    assert_eq!(
+        occurrences(&tbyte.code, &PAGE_CROSS_HEAD),
+        1,
+        "fld tbyte: alignment_bytes() is 4 below bytes() 10, so the bound is LIVE"
+    );
+    assert_eq!(
+        occurrences(&tbyte.code, &page_cross_compare(10)),
+        1,
+        "fld tbyte: cmp edx, 0xff6"
+    );
+}
+
+/// The behavioural half of the mutant row: a 4-aligned Qword at 0xFFC passes the alignment test
+/// and is refused ONLY by the crossing bound. With the bound gated out for the wide widths it
+/// would be served through the previous page's bias.
+#[test]
+fn a_four_aligned_qword_at_the_page_edge_still_exits() {
+    guarded(
+        &disp32(&[0xdd], 0, OPERAND_PAGE + 0xffc),
+        alignment_exits,
+        "fld qword [OPERAND_PAGE+0xffc]",
+    );
 }
 
 /// Guard 3 on the hold-load-bias ON arm. Alignment still diverts; clocks still match.

@@ -18900,8 +18900,10 @@ fn emit_segmented_linear_address(
     wrap: AddressWrap,
 ) {
     // The mask lands inside `emit_effective_address`, which is BEFORE the limit compare below.
-    // That ordering is load-bearing: the compare sits between the effective address and the
-    // segment base, so masking afterwards would compare an address the guest never forms.
+    // That ordering is load-bearing twice over: the compare sits between the effective address
+    // and the segment base, so masking afterwards would compare an address the guest never forms
+    // -- AND the mask is the precondition of the compare's own elision under `AddressWrap::Word`
+    // below. Hoist the mask after the compare and that elision stops being sound.
     emit_effective_address(e, addr, wrap);
     let descriptor = memory.segments.descriptor(addr.segment);
     if descriptor.limit != u32::MAX {
@@ -18916,13 +18918,37 @@ fn emit_segmented_linear_address(
             );
             return;
         };
-        e.cmp_r32_imm32(Reg::RAX, max_start);
-        e.jcc(
-            7,
-            sides
-                .segment_limit
-                .expect("finite native segment has a limit side exit"),
-        );
+        // `emit_effective_address` two lines up ended with `and eax, 0xFFFF` for
+        // `AddressWrap::Word`, and NOTHING between there and here writes RAX, so RAX is at most
+        // 0xFFFF at this compare. `jcc(7, ..)` is unsigned ABOVE, so it cannot be taken when
+        // `max_start` is 0xFFFF or more: the pair is dead code and is not emitted.
+        //
+        // Read the gate off `max_start`, NEVER off `descriptor.limit == 0xFFFF`. A real-mode
+        // segment load preserves a wider protected-mode limit on purpose (see `control.rs`'s
+        // note on why the limit is not re-stamped), so a 16-bit block can carry limit 0x1FFFF,
+        // and there the pair is dead for Dword as well as Byte. The `max_start` form gets that
+        // right without having to know it, and cannot go stale when a new width appears.
+        //
+        // Under a plain real-mode 0xFFFF limit the population is exactly Byte: `max_start` is
+        // 0xFFFF for Byte, 0xFFFE for Word, 0xFFFC for Dword, 0xFFF8 for Qword, 0xFFF6 for
+        // Tbyte, so only Byte's compare goes. This is the dividend of `emit_effective_address`
+        // owning the 64K mask -- the ordering that comment calls load-bearing is this proof's
+        // whole precondition.
+        //
+        // The `segment_limit` label is still allocated and its reason stub still appended: a
+        // Byte-only block can end up with a placed but unreferenced label and a dead stub,
+        // which costs a few cold bytes and nothing else. A wider width in the same block still
+        // emits its own compare, because the gate is per-`width` at each call.
+        let unreachable_under_word_wrap = wrap == AddressWrap::Word && max_start >= 0xFFFF;
+        if !unreachable_under_word_wrap {
+            e.cmp_r32_imm32(Reg::RAX, max_start);
+            e.jcc(
+                7,
+                sides
+                    .segment_limit
+                    .expect("finite native segment has a limit side exit"),
+            );
+        }
     }
     if descriptor.base != 0 {
         e.add_r32_imm32(Reg::RAX, descriptor.base);
@@ -19096,6 +19122,11 @@ fn emit_store_write_resolve(
 /// crosses into the next page. A 4-aligned Tbyte is worse: 10 bytes against a 4-byte alignment
 /// refuses everything from 0xFF8 up, which is what keeps `write_extended80`'s trailing word at +8
 /// inside the page the pointer was resolved against.
+///
+/// At the eleven REFUSING sites the two verdicts share one label, and there this compare is dead
+/// for the self-aligning widths -- `emit_wide_page_guard` gates it out and carries the proof.
+/// Nothing else may apply that gate: it is sound only where a crossing access and a misaligned
+/// access go to the same place.
 fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, cross: Label) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, 0x0fff);
@@ -19149,17 +19180,42 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 
 /// Both halves, both verdicts to one label: the eleven sites that refuse a wide access outright.
 ///
-/// SIZE-identical to the pre-decomposition emission -- eight instructions, two not-taken branches
-/// on the aligned path, same verdict, same side exit -- but deliberately NOT byte-identical: the
-/// two tests swap positions, so the `and` immediates move and the `jnz` and `ja` trade places.
-/// Every branch this emitter produces is a fixed-length near form, so the swap cannot move a
-/// block's size either.
+/// **The crossing bound is emitted only for a width that does NOT self-align**, which is Qword and
+/// Tbyte and nothing else. For the three self-aligning widths it is dead code here, and the proof
+/// is a statement about one 32-bit register value rather than about how that value was produced --
+/// both halves read RAX at the same point in the stream (`emit_page_cross_bound` and
+/// `emit_alignment_test` each open with `mov <scratch>, RAX`), and BOTH verdicts target the SAME
+/// label at these eleven sites:
 ///
-/// **The crossing bound comes FIRST, and that ordering is load-bearing rather than cosmetic.** At
-/// the two relaxed sites the alignment half's target is a local recovery path that serves the
-/// access, and a page-CROSSING access must never reach it. Testing the crossing bound first makes
-/// that structural instead of a second test inside the recovery. The wrapper keeps the same order
-/// so there is one order to reason about, not two.
+/// > for `N` in {2, 4} and any `x`: `(x & 0xFFF) > 0x1000 - N` implies `(x & (N-1)) != 0`
+///
+/// `N` divides 0x1000, so `x mod N == (x mod 0x1000) mod N`. The crossing interval
+/// `[0x1000 - N + 1, 0xFFF]` lies strictly between two consecutive multiples of `N` and so
+/// contains none of them. Concretely, Word's bound catches only 0xFFF (`& 1 == 1`) and Dword's
+/// catches 0xFFD, 0xFFE, 0xFFF (`& 3 == 1, 2, 3`) -- every one of which the alignment test one
+/// instruction later sends to the same place. Byte never reaches here at all.
+///
+/// The two wide widths keep it because `alignment_bytes() < bytes()` for them (see
+/// `alignment_bytes`): a 4-aligned Qword can start at 0xFFC and a 4-aligned Tbyte from 0xFF8 up,
+/// and those genuinely straddle the page the FastMap entry was resolved against.
+///
+/// The gate lives HERE and never at a call site. That is what keeps it sound: it may only be
+/// applied where the crossing verdict and the alignment verdict go to one label. The two lean
+/// one-lookup sites call the halves directly, and there the alignment verdict SERVES the access
+/// rather than refusing it, so their bound is live for every width and must stay.
+///
+/// On the default alignment arm the elision is register- and flag-IDENTICAL, not merely
+/// verdict-identical: before it, RDX went `RAX & 0xFFF` then `RAX` then `&= mask`; after it, RDX
+/// goes `RAX` then `&= mask`. Same final RDX, same final flags. On the
+/// `IZARRAVM_DIRECT_ALIGN_TEST_AL` arm the alignment half does not write scratch at all, so RDX
+/// is left untouched rather than holding `RAX & 0xFFF` -- which is the one place a stale-RDX
+/// reader would surface, and that arm has its own suite.
+///
+/// **The crossing bound comes FIRST wherever it is emitted, and that ordering is load-bearing
+/// rather than cosmetic.** At the two relaxed sites the alignment half's target is a local
+/// recovery path that serves the access, and a page-CROSSING access must never reach it. Testing
+/// the crossing bound first makes that structural instead of a second test inside the recovery.
+/// The wrapper keeps the same order so there is one order to reason about, not two.
 ///
 /// **Precondition, stated rather than assumed: no caller may rely on the host flag state this
 /// leaves behind.** Leftover ZF/CF/SF/OF/PF come from the ALIGNMENT half (`cmp scratch, 0` on
@@ -19168,7 +19224,9 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 /// the next branch, and guest EFLAGS live in RBP, never in host flags across a memory front.
 fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     debug_assert!(width.needs_alignment_guard());
-    emit_page_cross_bound(e, width, side);
+    if width.alignment_bytes() != width.bytes() {
+        emit_page_cross_bound(e, width, side);
+    }
     emit_alignment_test(e, width, Reg::RDX, side);
 }
 
