@@ -19089,6 +19089,11 @@ fn emit_store_write_resolve(
 /// crosses into the next page. A 4-aligned Tbyte is worse: 10 bytes against a 4-byte alignment
 /// refuses everything from 0xFF8 up, which is what keeps `write_extended80`'s trailing word at +8
 /// inside the page the pointer was resolved against.
+///
+/// At the eleven REFUSING sites the two verdicts share one label, and there this compare is dead
+/// for the self-aligning widths -- `emit_wide_page_guard` gates it out and carries the proof.
+/// Nothing else may apply that gate: it is sound only where a crossing access and a misaligned
+/// access go to the same place.
 fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, cross: Label) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, 0x0fff);
@@ -19142,17 +19147,42 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 
 /// Both halves, both verdicts to one label: the eleven sites that refuse a wide access outright.
 ///
-/// SIZE-identical to the pre-decomposition emission -- eight instructions, two not-taken branches
-/// on the aligned path, same verdict, same side exit -- but deliberately NOT byte-identical: the
-/// two tests swap positions, so the `and` immediates move and the `jnz` and `ja` trade places.
-/// Every branch this emitter produces is a fixed-length near form, so the swap cannot move a
-/// block's size either.
+/// **The crossing bound is emitted only for a width that does NOT self-align**, which is Qword and
+/// Tbyte and nothing else. For the three self-aligning widths it is dead code here, and the proof
+/// is a statement about one 32-bit register value rather than about how that value was produced --
+/// both halves read RAX at the same point in the stream (`emit_page_cross_bound` and
+/// `emit_alignment_test` each open with `mov <scratch>, RAX`), and BOTH verdicts target the SAME
+/// label at these eleven sites:
 ///
-/// **The crossing bound comes FIRST, and that ordering is load-bearing rather than cosmetic.** At
-/// the two relaxed sites the alignment half's target is a local recovery path that serves the
-/// access, and a page-CROSSING access must never reach it. Testing the crossing bound first makes
-/// that structural instead of a second test inside the recovery. The wrapper keeps the same order
-/// so there is one order to reason about, not two.
+/// > for `N` in {2, 4} and any `x`: `(x & 0xFFF) > 0x1000 - N` implies `(x & (N-1)) != 0`
+///
+/// `N` divides 0x1000, so `x mod N == (x mod 0x1000) mod N`. The crossing interval
+/// `[0x1000 - N + 1, 0xFFF]` lies strictly between two consecutive multiples of `N` and so
+/// contains none of them. Concretely, Word's bound catches only 0xFFF (`& 1 == 1`) and Dword's
+/// catches 0xFFD, 0xFFE, 0xFFF (`& 3 == 1, 2, 3`) -- every one of which the alignment test one
+/// instruction later sends to the same place. Byte never reaches here at all.
+///
+/// The two wide widths keep it because `alignment_bytes() < bytes()` for them (see
+/// `alignment_bytes`): a 4-aligned Qword can start at 0xFFC and a 4-aligned Tbyte from 0xFF8 up,
+/// and those genuinely straddle the page the FastMap entry was resolved against.
+///
+/// The gate lives HERE and never at a call site. That is what keeps it sound: it may only be
+/// applied where the crossing verdict and the alignment verdict go to one label. The two lean
+/// one-lookup sites call the halves directly, and there the alignment verdict SERVES the access
+/// rather than refusing it, so their bound is live for every width and must stay.
+///
+/// On the default alignment arm the elision is register- and flag-IDENTICAL, not merely
+/// verdict-identical: before it, RDX went `RAX & 0xFFF` then `RAX` then `&= mask`; after it, RDX
+/// goes `RAX` then `&= mask`. Same final RDX, same final flags. On the
+/// `IZARRAVM_DIRECT_ALIGN_TEST_AL` arm the alignment half does not write scratch at all, so RDX
+/// is left untouched rather than holding `RAX & 0xFFF` -- which is the one place a stale-RDX
+/// reader would surface, and that arm has its own suite.
+///
+/// **The crossing bound comes FIRST wherever it is emitted, and that ordering is load-bearing
+/// rather than cosmetic.** At the two relaxed sites the alignment half's target is a local
+/// recovery path that serves the access, and a page-CROSSING access must never reach it. Testing
+/// the crossing bound first makes that structural instead of a second test inside the recovery.
+/// The wrapper keeps the same order so there is one order to reason about, not two.
 ///
 /// **Precondition, stated rather than assumed: no caller may rely on the host flag state this
 /// leaves behind.** Leftover ZF/CF/SF/OF/PF come from the ALIGNMENT half (`cmp scratch, 0` on
@@ -19161,7 +19191,9 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 /// the next branch, and guest EFLAGS live in RBP, never in host flags across a memory front.
 fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     debug_assert!(width.needs_alignment_guard());
-    emit_page_cross_bound(e, width, side);
+    if width.alignment_bytes() != width.bytes() {
+        emit_page_cross_bound(e, width, side);
+    }
     emit_alignment_test(e, width, Reg::RDX, side);
 }
 

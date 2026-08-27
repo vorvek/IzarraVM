@@ -194,14 +194,14 @@ fn oversized_x87_program() -> Vec<u8> {
     memory[ENTRY as usize - 1] = 0x90;
     let mut code = Vec::new();
     for _ in 0..8 {
-        code.extend_from_slice(&[0xd9, 0x05, 0x00, 0x02, 0x00, 0x00]); // fld dword [0x200]
+        code.extend_from_slice(&[0xdd, 0x05, 0x00, 0x02, 0x00, 0x00]); // fld qword [0x200]
     }
     for _ in 0..4 {
         code.extend_from_slice(&[0x89, 0xc0]); // mov eax,eax
     }
     code.push(0xf4);
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
-    memory[DATA..DATA + 4].copy_from_slice(&1.5f32.to_bits().to_le_bytes());
+    memory[DATA..DATA + 8].copy_from_slice(&1.5f64.to_bits().to_le_bytes());
     memory
 }
 
@@ -223,7 +223,19 @@ fn oversized_x87_block_compiles_and_runs_as_fitting_prefixes() {
     )
     .expect("unrestricted x87 block");
     assert_eq!(usize::from(full.span.instructions), FULL_BLOCK_INSTRUCTIONS);
-    assert!(full.code.len() > jit::exec_mem::host_page_len());
+    // The eight slots are `fld QWORD`, and the width is load-bearing rather than incidental: a
+    // Qword's `alignment_bytes()` is 4, below its size, so its page-crossing bound is LIVE and
+    // `emit_wide_page_guard` keeps emitting it. A Dword slot's bound is dead code and is elided,
+    // which took 20 bytes off each of eight sites and dropped this fixture's block to 3999 bytes
+    // -- under a host page, so the oversize premise silently evaporated. Pinning the fixture on a
+    // width whose guard is not elidable keeps the premise a property of the block rather than of
+    // whatever the guard currently spells.
+    assert!(
+        full.code.len() > jit::exec_mem::host_page_len(),
+        "the fixture must genuinely overflow a host page: {} bytes against {}",
+        full.code.len(),
+        jit::exec_mem::host_page_len()
+    );
 
     let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("fitting x87 prefix");
     assert!((3..FULL_BLOCK_INSTRUCTIONS).contains(&usize::from(compilation.span.instructions)));
