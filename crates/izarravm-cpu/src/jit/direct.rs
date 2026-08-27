@@ -15264,12 +15264,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     let body_offset = e.position();
     e.place(loop_entry);
 
-    let mut completed = 0u8;
-    let mut completed_raw = 0u16;
-    let mut completed_weighted_fp_clocks = 0u32;
-    let mut completed_byte_reads = 0u8;
-    let mut completed_word_reads = 0u8;
-    let mut completed_dword_reads = 0u8;
+    let mut completed = StaticAccounting::default();
     let mut side_exits = Vec::new();
     let mut side_exit_reason_stubs = Vec::new();
     // Jcc terminators lowered through `emit_jcc_shadow`, by `JccShadowClass`. Zero on the OFF arm
@@ -15429,18 +15424,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     true,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // SAHF. RBP is the running materialized-EFLAGS shadow, so it is already what the
             // interpreter's `materialize_flags()` would settle to; the three lines below are the
@@ -15638,18 +15622,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     false,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::AluMemDest {
                 op,
@@ -15667,18 +15640,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     op != 7,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // The Dword arm is the ORIGINAL `emit_test`, called with the original arguments, so
             // the gate-OFF binary emits byte-identical code for every TEST it has ever emitted.
@@ -15730,18 +15692,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     // nothing here writes through the fast map.
                     false,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::ImulMem { dst, addr } => {
                 let side = e.label();
@@ -15755,18 +15706,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     // Read-only, exactly as AluMemSource and TestImmMem pass it.
                     false,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::NegReg { dst } => emit_neg_reg(&mut e, dst),
             DirectKind::MulReg { src } => emit_mul_reg(&mut e, src),
@@ -15781,18 +15721,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let guard = e.label();
                 emit_div_reg(&mut e, src, signed, guard);
                 side_exit_reason_stubs.push((guard, side, SideExitReason::DivideGuard));
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // TWO side-exit families through ONE `side` label: the read's memory reasons and the
             // divide guard. That is the pairing `DivReg`'s comment said had to be ordered before
@@ -15810,18 +15739,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     false,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::TestImmReg { dst, imm, width } => {
                 emit_test_imm_reg(&mut e, dst, imm, width);
@@ -15837,18 +15755,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     false,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // The count-lane forms differ from the baked forms in exactly one thing: where the
             // COUNT comes from. That one thing costs more here than it does for `AluByteImm`,
@@ -15890,18 +15797,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
                 emit_double_shift_mem(&mut e, left, src, count, addr, memory, reasons);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::Load {
                 dst, width, addr, ..
@@ -15916,18 +15812,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     false,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::LoadExtend {
                 dst,
@@ -15955,18 +15840,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     false,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::Store {
                 source,
@@ -15992,18 +15866,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     true,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::RmwIncDec {
                 is_dec,
@@ -16020,18 +15883,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     true,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::PushMem { addr } => {
                 let side = e.label();
@@ -16070,18 +15922,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     true,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 // LAST, and after the side exit is published. A faulting push must leave ESP at
                 // its pre-instruction value.
                 e.alu_r32_imm32(5, home(4), 4);
@@ -16108,18 +15949,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     AddressWrap::None,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r32_imm32(5, home(4), 4);
             }
             // PUSH on a 16-bit stack: two bytes at `(SP - 2) & 0xFFFF`, then SP alone advances.
@@ -16151,18 +15981,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     AddressWrap::Word,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r16_imm16(5, home(4), 2);
             }
             DirectKind::Pop { dst } => {
@@ -16180,18 +15999,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.add_r32_imm32(home(4), 4);
                 e.mov_r32_r32(home(dst), Reg::RDX);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // POP on a 16-bit stack: two bytes read at `SP & 0xFFFF`, SP alone advances, and the
             // destination is MERGED into rather than replaced.
@@ -16224,18 +16032,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.alu_r16_imm16(0, home(4), 2);
                 emit_write_gpr16(&mut e, dst, Reg::RDX);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // POP Sreg on a 16-bit stack (0x07 ES, 0x1F DS) in real mode or V86. `Pop16`'s read
             // followed by `LoadSegReal`'s write, both unchanged from the arms above.
@@ -16288,18 +16085,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.shift_r32_imm8(4, Reg::RAX, 4);
                 e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // RET near on a 16-bit stack: two bytes read at `SP & 0xFFFF`, the CS limit checked
             // BEFORE any stack release, then SP alone advances by `2 + release`.
@@ -16337,24 +16123,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
                 e.alu_r16_imm16(0, home(4), release.wrapping_add(2));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+                completed.retire(slot);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -16463,24 +16233,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // (f) EIP <- the popped offset, then the far PIC.
                 e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_RET_FAR_OFFSET);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+                completed.retire(slot);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -16528,18 +16282,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.add_r32_imm32(home(4), 4);
                 e.mov_r32_r32(home(5), Reg::RDX);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // LEAVE at Word operand size, both stack widths. The guard runs first, against
             // SS:(E)BP, for the reason the Dword arm above gives: that is the address the pop
@@ -16581,18 +16324,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 }
                 emit_write_gpr16(&mut e, 5, Reg::RDX);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // ENTER imm16, 0 at Word operand size, both stack widths.
             //
@@ -16630,18 +16362,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     wrap,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 if stack32 {
                     e.alu_r32_imm32(5, home(4), 2);
                 } else {
@@ -16701,18 +16422,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     );
                 }
                 side_exit_reason_stubs.push((eligibility, side, SideExitReason::X87Eligibility));
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             // The interpreter call-out slot. Two exits, both through the ordinary side-exit
             // machinery so nothing about EIP advance, fetch tracing or prefix accounting is
@@ -16721,9 +16431,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             //   abnormal   EIP at the call-out, prefix = the slots BEFORE it. Byte-for-byte the
             //              state the run loop sees today when a block ends at an IN barrier.
             //   step break EIP AFTER the call-out, prefix = the slots before it PLUS the call-out
-            //              itself. `raw_clocks` in the static prefix stays `completed_raw`: this
-            //              instruction's charge is runtime and was already added to the lane at
-            //              the call site, so counting it here too would double it.
+            //              itself. `raw_clocks` in the static prefix stays `completed.raw_clocks`:
+            //              this instruction's charge is runtime and was already added to the lane
+            //              at the call site, so counting it here too would double it.
             DirectKind::CallOut { helper } => {
                 let abnormal_common = e.label();
                 let abnormal_stub = e.label();
@@ -16763,7 +16473,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 emit_call_out(
                     &mut e,
                     helper,
-                    completed_raw,
+                    completed.raw_clocks,
                     abnormal_stub,
                     step_break_stub,
                     exit_arg,
@@ -16778,14 +16488,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 side_exits.push((
                     abnormal_common,
                     slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
+                    completed,
                 ));
                 side_exit_reason_stubs.push((
                     step_break_stub,
@@ -16797,14 +16500,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     slot.lin
                         .wrapping_add(u32::from(slot.len))
                         .wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed + 1,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
+                    completed.with_instruction_retired(),
                 ));
                 // The two RESYNC exits, and the whole of what makes them different from every
                 // other exit in this function: their EIP DELTA IS ZERO. The helper already left
@@ -16824,16 +16520,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     side_exits.push((
                         resync_common,
                         0,
-                        side_exit(
-                            // RETIRED: the instruction ran, so the block owns its retirement and
-                            // its fetch, exactly as the step-break arm does.
-                            completed + 1,
-                            completed_raw,
-                            completed_byte_reads,
-                            completed_word_reads,
-                            completed_dword_reads,
-                            completed_weighted_fp_clocks,
-                        ),
+                        // RETIRED: the instruction ran, so the block owns its retirement and
+                        // its fetch, exactly as the step-break arm does.
+                        completed.with_instruction_retired(),
                     ));
                     side_exit_reason_stubs.push((
                         fault_stub,
@@ -16843,17 +16532,10 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     side_exits.push((
                         fault_common,
                         0,
-                        side_exit(
-                            // NOT retired: `finish_instruction` already counted the instruction in
-                            // `perf.instructions` and charged its clocks, and the helper charged
-                            // its fetch, so the block reports the prefix and nothing more.
-                            completed,
-                            completed_raw,
-                            completed_byte_reads,
-                            completed_word_reads,
-                            completed_dword_reads,
-                            completed_weighted_fp_clocks,
-                        ),
+                        // NOT retired: `finish_instruction` already counted the instruction in
+                        // `perf.instructions` and charged its clocks, and the helper charged
+                        // its fetch, so the block reports the prefix and nothing more.
+                        completed,
                     ));
                 }
             }
@@ -16874,25 +16556,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     AddressWrap::None,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r32_imm32(5, home(4), 4);
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                completed.retire(slot);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -16936,25 +16602,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     AddressWrap::Word,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r16_imm16(5, home(4), 2);
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                completed.retire(slot);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -16970,12 +16620,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 break;
             }
             DirectKind::Jmp { target_delta } => {
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                completed.retire(slot);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -17020,24 +16665,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
                 e.add_r32_imm32(home(4), 4 + u32::from(release));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+                completed.retire(slot);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -17082,24 +16711,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // reloading from it is the only way to get the target back into RDX.
                 e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+                completed.retire(slot);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -17126,9 +16739,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // ORDER IS LOAD-BEARING, and differently from `CallReg`. `CallReg` publishes before
             // its `sub esp, 4` so a faulting push leaves ESP untouched; this arm has no guest byte
             // to protect at all. What it has instead is the resume point: the side exit records
-            // `completed` and `completed_raw` as they stand, so it must be pushed BEFORE they
-            // advance for this slot, or the interpreter re-enters past the very instruction that
-            // faulted with its 7 clocks already charged. That is mutation M4.
+            // `completed` as it stands, so it must be pushed BEFORE it advances for this slot,
+            // or the interpreter re-enters past the very instruction that faulted with its 7
+            // clocks already charged. That is mutation M4.
             DirectKind::JmpReg { dst } => {
                 let limit = memory.segments.cs.limit;
                 if limit != u32::MAX {
@@ -17137,28 +16750,12 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     e.cmp_r32_imm32(home(dst), limit);
                     e.jcc(7, limit_exit);
                     side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
-                    side_exits.push((
-                        side,
-                        slot.lin.wrapping_sub(span.key.linear),
-                        side_exit(
-                            completed,
-                            completed_raw,
-                            completed_byte_reads,
-                            completed_word_reads,
-                            completed_dword_reads,
-                            completed_weighted_fp_clocks,
-                        ),
-                    ));
+                    side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 }
                 // Reading `home(dst)` is safe for EVERY dst including ESP: nothing in this arm has
                 // written a guest home, so the value is the architectural pre-instruction one.
                 e.mov_r32_r32(Reg::RDX, home(dst));
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                completed.retire(slot);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -17203,18 +16800,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     AddressWrap::None,
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 // Pre-adjust: correct for EVERY dst, ESP included. `emit_store` cannot have
                 // clobbered `home(dst)`: its scratch set is RAX/RCX/RDX/RDI, and GUEST_HOMES is
                 // R8-R14 plus RBX, so the register read at the top of this arm is still live here.
@@ -17222,12 +16808,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // AFTER the side exit is published, the same faulting-push invariant `Call` keeps:
                 // a faulting push must leave ESP at its pre-instruction value.
                 e.alu_r32_imm32(5, home(4), 4);
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                completed.retire(slot);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -17285,29 +16866,13 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     true,
                 );
-                side_exits.push((
-                    side,
-                    slot.lin.wrapping_sub(span.key.linear),
-                    side_exit(
-                        completed,
-                        completed_raw,
-                        completed_byte_reads,
-                        completed_word_reads,
-                        completed_dword_reads,
-                        completed_weighted_fp_clocks,
-                    ),
-                ));
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 // AFTER the side exit is published, the same faulting-push invariant `Call`,
                 // `CallReg` and `PushMem` all keep: a faulting push leaves ESP untouched. The
                 // target is live in RDX across this and stays live: `home(4)` is a GUEST_HOMES
                 // register, never a scratch one.
                 e.alu_r32_imm32(5, home(4), 4);
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                completed.retire(slot);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -17326,12 +16891,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 condition,
                 taken_delta,
             } => {
-                completed += 1;
-                completed_raw += slot.kind.raw_clocks() as u16;
-                completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-                completed_byte_reads += slot.kind.byte_reads();
-                completed_word_reads += slot.kind.word_reads();
-                completed_dword_reads += slot.kind.dword_reads();
+                completed.retire(slot);
                 let taken = e.label();
                 // The one arm switch of the `IZARRAVM_JCC_SHADOW` slice, read at the emission
                 // site so both arms live in ONE binary and a ladder needs no rebuild. The OFF
@@ -17386,12 +16946,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 break;
             }
         }
-        completed += 1;
-        completed_raw += slot.kind.raw_clocks() as u16;
-        completed_weighted_fp_clocks += slot.weighted_fp_clocks;
-        completed_byte_reads += slot.kind.byte_reads();
-        completed_word_reads += slot.kind.word_reads();
-        completed_dword_reads += slot.kind.dword_reads();
+        completed.retire(slot);
     }
     if !terminal {
         emit_completed_path(
@@ -17495,12 +17050,12 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     }
     emit_store_homes(&mut e);
     emit_return(&mut e);
-    debug_assert_eq!(usize::from(completed), slots.len());
-    debug_assert_eq!(u32::from(completed_raw), raw_clocks);
-    debug_assert_eq!(completed_weighted_fp_clocks, weighted_fp_clocks);
-    debug_assert_eq!(completed_byte_reads, byte_reads);
-    debug_assert_eq!(completed_word_reads, word_reads);
-    debug_assert_eq!(completed_dword_reads, dword_reads);
+    debug_assert_eq!(usize::from(completed.instructions), slots.len());
+    debug_assert_eq!(u32::from(completed.raw_clocks), raw_clocks);
+    debug_assert_eq!(completed.weighted_fp_clocks, weighted_fp_clocks);
+    debug_assert_eq!(completed.byte_reads, byte_reads);
+    debug_assert_eq!(completed.word_reads, word_reads);
+    debug_assert_eq!(completed.dword_reads, dword_reads);
     debug_assert_eq!(
         slots.iter().map(|slot| slot.kind.byte_stores()).sum::<u8>(),
         byte_stores
@@ -18005,21 +17560,21 @@ struct StaticAccounting {
     weighted_fp_clocks: u32,
 }
 
-fn side_exit(
-    instructions: u8,
-    raw_clocks: u16,
-    byte_reads: u8,
-    word_reads: u8,
-    dword_reads: u8,
-    weighted_fp_clocks: u32,
-) -> StaticAccounting {
-    StaticAccounting {
-        instructions,
-        raw_clocks,
-        byte_reads,
-        word_reads,
-        dword_reads,
-        weighted_fp_clocks,
+impl StaticAccounting {
+    fn retire(&mut self, slot: &DirectInsn) {
+        self.instructions += 1;
+        self.raw_clocks += slot.kind.raw_clocks() as u16;
+        self.weighted_fp_clocks += slot.weighted_fp_clocks;
+        self.byte_reads += slot.kind.byte_reads();
+        self.word_reads += slot.kind.word_reads();
+        self.dword_reads += slot.kind.dword_reads();
+    }
+
+    fn with_instruction_retired(self) -> Self {
+        Self {
+            instructions: self.instructions + 1,
+            ..self
+        }
     }
 }
 
