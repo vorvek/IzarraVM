@@ -1,6 +1,6 @@
 {
   "duke3d-486": {
-    "dukemark_samples": 921,
+    "dukemark_samples": 940,
     "dukemark_samples_tolerance": 0.02
   },
   "duke3d-586": {
@@ -26,12 +26,13 @@
     "final_instructions_tolerance": 0.05
   },
   "prince-486": {
-    "frame_sha256": "6cc0d3549968b72031469eb7894f7465fe727919d5a7926d499188526ed4479c"
+    "frame_sha256": "e312f8f366a68442a247df6bc9bf51290ed41e4d49e89564c320c78739a42986"
   },
   "tombraid-586": {
     "anchor_frame_sha256": [
       "2c55fef04eeb555d02790b336a36fff2a7ce04245a40b810ea3bea83d9061403",
-      "30abcde0d496b5e275704c0dcf270f0ea15a3e7171cf9f1d04d7468074b259dd"
+      "30abcde0d496b5e275704c0dcf270f0ea15a3e7171cf9f1d04d7468074b259dd",
+      "8bef41b4270f8ccb277c47e6896b9335313db1a593a3204b21dc324d4bcfcdbe"
     ],
     "final_nonblack_percent_min": 89.0,
     "final_nonblack_percent_max": 100.0,
