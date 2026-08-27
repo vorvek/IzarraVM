@@ -303,6 +303,20 @@ fn type_com_fixture_is_present() {
 }
 
 #[test]
+fn relocchk_exe_fixture_carries_the_span_crossing_reloc_table() {
+    assert_eq!(&RELOCCHK_EXE[0..2], b"MZ");
+    // e_crlc at offset 6: 130 fixups = four full 32-entry kernel spans plus a
+    // 2-entry remainder, the shape the katea_run guest row depends on.
+    let e_crlc = u16::from_le_bytes([RELOCCHK_EXE[6], RELOCCHK_EXE[7]]);
+    assert_eq!(e_crlc, 130, "the fixture must keep its span-crossing count");
+    let e_lfarlc = u16::from_le_bytes([RELOCCHK_EXE[24], RELOCCHK_EXE[25]]);
+    assert_eq!(
+        e_lfarlc, 0x40,
+        "reloc table at 0x40, inside the 1 KB header"
+    );
+}
+
+#[test]
 fn exehello_exe_fixture_is_a_valid_mz() {
     assert!(EXEHELLO_EXE.len() > 0x1c);
     assert_eq!(&EXEHELLO_EXE[0..2], b"MZ");

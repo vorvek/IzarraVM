@@ -57,6 +57,16 @@ static BYTE *RcsId =
 #endif
 
 #define CHUNK 32256
+/* Modified by the Toka-DOS project, 2026: staging span for the .EXE
+   relocation table, read RELOC_SPAN entries per DosRWSft instead of one.
+   Recycles PriPathName (the 128-byte SDA name buffer, the same trick the
+   ExeHeader plays on SecPathName above): its last writer in the EXEC path
+   is DosOpenSft's truename, and nothing reads it again between the image
+   read and the close, so it is free during relocation. Recycling it keeps
+   the resident kernel's low-memory size unchanged -- a static span here
+   cost one KiB of reported conventional free (the MEM 599 KiB pins). */
+#define RELOC_SPAN 32
+#define reloc_span ((UWORD *)(void *)PriPathName)
 #define MAXENV 32768u
 #define ENV_KEEPFREE 83         /* keep unallocated by environment variables */
         /* The '65' added to nEnvSize does not cover the additional stuff:
@@ -749,15 +759,23 @@ COUNT DosExeLoader(BYTE FAR * namep, exec_blk * exp, COUNT mode, COUNT fd)
   }
 
   {                             /* relocate the image for new segment                   */
-    COUNT i;
-    UWORD reloc[2];
+    /* Modified by the Toka-DOS project, 2026: read the relocation table in
+       spans, not one 4-byte DosRWSft per fixup. Every DosRWSft pays the
+       full SFT-to-fnode round trip plus a buffer-cache scan; a large game
+       .EXE carries tens of thousands of fixups and paid all of that once
+       per fixup, at the very start of every load. One span read costs the
+       same as one old fixup read and covers RELOC_SPAN of them. */
+    UWORD todo = ExeHeader.exRelocItems;
     seg FAR *spot;
 
     SftSeek(fd, ExeHeader.exRelocTable, 0);
-    for (i = 0; i < ExeHeader.exRelocItems; i++)
+    while (todo > 0)
     {
-      if (DosRWSft
-          (fd, sizeof(reloc), (VOID FAR *) & reloc[0], XFR_READ) != sizeof(reloc))
+      UWORD i;
+      UWORD n = todo < RELOC_SPAN ? todo : RELOC_SPAN;
+
+      if (DosRWSft(fd, n * 2u * sizeof(UWORD), (VOID FAR *) reloc_span,
+                   XFR_READ) != (LONG) (n * 2u * sizeof(UWORD)))
       {
         if (mode != OVERLAY)
         {
@@ -766,17 +784,21 @@ COUNT DosExeLoader(BYTE FAR * namep, exec_blk * exp, COUNT mode, COUNT fd)
         }
         return DE_INVLDDATA;
       }
-      if (mode == OVERLAY)
+      for (i = 0; i < n; i++)
       {
-        spot = MK_FP(reloc[1] + mem, reloc[0]);
-        *spot += exp->load.reloc;
+        if (mode == OVERLAY)
+        {
+          spot = MK_FP(reloc_span[2 * i + 1] + mem, reloc_span[2 * i]);
+          *spot += exp->load.reloc;
+        }
+        else
+        {
+          /*      spot = MK_FP(reloc[1] + mem + 0x10, reloc[0]); */
+          spot = MK_FP(reloc_span[2 * i + 1] + start_seg, reloc_span[2 * i]);
+          *spot += start_seg;
+        }
       }
-      else
-      {
-        /*      spot = MK_FP(reloc[1] + mem + 0x10, reloc[0]); */
-        spot = MK_FP(reloc[1] + start_seg, reloc[0]);
-        *spot += start_seg;
-      }
+      todo -= n;
     }
   }
 

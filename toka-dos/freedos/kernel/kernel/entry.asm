@@ -49,6 +49,7 @@ segment HMA_TEXT
                 extern   int21regs_off
 
                 extern   _Int21AX
+                extern   _int2a_handler
 
                 extern  _DGROUP_
 
@@ -419,9 +420,33 @@ int21_ret:
 ;   end Dos Critical Section 0 thur 7
 ;
 ;
+; Modified by the Toka-DOS project, 2026: the stock system hooks nothing
+; onto INT 2Ah, so this call was an INT/IRET round trip to an iret stub on
+; every INT 21h disk call. Skip the INT while IVT[2Ah] still holds the
+; kernel's own stub: offset = the link-time DGROUP offset of _int2a_handler
+; (what setvec stored), segment = DS, which is DGROUP here (the _Int21AX
+; store above depends on that already). The vector is read live on every
+; call, so a server hook installed later is honoured from its next call.
+; No captured copy, no new resident byte.
 dos_crit_sect:
                 mov     [_Int21AX],ax       ; needed!
                 push    ax                  ; This must be here!!!
+                push    es
+                xor     ax,ax
+                mov     es,ax               ; ES -> the IVT page
+                mov     ax,[es:2ah*4]
+                cmp     ax,_int2a_handler wrt DGROUP
+                jne     .hooked
+                mov     ax,ds
+                cmp     ax,[es:2ah*4+2]
+                jne     .hooked
+                pop     es
+                pop     ax
+                ret
+.hooked:
+                pop     es
+                pop     ax
+                push    ax
                 mov     ah,82h              ; re-enrty sake before disk stack
                 int     2ah                 ; Calling Server Hook!
                 pop     ax

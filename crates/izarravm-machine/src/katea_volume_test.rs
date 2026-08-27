@@ -62,6 +62,13 @@ fn extracts_the_embedded_image_payload() {
     // unchecked carve cannot wrap; getblk_fat fills one sector per miss
     // when no UMB exists. The +176 remainder is the far pointer, the
     // one-sector fallback and the size guard. See blockio.c and config.c.
+    // 72395 -> 72459 (syscall-path waste, Tier A): +64 net. The .EXE
+    // relocation loop reads 32-entry spans through the recycled PriPathName
+    // buffer (task.c RELOC_SPAN) so conventional free stays at the MEM pins;
+    // dos_crit_sect skips its INT 2Ah while IVT[2Ah] still holds the stub
+    // (entry.asm, compared against _int2a_handler wrt DGROUP and DS);
+    // AH=4Ah drops its unconditional DosMemCheck walk; AH=02h polls the
+    // break stream every 32nd call (inthndlr.c).
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
@@ -75,7 +82,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(72395),
+        Some(72459),
         "KERNEL.SYS size"
     );
     assert_eq!(

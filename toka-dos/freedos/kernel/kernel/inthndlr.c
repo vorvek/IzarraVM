@@ -464,7 +464,20 @@ dispatch:
   }
   /* Check for Ctrl-Break */
   if (break_ena || (lr.AH >= 1 && lr.AH <= 5) || (lr.AH >= 8 && lr.AH <= 0x0b))
-    check_handle_break(&syscon);
+  {
+    /* Modified by the Toka-DOS project, 2026: AH=02h arrives once per
+       printed character, and check_handle_break costs a device request
+       plus an INT 16h per call. Poll the stream every 32nd AH=02h, the
+       throttle cooked_write already applies. The BIOS ^Break flag stays
+       checked on every call, so Ctrl-Break keeps its instant response;
+       a typed ^C is seen within 31 characters. BREAK=ON disables the
+       throttle. */
+    static UBYTE ah2_break_tick;
+
+    if (lr.AH != 0x02 || break_ena || ctrl_break_pressed()
+        || (++ah2_break_tick & 0x1f) == 0)
+      check_handle_break(&syscon);
+  }
 
   /* The dispatch handler                                         */
   switch (lr.AH)
@@ -1062,9 +1075,9 @@ dispatch:
 
       /* Set memory block size */
     case 0x4a:
-        if (DosMemCheck() != SUCCESS)
-          panic("before 4a: MCB chain corrupted");
-
+      /* Modified by the Toka-DOS project, 2026: the unconditional
+         DosMemCheck here walked the whole MCB chain on every SETBLOCK.
+         The error path below still checks the chain when 4Ah fails. */
       if ((rc = DosMemChange(lr.ES, lr.BX, &lr.BX)) < 0)
       {
 #if 0
