@@ -120,6 +120,8 @@ impl Machine {
             program_runtime: self.program_runtime,
             pending_toka_service: &mut self.pending_toka_service,
             toka_service_status: self.toka_service_status,
+            pending_cd_doorbell: &mut self.pending_cd_doorbell,
+            cd_doorbell_status: &mut self.cd_doorbell_status,
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
@@ -2436,6 +2438,10 @@ impl CpuBus for MachineBus<'_> {
             // Toka-DOS service status: 0 ok, 1 absent, other = error.
             return Ok(u32::from(self.toka_service_status));
         }
+        if port == 0x00e8 {
+            // IzarraCD doorbell status: 0 = idle/done, 1 = request pending.
+            return Ok(u32::from(*self.cd_doorbell_status));
+        }
         if port == 0x0092 {
             // System control port A: bit 1 mirrors the A20 gate (the 8042 output
             // port is the single source of truth). Other bits read 0.
@@ -2721,6 +2727,15 @@ impl CpuBus for MachineBus<'_> {
             // removed with the retired HLE DOS kernel.
             // The run loop performs it after this cycle (it needs &mut self).
             *self.pending_toka_service = Some(value as u8);
+            return Ok(());
+        }
+        if port == 0x00e8 {
+            // IzarraCD doorbell: execute the device request whose pointer the ROM
+            // strategy stub stored in the low-RAM mailbox. The run loop performs
+            // it after this cycle (it needs &mut self); the status reads busy
+            // from this write until the request completes.
+            *self.pending_cd_doorbell = Some(value as u8);
+            *self.cd_doorbell_status = 1;
             return Ok(());
         }
         if self.unittester.write_port(port, value as u8) {

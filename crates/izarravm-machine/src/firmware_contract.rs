@@ -108,6 +108,24 @@ pub(crate) mod address {
     pub(crate) const BIOS_STUB_WINDOW_LEN: u32 = 0x400;
     pub(crate) const BIOS_LEGACY_IRET_ROM_OFFSET: usize = 0xF000;
 
+    /// The IzarraCD ROM device header (`TOKACD01`): the MSCDEX-style character
+    /// device header that INT 2Fh AX=1501h hands out. It lives in the BIOS ROM,
+    /// so it is never linked into the DOS driver chain (its `dh_next` stays
+    /// FFFF:FFFF); it exists for programs that fetch the header and far-call
+    /// strategy/interrupt themselves. The strategy stub stores the caller's
+    /// ES:BX request pointer in the low-RAM mailbox; the interrupt stub rings
+    /// the Lotura CD doorbell (port 0xE8) and polls it until the host has
+    /// executed the request.
+    pub(crate) const CD_DEVICE_HEADER_ROM_OFFSET: usize = 0xF420;
+    pub(crate) const CD_DEVICE_HEADER_SEG: u16 = BIOS_ROM_IRET_SEG;
+    pub(crate) const CD_DEVICE_HEADER_OFF: u16 = 0x0420;
+    pub(crate) const CD_DEVICE_STRATEGY_ROM_OFFSET: usize = 0xF436;
+    pub(crate) const CD_DEVICE_INTERRUPT_ROM_OFFSET: usize = 0xF447;
+    /// Low-RAM mailbox the ROM strategy stub writes: request offset word, then
+    /// request segment word. Sits in the firmware scratch block, below
+    /// SYSVARS_SEG (0x640).
+    pub(crate) const CD_DEVICE_MAILBOX_ADDRESS: usize = 0x063C;
+
     pub(crate) const BIOS_CONFIG_TABLE_ADDR: u32 = 0x9FC10;
     pub(crate) const BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR: u32 = 0x9FC20;
     pub(crate) const BIOS_DISKETTE_PARAMETER_TABLE_ADDR: u32 = 0x9FC30;
@@ -219,6 +237,38 @@ const BIOS_TIMER_ISR_STUB: [u8; 25] = [
 
 const BIOS_MASTER_IRQ_ISR_STUB: [u8; 7] = [0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf];
 
+/// The 22-byte IzarraCD device header at `CD_DEVICE_HEADER_ROM_OFFSET`:
+/// dh_next FFFF:FFFF, attribute 0xC800 (character device with IOCTL), the
+/// strategy/interrupt entry offsets (within `CD_DEVICE_HEADER_SEG`), the
+/// device name `TOKACD01`, and the MSCDEX extension bytes (reserved word,
+/// first drive letter 4 = D:, one unit).
+const CD_DEVICE_HEADER: [u8; 22] = [
+    0xff, 0xff, 0xff, 0xff, // dh_next: end of chain
+    0x00, 0xc8, // attribute: character device + IOCTL
+    0x36, 0x04, // strategy offset (CD_DEVICE_STRATEGY_ROM_OFFSET - 0xF000)
+    0x47, 0x04, // interrupt offset (CD_DEVICE_INTERRUPT_ROM_OFFSET - 0xF000)
+    b'T', b'O', b'K', b'A', b'C', b'D', b'0', b'1', // device name
+    0x00, 0x00, // reserved
+    0x04, // first drive letter, 1-based (D:)
+    0x01, // number of units
+];
+
+/// Strategy: store the caller's ES:BX request pointer in the low-RAM mailbox.
+///   push ds / push ax / xor ax,ax / mov ds,ax
+///   mov [063Ch],bx / mov [063Eh],es / pop ax / pop ds / retf
+const CD_DEVICE_STRATEGY_STUB: [u8; 17] = [
+    0x1e, 0x50, 0x31, 0xc0, 0x8e, 0xd8, 0x89, 0x1e, 0x3c, 0x06, 0x8c, 0x06, 0x3e, 0x06, 0x58, 0x1f,
+    0xcb,
+];
+
+/// Interrupt: ring the Lotura CD doorbell and poll it until the host reports
+/// the request done (status 0).
+///   push ax / push dx / mov dx,00E8h / mov al,1 / out dx,al
+///   .wait: in al,dx / test al,al / jnz .wait / pop dx / pop ax / retf
+const CD_DEVICE_INTERRUPT_STUB: [u8; 16] = [
+    0x50, 0x52, 0xba, 0xe8, 0x00, 0xb0, 0x01, 0xee, 0xec, 0x84, 0xc0, 0x75, 0xfb, 0x5a, 0x58, 0xcb,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Bios32Call {
     Directory,
@@ -247,6 +297,41 @@ const _: () = {
             <= BIOS_INT_STUB_TABLE_ROM_OFFSET
     );
     assert!(BIOS_INT_STUB_TABLE_ROM_OFFSET + BIOS_INT_STUB_TABLE_LEN as usize <= BIOS_ROM_SIZE);
+    // The IzarraCD header block sits directly above the stub table, outside the
+    // firmware fetch window, and its in-segment entry offsets must agree with
+    // the ROM offsets the stubs are patched at.
+    assert!(
+        BIOS_INT_STUB_TABLE_ROM_OFFSET + BIOS_INT_STUB_TABLE_LEN as usize
+            <= CD_DEVICE_HEADER_ROM_OFFSET
+    );
+    assert!(CD_DEVICE_HEADER_ROM_OFFSET + CD_DEVICE_HEADER.len() <= CD_DEVICE_STRATEGY_ROM_OFFSET);
+    assert!(
+        CD_DEVICE_STRATEGY_ROM_OFFSET + CD_DEVICE_STRATEGY_STUB.len()
+            <= CD_DEVICE_INTERRUPT_ROM_OFFSET
+    );
+    assert!(CD_DEVICE_INTERRUPT_ROM_OFFSET + CD_DEVICE_INTERRUPT_STUB.len() <= 0xF500);
+    assert!(CD_DEVICE_HEADER_ROM_OFFSET == 0xF000 + CD_DEVICE_HEADER_OFF as usize);
+    assert!(
+        CD_DEVICE_HEADER[6] as usize | ((CD_DEVICE_HEADER[7] as usize) << 8)
+            == CD_DEVICE_STRATEGY_ROM_OFFSET - 0xF000
+    );
+    assert!(
+        CD_DEVICE_HEADER[8] as usize | ((CD_DEVICE_HEADER[9] as usize) << 8)
+            == CD_DEVICE_INTERRUPT_ROM_OFFSET - 0xF000
+    );
+    // The strategy stub's mailbox operands must match the mailbox constant, and
+    // the mailbox's four bytes must stay inside the firmware scratch block
+    // (below SYSVARS_SEG at 0x640).
+    assert!(
+        CD_DEVICE_STRATEGY_STUB[8] as usize | ((CD_DEVICE_STRATEGY_STUB[9] as usize) << 8)
+            == CD_DEVICE_MAILBOX_ADDRESS
+    );
+    assert!(
+        CD_DEVICE_STRATEGY_STUB[12] as usize | ((CD_DEVICE_STRATEGY_STUB[13] as usize) << 8)
+            == CD_DEVICE_MAILBOX_ADDRESS + 2
+    );
+    assert!(DOS_INT24_DEFAULT_STUB_ADDRESS + 5 <= CD_DEVICE_MAILBOX_ADDRESS);
+    assert!(CD_DEVICE_MAILBOX_ADDRESS + 4 <= 0x0640);
 
     assert!(
         INT10_FUNCTIONALITY_TABLE_OFFSET as usize + INT10_STATIC_FUNCTIONALITY.len()
@@ -300,6 +385,14 @@ pub(super) fn patch_rom(rom: &mut [u8]) {
     rom[BIOS_MASTER_IRQ_ISR_ROM_OFFSET
         ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()]
         .copy_from_slice(&BIOS_MASTER_IRQ_ISR_STUB);
+    rom[CD_DEVICE_HEADER_ROM_OFFSET..CD_DEVICE_HEADER_ROM_OFFSET + CD_DEVICE_HEADER.len()]
+        .copy_from_slice(&CD_DEVICE_HEADER);
+    rom[CD_DEVICE_STRATEGY_ROM_OFFSET
+        ..CD_DEVICE_STRATEGY_ROM_OFFSET + CD_DEVICE_STRATEGY_STUB.len()]
+        .copy_from_slice(&CD_DEVICE_STRATEGY_STUB);
+    rom[CD_DEVICE_INTERRUPT_ROM_OFFSET
+        ..CD_DEVICE_INTERRUPT_ROM_OFFSET + CD_DEVICE_INTERRUPT_STUB.len()]
+        .copy_from_slice(&CD_DEVICE_INTERRUPT_STUB);
     write_bios_int_stub_table(rom);
 }
 

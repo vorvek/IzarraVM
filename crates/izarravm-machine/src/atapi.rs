@@ -117,6 +117,9 @@ pub struct AtapiDevice {
     /// Set on a fresh mount so the first TEST UNIT READY reports UNIT ATTENTION
     /// (medium changed), as a real drive does after a disc swap.
     media_changed: bool,
+    /// Counts every insert and eject. Host-side caches keyed on the mounted
+    /// medium (the IzarraCD ISO index) compare against it instead of polling.
+    media_generation: u64,
     /// Latched by PREVENT/ALLOW MEDIUM REMOVAL (0x1E). While true, START STOP UNIT
     /// refuses to eject the tray.
     prevent_removal: bool,
@@ -142,6 +145,12 @@ impl AtapiDevice {
         }
     }
 
+    /// Monotonic count of inserts and ejects. Host caches keyed on the mounted
+    /// medium compare against this instead of polling the drive.
+    pub fn media_generation(&self) -> u64 {
+        self.media_generation
+    }
+
     /// Current CD-audio output volume (mode page 0x0E ports 0 and 1), 0xFF full.
     pub fn audio_volume(&self) -> [u8; 2] {
         self.audio_volume
@@ -152,6 +161,7 @@ impl AtapiDevice {
     pub fn insert(&mut self, image: CdImage) {
         self.image = Some(image);
         self.media_changed = true;
+        self.media_generation = self.media_generation.wrapping_add(1);
         self.started = false;
         self.play = Playback::default();
         self.mixer_lba = None;
@@ -167,6 +177,7 @@ impl AtapiDevice {
     pub fn eject(&mut self) {
         self.image = None;
         self.media_changed = true;
+        self.media_generation = self.media_generation.wrapping_add(1);
         self.started = false;
         self.prevent_removal = false;
         self.play = Playback::default();

@@ -769,6 +769,25 @@ impl Machine {
         self.sb16.set_linked_cd_level(level);
     }
 
+    /// The IzarraCD redirector's ISO index for the mounted medium, rebuilt when
+    /// the medium changes. `None` when no medium is mounted or the medium has
+    /// no parseable ISO9660 tree.
+    pub(super) fn cd_iso_index(&mut self) -> Option<&crate::cdiso::IsoIndex> {
+        let generation = self.ide.device().media_generation();
+        let stale = !matches!(&self.cd_iso_index, Some((cached, _)) if *cached == generation);
+        if stale {
+            let built = self
+                .ide
+                .device()
+                .image()
+                .and_then(crate::cdiso::IsoIndex::build);
+            self.cd_iso_index = Some((generation, built));
+        }
+        self.cd_iso_index
+            .as_ref()
+            .and_then(|(_, index)| index.as_ref())
+    }
+
     pub(super) fn icdex_cd_drive_number(&self) -> Option<u8> {
         // The ATAPI CD-ROM sits at a fixed DOS drive letter (D: = 3). With the
         // Rust DOS kernel retired there are no CONFIG.SYS block-device drivers
@@ -887,7 +906,12 @@ impl Machine {
             // the transfer address. Addressing mode 0 = HSG (LBA), 1 = Red Book.
             0x80 => {
                 let addr_mode = request[0x0D];
-                let xfer = driver_dword(&request, 0x0E);
+                // The transfer address is a real-mode far pointer (offset
+                // word, then segment word), per RBIL table 02597. Earlier
+                // code read it as a bare linear value, which agreed only
+                // while the segment word was zero.
+                let xfer_ptr = driver_dword(&request, 0x0E);
+                let xfer = ((xfer_ptr >> 16) << 4).wrapping_add(xfer_ptr & 0xFFFF);
                 let count = u16::from_le_bytes([request[0x12], request[0x13]]);
                 let start = driver_dword(&request, 0x14);
                 let lba = self.driver_addr_to_lba(addr_mode, start);
