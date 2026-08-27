@@ -47,8 +47,15 @@
 /* Modified by the Toka-DOS project, 2026: changed display banner from "FreeDOS kernel" to "Toka-DOS 3.0 kernel",
    and dropped the "- GIT " / raw OEM-id decoration for a cleaner user-facing string (build number only).
    This is string cosmetics only -- OEM_ID and the values reported via int 21 AH=30h/33FFh are unchanged. */
+/* Modified by the Toka-DOS project, 2026: the compile date is PINNED, not
+   __DATE__. The boot screen is a graded frame in the fixture scoreboard,
+   and __DATE__ moved its hash on every rebuild -- four allowed anchors
+   accumulated from date repaints alone. Update this string deliberately
+   when a release warrants it; the hash then moves once, on purpose. */
+#define TOKA_BUILD_DATE "Aug 27 2026"
+
 /* actual version string */
-#define KVS(v,s,o) "Toka-DOS 3.0 kernel " v "(build 20" #s ") [compiled " __DATE__ "]\n"
+#define KVS(v,s,o) "Toka-DOS 3.0 kernel " v "(build 20" #s ") [compiled " TOKA_BUILD_DATE "]\n"
 #define xKVS(v,s,o) KVS(v,s,o)
 #define KERNEL_VERSION_STRING xKVS(KERNEL_VERSION, REVISION_SEQ, OEM_ID)
 
@@ -60,7 +67,7 @@
 #define xTOKA_VERSION_STR(s) TOKA_VERSION_STR(s)
 #define TOKA_BUILD_LINE_1 \
   "Toka-DOS 3.0 - Kernel build 20" xTOKA_VERSION_STR(REVISION_SEQ) \
-  " - Compiled " __DATE__
+  " - Compiled " TOKA_BUILD_DATE
 #define TOKA_BUILD_LINE_2 \
   "(C) 1992-1997 Izarra SL - All Rights Reserved ** See LICENSE.TXT for more."
 

@@ -407,12 +407,29 @@ COUNT truename(const char FAR * src, char * dest, COUNT mode)
       if (media_check(TempCDS.cdsDpb) < 0)
         return DE_PATHNOTFND;
 
-      /* dos_cd ensures that the path exists; if not, we
-         need to change to the root directory */
-      if (dos_cd(cp) != SUCCESS) {
-        cp[TempCDS.cdsBackslashOffset + 1] =
-          cdsEntry->cdsCurrentPath[TempCDS.cdsBackslashOffset + 1] = '\0';
-        dos_cd(cp);
+      /* Modified by the Toka-DOS project, 2026: dos_cd re-walked the
+         current directory from the root on EVERY truename call -- one
+         full directory walk per open, delete, getattr and FindFirst.
+         When the driver just answered M_NOT_CHANGED for this exact call
+         and a prior walk already validated the CWD (cdsStrtClst holds
+         its cluster; a fresh CDS carries 0xFFFF), the walk cannot learn
+         anything new: dos_rmdir and dos_rename refuse the CWD by name,
+         the emptiness check protects every ancestor, and a renamed
+         ancestor leaves the cached cluster a valid directory, exactly
+         as on real MS-DOS, which trusts the CDS on fixed disks. Any
+         other media answer (M_CHANGED, M_DONT_KNOW, or a forced-rebuild
+         dpb flag) takes the old validating walk. */
+      if ((MediaReqHdr.r_mcretcode | TempCDS.cdsDpb->dpb_flags)
+              != M_NOT_CHANGED
+          || cdsEntry->cdsStrtClst == 0xFFFF)
+      {
+        /* dos_cd ensures that the path exists; if not, we
+           need to change to the root directory */
+        if (dos_cd(cp) != SUCCESS) {
+          cp[TempCDS.cdsBackslashOffset + 1] =
+            cdsEntry->cdsCurrentPath[TempCDS.cdsBackslashOffset + 1] = '\0';
+          dos_cd(cp);
+        }
       }
     }
 
@@ -662,7 +679,7 @@ if exist report.out del report.out
 cmdspy stop
 cmdspy flush
 cmdspy restart
-int ax=0x6000 -buf ds:si="abcöflkgsxkf\0" -buf es:di="%256s" -int 0x21 -d es:di:128 >spy_int.out
+int ax=0x6000 -buf ds:si="abcï¿½flkgsxkf\0" -buf es:di="%256s" -int 0x21 -d es:di:128 >spy_int.out
 cmdspy stop
 cmdspy report report.out
 more report.out
@@ -682,11 +699,11 @@ more report.out
 1123: IN:  C:\TOOL\INT.COM [FAIL 0001]
 1123: OUT:  C:\INTRSPY\SPY_INT.OUT
 1123: orig buffer:  C:\TOOL\INT.COM
-1123: IN:  abcöflkgsxkf [FAIL 0001]
+1123: IN:  abcï¿½flkgsxkf [FAIL 0001]
 1123: OUT:  C:\TOOL\INT.COM
-1123: orig buffer:  abcöflkgsxkf
+1123: orig buffer:  abcï¿½flkgsxkf
 1123: IN:  C:\INTRSPY\SPY_INT.BAT [FAIL 0001]
-1123: OUT:  C:\INTRSPY\ABCÖFLKG
+1123: OUT:  C:\INTRSPY\ABCï¿½FLKG
 1123: orig buffer:  C:\INTRSPY\SPY_INT.BAT
 1123: IN:  cmdspy.??? [FAIL 0001]
 1123: OUT:  C:\INTRSPY
@@ -708,7 +725,7 @@ DOSERR: 0000 (0)
 
 *<es:di:128> {
 43(C) 3A(:) 5C(\) 49(I) 4E(N) 54(T) 52(R) 53(S) 50(P) 59(Y) 5C(\) 41(A)
-42(B) 43(C) 99(Ö) 46(F) 4C(L) 4B(K) 47(G) 00(.) 3D(=) 30(0) 30(0) 30(0)
+42(B) 43(C) 99(ï¿½) 46(F) 4C(L) 4B(K) 47(G) 00(.) 3D(=) 30(0) 30(0) 30(0)
 30(0) 20( ) 20( ) 20( ) 43(C) 58(X) 3D(=) 30(0) 30(0) 30(0) 30(0) 28(()
 30(0) 29()) 20( ) 32(2) 38(8) 28(() 28(() 29()) 20( ) 33(3) 30(0) 28(()
 30(0) 29()) 20( ) 32(2) 39(9) 28(() 29()) 29()) 20( ) 32(2) 30(0) 28(()
