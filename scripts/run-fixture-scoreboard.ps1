@@ -71,6 +71,20 @@ pwsh scripts/run-fixture-scoreboard.ps1 -Fixtures doom-486,wolf3d-486 -Label qui
 pwsh scripts/run-fixture-scoreboard.ps1 -SelfTest
 #>
 
+# POSITIONAL BINDING IS OFF for the whole param block. Under `pwsh -File`, a
+# [string[]] parameter takes exactly ONE argument token; a second token becomes
+# a POSITIONAL argument and lands in the next unbound [string] parameter.
+# Measured 2026-08-27: `-Fixtures prince-486 tombraid-loader-586` (the shape an
+# outer PowerShell produces from `-Fixtures @('prince-486','tombraid-loader-586')`)
+# bound only prince-486 to -Fixtures, bound 'tombraid-loader-586' to
+# -ResultsDirectory, ran ONE row of a two-row sweep, wrote the board into a
+# directory literally named tombraid-loader-586 in the repository root, and
+# EXITED 0. With positional binding off, the stray token is a binder error
+# before one line of this script runs. Every argument must be named; every
+# documented caller already complies. The comma shape `-Fixtures a,b` still
+# works: Resolve-FixtureSelection splits it, the same way
+# Resolve-KnobPassthrough splits -Knobs.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Executable = "target/release/izarravm.exe",
     [string[]]$Fixtures = @(),
@@ -699,6 +713,7 @@ function Invoke-ScoreboardSelfTest {
     }
 
     Assert-ScoreboardKnobPassthroughSelfTest
+    Assert-ScoreboardFixtureSelectionSelfTest
 
     Write-Host "fixture scoreboard self-test passed"
 }
@@ -1800,9 +1815,15 @@ function Resolve-KnobPassthrough([string[]]$Specification, $ReservedNames) {
     # "1,B=2" and the second would never be armed at all: a board that ran an arm
     # nobody asked for and labelled it one that nobody ran.
     #
-    # -Fixtures survives the same binder quirk only because it checks its values
-    # against a known fixture list and throws on the mangled one. A knob value
-    # cannot be checked against a list, so the split has to happen here.
+    # -Fixtures does NOT survive the same binder quirk on its own. The old claim
+    # here -- that its known-name check throws on the mangled value -- was true
+    # for the comma shape only. For the two-token shape the extra token never
+    # reaches -Fixtures at all: it binds POSITIONALLY to a later [string]
+    # parameter, measured 2026-08-27 (see the note above the param block). So
+    # -Fixtures gets the same treatment: PositionalBinding is off script-wide,
+    # and Resolve-FixtureSelection splits commas the way this function does.
+    # A knob value cannot be checked against a list, so the split for -Knobs
+    # has to happen here.
     #
     # The consequence is that a knob VALUE may not contain a comma. That is not
     # a silent restriction: `IZARRAVM_X=a,b` splits to `IZARRAVM_X=a` and a bare
@@ -1853,6 +1874,51 @@ function Resolve-KnobPassthrough([string[]]$Specification, $ReservedNames) {
         $resolved[$name] = $value
     }
     return $resolved
+}
+
+<#
+Parse the -Fixtures selection into a validated list of fixture names.
+
+Pure, for the same reason Resolve-KnobPassthrough is: the self-test can drive
+it directly, and a typo fails before the first row rather than after it.
+
+It splits on the comma ITSELF because `pwsh -File ... -Fixtures a,b` binds ONE
+string "a,b" to the [string[]] parameter; without the split, the known-name
+check would reject the documented comma shape instead of running two rows.
+The two-token shape (`-Fixtures a b`) never gets here -- PositionalBinding is
+off for the whole script, so the binder rejects the second token first.
+
+Every element is then checked against the fixture table. Whitespace around an
+element is trimmed (a name can never gain meaning from padding); an empty
+element or a repeated one is refused, because both mean the caller's list and
+the board's row count disagree.
+#>
+function Resolve-FixtureSelection([string[]]$Specification, [string[]]$KnownNames) {
+    $entries = @()
+    foreach ($element in @($Specification)) {
+        if ($null -eq $element) {
+            throw "-Fixtures contains a null entry. Name each fixture, comma-separated."
+        }
+        $entries += ([string]$element).Split(',')
+    }
+
+    $selected = @()
+    foreach ($entry in $entries) {
+        $name = ([string]$entry).Trim()
+        if ($name -eq "") {
+            throw ("-Fixtures contains an empty entry. A stray comma would silently " +
+                "shrink the sweep, so it is refused instead.")
+        }
+        if (@($KnownNames) -notcontains $name) {
+            throw "Unknown fixture '$name'. Known: $(@($KnownNames) -join ', ')"
+        }
+        if ($selected -contains $name) {
+            throw ("-Fixtures names '$name' more than once. The board runs each fixture " +
+                "once, so a repeat would report fewer rows than the caller asked for.")
+        }
+        $selected += $name
+    }
+    return ,$selected
 }
 
 # The child environment for one row: scrub, then the board's own table, then the
@@ -2076,6 +2142,109 @@ function Assert-ScoreboardKnobPassthroughSelfTest {
     } finally {
         [Environment]::SetEnvironmentVariable($leak, $previousLeak)
         [Environment]::SetEnvironmentVariable($realKnob, $previousReal)
+    }
+}
+
+<#
+The -Fixtures selection self-test.
+
+Half of it drives Resolve-FixtureSelection directly. The other half spawns this
+very script under `pwsh -File` with the MANGLED two-token shape from the
+2026-08-27 incident, because that failure happens in the parameter binder --
+before any function in this file runs -- and only a real child invocation can
+prove the guard fires there. The campaign rule applies: a new guard must be
+shown to go RED on the broken input, and a green control must show the child
+harness itself works, so the red row cannot pass by being unable to run.
+#>
+function Assert-ScoreboardFixtureSelectionSelfTest {
+    $known = @((Get-FixtureTable).name)
+
+    # --- the `pwsh -File` comma-binding trap, resolved not rejected ----------
+    $split = Resolve-FixtureSelection @("doom-486,wolf3d-486") $known
+    Assert-ScoreboardSelfTestEqual $split.Count 2 `
+        "a comma-joined -Fixtures string splitting into two fixtures"
+    Assert-ScoreboardSelfTestEqual $split[0] "doom-486" `
+        "the first fixture of a comma-joined string"
+    Assert-ScoreboardSelfTestEqual $split[1] "wolf3d-486" `
+        "the second fixture of a comma-joined string"
+
+    $padded = Resolve-FixtureSelection @(" doom-486 , wolf3d-486") $known
+    Assert-ScoreboardSelfTestEqual $padded.Count 2 `
+        "whitespace around comma-joined fixture names"
+
+    # --- what must be refused, and loudly ------------------------------------
+    Assert-ScoreboardSelfTestThrows {
+        Resolve-FixtureSelection @("doom-486,not-a-fixture") $known
+    } "Unknown fixture 'not-a-fixture'" "an unknown name after the comma split"
+
+    Assert-ScoreboardSelfTestThrows {
+        Resolve-FixtureSelection @("doom-486,") $known
+    } "empty entry" "a stray trailing comma"
+
+    Assert-ScoreboardSelfTestThrows {
+        Resolve-FixtureSelection @("doom-486", "doom-486") $known
+    } "more than once" "a fixture named twice"
+
+    # --- the binder guard, observed from an actual child process -------------
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ("izarravm-fixsel-" +
+        [Guid]::NewGuid().ToString("N").Substring(0, 10))
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    try {
+        $pwshExecutable = (Get-Process -Id $PID).Path
+        $outputPath = Join-Path $scratch "stdout.txt"
+        $failurePath = Join-Path $scratch "stderr.txt"
+
+        # RED: the incident's exact shape. Two tokens after -Fixtures; the
+        # second must be a binder error, never a silent one-row board. The
+        # child carries -ListFixtures so that even a broken guard costs a
+        # listing, not a bench run.
+        $start = @{
+            FilePath               = $pwshExecutable
+            ArgumentList           = @("-NoProfile", "-File", $PSCommandPath,
+                "-Fixtures", "prince-486", "tombraid-loader-586", "-ListFixtures")
+            RedirectStandardOutput = $outputPath
+            RedirectStandardError  = $failurePath
+            PassThru               = $true
+            NoNewWindow            = $true
+        }
+        $process = Start-Process @start
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw "scoreboard self-test failed: the mangled -Fixtures child never exited"
+        }
+        if ($process.ExitCode -eq 0) {
+            throw ("scoreboard self-test failed: the mangled two-token -Fixtures " +
+                "invocation exited 0. The 2026-08-27 silent-subset hazard is back: " +
+                "the second fixture bound positionally instead of failing the binder.")
+        }
+        $failureText = [string](Get-Content -LiteralPath $failurePath -Raw)
+        if ($failureText -notmatch 'tombraid-loader-586') {
+            throw ("scoreboard self-test failed: the mangled -Fixtures child failed, but " +
+                "not on the stray token. stderr: $failureText")
+        }
+
+        # GREEN control: the same invocation minus the stray token must work,
+        # or the red row above proves nothing about the guard.
+        $start.ArgumentList = @("-NoProfile", "-File", $PSCommandPath,
+            "-Fixtures", "prince-486", "-ListFixtures")
+        $process = Start-Process @start
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw "scoreboard self-test failed: the -ListFixtures control child never exited"
+        }
+        if ($process.ExitCode -ne 0) {
+            $failureText = [string](Get-Content -LiteralPath $failurePath -Raw)
+            throw ("scoreboard self-test failed: the well-formed -ListFixtures control " +
+                "exited $($process.ExitCode); the red row above is therefore " +
+                "meaningless. stderr: $failureText")
+        }
+        $listing = [string](Get-Content -LiteralPath $outputPath -Raw)
+        if ($listing -notmatch 'tombraid-loader-586') {
+            throw ("scoreboard self-test failed: the -ListFixtures control printed no " +
+                "fixture table")
+        }
+    } finally {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -2603,13 +2772,8 @@ if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
 
 $table = Get-FixtureTable
 if ($Fixtures.Count -gt 0) {
-    $known = $table.name
-    foreach ($requested in $Fixtures) {
-        if ($known -notcontains $requested) {
-            throw "Unknown fixture '$requested'. Known: $($known -join ', ')"
-        }
-    }
-    $table = @($table | Where-Object { $Fixtures -contains $_.name })
+    $selected = Resolve-FixtureSelection $Fixtures @($table.name)
+    $table = @($table | Where-Object { $selected -contains $_.name })
 }
 
 if ([string]::IsNullOrWhiteSpace($ResultsDirectory)) {
