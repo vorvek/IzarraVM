@@ -2478,11 +2478,11 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
     };
 
     let mut unmasked = Encoder::new();
-    emit_effective_address(&mut unmasked, addr, AddressWrap::None);
+    emit_effective_address(&mut unmasked, addr, AddressWrap::None, 0);
     let unmasked = unmasked.finish();
 
     let mut masked = Encoder::new();
-    emit_effective_address(&mut masked, addr, AddressWrap::Word);
+    emit_effective_address(&mut masked, addr, AddressWrap::Word, 0);
     let masked = masked.finish();
 
     let mut probe = Encoder::new();

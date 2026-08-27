@@ -12100,9 +12100,9 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 //   formed first, then `emit_store_bias_probe` (RCX/RDI) and `emit_read_store_value` (RDX).
 //
 // So nothing is live across the address form at either site, and the lane arm's RAX write is
-// indistinguishable from the baked arm's `mov eax, imm32` to every caller. The `scale != 1`
-// index path clobbers RCX in BOTH arms; that is `emit_effective_address`'s pre-existing
-// contract, not the lane's, and it is as true for a store as it is for a load.
+// indistinguishable from the baked arm's `mov eax, imm32` to every caller. Since the LEA fusion,
+// `emit_effective_address` writes RAX and nothing else on either arm -- the `scale != 1` index
+// path's RCX detour is gone -- so the contract has narrowed rather than widened.
 //
 // # Semantics
 //
@@ -15507,7 +15507,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // above. At Word the interpreter's `write_gpr_sized(reg, Word, offset)` merges
                 // sixteen bits and leaves the destination's high half alone, which is what
                 // `emit_write_gpr16` does and what the `mov_r32_r32` below would destroy.
-                emit_effective_address(&mut e, addr, memory.address_wrap);
+                // `fold` is 0: guest LEA never reaches a segment, so there is no base to fold.
+                emit_effective_address(&mut e, addr, memory.address_wrap, 0);
                 match width {
                     MemoryWidth::Dword => e.mov_r32_r32(home(dst), Reg::RAX),
                     MemoryWidth::Word => emit_write_gpr16(&mut e, dst, Reg::RAX),
@@ -19077,34 +19078,62 @@ fn emit_double_shift_mem(
     unreachable!("direct memory lowering is x86-64-only")
 }
 
-fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: AddressWrap) {
-    // The lane form differs from the baked form in exactly where the displacement comes from:
-    // the four bytes of the guest instruction's disp32 field, loaded on every execution, so a
-    // guest patch of that field takes effect on the next entry with no recompile. Like the
-    // baked arm, the lane arm writes RAX and nothing else — and the 32-bit load clears the
-    // upper half, leaving exactly the state `mov eax, imm32` leaves — so the two arms present
-    // one register contract to every caller. (The scale != 1 index path below clobbers RCX in
-    // BOTH arms; that is this function's pre-existing contract, not the lane's.) Everything
-    // downstream (base/index adds, the 64K wrap, the segment-limit compare, the fast-map
-    // lookup and its guards) already runs on the runtime value, which is what makes a patched
-    // displacement take the same side exits the baked form would.
+/// Form the guest effective address in RAX, optionally with `fold` -- a segment base the CALLER
+/// has established may ride the address-forming instruction's own displacement field -- already
+/// added in.
+///
+/// The baked arm is ONE `lea` with the 0x67 address-size override: base, scaled index and
+/// displacement all land in the addressing mode, the sum is formed mod 2^32 out of the 32-bit
+/// register halves, and the 32-bit destination write zero-extends. That is bit-for-bit what the
+/// `mov`/`add`/`shl`/`add` chain it replaces computed, and it needs no invariant about the guest
+/// homes' upper halves for exactly the reason 86Box emits 0x67 on every EA-forming LEA it
+/// generates. It also writes NO FLAGS where the `add` chain wrote them: a strict weakening of a
+/// clobber set, and no consumer can have been depending on it, because the base-less index-less
+/// arm below is `mov eax, imm32` and has always preserved flags on the same paths.
+///
+/// The lane form differs from the baked form in exactly where the displacement comes from: the
+/// four bytes of the guest instruction's disp32 field, loaded on every execution, so a guest patch
+/// of that field takes effect on the next entry with no recompile. Like the baked arm, the lane
+/// arm writes RAX and nothing else -- and the 32-bit load clears the upper half, leaving exactly
+/// the state `mov eax, imm32` leaves -- so the two arms present one register contract to every
+/// caller. Everything downstream (the 64K wrap, the segment-limit compare, the fast-map lookup and
+/// its guards) already runs on the runtime value, which is what makes a patched displacement take
+/// the same side exits the baked form would.
+fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: AddressWrap, fold: u32) {
     match addr.disp_lane {
         Some(lane) => {
+            // `fold` is ALWAYS 0 here, and that is the CALLER's obligation rather than something
+            // this arm can check: the lane loads its displacement out of guest RAM on every
+            // execution, so there is no immediate field for a segment base to ride. `foldable`
+            // below excludes a live lane explicitly and by name. It is deliberately NOT a
+            // `debug_assert`: that compiles out in release, and the failure it would be guarding
+            // is a silently wrong guest address on every execution of the block.
             e.mov_r64_imm64(Reg::RAX, lane.host as u64);
             e.load_r32_disp32(Reg::RAX, Reg::RAX, 0);
+            if let Some(index) = addr.index {
+                // The scaled index folds into the LEA around the runtime displacement, which is
+                // what retires the `mov`/`shl`/`add` RCX detour the scale != 1 arm used to carry.
+                // This function no longer clobbers RCX on any arm; the contract narrows.
+                e.lea_r32(Reg::RAX, Some(Reg::RAX), Some((home(index), addr.scale)), 0);
+            }
+            if let Some(base) = addr.base {
+                e.add_r32_r32(Reg::RAX, home(base));
+            }
         }
-        None => e.mov_r32_imm32(Reg::RAX, addr.disp),
-    }
-    if let Some(base) = addr.base {
-        e.add_r32_r32(Reg::RAX, home(base));
-    }
-    if let Some(index) = addr.index {
-        if addr.scale == 1 {
-            e.add_r32_r32(Reg::RAX, home(index));
-        } else {
-            e.mov_r32_r32(Reg::RCX, home(index));
-            e.shl_r32_imm8(Reg::RCX, addr.scale.trailing_zeros() as u8);
-            e.add_r32_r32(Reg::RAX, Reg::RCX);
+        None => {
+            let disp = addr.disp.wrapping_add(fold);
+            match (addr.base, addr.index) {
+                // Not an LEA at all, and neither is 86Box's counterpart: with no register operand
+                // the whole address is the immediate, and `mov eax, imm32` is both shorter and
+                // flag-free.
+                (None, None) => e.mov_r32_imm32(Reg::RAX, disp),
+                (base, index) => e.lea_r32(
+                    Reg::RAX,
+                    base.map(home),
+                    index.map(|index| (home(index), addr.scale)),
+                    disp,
+                ),
+            }
         }
     }
     // The 64K wrap belongs HERE rather than in the segmented helper, because the effective
@@ -19144,8 +19173,22 @@ fn emit_segmented_linear_address(
     // and the segment base, so masking afterwards would compare an address the guest never forms
     // -- AND the mask is the precondition of the compare's own elision under `AddressWrap::Word`
     // below. Hoist the mask after the compare and that elision stops being sound.
-    emit_effective_address(e, addr, wrap);
     let descriptor = memory.segments.descriptor(addr.segment);
+    // Folding the segment base into the address-forming instruction's own displacement field is
+    // licensed only when NOTHING has to sit between the effective address and the base add:
+    //
+    //   * a FLAT limit, because no compare is emitted between them (the block below is skipped);
+    //   * `AddressWrap::None`, because the 64K mask is architecturally ON the effective address,
+    //     before the base, so it would sit between them;
+    //   * NO displacement lane, because the lane arm forms the address through a RUNTIME load out
+    //     of guest RAM and has no immediate field to fold into. Without this third term the fold
+    //     is computed, passed down and silently dropped, and every execution of the block
+    //     addresses the raw offset instead of `base + offset` -- in a release build too, which is
+    //     why it is a term of the predicate and not an assert inside the callee.
+    let foldable =
+        descriptor.limit == u32::MAX && wrap == AddressWrap::None && addr.disp_lane.is_none();
+    let fold = if foldable { descriptor.base } else { 0 };
+    emit_effective_address(e, addr, wrap, fold);
     if descriptor.limit != u32::MAX {
         // `bytes() - 1` here is the access's EXTENT, the offset of its last byte, not an alignment
         // mask and not the split charge. It shares a spelling with `split_extra_bytes` and
@@ -19190,7 +19233,9 @@ fn emit_segmented_linear_address(
             );
         }
     }
-    if descriptor.base != 0 {
+    // `foldable` is false on every path that reached the block above, so this add and the fold are
+    // mutually exclusive by construction and the base is added exactly once.
+    if descriptor.base != 0 && !foldable {
         e.add_r32_imm32(Reg::RAX, descriptor.base);
     }
 }

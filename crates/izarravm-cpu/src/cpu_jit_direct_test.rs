@@ -7545,6 +7545,147 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
     }
 }
 
+/// THE INSIDE-THE-LIMIT COMPANION to the fixture above, and it exists because of a mutant that
+/// fixture does not kill.
+///
+/// `emit_segmented_linear_address` may fold the segment base into the address-forming
+/// instruction's own displacement field only when the segment's limit is 4 GB. A finite limit puts
+/// a COMPARE between the effective address and the base add, and that compare is written against a
+/// segment OFFSET: fold the base under a finite limit and the compare reads `base + offset`
+/// against `limit - (width - 1)`.
+///
+/// The fixture above cannot see that. Its access is past the limit, so a compare against
+/// `base + offset` refuses it too -- by more, but a refusal is a refusal and every assertion there
+/// still holds. What the fold breaks is the OTHER direction: an access INSIDE the limit whose
+/// LINEAR address is above `max_start` starts refusing where it must serve.
+///
+/// So this fixture's constants are chosen for exactly that gap, `OFFSET <= max_start < base +
+/// OFFSET`. Every access here is architecturally legal and must be served natively with ZERO side
+/// exits, and it must read through the segment base rather than past it -- which is what the decoy
+/// planted at the raw offset pins absolutely, the way native-vs-interpreter equality alone could
+/// not (both roles could be wrong together).
+#[test]
+fn an_access_inside_a_based_segment_limit_is_served_natively_through_its_base() {
+    const ENTRY: u32 = 0x100;
+    const LOAD: u32 = ENTRY + 2;
+    const OFFSET: u32 = 0x1800;
+    // `max_start = LIMIT - 3 = 0x1ffc`, so OFFSET is inside the limit with room to spare while
+    // every base below carries `base + OFFSET` past it.
+    const LIMIT: u32 = 0x1fff;
+    const LOADED: u32 = 0xdead_beef;
+    const DECOY: u32 = 0x1111_2222;
+
+    for (segment, prefix, base) in [
+        (SegmentIndex::Ss, 0x36u8, 0x0800u32),
+        (SegmentIndex::Fs, 0x64u8, 0x0c00u32),
+    ] {
+        let mut code = vec![
+            0x40, // inc eax
+            0x41, // inc ecx
+        ];
+        code.push(prefix);
+        code.extend_from_slice(&[0x8b, 0x15]);
+        code.extend_from_slice(&OFFSET.to_le_bytes());
+        let mut memory = vec![0; 0x4000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let hit = (base + OFFSET) as usize;
+        memory[hit..hit + 4].copy_from_slice(&LOADED.to_le_bytes());
+        memory[OFFSET as usize..OFFSET as usize + 4].copy_from_slice(&DECOY.to_le_bytes());
+
+        let mut native = segment_override_cpu();
+        let mut interp = segment_override_cpu();
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+        for cpu in [&mut native, &mut interp] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.limit = LIMIT;
+            cpu.registers.set_segment(segment, descriptor);
+            cpu.registers.set_esp(0x0f00);
+            cpu.registers.eip = ENTRY;
+        }
+
+        for lin in [ENTRY, ENTRY + 1, LOAD] {
+            for (cpu, bus) in [
+                (&mut native, &mut native_bus),
+                (&mut interp, &mut interp_bus),
+            ] {
+                cpu.registers.eip = lin;
+                cpu.fetch_decoded(bus, lin).expect("fixture decode");
+            }
+        }
+        for cpu in [&mut native, &mut interp] {
+            cpu.registers.eip = ENTRY;
+        }
+        native.set_fast_map_enabled_for_test(true);
+        // Both the code page and the payload page, because this access is SERVED: the fixture
+        // above never reaches memory at all.
+        for page in (0..0x4000u32).step_by(0x1000) {
+            map_direct_page(
+                &mut native,
+                &mut native_bus,
+                page,
+                page,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                true,
+            );
+        }
+
+        let key = jit::direct::key_for(&native, ENTRY, true).unwrap();
+        assert!(matches!(
+            native.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let compilation = jit::direct::compile(&mut native, ENTRY, true).unwrap();
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{segment:?}: the block must span both INCs and the load"
+        );
+        let id = native.jit_direct.install(&compilation).unwrap();
+        let block = native
+            .jit_direct
+            .block(id)
+            .expect("installed block must be live");
+        let side_exits = native.perf_counters().jit_direct_side_exits;
+        let insns_before = native.perf_counters().jit_direct_insns;
+
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap()
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(
+            native.perf_counters().jit_direct_side_exits - side_exits,
+            0,
+            "{segment:?}: an access INSIDE the limit must take no side exit at all"
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - insns_before,
+            3,
+            "{segment:?}: all three slots must have retired natively"
+        );
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{segment:?}: registers"
+        );
+        assert_eq!(native_bus.memory, interp_bus.memory, "{segment:?}: RAM");
+        assert_eq!(
+            native.registers.edx(),
+            LOADED,
+            "{segment:?}: the load must have read through the segment base, not at the raw offset"
+        );
+    }
+}
+
 /// T4 of the watched-page-bit battery (the fast path really is fast): with the bit emission ON,
 /// an unwatched-by-bit store consults NOTHING — proven by deliberately constructing the
 /// incoherent state the strict-edge sweeps exist to prevent (a live bit-clear entry for a page

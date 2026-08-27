@@ -422,6 +422,140 @@ fn dword_load_widen_lane_matches_the_interpreter_across_patches() {
     }
 }
 
+/// The DS base for the BASED-FLAT fixture below. Non-zero deliberately, and paired with the flat
+/// limit `SegmentRegister::flat` already gives it.
+const BASED_DS_BASE: u32 = 0x1000;
+
+/// The based-flat displacements, as SEGMENT OFFSETS. `BASED_DS_BASE + offset` is `TARGETS`
+/// permuted, so every access lands on a mapped, writable, 4-byte-aligned address off the block's
+/// own code page -- and every one of them lands somewhere DIFFERENT from the raw offset, which is
+/// what makes a dropped base add a memory difference rather than a silent no-op.
+const BASED_OFFSETS: [u32; 4] = [0x1000, 0x2000, 0x3440, 0x0000];
+
+/// A flat DS (`limit == u32::MAX`) with a NON-ZERO base.
+fn based_flat_ds_cpu(arms: &ArmOverride) -> CpuGsw {
+    let mut cpu = flat_cpu(arms);
+    let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+    assert_eq!(
+        ds.limit,
+        u32::MAX,
+        "this fixture's whole subject is the FLAT-limit arm; a finite limit here would compile \n         the other shape and assert nothing"
+    );
+    ds.base = BASED_DS_BASE;
+    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+    cpu
+}
+
+/// THE FLAT-LIMIT, NON-ZERO-BASE, LIVE-LANE SHAPE -- the one combination no fixture in this tree
+/// compiled before, and the one the effective-address fusion's `foldable` predicate has to refuse.
+///
+/// `emit_segmented_linear_address` may fold the segment base into the address-forming instruction's
+/// displacement field only when nothing has to sit between the effective address and the base add:
+/// a flat limit (no compare is emitted between them) and `AddressWrap::None` (no 64K mask). Both
+/// hold here. The third condition is the one that is invisible from the descriptor: a live
+/// displacement LANE forms the address through a runtime load out of guest RAM and has **no
+/// immediate field to fold into**, so a `foldable` that consults only the descriptor and the wrap
+/// computes the fold, passes it down, and has it silently dropped -- and every execution of the
+/// block then addresses `patched_disp` instead of `BASED_DS_BASE + patched_disp`.
+///
+/// `cpu_jit_disp_store_lane_test.rs`'s finite-limit fixture cannot catch that: its limit is finite,
+/// so the fold is refused there for a different reason. The flat fixtures cannot catch it either:
+/// their base is zero, so the fold is zero. This fixture is the intersection.
+///
+/// The reference is an interpreter running the same bytes with no block at all, and the comparison
+/// is whole guest memory plus settled registers, so a store that landed 0x1000 bytes away and a
+/// load that read from 0x1000 bytes away are both failures.
+fn based_flat_identity(subject: [u8; 2], store: bool, widen: bool, one_lookup_store: bool) {
+    let arms = force_arms(store, widen, one_lookup_store);
+    let patches = [
+        BASED_OFFSETS[0],
+        BASED_OFFSETS[1],
+        BASED_OFFSETS[2],
+        BASED_OFFSETS[3],
+        BASED_OFFSETS[1],
+    ];
+
+    let mut native = based_flat_ds_cpu(&arms);
+    let mut native_bus = test_bus(image(subject, patches[0]));
+    map_flat_pages(&mut native, &mut native_bus);
+    decode_at(&mut native, &mut native_bus, &block_starts());
+    seed_patch_history(&mut native, LANE);
+    let id = install(&mut native, 3);
+    assert_eq!(
+        native.perf_counters().smc_lane_registrations,
+        1,
+        "{subject:02x?} (one_lookup_store={one_lookup_store}) did not take a lane; this fixture's \n         whole subject is the LANE arm and every assertion below would be vacuous"
+    );
+
+    let mut interpreter = based_flat_ds_cpu(&arms);
+    let mut interpreter_bus = test_bus(image(subject, patches[0]));
+    decode_at(&mut interpreter, &mut interpreter_bus, &block_starts());
+
+    for (round, &offset) in patches.iter().enumerate() {
+        if round != 0 {
+            // Through ES, which stays flat: `LANE` is a LINEAR address and DS is based here.
+            guest_store(&mut native, &mut native_bus, LANE, offset);
+            guest_store(&mut interpreter, &mut interpreter_bus, LANE, offset);
+        }
+        let ebx = 0x6162_6300u32.wrapping_add(round as u32 + 1);
+        arm_cpu(&mut native, ebx);
+        arm_cpu(&mut interpreter, ebx);
+
+        let block = native
+            .jit_direct
+            .block(id)
+            .expect("the lane block survives every patch");
+        let side_exits = native.perf_counters().jit_direct_side_exits;
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "native block did not run in round {round}"
+        );
+        for _ in 0..3 {
+            interpreter.cycle(&mut interpreter_bus).unwrap();
+        }
+
+        assert_eq!(
+            native.perf_counters().jit_direct_side_exits - side_exits,
+            0,
+            "a based-flat laned access must run to the end of the block natively \n             (offset {offset:#010x}, one_lookup_store={one_lookup_store})"
+        );
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interpreter),
+            "registers differ at offset {offset:#010x} (one_lookup_store={one_lookup_store})"
+        );
+        assert_eq!(
+            native.eflags(),
+            interpreter.eflags(),
+            "EFLAGS differ at offset {offset:#010x} (one_lookup_store={one_lookup_store})"
+        );
+        assert_eq!(
+            native_bus.memory, interpreter_bus.memory,
+            "guest memory differs at offset {offset:#010x} (one_lookup_store={one_lookup_store})"
+        );
+    }
+}
+
+/// The STORE front through a based flat segment with a live lane. Both store paths, because the
+/// two are different code and both reach the lane through `emit_segmented_linear_address`.
+#[test]
+fn a_laned_store_through_a_based_flat_segment_matches_the_interpreter() {
+    for one_lookup_store in [true, false] {
+        based_flat_identity(STORE_DWORD, true, false, one_lookup_store);
+    }
+}
+
+/// The READ front through the same segment shape. A different emitter and a different knob from
+/// the store above, sharing exactly the address front this fixture is about.
+#[test]
+fn a_laned_load_through_a_based_flat_segment_matches_the_interpreter() {
+    for one_lookup_store in [true, false] {
+        based_flat_identity(LOAD_DWORD, false, true, one_lookup_store);
+    }
+}
+
 /// THE MID-BLOCK PATCH: the store lane's own record is rewritten while the block is installed.
 ///
 /// The write is absorbed (`lane_only`), so the block is NOT retired, the heat map is untouched,
