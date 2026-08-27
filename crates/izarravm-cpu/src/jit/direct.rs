@@ -15201,6 +15201,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         word_reads,
         dword_reads,
         weighted_fp_clocks,
+        byte_stores,
+        word_stores,
+        dword_stores,
     };
     let mut e = Encoder::new();
     for reg in SAVED_HOST_REGS {
@@ -17056,6 +17059,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     debug_assert_eq!(completed.byte_reads, byte_reads);
     debug_assert_eq!(completed.word_reads, word_reads);
     debug_assert_eq!(completed.dword_reads, dword_reads);
+    debug_assert_eq!(completed.byte_stores, byte_stores);
+    debug_assert_eq!(completed.word_stores, word_stores);
+    debug_assert_eq!(completed.dword_stores, dword_stores);
     debug_assert_eq!(
         slots.iter().map(|slot| slot.kind.byte_stores()).sum::<u8>(),
         byte_stores
@@ -17111,13 +17117,15 @@ fn emit_accounting(
     }
 }
 
-fn accounting_fields(accounting: StaticAccounting) -> [(i8, u32); 5] {
+fn accounting_fields(accounting: StaticAccounting) -> [(i8, u32); 7] {
     [
         (STACK_INSTRUCTIONS, u32::from(accounting.instructions)),
         (STACK_RAW_CLOCKS, u32::from(accounting.raw_clocks)),
         (STACK_BYTE_READS, u32::from(accounting.byte_reads)),
         (STACK_DWORD_READS, u32::from(accounting.dword_reads)),
         (STACK_WEIGHTED_FP_CLOCKS, accounting.weighted_fp_clocks),
+        (STACK_RAM_BYTE_WRITES, u32::from(accounting.byte_stores)),
+        (STACK_RAM_DWORD_WRITES, u32::from(accounting.dword_stores)),
     ]
 }
 
@@ -17131,6 +17139,10 @@ fn emit_add_static_accounting(e: &mut Encoder, accounting: StaticAccounting) {
     if accounting.word_reads != 0 {
         e.mov_r64_imm64(Reg::RDX, u64::from(accounting.word_reads) << 32);
         e.add_r64_to_mem_disp8(Reg::RSP, STACK_BYTE_READS, Reg::RDX);
+    }
+    if accounting.word_stores != 0 {
+        e.mov_r64_imm64(Reg::RDX, u64::from(accounting.word_stores) << 32);
+        e.add_r64_to_mem_disp8(Reg::RSP, STACK_RAM_BYTE_WRITES, Reg::RDX);
     }
 }
 
@@ -17152,6 +17164,14 @@ fn emit_add_repeated_accounting(e: &mut Encoder, accounting: StaticAccounting) {
         }
         e.shift_r64_imm8(4, Reg::RDX, 32);
         e.add_r64_to_mem_disp8(Reg::RSP, STACK_BYTE_READS, Reg::RDX);
+    }
+    if accounting.word_stores != 0 {
+        e.load_r64_disp8(Reg::RDX, Reg::RSP, STACK_ITERATIONS);
+        if accounting.word_stores != 1 {
+            e.imul_r64_imm32(Reg::RDX, u32::from(accounting.word_stores));
+        }
+        e.shift_r64_imm8(4, Reg::RDX, 32);
+        e.add_r64_to_mem_disp8(Reg::RSP, STACK_RAM_BYTE_WRITES, Reg::RDX);
     }
 }
 
@@ -17558,6 +17578,9 @@ struct StaticAccounting {
     word_reads: u8,
     dword_reads: u8,
     weighted_fp_clocks: u32,
+    byte_stores: u8,
+    word_stores: u8,
+    dword_stores: u8,
 }
 
 impl StaticAccounting {
@@ -17568,6 +17591,9 @@ impl StaticAccounting {
         self.byte_reads += slot.kind.byte_reads();
         self.word_reads += slot.kind.word_reads();
         self.dword_reads += slot.kind.dword_reads();
+        self.byte_stores += slot.kind.byte_stores();
+        self.word_stores += slot.kind.word_stores();
+        self.dword_stores += slot.kind.dword_stores();
     }
 
     fn with_instruction_retired(self) -> Self {
@@ -17898,27 +17924,6 @@ fn emit_x87_memory_completion(
     let mode13 = e.label();
     let done = e.label();
     e.jz(mode13);
-    if direction == NativeX87MemoryDirection::Write {
-        match width {
-            MemoryWidth::Byte => unreachable!("no x87 memory form is byte-wide"),
-            MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
-            MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
-            // Two dword transactions per m64 access (`write_qword` splits into two independent
-            // 4-aligned dword writes; see `MemoryWidth::alignment_bytes`), so the dword lane
-            // moves by 2 rather than 1. This is the RAM lane, which is not mode-13: it feeds
-            // `exit.ram_dword_writes`, charged directly at run.rs.
-            MemoryWidth::Qword => emit_dynamic_increment_by(e, STACK_RAM_DWORD_WRITES, 2),
-            // An m80 write is three transactions, not two: `write_extended80` issues
-            // `write_qword`'s two dwords and then a word at +8. Both lanes move, and they must
-            // move together -- charging only the dword pair here against a static registration
-            // that counts the word too is exactly the underflow `x87_memory_width`'s comment
-            // warns about.
-            MemoryWidth::Tbyte => {
-                emit_dynamic_increment_by(e, STACK_RAM_DWORD_WRITES, 2);
-                emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES);
-            }
-        }
-    }
     e.jmp(done);
     e.place(mode13);
     match direction {
@@ -18412,14 +18417,6 @@ fn emit_alu_mem_dest(
     let done = e.label();
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.jz(mode13);
-    match width {
-        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
-        MemoryWidth::Qword | MemoryWidth::Tbyte => {
-            unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
-        }
-    }
     e.jmp(done);
     e.place(mode13);
     match width {
@@ -18545,7 +18542,6 @@ fn emit_double_shift_mem(
     let done = e.label();
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.jz(mode13);
-    emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
     e.jmp(done);
     e.place(mode13);
     emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
@@ -18855,16 +18851,6 @@ fn emit_store(
     e.place(ram);
     emit_store_write_resolve(e, width, map, code_watch_tables, memory, sides);
     emit_store_value(e, source, width);
-    match width {
-        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
-        // classify only ever produces a GPR-sized `Store` (Byte, Word or Dword); the x87 store
-        // forms (StoreF64, StoreI32) route through `emit_x87_slot`, not here.
-        MemoryWidth::Qword | MemoryWidth::Tbyte => {
-            unreachable!("GPR stores are never 8- or 10-byte wide")
-        }
-    }
     e.jmp(done);
 
     e.place(mode13);
@@ -21422,13 +21408,6 @@ fn emit_rmw_inc_dec(
     let done = e.label();
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.jz(mode13);
-    match width {
-        MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
-            unreachable!("group 5 INC/DEC is word or dword")
-        }
-        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
-    }
     e.jmp(done);
     e.place(mode13);
     match width {
@@ -21545,7 +21524,6 @@ fn emit_rmw_inc_dec_dword(
         emit_pending_inc_dec(e, is_dec, MemoryWidth::Dword, Reg::RCX, Reg::RAX);
     }
     e.store_r32_disp8(Reg::RDX, 0, Reg::RAX);
-    emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
 }
 
 /// PUSH r/m32 through memory (0xFF /6).
@@ -21687,7 +21665,6 @@ fn emit_push_mem(
     e.add_r64_r64(Reg::RDX, Reg::RAX);
     e.load_r64_disp32(Reg::RDI, Reg::RSP, STACK_PUSH_MEM_VALUE);
     e.store_r32_disp8(Reg::RDX, 0, Reg::RDI);
-    emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
 }
 #[cfg(not(all(
     target_arch = "x86_64",
@@ -21869,7 +21846,6 @@ fn emit_call_mem(
         Reg::RDI,
     );
     e.store_r32_disp8(Reg::RDX, 0, Reg::RDI);
-    emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
     // The target back into RDX for `emit_completed_dynamic_path`. Nothing between the park and
     // here preserved it; this is the only way to get it back.
     e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_PUSH_MEM_VALUE);
@@ -22350,15 +22326,6 @@ fn emit_store_fast(
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
     }
-    // The counter clobbers RDX only after the store, exactly as today's tails do.
-    match width {
-        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
-        MemoryWidth::Qword | MemoryWidth::Tbyte => {
-            unreachable!("GPR stores are never 8- or 10-byte wide")
-        }
-    }
     e.jmp(done);
 
     e.place(aux);
@@ -22766,18 +22733,10 @@ fn emit_slow_stub(
     e.shift_r64_imm8(5, Reg::RCX, 32);
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.jz(count_mode13);
-    match width {
-        MemoryWidth::Byte => emit_dynamic_increment(&mut e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Word => emit_dynamic_word_increment(&mut e, STACK_RAM_BYTE_WRITES),
-        MemoryWidth::Dword => emit_dynamic_increment(&mut e, STACK_RAM_DWORD_WRITES),
-        MemoryWidth::Qword | MemoryWidth::Tbyte => {
-            unreachable!("GPR stores are never 8- or 10-byte wide")
-        }
-    }
     // The misaligned RAM store this stub now SERVES rather than refuses: charge the extra byte
-    // cycles it owes beyond the one wide cycle the increment above accounts for. Placed here, in
-    // the RAM counter arm, because by this point the store has landed and the code-watch guard has
-    // passed -- the access is committed and can no longer refuse.
+    // cycles it owes beyond the one wide cycle the static store total already accounts for.
+    // Placed here, in the RAM arm, because by this point the store has landed and the code-watch
+    // guard has passed -- the access is committed and can no longer refuse.
     //
     // CONDITIONAL, and on this side that is not a formality. Everything the site cannot serve
     // inline arrives here: poisoned entries, supervisor entries at cpl3, and -- the population

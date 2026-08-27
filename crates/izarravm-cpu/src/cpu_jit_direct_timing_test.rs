@@ -4343,6 +4343,104 @@ fn fstp_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
     }
 }
 
+/// FSTP m80 in RAM and in the mode-13 window. An m80 write is two dwords plus a trailing word;
+/// dropping the Tbyte term from `word_stores` leaves a completing aperture store moving one
+/// mode13 word write against a static word-store total of 0, which fires the subset assert.
+fn fstp_m80_case(target: u32) -> Vec<u8> {
+    let mut code = vec![0xd9u8, 0xe8]; // fld1
+    code.push(0xdb);
+    code.push(0xbe); // fstp tbyte [esi+disp32]  /7
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0xf4]); // mov esi,esi ; hlt
+    code
+}
+
+#[test]
+fn fstp_m80_matches_the_interpreter_in_ram_and_in_the_aperture() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    for target in [RAM, MODE13] {
+        let code = fstp_m80_case(target);
+        let mut memory = vec![0; 0x000b_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        native.registers.eip = ENTRY;
+        interp.registers.eip = ENTRY;
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 8];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                target,
+                target,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                true,
+            );
+            cpu.fpu = X87::default();
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_esi(0);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.fp_rem = 3;
+            cpu.core_clocks_so_far = 0;
+            bus.trace = BusTrace::default();
+        }
+        let label = format!("fstp m80 at {target:#x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: did not run directly"
+        );
+        for _ in 0..block.span().instructions {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.fpu, interp.fpu, "{label}: x87 state");
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
+        assert_eq!(native_bus.memory, interp_bus.memory, "{label}: memory");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+        assert_eq!(native.fp_rem, interp.fp_rem, "{label}: x87 remainder");
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "{label}: bus clocks"
+        );
+    }
+}
+
 /// Slice 40's fixture 5, the aperture timing fixture: FILD m64 in RAM and in the mode-13 window,
 /// modelled directly on `fld_m64_matches_the_interpreter_in_ram_and_in_the_aperture` above, with
 /// two changes. First, `direct_page_wait_states`/`mode13_wait_states` price Dword differently per
