@@ -855,6 +855,10 @@ pub(crate) struct BlockCache {
     /// Stale epochs are simply overwritten on the next grant, so the map only ever holds one
     /// entry per key that has EVER been hot — thousands on a Build-engine fixture, cleared with
     /// the rest of the cache storage.
+    ///
+    /// Deliberately left on std's hasher while the linking maps moved to `PodKeyBuildHasher`: the
+    /// trial mechanism is live on duke3d, the SMC-fragile control row of that ladder, so swapping it
+    /// in the same slice would contaminate the control. A named follow-up, not an oversight.
     lane_trial_epochs: HashMap<BlockKey, u32>,
     /// Per-key x87 TOP-mismatch retire count, capped at `X87_TOP_RETIRE_CAP`. A key that has
     /// spent its budget is TOP-STICKY: the entry refusal in `run_direct_block` still fires and the
@@ -1021,6 +1025,9 @@ pub(crate) struct BlockCache {
     /// time and lifted for ever -- the exact treadmill the rule exists to stop, reached by a key
     /// whose two causes are both clearable. As a set the bound is what it says: at most one lift
     /// per key per cause, and `clearable_by_retry` names two causes, so at most two lifts per key.
+    ///
+    /// Deliberately left on std's hasher while the linking maps moved to `PodKeyBuildHasher`:
+    /// `retry_lift_enabled` is default-OFF, so there is no wall here to win.
     retry_lift_spent: HashSet<(BlockKey, RetryCause)>,
     /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
@@ -1037,12 +1044,12 @@ pub(crate) struct BlockCache {
     /// A `Vec` per block rather than a fixed array: `MAX_BLOCK_CALLOUT_SLOTS` blocks carry none at
     /// all, and this vector is never read on an entry path -- only at install and at retire.
     interpret_one_cells: Vec<Vec<Arc<InterpretOneCell>>>,
-    link_sources: HashMap<usize, LinkSource<BlockId>>,
+    link_sources: HashMap<usize, LinkSource<BlockId>, PodKeyBuildHasher>,
     outbound: Vec<[Option<BlockId>; 2]>,
     dynamic_next_slots: Vec<u8>,
-    inbound: HashMap<BlockId, Vec<LinkSource<BlockId>>>,
-    waiting: HashMap<LinkTarget, Vec<LinkSource<BlockId>>>,
-    linear_blocks: HashMap<LinkTarget, BlockId>,
+    inbound: HashMap<BlockId, Vec<LinkSource<BlockId>>, PodKeyBuildHasher>,
+    waiting: HashMap<LinkTarget, Vec<LinkSource<BlockId>>, PodKeyBuildHasher>,
+    linear_blocks: HashMap<LinkTarget, BlockId, PodKeyBuildHasher>,
     decode_dependencies: Box<[Vec<BlockId>]>,
     block_decode_slots: Vec<Vec<u32>>,
     decode_slot_mask: usize,
@@ -1209,7 +1216,7 @@ impl BlockCache {
             block_portals: Vec::new(),
             link_cells: Vec::new(),
             interpret_one_cells: Vec::new(),
-            link_sources: HashMap::new(),
+            link_sources: HashMap::default(),
             outbound: Vec::new(),
             global_block_upper_cache: [0; 2],
             iteration_upper_cache: Vec::new(),
@@ -1221,9 +1228,9 @@ impl BlockCache {
             global_block_upper_epoch: 0,
             iteration_upper_epoch: 0,
             dynamic_next_slots: Vec::new(),
-            inbound: HashMap::new(),
-            waiting: HashMap::new(),
-            linear_blocks: HashMap::new(),
+            inbound: HashMap::default(),
+            waiting: HashMap::default(),
+            linear_blocks: HashMap::default(),
             decode_dependencies: (0..decode_slot_count)
                 .map(|_| Vec::new())
                 .collect::<Vec<_>>()
