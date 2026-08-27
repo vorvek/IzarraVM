@@ -15334,7 +15334,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     e.mov_r64_imm64(Reg::RDX, lane.host as u64);
                     e.load_r32_disp32(Reg::RCX, Reg::RDX, 0);
                     e.mov_r32_r32(Reg::RAX, home(dst));
-                    emit_alu_preloaded(&mut e, op, dst, MemoryWidth::Dword);
+                    emit_alu_preloaded(&mut e, op, dst, MemoryWidth::Dword, Reg::RCX);
                 }
                 None => emit_alu(&mut e, op, dst, None, Some(imm), width),
             },
@@ -18340,7 +18340,7 @@ fn emit_alu_mem_source(
         }
     }
     e.mov_r32_r32(Reg::RAX, home(dst));
-    emit_alu_preloaded(e, op, dst, width);
+    emit_alu_preloaded(e, op, dst, width, Reg::RCX);
 }
 
 #[cfg(all(
@@ -18495,7 +18495,9 @@ fn emit_alu_mem_dest(
         emit_read_store_value(e, source, width, Reg::RCX);
         match width {
             MemoryWidth::Byte => emit_alu_byte_preloaded(e, op),
-            MemoryWidth::Word | MemoryWidth::Dword => emit_alu_preloaded(e, op, 0, width),
+            MemoryWidth::Word | MemoryWidth::Dword => {
+                emit_alu_preloaded(e, op, 0, width, Reg::RCX);
+            }
             MemoryWidth::Qword | MemoryWidth::Tbyte => {
                 unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
             }
@@ -19625,24 +19627,37 @@ fn emit_alu(
     imm: Option<u32>,
     width: MemoryWidth,
 ) {
-    // D-elision A. On the eager Dword non-CMP path RAX is unread: the ALU runs in place on
+    // D-elision A+B. On the eager Dword non-CMP path RAX is unread: the ALU runs in place on
     // home(dst), capture/publish do not take the old destination, and ADC/SBB feed carry-in
-    // through emit_load_host_flags which overwrites RAX. The three conjuncts are load-bearing
-    // (Word still masks RAX, CMP still does mov edx, eax, the OFF arm still stores RAX as
-    // descriptor a). Do not restyle. Part B (the RCX stage) stays unconditional.
-    if !(eager_flags_enabled() && matches!(width, MemoryWidth::Dword) && op != 7) {
+    // through emit_load_host_flags which overwrites RAX. The register source is unread in RCX
+    // on that same path: alu_r32_r32 takes home(src) directly. Immediate sources still stage
+    // RCX (ADC/SBB imm enter emit_carry_alu_preloaded, which takes a register source). The three
+    // conjuncts are load-bearing (Word still masks RAX and RCX, CMP still does mov edx, eax, the
+    // OFF arm still stores RAX and RCX as descriptors a/b). Bound once, used by dest and
+    // register-src. Do not restyle.
+    let eager_dword_non_cmp =
+        eager_flags_enabled() && matches!(width, MemoryWidth::Dword) && op != 7;
+    if !eager_dword_non_cmp {
         e.mov_r32_r32(Reg::RAX, home(dst));
     }
     if let Some(src) = src {
-        e.mov_r32_r32(Reg::RCX, home(src));
+        if eager_dword_non_cmp {
+            emit_alu_preloaded(e, op, dst, width, home(src));
+        } else {
+            e.mov_r32_r32(Reg::RCX, home(src));
+            emit_alu_preloaded(e, op, dst, width, Reg::RCX);
+        }
     } else {
         e.mov_r32_imm32(Reg::RCX, imm.expect("register or immediate source"));
+        emit_alu_preloaded(e, op, dst, width, Reg::RCX);
     }
-    emit_alu_preloaded(e, op, dst, width);
 }
 
-/// Emit an ALU operation with the old destination in EAX and the source in ECX.
-fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
+/// Emit an ALU operation.
+///
+/// OFF, Word, and CMP still have the old destination in EAX and the source in ECX.
+/// Eager Dword non-CMP has dest in `home(dst)` and source in `src_host`.
+fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, src_host: Reg) {
     // The WORD lane. Widened from CMP-only to the whole non-carry op set, with write-back, as the
     // emitter half of admitting `0x83` to `classify`'s OperandSize::Word allowlist.
     //
@@ -19664,6 +19679,12 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
             !matches!(op, 2 | 3),
             "ADC/SBB take the incoming CF as an operand and have no word lane; classify refuses \
              them at Word size"
+        );
+        debug_assert_eq!(
+            src_host,
+            Reg::RCX,
+            "Word lane masks RCX then ALUs against it; \
+             callers that skip the RCX stage are Dword-only"
         );
         let logic = matches!(op, 1 | 4 | 6);
         e.and_r32_imm32(Reg::RAX, 0xffff);
@@ -19704,7 +19725,7 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
     }
     debug_assert!(matches!(width, MemoryWidth::Dword));
     if matches!(op, 2 | 3) {
-        emit_carry_alu_preloaded(e, op, home(dst));
+        emit_carry_alu_preloaded(e, op, home(dst), src_host);
         return;
     }
     let writes = op != 7;
@@ -19715,7 +19736,7 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
         Reg::RDX
     };
     let host_op = if op == 7 { 5 } else { op };
-    e.alu_r32_r32(host_op, target, Reg::RCX);
+    e.alu_r32_r32(host_op, target, src_host);
 
     if matches!(op, 1 | 4 | 6) {
         emit_capture_flags(e, LOGIC_FLAGS);
@@ -19740,7 +19761,7 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
     }
 }
 
-fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg) {
+fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg, src_host: Reg) {
     debug_assert!(matches!(op, 2 | 3));
     let carry = e.label();
     let done = e.label();
@@ -19748,7 +19769,7 @@ fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg) {
     e.and_r32_imm32(Reg::RDI, crate::FLAG_CF);
     e.jnz(carry);
 
-    e.alu_r32_r32(op, target, Reg::RCX);
+    e.alu_r32_r32(op, target, src_host);
     emit_capture_flags(e, ARITH_FLAGS);
     if eager_flags_enabled() {
         emit_eager_publish(e, EAGER_CLASS_ARITH);
@@ -19769,7 +19790,7 @@ fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg) {
     // two arms collapses -- the carry arm already published and cleared, so on the eager arm the
     // two arms end identically and the branch remains only because the two ARITHMETICS differ.
     emit_load_host_flags(e);
-    e.alu_r32_r32(op, target, Reg::RCX);
+    e.alu_r32_r32(op, target, src_host);
     emit_capture_flags(e, ARITH_FLAGS);
     if eager_flags_enabled() {
         emit_eager_publish(e, EAGER_CLASS_ARITH);
