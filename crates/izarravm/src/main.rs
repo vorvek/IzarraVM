@@ -2644,19 +2644,38 @@ fn smc_census_assert_phase_closed(phase: &izarravm_cpu::DirectSmcCensusPhase) {
         units.keys_scanned, units.window_len_sum,
         "SMC census window lengths did not sum to the scanned keys"
     );
-    // Every key in the window took exactly one of four exits: the `entries` lookup missed, it did
-    // not overlap, it was claimed by a lane, or it died.
+    // Every key in the window took exactly one of five exits: the inline coverage pre-filter
+    // skipped it before any probe, the `entries` lookup missed, it did not overlap, it was claimed
+    // by a lane, or it died.
     assert_eq!(
         units.keys_scanned,
-        units.entries_get_misses
+        units.probes_elided
+            + units.entries_get_misses
             + units.keys_surviving
             + units.lane_accept_keys
             + units.keys_killed,
         "SMC census per-key exits did not close"
     );
     assert_eq!(
+        units.keys_scanned,
+        units.probes_elided + units.entries_get_calls,
+        "SMC census pre-filter split did not close"
+    );
+    assert_eq!(
+        units.entries_get_calls,
+        units.keys_killed
+            + units.keys_surviving
+            + units.lane_accept_keys
+            + units.entries_get_misses,
+        "SMC census probe exits did not close"
+    );
+    assert_eq!(
+        units.probe_divergences, 0,
+        "SMC census saw the inline pre-filter skip a row the authoritative test would have killed"
+    );
+    assert_eq!(
         units.survivors_moved,
-        units.keys_surviving + units.lane_accept_keys,
+        units.keys_surviving + units.lane_accept_keys + units.probes_elided,
         "SMC census survivor moves did not close"
     );
     assert_eq!(
@@ -2803,6 +2822,9 @@ fn smc_census_phase_json(phase: &izarravm_cpu::DirectSmcCensusPhase) -> serde_js
             "window_len_sum": u.window_len_sum,
             "keys_scanned": u.keys_scanned,
             "entries_get_misses": u.entries_get_misses,
+            "probes_elided": u.probes_elided,
+            "entries_get_calls": u.entries_get_calls,
+            "probe_divergences": u.probe_divergences,
             "keys_killed": u.keys_killed,
             "keys_surviving": u.keys_surviving,
             "lane_accept_keys": u.lane_accept_keys,
@@ -2841,6 +2863,10 @@ fn smc_census_phase_json(phase: &izarravm_cpu::DirectSmcCensusPhase) -> serde_js
             // R2. Review finding M7: W is surviving keys over scanned keys, not the no-kill call
             // key sum, because a killing call also scans survivors a presence filter would elide.
             "r2_w_surviving": ratio(u.keys_surviving, u.keys_scanned),
+            // C1's mechanism witness. `probes_elided / keys_scanned` is the share of the window
+            // the inline coverage pre-filter decided without touching `entries`; the ON-arm
+            // reconciliation is `probes_elided + keys_surviving(ON) == keys_surviving(OFF)`.
+            "c1_probes_elided_share": ratio(u.probes_elided, u.keys_scanned),
             "r2_w_no_kill_calls": ratio(u.keys_no_kill, u.keys_scanned),
             // R6 inputs are unit counts, not shares; the report converts them.
             "mean_page_occupancy": ratio(u.page_keys_len_sum, u.page_removes),

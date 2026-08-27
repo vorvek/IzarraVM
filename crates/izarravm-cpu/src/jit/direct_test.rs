@@ -1520,10 +1520,27 @@ fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
     // rather than only after a multi-minute fixture run.
     assert_eq!(
         whole.keys_scanned,
-        whole.entries_get_misses
+        whole.probes_elided
+            + whole.entries_get_misses
             + whole.keys_surviving
             + whole.lane_accept_keys
             + whole.keys_killed
+    );
+    // The pre-filter's own split of the window, and the probe population it leaves behind.
+    assert_eq!(
+        whole.keys_scanned,
+        whole.probes_elided + whole.entries_get_calls
+    );
+    assert_eq!(
+        whole.entries_get_calls,
+        whole.keys_killed
+            + whole.keys_surviving
+            + whole.lane_accept_keys
+            + whole.entries_get_misses
+    );
+    assert_eq!(
+        whole.probe_divergences, 0,
+        "the inline pre-filter skipped a row the authoritative test would have killed"
     );
     assert_eq!(whole.keys_scanned, whole.window_len_sum);
     assert_eq!(whole.page_visits, whole.page_removes + whole.page_absent);
@@ -1534,7 +1551,7 @@ fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
     assert_eq!(whole.window_searches, whole.page_removes);
     assert_eq!(
         whole.survivors_moved,
-        whole.keys_surviving + whole.lane_accept_keys
+        whole.keys_surviving + whole.lane_accept_keys + whole.probes_elided
     );
     // Page occupancy is NOT the window length, which is the whole reason `page_keys_len_sum`
     // exists (design §12.6). Two keys sit on the page; the two windows saw zero and one.
@@ -1567,6 +1584,104 @@ fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
         cache.clone().smc_census_snapshot().is_none(),
         "a lockstep clone must not double-count its parent"
     );
+}
+
+/// Non-vacuity for the C1 inline coverage pre-filter. The census test above is a real closure
+/// check but its window never contains a row the pre-filter can skip, so every new counter reads
+/// zero there and all four closures pass against a filter that does nothing. This fixture puts two
+/// point keys inside the widened window and off the write, which is exactly the population §1.1
+/// says dominates the corpus, and pins `probes_elided` to the EXACT count rather than to a range.
+#[cfg(all(
+    feature = "smc-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn inline_span_prefilter_elides_point_keys_the_write_cannot_reach() {
+    let mut cache = BlockCache::default();
+    cache.enable_smc_census_for_test(None);
+    // Two Seen point keys, rooted BELOW the write and reachable only because the block below
+    // widens the window's lower bound by `max_span`. Neither can overlap a one-byte write
+    // elsewhere on the page, and for a point key the inline test is EXACT, not merely
+    // conservative.
+    let parked_low = BlockKey::new(0x1012, 0x80_012, 7);
+    let parked_high = BlockKey::new(0x1014, 0x80_014, 7);
+    assert!(matches!(cache.probe(parked_low), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(parked_high), BlockProbe::Interpret));
+    let compiled = BlockKey::new(0x2020, 0x80_020, 7);
+    install_trivial(&mut cache, compiled, 16);
+
+    let result = cache.invalidate_physical_range(0x80_020, 1, false);
+    assert_eq!(result.blocks, 1, "the compiled block must still die");
+    assert_eq!(
+        result.keys_scanned, 3,
+        "the window is the two parked points plus the block, unchanged by the pre-filter"
+    );
+    // The two parked keys must still be tracked: a skipped row is compacted as a SURVIVOR, so it
+    // stays on the page and stays probeable.
+    assert!(matches!(cache.probe(parked_low), BlockProbe::Compile));
+    assert!(matches!(cache.probe(parked_high), BlockProbe::Compile));
+
+    let whole = cache
+        .smc_census_snapshot()
+        .expect("the census is armed")
+        .whole_run
+        .units;
+    assert_eq!(whole.keys_scanned, 3);
+    assert_eq!(
+        whole.probes_elided, 2,
+        "both parked points must be decided inline, with no `entries` probe"
+    );
+    assert_eq!(
+        whole.entries_get_calls, 1,
+        "only the overlapping row may reach the hash map"
+    );
+    assert_eq!(whole.keys_killed, 1);
+    assert_eq!(whole.keys_surviving, 0);
+    assert_eq!(whole.entries_get_misses, 0);
+    assert_eq!(whole.probe_divergences, 0);
+    // The four closures, on a fixture where every one of them is load-bearing.
+    assert_eq!(
+        whole.keys_scanned,
+        whole.probes_elided
+            + whole.entries_get_misses
+            + whole.keys_surviving
+            + whole.lane_accept_keys
+            + whole.keys_killed
+    );
+    assert_eq!(
+        whole.keys_scanned,
+        whole.probes_elided + whole.entries_get_calls
+    );
+    assert_eq!(
+        whole.entries_get_calls,
+        whole.keys_killed
+            + whole.keys_surviving
+            + whole.lane_accept_keys
+            + whole.entries_get_misses
+    );
+    assert_eq!(
+        whole.survivors_moved,
+        whole.keys_surviving + whole.lane_accept_keys + whole.probes_elided
+    );
+}
+
+/// PROVE THE GATE GOES RED. `probe_divergences == 0` and the pre-filter's `debug_assert!` read the
+/// same predicate — "a skipped row the authoritative per-state test would have killed" — and a
+/// predicate that cannot fail is not an instrument. Hand-corrupt one `lens` element so the filter
+/// under-bounds a live 16-byte block to a point, then write inside the span it no longer claims.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the inline pre-filter skipped a row")]
+fn a_corrupted_row_coverage_trips_the_prefilter_divergence_gate() {
+    let mut cache = BlockCache::default();
+    let compiled = BlockKey::new(0x2020, 0x80_020, 7);
+    install_trivial(&mut cache, compiled, 16);
+    cache.corrupt_page_len_for_test(compiled, 1);
+    // `max_span` is untouched, so the row is still IN the window; only its own coverage lies.
+    let _ = cache.invalidate_physical_range(0x80_028, 1, false);
 }
 
 /// An armed census with NO pinned window has no windowed phase, and events that arrive before the
