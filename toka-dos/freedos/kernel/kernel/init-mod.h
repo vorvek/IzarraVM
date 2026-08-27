@@ -278,6 +278,7 @@ extern struct dhdr DOSTEXTFAR ASM blk_dev; /* Block device (Disk) driver        
 
 extern struct buffer FAR *DOSFAR firstAvailableBuf; /* first 'available' buffer   */
 extern UBYTE FAR * DOSFAR fat_span; /* getblk_fat's FAT-run span buffer, in a UMB */
+extern UWORD FAR * DOSFAR buf_index; /* searchblock's offset-hint table, in a UMB */
 extern struct lol ASM FAR DATASTART;
 
 extern BYTE DOSFAR ASM _HMATextAvailable;    /* first byte of available CODE area    */

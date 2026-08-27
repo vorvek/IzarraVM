@@ -78,6 +78,40 @@ STATIC void move_buffer(struct buffer FAR *bp, size_t firstbp)
   b_prev(bp)->b_next = FP_OFF(bp);
 }
 
+/* modified by the Toka-DOS project, 2026: the offset-hint table in front
+   of searchblock's linear scan. The live chain is 41 buffers under the
+   stock DOS=HIGH boot (measured through the List of Lists, 2026-08-27),
+   so a hit averaged ~20 header compares and a miss always walked all 41
+   to gather its eviction inputs -- and getblk_fat pays one scan per
+   scattered sector, 33 per prefetch fill. The table is a HINT, never an
+   authority: a slot names the buffer offset that LAST held a block with
+   these low bits, the probe re-verifies block, validity, and unit against
+   the buffer header itself, and a stale slot is simply a miss. Buffer
+   offsets are stable for the life of the chain (move-to-front rewrites
+   links, not addresses), so no invalidation exists anywhere; every write
+   is a note at the single funnel points where b_blkno is (re)assigned or
+   a scan hit lands. With no UMB, buf_index is NULL and every path below
+   is byte-for-byte the old scan. */
+
+STATIC void buf_index_note(ULONG blkno, struct buffer FAR * bp)
+{
+  if (buf_index)
+    buf_index[(unsigned)blkno & (BUF_INDEX_SLOTS - 1)] = FP_OFF(bp);
+}
+
+/* The hit tail shared by the hint probe and the scan: clear UNCACHE and
+   move the buffer to the front of the LRU chain. */
+STATIC struct buffer FAR *take_hit(struct buffer FAR * bp, size_t firstbp)
+{
+  bp->b_flag &= ~BFR_UNCACHE;  /* reset uncache attribute */
+  if (FP_OFF(bp) != firstbp)
+  {
+    *(UWORD *)&firstbuf = FP_OFF(bp);
+    move_buffer(bp, firstbp);
+  }
+  return bp;
+}
+
 STATIC struct buffer FAR *searchblock(ULONG blkno, COUNT dsk)
 {
   int fat_count = 0;
@@ -90,6 +124,36 @@ STATIC struct buffer FAR *searchblock(ULONG blkno, COUNT dsk)
 #ifdef DISPLAY_GETBLOCK
   printf("[searchblock %d, blk %ld, buf ", dsk, blkno);
 #endif
+
+  /* The FRONT of the LRU chain first, exactly the old scan's first
+     compare: the FAT walk and sequential reads hit the same buffer back
+     to back, and the hint table must not tax that case (measured: the
+     probe-first shape cost ~20 instructions per AH=3Fh read). A front
+     hit moves no links and needs no note. */
+  bp = MK_FP(bufseg, firstbp);
+  if ((bp->b_blkno == blkno) &&
+      (bp->b_flag & BFR_VALID) && (bp->b_unit == dsk))
+  {
+    bp->b_flag &= ~BFR_UNCACHE;  /* reset uncache attribute */
+    return bp;
+  }
+
+  if (buf_index)
+  {
+    UWORD off = buf_index[(unsigned)blkno & (BUF_INDEX_SLOTS - 1)];
+    if (off != BUF_INDEX_EMPTY && off != firstbp)
+    {
+      bp = MK_FP(bufseg, off);
+      if ((bp->b_blkno == blkno) &&
+          (bp->b_flag & BFR_VALID) && (bp->b_unit == dsk))
+      {
+#ifdef DISPLAY_GETBLOCK
+        printf("HINT %04x:%04x]\n", FP_SEG(bp), FP_OFF(bp));
+#endif
+        return take_hit(bp, firstbp);
+      }
+    }
+  }
 
   /* Search through buffers to see if the required block  */
   /* is already in a buffer                               */
@@ -104,13 +168,8 @@ STATIC struct buffer FAR *searchblock(ULONG blkno, COUNT dsk)
 #ifdef DISPLAY_GETBLOCK
       printf("HIT %04x:%04x]\n", FP_SEG(bp), FP_OFF(bp));
 #endif
-      bp->b_flag &= ~BFR_UNCACHE;  /* reset uncache attribute */
-      if (FP_OFF(bp) != firstbp)
-      {
-        *(UWORD *)&firstbuf = FP_OFF(bp);
-        move_buffer(bp, firstbp);
-      }
-      return bp;
+      buf_index_note(blkno, bp);
+      return take_hit(bp, firstbp);
     }
 
     if (bp->b_flag & BFR_UNCACHE)
@@ -243,6 +302,7 @@ struct buffer FAR *getblk(ULONG blkno, COUNT dsk, BOOL overwrite)
   bp->b_flag = BFR_VALID | BFR_DATA;
   bp->b_unit = dsk;
   bp->b_blkno = blkno;
+  buf_index_note(blkno, bp);
 
   return bp;
 }
@@ -269,6 +329,7 @@ STATIC void mark_fat_buf(struct buffer FAR * bp, ULONG blkno,
   bp->b_flag |= BFR_FAT | BFR_VALID;
   bp->b_unit = dpbp->dpb_unit;
   bp->b_blkno = blkno;
+  buf_index_note(blkno, bp);
   bp->b_dpbp = dpbp;
   bp->b_copies = dpbp->dpb_fats;
   bp->b_offset = dpbp->dpb_fatsize;

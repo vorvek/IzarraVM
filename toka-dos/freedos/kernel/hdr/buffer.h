@@ -48,6 +48,15 @@ static BYTE *buffer_hRcsId =
 #define FAT_PREFETCH_SECS 32
 #endif
 
+/* modified by the Toka-DOS project, 2026: searchblock's offset-hint table
+   (blockio.c). One UWORD buffer offset per slot, keyed by the block
+   number's low bits; 0xFFFF marks an empty slot (a 532-byte buffer can
+   never start at that offset, while offset 0 is a legal KernelAlloc
+   result). PostConfig (config.c) sizes the UMB carve from this count, so
+   it lives here next to FAT_PREFETCH_SECS. */
+#define BUF_INDEX_SLOTS 64
+#define BUF_INDEX_EMPTY 0xFFFFu
+
 struct buffer {
   UWORD b_next;                 /* next buffer in LRU list      */
   UWORD b_prev;                 /* previous buffer in LRU list  */

@@ -249,6 +249,9 @@ GLOBAL char FAR *firstAvailableBuf;
    with no UMB it stays NULL and a FAT miss fills one sector. A resident
    array here would cost every guest 16 KiB of conventional memory. */
 GLOBAL UBYTE FAR *fat_span;
+/* modified by the Toka-DOS project, 2026: searchblock's 64-slot offset-hint
+   table (blockio.c), in a UMB beside fat_span; NULL means plain scans. */
+GLOBAL UWORD FAR *buf_index;
 extern struct cds FAR * ASM CDSp;   /* Current Directory Structure          */
 extern
 struct cds FAR * ASM current_ldt;

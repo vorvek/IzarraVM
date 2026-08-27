@@ -69,6 +69,13 @@ fn extracts_the_embedded_image_payload() {
     // (entry.asm, compared against _int2a_handler wrt DGROUP and DS);
     // AH=4Ah drops its unconditional DosMemCheck walk; AH=02h polls the
     // break stream every 32nd call (inthndlr.c).
+    // 72459 -> 72763 (Tier A slice 2): +304 net. searchblock gains a
+    // 64-slot offset-hint table in a UMB beside fat_span (blockio.c,
+    // buffer.h BUF_INDEX_SLOTS; the live chain is 41 buffers, measured);
+    // truename skips the per-call CWD re-walk when the driver answered
+    // M_NOT_CHANGED and the CDS start cluster is validated (newstuff.c);
+    // the compile date is pinned as TOKA_BUILD_DATE (version.h) so a
+    // rebuild no longer repaints the boot screen's hash.
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
@@ -82,7 +89,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(72459),
+        Some(72763),
         "KERNEL.SYS size"
     );
     assert_eq!(

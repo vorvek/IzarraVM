@@ -521,11 +521,26 @@ void PostConfig(void)
      allocations above. */
   if (UmbState == 1)
   {
-    UWORD need = (BUFFERSIZE * FAT_PREFETCH_SECS) / 16 + 1;
+    /* modified by the Toka-DOS project, 2026 (second carve): searchblock's
+       64-slot offset-hint table rides in the same UMB, sized up front so
+       the span keeps starvation priority on a tight UMB: both fit -> both;
+       only the span fits -> span alone; neither -> neither pointer moves
+       off NULL. The table is 128 bytes = 8 paragraphs + 1 MCB. */
+    UWORD span_need = (BUFFERSIZE * FAT_PREFETCH_SECS) / 16 + 1;
+    UWORD index_need = (BUF_INDEX_SLOTS * sizeof(UWORD)) / 16 + 1;
+    UWORD need = span_need;
     if (umb_base_seg == umb_start)
       need++;                     /* the DOS-data container carve takes one */
     if (para2far(umb_base_seg)->m_size >= need)
+    {
       fat_span = KernelAlloc(BUFFERSIZE * FAT_PREFETCH_SECS, 'B', 1);
+      if (para2far(umb_base_seg)->m_size >= index_need)
+      {
+        buf_index = KernelAlloc(BUF_INDEX_SLOTS * sizeof(UWORD), 'B', 1);
+        if (buf_index)
+          fmemset(buf_index, 0xFF, BUF_INDEX_SLOTS * sizeof(UWORD));
+      }
+    }
   }
   DebugPrintf(("Allocation completed: top at 0x%x\n", base_seg));
 
