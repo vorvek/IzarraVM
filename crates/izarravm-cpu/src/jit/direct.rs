@@ -15318,9 +15318,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // `emit_alu` would `mov ecx, imm32`; this loads the same four bytes out of guest RAM
             // instead, so a guest patch of the immediate field takes effect on the next entry
             // with no recompile. The operation, flag capture, and flag record still share
-            // `emit_alu_preloaded`, so result and flags cannot diverge. Baked eager Dword non-CMP
-            // no longer moves home(dst) into RAX (D-elision A); the lane arm still does, and that
-            // extra mov is dead on that arm rather than a second contract.
+            // `emit_alu_preloaded`. Both arms skip home(dst) into RAX on eager Dword non-CMP
+            // (D-elision A on baked, B-adj on the lane); CMP, Word, and OFF still stage dst.
             //
             // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, so
             // no guest register lives in it, and RDX is dead by the time `emit_alu_preloaded`
@@ -15340,7 +15339,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     debug_assert!(matches!(width, MemoryWidth::Dword));
                     e.mov_r64_imm64(Reg::RDX, lane.host as u64);
                     e.load_r32_disp32(Reg::RCX, Reg::RDX, 0);
-                    e.mov_r32_r32(Reg::RAX, home(dst));
+                    if !(eager_flags_enabled() && matches!(width, MemoryWidth::Dword) && op != 7) {
+                        e.mov_r32_r32(Reg::RAX, home(dst));
+                    }
                     emit_alu_preloaded(&mut e, op, dst, MemoryWidth::Dword, Reg::RCX);
                 }
                 None => emit_alu(&mut e, op, dst, None, Some(imm), width),
@@ -18346,7 +18347,9 @@ fn emit_alu_mem_source(
             unreachable!("ALU memory-source operands are never 8- or 10-byte wide")
         }
     }
-    e.mov_r32_r32(Reg::RAX, home(dst));
+    if !(eager_flags_enabled() && matches!(width, MemoryWidth::Dword) && op != 7) {
+        e.mov_r32_r32(Reg::RAX, home(dst));
+    }
     emit_alu_preloaded(e, op, dst, width, Reg::RCX);
 }
 

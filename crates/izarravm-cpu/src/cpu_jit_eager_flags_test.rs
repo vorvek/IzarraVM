@@ -222,6 +222,7 @@ struct Roles {
     code_len: usize,
     code: Vec<u8>,
     body_offset: usize,
+    imm_lanes: usize,
 }
 
 /// Compile `mov esi,esi / body / mov edi,edi / hlt` at `ENTRY` on the native role with the arm
@@ -325,6 +326,7 @@ fn build_with_arm(body: &[u8], seed: Seed, arm: Option<bool>) -> Roles {
     let sites = compilation.eager_flags_sites();
     let code_len = compilation.code.len();
     let body_offset = compilation.body_offset();
+    let imm_lanes = compilation.imm_lane_count();
     let id = native
         .jit_direct
         .install(&compilation)
@@ -362,6 +364,7 @@ fn build_with_arm(body: &[u8], seed: Seed, arm: Option<bool>) -> Roles {
         code_len,
         code: compilation.code,
         body_offset,
+        imm_lanes,
     }
 }
 
@@ -817,6 +820,89 @@ fn eager_dword_non_cmp_skips_both_gpr_stages() {
     finish();
 }
 
+/// B-adj encoding mutant (review M1). SHAPE_LEDGER has no row for the AluImm lane or for
+/// mem-source; bumping `add_eax_ecx` or `add_mem_eax` (form 1 mem-DEST) greens a coincidental
+/// 3-byte change and leaves both dest movs in place. Scan a real lane body and a real mem-source
+/// body. Body-only, for the same Windows-prologue reason as the register scan.
+#[test]
+fn eager_dword_non_cmp_skips_dst_stage_on_lane_and_mem_source() {
+    let dst = dst_stage_eax_bytes();
+    let add_rcx = alu_r8d_ecx_bytes(0);
+    assert_eq!(dst, [0x44, 0x89, 0xc0]);
+    assert_eq!(add_rcx, [0x41, 0x01, 0xc8]);
+
+    let add_imm32 = [0x81, 0xc0, 0x01, 0x00, 0x00, 0x00];
+    let on_lane = build(&add_imm32, Seed::new(), true);
+    assert!(
+        on_lane.imm_lanes >= 1,
+        "ON add eax,imm32 must take the AluImm lane arm, not baked emit_alu"
+    );
+    assert!(
+        !contains_bytes(body_of(&on_lane), &dst),
+        "ON lane add eax,imm32 must not stage home(dst) into RAX"
+    );
+    finish();
+
+    let cmp_imm32 = [0x81, 0xf8, 0x01, 0x00, 0x00, 0x00];
+    let on_lane_cmp = build(&cmp_imm32, Seed::new(), true);
+    assert!(
+        on_lane_cmp.imm_lanes >= 1,
+        "ON cmp eax,imm32 must take the AluImm lane arm"
+    );
+    assert!(
+        contains_bytes(body_of(&on_lane_cmp), &dst),
+        "ON lane cmp eax,imm32 still does mov edx, eax from the staged dst"
+    );
+    finish();
+
+    let off_lane = build(&add_imm32, Seed::new(), false);
+    assert!(
+        off_lane.imm_lanes >= 1,
+        "OFF add eax,imm32 must take the AluImm lane arm"
+    );
+    assert!(
+        contains_bytes(body_of(&off_lane), &dst),
+        "OFF lane add eax,imm32 still stores the staged dst as descriptor a"
+    );
+    finish();
+
+    let add_mem_src = [0x03, 0x05, 0x00, 0x20, 0x00, 0x00];
+    let on_mem = build(&add_mem_src, Seed::new(), true);
+    assert_eq!(on_mem.imm_lanes, 0, "mem-source is not an imm lane");
+    assert!(
+        !contains_bytes(body_of(&on_mem), &dst),
+        "ON add eax,[disp32] must not stage home(dst) into RAX"
+    );
+    assert!(
+        contains_bytes(body_of(&on_mem), &add_rcx),
+        "ON add eax,[disp32] ALUs home(dst) against the loaded RCX"
+    );
+    finish();
+
+    let cmp_mem_src = [0x3b, 0x05, 0x00, 0x20, 0x00, 0x00];
+    let on_mem_cmp = build(&cmp_mem_src, Seed::new(), true);
+    assert!(
+        contains_bytes(body_of(&on_mem_cmp), &dst),
+        "ON cmp eax,[disp32] still does mov edx, eax from the staged dst"
+    );
+    finish();
+
+    let add_ax_mem = [0x66, 0x03, 0x05, 0x00, 0x20, 0x00, 0x00];
+    let on_word_mem = build(&add_ax_mem, Seed::new(), true);
+    assert!(
+        contains_bytes(body_of(&on_word_mem), &dst),
+        "ON add ax,[disp32] still masks the staged dst in RAX"
+    );
+    finish();
+
+    let off_mem = build(&add_mem_src, Seed::new(), false);
+    assert!(
+        contains_bytes(body_of(&off_mem), &dst),
+        "OFF add eax,[disp32] still stores the staged dst as descriptor a"
+    );
+    finish();
+}
+
 // ---------------------------------------------------------------------------------------------
 // 4. The DIFFERENTIAL, on both arms.
 // ---------------------------------------------------------------------------------------------
@@ -1134,6 +1220,7 @@ fn build_multi(bodies: &[&[u8]], seed: Seed, on: bool) -> Roles {
     let sites = compilation.eager_flags_sites();
     let code_len = compilation.code.len();
     let body_offset = compilation.body_offset();
+    let imm_lanes = compilation.imm_lane_count();
     let id = native
         .jit_direct
         .install(&compilation)
@@ -1167,6 +1254,7 @@ fn build_multi(bodies: &[&[u8]], seed: Seed, on: bool) -> Roles {
         code_len,
         code: compilation.code,
         body_offset,
+        imm_lanes,
     }
 }
 
