@@ -31,10 +31,6 @@
 #include "portab.h"
 #include "globals.h"
 
-#ifndef FAT_PREFETCH_SECS
-#define FAT_PREFETCH_SECS 32
-#endif
-
 #ifdef VERSION_STRINGS
 static BYTE *blockioRcsId =
     "$Id: blockio.c 1702 2012-02-04 08:46:16Z perditionc $";
@@ -257,8 +253,14 @@ struct buffer FAR *getblk(ULONG blkno, COUNT dsk, BOOL overwrite)
    with the last frame held. Fill a run in one BIOS call, then scatter into
    the existing 512-byte buffer slots. Hits still take searchblock only.
    32 sectors is 16 KiB: one fill covers most of a 44 MB GRP cluster-chain
-   walk (88 FAT sectors at 4 KiB clusters). */
-static UBYTE fat_span[BUFFERSIZE * FAT_PREFETCH_SECS];
+   walk (88 FAT sectors at 4 KiB clusters). The span buffer (fat_span,
+   globals.h) lives in a UMB, allocated by PostConfig, because a resident
+   16 KiB array costs every guest 16 KiB of conventional memory. Before
+   PostConfig, and on a machine with no UMB, fat_span is NULL and a FAT
+   miss fills the one requested sector, the way getblk does. When the
+   UMB placement straddles a 64 KiB physical boundary, dsk.c's
+   DMA_max_transfer splits the fill into two BIOS calls; still a run,
+   not one call per sector. */
 
 STATIC void mark_fat_buf(struct buffer FAR * bp, ULONG blkno,
                          struct dpb FAR * dpbp)
@@ -289,6 +291,16 @@ struct buffer FAR *getblk_fat(ULONG blkno, struct dpb FAR * dpbp)
   bp = searchblock(blkno, dsk);
   if (!(bp->b_flag & BFR_UNCACHE))
   {
+    mark_fat_buf(bp, blkno, dpbp);
+    return bp;
+  }
+
+  if (fat_span == NULL)
+  {
+    if (!flush1(bp))
+      return NULL;
+    if (dskxfer(dsk, blkno, bp->b_buffer, 1, DSKREAD))
+      return NULL;
     mark_fat_buf(bp, blkno, dpbp);
     return bp;
   }

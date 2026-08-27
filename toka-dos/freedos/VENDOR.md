@@ -316,3 +316,30 @@ past the audit item 10 (MEM) baseline of 12 files. That fix predates the
 now that the command-line tools and drivers live in `C:\DOS`, the shipped
 root is back down to 5 entries (a single cluster) and `C:\DOS` -- with its
 20 files plus `.`/`..` -- is the multi-cluster chain instead.
+
+### Open Watcom toolchain drift (2026-08-27)
+
+The local Open Watcom installation (`D:\DevTools\OpenWatcom`) no longer
+reproduces the committed image's C-compiled userland byte-for-byte. A clean
+`toka-dos/build-freedos.ps1` run built every `wcl`-compiled tool slightly
+smaller than the committed copies (COMMAND.COM 87,447 -> 87,383, MOVE.EXE
+38,254 -> 37,702, MEM.EXE 24,998 -> 24,884, and likewise
+ATTRIB/CHOICE/MORE/FIND/LABEL/SORT/XCOPY/EDIT) with ~80,000 differing bytes
+in COMMAND.COM alone -- a whole-layout shift, not a timestamp. The source of
+every one of those tools was unchanged since the committed image, so the
+drift is the toolchain (or its libraries), not the code. NASM outputs
+(TOKAEMM.SYS, TOKACD.SYS, TOKAMOUS.COM, IZCDEX.COM, DELTREE.COM, the boot
+sectors) do reproduce byte-identical.
+
+Consequence for image rebuilds: after any rebuild, extract the old and new
+images with `scripts/build-freedos-hdd-image.py`'s `extract_from_image`
+(it takes image bytes, not a path) and diff file-by-file. For every file you
+did not mean to change, write the committed bytes back over the fresh build
+artifact the script reads (`freecom/command.com`, `move/src/move.exe`, and
+so on per the full-build path in the script), then re-run the image build.
+The fat_span relocation (PR #750) shipped this way: KERNEL.SYS is the only
+file that differs from the previous image. Note that the CI
+`build-freedos-hdd-image.py --check` step always takes the from-image path
+on a clean clone (no gitignored build artifacts exist there), so it
+round-trips those twelve binaries by construction and cannot catch this
+class of drift; the extraction diff above is the real check.

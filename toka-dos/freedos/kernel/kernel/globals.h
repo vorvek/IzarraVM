@@ -244,6 +244,11 @@ enum {LOC_CONV=0, LOC_HMA=1};
 extern unsigned char ASM bufloc;    /* 0=conv, 1=HMA                        */
 extern void far * ASM deblock_buf;  /* pointer to workspace buffer      */
 GLOBAL char FAR *firstAvailableBuf;
+/* modified by the Toka-DOS project, 2026: getblk_fat's FAT-run span buffer,
+   BUFFERSIZE * FAT_PREFETCH_SECS bytes. PostConfig allocates it from a UMB;
+   with no UMB it stays NULL and a FAT miss fills one sector. A resident
+   array here would cost every guest 16 KiB of conventional memory. */
+GLOBAL UBYTE FAR *fat_span;
 extern struct cds FAR * ASM CDSp;   /* Current Directory Structure          */
 extern
 struct cds FAR * ASM current_ldt;

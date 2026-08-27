@@ -40,6 +40,14 @@ static BYTE *buffer_hRcsId =
 #include "dsk.h"                /* only for MAX_SEC_SIZE        */
 #define BUFFERSIZE MAX_SEC_SIZE
 
+/* modified by the Toka-DOS project, 2026: getblk_fat (blockio.c) fills a
+   run of this many FAT sectors in one dskxfer call. PostConfig (config.c)
+   sizes the UMB span buffer from the same count, so the count lives here
+   next to BUFFERSIZE. */
+#ifndef FAT_PREFETCH_SECS
+#define FAT_PREFETCH_SECS 32
+#endif
+
 struct buffer {
   UWORD b_next;                 /* next buffer in LRU list      */
   UWORD b_prev;                 /* previous buffer in LRU list  */
