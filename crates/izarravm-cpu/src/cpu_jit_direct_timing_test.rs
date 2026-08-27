@@ -2073,6 +2073,16 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
             terminal: false,
             eflags: 0x202,
         },
+        // Form-2 byte memory source: ALU 2 plus the two register-move slots. Bus charge is
+        // not this table; `byte_lane_alu_memory_source_declares_one_byte_read` is the
+        // accessor pin.
+        DirectTimingCase {
+            name: "byte alu memory source",
+            opcode: &[0x02, 0x1d, 0x00, 0x30, 0x00, 0x00],
+            expected_raw_clocks: 2 + 2 + 2,
+            terminal: false,
+            eflags: 0x202,
+        },
     ]
 }
 
