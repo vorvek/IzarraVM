@@ -1305,9 +1305,7 @@ fn direct_cross_page_push_exits_before_esp_commit() {
     interp_bus.memory.copy_from_slice(&pristine);
     native_bus.trace = BusTrace::default();
     interp_bus.trace = BusTrace::default();
-    let exits = native
-        .perf_counters()
-        .jit_direct_exit_cross_page_or_alignment;
+    let exits = native.perf_counters().jit_direct_exit_unavailable_or_kind;
 
     assert!(
         native
@@ -1324,10 +1322,7 @@ fn direct_cross_page_push_exits_before_esp_commit() {
     assert_eq!(native.registers.esp(), INITIAL_ESP);
     assert_eq!(&native_bus.memory[..], &pristine[..]);
     assert_eq!(
-        native
-            .perf_counters()
-            .jit_direct_exit_cross_page_or_alignment
-            - exits,
+        native.perf_counters().jit_direct_exit_unavailable_or_kind - exits,
         1
     );
 
@@ -3240,9 +3235,11 @@ fn the_page_budget_ends_the_walk_before_the_recovery_search_runs() {
     //    claim that separates a working size model from a merely conservative one. An EQUALITY is
     //    what one would want here and it is not true, deliberately: the constants are calibrated
     //    on the tombraid loader, whose memory slots average 341 emitted bytes, and this fixture's
-    //    `mov eax,[disp32]` is the cheapest memory shape there is at 250. The model therefore ends
-    //    the block early on it, and this pins BY HOW MUCH -- three slots of a thirteen-slot
-    //    maximum. Re-calibrating the constants moves this number; a broken budget moves it a lot.
+    //    `mov eax,[disp32]` is the cheapest memory shape there is. R2b moved the 20-byte page-cross
+    //    bound off that lean load, so the slot is ~230 rather than the 250 this pin first measured.
+    //    The model still prices every memory slot at 352, so it still ends the block at 10 slots
+    //    where 14 now fit. This pins BY HOW MUCH -- four slots of a fourteen-slot maximum.
+    //    Re-calibrating the constants moves this number; a broken budget moves it a lot.
     let n = usize::from(budgeted.span.instructions);
     let mut longest = 0usize;
     for k in 3..=usize::from(unbudgeted.span.instructions) {
@@ -3262,8 +3259,8 @@ fn the_page_budget_ends_the_walk_before_the_recovery_search_runs() {
         "the budget must never admit MORE than fits: {n} slots against a {longest}-slot maximum"
     );
     assert!(
-        longest - n <= 3,
-        "the model gave up {} slots of {longest}, which is past the slack this fixture measured          (3). Either the constants moved or the estimate stopped tracking the emitter",
+        longest - n <= 4,
+        "the model gave up {} slots of {longest}, which is past the slack this fixture measured (4). Either the constants moved or the estimate stopped tracking the emitter",
         longest - n
     );
 

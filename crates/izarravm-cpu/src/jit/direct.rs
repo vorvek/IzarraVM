@@ -18931,19 +18931,23 @@ fn emit_store_write_resolve(
     }
 }
 
-/// The wide guard's PAGE-CROSSING half: refuse an access whose last byte lands on the next page.
-/// Scratch: RDX. Four instructions, and it must be emitted BEFORE the alignment half (see
-/// `emit_wide_page_guard`).
+/// The page-CROSSING half: refuse an access whose last byte lands on the next page.
 ///
-/// The crossing bound uses `bytes()` (the transaction's actual size), not `alignment_bytes()`
-/// (the guard's alignment requirement). For a Byte, Word or Dword access that is also ALIGNED the
-/// two are equal and this check cannot fire: an aligned access of size N can never sit within N
-/// bytes of the page end. It stopped being dead there the moment the lean one-lookup load and
-/// store sites began serving MISALIGNED accesses natively -- a Word at offset 0xFFF or a Dword at
-/// 0xFFD-0xFFF really does straddle -- and at those two sites this compare is now the ONLY thing
-/// keeping a served access inside the one page its FastMap entry was resolved against.
+/// Scratch is `Reg::RDX` at `emit_wide_page_guard` (Qword/Tbyte only) and `Reg::RCX` at the two
+/// stub RAM arms. Four instructions, 20 bytes at either scratch. `jcc(7)` is JA, strictly above:
+/// equal means the last byte sits on the page's last byte and must be served.
 ///
-/// It was already LIVE for the two wide widths, both of which have `alignment_bytes() = 4` below
+/// The bound uses `bytes()` (the transaction's actual size), not `alignment_bytes()`. For an
+/// aligned Byte, Word or Dword access the two are equal and this check cannot fire: an aligned
+/// access of size N never sits within N bytes of the page end.
+///
+/// At the two lean one-lookup sites the alignment verdict SERVES a page-local misaligned access,
+/// so every crossing Word/Dword (a subset of misaligned) takes the alignment test to the stub.
+/// The stub RAM arm emits this bound, targeting status 1 (`UnavailableOrKind`), before permission,
+/// pointer resolve, store, or split extra. That is what keeps a served access inside the one
+/// page its FastMap entry was resolved against.
+///
+/// It is already live for the two wide widths, both of which have `alignment_bytes() = 4` below
 /// their size. A 4-aligned Qword can start as late as offset 0xFFC and its second dword half
 /// crosses into the next page. A 4-aligned Tbyte is worse: 10 bytes against a 4-byte alignment
 /// refuses everything from 0xFF8 up, which is what keeps `write_extended80`'s trailing word at +8
@@ -18953,11 +18957,19 @@ fn emit_store_write_resolve(
 /// for the self-aligning widths -- `emit_wide_page_guard` gates it out and carries the proof.
 /// Nothing else may apply that gate: it is sound only where a crossing access and a misaligned
 /// access go to the same place.
-fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, cross: Label) {
-    e.mov_r32_r32(Reg::RDX, Reg::RAX);
-    e.and_r32_imm32(Reg::RDX, 0x0fff);
-    e.cmp_r32_imm32(Reg::RDX, 0x1000 - width.bytes());
-    e.jcc(7, cross);
+fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, scratch: Reg, cross: Label) {
+    debug_assert!(
+        matches!(scratch, Reg::RDX | Reg::RCX),
+        "the page-cross bound's scratch is RDX at the wrapper and RCX at the stub RAM arms"
+    );
+    debug_assert!(
+        width.needs_alignment_guard(),
+        "Byte skips the page-cross bound; a call here would emit a never-taken cmp, 0xFFF; ja"
+    );
+    e.mov_r32_r32(scratch, Reg::RAX);
+    e.and_r32_imm32(scratch, 0x0fff);
+    e.cmp_r32_imm32(scratch, 0x1000 - width.bytes());
+    e.jcc(7, cross); // JA, strictly above
 }
 
 /// The wide guard's ALIGNMENT half. The only half whose target varies by call site: eleven
@@ -19027,8 +19039,8 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 ///
 /// The gate lives HERE and never at a call site. That is what keeps it sound: it may only be
 /// applied where the crossing verdict and the alignment verdict go to one label. The two lean
-/// one-lookup sites call the halves directly, and there the alignment verdict SERVES the access
-/// rather than refusing it, so their bound is live for every width and must stay.
+/// one-lookup sites call only the alignment half; their crossing bound lives on the stub RAM
+/// arm, not here.
 ///
 /// On the default alignment arm the elision is register- and flag-IDENTICAL, not merely
 /// verdict-identical: before it, RDX went `RAX & 0xFFF` then `RAX` then `&= mask`; after it, RDX
@@ -19037,11 +19049,10 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 /// is left untouched rather than holding `RAX & 0xFFF` -- which is the one place a stale-RDX
 /// reader would surface, and that arm has its own suite.
 ///
-/// **The crossing bound comes FIRST wherever it is emitted, and that ordering is load-bearing
-/// rather than cosmetic.** At the two relaxed sites the alignment half's target is a local
-/// recovery path that serves the access, and a page-CROSSING access must never reach it. Testing
-/// the crossing bound first makes that structural instead of a second test inside the recovery.
-/// The wrapper keeps the same order so there is one order to reason about, not two.
+/// **The crossing bound comes FIRST wherever the wrapper emits it.** The lean sites no longer
+/// emit it inline: alignment sends a crossing Word/Dword to the stub, and the stub RAM arm
+/// refuses before it resolves a pointer. The wrapper keeps the bound-then-alignment order for
+/// Qword/Tbyte so there is one order to reason about, not two.
 ///
 /// **Precondition, stated rather than assumed: no caller may rely on the host flag state this
 /// leaves behind.** Leftover ZF/CF/SF/OF/PF come from the ALIGNMENT half (`cmp scratch, 0` on
@@ -19051,7 +19062,7 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     debug_assert!(width.needs_alignment_guard());
     if width.alignment_bytes() != width.bytes() {
-        emit_page_cross_bound(e, width, side);
+        emit_page_cross_bound(e, width, Reg::RDX, side);
     }
     emit_alignment_test(e, width, Reg::RDX, side);
 }
@@ -22267,34 +22278,27 @@ fn emit_store_fast(
     wrap: AddressWrap,
 ) {
     let map = memory.map.expect("native store has fast-map bases");
-    // HOISTED above the guard, because both halves below reference `slow`. The other three labels
-    // move with it so the set stays in one place.
+    // HOISTED above the alignment test, because that half below references `slow`. The other
+    // three labels move with it so the set stays in one place.
     let aux = e.label();
     let slow = e.label();
     let done = e.label();
     let fast_join = e.label();
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
-    if width.needs_alignment_guard() {
-        // The two halves are called DIRECTLY and, uniquely at this site, they are SPLIT AROUND THE
-        // VALUE MATERIALISATION. The crossing half keeps its position and its RDX scratch; the
-        // alignment half cannot.
-        emit_page_cross_bound(e, width, sides.cross_page_or_alignment);
-    }
     emit_store_bias_probe(e, map);
     // The value is materialized BEFORE the tag branch so the fast arm and both stubs share it
     // (the stubs receive it in RDX; the slow stub spills it across its own front — review F1).
     emit_read_store_value(e, source, width, Reg::RDX);
     if width.needs_alignment_guard() {
         // AFTER the value, and on RCX rather than RDX. Both halves of that are load-bearing and
-        // neither failure faults.
+        // neither failure faults. Crossing is refused on the stub RAM arm, not here.
         //
         // AFTER, because `slow` is the slow stub and the stub's contract is "RAX = linear address,
         // RDX = store value" -- it spills RDX as its SECOND instruction and reloads it to store.
-        // A `jnz slow` emitted with the crossing half, three emissions above, arrives before the
-        // value exists, so the stub spills and stores whatever RDX held from the PREVIOUS slot: a
-        // silent wrong-value store into guest RAM.
+        // A `jnz slow` emitted before the value exists means the stub spills and stores whatever
+        // RDX held from the PREVIOUS slot: a silent wrong-value store into guest RAM.
         //
-        // RCX, because RDX now holds that value and the two guard halves both use their scratch
+        // RCX, because RDX now holds that value and the alignment test uses its scratch
         // destructively. RCX is free by this pad's own rule -- the page index is not part of the
         // stub contract, and every stub that needs it recomputes it from RAX. Neither the fast arm
         // nor the aux arm reads RCX after the probe, and `emit_mode13_dirty_bit` recomputes the
@@ -22667,6 +22671,14 @@ fn emit_slow_stub(
     // Both kind arms share the resolve; the store tail re-splits on the kind, parked in the
     // upper word of the same pack `emit_rmw_inc_dec` uses for exactly this purpose.
     e.place(ram);
+    // Crossing Word/Dword: the lean site's alignment test sent us here, and FastMap is
+    // page-indexed, so refuse before permission, the write, or split extra. Scratch RCX: it is
+    // about to be overwritten with RAM_KIND. RDX still holds classify flags. The store value is
+    // on STACK_PUSH_MEM_VALUE, not in RDX. Do not place this after the value reload, and do not
+    // place it at `store` (that label also serves mode13, which already refused).
+    if width.needs_alignment_guard() {
+        emit_page_cross_bound(&mut e, width, Reg::RCX, status_unavailable);
+    }
     e.mov_r32_imm32(Reg::RCX, u32::from(NATIVE_RAM_KIND));
     e.jmp(store);
     e.place(mode13);
@@ -22982,13 +22994,10 @@ fn emit_ram_read_pointer_fast(
     let done = e.label();
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
     if width.needs_alignment_guard() {
-        // The two halves are called DIRECTLY, not through `emit_wide_page_guard`: that wrapper
-        // exists for the eleven sites that send both verdicts to one label, and this site does
-        // not. A page-CROSSING access still refuses -- the crossing bound is the only thing left
-        // keeping a served access inside the one page its entry was resolved against, which is
-        // why it is emitted first -- while a MISALIGNED page-local access now falls into this
-        // site's own slow stub and is served there.
-        emit_page_cross_bound(e, width, sides.cross_page_or_alignment);
+        // Alignment only. A crossing Word/Dword is also misaligned, so it takes this test to the
+        // counting-read stub; the stub RAM arm refuses before the pointer resolve. That is what
+        // keeps a served access inside the one page its FastMap entry was resolved against.
+        //
         // RDX is the scratch here, as it was before the decomposition: this precedes
         // `emit_load_bias_probe`, whose contract is "RDX is untouched", and nothing downstream of
         // it reads RDX. The STORE site cannot use RDX and uses RCX instead; see
@@ -23348,6 +23357,13 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     emit_stub_return(&mut e);
 
     e.place(ram);
+    // Crossing Word/Dword: the lean site's alignment test sent us here, and FastMap is
+    // page-indexed, so refuse before permission, the pointer resolve, or split extra.
+    // Scratch RCX: it is recomputed from RAX after permission. RDX still holds classify
+    // flags for the cpl3 permission check. RAX is the linear address and stays that way.
+    if width.needs_alignment_guard() {
+        emit_page_cross_bound(&mut e, width, Reg::RCX, status_unavailable);
+    }
     emit_read_permission_check(&mut e, cpl3, status_permission);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);

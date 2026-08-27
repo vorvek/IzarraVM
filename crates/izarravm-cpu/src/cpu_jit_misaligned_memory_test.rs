@@ -5,17 +5,18 @@
 //!
 //! Before this slice `emit_wide_page_guard` refused every access whose address was not a multiple
 //! of its `alignment_bytes()`, and on the payload fixture that single `jnz` was 99.97% of all
-//! native side exits. The guard is now two independent halves: the page-CROSSING bound, which
-//! still refuses at all thirteen call sites, and the ALIGNMENT test, which at the lean load and
-//! store sites targets the site's own slow stub instead of a side exit.
+//! native side exits. The ALIGNMENT test at the lean load and store sites targets the site's own
+//! slow stub instead of a side exit. The page-CROSSING bound at those two sites lives on the stub
+//! RAM arm (status 1, `UnavailableOrKind`), not inline. The eleven refusing sites still send both
+//! verdicts to `CrossPageOrAlignment`.
 //!
 //! What each row here is for:
 //!
 //! | row | what would break it |
 //! |---|---|
 //! | misaligned Word/Dword reads run natively | the relaxation not landing, or landing at the wrong half |
-//! | page-edge IN page runs, page-edge CROSSING exits | the crossing bound being relaxed along with the alignment test |
-//! | crossing AND misaligned exits | the two halves emitted in the wrong ORDER -- with alignment first, a crossing access reaches the recovery stub and is served across a page boundary its FastMap entry does not cover |
+//! | page-edge IN page runs, page-edge CROSSING exits | the stub RAM-arm bound being omitted |
+//! | crossing AND misaligned exits | the stub serving a crossing access across a page boundary its FastMap entry does not cover |
 //! | Mode 13h misaligned exits | the aperture refusal being dropped from the stub, or placed after the access |
 //! | non-relaxed sites still exit | a site being relaxed that this slice does not touch |
 //! | the split charge | the deposit being omitted, or sized `bytes()` instead of `bytes() - 1` |
@@ -155,6 +156,151 @@ fn map_page(cpu: &mut CpuGsw, bus: &mut TestBus, page: u32) {
     }
 }
 
+fn map_linear(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, physical: u32) {
+    for write in [false, true] {
+        let kind = if write {
+            BusAccessKind::DataWrite
+        } else {
+            BusAccessKind::DataRead
+        };
+        let host = bus.direct_page(physical, kind).unwrap().unwrap();
+        let ok = if write {
+            cpu.jit_fast_map.populate_write(
+                linear,
+                physical,
+                host,
+                jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(physical),
+            )
+        } else {
+            cpu.jit_fast_map.populate_read(
+                linear,
+                physical,
+                host,
+                jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(physical),
+            )
+        };
+        assert!(ok, "linear {linear:#x} -> phys {physical:#x} must map");
+    }
+}
+
+fn paged_cross_cpu() -> CpuGsw {
+    let mut cpu = flat_cpu();
+    cpu.control.cr0 |= CR0_PG | CR0_WP;
+    cpu.control.cr3 = 0x1000;
+    cpu
+}
+
+/// Linear 0x8000 -> phys 0x5000 (A), linear 0x9000 -> phys 0x7000 (B), with B != A+0x1000 and a
+/// decoy at A+0x1000. Modelled on `cross_page_paging_bus`. A dword at 0x8FFD that omitted the
+/// stub bound would read/write the decoy through A's host bias.
+const PAGED_CROSS_LINEAR: u32 = 0x8ffd;
+const PAGED_CROSS_FRAME_A: u32 = 0x5000;
+const PAGED_CROSS_FRAME_B: u32 = 0x7000;
+const PAGED_CROSS_DECOY: u32 = 0x6000;
+const PAGED_CROSS_DWORD: u32 = 0x4433_2211;
+
+fn plant_paged_cross_tables(memory: &mut [u8]) {
+    memory[0x1000..0x1004].copy_from_slice(&0x2007u32.to_le_bytes());
+    memory[0x2000..0x2004].copy_from_slice(&0x0007u32.to_le_bytes());
+    memory[0x200c..0x2010].copy_from_slice(&0x3007u32.to_le_bytes());
+    memory[0x2020..0x2024].copy_from_slice(&0x5007u32.to_le_bytes());
+    memory[0x2024..0x2028].copy_from_slice(&0x7007u32.to_le_bytes());
+    memory[(PAGED_CROSS_FRAME_A + 0xffd) as usize] = 0x11;
+    memory[(PAGED_CROSS_FRAME_A + 0xffe) as usize] = 0x22;
+    memory[(PAGED_CROSS_FRAME_A + 0xfff) as usize] = 0x33;
+    memory[PAGED_CROSS_FRAME_B as usize] = 0x44;
+    memory[PAGED_CROSS_DECOY as usize..PAGED_CROSS_DECOY as usize + 3]
+        .copy_from_slice(&[0xaa, 0xbb, 0xcc]);
+}
+
+fn build_paged_cross(body: &[u8]) -> Roles {
+    let mut code = MOV_ESI_ESI.to_vec();
+    let mut starts = vec![ENTRY];
+    let body_at = ENTRY + code.len() as u32;
+    starts.push(body_at);
+    code.extend_from_slice(body);
+    starts.push(ENTRY + code.len() as u32);
+    code.extend_from_slice(&MOV_EDI_EDI);
+    code.push(0xf4);
+
+    let mut memory = vec![0u8; 0xa000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    plant_paged_cross_tables(&mut memory);
+
+    let mut native = paged_cross_cpu();
+    let mut interp = paged_cross_cpu();
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    for (cpu, bus) in [
+        (&mut native, &mut native_bus),
+        (&mut interp, &mut interp_bus),
+    ] {
+        cpu.registers.set_esp(STACK_TOP);
+        for &linear in &starts {
+            cpu.set_eip(linear);
+            cpu.fetch_decoded(bus, linear).unwrap();
+        }
+        map_linear(cpu, bus, 0x3000, 0x3000);
+        map_linear(cpu, bus, 0x8000, PAGED_CROSS_FRAME_A);
+        map_linear(cpu, bus, 0x9000, PAGED_CROSS_FRAME_B);
+    }
+
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("entry key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = match jit::direct::compile(&mut native, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("structurally rejected: the tested form never reached the memory guard")
+        }
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
+    };
+    assert_eq!(
+        compilation.span.instructions, 3,
+        "the block must cover every slot, so the tested opcode really ran natively"
+    );
+    let code = compilation.code.clone();
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("block installs");
+    let block = native.jit_direct.block(id).expect("live block");
+
+    for cpu in [&mut native, &mut interp] {
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.registers.gpr = std::array::from_fn(|i| 0xdead_0000 | (0xa0 + i as u32));
+        cpu.registers.set_esp(STACK_TOP);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.set_eip(ENTRY);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    native_bus.trace = BusTrace::default();
+    interp_bus.trace = BusTrace::default();
+
+    Roles {
+        native,
+        native_bus,
+        interp,
+        interp_bus,
+        block,
+        body_at,
+        code,
+    }
+}
+
 /// Compile `mov esi,esi / body / mov edi,edi / hlt` at `ENTRY` on the native role, warm the same
 /// decode lines on the interpreter role, and seed both identically.
 fn build(body: &[u8]) -> Roles {
@@ -175,12 +321,34 @@ fn build(body: &[u8]) -> Roles {
 /// page whose watched bit is clear -- marking after populating would clear the entry just
 /// installed.
 fn build_watching(body: &[u8], watch: Option<u32>) -> Roles {
-    build_slots(&[body], watch)
+    build_slots(&[body], watch, false)
 }
 
 /// As `build`, for a pair of tested opcodes rather than one.
 fn build_two_body(first: &[u8], second: &[u8]) -> Roles {
-    build_slots(&[first, second], None)
+    build_slots(&[first, second], None, false)
+}
+
+fn build_user(body: &[u8]) -> Roles {
+    build_slots(&[body], None, true)
+}
+
+fn user_cpu() -> CpuGsw {
+    let mut cpu = flat_cpu();
+    cpu.cpl = 3;
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x0b, 0xfb));
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        cpu.registers
+            .set_segment(segment, SegmentRegister::flat(0x13, 0xf3));
+    }
+    cpu
 }
 
 /// Each element of `bodies` is one tested opcode, and each gets its own warmed decode line: a
@@ -188,7 +356,7 @@ fn build_two_body(first: &[u8], second: &[u8]) -> Roles {
 /// must then cover `bodies.len() + 2` slots -- asserted rather than assumed, because a body that
 /// silently failed to compile as one block would leave the tested opcode on the interpreter and
 /// the fixture would certify nothing.
-fn build_slots(bodies: &[&[u8]], watch: Option<u32>) -> Roles {
+fn build_slots(bodies: &[&[u8]], watch: Option<u32>, cpl3: bool) -> Roles {
     let mut code = MOV_ESI_ESI.to_vec();
     let mut starts = vec![ENTRY];
     let body_at = ENTRY + code.len() as u32;
@@ -206,8 +374,8 @@ fn build_slots(bodies: &[&[u8]], watch: Option<u32>) -> Roles {
     memory[(ENTRY - 1) as usize] = 0x90;
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
 
-    let mut native = flat_cpu();
-    let mut interp = flat_cpu();
+    let mut native = if cpl3 { user_cpu() } else { flat_cpu() };
+    let mut interp = if cpl3 { user_cpu() } else { flat_cpu() };
     let mut native_bus = TestBus::with_memory(memory.clone());
     let mut interp_bus = TestBus::with_memory(memory);
     for bus in [&mut native_bus, &mut interp_bus] {
@@ -378,6 +546,10 @@ fn lowered_aligned(body: &[u8], context: &str) {
 /// interpreter must then execute it and reach the same state.
 fn guarded(body: &[u8], exits: fn(&CpuGsw) -> u64, context: &str) {
     let mut roles = build(body);
+    guarded_roles(&mut roles, exits, context);
+}
+
+fn guarded_roles(roles: &mut Roles, exits: fn(&CpuGsw) -> u64, context: &str) {
     let retired = roles.native.perf_counters().jit_direct_insns;
     let before = exits(&roles.native);
     let ram_before = roles.native_bus.memory.to_vec();
@@ -419,13 +591,13 @@ fn guarded(body: &[u8], exits: fn(&CpuGsw) -> u64, context: &str) {
         "{context}: the refusal must leave guest RAM untouched, but byte {touched:?} moved -- a          refusal placed AFTER the write means the interpreter's re-execution writes it twice"
     );
     roles.interp.cycle(&mut roles.interp_bus).unwrap();
-    compare_state(&roles, &format!("{context}: at the guard"));
+    compare_state(roles, &format!("{context}: at the guard"));
 
     for _ in 0..2 {
         roles.native.cycle(&mut roles.native_bus).unwrap();
         roles.interp.cycle(&mut roles.interp_bus).unwrap();
     }
-    compare_state(&roles, &format!("{context}: after the re-execution"));
+    compare_state(roles, &format!("{context}: after the re-execution"));
 }
 
 fn alignment_exits(cpu: &CpuGsw) -> u64 {
@@ -434,6 +606,14 @@ fn alignment_exits(cpu: &CpuGsw) -> u64 {
 
 fn kind_exits(cpu: &CpuGsw) -> u64 {
     cpu.perf_counters().jit_direct_exit_unavailable_or_kind
+}
+
+fn permission_exits(cpu: &CpuGsw) -> u64 {
+    cpu.perf_counters().jit_direct_exit_permission
+}
+
+fn watch_exits(cpu: &CpuGsw) -> u64 {
+    cpu.perf_counters().jit_direct_exit_code_watch
 }
 
 /// `[disp32]` addressing: ModRM mod 00, rm 101. No base register, so no row's operand address can
@@ -512,9 +692,9 @@ fn a_misaligned_word_alu_memory_source_runs_natively() {
     }
 
     // The other half of the split guard, on the same slot: an operand on the page's LAST byte
-    // CROSSES, and the crossing bound refuses it whatever the alignment relaxation does. Without
-    // this row the test above would keep passing if the crossing half were relaxed along with the
-    // alignment half, and the pointer would then be used across a page the FastMap entry does not
+    // CROSSES. Alignment sends it to the counting-read stub, and the stub RAM arm refuses before
+    // the pointer resolve. Without this row the test above would keep passing if the stub bound
+    // were omitted, and the pointer would then be used across a page the FastMap entry does not
     // cover. `guarded` also asserts the refusal is transactional -- EIP left AT the slot, guest RAM
     // untouched, and the interpreted re-execution agreeing on both roles.
     let at = OPERAND_PAGE + 0xfff;
@@ -522,7 +702,7 @@ fn a_misaligned_word_alu_memory_source_runs_natively() {
     body.extend_from_slice(&disp32(&[0x2b], 0, at));
     guarded(
         &body,
-        alignment_exits,
+        kind_exits,
         &format!("sub ax, word [{at:#x}] crosses"),
     );
 }
@@ -635,13 +815,13 @@ fn a_misaligned_dword_read_runs_natively_at_every_sub_alignment() {
     }
 }
 
-/// The page edge, both sides of it, and this is the row the guard ORDER exists for.
+/// The page edge, both sides of it.
 ///
 /// An access that ends on the page's last byte is served; one that would run past it is refused,
-/// because the FastMap entry the pointer was formed against covers exactly one page. The crossing
-/// bound is emitted BEFORE the alignment test precisely so a crossing access can never reach the
-/// recovery path the alignment test now targets — reverse the two halves and the last three rows
-/// here are served across a page boundary instead of exiting.
+/// because the FastMap entry the pointer was formed against covers exactly one page. Alignment
+/// sends a crossing Word/Dword to the stub, and the stub RAM arm refuses before the pointer
+/// resolve. Omit that bound and the last three rows here are served across a page boundary
+/// instead of exiting.
 #[test]
 fn a_page_edge_access_runs_inside_the_page_and_exits_when_it_crosses() {
     // Word: 0xFFD and 0xFFE end inside the page (0xFFE is aligned, so it is the control); 0xFFF
@@ -654,7 +834,7 @@ fn a_page_edge_access_runs_inside_the_page_and_exits_when_it_crosses() {
     lowered_aligned(&word_load(OPERAND_PAGE + 0xffe), "word [page+0xffe]");
     guarded(
         &word_load(OPERAND_PAGE + 0xfff),
-        alignment_exits,
+        kind_exits,
         "movzx ebx, word [page+0xfff] crosses",
     );
 
@@ -668,10 +848,35 @@ fn a_page_edge_access_runs_inside_the_page_and_exits_when_it_crosses() {
         let at = OPERAND_PAGE + offset;
         guarded(
             &dword_load(at),
-            alignment_exits,
+            kind_exits,
             &format!("dword [{at:#x}] crosses"),
         );
     }
+}
+
+/// A crossing dword through noncontiguous paging aliases must side-exit, not serve the decoy at
+/// A+0x1000. Frames A=0x5000 and B=0x7000, decoy at 0x6000. Omit the stub bound and native reads
+/// A[0xFFD..0xFFF] || decoy[0] = 0xaa332211 instead of A || B[0] = 0x44332211.
+#[test]
+fn a_paging_alias_crossing_dword_load_exits_and_does_not_read_the_decoy() {
+    let mut roles = build_paged_cross(&dword_load(PAGED_CROSS_LINEAR));
+    let ebx_before = roles.native.registers.ebx();
+    guarded_roles(
+        &mut roles,
+        kind_exits,
+        "mov ebx, dword [0x8ffd] paging-alias crosses",
+    );
+    assert_eq!(
+        roles.native.registers.ebx(),
+        PAGED_CROSS_DWORD,
+        "interpreter re-execution must concatenate A[0xFFD..0xFFF] || B[0], not the decoy"
+    );
+    assert_ne!(ebx_before, PAGED_CROSS_DWORD);
+    assert_eq!(
+        &roles.native_bus.memory[PAGED_CROSS_DECOY as usize..PAGED_CROSS_DECOY as usize + 3],
+        &[0xaa, 0xbb, 0xcc],
+        "the decoy at A+0x1000 must not appear in any byte of EBX or be consumed"
+    );
 }
 
 /// A Mode 13h aperture read stays refused even when it is misaligned, and stays refused for the
@@ -743,18 +948,17 @@ fn a_misaligned_store_runs_natively_and_charges_the_split() {
 ///
 /// This row exists for one specific wrong shape, and it was written and watched to FAIL against it
 /// before the fix landed. The slow stub's contract is "RAX = linear address, RDX = store value",
-/// and `emit_slow_stub` spills RDX as its second instruction. But `emit_store_fast` materialises
-/// the value into RDX three emissions AFTER the point the guard sits. Retarget the alignment half
-/// in place -- the obvious edit, and the one the read site takes -- and the jump into the stub
-/// happens before the value exists: the stub spills, then stores, whatever RDX held from the
-/// PREVIOUS slot. Silent wrong-value store into guest RAM, no fault, no counter.
+/// and `emit_slow_stub` spills RDX as its second instruction. Hoist the alignment half before
+/// `emit_read_store_value` -- the obvious edit, and the one the read site takes -- and the jump
+/// into the stub happens before the value exists: the stub spills, then stores, whatever RDX held
+/// from the PREVIOUS slot. Silent wrong-value store into guest RAM, no fault, no counter.
 ///
 /// Two slots with different values is the only shape where a stale RDX is visible: with one slot,
 /// or with two slots writing the same value, the wrong register still holds a plausible number.
 ///
-/// The fix splits the guard around the value materialisation and gives the alignment half RCX,
-/// which is free by the store pad's own rule. This row is what guards that split against a future
-/// tidy-up that hoists the alignment half back next to the crossing bound.
+/// The alignment half sits AFTER the value and uses RCX, which is free by the store pad's own
+/// rule. This row is what guards that placement against a future tidy-up that hoists the
+/// alignment half before `emit_read_store_value`.
 #[test]
 fn a_misaligned_store_writes_its_own_value_not_the_previous_slots() {
     // The first slot is ALIGNED, so it takes the fast arm and leaves its value in RDX; the second
@@ -859,23 +1063,83 @@ fn a_misaligned_mode13_store_still_exits_without_writing() {
     );
 }
 
-/// A page-CROSSING store still refuses, at both widths. The crossing bound is emitted before the
-/// alignment half here for the same reason it is at the read site.
+/// A page-CROSSING store still refuses, at both widths. Alignment sends it to the slow stub, and
+/// the stub RAM arm refuses before the write.
 #[test]
 fn a_page_crossing_store_still_exits() {
     guarded(
         &word_store(OPERAND_PAGE + 0xfff, 0x1234),
-        alignment_exits,
+        kind_exits,
         "mov word [page+0xfff] crosses",
     );
     for offset in [0xffdu32, 0xffe, 0xfff] {
         let at = OPERAND_PAGE + offset;
         guarded(
             &dword_store(at, 0x1020_3040),
-            alignment_exits,
+            kind_exits,
             &format!("mov dword [{at:#x}] crosses"),
         );
     }
+}
+
+/// Store twin of the paging-alias load. Native must leave both frames and the decoy untouched;
+/// omit-refusal writes three bytes of A and one byte of the decoy page, not frame B.
+#[test]
+fn a_paging_alias_crossing_dword_store_exits_and_does_not_write_the_decoy() {
+    let mut roles = build_paged_cross(&dword_store(PAGED_CROSS_LINEAR, 0x1020_3040));
+    guarded_roles(
+        &mut roles,
+        kind_exits,
+        "mov dword [0x8ffd], imm32 paging-alias crosses",
+    );
+    assert_eq!(
+        &roles.native_bus.memory[PAGED_CROSS_DECOY as usize..PAGED_CROSS_DECOY as usize + 3],
+        &[0xaa, 0xbb, 0xcc],
+        "the decoy at A+0x1000 must stay planted; omit-refusal writes it"
+    );
+}
+
+/// Mutant 4 detector: a cpl3 page-local misaligned dword store whose offset does not look like
+/// USER|WRITABLE (0x20|0x10). Offset 0x100 is 4-aligned and would take the fast arm, never the
+/// stub permission check; 0x101 is the same flags-clobber class (`offset & 0x30 == 0`) and is
+/// the alignment-caused stub entry. Hardcoded-RDX at the stub RAM arm makes permission see
+/// 0x101 as flags and false-fail as Permission.
+#[test]
+fn a_cpl3_page_local_misaligned_dword_store_is_served() {
+    let at = OPERAND_PAGE + 0x101;
+    let mut roles = build_user(&dword_store(at, 0x1020_3040));
+    let retired = roles.native.perf_counters().jit_direct_insns;
+    let permission = permission_exits(&roles.native);
+    let kind = kind_exits(&roles.native);
+    let watch = watch_exits(&roles.native);
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "cpl3 page-local misaligned dword store: block did not run natively"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - retired,
+        3,
+        "cpl3 page-local misaligned dword store: all three slots must retire natively"
+    );
+    assert_eq!(
+        permission_exits(&roles.native) - permission,
+        0,
+        "cpl3 page-local misaligned dword store: must not false-fail as Permission"
+    );
+    assert_eq!(kind_exits(&roles.native) - kind, 0);
+    assert_eq!(watch_exits(&roles.native) - watch, 0);
+    for _ in 0..3 {
+        roles.interp.cycle(&mut roles.interp_bus).unwrap();
+    }
+    compare_state(&roles, "cpl3 page-local misaligned dword store");
+    assert_eq!(
+        roles.native_bus.trace.elapsed_clocks(),
+        roles.interp_bus.trace.elapsed_clocks() + expected_split_delta(4),
+        "cpl3 page-local misaligned dword store: split extra must be charged"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1017,6 +1281,17 @@ fn alignment_half(align_test_al: bool, mask: u32) -> Vec<u8> {
     }
 }
 
+/// The lean store site's alignment half: same as `alignment_half` on the ON arm, RCX scratch on
+/// the default arm (`mov ecx, eax; and ecx, mask`).
+fn alignment_half_rcx(align_test_al: bool, mask: u32) -> Vec<u8> {
+    if align_test_al {
+        vec![0xf6, 0xc0, mask as u8]
+    } else {
+        let mask = mask.to_le_bytes();
+        vec![0x89, 0xc1, 0x81, 0xe1, mask[0], mask[1], mask[2], mask[3]]
+    }
+}
+
 fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     haystack
         .windows(needle.len())
@@ -1069,6 +1344,40 @@ fn a_self_aligning_width_skips_the_dead_page_cross_bound_at_a_refusing_site() {
             occurrences(&word.code, &alignment_half(on, 1)),
             1,
             "{arm}: inc word [aligned]: with the Word mask, not the Dword one"
+        );
+    }
+    jit::direct::set_align_test_al_for_test(None);
+}
+
+/// Lean MOV no longer emits the page-cross bound in the block. The stub RAM arm holds it, in the
+/// shared pad, so `PAGE_CROSS_HEAD` (the RDX spelling) is absent here. The alignment half stays.
+#[test]
+fn a_lean_mov_skips_the_page_cross_bound_and_keeps_the_alignment_half() {
+    for on in [false, true] {
+        jit::direct::set_align_test_al_for_test(Some(on));
+        let arm = if on { "align-test-al ON" } else { "OFF" };
+        let load = build(&dword_load(OPERAND_PAGE + 0x200));
+        assert_eq!(
+            occurrences(&load.code, &PAGE_CROSS_HEAD),
+            0,
+            "{arm}: mov ebx, dword [aligned]: the lean load bound moved to the stub"
+        );
+        assert_eq!(
+            occurrences(&load.code, &alignment_half(on, 3)),
+            1,
+            "{arm}: mov ebx, dword [aligned]: the ALIGNMENT half must survive"
+        );
+
+        let store = build(&dword_store(OPERAND_PAGE + 0x200, 0x1020_3040));
+        assert_eq!(
+            occurrences(&store.code, &PAGE_CROSS_HEAD),
+            0,
+            "{arm}: mov dword [aligned], imm: the lean store bound moved to the stub"
+        );
+        assert_eq!(
+            occurrences(&store.code, &alignment_half_rcx(on, 3)),
+            1,
+            "{arm}: mov dword [aligned], imm: the ALIGNMENT half must survive, on RCX"
         );
     }
     jit::direct::set_align_test_al_for_test(None);
@@ -1151,12 +1460,15 @@ fn align_test_al_arm_still_passes_guard_3() {
     an_aligned_read_through_the_counting_stub_charges_no_split();
     a_misaligned_dword_read_runs_natively_at_every_sub_alignment();
     a_page_edge_access_runs_inside_the_page_and_exits_when_it_crosses();
+    a_paging_alias_crossing_dword_load_exits_and_does_not_read_the_decoy();
     a_misaligned_mode13_read_still_exits();
     a_misaligned_store_runs_natively_and_charges_the_split();
     a_misaligned_store_writes_its_own_value_not_the_previous_slots();
     an_aligned_store_through_the_slow_stub_charges_no_split();
     a_misaligned_mode13_store_still_exits_without_writing();
     a_page_crossing_store_still_exits();
+    a_paging_alias_crossing_dword_store_exits_and_does_not_write_the_decoy();
+    a_cpl3_page_local_misaligned_dword_store_is_served();
     a_straddling_misaligned_store_sees_every_granule_of_its_span();
     the_non_relaxed_sites_still_refuse_a_misaligned_access();
     a_misaligned_x87_access_still_exits();

@@ -2172,9 +2172,7 @@ fn cross_page_dword_read_side_exits_after_only_the_completed_prefix() {
     reset_read_measurement(&mut native, &mut native_bus);
     let native_before = native.perf_counters().jit_direct_insns;
     let exits_before = native.perf_counters().jit_direct_side_exits;
-    let cross_page_before = native
-        .perf_counters()
-        .jit_direct_exit_cross_page_or_alignment;
+    let kind_before = native.perf_counters().jit_direct_exit_unavailable_or_kind;
 
     let interp_outcomes = drive(&mut interp, &mut interp_bus);
     let native_outcomes = drive(&mut native, &mut native_bus);
@@ -2189,10 +2187,7 @@ fn cross_page_dword_read_side_exits_after_only_the_completed_prefix() {
         1
     );
     assert_eq!(
-        native
-            .perf_counters()
-            .jit_direct_exit_cross_page_or_alignment
-            - cross_page_before,
+        native.perf_counters().jit_direct_exit_unavailable_or_kind - kind_before,
         1
     );
 }
