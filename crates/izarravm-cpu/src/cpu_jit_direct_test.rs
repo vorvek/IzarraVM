@@ -4771,7 +4771,7 @@ fn a_mid_block_call_through_memory_matches_the_interpreter() {
         native.perf_counters().jit_native_store_hits - stores_before,
         1,
         "one native dword write: the return-address push, and it must reach NativeExit through \
-         the RAM dword-write lane"
+         the dword-store lane (static total, RAM after the mode13 subtract)"
     );
     // Anti-vacuity, and the load-bearing assertion. Two native instructions means the call itself
     // retired natively rather than the block silently stopping before it.

@@ -3099,16 +3099,16 @@ impl CpuGsw {
         let split_extra_bytes = exit.dword_reads >> 32;
         let mode13_byte_reads = exit.mode13_byte_reads & u64::from(u32::MAX);
         let mode13_word_reads = exit.mode13_byte_reads >> 32;
-        let ram_byte_writes = exit.ram_byte_writes & u64::from(u32::MAX);
-        let ram_word_writes = exit.ram_byte_writes >> 32;
+        let total_byte_stores = exit.ram_byte_writes & u64::from(u32::MAX);
+        let total_word_stores = exit.ram_byte_writes >> 32;
         // The same carry guard the `dword_reads` lane carries above, for the same reason: the
-        // block's dynamic RAM dword-write count must not reach the half a second quantity now
+        // block's static total dword-store count must not reach the half a second quantity now
         // lives in. It cannot -- both halves are bounded by the chain bounds `NativeExit`'s own
         // comment relies on, `MAX_CHAIN_BLOCKS` = 256 for the far returns and the per-block store
         // counts for the writes -- and this is what makes that checkable rather than argued.
         debug_assert!(
             exit.ram_dword_writes & u64::from(u32::MAX) <= u64::from(u32::MAX) / 2,
-            "RAM dword writes must not carry into the far-return half"
+            "static total dword stores must not carry into the far-return half"
         );
         // MASKED, and the mask must precede BOTH consumers of this lane. `STACK_RAM_DWORD_WRITES`'s
         // high half now carries the FAR-RETURN LEDGER: one per `RetFar16` slot that retired, which
@@ -3123,7 +3123,7 @@ impl CpuGsw {
         // `2^32 * jit_data_cost_clocks(Dword)` to `raw_bus_clocks`, `scaled_bus_clocks` and
         // `elapsed_clocks` -- landing in exactly the quantities this slice already declines to pin
         // as equalities, so it would be MISREAD as the timing change the slice admits to.
-        let ram_dword_writes = exit.ram_dword_writes & u64::from(u32::MAX);
+        let total_dword_stores = exit.ram_dword_writes & u64::from(u32::MAX);
         let far_returns = exit.ram_dword_writes >> 32;
         let mode13_byte_writes = exit.mode13_byte_writes & u64::from(u32::MAX);
         let mode13_word_writes = exit.mode13_byte_writes >> 32;
@@ -3209,6 +3209,12 @@ impl CpuGsw {
         let ram_byte_reads = byte_reads - mode13_byte_reads;
         let ram_word_reads = word_reads - mode13_word_reads;
         let ram_dword_reads = dword_reads - exit.mode13_dword_reads;
+        debug_assert!(mode13_byte_writes <= total_byte_stores);
+        debug_assert!(mode13_word_writes <= total_word_stores);
+        debug_assert!(exit.mode13_dword_writes <= total_dword_stores);
+        let ram_byte_writes = total_byte_stores - mode13_byte_writes;
+        let ram_word_writes = total_word_stores - mode13_word_writes;
+        let ram_dword_writes = total_dword_stores - exit.mode13_dword_writes;
 
         let data_clocks = bus
             .jit_data_cost_clocks(BusWidth::Byte)
