@@ -1840,6 +1840,23 @@ pub struct DirectSmcCensusUnits {
     pub keys_killed: u64,
     pub keys_surviving: u64,
     pub lane_accept_keys: u64,
+    /// Rows the inline coverage pre-filter (`PageKeys::lens`) skipped before the `entries` probe.
+    /// They are counted in `keys_scanned` and in `survivors_moved` and in NONE of the four per-key
+    /// exits above, so both exit closures carry this term. The mechanism witness for C1: the
+    /// magnitude that says whether the slice engaged is `probes_elided / keys_scanned`.
+    pub probes_elided: u64,
+    /// Rows that actually reached `self.entries.get`. `probes_elided + entries_get_calls ==
+    /// keys_scanned`, and `entries_get_calls == keys_killed + keys_surviving + lane_accept_keys +
+    /// entries_get_misses`.
+    pub entries_get_calls: u64,
+    /// Skipped rows the authoritative per-state test would have killed. MUST read zero. A non-zero
+    /// value is the pre-filter's coverage invariant broken, i.e. a missed invalidation, and is a
+    /// STOP rather than a tuning input.
+    ///
+    /// Costs the very `entries` probe the pre-filter exists to avoid, once per elided row, so a
+    /// census-armed arm CANNOT be read for the slice's wall effect -- only for its mechanism.
+    /// Grade the wall on plain builds, as the campaign's standing rule already says.
+    pub probe_divergences: u64,
 
     // Phase (d) — survivor compaction and drain.
     pub survivors_moved: u64,
