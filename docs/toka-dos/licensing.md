@@ -47,8 +47,8 @@ do not change its behavior.
 The image carries no CD-ROM driver files: the IzarraCD ROM Extensions in the
 system BIOS serve the CD-ROM. Earlier releases shipped `IZCDEX.COM`, a build
 of the SHSUCDX of Jason Hood, (C) 2005-2020, under the Zlib license. Its
-source stays in the repository for reference, with the Toka-DOS marks that
-license requires.
+vendored source left the tree with the consolidation; the repository's git
+history holds it complete, with the Toka-DOS marks that license requires.
 
 `TOKAEMM.SYS` is original NASM code. But its VCPI 1.0 server and its emulation
 of privileged instructions in virtual-8086 mode use the mechanisms of 386MAX,
@@ -73,10 +73,10 @@ file of the IzarraVM repository gives them.
 
 The IzarraVM repository holds the source code for each part of Toka-DOS:
 
-- `toka-dos/freedos/` holds the FreeDOS kernel, FreeCOM, the vendored command
-  sources, and the SHSUCDX source (kept for reference). The Toka-DOS changes
-  are in these sources. `toka-dos/freedos/VENDOR.md` records each upstream
-  revision and each local patch.
+- `toka-dos/freedos/` holds the FreeDOS kernel, FreeCOM, and the vendored
+  command sources. The Toka-DOS changes are in these sources.
+  `toka-dos/freedos/VENDOR.md` records each upstream revision and each local
+  patch, and the removal record for the SHSUCDX tree.
 - `crates/izarravm-firmware/roms/dos/` holds the NASM sources for the drivers
   and the tools that go directly into the image: `tokaemm.asm`, `tokacd.asm`,
   `gswmode.asm`, `sndctrl.asm`, `sndmixer.asm`, and `unhalt.asm`.

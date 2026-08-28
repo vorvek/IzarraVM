@@ -15,11 +15,18 @@ are the GPL corresponding source for the committed
 
 Neither tag has git submodules. (Upstream master has since diverged: kernel 2045 / FreeCom 0.87.)
 
-## SHSUCDX CD-ROM redirector
+## SHSUCDX CD-ROM redirector (REMOVED with the IzarraCD consolidation)
+
+The `shsucd/` tree and its `IZCDEX.COM` build left the repository with slice
+CD-3 (2026-08-28): the image ships no guest CD driver since PRs #755/#756,
+the BIOS serves the CD-ROM, and the host redirector was written against the
+DOS redirector interface's documented contract. Git history before CD-3
+holds the complete vendored tree and every Toka-DOS mark. The record below
+is kept for that history.
 
 - shsucd: github.com/adoxa/shsucd commit
   `5ea0787549f60270df5f70a0d6b8d4d9f5cb49da` (SHSUCDX 3.09, 2022-09-02).
-  The complete upstream tree is vendored under `shsucd/`.
+  The complete upstream tree was vendored under `shsucd/`.
 - License: the zlib-style permissive terms in `shsucd/LICENSE.txt`. The original
   copyright, credits, documentation, and redirector ABI are preserved.
 - Build: NASM `-O9 -Di8086` produces the compatibility build. Toka-DOS ships it
