@@ -2311,8 +2311,10 @@ fn hdd_map_probe_with_null_mailbox_parks_fe_and_registers_nothing() {
     machine.perform_cd_doorbell(0x03);
     assert_eq!(machine.cd_doorbell_status, 0xFE, "probe parks FE");
 
-    // Nothing was registered, so a lookup answers unregistered too.
-    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 0, 2, 0);
+    // Nothing was registered, so a lookup answers unregistered too. Unit 2
+    // on purpose: with the correct unit, only the registration guard can
+    // produce this 0xFE.
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 2, 2, 0);
     machine.perform_cd_doorbell(0x04);
     assert_eq!(machine.cd_doorbell_status, 0xFE);
 }
