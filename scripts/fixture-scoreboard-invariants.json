@@ -39,6 +39,9 @@
     "final_instructions": 18136220051,
     "final_instructions_tolerance": 0.05
   },
+  "tyrian-setup-486": {
+    "frame_sha256": "479a10ea0c16837ec1d2b8018a2641bd8c1820d291e0092bf1f13ee8e2edf5eb"
+  },
   "wolf3d-486": {
     "frame_sha256": "6101c4f39ee50cdee2fa3bc12c8ca3c678d82c9c22fee3275f5d22379dfbee04"
   },

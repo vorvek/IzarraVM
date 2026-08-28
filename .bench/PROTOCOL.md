@@ -984,6 +984,44 @@ duke3d-586 before any merge decision.**
   `scripts/fixture-scoreboard-invariants.json`; derivations in
   `New-FrameContract` in `scripts/run-fixture-scoreboard.ps1`.
 
+### Tyrian 2000 (Loudness audio clock + DPMI16, 486 and 586)
+
+Two fixtures, three rows, added 2026-08-29. They exist because Tyrian's
+Loudness driver is a different failure surface from every other row: it
+reprograms PIT channel 0 (mode 3, reload 0x4300, ~70 Hz) once per video frame
+from its main loop, paces music as MPU-401 UART MIDI through the wavetable
+part at P300, and keeps a single-cycle SB DSP block chain (command 0x14, 384
+samples at 10989 Hz) re-armed off the same clock. The 2026-08-28 PIT
+write-edge bug (a control word that raises OUT low-to-high produced no IRQ0
+edge; fixed in `854237ed`) silenced all of it while every scoreboard row
+stayed green — no other fixture drives the timer that way.
+
+- Location: `.bench/tyrian_setup_c` (SETUP.EXE) and `.bench/tyrian_c`
+  (TYRIAN.EXE, the launcher for `file0001.exe`, Borland DPMI16). Both trees
+  carry the owner's `TYRIAN.CFG` (music "Midi 300h", effects SoundBlaster) and
+  `TYRIAN.SAV`; AUTOEXEC sets BLASTER and loops the program.
+- Rows and exact invocations: the fixture table in
+  `scripts/run-fixture-scoreboard.ps1` (`tyrian-setup-486`, `tyrian-486`,
+  `tyrian-586`). Key/mouse offsets are CPU cycles: 66 M/guest-second at 486,
+  166 M at 586.
+  - `tyrian-setup-486`, 4.7e9 (~71 guest s): sit on the settings menu (music
+    must KEEP PLAYING there — that silence was the owner's first symptom),
+    five {down} to Jukebox at ~25 s, {enter}, jukebox to ~59 s, {esc} back.
+    End frame = the static settings menu, exact hash in the sidecar.
+  - `tyrian-486`, 3.2e9 (~48.5 guest s): title -> Start New Game -> 1 Player
+    Full Game -> episode -> difficulty -> station menu -> Start Level, left
+    mouse button HELD from ~31 s. The stationary ship dies at ~53 s, so the
+    budget ends ~4.5 s before that, inside gameplay; no end-frame hash.
+  - `tyrian-586`, 8.05e9: the same schedule at 586 guest-second offsets. The
+    PERF row: the owner reports ~10% realtime loads at this persona.
+- Oracle: PROFILE BANDS (`profileBands` in the fixture table, graded in
+  `Invoke-Fixture`) on `timer.irq0_edges`, `mpu.wavetable.data_writes` and
+  `sb_dsp.command_bytes`, plus the `cycle_limit` stop; the setup row adds the
+  end-frame hash. The bands are liveness floors sized >2x above the broken
+  tree's readings and are NOT cadence pins: a starved 70 Hz clock reads 18.2/s
+  boot-rate IRQ0 and near-zero MIDI, far below every floor. rt is the
+  performance measurement, never asserted.
+
 ## Traps (these bit prior rounds)
 
 0. COUNT-ONLY FRAMEBUFFER INVARIANTS DO NOT DISCRIMINATE. Grand Prix 2 under

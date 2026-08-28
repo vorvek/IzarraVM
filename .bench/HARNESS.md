@@ -29,6 +29,8 @@ the exception and runs DUKEMARK exactly once, then ends the VM itself with
 | `bench16_c` | 586 | synthetic 16-bit loop | historical; see the warning below |
 | `tombraid_c` | **586** | Tomb Raider Gold, DOS4GW, CD REQUIRED | late-DOS Pentium 3D + CD-streamed FMV; see below |
 | `duke3d_short_c` | 586 | the same DUKEMARK run, demo cut to 1560 records | the CHEAP duke ladder row: 143 s a leg against 342 s |
+| `tyrian_setup_c` | 486 | Tyrian 2000 SETUP.EXE, settings menu + jukebox | the guest 70 Hz audio clock (PIT rewrite per frame + MPU-401 MIDI + DSP 0x14 chain); see PROTOCOL.md |
+| `tyrian_c` | 486, 586 | Tyrian 2000 gameplay, scripted to level 1 with fire held | same audio clock under play; the 586 row is the perf row |
 
 `duke3d_short_c` is generated, not authored: `scripts/make-duke-short-fixture.ps1`
 writes it from `duke3d_c` by lowering the record count in BENCH2.DMO's header and
@@ -276,6 +278,9 @@ persona's rate: 486 is 66 MHz, 586 is 166 MHz.
 | Wolf3D | 486 | 4e9 | 61 s | |
 | Duke3D | 486 | 26.4e9 | 400 s | a GUARD; EXITVM fires at ~10.8e9 / 163 s |
 | Duke3D | 586 | 79.68e9 | 480 s | same guard role; EXITVM fires at ~23.2e9 / 140 s |
+| Tyrian setup | 486 | 4.7e9 | 71 s | menu to 25 s, jukebox 27-59 s, menu tail |
+| Tyrian | 486 | 3.2e9 | 48 s | gameplay from ~31 s; the ship dies at ~53 s, the budget stops before it |
+| Tyrian | 586 | 8.05e9 | 48 s | the same guest-second schedule at 166 MHz |
 
 **The Duke3D budget no longer sets the length of the run.** The guest exits
 itself through `EXITVM.COM` when DUKEMARK is done, so the budget is only there
