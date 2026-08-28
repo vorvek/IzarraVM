@@ -80,26 +80,22 @@ fn tokacd_is_an_8086_mscdex_character_driver() {
 }
 
 #[test]
-fn cdtest_fixture_requires_a_guest_device_header() {
+fn cdtest_fixture_requires_the_rom_device_header() {
+    assert!(CDTEST_COM_SOURCE.contains("mov ax, 0x1500"));
     assert!(CDTEST_COM_SOURCE.contains("mov ax, 0x1501"));
-    assert!(CDTEST_COM_SOURCE.contains("or ax, [device_list + 3]"));
+    assert!(CDTEST_COM_SOURCE.contains("db 'TOKACD01'"));
     assert!(CDTEST_COM_SOURCE.contains("D:\\PROBE.TXT"));
 }
 
 #[test]
-fn tokacd_protocol_fixture_calls_the_real_driver_and_checks_timeouts() {
+fn cd_request_fixtures_call_the_driver_entries_directly() {
     assert!(CDPROT_COM_SOURCE.contains("call far [strategy_ptr]"));
     assert!(CDPROT_COM_SOURCE.contains("call far [interrupt_ptr]"));
     assert!(CDPROT_COM_SOURCE.contains("mov ax, 0x1501"));
     assert!(CDPROT_COM_SOURCE.contains("mov al, 128"));
-    assert!(TOKACD_SYS_SOURCE.contains("mov ax, [es:0x006C]"));
-    assert!(TOKACD_SYS_SOURCE.contains("cmp ax, 182"));
-    assert!(TOKACD_SYS_SOURCE.contains("mov word [cs:poll_outer], 128"));
-    assert!(TOKACD_SYS_SOURCE.contains("mov word [cs:poll_inner], 0xFFFF"));
     assert!(CDAUDIO_COM_SOURCE.contains("mov al, 132"));
     assert!(CDAUDIO_COM_SOURCE.contains("mov al, 133"));
     assert!(CDAUDIO_COM_SOURCE.contains("mov al, 136"));
-    assert!(CDTIME_COM_SOURCE.contains("cmp word [request + 3], 0x810C"));
 }
 
 #[test]

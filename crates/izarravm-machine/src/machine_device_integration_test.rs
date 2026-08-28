@@ -1077,6 +1077,7 @@ fn icdex_send_request_read_long_loads_a_sector() {
     // transfer buffer at 0x4000. ES:BX -> header via ES base 0, BX = 0x2000.
     let header = 0x2000u32;
     let xfer = 0x4000u32;
+    machine.write_physical_u8(header, 27); // declared length (gated >= 13)
     machine.write_physical_u8(header + 2, 0x80); // command READ LONG
     machine.write_physical_u8(header + 0x0D, 0x00); // HSG addressing
     // transfer address dword at 0x0E
@@ -1120,6 +1121,7 @@ fn marked_data_cd() -> CdImage {
 /// and is encoded here.
 fn plant_read_long_request(machine: &mut Machine, header: u32, xfer: u32, lba: u32, count: u16) {
     let mut request = [0u8; 0x18];
+    request[0] = 27; // declared request length (the driver gates on >= 13)
     request[2] = 0x80; // READ LONG
     request[0x0D] = 0x00; // HSG addressing
     let xfer_far = ((xfer >> 4) << 16) | (xfer & 0xF);
@@ -1290,6 +1292,7 @@ fn icdex_send_request_play_audio_starts_playback() {
     let mut machine = test_machine();
     machine.mount_cd(audio_cd(40));
     let header = 0x2000u32;
+    machine.write_physical_u8(header, 22); // declared length (gated >= 13)
     machine.write_physical_u8(header + 2, 0x84); // PLAY AUDIO
     machine.write_physical_u8(header + 0x0D, 0x00); // HSG
     // start sector (LBA 1, the audio track) dword at 0x0E

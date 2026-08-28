@@ -268,6 +268,11 @@ void setvec(unsigned char intno, intvec vector)
 }
 #endif
 
+/* Toka-DOS 2026: the boot INT 2Fh vector, saved by setup_int_vectors and
+   consumed by IzarraCdClaim. */
+STATIC intvec Izarra_old2f;
+STATIC VOID IzarraCdClaim(VOID);
+
 STATIC void setup_int_vectors(void)
 {
   static struct vec
@@ -299,6 +304,10 @@ STATIC void setup_int_vectors(void)
 
   for (plvec = intvec_table; plvec < intvec_table + 5; plvec++)
     plvec->isv = getvec(plvec->intno);
+  /* Toka-DOS 2026: keep the boot INT 2Fh vector (the Izarra BIOS stub)
+     before the kernel handler replaces it. When the IzarraCD claim
+     succeeds, int2f.asm forwards AH=11h/15h to it. */
+  Izarra_old2f = getvec(0x2f);
   for (i = 0x23; i <= 0x3f; i++)
     setvec(i, empty_handler);
   /* Modified by the Toka-DOS project, 2026: 0 -> 1, matching the default set in
@@ -386,7 +395,64 @@ STATIC void init_kernel(void)
   
   configDone();
 
+  IzarraCdClaim();
+
   InitializeAllBPBs();
+}
+
+#ifdef __WATCOMC__
+STATIC UBYTE izarra_inp(UWORD port);
+#pragma aux izarra_inp = "in al,dx" parm [dx] value [al] modify exact [al];
+STATIC VOID izarra_outp(UWORD port, UBYTE value);
+#pragma aux izarra_outp = "out dx,al" parm [dx] [al] modify exact [];
+#endif
+
+/* Added by the Toka-DOS project, 2026: claim the IzarraCD ROM extension.
+ *
+ * The Izarra3000's CD-ROM is a proprietary-interface drive whose support
+ * software lives in the system BIOS. This claim runs once CONFIG.SYS is
+ * done: probe the Lotura chipset (port 0xE0 answers 0x5A), hand the BIOS
+ * the DOS data segment through the IzarraCD mailbox (0000:063Ch) and the
+ * doorbell (port 0xE8, command 2), then mark drive D: as a redirector
+ * drive with the exact CDS flag word the IZCDEX redirector wrote, and arm
+ * the INT 2Fh forward in int2f.asm. On any other machine the probe fails
+ * and every stock path stays. */
+STATIC VOID IzarraCdClaim(VOID)
+{
+#ifdef __WATCOMC__
+  struct cds FAR *cdsp;
+  UBYTE status;
+
+  if (izarra_inp(0xE0) != 0x5A)
+    return;
+  if (LoL->lastdrive <= 3)
+    return;
+  cdsp = &LoL->CDSp[3];
+  if (cdsp->cdsFlags & (CDSNETWDRV | CDSPHYSDRV))
+    return;
+
+  pokew(0, 0x63C, FP_SEG(LoL));
+  izarra_outp(0xE8, 0x02);
+  {
+    /* Bounded, like the other hardware gates: a host that parks the
+       doorbell busy must degrade to "no CD", not hang the boot. */
+    UWORD spin = 0xFFFF;
+    while ((status = izarra_inp(0xE8)) == 0x01 && --spin != 0)
+      ;
+  }
+  if (status != 0)
+    return;
+
+  /* Network + physical + hidden-from-redirector: the word IZCDEX's
+     SetRoot stored, and the signature it scanned for at uninstall. */
+  cdsp->cdsFlags = CDSNETWDRV | CDSPHYSDRV | 0x80;
+
+  izarra_cd_arm(FP_OFF(Izarra_old2f), FP_SEG(Izarra_old2f));
+
+  /* One boot-tree line in the shared glyph style. */
+  printf("%c%c> IzarraCD ROM Extensions: CD-ROM is drive %c:\n",
+         0xC3, 0xC4, 'A' + 3);
+#endif
 }
 
 STATIC VOID FsConfig(VOID)

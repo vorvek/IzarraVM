@@ -33,10 +33,14 @@ C:\DOS\
     COMMAND.COM     GSWMODE.COM     MOVE.EXE        MORE.EXE
     TOKAMOUS.COM    SNDCTRL.COM     SORT.EXE        FIND.EXE
     TOKAEMM.SYS     SNDMIXER.COM    MEM.EXE         LABEL.EXE
-    TOKACD.SYS      UNHALT.COM      ATTRIB.EXE      DELTREE.COM
-    IZCDEX.COM                      CHOICE.EXE      XCOPY.EXE
-                                    EDIT.COM        HELLO.TXT
+    UNHALT.COM      CHOICE.EXE      ATTRIB.EXE      DELTREE.COM
+                    EDIT.COM        XCOPY.EXE       HELLO.TXT
 ```
+
+The CD-ROM needs no driver files. The Izarra3000's CD-ROM drive uses a
+proprietary interface, and its support software — the IzarraCD ROM
+Extensions — is part of the system BIOS. Toka-DOS finds the extension at
+boot and assigns the drive to D:.
 
 `AUTOEXEC.BAT` adds `C:\DOS` to the `PATH`. Thus you can run each tool by its
 name from any directory. The [DOS command reference](commands.md) describes
@@ -104,7 +108,6 @@ FILES=40
 LASTDRIVE=D
 DEVICE=C:\DOS\TOKAEMM.SYS RAM /T
 DOS=HIGH,UMB
-DEVICEHIGH=C:\DOS\TOKACD.SYS
 SHELL=C:\DOS\COMMAND.COM C:\DOS /E:2048 /P=C:\AUTOEXEC.BAT
 ```
 
@@ -113,10 +116,11 @@ blocks. `/T` puts the tree connector of the boot screen in front of the
 sign-on line of the driver.
 
 `DOS=HIGH,UMB` moves the kernel into the HMA. It also adds the upper memory
-blocks to the DOS chain. `DEVICEHIGH` and `LH` need that chain.
+blocks to the DOS chain. `LH` needs that chain.
 
-`TOKACD.SYS` is the ATAPI CD-ROM device driver. The redirector that gives it a
-drive letter starts later, from `AUTOEXEC.BAT`.
+No line loads a CD-ROM driver. When the kernel finds the IzarraCD ROM
+Extensions in the system BIOS, it assigns the CD-ROM to drive D: and prints
+its own tree line. `LASTDRIVE=D` keeps the letter available.
 
 The `SHELL=` line starts FreeCOM with a 2048-byte environment. `C:\DOS` is the
 directory that FreeCOM makes `COMSPEC` from. `/P=` gives the name of the
@@ -136,13 +140,10 @@ IF NOT "%1"=="" GOTO %1
 PROMPT $P$G
 PATH C:\DOS
 SET BLASTER=A220 I7 D1 H5 P300 T6
-FOR %%C IN (CDROM MOUSE SOUND) DO CALL C:\AUTOEXEC.BAT %%C
+FOR %%C IN (MOUSE SOUND) DO CALL C:\AUTOEXEC.BAT %%C
 ECHO ╞════════════════════════════════════════════════════════════════════════════╕
 ECHO │   Starting in text mode. Run TOKADESK to enable the visual workbench.      │
 ECHO ╘════════════════════════════════════════════════════════════════════════════╛
-GOTO END
-:CDROM
-IZCDEX /I /D:TOKACD01 /L:D /T
 GOTO END
 :MOUSE
 LH TOKAMOUS /T
@@ -156,10 +157,9 @@ GOTO END
 
 The first run has no parameter. Thus the `IF NOT "%1"==""` line does not jump,
 and the file sets the environment: `PROMPT`, `PATH`, and `BLASTER`. The `FOR`
-loop then calls the same file three more times: with `CDROM`, with `MOUSE`,
-and with `SOUND`. On each of those runs, the `IF` line jumps to the related
-label. The block at that label loads one driver, and `GOTO END` goes to the
-end of the file.
+loop then calls the same file two more times: with `MOUSE`, and with `SOUND`.
+On each of those runs, the `IF` line jumps to the related label. The block at
+that label loads one driver, and `GOTO END` goes to the end of the file.
 
 This arrangement controls the order of the lines on the screen. Each driver
 prints its own line, at its own time, in the tree style of the boot screen.
@@ -173,7 +173,6 @@ The individual lines:
 | Line | What it does |
 | --- | --- |
 | `SET BLASTER=A220 I7 D1 H5 P300 T6` | Gives the digital audio resources of the [ReSonique II](../resonique2/manual.md) to a program that reads the variable: base 0x220, IRQ 7, 8-bit DMA 1, 16-bit DMA 5, MPU-401 at 0x300, and card type 6. |
-| `IZCDEX /I /D:TOKACD01 /L:D /T` | The CD-ROM redirector. `/D:` gives the device name of the driver, `TOKACD01`. That is the name of the driver in memory, and not its file name. `/L:D` gives it drive D:. `/I` installs the redirector even when a different redirector is already in memory. |
 | `LH TOKAMOUS /T` | Loads the INT 33h mouse driver. It uses an upper memory block if [TOKAEMM](../tokaemm/manual.md) has one free. If not, it uses conventional memory. |
 | `SNDCTRL /B /T` | Shows the current IRQ and DMA of the sound card. It writes nothing. |
 | `SNDMIXER /CFG C:\VOLCONF.CFG /S` | Sets the mixer levels that F10 saved in the full-screen mixer. `/S` stops the output of the tool. If the file does not exist, the card keeps its power-on levels. |

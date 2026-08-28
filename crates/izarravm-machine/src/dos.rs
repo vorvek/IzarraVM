@@ -619,7 +619,7 @@ impl Machine {
                 let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let bx = self.cpu.registers.ebx() as u16;
                 let header = es.wrapping_add(u32::from(bx));
-                self.icdex_device_request(header);
+                self.cd_device_request(header);
                 self.set_int_frame_carry(false);
                 true
             }
@@ -741,10 +741,25 @@ impl Machine {
     /// mailbox live in identity-mapped low memory, so the physical read is
     /// the value the stub wrote.
     ///
+    /// Command 2 is the Toka-DOS kernel's boot-time claim: the mailbox word
+    /// holds the DOS data segment, and the host arms the CD redirector with
+    /// it (see cdredir.rs).
+    ///
     /// A ring with any other command, or with a null mailbox, only parks the
     /// status: port 0xE8 was open bus before this port existed, so a stray
     /// OUT must stay inert instead of decoding low memory as a request.
     pub(super) fn perform_cd_doorbell(&mut self, command: u8) {
+        if command == 0x02 {
+            let dos_ds = u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
+                | (u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
+            if dos_ds == 0 {
+                self.cd_doorbell_status = 0xFE;
+                return;
+            }
+            self.arm_cd_redirector(dos_ds);
+            self.cd_doorbell_status = 0;
+            return;
+        }
         if command != 0x01 {
             self.cd_doorbell_status = 0xFF; // unknown command
             return;
@@ -758,7 +773,7 @@ impl Machine {
             return;
         }
         let header = (seg << 4).wrapping_add(off);
-        self.icdex_device_request(header);
+        self.cd_device_request(header);
         self.cd_doorbell_status = 0;
     }
 

@@ -230,9 +230,6 @@ def main(check: bool = False) -> int:
         vbr = bytearray(open(os.path.join(kdir, "boot", "fat32lba.bin"), "rb").read())
         kernel = open(os.path.join(kdir, "bin", "kernel.sys"), "rb").read()
         shell = open(os.path.join(fcdir, "command.com"), "rb").read()
-        izcdex = open(
-            os.path.join(repo, "toka-dos", "build-freedos-izcdex.com"), "rb"
-        ).read()
         move = open(os.path.join(movedir, "move.exe"), "rb").read()
         sort = open(os.path.join(sortdir, "sort.exe"), "rb").read()
         mem = open(os.path.join(memdir, "mem.exe"), "rb").read()
@@ -250,7 +247,6 @@ def main(check: bool = False) -> int:
         mbr, vbr, prev_files = extract_from_image(prev)
         kernel = prev_files["KERNEL.SYS"]
         shell = prev_files["COMMAND.COM"]
-        izcdex = prev_files["IZCDEX.COM"]
         move = prev_files["MOVE.EXE"]
         sort = prev_files["SORT.EXE"]
         mem = prev_files["MEM.EXE"]
@@ -286,8 +282,6 @@ def main(check: bool = False) -> int:
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokamous.com"), "rb").read()
     tokaemm = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokaemm.sys"), "rb").read()
-    tokacd = open(os.path.join(
-        repo, "crates", "izarravm-firmware", "roms", "dos", "tokacd.sys"), "rb").read()
     gswmode = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "gswmode.com"), "rb").read()
     unhalt = open(os.path.join(
@@ -306,27 +300,33 @@ def main(check: bool = False) -> int:
     # binaries live in C:\DOS (see the file layout below), so DEVICE= and SHELL=
     # name that subdirectory; only CONFIG.SYS/AUTOEXEC.BAT stay in the root. The
     # SHELL= dir argument (C:\DOS) is where FreeCOM builds COMSPEC from.
+    # No CD driver line: the Izarra3000's CD-ROM is a proprietary-interface
+    # drive whose support software lives in the system BIOS (the IzarraCD ROM
+    # extension); the kernel claims drive D: at boot when it finds it.
     config_sys = (b"FILES=40\r\nLASTDRIVE=D\r\n"
                   b"DEVICE=C:\\DOS\\TOKAEMM.SYS RAM /T\r\n"
                   b"DOS=HIGH,UMB\r\n"
-                  b"DEVICEHIGH=C:\\DOS\\TOKACD.SYS\r\n"
                   b"SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
     # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH C:\DOS
     # lets the command-line tools (MOVE/SORT/MEM/...) and TOKAMOUS resolve from any
     # current directory. SET BLASTER advertises the emulated SB16 (base 0x220, IRQ7,
     # DMA1, high DMA5, wavetable MPU at 0x300, type 6 SB16). The FOR %%C loop
-    # self-calls this same AUTOEXEC.BAT once per driver (CDROM/MOUSE/SOUND),
+    # self-calls this same AUTOEXEC.BAT once per driver (MOUSE/SOUND),
     # passing the label as %1 so "IF NOT %1==... GOTO %1" dispatches straight to
     # the matching block and back via GOTO END, letting each driver's /T banner
     # print in its own turn under the boot-tree styling instead of all at once.
+    # The CD-ROM needs no AUTOEXEC turn: the IzarraCD ROM extension is claimed
+    # by the kernel at boot, which prints its own tree line.
     # LH loads the INT 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low
     # load). After the loop, the closed footer box (single-line CP437 border,
     # 78 cols including the corners) tells the user text mode is active and how
     # to reach the visual workbench; the whole boot stays within the 25-row
-    # screen budget (10 logo + 4 box + 5 tree lines + 2 ReSonique II rows
+    # screen budget (10 logo + 4 box + 5 tree lines [kernel compat, C: drive,
+    # TOKAEMM, the kernel's IzarraCD claim, TOKAMOUS] + 2 ReSonique II rows
     # [heading + values] + 3 footer + 1 shell prompt = 25 -- the screen is
-    # exactly full; any component that grows a row must take one from another
-    # owner) so nothing scrolls the logo off row 0. (the kernel welcome box is
+    # exactly full; the IzarraCD claim line replaced IZCDEX's install line
+    # one-for-one, and any component that grows a row must take one from
+    # another owner) so nothing scrolls the logo off row 0. (the kernel welcome box is
     # deliberately 79 -- TOKA_BOX_W in kernel/kernel/init-mod.h -- both match
     # the approved mockup; they are not meant to align)
     footer_text = b"   Starting in text mode. Run TOKADESK to enable the visual workbench."
@@ -340,13 +340,10 @@ def main(check: bool = False) -> int:
                 b"IF NOT \"%1\"==\"\" GOTO %1\r\n"
                 b"PROMPT $P$G\r\nPATH C:\\DOS\r\n"
                 b"SET BLASTER=A220 I7 D1 H5 P300 T6\r\n"
-                b"FOR %%C IN (CDROM MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C\r\n"
+                b"FOR %%C IN (MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C\r\n"
                 b"ECHO " + footer_top + b"\r\n"
                 b"ECHO " + footer_middle + b"\r\n"
                 b"ECHO " + footer_bottom + b"\r\n"
-                b"GOTO END\r\n"
-                b":CDROM\r\n"
-                b"IZCDEX /I /D:TOKACD01 /L:D /T\r\n"
                 b"GOTO END\r\n"
                 b":MOUSE\r\n"
                 b"LH TOKAMOUS /T\r\n"
@@ -422,8 +419,6 @@ def main(check: bool = False) -> int:
         ("COMMAND.COM", shell, ATTR_ARCHIVE),
         ("TOKAMOUS.COM", tokamous, ATTR_ARCHIVE),
         ("TOKAEMM.SYS", tokaemm, ATTR_ARCHIVE),
-        ("TOKACD.SYS", tokacd, ATTR_ARCHIVE),
-        ("IZCDEX.COM", izcdex, ATTR_ARCHIVE),
         ("GSWMODE.COM", gswmode, ATTR_ARCHIVE),
         ("UNHALT.COM", unhalt, ATTR_ARCHIVE),
         ("SNDCTRL.COM", sndctrl, ATTR_ARCHIVE),

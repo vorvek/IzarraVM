@@ -472,13 +472,8 @@ fn render_config_sys(shape: ConfigShape) -> String {
         ConfigShape::C | ConfigShape::D => {}
     }
     lines.push("DOS=HIGH,UMB".to_string());
-    match shape {
-        ConfigShape::A => lines.push("DEVICEHIGH=C:\\DOS\\TOKACD.SYS".to_string()),
-        // No memory manager means no upper memory to load high into, so the
-        // driver goes in conventional memory rather than not at all.
-        ConfigShape::D => lines.push("DEVICE=C:\\DOS\\TOKACD.SYS".to_string()),
-        ConfigShape::B | ConfigShape::C => {}
-    }
+    // No CD driver line for any shape: the kernel claims the IzarraCD ROM
+    // extension at boot, so drive D: exists without a guest driver pair.
     lines.push("SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT".to_string());
     lines.join("\r\n") + "\r\n"
 }
@@ -511,9 +506,6 @@ fn render_autoexec(walk: &Walk, shape: ConfigShape) -> Vec<String> {
     match shape {
         ConfigShape::A | ConfigShape::B => lines.push("LH TOKAMOUS".to_string()),
         ConfigShape::C | ConfigShape::D => lines.push("TOKAMOUS".to_string()),
-    }
-    if matches!(shape, ConfigShape::A | ConfigShape::D) {
-        lines.push("IZCDEX /I /D:TOKACD01 /L:D /T".to_string());
     }
     lines.extend(walk.prelude.iter().cloned());
     lines.extend(walk.flattened.lines.iter().cloned());

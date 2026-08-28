@@ -111,7 +111,8 @@ fn a_cd_title_gets_shape_a_and_the_image_argument() {
 
     assert_eq!(result.config_sys_shape, ConfigShape::A);
     assert_eq!(result.cd_image, Some(game.join("cd").join("ATOMIC15.cue")));
-    assert!(result.autoexec.iter().any(|l| l.starts_with("IZCDEX")));
+    // The IzarraCD ROM extension needs no AUTOEXEC line; the kernel claims D:.
+    assert!(!result.autoexec.iter().any(|l| l.contains("IZCDEX")));
     // 63 is eXo's workaround for a 64 MB machine.
     assert_eq!(result.memory_mib, 64);
     assert!(result.invocation.windows(2).any(|w| w[0] == "--cd-image"));
@@ -143,8 +144,9 @@ fn the_confs_own_ems_key_names_the_titles_that_host_their_own_manager() {
     assert!(result.flags.contains(&"CONF-EMS-FALSE".to_string()));
     assert!(result.flags.contains(&"OWN-MEMORY-MANAGER".to_string()));
     assert!(!result.autoexec.iter().any(|l| l.contains("TOKAEMM")));
-    // A CD title that hosts its own manager keeps the CD driver: 25 of the 106
-    // also mount a disc, and shape C would have taken it away with TOKAEMM.
+    // A CD title that hosts its own manager still mounts its disc (shape D);
+    // the drive itself comes from the kernel's IzarraCD claim, not a driver
+    // line, so no shape emits one.
     let game = dir.path().join("DOOM");
     std::fs::create_dir_all(game.join("cd")).unwrap();
     std::fs::write(game.join("cd/DISC.cue"), b"FILE").unwrap();
@@ -155,7 +157,7 @@ fn the_confs_own_ems_key_names_the_titles_that_host_their_own_manager() {
     );
     let result = translate(&with_cd, &options(&dir, false)).expect("translate");
     assert_eq!(result.config_sys_shape, ConfigShape::D);
-    assert!(result.autoexec.iter().any(|l| l.starts_with("IZCDEX")));
+    assert!(!result.autoexec.iter().any(|l| l.contains("IZCDEX")));
     assert!(result.cd_image.is_some());
 }
 
@@ -258,7 +260,6 @@ fn the_config_sys_shapes_match_the_fixtures() {
     assert_eq!(
         render_config_sys(ConfigShape::A),
         "FILES=40\r\nLASTDRIVE=D\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM /T\r\nDOS=HIGH,UMB\r\n\
-         DEVICEHIGH=C:\\DOS\\TOKACD.SYS\r\n\
          SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }

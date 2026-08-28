@@ -1259,6 +1259,13 @@ impl Machine {
         // boundary the guest cannot place for us -- no code of ours runs inside
         // the BIOS -- and it costs nothing: INT 19h fires once per boot.
         self.note_post_phase_mark();
+        // A boot ends any earlier OS's IzarraCD claim: the redirector disarms
+        // and the driver state resets, so a foreign booter after a warm
+        // reboot keeps INT 2Fh to itself (the armed flag lifts the
+        // booter-inert stand-down only for the OS that rang the claim) and a
+        // fresh Toka-DOS boot re-claims from a clean driver.
+        self.disarm_cd_redirector();
+        self.cd_driver = crate::cddriver::CdDriverState::default();
         let primary = BootDevice::from_code(self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR));
         for device in primary.fallback_order() {
             if self.try_boot_device(device) {

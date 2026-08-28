@@ -161,7 +161,7 @@ GOTO END\r\n\
 #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
 fn stock_boot_paints_the_styled_init_screen() {
     // Measured cost of reaching C:\> on the full styled stock boot (rainbow
-    // art + kernel tree + TOKAEMM + IZCDEX + mouse + SNDCTRL /B + footer) is
+    // art + kernel tree + TOKAEMM + IzarraCD claim + mouse + SNDCTRL /B + footer) is
     // ~80M cycles at the 386 tier used here (`gsw_386`), so 700M is ~9x
     // headroom, not a calibrated figure. Boot cost scales with the CPU tier
     // (it is the timed F8/F5-style init window, not a fixed instruction
@@ -228,7 +228,7 @@ fn stock_boot_paints_the_styled_init_screen() {
     let exact_needles: [&str; 6] = [
         "\u{C3}\u{C4}> Kernel compatibility: 7.10 - WATCOMC - FAT32 support",
         "\u{C3}\u{C4}> TOKAEMM XMS/UMB/EMS memory manager; system running in V86.",
-        "\u{C3}\u{C4}> IZCDEX installed. Assigned [1] drive(s): [TOKACD01 D:]",
+        "\u{C3}\u{C4}> IzarraCD ROM Extensions: CD-ROM is drive D:",
         "\u{C3}\u{C4}> Toka-DOS mouse driver installed.",
         "\u{C3}\u{C4}> ReSonique II Configuration [Run SNDCTRL to change]",
         "\u{B3}     SB16 220 I7 D1 H5   WSS 530 I11 D0   MIDI 300 I9",
@@ -275,7 +275,9 @@ fn stock_boot_paints_the_styled_init_screen() {
     }
 
     // Zero scroll: the logo is still at row 0 (never pushed off the top),
-    // and the shell prompt lands exactly on the last row.
+    // and the shell prompt lands exactly on the last row. (The IzarraCD
+    // consolidation swapped the IZCDEX install line for the kernel's claim
+    // line one-for-one, so the 25-row budget still fills exactly.)
     let row0_has_logo = frame.cells[0..frame.columns]
         .iter()
         .any(|cell| cell.character == 0xB1 || cell.character == 0xDB);

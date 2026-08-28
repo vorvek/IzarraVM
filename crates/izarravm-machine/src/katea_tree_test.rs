@@ -843,8 +843,8 @@ fn walks_a_host_folder_into_a_tree_metadata_only_skipping_non_files() {
     let sys = vec![
         ("KERNEL.SYS".to_string(), vec![0xEBu8; 70]),
         ("COMMAND.COM".to_string(), vec![0u8; 50]),
-        ("TOKACD.SYS".to_string(), vec![0u8; 51]),
-        ("IZCDEX.COM".to_string(), vec![0u8; 52]),
+        ("TOKAEMM.SYS".to_string(), vec![0u8; 51]),
+        ("TOKAMOUS.COM".to_string(), vec![0u8; 52]),
     ];
     let tree = build_tree(&root, &sys);
 
@@ -861,8 +861,8 @@ fn walks_a_host_folder_into_a_tree_metadata_only_skipping_non_files() {
         .expect("a synthetic DOS subdir");
     assert_eq!(dos.dir.files.len(), 3);
     assert_eq!(&dos.dir.files[0].name, b"COMMAND COM");
-    assert_eq!(&dos.dir.files[1].name, b"TOKACD  SYS");
-    assert_eq!(&dos.dir.files[2].name, b"IZCDEX  COM");
+    assert_eq!(&dos.dir.files[1].name, b"TOKAEMM SYS");
+    assert_eq!(&dos.dir.files[2].name, b"TOKAMOUSCOM");
     assert!(
         !tree.root.files.iter().any(|f| &f.name == b"COMMAND COM"),
         "COMMAND.COM is not left at the root"
