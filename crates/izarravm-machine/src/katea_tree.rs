@@ -131,6 +131,19 @@ struct FatWalk {
     degraded: bool,
 }
 
+/// The answer to one guest FAT-position hypercall (doorbell command 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainMapOutcome {
+    /// The physical cluster after `steps` hops from `start`.
+    Cluster(u32),
+    /// The chain ends (EOC, BAD, or a free/reserved link) before the target.
+    /// The guest turns this into DE_SEEK, the native walk's answer.
+    EndBeforeTarget,
+    /// Out-of-range input. The guest falls back to the native walk and
+    /// disarms; a well-formed kernel never sends this.
+    Refused,
+}
+
 /// A memoized cluster chain, and exactly what would have to change to make it
 /// wrong.
 ///
@@ -2660,6 +2673,38 @@ impl KateaTreeVolume {
             entry.data_seq = self.store.seq();
         }
         Some((chain, entry.all_in_range, entry.data_written))
+    }
+
+    /// Walk `steps` FAT hops from `start` and return the landing cluster.
+    ///
+    /// Serves the B3 doorbell hypercall (design:
+    /// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.4). Uses the same
+    /// overlay-shadowed FAT view as `chain_of`, through a `FatWalk` cursor so a
+    /// long walk does not materialize a sector per entry. The step cap is
+    /// `total_sectors()` -- clusters are never more numerous than sectors -- so
+    /// a crafted circular chain terminates in `Refused` instead of hanging the
+    /// service block.
+    ///
+    /// No caller yet: wired to the port 0xE8 command 4 doorbell in Task 3 of
+    /// this slice.
+    #[allow(dead_code)]
+    pub(crate) fn map_chain(&self, start: u32, steps: u32) -> ChainMapOutcome {
+        if start < 2 || steps > self.total_sectors() {
+            return ChainMapOutcome::Refused;
+        }
+        let mut walk = FatWalk::default();
+        let mut cluster = start;
+        for _ in 0..steps {
+            let entry = self.fat_entry_walked(cluster, &mut walk);
+            // 0x0FFF_FFF7 covers BAD and every EOC value of a 28-bit entry. Katea
+            // never synthesizes BAD clusters, so folding it into EndBeforeTarget
+            // is a design-accepted divergence, not a real ambiguity.
+            if !(2..0x0FFF_FFF7).contains(&entry) {
+                return ChainMapOutcome::EndBeforeTarget;
+            }
+            cluster = entry;
+        }
+        ChainMapOutcome::Cluster(cluster)
     }
 
     /// Follow the cluster chain starting at `first`, memoized.
