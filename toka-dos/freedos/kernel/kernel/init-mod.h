@@ -295,8 +295,13 @@ struct izarra_map_req {
   ULONG steps;
   ULONG result_cluster;
 };
-extern struct izarra_map_req IzarraMapReq;
-extern UBYTE IzarraMapArmed;
+/* DOSFAR is load-bearing: without it, INIT-module code addresses these
+   through its own data segment and the resident copies never change --
+   the claim then "arms" a flag the resident kernel cannot see. Every
+   resident-data extern in this header carries it (fat_span, buf_index,
+   HaltCpuWhileIdle). */
+extern struct izarra_map_req DOSFAR IzarraMapReq;
+extern UBYTE DOSFAR IzarraMapArmed;
 extern struct lol ASM FAR DATASTART;
 
 extern BYTE DOSFAR ASM _HMATextAvailable;    /* first byte of available CODE area    */
