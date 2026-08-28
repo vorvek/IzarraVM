@@ -98,21 +98,24 @@ impl CdDriverState {
     }
 }
 
-/// Packed Red Book `00:MM:SS:FF` to LBA, with TOKACD's validation: the high
-/// byte must be zero, seconds < 60, frames < 75, and the address must not
-/// fall inside the 150-frame lead-in.
+/// Packed Red Book `00:MM:SS:FF` to LBA, the way TOKACD's converter worked:
+/// the high byte is MASKED (not validated), out-of-range seconds/frames are
+/// accepted numerically, and only an address inside the 150-frame lead-in
+/// fails. Syntax validation (frames < 75, seconds < 60, high byte zero) was
+/// a separate check TOKACD performed at the PLAY site only —
+/// `play_msf_syntax_ok` below carries that part.
 fn packed_msf_to_lba(packed: u32) -> Option<u32> {
-    if packed & 0xFF00_0000 != 0 {
-        return None;
-    }
     let frame = packed as u8;
     let second = (packed >> 8) as u8;
     let minute = (packed >> 16) as u8;
-    if frame >= 75 || second >= 60 {
-        return None;
-    }
     let frames = (u32::from(minute) * 60 + u32::from(second)) * 75 + u32::from(frame);
     frames.checked_sub(150)
+}
+
+/// The PLAY request's Red Book syntax gate (tokacd.asm request_play):
+/// frames < 75, seconds < 60, and a zero high byte.
+fn play_msf_syntax_ok(packed: u32) -> bool {
+    packed & 0xFF00_0000 == 0 && (packed as u8) < 75 && ((packed >> 8) as u8) < 60
 }
 
 fn lba_to_packed_msf(lba: u32) -> u32 {
@@ -405,6 +408,11 @@ impl Machine {
         }
         let input_start = self.cd_req_u32(header, RH_PLAY_START);
         let count = self.cd_req_u32(header, RH_PLAY_COUNT);
+        // Syntax before device traffic, as TOKACD ordered it: a malformed
+        // Red Book address fails ERR_SECTOR with no CDB sent.
+        if addr_mode != 0 && !play_msf_syntax_ok(input_start) {
+            return ST_ERROR | ERR_SECTOR;
+        }
         let capacity = match self.cd_disc_capacity() {
             Ok(capacity) => capacity,
             Err(code) => return ST_ERROR | code,
@@ -742,6 +750,10 @@ impl Machine {
                 0
             }
             2 => {
+                // TOKACD led with an ATA soft reset (SRST via ATA_CONTROL)
+                // before these CDBs. The host port owns the device object
+                // directly, so the bus-level reset has no equivalent here;
+                // the visible protocol (stop, unlock, state reset) matches.
                 let mut stop = [0u8; 12];
                 stop[0] = 0x4E;
                 if let Err(code) = self.cd_exec_checked(&stop, false) {

@@ -76,10 +76,11 @@ fn extracts_the_embedded_image_payload() {
     // M_NOT_CHANGED and the CDS start cluster is validated (newstuff.c);
     // the compile date is pinned as TOKA_BUILD_DATE (version.h) so a
     // rebuild no longer repaints the boot screen's hash.
-    // 72763 -> 73055 (IzarraCD slice CD-2): +292. The boot-time claim of
-    // the IzarraCD ROM extension (main.c IzarraCdClaim, the int2f.asm
-    // AH=11h/15h forward and its arm entry, one kernel.asm relocation
-    // thunk); TOKACD.SYS and IZCDEX.COM leave the image with it.
+    // 72763 -> 73071 (IzarraCD slice CD-2): +308. The boot-time claim of
+    // the IzarraCD ROM extension (main.c IzarraCdClaim with a bounded
+    // doorbell poll, the int2f.asm AH=11h/15h forward and its arm entry,
+    // one kernel.asm relocation thunk); TOKACD.SYS and IZCDEX.COM leave
+    // the image with it.
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
@@ -93,7 +94,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(73055),
+        Some(73071),
         "KERNEL.SYS size"
     );
     assert_eq!(

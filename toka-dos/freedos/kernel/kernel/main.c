@@ -433,8 +433,13 @@ STATIC VOID IzarraCdClaim(VOID)
 
   pokew(0, 0x63C, FP_SEG(LoL));
   izarra_outp(0xE8, 0x02);
-  while ((status = izarra_inp(0xE8)) == 0x01)
-    ;
+  {
+    /* Bounded, like the other hardware gates: a host that parks the
+       doorbell busy must degrade to "no CD", not hang the boot. */
+    UWORD spin = 0xFFFF;
+    while ((status = izarra_inp(0xE8)) == 0x01 && --spin != 0)
+      ;
+  }
   if (status != 0)
     return;
 

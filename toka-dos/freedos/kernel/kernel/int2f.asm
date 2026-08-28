@@ -91,7 +91,8 @@ segment	HMA_TEXT
 ; forwards AH=11h (redirector) and AH=15h (CD-ROM extensions) to the BIOS
 ; with the caller's frame intact. Both live in HMA_TEXT so the handler can
 ; reach them CS-relative with no register or stack traffic; the claim writes
-; them with pokeb/pokew through FP_SEG(int2f_handler).
+; them by calling izarra_cd_arm below (through its kernel.asm relocation
+; thunk), which stores CS-relative from inside this segment.
                 global  _izarra_cd_on
                 global  _izarra_cd_fwd
 _izarra_cd_on:  db 0
