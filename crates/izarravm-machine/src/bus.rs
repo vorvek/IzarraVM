@@ -2286,12 +2286,14 @@ impl CpuBus for MachineBus<'_> {
             let guest_tick = self.guest_tick_now();
             self.pic.set_irq_level(9, self.midi_mpu.irq_level());
             let value = self.wavetable_mpu.read_data_at(guest_tick);
+            self.opl_probe.record_mpu_data_read(true, value, guest_tick);
             self.sync_mpu_irq();
             return Ok(u32::from(value));
         }
         if port == WAVETABLE_MPU_BASE + 1 {
             let guest_tick = self.guest_tick_now();
             let value = self.wavetable_mpu.status_at(guest_tick);
+            self.opl_probe.record_mpu_status_read(true);
             self.sync_mpu_irq();
             return Ok(u32::from(value));
         }
@@ -2299,12 +2301,14 @@ impl CpuBus for MachineBus<'_> {
             let guest_tick = self.guest_tick_now();
             self.pic.set_irq_level(9, self.wavetable_mpu.irq_level());
             let value = self.midi_mpu.read_data_at(guest_tick);
+            self.opl_probe.record_mpu_data_read(false, value, guest_tick);
             self.sync_mpu_irq();
             return Ok(u32::from(value));
         }
         if port == MIDI_MPU_BASE + 1 {
             let guest_tick = self.guest_tick_now();
             let value = self.midi_mpu.status_at(guest_tick);
+            self.opl_probe.record_mpu_status_read(false);
             self.sync_mpu_irq();
             return Ok(u32::from(value));
         }
@@ -2619,24 +2623,32 @@ impl CpuBus for MachineBus<'_> {
         if port == WAVETABLE_MPU_BASE {
             let guest_tick = self.guest_tick_now();
             self.wavetable_mpu.write_data(value as u8, guest_tick);
+            self.opl_probe
+                .record_mpu_data_write(true, value as u8, guest_tick);
             self.sync_mpu_irq();
             return Ok(());
         }
         if port == WAVETABLE_MPU_BASE + 1 {
             let guest_tick = self.guest_tick_now();
             self.wavetable_mpu.write_command_at(value as u8, guest_tick);
+            self.opl_probe
+                .record_mpu_command(true, value as u8, guest_tick);
             self.sync_mpu_irq();
             return Ok(());
         }
         if port == MIDI_MPU_BASE {
             let guest_tick = self.guest_tick_now();
             self.midi_mpu.write_data(value as u8, guest_tick);
+            self.opl_probe
+                .record_mpu_data_write(false, value as u8, guest_tick);
             self.sync_mpu_irq();
             return Ok(());
         }
         if port == MIDI_MPU_BASE + 1 {
             let guest_tick = self.guest_tick_now();
             self.midi_mpu.write_command_at(value as u8, guest_tick);
+            self.opl_probe
+                .record_mpu_command(false, value as u8, guest_tick);
             self.sync_mpu_irq();
             return Ok(());
         }
@@ -2823,10 +2835,32 @@ impl CpuBus for MachineBus<'_> {
         // but shares the arm so the port test stays one range compare.
         if matches!(port, 0x40..=0x43) {
             let elapsed_pit_clocks = self.elapsed_pit_clocks();
-            if self
-                .pit
-                .write_port_at(port, value as u8, elapsed_pit_clocks)
-            {
+            // A channel-0 control word (SC=0, RW!=0 -- RW=0 is the latch
+            // command, which touches nothing) forces OUT to the mode's initial
+            // level IMMEDIATELY, no CLK involved (8254 datasheet; 86Box and
+            // DOSBox both drive the IRQ0 line from it). When the write lands
+            // in the LOW half of a running mode-3 square wave, that
+            // low-to-high move IS an IRQ0 rising edge, and the batch-end
+            // advance can never see it: it advances the post-write state.
+            // Tyrian 2000 reprograms channel 0 every video frame and its
+            // whole 70 Hz clock starves without this edge.
+            let byte = value as u8;
+            let control0_rising = port == 0x43
+                && byte >> 6 == 0
+                && (byte >> 4) & 0x3 != 0
+                && (byte >> 1) & 0x7 != 0
+                && !self
+                    .pit
+                    .out_after(0, elapsed_pit_clocks)
+                    .unwrap_or_else(|| self.pit.channel_out(0));
+            if self.pit.write_port_at(port, byte, elapsed_pit_clocks) {
+                if control0_rising {
+                    let guest_tick = self.guest_tick_now();
+                    self.opl_probe.count_irq0_edge(guest_tick);
+                    self.pic.request(0);
+                }
+                let guest_tick = self.guest_tick_now();
+                self.opl_probe.record_pit_write(port, byte, guest_tick);
                 self.note_pit_observer();
                 return Ok(());
             }

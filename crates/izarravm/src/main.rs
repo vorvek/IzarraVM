@@ -2088,6 +2088,17 @@ fn write_hdd_profile_json(
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
         "sb_dsp": sb_dsp_json(machine.sb_dsp_diagnostics()),
+        "mpu": mpu_json(machine.mpu_diagnostics(), machine.midi_trace()),
+        "timer": {
+            "irq0_edges": machine.timer_diagnostics().0,
+            "sb_irq_requests": machine.timer_diagnostics().1,
+            "pit_writes": machine.timer_diagnostics().2,
+            "pit_trace": machine.pit_write_trace().iter().map(|e| json!({
+                "port": e.port,
+                "val": e.value,
+                "tick": e.master_ticks,
+            })).collect::<Vec<_>>(),
+        },
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
@@ -2167,6 +2178,47 @@ fn opl_diagnostics_json(
             "val": e.value,
             "clk": e.core_clocks,
             "us": e.pending_micros,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Guest MPU-401 activity for both parts, plus the `IZARRAVM_MIDI_TRACE`
+/// access trace. Which part carries traffic says which music device the game
+/// drives; the trace's tick spacing says the tempo it drives it at.
+fn mpu_json(
+    (wavetable, midi): (
+        izarravm_machine::MpuDiagnostics,
+        izarravm_machine::MpuDiagnostics,
+    ),
+    trace: &[izarravm_machine::MidiTraceEntry],
+) -> serde_json::Value {
+    fn one(d: izarravm_machine::MpuDiagnostics) -> serde_json::Value {
+        json!({
+            "command_writes": d.command_writes,
+            "data_writes": d.data_writes,
+            "data_reads": d.data_reads,
+            "status_reads": d.status_reads,
+            "uart_enters": d.uart_enters,
+            "resets": d.resets,
+            "start_playbacks": d.start_playbacks,
+            "stop_playbacks": d.stop_playbacks,
+            "output_messages": d.output_messages,
+            "output_bytes": d.output_bytes,
+        })
+    }
+    json!({
+        "wavetable": one(wavetable),
+        "midi": one(midi),
+        "trace": trace.iter().map(|e| json!({
+            "k": match e.kind {
+                izarravm_machine::MidiTraceKind::CommandWrite => "cmd",
+                izarravm_machine::MidiTraceKind::DataWrite => "data",
+                izarravm_machine::MidiTraceKind::DataRead => "read",
+                izarravm_machine::MidiTraceKind::Output => "out",
+            },
+            "wt": e.wavetable,
+            "val": e.value,
+            "tick": e.master_ticks,
         })).collect::<Vec<_>>(),
     })
 }
