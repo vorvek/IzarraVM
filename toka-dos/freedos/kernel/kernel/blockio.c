@@ -218,6 +218,64 @@ STATIC struct buffer FAR *searchblock(ULONG blkno, COUNT dsk)
   return bp;
 }
 
+#ifdef __WATCOMC__
+STATIC UBYTE izmap_inp(UWORD port);
+#pragma aux izmap_inp = "in al,dx" parm [dx] value [al] modify exact [al];
+STATIC VOID izmap_outp(UWORD port, UBYTE value);
+#pragma aux izmap_outp = "out dx,al" parm [dx] [al] modify exact [];
+#endif
+
+/* Toka-DOS 2026, Tier B B3 (dev_docs/tier-b-b3-a2-design-2026-08-28.md
+   2.5-2.6): ask the host for the cluster `steps` hops from `start`.
+   Returns SUCCESS with *out set, DE_SEEK when the host reports the
+   chain ends first, or -1 meaning "use the native walk" (not armed,
+   dirty FAT in the cache, or a refusal -- refusals also disarm).
+
+   The dirty scan is the coherence rule: the host answers from its own
+   FAT view, which sees flushed writes only, so any BFR_FAT|BFR_DIRTY
+   buffer makes the native walk the only correct one. ~41 headers per
+   call against the thousands of entry reads the walk costs. */
+COUNT izarra_map_lookup(COUNT dsk, CLUSTER start, CLUSTER steps,
+                        CLUSTER * out)
+{
+#ifdef __WATCOMC__
+  struct buffer FAR *bp;
+  UBYTE status;
+  UWORD spin;
+
+  if (!IzarraMapArmed)
+    return -1;
+
+  bp = firstbuf;
+  do
+  {
+    if ((bp->b_flag & (BFR_FAT | BFR_DIRTY)) == (BFR_FAT | BFR_DIRTY))
+      return -1;
+    bp = b_next(bp);
+  } while (FP_OFF(bp) != FP_OFF(firstbuf));
+
+  IzarraMapReq.unit = (UBYTE)dsk;
+  IzarraMapReq.start_cluster = start;
+  IzarraMapReq.steps = steps;
+  izmap_outp(0xE8, 0x04);
+  spin = 0xFFFF;
+  while ((status = izmap_inp(0xE8)) == 0x01 && --spin != 0)
+    ;
+  if (status == 0)
+  {
+    *out = IzarraMapReq.result_cluster;
+    return SUCCESS;
+  }
+  if (status == 2)
+    return DE_SEEK;
+  /* 0xFE, 0xFF, or a busy timeout: this host will keep refusing. */
+  IzarraMapArmed = 0;
+  return -1;
+#else
+  return -1;
+#endif
+}
+
 BOOL DeleteBlockInBufferCache(ULONG blknolow, ULONG blknohigh, COUNT dsk, int mode)
 {
   struct buffer FAR *bp = firstbuf;
