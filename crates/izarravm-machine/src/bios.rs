@@ -1265,6 +1265,7 @@ impl Machine {
         // booter-inert stand-down only for the OS that rang the claim) and a
         // fresh Toka-DOS boot re-claims from a clean driver.
         self.disarm_cd_redirector();
+        self.disarm_hdd_map();
         self.cd_driver = crate::cddriver::CdDriverState::default();
         let primary = BootDevice::from_code(self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR));
         for device in primary.fallback_order() {

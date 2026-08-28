@@ -2693,9 +2693,6 @@ impl KateaTreeVolume {
     /// cluster, which classifies as `EndBeforeTarget` -- the same conclusion a
     /// native guest walk would reach hitting the same failed sector.
     ///
-    /// No caller yet: wired to the port 0xE8 command 4 doorbell in Task 3 of
-    /// this slice.
-    #[allow(dead_code)]
     pub(crate) fn map_chain(&self, start: u32, steps: u32) -> ChainMapOutcome {
         if !self.cluster_in_range(start) || steps as usize > self.max_chain() {
             return ChainMapOutcome::Refused;

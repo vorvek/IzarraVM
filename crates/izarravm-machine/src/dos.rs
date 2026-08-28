@@ -745,6 +745,11 @@ impl Machine {
     /// holds the DOS data segment, and the host arms the CD redirector with
     /// it (see cdredir.rs).
     ///
+    /// Command 3 registers the B3 FAT-position request block (design:
+    /// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.2), borrowing the same
+    /// mailbox and far-pointer layout as command 1. Command 4 answers a
+    /// lookup from that block (`perform_hdd_map_lookup`).
+    ///
     /// A ring with any other command, or with a null mailbox, only parks the
     /// status: port 0xE8 was open bus before this port existed, so a stray
     /// OUT must stay inert instead of decoding low memory as a request.
@@ -758,6 +763,23 @@ impl Machine {
             }
             self.arm_cd_redirector(dos_ds);
             self.cd_doorbell_status = 0;
+            return;
+        }
+        if command == 0x03 {
+            let off = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
+                | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
+            let seg = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 2))
+                | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 3)) << 8);
+            if seg == 0 && off == 0 {
+                self.cd_doorbell_status = 0xFE; // probe: parsed, nothing registered
+                return;
+            }
+            self.hdd_map_block = Some((seg << 4).wrapping_add(off));
+            self.cd_doorbell_status = 0;
+            return;
+        }
+        if command == 0x04 {
+            self.perform_hdd_map_lookup();
             return;
         }
         if command != 0x01 {
@@ -775,6 +797,36 @@ impl Machine {
         let header = (seg << 4).wrapping_add(off);
         self.cd_device_request(header);
         self.cd_doorbell_status = 0;
+    }
+
+    /// Doorbell command 4: answer the registered B3 FAT-position request.
+    /// Status codes and the block layout are the design's §2.3. The unit byte
+    /// is deliberately not validated here — the kernel gates drive selection
+    /// (boot HDD only), and the host refuses whenever no Katea host-folder
+    /// disk is mounted.
+    fn perform_hdd_map_lookup(&mut self) {
+        let Some(block) = self.hdd_map_block else {
+            self.cd_doorbell_status = 0xFE;
+            return;
+        };
+        let start = self.read_physical_u32(block + 4);
+        let steps = self.read_physical_u32(block + 8);
+        let outcome = self
+            .ata
+            .as_ref()
+            .and_then(|disk| disk.map_fat_chain(start, steps));
+        let status = match outcome {
+            Some(crate::katea_tree::ChainMapOutcome::Cluster(cluster)) => {
+                self.write_physical_u32(block + 12, cluster);
+                0
+            }
+            Some(crate::katea_tree::ChainMapOutcome::EndBeforeTarget) => 2,
+            Some(crate::katea_tree::ChainMapOutcome::Refused) | None => 0xFE,
+        };
+        // Charge guest time the way HLE INT 13h does: a base plus a term for
+        // the walk the guest did not run (design §2.4).
+        self.stall_for_master_ticks(64 + u64::from(steps) / 16);
+        self.cd_doorbell_status = status;
     }
 
     /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the

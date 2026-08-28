@@ -2240,3 +2240,129 @@ fn izarracd_doorbell_refuses_stray_rings() {
     machine.perform_cd_doorbell(1);
     assert_eq!(machine.read_guest_word(0x0002), int0_seg);
 }
+
+// ---------------------------------------------------------------------------
+// The B3 FAT-position hypercall (Lotura doorbell commands 3/4). Design:
+// dev_docs/tier-b-b3-a2-design-2026-08-28.md sections 2.2-2.4.
+
+/// Fill a 16-byte B3 request block (design §2.3) at `block`. The host-written
+/// result dword at `+12` is zeroed here so a test can tell a real answer from
+/// a stale one.
+fn write_map_request(machine: &mut Machine, block: u32, unit: u8, start: u32, steps: u32) {
+    machine.write_physical_u8(block, 0);
+    machine.write_physical_u8(block + 1, unit);
+    machine.write_physical_u16(block + 2, 0);
+    machine.write_physical_u32(block + 4, start);
+    machine.write_physical_u32(block + 8, steps);
+    machine.write_physical_u32(block + 12, 0);
+}
+
+/// Ring command 3 the way the kernel's boot probe/register does: the far
+/// pointer's offset word then segment word in the CD mailbox (command 1's
+/// layout), `block` split so `(seg << 4) + off == block`.
+fn register_map_block(machine: &mut Machine, block: u32) {
+    machine.write_physical_u16(0x063C, (block & 0xF) as u16);
+    machine.write_physical_u16(0x063E, (block >> 4) as u16);
+    machine.perform_cd_doorbell(0x03);
+}
+
+/// The host-written result dword at `block + 12`, composed from four
+/// physical-byte reads (no `read_physical_u32` needed for a test-only path).
+fn read_map_result(machine: &mut Machine, block: u32) -> u32 {
+    u32::from(machine.read_physical_u8(block + 12))
+        | (u32::from(machine.read_physical_u8(block + 13)) << 8)
+        | (u32::from(machine.read_physical_u8(block + 14)) << 16)
+        | (u32::from(machine.read_physical_u8(block + 15)) << 24)
+}
+
+/// Mount `dir` as C: through Katea, the way `machine_storage_test.rs`'s
+/// `machine_with_hdd_folder` does — a fresh machine plus a host-folder mount,
+/// so `map_fat_chain` has a real Katea volume to answer from.
+fn hdd_map_machine(dir: &std::path::Path) -> Machine {
+    let mut machine = test_machine();
+    machine.mount_hdd_folder(dir).unwrap();
+    machine
+}
+
+/// A scratch host folder for the B3 hypercall tests, emptied first so a
+/// previous run cannot seed it.
+fn hdd_map_scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("izarra_hdd_map_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+const HDD_MAP_TEST_BLOCK: u32 = 0x0520;
+
+#[test]
+fn hdd_map_probe_with_null_mailbox_parks_fe_and_registers_nothing() {
+    let mut machine = test_machine();
+    machine.write_physical_u16(0x063C, 0);
+    machine.write_physical_u16(0x063E, 0);
+    machine.perform_cd_doorbell(0x03);
+    assert_eq!(machine.cd_doorbell_status, 0xFE, "probe parks FE");
+
+    // Nothing was registered, so a lookup answers unregistered too.
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 0, 2, 0);
+    machine.perform_cd_doorbell(0x04);
+    assert_eq!(machine.cd_doorbell_status, 0xFE);
+}
+
+#[test]
+fn hdd_map_lookup_maps_and_reports_end_of_chain() {
+    let dir = hdd_map_scratch("lookup");
+    let mut machine = hdd_map_machine(&dir);
+
+    register_map_block(&mut machine, HDD_MAP_TEST_BLOCK);
+    assert_eq!(machine.cd_doorbell_status, 0, "registration ok");
+
+    // Cluster 2 is the volume root, always allocated: zero steps just
+    // confirms the walk starts where it is told to.
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 2, 2, 0);
+    machine.perform_cd_doorbell(0x04);
+    assert_eq!(machine.cd_doorbell_status, 0);
+    assert_eq!(read_map_result(&mut machine, HDD_MAP_TEST_BLOCK), 2);
+
+    // A step count past the chain cap is refused (design §2.4's Refused
+    // path — the guest falls back to its native walk).
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 2, 2, u32::MAX);
+    machine.perform_cd_doorbell(0x04);
+    assert_eq!(machine.cd_doorbell_status, 0xFE);
+}
+
+#[test]
+fn hdd_map_lookup_without_katea_hdd_refuses() {
+    let mut machine = test_machine(); // no ATA disk mounted
+    register_map_block(&mut machine, HDD_MAP_TEST_BLOCK);
+    assert_eq!(machine.cd_doorbell_status, 0, "registration alone never touches ata");
+
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 0, 2, 1);
+    machine.perform_cd_doorbell(0x04);
+    assert_eq!(machine.cd_doorbell_status, 0xFE);
+}
+
+#[test]
+fn unknown_doorbell_commands_still_park_ff() {
+    let mut machine = test_machine();
+    machine.perform_cd_doorbell(0x05);
+    assert_eq!(machine.cd_doorbell_status, 0xFF);
+}
+
+#[test]
+fn int19_disarms_the_hdd_map_registration() {
+    let dir = hdd_map_scratch("disarm");
+    let mut machine = hdd_map_machine(&dir);
+
+    register_map_block(&mut machine, HDD_MAP_TEST_BLOCK);
+    assert_eq!(machine.cd_doorbell_status, 0);
+
+    machine.disarm_hdd_map();
+
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 2, 2, 0);
+    machine.perform_cd_doorbell(0x04);
+    assert_eq!(
+        machine.cd_doorbell_status, 0xFE,
+        "disarm forgets the registration, same as a never-registered kernel"
+    );
+}

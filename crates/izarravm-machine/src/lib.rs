@@ -1525,6 +1525,11 @@ pub struct Machine {
     // set, the host serves the INT 2Fh AH=11h file-I/O surface for the CD
     // drive (see cdredir.rs).
     cd_redirector_dos_ds: Option<u16>,
+    // Physical address of the guest kernel's B3 FAT-position request block,
+    // registered by doorbell command 3 (design:
+    // dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.2). None until a kernel
+    // registers; INT 19h clears it.
+    hdd_map_block: Option<u32>,
     // The IzarraCD device driver's resident state (the host port of
     // TOKACD.SYS's variables; see cddriver.rs).
     cd_driver: cddriver::CdDriverState,
@@ -1920,6 +1925,7 @@ impl Machine {
             icdex_joliet: 0,
             cd_iso_index: None,
             cd_redirector_dos_ds: None,
+            hdd_map_block: None,
             cd_redirector_read_bytes: 0,
             cd_driver: cddriver::CdDriverState::default(),
             ata: None,

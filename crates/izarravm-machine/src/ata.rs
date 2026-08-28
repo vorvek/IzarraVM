@@ -375,8 +375,6 @@ impl AtaDisk {
 
     /// Answer a B3 FAT-position hypercall, or None for an image-backed disk —
     /// the hypercall serves only the Katea host-folder volume.
-    // No caller yet: Task 3 wires this up from the doorbell service path.
-    #[allow(dead_code)]
     pub fn map_fat_chain(
         &self,
         start: u32,
