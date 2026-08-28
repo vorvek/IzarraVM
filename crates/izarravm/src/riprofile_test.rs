@@ -450,13 +450,13 @@ fn find_run_until_tick(process: windows_sys::Win32::Foundation::HANDLE) -> Optio
 }
 
 #[test]
-fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1677() {
+fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1681() {
     if std::env::var_os("IZARRAVM_RIPROFILE_INLINE_CHILD").is_some() {
         inline_chain_check_in_this_process();
         return;
     }
     let output = spawn_riprofile_child(
-        "riprofile::tests::inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1677",
+        "riprofile::tests::inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1681",
         "IZARRAVM_RIPROFILE_INLINE_CHILD",
     );
     assert!(
@@ -570,9 +570,10 @@ fn inline_chain_check_in_this_process() {
 
     // Scan the function's own recorded extent for an address where the OLD
     // resolver collapses to exactly `run_until_tick` @
-    // `machine/src/run.rs:1677` (the call `cpu.run_budgeted(&mut bus,
+    // `machine/src/run.rs:1681` (the call `cpu.run_budgeted(&mut bus,
     // run_budget)`, the specific defect example this instrument exists to
-    // fix) and the NEW resolver's innermost frame names something else, with
+    // fix — 1677 -> 1681 when the IzarraCD doorbell fields joined run.rs
+    // above it) and the NEW resolver's innermost frame names something else, with
     // a real `izarravm-cpu` `run.rs` line. A stride of 8 keeps this well
     // under a second even over a ~55KB function.
     //
@@ -599,7 +600,7 @@ fn inline_chain_check_in_this_process() {
         let Some(old_line) = super::resolve_line(process, addr) else {
             continue;
         };
-        if !old_line.contains("run.rs:1677") {
+        if !old_line.contains("run.rs:1681") {
             continue;
         }
         let chain = resolve_inline_chain(process, addr);
@@ -609,7 +610,7 @@ fn inline_chain_check_in_this_process() {
         if !innermost.name.contains("run_until_tick")
             && innermost.site.contains("izarravm-cpu")
             && innermost.site.contains("run.rs")
-            && !innermost.site.contains(":1677")
+            && !innermost.site.contains(":1681")
         {
             best = Some((addr, innermost.clone(), old_line));
             break;
@@ -623,7 +624,7 @@ fn inline_chain_check_in_this_process() {
     let (addr, innermost, old_line) = best.unwrap_or_else(|| {
         panic!(
             "no address in run_until_tick's {size:#x}-byte extent reproduced the \
-             defect example: OLD resolver collapsing to machine/src/run.rs:1677 while \
+             defect example: OLD resolver collapsing to machine/src/run.rs:1681 while \
              NEW resolver names a different izarravm-cpu run.rs line. Either the OLD \
              resolver no longer collapses there (recheck the claim in the module doc) \
              or the NEW resolver regressed."
@@ -631,7 +632,7 @@ fn inline_chain_check_in_this_process() {
     });
 
     assert_eq!(
-        old_line, "crates\\izarravm-machine\\src\\run.rs:1677",
+        old_line, "crates\\izarravm-machine\\src\\run.rs:1681",
         "the defect's OLD side must be exactly the documented collapse"
     );
     // The physical symbol itself is NEVER a member of the inline chain (a

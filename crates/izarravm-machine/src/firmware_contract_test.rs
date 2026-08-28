@@ -165,6 +165,20 @@ fn assert_rom_patch_contract(machine: &Machine, original: &[u8]) {
         &rom[BIOS32_PCI_ROM_OFFSET..BIOS32_PCI_ROM_OFFSET + 2],
         &[0x90, 0xcb]
     );
+    assert_eq!(
+        &rom[CD_DEVICE_HEADER_ROM_OFFSET..CD_DEVICE_HEADER_ROM_OFFSET + CD_DEVICE_HEADER.len()],
+        &CD_DEVICE_HEADER
+    );
+    assert_eq!(
+        &rom[CD_DEVICE_STRATEGY_ROM_OFFSET
+            ..CD_DEVICE_STRATEGY_ROM_OFFSET + CD_DEVICE_STRATEGY_STUB.len()],
+        &CD_DEVICE_STRATEGY_STUB
+    );
+    assert_eq!(
+        &rom[CD_DEVICE_INTERRUPT_ROM_OFFSET
+            ..CD_DEVICE_INTERRUPT_ROM_OFFSET + CD_DEVICE_INTERRUPT_STUB.len()],
+        &CD_DEVICE_INTERRUPT_STUB
+    );
 
     let mut owned = vec![false; BIOS_ROM_SIZE];
     mark_range(
@@ -218,6 +232,20 @@ fn assert_rom_patch_contract(machine: &Machine, original: &[u8]) {
         BIOS32_DIRECTORY_ROM_OFFSET..BIOS32_DIRECTORY_ROM_OFFSET + 2,
     );
     mark_range(&mut owned, BIOS32_PCI_ROM_OFFSET..BIOS32_PCI_ROM_OFFSET + 2);
+    mark_range(
+        &mut owned,
+        CD_DEVICE_HEADER_ROM_OFFSET..CD_DEVICE_HEADER_ROM_OFFSET + CD_DEVICE_HEADER.len(),
+    );
+    mark_range(
+        &mut owned,
+        CD_DEVICE_STRATEGY_ROM_OFFSET
+            ..CD_DEVICE_STRATEGY_ROM_OFFSET + CD_DEVICE_STRATEGY_STUB.len(),
+    );
+    mark_range(
+        &mut owned,
+        CD_DEVICE_INTERRUPT_ROM_OFFSET
+            ..CD_DEVICE_INTERRUPT_ROM_OFFSET + CD_DEVICE_INTERRUPT_STUB.len(),
+    );
     for (offset, (&before, &after)) in original.iter().zip(rom).enumerate() {
         if !owned[offset] {
             assert_eq!(after, before, "unowned ROM byte changed at {offset:#06x}");
@@ -232,7 +260,9 @@ fn machine_patches_only_the_owned_rom_windows() {
         .collect();
     let machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), &original).unwrap();
     assert_rom_patch_contract(&machine, &original);
-    assert_eq!(crate::unittester::crc32(&machine.rom), 0xda7d_7b97);
+    // 0xda7d_7b97 -> 0xdc41_6399: the IzarraCD device header and its
+    // strategy/interrupt stubs joined the patched windows at 0xF420.
+    assert_eq!(crate::unittester::crc32(&machine.rom), 0xdc41_6399);
 }
 
 #[test]
@@ -253,6 +283,8 @@ fn committed_izarra_bios_reserves_every_machine_patch_window() {
             ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len(),
         BIOS_INT_STUB_TABLE_ROM_OFFSET
             ..BIOS_INT_STUB_TABLE_ROM_OFFSET + BIOS_INT_STUB_TABLE_LEN as usize,
+        CD_DEVICE_HEADER_ROM_OFFSET
+            ..CD_DEVICE_INTERRUPT_ROM_OFFSET + CD_DEVICE_INTERRUPT_STUB.len(),
     ] {
         assert!(
             rom[range.clone()].iter().all(|byte| *byte == 0),

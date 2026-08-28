@@ -407,6 +407,8 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         program_runtime: machine.program_runtime,
         pending_toka_service: &mut machine.pending_toka_service,
         toka_service_status: machine.toka_service_status,
+        pending_cd_doorbell: &mut machine.pending_cd_doorbell,
+        cd_doorbell_status: &mut machine.cd_doorbell_status,
         unittester: &mut machine.unittester,
         wait_states: machine.profile.wait_states,
         cache: &mut machine.cache_model,

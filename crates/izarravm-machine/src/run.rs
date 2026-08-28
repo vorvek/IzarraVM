@@ -1433,6 +1433,8 @@ impl Machine {
                     program_runtime,
                     pending_toka_service,
                     toka_service_status,
+                    pending_cd_doorbell,
+                    cd_doorbell_status,
                     unittester,
                     pci,
                     io_touched,
@@ -1494,6 +1496,8 @@ impl Machine {
                     program_runtime: *program_runtime,
                     pending_toka_service,
                     toka_service_status: *toka_service_status,
+                    pending_cd_doorbell,
+                    cd_doorbell_status,
                     unittester,
                     wait_states: profile.wait_states,
                     icache_fetch_clocks: u64::from(izarravm_bus::BusCycle::clocks_for(
@@ -1769,6 +1773,10 @@ impl Machine {
                     if let Some(cmd) = self.pending_toka_service.take() {
                         serviced = true;
                         self.perform_toka_service(cmd); // Repair (cmd 0x01)
+                    }
+                    if let Some(cmd) = self.pending_cd_doorbell.take() {
+                        serviced = true;
+                        self.perform_cd_doorbell(cmd);
                     }
                     if let Some(cmd) = self.unittester.take_pending() {
                         serviced = true;

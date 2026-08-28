@@ -266,8 +266,14 @@ impl Machine {
                 true
             }
             0x1101..=0x111C | 0x111E | 0x111F | 0x1121 | 0x1123..=0x112F => {
-                self.set_ax(0x0001);
-                self.set_int_frame_carry(true);
+                // The armed IzarraCD redirector serves the CD drive's file
+                // I/O host-side; anything else keeps the absent-redirector
+                // refusal, which is also what the kernel's own default
+                // returned.
+                if !self.handle_cd_redirector(ax) {
+                    self.set_ax(0x0001);
+                    self.set_int_frame_carry(true);
+                }
                 true
             }
             // Critical-error helper: no resident message override is installed, so
@@ -326,35 +332,68 @@ impl Machine {
             0x1500 => {
                 // One CD drive is present if any D:..Z: letter remains after
                 // CONFIG.SYS block drivers. No disc is still a present drive.
+                // AL=FFh marks the extensions installed, as IZCDEX reported.
                 let cd_drive = self.icdex_cd_drive_number();
                 let bx = u16::from(cd_drive.is_some());
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | u32::from(bx);
                 self.cpu.registers.set_ebx(ebx);
                 let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(cd_drive.unwrap_or(0));
                 self.cpu.registers.set_ecx(ecx);
-                true
-            }
-            // Get drive device list: ES:BX -> 5 bytes per drive (subunit + driver
-            // header far pointer). We write one entry: subunit 0, a null header
-            // pointer (the guest only needs the drive count/letter to map the
-            // drive; the header is informational for our HLE path).
-            0x1501 => {
-                if self.icdex_cd_drive_number().is_some() {
-                    let addr = self.icdex_es_bx();
-                    self.write_guest_linear_block(addr, &[0u8; 5]); // subunit 0, header 0:0
+                if cd_drive.is_some() {
+                    self.set_eax_al(0xFF);
                 }
                 true
             }
-            // Metadata filenames from the ISO primary volume descriptor. Until the
-            // descriptor parser grows those fields, report empty names for a valid
-            // CD drive rather than leaking stale guest buffer bytes.
+            // Get drive device list: ES:BX -> 5 bytes per drive (subunit + driver
+            // header far pointer). One entry: subunit 0, the IzarraCD ROM device
+            // header (`TOKACD01`) — a caller may far-call its strategy/interrupt
+            // entries directly and reach the host through the doorbell.
+            0x1501 => {
+                if self.icdex_cd_drive_number().is_some() {
+                    let addr = self.icdex_es_bx();
+                    let mut entry = [0u8; 5];
+                    entry[1..3].copy_from_slice(&CD_DEVICE_HEADER_OFF.to_le_bytes());
+                    entry[3..5].copy_from_slice(&CD_DEVICE_HEADER_SEG.to_le_bytes());
+                    self.write_guest_linear_block(addr, &entry);
+                }
+                true
+            }
+            // Metadata filenames from the ISO primary volume descriptor:
+            // 1502h copyright file, 1503h abstract file, 1504h bibliographic
+            // file. Each is a 37-byte field in the PVD, returned NUL-terminated
+            // in the caller's 38-byte buffer. No medium or no PVD fails with
+            // the drive-not-ready code.
             0x1502..=0x1504 => {
                 if !self.icdex_drive_matches(self.cpu.registers.ecx() as u16) {
                     self.icdex_fail(0x000F);
                     return true;
                 }
-                self.write_guest_linear_block(self.icdex_es_bx(), &[0u8; 38]);
-                self.set_int_frame_carry(false);
+                let pvd = self
+                    .ide
+                    .device()
+                    .image()
+                    .and_then(|img| img.read_data_sector(16));
+                match pvd {
+                    Some(pvd) if pvd[0] == 0x01 && &pvd[1..6] == b"CD001" => {
+                        let field_at = match ax {
+                            0x1502 => 776, // copyright_file_id
+                            0x1503 => 813, // abstract_file_id
+                            _ => 850,      // bibliographic_file_id
+                        };
+                        let mut out = [0u8; 38];
+                        out[..37].copy_from_slice(&pvd[field_at..field_at + 37]);
+                        // The ISO field is space-padded; DOS callers expect an
+                        // ASCIZ name, so trim the padding before terminating.
+                        let end = out[..37]
+                            .iter()
+                            .rposition(|&b| b != b' ' && b != 0)
+                            .map_or(0, |i| i + 1);
+                        out[end..].fill(0);
+                        self.write_guest_linear_block(self.icdex_es_bx(), &out);
+                        self.set_int_frame_carry(false);
+                    }
+                    _ => self.icdex_fail(0x0015),
+                }
                 true
             }
             // Read ISO volume descriptor N. VTOC index 0 maps to LBA 16.
@@ -459,9 +498,10 @@ impl Machine {
                 self.set_int_frame_carry(false);
                 true
             }
-            // Get IZCDEX version: BH = major, BL = minor. Report 2.23.
+            // Get IZCDEX version: BH = major, BL = minor. Report 2.30, the
+            // version the IZCDEX.COM redirector reported.
             0x150C => {
-                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
+                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x021E; // 2.30
                 self.cpu.registers.set_ebx(ebx);
                 true
             }
@@ -472,7 +512,8 @@ impl Machine {
                     self.icdex_fail(0x000F);
                     return true;
                 }
-                match self.cpu.registers.ebx() as u16 {
+                let bx = self.cpu.registers.ebx() as u16;
+                match bx & 0x00FF {
                     0x0000 => {
                         self.set_dx(self.icdex_vd_preference);
                         self.set_int_frame_carry(false);
@@ -489,6 +530,14 @@ impl Machine {
                         } else {
                             self.icdex_fail(0x0001);
                         }
+                    }
+                    // BL=02h: the IZCDEX/DOSLFN Joliet toggle. IZCDEX stored
+                    // and compared the raw BH byte; mirror that. No
+                    // supplementary-descriptor parse exists host-side, so the
+                    // byte is stored and acknowledged only.
+                    0x0002 => {
+                        self.icdex_joliet = (bx >> 8) as u8;
+                        self.set_int_frame_carry(false);
                     }
                     _ => self.icdex_fail(0x0001),
                 }
@@ -684,6 +733,35 @@ impl Machine {
         Ok(None)
     }
 
+    /// Perform the IzarraCD doorbell rung through Lotura port 0xE8. Command 1
+    /// executes the CD device request whose far pointer the ROM strategy stub
+    /// stored in the low-RAM mailbox, then drops the status back to 0 so the
+    /// ROM interrupt stub's poll loop completes. The mailbox holds the
+    /// request's real-mode offset word then segment word; both stub and
+    /// mailbox live in identity-mapped low memory, so the physical read is
+    /// the value the stub wrote.
+    ///
+    /// A ring with any other command, or with a null mailbox, only parks the
+    /// status: port 0xE8 was open bus before this port existed, so a stray
+    /// OUT must stay inert instead of decoding low memory as a request.
+    pub(super) fn perform_cd_doorbell(&mut self, command: u8) {
+        if command != 0x01 {
+            self.cd_doorbell_status = 0xFF; // unknown command
+            return;
+        }
+        let off = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
+            | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
+        let seg = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 2))
+            | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 3)) << 8);
+        if seg == 0 && off == 0 {
+            self.cd_doorbell_status = 0xFE; // no request stored
+            return;
+        }
+        let header = (seg << 4).wrapping_add(off);
+        self.icdex_device_request(header);
+        self.cd_doorbell_status = 0;
+    }
+
     /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the
     /// status the BIOS reads back. Cmd 0x01 (Repair Toka-DOS) resets the Katea host
     /// folder's CONFIG.SYS/AUTOEXEC.BAT. The retired Rust DOS kernel's legacy
@@ -738,7 +816,7 @@ impl Machine {
     /// read rather than the whole bound -- and, more to the point, a name that
     /// ends before a page the caller's tables do not map is not turned into a
     /// walk of that page.
-    fn read_guest_linear_asciiz_lossy(&mut self, linear: u32, max: usize) -> String {
+    pub(super) fn read_guest_linear_asciiz_lossy(&mut self, linear: u32, max: usize) -> String {
         let mut bytes = Vec::new();
         while bytes.len() < max {
             let at = linear.wrapping_add(bytes.len() as u32);

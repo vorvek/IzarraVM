@@ -247,6 +247,8 @@ pub enum MachineCanonicalCaptureError {
     PendingModeChange,
     #[error("Toka service command {command:#04x} has not been serviced")]
     PendingTokaService { command: u8 },
+    #[error("an IzarraCD doorbell ring has not been serviced")]
+    PendingCdDoorbell,
     #[error("a BIOS32 service has not been serviced")]
     PendingBios32Service,
     #[error("an exact device-memory write has not been published to the CPU")]
@@ -783,6 +785,9 @@ impl Machine {
         }
         if let Some(command) = self.pending_toka_service {
             return Err(MachineCanonicalCaptureError::PendingTokaService { command });
+        }
+        if self.pending_cd_doorbell.is_some() {
+            return Err(MachineCanonicalCaptureError::PendingCdDoorbell);
         }
         if self.pending_bios32.is_some() {
             return Err(MachineCanonicalCaptureError::PendingBios32Service);

@@ -39,6 +39,8 @@ mod bmide;
 mod bus;
 mod canonical_state;
 mod cdimage;
+mod cdiso;
+mod cdredir;
 mod dma;
 mod dos;
 mod pci;
@@ -135,13 +137,14 @@ pub(crate) use firmware_contract::address::{
     BIOS_INT_STUB_TABLE_LINEAR, BIOS_LEGACY_IRET_LINEAR, BIOS_POST_ERROR_LOG_ADDR,
     BIOS_POST_ERROR_LOG_COUNT_ADDR, BIOS_POST_ERROR_LOG_MAX, BIOS_ROM_IRET_SEG, BIOS_ROM_SEGMENT,
     BIOS_STUB_WINDOW_LEN, BIOS32_DIRECTORY_LINEAR, BIOS32_PCI_LINEAR, BIOS32_PCI_ROM_OFFSET,
-    CMOS_AUDIO_MAGIC, CMOS_AUDIO_MAGIC_VALUE, CMOS_GSW_MODE, CMOS_MPU_PORT,
-    CMOS_PRIMARY_BOOT_DEVICE, CMOS_SB_DMA8, CMOS_SB_DMA16, CMOS_SB_IRQ, CMOS_WSS_DMA, CMOS_WSS_IRQ,
-    CODEPAGE_FONT_WINDOW, CONVENTIONAL_MEMORY_TOP, EBDA_CD_BOOTABLE_OFF, EBDA_LINEAR,
-    EBDA_MOUSE_HANDLER_OFF, EBDA_MOUSE_PKT_SIZE_OFF, EBDA_SEGMENT, FIRMWARE_FETCH_WINDOW_LEN,
-    FIRMWARE_FETCH_WINDOW_START, INT10_FUNCTIONALITY_TABLE_OFFSET,
-    INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET, RESULT_BLOCK_ADDRESS, VGA_BIOS_FONT_TABLE_OFF,
-    VGA_BIOS_INT43_FONT_ADDR, VGA_BIOS_SEGMENT, VGA_BIOS_SPAN_SIZE, bios_int_stub_off,
+    CD_DEVICE_HEADER_OFF, CD_DEVICE_HEADER_SEG, CD_DEVICE_MAILBOX_ADDRESS, CMOS_AUDIO_MAGIC,
+    CMOS_AUDIO_MAGIC_VALUE, CMOS_GSW_MODE, CMOS_MPU_PORT, CMOS_PRIMARY_BOOT_DEVICE, CMOS_SB_DMA8,
+    CMOS_SB_DMA16, CMOS_SB_IRQ, CMOS_WSS_DMA, CMOS_WSS_IRQ, CODEPAGE_FONT_WINDOW,
+    CONVENTIONAL_MEMORY_TOP, EBDA_CD_BOOTABLE_OFF, EBDA_LINEAR, EBDA_MOUSE_HANDLER_OFF,
+    EBDA_MOUSE_PKT_SIZE_OFF, EBDA_SEGMENT, FIRMWARE_FETCH_WINDOW_LEN, FIRMWARE_FETCH_WINDOW_START,
+    INT10_FUNCTIONALITY_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET, RESULT_BLOCK_ADDRESS,
+    VGA_BIOS_FONT_TABLE_OFF, VGA_BIOS_INT43_FONT_ADDR, VGA_BIOS_SEGMENT, VGA_BIOS_SPAN_SIZE,
+    bios_int_stub_off,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -1389,6 +1392,12 @@ pub struct Machine {
     // the resulting status is read back at 0xE3.
     pending_toka_service: Option<u8>,
     toka_service_status: u8,
+    // IzarraCD doorbell (Lotura port 0xE8): the ROM device header's interrupt
+    // stub writes here after the strategy stub stored the request pointer in
+    // the low-RAM mailbox. The run loop executes the request after the cycle;
+    // the stub polls 0xE8 until the status returns to 0.
+    pending_cd_doorbell: Option<u8>,
+    cd_doorbell_status: u8,
     /// The host folder backing the Katea C: drive (set by `mount_hdd_folder`), so
     /// the BIOS "Repair Toka-DOS" service can reset CONFIG.SYS/AUTOEXEC.BAT on it.
     katea_root: Option<std::path::PathBuf>,
@@ -1503,6 +1512,20 @@ pub struct Machine {
     // MSCDEX/IZCDEX volume-descriptor preference. The default selects the primary
     // volume descriptor.
     icdex_vd_preference: u16,
+    // The IZCDEX BL=02h Joliet toggle (the raw BH byte, as IZCDEX kept it).
+    // Stored and acknowledged only; no supplementary-descriptor parse exists
+    // host-side.
+    icdex_joliet: u8,
+    // The IzarraCD redirector's parsed ISO index, keyed on the ATAPI
+    // media-generation counter. `None` inside the pair records a medium with
+    // no parseable ISO tree, so it is not re-parsed per call.
+    cd_iso_index: Option<(u64, Option<cdiso::IsoIndex>)>,
+    // The guest kernel's DOS data segment, set by `arm_cd_redirector`. While
+    // set, the host serves the INT 2Fh AH=11h file-I/O surface for the CD
+    // drive (see cdredir.rs).
+    cd_redirector_dos_ds: Option<u16>,
+    // Bytes delivered by the redirector Read handler.
+    cd_redirector_read_bytes: u64,
     // ATA hard disk on the primary IDE channel (0x1F0-0x1F7/0x3F6, IRQ14). The
     // boot drive C:; None when no image is mounted. INT 13h DL>=0x80 and the
     // primary-channel ports drive it.
@@ -1828,6 +1851,8 @@ impl Machine {
             ipe_windows: Vec::new(),
             pending_toka_service: None,
             toka_service_status: 0,
+            pending_cd_doorbell: None,
+            cd_doorbell_status: 0,
             katea_root: None,
             dos_screen_shown: 0,
             program_runtime: false,
@@ -1888,6 +1913,10 @@ impl Machine {
             eltorito_boot: None,
             eltorito_emulation: None,
             icdex_vd_preference: 0x0100,
+            icdex_joliet: 0,
+            cd_iso_index: None,
+            cd_redirector_dos_ds: None,
+            cd_redirector_read_bytes: 0,
             ata: None,
             bmide: bmide::BusMasterIde::default(),
             fat32_c: None,
@@ -3356,6 +3385,8 @@ struct MachineBus<'a> {
     program_runtime: bool,
     pending_toka_service: &'a mut Option<u8>, // a 0xE3 write records the command
     toka_service_status: u8,                  // a copy, for the 0xE3 status read
+    pending_cd_doorbell: &'a mut Option<u8>,  // a 0xE8 write records the ring
+    cd_doorbell_status: &'a mut u8,           // mutable: the ring must read busy at once
     unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
     wait_states: WaitStateProfile,
     // The cache model carries the active CPU level's geometry/cost. A data access

@@ -1115,12 +1115,15 @@ fn marked_data_cd() -> CdImage {
 }
 
 /// Plant a READ LONG (0x80) device-driver request at guest linear `header`,
-/// through the caller's own mapping.
+/// through the caller's own mapping. The transfer field carries the MSCDEX
+/// far-pointer form (offset word, then segment word); `xfer` arrives linear
+/// and is encoded here.
 fn plant_read_long_request(machine: &mut Machine, header: u32, xfer: u32, lba: u32, count: u16) {
     let mut request = [0u8; 0x18];
     request[2] = 0x80; // READ LONG
     request[0x0D] = 0x00; // HSG addressing
-    request[0x0E..0x12].copy_from_slice(&xfer.to_le_bytes());
+    let xfer_far = ((xfer >> 4) << 16) | (xfer & 0xF);
+    request[0x0E..0x12].copy_from_slice(&xfer_far.to_le_bytes());
     request[0x12..0x14].copy_from_slice(&count.to_le_bytes());
     request[0x14..0x18].copy_from_slice(&lba.to_le_bytes());
     machine.write_guest_linear_block(header, &request);
@@ -1681,9 +1684,10 @@ fn icdex_drive_device_list_uses_the_non_identity_mapped_caller_buffer() {
     machine.cpu.registers.set_eax(0x1501);
     assert!(machine.handle_int2f(), "AX=1501h handled");
 
+    // Subunit 0, then the IzarraCD ROM device header far pointer.
     assert_eq!(
         machine.read_guest_block(super::margo::UMB_BUFFER_PHYSICAL, 5),
-        vec![0; 5],
+        vec![0x00, 0x20, 0x04, 0x00, 0xFF],
         "the device-list entry must reach the frame the caller's page is mapped to"
     );
 }
@@ -1812,4 +1816,424 @@ fn icdex_directory_entry_writes_a_non_identity_mapped_destination() {
         b"README.TXT",
         "the canonical record's name must follow the second page's mapping"
     );
+}
+
+// ---------------------------------------------------------------------------
+// IzarraCD host redirector (cdredir.rs): the INT 2Fh AH=11h surface served
+// from the host ISO index. Each test lays the kernel structures out by hand
+// at REDIR_DS (the DOS data segment the redirector is armed with) and calls
+// handle_int2f directly, the way the icdex_* tests above do for AH=15h.
+
+const REDIR_DS: u16 = 0x0800;
+const REDIR_SFT_SEG: u16 = 0x8800;
+const REDIR_DTA_SEG: u16 = 0x8C00;
+
+fn redir_lin(offset: u32) -> u32 {
+    (u32::from(REDIR_DS) << 4) + offset
+}
+
+fn redir_sft_lin() -> u32 {
+    u32::from(REDIR_SFT_SEG) << 4
+}
+
+fn redir_dta_lin() -> u32 {
+    u32::from(REDIR_DTA_SEG) << 4
+}
+
+/// A folder disc plus an armed machine. The TempDir must stay alive: file
+/// extents read lazily from the host folder.
+fn redirector_machine() -> (tempfile::TempDir, Machine) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("readme.txt"), b"root file").unwrap();
+    let game = dir.path().join("game");
+    std::fs::create_dir(&game).unwrap();
+    std::fs::write(
+        game.join("data.bin"),
+        (0..5000u32).map(|i| i as u8).collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    let levels = game.join("levels");
+    std::fs::create_dir(&levels).unwrap();
+    std::fs::write(levels.join("e1m1.map"), b"level bytes").unwrap();
+    let built = crate::iso9660::build(dir.path()).unwrap();
+
+    let mut machine = test_machine();
+    machine.mount_cd(CdImage::from_folder(built).unwrap());
+    machine.arm_cd_redirector(REDIR_DS);
+    // The SDA DTA field points at the transfer area unless a test moves it.
+    machine.write_guest_linear_block(
+        redir_lin(0x32C),
+        &[0, 0, REDIR_DTA_SEG as u8, (REDIR_DTA_SEG >> 8) as u8],
+    );
+    (dir, machine)
+}
+
+fn redir_set_path(machine: &mut Machine, path: &str) {
+    let mut bytes = path.as_bytes().to_vec();
+    bytes.push(0);
+    machine.write_guest_linear_block(redir_lin(0x3BE), &bytes);
+}
+
+/// Point ES:DI at the scratch SFT and zero it.
+fn redir_prime_sft(machine: &mut Machine) {
+    machine.write_guest_linear_block(redir_sft_lin(), &[0u8; 0x40]);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(REDIR_SFT_SEG));
+    machine.cpu.registers.set_edi(0);
+}
+
+/// The open-mode word the kernel pushes before INT 2Fh, above the frame that
+/// prime_dos_int_frame builds: SS:SP+6.
+fn redir_set_open_mode(machine: &mut Machine, mode: u16) {
+    machine
+        .memory
+        .write_u16(0x9000 * 16 + 0x0106, mode)
+        .unwrap();
+}
+
+fn redir_call(machine: &mut Machine, ax: u16) {
+    prime_dos_int_frame(machine);
+    machine.cpu.registers.set_eax(u32::from(ax));
+    assert!(machine.handle_int2f(), "AX={ax:04X}h handled");
+}
+
+#[test]
+fn cd_redirector_open_read_close_roundtrip() {
+    let (_disc, mut machine) = redirector_machine();
+    redir_set_path(&mut machine, "D:\\GAME\\DATA.BIN");
+    redir_prime_sft(&mut machine);
+    redir_set_open_mode(&mut machine, 0x0000);
+    redir_call(&mut machine, 0x1116);
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "open succeeds");
+
+    let sft = redir_sft_lin();
+    assert_eq!(
+        machine.read_guest_linear_block(sft + 0x20, 11),
+        b"DATA    BIN"
+    );
+    assert_eq!(machine.read_guest_linear_block(sft + 0x04, 1)[0], 0x01);
+    let flags = machine.read_guest_word(sft + 0x05);
+    assert_eq!(flags, 0x8040 | u16::from(CD_DRIVE_NUMBER));
+    assert_eq!(machine.read_guest_dword(sft + 0x11), 5000, "size");
+    assert_eq!(machine.read_guest_dword(sft + 0x15), 0, "position");
+    let lba = machine.read_guest_dword(sft + 0x19);
+    assert_ne!(lba, 0, "extent LBA recorded");
+
+    // Read 100 bytes, then a read that crosses EOF.
+    machine.cpu.registers.set_ecx(100);
+    redir_call(&mut machine, 0x1108);
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "read succeeds");
+    assert_eq!(machine.cpu.registers.ecx() as u16, 100);
+    let data = machine.read_guest_linear_block(redir_dta_lin(), 100);
+    assert_eq!(data[0], 0);
+    assert_eq!(data[99], 99);
+    assert_eq!(machine.read_guest_dword(sft + 0x15), 100);
+
+    machine.write_guest_linear_block(sft + 0x15, &4990u32.to_le_bytes());
+    machine.cpu.registers.set_ecx(100);
+    redir_call(&mut machine, 0x1108);
+    assert_eq!(machine.cpu.registers.ecx() as u16, 10, "clamped at EOF");
+    assert_eq!(
+        machine.read_guest_linear_block(redir_dta_lin(), 10),
+        (4990..5000u32).map(|i| i as u8).collect::<Vec<u8>>()
+    );
+    assert_eq!(machine.cd_redirector_read_bytes(), 110);
+
+    // Close drops the reference count and clamps at zero.
+    machine.write_guest_linear_block(sft, &1u16.to_le_bytes());
+    redir_call(&mut machine, 0x1106);
+    assert_eq!(machine.read_guest_word(sft), 0);
+    redir_call(&mut machine, 0x1106);
+    assert_eq!(machine.read_guest_word(sft), 0, "clamped");
+}
+
+#[test]
+fn cd_redirector_read_spans_sector_boundaries() {
+    let (_disc, mut machine) = redirector_machine();
+    redir_set_path(&mut machine, "D:\\GAME\\DATA.BIN");
+    redir_prime_sft(&mut machine);
+    redir_set_open_mode(&mut machine, 0x0002); // read-write passes, as through IZCDEX
+    redir_call(&mut machine, 0x1116);
+    let sft = redir_sft_lin();
+    // Start 10 bytes before the first sector boundary and read 30.
+    machine.write_guest_linear_block(sft + 0x15, &2038u32.to_le_bytes());
+    machine.cpu.registers.set_ecx(30);
+    redir_call(&mut machine, 0x1108);
+    assert_eq!(machine.cpu.registers.ecx() as u16, 30);
+    let data = machine.read_guest_linear_block(redir_dta_lin(), 30);
+    let expect: Vec<u8> = (2038..2068u32).map(|i| i as u8).collect();
+    assert_eq!(data, expect, "bytes on both sides of the boundary");
+}
+
+#[test]
+fn cd_redirector_denies_writes_and_reports_lookup_errors() {
+    let (_disc, mut machine) = redirector_machine();
+
+    // Open for write.
+    redir_set_path(&mut machine, "D:\\GAME\\DATA.BIN");
+    redir_prime_sft(&mut machine);
+    redir_set_open_mode(&mut machine, 0x0001);
+    redir_call(&mut machine, 0x1116);
+    assert_eq!(dos_int_flags(&machine) & 1, 1);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0005);
+
+    // Extended open with write mode (SDA+2E1h bit 0).
+    redir_prime_sft(&mut machine);
+    machine.write_guest_linear_block(redir_lin(0x601), &[0x01]);
+    machine.write_guest_linear_block(redir_lin(0x5FD), &[0x00]);
+    redir_call(&mut machine, 0x112E);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0005);
+
+    // Extended open that would truncate (action bit 1).
+    machine.write_guest_linear_block(redir_lin(0x601), &[0x00]);
+    machine.write_guest_linear_block(redir_lin(0x5FD), &[0x02]);
+    redir_call(&mut machine, 0x112E);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0005);
+
+    // A read-only extended open succeeds.
+    machine.write_guest_linear_block(redir_lin(0x5FD), &[0x01]);
+    redir_prime_sft(&mut machine);
+    redir_call(&mut machine, 0x112E);
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "extended open succeeds");
+
+    // Missing file in an existing directory: 02h. Missing directory: 03h.
+    redir_set_path(&mut machine, "D:\\GAME\\NOPE.BIN");
+    redir_prime_sft(&mut machine);
+    redir_set_open_mode(&mut machine, 0x0000);
+    redir_call(&mut machine, 0x1116);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0002);
+    redir_set_path(&mut machine, "D:\\NODIR\\NOPE.BIN");
+    redir_prime_sft(&mut machine);
+    redir_call(&mut machine, 0x1116);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0003);
+}
+
+#[test]
+fn cd_redirector_getattr_chdir_getspace_and_seek() {
+    let (_disc, mut machine) = redirector_machine();
+
+    // GetAttr: AX = attributes, BX:DI = size, CX = time, DX = date.
+    redir_set_path(&mut machine, "D:\\GAME\\DATA.BIN");
+    redir_call(&mut machine, 0x110F);
+    assert_eq!(dos_int_flags(&machine) & 1, 0);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0001, "read-only file");
+    let size = (u32::from(machine.cpu.registers.ebx() as u16) << 16)
+        | u32::from(machine.cpu.registers.edi() as u16);
+    assert_eq!(size, 5000);
+    assert_ne!(machine.cpu.registers.edx() as u16, 0, "date stamp present");
+
+    redir_set_path(&mut machine, "D:\\GAME");
+    redir_call(&mut machine, 0x110F);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0010, "directory");
+
+    // ChDir validates directories only.
+    redir_set_path(&mut machine, "D:\\GAME\\LEVELS");
+    redir_call(&mut machine, 0x1105);
+    assert_eq!(dos_int_flags(&machine) & 1, 0);
+    redir_set_path(&mut machine, "D:\\GAME\\DATA.BIN");
+    redir_call(&mut machine, 0x1105);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0003);
+
+    // GetSpace against the CDS: AL=1, AH=0, CX=2048, DX=0.
+    let cds = 0x7800u32 << 4;
+    machine.write_guest_linear_block(cds, b"D:\\\0");
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0x7800));
+    machine.cpu.registers.set_edi(0);
+    redir_call(&mut machine, 0x110C);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+    assert_eq!(machine.cpu.registers.ecx() as u16, 2048);
+    assert_eq!(machine.cpu.registers.edx() as u16, 0);
+    assert_ne!(machine.cpu.registers.ebx() as u16, 0, "volume sectors");
+
+    // Seek from end: DX:AX = size + signed CX:DX offset.
+    redir_set_path(&mut machine, "D:\\GAME\\DATA.BIN");
+    redir_prime_sft(&mut machine);
+    redir_set_open_mode(&mut machine, 0x0000);
+    redir_call(&mut machine, 0x1116);
+    machine.cpu.registers.set_ecx(0xFFFF); // CX:DX = -1000
+    machine.cpu.registers.set_edx((-1000i32 as u32) & 0xFFFF);
+    redir_call(&mut machine, 0x1121);
+    let position = (u32::from(machine.cpu.registers.edx() as u16) << 16)
+        | u32::from(machine.cpu.registers.eax() as u16);
+    assert_eq!(position, 4000);
+    assert_eq!(
+        machine.read_guest_dword(redir_sft_lin() + 0x15),
+        0,
+        "seek must not move the stored position"
+    );
+}
+
+#[test]
+fn cd_redirector_findfirst_findnext_walks_a_directory() {
+    let (_disc, mut machine) = redirector_machine();
+    // Search D:\GAME\*.* for files and directories.
+    redir_set_path(&mut machine, "D:\\GAME\\*.*");
+    machine.write_guest_linear_block(redir_lin(0x56D), &[0x10]);
+    redir_call(&mut machine, 0x111B);
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "first match");
+
+    let fdb = redir_dta_lin() + 0x15;
+    let mut names = vec![machine.read_guest_linear_block(fdb, 11)];
+    loop {
+        redir_call(&mut machine, 0x111C);
+        if dos_int_flags(&machine) & 1 != 0 {
+            assert_eq!(machine.cpu.registers.eax() as u16, 0x0012);
+            break;
+        }
+        names.push(machine.read_guest_linear_block(fdb, 11));
+    }
+    // A subdirectory lists `.` and `..` first, the way DOS and the guest
+    // redirector did; then its children in disc order.
+    assert_eq!(names.len(), 4, "{names:?}");
+    assert_eq!(names[0], b".          ".to_vec());
+    assert_eq!(names[1], b"..         ".to_vec());
+    assert!(names.contains(&b"DATA    BIN".to_vec()));
+    assert!(names.contains(&b"LEVELS     ".to_vec()));
+
+    // The directory entry carries the subdirectory attribute in the FDB.
+    redir_set_path(&mut machine, "D:\\GAME\\LEVELS");
+    redir_call(&mut machine, 0x111B);
+    assert_eq!(machine.read_guest_linear_block(fdb + 11, 1)[0], 0x10);
+
+    // A search with attributes 08h exactly returns the volume label.
+    redir_set_path(&mut machine, "D:\\*.*");
+    machine.write_guest_linear_block(redir_lin(0x56D), &[0x08]);
+    redir_call(&mut machine, 0x111B);
+    assert_eq!(dos_int_flags(&machine) & 1, 0, "label search succeeds");
+    assert_eq!(machine.read_guest_linear_block(fdb + 11, 1)[0], 0x08);
+    redir_call(&mut machine, 0x111C);
+    assert_eq!(
+        machine.cpu.registers.eax() as u16,
+        0x0012,
+        "label ends search"
+    );
+
+    // A pattern with no match fails FindFirst with no-more-files.
+    redir_set_path(&mut machine, "D:\\GAME\\*.XYZ");
+    machine.write_guest_linear_block(redir_lin(0x56D), &[0x10]);
+    redir_call(&mut machine, 0x111B);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0012);
+}
+
+#[test]
+fn cd_redirector_ignores_other_drives_and_disarmed_machines() {
+    let (_disc, mut machine) = redirector_machine();
+    // A path on C: falls back to the absent-redirector refusal.
+    redir_set_path(&mut machine, "C:\\ANYTHING");
+    redir_call(&mut machine, 0x110F);
+    assert_eq!(dos_int_flags(&machine) & 1, 1);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+
+    // Disarmed, even a D: path is refused the old way.
+    machine.disarm_cd_redirector();
+    redir_set_path(&mut machine, "D:\\GAME");
+    redir_call(&mut machine, 0x110F);
+    assert_eq!(dos_int_flags(&machine) & 1, 1);
+    assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+}
+
+// ---------------------------------------------------------------------------
+// The IzarraCD ROM device header and the Lotura doorbell (port 0xE8).
+
+#[test]
+fn izarracd_rom_header_is_returned_by_1501_and_carries_the_stubs() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(4));
+    // AX=1501h writes subunit 0 plus the ROM header far pointer.
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0x9000));
+    machine.cpu.registers.set_ebx(0x0200);
+    machine.cpu.registers.set_eax(0x1501);
+    assert!(machine.handle_int2f());
+    let entry = machine.read_guest_linear_block(0x9000 * 16 + 0x0200, 5);
+    assert_eq!(entry[0], 0, "subunit");
+    let off = u16::from_le_bytes([entry[1], entry[2]]);
+    let seg = u16::from_le_bytes([entry[3], entry[4]]);
+    assert_eq!((seg, off), (0xFF00, 0x0420));
+
+    // The header bytes live in the ROM: name, strategy/interrupt offsets.
+    let header = machine.read_guest_linear_block(0xFF420, 22);
+    assert_eq!(&header[10..18], b"TOKACD01");
+    let strategy = u16::from_le_bytes([header[6], header[7]]);
+    let interrupt = u16::from_le_bytes([header[8], header[9]]);
+    // Both entries hold real code ending in RETF (CBh).
+    let strategy_code = machine.read_guest_linear_block(0xFF000 + u32::from(strategy), 17);
+    assert_eq!(*strategy_code.last().unwrap(), 0xCB);
+    let interrupt_code = machine.read_guest_linear_block(0xFF000 + u32::from(interrupt), 16);
+    assert_eq!(*interrupt_code.last().unwrap(), 0xCB);
+}
+
+#[test]
+fn izarracd_doorbell_executes_the_mailbox_request() {
+    let mut machine = test_machine();
+    machine.mount_cd(marked_data_cd());
+
+    // The strategy stub would have stored the request pointer here: header at
+    // 0200:0060 (linear 0x2060).
+    machine.memory.write_u16(0x063C, 0x0060).unwrap();
+    machine.memory.write_u16(0x063E, 0x0200).unwrap();
+    plant_read_long_request(&mut machine, 0x2060, 0x4000, 2, 1);
+
+    // Ring the doorbell the way the ROM interrupt stub does.
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x00E8, BusWidth::Byte, 1, false).unwrap();
+        assert_eq!(
+            bus.read_io(0x00E8, BusWidth::Byte, 0, false).unwrap(),
+            1,
+            "busy until serviced"
+        );
+    });
+    assert!(machine.pending_cd_doorbell.is_some());
+    machine.pending_cd_doorbell.take();
+    machine.perform_cd_doorbell(1);
+
+    with_bus(&mut machine, |bus| {
+        assert_eq!(
+            bus.read_io(0x00E8, BusWidth::Byte, 0, false).unwrap(),
+            0,
+            "idle after service"
+        );
+    });
+    assert_eq!(machine.read_physical_u8(0x4000), 0x99, "sector delivered");
+    let status = machine.read_guest_word(0x2060 + 3);
+    assert_ne!(status & 0x0100, 0, "done bit");
+    assert_eq!(status & 0x8000, 0, "no error");
+}
+
+/// A stray OUT to 0xE8 (wrong command, or no request stored) must stay inert:
+/// the port was open bus before the doorbell existed, so garbage rings must
+/// never decode low memory as a device request.
+#[test]
+fn izarracd_doorbell_refuses_stray_rings() {
+    let mut machine = test_machine();
+    machine.mount_cd(marked_data_cd());
+
+    // Unknown command: status parks at 0xFF, nothing executes.
+    machine.memory.write_u16(0x063C, 0x0060).unwrap();
+    machine.memory.write_u16(0x063E, 0x0200).unwrap();
+    plant_read_long_request(&mut machine, 0x2060, 0x4000, 2, 1);
+    machine.pending_cd_doorbell = Some(0x77);
+    machine.pending_cd_doorbell.take();
+    machine.perform_cd_doorbell(0x77);
+    assert_eq!(machine.read_physical_u8(0x4000), 0, "no transfer happened");
+    assert_eq!(
+        machine.read_guest_word(0x2060 + 3),
+        0,
+        "status word untouched"
+    );
+
+    // Command 1 with a null mailbox: refused, and the INT 0 vector's segment
+    // word (linear 0x0003, where a request-at-0 would land its status) stays.
+    machine.memory.write_u16(0x063C, 0).unwrap();
+    machine.memory.write_u16(0x063E, 0).unwrap();
+    let int0_seg = machine.read_guest_word(0x0002);
+    machine.perform_cd_doorbell(1);
+    assert_eq!(machine.read_guest_word(0x0002), int0_seg);
 }
