@@ -1221,10 +1221,14 @@ function Get-FixtureTable {
             # the parent `d2640de0` still hashes 2c55fef0. `c1447356` (current
             # main) reproduces 8bef41b4 with entries and coverage IDENTICAL to
             # 96882738, so nothing merged after PR #736 touches this row.
+            #
+            # REPINNED 2026-08-28 to e446305c alone: IzarraCD CD-2 replaced the
+            # IZCDEX install line with the kernel's own claim line on the boot
+            # screen this anchor contains. Bit-identical ON and OFF
+            # IZARRAVM_TEST_WORD_ROWS on this binary (hash AND 18,136,142,698
+            # retired instructions).
             frame_sha256_allowed = @(
-                "2c55fef04eeb555d02790b336a36fff2a7ce04245a40b810ea3bea83d9061403"
-                "30abcde0d496b5e275704c0dcf270f0ea15a3e7171cf9f1d04d7468074b259dd"
-                "8bef41b4270f8ccb277c47e6896b9335313db1a593a3204b21dc324d4bcfcdbe"
+                "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
             )
             stdout_contains = "DOS/4GW Protected Mode Run-time  Version 1.97"
             expected_display = "VgaRaster"; expected_video_mode = "Text"

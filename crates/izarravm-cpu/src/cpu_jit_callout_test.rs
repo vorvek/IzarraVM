@@ -2361,7 +2361,7 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
 // the `classify` arm are covered separately in `cpu_jit_in_imm8_callout_test.rs`.
 //
 // Every positive fixture states the knob through `select_in_imm8_callout`, in both directions, for
-// `cpu_jit_test_word_row_test.rs`'s reason: the default is OFF.
+// `cpu_jit_test_word_row_test.rs`'s reason: both arms, not the ambient default.
 //
 // `select_in_imm8_callout` returns a DROP GUARD rather than leaving the reset to the caller's own
 // last statement (ROUND-3 review m3-6): a panicking assertion partway through a fixture used to

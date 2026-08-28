@@ -10515,10 +10515,9 @@ pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::V
 /// Whether `classify` admits **`0x85` TEST r/m16, r16, REGISTER form, at Word operand size**
 /// (`IZARRAVM_TEST_WORD_ROWS`).
 ///
-/// **DEFAULT OFF.** An unset knob is the pre-slice refusal and the A/B base, the same contract
-/// `IZARRAVM_IMM8_LANES` ships under and the OPPOSITE of `IZARRAVM_V86_LOOP_ROWS` /
-/// `IZARRAVM_ROTATE_ROWS` / `IZARRAVM_COUNT_LANES` / `IZARRAVM_FPU_LOOP_ROWS`, whose unset arm is
-/// the slice. Both arms ship in one executable because this box has measured 6% wall variance
+/// **DEFAULT ON SINCE THE 2026-08-28 RE-PRICE.** An unset knob admits the Word register-form
+/// TEST row. `0` or `off` is the escape back to the pre-slice refusal, which still ships whole
+/// because it is the base every A/B on this row is read against. Both arms ship in one executable because this box has measured 6% wall variance
 /// between builds of byte-identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a
 /// cross-build comparison would not be evidence.
 ///
@@ -10587,12 +10586,12 @@ pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::V
 /// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
 /// whitespace and one set from a PowerShell ladder picks up capitalisation.
 ///
-/// * unset, `` (empty), `0` or `off` -> OFF. The shipped base.
-/// * `1` or `on` -> ON. The slice.
+/// * unset, `` (empty), `1` or `on` -> ON. The shipped default since 2026-08-28.
+/// * `0` or `off` -> OFF. The pre-slice refusal.
 /// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason in this slice's terms: a
-///   mistyped ladder leg (`=yes`, `=test`, `=true`) that fell through to OFF would run the BASE
-///   and be read as "the TEST word row did nothing", which is the one wrong conclusion this slice
-///   exists to avoid.
+///   mistyped ladder leg (`=yes`, `=test`, `=true`) that fell through to the default would run
+///   the ON arm and be read as "the TEST word row did nothing", which is the one wrong
+///   conclusion an A/B exists to avoid.
 pub(crate) fn test_word_rows_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = TEST_WORD_ROWS_OVERRIDE.with(std::cell::Cell::get) {
@@ -10606,27 +10605,31 @@ pub(crate) fn test_word_rows_enabled() -> bool {
 /// unit-tested without a process-global env write. See `test_word_rows_enabled` for the contract.
 fn parse_test_word_rows_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the default, and the default is ON since the 2026-08-28 re-price.
+        Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
         // than the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_TEST_WORD_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset, `0` or `off` (the shipped base, under which `0x85` at Word \
-                 stays a barrier), and `1` or `on` (the Word register-form TEST admission)"
+                 spellings are unset (the shipped default: ON since 2026-08-28), `0` or `off` \
+                 (the pre-slice refusal, under which `0x85` at Word stays a barrier), and `1` or \
+                 `on` (the Word register-form TEST admission)"
             )
         }
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" => false,
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        "" => true,
+        "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_TEST_WORD_ROWS={other:?} names no arm; accepted spellings are unset, `0` or \
-             `off` (the shipped base) and `1` or `on` (the `0x85` TEST r/m16,r16 register-form \
-             admission at Word operand size). \
-             Refusing to guess: a mistyped ladder leg that silently ran the base would be read as \
-             the slice failing"
+            "IZARRAVM_TEST_WORD_ROWS={other:?} names no arm; accepted spellings are unset (the \
+             shipped default, ON since 2026-08-28), `0` or `off` (the pre-slice refusal) and `1` \
+             or `on` (the `0x85` TEST r/m16,r16 register-form admission at Word operand size). \
+             Refusing to guess: a mistyped ladder leg that silently ran the default would be \
+             read as the arm it did not run"
         ),
     }
 }
@@ -12863,10 +12866,10 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     | 0xf8
                     | 0xf9
             ))
-        // THE WORD TEST ROW (`IZARRAVM_TEST_WORD_ROWS`, default OFF) is a THIRD allowlist, written
-        // as its own term for the reason the V86 term above is: the gate-off arm stays byte-
-        // identical to the pre-slice tree by inspection rather than by reading a hundred-line
-        // `matches!`.
+        // THE WORD TEST ROW (`IZARRAVM_TEST_WORD_ROWS`, default ON since 2026-08-28) is a THIRD
+        // allowlist, written as its own term for the reason the V86 term above is: the gate-off
+        // arm stays byte-identical to the pre-slice tree by inspection rather than by reading a
+        // hundred-line `matches!`.
         //
         // `0x85` is named in this file's header as a Dword sibling whose kind hard-codes Dword,
         // and that WAS the whole reason it was refused at Word. `DirectKind::Test` carries a

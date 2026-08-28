@@ -30,15 +30,13 @@
   },
   "tombraid-586": {
     "anchor_frame_sha256": [
-      "2c55fef04eeb555d02790b336a36fff2a7ce04245a40b810ea3bea83d9061403",
-      "30abcde0d496b5e275704c0dcf270f0ea15a3e7171cf9f1d04d7468074b259dd",
-      "8bef41b4270f8ccb277c47e6896b9335313db1a593a3204b21dc324d4bcfcdbe"
+      "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
     ],
     "final_nonblack_percent_min": 89.0,
     "final_nonblack_percent_max": 100.0,
     "final_distinct_colors_min": 79,
     "final_distinct_colors_max": 256,
-    "final_instructions": 16822094052,
+    "final_instructions": 18136220051,
     "final_instructions_tolerance": 0.05
   },
   "wolf3d-486": {

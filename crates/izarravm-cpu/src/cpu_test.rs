@@ -3893,7 +3893,7 @@ mod jit_general;
 /// The corollary for a DEFAULT PIN — the one fixture per gate that is *supposed* to read the
 /// ambient arm — is that it must apply the gate's own spelling table to the real environment
 /// rather than hard-asserting a constant, or the suite cannot be green on both arms by
-/// construction. `imm8_lanes_ship_on_by_default` and `test_word_rows_ship_off_by_default` are the
+/// construction. `imm8_lanes_ship_on_by_default` and `test_word_rows_ship_on_by_default` are the
 /// two shapes of that.
 #[cfg(all(
     feature = "jit",
