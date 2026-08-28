@@ -4126,6 +4126,9 @@ pub(crate) enum DirectKind {
     },
     AluMemSource {
         op: u8,
+        /// At Word/Dword this is a GPR index (EAX..EDI). At Byte it is a
+        /// byte-register index (AL..BH). Width is the discriminator. `home(dst)`
+        /// is the wrong register file for Byte: index 4 is ESP, index 7 is EDI.
         dst: u8,
         width: MemoryWidth,
         addr: DirectAddr,
@@ -5158,6 +5161,9 @@ impl DirectKind {
                 width: MemoryWidth::Byte,
                 ..
             } | Self::AluMemDest {
+                width: MemoryWidth::Byte,
+                ..
+            } | Self::AluMemSource {
                 width: MemoryWidth::Byte,
                 ..
             } | Self::TestImmMem {
@@ -12531,10 +12537,10 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // all 347,134,532 block-stopping hits, `0xfe` at 3.39% and `0x38` at 2.69% heading them.
     // Both forms satisfy the structural rule above rather than bending it: form 0 produces
     // `AluRegByte`, which has no width field at all, or `AluMemDest` carrying a literal
-    // `MemoryWidth::Byte`; form 2 produces `AluRegByte` for the register shape and refuses the
-    // memory shape inside its arm, so the `None` it already returns is what a 16-bit
-    // `0x0a /0 mem` keeps getting. `0xa0`, `0xa2` and `0xfe` are the same case one arm at a time
-    // (`Load`/`Store`/`IncDecReg`, every one a literal `MemoryWidth::Byte`).
+    // `MemoryWidth::Byte`; form 2 produces `AluRegByte` for the register shape and
+    // `AluMemSource { width: Byte }` for the memory shape. `0xa0`, `0xa2` and `0xfe` are the
+    // same case one arm at a time (`Load`/`Store`/`IncDecReg`, every one a literal
+    // `MemoryWidth::Byte`).
     //
     // `0xa1` and `0xa3` sat between them in the opcode map and WERE the counterexample worth
     // naming, because proximity is exactly how they would have got swept in: both hard-coded
@@ -13204,33 +13210,27 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         }),
                     };
                 }
-                // Byte register destination, byte r/m source — the form that had NO arm at all
-                // before Slice 7, in either operand shape. Register only.
-                //
-                // Roles are form 0's mirrored, and they follow `execute_alu_decoded`'s form-2 arm:
-                // `a` is `modrm.reg` (the destination, written back through `write_gpr8` unless op
-                // is CMP) and `b` is the r/m.
-                //
-                // The MEMORY form is deliberately absent and is a missed lowering rather than a
-                // hazard — the `else` returns None and the instruction stays the barrier it is
-                // today. `AluMemSource` looks as if it already covers it (its read match has a
-                // `MemoryWidth::Byte` arm) but that arm is UNREACHABLE and incomplete: it falls
-                // into `mov eax, home(dst)` and `emit_alu_preloaded`, which has no byte lane at
-                // all and would read a 32-bit register where a byte lane is meant, and
-                // `DirectKind::byte_reads` does not count `AluMemSource` either, so the bus
-                // accounting would be short a byte read. Building it is a second mechanism behind
-                // one census measurement (quake 21,686 exits on `0x32 /0`, doom zero); this arm
-                // is the register lane and nothing else.
+                // Byte register destination, byte r/m source. Roles are form 0's mirrored, and
+                // they follow `execute_alu_decoded`'s form-2 arm: `a` is `modrm.reg` (the
+                // destination, written back through `write_gpr8` unless op is CMP) and `b` is
+                // the r/m. Memory is `AluMemSource { width: Byte }`; the Byte emit arm is a
+                // real byte lane (`emit_read_store_value` / `emit_alu_byte_preloaded` /
+                // `emit_write_gpr8`), not `home(dst)` / `emit_alu_preloaded`.
                 2 => {
                     let m = insn.modrm?;
-                    let DecodedOperand::Reg(src) = insn.operand? else {
-                        return None;
+                    return match insn.operand? {
+                        DecodedOperand::Reg(src) => Some(DirectKind::AluRegByte {
+                            op,
+                            dst: m.reg,
+                            src,
+                        }),
+                        DecodedOperand::Mem(addr) => Some(DirectKind::AluMemSource {
+                            op,
+                            dst: m.reg,
+                            width: MemoryWidth::Byte,
+                            addr: direct_addr(addr)?,
+                        }),
                     };
-                    return Some(DirectKind::AluRegByte {
-                        op,
-                        dst: m.reg,
-                        src,
-                    });
                 }
                 3 => {
                     let m = insn.modrm?;
@@ -18141,17 +18141,32 @@ fn emit_alu_mem_source(
 ) {
     emit_ram_read_pointer(e, width, addr, memory, sides, memory.address_wrap);
     match width {
-        MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RCX, Reg::RDI, 0),
-        MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0),
-        MemoryWidth::Dword => e.load_r32_disp8(Reg::RCX, Reg::RDI, 0),
+        MemoryWidth::Byte => {
+            // Dest is a byte-register index. `home(dst)` / `emit_alu_preloaded` is the
+            // Word/Dword path and would treat AH as ESP and BH as EDI.
+            e.movzx_r32_byte_disp8(Reg::RCX, Reg::RDI, 0);
+            emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RAX);
+            emit_alu_byte_preloaded(e, op);
+            if op != 7 {
+                emit_write_gpr8(e, dst, Reg::RDX);
+            }
+        }
+        MemoryWidth::Word => {
+            e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0);
+            e.mov_r32_r32(Reg::RAX, home(dst));
+            emit_alu_preloaded(e, op, dst, width, Reg::RCX);
+        }
+        MemoryWidth::Dword => {
+            e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
+            if !(eager_flags_enabled() && op != 7) {
+                e.mov_r32_r32(Reg::RAX, home(dst));
+            }
+            emit_alu_preloaded(e, op, dst, width, Reg::RCX);
+        }
         MemoryWidth::Qword | MemoryWidth::Tbyte => {
             unreachable!("ALU memory-source operands are never 8- or 10-byte wide")
         }
     }
-    if !(eager_flags_enabled() && matches!(width, MemoryWidth::Dword) && op != 7) {
-        e.mov_r32_r32(Reg::RAX, home(dst));
-    }
-    emit_alu_preloaded(e, op, dst, width, Reg::RCX);
 }
 
 #[cfg(all(

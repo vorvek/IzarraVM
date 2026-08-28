@@ -81,7 +81,15 @@ struct Roles {
 /// with a two-slot prefix, which is under the `slots.len() < 3 && !terminal` minimum and is
 /// therefore returned as a structural reject rather than a short block.
 fn build(body: &[u8], seed: Seed) -> Roles {
-    build_n(&[body], seed)
+    build_n(&[body], seed, &[])
+}
+
+/// `build` plus a disp32 operand page in the FastMap. Register-only `build` does not populate
+/// data pages; a memory operand then comes back `Retry` and looks like the opcode is still a
+/// barrier. Writes `fills` into guest RAM before wrapping the bus, then maps each touched page
+/// for both roles before compile.
+fn build_mem(body: &[u8], seed: Seed, fills: &[(u32, u8)]) -> Roles {
+    build_n(&[body], seed, fills)
 }
 
 /// `build` for a body of SEVERAL instructions, each given separately so the decode lines can be
@@ -93,7 +101,7 @@ fn build(body: &[u8], seed: Seed) -> Roles {
 /// accumulation to separate them, which is the lesson `cpu_jit_callout_matrix_test.rs` recorded
 /// when the Phase 5 call-out shipped a two-clock double-charge that every single-slot fixture
 /// agreed with. Four IMUL slots put 60 raw against 40, which is 5 scaled clocks against 3.
-fn build_n(bodies: &[&[u8]], seed: Seed) -> Roles {
+fn build_n(bodies: &[&[u8]], seed: Seed, fills: &[(u32, u8)]) -> Roles {
     let mut code = LEAD.to_vec();
     let mut starts = vec![ENTRY];
     for body in bodies {
@@ -109,6 +117,9 @@ fn build_n(bodies: &[&[u8]], seed: Seed) -> Roles {
     // A NOP before the entry, so the block is reachable as a continuation as well as directly.
     memory[(ENTRY - 1) as usize] = 0x90;
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    for &(addr, byte) in fills {
+        memory[addr as usize] = byte;
+    }
 
     let mut native = flat_cpu();
     let mut interp = flat_cpu();
@@ -126,6 +137,37 @@ fn build_n(bodies: &[&[u8]], seed: Seed) -> Roles {
         for &linear in &starts {
             cpu.set_eip(linear);
             cpu.fetch_decoded(bus, linear).unwrap();
+        }
+        let mut pages = Vec::new();
+        for &(addr, _) in fills {
+            let page = addr & !0xfff;
+            if !pages.contains(&page) {
+                pages.push(page);
+            }
+        }
+        for page in pages {
+            let read = bus
+                .direct_page(page, BusAccessKind::DataRead)
+                .unwrap()
+                .unwrap();
+            assert!(cpu.jit_fast_map.populate_read(
+                page,
+                page,
+                read,
+                jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page)
+            ));
+            let write = bus
+                .direct_page(page, BusAccessKind::DataWrite)
+                .unwrap()
+                .unwrap();
+            assert!(cpu.jit_fast_map.populate_write(
+                page,
+                page,
+                write,
+                jit::fast_map::PagePermissions::UNPAGED,
+                cpu.physical_page_watched(page)
+            ));
         }
     }
 
@@ -397,7 +439,8 @@ fn three_operand_imul_charge_matches_the_interpreter_across_slot_counts() {
             .collect();
         let refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
         let seed = Seed::new([7; 8]);
-        run_and_compare(build_n(&refs, seed), &format!("{count} IMUL slots"));
+        // IMUL rows are register-only; no data-page fills.
+        run_and_compare(build_n(&refs, seed, &[]), &format!("{count} IMUL slots"));
     }
 }
 
@@ -444,6 +487,13 @@ fn alu_byte_rm_dst(op: u8, dst: u8, src: u8) -> Vec<u8> {
 /// `dst` is the ModRM reg field and `src` is the r/m.
 fn alu_byte_reg_dst(op: u8, dst: u8, src: u8) -> Vec<u8> {
     vec![(op << 3) | 2, 0b1100_0000 | (dst << 3) | src]
+}
+
+/// Form 2 with a disp32 memory source. ModRM `mod=00 rm=101`.
+fn alu_byte_reg_mem(op: u8, dst: u8, target: u32) -> Vec<u8> {
+    let mut bytes = vec![(op << 3) | 2, (dst << 3) | 0b101];
+    bytes.extend_from_slice(&target.to_le_bytes());
+    bytes
 }
 
 /// A seed whose eight registers carry DISTINCT bytes in every lane, so a lowering that read the
@@ -575,13 +625,64 @@ fn byte_lane_register_alu_leaves_the_rest_of_the_destination_alone() {
 }
 
 #[test]
-fn byte_lane_alu_memory_source_form_is_still_a_barrier() {
-    // `XOR AL, [EBX]` — 0x32 /r with mod = 0b00, quake's `0x32 /0` census row. The register arm
-    // must not have widened into the memory form: `AluMemSource`'s byte path is unreachable and
-    // incomplete (no byte lane in `emit_alu_preloaded`, and `byte_reads` does not count it), so
-    // admitting it here would be a miscompile rather than a lowering.
-    still_a_barrier(&[0x32, 0b0000_0011], "0x32 memory source");
-    still_a_barrier(&[0x3a, 0b0000_0011], "0x3A memory source");
+fn byte_lane_alu_memory_source_matches_the_interpreter_for_every_op_and_lane() {
+    // Form 2 memory: all eight ops, BL (census dest), BH and AH (the high-byte dests that
+    // `home(dst)` miscompiles as EDI/ESP). Operand 0x80 so a naive dword ADD of a zeroed
+    // register cannot agree with the byte ALU. Poison high halves come from `byte_seed`.
+    const TARGET: u32 = 0x3f00;
+    let seed = byte_seed();
+    for op in 0u8..8 {
+        for dst in [3u8, 7, 4] {
+            for mem in [0x80u8, 0x01] {
+                for eflags in [0x202u32, 0x203] {
+                    for pending in [false, true] {
+                        let seed = seed.flags(eflags);
+                        let seed = if pending { seed.pending() } else { seed };
+                        let label = format!(
+                            "form2 mem op={op} dst={dst} mem={mem:#x} eflags={eflags:#x} pending={pending}"
+                        );
+                        run_and_compare(
+                            build_mem(&alu_byte_reg_mem(op, dst, TARGET), seed, &[(TARGET, mem)]),
+                            &label,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_lane_alu_memory_source_at_the_last_byte_of_a_page_reads_only_that_byte() {
+    // Mutant 11: `load_r32_disp8` through a Byte-validated FastMap pointer reads past 0xFFF
+    // into the next guest page. The ALU only looks at CL, so a page-interior matrix cannot
+    // see it. Populate the operand page only; the decoy at 0x1000 lives in the bus vec.
+    const TARGET: u32 = 0x0fff;
+    const DECOY: u32 = 0x1000;
+    let seed = byte_seed();
+    let mut roles = build_mem(&alu_byte_reg_mem(0, 3, TARGET), seed, &[(TARGET, 0x80)]);
+    // Decoy is on the next guest page, not FastMap-populated. A dword load at 0xFFF
+    // through page 0's host pointer still reads it from the contiguous bus vec.
+    roles.native_bus.memory[DECOY as usize] = 0x11;
+    roles.interp_bus.memory[DECOY as usize] = 0x11;
+    run_and_compare(roles, "add bl, [0xfff] with decoy at 0x1000");
+}
+
+#[test]
+fn byte_lane_alu_memory_source_declares_one_byte_read() {
+    const TARGET: u32 = 0x3f00;
+    let roles = build_mem(
+        &alu_byte_reg_mem(0, 3, TARGET),
+        byte_seed(),
+        &[(TARGET, 0x80)],
+    );
+    assert_eq!(
+        roles.block.byte_reads(),
+        1,
+        "form-2 byte mem is one byte read"
+    );
+    assert_eq!(roles.block.word_reads(), 0);
+    assert_eq!(roles.block.dword_reads(), 0);
 }
 
 #[test]
@@ -612,6 +713,12 @@ fn sixteen_bit_byte_alu_register_form_matches_its_unprefixed_encoding() {
                 let mut form2 = vec![0x66];
                 form2.extend_from_slice(&alu_byte_reg_dst(op, dst, src));
                 differential(&form2, seed, &format!("66 form 2 {label}"));
+                let mut form2_mem = vec![0x66];
+                form2_mem.extend_from_slice(&alu_byte_reg_mem(op, dst, 0x3f00));
+                run_and_compare(
+                    build_mem(&form2_mem, seed, &[(0x3f00, 0x80)]),
+                    &format!("66 form 2 mem {label}"),
+                );
             }
         }
     }
