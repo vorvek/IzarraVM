@@ -3,6 +3,14 @@
 
 use super::*;
 
+// B3 FAT-position request-block offsets (design:
+// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.3's 16-byte layout). Named
+// the way cddriver.rs's `RH_*` request-header offsets are, and shared by
+// `perform_hdd_map_lookup` and its tests (`machine_device_integration_test.rs`).
+pub(crate) const HDD_MAP_START: u32 = 4; // u32, guest writes: walk's starting cluster
+pub(crate) const HDD_MAP_STEPS: u32 = 8; // u32, guest writes: hops forward along the chain
+pub(crate) const HDD_MAP_RESULT: u32 = 12; // u32, host writes: the landing cluster
+
 impl Machine {
     /// Enter or leave booter-inert mode. When set, the Toka-DOS HLE and IZEMM stop
     /// intercepting the DOS/memory-manager interrupts (0x20/0x21/0x25/0x26/0x29/
@@ -754,49 +762,51 @@ impl Machine {
     /// status: port 0xE8 was open bus before this port existed, so a stray
     /// OUT must stay inert instead of decoding low memory as a request.
     pub(super) fn perform_cd_doorbell(&mut self, command: u8) {
-        if command == 0x02 {
-            let dos_ds = u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
-                | (u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
-            if dos_ds == 0 {
-                self.cd_doorbell_status = 0xFE;
-                return;
+        match command {
+            0x01 => {
+                let Some(header) = self.mailbox_far_pointer() else {
+                    self.cd_doorbell_status = 0xFE; // no request stored
+                    return;
+                };
+                self.cd_device_request(header);
+                self.cd_doorbell_status = 0;
             }
-            self.arm_cd_redirector(dos_ds);
-            self.cd_doorbell_status = 0;
-            return;
-        }
-        if command == 0x03 {
-            let off = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
-                | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
-            let seg = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 2))
-                | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 3)) << 8);
-            if seg == 0 && off == 0 {
-                self.cd_doorbell_status = 0xFE; // probe: parsed, nothing registered
-                return;
+            0x02 => {
+                let dos_ds = u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
+                    | (u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
+                if dos_ds == 0 {
+                    self.cd_doorbell_status = 0xFE;
+                    return;
+                }
+                self.arm_cd_redirector(dos_ds);
+                self.cd_doorbell_status = 0;
             }
-            self.hdd_map_block = Some((seg << 4).wrapping_add(off));
-            self.cd_doorbell_status = 0;
-            return;
+            0x03 => {
+                let Some(block) = self.mailbox_far_pointer() else {
+                    self.cd_doorbell_status = 0xFE; // probe: parsed, nothing registered
+                    return;
+                };
+                self.hdd_map_block = Some(block);
+                self.cd_doorbell_status = 0;
+            }
+            0x04 => self.perform_hdd_map_lookup(),
+            _ => self.cd_doorbell_status = 0xFF, // unknown command
         }
-        if command == 0x04 {
-            self.perform_hdd_map_lookup();
-            return;
-        }
-        if command != 0x01 {
-            self.cd_doorbell_status = 0xFF; // unknown command
-            return;
-        }
+    }
+
+    /// Read the mailbox's far pointer (offset word then segment word, both
+    /// commands 1 and 3's layout) and resolve it to a physical address, or
+    /// `None` for the null 0:0 pointer -- the "nothing stored" sentinel both
+    /// callers treat as a refusal.
+    fn mailbox_far_pointer(&mut self) -> Option<u32> {
         let off = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
             | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
         let seg = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 2))
             | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 3)) << 8);
         if seg == 0 && off == 0 {
-            self.cd_doorbell_status = 0xFE; // no request stored
-            return;
+            return None;
         }
-        let header = (seg << 4).wrapping_add(off);
-        self.cd_device_request(header);
-        self.cd_doorbell_status = 0;
+        Some((seg << 4).wrapping_add(off))
     }
 
     /// Doorbell command 4: answer the registered B3 FAT-position request.
@@ -809,15 +819,15 @@ impl Machine {
             self.cd_doorbell_status = 0xFE;
             return;
         };
-        let start = self.read_physical_u32(block + 4);
-        let steps = self.read_physical_u32(block + 8);
+        let start = self.read_physical_u32(block + HDD_MAP_START);
+        let steps = self.read_physical_u32(block + HDD_MAP_STEPS);
         let outcome = self
             .ata
             .as_ref()
             .and_then(|disk| disk.map_fat_chain(start, steps));
         let status = match outcome {
             Some(crate::katea_tree::ChainMapOutcome::Cluster(cluster)) => {
-                self.write_physical_u32(block + 12, cluster);
+                self.write_physical_u32(block + HDD_MAP_RESULT, cluster);
                 0
             }
             Some(crate::katea_tree::ChainMapOutcome::EndBeforeTarget) => 2,

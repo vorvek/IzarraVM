@@ -2692,7 +2692,6 @@ impl KateaTreeVolume {
     /// back) is not special-cased: it yields entry `0` for the affected
     /// cluster, which classifies as `EndBeforeTarget` -- the same conclusion a
     /// native guest walk would reach hitting the same failed sector.
-    ///
     pub(crate) fn map_chain(&self, start: u32, steps: u32) -> ChainMapOutcome {
         if !self.cluster_in_range(start) || steps as usize > self.max_chain() {
             return ChainMapOutcome::Refused;
