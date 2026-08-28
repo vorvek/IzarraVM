@@ -2714,6 +2714,10 @@ fn mpu_diagnostics_classify_commands_and_split_the_two_parts() {
         bus.write_io(0x301, BusWidth::Byte, 0xff, false).unwrap();
         bus.read_io(0x300, BusWidth::Byte, 0, false).unwrap(); // ACK
         bus.write_io(0x301, BusWidth::Byte, 0x3f, false).unwrap();
+        // In UART mode the part ignores every command except reset, and the
+        // classifier must ignore the same bytes: this start-play must not
+        // count as intelligent-mode activity.
+        bus.write_io(0x301, BusWidth::Byte, 0x08, false).unwrap();
         for byte in [0x90u8, 60, 100] {
             bus.write_io(0x300, BusWidth::Byte, u32::from(byte), false)
                 .unwrap();
@@ -2725,9 +2729,13 @@ fn mpu_diagnostics_classify_commands_and_split_the_two_parts() {
     });
 
     let (wavetable, midi) = machine.mpu_diagnostics();
-    assert_eq!(wavetable.command_writes, 2);
+    assert_eq!(wavetable.command_writes, 3);
     assert_eq!(wavetable.resets, 1);
     assert_eq!(wavetable.uart_enters, 1);
+    assert_eq!(
+        wavetable.start_playbacks, 0,
+        "a command the UART-mode part ignores must not be classified"
+    );
     assert_eq!(wavetable.data_writes, 3);
     assert_eq!(wavetable.data_reads, 1);
     assert_eq!(wavetable.status_reads, 1);

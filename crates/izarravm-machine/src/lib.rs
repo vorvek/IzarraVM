@@ -1104,7 +1104,10 @@ pub struct MpuDiagnostics {
     pub start_playbacks: u64,
     /// Intelligent-mode stop-play commands (0x04 bit set in a 0x00-0x2F command).
     pub stop_playbacks: u64,
-    /// Complete MIDI messages the part emitted toward the synth.
+    /// Complete MIDI messages the part emitted toward the synth. Counted at
+    /// the DRAIN (`take_*_midi_message`), which only the GUI's MIDI pump
+    /// calls -- a headless profile reads 0 here beside live `data_writes`,
+    /// and that zero means "nothing drained the queue", not "no music".
     pub output_messages: u64,
     pub output_bytes: u64,
 }
@@ -1150,6 +1153,10 @@ pub struct OplProbe {
     mpu_midi: MpuDiagnostics,
     midi_trace: Vec<MidiTraceEntry>,
     midi_cap: usize,
+    // Per-part UART latches, mirrored from the command stream so the
+    // classifier can ignore what the part ignores (see `record_mpu_command`).
+    mpu_wavetable_uart: bool,
+    mpu_midi_uart: bool,
     pit_writes: u64,
     pit_trace: Vec<PitTraceEntry>,
     pit_cap: usize,
@@ -1169,18 +1176,17 @@ pub struct PitTraceEntry {
 
 impl OplProbe {
     fn from_env() -> Self {
-        let cap = std::env::var("IZARRAVM_OPL_TRACE")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        let midi_cap = std::env::var("IZARRAVM_MIDI_TRACE")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        let pit_cap = std::env::var("IZARRAVM_PIT_TRACE")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
+        // Shared off-spelling for all three trace knobs: unset, empty or
+        // garbage all read as 0 = off (see the env-null-vs-empty trap).
+        fn trace_cap(variable: &str) -> usize {
+            std::env::var(variable)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        }
+        let cap = trace_cap("IZARRAVM_OPL_TRACE");
+        let midi_cap = trace_cap("IZARRAVM_MIDI_TRACE");
+        let pit_cap = trace_cap("IZARRAVM_PIT_TRACE");
         Self {
             counters: OplDiagnostics::default(),
             sb: SbDspDiagnostics::default(),
@@ -1190,6 +1196,8 @@ impl OplProbe {
             mpu_midi: MpuDiagnostics::default(),
             midi_trace: Vec::new(),
             midi_cap,
+            mpu_wavetable_uart: false,
+            mpu_midi_uart: false,
             pit_writes: 0,
             pit_trace: Vec::new(),
             pit_cap,
@@ -1318,13 +1326,29 @@ impl OplProbe {
 
     /// Record a command-port write. The command classification mirrors the
     /// `Mpu401` decoder without reading its state: 0x00-0x2F carries start/stop
-    /// bits, 0x3F enters UART, 0xFF resets.
+    /// bits, 0x3F enters UART, 0xFF resets -- and while the part sits in UART
+    /// mode it ignores everything except the reset, so the classifier keeps
+    /// its own per-part UART latch and ignores the same bytes. Without the
+    /// latch, a UART game whose stream bytes land on the command port would
+    /// read as intelligent-mode playback in the profile.
     fn record_mpu_command(&mut self, wavetable: bool, value: u8, master_ticks: u64) {
+        let uart = if wavetable {
+            self.mpu_wavetable_uart
+        } else {
+            self.mpu_midi_uart
+        };
         let mpu = self.mpu_mut(wavetable);
         mpu.command_writes += 1;
         match value {
-            0x3f => mpu.uart_enters += 1,
-            0xff => mpu.resets += 1,
+            0xff => {
+                mpu.resets += 1;
+                *self.mpu_uart_mut(wavetable) = false;
+            }
+            _ if uart => {}
+            0x3f => {
+                mpu.uart_enters += 1;
+                *self.mpu_uart_mut(wavetable) = true;
+            }
             0x00..=0x2f if value & 0x0f < 0x0c => {
                 match value & 0x0c {
                     0x08 => mpu.start_playbacks += 1,
@@ -1335,6 +1359,14 @@ impl OplProbe {
             _ => {}
         }
         self.midi_push(MidiTraceKind::CommandWrite, wavetable, value, master_ticks);
+    }
+
+    fn mpu_uart_mut(&mut self, wavetable: bool) -> &mut bool {
+        if wavetable {
+            &mut self.mpu_wavetable_uart
+        } else {
+            &mut self.mpu_midi_uart
+        }
     }
 
     fn record_mpu_data_write(&mut self, wavetable: bool, value: u8, master_ticks: u64) {
@@ -1351,29 +1383,36 @@ impl OplProbe {
         self.mpu_mut(wavetable).status_reads += 1;
     }
 
-    /// Edge entries share the PIT trace under pseudo-ports so the timeline of
-    /// programmed rate against delivered edges reads out of one series:
-    /// 0xF0 = an IRQ0 edge, 0xF1 = an SB16 IRQ request.
-    pub(crate) fn count_irq0_edge(&mut self, master_ticks: u64) {
-        self.irq0_edges += 1;
+    /// Whether the PIT trace still accepts entries. The bus checks it before
+    /// paying for a tick conversion the trace is the only consumer of.
+    pub(crate) fn pit_trace_armed(&self) -> bool {
+        self.pit_trace.len() < self.pit_cap
+    }
+
+    fn pit_push(&mut self, port: u16, value: u8, master_ticks: u64) {
         if self.pit_trace.len() < self.pit_cap {
             self.pit_trace.push(PitTraceEntry {
-                port: 0xF0,
-                value: 0,
+                port,
+                value,
                 master_ticks,
             });
         }
     }
 
+    /// Edge entries share the PIT trace under pseudo-ports so the timeline of
+    /// programmed rate against delivered edges reads out of one series:
+    /// 0xF0 = an IRQ0 edge, 0xF1 = an SB16 IRQ request. Batch-end edges are
+    /// stamped with the batch-end tick, so N edges retired by one advance
+    /// share a timestamp; read edge RATE from the series, not per-edge
+    /// spacing, when batches are coarse.
+    pub(crate) fn count_irq0_edge(&mut self, master_ticks: u64) {
+        self.irq0_edges += 1;
+        self.pit_push(0xF0, 0, master_ticks);
+    }
+
     pub(crate) fn count_sb_irq_request(&mut self, master_ticks: u64) {
         self.sb_irq_requests += 1;
-        if self.pit_trace.len() < self.pit_cap {
-            self.pit_trace.push(PitTraceEntry {
-                port: 0xF1,
-                value: 0,
-                master_ticks,
-            });
-        }
+        self.pit_push(0xF1, 0, master_ticks);
     }
 
     pub fn timer_counters(&self) -> (u64, u64, u64) {
@@ -1384,16 +1423,11 @@ impl OplProbe {
         &self.pit_trace
     }
 
-    /// Record a guest write to a PIT port (0x40-0x43).
+    /// Record a guest write to a PIT port (0x40-0x43). `master_ticks` may be
+    /// 0 when the trace is unarmed; only the trace reads it.
     fn record_pit_write(&mut self, port: u16, value: u8, master_ticks: u64) {
         self.pit_writes += 1;
-        if self.pit_trace.len() < self.pit_cap {
-            self.pit_trace.push(PitTraceEntry {
-                port,
-                value,
-                master_ticks,
-            });
-        }
+        self.pit_push(port, value, master_ticks);
     }
 
     /// Record one complete message the part emitted toward the synth.
@@ -3543,20 +3577,25 @@ impl Machine {
     /// Take the next complete message written to the wavetable MPU at
     /// 0x300/0x301. The MIDI engine drains this after each emulation pass.
     pub fn take_wavetable_midi_message(&mut self) -> Option<TimedMidiMessage> {
-        let message = self.wavetable_mpu.take_message();
-        if let Some(message) = &message {
-            self.opl_probe
-                .record_mpu_output(true, &message.bytes, message.guest_tick);
-        }
-        message
+        self.take_mpu_message(true)
     }
 
     /// Take the next complete message written to the MIDI MPU at 0x330/0x331.
     pub fn take_midi_message(&mut self) -> Option<TimedMidiMessage> {
-        let message = self.midi_mpu.take_message();
+        self.take_mpu_message(false)
+    }
+
+    /// The one drain for both parts, so the probe hook cannot drift between
+    /// them: whatever leaves a part toward the synth is recorded the same way.
+    fn take_mpu_message(&mut self, wavetable: bool) -> Option<TimedMidiMessage> {
+        let message = if wavetable {
+            self.wavetable_mpu.take_message()
+        } else {
+            self.midi_mpu.take_message()
+        };
         if let Some(message) = &message {
             self.opl_probe
-                .record_mpu_output(false, &message.bytes, message.guest_tick);
+                .record_mpu_output(wavetable, &message.bytes, message.guest_tick);
         }
         message
     }

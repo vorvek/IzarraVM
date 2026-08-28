@@ -541,6 +541,11 @@ function Invoke-ScoreboardSelfTest {
     $bandMissing = Test-ProfileBands $bandProfile @(
         @{ path = "sb_dsp.command_bytes"; min = 1; max = 2 })
     Assert-ScoreboardSelfTestEqual $bandMissing.failures.Count 1 "a missing field goes RED"
+    # A path that stops one segment short resolves to an OBJECT; the grader
+    # must turn the failed cast into a RED row, never a terminating error.
+    $bandObject = Test-ProfileBands $bandProfile @(
+        @{ path = "mpu.wavetable"; min = 1; max = 2 })
+    Assert-ScoreboardSelfTestEqual $bandObject.failures.Count 1 "a non-numeric target goes RED"
 
     $noJit = Get-CoverageMetrics (New-CoverageSelfTestProfile 100 0 0 0 0)
     Assert-ScoreboardSelfTestEqual $noJit.interpreted_insns 100 "no-JIT instructions"
@@ -1075,7 +1080,15 @@ function Test-ProfileBands($Profile, $Bands) {
             $failures += "profile band '$($band.path)': the profile has no such field"
             continue
         }
-        $number = [double]$value
+        # The cast throws under the script's Stop preference when the path
+        # resolves to a non-numeric node (a typo'd path that stops one segment
+        # short lands on an object). That must be one RED row, not a dead
+        # sweep -- a gate that can only crash is a gate that cannot fail.
+        $number = $null
+        try { $number = [double]$value } catch {
+            $failures += "profile band '$($band.path)': the value is not numeric"
+            continue
+        }
         $values["band_" + ($band.path -replace '\.', '_')] = $number
         if ($number -lt $band.min -or $number -gt $band.max) {
             $failures += ("profile band '$($band.path)' is {0}, outside [{1}, {2}]" -f
@@ -1263,8 +1276,12 @@ function Get-FixtureTable {
             # fixed tree (854237ed, 486, 71.2 guest s, scoreboard-20260829-
             # 001320): irq0_edges 4830 (70/s steady), MIDI data_writes 10823,
             # DSP command bytes 14345. The broken parent reads irq0 ~100
-            # (edges stop at 3.5 s), MIDI 5237 (menu phases silent), DSP 6803
-            # -- every floor separates the two arms by 2x or more.
+            # (edges stop at 3.5 s), MIDI 5237 (menu phases silent), DSP
+            # 6803. irq0 is the PRIMARY discriminator (~35x separation); the
+            # MIDI and DSP floors sit between the arms with thinner margins
+            # (broken 5237 / floor 7000 / fixed 10823, and 6803/8500/14345)
+            # and exist to catch a collapse the irq0 count alone cannot see,
+            # e.g. music dead with the timer alive.
             name = "tyrian-setup-486"; folder = "tyrian_setup_c"
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]4700000000
@@ -1285,8 +1302,8 @@ function Get-FixtureTable {
             # then the left mouse button HELD from 31 s so the ship fires
             # through the first waves. The ship dies at ~53 s under this
             # schedule; the 3.2e9 budget (~48.5 guest s, ~17.5 s of play)
-            # lands the end frame safely inside gameplay, so the end frame is
-            # recorded but not hashed and the row grades on bands.
+            # ends the run safely inside gameplay. The end frame animates, so
+            # the row keeps no frame artifact at all and grades on bands.
             # Same 70 Hz-clock liveness rationale as tyrian-setup-486.
             name = "tyrian-486"; folder = "tyrian_c"
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")

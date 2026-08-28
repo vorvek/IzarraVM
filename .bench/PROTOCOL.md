@@ -1017,10 +1017,12 @@ stayed green — no other fixture drives the timer that way.
 - Oracle: PROFILE BANDS (`profileBands` in the fixture table, graded in
   `Invoke-Fixture`) on `timer.irq0_edges`, `mpu.wavetable.data_writes` and
   `sb_dsp.command_bytes`, plus the `cycle_limit` stop; the setup row adds the
-  end-frame hash. The bands are liveness floors sized >2x above the broken
-  tree's readings and are NOT cadence pins: a starved 70 Hz clock reads 18.2/s
-  boot-rate IRQ0 and near-zero MIDI, far below every floor. rt is the
-  performance measurement, never asserted.
+  end-frame hash. The bands are liveness floors, NOT cadence pins: a starved
+  70 Hz clock reads ~100 IRQ0 edges total against a floor of 3500 (the ~35x
+  primary discriminator); the MIDI/DSP byte floors sit between the two arms
+  with thinner margins (per-row derivations beside each row in the fixture
+  table) and catch a music-only collapse. rt is the performance measurement,
+  never asserted.
 
 ## Traps (these bit prior rounds)
 

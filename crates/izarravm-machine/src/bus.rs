@@ -2845,22 +2845,32 @@ impl CpuBus for MachineBus<'_> {
             // Tyrian 2000 reprograms channel 0 every video frame and its
             // whole 70 Hz clock starves without this edge.
             let byte = value as u8;
+            // The peek declines BCD counters; treating "unknown" as HIGH
+            // synthesizes no edge there, which is the pre-fix behavior. The
+            // live `channel_out` level is the batch-START state and BCD is
+            // also the one case the rise-based batch cap declines, so a
+            // stale read could fabricate an edge; no PC software clocks
+            // channel 0 in BCD (see `count_after`'s precedent).
             let control0_rising = port == 0x43
                 && byte >> 6 == 0
                 && (byte >> 4) & 0x3 != 0
                 && (byte >> 1) & 0x7 != 0
-                && !self
-                    .pit
-                    .out_after(0, elapsed_pit_clocks)
-                    .unwrap_or_else(|| self.pit.channel_out(0));
+                && !self.pit.out_after(0, elapsed_pit_clocks).unwrap_or(true);
             if self.pit.write_port_at(port, byte, elapsed_pit_clocks) {
+                // The tick is only for the trace: gp2-class guests hammer the
+                // latch command thousands of times a second, and the probe's
+                // contract is that an unarmed trace costs a capacity check,
+                // not a RatePhase preview per write.
+                let trace_tick = if self.opl_probe.pit_trace_armed() {
+                    self.guest_tick_now()
+                } else {
+                    0
+                };
+                self.opl_probe.record_pit_write(port, byte, trace_tick);
                 if control0_rising {
-                    let guest_tick = self.guest_tick_now();
-                    self.opl_probe.count_irq0_edge(guest_tick);
+                    self.opl_probe.count_irq0_edge(trace_tick);
                     self.pic.request(0);
                 }
-                let guest_tick = self.guest_tick_now();
-                self.opl_probe.record_pit_write(port, byte, guest_tick);
                 self.note_pit_observer();
                 return Ok(());
             }

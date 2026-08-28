@@ -2089,16 +2089,7 @@ fn write_hdd_profile_json(
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
         "sb_dsp": sb_dsp_json(machine.sb_dsp_diagnostics()),
         "mpu": mpu_json(machine.mpu_diagnostics(), machine.midi_trace()),
-        "timer": {
-            "irq0_edges": machine.timer_diagnostics().0,
-            "sb_irq_requests": machine.timer_diagnostics().1,
-            "pit_writes": machine.timer_diagnostics().2,
-            "pit_trace": machine.pit_write_trace().iter().map(|e| json!({
-                "port": e.port,
-                "val": e.value,
-                "tick": e.master_ticks,
-            })).collect::<Vec<_>>(),
-        },
+        "timer": timer_json(machine),
         "perf": bench::perf_counters_json(
             perf,
             machine.cpu().poll_skip_memory(),
@@ -2182,9 +2173,28 @@ fn opl_diagnostics_json(
     })
 }
 
+/// The guest timer-clock block: IRQ0 edges delivered to the PIC, SB16 IRQ
+/// requests, guest PIT writes, and the `IZARRAVM_PIT_TRACE` series (real
+/// ports 0x40-0x43 plus pseudo-ports 0xF0 = IRQ0 edge, 0xF1 = SB IRQ).
+fn timer_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
+    let (irq0_edges, sb_irq_requests, pit_writes) = machine.timer_diagnostics();
+    json!({
+        "irq0_edges": irq0_edges,
+        "sb_irq_requests": sb_irq_requests,
+        "pit_writes": pit_writes,
+        "pit_trace": machine.pit_write_trace().iter().map(|e| json!({
+            "port": e.port,
+            "val": e.value,
+            "tick": e.master_ticks,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// Guest MPU-401 activity for both parts, plus the `IZARRAVM_MIDI_TRACE`
 /// access trace. Which part carries traffic says which music device the game
 /// drives; the trace's tick spacing says the tempo it drives it at.
+/// `output_messages`/`output_bytes` count at the GUI drain and read 0 in a
+/// headless profile -- see `MpuDiagnostics::output_messages`.
 fn mpu_json(
     (wavetable, midi): (
         izarravm_machine::MpuDiagnostics,
