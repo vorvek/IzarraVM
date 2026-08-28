@@ -802,51 +802,53 @@ pub(crate) enum BlockProbe {
 }
 
 /// Per-physical-page key index for the SMC invalidation choke. Struct of
-/// arrays: one logical ROW per tracked key, `starts` / `lens` / `keys` at the
-/// same index. `starts` stays SORTED ascending so `invalidate_physical_range`
-/// can binary-search the overlap window instead of walking every key on the
-/// page: nascar-586 held ~950 keys on its hot pages and a RIP-sample profile
-/// put 40% of its wall in that walk (2026-08-08 campaign, lever 1).
+/// arrays: one logical ROW per live **span** key (`Compiled` or `Rejected`),
+/// `starts` / `lens` / `keys` at the same index. `Seen` and `Dormant` have
+/// zero rows: they carry no native code and no watch, so they do not belong
+/// on the scan vector. `starts` stays SORTED ascending so
+/// `invalidate_physical_range` can binary-search the overlap window instead of
+/// walking every key on the page.
 ///
 /// `lens[i]` is row `i`'s coverage in guest bytes, carried inline so the window
 /// scan can decide overlap WITHOUT probing `entries` for the key's state and
-/// span. That probe was 1.545% of nascar-586's wall and 3.596% of duke3d-586's
-/// (`.bench/results/rip-census-20260826/nascar-rip.txt`,
-/// `dev_docs/specs/2026-08-27-duke-gp2-rip.md`), and the per-state `match`
-/// behind it another 0.754% / 2.660%. The inline test is CONSERVATIVE by
-/// construction and EXACT for point keys; see the three invariants below.
+/// span. The inline test is CONSERVATIVE by construction for live span rows;
+/// see the three invariants below.
 ///
 /// Three invariants, of three different kinds:
 ///
-/// * **(ROW)** one row per live key. `starts.len() == lens.len() == keys.len()`
-///   and no two rows on a page carry the same `BlockKey`. Rows are appended
-///   only by `track_physical_key` and are moved or dropped only in index-sync
-///   (the survivor compaction and the drain in `invalidate_physical_range` move
-///   all three vectors together). A row may NEVER lag: a lagged row is not a
-///   conservative approximation, it is a desynchronised index after which
-///   `starts[i]`, `lens[i]` and `keys[i]` name three different keys.
+/// * **(ROW)** one row per live span-bearing key. `starts.len() == lens.len()
+///   == keys.len()` and no two rows on a page carry the same `BlockKey`. A key
+///   in `Compiled` or `Rejected` has exactly one row; a key in `Seen` or
+///   `Dormant` has zero; `None` in `entries` has zero. Rows are appended only
+///   by `track_physical_key` (reached only from `note_page_span`'s
+///   insert-if-absent arm) and are moved or dropped only in index-sync (the
+///   survivor compaction and the drain in `invalidate_physical_range`) or by
+///   `drop_page_key` on `Compiled → Seen`. A lagged **span** row is a missed
+///   kill, not a conservative approximation.
 /// * **(IDX)** `starts[i] == keys[i].physical`. Sound because every state is
 ///   filed at its own span key: `Rejected(span)` is inserted at `span.key` and
 ///   `Compiled(id)`'s `block.span.key` is the key `install` inserted.
-/// * **(INV)** `lens[i]` is at least the width the authoritative per-state test
-///   in `invalidate_physical_range` would use for `keys[i]` in its CURRENT
-///   state. Coverage grows (`note_page_span`) and is never shrunk, so a key
-///   that downgrades from a span back to a point keeps the wider bound. This is
-///   the ONLY quantity permitted to be conservative-stale, and it is the same
-///   choice `max_span` already makes.
+/// * **(INV)** `lens[i]` is at least the current span width of that
+///   Compiled/Rejected key. Coverage grows (`note_page_span`) and is never
+///   shrunk **while the row lives**. A key that downgrades from a span back to
+///   a point **drops the row** (`retire_key_for_recompile`); it does not keep
+///   the wider bound. Conservative-stale `lens` is allowed only on a still-live
+///   span row. This is the ONLY quantity permitted to be conservative-stale,
+///   and it is the same choice `max_span` already makes.
 ///
 /// `physical_ranges_overlap` is monotone increasing in the second range's
 /// width, so (INV) gives "authoritative overlap ⇒ inline overlap": a row the
-/// pre-filter skips would have been a survivor anyway. For point keys
-/// (`lens[i] == 1`) the two tests are IDENTICAL, not merely ordered, which is
-/// what carries the win — the widened window is point-dominated.
+/// pre-filter skips would have been a survivor anyway. A leaked point row
+/// (`lens[i] == 1` on a `Seen`/`Dormant` key) is a bijection hole: the
+/// Seen/Dormant arm of the scan is a tripwire, not a population.
 ///
 /// `max_span` is the longest guest span (bytes) any Compiled/Rejected state
 /// rooted on this page has carried since the vecs were last emptied; a span key
-/// below `write_start - (max_span - 1)` cannot reach the write. Seen/Dormant
-/// keys are points. The bound only grows (a stale-high value is correct, just
-/// less tight) and resets with the vecs. Spans never cross a 4 KiB page (the
-/// span constructors refuse page-crossing spans -- see `BlockSpan::new`), so a
+/// below `write_start - (max_span - 1)` cannot reach the write. The bound only
+/// grows (a stale-high value is correct, just less tight) and resets with the
+/// vecs. A page whose last span row is dropped empties and is removed, so
+/// `max_span` dies with it. Spans never cross a 4 KiB page (the span
+/// constructors refuse page-crossing spans -- see `BlockSpan::new`), so a
 /// page's own window covers every span its keys can root and `starts[i] +
 /// lens[i]` never leaves the page the row is filed on.
 #[derive(Default)]
@@ -865,8 +867,9 @@ struct PageKeys {
 impl PageKeys {
     /// The half-open index range of rows rooted at exactly `physical`. Ties are
     /// possible: two keys differing only in `linear` or `mode_key` share a
-    /// start. Used by both `note_page_span` (which widens every matching row)
-    /// and `track_physical_key`'s (ROW) precondition.
+    /// start. Used by `note_page_span` (widen or insert-if-absent),
+    /// `track_physical_key`'s (ROW) precondition, and `drop_page_key` (full
+    /// `BlockKey` match, not physical alone).
     fn tie_run(&self, physical: u32) -> core::ops::Range<usize> {
         let start = self.starts.partition_point(|start| *start < physical);
         let end = start + self.starts[start..].partition_point(|start| *start == physical);
@@ -1435,7 +1438,6 @@ impl BlockCache {
                     self.reset_storage(watch);
                 }
                 self.entries.insert(key, BlockState::Seen);
-                self.track_physical_key(key);
                 BlockProbe::Interpret
             }
         }
@@ -1478,7 +1480,6 @@ impl BlockCache {
                 }
                 self.reset_storage(watch);
                 self.entries.insert(span.key, BlockState::Seen);
-                self.track_physical_key(span.key);
             }
         }
         if self.arena.is_none() {
@@ -2072,15 +2073,19 @@ impl BlockCache {
         reason: DormantReason,
         cause: Option<RetryCause>,
     ) {
-        // Ordered BEFORE the insert and GUARDED, so the bijection `PageKeys` depends on holds for
-        // a key this fixture parks without ever probing. If the key is already in `entries` it
-        // already has a row and must not get a second -- that duplicate is exactly the (ROW)
-        // break `track_physical_key`'s `debug_assert!` names. Idempotent by construction.
-        if !self.entries.contains_key(&key) {
-            self.track_physical_key(key);
-        }
+        // Dormant has no PageKeys row. A key this fixture parks without ever probing stays off
+        // the scan vector; if it is already in `entries` it already has the right (zero-row)
+        // bijection. Idempotent by construction.
         self.entries.insert(key, BlockState::Seen);
         self.dormant(key, reason, cause);
+    }
+
+    /// Occupancy of the page that would host `physical`, or 0 if the page is not in the map.
+    #[cfg(test)]
+    pub(crate) fn page_key_count_for_test(&self, physical: u32) -> usize {
+        self.physical_keys
+            .get(&(physical >> BLOCK_PAGE_SHIFT))
+            .map_or(0, |page| page.keys.len())
     }
 
     /// Hand-corrupt one page row's coverage, breaking (INV) on purpose so the invalidation scan's
@@ -2124,8 +2129,8 @@ impl BlockCache {
 
     /// G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out (older epoch)
     /// returns to Seen, so the next probe walks the normal admission path (both heat gates
-    /// re-check). Seen rather than a remove keeps the key tracked exactly once in `physical_keys`
-    /// (the `retire_key_for_recompile` transition); the stamp is consumed, one recovery per demotion.
+    /// re-check). Both states have zero `PageKeys` rows; the stamp is consumed, one recovery per
+    /// demotion.
     ///
     /// Returns which of the three shapes this call took. `StillDormant` is EXACTLY the predicate
     /// the sticky-decline memo encodes — "was Dormant, did not lift"
@@ -2383,6 +2388,11 @@ impl BlockCache {
         // is permanently unchained for its predecessor incarnation's judgement.
         self.forget_data_segment_decline(key);
         self.retire_block(watch, id);
+        // Compiled → Seen: the leftover span row would be a point key in the window, which is
+        // the population this bijection removes. Drop it with the full BlockKey, not physical
+        // alone (two keys can share a start). An emptied page comes out of the map so max_span
+        // dies with it.
+        self.drop_page_key(key);
         true
     }
 
@@ -2653,9 +2663,9 @@ impl BlockCache {
                 // Only keys whose `physical` lies in
                 // `[write_start - (max_span - 1), write_end)` can overlap the
                 // write: a span rooted below the lower bound ends at or before
-                // `write_start` (see `PageKeys`), and Seen/Dormant point keys
-                // must sit inside the write itself. Binary-search that window
-                // instead of walking the whole page.
+                // `write_start` (see `PageKeys`). Binary-search that window
+                // instead of walking the whole page. Seen/Dormant keys have no
+                // row; a leaked point row is the tripwire on the per-state arm.
                 let window_low = physical.saturating_sub(page_keys.max_span.saturating_sub(1));
                 let window_high = physical.saturating_add(width);
                 debug_assert!(
@@ -2700,9 +2710,9 @@ impl BlockCache {
                     // walks, so the overlap decision costs two sequential reads instead of a
                     // `HashMap` probe plus a per-state `match`. (INV) makes it conservative --
                     // `physical_ranges_overlap` is monotone in the second width -- so a skipped row
-                    // is one the authoritative test would have called a survivor too. For a point
-                    // key (`lens[index] == 1`) the two tests are identical, which is the majority
-                    // of the window.
+                    // is one the authoritative test would have called a survivor too. Live rows
+                    // are spans; a leaked point row (`lens == 1` on Seen/Dormant) is the tripwire
+                    // below, not the population this filter was written for.
                     //
                     // `physical_ranges_overlap` is the SAME primitive the authoritative test uses,
                     // so the filter and the thing it approximates cannot disagree about wrap.
@@ -2753,6 +2763,14 @@ impl BlockCache {
                     };
                     let overlaps = match state {
                         BlockState::Seen | BlockState::Dormant(..) => {
+                            // A point row is a bijection hole: probe / park / R4 must not file
+                            // one. Debug panics; release still kills so a missed drop self-heals
+                            // on the next overlapping write instead of leaving a ghost row.
+                            #[cfg(feature = "smc-census")]
+                            {
+                                census_page.point_rows_scanned += 1;
+                            }
+                            Self::assert_no_point_row();
                             physical_range_contains(physical, width, key.physical)
                         }
                         BlockState::Rejected(span) => physical_ranges_overlap(
@@ -26516,18 +26534,31 @@ impl BlockCache {
         self.note_smc_census_retire(true, u64::from(span.guest_len), census_decode_slots);
     }
 
-    /// The ONLY site that appends a row to a page. Both callers -- `probe`'s
-    /// `None` arm and `install`'s post-`reset_storage` repair -- have already
-    /// established that no row exists for `key`, which is why the append is
-    /// unconditional; the `debug_assert!` below writes that precondition down.
-    fn track_physical_key(&mut self, key: BlockKey) {
-        // Stated on the ROW, not on `entries`. `!self.entries.contains_key(&key)`
-        // reads FALSE at both call sites by the time the call is made -- `probe`
-        // inserts immediately before calling and so does `install` -- so it is
-        // not the precondition that actually holds. The row one is: at `probe`
-        // the key was absent from `entries` an instant earlier and therefore, by
-        // the bijection, had no row; at `install` `reset_storage` cleared every
-        // page two statements earlier.
+    /// Debug tripwire for a leaked point row on the scan's Seen/Dormant arm.
+    /// Isolated in its own function so the panic does not make the rest of the
+    /// arm unreachable for clippy: release still kills the leftover.
+    #[inline]
+    fn assert_no_point_row() {
+        if cfg!(debug_assertions) {
+            panic!("window-shrink: a Seen/Dormant key still has a PageKeys row");
+        }
+    }
+
+    /// Debug tripwire for R4 / install: a Compiled key must have a PageKeys row.
+    /// Isolated so a missing row in release is a silent no-op (already the
+    /// no-row state) rather than an unreachable `return`.
+    #[inline]
+    fn assert_compiled_row_found(found: bool) {
+        if cfg!(debug_assertions) && !found {
+            panic!("(ROW): Compiled without a PageKeys row");
+        }
+    }
+
+    /// The ONLY site that appends a row to a page. The only production caller is
+    /// `note_page_span`'s insert-if-absent arm, after a key becomes Compiled or
+    /// Rejected. `len` is the span width, never 1: a `lens == 1` row for a
+    /// 16-byte span would miss a write at `start+8`.
+    fn track_physical_key(&mut self, key: BlockKey, len: u16) {
         debug_assert!(
             !self
                 .physical_keys
@@ -26545,34 +26576,63 @@ impl BlockCache {
         // exists for. All three vectors take the same index, or (ROW) breaks.
         let at = page.starts.partition_point(|start| *start <= key.physical);
         page.starts.insert(at, key.physical);
-        // A freshly tracked key is `Seen`, whose authoritative test is the POINT
-        // test, so 1 is the exact coverage and not a conservative one.
-        page.lens.insert(at, 1);
+        page.lens.insert(at, len);
         page.keys.insert(at, key);
         debug_assert!(page.rows_agree(), "(ROW): the three vectors came apart");
     }
 
+    /// Drop the span row for `key`. Used by `retire_key_for_recompile` when
+    /// Compiled becomes Seen. Matches the full `BlockKey` via `tie_run`; a
+    /// physical-only remove would drop a live alias at the same start. An empty
+    /// page is removed so `max_span` dies with it. Compiled without a row is
+    /// the missed-kill bijection hole; debug asserts, release is already the
+    /// no-row state and must not append on the way out.
+    fn drop_page_key(&mut self, key: BlockKey) {
+        let page_id = key.physical >> BLOCK_PAGE_SHIFT;
+        let empty = {
+            let Some(page) = self.physical_keys.get_mut(&page_id) else {
+                Self::assert_compiled_row_found(false);
+                return;
+            };
+            let found = page
+                .tie_run(key.physical)
+                .find(|&index| page.keys[index] == key);
+            let Some(index) = found else {
+                Self::assert_compiled_row_found(false);
+                return;
+            };
+            page.starts.remove(index);
+            page.lens.remove(index);
+            page.keys.remove(index);
+            debug_assert!(page.rows_agree(), "(ROW): the three vectors came apart");
+            page.keys.is_empty()
+        };
+        if empty {
+            self.physical_keys.remove(&page_id);
+        }
+    }
+
     /// Record that `key`'s page roots a span of `guest_len` bytes, widening both
-    /// the page's invalidation window bound and the key's own row coverage.
-    /// Called when a key becomes Compiled/Rejected; `track_physical_key` has
-    /// always run first.
+    /// the page's invalidation window bound and the key's own row coverage, and
+    /// filing the row if this is the first span on that page.
     ///
     /// The ONLY site that widens `lens`, and therefore the only site (INV) can
     /// be broken from. Called once per install or reject -- orders of magnitude
-    /// rarer than the store-side scan the row lookup here pays for.
+    /// rarer than the store-side scan the row lookup here pays for. Probe and
+    /// post-reset repair do not file a row; every first span hits a vacant map
+    /// and `entry().or_default()` is what creates it.
     fn note_page_span(&mut self, key: BlockKey, guest_len: u32) {
-        if let Some(page) = self
-            .physical_keys
-            .get_mut(&(key.physical >> BLOCK_PAGE_SHIFT))
-        {
+        let page_id = key.physical >> BLOCK_PAGE_SHIFT;
+        // SATURATING, never `as`. `guest_len` is a `u32` here and `lens` is
+        // `u16`; a truncating conversion is an UNDER-bound and an
+        // under-bound `lens` is exactly the missed kill (INV) exists to
+        // prevent. Today `guest_len <= 4096` by construction (the span
+        // constructors refuse page-crossing spans) so this cannot bite --
+        // but the signature does not say so, and that is the point.
+        let len = u16::try_from(guest_len).unwrap_or(u16::MAX);
+        let insert = {
+            let page = self.physical_keys.entry(page_id).or_default();
             page.max_span = page.max_span.max(guest_len);
-            // SATURATING, never `as`. `guest_len` is a `u32` here and `lens` is
-            // `u16`; a truncating conversion is an UNDER-bound and an
-            // under-bound `lens` is exactly the missed kill (INV) exists to
-            // prevent. Today `guest_len <= 4096` by construction (the span
-            // constructors refuse page-crossing spans) so this cannot bite --
-            // but the signature does not say so, and that is the point.
-            let len = u16::try_from(guest_len).unwrap_or(u16::MAX);
             let mut matched = 0usize;
             for index in page.tie_run(key.physical) {
                 if page.keys[index] == key {
@@ -26580,15 +26640,21 @@ impl BlockCache {
                     matched += 1;
                 }
             }
-            // Under (ROW) the match is unique. Every matching row is widened
-            // anyway, so the code is correct under either reading and this
-            // assertion is what says which. Zero matches on a resident page is a
-            // bijection hole: a key reached `entries` without reaching a row.
-            debug_assert_eq!(
-                matched, 1,
+            debug_assert!(
+                matched <= 1,
                 "(ROW): note_page_span found {matched} rows for one key"
             );
+            matched == 0
+        };
+        if insert {
+            self.track_physical_key(key, len);
         }
+        debug_assert!(
+            self.physical_keys
+                .get(&page_id)
+                .is_some_and(|page| page.contains_key(key)),
+            "(ROW): note_page_span left no row for a live span key"
+        );
     }
 
     fn make_link_visible(&mut self, id: BlockId) {
@@ -30227,8 +30293,9 @@ impl crate::jit::JitState {
 // # What the numbers mean, and what they do not
 //
 // - `keys_killed` is a KEY count, not a distinct-block count (design §9.1): `invalidated += 1`
-//   in `invalidate_physical_range` fires once per key, including `Seen`/`Dormant`/`Rejected`
-//   keys that own no compiled block. It is never relabelled "blocks".
+//   in `invalidate_physical_range` fires once per overlapping span row. A Seen/Dormant kill is
+//   the point-row tripwire (`point_rows_scanned`), not the population. It is never relabelled
+//   "blocks".
 // - `keys_scanned` is a WINDOW length, not page occupancy (design §9.2, §12.6). `page_keys_len_sum`
 //   is the only counter that answers the occupancy question, and it is new here.
 // - Scan calls and narrow decode kills have different denominators (design §1). The choke 2x2 is
@@ -30485,6 +30552,8 @@ pub(crate) struct PageAccum {
     /// Skipped rows the authoritative test would have killed. MUST be zero; a non-zero reading is
     /// (INV) broken and is a STOP, not a tuning input.
     pub(crate) probe_divergences: u64,
+    /// Leaked point rows that reached the Seen/Dormant arm. MUST be zero.
+    pub(crate) point_rows_scanned: u64,
     pub(crate) survivors_moved: u64,
     pub(crate) drain_calls: u64,
     pub(crate) drain_elements: u64,
@@ -30573,6 +30642,7 @@ impl SmcCensus {
             phase.units.probes_elided += accum.probes_elided;
             phase.units.entries_get_calls += accum.entries_get_calls;
             phase.units.probe_divergences += accum.probe_divergences;
+            phase.units.point_rows_scanned += accum.point_rows_scanned;
             phase.units.survivors_moved += accum.survivors_moved;
             phase.units.drain_calls += accum.drain_calls;
             phase.units.drain_elements += accum.drain_elements;

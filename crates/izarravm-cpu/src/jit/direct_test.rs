@@ -1426,9 +1426,15 @@ fn physical_invalidation_forgets_seen_and_rejected_entries_only_on_overlap() {
     assert!(matches!(cache.probe(rejected), BlockProbe::Compile));
     reject(&mut cache, rejected, 1);
     assert!(matches!(cache.probe(adjacent), BlockProbe::Interpret));
+    assert_eq!(cache.page_key_count_for_test(0x40_010), 1);
 
-    assert_eq!(cache.retire_physical_range_for_test(0x40_010, 1), 2);
-    assert!(matches!(cache.probe(seen), BlockProbe::Interpret));
+    // Seen has no PageKeys row. Only the Rejected span dies. The leftover Seen stays Compile,
+    // which is the production-shaped statement of window-shrink §4.1: isolated and overlapping
+    // points survive, decode is an independent door, and kill-count 2 would mean point rows
+    // were restored.
+    assert_eq!(cache.retire_physical_range_for_test(0x40_010, 1), 1);
+    assert_eq!(cache.page_key_count_for_test(0x40_010), 0);
+    assert!(matches!(cache.probe(seen), BlockProbe::Compile));
     assert!(matches!(cache.probe(rejected), BlockProbe::Interpret));
     assert!(matches!(cache.probe(adjacent), BlockProbe::Compile));
 }
@@ -1542,6 +1548,10 @@ fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
         whole.probe_divergences, 0,
         "the inline pre-filter skipped a row the authoritative test would have killed"
     );
+    assert_eq!(
+        whole.point_rows_scanned, 0,
+        "a Seen/Dormant key still has a PageKeys row"
+    );
     assert_eq!(whole.keys_scanned, whole.window_len_sum);
     assert_eq!(whole.page_visits, whole.page_removes + whole.page_absent);
     assert_eq!(
@@ -1586,11 +1596,9 @@ fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
     );
 }
 
-/// Non-vacuity for the C1 inline coverage pre-filter. The census test above is a real closure
-/// check but its window never contains a row the pre-filter can skip, so every new counter reads
-/// zero there and all four closures pass against a filter that does nothing. This fixture puts two
-/// point keys inside the widened window and off the write, which is exactly the population §1.1
-/// says dominates the corpus, and pins `probes_elided` to the EXACT count rather than to a range.
+/// Window-shrink non-vacuity. C1's elision fixture put two Seen points in the widened window
+/// and pinned `probes_elided == 2`. After the bijection those points have no row: the window
+/// is the compiled span alone, occupancy is one, and the parked keys still probe Compile.
 #[cfg(all(
     feature = "smc-census",
     any(
@@ -1602,25 +1610,20 @@ fn smc_census_units_close_and_its_window_filter_is_not_vacuous() {
 fn inline_span_prefilter_elides_point_keys_the_write_cannot_reach() {
     let mut cache = BlockCache::default();
     cache.enable_smc_census_for_test(None);
-    // Two Seen point keys, rooted BELOW the write and reachable only because the block below
-    // widens the window's lower bound by `max_span`. Neither can overlap a one-byte write
-    // elsewhere on the page, and for a point key the inline test is EXACT, not merely
-    // conservative.
     let parked_low = BlockKey::new(0x1012, 0x80_012, 7);
     let parked_high = BlockKey::new(0x1014, 0x80_014, 7);
     assert!(matches!(cache.probe(parked_low), BlockProbe::Interpret));
     assert!(matches!(cache.probe(parked_high), BlockProbe::Interpret));
     let compiled = BlockKey::new(0x2020, 0x80_020, 7);
     install_trivial(&mut cache, compiled, 16);
+    assert_eq!(cache.page_key_count_for_test(0x80_020), 1);
 
     let result = cache.invalidate_physical_range(0x80_020, 1, false);
     assert_eq!(result.blocks, 1, "the compiled block must still die");
     assert_eq!(
-        result.keys_scanned, 3,
-        "the window is the two parked points plus the block, unchanged by the pre-filter"
+        result.keys_scanned, 1,
+        "point keys must not occupy the window"
     );
-    // The two parked keys must still be tracked: a skipped row is compacted as a SURVIVOR, so it
-    // stays on the page and stays probeable.
     assert!(matches!(cache.probe(parked_low), BlockProbe::Compile));
     assert!(matches!(cache.probe(parked_high), BlockProbe::Compile));
 
@@ -1629,20 +1632,17 @@ fn inline_span_prefilter_elides_point_keys_the_write_cannot_reach() {
         .expect("the census is armed")
         .whole_run
         .units;
-    assert_eq!(whole.keys_scanned, 3);
-    assert_eq!(
-        whole.probes_elided, 2,
-        "both parked points must be decided inline, with no `entries` probe"
-    );
+    assert_eq!(whole.keys_scanned, 1);
+    assert_eq!(whole.probes_elided, 0);
     assert_eq!(
         whole.entries_get_calls, 1,
-        "only the overlapping row may reach the hash map"
+        "only the overlapping span row may reach the hash map"
     );
     assert_eq!(whole.keys_killed, 1);
     assert_eq!(whole.keys_surviving, 0);
     assert_eq!(whole.entries_get_misses, 0);
     assert_eq!(whole.probe_divergences, 0);
-    // The four closures, on a fixture where every one of them is load-bearing.
+    assert_eq!(whole.point_rows_scanned, 0);
     assert_eq!(
         whole.keys_scanned,
         whole.probes_elided
@@ -1719,35 +1719,94 @@ fn smc_census_without_a_window_leaves_its_windowed_phase_empty() {
     assert!(snapshot.windowed.pages.is_empty());
 }
 
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
 #[test]
 fn physical_invalidation_window_survives_a_middle_kill_in_sorted_order() {
     let mut cache = BlockCache::default();
     let first = BlockKey::new(0x1000, 0x80_010, 7);
     let middle = BlockKey::new(0x2000, 0x80_040, 7);
     let last = BlockKey::new(0x3000, 0x80_080, 7);
-    for tracked in [first, middle, last] {
-        assert!(matches!(cache.probe(tracked), BlockProbe::Interpret));
-    }
+    install_trivial(&mut cache, first, 16);
+    install_trivial(&mut cache, middle, 16);
+    install_trivial(&mut cache, last, 16);
 
-    // Killing the middle Seen key must close the hole without disturbing the
+    // Killing the middle span must close the hole without disturbing the
     // sorted order the later windows depend on.
     assert_eq!(cache.retire_physical_range_for_test(0x80_040, 1), 1);
+    assert!(matches!(cache.probe(first), BlockProbe::Ready(_)));
+    assert!(matches!(cache.probe(middle), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(last), BlockProbe::Ready(_)));
     assert_eq!(cache.retire_physical_range_for_test(0x80_080, 1), 1);
     assert_eq!(cache.retire_physical_range_for_test(0x80_010, 1), 1);
     assert_eq!(cache.retire_physical_range_for_test(0x80_010, 0x100), 0);
 }
 
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
 #[test]
 fn physical_invalidation_checks_both_pages_of_a_cross_page_write() {
     let mut cache = BlockCache::default();
     let low = BlockKey::new(0x1000, 0x4fff, 7);
     let high = BlockKey::new(0x2000, 0x5000, 7);
-    assert!(matches!(cache.probe(low), BlockProbe::Interpret));
-    assert!(matches!(cache.probe(high), BlockProbe::Interpret));
+    install_trivial(&mut cache, low, 1);
+    install_trivial(&mut cache, high, 1);
 
     assert_eq!(cache.retire_physical_range_for_test(0x4fff, 2), 2);
     assert!(matches!(cache.probe(low), BlockProbe::Interpret));
     assert!(matches!(cache.probe(high), BlockProbe::Interpret));
+}
+
+#[cfg(all(
+    feature = "smc-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn retire_key_for_recompile_drops_the_span_row() {
+    let mut cache = BlockCache::default();
+    cache.enable_smc_census_for_test(None);
+    let key = BlockKey::new(0x1000, 0x60_010, 7);
+    install_trivial(&mut cache, key, 16);
+    assert_eq!(cache.page_key_count_for_test(0x60_010), 1);
+    assert!(cache.retire_key_for_recompile(key));
+    assert!(matches!(cache.probe(key), BlockProbe::Compile));
+    assert_eq!(cache.page_key_count_for_test(0x60_010), 0);
+
+    let result = cache.invalidate_physical_range(0x60_010, 16, false);
+    assert_eq!(result.blocks, 0);
+    assert_eq!(result.keys_scanned, 0);
+    let whole = cache
+        .smc_census_snapshot()
+        .expect("the census is armed")
+        .whole_run
+        .units;
+    assert_eq!(whole.page_absent, 1);
+    assert_eq!(whole.page_keys_len_sum, 0);
+    assert_eq!(whole.point_rows_scanned, 0);
+}
+
+#[test]
+fn overlapping_write_leaves_a_dormant_key_parked() {
+    let mut cache = BlockCache::default();
+    let parked = BlockKey::new(0x1000, 0x40_010, 7);
+    let neighbor = BlockKey::new(0x2000, 0x40_010, 9);
+    cache.park_dormant_for_test(parked, DormantReason::SpanHot, None);
+    assert!(matches!(cache.probe(neighbor), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(neighbor), BlockProbe::Compile));
+    reject(&mut cache, neighbor, 16);
+    assert!(cache.is_dormant_for_test(parked));
+
+    assert_eq!(cache.retire_physical_range_for_test(0x40_010, 1), 1);
+    assert!(cache.is_dormant_for_test(parked));
+    assert!(matches!(cache.probe(parked), BlockProbe::Rejected));
+    assert!(matches!(cache.probe(neighbor), BlockProbe::Interpret));
 }
 
 #[cfg(any(
