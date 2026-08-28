@@ -283,6 +283,20 @@ extern struct dhdr DOSTEXTFAR ASM blk_dev; /* Block device (Disk) driver        
 extern struct buffer FAR *DOSFAR firstAvailableBuf; /* first 'available' buffer   */
 extern UBYTE FAR * DOSFAR fat_span; /* getblk_fat's FAT-run span buffer, in a UMB */
 extern UWORD FAR * DOSFAR buf_index; /* searchblock's offset-hint table, in a UMB */
+
+/* Toka-DOS 2026, Tier B B3: same request block as globals.h (kept in sync --
+   main.c is compiled against this header, not globals.h, for the INIT
+   module). See globals.h for field-by-field documentation. */
+struct izarra_map_req {
+  UBYTE reserved;
+  UBYTE unit;
+  UWORD reserved2;
+  ULONG start_cluster;
+  ULONG steps;
+  ULONG result_cluster;
+};
+extern struct izarra_map_req IzarraMapReq;
+extern UBYTE IzarraMapArmed;
 extern struct lol ASM FAR DATASTART;
 
 extern BYTE DOSFAR ASM _HMATextAvailable;    /* first byte of available CODE area    */
