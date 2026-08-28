@@ -14,8 +14,9 @@ The product banner reads "Toka-DOS 3.0"; the kernel reports DOS compatibility
 (XMS/UMB/EMS + the V86 monitor everything else runs under), and small guest
 tools like `TOKAMOUS.COM` (PS/2 mouse TSR) and `GSWMODE.COM` (runtime CPU-speed
 switch) are Izarra-specific additions layered on top of stock FreeDOS.
-`TOKACD.SYS` and `IZCDEX.COM` provide the guest-owned ATAPI and ISO 9660 CD-ROM
-stack for drive D:.
+The CD-ROM ships with no guest driver files: the kernel claims the IzarraCD
+ROM Extensions in the system BIOS at boot, and the BIOS serves drive D:
+(earlier releases loaded `TOKACD.SYS` + `IZCDEX.COM` instead).
 
 ## Layout
 
@@ -29,9 +30,10 @@ stack for drive D:.
   not vendored FreeDOS), assembled straight into `TOKAMOUS.COM`.
 - `build-freedos.ps1` the build script: builds the FreeDOS kernel + FreeCOM
   shell (Open Watcom cross-compile), builds `MOVE.EXE`/`SORT.EXE` from the
-  vendored userland sources, assembles `TOKAMOUS.COM`, `TOKAEMM.SYS`, and
-  `TOKACD.SYS`, builds `IZCDEX.COM`, and invokes
-  `scripts/build-freedos-hdd-image.py` to assemble the committed disk image.
+  vendored userland sources, assembles `TOKAMOUS.COM` and `TOKAEMM.SYS`, and
+  invokes `scripts/build-freedos-hdd-image.py` to assemble the committed disk
+  image. (It still assembles the retired `TOKACD.SYS`/`IZCDEX.COM` binaries
+  for reference; the image script no longer takes them.)
 
 Small standalone guest `.COM`/`.SYS` tools that aren't vendored FreeDOS source
 (`TOKAEMM.SYS`, `GSWMODE.COM`, and DOS test fixtures like `MOUSETST.COM`) live
@@ -50,7 +52,7 @@ Requires Open Watcom (`D:\DevTools\OpenWatcom`) and NASM on PATH.
     pwsh toka-dos/build-freedos.ps1
 
 This builds `kernel.sys`, the FAT12/FAT32-LBA/MBR boot sectors, `command.com`,
-the DOS tools and drivers, `IZCDEX.COM`, and `GSWMODE.COM`, then runs
+the DOS tools and drivers, and `GSWMODE.COM`, then runs
 `scripts/build-freedos-hdd-image.py` to assemble them into
 `crates/izarravm-firmware/roms/tokados-hdd.img`. At runtime,
 `crates/izarravm-machine/src/katea_volume.rs::extract_system_payload` parses
@@ -59,29 +61,20 @@ that image and overlays every payload file except `HELLO.TXT`/`CONFIG.SYS`/
 
 If the Open Watcom kernel/FreeCOM build artifacts are absent (e.g. a
 from-image rebuild after only touching `build-freedos-hdd-image.py` itself),
-the Python script falls back to re-extracting `KERNEL.SYS`/`COMMAND.COM`/
-`TOKAMOUS.COM`/`IZCDEX.COM` from the previously committed image, so the image
-can still be regenerated without a full Open Watcom rebuild.
+the Python script falls back to re-extracting `KERNEL.SYS`/`COMMAND.COM` and
+the userland tools from the previously committed image, so the image can
+still be regenerated without a full Open Watcom rebuild.
 
 ## Default CD-ROM setup
 
-The stock `CONFIG.SYS` loads `TOKACD.SYS` high after TOKAEMM has enabled upper
-memory. `AUTOEXEC.BAT` then assigns D: with IZCDEX before loading the mouse
-driver. Host-folder installations upgrade each file only when its bytes match
-the immediately preceding stock version. Customized files are left alone. Add
-these lines manually when keeping a customized setup:
-
-    DEVICEHIGH=C:\DOS\TOKACD.SYS
-    IZCDEX /I /D:TOKACD01 /L:D /T
-
-The first line belongs after `DOS=HIGH,UMB` in `CONFIG.SYS`; the second belongs
-after `SET BLASTER` and before `LH TOKAMOUS` in `AUTOEXEC.BAT`. `/T` is the
-optional boot-tree styling (a one-line tree-styled install banner instead of
-plain output); drop it for plain output. These two lines alone do not
-reproduce the full styled boot (TOKAEMM's own `/T`, the self-calling `FOR`
-dispatch loop, and the closed footer box) -- for that, use the shipped stock
-`AUTOEXEC.BAT` as the reference, or run BIOS Setup's Repair Toka-DOS command,
-which still backs up both files and restores the complete current defaults.
+No configuration lines exist for the CD-ROM. The kernel probes the Lotura
+chipset at boot (`main.c` `IzarraCdClaim`); when the IzarraCD ROM Extensions
+answer, it assigns drive D:, arms the INT 2Fh forward in `int2f.asm`, and
+prints its own tree line. A customized `CONFIG.SYS`/`AUTOEXEC.BAT` keeps its
+CD support automatically for the same reason. Host-folder installations
+upgrade each file only when its bytes match the immediately preceding stock
+version; customized files are left alone, and BIOS Setup's Repair Toka-DOS
+command still backs up both files and restores the complete current defaults.
 
 ## Adding a new guest tool
 

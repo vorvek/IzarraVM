@@ -94,8 +94,6 @@ pub const CDPROT_COM: &[u8] = include_bytes!("../roms/dos/cdprot.com");
 pub const CDPROT_COM_SOURCE: &str = include_str!("../roms/dos/cdprot.asm");
 pub const CDAUDIO_COM: &[u8] = include_bytes!("../roms/dos/cdaudio.com");
 pub const CDAUDIO_COM_SOURCE: &str = include_str!("../roms/dos/cdaudio.asm");
-pub const CDTIME_COM: &[u8] = include_bytes!("../roms/dos/cdtime.com");
-pub const CDTIME_COM_SOURCE: &str = include_str!("../roms/dos/cdtime.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
 pub const TOKAMOUS_COM: &[u8] = include_bytes!("../roms/dos/tokamous.com");
 pub const MOUSEGFX_COM: &[u8] = include_bytes!("../roms/dos/mousegfx.com");
@@ -533,8 +531,9 @@ pub fn tokacd_sys() -> &'static [u8] {
     TOKACD_SYS
 }
 
-/// Guest fixture for the complete IZCDEX and TOKACD path. It checks the
-/// redirector and device list, then reads a known file from D: through DOS.
+/// Guest fixture for the IzarraCD ROM extension's DOS surface. It checks the
+/// INT 2Fh install and device list, verifies the ROM device header by name,
+/// then reads a known file from D: through DOS.
 pub fn cdtest_com() -> &'static [u8] {
     CDTEST_COM
 }
@@ -554,19 +553,16 @@ pub fn mousegfx_com() -> &'static [u8] {
     MOUSEGFX_COM
 }
 
-/// Guest fixture that calls TOKACD's request-packet entry points directly.
+/// Guest fixture that calls the CD driver's request-packet entry points
+/// directly (through the IzarraCD ROM header's strategy/interrupt stubs).
 pub fn cdprot_com() -> &'static [u8] {
     CDPROT_COM
 }
 
-/// Guest fixture for TOKACD play, pause, resume, seek, and read ordering.
+/// Guest fixture for CD play, pause, resume, seek, and read ordering through
+/// the same request-packet entries.
 pub fn cdaudio_com() -> &'static [u8] {
     CDAUDIO_COM
-}
-
-/// Guest fixture for TOKACD's bounded polling timeout.
-pub fn cdtime_com() -> &'static [u8] {
-    CDTIME_COM
 }
 
 pub fn exehello_exe() -> &'static [u8] {

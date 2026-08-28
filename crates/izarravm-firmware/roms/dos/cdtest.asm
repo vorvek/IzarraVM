@@ -1,42 +1,36 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; Guest-owned Toka-DOS CD stack fixture. Runs from AUTOEXEC after IZCDEX.
-; It distinguishes the real SHSUCDX-derived redirector from the host fallback,
-; checks the MSCDEX device list contains a non-null TOKACD header, then opens
-; and verifies D:\PROBE.TXT through ordinary DOS file I/O.
+; Guest CD stack fixture for the IzarraCD ROM extension. Runs from AUTOEXEC
+; on a full Toka-DOS boot. It checks the MSCDEX-style install surface the
+; BIOS serves (INT 2Fh AX=1500h/1501h), verifies the ROM device header by
+; name through the returned far pointer, then opens and verifies
+; D:\PROBE.TXT through ordinary DOS file I/O — which the kernel forwards to
+; the BIOS redirector.
 ;
 ; Build: nasm -f bin cdtest.asm -o cdtest.com
 cpu 8086
 org 0x100
 
 OK              equ 0xA5
-SHSUCDX_QUERY   equ 0xBABE
 
 start:
     push cs
     pop ds
 
-    ; SHSUCDX v3 private installation query. The old host HLE leaves BX at
-    ; BABEh and AL clear, while the guest redirector returns AL=FFh, replaces
-    ; BX with its compile flags, and publishes a non-empty drive table.
-    mov ax, 0x1100
-    mov bx, SHSUCDX_QUERY
+    ; Install check: AL=FFh marks the extensions present, BX = drive count
+    ; (one), CX = the first drive (D: = 3).
+    mov ax, 0x1500
+    xor bx, bx
     int 0x2F
     cmp al, 0xFF
-    jne fail_redirector
-    cmp bx, SHSUCDX_QUERY
-    je fail_redirector
-    or cx, cx
-    jz fail_drive_count
-    or dx, dx
-    jz fail_drive_count
-    mov ax, es
-    or ax, di
-    jz fail_drive_table
+    jne fail_install
+    cmp bx, 1
+    jne fail_drive_count
+    cmp cx, 3
+    jne fail_drive_letter
 
-    ; MSCDEX get-device-list. The host fallback returns a null header pointer;
-    ; the guest stack must return TOKACD's real character-device header.
+    ; Get-device-list: one 5-byte entry, subunit + the ROM header pointer.
     push ds
     pop es
     mov bx, device_list
@@ -46,8 +40,22 @@ start:
     or ax, [device_list + 3]
     jz fail_device_header
 
-    ; Read a known file from D: through DOS, which now routes through IZCDEX,
-    ; TOKACD, and the secondary-channel ATAPI PIO path.
+    ; The header must carry the device name TOKACD01 at offset 10.
+    les si, [device_list + 1]
+    mov di, header_name
+    mov cx, 8
+.name_check:
+    mov al, [es:si + 10]
+    cmp al, [di]
+    jne fail_header_name
+    inc si
+    inc di
+    loop .name_check
+
+    ; Read a known file from D: through DOS. The kernel forwards the
+    ; redirector calls to the BIOS, which serves them from the host index.
+    push cs
+    pop es
     mov dx, probe_path
     mov ax, 0x3D00
     int 0x21
@@ -62,8 +70,6 @@ start:
     cmp ax, probe_expected_len
     jne fail_data_close
 
-    push cs
-    pop es
     mov si, read_buffer
     mov di, probe_expected
     mov cx, probe_expected_len
@@ -87,13 +93,15 @@ close_signal:
     pop ax
     jmp signal
 
-fail_redirector:    mov al, 0xE1
+fail_install:       mov al, 0xE1
                     jmp signal
 fail_drive_count:   mov al, 0xE2
                     jmp signal
-fail_drive_table:   mov al, 0xE3
+fail_drive_letter:  mov al, 0xE3
                     jmp signal
 fail_device_header: mov al, 0xE4
+                    jmp signal
+fail_header_name:   mov al, 0xE8
                     jmp signal
 fail_open:          mov al, 0xE5
 
@@ -111,6 +119,8 @@ signal:
 
 device_list:
     times 5 db 0
+header_name:
+    db 'TOKACD01'
 probe_path:
     db 'D:\PROBE.TXT', 0
 probe_expected:

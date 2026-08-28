@@ -76,6 +76,10 @@ fn extracts_the_embedded_image_payload() {
     // M_NOT_CHANGED and the CDS start cluster is validated (newstuff.c);
     // the compile date is pinned as TOKA_BUILD_DATE (version.h) so a
     // rebuild no longer repaints the boot screen's hash.
+    // 72763 -> 73055 (IzarraCD slice CD-2): +292. The boot-time claim of
+    // the IzarraCD ROM extension (main.c IzarraCdClaim, the int2f.asm
+    // AH=11h/15h forward and its arm entry, one kernel.asm relocation
+    // thunk); TOKACD.SYS and IZCDEX.COM leave the image with it.
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
@@ -89,7 +93,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(72763),
+        Some(73055),
         "KERNEL.SYS size"
     );
     assert_eq!(
@@ -121,8 +125,17 @@ fn extracts_the_embedded_image_payload() {
         String::from_utf8_lossy(autoexec).contains("LH TOKAMOUS"),
         "default AUTOEXEC loads the mouse driver high"
     );
-    assert!(by_name.contains_key("TOKACD.SYS"), "TOKACD.SYS present");
-    assert!(by_name.contains_key("IZCDEX.COM"), "IZCDEX.COM present");
+    // The IzarraCD consolidation removed the guest CD stack: the kernel
+    // claims the BIOS ROM extension at boot instead of loading a driver
+    // pair, so a payload that still carries either file is stale.
+    assert!(
+        !by_name.contains_key("TOKACD.SYS"),
+        "TOKACD.SYS must not ship"
+    );
+    assert!(
+        !by_name.contains_key("IZCDEX.COM"),
+        "IZCDEX.COM must not ship"
+    );
 
     // SNDCTRL.COM ships from the committed firmware binary, not from whatever
     // the previous image happened to contain: a stale copy here would be a tool
@@ -149,12 +162,12 @@ fn extracts_the_embedded_image_payload() {
     // boot order silently flipped.
     let autoexec_text = String::from_utf8_lossy(autoexec);
     assert!(
-        autoexec_text.contains("FOR %%C IN (CDROM MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C"),
-        "default AUTOEXEC dispatches CDROM, then MOUSE, then SOUND, via the self-calling FOR loop"
+        autoexec_text.contains("FOR %%C IN (MOUSE SOUND) DO CALL C:\\AUTOEXEC.BAT %%C"),
+        "default AUTOEXEC dispatches MOUSE, then SOUND, via the self-calling FOR loop"
     );
     assert!(
-        autoexec_text.contains("IZCDEX /I /D:TOKACD01 /L:D /T"),
-        "default AUTOEXEC's CDROM block assigns the guest CD-ROM as D:"
+        !autoexec_text.contains("IZCDEX"),
+        "default AUTOEXEC must not load the retired guest CD redirector"
     );
     assert!(
         autoexec_text.contains("LH TOKAMOUS /T"),
@@ -208,41 +221,21 @@ fn extracts_the_embedded_image_payload() {
         config_text.contains("DOS=HIGH,UMB"),
         "default CONFIG.SYS uses the HMA + UMBs"
     );
-    let umb_pos = config_text
-        .find("DOS=HIGH,UMB")
-        .expect("default CONFIG.SYS enables upper memory");
-    let tokacd_pos = config_text
-        .find("DEVICEHIGH=C:\\DOS\\TOKACD.SYS")
-        .expect("default CONFIG.SYS loads TOKACD high");
     assert!(
-        umb_pos < tokacd_pos,
-        "default CONFIG.SYS enables upper memory before TOKACD"
+        !config_text.contains("TOKACD"),
+        "default CONFIG.SYS must not load the retired guest CD driver"
     );
     assert!(
         config_text.contains("LASTDRIVE=D"),
         "default CONFIG.SYS caps LASTDRIVE at D (A: floppy, C: HDD, D: CD)"
     );
 
-    // IZCDEX.COM and TOKAMOUS.COM have no committed reference binaries to
-    // identity-pin (the build script may legitimately re-extract them), so
-    // pin the /T feature's own bytes instead: the CP437 tree prefix and the
-    // one-line install text. The needle for the install text is the whole
-    // "IZCDEX installed. Assigned [" string, not just "drive(s)" -- the old
-    // pre-/T IZCDEX binary already contained "drive(s)" (from its DrivesAvail
-    // string), so that alone would not catch a stale pre-styled copy. A
-    // stale pre-styled copy fails here instead of silently unstyling the
-    // boot tree.
+    // TOKAMOUS.COM has no committed reference binary to identity-pin (the
+    // build script may legitimately re-extract it), so pin the /T feature's
+    // own bytes instead: the CP437 tree prefix. A stale pre-styled copy
+    // fails here instead of silently unstyling the boot tree. The kernel's
+    // own IzarraCD claim line is pinned below through its compiled-in text.
     let tree_prefix: &[u8] = &[0xC3, 0xC4, b'>', b' '];
-    let install_text: &[u8] = b"IZCDEX installed. Assigned [";
-    let izcdex = by_name.get("IZCDEX.COM").expect("IZCDEX.COM present");
-    assert!(
-        izcdex.windows(tree_prefix.len()).any(|w| w == tree_prefix)
-            && izcdex
-                .windows(install_text.len())
-                .any(|w| w == install_text),
-        "IZCDEX.COM on the payload lacks the /T tree prefix or the one-line \
-         install text -- stale pre-styled binary in the image?"
-    );
     let tokamous = by_name.get("TOKAMOUS.COM").expect("TOKAMOUS.COM present");
     assert!(
         tokamous
@@ -257,6 +250,13 @@ fn extracts_the_embedded_image_payload() {
     // sector relies on.
     let kernel = by_name.get("KERNEL.SYS").unwrap();
     assert_eq!(kernel[0], 0xEB, "KERNEL.SYS begins with a short JMP");
+    // The IzarraCD claim line is compiled into the kernel (main.c
+    // IzarraCdClaim); a kernel without it predates the CD consolidation.
+    let claim_text: &[u8] = b"IzarraCD ROM Extensions: CD-ROM is drive";
+    assert!(
+        kernel.windows(claim_text.len()).any(|w| w == claim_text),
+        "KERNEL.SYS lacks the IzarraCD claim line -- stale pre-consolidation kernel?"
+    );
 
     // The rebranded, trimmed signon banner is compiled into the kernel. The
     // welcome box's copyright line (TOKA_BUILD_LINE_2 in version.h) supersedes

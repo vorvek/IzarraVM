@@ -1435,6 +1435,7 @@ impl Machine {
                     toka_service_status,
                     pending_cd_doorbell,
                     cd_doorbell_status,
+                    cd_redirector_dos_ds,
                     unittester,
                     pci,
                     io_touched,
@@ -1498,6 +1499,7 @@ impl Machine {
                     toka_service_status: *toka_service_status,
                     pending_cd_doorbell,
                     cd_doorbell_status,
+                    cd_redirector_armed: cd_redirector_dos_ds.is_some(),
                     unittester,
                     wait_states: profile.wait_states,
                     icache_fetch_clocks: u64::from(izarravm_bus::BusCycle::clocks_for(

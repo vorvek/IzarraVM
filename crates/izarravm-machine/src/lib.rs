@@ -38,6 +38,7 @@ mod bios;
 mod bmide;
 mod bus;
 mod canonical_state;
+mod cddriver;
 mod cdimage;
 mod cdiso;
 mod cdredir;
@@ -1524,6 +1525,9 @@ pub struct Machine {
     // set, the host serves the INT 2Fh AH=11h file-I/O surface for the CD
     // drive (see cdredir.rs).
     cd_redirector_dos_ds: Option<u16>,
+    // The IzarraCD device driver's resident state (the host port of
+    // TOKACD.SYS's variables; see cddriver.rs).
+    cd_driver: cddriver::CdDriverState,
     // Bytes delivered by the redirector Read handler.
     cd_redirector_read_bytes: u64,
     // ATA hard disk on the primary IDE channel (0x1F0-0x1F7/0x3F6, IRQ14). The
@@ -1917,6 +1921,7 @@ impl Machine {
             cd_iso_index: None,
             cd_redirector_dos_ds: None,
             cd_redirector_read_bytes: 0,
+            cd_driver: cddriver::CdDriverState::default(),
             ata: None,
             bmide: bmide::BusMasterIde::default(),
             fat32_c: None,
@@ -3387,6 +3392,7 @@ struct MachineBus<'a> {
     toka_service_status: u8,                  // a copy, for the 0xE3 status read
     pending_cd_doorbell: &'a mut Option<u8>,  // a 0xE8 write records the ring
     cd_doorbell_status: &'a mut u8,           // mutable: the ring must read busy at once
+    cd_redirector_armed: bool, // the IzarraCD claim lifts the booter-inert 2Fh stand-down
     unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
     wait_states: WaitStateProfile,
     // The cache model carries the active CPU level's geometry/cost. A data access

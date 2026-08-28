@@ -237,6 +237,10 @@ VOID ASMCFUNC FAR int2a_handler(void);
 VOID ASMCFUNC FAR int2f_handler(void);
 VOID ASMCFUNC FAR cpm_entry(void);
 
+/* int2f.asm, via the kernel.asm HMA relocation thunk: arm the IzarraCD
+   INT 2Fh forward with the saved boot vector (Toka-DOS, 2026). */
+VOID ASMCFUNC FAR izarra_cd_arm(UWORD fwd_off, UWORD fwd_seg);
+
 /* kernel.asm */
 #ifdef __GNUC__
 VOID ASMCFUNC init_call_p_0(struct config FAR *Config) FAR __attribute__((noreturn));

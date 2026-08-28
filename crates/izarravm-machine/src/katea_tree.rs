@@ -542,8 +542,6 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
     "COMMAND.COM",
     "TOKAMOUS.COM",
     "TOKAEMM.SYS",
-    "TOKACD.SYS",
-    "IZCDEX.COM",
     "GSWMODE.COM",
     "UNHALT.COM",
     "SNDCTRL.COM",

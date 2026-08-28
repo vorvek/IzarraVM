@@ -122,6 +122,7 @@ impl Machine {
             toka_service_status: self.toka_service_status,
             pending_cd_doorbell: &mut self.pending_cd_doorbell,
             cd_doorbell_status: &mut self.cd_doorbell_status,
+            cd_redirector_armed: self.cd_redirector_dos_ds.is_some(),
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
@@ -3123,16 +3124,20 @@ impl MachineBus<'_> {
     /// chaining to a saved default vector) and `interrupt_acknowledge` (the
     /// legacy-chain stash and the raw-program low-RAM vectors).
     ///
-    /// The DOS multiplex vector (INT 2Fh) HLE -- including the AX=1686h/1687h
-    /// DPMI-install check -- only stands in for a real handler when none
-    /// exists: once a guest hooks IVT[0x2F] (JEMMEX, DOS/32A's stub) the hook
-    /// owns it, same for the absent-resident-API vectors. In booter-inert mode
-    /// 2Fh also stands down so a self-booting disk owns it through the IVT.
+    /// The DOS multiplex vector (INT 2Fh) HLE is landing-scoped: it services
+    /// a fetch that LANDS on the ROM stub, which happens only when every
+    /// hook above chained down to the boot vector — the Toka-DOS kernel
+    /// forwards AH=11h/15h there when the IzarraCD claim armed, and a guest
+    /// TSR that chains behaves the same. A hook that fully handles 2Fh
+    /// (JEMMEX, DOS/32A's stub) never lands, so it still owns the vector;
+    /// in booter-inert mode 2Fh stands down entirely. (Before the IzarraCD
+    /// consolidation this also required the IVT to still point at the stub,
+    /// which made a chained landing unreachable.)
     /// The pure DOS vectors 0x20-0x2E are not intercepted at all outside the
     /// raw-program runtime now that the Rust DOS kernel is retired, and INT
     /// 67h is never intercepted (the TOKAEMM guest driver owns the EMS API).
     fn soft_int_intercepted(&mut self, vector: u8) -> Result<bool, BusError> {
-        let dos_multiplex = vector == 0x2F && self.vector_points_at_rom_iret(vector)?;
+        let dos_multiplex = vector == 0x2F;
         // 60h/68h/6Fh left this set when POST stopped seeding 60h-6Fh (defect
         // E2): a null vector never lands on the ROM stub, so those arms were
         // dead code. A guest that wants those APIs answered installs its own
@@ -3149,7 +3154,12 @@ impl MachineBus<'_> {
         ) || raw_program_vector
             || absent_resident_api
             || dos_multiplex;
-        Ok(intercepted && !(self.booter_inert && vector == 0x2F))
+        // Every hard-disk boot runs booter-inert (try_boot_hard_disk), which
+        // stands 2Fh down so a self-booting disk owns the vector. The
+        // IzarraCD claim is the guest kernel's explicit opt-in to the BIOS CD
+        // services, so an armed claim lifts that stand-down; a foreign booter
+        // never rings the claim and keeps the vector to itself.
+        Ok(intercepted && !(self.booter_inert && vector == 0x2F && !self.cd_redirector_armed))
     }
 
     /// The fetch-seam half of software-interrupt interception: execution has

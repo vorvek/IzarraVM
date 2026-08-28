@@ -6,15 +6,6 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
-/// Header bytes a CD-ROM device driver request occupies, through the last field
-/// any supported command reads (the READ LONG starting sector at offset 0x14).
-const DRIVER_REQUEST_BYTES: usize = 0x18;
-
-/// One little-endian dword out of a device-driver request header.
-fn driver_dword(request: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(request[at..at + 4].try_into().expect("four bytes"))
-}
-
 /// The INT 13h status every sector-moving service ends on. A complete transfer
 /// is 0; a short one blames the caller's buffer or the media, and never the
 /// media for something the buffer caused.
@@ -884,121 +875,8 @@ impl Machine {
         self.write_guest_linear_block(dst, &out);
     }
 
-    /// Execute one CD-ROM device driver request whose header begins at linear
-    /// `header`. Decodes the command code and the per-command fields (see RBIL
-    /// table 02597) and drives the ATAPI device, writing data back to the
-    /// transfer address and the status word back into the header. Supports the
-    /// CD commands a game uses: READ LONG (0x80), SEEK (0x83), PLAY AUDIO (0x84),
-    /// STOP (0x85), RESUME (0x88), and IOCTL INPUT (0x03) device-status queries.
-    ///
-    /// `header` is a guest LINEAR address, and so is the transfer address held
-    /// in the header: a request header reaches this from a caller's ES:BX, and
-    /// the buffer it names belongs to that same caller. The header is taken in
-    /// one page-split read so a request that straddles a page boundary is
-    /// decoded from the caller's bytes on both sides of it.
-    pub(super) fn icdex_device_request(&mut self, header: u32) {
-        let request = self.read_guest_linear_block(header, DRIVER_REQUEST_BYTES);
-        let command = request[2];
-        // Status word at offset 3: bit 8 = done, bit 15 = error, low byte = code.
-        let mut status: u16 = 0x0100; // done
-        match command {
-            // READ LONG: read `count` sectors starting at the given sector into
-            // the transfer address. Addressing mode 0 = HSG (LBA), 1 = Red Book.
-            0x80 => {
-                let addr_mode = request[0x0D];
-                // The transfer address is a real-mode far pointer (offset
-                // word, then segment word), per RBIL table 02597. Earlier
-                // code read it as a bare linear value, which agreed only
-                // while the segment word was zero.
-                let xfer_ptr = driver_dword(&request, 0x0E);
-                let xfer = ((xfer_ptr >> 16) << 4).wrapping_add(xfer_ptr & 0xFFFF);
-                let count = u16::from_le_bytes([request[0x12], request[0x13]]);
-                let start = driver_dword(&request, 0x14);
-                let lba = self.driver_addr_to_lba(addr_mode, start);
-                let mut done = 0u16;
-                let mut ok = true;
-                for i in 0..u32::from(count) {
-                    match self
-                        .ide
-                        .device()
-                        .image()
-                        .and_then(|img| img.read_data_sector(lba + i))
-                    {
-                        Some(sector) => {
-                            let at = xfer.wrapping_add(i * cdimage::DATA_SECTOR as u32);
-                            if self.write_guest_linear_block(at, &sector) < sector.len() {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    done += 1;
-                }
-                self.cd_accesses += 1;
-                // The count field is where a block driver returns what it
-                // actually moved, so a short transfer has to be visible there
-                // and not only in the status word.
-                self.write_guest_linear_block(header + 0x12, &done.to_le_bytes());
-                if !ok {
-                    status = 0x8000 | 0x0100 | 0x000F; // error + done, sector not found
-                }
-            }
-            // SEEK: advisory; accept it (the timing model does not need it).
-            0x83 => {}
-            // PLAY AUDIO: start playback at the given sector for `count` sectors.
-            0x84 => {
-                let addr_mode = request[0x0D];
-                let start = driver_dword(&request, 0x0E);
-                let count = driver_dword(&request, 0x12);
-                let lba = self.driver_addr_to_lba(addr_mode, start);
-                let mut cdb = [0u8; 12];
-                cdb[0] = 0x45; // PLAY AUDIO(10)
-                cdb[2..6].copy_from_slice(&lba.to_be_bytes());
-                let frames = count.min(u32::from(u16::MAX)) as u16;
-                cdb[7..9].copy_from_slice(&frames.to_be_bytes());
-                if matches!(self.ide.device_mut().execute(&cdb), atapi::CmdResult::Error) {
-                    status = 0x8000 | 0x0100 | 0x000F;
-                }
-            }
-            // STOP AUDIO.
-            0x85 => {
-                let mut cdb = [0u8; 12];
-                cdb[0] = 0x4E;
-                let _ = self.ide.device_mut().execute(&cdb);
-            }
-            // RESUME AUDIO.
-            0x88 => {
-                let mut cdb = [0u8; 12];
-                cdb[0] = 0x4B;
-                cdb[8] = 0x01; // resume bit
-                let _ = self.ide.device_mut().execute(&cdb);
-            }
-            // IOCTL INPUT and any other command: report done with no data. A
-            // real driver answers control-block queries here; a game that only
-            // needs the data/audio path tolerates a benign success.
-            _ => {}
-        }
-        // Write the status word back into the header (offset 3).
-        self.write_guest_linear_block(header + 3, &status.to_le_bytes());
-    }
-
-    /// Convert a CD device-driver address (HSG LBA when `addr_mode` == 0, packed
-    /// Red Book frame/second/minute when 1) to a logical LBA.
-    fn driver_addr_to_lba(&self, addr_mode: u8, raw: u32) -> u32 {
-        if addr_mode == 0 {
-            raw // HSG = logical sector number = LBA
-        } else {
-            // Red Book packed as frame/second/minute/unused in the low bytes.
-            let frame = raw as u8;
-            let second = (raw >> 8) as u8;
-            let minute = (raw >> 16) as u8;
-            cdimage::msf_to_lba(minute, second, frame)
-        }
-    }
+    // The CD device-request executor moved to cddriver.rs as the full host
+    // port of TOKACD.SYS (Machine::cd_device_request).
 
     /// Service the host side of an `INT 13h` disk request. Only floppy A: (DL=0)
     /// is backed, by the mounted image. CHS to LBA uses the mounted media

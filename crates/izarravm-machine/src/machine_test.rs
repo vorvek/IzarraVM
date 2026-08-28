@@ -409,6 +409,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         toka_service_status: machine.toka_service_status,
         pending_cd_doorbell: &mut machine.pending_cd_doorbell,
         cd_doorbell_status: &mut machine.cd_doorbell_status,
+        cd_redirector_armed: machine.cd_redirector_dos_ds.is_some(),
         unittester: &mut machine.unittester,
         wait_states: machine.profile.wait_states,
         cache: &mut machine.cache_model,

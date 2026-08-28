@@ -85,11 +85,25 @@ segment	HMA_TEXT
 
             extern _DGROUP_
 
+; Added by the Toka-DOS project, 2026: the IzarraCD ROM extension. When the
+; boot-time claim (main.c IzarraCdClaim) finds the Izarra BIOS CD services,
+; it stores the boot INT 2Fh vector here and sets the flag; the handler then
+; forwards AH=11h (redirector) and AH=15h (CD-ROM extensions) to the BIOS
+; with the caller's frame intact. Both live in HMA_TEXT so the handler can
+; reach them CS-relative with no register or stack traffic; the claim writes
+; them with pokeb/pokew through FP_SEG(int2f_handler).
+                global  _izarra_cd_on
+                global  _izarra_cd_fwd
+_izarra_cd_on:  db 0
+_izarra_cd_fwd: dd 0
+
                 global  reloc_call_int2f_handler
 reloc_call_int2f_handler:
                 sti                             ; Enable interrupts
                 cmp     ah,11h                  ; Network interrupt?
                 jne     Int2f3                  ; No, continue
+                cmp     byte [cs:_izarra_cd_on],0 ; IzarraCD claimed?
+                jne     IzarraCdFwd             ; yes: the BIOS serves AH=11h
 Int2f1:
                 or      al,al                   ; Installation check?
                 jz      FarTabRetn              ; yes, just return
@@ -101,6 +115,24 @@ Int2f2:
                 stc
 FarTabRetn:
                 retf    2                       ; Return far
+
+IzarraCdFwd:    jmp     far [cs:_izarra_cd_fwd] ; tail-forward, frame intact
+
+; void ASMCFUNC far izarra_cd_arm(UWORD fwd_off, UWORD fwd_seg)
+; Called once from init (through the kernel.asm relocation thunk) when the
+; boot-time claim succeeds: store the boot INT 2Fh vector and set the
+; forward flag, both CS-relative in this segment.
+                global  reloc_call_izarra_cd_arm
+reloc_call_izarra_cd_arm:
+                push    bp
+                mov     bp,sp
+                mov     ax,[bp+6]       ; fwd_off (far cdecl: args above seg:off)
+                mov     [cs:_izarra_cd_fwd],ax
+                mov     ax,[bp+8]       ; fwd_seg
+                mov     [cs:_izarra_cd_fwd+2],ax
+                mov     byte [cs:_izarra_cd_on],1
+                pop     bp
+                retf
 
 WinIdle:					; only HLT if at haltlevel 2+
 		push	ds
@@ -124,7 +156,12 @@ Int2f3:         cmp     ax,1680h                ; Win "release time slice"
                 je      WinIdle
                 cmp     ah,16h
                 je      FarTabRetn              ; other Win Hook return fast
-                cmp     ah,12h
+                cmp     ah,15h                  ; CD-ROM extensions?
+                jne     Int2f3a
+                cmp     byte [cs:_izarra_cd_on],0 ; IzarraCD claimed?
+                jne     IzarraCdFwd             ; yes: the BIOS serves AH=15h
+                jmp     Int2f?iret              ; no: consume, as before
+Int2f3a:        cmp     ah,12h
                 je      IntDosCal               ; Dos Internal calls
 
                 cmp     ax,4a01h

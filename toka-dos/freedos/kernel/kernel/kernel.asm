@@ -1021,6 +1021,13 @@ _CharMapSrvc:   jmp 0:_reloc_call_CharMapSrvc
 _init_call_p_0: jmp  0:reloc_call_p_0
                 call near forceEnableA20
 
+; Added by the Toka-DOS project, 2026: the IzarraCD claim's one-time call
+; into int2f.asm's HMA_TEXT (see izarra_cd_arm there).
+                global  _izarra_cd_arm
+                extern  reloc_call_izarra_cd_arm
+_izarra_cd_arm: jmp 0:reloc_call_izarra_cd_arm
+                call near forceEnableA20
+
 
    global __HMARelocationTableEnd
 __HMARelocationTableEnd:    

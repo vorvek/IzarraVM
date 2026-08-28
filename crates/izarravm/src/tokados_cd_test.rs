@@ -1,14 +1,16 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
+//! Full-boot tests for the IzarraCD ROM extension: the kernel claims drive D:
+//! at boot (no guest driver files), DOS file I/O on D: is served by the host
+//! redirector, and request packets reach the host driver through the ROM
+//! header's strategy/interrupt stubs and the Lotura doorbell.
+
 use super::*;
 
 fn cd_autoexec(command: &str) -> Vec<u8> {
-    format!(
-        "@ECHO OFF\r\nPATH C:\\DOS\r\nSET BLASTER=A220 I5 D1 H5 P300 T6\r\n\
-         IZCDEX /I /D:TOKACD01 /L:D /Q\r\n{command}\r\n"
-    )
-    .into_bytes()
+    format!("@ECHO OFF\r\nPATH C:\\DOS\r\nSET BLASTER=A220 I5 D1 H5 P300 T6\r\n{command}\r\n")
+        .into_bytes()
 }
 
 fn run_cd_memory_command(
@@ -47,7 +49,7 @@ fn run_cd_memory_command(
 }
 
 #[test]
-#[ignore = "boots Toka-DOS and reads a folder-backed CD through the guest driver"]
+#[ignore = "boots Toka-DOS and reads a folder-backed CD through the BIOS redirector"]
 fn guest_cd_stack_owns_d_and_reads_a_file() {
     let hdd_scratch = TokaScratch::new("hdd");
     let cd_scratch = TokaScratch::new("disc");
@@ -78,10 +80,10 @@ fn guest_cd_stack_owns_d_and_reads_a_file() {
         .run_until_halt_or_cycles(800_000_000)
         .expect("run guest CD fixture");
     let text = machine.screen_text().as_text();
-    let pio_bytes = machine.cd_pio_byte_count();
+    let redirector_bytes = machine.cd_redirector_read_bytes();
 
     if let StopReason::CpuError(msg) = &stop {
-        panic!("CPU fault while exercising the guest CD stack: {msg}\n{text}");
+        panic!("CPU fault while exercising the CD stack: {msg}\n{text}");
     }
     assert_eq!(
         stop,
@@ -89,14 +91,20 @@ fn guest_cd_stack_owns_d_and_reads_a_file() {
         "CDTEST failure code identifies the broken layer.\n{text}"
     );
     assert!(
-        pio_bytes >= 2048,
-        "the guest test passed without a sector crossing the ATAPI PIO path"
+        redirector_bytes >= 12,
+        "the probe file's bytes must be delivered by the host redirector \
+         (got {redirector_bytes})"
+    );
+    assert_eq!(
+        machine.cd_pio_byte_count(),
+        0,
+        "no sector may cross the retired ATAPI PIO path on the Toka boot"
     );
 }
 
 #[test]
-#[ignore = "boots Toka-DOS and directly exercises TOKACD request packets"]
-fn guest_tokacd_protocol_matrix() {
+#[ignore = "boots Toka-DOS and directly exercises IzarraCD request packets"]
+fn guest_izarracd_request_protocol_matrix() {
     let hdd_scratch = TokaScratch::new("protocol_hdd");
     let cd_scratch = TokaScratch::new("protocol_disc");
     std::fs::write(cd_scratch.path().join("PROBE.TXT"), b"TOKA-CD-PROTOCOL\r\n")
@@ -125,20 +133,18 @@ fn guest_tokacd_protocol_matrix() {
 
     let stop = machine
         .run_until_halt_or_cycles(900_000_000)
-        .expect("run TOKACD protocol fixture");
+        .expect("run CD protocol fixture");
     let text = machine.screen_text().as_text();
-    let pio_bytes = machine.cd_pio_byte_count();
     let media_present = machine.cd_audio_state().media_present;
 
     if let StopReason::CpuError(msg) = &stop {
-        panic!("CPU fault while exercising TOKACD requests: {msg}\n{text}");
+        panic!("CPU fault while exercising CD requests: {msg}\n{text}");
     }
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA6 },
         "CDPROT failure code identifies the failed request group.\n{text}"
     );
-    assert!(pio_bytes >= 4096, "protocol reads did not cross ATAPI PIO");
     assert!(
         !media_present,
         "the final protocol Eject did not remove media"
@@ -147,7 +153,7 @@ fn guest_tokacd_protocol_matrix() {
 
 #[test]
 #[ignore = "boots Toka-DOS, swaps data media for mixed mode, and tests CD audio"]
-fn guest_tokacd_live_swap_and_audio_sequence() {
+fn guest_izarracd_live_swap_and_audio_sequence() {
     const DATA_SECTOR: usize = 2048;
     const RAW_SECTOR: usize = 2352;
     let hdd_scratch = TokaScratch::new("audio_hdd");
@@ -215,68 +221,14 @@ fn guest_tokacd_live_swap_and_audio_sequence() {
     );
 }
 
-#[test]
-#[ignore = "boots Toka-DOS and verifies TOKACD escapes an unanswered PACKET"]
-fn guest_tokacd_packet_timeout_is_bounded() {
-    let hdd_scratch = TokaScratch::new("timeout_hdd");
-    let cd_scratch = TokaScratch::new("timeout_disc");
-    let built = izarravm_machine::build_cd_folder(cd_scratch.path()).expect("build timeout CD");
-    let image = izarravm_machine::CdImage::from_folder(built).expect("mount timeout CD");
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::izarra_bios(),
-    )
-    .expect("build machine");
-    machine.mount_cd(image);
-    machine
-        .mount_hdd_folder_with(
-            hdd_scratch.path(),
-            vec![
-                (
-                    "AUTOEXEC.BAT".to_string(),
-                    cd_autoexec("ECHO TIMEOUT READY"),
-                ),
-                (
-                    "CDTIME.COM".to_string(),
-                    izarravm_firmware::cdtime_com().to_vec(),
-                ),
-            ],
-        )
-        .expect("mount Toka-DOS folder");
-    let (first_stop, _) = run_until_toka_condition(&mut machine, 600_000_000, |machine| {
-        current_root_prompt(machine) && machine.screen_text().as_text().contains("TIMEOUT READY")
-    });
-    let first_text = machine.screen_text().as_text();
-    if let StopReason::CpuError(msg) = &first_stop {
-        panic!("CPU fault before timeout test: {msg}\n{first_text}");
-    }
-    assert!(
-        first_text.contains("TIMEOUT READY") && first_text.to_ascii_lowercase().contains("c:\\>"),
-        "Toka-DOS did not reach the timeout point (stop={first_stop:?}).\n{first_text}"
-    );
-
-    machine.set_test_cd_packet_stall(true);
-    let keys = "CDTIME\r"
-        .chars()
-        .flat_map(ascii_to_set1)
-        .collect::<Vec<_>>();
-    machine.inject_key_scancodes(&keys);
-    let stop = machine
-        .run_until_halt_or_cycles(900_000_000)
-        .expect("run packet timeout fixture");
-    let text = machine.screen_text().as_text();
-    if let StopReason::CpuError(msg) = &stop {
-        panic!("CPU fault during packet timeout: {msg}\n{text}");
-    }
-    assert_eq!(
-        stop,
-        StopReason::TestExit { code: 0xA8 },
-        "CDTIME did not return the bounded timeout status.\n{text}"
-    );
-}
+// The `guest_tokacd_packet_timeout_is_bounded` test retired with TOKACD.SYS:
+// its subject was the guest driver's bounded ATAPI polling loop (CDTIME.COM +
+// `set_test_cd_packet_stall`), and no guest code polls the ATAPI ports on the
+// Toka boot any more. The ATAPI device model and its stall hook remain for
+// machine-level tests.
 
 #[test]
-#[ignore = "boots Toka-DOS with the guest CD stack and an empty drive"]
+#[ignore = "boots Toka-DOS with the IzarraCD claim and an empty drive"]
 fn guest_cd_stack_boots_without_media() {
     let hdd_scratch = TokaScratch::new("empty");
     let mut machine = Machine::new(
@@ -302,45 +254,38 @@ fn guest_cd_stack_boots_without_media() {
         text.contains("CD EMPTY OK") && text.to_ascii_lowercase().contains("c:\\>"),
         "the empty CD drive prevented a normal boot (stop={stop:?}).\n{text}"
     );
+    assert!(
+        text.contains("IzarraCD ROM Extensions"),
+        "the kernel must still claim drive D: with no media in the drive.\n{text}"
+    );
 }
 
 #[test]
-#[ignore = "boots Toka-DOS and inspects upper-memory residency"]
-fn guest_cd_components_reside_in_upper_memory() {
+#[ignore = "boots Toka-DOS and verifies the CD stack leaves no resident components"]
+fn guest_cd_stack_has_no_resident_components() {
     let (_scratch, stop, text) =
         run_cd_memory_command("memory", "LH TOKAMOUS\r\nMEM /P", |machine| {
             let upper = machine.screen_text().as_text().to_ascii_uppercase();
-            let upper_detail = upper
-                .split_once("UPPER MEMORY DETAIL:")
-                .map(|(_, rows)| rows)
-                .unwrap_or("");
-            current_root_prompt(machine)
-                && upper_detail.contains("TOKACD")
-                && upper_detail.contains("IZCDEX")
+            current_root_prompt(machine) && upper.contains("UPPER MEMORY DETAIL:")
         });
     if let StopReason::CpuError(msg) = &stop {
-        panic!("CPU fault while checking CD upper-memory residency: {msg}\n{text}");
+        panic!("CPU fault while checking CD residency: {msg}\n{text}");
     }
     let upper = text.to_ascii_uppercase();
+    // The consolidation's memory claim: the CD stack costs zero resident
+    // bytes. Neither retired component may appear anywhere in MEM's output,
+    // while the upper-memory machinery itself still works (TOKAMOUS loads
+    // high and is listed).
+    assert!(
+        !upper.contains("TOKACD") && !upper.contains("IZCDEX"),
+        "a retired guest CD component is still resident.\n{text}"
+    );
     let upper_detail = upper
         .split_once("UPPER MEMORY DETAIL:")
         .map(|(_, rows)| rows)
         .unwrap_or("");
     assert!(
-        upper_detail.contains("TOKACD") && upper_detail.contains("IZCDEX"),
-        "TOKACD and IZCDEX must both appear in the upper-memory section.\n{text}"
+        upper_detail.contains("TOKAMOUS"),
+        "TOKAMOUS must still load into upper memory.\n{text}"
     );
 }
-
-// There was a `guest_cd_stack_keeps_about_600k_conventional_free` here that
-// pinned MEM's free-conventional column to the literal "(599K)". It measured
-// nothing about the CD stack: free conventional is dominated by TOKAEMM's
-// resident size, and the number tracked TOKAEMM's shared-arena work down to
-// the byte (26,096 -> 596K, 29,376 -> 593K) while TOKACD and IZCDEX never left
-// upper memory. `guest_cd_components_reside_in_upper_memory` above is the real
-// invariant for this file, and `tokaemm_mem_plain_reports_conventional_memory`
-// in tokados_tokaemm_test.rs already pins 593K where the component that owns
-// the number lives. This was a stale second copy of that pin, and because its
-// completion predicate waited on the same literal, going stale cost a
-// 5M-cycle timeout and a "did not return to a complete shell state" message
-// instead of an assertion diff naming the value.
