@@ -6,7 +6,8 @@
 //! resident.
 //!
 //! The contract mirrors the IZCDEX.COM (SHSUCDX 3.09) redirector field by
-//! field, extracted from `toka-dos/freedos/shsucd/shsucdx.nsm` and verified
+//! field, extracted from SHSUCDX 3.09's `shsucdx.nsm` (the vendored tree
+//! left with slice CD-3; git history holds it) and verified
 //! against the Toka-DOS kernel (`kernel.asm` SDA layout, `dosfns.c` call
 //! sites). The kernel calls these functions itself for any operation on a
 //! drive whose CDS carries the network flag; the arguments live in the SDA at

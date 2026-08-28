@@ -86,8 +86,6 @@ pub const PICSTALE_COM: &[u8] = include_bytes!("../roms/dos/picstale.com");
 pub const PICSTALE_COM_SOURCE: &str = include_str!("../roms/dos/picstale.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
-pub const TOKACD_SYS: &[u8] = include_bytes!("../roms/dos/tokacd.sys");
-pub const TOKACD_SYS_SOURCE: &str = include_str!("../roms/dos/tokacd.asm");
 pub const CDTEST_COM: &[u8] = include_bytes!("../roms/dos/cdtest.com");
 pub const CDTEST_COM_SOURCE: &str = include_str!("../roms/dos/cdtest.asm");
 pub const CDPROT_COM: &[u8] = include_bytes!("../roms/dos/cdprot.com");
@@ -522,13 +520,6 @@ pub fn umbmech_com() -> &'static [u8] {
 /// `DEVICE=C:\DOS\TOKAEMM.SYS`.
 pub fn tokaemm_sys() -> &'static [u8] {
     TOKAEMM_SYS
-}
-
-/// TOKACD.SYS is the Toka-DOS MSCDEX hardware driver for Izarra's fixed
-/// secondary-master ATAPI CD-ROM. It uses bounded polling PIO and exposes one
-/// unit named TOKACD01.
-pub fn tokacd_sys() -> &'static [u8] {
-    TOKACD_SYS
 }
 
 /// Guest fixture for the IzarraCD ROM extension's DOS surface. It checks the

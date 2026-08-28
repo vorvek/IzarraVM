@@ -1,7 +1,7 @@
 IzarraVM bundles Toka-DOS, built from FreeDOS source (https://www.freedos.org/).
 FreeDOS kernel: © 1995-2012 Pasquale J. Villani and The FreeDOS Project, GPLv2-or-later.
 FreeCOM: © 1994-2005 Tim Norman and others, GPLv2-or-later.
-SHSUCDX: © 2005-2020 Jason Hood, Zlib license. Vendored for reference; the shipped image no longer carries the IZCDEX build (the BIOS serves the CD).
+SHSUCDX: © 2005-2020 Jason Hood, Zlib license. Earlier releases shipped it as IZCDEX; the BIOS serves the CD now and the vendored source left the tree (git history before slice CD-3 holds it, marks intact).
 Modified by the Toka-DOS project (2026). Corresponding source: toka-dos/freedos/.
 Project license: GPL-3.0-only (see LICENSE).
 FreeDOS MOVE: © 1997-2002 Joe Cosentino, © 2003-2004 Imre Leber, GPLv2-or-later.

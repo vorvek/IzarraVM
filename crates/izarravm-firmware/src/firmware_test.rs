@@ -69,17 +69,6 @@ fn guest_tools_name_code_3_386_slow() {
 }
 
 #[test]
-fn tokacd_is_an_8086_mscdex_character_driver() {
-    assert!(TOKACD_SYS.len() < 8 * 1024);
-    assert_eq!(&TOKACD_SYS[0..4], &[0xff; 4]);
-    assert_eq!(u16::from_le_bytes([TOKACD_SYS[4], TOKACD_SYS[5]]), 0xc800);
-    assert_eq!(&TOKACD_SYS[10..18], b"TOKACD01");
-    assert_eq!(&TOKACD_SYS[18..22], &[0, 0, 0, 1]);
-    assert!(TOKACD_SYS_SOURCE.contains("cpu 8086"));
-    assert!(TOKACD_SYS_SOURCE.contains("times 512 db 0"));
-}
-
-#[test]
 fn cdtest_fixture_requires_the_rom_device_header() {
     assert!(CDTEST_COM_SOURCE.contains("mov ax, 0x1500"));
     assert!(CDTEST_COM_SOURCE.contains("mov ax, 0x1501"));

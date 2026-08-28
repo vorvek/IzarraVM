@@ -8,7 +8,9 @@
 //! module instead — through INT 2Fh AX=1510h, or through the ROM device
 //! header's stubs and the Lotura doorbell. The dispatcher, the length/unit
 //! gates, every IOCTL control block, and the audio state machine are a
-//! faithful transcription of `crates/izarravm-firmware/roms/dos/tokacd.asm`;
+//! faithful transcription of TOKACD.SYS's source (formerly
+//! `crates/izarravm-firmware/roms/dos/tokacd.asm`; removed with slice CD-3,
+//! complete in git history);
 //! where TOKACD issued an ATAPI packet over the wire, this port calls
 //! `AtapiDevice::execute` with the same CDB, so the device-visible behavior
 //! (unit-attention retry, sense mapping, audio interruption on reads and
