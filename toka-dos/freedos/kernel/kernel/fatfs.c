@@ -1011,8 +1011,10 @@ COUNT map_cluster(REG f_node_ptr fnp, COUNT mode)
      native path (the guard scan would cost more than they do). All
      guard logic beyond these tests lives in izarra_map_lookup. BootDrive
      is the bare global (globals.h), 1-based, the same value LoL->BootDrive
-     aliases -- LoL itself is not visible in this file. */
-  if (mode == XFR_READ && IzarraMapArmed
+     aliases -- LoL itself is not visible in this file. BootDrive >= 3
+     rejects a floppy boot outright: on one, dpb_unit == BootDrive - 1
+     names drive A:, and the host would answer from the HDD's FAT. */
+  if (mode == XFR_READ && IzarraMapArmed && BootDrive >= 3
       && fnp->f_dpb->dpb_unit == BootDrive - 1
       && relcluster > fnp->f_cluster_offset
       && relcluster - fnp->f_cluster_offset >= IZARRA_MAP_MIN_STEPS)

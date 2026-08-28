@@ -2245,14 +2245,14 @@ fn izarracd_doorbell_refuses_stray_rings() {
 // The B3 FAT-position hypercall (Lotura doorbell commands 3/4). Design:
 // dev_docs/tier-b-b3-a2-design-2026-08-28.md sections 2.2-2.4.
 
-use crate::dos::{HDD_MAP_RESULT, HDD_MAP_START, HDD_MAP_STEPS};
+use crate::dos::{HDD_MAP_RESULT, HDD_MAP_START, HDD_MAP_STEPS, HDD_MAP_UNIT};
 
 /// Fill a 16-byte B3 request block (design §2.3) at `block`. The host-written
 /// result dword at `HDD_MAP_RESULT` is zeroed here so a test can tell a real
 /// answer from a stale one.
 fn write_map_request(machine: &mut Machine, block: u32, unit: u8, start: u32, steps: u32) {
     machine.write_physical_u8(block, 0);
-    machine.write_physical_u8(block + 1, unit);
+    machine.write_physical_u8(block + HDD_MAP_UNIT, unit);
     machine.write_physical_u16(block + 2, 0);
     machine.write_physical_u32(block + HDD_MAP_START, start);
     machine.write_physical_u32(block + HDD_MAP_STEPS, steps);
@@ -2380,9 +2380,26 @@ fn hdd_map_lookup_without_katea_hdd_refuses() {
         "registration alone never touches ata"
     );
 
-    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 0, 2, 1);
+    // Unit 2 on purpose: this test must reach the missing-disk refusal, not
+    // stop earlier at the wrong-unit check.
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 2, 2, 1);
     machine.perform_cd_doorbell(0x04);
     assert_eq!(machine.cd_doorbell_status, 0xFE);
+}
+
+/// The host half of the two-sided drive guard: a request whose unit byte is
+/// not the Katea HDD (DOS unit 2) refuses before any FAT walk. The kernel
+/// half is `BootDrive >= 3` in fatfs.c's fast-path conjunction.
+#[test]
+fn hdd_map_lookup_refuses_a_wrong_unit() {
+    let scratch = hdd_map_scratch("wrong_unit");
+    let mut machine = hdd_map_machine(&scratch);
+    register_map_block(&mut machine, HDD_MAP_TEST_BLOCK);
+
+    write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 0, 2, 0);
+    machine.perform_cd_doorbell(0x04);
+    assert_eq!(machine.cd_doorbell_status, 0xFE);
+    assert_eq!(read_map_result(&mut machine, HDD_MAP_TEST_BLOCK), 0);
 }
 
 #[test]

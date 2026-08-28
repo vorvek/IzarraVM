@@ -7,6 +7,7 @@ use super::*;
 // dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.3's 16-byte layout). Named
 // the way cddriver.rs's `RH_*` request-header offsets are, and shared by
 // `perform_hdd_map_lookup` and its tests (`machine_device_integration_test.rs`).
+pub(crate) const HDD_MAP_UNIT: u32 = 1; // u8, guest writes: DOS unit (A=0; the Katea HDD is 2)
 pub(crate) const HDD_MAP_START: u32 = 4; // u32, guest writes: walk's starting cluster
 pub(crate) const HDD_MAP_STEPS: u32 = 8; // u32, guest writes: hops forward along the chain
 pub(crate) const HDD_MAP_RESULT: u32 = 12; // u32, host writes: the landing cluster
@@ -810,15 +811,24 @@ impl Machine {
     }
 
     /// Doorbell command 4: answer the registered B3 FAT-position request.
-    /// Status codes and the block layout are the design's §2.3. The unit byte
-    /// is deliberately not validated here — the kernel gates drive selection
-    /// (boot HDD only), and the host refuses whenever no Katea host-folder
-    /// disk is mounted.
+    /// Status codes and the block layout are the design's §2.3. The unit
+    /// check is one half of a two-sided guard: the kernel gates drive
+    /// selection (boot HDD only, `BootDrive >= 3`), and the host refuses
+    /// any unit that is not the Katea HDD -- on a floppy boot the kernel's
+    /// `dpb_unit == BootDrive - 1` test would otherwise name drive A: and
+    /// this answer would come from the wrong volume's FAT.
     fn perform_hdd_map_lookup(&mut self) {
+        // DOS block units count A=0, B=1, first hard disk=2; the Katea
+        // volume is always the machine's only HDD, C:.
+        const KATEA_HDD_DOS_UNIT: u8 = 2;
         let Some(block) = self.hdd_map_block else {
             self.cd_doorbell_status = 0xFE;
             return;
         };
+        if self.read_physical_u8(block + HDD_MAP_UNIT) != KATEA_HDD_DOS_UNIT {
+            self.cd_doorbell_status = 0xFE;
+            return;
+        }
         let start = self.read_physical_u32(block + HDD_MAP_START);
         let steps = self.read_physical_u32(block + HDD_MAP_STEPS);
         let outcome = self
