@@ -2681,15 +2681,23 @@ impl KateaTreeVolume {
     /// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.4). Uses the same
     /// overlay-shadowed FAT view as `chain_of`, through a `FatWalk` cursor so a
     /// long walk does not materialize a sector per entry. The step cap is
-    /// `total_sectors()` -- clusters are never more numerous than sectors -- so
-    /// a crafted circular chain terminates in `Refused` instead of hanging the
-    /// service block.
+    /// `max_chain()` -- the same corrupt-chain ceiling `chain_with_token`
+    /// enforces, since a chain can never have more links than there are
+    /// clusters. Refusal is decided entirely up front from `steps` against that
+    /// cap, so the loop below runs at most `max_chain()` iterations on any
+    /// input; a circular FAT does not extend the walk, it just makes every
+    /// iteration land back on a cluster already seen.
+    ///
+    /// A `walk.degraded` read (a spilled FAT sector the store could not read
+    /// back) is not special-cased: it yields entry `0` for the affected
+    /// cluster, which classifies as `EndBeforeTarget` -- the same conclusion a
+    /// native guest walk would reach hitting the same failed sector.
     ///
     /// No caller yet: wired to the port 0xE8 command 4 doorbell in Task 3 of
     /// this slice.
     #[allow(dead_code)]
     pub(crate) fn map_chain(&self, start: u32, steps: u32) -> ChainMapOutcome {
-        if start < 2 || steps > self.total_sectors() {
+        if !self.cluster_in_range(start) || steps as usize > self.max_chain() {
             return ChainMapOutcome::Refused;
         }
         let mut walk = FatWalk::default();
@@ -2701,6 +2709,13 @@ impl KateaTreeVolume {
             // is a design-accepted divergence, not a real ambiguity.
             if !(2..0x0FFF_FFF7).contains(&entry) {
                 return ChainMapOutcome::EndBeforeTarget;
+            }
+            // A link can point outside the data region (corrupt or guest-crafted).
+            // Out-of-range is Refused, not EndBeforeTarget: the guest's answer for
+            // "walk failed" is to fall back to its native walk, not to accept a
+            // landing cluster reconcile itself would refuse to materialize from.
+            if !self.cluster_in_range(entry) {
+                return ChainMapOutcome::Refused;
             }
             cluster = entry;
         }
