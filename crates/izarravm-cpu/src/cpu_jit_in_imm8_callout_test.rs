@@ -11,9 +11,9 @@
 //! placement.
 //!
 //! **Every fixture here states its arm through `set_direct_in_imm8_callout_for_test`, in both
-//! directions**, for `cpu_jit_test_word_row_test.rs`'s reason: the default is OFF, so a positive
-//! fixture that read the ambient knob would be testing the refusal and calling it a lowering, and
-//! a refusal fixture that inherited the arm would go vacuous the day the default moves.
+//! directions**, for `cpu_jit_test_word_row_test.rs`'s reason: a positive fixture that read the
+//! ambient knob would be testing the shipped default rather than the gate, and a refusal fixture
+//! that inherited the arm would go vacuous.
 
 use super::*;
 

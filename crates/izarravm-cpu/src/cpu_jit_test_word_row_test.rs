@@ -21,10 +21,10 @@
 //! the Byte form in production.
 //!
 //! **Every fixture here states its arm through `set_test_word_rows_for_test`, in both directions.**
-//! The default is OFF, so a positive fixture that read the ambient knob would be testing the
-//! refusal and calling it a lowering; and a refusal fixture that inherited the arm would go vacuous
-//! the day the default moves. The default pin is the one assertion that reads the ambient knob, and
-//! it is supposed to.
+//! The default is ON since 2026-08-28, so a refusal fixture that inherited the arm would go
+//! vacuous, and a positive fixture that read the ambient knob would be testing the shipped
+//! default rather than the gate. The default pin is the one assertion that reads the ambient
+//! knob, and it is supposed to.
 //!
 //! The differential rows run the same guest bytes natively and through a block-free interpreter
 //! from identical state, and compare registers (segment registers and EIP included), the raw lazy
@@ -255,16 +255,17 @@ const CONTROL: [u8; 2] = [0x89, 0xc8];
 
 /// THE DEFAULT PIN, and it is the one assertion that decides what a shipped binary admits.
 ///
-/// Catches: a flip of `parse_test_word_rows_arm`'s `NotPresent` arm. The row is DEFAULT OFF and a
-/// default that moved without a ladder would change every shipped binary's admission silently.
+/// Catches: a flip of `parse_test_word_rows_arm`'s `NotPresent` arm. The row ships DEFAULT ON
+/// since the 2026-08-28 re-price; a default that moved without that decision would change every
+/// shipped binary's admission silently.
 ///
 /// It reads the AMBIENT knob deliberately -- no override -- and it must therefore agree with the
 /// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: the whole point
-/// of the `DIRECT_BARRIER` episode is that a knob's ON arm has to be green too, and a fixture that
-/// hard-asserted "off" would make that impossible by construction. With the variable unset the
-/// assertion reduces to "the default is OFF", which is the claim this fixture exists for.
+/// of the `DIRECT_BARRIER` episode is that a knob's OFF arm has to be green too, and a fixture that
+/// hard-asserted "on" would make that impossible by construction. With the variable unset the
+/// assertion reduces to "the default is ON", which is the claim this fixture exists for.
 #[test]
-fn test_word_rows_ship_off_by_default() {
+fn test_word_rows_ship_on_by_default() {
     jit::direct::set_test_word_rows_for_test(None);
     let ambient = std::env::var("IZARRAVM_TEST_WORD_ROWS");
     let expected = jit::direct::parse_test_word_rows_arm_for_test(ambient.clone());
@@ -276,9 +277,8 @@ fn test_word_rows_ship_off_by_default() {
     );
     if ambient.is_err() {
         assert!(
-            !expected,
-            "IZARRAVM_TEST_WORD_ROWS must default OFF; the row has not been priced on a wall \
-             ladder that authorized a flip"
+            expected,
+            "IZARRAVM_TEST_WORD_ROWS must default ON since the 2026-08-28 re-price"
         );
     }
 }
@@ -291,19 +291,18 @@ fn test_word_rows_ship_off_by_default() {
 #[test]
 fn test_word_rows_spelling_table_names_both_arms() {
     use std::env::VarError;
+    let unset = jit::direct::parse_test_word_rows_arm_for_test(Err(VarError::NotPresent));
+    let empty = jit::direct::parse_test_word_rows_arm_for_test(Ok(String::new()));
     assert!(
-        !jit::direct::parse_test_word_rows_arm_for_test(Err(VarError::NotPresent)),
-        "unset must name the OFF arm: this row is default-off"
+        unset,
+        "unset must name the ON arm: this row ships default ON since the 2026-08-28 re-price"
     );
-    // The empty string and unset happen to agree HERE, and the case is pinned anyway because the
-    // family's other four knobs default ON, where the two differ: nulling an environment variable
-    // in PowerShell leaves it PRESENT and EMPTY, and three earlier evidence directories ran their
-    // default-ON knobs off believing they had left them at the default.
-    assert!(
-        !jit::direct::parse_test_word_rows_arm_for_test(Ok(String::new())),
-        "the empty string is the OFF arm"
+    assert_eq!(
+        unset, empty,
+        "unset and \"\" must name the SAME arm (the TEST_WORD_ROWS convention), not \
+         IZARRAVM_ATA_POLL_SKIP's inverted one"
     );
-    for off in ["", "0", "off", "OFF", " off ", "Off"] {
+    for off in ["0", "off", "OFF", " off ", "Off"] {
         assert!(
             !jit::direct::parse_test_word_rows_arm_for_test(Ok(off.to_string())),
             "{off:?} must name the off arm"
