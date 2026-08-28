@@ -81,6 +81,13 @@ fn extracts_the_embedded_image_payload() {
     // doorbell poll, the int2f.asm AH=11h/15h forward and its arm entry,
     // one kernel.asm relocation thunk); TOKACD.SYS and IZCDEX.COM leave
     // the image with it.
+    // 73071 -> 73487 (Tier B slice 2, HDD hypercalls): +416. The kernel
+    // claims a host FAT-position hypercall at boot, blockio.c's
+    // getblk_fat gains a guarded call site that asks the host for the
+    // cluster's FAT-chain position instead of walking it in software, and
+    // map_cluster routes long read walks through the same hypercall
+    // (kernel.asm relocation thunk plus the boot-claim/guard/call-site
+    // logic in blockio.c and main.c).
     //
     // 87495 -> 87447 (styled init screen): COMMAND.COM shrank -48 bytes.
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
@@ -94,7 +101,7 @@ fn extracts_the_embedded_image_payload() {
     // command in both cases; only the automatic startup call is gone.
     assert_eq!(
         by_name.get("KERNEL.SYS").map(|d| d.len()),
-        Some(73071),
+        Some(73487),
         "KERNEL.SYS size"
     );
     assert_eq!(
