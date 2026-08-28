@@ -272,6 +272,7 @@ void setvec(unsigned char intno, intvec vector)
    consumed by IzarraCdClaim. */
 STATIC intvec Izarra_old2f;
 STATIC VOID IzarraCdClaim(VOID);
+STATIC VOID IzarraHddMapClaim(VOID);
 
 STATIC void setup_int_vectors(void)
 {
@@ -396,6 +397,7 @@ STATIC void init_kernel(void)
   configDone();
 
   IzarraCdClaim();
+  IzarraHddMapClaim();
 
   InitializeAllBPBs();
 }
@@ -452,6 +454,46 @@ STATIC VOID IzarraCdClaim(VOID)
   /* One boot-tree line in the shared glyph style. */
   printf("%c%c> IzarraCD ROM Extensions: CD-ROM is drive %c:\n",
          0xC3, 0xC4, 'A' + 3);
+#endif
+}
+
+/* Toka-DOS 2026, Tier B B3: claim the IzarraVM FAT-position hypercall.
+   Probe first with a null mailbox: a host that knows command 3 parks
+   0xFE ("parsed, nothing registered"); an older host parks 0xFF, and
+   open bus reads 0xFF. Only a 0xFE probe answer registers the real
+   block. Spins are bounded like IzarraCdClaim's: a wedged host must
+   degrade to the native walk, never hang the boot. */
+STATIC VOID IzarraHddMapClaim(VOID)
+{
+#ifdef __WATCOMC__
+  UBYTE status;
+  UWORD spin;
+
+  if (izarra_inp(0xE0) != 0x5A)
+    return;
+
+  disable();
+  pokew(0, 0x63C, 0);
+  pokew(0, 0x63E, 0);
+  izarra_outp(0xE8, 0x03);
+  enable();
+  spin = 0xFFFF;
+  while ((status = izarra_inp(0xE8)) == 0x01 && --spin != 0)
+    ;
+  if (status != 0xFE)
+    return;
+
+  disable();
+  pokew(0, 0x63C, FP_OFF(&IzarraMapReq));
+  pokew(0, 0x63E, FP_SEG(LoL));
+  izarra_outp(0xE8, 0x03);
+  enable();
+  spin = 0xFFFF;
+  while ((status = izarra_inp(0xE8)) == 0x01 && --spin != 0)
+    ;
+  if (status != 0)
+    return;
+  IzarraMapArmed = 1;
 #endif
 }
 

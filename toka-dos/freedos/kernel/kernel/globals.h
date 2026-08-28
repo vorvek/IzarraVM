@@ -252,6 +252,20 @@ GLOBAL UBYTE FAR *fat_span;
 /* modified by the Toka-DOS project, 2026: searchblock's 64-slot offset-hint
    table (blockio.c), in a UMB beside fat_span; NULL means plain scans. */
 GLOBAL UWORD FAR *buf_index;
+/* modified by the Toka-DOS project, 2026 (Tier B B3): the IzarraVM
+   FAT-position request block, registered with doorbell command 3 and
+   filled by command 4 (dev_docs/tier-b-b3-a2-design-2026-08-28.md).
+   IzarraMapArmed is set once at claim and cleared on any refusal. */
+struct izarra_map_req {
+  UBYTE reserved;
+  UBYTE unit;
+  UWORD reserved2;
+  ULONG start_cluster;
+  ULONG steps;
+  ULONG result_cluster;
+};
+GLOBAL struct izarra_map_req IzarraMapReq;
+GLOBAL UBYTE IzarraMapArmed;
 extern struct cds FAR * ASM CDSp;   /* Current Directory Structure          */
 extern
 struct cds FAR * ASM current_ldt;
