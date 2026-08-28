@@ -2674,6 +2674,10 @@ fn smc_census_assert_phase_closed(phase: &izarravm_cpu::DirectSmcCensusPhase) {
         "SMC census saw the inline pre-filter skip a row the authoritative test would have killed"
     );
     assert_eq!(
+        units.point_rows_scanned, 0,
+        "SMC census scanned a Seen/Dormant point row; window-shrink forbids those on PageKeys"
+    );
+    assert_eq!(
         units.survivors_moved,
         units.keys_surviving + units.lane_accept_keys + units.probes_elided,
         "SMC census survivor moves did not close"
@@ -2825,6 +2829,7 @@ fn smc_census_phase_json(phase: &izarravm_cpu::DirectSmcCensusPhase) -> serde_js
             "probes_elided": u.probes_elided,
             "entries_get_calls": u.entries_get_calls,
             "probe_divergences": u.probe_divergences,
+            "point_rows_scanned": u.point_rows_scanned,
             "keys_killed": u.keys_killed,
             "keys_surviving": u.keys_surviving,
             "lane_accept_keys": u.lane_accept_keys,

@@ -1857,6 +1857,10 @@ pub struct DirectSmcCensusUnits {
     /// census-armed arm CANNOT be read for the slice's wall effect -- only for its mechanism.
     /// Grade the wall on plain builds, as the campaign's standing rule already says.
     pub probe_divergences: u64,
+    /// Leaked `Seen`/`Dormant` rows that reached the scan's point-key arm. MUST read zero after
+    /// window-shrink: a non-zero value is a leftover point row in the window (missed R4 or a
+    /// probe that still files). STOP, same class as `entries_get_misses > 0`.
+    pub point_rows_scanned: u64,
 
     // Phase (d) — survivor compaction and drain.
     pub survivors_moved: u64,
