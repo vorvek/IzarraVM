@@ -4351,3 +4351,146 @@ fn a_direct_system_read_charges_exactly_what_the_general_read_charges() {
         });
     }
 }
+
+/// A 32-bit game runs its code and keeps its data ABOVE 1 MB, and the bus's only
+/// screen against the device-window gauntlet was `< 0x000A_0000`. So every
+/// instruction-fetch run and every data access such a game makes used to walk
+/// the whole gauntlet -- `rom_offset`, then Vega's ten aperture predicates --
+/// to be told what the address range already guarantees: nothing claims it.
+///
+/// This pins the screen that answers it directly. The counter is the only way to
+/// see it: `is_device_window` returns false either way, and a wait-state
+/// comparison cannot separate "answered cheaply" from "answered expensively".
+/// Both entry points are covered, because they are separate screens on separate
+/// callers -- `is_device_window` serves the fetch and data-access classification,
+/// `memory_wait_states_device` serves the byte-cost path.
+#[test]
+fn extended_ram_is_classified_without_entering_the_device_window_gauntlet() {
+    // 2 MB: real RAM in a 16 MiB test machine, above the 1 MB line, and far
+    // below `MARGO_LFB_BASE`, which is where the device-free window ends.
+    const EXTENDED: u32 = 0x0020_0000;
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+            let before = bus.vega.device_window_classifications();
+            assert!(
+                !bus.is_device_window(EXTENDED, width),
+                "extended RAM at {EXTENDED:#x} is not a device window"
+            );
+            assert_eq!(
+                bus.vega.device_window_classifications(),
+                before,
+                "classifying extended RAM at width {width:?} must not enter the gauntlet"
+            );
+        }
+
+        let before = bus.vega.device_window_classifications();
+        assert_eq!(
+            bus.memory_wait_states(EXTENDED),
+            bus.wait_states.ram,
+            "extended RAM is charged the RAM wait-state"
+        );
+        assert_eq!(
+            bus.vega.device_window_classifications(),
+            before,
+            "the byte-cost path must not enter the gauntlet for extended RAM either"
+        );
+    });
+}
+
+/// The other half of the screen: an address a window really does claim must
+/// still reach the gauntlet and be classified by it. Without this the test above
+/// is satisfied by a screen that swallows everything.
+///
+/// Each address is one that the screen must DECLINE, and for a different reason:
+/// conventional memory and the VGA aperture are below the 1 MB floor, the Margo
+/// LFB and MMIO block and the BIOS alias at the top of the address space are at
+/// or above the ceiling, and the byte before `MARGO_LFB_BASE` is the last
+/// address the screen may accept -- a Dword there straddles the boundary, which
+/// is what the width term in the screen is for.
+#[test]
+fn the_screen_declines_every_address_a_window_can_claim() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        for (address, width, claimed) in [
+            (0x0000_2000, BusWidth::Dword, false),   // conventional RAM
+            (VGA_MODE13H_BASE, BusWidth::Byte, true), // the VGA aperture
+            (LOW_BIOS_BASE, BusWidth::Byte, true),   // the low BIOS image
+            (MARGO_LFB_BASE, BusWidth::Byte, true),  // Margo's framebuffer
+            (MARGO_MMIO_BASE, BusWidth::Byte, true), // Margo's registers
+            (HIGH_ROM_BASE, BusWidth::Byte, true),   // the BIOS alias at 4 GB
+        ] {
+            let before = bus.vega.device_window_classifications();
+            assert_eq!(
+                bus.is_device_window(address, width),
+                claimed,
+                "{address:#x} width {width:?} classification"
+            );
+            assert!(
+                bus.vega.device_window_classifications() > before,
+                "{address:#x} must be decided by the gauntlet, not by the screen"
+            );
+        }
+
+        // The last byte below the ceiling is inside the window; a Dword based
+        // there is not, because it reaches the framebuffer's first byte.
+        let before = bus.vega.device_window_classifications();
+        assert!(!bus.is_device_window(MARGO_LFB_BASE - 1, BusWidth::Byte));
+        assert_eq!(
+            bus.vega.device_window_classifications(),
+            before,
+            "the byte below the ceiling is still screened"
+        );
+        assert!(!bus.is_device_window(MARGO_LFB_BASE - 1, BusWidth::Dword));
+        assert!(
+            bus.vega.device_window_classifications() > before,
+            "a Dword that straddles the ceiling must reach the gauntlet"
+        );
+    });
+}
+
+/// The ceiling is not a constant: Distira's BAR moves wherever the guest writes
+/// BAR0, and a guest that maps it low shrinks the device-free window. The screen
+/// reads the live floor, so relocating the BAR into what was screened memory
+/// must pull the ceiling down with it.
+///
+/// `debug_assert` inside the screen would catch the opposite mistake (a screen
+/// that kept the old ceiling and swallowed the relocated BAR) on any debug run;
+/// this test states the intent in one place and covers release builds too.
+#[test]
+fn relocating_the_distira_bar_lowers_the_device_free_ceiling() {
+    // BAR0 decodes its top byte only (`pci_write_config_byte` offset 0x13), so
+    // 0x40 places the 16 MB BAR at 0x4000_0000 -- well below MARGO_LFB_BASE and
+    // inside what the default configuration screens as plain RAM.
+    const RELOCATED: u32 = 0x4000_0000;
+    let mut machine = test_machine();
+    assert_eq!(
+        machine.vega.device_free_extended_floor(),
+        MARGO_LFB_BASE,
+        "the default ceiling is Margo's framebuffer"
+    );
+    with_bus(&mut machine, |bus| {
+        assert!(
+            !bus.is_device_window(RELOCATED, BusWidth::Byte),
+            "nothing claims {RELOCATED:#x} before the BAR moves"
+        );
+    });
+
+    machine.vega.pci_write_config_byte(0x13, 0x40);
+    assert_eq!(
+        machine.vega.device_free_extended_floor(),
+        RELOCATED,
+        "the relocated BAR is now the lowest claimant above 1 MB"
+    );
+    with_bus(&mut machine, |bus| {
+        let before = bus.vega.device_window_classifications();
+        assert!(
+            bus.is_device_window(RELOCATED, BusWidth::Byte),
+            "the relocated BAR is a device window"
+        );
+        assert!(
+            bus.vega.device_window_classifications() > before,
+            "an address at or above the ceiling reaches the gauntlet"
+        );
+    });
+}

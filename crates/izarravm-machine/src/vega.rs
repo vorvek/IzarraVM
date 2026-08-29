@@ -177,6 +177,18 @@ pub(crate) struct Vega {
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
+    /// How many times the BUS asked the aperture gauntlet to classify an
+    /// address for timing (`MachineBus::is_device_window` and
+    /// `memory_wait_states_device`). Test-only, and deliberately NOT a counter
+    /// inside `owns_memory`: the debug-only `claims_no_byte_in` assertion also
+    /// calls `owns_memory`, so a counter there would move for a reason that has
+    /// nothing to do with the path under test.
+    ///
+    /// It exists because the screen it pins is a mechanism no value comparison
+    /// can see: an extended-RAM address classifies as "not a device window"
+    /// either way, and only the cost of reaching that answer changes.
+    #[cfg(test)]
+    device_window_classifications: Cell<u64>,
 }
 
 impl Default for Vega {
@@ -200,6 +212,8 @@ impl Default for Vega {
             distira_command: 0x0002,
             distira_mem_base: DISTIRA_MMIO_BASE & !(DISTIRA_PCI_BAR_SIZE - 1),
             distira_init_enable: 0,
+            #[cfg(test)]
+            device_window_classifications: Cell::new(0),
         }
     }
 }
@@ -1554,6 +1568,39 @@ impl Vega {
         self.distira_memory_enabled()
             && (self.distira_mem_base..self.distira_mem_base.saturating_add(DISTIRA_PCI_BAR_SIZE))
                 .contains(&address)
+    }
+
+    /// The lowest address at or above 1 MB that any aperture in this card can
+    /// claim. Every address in `0x0010_0000 .. floor` is therefore plain memory
+    /// as far as `owns_memory` is concerned, and the bus uses that to skip the
+    /// gauntlet for the extended RAM a 32-bit game runs in.
+    ///
+    /// DERIVED FROM `may_own_memory`, which is the hand-written superset of every
+    /// aperture: of its three regions, the legacy one ends at 0x000C_0000 (below
+    /// 1 MB, so it cannot bound this), Margo's LFB+MMIO block starts at
+    /// `MARGO_LFB_BASE`, and Distira's BAR starts wherever the guest last wrote
+    /// BAR0. Any aperture added to `may_own_memory` above 1 MB MUST be added
+    /// here as well; `may_own_memory_agrees_with_the_extended_floor` is the test
+    /// that fails when one is not.
+    pub(crate) fn device_free_extended_floor(&self) -> u32 {
+        if self.distira_memory_enabled() && self.distira_mem_base < MARGO_LFB_BASE {
+            self.distira_mem_base
+        } else {
+            MARGO_LFB_BASE
+        }
+    }
+
+    /// Called by the bus each time it enters the gauntlet to classify an address
+    /// for timing. See [`Vega::device_window_classifications`].
+    #[cfg(test)]
+    pub(crate) fn note_device_window_classification(&self) {
+        self.device_window_classifications
+            .set(self.device_window_classifications.get() + 1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_window_classifications(&self) -> u64 {
+        self.device_window_classifications.get()
     }
 
     pub(crate) fn owns_memory(&self, address: u32, width: usize) -> bool {
