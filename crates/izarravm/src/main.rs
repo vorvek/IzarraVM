@@ -15,6 +15,7 @@ mod crt;
 mod gui;
 mod host_input;
 mod ipe_trace;
+mod mode_census_json;
 mod prefs;
 #[cfg(windows)]
 mod riprofile;
@@ -34,6 +35,7 @@ use izarravm_machine::{
     ActiveDisplay, ExecutionBackend, Machine, MachineHostProfileSnapshot, MachineProfile,
     PerfCounters, StopReason, set_process_execution_backend,
 };
+use mode_census_json::mode_census_json;
 use serde_json::json;
 use startup::ResolvedStartup;
 use std::cmp::Reverse;
@@ -166,6 +168,24 @@ struct Cli {
     /// published frame, and a substitute would read as a measurement.
     #[arg(long)]
     presented_ppm: Option<PathBuf>,
+    /// With --hdd-folder, write the video mode census to this JSON path at the
+    /// end of the run: every geometry the guest programmed and how many times.
+    ///
+    /// The key is the CRTC's own fields, not a presented pixel count, because
+    /// 200 visible lines double scanned and 199 lines single scanned both
+    /// present 400 raster lines and a pixel height cannot separate them.
+    ///
+    /// The COUNT is the part no other instrument reports. A guest that replays
+    /// its CRTC register table every frame reads in the thousands where a guest
+    /// that sets a mode once reads two or three, and that is the property a
+    /// raster-erase defect hid behind for as long as it did.
+    ///
+    /// The counter itself always runs and costs nothing on the hot path, because
+    /// a mode set is rare. Only the write is gated on this flag. Unlike
+    /// --screen-dump-dir it does not slice the run, so a census run is still a
+    /// benchmark path.
+    #[arg(long, requires = "hdd_folder")]
+    mode_census: Option<PathBuf>,
     /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
     #[arg(long, requires = "hdd_folder")]
     expect_test_exit: bool,
@@ -383,6 +403,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             cli.dump_result,
             cli.result_ppm.as_deref(),
             cli.presented_ppm.as_deref(),
+            cli.mode_census.as_deref(),
             cli.profile_json.as_deref(),
             cli.expect_test_exit,
             cli.inject_keys.as_deref(),
@@ -1530,6 +1551,7 @@ fn run_boot_hdd_folder(
     dump_result: bool,
     result_ppm: Option<&Path>,
     presented_ppm: Option<&Path>,
+    mode_census: Option<&Path>,
     profile_json: Option<&Path>,
     expect_test_exit: bool,
     inject_keys: Option<&str>,
@@ -1930,6 +1952,16 @@ fn run_boot_hdd_folder(
         } else {
             println!("presented: none (no completed raster)");
         }
+    }
+    if let Some(path) = mode_census {
+        let census = mode_census_json(machine.mode_census(), machine.distira_census());
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&census)?
+                + "
+",
+        )?;
+        println!("mode census: {}", path.display());
     }
     // Final reconcile. Katea projects completed write commands to the host as
     // they happen, but a write whose FAT, directory or path was still

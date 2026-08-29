@@ -2414,6 +2414,19 @@ impl Machine {
         self.vega.active_video_mode()
     }
 
+    /// Every geometry the guest programmed on the legacy VGA path, against
+    /// its count. See `izarravm_video::mode_census` for why the key is the
+    /// CRTC's own fields and not a presented pixel count.
+    pub fn mode_census(&self) -> &ModeCensus {
+        self.vega.mode_census()
+    }
+
+    /// Every frame size the guest gave Distira, against its count. An empty
+    /// census means the guest never reached the 3D unit.
+    pub fn distira_census(&self) -> &DistiraCensus {
+        self.vega.distira_census()
+    }
+
     pub fn margo_display(&self) -> Option<crate::MargoDisplay> {
         self.vega.margo_active().then(|| self.vega.margo_display())
     }

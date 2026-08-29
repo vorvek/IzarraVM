@@ -10,8 +10,8 @@ use std::sync::Arc;
 use izarravm_bus::{BusWidth, Memory};
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 use izarravm_video::{
-    CGA_FB_SIZE, DAC_ENTRIES, Distira, HGC_FB_SIZE, MARGO_FRAME_HZ, MARGO_MMIO_SIZE,
-    MARGO_VRAM_SIZE, Margo, MargoDisplay, MargoScanTiming, TextFrame, VGA_MODE13H_BASE,
+    CGA_FB_SIZE, DAC_ENTRIES, Distira, DistiraCensus, HGC_FB_SIZE, MARGO_FRAME_HZ, MARGO_MMIO_SIZE,
+    MARGO_VRAM_SIZE, Margo, MargoDisplay, MargoScanTiming, ModeCensus, TextFrame, VGA_MODE13H_BASE,
     VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode,
 };
 
@@ -502,6 +502,14 @@ impl Vega {
 
     pub(crate) fn active_video_mode(&self) -> VideoMode {
         self.vga.active_mode()
+    }
+
+    pub(crate) fn mode_census(&self) -> &ModeCensus {
+        self.vga.mode_census()
+    }
+
+    pub(crate) fn distira_census(&self) -> &DistiraCensus {
+        self.distira.census()
     }
 
     pub(crate) fn mode13_direct_page_available(&self) -> bool {

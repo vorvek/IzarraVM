@@ -25,7 +25,7 @@ use izarravm_video::{
     CGA_FB_SIZE, DAC_ENTRIES, MARGO_VBE_MODES, TextFrame, VGA_PLANAR_WINDOW_SIZE,
     VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, bytes_per_pixel, font, pixel_format, vbe_mode,
 };
-pub use izarravm_video::{MARGO_ID_VALUE, MargoDisplay, VideoMode};
+pub use izarravm_video::{DistiraCensus, MARGO_ID_VALUE, MargoDisplay, ModeCensus, VideoMode};
 #[cfg(test)]
 use izarravm_video::{Margo, Vga, VgaRaster};
 use std::collections::VecDeque;
