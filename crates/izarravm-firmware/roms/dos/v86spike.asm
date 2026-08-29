@@ -117,6 +117,12 @@ pm_entry:
     mov esp, 0x7000
     mov ax, 0x18
     ltr ax
+    ; IVT[8] must exist BEFORE the iretd below: programming the PIT in the
+    ; boot stage raised channel 0's OUT from its power-on low, and that
+    ; write-side rising edge latched an IRQ0 request. The V86 frame carries
+    ; real IF=1, so the tick can deliver on the stub's FIRST instruction.
+    mov word [0x20], v86_timer
+    mov word [0x22], 0
     push dword 0                            ; GS
     push dword 0                            ; FS
     push dword 0                            ; DS

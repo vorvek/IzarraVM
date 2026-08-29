@@ -54,7 +54,7 @@ crates/izarravm-firmware/roms/dos/type.com	generated-guest-binary	IzarraVM proje
 crates/izarravm-firmware/roms/dos/umbmech.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	06e04e3855157df3215fd14bb84df0467e56fc230ecea3e22e2d6a40d0a545cc
 crates/izarravm-firmware/roms/dos/umbtest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	6d6511b1040256e62f7e9f9231a01077b89623de1285655a4e1ea20d408ac42a
 crates/izarravm-firmware/roms/dos/unhalt.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	82dc6645243b51946270f5516174a0ed9a41567a50f60f16737aad5b77e9bae1
-crates/izarravm-firmware/roms/dos/v86spike.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	cb9a380c1367c038c3d6b9101dd80abcefa1375515be4857d0d274572245c865
+crates/izarravm-firmware/roms/dos/v86spike.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	13501fdcb88185aaf347ad5604d9af4b47b1ed9fb6eed6e82043dd396fcc5f83
 crates/izarravm-firmware/roms/dos/vcpidet.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	701e71522453b1e6b8887ce302f4e8fe555fd9153dabedf781a86aa8d7e7c2a9
 crates/izarravm-firmware/roms/dos/vcpiif.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	61c18058cca4a4936775fe13918d14641e8eceffc7495c878fef4b7331cfefdd
 crates/izarravm-firmware/roms/dos/vcpilow.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	5440f42b004acfbe146ba2614088d52ad13669b7698a24d61a282876b589175c
@@ -113,7 +113,7 @@ docs/izarra-3000-chassis.jpg	project-artwork	IzarraVM project	GPL-3.0-only	2c1ee
 docs/izarra3000-logo.png	project-artwork	IzarraVM project	GPL-3.0-only	2533847bd1b9db59b06e6af6f70c83e94ebadec04195a5df9eff74507f78fb91
 docs/izarravm-screenshot.png	project-screenshot	IzarraVM project	GPL-3.0-only	cc5204840f4185cd4bfa50ef7a5650c9d7d51031ce8abdcb9502c21d16e10357
 docs/resonique2/sndctrl.png	project-screenshot	IzarraVM project	GPL-3.0-only	7a03094a1086619d5a4b51385fe1c7632189df8809aee06dcd37508c461bc824
-scripts/fixture-scoreboard-invariants.json	test-fixture	IzarraVM project	GPL-3.0-only	64fcd4cbf42d5d2728f5fe2dc86bd2f15b8b9366e071f5a4345af35214237b89
+scripts/fixture-scoreboard-invariants.json	test-fixture	IzarraVM project	GPL-3.0-only	5def32a4f8de4d528504718e99f5af5b180d85a09e5b8ccca0bbf70b89b7fbf0
 scripts/realtime-gate-inputs.json	test-fixture	IzarraVM project	GPL-3.0-only	394d48133a154f86900f1f1f83cb7c5f35b3b19023e992449a8d6e7eba1413d4
 third_party/fluidr3mono/FluidR3Mono_GM.sf3	vendored-soundfont	FluidR3Mono from MuseScore	MIT	cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2
 third_party/fluidr3mono/FluidR3Mono_License.md	third-party-license-text	FluidR3Mono by Frank Wen and Michael Cowgill	MIT	09926f9451f751408abd65162c99343f840234d2a708584808fd46427633063f

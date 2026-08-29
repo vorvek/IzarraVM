@@ -2704,6 +2704,64 @@ fn wss_carries_frames_a_short_render_window_did_not_claim() {
 }
 
 #[test]
+fn mpu_diagnostics_classify_commands_and_split_the_two_parts() {
+    // The counters exist to answer "which MPU carries the music, and in which
+    // mode". The command classification mirrors the Mpu401 decoder: 0xFF
+    // reset, 0x3F UART, and the 0x00-0x2F start/stop bit pairs.
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        // Wavetable part at 0x300/0x301: reset, enter UART, one 3-byte note-on.
+        bus.write_io(0x301, BusWidth::Byte, 0xff, false).unwrap();
+        bus.read_io(0x300, BusWidth::Byte, 0, false).unwrap(); // ACK
+        bus.write_io(0x301, BusWidth::Byte, 0x3f, false).unwrap();
+        // In UART mode the part ignores every command except reset, and the
+        // classifier must ignore the same bytes: this start-play must not
+        // count as intelligent-mode activity.
+        bus.write_io(0x301, BusWidth::Byte, 0x08, false).unwrap();
+        for byte in [0x90u8, 60, 100] {
+            bus.write_io(0x300, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+        bus.read_io(0x301, BusWidth::Byte, 0, false).unwrap(); // status
+        // MIDI part at 0x330/0x331: intelligent-mode start and stop play.
+        bus.write_io(0x331, BusWidth::Byte, 0x08, false).unwrap();
+        bus.write_io(0x331, BusWidth::Byte, 0x05, false).unwrap();
+    });
+
+    let (wavetable, midi) = machine.mpu_diagnostics();
+    assert_eq!(wavetable.command_writes, 3);
+    assert_eq!(wavetable.resets, 1);
+    assert_eq!(wavetable.uart_enters, 1);
+    assert_eq!(
+        wavetable.start_playbacks, 0,
+        "a command the UART-mode part ignores must not be classified"
+    );
+    assert_eq!(wavetable.data_writes, 3);
+    assert_eq!(wavetable.data_reads, 1);
+    assert_eq!(wavetable.status_reads, 1);
+    assert_eq!(midi.command_writes, 2);
+    assert_eq!(midi.start_playbacks, 1);
+    assert_eq!(midi.stop_playbacks, 1);
+    assert_eq!(midi.data_writes, 0, "the parts must not share counters");
+
+    // The queued messages reach the synth through the drain, and the drain is
+    // what counts output messages. The reset queued its own 0xFF plus the
+    // all-notes-off sweep ahead of the UART note-on, so drain everything and
+    // assert the note-on arrived and the counters saw every message.
+    let mut drained = Vec::new();
+    while let Some(message) = machine.take_wavetable_midi_message() {
+        drained.push(message.bytes);
+    }
+    assert!(drained.contains(&vec![0x90, 60, 100]), "{drained:?}");
+    let (wavetable, _) = machine.mpu_diagnostics();
+    assert_eq!(wavetable.output_messages, drained.len() as u64);
+    assert_eq!(
+        wavetable.output_bytes,
+        drained.iter().map(|m| m.len() as u64).sum::<u64>()
+    );
+}
+
+#[test]
 fn opl_diagnostics_classify_writes_reads_and_key_state() {
     // The counters exist to answer "did the guest strike any notes", so the
     // key-on/key-off split is the load-bearing part: 0xB0-0xB8 bit 5 is KEY ON,

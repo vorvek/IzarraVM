@@ -333,6 +333,61 @@ fn pit_bulk_advance_arms_are_identical_through_the_device_advance() {
 }
 
 #[test]
+fn pit_control_word_that_raises_out_is_an_irq0_edge() {
+    // Tyrian 2000's Loudness driver reprograms channel 0 (control word 0x36,
+    // then a 70 Hz reload) once per video frame from its main loop. On the
+    // 8254 the control word forces OUT to the mode's initial HIGH level at
+    // once, with no CLK involved. When the write lands in the LOW half of the
+    // running square wave, that low-to-high move on channel 0 IS an IRQ0
+    // rising edge. Swallowing it starves the driver's clock: the setup menu
+    // goes silent and the game's time dilates (2026-08-28).
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        // Mode 3, lo/hi, reload 0x4300 = 17152 CLKs (~69.6 Hz), the exact
+        // program the game writes.
+        bus.write_io(0x43, BusWidth::Byte, 0x36, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x43, false).unwrap();
+    });
+    // Land inside the LOW half: past 8576 CLKs, short of the 17152-CLK period.
+    let ticks_per_clk = izarravm_core::MASTER_CLOCK_HZ / u64::from(crate::PIT_INPUT_HZ);
+    machine.advance_devices_ticks(ticks_per_clk * 12_000);
+    assert!(
+        !machine.pit.channel_out(0),
+        "the advance must land in the low half of the square wave"
+    );
+    let (edges_before, _, _) = machine.timer_diagnostics();
+
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0x36, false).unwrap();
+    });
+
+    assert!(
+        machine.pit.channel_out(0),
+        "the control word forces OUT to its initial high level with no CLK"
+    );
+    let (edges_after, _, _) = machine.timer_diagnostics();
+    assert_eq!(
+        edges_after,
+        edges_before + 1,
+        "the write-side low-to-high move must reach the PIC as an IRQ0 edge"
+    );
+
+    // The high-to-high case is NOT an edge: reprogramming while OUT is
+    // already high must stay silent, or every rewrite would double-tick.
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0x36, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x43, false).unwrap();
+    });
+    let (edges_final, _, _) = machine.timer_diagnostics();
+    assert_eq!(
+        edges_final, edges_after,
+        "a rewrite with OUT already high is not an edge"
+    );
+}
+
+#[test]
 fn device_only_advance_moves_global_time_not_cpu_work() {
     let mut machine = test_machine();
     let work_before = machine.elapsed_clocks();

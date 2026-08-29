@@ -2818,6 +2818,12 @@ fn pit_capture_preserves_the_exact_586_irq0_deadline() {
         machine.set_mode(GswMode::Gsw586);
         initialize_pic_pair(&mut machine, false);
         write_pit_port(&mut machine, 0x43, 0x34);
+        // The control word raised channel 0's OUT from its power-on low, and
+        // that write-side move is a real IRQ0 edge (the 8254 forces OUT with
+        // no CLK). Consume it here: this test pins the NEXT, counted edge.
+        assert!(machine.pic.irr_bit(0));
+        assert_eq!(machine.pic.acknowledge(), Some(0x20));
+        write_pic_port(&mut machine, 0x20, 0x20);
         write_pit_port(&mut machine, 0x40, 4);
         write_pit_port(&mut machine, 0x40, 0);
         machine
@@ -2877,6 +2883,11 @@ fn pit_timeline_and_pic_payloads_match_split_586_advancement() {
         machine.set_mode(GswMode::Gsw586);
         initialize_pic_pair(&mut machine, false);
         write_pit_port(&mut machine, 0x43, 0x34);
+        // Consume the write-side edge (the control word raised OUT from its
+        // power-on low), so the irr assertion below proves the COUNTED edge
+        // of the advance arrived, not this configure-time one.
+        assert_eq!(machine.pic.acknowledge(), Some(0x20));
+        write_pic_port(&mut machine, 0x20, 0x20);
         write_pit_port(&mut machine, 0x40, 7);
         write_pit_port(&mut machine, 0x40, 0);
         machine

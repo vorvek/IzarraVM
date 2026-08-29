@@ -438,6 +438,110 @@ fn direct_poll_skip_engages_through_native_codegen() {
     );
 }
 
+/// The 16-bit screen: a 0x3DA call-out from a 16-bit code segment must decline
+/// BEFORE the scan. Every shape is 32-bit (`poll_head_possible` requires `d`),
+/// so the scan can only ever say no -- and it says no expensively, one block
+/// decode plus its allocations per call-out. Tyrian 2000 spins on 0x3DA from
+/// 16-bit native blocks and paid 1.5e9 doomed scans, ~80% of its wall,
+/// before this screen existed (2026-08-29; the OFF-arm A/B measured 5.2x at
+/// 586 and 4.0x at 486 on identical retired instructions).
+#[cfg(feature = "jit")]
+#[test]
+fn a_sixteen_bit_callout_declines_before_the_scan() {
+    // The same 3-slot spin as `direct_poll_skip_engages_through_native_codegen`,
+    // but with the fixture's 16-bit default cs kept as it is.
+    let program = [0xec, 0xa8, 0x08, 0x75, 0xfb];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    machine.set_jit_auto_admit(true);
+    machine.cpu.set_native_backend_enabled(true);
+    machine.cpu.set_direct_poll_skip_override(Some(true));
+    machine.cpu.registers.set_edx(0x03da);
+    machine.cpu.registers.eip = 0x100;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    set_status1_bit(&mut machine, 0x08, true);
+
+    machine
+        .run_cycles(2_000_000)
+        .expect("the fixture must not stop the machine");
+    let snapshot = machine.cpu.direct_stall_snapshot();
+    assert!(
+        snapshot.poll_attempts > 0,
+        "the 16-bit spin never reached the port call-out at all \
+         (blocks_installed={})",
+        machine.cpu.perf_counters().jit_direct_blocks_installed,
+    );
+    assert!(
+        snapshot.poll_declined_sixteen_bit > 0,
+        "a 16-bit cs must land in the sixteen-bit lane; attempts={} declined(port={} \
+         knob={} eligibility={} shape={})",
+        snapshot.poll_attempts,
+        snapshot.poll_declined_port,
+        snapshot.poll_declined_knob,
+        snapshot.poll_declined_eligibility,
+        snapshot.poll_declined_shape,
+    );
+    assert_eq!(
+        snapshot.poll_declined_shape, 0,
+        "no scan may run for a 16-bit cs -- the shape lane counts scans that ran"
+    );
+}
+
+/// The call-out-site negative cache: a 32-bit loop that reads 0x3DA but does
+/// not certify (a NOP breaks the 3-slot shape) must be SCANNED ONCE and then
+/// answered from the interpreter path's own negative cache, not re-scanned on
+/// every iteration. The cache key is the scan anchor; the page-insert
+/// generation guard invalidates it exactly as it does for the interpreter.
+#[cfg(feature = "jit")]
+#[test]
+fn a_non_certifiable_callout_scan_is_answered_from_the_negative_cache() {
+    // `in al,dx; test al,0x08; nop; jnz $-5`: the NOP is a code byte no shape
+    // holds, so the backward scan returns a structural (cacheable) negative.
+    let program = [0xec, 0xa8, 0x08, 0x90, 0x75, 0xfa];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    machine.set_jit_auto_admit(true);
+    machine.cpu.set_native_backend_enabled(true);
+    machine.cpu.set_direct_poll_skip_override(Some(true));
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    let mut cs = machine.cpu.registers.cs();
+    cs.default_size_32 = true;
+    cs.limit = u32::MAX;
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    machine.cpu.registers.set_edx(0x03da);
+    machine.cpu.registers.eip = 0x100;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    set_status1_bit(&mut machine, 0x08, true);
+
+    machine
+        .run_cycles(2_000_000)
+        .expect("the fixture must not stop the machine");
+    let snapshot = machine.cpu.direct_stall_snapshot();
+    let perf = machine.cpu.perf_counters();
+    assert!(
+        snapshot.poll_declined_shape > 2,
+        "the spin must decline on shape repeatedly; attempts={}",
+        snapshot.poll_attempts,
+    );
+    assert!(
+        perf.poll_neg_cache_stores >= 1,
+        "the first structural negative must be stored"
+    );
+    assert!(
+        perf.poll_neg_cache_hits > 0
+            && perf.poll_neg_cache_hits + perf.poll_neg_cache_stores + perf.poll_neg_cache_volatile
+                >= snapshot.poll_declined_shape,
+        "later call-outs must answer from the cache instead of re-scanning: \
+         hits={} stores={} volatile={} against {} shape declines",
+        perf.poll_neg_cache_hits,
+        perf.poll_neg_cache_stores,
+        perf.poll_neg_cache_volatile,
+        snapshot.poll_declined_shape,
+    );
+}
+
 /// **Rank-2 killer**: `build_poll_loop_from`'s `slot_delta` composition in a CHAINED block. The
 /// fixture above deliberately puts the poll loop AT its own block's entry ("no chain/re-entry
 /// subtlety to get wrong", its own comment says so); this one puts the poll loop in a SECOND

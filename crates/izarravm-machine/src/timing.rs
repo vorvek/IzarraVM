@@ -230,6 +230,8 @@ impl Machine {
             sb16.advance(advance.microseconds, advance.dsp_frames, dma, memory)
         };
         if let Some(irq) = sb16_irq {
+            let now = self.timeline.now_ticks();
+            self.opl_probe.count_sb_irq_request(now);
             self.pic.request(irq.line());
         }
 
@@ -348,7 +350,9 @@ impl Machine {
         // Per-edge forwarding, same multi-edge contract as the DSP loop above:
         // N channel-0 edges in one step issue N requests and the PIC's IRR
         // coalesces them into the one interrupt the guest can actually take.
+        let now = self.timeline.now_ticks();
         for _ in 0..edges {
+            self.opl_probe.count_irq0_edge(now);
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
 

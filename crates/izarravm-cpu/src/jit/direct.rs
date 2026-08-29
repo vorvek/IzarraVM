@@ -24543,86 +24543,116 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
             && !crate::run::diff_trace_enabled())
         {
             cpu.jit_direct.note_poll_declined_eligibility();
+        } else if !cpu.registers.cs().default_size_32 {
+            // The 16-bit screen, BEFORE the scan. Every shape is 32-bit by
+            // construction (`poll_head_possible` requires `d`), so a 16-bit
+            // cs can never certify and the scan below would burn a block
+            // decode plus its `Vec` allocations to say no. Tyrian 2000 spins
+            // on 0x3DA from 16-bit native blocks: 1.5e9 doomed scans, ~80%
+            // of its wall, until this screen existed (2026-08-29; OFF-arm
+            // A/B: 5.2x at 586, 4.0x at 486, identical retired
+            // instructions). The interpreter path has carried the same
+            // screen inside `poll_head_possible` all along.
+            cpu.jit_direct.note_poll_declined_sixteen_bit();
         } else {
             let slot_linear = cpu
                 .registers
                 .cs()
                 .base
                 .wrapping_add(cpu.registers.eip.wrapping_add(slot_delta as u32));
-            match build_poll_loop_from(cpu, slot_linear) {
-                PollScanOutcome::NegativeCacheable | PollScanOutcome::NegativeVolatile => {
-                    cpu.jit_direct.note_poll_declined_shape();
-                }
-                PollScanOutcome::Found(poll) => {
-                    // Unreachable by construction (review MEDIUM 7 on the GP2 poll-skip design: a
-                    // backward scan containing an `IN` slot cannot return a memory-family shape,
-                    // which has no `0xEC` fetch start). `debug_assert!` rather than a counted
-                    // decline lane the review found could never be non-zero.
-                    debug_assert_eq!(
-                        poll.family(),
-                        PollFamily::Io,
-                        "a port call-out's backward scan certified a non-Io shape"
-                    );
-                    // Positional: the slot the scan was told to contain must be the shape's OWN
-                    // `IN` fetch, one byte long. `build_poll_loop_from`'s containment test already
-                    // guarantees SOME fetch matches `slot_linear`; this pins it to the right one.
-                    debug_assert!(
-                        (0..poll.fetch_count()).any(|index| poll
-                            .fetch(index)
-                            .is_some_and(|(linear, _, len)| linear == slot_linear && len == 1)),
-                        "the certified shape does not contain this call-out's own IN slot"
-                    );
-                    if poll.family() != PollFamily::Io || poll.resolved_port(cpu) != 0x03da {
-                        cpu.jit_direct.note_poll_declined_port_source();
-                    } else {
-                        bus.publish_core_clocks(now);
-                        let mut fetches = [(0u32, 0u32, 0u8); 6];
-                        for (slot, index) in fetches.iter_mut().zip(0..poll.fetch_count()) {
-                            if let Some(fetch) = poll.fetch(index) {
-                                *slot = fetch;
-                            }
+            // The interpreter path's negative cache, on the same key
+            // discipline: the scan ANCHOR (its `current`), a structural
+            // negative only, guarded by the page insert generation. `d` is
+            // `true` on every path past the screen above. Without this a
+            // 32-bit loop that never certifies re-scans on every iteration.
+            if cpu.poll_neg_cache_enabled && cpu.decode_cache.poll_negative_live(slot_linear, true)
+            {
+                cpu.perf.poll_neg_cache_hits += 1;
+                cpu.jit_direct.note_poll_declined_shape();
+            } else {
+                match build_poll_loop_from(cpu, slot_linear) {
+                    PollScanOutcome::NegativeCacheable => {
+                        if cpu.poll_neg_cache_enabled {
+                            cpu.perf.poll_neg_cache_stores += 1;
+                            cpu.decode_cache.record_poll_negative(slot_linear, true);
                         }
-                        let (core_num, core_den) = crate::level_timing(cpu.persona());
-                        let request = CalloutPollSkipRequest {
-                            fetches,
-                            fetch_count: poll.fetch_count() as u8,
-                            status_mask: poll.status_mask(),
-                            spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
-                            raw_core_clocks: poll.raw_core_clocks(),
-                            core_clocks_at_block_entry: cpu.core_clocks_so_far,
-                            prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
-                            core_num,
-                            core_den,
-                            timing_rem: cpu.poll_skip_timing_remainder(),
-                            cap: cpu.jit_direct.block_batch_cap(),
-                            bus_scaled_at_run_entry: cpu.jit_direct.block_bus_at_entry(),
-                            min_iterations: direct_poll_skip_min_iterations(),
-                            max_skipped_raw: direct_poll_skip_max_raw(),
-                        };
-                        match bus.callout_poll_skip(&request) {
-                            Ok(outcome) => {
-                                extra_raw_clocks = outcome.skipped_raw_core_clocks;
-                                now = outcome.now_after;
-                                bus.publish_core_clocks(now);
-                                forced_step_break = true;
-                                let head = poll.fetch(0).map_or(slot_linear, |(l, _, _)| l);
-                                cpu.jit_direct.note_poll_skip_span(
-                                    poll.diagnostic_class(),
-                                    outcome.iterations,
-                                    outcome.skipped_raw_core_clocks,
-                                    outcome.committed_raw_bus_clocks,
-                                    head,
-                                );
+                        cpu.jit_direct.note_poll_declined_shape();
+                    }
+                    PollScanOutcome::NegativeVolatile => {
+                        cpu.perf.poll_neg_cache_volatile += 1;
+                        cpu.jit_direct.note_poll_declined_shape();
+                    }
+                    PollScanOutcome::Found(poll) => {
+                        // Unreachable by construction (review MEDIUM 7 on the GP2 poll-skip design: a
+                        // backward scan containing an `IN` slot cannot return a memory-family shape,
+                        // which has no `0xEC` fetch start). `debug_assert!` rather than a counted
+                        // decline lane the review found could never be non-zero.
+                        debug_assert_eq!(
+                            poll.family(),
+                            PollFamily::Io,
+                            "a port call-out's backward scan certified a non-Io shape"
+                        );
+                        // Positional: the slot the scan was told to contain must be the shape's OWN
+                        // `IN` fetch, one byte long. `build_poll_loop_from`'s containment test already
+                        // guarantees SOME fetch matches `slot_linear`; this pins it to the right one.
+                        debug_assert!(
+                            (0..poll.fetch_count()).any(|index| poll
+                                .fetch(index)
+                                .is_some_and(|(linear, _, len)| linear == slot_linear && len == 1)),
+                            "the certified shape does not contain this call-out's own IN slot"
+                        );
+                        if poll.family() != PollFamily::Io || poll.resolved_port(cpu) != 0x03da {
+                            cpu.jit_direct.note_poll_declined_port_source();
+                        } else {
+                            bus.publish_core_clocks(now);
+                            let mut fetches = [(0u32, 0u32, 0u8); 6];
+                            for (slot, index) in fetches.iter_mut().zip(0..poll.fetch_count()) {
+                                if let Some(fetch) = poll.fetch(index) {
+                                    *slot = fetch;
+                                }
                             }
-                            // M3: `Cap` is split into its own lane -- it is exactly what BOTH
-                            // BLOCKER 1 and BLOCKER 2 surfaced through before their fixes, so a
-                            // ladder profile needs to tell "the budget genuinely ran out" apart
-                            // from "the other four screens declined" (`poll_declined_seam`).
-                            Err(CalloutPollDecline::Cap) => {
-                                cpu.jit_direct.note_poll_declined_cap();
-                            }
-                            Err(_) => {
-                                cpu.jit_direct.note_poll_declined_seam();
+                            let (core_num, core_den) = crate::level_timing(cpu.persona());
+                            let request = CalloutPollSkipRequest {
+                                fetches,
+                                fetch_count: poll.fetch_count() as u8,
+                                status_mask: poll.status_mask(),
+                                spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
+                                raw_core_clocks: poll.raw_core_clocks(),
+                                core_clocks_at_block_entry: cpu.core_clocks_so_far,
+                                prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
+                                core_num,
+                                core_den,
+                                timing_rem: cpu.poll_skip_timing_remainder(),
+                                cap: cpu.jit_direct.block_batch_cap(),
+                                bus_scaled_at_run_entry: cpu.jit_direct.block_bus_at_entry(),
+                                min_iterations: direct_poll_skip_min_iterations(),
+                                max_skipped_raw: direct_poll_skip_max_raw(),
+                            };
+                            match bus.callout_poll_skip(&request) {
+                                Ok(outcome) => {
+                                    extra_raw_clocks = outcome.skipped_raw_core_clocks;
+                                    now = outcome.now_after;
+                                    bus.publish_core_clocks(now);
+                                    forced_step_break = true;
+                                    let head = poll.fetch(0).map_or(slot_linear, |(l, _, _)| l);
+                                    cpu.jit_direct.note_poll_skip_span(
+                                        poll.diagnostic_class(),
+                                        outcome.iterations,
+                                        outcome.skipped_raw_core_clocks,
+                                        outcome.committed_raw_bus_clocks,
+                                        head,
+                                    );
+                                }
+                                // M3: `Cap` is split into its own lane -- it is exactly what BOTH
+                                // BLOCKER 1 and BLOCKER 2 surfaced through before their fixes, so a
+                                // ladder profile needs to tell "the budget genuinely ran out" apart
+                                // from "the other four screens declined" (`poll_declined_seam`).
+                                Err(CalloutPollDecline::Cap) => {
+                                    cpu.jit_direct.note_poll_declined_cap();
+                                }
+                                Err(_) => {
+                                    cpu.jit_direct.note_poll_declined_seam();
+                                }
                             }
                         }
                     }
@@ -28470,6 +28500,13 @@ pub(crate) struct DirectStallTally {
     pub poll_declined_port_source: u64,
     pub poll_declined_knob: u64,
     pub poll_declined_eligibility: u64,
+    /// The 16-bit-code screen, BEFORE the scan: every shape is 32-bit, so a
+    /// cs with `default_size_32 == false` can never certify and the scan
+    /// would burn a block decode plus its allocations to say so. Tyrian 2000
+    /// spins on 0x3DA from 16-bit native blocks and paid 1.5e9 doomed scans
+    /// (~80% of its wall) through `poll_declined_shape` before this screen
+    /// existed (2026-08-29).
+    pub poll_declined_sixteen_bit: u64,
     pub poll_declined_shape: u64,
     /// `MachineBus::callout_poll_skip` declining through `CalloutPollDecline::Cap` -- split OUT of
     /// `poll_declined_seam` (M3, GP2 poll-skip revision report): `Cap` is exactly the lane BOTH
@@ -30037,6 +30074,7 @@ impl crate::jit::JitState {
             poll_declined_port_source: self.stalls.poll_declined_port_source,
             poll_declined_knob: self.stalls.poll_declined_knob,
             poll_declined_eligibility: self.stalls.poll_declined_eligibility,
+            poll_declined_sixteen_bit: self.stalls.poll_declined_sixteen_bit,
             poll_declined_shape: self.stalls.poll_declined_shape,
             poll_declined_cap: self.stalls.poll_declined_cap,
             poll_declined_seam: self.stalls.poll_declined_seam,
@@ -30129,6 +30167,10 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_poll_declined_eligibility(&mut self) {
         self.stalls.poll_declined_eligibility += 1;
+    }
+
+    pub(crate) fn note_poll_declined_sixteen_bit(&mut self) {
+        self.stalls.poll_declined_sixteen_bit += 1;
     }
 
     pub(crate) fn note_poll_declined_shape(&mut self) {

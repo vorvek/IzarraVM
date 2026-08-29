@@ -524,6 +524,29 @@ function New-CoverageSelfTestProfile([UInt64]$Total, [UInt64]$Direct,
 }
 
 function Invoke-ScoreboardSelfTest {
+    # The profile-band grader must be provable RED: a gate that cannot fail is
+    # systemic. One in-range band, one below the floor, one missing path.
+    $bandProfile = [pscustomobject]@{
+        timer = [pscustomobject]@{ irq0_edges = 3500 }
+        mpu   = [pscustomobject]@{ wavetable = [pscustomobject]@{ data_writes = 90 } }
+    }
+    $bandPass = Test-ProfileBands $bandProfile @(
+        @{ path = "timer.irq0_edges"; min = 2400; max = 4800 })
+    Assert-ScoreboardSelfTestEqual $bandPass.failures.Count 0 "in-range band passes"
+    Assert-ScoreboardSelfTestEqual $bandPass.values["band_timer_irq0_edges"] 3500.0 `
+        "band value is recorded"
+    $bandFail = Test-ProfileBands $bandProfile @(
+        @{ path = "mpu.wavetable.data_writes"; min = 3000; max = 20000 })
+    Assert-ScoreboardSelfTestEqual $bandFail.failures.Count 1 "a collapsed count goes RED"
+    $bandMissing = Test-ProfileBands $bandProfile @(
+        @{ path = "sb_dsp.command_bytes"; min = 1; max = 2 })
+    Assert-ScoreboardSelfTestEqual $bandMissing.failures.Count 1 "a missing field goes RED"
+    # A path that stops one segment short resolves to an OBJECT; the grader
+    # must turn the failed cast into a RED row, never a terminating error.
+    $bandObject = Test-ProfileBands $bandProfile @(
+        @{ path = "mpu.wavetable"; min = 1; max = 2 })
+    Assert-ScoreboardSelfTestEqual $bandObject.failures.Count 1 "a non-numeric target goes RED"
+
     $noJit = Get-CoverageMetrics (New-CoverageSelfTestProfile 100 0 0 0 0)
     Assert-ScoreboardSelfTestEqual $noJit.interpreted_insns 100 "no-JIT instructions"
     Assert-ScoreboardSelfTestEqual $noJit.emitted_coverage 0.0 "no-JIT emitted coverage"
@@ -1039,6 +1062,42 @@ function New-FrameContract {
 # in the .DESCRIPTION above about why they are copied rather than normalised.
 # ---------------------------------------------------------------------------
 
+# Grade one profile against a row's `profileBands` (see the Tyrian rows).
+# Returns @{ values = <ordered name->number>; failures = <string[]> }. Pure so
+# the self-test can drive it red and green without an emulator run.
+function Test-ProfileBands($Profile, $Bands) {
+    $values = [ordered]@{}
+    $failures = @()
+    foreach ($band in $Bands) {
+        $value = $Profile
+        $resolved = $true
+        foreach ($segment in ($band.path -split '\.')) {
+            $property = if ($null -ne $value) { $value.PSObject.Properties[$segment] } else { $null }
+            if ($null -eq $property) { $resolved = $false; break }
+            $value = $property.Value
+        }
+        if (-not $resolved) {
+            $failures += "profile band '$($band.path)': the profile has no such field"
+            continue
+        }
+        # The cast throws under the script's Stop preference when the path
+        # resolves to a non-numeric node (a typo'd path that stops one segment
+        # short lands on an object). That must be one RED row, not a dead
+        # sweep -- a gate that can only crash is a gate that cannot fail.
+        $number = $null
+        try { $number = [double]$value } catch {
+            $failures += "profile band '$($band.path)': the value is not numeric"
+            continue
+        }
+        $values["band_" + ($band.path -replace '\.', '_')] = $number
+        if ($number -lt $band.min -or $number -gt $band.max) {
+            $failures += ("profile band '$($band.path)' is {0}, outside [{1}, {2}]" -f
+                $number, $band.min, $band.max)
+        }
+    }
+    @{ values = $values; failures = $failures }
+}
+
 function Get-FixtureTable {
     @(
         [pscustomobject]@{
@@ -1201,6 +1260,90 @@ function Get-FixtureTable {
             injection = @("--inject-mouse", ("3320000000:home;3652000000:move:320,386;" +
                 "3984000000:click;4648000000:move:0,-115;5146000000:click;" +
                 "5976000000:move:-273,181;6474000000:click"))
+        }
+        [pscustomobject]@{
+            # Tyrian 2000 SETUP.EXE: the settings menu, then the jukebox. The
+            # row exists for the guest's 70 Hz audio clock -- the Loudness
+            # driver paces music (MPU-401 MIDI at P300) and its DSP re-arm
+            # chain off a PIT channel 0 it reprograms every video frame, and
+            # the 2026-08-28 write-edge bug silenced exactly this screen.
+            # Schedule at 66 M cycles/guest-second: the menu is stable by 4 s;
+            # five {down}s walk the cursor to Jukebox at ~25 s, {enter} at
+            # ~27 s, {esc} back to the menu at ~59 s. The end frame is the
+            # static settings menu, so it takes an exact hash.
+            #
+            # The bands are liveness floors, not cadence pins. Measured on the
+            # fixed tree (854237ed, 486, 71.2 guest s, scoreboard-20260829-
+            # 001320): irq0_edges 4830 (70/s steady), MIDI data_writes 10823,
+            # DSP command bytes 14345. The broken parent reads irq0 ~100
+            # (edges stop at 3.5 s), MIDI 5237 (menu phases silent), DSP
+            # 6803. irq0 is the PRIMARY discriminator (~35x separation); the
+            # MIDI and DSP floors sit between the arms with thinner margins
+            # (broken 5237 / floor 7000 / fixed 10823, and 6803/8500/14345)
+            # and exist to catch a collapse the irq0 count alone cannot see,
+            # e.g. music dead with the timer alive.
+            name = "tyrian-setup-486"; folder = "tyrian_setup_c"
+            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
+            cycles = [uint64]4700000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            qconsole = $false; resultPpm = $true; dukemark = $null
+            injection = @("--inject-keys", ("1670000000:{down};1690000000:{down};" +
+                "1710000000:{down};1730000000:{down};1750000000:{down};" +
+                "1800000000:{enter};3900000000:{esc}"))
+            profileBands = @(
+                @{ path = "timer.irq0_edges"; min = 3500; max = 7000 }
+                @{ path = "mpu.wavetable.data_writes"; min = 7000; max = 21000 }
+                @{ path = "sb_dsp.command_bytes"; min = 8500; max = 26000 }
+            )
+        }
+        [pscustomobject]@{
+            # Tyrian 2000 gameplay: title -> Start New Game -> 1 Player Full
+            # Game -> episode -> difficulty -> station menu -> Start Level,
+            # then the left mouse button HELD from 31 s so the ship fires
+            # through the first waves. The ship dies at ~53 s under this
+            # schedule; the 3.2e9 budget (~48.5 guest s, ~17.5 s of play)
+            # ends the run safely inside gameplay. The end frame animates, so
+            # the row keeps no frame artifact at all and grades on bands.
+            # Same 70 Hz-clock liveness rationale as tyrian-setup-486.
+            name = "tyrian-486"; folder = "tyrian_c"
+            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
+            cycles = [uint64]3200000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            qconsole = $false; resultPpm = $false; dukemark = $null
+            injection = @(
+                "--inject-keys", ("1056000000:{enter};1188000000:{enter};" +
+                    "1320000000:{enter};1452000000:{enter};1650000000:{down};" +
+                    "1670000000:{down};1690000000:{down};1710000000:{down};" +
+                    "1780000000:{enter};1910000000:{enter}"),
+                "--inject-mouse", "2050000000:down")
+            profileBands = @(
+                @{ path = "timer.irq0_edges"; min = 2400; max = 4800 }
+                @{ path = "mpu.wavetable.data_writes"; min = 3000; max = 20000 }
+                @{ path = "sb_dsp.command_bytes"; min = 4000; max = 25000 }
+            )
+        }
+        [pscustomobject]@{
+            # The same gameplay run at 586, the persona the owner reports at
+            # ~10% realtime under load: this is the PERF row of the pair.
+            # Offsets are the 486 row's guest-second schedule at 166 M
+            # cycles/guest-second; the menus wait on input, so keys landing
+            # later than the screen appears is safe.
+            name = "tyrian-586"; folder = "tyrian_c"
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            cycles = [uint64]8050000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            qconsole = $false; resultPpm = $false; dukemark = $null
+            injection = @(
+                "--inject-keys", ("2656000000:{enter};2988000000:{enter};" +
+                    "3320000000:{enter};3652000000:{enter};4117000000:{down};" +
+                    "4167000000:{down};4216000000:{down};4266000000:{down};" +
+                    "4482000000:{enter};4814000000:{enter}"),
+                "--inject-mouse", "5163000000:down")
+            profileBands = @(
+                @{ path = "timer.irq0_edges"; min = 2400; max = 4800 }
+                @{ path = "mpu.wavetable.data_writes"; min = 3000; max = 20000 }
+                @{ path = "sb_dsp.command_bytes"; min = 4000; max = 25000 }
+            )
         }
         [pscustomobject]@{
             name = "tombraid-loader-586"; folder = "tombraid_loader_c"
@@ -2738,6 +2881,28 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
                     -Value $scraped.report
             }
         }
+    }
+
+    # PROFILE BANDS. A row may pin dotted profile-JSON fields to [min, max]
+    # ranges. The Tyrian rows use them for the guest's own audio-clock
+    # liveness: MPU-401 MIDI byte counts and IRQ0 edge counts collapse to
+    # near-zero when the 70 Hz tick starves (the 2026-08-28 PIT write-edge
+    # bug), and no frame hash can see that. Bands are deliberately WIDE --
+    # they exist to catch collapse and runaway, not cadence drift; the
+    # derivation of each row's numbers is beside the row in the table.
+    # A row with bands also demands the cycle_limit stop: every band was
+    # derived over the full budget, so a short run would read as collapse.
+    $bandsProperty = $Fixture.PSObject.Properties['profileBands']
+    if ($null -ne $bandsProperty -and $bandsProperty.Value) {
+        if ($profile.stop.kind -ne "cycle_limit") {
+            $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
+                "'cycle_limit' -- the profile bands were derived over the full budget")
+        }
+        $graded = Test-ProfileBands $profile $bandsProperty.Value
+        foreach ($entry in $graded.values.GetEnumerator()) {
+            $result | Add-Member -Force -NotePropertyName $entry.Key -NotePropertyValue $entry.Value
+        }
+        $failures += $graded.failures
     }
 
     $result.invariant = if ($failures.Count -eq 0) { "pass" } else { "FAIL" }

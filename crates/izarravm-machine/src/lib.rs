@@ -1087,6 +1087,54 @@ impl OplTraceEntry {
     pub const NO_REGISTER: u16 = 0x100;
 }
 
+/// Counters for one MPU-401 (the wavetable one at P300, or the MIDI one at
+/// P330). Diagnostic only, never read by an emulation decision. Always
+/// collected: every counted access already ends the CPU batch.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MpuDiagnostics {
+    pub command_writes: u64,
+    pub data_writes: u64,
+    pub data_reads: u64,
+    pub status_reads: u64,
+    /// Command 0x3F: the guest put the part in UART mode.
+    pub uart_enters: u64,
+    /// Command 0xFF.
+    pub resets: u64,
+    /// Intelligent-mode start-play commands (0x08 bit set in a 0x00-0x2F command).
+    pub start_playbacks: u64,
+    /// Intelligent-mode stop-play commands (0x04 bit set in a 0x00-0x2F command).
+    pub stop_playbacks: u64,
+    /// Complete MIDI messages the part emitted toward the synth. Counted at
+    /// the DRAIN (`take_*_midi_message`), which only the GUI's MIDI pump
+    /// calls -- a headless profile reads 0 here beside live `data_writes`,
+    /// and that zero means "nothing drained the queue", not "no music".
+    pub output_messages: u64,
+    pub output_bytes: u64,
+}
+
+/// What one `MidiTraceEntry` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidiTraceKind {
+    CommandWrite,
+    DataWrite,
+    DataRead,
+    /// A complete message handed to the synth; `value` is its status byte.
+    Output,
+}
+
+/// One recorded MPU-401 access or emitted message, for `IZARRAVM_MIDI_TRACE`.
+/// Status reads are counted but never traced: a guest polls status thousands
+/// of times a second and would exhaust any cap with no information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MidiTraceEntry {
+    pub kind: MidiTraceKind,
+    /// True for the wavetable MPU (P300), false for the MIDI MPU (P330).
+    pub wavetable: bool,
+    pub value: u8,
+    /// Fixed machine-timeline tick of the access, or of message completion.
+    pub master_ticks: u64,
+}
+
 /// Counters plus an optional capped access trace. `IZARRAVM_OPL_TRACE=<n>`
 /// records the first `n` accesses; unset records none and costs one `is_empty`
 /// style capacity check per access.
@@ -1101,19 +1149,60 @@ pub struct OplProbe {
     sb: SbDspDiagnostics,
     trace: Vec<OplTraceEntry>,
     cap: usize,
+    mpu_wavetable: MpuDiagnostics,
+    mpu_midi: MpuDiagnostics,
+    midi_trace: Vec<MidiTraceEntry>,
+    midi_cap: usize,
+    // Per-part UART latches, mirrored from the command stream so the
+    // classifier can ignore what the part ignores (see `record_mpu_command`).
+    mpu_wavetable_uart: bool,
+    mpu_midi_uart: bool,
+    pit_writes: u64,
+    pit_trace: Vec<PitTraceEntry>,
+    pit_cap: usize,
+    irq0_edges: u64,
+    sb_irq_requests: u64,
+}
+
+/// One recorded guest PIT port write, for `IZARRAVM_PIT_TRACE`. The written
+/// byte plus the port is enough to read back the guest's timer program: 0x43
+/// carries the mode word, 0x40-0x42 the reload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PitTraceEntry {
+    pub port: u16,
+    pub value: u8,
+    pub master_ticks: u64,
 }
 
 impl OplProbe {
     fn from_env() -> Self {
-        let cap = std::env::var("IZARRAVM_OPL_TRACE")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
+        // Shared off-spelling for all three trace knobs: unset, empty or
+        // garbage all read as 0 = off (see the env-null-vs-empty trap).
+        fn trace_cap(variable: &str) -> usize {
+            std::env::var(variable)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        }
+        let cap = trace_cap("IZARRAVM_OPL_TRACE");
+        let midi_cap = trace_cap("IZARRAVM_MIDI_TRACE");
+        let pit_cap = trace_cap("IZARRAVM_PIT_TRACE");
         Self {
             counters: OplDiagnostics::default(),
             sb: SbDspDiagnostics::default(),
             trace: Vec::new(),
             cap,
+            mpu_wavetable: MpuDiagnostics::default(),
+            mpu_midi: MpuDiagnostics::default(),
+            midi_trace: Vec::new(),
+            midi_cap,
+            mpu_wavetable_uart: false,
+            mpu_midi_uart: false,
+            pit_writes: 0,
+            pit_trace: Vec::new(),
+            pit_cap,
+            irq0_edges: 0,
+            sb_irq_requests: 0,
         }
     }
 
@@ -1202,6 +1291,150 @@ impl OplProbe {
             core_clocks,
             pending_micros: 0,
         });
+    }
+
+    pub fn mpu(&self, wavetable: bool) -> MpuDiagnostics {
+        if wavetable {
+            self.mpu_wavetable
+        } else {
+            self.mpu_midi
+        }
+    }
+
+    pub fn midi_trace(&self) -> &[MidiTraceEntry] {
+        &self.midi_trace
+    }
+
+    fn mpu_mut(&mut self, wavetable: bool) -> &mut MpuDiagnostics {
+        if wavetable {
+            &mut self.mpu_wavetable
+        } else {
+            &mut self.mpu_midi
+        }
+    }
+
+    fn midi_push(&mut self, kind: MidiTraceKind, wavetable: bool, value: u8, master_ticks: u64) {
+        if self.midi_trace.len() < self.midi_cap {
+            self.midi_trace.push(MidiTraceEntry {
+                kind,
+                wavetable,
+                value,
+                master_ticks,
+            });
+        }
+    }
+
+    /// Record a command-port write. The command classification mirrors the
+    /// `Mpu401` decoder without reading its state: 0x00-0x2F carries start/stop
+    /// bits, 0x3F enters UART, 0xFF resets -- and while the part sits in UART
+    /// mode it ignores everything except the reset, so the classifier keeps
+    /// its own per-part UART latch and ignores the same bytes. Without the
+    /// latch, a UART game whose stream bytes land on the command port would
+    /// read as intelligent-mode playback in the profile.
+    fn record_mpu_command(&mut self, wavetable: bool, value: u8, master_ticks: u64) {
+        let uart = if wavetable {
+            self.mpu_wavetable_uart
+        } else {
+            self.mpu_midi_uart
+        };
+        let mpu = self.mpu_mut(wavetable);
+        mpu.command_writes += 1;
+        match value {
+            0xff => {
+                mpu.resets += 1;
+                *self.mpu_uart_mut(wavetable) = false;
+            }
+            _ if uart => {}
+            0x3f => {
+                mpu.uart_enters += 1;
+                *self.mpu_uart_mut(wavetable) = true;
+            }
+            0x00..=0x2f if value & 0x0f < 0x0c => match value & 0x0c {
+                0x08 => mpu.start_playbacks += 1,
+                0x04 => mpu.stop_playbacks += 1,
+                _ => {}
+            },
+            _ => {}
+        }
+        self.midi_push(MidiTraceKind::CommandWrite, wavetable, value, master_ticks);
+    }
+
+    fn mpu_uart_mut(&mut self, wavetable: bool) -> &mut bool {
+        if wavetable {
+            &mut self.mpu_wavetable_uart
+        } else {
+            &mut self.mpu_midi_uart
+        }
+    }
+
+    fn record_mpu_data_write(&mut self, wavetable: bool, value: u8, master_ticks: u64) {
+        self.mpu_mut(wavetable).data_writes += 1;
+        self.midi_push(MidiTraceKind::DataWrite, wavetable, value, master_ticks);
+    }
+
+    fn record_mpu_data_read(&mut self, wavetable: bool, value: u8, master_ticks: u64) {
+        self.mpu_mut(wavetable).data_reads += 1;
+        self.midi_push(MidiTraceKind::DataRead, wavetable, value, master_ticks);
+    }
+
+    fn record_mpu_status_read(&mut self, wavetable: bool) {
+        self.mpu_mut(wavetable).status_reads += 1;
+    }
+
+    /// Whether the PIT trace still accepts entries. The bus checks it before
+    /// paying for a tick conversion the trace is the only consumer of.
+    pub(crate) fn pit_trace_armed(&self) -> bool {
+        self.pit_trace.len() < self.pit_cap
+    }
+
+    fn pit_push(&mut self, port: u16, value: u8, master_ticks: u64) {
+        if self.pit_trace.len() < self.pit_cap {
+            self.pit_trace.push(PitTraceEntry {
+                port,
+                value,
+                master_ticks,
+            });
+        }
+    }
+
+    /// Edge entries share the PIT trace under pseudo-ports so the timeline of
+    /// programmed rate against delivered edges reads out of one series:
+    /// 0xF0 = an IRQ0 edge, 0xF1 = an SB16 IRQ request. Batch-end edges are
+    /// stamped with the batch-end tick, so N edges retired by one advance
+    /// share a timestamp; read edge RATE from the series, not per-edge
+    /// spacing, when batches are coarse.
+    pub(crate) fn count_irq0_edge(&mut self, master_ticks: u64) {
+        self.irq0_edges += 1;
+        self.pit_push(0xF0, 0, master_ticks);
+    }
+
+    pub(crate) fn count_sb_irq_request(&mut self, master_ticks: u64) {
+        self.sb_irq_requests += 1;
+        self.pit_push(0xF1, 0, master_ticks);
+    }
+
+    pub fn timer_counters(&self) -> (u64, u64, u64) {
+        (self.irq0_edges, self.sb_irq_requests, self.pit_writes)
+    }
+
+    pub fn pit_trace(&self) -> &[PitTraceEntry] {
+        &self.pit_trace
+    }
+
+    /// Record a guest write to a PIT port (0x40-0x43). `master_ticks` may be
+    /// 0 when the trace is unarmed; only the trace reads it.
+    fn record_pit_write(&mut self, port: u16, value: u8, master_ticks: u64) {
+        self.pit_writes += 1;
+        self.pit_push(port, value, master_ticks);
+    }
+
+    /// Record one complete message the part emitted toward the synth.
+    fn record_mpu_output(&mut self, wavetable: bool, bytes: &[u8], master_ticks: u64) {
+        let mpu = self.mpu_mut(wavetable);
+        mpu.output_messages += 1;
+        mpu.output_bytes += bytes.len() as u64;
+        let status = bytes.first().copied().unwrap_or(0);
+        self.midi_push(MidiTraceKind::Output, wavetable, status, master_ticks);
     }
 }
 
@@ -2977,6 +3210,26 @@ impl Machine {
         self.opl_probe.trace()
     }
 
+    /// Guest MPU-401 activity since power-on: (wavetable at P300, MIDI at P330).
+    pub fn mpu_diagnostics(&self) -> (MpuDiagnostics, MpuDiagnostics) {
+        (self.opl_probe.mpu(true), self.opl_probe.mpu(false))
+    }
+
+    /// The recorded MPU access trace, empty unless `IZARRAVM_MIDI_TRACE` was set.
+    pub fn midi_trace(&self) -> &[MidiTraceEntry] {
+        self.opl_probe.midi_trace()
+    }
+
+    /// (IRQ0 edges forwarded to the PIC, SB16 IRQ requests, guest PIT writes).
+    pub fn timer_diagnostics(&self) -> (u64, u64, u64) {
+        self.opl_probe.timer_counters()
+    }
+
+    /// The recorded PIT write trace, empty unless `IZARRAVM_PIT_TRACE` was set.
+    pub fn pit_write_trace(&self) -> &[PitTraceEntry] {
+        self.opl_probe.pit_trace()
+    }
+
     /// Arm the OPL access trace directly, bypassing `IZARRAVM_OPL_TRACE`.
     ///
     /// For tests: the environment is process-global, so a test that set the
@@ -3328,12 +3581,27 @@ impl Machine {
     /// Take the next complete message written to the wavetable MPU at
     /// 0x300/0x301. The MIDI engine drains this after each emulation pass.
     pub fn take_wavetable_midi_message(&mut self) -> Option<TimedMidiMessage> {
-        self.wavetable_mpu.take_message()
+        self.take_mpu_message(true)
     }
 
     /// Take the next complete message written to the MIDI MPU at 0x330/0x331.
     pub fn take_midi_message(&mut self) -> Option<TimedMidiMessage> {
-        self.midi_mpu.take_message()
+        self.take_mpu_message(false)
+    }
+
+    /// The one drain for both parts, so the probe hook cannot drift between
+    /// them: whatever leaves a part toward the synth is recorded the same way.
+    fn take_mpu_message(&mut self, wavetable: bool) -> Option<TimedMidiMessage> {
+        let message = if wavetable {
+            self.wavetable_mpu.take_message()
+        } else {
+            self.midi_mpu.take_message()
+        };
+        if let Some(message) = &message {
+            self.opl_probe
+                .record_mpu_output(wavetable, &message.bytes, message.guest_tick);
+        }
+        message
     }
 
     /// (Left, Right) linear gain for the MIDI legs, from the ReSonique II
