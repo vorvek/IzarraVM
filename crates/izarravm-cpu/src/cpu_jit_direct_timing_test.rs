@@ -2248,6 +2248,342 @@ fn mul_mem_rows_spelling_table_names_both_arms() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `0xE2` LOOP as a native terminal (`DirectKind::Loop`), behind `IZARRAVM_LOOP_ROWS`.
+// The gp2-586 census's LARGEST rejected head: 20,918,551 runtime_hits, 18,374,120 unbound exits,
+// 294 sites. Design: dev_docs/gp2-loop-slice-design-2026-08-29.md.
+//
+// WHAT THESE CATCH THAT A JCC FIXTURE CANNOT:
+//  * a published host flag. LOOP touches NO guest flag, and the emitter clobbers host flags with
+//    its own decrement, so a stray capture or an `emit_load_host_flags` ported over from the Jcc
+//    arm corrupts the guest's eflags. `loop_preserves_every_flag` is the catcher.
+//  * the ECX == 0 entry. The decrement wraps to 0xFFFFFFFF, which is NON-ZERO, so the branch is
+//    TAKEN. A pre-decrement test, or a `jz`/`jnz` inversion, gets this one case wrong and every
+//    other case right.
+//  * the `raw_clocks` arm. The interpreter charges 11 taken or not; the default is 2.
+// ---------------------------------------------------------------------------
+
+/// Select the arm for this thread and PROVE the selection took. Every LOOP fixture states its arm
+/// in BOTH directions rather than reading the ambient knob: a positive fixture riding the default
+/// would go vacuous the day the default flips, and the refusal fixtures would go vacuous from the
+/// other side.
+fn select_loop_rows(enabled: bool) {
+    jit::direct::set_loop_rows_for_test(Some(enabled));
+    assert_eq!(
+        jit::direct::loop_rows_enabled(),
+        enabled,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_LOOP_ROWS"
+    );
+}
+
+/// `mov esi,esi; mov edi,edi; loop +2`, then a HLT on each of the two paths. The LOOP target is
+/// ENTRY+8 and the fallthrough is ENTRY+6, so the two are distinguishable in EIP -- a lowering
+/// that took the wrong path fails on the register comparison rather than needing its own
+/// assertion.
+fn loop_case() -> Vec<u8> {
+    vec![
+        0x89, 0xf6, // mov esi, esi
+        0x89, 0xff, // mov edi, edi
+        0xe2, 0x02, // loop +2  -> ENTRY+8
+        0xf4, 0x90, // ENTRY+6: hlt (the not-taken path), pad
+        0xf4, // ENTRY+8: hlt (the taken path)
+    ]
+}
+
+/// THE DIFFERENTIAL, and the counter boundary is the whole point of the seed list.
+#[test]
+fn loop_matches_the_interpreter_across_the_counter_boundary() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    // 1 -> 0, NOT taken. 2 -> 1, taken. 3 -> 2, taken.
+    // 0 -> 0xFFFFFFFF, TAKEN -- the wrap, and the case a pre-decrement test gets wrong.
+    for seed_ecx in [1u32, 2, 3, 0, 0xffff_ffff] {
+        let code = loop_case();
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        let block = install_fixture_block(&mut native, ENTRY);
+
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_ecx(seed_ecx);
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+
+        let label = format!("ecx={seed_ecx:#010x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
+        assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+        // The clock comparison IS the raw_clocks pin: an arm charging the `_ => 2` default
+        // instead of 11 shows up here as a nine-clock shortfall on every seed.
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks -- 11 per LOOP, taken or not"
+        );
+
+        // Pin the concrete answers, so a lowering that agreed with a WRONG interpreter still
+        // fails, and so the wrap case names itself.
+        assert_eq!(
+            native.registers.ecx(),
+            seed_ecx.wrapping_sub(1),
+            "{label}: ECX must be decremented exactly once"
+        );
+        let expected_eip = if seed_ecx.wrapping_sub(1) != 0 {
+            ENTRY + 8
+        } else {
+            ENTRY + 6
+        };
+        assert_eq!(
+            native.registers.eip, expected_eip,
+            "{label}: the branch is taken when the DECREMENTED counter is non-zero"
+        );
+    }
+}
+
+/// THE FLAG FIXTURE, and the reason this slice needs one at all. LOOP writes no guest flag, while
+/// the emitter clobbers HOST flags with its own decrement. Slot 0 is an ADD, so a live pending
+/// descriptor is in flight across the LOOP; every arithmetic flag must come out of the ADD.
+#[test]
+fn loop_preserves_every_flag() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    for (seed_eax, seed_add, seed_ecx, seed_eflags) in [
+        (0x0000_0005u32, 0x0000_0003u32, 2u32, 0x0202u32),
+        // Carry, overflow and sign all set by the ADD itself.
+        (0x8000_0000, 0x8000_0000, 1, 0x0202),
+        // Every arithmetic flag seeded SET on the way in, and AF seeded set too.
+        (0x0000_0001, 0x0000_0001, 3, 0x0ed7),
+        // The counter wrap, with flags live.
+        (0xffff_ffff, 0x0000_0001, 0, 0x0202),
+    ] {
+        // 01 c8 = add eax, ecx, then the LOOP. Two slots plus the terminal.
+        let code = vec![
+            0x01, 0xc8, // add eax, ecx
+            0x89, 0xf6, // mov esi, esi
+            0xe2, 0x02, // loop +2
+            0xf4, 0x90, 0xf4,
+        ];
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        let block = install_fixture_block(&mut native, ENTRY);
+
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_eax(seed_eax);
+            cpu.registers.set_ecx(seed_ecx);
+            cpu.registers.eflags = seed_eflags;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+
+        let label = format!(
+            "eax={seed_eax:#010x} add={seed_add:#010x} ecx={seed_ecx} fl={seed_eflags:#06x}"
+        );
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
+        assert_eq!(
+            native.eflags(),
+            interp.eflags(),
+            "{label}: eflags -- LOOP must publish NO host flag"
+        );
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+    }
+}
+
+/// The positive admission pin. Without it every refusal below passes whenever the classify arm is
+/// unreachable or the fixture cannot compile anything at all.
+#[test]
+fn loop_is_lowered_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    let code = loop_case();
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    let instructions = outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions);
+    assert_eq!(
+        instructions,
+        Some(3),
+        "LOOP must terminate and carry the whole three-slot block with the gate on"
+    );
+}
+
+/// THE REFUSALS, every one forced knob-ON so the refusal cannot be the knob's doing.
+///
+/// `0x67` makes the COUNTER 16-bit: a decrement through `alu_r32_imm32` would clear the high half
+/// of ECX. `0x66` makes the TARGET wrap at 64K in `relative_jump`, which `taken_delta` does not
+/// model. `0xE0`/`0xE1` read ZF and belong to a different flag contract.
+#[test]
+fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    for (code, why) in [
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0x67, 0xe2, 0x02, 0xf4],
+            "67 E2: a 16-bit COUNTER, and a 32-bit decrement would clear the high half of ECX",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0x66, 0xe2, 0x02, 0xf4],
+            "66 E2: a 16-bit TARGET, which relative_jump wraps at 64K and taken_delta does not",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0xe1, 0x02, 0xf4],
+            "E1 LOOPE: reads ZF, a different flag contract",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0xe0, 0x02, 0xf4],
+            "E0 LOOPNE: reads ZF, a different flag contract",
+        ),
+    ] {
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        // The block may still compile its first two slots; what must NOT happen is the terminal
+        // being admitted, which would carry all three.
+        let instructions = outcome
+            .is_some()
+            .then(|| outcome.unwrap().span.instructions);
+        assert_ne!(
+            instructions,
+            Some(3),
+            "{code:02x?} must not lower its terminal: {why}"
+        );
+    }
+}
+
+/// The shipped default, read AMBIENT on purpose so it also fails if `IZARRAVM_LOOP_ROWS=1` is
+/// exported in the environment running the suite.
+#[test]
+fn loop_rows_ships_off_by_default() {
+    jit::direct::set_loop_rows_for_test(None);
+    assert!(
+        !jit::direct::loop_rows_enabled(),
+        "IZARRAVM_LOOP_ROWS must default OFF until a gp2-586 ladder prices the flip"
+    );
+}
+
+/// The spelling table, both arms and the refusal.
+#[test]
+fn loop_rows_spelling_table_names_both_arms() {
+    use std::env::VarError;
+    assert!(
+        !jit::direct::parse_loop_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the OFF arm"
+    );
+    for off in ["", "0", "off", "OFF", " off ", "Off"] {
+        assert!(
+            !jit::direct::parse_loop_rows_arm_for_test(Ok(off.to_string())),
+            "{off:?} must name the off arm"
+        );
+    }
+    for on in ["1", "on", "ON", " on ", "On"] {
+        assert!(
+            jit::direct::parse_loop_rows_arm_for_test(Ok(on.to_string())),
+            "{on:?} must name the on arm"
+        );
+    }
+    for typo in ["yes", "true", "2", "loop", "rows"] {
+        let panicked = std::panic::catch_unwind(|| {
+            jit::direct::parse_loop_rows_arm_for_test(Ok(typo.to_string()))
+        })
+        .is_err();
+        assert!(
+            panicked,
+            "IZARRAVM_LOOP_ROWS={typo:?} names no arm and must panic rather than silently \
+             running the default"
+        );
+    }
+}
+
 struct DirectTimingCase {
     name: &'static str,
     opcode: &'static [u8],

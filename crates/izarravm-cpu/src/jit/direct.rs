@@ -4915,6 +4915,50 @@ pub(crate) enum DirectKind {
         condition: u8,
         taken_delta: u32,
     },
+    /// `0xE2` LOOP: `ECX -= 1`, branch while the result is non-zero. Behind
+    /// `IZARRAVM_LOOP_ROWS`.
+    ///
+    /// The gp2-586 census's LARGEST rejected head: 20,918,551 `runtime_hits` and 18,374,120
+    /// unbound exits across 294 sites, against the MUL-memory slice's 8,999,050. nascar-586 adds
+    /// 9.2 M for `0xE0`/`0xE1`/`0xE2` together, so this is a cross-row lever.
+    ///
+    /// **It cannot be an `InterpretOne` call-out and never could be.** The string-call-out
+    /// slice's doc comment already settled that: LOOP is a control transfer, and R1 refuses
+    /// resume unless `eip == start + len` after the step. A native terminal is the only route.
+    ///
+    /// SIMPLER THAN `Jcc`, which is the surprise in this kind. LOOP touches NO FLAGS -- the
+    /// interpreter's `0xe2` arm (execute.rs) contains not one `set_flag` -- so there is no
+    /// condition to materialise, no `emit_capture_flags`, no pending descriptor and no
+    /// `emit_load_host_flags`. The emitted decrement sets the host ZF that the emitted branch
+    /// reads, one instruction later, and nothing publishes host flags to the guest.
+    ///
+    /// **THE EMITTER'S WHOLE INVARIANT, stated as a requirement rather than left as an accident
+    /// of ordering: nothing may be inserted between the decrement and the branch.** Anything
+    /// placed there -- a counter, a probe, a future guard -- reads a stale ZF, and the loop then
+    /// either never exits or exits at once. `Jcc`'s arm calls `emit_load_host_flags` in exactly
+    /// that gap; this kind must NOT, and a reader porting one arm to the other will reach for it.
+    ///
+    /// `raw_clocks` carries an EXPLICIT 11: the interpreter charges `clocks(11)` whether the
+    /// branch is taken or not, against a `_ => 2` default. This is the `ImulMem` situation (an
+    /// arm is required), not the `ImulMemAcc` one (rides the default), and getting the two
+    /// backwards is the most likely silent error in this slice -- `completed_raw` sums the same
+    /// accessor, so the end-of-emit assertion agrees with itself whatever it returns.
+    ///
+    /// TWO WIDTHS IN ONE INSTRUCTION, and both are refused rather than widened. The COUNTER is
+    /// CX or ECX by ADDRESS size; the branch target wraps by OPERAND size
+    /// (`relative_jump(rel, operand_size)` masks EIP to 16 bits at Word). `classify` admits only
+    /// `AddressSize::Dword` with `OperandSize::Dword`: a Word counter would need a 16-bit
+    /// decrement preserving the high half of ECX, which `alu_r32_imm32` does not do, and a Word
+    /// target would wrap at 64K where `taken_delta` does not.
+    ///
+    /// `0xE0` LOOPNE and `0xE1` LOOPE are deliberately NOT folded in. They read ZF, which is a
+    /// different flag contract and a different emitter, and the gp2 census's head is `0xE2`
+    /// alone. Splitting a family is normally the arbitrary half-admission the top of `classify`
+    /// warns against; the justification here is that the halves differ in the FLAG CONTRACT
+    /// rather than merely in the opcode.
+    Loop {
+        taken_delta: u32,
+    },
     /// NOP (0x90, architecturally XCHG (E)AX, (E)AX). Emits ZERO bytes.
     ///
     /// It exists only so block growth continues through it. The interpreter's arms are
@@ -5323,6 +5367,12 @@ impl DirectKind {
             // every lowered NOP by one core clock, which NO other assertion in the tree can see:
             // the same gap shipped twice this campaign and was caught only by a mutation.
             Self::Jcc { .. } | Self::Nop => 3,
+            // LOOP charges clocks(11) TAKEN OR NOT (execute.rs, the 0xe2 arm returns one
+            // `Ok(clocks(11))` past both branches). Against the `_ => 2` default an omitted arm
+            // undercharges every lowered LOOP by NINE core clocks, and nothing inside the
+            // emitter can see it: `completed_raw` sums this same accessor, so the end-of-emit
+            // assertion agrees with itself whatever this returns. Only a fixture catches it.
+            Self::Loop { .. } => 11,
             // Both widths charge the same: the interpreter returns clocks(4) for 0x58..=0x5f
             // irrespective of operand size. Unlike Push, which correctly rides the `_ => 2`
             // default, an omitted arm here undercharges every pop by 2 core clocks and no test
@@ -5950,6 +6000,7 @@ impl DirectKind {
                 | Self::RetFar { .. }
                 | Self::RetFar16 { .. }
                 | Self::Jcc { .. }
+                | Self::Loop { .. }
                 | Self::CallReg { .. }
                 | Self::CallMem { .. }
         )
@@ -8000,7 +8051,7 @@ fn compile_with_budget(
         && segment_writes == 0
         && matches!(
             slots.last().map(|slot| slot.kind),
-            Some(DirectKind::Jcc { taken_delta: 0, .. })
+            Some(DirectKind::Jcc { taken_delta: 0, .. } | DirectKind::Loop { taken_delta: 0 })
         );
     if self_loop && x87_slots != 0 && x87_entry_top != x87_exit_top {
         return CompileOutcome::Retry(RetryCause::PostWalk);
@@ -8212,17 +8263,19 @@ fn compile_with_budget(
     }
     #[cfg(feature = "direct-link-refusal-census")]
     let terminal_links = match slots.last().map(|slot| slot.kind) {
-        Some(DirectKind::Jcc { taken_delta, .. }) => TerminalLinks {
-            targets: [
-                Some(fallthrough),
-                Some(LinkTarget {
-                    linear: entry_lin.wrapping_add(taken_delta),
-                    mode_key: key.mode_key,
-                }),
-            ],
-            successor_mask: [true, !self_loop],
-            emitted_mask: [!self_loop; 2],
-        },
+        Some(DirectKind::Jcc { taken_delta, .. } | DirectKind::Loop { taken_delta }) => {
+            TerminalLinks {
+                targets: [
+                    Some(fallthrough),
+                    Some(LinkTarget {
+                        linear: entry_lin.wrapping_add(taken_delta),
+                        mode_key: key.mode_key,
+                    }),
+                ],
+                successor_mask: [true, !self_loop],
+                emitted_mask: [!self_loop; 2],
+            }
+        }
         Some(
             DirectKind::Call { target_delta, .. }
             | DirectKind::Call16 { target_delta, .. }
@@ -8278,7 +8331,7 @@ fn compile_with_budget(
     #[cfg(not(feature = "direct-link-refusal-census"))]
     let successors = match slots.last().map(|slot| slot.kind) {
         _ if segment_write_block => [None, None],
-        Some(DirectKind::Jcc { taken_delta, .. }) => [
+        Some(DirectKind::Jcc { taken_delta, .. } | DirectKind::Loop { taken_delta }) => [
             Some(fallthrough),
             (!self_loop).then_some(LinkTarget {
                 linear: entry_lin.wrapping_add(taken_delta),
@@ -8466,7 +8519,7 @@ fn static_control_target(kind: DirectKind) -> Option<u32> {
         DirectKind::Call { target_delta, .. }
         | DirectKind::Call16 { target_delta, .. }
         | DirectKind::Jmp { target_delta } => Some(target_delta),
-        DirectKind::Jcc { taken_delta, .. } => Some(taken_delta),
+        DirectKind::Jcc { taken_delta, .. } | DirectKind::Loop { taken_delta } => Some(taken_delta),
         _ => None,
     }
 }
@@ -10859,6 +10912,76 @@ pub(crate) fn set_mul_mem_rows_for_test(forced: Option<bool>) {
 #[cfg(test)]
 pub(crate) fn parse_mul_mem_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
     parse_mul_mem_rows_arm(value)
+}
+
+/// Whether the backend lowers `0xE2` LOOP natively (`DirectKind::Loop`). **DEFAULT OFF.**
+///
+/// The row: the gp2-586 barrier census at `ce4fd221` measures `0xE2` at 20,918,551 `runtime_hits`
+/// and 18,374,120 unbound exits across 294 sites -- the LARGEST head of that fixture's rejected
+/// class. nascar-586 adds 9.2 M for `0xE0`/`0xE1`/`0xE2` together.
+///
+/// **Chosen because it is large enough to MEASURE.** The MUL-memory slice removed 8.99 M exits,
+/// priced at 1.6-2.2%, and gp2's within-arm null runs from 0.45% on a quiet round to 16% on a
+/// contaminated one; that slice is parked because the ladder could not resolve it. This row is
+/// 2.05x larger and should read 3.4-4.5%. If it ALSO reads inside the null, the campaign's
+/// entry-cost model is wrong and that is the more valuable finding.
+///
+/// Spelling table identical to `IZARRAVM_MUL_MEM_ROWS`: unset / `` / `0` / `off` -> OFF (the
+/// shipped default and the A/B base), `1` / `on` -> ON, anything else PANICS so a mistyped
+/// ladder leg cannot run the default and be read as the arm it named doing nothing.
+pub(crate) fn loop_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = LOOP_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_loop_rows_arm(std::env::var("IZARRAVM_LOOP_ROWS")))
+}
+
+/// The `IZARRAVM_LOOP_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `loop_rows_enabled` for the contract.
+fn parse_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_LOOP_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `0` / `off` (the shipped default: `0xE2` LOOP stays a \
+                 barrier), and `1` / `on` (the candidate: LOOP lowers as a native terminal)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `0` / \
+             `off` (the shipped default: `0xE2` LOOP stays a barrier, which is the A/B base), \
+             and `1` / `on` (the candidate: `DirectKind::Loop`). Refusing to guess: a mistyped \
+             ladder leg would silently run the DEFAULT and be read as the arm it named doing \
+             nothing"
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOOP_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the LOOP-row arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_LOOP_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_loop_rows_for_test(forced: Option<bool>) {
+    LOOP_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `loop_rows_enabled` caches its env reading in
+/// a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process.
+#[cfg(test)]
+pub(crate) fn parse_loop_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_loop_rows_arm(value)
 }
 
 /// Whether the backend admits the SIX rows the tombraid FMV census's loop A names, plus the two
@@ -16187,6 +16310,36 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     taken_delta: end_delta.wrapping_add(insn.imm),
                 });
             }
+            // `0xE2` LOOP. `taken_delta` is computed exactly as the Jcc arm above computes it,
+            // and deliberately through the same three lines rather than a helper: the two arms
+            // must agree, and a shared helper would let one of them acquire a wrap or a mask the
+            // other did not.
+            //
+            // THREE REFUSALS, each a boundary rather than an omission:
+            //
+            // * `address_size != Dword`. The counter would be CX, a 16-bit decrement that has to
+            //   preserve the high half of ECX. `alu_r32_imm32` writes all 32 bits, so a Word
+            //   form routed here would clear the top half of the guest's ECX. The census row is
+            //   `address_size: dword` and no fixture measures a Word one.
+            // * `operand_size != Dword`. `relative_jump(rel, operand_size)` masks EIP to 16 bits
+            //   at Word, so the taken target wraps at 64K. `taken_delta` carries no such wrap and
+            //   would send the block outside the segment.
+            // * `0xE0`/`0xE1`. They read ZF; see the `DirectKind::Loop` comment for why the flag
+            //   contract is what splits the family rather than the opcode.
+            0xe2 if insn.group == DecodeGroup::Branch => {
+                if insn.address_size != AddressSize::Dword
+                    || insn.operand_size != OperandSize::Dword
+                    || !loop_rows_enabled()
+                {
+                    return None;
+                }
+                let end_delta = lin
+                    .wrapping_add(u32::from(insn.len))
+                    .wrapping_sub(entry_lin);
+                return Some(DirectKind::Loop {
+                    taken_delta: end_delta.wrapping_add(insn.imm),
+                });
+            }
             0xe8 if insn.group == DecodeGroup::Branch => {
                 let return_delta = lin
                     .wrapping_add(u32::from(insn.len))
@@ -18185,6 +18338,72 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     fetch_trace,
                     false,
                 );
+                terminal = true;
+                break;
+            }
+            // `0xE2` LOOP. Structurally `Jcc`'s arm below, with ONE difference that is the whole
+            // correctness argument: where that arm calls `emit_load_host_flags` to pull the
+            // GUEST condition into host flags, this arm emits the decrement whose OWN host ZF
+            // the branch then reads.
+            //
+            // NOTHING MAY BE INSERTED BETWEEN THE SUBTRACT AND THE BRANCH. A counter, a probe or
+            // a future guard placed there reads a stale ZF, and the loop then either never exits
+            // or exits at once. This is the one place in the slice where a host flag is read,
+            // and it is read one instruction after it is written.
+            //
+            // `alu_r32_imm32(5, home(1), 1)` is SUB, not DEC, and the difference is deliberate:
+            // both set ZF identically, SUB additionally writes CF, and NOTHING here publishes
+            // host flags to the guest -- so the extra flag is free while the shared ALU
+            // primitive avoids a second encoder entry point. `home(1)` IS the guest ECX during
+            // native execution, so the subtract is the architectural write-back; there is no
+            // separate store.
+            DirectKind::Loop { taken_delta } => {
+                completed.retire(slot);
+                let taken = e.label();
+                e.alu_r32_imm32(5, home(1), 1);
+                // JNZ. Condition 5 is the guest's own `0x75` encoding, passed straight through
+                // exactly as the Jcc arm passes its `condition`.
+                e.jcc(5, taken);
+                if self_loop {
+                    emit_dynamic_increment(&mut e, STACK_ITERATIONS);
+                    emit_advance_eip(&mut e, u32::from(span.guest_len));
+                    e.jmp(self_loop_return.expect("self loop must have a return stub"));
+                } else {
+                    emit_completed_path(
+                        &mut e,
+                        span,
+                        false,
+                        u32::from(span.guest_len),
+                        Some(link_cell_ptrs[0]),
+                        shared_return,
+                        full_accounting,
+                        x87_entry_top.is_some(),
+                        fetch_trace,
+                    );
+                }
+                e.place(taken);
+                if self_loop {
+                    emit_dynamic_increment(&mut e, STACK_ITERATIONS);
+                    debug_assert_eq!(taken_delta, 0);
+                    e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_QUOTA);
+                    e.sub_r64_imm32(Reg::RAX, 1);
+                    e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
+                    e.jnz(loop_entry);
+                    emit_advance_eip(&mut e, taken_delta);
+                    e.jmp(self_loop_return.expect("self loop must have a return stub"));
+                } else {
+                    emit_completed_path(
+                        &mut e,
+                        span,
+                        false,
+                        taken_delta,
+                        Some(link_cell_ptrs[1]),
+                        shared_return,
+                        full_accounting,
+                        x87_entry_top.is_some(),
+                        fetch_trace,
+                    );
+                }
                 terminal = true;
                 break;
             }
