@@ -11316,12 +11316,21 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 /// ways.** They are members of the same `StringOp` family and would be swept in by any rule
 /// phrased as "the string opcodes" or written as a `StringOp` match; they perform PORT I/O, so
 /// they bypass both the port helper's two-phase TSS-bitmap probe and `run_direct_block`'s entry
-/// privilege gate on `callout_port_slots()`, and they break the batch premise. The three bars:
-/// `classify`'s arms are the two explicit byte ranges `0xA4..=0xA7` and `0xAA..=0xAF`, which
-/// cannot reach `0x6C..=0x6F`; `execute_string_decoded`'s match is `unreachable!` outside
-/// `0xa4..=0xaf`, so they could never pick up the flat `clocks(4)` even if admitted; and their
-/// charge (12/10 through the port arm, 15/14 through the REP model) would raise the fold past 7
-/// and move `INTERPRET_ONE_MAX_CORE_CLOCKS`. Two fixtures catch the same hole from opposite ends.
+/// privilege gate on `callout_port_slots()`, and they break the batch premise. FOUR bars, in the
+/// order the mutation record established rather than the order the design assumed:
+///
+/// 1. **`block_continuable`, ABOVE `classify`.** `route_group` puts INS/OUTS in
+///    `DecodeGroup::Misc`, whose arm admits only `0xa8`/`0xa9`, so the compile walk refuses them
+///    before the classifier is reached and their census arm is `non_continuable`. This is the bar
+///    that holds today, and it is why widening the classify arm alone changes nothing.
+/// 2. `classify`'s arms are the two explicit byte ranges `0xA4..=0xA7` and `0xAA..=0xAF`, which
+///    cannot reach `0x6C..=0x6F`.
+/// 3. `execute_string_decoded`'s match is `unreachable!` outside `0xa4..=0xaf`, so they could
+///    never pick up the flat `clocks(4)` even if admitted.
+/// 4. Their charge (12/10 through the port arm, 15/14 through the REP model) would raise the fold
+///    past 7 and move `INTERPRET_ONE_MAX_CORE_CLOCKS`.
+///
+/// Two fixtures catch the same hole from opposite ends.
 ///
 /// **REP/REPNE forms are refused upstream** by `prefixes_supported_for` and stop as
 /// `BarrierStop::PrefixUnsupported`, a different census arm from these rows'. R8 refuses resume on
@@ -15230,8 +15239,13 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // PORT I/O, so they would bypass the port helper's two-phase TSS-bitmap probe and
             // `run_direct_block`'s entry privilege gate on `callout_port_slots()`, neither of which
             // an `InterpretOne` slot carries. `0xA4..=0xA7` and `0xAA..=0xAF` cannot reach them.
-            // That is structural rather than a judgement call, and it is the first of the three
-            // independent bars the knob's doc enumerates.
+            // That is structural rather than a judgement call, and it is the SECOND of the four
+            // independent bars the knob's doc enumerates. It is not the first, and the difference
+            // was measured rather than assumed: `block_continuable` refuses INS/OUTS above this
+            // function entirely, so widening this arm to `0x6c..=0x6f` changes nothing observable
+            // and is a mutation that SURVIVES. Do not read that survival as the arm being
+            // decorative -- read it as this bar being the one that still holds if the walk's
+            // continuable rule ever moves.
             //
             // A CALL-OUT rather than a lowering, and the reason is the operand path rather than the
             // census. A string primitive reads DF, picks a segment that may be overridden, indexes

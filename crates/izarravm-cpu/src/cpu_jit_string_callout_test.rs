@@ -35,12 +35,22 @@
 //! `0x6C`-`0x6F` INS/OUTS are members of the same `StringOp` family and would be swept in by any
 //! rule phrased as "the string opcodes". They perform PORT I/O, bypassing both the port helper's
 //! two-phase TSS-bitmap probe and `run_direct_block`'s entry privilege gate on
-//! `callout_port_slots()`. THREE independent bars stop them: `classify`'s two explicit byte ranges
-//! cannot reach `0x6C..=0x6F`; `execute_string_decoded`'s match is `unreachable!` outside
-//! `0xa4..=0xaf`, so they could never pick up the flat `clocks(4)`; and their charge (12/10 through
-//! the port arm, 15/14 through the REP model) would raise the fold past 7 and move
-//! `INTERPRET_ONE_MAX_CORE_CLOCKS`. `the_denied_neighbours_stay_barriers_in_their_own_census_arm`
-//! and `interpret_one_fold_is_unmoved_by_the_string_rows` catch the same hole from opposite ends.
+//! `callout_port_slots()`. FOUR independent bars stop them, and the mutation table below is what
+//! established the ORDER -- which matters, because the first bar is not the one the design named:
+//!
+//! 1. **`block_continuable`, above `classify`.** `route_group` puts INS/OUTS in
+//!    `DecodeGroup::Misc`, whose `block_continuable` arm admits only `0xa8`/`0xa9`, so the compile
+//!    walk refuses them one test EARLIER than the classifier and their census arm is
+//!    `non_continuable`. This is the bar that actually holds today.
+//! 2. `classify`'s two explicit byte ranges cannot reach `0x6C..=0x6F`. Real, and currently
+//!    unreachable -- M2 widens it and nothing changes.
+//! 3. `execute_string_decoded`'s match is `unreachable!` outside `0xa4..=0xaf`, so they could
+//!    never pick up the flat `clocks(4)` even if admitted.
+//! 4. Their charge (12/10 through the port arm, 15/14 through the REP model) would raise the fold
+//!    past 7 and move `INTERPRET_ONE_MAX_CORE_CLOCKS`.
+//!
+//! `the_denied_neighbours_stay_barriers_in_their_own_census_arm` and
+//! `interpret_one_fold_is_unmoved_by_the_string_rows` catch the same hole from opposite ends.
 //!
 //! REP forms never reach `classify` at all: `prefixes_supported_for` refuses the prefix upstream,
 //! and the census arm is `prefix_unsupported`, NOT `hard_boundary`. That distinction is pinned per
@@ -54,18 +64,32 @@
 //! against the whole `izarravm-cpu` suite, because a survivor is the only outcome a filtered run
 //! can get wrong in the direction that matters.
 //!
-//! | # | mutation | outcome, and the row that fired first |
+//! | # | mutation | outcome, and the rows that fired |
 //! |---|---|---|
-//! | M1 | the `0xac \| 0xad` classify arm returns `None` | RED, `a_lodsd_at_slot_zero_compiles_only_with_the_gate` |
-//! | M2 | widen the `0xa4 \| 0xa5` arm to `0x6c..=0x6f` | RED, `the_denied_neighbours_stay_barriers_in_their_own_census_arm` |
-//! | M3 | `STRING_CORE_CLOCKS` 4 -> 8 | RED, `interpret_one_fold_is_unmoved_by_the_string_rows` |
-//! | M4 | drop the `STRING_CORE_CLOCKS` term from the `INTERPRET_ONE_MAX_CORE_CLOCKS` fold | SURVIVES -- see below |
+//! | M1 | the `0xac \| 0xad` classify arm returns `None` | RED, 8 rows, led by `a_lodsd_at_slot_zero_compiles_only_with_the_gate` |
+//! | M2 | widen the `0xa4 \| 0xa5` arm to `0x6c..=0x6f` | **SURVIVES -- and the survival is a FINDING, see below** |
+//! | M2b | M2 **plus** `0x6c..=0x6f` added to `jit_admits_non_continuable` | RED, `the_denied_neighbours_...` and `the_gate_admits_exactly_the_ten_string_opcodes` |
+//! | M3 | `STRING_CORE_CLOCKS` 4 -> 8 | RED **at compile time**: T6's `const` block refuses to evaluate |
+//! | M3b | `POP_SS_CORE_CLOCKS` 7 -> 9 (the fold moves, the string term does not) | RED, `interpret_one_fold_is_unmoved_by_the_string_rows`, with the "re-ladder" message |
+//! | M4 | drop the `STRING_CORE_CLOCKS` term from the `INTERPRET_ONE_MAX_CORE_CLOCKS` fold | SURVIVES, by design -- see below |
 //! | M5 | give `StringStore` `may_write_segment() == true` | RED, `the_resume_matrix_holds_for_every_string_row` |
-//! | M6 | delete the memory-eflags half of `emit_direction_flag` | RED, both DF rows |
-//! | M7 | drop the runtime clock add at the call-out slot | RED, both differential positions |
-//! | M8 | fold `StringCompare` into `StringLoad` (one row for both) | RED, `each_string_execution_is_attributed_to_its_own_row` |
-//! | M9 | `generic_callout_enabled()`'s ENV path returns `true` | RED, `generic_callout_ships_the_off_arm_by_default` |
+//! | M6 | delete the memory-eflags half of `emit_direction_flag` | RED, `a_string_slot_reads_the_direction_flag_from_a_cld_std_slot` |
+//! | M7 | delete the call-out's runtime clock add | RED, 5 rows incl. BOTH differential positions -- **but only after the `timing_rem` fix below** |
+//! | M8 | the `0xa6/0xa7/0xae/0xaf` arm charges `StringLoad` instead | RED, `each_string_execution_is_attributed_to_its_own_row` |
+//! | M9 | `generic_callout_enabled()`'s ENV path returns `true` | RED, `generic_callout_ships_the_off_arm_by_default` + the spelling table |
 //! | M10 | `"" => false` -> `"" => true` in the parse table | RED, `generic_callout_spelling_table_names_every_arm` |
+//!
+//! **M2 SURVIVES, and it refutes the mutation the design specified for T2.** The design's T2 says
+//! *"widen the classify arm to `0x6C..=0x6F` -> INS/OUTS compile -> red"*. They do not compile,
+//! and the classify arm is not what stops them: `route_group` puts INS/OUTS in
+//! `DecodeGroup::Misc`, `block_continuable`'s `Misc` arm admits only `0xa8`/`0xa9`, and the
+//! compile walk refuses a non-continuable shape ABOVE `classify` -- so a widened classify arm for
+//! them is unreachable code and no fixture can see it. The exclusion is enforced FOUR ways, not
+//! three, and the byte-range bar is the *fourth* rather than the first. M2b is the mutation that
+//! is actually discriminating: widen the arm AND make the shape continuable, which is the shape a
+//! future editor unifying the two ranges into a `StringOp` match would have to produce before the
+//! hole opened. Recorded rather than quietly substituted, because "the deny is enforced three
+//! ways" was a claim this file made and one of the three turned out to be inert.
 //!
 //! **M4 SURVIVES and is recorded rather than papered over.** `STRING_CORE_CLOCKS` is 4 and the
 //! fold's other terms already reach 7, so removing the term changes no value today. That is
@@ -73,8 +97,16 @@
 //! under-budgeted chain hop the day its arm's charge rises -- and no fixture can separate a
 //! present term from an absent one while the term is dominated. Pinning it would mean asserting
 //! the text of the constant, which is a shape test dressed as a behaviour test. The term is in the
-//! fold, the reason is in its doc, and `interpret_one_fold_is_unmoved_by_the_string_rows` catches
-//! the case that actually matters: the VALUE moving.
+//! fold, the reason is in its doc, and M3/M3b cover the two ways the VALUE can move.
+//!
+//! **M7 caught a real hole in this file on its first run, and the hole is the more useful
+//! finding.** With only `elapsed_clocks` compared, deleting the runtime clock add survived every
+//! three- and four-slot row here and died on ONE longer block by luck. `level_timing` at 586 is
+//! **1/12**, so a whole string primitive's four raw clocks scale to ZERO elapsed clocks and land
+//! entirely in `timing_rem`, which nothing was comparing. `compare_state` now compares the
+//! remainder as well as the quotient; both roles start it at zero. Any differential in this tree
+//! that compares `elapsed_clocks` alone has the same blind spot for any charge under twelve
+//! clocks.
 
 use super::*;
 
@@ -467,6 +499,16 @@ fn compare_state(roles: &mut Roles, context: &str) {
     assert_eq!(
         roles.native.elapsed_clocks, roles.interp.elapsed_clocks,
         "{context}: core clocks"
+    );
+    // The REMAINDER as well as the quotient, and this is not belt-and-braces: `level_timing` at
+    // 586 is 1/12, so a whole string primitive's four raw clocks scale to ZERO elapsed clocks and
+    // land entirely in this carry. Both roles start it at 0. Without this line the mutation that
+    // deletes the call-out's runtime clock add SURVIVES every three-and-four-slot row in this
+    // file -- which is what the first run of the mutation table measured, and the reason the
+    // deletion was caught by one longer block by luck rather than by design.
+    assert_eq!(
+        roles.native.timing_rem, roles.interp.timing_rem,
+        "{context}: scaled-clock remainder"
     );
     assert_eq!(
         roles.native_bus.trace.elapsed_clocks(),

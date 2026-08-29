@@ -4974,9 +4974,11 @@ pub(crate) const POP_SS_CORE_CLOCKS: u32 = 7;
 /// opcodes", but they do not route through `execute_string_decoded` at all -- its match is
 /// `unreachable!` outside `0xa4..=0xaf` and they execute in the port block below it, charging 12
 /// (IN) or 10 (OUT), with the REP model charging 15 and 14. Admitting either would raise the fold
-/// past 7 and move `INTERPRET_ONE_MAX_CORE_CLOCKS`, which is the second of the three independent
-/// ways the exclusion is enforced; the first is that `classify`'s arms are the two explicit byte
-/// ranges `0xA4..=0xA7` and `0xAA..=0xAF`, and the third is the `unreachable!` itself.
+/// past 7 and move `INTERPRET_ONE_MAX_CORE_CLOCKS`, which is the LAST of four independent ways the
+/// exclusion is enforced. The others, in the order they actually fire: `block_continuable` refuses
+/// INS/OUTS above `classify` entirely (they are `DecodeGroup::Misc`, whose arm admits only
+/// `0xa8`/`0xa9`); `classify`'s arms are the two explicit byte ranges `0xA4..=0xA7` and
+/// `0xAA..=0xAF`; and `execute_string_decoded`'s `unreachable!` itself.
 ///
 /// FOUR, and therefore BELOW the fold's existing value of 7. That is the fact that lets the string
 /// rows ship behind a knob at all: `INTERPRET_ONE_MAX_CORE_CLOCKS` is a `const` and no knob can
