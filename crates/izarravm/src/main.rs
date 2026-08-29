@@ -1818,7 +1818,10 @@ fn run_boot_hdd_folder(
                 out.push_str(&format!("{lin:08X},{samples}\n"));
             }
             std::fs::write(&path, out)?;
-            println!("cpu-profile addrs sidecar: {} rows -> {path}", snapshot.hot_addrs.len());
+            println!(
+                "cpu-profile addrs sidecar: {} rows -> {path}",
+                snapshot.hot_addrs.len()
+            );
         }
         let target = dump_override.or_else(|| snapshot.hot_addrs.first().map(|&(t, _)| (t, 0x180)));
         if let Some((top, dump_len)) = target {
