@@ -1440,6 +1440,152 @@ fn a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows() {
     );
 }
 
+/// Every mode whose raster this build can enter, for the collision sweep below.
+/// Each entry drives the same public path a guest would.
+fn every_reachable_mode() -> Vec<(&'static str, fn(&mut Vga))> {
+    vec![
+        ("text 03h", |v: &mut Vga| v.set_text_mode()),
+        ("text 07h mono", |v: &mut Vga| v.set_mono_text_mode()),
+        ("0Dh planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x0D));
+        }),
+        ("0Eh planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x0E));
+        }),
+        ("0Fh planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x0F));
+        }),
+        ("10h planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x10));
+        }),
+        ("11h planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x11));
+        }),
+        ("12h planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x12));
+        }),
+        ("13h chained", |v: &mut Vga| {
+            assert!(v.set_mode(0x13));
+        }),
+        ("mode X unchained", |v: &mut Vga| {
+            assert!(v.set_mode(0x13));
+            v.write_port(0x3C4, 0x04);
+            v.write_port(0x3C5, 0x06);
+        }),
+        ("CGA 04h graphics", |v: &mut Vga| {
+            if v.is_cga_personality() {
+                v.write_port(0x3D8, 0x0A); // graphics, 320x200, video on
+            } else {
+                assert!(v.set_cga_mode(0x04));
+            }
+        }),
+        ("CGA 06h graphics", |v: &mut Vga| {
+            if v.is_cga_personality() {
+                v.write_port(0x3D8, 0x1A); // graphics, 640x200, video on
+            } else {
+                assert!(v.set_cga_mode(0x06));
+            }
+        }),
+        ("CGA 40x25 text", |v: &mut Vga| {
+            if !v.is_cga_personality() {
+                assert!(v.set_cga_mode(0x04));
+            }
+            v.write_port(0x3D8, 0x08);
+        }),
+        ("CGA 80x25 text", |v: &mut Vga| {
+            if !v.is_cga_personality() {
+                assert!(v.set_cga_mode(0x04));
+            }
+            v.write_port(0x3D8, 0x09);
+        }),
+        ("Hercules graphics", |v: &mut Vga| {
+            v.write_port(0x3BF, 0x03);
+            v.write_port(0x3B8, 0x0A);
+        }),
+    ]
+}
+
+/// No mode change may leave the previous mode's pixels in the work raster,
+/// for ANY pair of modes that happens to share a raster size.
+///
+/// `resize_work` reuses a same-size buffer, which is what keeps a per-frame CRTC
+/// replay from erasing the frame the beam has drawn. Two DIFFERENT modes can
+/// share a size, and the CGA personality's mode-control path resizes without
+/// resetting the render cursor, so a reused buffer there publishes the old
+/// mode's rows. `a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows`
+/// is the end-to-end case for the pair that was found by being bitten by it;
+/// this sweep computes the colliding pairs instead of naming them, so a
+/// collision nobody has met yet -- including one a future mode introduces --
+/// is covered too.
+#[test]
+fn no_mode_change_reuses_the_previous_modes_raster() {
+    let modes = every_reachable_mode();
+
+    // Group the modes by the raster size each one installs.
+    let mut sizes = Vec::new();
+    for (label, enter) in &modes {
+        let mut vga = Vga::default();
+        enter(&mut vga);
+        sizes.push((*label, vga.raster_width() * vga.raster_height()));
+    }
+
+    let mut collisions = 0;
+    let mut cleared_pairs = 0;
+    for (from_index, (from_label, from_size)) in sizes.iter().enumerate() {
+        for (to_index, (to_label, to_size)) in sizes.iter().enumerate() {
+            if from_index == to_index || from_size != to_size {
+                continue;
+            }
+            collisions += 1;
+            let mut vga = Vga::default();
+            modes[from_index].1(&mut vga);
+            // Drive the beam a hundred lines into a frame, so the render cursor
+            // is NOT at zero when the mode changes. Without this the cursor arm
+            // of the assertion below is vacuously true for every pair and the
+            // sweep passes with the guard removed -- measured, not assumed.
+            vga.advance(vga.frame_dots());
+            let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
+            vga.advance(line_dots * 100);
+            vga.read_status1();
+            assert_eq!(vga.last_line, 100, "{from_label}: the beam drew 100 rows");
+            // Stand in for a raster the beam has already drawn. Asserting on the
+            // buffer rather than on rendered pixels keeps the sweep independent
+            // of how any one mode fills a scanline.
+            vga.work.fill(0xAB);
+            modes[to_index].1(&mut vga);
+            // Either arm satisfies the invariant that actually matters: no row
+            // drawn in the old mode may reach a published frame. Clearing the
+            // raster removes those rows; resetting the render cursor to 0 means
+            // `finalize_frame` redraws every one of them before it publishes.
+            let cleared = vga.work.iter().all(|&pixel| pixel == 0);
+            if cleared {
+                cleared_pairs += 1;
+            }
+            assert!(
+                cleared || vga.last_line == 0,
+                "{from_label} -> {to_label} (both {from_size} px) kept the old \
+                 mode's raster AND left the render cursor at {}",
+                vga.last_line
+            );
+        }
+    }
+
+    // The sweep is worthless if no pair collides, so say how many did. The CGA
+    // 320x200-graphics / 40x25-text pair alone guarantees a non-zero count.
+    assert!(
+        collisions > 0,
+        "no two reachable modes share a raster size, so this sweep proved nothing"
+    );
+    // And it proves nothing about the guard under test if EVERY colliding pair
+    // takes the cursor-reset arm, because then no pair exercises the clear. The
+    // CGA pair is the one that does not reset its cursor, so this stays non-zero.
+    assert!(
+        cleared_pairs > 0,
+        "{collisions} colliding pairs and none needed the raster cleared: this \
+         sweep would pass with the guard removed"
+    );
+}
+
 #[test]
 fn mode_x_direct_write_page_tracks_the_selected_plane() {
     let mut vga = direct_mode_x(0);
