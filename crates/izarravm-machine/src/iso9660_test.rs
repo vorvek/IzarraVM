@@ -172,3 +172,148 @@ fn find_child(image: &CdImage, dir_lba: u32, wanted: &[u8]) -> Option<Vec<u8>> {
     }
     None
 }
+
+/// Build a tree of two multi-sector files, so a sequential read crosses an
+/// extent boundary from one host file into the next. `build` orders extents by
+/// LBA, and the byte patterns differ per file, so a read that landed in the
+/// wrong extent shows up as wrong CONTENT and not merely as a wrong open count.
+fn two_file_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    // 8 sectors each. The pattern is a function of the byte's index within its
+    // own file, so no two positions in either file share a value by accident.
+    let first: Vec<u8> = (0..8 * 2048).map(|i| (i % 251) as u8).collect();
+    let second: Vec<u8> = (0..8 * 2048)
+        .map(|i| ((i % 241) as u8).wrapping_add(3))
+        .collect();
+    fs::write(dir.path().join("first.bin"), &first).unwrap();
+    fs::write(dir.path().join("second.bin"), &second).unwrap();
+    dir
+}
+
+/// A folder mount used to pay a host `File::open`, a seek and a `Vec`
+/// allocation for EVERY 2048-byte sector, so a game streaming from a
+/// folder-mounted disc opened the same file thousands of times a second. The
+/// HDD path solved this with a handle LRU; this is the same fix one device over.
+///
+/// The cache is invisible to a value comparison — the sectors are byte-identical
+/// with it and without it — so the open COUNT is the only thing that can show it
+/// works. A count on its own is not evidence either: "K sequential sectors cost
+/// one open" reads the same whether the cache works or the read path never ran.
+/// So this takes the count TWICE from one binary, one flag apart, and the
+/// uncached arm is what gives the cached arm meaning.
+///
+/// It also asserts the BYTES, over a range that crosses from one host file into
+/// the next. An open count alone would be satisfied by a cache that serves the
+/// wrong sector from the right handle.
+#[test]
+fn a_folder_mount_opens_each_host_file_once_not_once_per_sector() {
+    let dir = two_file_tree();
+    let sectors: Vec<u32> = {
+        let built = build(dir.path()).unwrap();
+        let meta_sectors = (built.meta.len() / SECTOR) as u32;
+        // Every file sector on the disc, in LBA order, crossing the boundary
+        // between the two extents partway through.
+        (meta_sectors..built.total_sectors).collect()
+    };
+    assert!(
+        sectors.len() >= 16,
+        "expected both 8-sector files on the disc, got {} sectors",
+        sectors.len()
+    );
+
+    // UNCACHED ARM: the behaviour before this fix. One open per sector.
+    let uncached = CdImage::from_folder(build(dir.path()).unwrap()).unwrap();
+    assert!(
+        uncached.disable_read_cache_for_test(),
+        "a folder mount must have a cache to disable"
+    );
+    let mut uncached_bytes = Vec::new();
+    for &lba in &sectors {
+        uncached_bytes.push(uncached.read_data_sector(lba).unwrap());
+    }
+    let uncached_opens = uncached.host_file_opens().unwrap();
+    assert_eq!(
+        uncached_opens,
+        sectors.len() as u64,
+        "the uncached arm must open once per sector; without this number the \
+         cached arm below proves nothing"
+    );
+
+    // CACHED ARM: same reads, same binary, cache on.
+    let cached = CdImage::from_folder(build(dir.path()).unwrap()).unwrap();
+    let mut cached_bytes = Vec::new();
+    for &lba in &sectors {
+        cached_bytes.push(cached.read_data_sector(lba).unwrap());
+    }
+    let cached_opens = cached.host_file_opens().unwrap();
+    assert_eq!(
+        cached_opens, 2,
+        "two host files, read in LBA order, must cost exactly two opens \
+         (uncached arm took {uncached_opens})"
+    );
+
+    // And the bytes must be identical across the boundary, or the count above
+    // is measuring a cache that serves the wrong sector cheaply.
+    assert_eq!(
+        cached_bytes, uncached_bytes,
+        "cached and uncached reads must return identical sectors"
+    );
+
+    // Independently of both arms: the content must match the host files, so a
+    // cache that returned the same wrong bytes twice cannot pass.
+    let first = fs::read(dir.path().join("first.bin")).unwrap();
+    let second = fs::read(dir.path().join("second.bin")).unwrap();
+    let flat: Vec<u8> = cached_bytes.concat();
+    let first_at = flat
+        .windows(first.len())
+        .position(|w| w == first.as_slice())
+        .expect("first.bin's bytes must appear in the disc's file sectors");
+    let second_at = flat
+        .windows(second.len())
+        .position(|w| w == second.as_slice())
+        .expect("second.bin's bytes must appear in the disc's file sectors");
+    assert_ne!(
+        first_at, second_at,
+        "the two files must land at different offsets"
+    );
+}
+
+/// The LRU has to evict, and an evicted path has to be re-openable. With more
+/// files in flight than slots, a strictly round-robin access pattern is the
+/// worst case: every read misses. That is allowed to be slow, but it must still
+/// be CORRECT, and the count must reflect the misses rather than hiding them.
+#[test]
+fn a_folder_mount_reopens_a_path_the_lru_evicted() {
+    let dir = tempfile::tempdir().unwrap();
+    // Six files against four slots.
+    for index in 0..6u8 {
+        let body: Vec<u8> = (0..2048).map(|i| (i as u8).wrapping_add(index)).collect();
+        fs::write(dir.path().join(format!("f{index}.bin")), &body).unwrap();
+    }
+    let built = build(dir.path()).unwrap();
+    let meta_sectors = (built.meta.len() / SECTOR) as u32;
+    let total = built.total_sectors;
+    let image = CdImage::from_folder(built).unwrap();
+
+    // Round-robin over every file sector, three passes.
+    let mut first_pass = Vec::new();
+    for pass in 0..3 {
+        for lba in meta_sectors..total {
+            let sector = image.read_data_sector(lba).unwrap();
+            if pass == 0 {
+                first_pass.push(sector);
+            } else {
+                let index = (lba - meta_sectors) as usize;
+                assert_eq!(
+                    sector, first_pass[index],
+                    "sector {lba} changed on pass {pass}: an evicted handle was \
+                     re-opened at the wrong offset"
+                );
+            }
+        }
+    }
+    assert!(
+        image.host_file_opens().unwrap() >= 6,
+        "six distinct files must have been opened at least once each"
+    );
+}
