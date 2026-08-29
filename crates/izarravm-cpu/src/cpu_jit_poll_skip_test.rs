@@ -520,3 +520,73 @@ fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
         "a different slot must re-enter the scan"
     );
 }
+
+// ---------------------------------------------------------------------------
+// THE MUTATION RECORD for the 16-bit poll certification slice (D1 + D1b).
+//
+// Run by hand at implementation time against the design's §4.3 table. Recorded
+// here rather than in a report file because this is where the rows it grades
+// live, and because a mutation table nobody can re-run is a claim rather than
+// evidence. Each row names the edit and the fixture that went RED under it.
+//
+//   1. Delete the D-O1 `cs.limit <= 0xFFFF` term in `build_poll_loop_at`
+//      => a_sixteen_bit_shape_over_a_big_limit_segment_is_volatile RED ("got
+//         Found"). Verified to FIRE, which is the point MAJOR-2 made: under a
+//         real-mode `limit == 0xFFFF` fixture this row would still pass with the
+//         term deleted, because poll_slots_within_live_cs already catches the
+//         wrap. The big-limit segment is what makes the row able to fail.
+//   2. Relax D1b's `modrm.reg == 4` to any reg
+//      => every_other_register_mask_encoding_refuses_cacheably RED.
+//   3. Accept a memory operand in the D1b test slot
+//      => every_other_register_mask_encoding_refuses_cacheably RED.
+//      This row needed the fixture fixed before it could fire. With `mod == 3`
+//      also required, `84 27` was refused by the ModRM triple and the operand
+//      term could never be load-bearing -- a gate that cannot fail. The check is
+//      now `reg == 4` plus `DecodedOperand::Reg(0)`, and the `84 20` row
+//      (`TEST [BX+SI],AH`, whose reg/rm fields match `84 E0`'s exactly) is what
+//      the operand term alone refuses.
+//   4. Add `0x84` to poll_head_possible's opcode set
+//      => the_register_mask_test_slot_is_exempt_from_the_head_prefilter_set RED.
+//      The INVERTED form MAJOR-9 asked for: the set membership is the defect and
+//      the exemption is the invariant.
+//   5. Hardcode `sixteen_bit_ok = true` at the interpreter's build_poll_loop
+//      => the_sixteen_bit_parameter_gates_the_three_slot_shape RED.
+//      This row also needed the fixture strengthened. Driving the raw scanner
+//      with `false` cannot see a mutated call site, and a 16-bit head is refused
+//      by poll_head_possible's `!d` first, so the row that fires is the 32-bit
+//      D1b shape refusing through `cpu.poll_loop()` -- which is D1b-6's
+//      gp2-stays-a-control decision as an assertion.
+//   6. Change raw_core_clocks 17 -> 16 on the 3-slot arm
+//      => both 16-bit certification rows RED.
+//   7. Move D1b's mask check from the call-out into certification (make
+//      with_resolved_mask synthesise a mask instead of reading AH)
+//      => a_wrong_mask_value_declines_through_its_own_lane_without_caching RED.
+//   8. Drop the mask-value check at the call-out entirely
+//      => a_wrong_mask_value_declines_through_its_own_lane_without_caching RED.
+//   9. Move the knob test out of the 16-bit screen, so the screen always opens
+//      => the_sixteen_bit_off_arm_screens_before_the_scan RED, and
+//         a_sixteen_bit_callout_declines_before_the_scan RED with it.
+//      Worth naming: the design recorded knob ORDERING as a mutation NO unit
+//      test could catch, guarded only by the ladder's A-arm identity check.
+//      That gap is now closed by a fixture.
+//
+// TWO DISCLOSED GAPS, stated rather than papered over.
+//
+//   * Feeding `fresh_iteration_spins` and `req.status_mask` independently-derived
+//     masks. Not expressible any more: with_resolved_mask returns a settled COPY
+//     and both fields read `poll.status_mask()`, so there is exactly ONE
+//     derivation by construction -- which is the obligation, obtained
+//     structurally. A mutation that substitutes an arbitrary CONSTANT at one of
+//     the two uses is a different defect, and it survives: it inverts
+//     spins_when_bit_set, the seam declines NotSpinning while the guest is
+//     spinning, and then commits during the opposite half of the line. Catching
+//     that needs a skipped-versus-unskipped clock-identity fixture, which this
+//     repository could not build (see this file's header note on converging
+//     back-edges). The related mutation that IS caught is making
+//     with_resolved_mask never read AH at all (row 7).
+//   * Reading AH at certification time and reusing it across the span. No test
+//     catches it TODAY because AH is loop-invariant over the certified slot set
+//     (IN writes AL only, TEST writes flags only, Jcc writes nothing). It
+//     becomes catchable only if a future shape admits a body that can write the
+//     mask register. Carried forward from the design as a known gap.
+// ---------------------------------------------------------------------------
