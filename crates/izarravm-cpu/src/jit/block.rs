@@ -286,6 +286,17 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
     Some((slots, is_loop))
 }
 
+/// Whether every slot's last byte is inside the LIVE code segment's limit.
+///
+/// **Under the 16-bit slice (design D1) this is also the IP-WRAP catcher**, and that role
+/// is load-bearing rather than incidental. `build_block` walks LINEARLY, so a shape that
+/// wraps IP produces a slot at `cs.base + 0x10000 + k`, whose `slot_eip` is `>= 0x10000`.
+/// `fetch_within_limit` is `eip <= limit - (len - 1)`, so with the `cs.limit <= 0xFFFF`
+/// admission term in force (the 3-slot arm's `!d` branch) that slot fails here and the
+/// shape refuses `NegativeVolatile`. No certified slot can then start at or past
+/// `0x10000`, and none can have a last byte above `0xFFFF` -- which is why the admission
+/// term delegates the boundary arithmetic here instead of carrying its own `slot_eip +
+/// len` compare, and why it has no off-by-one at the segment top.
 fn poll_slots_within_live_cs(cpu: &CpuGsw, slots: &[Slot]) -> bool {
     let cs = cpu.registers.cs();
     slots.iter().all(|slot| {
@@ -339,7 +350,21 @@ pub(crate) enum PollScanOutcome {
 /// view used by compiled blocks. Re-running this before every span makes an SMC
 /// restamp replace the descriptor rather than reusing stale bytes or addresses.
 /// Slot opcodes here are mirrored in poll_head_possible's set; extending the
-/// shapes requires extending that set.
+/// shapes requires extending that set -- with ONE documented exemption, the
+/// `sixteen_bit_ok`-only D1b test slot (`0x84`), which cannot reach that
+/// prefilter at all. See `poll_head_possible`'s own doc.
+///
+/// The 3-slot IO arm is the only one that admits a 16-bit code segment, and only
+/// when the caller passes `sixteen_bit_ok` (the Direct call-out under
+/// `IZARRAVM_DIRECT_POLL_SKIP_16`). No byte of that shape decodes differently
+/// under `CS.D = 0`: `0xEC` is fixed 1 byte and always an 8-bit port read into
+/// AL, the accumulator `TEST` forms and `Jcc rel8` are operand-size-invariant
+/// encodings of fixed length, and `raw_core_clocks: 17` is likewise
+/// operand-size independent (`IN_PORT_CORE_CLOCKS` 12 + `TEST` 2 + taken `Jcc`
+/// 3, from the same constants the interpreter charges). The other two shape
+/// families carry real `OperandSize::Dword` / `AddressSize::Dword` terms, whose
+/// unprefixed 16-bit forms are DIFFERENT instructions with different lengths, so
+/// they stay 32-bit-only.
 ///
 /// `current` is the scan's ORIGIN -- the instruction start every `at_head` computed
 /// here is measured against -- and it is a caller-supplied value rather than a fresh
@@ -371,7 +396,7 @@ fn build_poll_loop_at(
     // 3-slot direct shape. Structure first, register check second, so a
     // register failure is reported volatile instead of cached.
     if let [input, test, branch] = slots.as_slice()
-        && d
+        && (d || sixteen_bit_ok)
         && is_loop
         && input.insn.opcode == 0xec
         && input.insn.len == 1
@@ -380,6 +405,18 @@ fn build_poll_loop_at(
         let Some((mask, branch_when_zero)) = exact_poll_test_branch(test, branch) else {
             return PollScanOutcome::NegativeCacheable;
         };
+        // D-O1, the 16-bit slice's ONE added admission term. `CS.D = 0` with a limit
+        // above 0xFFFF -- a 16-bit protected-mode code segment with G=1, or any
+        // descriptor whose D bit and limit disagree -- is the single reachable state
+        // where IP wraps at 0xFFFF and the limit check does NOT catch it. It is also
+        // what makes the call-out's unmasked scan anchor (`cs.base + eip + slot_delta`)
+        // exact, because the compile walk's own guarantee is written in terms of
+        // `cs.limit`. VOLATILE, never cacheable: `cs.limit` is a segment fact and the
+        // negative cache is keyed on `(lin, d)` alone, so a cached refusal here would
+        // poison the entry for every other segment state over the same bytes.
+        if !d && cpu.registers.cs().limit > 0xffff {
+            return PollScanOutcome::NegativeVolatile;
+        }
         if cpu.registers.edx() as u16 != 0x03da {
             return PollScanOutcome::NegativeVolatile;
         }
