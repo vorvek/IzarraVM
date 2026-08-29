@@ -493,8 +493,16 @@ mod matrix;
 /// the env gate is a process-global `OnceLock`: a hot entry chunk spends exactly one compile
 /// per key per epoch, and a lane-bearing compilation installs THROUGH the hot span. The
 /// lane-free demote arm is pinned by the G1 tests in cpu_jit_compile_outcome_test.rs.
+///
+/// THE ARM IS STATED, NOT INHERITED, and after the 2026-08-29 budget flip that is load-bearing: the
+/// shipped default is now `MAX_LANE_TRIAL_BUDGET`, so "exactly one compile" is no longer something
+/// the budget enforces here. It holds because the trial's block INSTALLS and survives — every later
+/// probe answers `Ready` and never reaches `BlockProbe::Compile`, so no second grant is ever asked
+/// for. Forcing the shipped arm is what keeps this a test of that, rather than a test of a budget
+/// of 1 that no shipped build runs.
 #[test]
 fn lane_trial_compiles_once_and_installs_through_a_hot_span() {
+    jit::direct::set_lane_trial_budget_for_test(Some(jit::direct::MAX_LANE_TRIAL_BUDGET));
     let mut cpu = flat_cpu();
     let mut bus = test_bus(image(0x1111_2222));
     decode_at(&mut cpu, &mut bus, &block_starts());
@@ -533,4 +541,5 @@ fn lane_trial_compiles_once_and_installs_through_a_hot_span() {
         matches!(cpu.jit_direct.probe(key), jit::direct::BlockProbe::Ready(_)),
         "the installed trial block must answer the next probe"
     );
+    jit::direct::set_lane_trial_budget_for_test(None);
 }

@@ -9651,8 +9651,9 @@ pub(crate) fn set_lane_family_for_test(forced: Option<bool>) {
 /// From there the mechanism self-selects. If the lanes cover the guest's patches, the writes
 /// become `lane_accepts`, contribute no heat, the chunk cools at the next epoch, and admission
 /// normalizes. If they do not, the next patch kills the block, the key re-parks Dormant exactly
-/// as before, and the trial cannot re-fire until the epoch turns — worst case one extra compile
-/// and install per key per epoch, or `lane_trial_budget()` of them once that knob is flipped.
+/// as before, and the trial cannot re-fire until the epoch turns — worst case `lane_trial_budget()`
+/// extra compiles and installs per key per epoch, of which all but the first must be EARNED by the
+/// previous one installing. That budget is 4 since the 2026-08-29 ladder; it was 1 before it.
 pub(crate) fn lane_trial_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_SMC_LANE_TRIAL").as_deref(), Ok("0")))
@@ -9701,17 +9702,37 @@ pub(crate) const DORMANT_HEAT_HEAD3_LINEARS: [u32; 3] = [0x0054_0220, 0x0054_026
 /// (`IZARRAVM_SMC_LANE_TRIAL_BUDGET`). Grants past the first are EARNED — see `lane_trial_spend`
 /// for INV-B3 — so this is a ceiling on a probation ladder, not a flat allowance.
 ///
-/// **DEFAULT 1: unset is the pre-slice world, byte for byte.** The flip to a measured arm is its
-/// own commit, after the ladder.
+/// **DEFAULT 4 SINCE THE 2026-08-29 LADDER.** It shipped at 1 — the pre-slice world, byte for byte
+/// — for exactly one commit, and the flip is priced by its own measurement, the `IZARRAVM_COUNT_LANES`
+/// and `IZARRAVM_ROTATE_ROWS` pattern.
+///
+/// THE EVIDENCE LINE. duke3d-586-short min-wall **-11.5%** (75.13 -> 66.48 s) and the duke3d-586
+/// LONG merge-gate row **-8.8%** (rt 0.81 -> 0.89) at budget 4, interleaved legs on one binary.
+/// Non-vacuity all green on the short row: `unbound_targets` 121.2 M -> 92.2 M,
+/// `heat_demote_trial_spent` 9,756 -> 2,376 — the population Lever B exists to drain, draining —
+/// and 33,116 re-grants producing 60,486 installs, so the re-grants are not pure recompile cost.
+/// Controls nascar-586, tyrian-586 and doom-586 all inside the +/-2% floor. Task 0's go/no-go
+/// passed before the ladder ran: the earned share of `smc_heat_demotions` was ~100% (against the
+/// 5% cancel floor), `_earned_head3` 32%, so the lever does reach duke's head cluster.
+///
+/// The park-length reading is the other half and it is why the LIFT side is still open: a mean of
+/// **>= 11 epochs**, and that is the CENSORED lower bound (`dormant_heat_park_epochs / park_lifts`
+/// counts only parks that lifted; never-lifted and reset-ended parks are the longest and contribute
+/// nothing). A head-only lever cannot shorten a park in progress, so this number is evidence for
+/// the lift-side slice, not against this flip.
+///
+/// AUTHORITY. This is the campaign's standing-authority call on its own measurement, **not an owner
+/// ruling**. It reverts alone: spelling `1` restores the pre-slice arm exactly.
 ///
 /// # THE SPELLING TABLE
 ///
 /// Trimmed and case-folded on the way in, the shape `IZARRAVM_COUNT_LANES` carries. This is a
 /// PARAMETER, so per the house rule it has **no `0` or `off` spelling** — UNSET is the escape:
 ///
-/// * **unset -> 1.** Today's behaviour. The shipped default.
-/// * `1` -> 1. Spellable so the BASE arm of an A/B is nameable in a ladder leg.
-/// * `2`, `3`, `4` -> the probation arms.
+/// * **unset -> 4.** The shipped default since the 2026-08-29 ladder.
+/// * `1` -> 1. The BASE and the ESCAPE: the pre-slice world, one trial per key per heat epoch, and
+///   the arm every A/B on this class is read against. Spellable so a ladder leg can name it.
+/// * `2`, `3`, `4` -> the probation arms; `4` is what the default now runs.
 /// * `0`, anything above `4`, and anything unparseable **PANIC**. `0` would disable the trial
 ///   through the wrong knob (`IZARRAVM_SMC_LANE_TRIAL=0` is that knob) and would read as an arm
 ///   rather than as the escape; a value above `MAX_LANE_TRIAL_BUDGET` is the storm this gate
@@ -9732,11 +9753,15 @@ pub(crate) fn lane_trial_budget() -> u32 {
 /// The `IZARRAVM_SMC_LANE_TRIAL_BUDGET` spelling table, lifted out of the `OnceLock` closure so it
 /// can be unit-tested without a process-global env write. See `lane_trial_budget`.
 fn parse_lane_trial_budget_arm(value: Result<String, std::env::VarError>) -> u32 {
-    const ACCEPTED: &str = "accepted spellings are unset (the shipped default, one trial per key \
-                            per heat epoch — the pre-slice world) or `1`, `2`, `3`, `4`. This is a \
-                            PARAMETER: it has no `0` or `off` spelling, and UNSET is the escape";
+    const ACCEPTED: &str = "accepted spellings are unset (the shipped default since the 2026-08-29 \
+                            ladder, four earned trials per key per heat epoch) or `1` (the \
+                            pre-slice world, one trial per key per epoch — the base and the \
+                            escape), `2`, `3`, `4`. This is a PARAMETER: it has no `0` or `off` \
+                            spelling, and `1` rather than `0` is how the pre-slice arm is named";
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return 1,
+        // The 2026-08-29 flip. `1` is still spellable and is the escape; see `lane_trial_budget`
+        // for the evidence line the default rests on.
+        Err(std::env::VarError::NotPresent) => return MAX_LANE_TRIAL_BUDGET,
         // Not-UTF-8 is not a spelling of any arm. It reaches the same panic as a typo rather than
         // the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {

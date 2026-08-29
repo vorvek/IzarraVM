@@ -2286,16 +2286,20 @@ fn note_lane_trial_install_on_a_missing_slot_is_a_silent_no_op() {
     );
 }
 
-/// The knob's spelling table. A PARAMETER has no `0` or `off` spelling — UNSET is the escape — and
-/// a typo must PANIC rather than fall through to the default, which a ladder leg would read as
-/// "the arm I asked for changed nothing".
+/// The knob's spelling table. A PARAMETER has no `0` or `off` spelling — `1` is how the pre-slice
+/// arm is named — and a typo must PANIC rather than fall through to the default, which a ladder leg
+/// would read as "the arm I asked for changed nothing".
+///
+/// The unset row MOVED with the 2026-08-29 flip (1 -> 4). It is asserted against the constant and
+/// not against a literal `4`, so the default and its ceiling cannot drift apart silently.
 #[test]
 fn lane_trial_budget_spelling_table() {
     use std::env::VarError;
 
     assert_eq!(
         parse_lane_trial_budget_arm_for_test(Err(VarError::NotPresent)),
-        1
+        MAX_LANE_TRIAL_BUDGET,
+        "unset is the shipped default, which the ladder moved to the ceiling"
     );
     for (spelling, budget) in [("1", 1), ("2", 2), (" 3 ", 3), ("4", 4)] {
         assert_eq!(
