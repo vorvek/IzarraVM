@@ -81,12 +81,36 @@ function Get-RowTable {
     @(
         [pscustomobject]@{
             name = "pinball-fantasies-486"; folder = "pinbllf_c"
-            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
-            # Three mode X geometries in 40 guest seconds, one of them 256 pixels
-            # wide, which no other fixture anywhere exercises. `machine=vgaonly`,
-            # and the closest sibling to Psycho Pinball.
-            targetMode = "ModeX"; targetNote = "hdisp_end 256"
+            # 32 MiB, not 64: its conf says memsize=32 and that is what the
+            # packager chose. `machine=vgaonly`.
+            arguments = @("--cpu", "486", "--memory-mib", "32", "--video", "vega")
+            # 6.6e9 clocks is 100 guest seconds at 486/66 MHz. MEASURED
+            # timeline: boot to 2.5 s, mode X intro 2.5-23.5 s, planar 640x480
+            # title and attract loop 23.5-41.5 s, and the table in play from
+            # 41.5 s to the end. The end frame lands about a minute into a
+            # table, the way psycho-486 does.
+            cycles = [uint64]6600000000
+            # Enter through the intro and the title, F1 to pick Party Land at
+            # 40 s, then the plunger and flippers on space every 3 s. WITHOUT
+            # the F1 the run parks on the attract loop forever: measured over
+            # 121 guest seconds with no input, it never leaves it.
+            injectKeys = "330000000:{enter};462000000:{enter};594000000:{enter};726000000:{enter};858000000:{enter};990000000:{enter};1122000000:{enter};1254000000:{enter};1386000000:{enter};1518000000:{enter};1650000000:{enter};1782000000:{enter};1914000000:{enter};2640000000:{f1};2970000000:{space};3168000000:{space};3366000000:{space};3564000000:{space};3762000000:{space};3960000000:{space};4158000000:{space};4356000000:{space};4554000000:{space};4752000000:{space};4950000000:{space};5148000000:{space};5346000000:{space};5544000000:{space};5742000000:{space};5940000000:{space};6138000000:{space}"
+            injectMouse = $null
+            # THE SURVEY'S 256-WIDE CLAIM DOES NOT REPRODUCE. It named "mode X
+            # 320x480, 640x480 and 256x480" and that is why this title was the
+            # board's strongest candidate. MEASURED over three runs, including
+            # into gameplay, every presented frame is 720x400, 320x480, 640x480
+            # or 320x350. No 256-wide frame exists and the census agrees.
+            #
+            # What the row DOES carry, and why it stays:
+            #   - a 350-line mode X, NOT double scanned. 350 source rows is not
+            #     200, 240 or 480, and it only exists once a table is loaded, so
+            #     this target cannot be satisfied by a menu.
+            #   - a PLANAR per-frame CRTC replayer. Its 640x480 attract loop
+            #     reprograms the CRTC 5164 times in 121 guest seconds. psycho-486
+            #     replays in mode X; a planar replayer is new coverage.
+            #   - mode X programmed 360 dots wide, which nothing else reaches.
+            targetMode = "ModeX"; targetNote = "source_lines 350"
         }
         [pscustomobject]@{
             name = "keen4-486"; folder = "ckeen4_c"
