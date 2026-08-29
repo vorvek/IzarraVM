@@ -2178,6 +2178,11 @@ pub struct DirectStallSnapshot {
     pub poll_declined_port_source: u64,
     pub poll_declined_knob: u64,
     pub poll_declined_eligibility: u64,
+    /// A 16-bit code segment can never certify a shape (every shape is
+    /// 32-bit; `poll_head_possible` requires `d`), so the call-out screens
+    /// it out BEFORE the scan. Tyrian 2000 paid 1.5e9 doomed scans -- ~80%
+    /// of its wall -- before this lane existed (2026-08-29).
+    pub poll_declined_sixteen_bit: u64,
     pub poll_declined_shape: u64,
     pub poll_declined_cap: u64,
     pub poll_declined_seam: u64,
