@@ -32,29 +32,49 @@ fn a_cd_title_keeps_its_image() {
 }
 
 #[test]
-fn a_non_vga_machine_is_hard_blocked() {
+fn a_machine_with_no_video_path_is_hard_blocked() {
     let out = verdict(
         "mount c .\\eXoDOS\\X\nc:\ngame\nexit\n",
-        "[dosbox]\nmachine=cga\n",
+        "[dosbox]\nmachine=tandy\n",
     );
     assert_eq!(out.class, Class::Untranslatable);
     assert!(out.reasons.contains(&"machine-non-vga".to_string()));
 }
 
 #[test]
-fn the_vga_family_includes_the_exo_typo() {
+fn a_cga_machine_translates() {
+    let out = verdict(
+        "mount c .\\eXoDOS\\X\nc:\ngame\nexit\n",
+        "[dosbox]\nmachine=cga\n",
+    );
+    assert_eq!(out.class, Class::Translatable);
+    assert!(!out.reasons.contains(&"machine-non-vga".to_string()));
+}
+
+#[test]
+fn the_supported_cards_are_the_ones_with_a_video_path() {
+    // Every card IzarraVM scans out. The empty string is a conf with no
+    // machine= line at all, which DOSBox reads as its svga_s3 default.
     for machine in [
         "svga_s3",
         "svga_et4000",
+        "svga_paradise",
         "vesa_nolfb",
+        // eXo's own typo, 11 confs.
         "vesa_noflb",
+        "vesa_oldvbe",
         "vgaonly",
+        "cga",
+        "ega",
+        "hercules",
         "",
     ] {
-        assert!(is_vga_family(machine), "{machine}");
+        assert!(is_supported_video_machine(machine), "{machine}");
     }
-    for machine in ["cga", "tandy", "pcjr", "ega", "hercules", "amstrad"] {
-        assert!(!is_vga_family(machine), "{machine}");
+    // No video path exists for these. tandy is 107 corpus confs, pcjr 59,
+    // amstrad 1.
+    for machine in ["tandy", "pcjr", "amstrad"] {
+        assert!(!is_supported_video_machine(machine), "{machine}");
     }
 }
 

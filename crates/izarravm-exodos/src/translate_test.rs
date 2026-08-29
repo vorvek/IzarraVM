@@ -297,9 +297,12 @@ fn a_cd_the_translator_cannot_mount_is_refused_not_translated() {
 
 #[test]
 fn an_untranslatable_title_writes_nothing() {
+    // tandy, not cga: IzarraVM has a CGA path and cga TRANSLATES since
+    // 2026-08-29. tandy has no video path at all, so it is a stable way to
+    // build an untranslatable title without depending on the card list.
     let dir = doom_extraction();
     let conf = DosboxConf::parse(
-        "[dosbox]\nmachine=cga\n[autoexec]\nmount c .\\eXoDOS\\DOOM\nc:\ncall run\nexit\n",
+        "[dosbox]\nmachine=tandy\n[autoexec]\nmount c .\\eXoDOS\\DOOM\nc:\ncall run\nexit\n",
     );
     let result = translate(&conf, &options(&dir, true)).expect("translate");
     assert_eq!(result.class, Class::Untranslatable);

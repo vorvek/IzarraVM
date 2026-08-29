@@ -47,8 +47,20 @@ pub struct ConfVerdict {
     pub payload_commands: usize,
 }
 
-/// The video cards that map onto our one real card.
-pub fn is_vga_family(machine: &str) -> bool {
+/// The video cards IzarraVM can scan out. VGA and SVGA are the bulk; CGA,
+/// planar EGA and Hercules each have their own path in `izarravm-video`.
+/// `tandy`, `pcjr` and `amstrad` have none, so a title that needs one is
+/// refused rather than run against the wrong hardware.
+///
+/// An empty string is a conf with no `machine=` line, which DOSBox reads as its
+/// `svga_s3` default. 6,946 of the corpus's 7,666 confs are that default, so an
+/// empty or `svga_s3` value is silence about the game, not a claim.
+///
+/// This accepted only the VGA family until 2026-08-29, which refused 621 corpus
+/// games outright and meant no sweep had ever run a CGA, EGA or Hercules title.
+/// 454 of those refusals were stale: the cards had a path and the check had not
+/// been told.
+pub fn is_supported_video_machine(machine: &str) -> bool {
     let machine = machine.trim().to_ascii_lowercase();
     machine.is_empty()
         || machine.starts_with("svga_")
@@ -56,6 +68,9 @@ pub fn is_vga_family(machine: &str) -> bool {
         || machine == "vgaonly"
         // eXo's own typo, 11 confs.
         || machine == "vesa_noflb"
+        || machine == "cga"
+        || machine == "ega"
+        || machine == "hercules"
 }
 
 /// Image extensions `izarravm --cd-image` mounts. MEASURED against
@@ -94,7 +109,7 @@ pub fn classify_conf(conf: &DosboxConf) -> ConfVerdict {
     let mut hard: Vec<String> = Vec::new();
     let mut soft: Vec<String> = Vec::new();
 
-    if !is_vga_family(conf.machine()) {
+    if !is_supported_video_machine(conf.machine()) {
         hard.push("machine-non-vga".to_string());
     }
 
