@@ -10755,11 +10755,29 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
 /// `0xC0 /5,/6,/7`**, and whether `0xC0`/`0xD0` reach the `OperandSize::Word` decode path at all
 /// (`IZARRAVM_BYTE_SHIFT_ROWS`).
 ///
-/// **DEFAULT OFF.** The slice lands with the knob off so the A leg of its ladder is
-/// byte-identical to the pre-slice tree by inspection: with the knob off the allowlist term
-/// collapses to `&& !false` and every new classifier arm returns `None` from its first line. The
-/// default moves only on the ladder, in a commit of its own, exactly as `IZARRAVM_FPU_LOOP_ROWS`
-/// did.
+/// **DEFAULT ON SINCE THE 2026-08-29 RE-LADDER.** It shipped default OFF for exactly three
+/// commits, long enough for its own A/B to be run against it, which is the shape
+/// `IZARRAVM_FPU_LOOP_ROWS` established: the flip is attributable to a measurement rather than to
+/// a design document.
+///
+/// **The evidence.** tyrian-586 re-laddered on main AFTER the poll16 merge moved the denominator:
+/// **min-wall -9.5%, 19.95 s -> 18.06 s**, with dispatcher entries **37.2 M -> 23.6 M**. Retired
+/// instructions and `irq0_edges` are IDENTICAL per arm, which is what says the win is fewer
+/// entries over the same work rather than a different guest execution -- the currency this
+/// campaign ranks 16-bit slices by. The flip is the overnight campaign's standing-authority call
+/// under [[autonomous-overnight-working-style]] rather than an owner ruling.
+///
+/// `0` / `off` still names the pre-slice refusal and still ships whole, because it is the base
+/// every A/B on these rows is read against: with the knob off the allowlist term collapses to
+/// `&& !false` and every new classifier arm returns `None` from its first line, so the off tree is
+/// the pre-slice one by inspection rather than by argument. Both arms ship in one executable, so a
+/// later ladder can re-price the rows without a rebuild.
+///
+/// **This flip also changes what `IZARRAVM_BYTE_SHIFT_ROWS=` (the empty string) means, from OFF to
+/// ON**, because `""` names the same arm as unset. It is stated here, in
+/// `parse_byte_shift_rows_arm` and in the flip commit. Every ladder leg exports an explicit `0` or
+/// `1` and records the RESOLVED arm, so no recorded leg is affected -- which is the whole reason
+/// that rule exists.
 ///
 /// # The rows, from the census that ranked them
 ///
@@ -10810,8 +10828,9 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
 /// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
 /// whitespace and one set from a PowerShell ladder picks up capitalisation.
 ///
-/// * unset or `` (empty) -> the shipped default, which is OFF today.
-/// * `0` / `off` -> the pre-slice refusal. `1` / `on` -> the byte-shift admission.
+/// * unset or `` (empty) -> the shipped default, ON since the 2026-08-29 re-ladder.
+/// * `0` / `off` -> the pre-slice refusal, the escape and the A/B base.
+/// * `1` / `on` -> the byte-shift admission, and the explicit spelling of today's default.
 /// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
 ///   fell through to the default would be read as "the rows I asked for changed nothing", the one
 ///   wrong conclusion an A/B exists to avoid.
@@ -10825,8 +10844,11 @@ pub(crate) fn byte_shift_rows_enabled() -> bool {
 }
 
 /// The arm an unset -- and an EMPTY -- `IZARRAVM_BYTE_SHIFT_ROWS` names. Named rather than spelled
-/// twice so the two cannot drift apart the day the default moves.
-const BYTE_SHIFT_ROWS_DEFAULT_ARM: bool = false;
+/// twice so the two cannot drift apart the day the default moves, and it HAS moved once: ON since
+/// the 2026-08-29 re-ladder (tyrian-586 min-wall -9.5%, entries 37.2 M -> 23.6 M). The fixtures
+/// reach it through `byte_shift_rows_default_arm_for_test`, so the empty-string assertion tracks
+/// this constant instead of restating it and going stale at the next flip.
+const BYTE_SHIFT_ROWS_DEFAULT_ARM: bool = true;
 
 /// The `IZARRAVM_BYTE_SHIFT_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
 /// unit-tested without a process-global env write. See `byte_shift_rows_enabled` for the contract.
@@ -10838,8 +10860,9 @@ fn parse_byte_shift_rows_arm(value: Result<String, std::env::VarError>) -> bool 
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_BYTE_SHIFT_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `` (both the shipped default), `0` / `off` (the \
-                 pre-slice refusal) and `1` / `on` (the byte-shift admission)"
+                 spellings are unset or `` (both the shipped default, ON since the 2026-08-29 \
+                 re-ladder), `0` / `off` (the pre-slice refusal) and `1` / `on` (the byte-shift \
+                 admission)"
             )
         }
         Ok(raw) => raw,
@@ -10858,19 +10881,24 @@ fn parse_byte_shift_rows_arm(value: Result<String, std::env::VarError>) -> bool 
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_BYTE_SHIFT_ROWS={other:?} names no arm; accepted spellings are unset or `` \
-             (both the shipped default), `0` / `off` (the pre-slice refusal) and `1` / `on` (the \
-             byte-shift admission). Refusing to guess: a mistyped ladder leg that silently ran \
-             the default would be read as the arm it did not run"
+             (both the shipped default, ON since the 2026-08-29 re-ladder), `0` / `off` (the \
+             pre-slice refusal, the escape and the A/B base) and `1` / `on` (the byte-shift \
+             admission). Refusing to guess: a mistyped ladder leg that silently ran the default \
+             would be read as the arm it did not run"
         ),
     }
 }
 
 // Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
 // `OnceLock` and the fixtures have to run both arms in one process, so one test's arm selection
-// must not reach another's compile. Since the arm is default-OFF, every positive fixture for these
-// rows MUST force it on through here or it would test the refusal and call it a lowering; and
-// every refusal fixture states the off arm rather than inheriting it, so that it keeps meaning
-// what it says the day the default moves.
+// must not reach another's compile.
+//
+// The direction that matters flipped on 2026-08-29 and no fixture had to move, because every one
+// of them already stated its arm rather than inheriting it. While the arm was default-OFF it was
+// the POSITIVE fixtures that had to force it on, or they would have tested the refusal and called
+// it a lowering; now it is the REFUSAL fixtures that must force `Some(false)`, or they would
+// compile the rows and pass for the wrong reason. The default pin is the one fixture that reads
+// the ambient knob, and it is supposed to.
 #[cfg(test)]
 thread_local! {
     static BYTE_SHIFT_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
@@ -13250,8 +13278,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // Operand-size-invariant for the same reason `0xec` is (the classifier arm's own comment):
         // the interpreter's `0xe4` arm always reads and writes a byte regardless of `operand_size`.
         && !(direct_in_imm8_callout_armed() && insn.opcode == 0xe4)
-        // THE BYTE-SHIFT ROWS (`IZARRAVM_BYTE_SHIFT_ROWS`, default OFF until its ladder) are a
-        // FIFTH allowlist term, written as its own term for the reason the V86 and TEST terms
+        // THE BYTE-SHIFT ROWS (`IZARRAVM_BYTE_SHIFT_ROWS`, default ON since the 2026-08-29
+        // re-ladder) are a FIFTH allowlist term, written as its own term for the reason the V86 and TEST terms
         // above are: the gate-off arm stays byte-identical to the pre-slice tree by inspection
         // rather than by reading a hundred-line `matches!`. With the knob off this whole term
         // collapses to `&& !false`.

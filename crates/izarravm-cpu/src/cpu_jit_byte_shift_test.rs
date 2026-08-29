@@ -71,8 +71,10 @@
 //!
 //! # Mutation record
 //!
-//! Twenty applied BY HAND to the committed tree, run, observed, and restored with
-//! `git checkout -- <file>`. Each was run against the whole `cpu_jit_byte_shift_test` module (its
+//! Twenty-one applied BY HAND to the committed tree, run, observed, and restored with
+//! `git checkout -- <file>` -- which is exactly why each is applied to a COMMITTED tree: that
+//! command discards every uncommitted change to the file, not only the mutation, and during this
+//! slice it ate an uncommitted edit once before the rule was re-learned. Each was run against the whole `cpu_jit_byte_shift_test` module (its
 //! own 15 rows plus the 2,073 the filter excludes are unaffected by a byte-shift edit); the four
 //! SURVIVORS were then re-run against the WHOLE `izarravm-cpu` suite -- 2,067 tests, all green on
 //! each -- because a survivor is the only outcome a filtered run can get wrong in the direction
@@ -98,8 +100,9 @@
 //! | M16 | `count = raw_count & 0x1f` -> `raw_count` in `emit_shift` | RED, both differentials -- **same** |
 //! | M17 | swap `emit_commit_shift_flags` / `emit_write_gpr8` in `emit_shift_reg8` | RED, 3 rows |
 //! | M18 | `op: if m.reg == 6 { 4 }` -> `op: m.reg` (drop the normalisation) | **SURVIVES, by design** |
-//! | M19 | `byte_shift_rows_enabled()` returns `true` unconditionally | RED, `byte_shift_rows_ship_the_default_arm` ALONE |
-//! | M20 | `"" => DEFAULT_ARM` -> `"" => false` in the parse table | **SURVIVES while the default is OFF** |
+//! | M19 | `byte_shift_rows_enabled()`'s ENV path returns `true`, override intact | **SURVIVES since the flip -- see below** |
+//! | M19b | the WHOLE of `byte_shift_rows_enabled()` returns `true` | RED, 4 rows |
+//! | M20 | `"" => DEFAULT_ARM` -> `"" => false` in the parse table | RED since the flip, `byte_shift_rows_spelling_table_names_every_arm` |
 //!
 //! **M15 and M16 caught a real hole in this file, and the hole is the more useful finding.** On
 //! the first run both SURVIVED. `emit_shift`'s count-0 return and its five-bit mask are reachable
@@ -126,19 +129,33 @@
 //! * **M9 is inert for the same class of reason.** Both orderings return `None` for `/0..=/3`, and
 //!   the knob is a pure function of the environment with no side effect but its panic, which still
 //!   fires the first time any gated row is classified.
-//! * **M20 cannot be observed while the shipped default is OFF**, because `"" => false` and
-//!   `"" => DEFAULT_ARM` name the same arm today. `byte_shift_rows_spelling_table_names_every_arm`
-//!   asserts `""` against `byte_shift_rows_default_arm_for_test()` rather than against a literal,
-//!   so the mutant dies the moment the default flips -- which is the commit that makes the
-//!   distinction real.
+//! * **M19 survives the ENV path alone, and only since the default flipped ON.** The mutant makes
+//!   the `OnceLock` read return `true` while leaving the `#[cfg(test)]` override intact, so the
+//!   only fixture that can see it is the default pin -- and with the knob unset the pin's expected
+//!   value is now `true` as well, so the two agree. It died while the default was OFF and it would
+//!   die again at any flip back. This is the blind spot EVERY default-ON knob in this file has,
+//!   `IZARRAVM_TEST_WORD_ROWS` included, and it is structural rather than an oversight: a fixture
+//!   cannot set the process-wide env the `OnceLock` reads without deciding the arm for every other
+//!   test in the process. What covers it instead is the ladder, whose A leg exports an explicit
+//!   `IZARRAVM_BYTE_SHIFT_ROWS=0` and records the RESOLVED arm -- a build that ignored the env
+//!   would show up there as an A leg that measured the B arm. **M19b is the faithful form the
+//!   design named** -- the whole function returns `true`, override included -- and it dies on four
+//!   rows, because `force_byte_shift_rows` asserts that its own selection took.
 //!
 //! **What the record says about where the coverage actually lives.** Three mutants are caught by
 //! exactly ONE row each, and two of them are the heat-gate pair: M13 and M14 die only on
 //! `the_two_group_two_knobs_are_independent`'s `(HeatGated, *)` cells, which is why that row is a
 //! 3x2 matrix over `RotateRowsArm` and not a 2x2 over booleans -- `rotate_row_count_byte` is
 //! reached only under the `HeatGated` arm, so a boolean matrix would have been a gate that cannot
-//! fail. M19 dies only on the default pin, because every other row forces the arm through the
-//! thread-local override and so never reaches the `OnceLock` the mutant edits.
+//! fail. M19b dies on four rows because `force_byte_shift_rows` asserts that its own selection
+//! took, while the narrower M19 reaches only the default pin -- every other row forces the arm
+//! through the thread-local override and so never touches the `OnceLock` that mutant edits.
+//!
+//! **The 2026-08-29 default flip traded two mutants, and neither trade is left silent.** M20 was
+//! inert while the default was OFF (`"" => false` and `"" => DEFAULT_ARM` named one arm) and kills
+//! cleanly now. The narrow M19 was the reverse: it died on the default pin while the default was
+//! OFF and stopped dying at the flip. Both are recorded at their CURRENT outcome rather than at
+//! the one the pre-flip run measured, and M19's entry says what covers it instead.
 
 use super::*;
 

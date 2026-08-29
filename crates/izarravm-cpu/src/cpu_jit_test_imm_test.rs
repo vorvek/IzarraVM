@@ -2110,31 +2110,40 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
     // `the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admissions`; the
     // guards are pinned here, and the two must not be allowed to stand in for each other.
     select_rotate_rows(true);
+    // FORCED ON for the same reason, one knob later. The byte-shift-rows slice moved
+    // `0xC0 /5,/6,/7` and the whole of `0xD0 /4..=7` out of this list and behind
+    // `IZARRAVM_BYTE_SHIFT_ROWS`, so on that knob's OFF arm the rows below would be refused by the
+    // KNOB before any guard ran -- the exact vacuity the paragraph above describes. Forcing it ON
+    // is what keeps the remaining byte rows a statement about `matches!(m.reg, 4..=7)` and about
+    // the register-only `let-else` rather than about a gate.
+    select_byte_shift_rows(true);
     for code in [
         vec![0xc1, 0xd3, 0x05], // /2 RCL: takes the incoming CF as a rotate input
         vec![0xc1, 0xdb, 0x05], // /3 RCR: same
         vec![0xd1, 0xd3],       // /2 RCL by 1
         vec![0xd1, 0xdb],       // /3 RCR by 1
-        // The BYTE group's rotates. 0xC0 has a classify arm as of the 2026-08-09 slice, and it
-        // admits `/4` ALONE -- these four rows are what says the `m.reg != 4` guard is doing the
-        // work rather than the arm having been widened to the whole group by inspection.
+        // The BYTE group's rotates, at BOTH byte opcodes. `0xC0` has admitted `/4..=7` since the
+        // byte-shift slice and `0xD0` has an arm of its own now, so these eight rows are what says
+        // both arms' `matches!(m.reg, 4..=7)` is doing the work rather than either having been
+        // widened to `0 | 1 | 4..=7` "to mirror the sibling arm". They can never be a list entry:
+        // `DirectKind::RotateReg` carries no width field at all and `emit_rotate_reg` is a 32-bit
+        // host rotate over the guest home, so a byte rotate through it rotates 32 bits and takes
+        // CF from bit 31 instead of bit 7. RCL/RCR are out at every width for the standing reason.
         vec![0xc0, 0xc3, 0x05], // /0 ROL r8, imm8
         vec![0xc0, 0xcb, 0x05], // /1 ROR r8, imm8
         vec![0xc0, 0xd3, 0x05], // /2 RCL r8, imm8
         vec![0xc0, 0xdb, 0x05], // /3 RCR r8, imm8
-        // The byte SHIFTS the arm does not claim. /5 SHR, /6 the SAL alias of /4 and /7 SAR are
-        // each one character away from admitted and none has a measured census row; the arm's
-        // `m.reg != 4` refuses all three, and dropping this trio would let a widening to
-        // `4..=7` pass unnoticed.
-        vec![0xc0, 0xeb, 0x05], // /5 SHR r8, imm8
-        vec![0xc0, 0xf3, 0x05], // /6 SAL r8, imm8, the undocumented /4 alias
-        vec![0xc0, 0xfb, 0x05], // /7 SAR r8, imm8
-        // SHL r8 by an implicit 1 and by CL. Same byte width, same sub-opcode, different opcodes
-        // and no arm: the duke3d-586 re-census tops 0xD0 out at 49,021 runtime hits across every
-        // sub-opcode, three orders below the row 0xC0 /4 is admitted for.
-        vec![0xd0, 0xe3], // /4 SHL r8, 1
+        vec![0xd0, 0xc3],       // /0 ROL r8, 1
+        vec![0xd0, 0xcb],       // /1 ROR r8, 1
+        vec![0xd0, 0xd3],       // /2 RCL r8, 1
+        vec![0xd0, 0xdb],       // /3 RCR r8, 1
+        // The byte group BY CL, every sub-opcode. `0xD2` has no arm at any width and no census row
+        // asks for one: `emit_shift_cl` is Dword-only, exactly as `0xD3`'s arm says. This is the
+        // row that would catch `0xd2` being swept in beside `0xd0` on the strength of the two
+        // being one instruction apart in the opcode map.
         vec![0xd2, 0xe3], // /4 SHL r8, CL
-        vec![0xd0, 0xcb], // byte ROR by 1
+        vec![0xd2, 0xeb], // /5 SHR r8, CL
+        vec![0xd2, 0xfb], // /7 SAR r8, CL
         vec![0xd2, 0xcb], // byte ROR by CL
         vec![0xd3, 0xcb], // /1 ROR by CL: a runtime count, deliberately out of this slice
         vec![0xd3, 0xc3], // /0 ROL by CL: same
@@ -2145,6 +2154,12 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
         vec![0xc1, 0x0d, 0x00, 0x50, 0x00, 0x00, 0x05],
         vec![0xc1, 0x05, 0x00, 0x50, 0x00, 0x00, 0x05],
         vec![0xc0, 0x25, 0x00, 0x50, 0x00, 0x00, 0x05],
+        // And the memory forms of the two rows the byte-shift slice DID admit, which are separate
+        // census rows it does not claim. Both are refused by the shared register-only `let-else`,
+        // so replacing that bind with a defaulting match would shift AL instead and survive every
+        // register battery above.
+        vec![0xc0, 0x2d, 0x00, 0x50, 0x00, 0x00, 0x05],
+        vec![0xd0, 0x2d, 0x00, 0x50, 0x00, 0x00],
         // 66-prefixed ROR and ROL r/m16. The OperandSize::Word guard inside the classify arm is
         // the only thing stopping these from being lowered as 32-bit rotates, which would smear
         // the high half into the low one.
@@ -2156,6 +2171,10 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
             "group 2 {code:02x?} must stay interpreter-only"
         );
     }
+    // Restore the byte-shift arm rather than leaking it: the override is thread-local and the
+    // harness reuses threads, so a leaked ON would decide the arm for whichever fixture runs next
+    // on this one -- including the refusal fixtures whose whole point is that it is off.
+    jit::direct::set_byte_shift_rows_for_test(None);
 }
 
 #[test]
@@ -2223,6 +2242,15 @@ fn select_rotate_rows(enabled: bool) {
         jit::direct::rotate_rows_enabled(),
         enabled,
         "the fixture override must decide the arm, not the ambient IZARRAVM_ROTATE_ROWS"
+    );
+}
+
+fn select_byte_shift_rows(enabled: bool) {
+    jit::direct::set_byte_shift_rows_for_test(Some(enabled));
+    assert_eq!(
+        jit::direct::byte_shift_rows_enabled(),
+        enabled,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_BYTE_SHIFT_ROWS"
     );
 }
 
