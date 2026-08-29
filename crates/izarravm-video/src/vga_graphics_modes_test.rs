@@ -1314,6 +1314,66 @@ fn clearing_chain4_in_mode13h_enters_and_leaves_mode_x() {
     assert_eq!(vga.active_mode(), VideoMode::Mode13h);
 }
 
+/// A CRTC write that leaves the raster the same size must not erase the
+/// scanlines the beam has already drawn.
+///
+/// Psycho Pinball rewrites its vertical CRTC group once per frame while a table
+/// is in play, close to the end of the frame. Every one of those writes
+/// reallocated the work raster to zeros, so the frame published at the next
+/// vertical retrace held only the handful of lines drawn after the write. The
+/// screen was black while video memory held the table: measured at 4109 wipes
+/// of a drawn raster against 4361 published frames, and 5589 non-zero pixels
+/// per published frame out of 117760.
+///
+/// Real silicon has no such buffer. Rewriting a register with the value it
+/// already holds changes nothing the beam is doing.
+#[test]
+fn a_same_size_crtc_write_keeps_the_scanlines_already_drawn() {
+    let mut vga = direct_mode_x(0);
+    vga.vram.fill(0x2A);
+    // One full frame, so the work raster holds the pattern on every line.
+    vga.advance(vga.frame_dots());
+    let full = vga
+        .last_presented()
+        .expect("a completed frame")
+        .pixels
+        .iter()
+        .filter(|&&index| index != 0)
+        .count();
+    assert!(full > 0, "the pattern reaches the raster at all");
+
+    // Draw all but the last line of the next frame, then rewrite a vertical
+    // CRTC register with the value it already holds -- the guest's own table
+    // replay. Only one line is left for the finalize to draw, so a wipe here
+    // costs the whole picture.
+    let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
+    vga.advance(vga.frame_dots());
+    vga.advance(line_dots * u64::from(vga.crtc.vtotal - 1));
+    vga.read_status1();
+    assert_eq!(vga.last_line, vga.crtc.vtotal - 1);
+
+    let unchanged = vga.crtc_regs.r12;
+    let vtotal = vga.crtc.vtotal;
+    let vdisp = vga.crtc.vdisp_end;
+    vga.write_port(0x3D4, 0x12);
+    vga.write_port(0x3D5, unchanged);
+    assert_eq!(vga.crtc.vtotal, vtotal, "the write changed no geometry");
+    assert_eq!(vga.crtc.vdisp_end, vdisp, "the write changed no geometry");
+
+    finish_current_frame(&mut vga);
+    let published = vga
+        .last_presented()
+        .expect("a completed frame")
+        .pixels
+        .iter()
+        .filter(|&&index| index != 0)
+        .count();
+    assert_eq!(
+        published, full,
+        "a write that resizes nothing keeps every scanline already drawn"
+    );
+}
+
 #[test]
 fn mode_x_direct_write_page_tracks_the_selected_plane() {
     let mut vga = direct_mode_x(0);
