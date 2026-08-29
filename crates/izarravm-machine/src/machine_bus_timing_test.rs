@@ -4604,3 +4604,107 @@ fn a_masked_a20_folds_a_fetch_run_into_the_vga_aperture_and_must_not_take_the_fa
         );
     });
 }
+
+/// The test `Vega::device_free_extended_floor`'s doc comment names, and the one
+/// that has to exist for its claim to mean anything: the floor is a HAND-DERIVED
+/// summary of `may_own_memory` plus `rom_offset`, and a hand-derived claim is
+/// only as good as the thing that re-checks it. Add an aperture above 1 MB to
+/// `may_own_memory` and forget the floor, and the screen starts answering "plain
+/// RAM" for a window -- which charges the wrong wait-state, silently, on a path
+/// that runs millions of times a second.
+///
+/// The comparison is against `device_window_uncached`, the gauntlet with the
+/// screen bypassed. Asking `is_device_window` instead would be circular: it
+/// answers `false` BY returning early, so it would agree with the screen by
+/// construction and pass forever.
+///
+/// BOTH BAR configurations, and the first draft of this test got that wrong in a
+/// way worth recording. It relocated Distira's BAR low in order to exercise the
+/// variable half of the floor -- and by doing so took the `distira_mem_base` arm
+/// on EVERY probe, so the constant `MARGO_LFB_BASE` arm was never evaluated at
+/// all. Breaking that arm deliberately (returning `HIGH_ROM_BASE`, which makes
+/// the screen swallow Margo's whole framebuffer) left the test GREEN. A sweep
+/// that covers one arm of a two-arm function is not a sweep. Both are covered
+/// now, and the deliberate break was re-run against them to confirm it goes red.
+///
+/// The probe list is a coarse stride plus every boundary the derivation actually
+/// leans on, because a pure stride is overwhelmingly likely to step straight over
+/// a 64 KB register block. The boundaries are the claim; the stride is there to
+/// catch a region nobody thought to name.
+#[test]
+fn may_own_memory_agrees_with_the_extended_floor() {
+    let mut probes: Vec<u32> = Vec::new();
+    // Every boundary the derivation names, and the byte either side of it.
+    for anchor in [
+        0x0000_0000u32,
+        0x000A_0000,
+        0x000C_0000,
+        LOW_BIOS_BASE,
+        0x0010_0000,
+        0x0011_0000,
+        0x4000_0000,
+        0x4100_0000,
+        MARGO_LFB_BASE,
+        MARGO_MMIO_BASE,
+        0xE041_0000,
+        HIGH_ROM_BASE,
+    ] {
+        for delta in [0u32, 1, 4] {
+            probes.push(anchor.saturating_sub(delta));
+            probes.push(anchor.saturating_add(delta));
+        }
+    }
+    // A coarse sweep of the whole 32-bit space on top, for a region nobody named.
+    let mut address = 0u32;
+    loop {
+        probes.push(address);
+        let Some(next) = address.checked_add(0x0080_0000) else {
+            break;
+        };
+        address = next;
+    }
+    probes.push(u32::MAX);
+
+    // `None` leaves Distira's BAR where it powers on (0xE100_0000, ABOVE Margo),
+    // so the floor takes its constant arm. `Some(top)` writes BAR0's decoded top
+    // byte, putting the BAR below Margo so the floor takes its variable arm.
+    for relocation in [None, Some(0x40u8)] {
+        let mut machine = test_machine();
+        if let Some(top) = relocation {
+            machine.vega.pci_write_config_byte(0x13, top);
+        }
+        let floor = machine.vega.device_free_extended_floor();
+        let expected = match relocation {
+            None => MARGO_LFB_BASE,
+            Some(top) => u32::from(top) << 24,
+        };
+        assert_eq!(
+            floor, expected,
+            "the {relocation:?} configuration must exercise the arm this iteration is for"
+        );
+
+        // The screen has to actually ACCEPT things, or every assertion below is
+        // skipped by the `continue` and the test proves nothing.
+        let mut accepted = 0u32;
+        with_bus(&mut machine, |bus| {
+            for probe in &probes {
+                for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                    if !bus.is_device_free_extended_ram(*probe, width.bytes() as usize) {
+                        // Declining costs only speed, never correctness: the
+                        // gauntlet decides it, exactly as before the screen.
+                        continue;
+                    }
+                    accepted += 1;
+                    assert!(
+                        !bus.device_window_uncached(*probe, width),
+                        "floor {floor:#x}: the screen accepted {probe:#x} width {width:?}, but a                          window claims it -- device_free_extended_floor is out of date with                          may_own_memory or rom_offset"
+                    );
+                }
+            }
+        });
+        assert!(
+            accepted > 100,
+            "floor {floor:#x}: only {accepted} probes were screened in, so this sweep is              close to vacuous"
+        );
+    }
+}

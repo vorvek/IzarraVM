@@ -3989,6 +3989,21 @@ impl MachineBus<'_> {
         rom_offset(address, bytes).is_some() || self.vega.owns_memory(address, bytes)
     }
 
+    /// The device-window gauntlet with the extended-RAM screen BYPASSED: what
+    /// `is_device_window` would answer if the screen did not exist.
+    ///
+    /// Test-only, and the exact sibling of `Vega::owns_memory_uncached`, which
+    /// exists for the same reason one region down. A test that asked
+    /// `is_device_window` whether the screen is safe would be circular: the
+    /// screen returns `false` by returning early, so the answer would agree
+    /// with itself. This is the independent second opinion the sweep compares
+    /// against.
+    #[cfg(test)]
+    pub(super) fn device_window_uncached(&self, address: u32, width: BusWidth) -> bool {
+        let bytes = width.bytes() as usize;
+        rom_offset(address, bytes).is_some() || self.vega.owns_memory(address, bytes)
+    }
+
     /// True when `address` (post-A20, `bytes` wide) is extended RAM that NO
     /// window can claim, so the gauntlet below would answer `false` after
     /// running every predicate in it.
@@ -4014,7 +4029,6 @@ impl MachineBus<'_> {
     /// address alone, so a straddling access at the very top of the window is
     /// already classified by its base. Including the width can only make the
     /// screen decline more often, never wrongly accept.
-    #[inline]
     ///
     /// A20 is the way this screen could be wrong without ever looking wrong:
     /// with the gate masked, `0x0010_0000..0x0010_FFEF` aliases DOWN into
@@ -4031,6 +4045,7 @@ impl MachineBus<'_> {
     /// real-mode fetches out of the HMA (`0x0010_0000..0x0010_FFEF` with A20
     /// open) are extended RAM by this test and take the fast path on every boot.
     /// That is deliberate, not incidental.
+    #[inline]
     pub(super) fn is_device_free_extended_ram(&self, address: u32, bytes: usize) -> bool {
         debug_assert_eq!(
             self.apply_a20(address),
