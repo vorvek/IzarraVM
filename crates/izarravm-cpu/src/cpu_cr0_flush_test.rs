@@ -16,7 +16,9 @@
 //!    `pmode_entry_reuses_a_real_mode_decode_line_and_still_faults`) -- red before the slice;
 //! 2. the ANTI-REGRESSION rows (`cr0_pg_*`, `cr0_wp_change_under_paging_still_flushes`,
 //!    `mov_cr3_still_flushes`) -- green before AND after, and they are what catches an inverted
-//!    predicate or a swapped old/new argument pair;
+//!    predicate, or an `old_cr0` captured after the assignment instead of before it. They do NOT
+//!    catch a swapped old/new argument pair, which is provably inert; see the mutation ledger at
+//!    the foot of this file;
 //! 3. the LOAD-BEARING row (`retained_real_mode_chain_is_unreachable_under_pe`) -- green before
 //!    and after, pinning the section 3.2 argument the whole slice rests on: a retained real-mode
 //!    chain is not reachable under PE because `jit_mode_key` bit 1 is inside both `BlockKey` and
@@ -26,6 +28,12 @@ use super::*;
 
 /// A real-mode CPU with a 32-bit default code size, CS/DS/SS/ES at base 0. PE is CLEAR, which is
 /// the precondition every keep row needs: the predicate must return `false` for these writes.
+///
+/// EVERY segment gets `default_size_32 = true`, not just CS. That is load-bearing for
+/// `retained_real_mode_chain_is_unreachable_under_pe`: `jit_mode_key` carries the SS B bit as well
+/// as PE, so a fixture that entered protected mode with a 32-bit SS after starting with a 16-bit
+/// one would see the mode key move for a reason that has nothing to do with PE, and would pass
+/// with PE dropped from the key entirely.
 fn real_mode_cr0_cpu(entry: u32) -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw586);
@@ -36,9 +44,11 @@ fn real_mode_cr0_cpu(entry: u32) -> CpuGsw {
         SegmentIndex::Es,
     ] {
         cpu.load_segment_real(segment, 0);
+        let mut descriptor = cpu.registers.segment(segment);
+        descriptor.default_size_32 = true;
+        cpu.registers.set_segment(segment, descriptor);
     }
     let mut cs = cpu.registers.cs();
-    cs.default_size_32 = true;
     cs.access = 0x9b;
     cpu.registers.set_segment(SegmentIndex::Cs, cs);
     cpu.set_eip(entry);
@@ -568,9 +578,14 @@ mod links {
             pmode_key.physical, real_key.physical,
             "and the same physical address: paging is off on both sides"
         );
-        assert_ne!(
-            pmode_key.mode_key, real_key.mode_key,
-            "PE must be inside the mode key"
+        // Not merely "different": different in EXACTLY the PE bit. `jit_mode_key` also carries
+        // CS.D, V86, the SS B bit and PG, and a fixture that let any of those move would stay
+        // green with PE dropped from the key altogether -- which is the mutation this row is the
+        // only catcher for.
+        assert_eq!(
+            pmode_key.mode_key ^ real_key.mode_key,
+            1 << 1,
+            "the two keys must differ in the PE bit and nothing else"
         );
         assert!(
             matches!(
@@ -600,3 +615,44 @@ mod links {
         );
     }
 }
+
+// MUTATION EVIDENCE for the CR0 flush predicate (2026-08-29, applied by hand, run, restored).
+// Each row names the fixture that caught it; a mutation nobody catches is recorded as a NON-GATE
+// rather than claimed as coverage (`gates-that-cannot-fail-are-systemic`). Rows run against
+// `cargo test -p izarravm-cpu --lib cr0_flush` unless the row says otherwise.
+//
+// | mutation | caught by |
+// |---|---|
+// | `cr0_write_moves_code_translation` -> always `true` | the five keep rows, and the split is EXACTLY the 6-pass/5-fail split this branch's first commit recorded against `0333d956` -- which is the design's requirement that the one-line kill switch be behaviour-identical to base, measured rather than assumed |
+// | -> always `false` | `cr0_pg_set_still_flushes`, `cr0_pg_clear_still_flushes`, `cr0_wp_change_under_paging_still_flushes` |
+// | `delta & CR0_PG` -> `new & CR0_PG` | `cr0_pg_clear_still_flushes` |
+// | `delta & CR0_PG` -> `old & CR0_PG` | `cr0_pg_set_still_flushes` |
+// | drop the WP disjunct | `cr0_wp_change_under_paging_still_flushes` |
+// | `CR0_PG` -> `CR0_PE` in the predicate | seven rows: both PE-keep rows, the link row, LMSW, the pmode-reuse row, and both PG rows |
+// | `old_cr0` captured AFTER the assignment at MOV CR0 | `cr0_pg_set_still_flushes`, `cr0_pg_clear_still_flushes`, `cr0_wp_change_under_paging_still_flushes` |
+// | `old_cr0` captured AFTER the assignment at LMSW | **NON-GATE** -- inert, see below |
+// | old/new arguments swapped at MOV CR0 | **NON-GATE** -- inert, see below |
+// | old/new arguments swapped at LMSW | **NON-GATE** -- inert, see below |
+// | drop PE from `jit_mode_key` | `retained_real_mode_chain_is_unreachable_under_pe` |
+// | `BlockKey::new` keeps only `linear` | `retained_real_mode_chain_is_unreachable_under_pe`, `cr0_pe_toggle_keeps_direct_links` |
+// | decode-line hit test stops comparing `d` (whole-crate run) | `d_bit_change_at_the_same_linear_address_re_decodes`, `decode_cache_hits_only_on_matching_tag_and_generation` -- NOT by any row here, because every row in this file uses one `d` on both sides of the mode change |
+// | `flush_tlb_keep_code_caches` stops dropping the fetch frontend | `pe_toggle_still_drops_prefetch` |
+// | the gate applied to the MOV CR3 path too | `mov_cr3_still_flushes` |
+//
+// THE ARGUMENT SWAP IS INERT AT BOTH SITES, and this corrects the design's expectation that the
+// MOV CR0 swap would be caught by the PG rows. It is not, and it cannot be: `delta = old ^ new`
+// is symmetric, and the only asymmetric term (`new & CR0_PG`) is reached only when
+// `delta & CR0_PG == 0` -- at which point `old & CR0_PG == new & CR0_PG` by construction. So
+// swapping the pair cannot change the predicate's answer for ANY input, at either site. The
+// ordering hazard the design was actually worried about is a capture taken AFTER the assignment,
+// which collapses both arguments to the new value; that one is real, it is caught at MOV CR0 by
+// three rows, and it is inert at LMSW for the same reason every other LMSW mutation is (the
+// predicate is false there for every operand).
+//
+// `drop PE from jit_mode_key` did NOT fail on the first attempt, and the reason is worth the
+// ledger space: `real_mode_cr0_cpu` originally left SS with `default_size_32 = false`, so entering
+// protected mode with a flat 32-bit SS moved `jit_mode_key` bit 3 as well as bit 1. The row's
+// `assert_ne!` on the whole mode key was therefore satisfied by the SS bit alone and the mutation
+// ran green. The fixture now gives every segment a 32-bit default and the row asserts the two keys
+// differ in EXACTLY `1 << 1` -- an assertion that is stronger than the design asked for, and that
+// is what turns this row into the only catcher the mutation has.

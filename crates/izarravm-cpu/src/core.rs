@@ -280,9 +280,15 @@ impl CpuGsw {
     }
 
     /// The gated flush the two CR0 writers take. `old` is the value CR0 held BEFORE the write;
-    /// `new` is the value it holds after. Both call sites assign `self.control.cr0` first, so the
-    /// old value has to be captured before the assignment -- passing them the other way round
-    /// inverts the predicate, which is what the PG rows in `cpu_cr0_flush_test.rs` catch.
+    /// `new` is the value it holds after. Both call sites flush AFTER assigning `self.control.cr0`,
+    /// so the old value has to be captured before that assignment; capturing it after collapses
+    /// both arguments to the new value and the predicate then never fires. The PG rows in
+    /// `cpu_cr0_flush_test.rs` catch exactly that.
+    ///
+    /// SWAPPING the two arguments, by contrast, is provably INERT and no test catches it:
+    /// `delta` is symmetric, and the asymmetric `new & CR0_PG` term is only reached when
+    /// `delta & CR0_PG == 0`, at which point `old & CR0_PG == new & CR0_PG`. The mutation ledger
+    /// at the foot of `cpu_cr0_flush_test.rs` records this as a non-gate rather than as coverage.
     pub(super) fn flush_tlb_for_cr0_write(&mut self, old_cr0: u32, new_cr0: u32) {
         if Self::cr0_write_moves_code_translation(old_cr0, new_cr0) {
             self.flush_tlb_and_code_caches();
