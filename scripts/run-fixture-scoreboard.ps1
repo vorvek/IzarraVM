@@ -1141,6 +1141,15 @@ function Get-FixtureTable {
             cycles = [uint64]4000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; dukemark = $null
+            # 2026-08-29 re-pin, e312f8f3 -> 04fd8558. PR #760 (Tier B B3)
+            # rebuilt KERNEL.SYS inside tokados-hdd.img (73071 -> 73487 bytes),
+            # which shifts the boot phase; the 4e9 budget lands one torch-flame
+            # frame off. Proven by a code-identical A/B at 0333d956 with only
+            # the image swapped: old image reproduces e312f8f3, new image
+            # 04fd8558. 16 of 128000 pixels differ, all inside the left torch
+            # sprite at x 47-50 / y 160-169. The #762/#763 merges are NOT the
+            # movers (each reproduces the same hash as plain 0333d956).
+            #
             # 2026-08-27 re-pin, 6cc0d354 -> e312f8f3. PR #736 (the Toka-DOS FAT
             # prefetch slice) cut the INT 13h count of the load phase, so the
             # 4e9-cycle budget now lands one TORCH-FLAME frame further along.
