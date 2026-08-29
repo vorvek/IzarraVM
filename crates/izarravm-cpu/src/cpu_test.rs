@@ -4411,3 +4411,6 @@ fn range_hits_code_masked_test_matches_the_per_byte_definition_at_both_edges() {
     assert!(!cache.range_hits_code(0x1_003c, 4));
     assert!(!cache.range_hits_code(SMC_BYTE_COVERAGE - 4, 4));
 }
+
+#[path = "cpu_cr0_flush_test.rs"]
+mod cr0_flush;
