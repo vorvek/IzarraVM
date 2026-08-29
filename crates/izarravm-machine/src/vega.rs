@@ -177,18 +177,29 @@ pub(crate) struct Vega {
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
-    /// How many times the BUS asked the aperture gauntlet to classify an
-    /// address for timing (`MachineBus::is_device_window` and
-    /// `memory_wait_states_device`). Test-only, and deliberately NOT a counter
-    /// inside `owns_memory`: the debug-only `claims_no_byte_in` assertion also
-    /// calls `owns_memory`, so a counter there would move for a reason that has
-    /// nothing to do with the path under test.
+    /// The two halves of the device-window classification, counted separately
+    /// so a test can tell which of them a change removed.
     ///
-    /// It exists because the screen it pins is a mechanism no value comparison
-    /// can see: an extended-RAM address classifies as "not a device window"
-    /// either way, and only the cost of reaching that answer changes.
+    /// `questions` counts every time the BUS asks whether an address is a device
+    /// window (`MachineBus::is_device_window` and `memory_wait_states_device`).
+    /// `gauntlet_entries` counts the subset that got past the extended-RAM
+    /// screen and actually walked `rom_offset` plus Vega's ten predicates. The
+    /// fetch fast path removes QUESTIONS; the screen removes GAUNTLET ENTRIES.
+    /// One counter could not separate those, and a test that cannot separate
+    /// them passes for the wrong reason.
+    ///
+    /// Test-only, and deliberately NOT counted inside `owns_memory`: the
+    /// debug-only `claims_no_byte_in` assertion also calls `owns_memory`, so a
+    /// counter there would move for a reason that has nothing to do with the
+    /// path under test.
+    ///
+    /// They exist because what they pin is a mechanism no value comparison can
+    /// see: an extended-RAM address classifies as "not a device window" either
+    /// way, and only the cost of reaching that answer changes.
     #[cfg(test)]
-    device_window_classifications: Cell<u64>,
+    device_window_questions: Cell<u64>,
+    #[cfg(test)]
+    device_window_gauntlet_entries: Cell<u64>,
 }
 
 impl Default for Vega {
@@ -213,7 +224,9 @@ impl Default for Vega {
             distira_mem_base: DISTIRA_MMIO_BASE & !(DISTIRA_PCI_BAR_SIZE - 1),
             distira_init_enable: 0,
             #[cfg(test)]
-            device_window_classifications: Cell::new(0),
+            device_window_questions: Cell::new(0),
+            #[cfg(test)]
+            device_window_gauntlet_entries: Cell::new(0),
         }
     }
 }
@@ -1590,17 +1603,31 @@ impl Vega {
         }
     }
 
-    /// Called by the bus each time it enters the gauntlet to classify an address
-    /// for timing. See [`Vega::device_window_classifications`].
+    /// Called by the bus each time it ASKS whether an address is a device
+    /// window, before the extended-RAM screen runs. See
+    /// [`Vega::device_window_questions`].
     #[cfg(test)]
-    pub(crate) fn note_device_window_classification(&self) {
-        self.device_window_classifications
-            .set(self.device_window_classifications.get() + 1);
+    pub(crate) fn note_device_window_question(&self) {
+        self.device_window_questions
+            .set(self.device_window_questions.get() + 1);
+    }
+
+    /// Called by the bus each time a question got past the screen and entered
+    /// the gauntlet itself.
+    #[cfg(test)]
+    pub(crate) fn note_device_window_gauntlet_entry(&self) {
+        self.device_window_gauntlet_entries
+            .set(self.device_window_gauntlet_entries.get() + 1);
     }
 
     #[cfg(test)]
-    pub(crate) fn device_window_classifications(&self) -> u64 {
-        self.device_window_classifications.get()
+    pub(crate) fn device_window_questions(&self) -> u64 {
+        self.device_window_questions.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_window_gauntlet_entries(&self) -> u64 {
+        self.device_window_gauntlet_entries.get()
     }
 
     pub(crate) fn owns_memory(&self, address: u32, width: usize) -> bool {

@@ -1951,8 +1951,29 @@ impl CpuBus for MachineBus<'_> {
         // cacheable-RAM arm and charge ONE I-cache access at the constant
         // wait-state, so charge exactly that in one step. ROM/device/A20-edge
         // runs keep the full classification, byte-for-byte.
+        // The same argument, one region up. A 32-bit game's code lives in
+        // extended RAM, so the screen above never fires for it and every fetch
+        // run pays the `#[cold]` tail: two A20 folds, two wait-state lookups
+        // through the device gauntlet, and the uniformity test. A run that lies
+        // wholly inside `0x0010_0000 .. device_free_extended_floor()` reaches
+        // exactly the same conclusion as that tail -- cacheable RAM, uniform,
+        // one I-cache access -- because no window claims any byte of it (see
+        // `is_device_free_extended_ram`) and a contiguous run inside one region
+        // is uniform by construction.
+        //
+        // A20 has to be OPEN for this arm, and that is not the same requirement
+        // the conventional arm carries. Below 1 MB the mask is the identity, so
+        // that arm can ignore the gate; up here a masked gate folds the run down
+        // into conventional memory, where a window may well claim it. Testing
+        // the gate first also makes `physical_start` a post-A20 address, which
+        // is what `is_device_free_extended_ram` asserts it is given.
+        // Written as one short-circuiting condition on purpose: a run below the
+        // video aperture must not pay for the extended test, so the gate read
+        // and the floor comparison sit behind the `||`.
         if let Some(end) = physical_start.checked_add(count - 1)
-            && end < 0x000A_0000
+            && (end < 0x000A_0000
+                || (self.keyboard.a20_enabled()
+                    && self.is_device_free_extended_ram(physical_start, count as usize)))
         {
             debug_assert_eq!(
                 self.icache_fetch_clocks,
@@ -3920,6 +3941,8 @@ impl MachineBus<'_> {
     /// `address >= 0xA0000`, so conventional RAM never reaches here.
     pub(super) fn is_device_window(&self, address: u32, width: BusWidth) -> bool {
         let bytes = width.bytes() as usize;
+        #[cfg(test)]
+        self.vega.note_device_window_question();
         if self.is_device_free_extended_ram(address, bytes) {
             // The screen is a hand-derived claim about the two claimants below,
             // so prove it on every debug run rather than trusting the
@@ -3935,7 +3958,7 @@ impl MachineBus<'_> {
             return false;
         }
         #[cfg(test)]
-        self.vega.note_device_window_classification();
+        self.vega.note_device_window_gauntlet_entry();
         rom_offset(address, bytes).is_some() || self.vega.owns_memory(address, bytes)
     }
 
@@ -4007,6 +4030,8 @@ impl MachineBus<'_> {
 
     #[cold]
     fn memory_wait_states_device(&self, address: u32) -> u8 {
+        #[cfg(test)]
+        self.vega.note_device_window_question();
         // Extended RAM reaches here because the caller's screen is `< 0xA0000`,
         // and it would fall all the way through to the `wait_states.ram` arm at
         // the bottom. Answer it here instead. See `is_device_free_extended_ram`.
@@ -4018,7 +4043,7 @@ impl MachineBus<'_> {
             return self.wait_states.ram;
         }
         #[cfg(test)]
-        self.vega.note_device_window_classification();
+        self.vega.note_device_window_gauntlet_entry();
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
         } else if self.vega.owns_memory(address, 1) {

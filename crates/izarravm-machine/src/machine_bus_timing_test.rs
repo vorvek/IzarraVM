@@ -4372,26 +4372,26 @@ fn extended_ram_is_classified_without_entering_the_device_window_gauntlet() {
     let mut machine = test_machine();
     with_bus(&mut machine, |bus| {
         for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
-            let before = bus.vega.device_window_classifications();
+            let before = bus.vega.device_window_gauntlet_entries();
             assert!(
                 !bus.is_device_window(EXTENDED, width),
                 "extended RAM at {EXTENDED:#x} is not a device window"
             );
             assert_eq!(
-                bus.vega.device_window_classifications(),
+                bus.vega.device_window_gauntlet_entries(),
                 before,
                 "classifying extended RAM at width {width:?} must not enter the gauntlet"
             );
         }
 
-        let before = bus.vega.device_window_classifications();
+        let before = bus.vega.device_window_gauntlet_entries();
         assert_eq!(
             bus.memory_wait_states(EXTENDED),
             bus.wait_states.ram,
             "extended RAM is charged the RAM wait-state"
         );
         assert_eq!(
-            bus.vega.device_window_classifications(),
+            bus.vega.device_window_gauntlet_entries(),
             before,
             "the byte-cost path must not enter the gauntlet for extended RAM either"
         );
@@ -4420,30 +4420,30 @@ fn the_screen_declines_every_address_a_window_can_claim() {
             (MARGO_MMIO_BASE, BusWidth::Byte, true), // Margo's registers
             (HIGH_ROM_BASE, BusWidth::Byte, true),   // the BIOS alias at 4 GB
         ] {
-            let before = bus.vega.device_window_classifications();
+            let before = bus.vega.device_window_gauntlet_entries();
             assert_eq!(
                 bus.is_device_window(address, width),
                 claimed,
                 "{address:#x} width {width:?} classification"
             );
             assert!(
-                bus.vega.device_window_classifications() > before,
+                bus.vega.device_window_gauntlet_entries() > before,
                 "{address:#x} must be decided by the gauntlet, not by the screen"
             );
         }
 
         // The last byte below the ceiling is inside the window; a Dword based
         // there is not, because it reaches the framebuffer's first byte.
-        let before = bus.vega.device_window_classifications();
+        let before = bus.vega.device_window_gauntlet_entries();
         assert!(!bus.is_device_window(MARGO_LFB_BASE - 1, BusWidth::Byte));
         assert_eq!(
-            bus.vega.device_window_classifications(),
+            bus.vega.device_window_gauntlet_entries(),
             before,
             "the byte below the ceiling is still screened"
         );
         assert!(!bus.is_device_window(MARGO_LFB_BASE - 1, BusWidth::Dword));
         assert!(
-            bus.vega.device_window_classifications() > before,
+            bus.vega.device_window_gauntlet_entries() > before,
             "a Dword that straddles the ceiling must reach the gauntlet"
         );
     });
@@ -4483,14 +4483,114 @@ fn relocating_the_distira_bar_lowers_the_device_free_ceiling() {
         "the relocated BAR is now the lowest claimant above 1 MB"
     );
     with_bus(&mut machine, |bus| {
-        let before = bus.vega.device_window_classifications();
+        let before = bus.vega.device_window_gauntlet_entries();
         assert!(
             bus.is_device_window(RELOCATED, BusWidth::Byte),
             "the relocated BAR is a device window"
         );
         assert!(
-            bus.vega.device_window_classifications() > before,
+            bus.vega.device_window_gauntlet_entries() > before,
             "an address at or above the ceiling reaches the gauntlet"
+        );
+    });
+}
+
+/// The fetch-charging fast path had one screen, `end < 0x000A_0000`, and a
+/// 32-bit game's code is nowhere near it. Every fetch run such a game makes fell
+/// through to `charge_classified_instruction_fetch_run` -- two A20 folds, two
+/// wait-state lookups through the device gauntlet, and a uniformity test -- to
+/// reach the conclusion the address range already guarantees.
+///
+/// The signal is the QUESTION counter, not the gauntlet counter. The screen in
+/// the previous commit already stops an extended-RAM question from reaching the
+/// gauntlet, so a gauntlet counter reads zero either way and would pass whether
+/// or not the tail ran. What this commit removes is the question itself: the
+/// fast arm never calls `code_fetch_wait_states`, so the bus never asks.
+///
+/// `elapsed_clocks` is asserted beside it, because a fast arm that skipped the
+/// question AND the charge would otherwise satisfy the counter.
+#[test]
+fn an_extended_ram_fetch_run_skips_the_cold_classification_tail() {
+    // 2 MB: real RAM in a 16 MiB test machine, above 1 MB, far below the
+    // device-free ceiling at MARGO_LFB_BASE.
+    const EXTENDED: u32 = 0x0020_0000;
+    let mut machine = test_machine();
+    machine.set_bus_trace_detailed(false);
+    with_bus(&mut machine, |bus| {
+        // A real machine powers on with A20 masked, and the extended arm
+        // requires it open. Port 0x92 bit 1 is the fast gate.
+        bus.write_io(0x92, BusWidth::Byte, 0x02, false).unwrap();
+        assert!(bus.keyboard.a20_enabled(), "A20 is open for this test");
+
+        let questions = bus.vega.device_window_questions();
+        let clocks = bus.trace.elapsed_clocks();
+        bus.charge_instruction_fetch_run(EXTENDED, 5).unwrap();
+        assert_eq!(
+            bus.vega.device_window_questions(),
+            questions,
+            "an extended-RAM run takes the fast arm, which never asks the classification"
+        );
+        assert_eq!(
+            bus.trace.elapsed_clocks() - clocks,
+            bus.icache_fetch_clocks,
+            "and charges exactly one I-cache access for the whole run"
+        );
+    });
+}
+
+/// The extended arm's own precondition, and the one that separates it from the
+/// conventional arm above it: below 1 MB the A20 mask is the identity, so that
+/// arm may ignore the gate, but up here a masked gate folds the run DOWN into
+/// conventional memory, where a window can claim it.
+///
+/// `A20_MASK` clears bit 20 and nothing else, so `0x001A_0000` folds to
+/// `0x000A_0000` -- the VGA aperture. That is not a hypothetical: a run there
+/// must be charged as a device window, per byte, and the fast arm would charge
+/// it as one I-cache access out of cacheable RAM. The clock delta is asserted,
+/// not just the counter, because the counter alone would not say the charge
+/// came out right.
+#[test]
+fn a_masked_a20_folds_a_fetch_run_into_the_vga_aperture_and_must_not_take_the_fast_arm() {
+    // Folds to VGA_MODE13H_BASE when the gate is masked; ordinary extended RAM
+    // when it is open.
+    const ALIASES_ONTO_VGA: u32 = 0x001A_0000;
+    let mut machine = test_machine();
+    machine.set_bus_trace_detailed(false);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x92, BusWidth::Byte, 0x02, false).unwrap();
+        assert!(bus.keyboard.a20_enabled(), "A20 is open");
+        let questions = bus.vega.device_window_questions();
+        let clocks = bus.trace.elapsed_clocks();
+        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4).unwrap();
+        assert_eq!(
+            bus.vega.device_window_questions(),
+            questions,
+            "with the gate open this is ordinary extended RAM and takes the fast arm"
+        );
+        assert_eq!(
+            bus.trace.elapsed_clocks() - clocks,
+            bus.icache_fetch_clocks,
+            "charged as one I-cache access"
+        );
+
+        // Close the gate. The same run now aliases onto the VGA aperture.
+        bus.write_io(0x92, BusWidth::Byte, 0x00, false).unwrap();
+        assert!(!bus.keyboard.a20_enabled(), "A20 is masked again");
+        assert_eq!(
+            bus.apply_a20(ALIASES_ONTO_VGA),
+            VGA_MODE13H_BASE,
+            "the masked run folds onto the aperture this test is about"
+        );
+        let questions = bus.vega.device_window_questions();
+        let clocks = bus.trace.elapsed_clocks();
+        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4).unwrap();
+        assert!(
+            bus.vega.device_window_questions() > questions,
+            "a masked gate must send the run to the tail, which folds the address first"
+        );
+        assert!(
+            bus.trace.elapsed_clocks() - clocks > bus.icache_fetch_clocks,
+            "and the tail must charge it as the device window it folded onto"
         );
     });
 }
