@@ -4484,23 +4484,27 @@ pub(crate) enum DirectKind {
     NegReg {
         dst: u8,
     },
-    /// ROL and ROR r/m32, register form (0xC1 and 0xD1, sub-opcodes /0 and /1). `count` is the RAW
-    /// decoded immediate; the emitter applies the architectural five-bit mask, exactly as `Shift`
-    /// does.
+    /// The register-form ROTATES: ROL and ROR (`0xC1`/`0xD1` `/0`, `/1`) and, behind
+    /// `IZARRAVM_RCL_ROWS`, RCL and RCR (`0xD1` `/2`, `/3`). `count` is the RAW decoded immediate;
+    /// the emitter applies the architectural five-bit mask, exactly as `Shift` does.
     ///
-    /// `op` is the guest ModRM `reg` field, 0 for ROL and 1 for ROR, and it is passed STRAIGHT
-    /// through to `shift_r32_imm8`'s own `/op` slot. Host group 2 numbers its sub-opcodes the same
-    /// way the guest does, so the field needs no translation table and a widening to a third
-    /// sub-opcode would need one -- /2 and /3 are RCL and RCR, which the classify arm refuses
-    /// because they take the incoming CF as a rotate INPUT.
+    /// `op` is the guest ModRM `reg` field -- 0 ROL, 1 ROR, 2 RCL, 3 RCR -- and it is passed
+    /// STRAIGHT through to `shift_r32_imm8`'s own `/op` slot. Host group 2 numbers its sub-opcodes
+    /// the same way the guest does, so the field needs no translation table at any of the four.
+    ///
+    /// The through-carry pair differ from the plain pair in ONE thing and it is an INPUT: CF is an
+    /// operand of the rotate, so `emit_rotate_reg` preloads the host flags from the RBP shadow
+    /// before the instruction. Every OUTPUT is the same for all four -- CF always, OF at count 1,
+    /// SF/ZF/PF/AF preserved -- which is why they share this kind and that emitter.
     ///
     /// No `width` field, and refusing rather than adding one is a deliberate boundary: `classify`
-    /// returns None for both sub-opcodes at `OperandSize::Word`, because this kind's emitter is
+    /// returns None for all four sub-opcodes at `OperandSize::Word`, because this kind's emitter is
     /// `shift_r32_imm8` and a 66-prefixed rotate routed through it would rotate 32 bits where the
     /// guest rotates 16 -- wrong result AND wrong CF, since the bit rotated across the boundary
-    /// comes from bit 31 instead of bit 15. Neither the duke3d-586 nor the 16-bit census measures
-    /// a Word row for either sub-opcode, so a second emitter lane would be an unmeasured
-    /// admission.
+    /// comes from bit 31 instead of bit 15 -- and, for `/2`/`/3`, it would additionally seed bit
+    /// 16 of the destination from the guest's CF, writing into a half of the register a 16-bit
+    /// rotate must PRESERVE. No census measures a Word row for any of the four, so a second
+    /// emitter lane would be an unmeasured admission.
     ///
     /// Deliberately NOT folded into `Shift`. That variant's emitter falls through to an
     /// arithmetic shift right, so a rotate routed through it would be silently emitted as SAR.
@@ -4671,12 +4675,13 @@ pub(crate) enum DirectKind {
         /// allowlist, so it reached the emitter, which has no CL-form Word lane and panicked the
         /// compiler. The width test is the bar and
         /// `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
-        /// fixture. (`RotateReg` needs no such field: classify refuses both rotates at Word
-        /// outright.)
+        /// fixture. (`RotateReg` needs no such field: classify refuses all four rotates at Word
+        /// outright. The `/2` and `/3` rows additionally can never carry a lane at all, because
+        /// this function keys on `insn.opcode` being `0xC0`/`0xC1` and they are `0xD1` only.)
         lane: Option<ImmLane>,
     },
     /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
-    /// admits ROL (/0) and ROR (/1) but routes them to `RotateReg`, because rotates do not define
+    /// admits the rotates and routes them to `RotateReg`, because rotates do not define
     /// PF, ZF, SF or AF and `emit_shift_cl` merges the shift mask.
     ///
     /// A separate variant rather than a `ShiftCount` field on `Shift`: `Shift` carries its count
@@ -6681,7 +6686,7 @@ fn imm8_lane_for(
 ///   kind's own width is what makes the refusal a fact rather than an inference about encodings.
 ///   `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
 ///   fixture; the Word form keeps compiling with a baked count, exactly as before this slice.
-///   `RotateReg` needs no width test: classify refuses both rotates at Word outright.
+///   `RotateReg` needs no width test: classify refuses all four rotates at Word outright.
 /// - `insn.opcode == 0xC1 || insn.opcode == 0xC0`: `0xD1` produces the SAME two kinds but carries
 ///   no immediate at all — its count is the literal 1 baked into the opcode — so `physical + 2`
 ///   would name the next instruction's first byte. **This bar is REDUNDANT today and kept anyway,
@@ -11487,6 +11492,157 @@ pub(crate) fn generic_callout_default_arm_for_test() -> bool {
     GENERIC_CALLOUT_DEFAULT_ARM
 }
 
+/// Whether `classify` lowers **`0xD1 /2` RCL and `0xD1 /3` RCR at Dword, REGISTER form** natively
+/// (`IZARRAVM_RCL_ROWS`, default OFF).
+///
+/// # The row, from the census that ranked it
+///
+/// nascar-586 at main `f777010c`, `IZARRAVM_DIRECT_BARRIER_CENSUS=1`, plain release build. The
+/// `rejected` class is 40,666,390 unbound exits and `0xD1 /2` RCL r32,1 register is its
+/// **8,704,380**-runtime-hit head, third behind the two string primitives, with a native prefix of
+/// 10 and a suffix of 4. It is the other half of the `shl eax,1` / `rcl edx,1` idiom that shifts a
+/// 64-bit quantity through two 32-bit registers, so it sits directly behind rows this backend has
+/// been lowering since the group-2 slices -- which is why the exits pile onto it.
+///
+/// A LOWERING and not a call-out, and that is the whole design decision. A call-out frame is ~40
+/// host instructions plus a helper invocation that captures six segment records, three control
+/// registers and two epochs; the lowering below is `emit_load_host_flags`, one host `rcl`, and the
+/// flag capture the ROL/ROR rows already emit.
+///
+/// # The flag contract, read off the interpreter and not off the manual
+///
+/// `shift_rotate` (`core.rs`) takes the `matches!(op, 4..=7)` FALSE branch for every rotate:
+/// `set_flag(FLAG_CF, cf)` unconditionally and, **at count 1 only**, `set_flag(FLAG_OF, top ^ cf)`.
+/// **SF, ZF, PF and AF are UNTOUCHED**, so a live lazy descriptor keeps its authority across the
+/// rotate. That is `emit_rotate_reg`'s existing contract for ROL and ROR, which is why RCL/RCR
+/// join THAT emitter rather than growing one of their own.
+///
+/// **It is emphatically NOT `emit_carry_alu_preloaded`'s contract**, and the code's own comment on
+/// the `0xc1 | 0xd1` arm used to recommend exactly that ("the shape `emit_carry_alu_preloaded`
+/// has"). That emitter does `emit_capture_flags(ARITH_FLAGS)` and then publishes the whole
+/// arithmetic class, which is right for ADC/SBB and **wrong for a rotate by four flags**: a block
+/// running `cmp` (live descriptor), then a lowered RCL, then `jz` would branch on flags the
+/// interpreter preserves and the emitter had overwritten -- a guest-visible divergence, not a
+/// timing question. The comment is corrected in the same commit that adds these rows, because it
+/// is where the wrong idea came from and leaving it would re-seed it.
+///
+/// The ONE line worth borrowing from `emit_carry_alu_preloaded` is `emit_load_host_flags`, emitted
+/// BEFORE the host rotate, because CF is a rotate INPUT: `shift_rotate` seeds `cf` from
+/// `flag(FLAG_CF)` before its loop. Its two-arm branch on CF is not needed and would not be sound
+/// here -- there is no CF=0 arithmetic variant of RCL with the same flag contract (SHL defines
+/// SF/ZF/PF; RCL must not).
+///
+/// # Three refusals, each of which the code already warned about
+///
+/// 1. **Word.** `DirectKind::RotateReg` carries no `width` field and `emit_rotate_reg` is
+///    `shift_r32_imm8`, so a 66-prefixed rotate through it would rotate 32 bits where the guest
+///    rotates 16 -- wrong result AND wrong CF, since the bit rotated across the boundary would
+///    come from bit 31 instead of bit 15. RCL/RCR take the SAME `OperandSize::Word` guard the
+///    arm already applies to ROL/ROR, which that guard's own comment calls "the only thing that
+///    stops them". The census row is `operand_size: dword, prefix_mask: 0`.
+/// 2. **Byte forms** (`0xD0 /2`, `0xC0 /2`) stay out. A byte rotate through this emitter rotates
+///    32 bits, takes CF from bit 31 instead of bit 7, and for byte indices 4..7 reaches a guest
+///    ESP/EBP/ESI/EDI home instead of AH/CH/DH/BH.
+/// 3. **`0xC1` does NOT come along for free.** `/2` and `/3` are added inside the SHARED
+///    `0xc1 | 0xd1` arm, so the new admission gates on `opcode == 0xd1` explicitly. The imm-count
+///    form would need `emit_rotate_reg`'s three-way compile-time split on the masked count (0 = no
+///    rotate and no flags; 1 = CF|OF; 2..31 = CF only) to be re-derived for a carry-seeded rotate,
+///    and the census head is `0xD1 /2` alone. The COUNT-LANE form is refused by the same fact from
+///    the other side: `count_lane_for` keys on `insn.opcode` being `0xc0 | 0xc1`, so a `0xd1` row
+///    can never carry a lane and `emit_rotate_reg_lane` is unreachable for these sub-opcodes --
+///    its `debug_assert` says so.
+///
+/// # RCL/RCR are OUTSIDE the L1 heat gate, and the implementer does nothing to put them there
+///
+/// `rotate_row_count_byte` is keyed on `(opcode, reg)` and its three arms are `0xc0 reg == 4`,
+/// `0xc1 reg == 0` and `0xd1 reg == 0`. `0xd1 reg == 2` falls to `_ => return None`, so these rows
+/// are outside the gate BY DEFAULT.
+///
+/// The reason matters as much as the answer, because the obvious one is false. It is NOT that
+/// `0xD1` has no patchable count byte: the `0xd1 if reg == 0` arm returns `physical + len - 2`,
+/// the OPCODE byte, precisely because for `0xD1` the count IS the opcode and patching that byte is
+/// the SMC shape the gate watches. `0xD1 /0` ROL is very much inside the gate and does have a gate
+/// site. Stating it the wrong way would tell a future editor that `0xD1` has no gate site, which
+/// would justify deleting a live arm.
+///
+/// # The spelling table
+///
+/// Trimmed and case-folded on the way in. DEFAULT OFF, so `""` folds in with `0`/`off` rather than
+/// naming the default separately; an OFF ladder leg must EXPORT `0` rather than null the variable.
+///
+/// * unset, `` (empty), `0` or `off` -> OFF, the pre-slice refusal, the escape and the A/B base.
+///   With the knob off the arm's guard is the one it had before this slice, by inspection.
+/// * `1` / `on` -> `0xD1 /2` and `/3` at Dword, register form, are lowered.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
+///   fell through to the default would be read as "the rows I asked for changed nothing".
+///
+/// The default flip is a SEPARATE commit with its own ladder leg.
+pub(crate) fn rcl_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = RCL_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_rcl_rows_arm(std::env::var("IZARRAVM_RCL_ROWS")))
+}
+
+/// The `IZARRAVM_RCL_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `rcl_rows_enabled` for the contract.
+fn parse_rcl_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset is OFF, and so is the empty string two arms down. They coincide because the
+        // shipped default is OFF; if the default ever flips they must NOT be unified, because a
+        // wrapper that computes a leg value and produces "" has missed a lookup rather than said
+        // "on". `parse_byte_shift_rows_arm` is the shape to copy on that day.
+        Err(std::env::VarError::NotPresent) => return false,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_RCL_ROWS is set to a value that is not valid UTF-8; accepted spellings \
+                 are unset or `` / `0` / `off` (the shipped default: `0xD1 /2` and `/3` stay \
+                 barriers) and `1` / `on` (both are lowered at Dword, register form)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_RCL_ROWS={other:?} names no arm; accepted spellings are unset or `` / `0` / \
+             `off` (the shipped default: `0xD1 /2` RCL and `/3` RCR stay barriers) and `1` / `on` \
+             (both are lowered at Dword, register form). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `BYTE_SHIFT_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
+// `OnceLock` and the fixtures have to run both arms in one process. While the arm is default-OFF
+// it is the POSITIVE fixtures that must force it on, or they would test the refusal and call it a
+// lowering.
+#[cfg(test)]
+thread_local! {
+    static RCL_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the RCL/RCR row arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_RCL_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_rcl_rows_for_test(forced: Option<bool>) {
+    RCL_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `rcl_rows_enabled` caches its env reading in a
+/// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
+/// never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_rcl_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_rcl_rows_arm(value)
+}
+
 /// Whether `classify` admits **`0xE4` IN AL,imm8, for ANY immediate port** as a `PortReadAlImm8`
 /// call-out (`IZARRAVM_DIRECT_IN_IMM8_CALLOUT`, gp2 in-imm8 callout design rev 3).
 ///
@@ -15555,12 +15711,41 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // largest refused-row seam, up from 10.3M once the disp-lane slice raised coverage
                 // and blocks started compiling up TO it and seaming every pass.
                 //
-                // RCL (/2) and RCR (/3) stay out and the reason is structural rather than a
-                // missing row: both take the incoming CF as a rotate INPUT (`shift_rotate` seeds
-                // `cf` from `flag(FLAG_CF)` before its loop), which needs the guest flags loaded
-                // into the host before the rotate rather than only captured after it -- the shape
-                // `emit_carry_alu_preloaded` has, and a slice of its own rather than a list entry.
-                if !matches!(m.reg, 0 | 1 | 4..=7) {
+                // RCL (/2) and RCR (/3) join the ROTATE half as of the carry-lowering slice,
+                // behind `IZARRAVM_RCL_ROWS` and at `0xD1` ONLY. The nascar-586 census ranks
+                // `0xD1 /2` register dword at 8,704,380 runtime hits, third in the whole rejected
+                // class.
+                //
+                // THE CORRECTED CITATION. An earlier version of this comment said both "need the
+                // guest flags loaded into the host before the rotate rather than only captured
+                // after it -- the shape `emit_carry_alu_preloaded` has". The first half is right
+                // and is the whole of what `emit_load_host_flags` is for: `shift_rotate` seeds
+                // `cf` from `flag(FLAG_CF)` before its loop, so CF is a rotate INPUT. The second
+                // half is WRONG and was the source of a blocked design revision.
+                // `emit_carry_alu_preloaded` does `emit_capture_flags(ARITH_FLAGS)` and publishes
+                // the whole arithmetic class, which is right for ADC/SBB and wrong for a rotate by
+                // four flags: the interpreter's rotate branch writes CF always and OF at count 1
+                // and leaves SF, ZF, PF and AF ALONE, so a live descriptor keeps its authority.
+                // `cmp` then a lowered RCL then `jz` would have branched on flags the interpreter
+                // preserves and that emitter overwrites. The right shape is `emit_rotate_reg`'s
+                // own count-1 arm -- which these rows share -- plus that one preloading call.
+                //
+                // `0xC1` does NOT come along: `/2` and `/3` sit inside this SHARED arm, so the
+                // admission gates on `opcode == 0xd1` explicitly. The imm-count form would need
+                // `emit_rotate_reg`'s three-way compile-time split on the masked count re-derived
+                // for a carry-seeded rotate, and the census head is `0xD1 /2` alone. The COUNT
+                // LANE is refused by the same fact from the other side: `count_lane_for` keys on
+                // `insn.opcode` being `0xc0 | 0xc1`, so a `0xd1` row can never carry one.
+                //
+                // `/3` RCR rides the arm with `/2` on this file's closure rule and has no census
+                // row of its own. It is the same emitter, the same interpreter branch and the same
+                // flag contract at both counts -- the host computes RCR's count-1 OF exactly as it
+                // computes RCL's -- so refusing one polarity of a two-polarity rotate would be
+                // arbitrary in the way `emit_rotate_reg`'s own header calls out for ROL and ROR.
+                // It is named here rather than smuggled: it is an UNMEASURED closure admission.
+                if !matches!(m.reg, 0 | 1 | 4..=7)
+                    && !(opcode == 0xd1 && matches!(m.reg, 2 | 3) && rcl_rows_enabled())
+                {
                     return None;
                 }
                 // The off arm (`IZARRAVM_ROTATE_ROWS=0`, the opt-out since the 2026-08-19/20 flip),
@@ -15584,16 +15769,22 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // The RAW immediate, unmasked, matching what the Shift arm has always stored. The
                 // architectural five-bit mask is applied in the emitter.
                 let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 };
-                if matches!(m.reg, 0 | 1) {
-                    // BOTH rotates are REFUSED at Word, and this guard is the only thing that
+                if matches!(m.reg, 0..=3) {
+                    // ALL FOUR rotates are REFUSED at Word, and this guard is the only thing that
                     // stops them now that 0xc1 is on the Word allowlist. `RotateReg` carries no
                     // width and its emitter is `shift_r32_imm8(op, ..)` plus `emit_set_cf_only`,
                     // so a 66-prefixed rotate routed through it would rotate 32 bits where the
                     // guest rotates 16 -- wrong result AND wrong CF, since the bit rotated across
                     // the boundary comes from bit 31 instead of bit 15. The duke3d-586 re-census
-                    // measures the ROL row at `operand_size: dword` with `prefix_mask: 0`, and no
-                    // fixture measures a Word row for either sub-opcode, so this is a refusal with
-                    // nothing to buy rather than a missed lowering worth the second emitter lane.
+                    // measures the ROL row at `operand_size: dword` with `prefix_mask: 0` and the
+                    // nascar-586 census measures `0xD1 /2` the same way, and no fixture measures a
+                    // Word row for any of the four, so this is a refusal with nothing to buy
+                    // rather than a missed lowering worth the second emitter lane.
+                    //
+                    // For RCL/RCR the wrong-width failure is one worse than for ROL/ROR: as well
+                    // as rotating the wrong number of bits it would seed bit 16 of the destination
+                    // from the guest's CF, writing into a half of the register a 16-bit rotate
+                    // must PRESERVE.
                     if insn.operand_size == OperandSize::Word {
                         return None;
                     }
@@ -21735,14 +21926,33 @@ fn emit_set_cf_only(e: &mut Encoder) {
     e.place(done);
 }
 
-/// ROL and ROR r32, imm8 (0xC1 and 0xD1, sub-opcodes /0 and /1), register destination.
+/// The register-destination ROTATES: ROL and ROR (`0xC1`/`0xD1` `/0`, `/1`) and, behind
+/// `IZARRAVM_RCL_ROWS`, RCL and RCR (`0xD1` `/2`, `/3`).
 ///
 /// `op` is the guest ModRM `reg` field and goes STRAIGHT into `shift_r32_imm8`'s `/op` slot: host
-/// group 2 numbers ROL 0 and ROR 1 exactly as the guest does, so there is no translation to get
-/// wrong. Everything below this line is direction-independent, which is the whole reason the two
-/// sub-opcodes share one function -- the flag contract, not the rotate, is what the code is for.
+/// group 2 numbers ROL 0, ROR 1, RCL 2 and RCR 3 exactly as the guest does, so there is no
+/// translation to get wrong. Everything below the preload is direction-independent AND
+/// carry-independent, which is the whole reason the four sub-opcodes share one function -- the
+/// flag contract, not the rotate, is what the code is for.
+///
+/// THE ONE ASYMMETRY, and it is an input rather than an output. RCL and RCR take the incoming CF
+/// as an OPERAND (`shift_rotate` seeds `cf` from `flag(FLAG_CF)` before its loop), so the guest's
+/// CF has to be in the HOST's flags before the rotate executes, not merely captured after it.
+/// `emit_load_host_flags` does exactly that from the RBP shadow, which is the running materialized
+/// EFLAGS word at every point in a block body -- the same read `emit_carry_alu_preloaded` makes
+/// for ADC/SBB's carry-in, and the only thing worth taking from that emitter. Its two-arm branch
+/// on CF is not needed here and would not be sound: there is no CF=0 arithmetic variant of RCL
+/// with this flag contract (SHL defines SF/ZF/PF; a rotate must not).
+///
+/// Everything AFTER the rotate is already correct for all four, and that is the finding this slice
+/// rests on rather than new code: the interpreter's rotate branch writes CF unconditionally and OF
+/// at count 1 only, leaving SF, ZF, PF and AF to whatever owns them. The two arms below are that
+/// contract, and they were written for ROL/ROR before RCL existed here.
 fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
-    debug_assert!(matches!(op, 0 | 1), "only ROL and ROR reach this emitter");
+    debug_assert!(
+        matches!(op, 0..=3),
+        "only the four rotates reach this emitter"
+    );
     // The five-bit mask is applied HERE, on the raw decoded immediate, the same way emit_shift
     // does it. classify stores the immediate unmasked, so selecting the shape below on the raw
     // byte would misread `ror eax, 32` as a fourth case instead of the no-op it is.
@@ -21756,11 +21966,26 @@ fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
     // have to be read off `shift_rotate` rather than off the manual, because the manual calls OF
     // undefined above count 1 and this tree's oracle is the interpreter.
     //
-    // CF is the bit rotated across the boundary -- out of the MSB for ROL, out of bit 0 for ROR --
-    // which is what the loop leaves in `cf` for either direction. At count 1 the interpreter's OF
-    // arm splits by op: `0 | 2 => top ^ cf` for a left rotate and `1 | 3 => top ^ (bit 30 of the
-    // result)` for a right one. Those are the SAME two definitions x86 gives ROL and ROR, so the
-    // host computes each one for us and the split never appears in this function.
+    // CF is the bit rotated across the boundary -- out of the MSB for a left rotate, out of bit 0
+    // for a right one -- which is what the loop leaves in `cf` for either direction and for both
+    // the through-carry and the plain forms. At count 1 the interpreter's OF arm splits by
+    // DIRECTION and not by carry: `0 | 2 => top ^ cf` for a left rotate and
+    // `1 | 3 => top ^ (bit 30 of the result)` for a right one. Those are the SAME definitions x86
+    // gives ROL/RCL and ROR/RCR, so the host computes each one for us and neither split appears in
+    // this function.
+    //
+    // THE CARRY PRELOAD, and its position is the contract. `emit_load_host_flags` must run before
+    // the rotate, because for `/2` and `/3` CF is an operand of it. It is skipped for ROL/ROR so
+    // that their emitted bytes stay exactly what they were before this slice: those two read no
+    // flag at all, and the off arm of `IZARRAVM_RCL_ROWS` therefore reproduces the pre-slice tree
+    // by inspection rather than by argument.
+    //
+    // It clobbers RAX and moves RSP by 8 across the push/popfq -- the accepted unwind gap
+    // `emit_capture_flags` already carries. `home(dst)` is one of `GUEST_HOMES`, none of which is
+    // RAX, so the destination cannot be the register the preload stages through.
+    if matches!(op, 2 | 3) {
+        emit_load_host_flags(e);
+    }
     e.shift_r32_imm8(op, home(dst), count);
     if count == 1 {
         // Two set_flag calls, and their ORDER is what makes this branch-free. set_flag(FLAG_CF)
@@ -21838,7 +22063,15 @@ const SHIFT_DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | cr
 /// Nothing between the mask and the last read of RCX writes it: `rol r32, cl` only READS CL, and
 /// `emit_capture_flags`/`emit_set_cf_only`/`emit_clear_pending` work in RAX, RDI and RBP.
 fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, lane: ImmLane) {
-    debug_assert!(matches!(op, 0 | 1), "only ROL and ROR reach this emitter");
+    // ROL and ROR only, and for the through-carry pair the bar is structural rather than a policy
+    // choice: `count_lane_for` keys on `insn.opcode` being `0xC0`/`0xC1`, and RCL/RCR are admitted
+    // at `0xD1` alone, so a lane can never attach to one. If that ever changes, this emitter needs
+    // the carry preload placed inside BOTH count arms below -- not once at the top, because the
+    // count-0 arm must leave CF alone -- and this assert is what will say so.
+    debug_assert!(
+        matches!(op, 0 | 1),
+        "only ROL and ROR reach the lane emitter"
+    );
     debug_assert_eq!(u32::from(lane.width), IMM8_LANE_WIDTH);
     let one = e.label();
     let done = e.label();

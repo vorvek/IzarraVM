@@ -269,6 +269,12 @@ mod eager_flags;
 #[path = "cpu_jit_string_callout_test.rs"]
 mod string_callout;
 
+/// `0xD1 /2` RCL and `0xD1 /3` RCR at Dword, register form, behind `IZARRAVM_RCL_ROWS`. Nested
+/// here for the reason the eight modules above are: it wants this module's `ENTRY`, `STACK_TOP`
+/// and `flat_cpu` rather than a tenth copy of them.
+#[path = "cpu_jit_rcl_rows_test.rs"]
+mod rcl_rows;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a
