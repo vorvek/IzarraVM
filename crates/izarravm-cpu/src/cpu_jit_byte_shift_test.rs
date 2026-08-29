@@ -72,32 +72,43 @@
 //! # Mutation record
 //!
 //! Twenty applied BY HAND to the committed tree, run, observed, and restored with
-//! `git checkout -- <file>`. The `caught by` column names the first test that fired; the whole
-//! `izarravm-cpu` suite was run each time rather than a filter, per Slice 3's lesson that a
-//! filtered mutation run understates the blast radius as readily as it understates the catch.
+//! `git checkout -- <file>`. Each was run against the whole `cpu_jit_byte_shift_test` module (its
+//! own 15 rows plus the 2,073 the filter excludes are unaffected by a byte-shift edit); the four
+//! SURVIVORS were then re-run against the WHOLE `izarravm-cpu` suite -- 2,067 tests, all green on
+//! each -- because a survivor is the only outcome a filtered run can get wrong in the direction
+//! that matters.
 //!
-//! | # | mutation | outcome |
+//! | # | mutation | outcome, and the row that fired first |
 //! |---|---|---|
-//! | M1 | `width: MemoryWidth::Byte` -> `operand_width` in the `0xD0` arm | RED |
-//! | M2 | `count: 1` -> `insn.imm as u8` in the `0xD0` arm | RED |
-//! | M3 | `matches!(m.reg, 4..=7)` -> `0 \| 1 \| 4..=7` in the `0xD0` arm | RED |
-//! | M4 | fold `0xd0` into the `0xc1 \| 0xd1` arm | RED |
-//! | M5 | drop `0xd0` from the allowlist term | RED |
-//! | M6 | drop `0xc0` from the allowlist term | RED |
+//! | M1 | `width: MemoryWidth::Byte` -> `operand_width` in the `0xD0` arm | RED, 3 rows: both differentials + the high-byte row |
+//! | M2 | `count: 1` -> `insn.imm as u8` in the `0xD0` arm | RED, the same 3 |
+//! | M3 | `matches!(m.reg, 4..=7)` -> `0 \| 1 \| 4..=7` in the `0xD0` arm | RED, `byte_rotates_stay_a_hard_boundary_*` + the neighbour sweep |
+//! | M4 | fold `0xd0` into the `0xc1 \| 0xd1` arm | RED, 7 rows |
+//! | M5 | drop `0xd0` from the allowlist term | RED, 7 rows incl. `a_sixteen_bit_segment_block_compiles_through_shr_r8_1` |
+//! | M6 | drop `0xc0` from the allowlist term | RED, 9 rows |
 //! | M7 | drop the sub-opcode key from the allowlist term | **SURVIVES -- see below** |
-//! | M8 | `4 if !rotate_rows_enabled()` arm deleted from the `0xc0` arm | RED |
+//! | M8 | delete the `4 if !rotate_rows_enabled()` arm from `0xc0` | RED, `the_two_group_two_knobs_are_independent` ALONE |
 //! | M9 | knob read moved below the `m.reg` test in the `0xD0` arm | **SURVIVES -- see below** |
-//! | M10 | `emit_shift_reg8` assert reverted to `op == 4` | RED (debug panic) |
-//! | M11 | `emit_shift_lane` Byte assert reverted to `op == 4` | RED (debug panic) |
-//! | M12 | `emit_shift_reg8` body -> `shift_r32_imm8(op, home(dst), count)` | RED |
-//! | M13 | widen `rotate_row_count_byte` to `0xc0 if matches!(reg, 4..=7)` | RED |
-//! | M14 | `rotate_row_count_byte`'s `0xc0 if reg == 4` -> `_ => None` | RED |
-//! | M15 | drop the `count == 0` early return in `emit_shift` | RED |
-//! | M16 | `count = raw_count & 0x1f` -> `raw_count` in `emit_shift` | RED |
-//! | M17 | swap `emit_commit_shift_flags` / `emit_write_gpr8` in `emit_shift_reg8` | RED |
+//! | M10 | `emit_shift_reg8` assert reverted to `op == 4` | RED, 8 rows (debug panic) |
+//! | M11 | `emit_shift_lane` Byte assert reverted to `op == 4` | RED, 10 rows (debug panic) |
+//! | M12 | `emit_shift_reg8` body -> `shift_r32_imm8(op, home(dst), count)` | RED, both differentials + the high-byte row |
+//! | M13 | widen `rotate_row_count_byte` to `0xc0 if matches!(reg, 4..=7)` | RED, `the_two_group_two_knobs_are_independent` ALONE |
+//! | M14 | `rotate_row_count_byte`'s `0xc0 if reg == 4` -> `_ => None` | RED, the same row alone |
+//! | M15 | drop the `count == 0` early return in `emit_shift` | RED, both differentials -- **but only after the fix below** |
+//! | M16 | `count = raw_count & 0x1f` -> `raw_count` in `emit_shift` | RED, both differentials -- **same** |
+//! | M17 | swap `emit_commit_shift_flags` / `emit_write_gpr8` in `emit_shift_reg8` | RED, 3 rows |
 //! | M18 | `op: if m.reg == 6 { 4 }` -> `op: m.reg` (drop the normalisation) | **SURVIVES, by design** |
-//! | M19 | `byte_shift_rows_enabled()` returns `true` unconditionally | RED |
+//! | M19 | `byte_shift_rows_enabled()` returns `true` unconditionally | RED, `byte_shift_rows_ship_the_default_arm` ALONE |
 //! | M20 | `"" => DEFAULT_ARM` -> `"" => false` in the parse table | **SURVIVES while the default is OFF** |
+//!
+//! **M15 and M16 caught a real hole in this file, and the hole is the more useful finding.** On
+//! the first run both SURVIVED. `emit_shift`'s count-0 return and its five-bit mask are reachable
+//! from the byte rows only through the BAKED emitter, and on the shipped `IZARRAVM_COUNT_LANES`
+//! arm every `0xC0` row here was taking a count lane instead -- while `0xD0`'s count is the
+//! literal 1 and can never be 0 or 32. So the two rows that the design named as M15's and M16's
+//! killers were exercising a different emitter than the mutants edited. The differentials now
+//! force the count-lane arm OFF and the laned arm has sweeps of its own, which is
+//! `cpu_jit_count_lane_test.rs`'s recorded lesson arriving here a second time.
 //!
 //! **The four survivors are recorded rather than papered over, and each has a reason.**
 //!
@@ -105,13 +116,13 @@
 //!   instruction, so no differential can separate them. Inventing a test that pinned
 //!   `DirectKind::Shift.op == 4` for a `/6` input would be a shape test dressed as a behaviour
 //!   test. The design predicted this survivor by name.
-//! * **M7 is behaviourally inert on this tree, which the design did not predict.** Dropping the
-//!   sub-opcode key lets `0xC0 /0..=/3` and `0xD0 /0..=/3` past the Word GATE, and they then hit
-//!   `return None` inside their own arm one step later -- the same `classify` answer, the same
-//!   `hard_boundary` census row, the same compile outcome. There is no observable difference to
-//!   assert on, so `the_gate_does_not_sweep_in_its_neighbours` records the rows as boundaries
-//!   (which they are on both shapes) and the key stays in the source because it is what keeps the
-//!   two refusals stated in the same place rather than split across two mechanisms.
+//! * **M7 is behaviourally inert on this tree, which the design did NOT predict** -- it expected
+//!   the neighbour sweep to kill it. Dropping the sub-opcode key lets `0xC0 /0..=/3` and
+//!   `0xD0 /0..=/3` past the Word GATE, and they then hit `return None` inside their own arm one
+//!   step later: the same `classify` answer, the same `hard_boundary` census row, the same compile
+//!   outcome. There is nothing to assert on. The key stays in the source because it keeps both
+//!   halves of the refusal stated in one place, so a later widening of the arms cannot silently
+//!   widen what the Word gate admits -- but it buys no behaviour today and this record says so.
 //! * **M9 is inert for the same class of reason.** Both orderings return `None` for `/0..=/3`, and
 //!   the knob is a pure function of the environment with no side effect but its panic, which still
 //!   fires the first time any gated row is classified.
@@ -120,6 +131,14 @@
 //!   asserts `""` against `byte_shift_rows_default_arm_for_test()` rather than against a literal,
 //!   so the mutant dies the moment the default flips -- which is the commit that makes the
 //!   distinction real.
+//!
+//! **What the record says about where the coverage actually lives.** Three mutants are caught by
+//! exactly ONE row each, and two of them are the heat-gate pair: M13 and M14 die only on
+//! `the_two_group_two_knobs_are_independent`'s `(HeatGated, *)` cells, which is why that row is a
+//! 3x2 matrix over `RotateRowsArm` and not a 2x2 over booleans -- `rotate_row_count_byte` is
+//! reached only under the `HeatGated` arm, so a boolean matrix would have been a gate that cannot
+//! fail. M19 dies only on the default pin, because every other row forces the arm through the
+//! thread-local override and so never reaches the `OnceLock` the mutant edits.
 
 use super::*;
 
@@ -275,6 +294,14 @@ impl Drop for ArmOverride {
 /// Force the byte-shift arm and PROVE the selection took. `IZARRAVM_ROTATE_ROWS` is pinned to `On`
 /// alongside it, because `0xC0 /4` sits at the intersection of the two axes and a fixture that
 /// inherited the ambient rotate arm would be reading a different cell of the matrix than it says.
+///
+/// **The count-lane arm is left AMBIENT here and forced by the rows that care**, because it
+/// selects which of two emitters the `0xC0` rows reach and the two need separate sweeps. That is
+/// `cpu_jit_count_lane_test.rs`'s recorded lesson -- when `IZARRAVM_COUNT_LANES` flipped default
+/// ON, every unforced group-2 fixture in the tree quietly stopped exercising the baked emitter.
+/// It bit this file too: with the arm ambient, `emit_shift`'s `count == 0` early return and its
+/// five-bit mask were unreachable from the `0xC0` rows here (`0xD0`'s count is 1 and never zero),
+/// and the mutants that delete them both SURVIVED the first run of this suite.
 #[must_use]
 fn force_byte_shift_rows(on: bool) -> ArmOverride {
     jit::direct::set_byte_shift_rows_for_test(Some(on));
@@ -691,6 +718,10 @@ fn a_sixteen_bit_segment_block_compiles_through_shr_r8_1() {
 #[test]
 fn byte_shift_register_forms_match_the_interpreter_in_a_sixteen_bit_segment() {
     let _arm = force_byte_shift_rows(true);
+    // THE BAKED EMITTER, forced. See `force_byte_shift_rows`: on the shipped count-lane arm every
+    // `0xC0` row here would reach `emit_shift_lane` instead, and `emit_shift`'s count-0 return and
+    // five-bit mask would go untested. The laned arm has its own sweep below.
+    jit::direct::set_count_lanes_for_test(Some(false));
     byte_shift_differential(Seg::Sixteen);
 }
 
@@ -698,6 +729,8 @@ fn byte_shift_register_forms_match_the_interpreter_in_a_sixteen_bit_segment() {
 #[test]
 fn byte_shift_register_forms_match_the_interpreter_in_a_thirty_two_bit_segment() {
     let _arm = force_byte_shift_rows(true);
+    // The baked emitter, forced, for the reason the sixteen-bit row above states.
+    jit::direct::set_count_lanes_for_test(Some(false));
     byte_shift_differential(Seg::ThirtyTwo);
 }
 
@@ -762,6 +795,9 @@ fn byte_shift_differential(seg: Seg) {
 #[test]
 fn byte_shift_into_a_high_byte_register_matches_the_interpreter() {
     let _arm = force_byte_shift_rows(true);
+    // The baked emitter, forced: `emit_shift_reg8` is the function whose `home(dst)` trap this row
+    // exists for, and on the ambient arm the `0xC0` half would reach the lane emitter instead.
+    jit::direct::set_count_lanes_for_test(Some(false));
     for seg in SEGMENTS {
         for (label, op) in SUB_OPS {
             for dst in 4..8u8 {
