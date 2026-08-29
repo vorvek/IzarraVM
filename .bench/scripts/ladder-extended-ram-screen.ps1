@@ -34,19 +34,31 @@ Arms, both reachable in one binary:
   IZARRAVM_EXTENDED_RAM_SCREEN=0  the OFF arm, main's gauntlet, the A/B base
   IZARRAVM_EXTENDED_RAM_SCREEN=1  the ON arm, the screen
 
-ROW CHOICE. Both defaults are 32-bit protected-mode titles, which is the shape
-the screen is for. `quake-586` earns its place twice over: its demo finishes
-before the budget and the run stops in an idle tail whose length moves with the
-TIMING MODEL (see the scoreboard's own note on that row), so its instruction
-count is the most sensitive identity column on the board. A screen that moved a
-single charged wait-state would show up there first.
+ROW CHOICE, and the correction that produced it. The obvious row was nascar-586,
+because it carries the worst real-time factor on the board. It is the wrong
+headline row for THIS slice. The riprofile share the screen targets is
+`charge_classified_instruction_fetch_run` plus `Vega::owns_memory`, and on
+nascar a large part of the `owns_memory` half is the DATA path: 48.2 M bytes per
+run go to Margo's banked window at 0x000A_0000, which is BELOW the 1 MB floor and
+which this screen therefore cannot help at all. Only nascar's fetch half is in
+scope. duke3d-586 carries the larger share to begin with (4.65% against 2.49%)
+and its video traffic is Mode 13h in the same low aperture, so the same argument
+leaves proportionally more of its share reachable.
 
-Pre-registered bars, from the riprofile shares the screen targets
-(`charge_classified_instruction_fetch_run` plus `Vega::owns_memory`: 2.49% of
-nascar-586 wall, 4.65% of duke3d-586):
-  nascar-586  min-wall ratio >= 1.015 AND pairs above 1 in at least 3 of 4 rounds
-  quake-586   sign agrees with nascar (this row is short, so it is a direction
-              check and a timing falsifier, not a magnitude claim)
+Both defaults are 32-bit protected-mode titles, which is the shape the screen is
+for. `quake-586` earns its place twice over: its demo finishes before the budget
+and the run stops in an idle tail whose length moves with the TIMING MODEL (see
+the scoreboard's own note on that row), so its instruction count is the most
+sensitive identity column on the board. A screen that moved a single charged
+wait-state would show up there first.
+
+Pre-registered bars, written before the first graded leg:
+  duke3d-586-short  min-wall ratio >= 1.02 AND pairs above 1 in at least 3 of 4
+                    rounds. This is the magnitude claim.
+  quake-586         sign agrees with duke3d. This row is short, so it is a
+                    direction check and a timing falsifier, not a magnitude claim.
+  nascar-586        NOT a bar. Run it for coverage if the box allows, and expect
+                    less than duke3d for the reason above.
 A ratio below the bar is a PARK, not a fail: the change removes work and cannot
 make the emulator slower, so a null result means the work was cheaper than the
 profile suggested, and the honest report is the null.
@@ -65,7 +77,7 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = "Run")][string]$Executable,
     [string]$OutDir = "",
     [int]$Rounds = 4,
-    [string[]]$Rows = @("nascar-586", "quake-586"),
+    [string[]]$Rows = @("duke3d-586-short", "quake-586"),
     # Resolve -Rows, print the selection, exit 0. Exists so the self-test's
     # green control can prove a well-formed invocation binds without running a
     # leg. Run-set arguments still have to be supplied; dummies are fine.
@@ -114,8 +126,7 @@ $fixtures = @{
         arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
         cycles    = "6200000000"
     }
-    # Not a default row: 74 s a leg against nascar's 56, and four rounds of it
-    # alone is 20 minutes. Name it explicitly when the box is free for longer.
+    # The magnitude row: 74 s a leg, so four rounds of it alone is 20 minutes.
     "duke3d-586-short" = @{
         folder    = "duke3d_short_c"
         arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
