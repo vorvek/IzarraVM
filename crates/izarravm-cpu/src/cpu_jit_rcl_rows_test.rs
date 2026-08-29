@@ -50,19 +50,26 @@
 //! Each was run against the whole `cpu_jit_rcl_rows_test` module; survivors were re-run against
 //! the whole `izarravm-cpu` suite.
 //!
-//! | # | mutation | outcome |
+//! | # | mutation | outcome, and the rows that fired |
 //! |---|---|---|
-//! | M1 | drop `emit_load_host_flags` from the `2 \| 3` arm of `emit_rotate_reg` | RED |
-//! | M2 | move `emit_load_host_flags` to AFTER the host rotate | RED |
-//! | M3 | `emit_rotate_reg`'s count-1 arm -> `emit_capture_flags(ARITH_FLAGS)` + eager publish (the wrong emitter's contract) | RED |
-//! | M4 | capture `CF` only at count 1, dropping `OF` | RED |
-//! | M5 | drop the `opcode == 0xd1` term from the classify guard | RED |
-//! | M6 | drop the `OperandSize::Word` refusal for `2 \| 3` | RED |
-//! | M7 | widen `rotate_row_count_byte` with a `0xd1 if reg == 2` arm | RED |
-//! | M8 | `rcl_rows_enabled()`'s ENV path returns `true` | RED |
-//! | M9 | `"" => false` -> `"" => true` in the parse table | RED |
+//! | M1 | drop `emit_load_host_flags` from the `2 \| 3` arm of `emit_rotate_reg` | RED, 5 rows |
+//! | M2 | move `emit_load_host_flags` to AFTER the host rotate | RED, the same 5 |
+//! | M3 | the count-1 arm -> `emit_capture_flags(ARITH_FLAGS)` + eager publish (the WRONG emitter's contract) | RED, exactly the two flag-contract rows |
+//! | M4 | capture `CF` only at count 1, dropping `OF` | RED, 5 rows |
+//! | M5 | drop the `opcode == 0xd1` term from the classify guard | RED, `the_refusals_hold_on_both_arms` alone |
+//! | M6 | admit `2 \| 3` ABOVE the `OperandSize::Word` refusal | RED, `the_refusals_hold_on_both_arms` alone |
+//! | M7 | widen `rotate_row_count_byte` to `0xd1 if reg == 0 \|\| reg == 2` | RED, `the_heat_gate_keys_on_the_sub_opcode_as_well_as_the_opcode` alone |
+//! | M8 | `rcl_rows_enabled()`'s ENV path returns `true` | RED, the default pin + the spelling table |
+//! | M9 | `"" => false` -> `"" => true` in the parse table | RED, `rcl_rows_spelling_table_names_every_arm` |
 //!
-//! The recorded outcomes and the rows each killed are in the PR body; every one of the nine kills.
+//! **All nine kill; there are no survivors.** M3 is the one worth reading twice: it applies the
+//! contract the design's first revision specified and the review blocked, and it goes red on
+//! EXACTLY the two flag-contract rows and nothing else -- so the eight other rows would all have
+//! shipped that bug green. `a_live_descriptor_survives_a_lowered_rotate` is doing the work the
+//! adversarial review asked a fixture to do.
+//!
+//! M5, M6 and M7 each die on ONE row, which is what a refusal fixture is supposed to look like:
+//! the discriminating row is the only one that can see the boundary being moved.
 
 use super::*;
 
