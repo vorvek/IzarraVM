@@ -2606,3 +2606,52 @@ fn phase_mark_series_carries_the_cd_columns() {
         );
     }
 }
+
+#[test]
+fn scancode_groups_cover_the_function_keys() {
+    // Added 2026-08-29 for the compatibility board. Pinball Fantasies selects
+    // its table with F1 to F4 and there was no way to spell one, so the row
+    // could not reach gameplay at all -- and gameplay is the only place its
+    // 256-pixel-wide mode X exists. A menu that answers only to a function key
+    // is common enough in DOS games that the whole block is here rather than
+    // just the four this needed.
+    //
+    // Set 1 make codes, from the AT keyboard: F1..F10 are the contiguous run
+    // 0x3B..0x44, and F11/F12 are 0x57/0x58 -- NOT 0x45/0x46, which are
+    // NumLock and ScrollLock. F11 and F12 were added with the 101-key layout
+    // and did not extend the run.
+    for (name, make) in [
+        ("f1", 0x3b_u8),
+        ("f2", 0x3c),
+        ("f3", 0x3d),
+        ("f4", 0x3e),
+        ("f5", 0x3f),
+        ("f6", 0x40),
+        ("f7", 0x41),
+        ("f8", 0x42),
+        ("f9", 0x43),
+        ("f10", 0x44),
+        ("f11", 0x57),
+        ("f12", 0x58),
+    ] {
+        assert_eq!(
+            text_to_scancode_groups(&format!("{{{name}}}")).unwrap(),
+            vec![vec![make, make | 0x80]],
+            "{name}"
+        );
+    }
+
+    // The hold form works on them too, the same as it does on the arrows.
+    assert_eq!(text_to_scancode_groups("{+f3}").unwrap(), vec![vec![0x3d]]);
+    assert_eq!(text_to_scancode_groups("{-f3}").unwrap(), vec![vec![0xbd]]);
+
+    // Tab, which several installers and setup menus need.
+    assert_eq!(
+        text_to_scancode_groups("{tab}").unwrap(),
+        vec![vec![0x0f, 0x8f]]
+    );
+
+    // A name that is nearly a function key is still an error, not a silent 0.
+    assert!(text_to_scancode_groups("{f0}").is_err());
+    assert!(text_to_scancode_groups("{f13}").is_err());
+}

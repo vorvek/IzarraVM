@@ -981,6 +981,28 @@ fn text_to_scancode_groups(text: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
                 "down" => 0x50,
                 "left" => 0x4b,
                 "right" => 0x4d,
+                "tab" => 0x0f,
+                // Set 1 make codes. F1..F10 are the contiguous run 0x3B..0x44;
+                // F11 and F12 are 0x57 and 0x58, NOT 0x45 and 0x46, which are
+                // NumLock and ScrollLock. F11/F12 arrived with the 101-key
+                // layout and did not extend the run.
+                //
+                // Added for the compatibility board: Pinball Fantasies selects
+                // its table with F1..F4, so without these its row could not
+                // reach gameplay, and gameplay is the only place its
+                // 256-pixel-wide mode X exists.
+                "f1" => 0x3b,
+                "f2" => 0x3c,
+                "f3" => 0x3d,
+                "f4" => 0x3e,
+                "f5" => 0x3f,
+                "f6" => 0x40,
+                "f7" => 0x41,
+                "f8" => 0x42,
+                "f9" => 0x43,
+                "f10" => 0x44,
+                "f11" => 0x57,
+                "f12" => 0x58,
                 other => return Err(format!("--inject-keys: unknown key {{{other}}}").into()),
             };
             groups.push(match edge {
