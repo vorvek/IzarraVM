@@ -142,10 +142,21 @@ impl CpuGsw {
         self.jit_direct.clear();
     }
 
-    fn invalidate_decode_frontend(&mut self) {
+    /// The O(1) fetch-window drop, extracted so `flush_tlb_keep_code_caches` can run it without
+    /// the decode-line teardown below it.
+    ///
+    /// These three are dropped for a reason unrelated to INV-T (the translation invariant the
+    /// decode-line bump protects): the eip-window prefetch may hold bytes fetched under the old
+    /// segmentation, and the code page / fetch page are per-fetch translation caches. A mode
+    /// change has to drop them whether or not the linear->physical map moved.
+    fn invalidate_fetch_frontend(&mut self) {
         self.code_page.valid = false;
         self.prefetch.invalidate();
         self.fetch_page.invalidate();
+    }
+
+    fn invalidate_decode_frontend(&mut self) {
+        self.invalidate_fetch_frontend();
         // Paging, mode, A20, and physical-map changes route through here. Any can make the same
         // linear address decode from different bytes, so invalidate the lines and their SMC marks.
         self.decode_cache.invalidate_and_clear_code_marks();
@@ -188,7 +199,16 @@ impl CpuGsw {
         self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
     }
 
-    pub(super) fn flush_tlb_and_code_caches(&mut self) {
+    /// The half every control-register flush runs: the TLB, the physical data-page caches and the
+    /// FastMap. Deliberately NOT gated by `cr0_write_moves_code_translation` -- the FastMap is
+    /// linear-keyed and privilege-tagged and a PE toggle changes CPL, which is a separate argument
+    /// with a separate blast radius. Keeping it ungated also keeps the `memory.rs` WP invariant
+    /// ("WP changes flush, so `wp` is consistent within a generation") true unconditionally.
+    ///
+    /// `wipes_tlb_flush` is counted HERE, above the gate, so it keeps counting flush EVENTS on the
+    /// gated arm: it is the divergence check that says the guest took the same path the same
+    /// number of times.
+    fn flush_tlb_and_direct_pages(&mut self) {
         self.tlb.flush();
         // Clear the physical caches with the linear FastMap so alias-verification tags and
         // mappings are rebuilt from the current translation and permissions.
@@ -204,7 +224,71 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.record_fast_map_wipe_extent();
+    }
+
+    pub(super) fn flush_tlb_and_code_caches(&mut self) {
+        self.flush_tlb_and_direct_pages();
         self.invalidate_translation_code_caches();
+    }
+
+    /// `flush_tlb_and_code_caches` without the code-translation teardown: the decode lines, their
+    /// SMC marks, the aperture flag and the Direct link graph all stay.
+    ///
+    /// What this gives up, and why each one is safe to retain (design section 4.1):
+    ///
+    /// | skipped | why retaining it is safe |
+    /// |---|---|
+    /// | decode-line generation bump | the line key is `(linear, d)` plus a stored `phys_start`; the map did not move, `d` is compared at every hit site, and nothing mode-dependent is baked into `DecodedInsn` |
+    /// | dirty-word wipe of `code_bytes` / `code_pages` | sticky SMC marks retained means MORE trapping, never less; a stale mark costs one future narrow attempt |
+    /// | `dirty_byte_words` / `dirty_page_words` clear | bookkeeping for the wipe above, bounded by the bitmap size |
+    /// | `native_code_watch.clear()` | an armed host write-watch retained is the conservative direction; skipping a clear creates no new watch edges |
+    /// | `code_page_lin.clear()` | it maps physical page to linear page; the map did not move, so every entry stays true |
+    /// | `has_aperture_code.0 = false` | the lines survive, so the flag describing them should too -- clearing it while they stay live would be the bug |
+    /// | `jit_direct.invalidate_translation()` | links carry `mode_key`, and no static edge can cross a `mode_key` boundary, so a retained link is unreachable under the new mode |
+    ///
+    /// The last row also gives up a periodic link-policy amnesty (the chain-layout reset and the
+    /// data-segment decline clear that ride inside `invalidate_translation`). Losing an amnesty can
+    /// only make link ADMISSION stricter, never admit an edge that should be refused, so it is not
+    /// a soundness question -- but it is why the ladder measures `link_refusals` alongside the win.
+    fn flush_tlb_keep_code_caches(&mut self) {
+        self.flush_tlb_and_direct_pages();
+        self.invalidate_fetch_frontend();
+    }
+
+    /// Whether a CR0 write from `old` to `new` can move the linear->physical map.
+    ///
+    /// PG is the ONLY bit of CR0 that participates in address translation. Every other bit (PE,
+    /// MP, EM, TS, NE, AM, NW, CD) leaves the map identical: PE is `jit_mode_key` bit 1, so it is
+    /// inside `BlockKey` and inside `LinkTarget` and no static edge crosses a `mode_key` boundary;
+    /// MP/EM/TS/NE are re-read from this struct by emitted x87 code at runtime (`emit_gate` in
+    /// `jit/x87_avx2_emit.rs`, mirrored on the admission side in `jit/native_x87.rs`); AM is
+    /// re-read at every dispatcher entry through the `alignment_armed` mirror, which both call
+    /// sites recompute before they flush; CD/NW are inert storage. `CLTS` writes CR0 with no flush
+    /// at all, and a task switch sets `CR0_TS` with no code flush either -- this rule is existing
+    /// policy, stated by existing code, and the two CR0 writers were the inconsistency.
+    ///
+    /// WP IS NOT HERE FOR CODE TRANSLATION. Code fetch is a read; WP is supervisor *write*
+    /// permission, so it cannot stale a decode line or a link. It is in this predicate for the
+    /// DATA-SIDE successor slice, whose invariant is stated in `memory.rs`: the protection check is
+    /// redone from the cached page bits against the current accessor (CPL can change without a
+    /// flush); WP changes flush, so `wp` is consistent within a generation. That invariant holds
+    /// TODAY regardless of this term, because `flush_tlb_and_direct_pages` is ungated. Keeping the
+    /// term costs nothing and pre-pays the follow-on. Do not "simplify" it away.
+    fn cr0_write_moves_code_translation(old: u32, new: u32) -> bool {
+        let delta = old ^ new;
+        delta & CR0_PG != 0 || (new & CR0_PG != 0 && delta & CR0_WP != 0)
+    }
+
+    /// The gated flush the two CR0 writers take. `old` is the value CR0 held BEFORE the write;
+    /// `new` is the value it holds after. Both call sites assign `self.control.cr0` first, so the
+    /// old value has to be captured before the assignment -- passing them the other way round
+    /// inverts the predicate, which is what the PG rows in `cpu_cr0_flush_test.rs` catch.
+    pub(super) fn flush_tlb_for_cr0_write(&mut self, old_cr0: u32, new_cr0: u32) {
+        if Self::cr0_write_moves_code_translation(old_cr0, new_cr0) {
+            self.flush_tlb_and_code_caches();
+        } else {
+            self.flush_tlb_keep_code_caches();
+        }
     }
 
     pub(super) fn set_eip(&mut self, eip: u32) {

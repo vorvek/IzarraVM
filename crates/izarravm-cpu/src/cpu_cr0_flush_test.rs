@@ -319,18 +319,21 @@ fn lmsw_never_flushes_for_any_operand() {
 /// RED before the slice: LMSW flushes, so the line is gone and the row's premise never holds.
 #[test]
 fn pmode_entry_reuses_a_real_mode_decode_line_and_still_faults() {
-    const PRIVILEGED: u32 = 0x0500; // `cli`, legal in real mode, #GP at CPL 3 with IOPL 0.
+    // `mov cr0, eax`: decodes identically in real mode and protected mode, and is CPL-0-only.
+    // Privilege is checked by the EXECUTOR from the decoded form, which is exactly the property
+    // this row exists to pin.
+    const PRIVILEGED: u32 = 0x0500;
 
     let mut memory = vec![0u8; 0x10000];
     memory[WRITER as usize..WRITER as usize + 3].copy_from_slice(&LMSW_AX);
-    memory[PRIVILEGED as usize] = 0xfa; // cli
+    memory[PRIVILEGED as usize..PRIVILEGED as usize + 3].copy_from_slice(&mov_to_cr(0));
     let mut cpu = real_mode_cr0_cpu(WRITER);
     let mut bus = TestBus::with_memory(memory);
     let d = cpu.registers.cs().default_size_32;
 
     // Warm the line in REAL mode.
     cpu.fetch_decoded(&mut bus, PRIVILEGED)
-        .expect("cli decodes");
+        .expect("the privileged instruction decodes");
     assert!(cpu.decode_cache.line_live(PRIVILEGED, d));
 
     // Enter protected mode through LMSW.
@@ -341,7 +344,7 @@ fn pmode_entry_reuses_a_real_mode_decode_line_and_still_faults() {
         "the real-mode line must survive the mode change for this row to mean anything"
     );
 
-    // Same linear, same `d`, now at CPL 3 with IOPL 0.
+    // Same linear, same `d`, now at CPL 3.
     cpu.registers.set_segment(
         SegmentIndex::Cs,
         SegmentRegister {
@@ -574,7 +577,8 @@ mod links {
                 cpu.jit_direct.probe(pmode_key),
                 jit::direct::BlockProbe::Interpret
             ),
-            "the retained real-mode block must NOT be reachable under PE: a probe on the              protected-mode key must MISS, not land in the retained chain"
+            "the retained real-mode block must NOT be reachable under PE: a probe on the \
+             protected-mode key must MISS, not land in the retained chain"
         );
 
         // And the pmode side gets a block of its own rather than inheriting one.

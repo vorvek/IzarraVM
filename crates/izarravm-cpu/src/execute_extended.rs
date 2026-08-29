@@ -348,9 +348,16 @@ impl CpuGsw {
                             cr0 |= CR0_PE;
                         }
                         if self.control.cr0 != cr0 {
+                            // Captured BEFORE the assignment: the flush predicate needs the old
+                            // value, and the flush itself must run after the new one is in place.
+                            let old_cr0 = self.control.cr0;
                             self.control.cr0 = cr0;
                             self.recompute_alignment_armed();
-                            self.flush_tlb_and_code_caches();
+                            // LMSW's switchable set is MP|EM|TS plus an optional PE SET, so it can
+                            // never reach PG or WP and the predicate is always false here. The
+                            // gated call is still the right shape: gating on what actually moves
+                            // the map is stronger than special-casing this opcode.
+                            self.flush_tlb_for_cr0_write(old_cr0, cr0);
                             // LMSW can only set PE (never clear it, masked out of
                             // `switchable` above), and require_cpl0 above already forced
                             // cpl == 0 -- entering protected mode this way starts at ring 0
@@ -563,9 +570,11 @@ impl CpuGsw {
                                 error_code: Some(0),
                             });
                         }
+                        // Captured BEFORE the assignment; see `flush_tlb_for_cr0_write`.
+                        let old_cr0 = self.control.cr0;
                         self.control.cr0 = value;
                         self.recompute_alignment_armed();
-                        self.flush_tlb_and_code_caches();
+                        self.flush_tlb_for_cr0_write(old_cr0, value);
                     }
                     2 => self.control.cr2 = value,
                     3 => {
