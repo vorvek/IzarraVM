@@ -96,8 +96,32 @@ impl Vga {
         self.crtc.vtotal
     }
 
+    /// Size the work raster to the active geometry, keeping what the beam has
+    /// already drawn when the size does not change.
+    ///
+    /// Every recompute of the CRTC timing calls this, and a guest that rewrites
+    /// its register table each frame therefore calls it each frame. Discarding
+    /// the raster on those writes cost Psycho Pinball its whole picture: it
+    /// replays the table late in the frame, so the frame published at the next
+    /// vertical retrace held only the lines drawn after the write. Real silicon
+    /// has no such buffer -- rewriting a register with the value it already
+    /// holds changes nothing the beam is doing. A genuine size change still
+    /// starts from a cleared buffer, because none of the old lines apply to the
+    /// new geometry.
     pub(super) fn resize_work(&mut self) {
-        self.work = vec![0; (self.raster_width() * self.raster_height()) as usize];
+        let pixels = (self.raster_width() * self.raster_height()) as usize;
+        if self.work.len() != pixels {
+            self.work = vec![0; pixels];
+        } else if self.work_mode != self.mode {
+            // Same size, different mode. The rows in the buffer belong to the
+            // mode being left, and the CGA personality's mode-control path
+            // resizes WITHOUT resetting the render cursor, so keeping them would
+            // publish the old mode's picture in the new mode's first frame. CGA
+            // 320x200 graphics and CGA 40x25 text are both 320x262, so the pair
+            // is reachable rather than hypothetical.
+            self.work.fill(0);
+        }
+        self.work_mode = self.mode;
     }
 
     /// Render scanlines from last_line up to (not including) the current beam

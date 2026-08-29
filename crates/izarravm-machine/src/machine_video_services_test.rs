@@ -997,6 +997,12 @@ fn mode_x_320x240_through_the_machine() {
     machine.video_mut().write_port(0x3C4, 0x04);
     machine.video_mut().write_port(0x3C5, 0x06);
     assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+    // Mode 13h's BIOS register set leaves the CRTC write protect (11h bit 7)
+    // SET, so registers 00h-07h are read-only until the guest clears it. Real
+    // silicon refuses the 06h/07h writes below without this, and so does the
+    // model.
+    machine.video_mut().write_port(0x3D4, 0x11);
+    machine.video_mut().write_port(0x3D5, 0x0E);
     // Abrash's 320x240 vertical timing through the CRTC ports.
     for (idx, val) in [
         (0x06u8, 0x0Du8),

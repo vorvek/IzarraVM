@@ -78,6 +78,10 @@ fn the_index_line_carries_every_field_the_sweep_reads() {
         assert_eq!(line["i"].as_u64(), Some(expected_index as u64));
         assert!(line["master_ticks"].is_u64());
         assert!(line["guest_ms"].is_u64());
+        // The completed-raster count says whether the display is still
+        // publishing frames, which is what tells a guest redrawing one picture
+        // apart from a raster that stopped.
+        assert!(line["frames"].is_u64());
         // The sweep's `Measure-ScreenRecurrence` reads `hash`, `Get-Outcome`
         // reads `video_mode`; both must be present on every line.
         assert_eq!(line["hash"].as_str().map(str::len), Some(16));
@@ -92,6 +96,10 @@ fn the_index_line_carries_every_field_the_sweep_reads() {
         "writing a glyph must move the frame hash"
     );
     assert!(lines[1]["guest_ms"].as_u64() >= lines[0]["guest_ms"].as_u64());
+    assert!(
+        lines[1]["frames"].as_u64() >= lines[0]["frames"].as_u64(),
+        "the completed-raster count never runs backwards"
+    );
 }
 
 #[test]

@@ -106,6 +106,9 @@ pub struct Vga {
     mode13_dirty_pages: Cell<u16>,
     mode13_direct_batch_dirty: bool,
     graphics_settle_frames: u8,
+    /// The mode the `work` raster was last sized or cleared for. `resize_work`
+    /// keeps a same-size buffer only while this still matches the active mode.
+    work_mode: VideoMode,
     mode13_argb_full_dirty: Cell<bool>,
     mode13_argb_cache: RefCell<Mode13ArgbCache>,
     pub(crate) crtc: CrtcTiming,
@@ -183,6 +186,7 @@ impl Default for Vga {
             mode13_dirty_pages: Cell::new(0),
             mode13_direct_batch_dirty: false,
             graphics_settle_frames: 0,
+            work_mode: VideoMode::Text,
             mode13_argb_full_dirty: Cell::new(true),
             mode13_argb_cache: RefCell::new(Mode13ArgbCache::default()),
             crtc: CrtcTiming::text_03h(),
@@ -2646,12 +2650,33 @@ impl Vga {
         self.sync_mode13_planar();
         // seq.memory_mode already holds the chain-4-off value from the write_seq
         // call that triggered this entry, so it is not reseeded here.
+        //
+        // The raw CRTC bytes are NOT reseeded either. Clearing chain-4 changes
+        // the CPU write decode, not the display timing, so the CRTC keeps
+        // whatever the guest last wrote. Psycho Pinball programs its whole
+        // 320x370 vertical timing BEFORE it clears the bit, and re-seeding the
+        // canonical 320x200 register set here threw that timing away and cropped
+        // the bottom 170 rows of every frame. The timing table below is the
+        // 320x200 base a guest that wrote nothing still gets: mode 13h's table
+        // is byte-identical to it, and `set_mode13h` is the only way into the
+        // mode this entry comes from, so the recompute below reproduces the base
+        // exactly when the guest has been quiet.
+        //
+        // The reseed also cleared the CRTC write protect as a side effect, since
+        // the 320x200 register set carries 11h = 0Eh. Mode 13h's BIOS table
+        // carries 11h = 8Eh, so the protect is SET on entry here, and a guest
+        // that wants to retune registers 00h-07h must clear it first -- which is
+        // what it must do on real silicon too.
         self.crtc = CrtcTiming::mode_x();
-        self.crtc_regs = CrtcRegs::mode_x_320x200();
+        // The mode is set BEFORE the recompute, because the recompute sizes the
+        // work raster and `resize_work` keeps a same-size buffer only while the
+        // mode is unchanged. Setting it afterwards left the buffer labelled with
+        // the mode being left, so the next same-size recompute cleared a raster
+        // it should have kept.
+        self.mode = VideoMode::ModeX;
         self.recompute_vertical_timing(); // derives the vertical fields and sizes work
         self.beam = 0;
         self.last_line = 0;
-        self.mode = VideoMode::ModeX;
         self.presented = None;
     }
 

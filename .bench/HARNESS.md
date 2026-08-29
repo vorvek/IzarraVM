@@ -31,6 +31,7 @@ the exception and runs DUKEMARK exactly once, then ends the VM itself with
 | `duke3d_short_c` | 586 | the same DUKEMARK run, demo cut to 1560 records | the CHEAP duke ladder row: 143 s a leg against 342 s |
 | `tyrian_setup_c` | 486 | Tyrian 2000 SETUP.EXE, settings menu + jukebox | the guest 70 Hz audio clock (PIT rewrite per frame + MPU-401 MIDI + DSP 0x14 chain); see PROTOCOL.md |
 | `tyrian_c` | 486, 586 | Tyrian 2000 gameplay, scripted to level 1 with fire held | same audio clock under play; the 586 row is the perf row |
+| `psycho_c` | **486** | Psycho Pinball, DOS/4GW, a table in play | the only row that replays its CRTC register table EVERY FRAME; grades the PUBLISHED frame, not a re-render |
 
 `duke3d_short_c` is generated, not authored: `scripts/make-duke-short-fixture.ps1`
 writes it from `duke3d_c` by lowering the record count in BENCH2.DMO's header and
@@ -81,6 +82,41 @@ The game's sound config (`HMISET.CFG`) selects Sound Blaster 16 at 220/7/1
 with no MIDI device. `TOMBPATH.TXT` sits in `C:\` (17 bytes, NO trailing
 newline - the copy is byte-exact from the owner's install) and points the game
 at `C:\GAMES\TOMBRAID`.
+
+### Psycho Pinball grades the PUBLISHED frame (added 2026-08-29)
+
+`psycho_c` is the only row whose picture comes from `--presented-ppm` rather
+than `--result-ppm`, and the distinction is the reason the row exists.
+`--result-ppm` RE-RENDERS the whole frame at stop-time register state, so it
+reports what video memory holds; `--presented-ppm` writes the frame the scanout
+actually published, which is what a user sees. A defect that fills video memory
+correctly and never publishes it is invisible to the first and plain in the
+second: measured on this fixture with the `resize_work` raster wipe restored,
+the same run reads **82.9% non-black / 127 colours** through `--result-ppm` and
+**0.0% / 1 colour** through `--presented-ppm`.
+
+The row also carries the only per-frame CRTC replay in the table. The other
+graded rows touch `resize_work` with an unchanged pixel count two or three times
+across a whole run; this one does it 4144 times, roughly once a frame. That is
+why a raster-lifetime defect could sit in the VGA core with every board row
+green.
+
+WHAT IT CATCHES, both arms measured by restoring the defect and re-running:
+
+* raster wipe restored -> FAIL, `non-black coverage % is 0, outside the band
+  [60, 95]`, plus `distinct colours is 1`.
+* mode X CRTC reseed restored -> PASS. It does NOT catch that one. The reseed
+  damages only the FIRST mode set, which is the menu phase; by the budget the
+  game has re-entered its gameplay mode from inside mode X, so the geometry is
+  320x368 either way. Geometry regressions are covered by the video-crate unit
+  tests, which is where they belong.
+
+No end-of-budget hash, for the reason Duke3D and Tomb Raider lost theirs: the
+picture animates continuously. Three repeat runs are bit-identical, so the
+determinism is real; it is robustness to CODE change that a hash would lack.
+The anchor is the Toka-DOS boot text at 0.6 guest seconds -- the ONLY run of
+four identical 250 ms samples in the first 25 guest seconds, measured rather
+than assumed -- so it pins boot determinism and nothing about the graphics.
 
 ### The warning about `bench16_c`
 

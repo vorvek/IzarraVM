@@ -1021,6 +1021,11 @@ fn guest_crtc_bang_retunes_mode_x_to_320x240() {
     vga.write_port(0x3C4, 0x04);
     vga.write_port(0x3C5, 0x06); // enter mode X, 320x200 base
     assert_eq!(vga.raster_height(), 449);
+    // Mode 13h's BIOS register set leaves the CRTC write protect (11h bit 7)
+    // SET, so registers 00h-07h are read-only until the guest clears it. Real
+    // silicon refuses these writes without this, and so does the model.
+    vga.write_port(0x3D4, 0x11);
+    vga.write_port(0x3D5, 0x0E);
     // Abrash's 320x240 vertical timing (Black Book Listing 47.1), index then data.
     for (idx, val) in [
         (0x06u8, 0x0Du8), // vertical total
@@ -1052,6 +1057,11 @@ fn guest_crtc_bang_retunes_mode_x_to_360x240() {
     vga.write_port(0x3C4, 0x04);
     vga.write_port(0x3C5, 0x06); // enter mode X, 320x200 base
     assert_eq!(vga.raster_width(), 320);
+    // Mode 13h's BIOS register set leaves the CRTC write protect (11h bit 7)
+    // SET, so registers 00h-07h are read-only until the guest clears it. Real
+    // silicon refuses these writes without this, and so does the model.
+    vga.write_port(0x3D4, 0x11);
+    vga.write_port(0x3D5, 0x0E);
     // Abrash's wide mode X (Black Book ch.47): the 28.322 MHz dot clock with 90
     // character clocks of active display. A 256-color pixel takes two dot
     // clocks, so 90 * 8 / 2 = 360 pixels, and offset 45 gives the matching 90
@@ -1084,6 +1094,138 @@ fn guest_crtc_bang_retunes_mode_x_to_360x240() {
     assert!(vga.crtc.double_scan, "240 source rows over 480 scanlines");
     // 112 * 8 dots * 527 lines at 28.322 MHz is the mode's 60 Hz refresh.
     assert_eq!(vga.frame_dots(), 112 * 8 * 527);
+}
+
+/// Psycho Pinball (Codemasters, 1994, DOS/4GW) sets BIOS mode 13h and then
+/// plays one register table that programs the WHOLE CRTC BEFORE it clears
+/// chain-4 in Sequencer Memory Mode. The table is at file offset 433720 of
+/// `_P_.EXE` as (port, index, value) triplets, and its two mode tables are the
+/// two tests below. Clearing chain-4 changes the memory decode, not the display
+/// timing, so the mode X entry must keep the CRTC bytes the guest already
+/// wrote. Re-seeding the canonical 320x200 register set there threw the game's
+/// own vertical timing away and cropped every frame.
+///
+/// This first table keeps mode 13h's 449-line frame but clears the double-scan
+/// (09h = 00h) and lowers the vertical display end to 370 source rows, so the
+/// active picture is 320x370.
+#[test]
+fn tall_crtc_bang_before_the_chain4_clear_survives_the_mode_x_entry() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    // Misc Output: 28.322 MHz dot clock, colour I/O, RAM enabled.
+    vga.write_port(0x3C2, 0xA7);
+    for (idx, val) in [
+        (0x00u8, 0x70u8), // horizontal total
+        (0x01, 0x4F),     // horizontal display end: 80 character clocks
+        (0x02, 0x50),
+        (0x03, 0x8E),
+        (0x04, 0x5E),
+        (0x05, 0x8A),
+        (0x06, 0xBF), // vertical total: mode 13h's 449 lines
+        (0x07, 0x1F), // overflow (high bits)
+        (0x08, 0x00),
+        (0x09, 0x00), // max scan line 0: the double-scan is CLEARED
+        (0x10, 0x8C), // vretrace start
+        (0x11, 0x70), // vretrace end, write protect off
+        (0x12, 0x71), // vertical display end: 370 with the overflow bit
+        (0x13, 0x28), // offset 40: 80 bytes per plane per row
+        (0x14, 0x00),
+        (0x15, 0x6F), // vblank start
+        (0x16, 0xB9), // vblank end
+        (0x17, 0xE3), // mode control
+    ] {
+        vga.write_port(0x3D4, idx);
+        vga.write_port(0x3D5, val);
+    }
+    // Only NOW does the guest unchain: 8-dot characters, then extended memory
+    // with odd/even off and chain-4 (bit 3) CLEARED.
+    vga.write_port(0x3C4, 0x01);
+    vga.write_port(0x3C5, 0x01);
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+    // Graphics Controller: 256-colour shift, graphics at A0000.
+    vga.write_port(0x3CE, 0x05);
+    vga.write_port(0x3CF, 0x40);
+    vga.write_port(0x3CE, 0x06);
+    vga.write_port(0x3CF, 0x05);
+    // Attribute Controller: graphics + 8-bit colour, no pel pan.
+    vga.write_port(0x3C0, 0x10);
+    vga.write_port(0x3C0, 0x41);
+    vga.write_port(0x3C0, 0x13);
+    vga.write_port(0x3C0, 0x00);
+
+    assert_eq!(vga.active_mode(), VideoMode::ModeX);
+    assert_eq!(vga.raster_width(), 320, "320 active pixels per row");
+    assert_eq!(vga.crtc.vtotal, 449, "449 total scanlines");
+    assert_eq!(vga.crtc.vdisp_end, 370, "370 active scanlines");
+    assert!(
+        !vga.crtc.double_scan,
+        "the guest cleared the double-scan: 370 source rows, not 185"
+    );
+    assert_eq!(vga.crtc.offset, 40, "80 bytes per plane per row");
+    assert_eq!(
+        vga.render_full_frame().display_height,
+        370,
+        "the host crops to the guest's 370 rows, not to 200"
+    );
+}
+
+/// The game's second table, same order: the whole CRTC, then the chain-4 clear.
+/// This one is Abrash's canonical 320x240 mode Y (Black Book Listing 47.1), so
+/// it is the same register set `guest_crtc_bang_retunes_mode_x_to_320x240`
+/// writes AFTER the unchain. Both orders must reach the same geometry.
+#[test]
+fn mode_y_crtc_bang_before_the_chain4_clear_survives_the_mode_x_entry() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    // Mode 13h leaves the CRTC write protect set, and this table changes 06h and
+    // 07h, so something must clear it first. The game's tall table does exactly
+    // that (it writes 11h = 70h); this test clears it directly so the two tables
+    // stay independent.
+    vga.write_port(0x3D4, 0x11);
+    vga.write_port(0x3D5, 0x0E);
+    vga.write_port(0x3C2, 0xE3); // Misc Output: 25.175 MHz dot clock
+    for (idx, val) in [
+        (0x00u8, 0x5Fu8),
+        (0x01, 0x4F),
+        (0x02, 0x50),
+        (0x03, 0x82),
+        (0x04, 0x54),
+        (0x05, 0x80),
+        (0x06, 0x0D), // vertical total: 527 lines
+        (0x07, 0x3E), // overflow (high bits)
+        (0x08, 0x00),
+        (0x09, 0x41), // max scan line: 2 scanlines per row
+        (0x10, 0xEA),
+        (0x11, 0xAC), // vretrace end + write protect
+        (0x12, 0xDF), // vertical display end: 480
+        (0x13, 0x28),
+        (0x14, 0x00),
+        (0x15, 0xE7),
+        (0x16, 0x06),
+        (0x17, 0xE3),
+    ] {
+        vga.write_port(0x3D4, idx);
+        vga.write_port(0x3D5, val);
+    }
+    vga.write_port(0x3C4, 0x01);
+    vga.write_port(0x3C5, 0x01);
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+    vga.write_port(0x3CE, 0x05);
+    vga.write_port(0x3CF, 0x40);
+    vga.write_port(0x3CE, 0x06);
+    vga.write_port(0x3CF, 0x05);
+    vga.write_port(0x3C0, 0x10);
+    vga.write_port(0x3C0, 0x41);
+    vga.write_port(0x3C0, 0x13);
+    vga.write_port(0x3C0, 0x00);
+
+    assert_eq!(vga.active_mode(), VideoMode::ModeX);
+    assert_eq!(vga.crtc.vtotal, 527, "527 total scanlines");
+    assert_eq!(vga.crtc.vdisp_end, 480, "480 active scanlines");
+    assert!(vga.crtc.double_scan, "240 source rows over 480 scanlines");
+    assert_eq!(vga.raster_width(), 320);
 }
 
 #[test]
@@ -1167,6 +1309,282 @@ fn clearing_chain4_in_mode13h_enters_and_leaves_mode_x() {
     vga.write_port(0x3C4, 0x04);
     vga.write_port(0x3C5, 0x0E);
     assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+}
+
+/// A CRTC write that leaves the raster the same size must not erase the
+/// scanlines the beam has already drawn.
+///
+/// Psycho Pinball rewrites its vertical CRTC group once per frame while a table
+/// is in play, close to the end of the frame. Every one of those writes
+/// reallocated the work raster to zeros, so the frame published at the next
+/// vertical retrace held only the handful of lines drawn after the write. The
+/// screen was black while video memory held the table: measured at 4109 wipes
+/// of a drawn raster against 4361 published frames, and 5589 non-zero pixels
+/// per published frame out of 117760.
+///
+/// Real silicon has no such buffer. Rewriting a register with the value it
+/// already holds changes nothing the beam is doing.
+#[test]
+fn a_same_size_crtc_write_keeps_the_scanlines_already_drawn() {
+    let mut vga = direct_mode_x(0);
+    vga.vram.fill(0x2A);
+    // One full frame, so the work raster holds the pattern on every line.
+    vga.advance(vga.frame_dots());
+    let full = vga
+        .last_presented()
+        .expect("a completed frame")
+        .pixels
+        .iter()
+        .filter(|&&index| index != 0)
+        .count();
+    assert!(full > 0, "the pattern reaches the raster at all");
+
+    // Draw all but the last line of the next frame, then rewrite a vertical
+    // CRTC register with the value it already holds -- the guest's own table
+    // replay. Only one line is left for the finalize to draw, so a wipe here
+    // costs the whole picture.
+    let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
+    vga.advance(vga.frame_dots());
+    vga.advance(line_dots * u64::from(vga.crtc.vtotal - 1));
+    vga.read_status1();
+    assert_eq!(vga.last_line, vga.crtc.vtotal - 1);
+
+    let unchanged = vga.crtc_regs.r12;
+    let vtotal = vga.crtc.vtotal;
+    let vdisp = vga.crtc.vdisp_end;
+    vga.write_port(0x3D4, 0x12);
+    vga.write_port(0x3D5, unchanged);
+    assert_eq!(vga.crtc.vtotal, vtotal, "the write changed no geometry");
+    assert_eq!(vga.crtc.vdisp_end, vdisp, "the write changed no geometry");
+
+    finish_current_frame(&mut vga);
+    let published = vga
+        .last_presented()
+        .expect("a completed frame")
+        .pixels
+        .iter()
+        .filter(|&&index| index != 0)
+        .count();
+    assert_eq!(
+        published, full,
+        "a write that resizes nothing keeps every scanline already drawn"
+    );
+}
+
+/// A mode change must not publish the previous mode's scanlines, even when the
+/// two modes happen to share a raster size.
+///
+/// CGA 320x200 graphics and CGA 40x25 text are both 320x262, and the CGA
+/// personality's mode-control path (port 3D8h) sets the mode and resizes the
+/// work raster WITHOUT resetting the render cursor. Reusing a same-size buffer
+/// there would carry the old mode's rows into the first published frame of the
+/// new one -- the classic flash of the previous screen. Keeping the raster is
+/// right for a timing recompute at a CONSTANT mode; it is wrong across a mode
+/// change, and the two predicates are not the same.
+#[test]
+fn a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows() {
+    let mut vga = Vga::default();
+    assert!(vga.set_cga_mode(0x04)); // 320x200 graphics, 320x262 raster
+    let size = (vga.raster_width(), vga.raster_height());
+    // Fill both interleaved banks so every graphics scanline renders non-zero.
+    for offset in 0..CGA_FB_SIZE {
+        vga.cga_write(offset, 0b11_11_11_11);
+    }
+    vga.advance(vga.frame_dots());
+    assert!(
+        vga.last_presented()
+            .expect("a graphics frame")
+            .pixels
+            .iter()
+            .any(|&index| index != 0),
+        "the CGA framebuffer reaches the raster"
+    );
+
+    // 100 lines into the next frame, switch to 40x25 text through 3D8h: video
+    // enabled, graphics bit CLEAR, 40 columns. The text page is blank and its
+    // attributes are zero, so every correctly rendered row is black.
+    let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
+    vga.advance(vga.frame_dots());
+    vga.advance(line_dots * 100);
+    vga.read_status1();
+    assert_eq!(vga.last_line, 100, "the beam drew 100 graphics rows");
+
+    vga.write_port(0x3D8, 0x08);
+    assert_eq!(vga.active_mode(), VideoMode::Text);
+    assert_eq!(
+        (vga.raster_width(), vga.raster_height()),
+        size,
+        "the two modes share a raster size, which is the whole point"
+    );
+
+    finish_current_frame(&mut vga);
+    let frame = vga.last_presented().expect("a text frame");
+    // Rows 0-99 are the ones the beam drew in the OLD mode. They must not reach
+    // the published frame. Rows 100 upwards were drawn after the switch and are
+    // the new mode's own output -- lit here because B8000 is shared between the
+    // CGA framebuffer and the text page, so the fill above is now text.
+    let width = frame.width as usize;
+    let stale: Vec<usize> = (0..100)
+        .filter(|row| {
+            frame.pixels[row * width..(row + 1) * width]
+                .iter()
+                .any(|&index| index != 0)
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "rows drawn in the old mode reached the published frame: {stale:?}"
+    );
+}
+
+/// One entry of the mode table below: a label, and the public path that enters
+/// or transitions into that mode.
+type ModeEntry = (&'static str, fn(&mut Vga));
+
+/// Every mode whose raster this build can enter, for the collision sweep below.
+/// Each entry drives the same public path a guest would.
+fn every_reachable_mode() -> Vec<ModeEntry> {
+    vec![
+        ("text 03h", |v: &mut Vga| v.set_text_mode()),
+        ("text 07h mono", |v: &mut Vga| v.set_mono_text_mode()),
+        ("0Dh planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x0D));
+        }),
+        ("0Eh planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x0E));
+        }),
+        ("0Fh planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x0F));
+        }),
+        ("10h planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x10));
+        }),
+        ("11h planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x11));
+        }),
+        ("12h planar", |v: &mut Vga| {
+            assert!(v.set_mode(0x12));
+        }),
+        ("13h chained", |v: &mut Vga| {
+            assert!(v.set_mode(0x13));
+        }),
+        ("mode X unchained", |v: &mut Vga| {
+            assert!(v.set_mode(0x13));
+            v.write_port(0x3C4, 0x04);
+            v.write_port(0x3C5, 0x06);
+        }),
+        ("CGA 04h graphics", |v: &mut Vga| {
+            if v.is_cga_personality() {
+                v.write_port(0x3D8, 0x0A); // graphics, 320x200, video on
+            } else {
+                assert!(v.set_cga_mode(0x04));
+            }
+        }),
+        ("CGA 06h graphics", |v: &mut Vga| {
+            if v.is_cga_personality() {
+                v.write_port(0x3D8, 0x1A); // graphics, 640x200, video on
+            } else {
+                assert!(v.set_cga_mode(0x06));
+            }
+        }),
+        ("CGA 40x25 text", |v: &mut Vga| {
+            if !v.is_cga_personality() {
+                assert!(v.set_cga_mode(0x04));
+            }
+            v.write_port(0x3D8, 0x08);
+        }),
+        ("CGA 80x25 text", |v: &mut Vga| {
+            if !v.is_cga_personality() {
+                assert!(v.set_cga_mode(0x04));
+            }
+            v.write_port(0x3D8, 0x09);
+        }),
+        ("Hercules graphics", |v: &mut Vga| {
+            v.write_port(0x3BF, 0x03);
+            v.write_port(0x3B8, 0x0A);
+        }),
+    ]
+}
+
+/// No mode change may leave the previous mode's pixels in the work raster,
+/// for ANY pair of modes that happens to share a raster size.
+///
+/// `resize_work` reuses a same-size buffer, which is what keeps a per-frame CRTC
+/// replay from erasing the frame the beam has drawn. Two DIFFERENT modes can
+/// share a size, and the CGA personality's mode-control path resizes without
+/// resetting the render cursor, so a reused buffer there publishes the old
+/// mode's rows. `a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows`
+/// is the end-to-end case for the pair that was found by being bitten by it;
+/// this sweep computes the colliding pairs instead of naming them, so a
+/// collision nobody has met yet -- including one a future mode introduces --
+/// is covered too.
+#[test]
+fn no_mode_change_reuses_the_previous_modes_raster() {
+    let modes = every_reachable_mode();
+
+    // Group the modes by the raster size each one installs.
+    let mut sizes = Vec::new();
+    for (label, enter) in &modes {
+        let mut vga = Vga::default();
+        enter(&mut vga);
+        sizes.push((*label, vga.raster_width() * vga.raster_height()));
+    }
+
+    let mut collisions = 0;
+    let mut cleared_pairs = 0;
+    for (from_index, (from_label, from_size)) in sizes.iter().enumerate() {
+        for (to_index, (to_label, to_size)) in sizes.iter().enumerate() {
+            if from_index == to_index || from_size != to_size {
+                continue;
+            }
+            collisions += 1;
+            let mut vga = Vga::default();
+            modes[from_index].1(&mut vga);
+            // Drive the beam a hundred lines into a frame, so the render cursor
+            // is NOT at zero when the mode changes. Without this the cursor arm
+            // of the assertion below is vacuously true for every pair and the
+            // sweep passes with the guard removed -- measured, not assumed.
+            vga.advance(vga.frame_dots());
+            let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
+            vga.advance(line_dots * 100);
+            vga.read_status1();
+            assert_eq!(vga.last_line, 100, "{from_label}: the beam drew 100 rows");
+            // Stand in for a raster the beam has already drawn. Asserting on the
+            // buffer rather than on rendered pixels keeps the sweep independent
+            // of how any one mode fills a scanline.
+            vga.work.fill(0xAB);
+            modes[to_index].1(&mut vga);
+            // Either arm satisfies the invariant that actually matters: no row
+            // drawn in the old mode may reach a published frame. Clearing the
+            // raster removes those rows; resetting the render cursor to 0 means
+            // `finalize_frame` redraws every one of them before it publishes.
+            let cleared = vga.work.iter().all(|&pixel| pixel == 0);
+            if cleared {
+                cleared_pairs += 1;
+            }
+            assert!(
+                cleared || vga.last_line == 0,
+                "{from_label} -> {to_label} (both {from_size} px) kept the old \
+                 mode's raster AND left the render cursor at {}",
+                vga.last_line
+            );
+        }
+    }
+
+    // The sweep is worthless if no pair collides, so say how many did. The CGA
+    // 320x200-graphics / 40x25-text pair alone guarantees a non-zero count.
+    assert!(
+        collisions > 0,
+        "no two reachable modes share a raster size, so this sweep proved nothing"
+    );
+    // And it proves nothing about the guard under test if EVERY colliding pair
+    // takes the cursor-reset arm, because then no pair exercises the clear. The
+    // CGA pair is the one that does not reset its cursor, so this stays non-zero.
+    assert!(
+        cleared_pairs > 0,
+        "{collisions} colliding pairs and none needed the raster cleared: this \
+         sweep would pass with the guard removed"
+    );
 }
 
 #[test]

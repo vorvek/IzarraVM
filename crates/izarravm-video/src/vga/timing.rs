@@ -426,33 +426,6 @@ impl CrtcRegs {
         }
     }
 
-    /// The 320x200 unchained register set, matching `CrtcTiming::mode_x()`. The
-    /// horizontal group (r00-r05) carries the stock 320-pixel CRTC values so a
-    /// guest that reads them back before reprogramming sees the mode default.
-    pub fn mode_x_320x200() -> Self {
-        Self {
-            r00: 0x5F,
-            r01: 0x4F,
-            r02: 0x50,
-            r03: 0x82,
-            r04: 0x54,
-            r05: 0x80,
-            r06: 0xBF,
-            r07: 0x1F,
-            r08: 0x00,
-            r09: 0x41,
-            r10: 0x9C,
-            r11: 0x0E,
-            r12: 0x8F,
-            r13: 0x28,
-            r14: 0x40,
-            r15: 0x97,
-            r16: 0xBA,
-            r17: 0xA3,
-            r18: 0xFF,
-        }
-    }
-
     pub fn cga_text_40x25() -> Self {
         Self {
             r00: 0x38,
