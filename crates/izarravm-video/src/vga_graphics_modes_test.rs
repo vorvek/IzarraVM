@@ -1374,6 +1374,72 @@ fn a_same_size_crtc_write_keeps_the_scanlines_already_drawn() {
     );
 }
 
+/// A mode change must not publish the previous mode's scanlines, even when the
+/// two modes happen to share a raster size.
+///
+/// CGA 320x200 graphics and CGA 40x25 text are both 320x262, and the CGA
+/// personality's mode-control path (port 3D8h) sets the mode and resizes the
+/// work raster WITHOUT resetting the render cursor. Reusing a same-size buffer
+/// there would carry the old mode's rows into the first published frame of the
+/// new one -- the classic flash of the previous screen. Keeping the raster is
+/// right for a timing recompute at a CONSTANT mode; it is wrong across a mode
+/// change, and the two predicates are not the same.
+#[test]
+fn a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows() {
+    let mut vga = Vga::default();
+    assert!(vga.set_cga_mode(0x04)); // 320x200 graphics, 320x262 raster
+    let size = (vga.raster_width(), vga.raster_height());
+    // Fill both interleaved banks so every graphics scanline renders non-zero.
+    for offset in 0..CGA_FB_SIZE {
+        vga.cga_write(offset, 0b11_11_11_11);
+    }
+    vga.advance(vga.frame_dots());
+    assert!(
+        vga.last_presented()
+            .expect("a graphics frame")
+            .pixels
+            .iter()
+            .any(|&index| index != 0),
+        "the CGA framebuffer reaches the raster"
+    );
+
+    // 100 lines into the next frame, switch to 40x25 text through 3D8h: video
+    // enabled, graphics bit CLEAR, 40 columns. The text page is blank and its
+    // attributes are zero, so every correctly rendered row is black.
+    let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
+    vga.advance(vga.frame_dots());
+    vga.advance(line_dots * 100);
+    vga.read_status1();
+    assert_eq!(vga.last_line, 100, "the beam drew 100 graphics rows");
+
+    vga.write_port(0x3D8, 0x08);
+    assert_eq!(vga.active_mode(), VideoMode::Text);
+    assert_eq!(
+        (vga.raster_width(), vga.raster_height()),
+        size,
+        "the two modes share a raster size, which is the whole point"
+    );
+
+    finish_current_frame(&mut vga);
+    let frame = vga.last_presented().expect("a text frame");
+    // Rows 0-99 are the ones the beam drew in the OLD mode. They must not reach
+    // the published frame. Rows 100 upwards were drawn after the switch and are
+    // the new mode's own output -- lit here because B8000 is shared between the
+    // CGA framebuffer and the text page, so the fill above is now text.
+    let width = frame.width as usize;
+    let stale: Vec<usize> = (0..100)
+        .filter(|row| {
+            frame.pixels[row * width..(row + 1) * width]
+                .iter()
+                .any(|&index| index != 0)
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "rows drawn in the old mode reached the published frame: {stale:?}"
+    );
+}
+
 #[test]
 fn mode_x_direct_write_page_tracks_the_selected_plane() {
     let mut vga = direct_mode_x(0);

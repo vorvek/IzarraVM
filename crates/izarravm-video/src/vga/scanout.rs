@@ -112,7 +112,16 @@ impl Vga {
         let pixels = (self.raster_width() * self.raster_height()) as usize;
         if self.work.len() != pixels {
             self.work = vec![0; pixels];
+        } else if self.work_mode != self.mode {
+            // Same size, different mode. The rows in the buffer belong to the
+            // mode being left, and the CGA personality's mode-control path
+            // resizes WITHOUT resetting the render cursor, so keeping them would
+            // publish the old mode's picture in the new mode's first frame. CGA
+            // 320x200 graphics and CGA 40x25 text are both 320x262, so the pair
+            // is reachable rather than hypothetical.
+            self.work.fill(0);
         }
+        self.work_mode = self.mode;
     }
 
     /// Render scanlines from last_line up to (not including) the current beam
