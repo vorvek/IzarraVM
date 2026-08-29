@@ -1021,6 +1021,11 @@ fn guest_crtc_bang_retunes_mode_x_to_320x240() {
     vga.write_port(0x3C4, 0x04);
     vga.write_port(0x3C5, 0x06); // enter mode X, 320x200 base
     assert_eq!(vga.raster_height(), 449);
+    // Mode 13h's BIOS register set leaves the CRTC write protect (11h bit 7)
+    // SET, so registers 00h-07h are read-only until the guest clears it. Real
+    // silicon refuses these writes without this, and so does the model.
+    vga.write_port(0x3D4, 0x11);
+    vga.write_port(0x3D5, 0x0E);
     // Abrash's 320x240 vertical timing (Black Book Listing 47.1), index then data.
     for (idx, val) in [
         (0x06u8, 0x0Du8), // vertical total
@@ -1052,6 +1057,11 @@ fn guest_crtc_bang_retunes_mode_x_to_360x240() {
     vga.write_port(0x3C4, 0x04);
     vga.write_port(0x3C5, 0x06); // enter mode X, 320x200 base
     assert_eq!(vga.raster_width(), 320);
+    // Mode 13h's BIOS register set leaves the CRTC write protect (11h bit 7)
+    // SET, so registers 00h-07h are read-only until the guest clears it. Real
+    // silicon refuses these writes without this, and so does the model.
+    vga.write_port(0x3D4, 0x11);
+    vga.write_port(0x3D5, 0x0E);
     // Abrash's wide mode X (Black Book ch.47): the 28.322 MHz dot clock with 90
     // character clocks of active display. A 256-color pixel takes two dot
     // clocks, so 90 * 8 / 2 = 360 pixels, and offset 45 gives the matching 90
@@ -1084,6 +1094,141 @@ fn guest_crtc_bang_retunes_mode_x_to_360x240() {
     assert!(vga.crtc.double_scan, "240 source rows over 480 scanlines");
     // 112 * 8 dots * 527 lines at 28.322 MHz is the mode's 60 Hz refresh.
     assert_eq!(vga.frame_dots(), 112 * 8 * 527);
+}
+
+/// Psycho Pinball (Codemasters, 1994, DOS/4GW) sets BIOS mode 13h and then
+/// plays one register table that programs the WHOLE CRTC BEFORE it clears
+/// chain-4 in Sequencer Memory Mode. The table is at file offset 433720 of
+/// `_P_.EXE` as (port, index, value) triplets, and its two mode tables are the
+/// two tests below. Clearing chain-4 changes the memory decode, not the display
+/// timing, so the mode X entry must keep the CRTC bytes the guest already
+/// wrote. Re-seeding the canonical 320x200 register set there threw the game's
+/// own vertical timing away and cropped every frame.
+///
+/// This first table keeps mode 13h's 449-line frame but clears the double-scan
+/// (09h = 00h) and lowers the vertical display end to 370 source rows, so the
+/// active picture is 320x370.
+#[test]
+fn tall_crtc_bang_before_the_chain4_clear_survives_the_mode_x_entry() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    // Misc Output: 28.322 MHz dot clock, colour I/O, RAM enabled.
+    vga.write_port(0x3C2, 0xA7);
+    for (idx, val) in [
+        (0x00u8, 0x70u8), // horizontal total
+        (0x01, 0x4F),     // horizontal display end: 80 character clocks
+        (0x02, 0x50),
+        (0x03, 0x8E),
+        (0x04, 0x5E),
+        (0x05, 0x8A),
+        (0x06, 0xBF), // vertical total: mode 13h's 449 lines
+        (0x07, 0x1F), // overflow (high bits)
+        (0x08, 0x00),
+        (0x09, 0x00), // max scan line 0: the double-scan is CLEARED
+        (0x10, 0x8C), // vretrace start
+        (0x11, 0x70), // vretrace end, write protect off
+        (0x12, 0x71), // vertical display end: 370 with the overflow bit
+        (0x13, 0x28), // offset 40: 80 bytes per plane per row
+        (0x14, 0x00),
+        (0x15, 0x6F), // vblank start
+        (0x16, 0xB9), // vblank end
+        (0x17, 0xE3), // mode control
+    ] {
+        vga.write_port(0x3D4, idx);
+        vga.write_port(0x3D5, val);
+    }
+    // Only NOW does the guest unchain: 8-dot characters, then extended memory
+    // with odd/even off and chain-4 (bit 3) CLEARED.
+    vga.write_port(0x3C4, 0x01);
+    vga.write_port(0x3C5, 0x01);
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+    // Graphics Controller: 256-colour shift, graphics at A0000.
+    vga.write_port(0x3CE, 0x05);
+    vga.write_port(0x3CF, 0x40);
+    vga.write_port(0x3CE, 0x06);
+    vga.write_port(0x3CF, 0x05);
+    // Attribute Controller: graphics + 8-bit colour, no pel pan.
+    vga.write_port(0x3C0, 0x10);
+    vga.write_port(0x3C0, 0x41);
+    vga.write_port(0x3C0, 0x13);
+    vga.write_port(0x3C0, 0x00);
+
+    assert_eq!(vga.active_mode(), VideoMode::ModeX);
+    assert_eq!(vga.raster_width(), 320, "320 active pixels per row");
+    assert_eq!(vga.crtc.vtotal, 449, "449 total scanlines");
+    assert_eq!(vga.crtc.vdisp_end, 370, "370 active scanlines");
+    assert!(
+        !vga.crtc.double_scan,
+        "the guest cleared the double-scan: 370 source rows, not 185"
+    );
+    assert_eq!(vga.crtc.offset, 40, "80 bytes per plane per row");
+    assert_eq!(
+        vga.render_full_frame().display_height,
+        370,
+        "the host crops to the guest's 370 rows, not to 200"
+    );
+}
+
+/// The game's second table, same order: the whole CRTC, then the chain-4 clear.
+/// This one is Abrash's canonical 320x240 mode Y (Black Book Listing 47.1), so
+/// it is the same register set `guest_crtc_bang_retunes_mode_x_to_320x240`
+/// writes AFTER the unchain. Both orders must reach the same geometry.
+#[test]
+fn mode_y_crtc_bang_before_the_chain4_clear_survives_the_mode_x_entry() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    // Mode 13h leaves the CRTC write protect set, and this table changes 06h and
+    // 07h, so something must clear it first. The game's tall table does exactly
+    // that (it writes 11h = 70h); this test clears it directly so the two tables
+    // stay independent.
+    vga.write_port(0x3D4, 0x11);
+    vga.write_port(0x3D5, 0x0E);
+    vga.write_port(0x3C2, 0xE3); // Misc Output: 25.175 MHz dot clock
+    for (idx, val) in [
+        (0x00u8, 0x5Fu8),
+        (0x01, 0x4F),
+        (0x02, 0x50),
+        (0x03, 0x82),
+        (0x04, 0x54),
+        (0x05, 0x80),
+        (0x06, 0x0D), // vertical total: 527 lines
+        (0x07, 0x3E), // overflow (high bits)
+        (0x08, 0x00),
+        (0x09, 0x41), // max scan line: 2 scanlines per row
+        (0x10, 0xEA),
+        (0x11, 0xAC), // vretrace end + write protect
+        (0x12, 0xDF), // vertical display end: 480
+        (0x13, 0x28),
+        (0x14, 0x00),
+        (0x15, 0xE7),
+        (0x16, 0x06),
+        (0x17, 0xE3),
+    ] {
+        vga.write_port(0x3D4, idx);
+        vga.write_port(0x3D5, val);
+    }
+    vga.write_port(0x3C4, 0x01);
+    vga.write_port(0x3C5, 0x01);
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+    vga.write_port(0x3CE, 0x05);
+    vga.write_port(0x3CF, 0x40);
+    vga.write_port(0x3CE, 0x06);
+    vga.write_port(0x3CF, 0x05);
+    vga.write_port(0x3C0, 0x10);
+    vga.write_port(0x3C0, 0x41);
+    vga.write_port(0x3C0, 0x13);
+    vga.write_port(0x3C0, 0x00);
+
+    assert_eq!(vga.active_mode(), VideoMode::ModeX);
+    assert_eq!(vga.crtc.vtotal, 527, "527 total scanlines");
+    assert_eq!(vga.crtc.vdisp_end, 480, "480 active scanlines");
+    assert!(
+        vga.crtc.double_scan,
+        "240 source rows over 480 scanlines"
+    );
+    assert_eq!(vga.raster_width(), 320);
 }
 
 #[test]

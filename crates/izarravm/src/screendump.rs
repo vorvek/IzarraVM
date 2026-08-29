@@ -7,9 +7,15 @@
 //! A corpus sweep runs thousands of games nobody watches, and the one question
 //! no counter answers is whether the picture ever changed. This samples the
 //! presented frame on a guest-clock schedule and writes an index line per
-//! sample: the frame hash, the active display and video mode, and the non-blank
-//! glyph count in text mode. A run whose hash never moves is parked on a menu
-//! or hung, however busy its counters look.
+//! sample: the frame hash, the count of completed rasters, the active display
+//! and video mode, and the non-blank glyph count in text mode. A run whose hash
+//! never moves is parked on a menu or hung, however busy its counters look.
+//!
+//! The raster count separates the two ways a hash can stand still. A guest that
+//! redraws the same picture completes frames while the hash holds; a guest whose
+//! raster stopped completing them holds the hash because nothing new is ever
+//! published. Those are different faults and the hash alone cannot tell them
+//! apart.
 //!
 //! Three deliberate choices. It reads `presented_frame_argb`, which borrows the
 //! machine immutably and leaves the in-progress raster alone;
@@ -97,12 +103,13 @@ impl ScreenDumper {
         let master_ticks = machine.master_ticks();
         writeln!(
             self.index,
-            "{{\"i\":{},\"master_ticks\":{},\"guest_ms\":{},\"display\":\"{}\",\
+            "{{\"i\":{},\"master_ticks\":{},\"guest_ms\":{},\"frames\":{},\"display\":\"{}\",\
              \"video_mode\":{},\"presented\":{},\"hash\":{},\"changed\":{},\"ppm\":{},\
              \"text_glyphs\":{}}}",
             self.samples,
             master_ticks,
             master_ticks.saturating_mul(1000) / MASTER_CLOCK_HZ,
+            machine.frame_sequence(),
             display_name(display),
             match mode {
                 Some(mode) => format!("\"{}\"", mode_name(mode)),
