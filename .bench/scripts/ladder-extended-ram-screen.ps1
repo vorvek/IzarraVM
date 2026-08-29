@@ -348,6 +348,14 @@ function Invoke-Leg([string]$Row, [string]$Arm, [int]$Round) {
     $buildersAfter = Get-BuilderCount
     if ($LASTEXITCODE -ne 0) { throw "$stamp exited $LASTEXITCODE" }
 
+    # duke3d writes its own scorecard into the working copy and then ends the VM
+    # with EXITVM. Keep it before the copy goes: its sample count and Info String
+    # are invariants of the run, so a leg whose scorecard differs is a leg that
+    # did not run the same demo, whatever the wall says.
+    $scorecard = Join-Path $copy "DUKEMARK.TXT"
+    if (Test-Path -LiteralPath $scorecard) {
+        Copy-Item -LiteralPath $scorecard (Join-Path $OutDir "$stamp.dukemark.txt")
+    }
     Remove-Item -Recurse -Force $copy
     $report = Get-Content $profilePath -Raw | ConvertFrom-Json
     [pscustomobject]@{
