@@ -29,7 +29,8 @@
 
 use crate::{
     AddressSize, CpuGsw, CpuPersona, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize,
-    PollBranchShape, PollLoop, PollMemoryFields, PollPortSource, Prefixes, SegmentIndex,
+    PollBranchShape, PollLoop, PollMaskSource, PollMemoryFields, PollPortSource, Prefixes,
+    SegmentIndex,
 };
 
 use super::step::Slot;
@@ -432,6 +433,7 @@ fn build_poll_loop_at(
             port_source: PollPortSource::CurrentDx,
             branch_shape: PollBranchShape::Direct,
             status_mask: mask,
+            mask_source: PollMaskSource::Immediate(mask),
             branch_when_zero,
             raw_core_clocks: 17,
             at_head: current == entry,
@@ -485,6 +487,7 @@ fn build_poll_loop_at(
             port_source: PollPortSource::CurrentDx,
             branch_shape: PollBranchShape::Direct,
             status_mask: 0,
+            mask_source: PollMaskSource::Immediate(0),
             branch_when_zero: false,
             raw_core_clocks: MEMORY_POLL_RAW_CORE_CLOCKS,
             at_head: current == entry,
@@ -547,6 +550,7 @@ fn build_poll_loop_at(
             port_source,
             branch_shape: PollBranchShape::Direct,
             status_mask: mask,
+            mask_source: PollMaskSource::Immediate(mask),
             branch_when_zero,
             raw_core_clocks: 21,
             at_head: current == entry,
@@ -595,6 +599,7 @@ fn build_poll_loop_at(
         port_source,
         branch_shape: PollBranchShape::PairedJmp,
         status_mask: mask,
+        mask_source: PollMaskSource::Immediate(mask),
         branch_when_zero,
         raw_core_clocks: 28,
         at_head: current == entry,

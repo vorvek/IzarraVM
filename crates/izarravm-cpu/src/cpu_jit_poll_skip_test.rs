@@ -87,6 +87,7 @@ fn direct_poll_skip_ships_on_by_default() {
 // the parameter's gating is pinned rather than assumed.
 // ---------------------------------------------------------------------------
 
+use crate::PollMaskSource;
 use crate::jit::block::{PollScanOutcome, build_poll_loop_from};
 
 const POLL16_ENTRY: u32 = 0x501;
@@ -233,4 +234,69 @@ fn sixteen_bit_admission_opens_exactly_one_shape_family() {
         "the M1 memory shape stays 32-bit-only; got {}",
         outcome_name(&outcome)
     );
+}
+
+/// **T-D1b-4** (round-2 MAJOR-8's form). `with_resolved_mask` is the IDENTITY on an
+/// `Immediate` shape, and `fresh_iteration_spins` answers exactly as it did before the
+/// D1b refactor for all four `(mask, branch_when_zero)` cells. This is what pins the D1
+/// arm as unchanged by D1b: the mask resolution is a COPY on `PollLoop`, not a signature
+/// change on `fresh_iteration_spins`, whose parameter is a STATUS BYTE and not a mask
+/// (the interpreter passes a real device status there).
+#[test]
+fn resolving_the_mask_is_the_identity_on_an_immediate_shape() {
+    for mask in [0x01u8, 0x08] {
+        for jz in [false, true] {
+            let code = [0xec, 0xa8, mask, if jz { 0x74 } else { 0x75 }, 0xfb];
+            let (cpu, _bus) = warm_poll_code(&code, POLL3_STARTS, true, 0xffff_ffff, 0x40);
+            let outcome = build_poll_loop_from(&cpu, POLL16_ENTRY, false);
+            let PollScanOutcome::Found(poll) = outcome else {
+                panic!(
+                    "the 32-bit 3-slot shape must certify; got {}",
+                    outcome_name(&outcome)
+                );
+            };
+            assert_eq!(poll.mask_source(), PollMaskSource::Immediate(mask));
+            let resolved = poll.with_resolved_mask(&cpu);
+            assert_eq!(
+                resolved, poll,
+                "with_resolved_mask must be the identity on an Immediate shape, even with                  an unrelated AH live"
+            );
+            assert_eq!(poll.status_mask(), mask);
+            assert_eq!(poll.fresh_iteration_spins(0), jz);
+            assert_eq!(poll.fresh_iteration_spins(mask), !jz);
+            assert_eq!(poll.fresh_backedge_taken(mask), !jz);
+            assert!(poll.mask_is_resolved());
+        }
+    }
+}
+
+/// **T-D1b-5.** `TEST AL,AH` (`84 E0`) and `TEST AL,imm8` (`A8 imm`) with the SAME mask
+/// value leave identical flags and charge identical clocks. Both reach the same
+/// `alu(4, .., BusWidth::Byte)` call and both return `clocks(2)`, which is why D1b needs
+/// no new clock constant and why `raw_core_clocks: 17` is shared unchanged. A
+/// characterization pin: it is green today, and it exists so a future divergence in
+/// either arm cannot land silently.
+#[test]
+fn the_two_test_encodings_charge_and_flag_identically() {
+    for al in [0x00u8, 0x01, 0x08, 0x77, 0xff] {
+        for mask in [0x01u8, 0x08] {
+            let mut observed = Vec::new();
+            for code in [[0xa8u8, mask], [0x84, 0xe0]] {
+                let (mut cpu, mut bus) = warm_poll_code(&code, &[0], true, 0xffff_ffff, mask);
+                cpu.registers
+                    .set_eax((u32::from(mask) << 8) | u32::from(al));
+                cpu.registers.eflags = 0x8d7;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.elapsed_clocks = 0;
+                cpu.set_eip(POLL16_ENTRY);
+                cpu.run_budgeted(&mut bus, 0).expect("one TEST retires");
+                cpu.materialize_flags();
+                observed.push((cpu.registers.eflags, cpu.elapsed_clocks));
+            }
+            assert_eq!(
+                observed[0], observed[1],
+                "TEST AL,imm8 and TEST AL,AH must agree on flags and clocks                  (al={al:#04x} mask={mask:#04x})"
+            );
+        }
+    }
 }

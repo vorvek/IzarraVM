@@ -945,6 +945,10 @@ pub struct PollLoop {
     port_source: PollPortSource,
     branch_shape: PollBranchShape,
     status_mask: u8,
+    /// Where `status_mask` came from. `Immediate` means it is already settled from a
+    /// code byte; `Ah` means the shape is the D1b register-mask form and `status_mask`
+    /// is a PLACEHOLDER until `with_resolved_mask` settles it against live AH.
+    mask_source: PollMaskSource,
     branch_when_zero: bool,
     raw_core_clocks: u64,
     at_head: bool,
@@ -958,6 +962,30 @@ enum PollPortSource {
     CurrentDx,
     Ebx,
     Ecx,
+}
+
+/// Where a certified poll shape's status MASK comes from.
+///
+/// The exact mirror of `PollPortSource`, and for the same reason: a shape is certified
+/// from CODE BYTES alone, so any operand that lives in a register is recorded
+/// symbolically here and resolved later, at the call-out, where the registers are live
+/// and reading them is free.
+///
+/// * `Immediate` is the `TEST AL,imm8` (`0xA8`) form. The mask is a code byte, so it is
+///   settled at certification and the `matches!(mask, 0x01 | 0x08)` check is a
+///   code-byte fact -- a failure is `NegativeCacheable` like any other non-shape.
+/// * `Ah` is the D1b `TEST AL,AH` (`84 E0`) form, whose mask is staged by a `MOV AH,imm8`
+///   OUTSIDE the loop. The certifier checks the ENCODING only (opcode, len, modrm
+///   mode/reg/rm, and a register rather than memory operand) and never reads AH, so a
+///   structural mismatch is still cacheable and no register-dependent value ever reaches
+///   the negative cache. AH is loop-invariant across a skipped span by construction: the
+///   certified slot set is exactly `IN`/`TEST`/`Jcc`, and `IN AL,DX` writes AL only
+///   (`write_gpr8(0, ..)`), `TEST` writes flags only, `Jcc rel8` writes nothing.
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollMaskSource {
+    Immediate(u8),
+    Ah,
 }
 
 #[cfg(feature = "jit")]
@@ -1009,6 +1037,53 @@ impl PollLoop {
 
     pub fn status_mask(self) -> u8 {
         self.status_mask
+    }
+
+    pub(crate) fn mask_source(self) -> PollMaskSource {
+        self.mask_source
+    }
+
+    /// Whether this loop's mask is already settled, i.e. it is NOT an unresolved D1b
+    /// register-mask shape. The interpreter's `try_poll_skip` asserts this at entry: a
+    /// `PollMaskSource::Ah` loop can only be produced with `sixteen_bit_ok`, which only
+    /// the Direct call-out passes, and the interpreter's own consumers
+    /// (`fresh_iteration_spins`, `req.status_mask.trailing_zeros()`) assume a mask that
+    /// already passed the `0x01 | 0x08` check.
+    pub fn mask_is_resolved(self) -> bool {
+        matches!(self.mask_source, PollMaskSource::Immediate(_))
+    }
+
+    /// This loop with any register-sourced mask resolved against the LIVE registers.
+    ///
+    /// The exact analogue of `resolved_port(cpu)`, and a COPY rather than a signature
+    /// change on `fresh_iteration_spins`: `PollLoop` is `Copy`, `Found` results are never
+    /// cached, and `fresh_iteration_spins`'s parameter is a STATUS BYTE rather than a
+    /// mask -- the interpreter passes a real device status there. Returning a settled
+    /// copy means `status_mask()`, `fresh_iteration_spins()` and `fresh_backedge_taken()`
+    /// keep their meaning, and the call-out's `req.status_mask` and `spins_when_bit_set`
+    /// are derived STRUCTURALLY from one value rather than from two independent
+    /// resolutions.
+    ///
+    /// Idempotent: the returned copy always carries `Immediate`, so a second call is the
+    /// identity.
+    pub fn with_resolved_mask(self, cpu: &CpuGsw) -> Self {
+        match self.mask_source {
+            PollMaskSource::Immediate(mask) => {
+                debug_assert_eq!(
+                    mask, self.status_mask,
+                    "an Immediate mask source must agree with the stored status mask"
+                );
+                self
+            }
+            PollMaskSource::Ah => {
+                let mask = cpu.read_gpr8(4);
+                Self {
+                    status_mask: mask,
+                    mask_source: PollMaskSource::Immediate(mask),
+                    ..self
+                }
+            }
+        }
     }
 
     pub fn at_head(self) -> bool {
