@@ -4026,10 +4026,13 @@ fn write_presented_ppm(machine: &Machine, path: &Path) -> Result<bool, Box<dyn E
         return Ok(false);
     };
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    write!(out, "P6
+    write!(
+        out,
+        "P6
 {width} {height}
 255
-")?;
+"
+    )?;
     for color in pixels {
         out.write_all(&[(color >> 16) as u8, (color >> 8) as u8, color as u8])?;
     }

@@ -1224,10 +1224,7 @@ fn mode_y_crtc_bang_before_the_chain4_clear_survives_the_mode_x_entry() {
     assert_eq!(vga.active_mode(), VideoMode::ModeX);
     assert_eq!(vga.crtc.vtotal, 527, "527 total scanlines");
     assert_eq!(vga.crtc.vdisp_end, 480, "480 active scanlines");
-    assert!(
-        vga.crtc.double_scan,
-        "240 source rows over 480 scanlines"
-    );
+    assert!(vga.crtc.double_scan, "240 source rows over 480 scanlines");
     assert_eq!(vga.raster_width(), 320);
 }
 
@@ -1440,9 +1437,13 @@ fn a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows() {
     );
 }
 
+/// One entry of the mode table below: a label, and the public path that enters
+/// or transitions into that mode.
+type ModeEntry = (&'static str, fn(&mut Vga));
+
 /// Every mode whose raster this build can enter, for the collision sweep below.
 /// Each entry drives the same public path a guest would.
-fn every_reachable_mode() -> Vec<(&'static str, fn(&mut Vga))> {
+fn every_reachable_mode() -> Vec<ModeEntry> {
     vec![
         ("text 03h", |v: &mut Vga| v.set_text_mode()),
         ("text 07h mono", |v: &mut Vga| v.set_mono_text_mode()),
