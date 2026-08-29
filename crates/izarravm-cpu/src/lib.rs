@@ -4960,6 +4960,31 @@ pub(crate) const MOV_SREG_CORE_CLOCKS: u32 = 7;
 /// folding them would make a future divergence in one silently change the other row's budget term.
 pub(crate) const POP_SS_CORE_CLOCKS: u32 = 7;
 
+/// What an UNPREFIXED string primitive charges (execute.rs `execute_string_decoded`): `0xA4`/`0xA5`
+/// MOVS, `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS.
+///
+/// ONE constant for all four census rows and all ten opcodes, and that is a property of the
+/// interpreter rather than a simplification here: `execute_string_decoded` has a single exit,
+/// `Ok(clocks(4))`, reached by every arm of its `0xa4..=0xaf` match. There is no per-operation and
+/// no per-width term to fold, so four constants would be four names for one number and a future
+/// divergence would have to invent the arm before it could need the constant.
+///
+/// `0x6C`-`0x6F` INS/OUTS are NOT priced by this and could not be. They are members of the same
+/// `StringOp` family (`strings.rs`) and would be swept in by any rule phrased as "the string
+/// opcodes", but they do not route through `execute_string_decoded` at all -- its match is
+/// `unreachable!` outside `0xa4..=0xaf` and they execute in the port block below it, charging 12
+/// (IN) or 10 (OUT), with the REP model charging 15 and 14. Admitting either would raise the fold
+/// past 7 and move `INTERPRET_ONE_MAX_CORE_CLOCKS`, which is the second of the three independent
+/// ways the exclusion is enforced; the first is that `classify`'s arms are the two explicit byte
+/// ranges `0xA4..=0xA7` and `0xAA..=0xAF`, and the third is the `unreachable!` itself.
+///
+/// FOUR, and therefore BELOW the fold's existing value of 7. That is the fact that lets the string
+/// rows ship behind a knob at all: `INTERPRET_ONE_MAX_CORE_CLOCKS` is a `const` and no knob can
+/// gate it, so a row whose charge raised the fold would change `compute_iteration_upper`'s chain
+/// quota for every block on every fixture with the knob OFF, and the OFF leg of a ladder would not
+/// be main. See `interpret_one_fold_is_unmoved_by_the_string_rows` for the fixture that pins it.
+pub(crate) const STRING_CORE_CLOCKS: u32 = 4;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -4990,6 +5015,18 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0xFB STI | execute.rs `0xfb` | `STI_CORE_CLOCKS` |
 /// | 0x8E /2 MOV SS,r/m | execute.rs `0x8e` | `MOV_SREG_CORE_CLOCKS` |
 /// | 0x17 POP SS | execute.rs `0x17` | `POP_SS_CORE_CLOCKS` |
+/// | 0xA4/0xA5 MOVS | execute.rs `execute_string_decoded` | `STRING_CORE_CLOCKS` |
+/// | 0xA6/0xA7 CMPS, 0xAE/0xAF SCAS | execute.rs `execute_string_decoded` | `STRING_CORE_CLOCKS` |
+/// | 0xAA/0xAB STOS | execute.rs `execute_string_decoded` | `STRING_CORE_CLOCKS` |
+/// | 0xAC/0xAD LODS | execute.rs `execute_string_decoded` | `STRING_CORE_CLOCKS` |
+///
+/// The four string rows share ONE term because they share ONE interpreter arm. That is the shape
+/// this fold was always meant to have -- one term per ARM, not one per opcode -- and it is worth
+/// saying here because the reverse belief (that a class has to enumerate its opcodes before it can
+/// be priced) is what kept the string families out of the allowlist for two design revisions.
+/// Their four terms fold to 4, which is below the seven `MOV_SREG_CORE_CLOCKS` and
+/// `POP_SS_CORE_CLOCKS` already contribute, so this constant's VALUE does not move when they are
+/// admitted and the chain quota is identical with the knob off and on.
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
@@ -5005,7 +5042,10 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
                 larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
                 larger(
                     larger(MOV_SREG_CORE_CLOCKS, STI_CORE_CLOCKS),
-                    POP_SS_CORE_CLOCKS,
+                    // One term for the four string rows, because they are one interpreter arm with
+                    // one exit. Folded in rather than left out on the argument that 4 < 7 today:
+                    // the point of a fold is that the argument does not have to be re-made.
+                    larger(POP_SS_CORE_CLOCKS, STRING_CORE_CLOCKS),
                 ),
             ),
         ),
@@ -5032,6 +5072,16 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
 /// | 0x8E memory, PROTECTED mode | operand read + two descriptor dwords + accessed-bit write-back = 4 |
 /// | 0x8E /2 memory, PROTECTED mode | the same four |
 /// | 0x17 POP SS, PROTECTED mode | stack read + two descriptor dwords + accessed-bit write-back = 4 |
+/// | 0xA4/0xA5 MOVS | source read + destination store = 2 |
+/// | 0xA6/0xA7 CMPS | two reads = 2 |
+/// | 0xAA/0xAB STOS | one store = 1 |
+/// | 0xAC/0xAD LODS | one read = 1 |
+/// | 0xAE/0xAF SCAS | one read = 1 |
+///
+/// The string rows are `rep_memory_accesses` (strings.rs) read off the same table the REP model
+/// prices its chunks with: `Movs | Cmps => 2`, everything else `=> 1`. Both are at or below the
+/// two the ordinary memory rows already present, so this bound does not move when they are
+/// admitted -- the protected-mode segment rows are still the only reason it is four.
 ///
 /// The protected-mode segment rows are why this is FOUR rather than two, and the first of them is
 /// the one the S3 policy widening moved: a protected-mode segment load reads eight bytes of

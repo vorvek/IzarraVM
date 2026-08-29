@@ -2264,7 +2264,8 @@ impl CpuGsw {
         // No PAGE-WALK term, and that one is NOT a proof, it is ACCEPTED OVERSHOOT. The step's own
         // stack read and operand write go through the interpreter's ordinary memory path, which
         // walks the page table on a TLB miss, and each walk is bus traffic this bound does not
-        // contain. It is bounded (two accesses, so at most two walks per slot) and it is the same
+        // contain. It is bounded -- at most two translations per access, so at most
+        // `2 * INTERPRET_ONE_MAX_DATA_ACCESSES` walks per slot -- and it is the same
         // class of overshoot the owner's ruling of 2026-07-30 accepted for the chain quota, quoted
         // at the chain-pricing note in `run_direct_block`: sub-perceptual timing exactness is not
         // worth pricing every worst case, real parts of one stepping vary between packages, and
@@ -2274,7 +2275,14 @@ impl CpuGsw {
         //
         // What this must NOT become is a silent claim. The earlier revision of this comment said
         // the path could not walk at all, which was false, and a false proof in a budget bound is
-        // worse than a stated overshoot.
+        // worse than a stated overshoot. The revision before THIS one said "two accesses, so at
+        // most two walks per slot", which was false twice over as of the string-call-out rows:
+        // the access count is `INTERPRET_ONE_MAX_DATA_ACCESSES` and has been four since `0x8E`
+        // joined, and ONE access can need TWO translations -- a MOVS dword whose source or
+        // destination straddles a page boundary is the shape, and the string rows are what put it
+        // on this path. The class and the ruling are unchanged; only the arithmetic in the
+        // parenthesis was wrong, and a budget derivation that leans on this sentence would have
+        // inherited it.
         let callout_bus_upper = u64::from(block.callout_port_slots())
             .saturating_mul(bus.jit_io_cost_clocks(BusWidth::Byte))
             .saturating_add(

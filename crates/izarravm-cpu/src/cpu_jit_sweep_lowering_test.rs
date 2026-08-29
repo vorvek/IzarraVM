@@ -263,6 +263,12 @@ mod slice7;
 #[path = "cpu_jit_eager_flags_test.rs"]
 mod eager_flags;
 
+/// The four unprefixed STRING FAMILIES as `InterpretOne` call-out rows, behind
+/// `IZARRAVM_GENERIC_CALLOUT`. Nested here for the reason the seven modules above are: it wants
+/// this module's `ENTRY`, `STACK_TOP` and `flat_cpu` rather than a ninth copy of them.
+#[path = "cpu_jit_string_callout_test.rs"]
+mod string_callout;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a
