@@ -2088,3 +2088,80 @@ fn mode13h_line_compare_split_renders_top_scrolled_and_bottom_from_offset_zero()
         "split region row 10 renders source row 10 from offset 0"
     );
 }
+
+#[test]
+fn a_mode_set_records_its_geometry() {
+    let mut vga = Vga::default();
+    // Vga::default() sizes the work raster itself, so a text entry is already
+    // there. Assert what the key HOLDS, not how many times the constructor
+    // happened to call resize_work: that number is an implementation detail
+    // and a test that pins it breaks on any unrelated refactor.
+    assert!(
+        vga.mode_census()
+            .entries()
+            .any(|(key, _)| key.mode == VideoMode::Text),
+        "the default text mode is recorded"
+    );
+
+    vga.set_mode13h();
+    let (key, _) = vga
+        .mode_census()
+        .entries()
+        .find(|(key, _)| key.mode == VideoMode::Mode13h)
+        .map(|(key, count)| (*key, *count))
+        .expect("mode 13h was recorded");
+    assert_eq!(key.hdisp_end, 320);
+    assert_eq!(key.bpp, 8);
+    assert_eq!(
+        vga.mode_census()
+            .entries()
+            .filter(|(key, _)| key.mode == VideoMode::Mode13h)
+            .count(),
+        1,
+        "one geometry is one row"
+    );
+}
+
+#[test]
+fn a_replayed_register_table_counts_every_replay() {
+    // THE DEFECT THIS INSTRUMENT EXISTS FOR. A guest that rewrites its CRTC
+    // table every frame at an unchanged pixel count reads in the thousands
+    // here, where a guest that sets a mode once reads two or three. No
+    // scoreboard row before 2026-08-29 could tell those apart.
+    fn mode13h_count(vga: &Vga) -> u64 {
+        vga.mode_census()
+            .entries()
+            .find(|(key, _)| key.mode == VideoMode::Mode13h)
+            .map(|(_, count)| *count)
+            .expect("mode 13h was recorded")
+    }
+
+    let mut vga = Vga::default();
+    // Calibrate against ONE mode set rather than assuming set_mode13h calls
+    // resize_work exactly once. How many times it calls it is an internal
+    // detail; that ten replays cost ten times one replay is the property.
+    vga.set_mode13h();
+    let after_first = mode13h_count(&vga);
+    vga.set_mode13h();
+    let per_set = mode13h_count(&vga) - after_first;
+    assert!(per_set >= 1, "a mode set records at least once");
+
+    let before = mode13h_count(&vga);
+    for _ in 0..10 {
+        vga.set_mode13h();
+    }
+
+    assert_eq!(
+        mode13h_count(&vga) - before,
+        per_set * 10,
+        "the same geometry set 10 more times counts 10 more sets, and adds no row"
+    );
+    assert_eq!(
+        vga.mode_census()
+            .entries()
+            .filter(|(key, _)| key.mode == VideoMode::Mode13h)
+            .count(),
+        1,
+        "a replay is a count, not a new row"
+    );
+}

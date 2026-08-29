@@ -109,6 +109,20 @@ impl Vga {
     /// starts from a cleared buffer, because none of the old lines apply to the
     /// new geometry.
     pub(super) fn resize_work(&mut self) {
+        // Recorded FIRST, and before the size comparison, so a same-size replay
+        // still counts. The count is the whole point: it separates a guest that
+        // sets a mode once from one that rewrites its register table per frame.
+        self.mode_census.record(ModeCensusKey {
+            mode: self.mode,
+            hdisp_end: self.crtc.hdisp_end,
+            vdisp_end: self.crtc.vdisp_end,
+            vtotal: self.crtc.vtotal,
+            double_scan: self.crtc.double_scan,
+            // A line compare at or past vdisp_end never fires, so only a value
+            // inside the visible area means the guest is splitting the screen.
+            line_compare_active: self.crtc.line_compare < self.crtc.vdisp_end,
+            bpp: bits_per_pixel(self.mode),
+        });
         let pixels = (self.raster_width() * self.raster_height()) as usize;
         if self.work.len() != pixels {
             self.work = vec![0; pixels];

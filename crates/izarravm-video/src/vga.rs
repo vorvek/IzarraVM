@@ -15,9 +15,9 @@ use std::cell::{Cell, RefCell};
 use izarravm_bus::PageAlignedBytes;
 
 use crate::{
-    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
-    VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS,
-    VideoError, VideoMode,
+    DAC_ENTRIES, Dac, ModeCensus, ModeCensusKey, TextCell, TextFrame, VGA_MODE13H_BASE,
+    VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS,
+    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS, VideoError, VideoMode, bits_per_pixel,
 };
 mod datapath;
 mod legacy;
@@ -109,6 +109,10 @@ pub struct Vga {
     /// The mode the `work` raster was last sized or cleared for. `resize_work`
     /// keeps a same-size buffer only while this still matches the active mode.
     work_mode: VideoMode,
+    /// Every geometry this guest programmed, and how many times. Recorded in
+    /// `resize_work`, which every CRTC timing recompute calls, so a guest that
+    /// replays its register table each frame is visible as a large count.
+    mode_census: ModeCensus,
     mode13_argb_full_dirty: Cell<bool>,
     mode13_argb_cache: RefCell<Mode13ArgbCache>,
     pub(crate) crtc: CrtcTiming,
@@ -187,6 +191,7 @@ impl Default for Vga {
             mode13_direct_batch_dirty: false,
             graphics_settle_frames: 0,
             work_mode: VideoMode::Text,
+            mode_census: ModeCensus::default(),
             mode13_argb_full_dirty: Cell::new(true),
             mode13_argb_cache: RefCell::new(Mode13ArgbCache::default()),
             crtc: CrtcTiming::text_03h(),
@@ -2682,6 +2687,11 @@ impl Vga {
 
     pub fn active_mode(&self) -> VideoMode {
         self.mode
+    }
+
+    /// Every geometry this guest programmed, against its count.
+    pub fn mode_census(&self) -> &ModeCensus {
+        &self.mode_census
     }
 
     /// True only in a text mode. Text adds time-based cursor/attribute blink with
