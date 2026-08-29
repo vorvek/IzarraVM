@@ -509,6 +509,30 @@ fn generated_direct_blocks_match_interpreter_with_imm8_lanes_admitted() {
     );
 }
 
+/// INV-B6, the whole-block form: **no emitted byte changes on any lane-trial budget arm.** The
+/// budget gates ADMISSION through the G1 SMC heat gates and nothing else — it selects whether a key
+/// gets another compile, never what that compile emits — so a raised budget must be invisible to
+/// the differential. A lever that moved guest-visible state would have escaped its scope.
+///
+/// Forced to the ceiling rather than to 2, because the ceiling is the arm the storm argument is
+/// stated at and the one a ladder leg is most likely to name.
+#[test]
+fn generated_direct_blocks_match_interpreter_under_a_raised_lane_trial_budget() {
+    // The arm is STATED, not inherited, both of it: the baked form's differential needs the
+    // one-byte lane arm off, and this sweep needs the budget at its ceiling.
+    jit::direct::set_imm8_lanes_for_test(Some(false));
+    jit::direct::set_lane_trial_budget_for_test(Some(jit::direct::MAX_LANE_TRIAL_BUDGET));
+    assert_eq!(
+        jit::direct::lane_trial_budget(),
+        jit::direct::MAX_LANE_TRIAL_BUDGET,
+        "the sweep needs the raised budget arm forced on, or it is a third copy of the base one"
+    );
+    assert_eq!(run_generated_mode(GswMode::Gsw486, 0), 0);
+    assert_eq!(run_generated_mode(GswMode::Gsw586, CASES_PER_MODE), 0);
+    jit::direct::set_lane_trial_budget_for_test(None);
+    jit::direct::set_imm8_lanes_for_test(None);
+}
+
 fn single_case_memory(case: &GeneratedCase) -> Vec<u8> {
     let mut memory = vec![0; MEMORY_LEN];
     let start = case.entry as usize;

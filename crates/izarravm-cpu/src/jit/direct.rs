@@ -788,6 +788,13 @@ pub(crate) enum DormantLift {
     /// The entry chunk's heat stamp had aged out; the key is back to `Seen`.
     Lifted,
     /// Dormant, stamp still current: parked, and provably parked for the rest of this epoch.
+    ///
+    /// FOR THE REST OF THIS EPOCH ONLY — this is not a bound on the park. With no live block over
+    /// the span, `range_hits_compiled_code` is false, `lane_only` can never be set, and every
+    /// further guest patch charges FULL heat at the write's physical, re-stamping the parked key's
+    /// entry chunk to the then-current epoch. A park therefore RENEWS across epoch boundaries for
+    /// as long as the guest keeps patching that chunk, and staleness is the wrong lift predicate
+    /// for exactly the population that costs the most. `dormant_heat_park_epochs` measures it.
     StillDormant,
 }
 
@@ -942,16 +949,31 @@ pub(crate) struct BlockCache {
     /// value that needs no unmasking. The width is read only on the slots that already matched or
     /// already overlap.
     block_imm_lane_widths: Vec<[u8; MAX_BLOCK_IMM_LANES]>,
-    /// G1 lane trial spend marks: the heat epoch in which `lane_trial_spend` last granted this
-    /// key its one compile-through-heat attempt (see `lane_trial_enabled` for the mechanism).
-    /// Stale epochs are simply overwritten on the next grant, so the map only ever holds one
+    /// G1 lane trial spend marks: per key, the heat epoch of its most recent grant, how many
+    /// grants that epoch has already spent, and whether the LATEST of them installed (see
+    /// `lane_trial_enabled` for the mechanism and `lane_trial_budget` for the budget it spends
+    /// against). Stale epochs are reset in place on the next ask, so the map only ever holds one
     /// entry per key that has EVER been hot — thousands on a Build-engine fixture, cleared with
     /// the rest of the cache storage.
     ///
     /// Deliberately left on std's hasher while the linking maps moved to `PodKeyBuildHasher`: the
     /// trial mechanism is live on duke3d, the SMC-fragile control row of that ladder, so swapping it
     /// in the same slice would contaminate the control. A named follow-up, not an oversight.
-    lane_trial_epochs: HashMap<BlockKey, u32>,
+    lane_trial_epochs: HashMap<BlockKey, LaneTrial>,
+    /// The DEMOTE epoch of every key currently parked `Dormant(SpanHot)`, for the park-LENGTH
+    /// diagnostic: `lift_cold_smc_dormant`'s `Lifted` arm subtracts it from the lifting epoch and
+    /// folds the difference into `dormant_heat_park_epochs`.
+    ///
+    /// A SIDE MAP rather than a field on `DormantEntry`, deliberately: `DormantEntry` is the
+    /// payload of `BlockState`, the value type of `entries`, which every probe and every
+    /// invalidation walks. It exactly fills the `Compiled(BlockId)` payload today, so a `u32`
+    /// there would DOUBLE it — a footprint change on a hot map inside the duke-fragile SMC
+    /// machinery, for a diagnostic. Behind the census feature, so the shipped build's footprint is
+    /// byte-identical.
+    ///
+    /// Cleared with `lane_trial_epochs` in `reset_storage`, or it outlives its keys.
+    #[cfg(feature = "direct-admission-census")]
+    park_epochs: HashMap<BlockKey, u32>,
     /// Per-key x87 TOP-mismatch retire count, capped at `X87_TOP_RETIRE_CAP`. A key that has
     /// spent its budget is TOP-STICKY: the entry refusal in `run_direct_block` still fires and the
     /// instruction still interprets, but the block is no longer demoted for another
@@ -1324,6 +1346,8 @@ impl BlockCache {
             block_imm_lanes: Vec::new(),
             block_imm_lane_widths: Vec::new(),
             lane_trial_epochs: HashMap::default(),
+            #[cfg(feature = "direct-admission-census")]
+            park_epochs: HashMap::default(),
             top_mismatch_retires: HashMap::default(),
             data_segment_retires: HashMap::default(),
             data_segment_link_declined: HashSet::default(),
@@ -1962,23 +1986,129 @@ impl BlockCache {
         }
     }
 
-    /// G1 lane trial: grant `key` its one compile-through-heat attempt for `epoch`, or refuse
-    /// because the knob is off or the attempt was already spent this epoch. Granting stamps, so
-    /// a caller that asks is committed to the attempt; asking twice in one epoch demotes.
+    /// G1 lane trial: grant `key` a compile-through-heat attempt for `epoch`, or refuse because
+    /// the knob is off, the epoch's budget is spent, or the LATEST grant did not install.
+    /// Granting stamps, so a caller that asks is committed to the attempt.
+    ///
+    /// The first ask of an epoch is always granted, exactly as before this slice. Grants beyond
+    /// it are EARNED: they require `lane_trial_budget()` above 1 (unset is 1, the pre-slice world)
+    /// AND the previous grant's compilation to have installed (INV-B3). A key whose trial did not
+    /// install therefore still gets exactly one trial per epoch — re-granting there would
+    /// recompile identical code to fail identically, which is the recompile storm this gate
+    /// exists to prevent.
+    ///
+    /// INV-B7: the stale-epoch reset runs BEFORE the decision reads `spent` or `earned`. That
+    /// ordering is the ENTIRE defence against cross-epoch `earned` leakage — with the reset below
+    /// the decision, a key that earned an install at epoch E would arrive at E+1 and be granted as
+    /// an earned RE-grant rather than as a first trial, silently doubling the per-epoch budget.
     pub(crate) fn lane_trial_spend(&mut self, key: BlockKey, epoch: u32) -> bool {
         if !self.lane_trial_override.unwrap_or_else(lane_trial_enabled) {
             return false;
         }
-        let granted = self.lane_trial_epochs.insert(key, epoch) != Some(epoch);
+        let budget = lane_trial_budget();
+        let slot = self
+            .lane_trial_epochs
+            .entry(key)
+            .or_insert(LaneTrial::first(epoch));
+        // INV-B7. Above the decision, never below it.
+        if slot.epoch != epoch {
+            *slot = LaneTrial::first(epoch);
+        }
+        let first = slot.spent == 0;
+        let granted = first || (slot.earned && u32::from(slot.spent) < budget);
         if granted {
+            slot.spent = slot.spent.saturating_add(1);
+            // Per-GRANT probation: only an install may earn the NEXT grant. Without this clear a
+            // single earned install would buy grants 2, 3 and 4 with none of them installing.
+            slot.earned = false;
             self.stalls.lane_trials += 1;
+            if first {
+                self.stalls.lane_trial_first_grants += 1;
+            } else {
+                self.stalls.lane_trial_regrants += 1;
+            }
+        } else {
+            // `first` is false here by construction, so this is always a budget/probation refusal
+            // and never the "never asked this epoch" case.
+            self.stalls.lane_trial_budget_refusals += 1;
         }
         granted
     }
 
-    /// A lane trial's compilation installed under a hot span: the mechanism's success half.
-    pub(crate) fn note_lane_trial_install(&mut self) {
+    /// A lane trial's compilation INSTALLED while the continuation held the trial: the mechanism's
+    /// success half, and the only thing that earns `key` a further grant this epoch.
+    ///
+    /// NOT "installed under a hot span", which is what this counter's doc said before this slice:
+    /// the call site fires on `if lane_trial`, true for the entry-hot / span-COLD path where the
+    /// span gate never ran at all.
+    ///
+    /// A missing slot is a silent no-op, never an `expect`. A slot always exists when this is
+    /// called — `lane_trial` implies a prior grant, and a grant inserts one — so an `expect` would
+    /// be "correct" today and would turn a diagnostic into a crash the first time a
+    /// `reset_storage` landed between the grant and the install.
+    pub(crate) fn note_lane_trial_install(&mut self, key: BlockKey) {
         self.stalls.lane_trial_installs += 1;
+        if let Some(slot) = self.lane_trial_epochs.get_mut(&key) {
+            slot.earned = true;
+        }
+    }
+
+    /// Task 0, the F2 population: an entry-gate heat demote whose key had ALREADY spent a trial
+    /// this epoch, split by whether that trial's compilation installed. The `_earned` half is the
+    /// only set INV-B3 will ever re-grant — trial spent, block installed, then killed by a write —
+    /// so a go/no-go read off the gross count alone can pass on a population the lever cannot
+    /// touch.
+    ///
+    /// A key with no slot, or a slot from an older epoch, is a knob-off or first-ask refusal and
+    /// counts nothing.
+    pub(crate) fn note_heat_demote_trial_spent(&mut self, key: BlockKey, epoch: u32) {
+        let Some(slot) = self.lane_trial_epochs.get(&key) else {
+            return;
+        };
+        if slot.epoch != epoch || slot.spent == 0 {
+            return;
+        }
+        let earned = slot.earned;
+        self.stalls.heat_demote_trial_spent += 1;
+        if earned {
+            self.stalls.heat_demote_trial_spent_earned += 1;
+            #[cfg(feature = "direct-admission-census")]
+            if DORMANT_HEAT_HEAD3_LINEARS.contains(&key.linear) {
+                self.stalls.heat_demote_trial_spent_earned_head3 += 1;
+            }
+        }
+    }
+
+    /// Task 0, the span-gate demote arm, split by whether the refused compilation carried any
+    /// mutable lane at all. `no_lanes` is the §0.4 confound: a zero-lane compilation short-circuits
+    /// `run.rs`'s `imm_lane_count() > 0 && …` and spends no trial, so it is a demotion Lever B can
+    /// never convert. `trial_spent` is the complement — the trial, not the lane, was the refusal.
+    #[cfg(feature = "direct-admission-census")]
+    pub(crate) fn note_lane_install_demote(&mut self, had_lanes: bool) {
+        if had_lanes {
+            self.stalls.lane_install_demote_trial_spent += 1;
+        } else {
+            self.stalls.lane_install_demote_no_lanes += 1;
+        }
+    }
+
+    /// The per-key lane-trial record, for the fixtures that pin the epoch reset and the per-grant
+    /// probation clear.
+    #[cfg(test)]
+    pub(crate) fn lane_trial_record_for_test(&self, key: BlockKey) -> Option<(u32, u8, bool)> {
+        self.lane_trial_epochs
+            .get(&key)
+            .map(|slot| (slot.epoch, slot.spent, slot.earned))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lane_trial_records_len_for_test(&self) -> usize {
+        self.lane_trial_epochs.len()
+    }
+
+    #[cfg(all(test, feature = "direct-admission-census"))]
+    pub(crate) fn park_epochs_len_for_test(&self) -> usize {
+        self.park_epochs.len()
     }
 
     /// Displacement lanes registered by an install — the disp share of the aggregate
@@ -2161,6 +2291,11 @@ impl BlockCache {
     pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
         self.dormant(key, DormantReason::SpanHot, None);
         let _ = heat.bump(key.physical, 1, epoch);
+        // The park-LENGTH diagnostic's opening end. A second demote without an intervening lift
+        // overwrites: each demote is a fresh park head, and the key's earlier one is then censored
+        // exactly as an unlifted park is.
+        #[cfg(feature = "direct-admission-census")]
+        self.park_epochs.insert(key, epoch);
     }
 
     /// G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out (older epoch)
@@ -2183,6 +2318,17 @@ impl BlockCache {
         }
         if heat.take_stale_stamp(key.physical, epoch) {
             self.entries.insert(key, BlockState::Seen);
+            // The park-LENGTH diagnostic's closing end, and the ONLY place a park is measured.
+            // A park that never lifts — and a park ended by a cache-wide `reset_storage`, which
+            // drops the heat record so this arm is never reached — contributes NOTHING here and
+            // one to the censoring count `smc_heat_demotions - park_lifts`. Those are precisely
+            // the LONGEST parks, so the mean over `dormant_heat_park_epochs / park_lifts` is a
+            // LOWER BOUND on park length and must be published with the censoring rate beside it.
+            #[cfg(feature = "direct-admission-census")]
+            if let Some(demoted_at) = self.park_epochs.remove(&key) {
+                self.stalls.dormant_heat_park_epochs += u64::from(epoch.saturating_sub(demoted_at));
+                self.stalls.park_lifts += 1;
+            }
             DormantLift::Lifted
         } else {
             DormantLift::StillDormant
@@ -3532,6 +3678,10 @@ impl BlockCache {
         self.block_imm_lanes.clear();
         self.block_imm_lane_widths.clear();
         self.lane_trial_epochs.clear();
+        // INV-B4: the park-length side map is keyed by `BlockKey` and every key it names is gone
+        // by the line above, so it clears here or it outlives its keys.
+        #[cfg(feature = "direct-admission-census")]
+        self.park_epochs.clear();
         self.top_mismatch_retires.clear();
         self.clear_data_segment_state();
         self.demoted_callout_sites.clear();
@@ -3777,6 +3927,14 @@ pub(crate) struct Compilation {
     /// Physical start of each mutable immediate this block's emitted code reads from guest RAM,
     /// `NO_IMM_LANE` for an unused slot. `install` copies these into the cache's per-block lane
     /// array, which is what the SMC write choke matches a patch against.
+    ///
+    /// **The name is narrower than the contents.** This array holds EVERY mutable-lane family —
+    /// imm, imm8, group-2 count, displacement, Option D store and load-widen — written through one
+    /// cursor against one `MAX_BLOCK_IMM_LANES` budget, and the five `u8` fields below are SUBSET
+    /// TALLIES of it, not parallel arrays. There is exactly one lane registration path and one
+    /// write-choke array (`block_imm_lanes`); a disp-only compilation already installs through it
+    /// today. The rename to `mutable_lanes` is declined as churn in duke-fragile machinery for zero
+    /// behaviour; this sentence and the one on `imm_lane_count` are the fix.
     imm_lanes: [u32; MAX_BLOCK_IMM_LANES],
     /// The width class of each `imm_lanes` entry, `0` for an unused slot. Copied into the cache's
     /// `block_imm_lane_widths` beside the addresses; see that field for why the two are parallel
@@ -3832,6 +3990,17 @@ pub(crate) struct Compilation {
 }
 
 impl Compilation {
+    /// How many mutable lanes this compilation registered — **EVERY family, not the immediate
+    /// family alone.** The five sibling accessors below (`disp_lane_count`, `imm8_lane_count`,
+    /// `count_lane_count`, `disp_store_lane_count`, `disp_load_widen_lane_count`) are SUBSET
+    /// TALLIES of the same `imm_lanes` array through the same cursor, so
+    /// `disp_lane_count() > 0` implies `imm_lane_count() > 0` and their sum double-counts.
+    ///
+    /// Stated on the ACCESSOR and not only on the field, because this is the name a reader meets
+    /// at the call site: `run.rs`'s `imm_lane_count() > 0` install predicate reads as "immediate
+    /// lanes only" against a contract that says "at least one mutable lane", and a 2026-08-29
+    /// design derived a whole (provably inert) lever from exactly that misreading, sixty lines and
+    /// one `impl` block away from the field doc that would have prevented it.
     pub(crate) fn imm_lane_count(&self) -> usize {
         self.imm_lanes
             .iter()
@@ -9413,39 +9582,6 @@ pub(crate) fn sixteen_bit_admission_level() -> u8 {
     })
 }
 
-/// Whether a hot SMC chunk may spend one compile-through-heat "lane trial" per key per heat
-/// epoch (`IZARRAVM_SMC_LANE_TRIAL`, ON for every value except exactly "0"). Per KEY, not per
-/// chunk, deliberately: N entry points inside one 16-byte chunk buy N trials per epoch, which
-/// stays bounded and lets each entry's own lane coverage decide its fate.
-///
-/// DEFAULT ON SINCE THE DISP LANES LANDED, and the flip is the same measurement that once
-/// turned it off, repeated on the other side of its stated precondition. 2026-08-08
-/// (duke586-lanetrial-{0,1}.json), imm lanes only: 146,956 trials, 61,216 installs, rt -5.5%
-/// (0.2600 -> 0.2456) — Build's patch bursts mix lane-shaped 0x81 writes with disp-field 0x8A
-/// rewrites in the same chunks, so trial installs died to the writes the lanes could not
-/// absorb, and the doc said "re-measure after displacement lanes exist". 2026-08-09
-/// (duke586-displane3-{0,1,trial}.json), heat-gated disp lanes shipped: trial-off is INERT on
-/// duke3d-586 (rt 0.2443 vs 0.2445 off-arm, because the kill that writes a disp lane's heat
-/// record also heats the chunk toward this very gate, so the laned recompile mostly never
-/// installs), and trial-on is rt 0.2801, +14.6%, with 446,503 disp lanes registered and
-/// narrow kills down 0.9M. The lanes and the trial are ONE mechanism: the trial is how a laned
-/// block gets past the heat gate, the lanes are why its install survives. doom-486/586 take
-/// ZERO disp lanes (heat-gated admission) and measured neutral in the same sitting.
-///
-/// WHY THE TRIAL EXISTS. G1's admission gates and the mutable-lane mechanism deadlock against
-/// each other on a fixture whose patch loop never pauses: the gate refuses to compile while the
-/// chunk is hot, so no block exists, so no lanes register, so every patch narrow-kills decode
-/// lines and re-stamps the heat, forever. Duke3d spends 44.8% of its dispatcher seams exiting
-/// into exactly this state (dev_docs/2026-08-08-dispatch-tier-next.md). Doom never hit the
-/// deadlock only because its blocks compiled BEFORE the heat crossed the threshold.
-///
-/// The trial breaks the cycle with a bounded probe: one compilation per key per heat epoch is
-/// allowed THROUGH the hot gate; it installs only if it registered at least one mutable lane.
-/// From there the mechanism self-selects. If the lanes cover the guest's patches, the writes
-/// become `lane_accepts`, contribute no heat, the chunk cools at the next epoch, and admission
-/// normalizes. If they do not, the next patch kills the block, the key re-parks Dormant exactly
-/// as before, and the trial cannot re-fire until the epoch turns — worst case one extra compile
-/// and install per key per epoch.
 /// Whether `imm_lane_for` admits the whole `0x81 /r` reg dword family (`IZARRAVM_LANE_FAMILY`,
 /// on for every value except exactly "0") or only the original `/0 ADD` shape. The off arm
 /// exists for one-binary A/B measurement, the same contract as the JIT16 pair: both arms ship
@@ -9482,9 +9618,196 @@ pub(crate) fn set_lane_family_for_test(forced: Option<bool>) {
     LANE_FAMILY_OVERRIDE.with(|cell| cell.set(forced));
 }
 
+/// Whether a hot SMC chunk may spend a compile-through-heat "lane trial" per key per heat
+/// epoch (`IZARRAVM_SMC_LANE_TRIAL`, ON for every value except exactly "0"). Per KEY, not per
+/// chunk, deliberately: N entry points inside one 16-byte chunk buy N trials per epoch, which
+/// stays bounded and lets each entry's own lane coverage decide its fate. HOW MANY per key is
+/// `lane_trial_budget`'s question, and its per-chunk worst case is that budget times the entry
+/// points in the chunk.
+///
+/// DEFAULT ON SINCE THE DISP LANES LANDED, and the flip is the same measurement that once
+/// turned it off, repeated on the other side of its stated precondition. 2026-08-08
+/// (duke586-lanetrial-{0,1}.json), imm lanes only: 146,956 trials, 61,216 installs, rt -5.5%
+/// (0.2600 -> 0.2456) — Build's patch bursts mix lane-shaped 0x81 writes with disp-field 0x8A
+/// rewrites in the same chunks, so trial installs died to the writes the lanes could not
+/// absorb, and the doc said "re-measure after displacement lanes exist". 2026-08-09
+/// (duke586-displane3-{0,1,trial}.json), heat-gated disp lanes shipped: trial-off is INERT on
+/// duke3d-586 (rt 0.2443 vs 0.2445 off-arm, because the kill that writes a disp lane's heat
+/// record also heats the chunk toward this very gate, so the laned recompile mostly never
+/// installs), and trial-on is rt 0.2801, +14.6%, with 446,503 disp lanes registered and
+/// narrow kills down 0.9M. The lanes and the trial are ONE mechanism: the trial is how a laned
+/// block gets past the heat gate, the lanes are why its install survives. doom-486/586 take
+/// ZERO disp lanes (heat-gated admission) and measured neutral in the same sitting.
+///
+/// WHY THE TRIAL EXISTS. G1's admission gates and the mutable-lane mechanism deadlock against
+/// each other on a fixture whose patch loop never pauses: the gate refuses to compile while the
+/// chunk is hot, so no block exists, so no lanes register, so every patch narrow-kills decode
+/// lines and re-stamps the heat, forever. Duke3d spends 44.8% of its dispatcher seams exiting
+/// into exactly this state (dev_docs/2026-08-08-dispatch-tier-next.md). Doom never hit the
+/// deadlock only because its blocks compiled BEFORE the heat crossed the threshold.
+///
+/// The trial breaks the cycle with a bounded probe: a compilation per key per heat epoch is
+/// allowed THROUGH the hot gate; it installs only if it registered at least one mutable lane.
+/// From there the mechanism self-selects. If the lanes cover the guest's patches, the writes
+/// become `lane_accepts`, contribute no heat, the chunk cools at the next epoch, and admission
+/// normalizes. If they do not, the next patch kills the block, the key re-parks Dormant exactly
+/// as before, and the trial cannot re-fire until the epoch turns — worst case `lane_trial_budget()`
+/// extra compiles and installs per key per epoch, of which all but the first must be EARNED by the
+/// previous one installing. That budget is 4 since the 2026-08-29 ladder; it was 1 before it.
 pub(crate) fn lane_trial_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !matches!(std::env::var("IZARRAVM_SMC_LANE_TRIAL").as_deref(), Ok("0")))
+}
+
+/// One key's lane-trial state inside ONE heat epoch: which epoch it belongs to, how many grants
+/// it has already spent there, and whether the LATEST of those grants installed.
+///
+/// Four bytes, and the whole of Lever B's state. `spent` is per-`(key, epoch)` and is RESET — not
+/// decremented, not aged — the first time the key is asked in a new epoch (INV-B2: nothing outside
+/// an epoch change may clear it, because a per-probe or per-kill reset makes the budget unbounded
+/// per epoch and IS the recompile storm the gate exists to prevent).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LaneTrial {
+    epoch: u32,
+    spent: u8,
+    earned: bool,
+}
+
+impl LaneTrial {
+    /// The record a key arrives at an epoch with: nothing spent, nothing earned.
+    const fn first(epoch: u32) -> Self {
+        Self {
+            epoch,
+            spent: 0,
+            earned: false,
+        }
+    }
+}
+
+/// The hard ceiling on `IZARRAVM_SMC_LANE_TRIAL_BUDGET`, and the reason the knob panics above it
+/// rather than clamping: an unbounded per-epoch trial budget is the recompile storm G1 exists to
+/// prevent, and a clamp would let a ladder leg name an arm the binary did not run.
+pub(crate) const MAX_LANE_TRIAL_BUDGET: u32 = 4;
+
+/// duke3d-586's `dormant_heat` head cluster — `0x00540220` alone is 47.5% of the class and the
+/// three together are 79% of it (census at `f777010c`). The one split that answers "can a
+/// head-only lever reach duke's 79% at all", as against "does it have anything to act on
+/// anywhere"; the two questions have opposite answers if the convertible heads sit in the 34-site
+/// tail. Hard-coded because it is a property of ONE measured fixture, not a tunable: a census
+/// counter that moved with an env var could not be compared across the legs it exists to compare.
+#[cfg(feature = "direct-admission-census")]
+pub(crate) const DORMANT_HEAT_HEAD3_LINEARS: [u32; 3] = [0x0054_0220, 0x0054_0266, 0x0054_0280];
+
+/// How many compile-through-heat lane trials ONE key may spend in ONE heat epoch
+/// (`IZARRAVM_SMC_LANE_TRIAL_BUDGET`). Grants past the first are EARNED — see `lane_trial_spend`
+/// for INV-B3 — so this is a ceiling on a probation ladder, not a flat allowance.
+///
+/// **DEFAULT 4 SINCE THE 2026-08-29 LADDER.** It shipped at 1 — the pre-slice world, byte for byte
+/// — for exactly one commit, and the flip is priced by its own measurement, the `IZARRAVM_COUNT_LANES`
+/// and `IZARRAVM_ROTATE_ROWS` pattern.
+///
+/// THE EVIDENCE LINE. duke3d-586-short min-wall **-11.5%** (75.13 -> 66.48 s) and the duke3d-586
+/// LONG merge-gate row **-8.8%** (rt 0.81 -> 0.89) at budget 4, interleaved legs on one binary.
+/// Non-vacuity all green on the short row: `unbound_targets` 121.2 M -> 92.2 M,
+/// `heat_demote_trial_spent` 9,756 -> 2,376 — the population Lever B exists to drain, draining —
+/// and 33,116 re-grants producing 60,486 installs, so the re-grants are not pure recompile cost.
+/// Controls nascar-586, tyrian-586 and doom-586 all inside the +/-2% floor. Task 0's go/no-go
+/// passed before the ladder ran: the earned share of `smc_heat_demotions` was ~100% (against the
+/// 5% cancel floor), `_earned_head3` 32%, so the lever does reach duke's head cluster.
+///
+/// The park-length reading is the other half and it is why the LIFT side is still open: a mean of
+/// **>= 11 epochs**, and that is the CENSORED lower bound (`dormant_heat_park_epochs / park_lifts`
+/// counts only parks that lifted; never-lifted and reset-ended parks are the longest and contribute
+/// nothing). A head-only lever cannot shorten a park in progress, so this number is evidence for
+/// the lift-side slice, not against this flip.
+///
+/// AUTHORITY. This is the campaign's standing-authority call on its own measurement, **not an owner
+/// ruling**. It reverts alone: spelling `1` restores the pre-slice arm exactly.
+///
+/// # THE SPELLING TABLE
+///
+/// Trimmed and case-folded on the way in, the shape `IZARRAVM_COUNT_LANES` carries. This is a
+/// PARAMETER, so per the house rule it has **no `0` or `off` spelling** — UNSET is the escape:
+///
+/// * **unset -> 4.** The shipped default since the 2026-08-29 ladder.
+/// * `1` -> 1. The BASE and the ESCAPE: the pre-slice world, one trial per key per heat epoch, and
+///   the arm every A/B on this class is read against. Spellable so a ladder leg can name it.
+/// * `2`, `3`, `4` -> the probation arms; `4` is what the default now runs.
+/// * `0`, anything above `4`, and anything unparseable **PANIC**. `0` would disable the trial
+///   through the wrong knob (`IZARRAVM_SMC_LANE_TRIAL=0` is that knob) and would read as an arm
+///   rather than as the escape; a value above `MAX_LANE_TRIAL_BUDGET` is the storm this gate
+///   exists to prevent; and a typo that fell through to the default would be read as "the arm I
+///   asked for changed nothing", which is the one wrong conclusion an arm ladder exists to avoid
+///   (`parse_count_lanes_arm`'s reasoning).
+pub(crate) fn lane_trial_budget() -> u32 {
+    #[cfg(test)]
+    if let Some(forced) = LANE_TRIAL_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        parse_lane_trial_budget_arm(std::env::var("IZARRAVM_SMC_LANE_TRIAL_BUDGET"))
+    })
+}
+
+/// The `IZARRAVM_SMC_LANE_TRIAL_BUDGET` spelling table, lifted out of the `OnceLock` closure so it
+/// can be unit-tested without a process-global env write. See `lane_trial_budget`.
+fn parse_lane_trial_budget_arm(value: Result<String, std::env::VarError>) -> u32 {
+    const ACCEPTED: &str = "accepted spellings are unset (the shipped default since the 2026-08-29 \
+                            ladder, four earned trials per key per heat epoch) or `1` (the \
+                            pre-slice world, one trial per key per epoch — the base and the \
+                            escape), `2`, `3`, `4`. This is a PARAMETER: it has no `0` or `off` \
+                            spelling, and `1` rather than `0` is how the pre-slice arm is named";
+    let raw = match value {
+        // The 2026-08-29 flip. `1` is still spellable and is the escape; see `lane_trial_budget`
+        // for the evidence line the default rests on.
+        Err(std::env::VarError::NotPresent) => return MAX_LANE_TRIAL_BUDGET,
+        // Not-UTF-8 is not a spelling of any arm. It reaches the same panic as a typo rather than
+        // the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_SMC_LANE_TRIAL_BUDGET is set to a value that is not valid UTF-8; \
+                 {ACCEPTED}"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    let trimmed = raw.trim().to_ascii_lowercase();
+    match trimmed.parse::<u32>() {
+        Ok(budget) if (1..=MAX_LANE_TRIAL_BUDGET).contains(&budget) => budget,
+        _ => panic!(
+            "IZARRAVM_SMC_LANE_TRIAL_BUDGET={trimmed:?} names no arm; {ACCEPTED}. Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm it \
+             named doing nothing, and a value above {MAX_LANE_TRIAL_BUDGET} is the recompile storm \
+             the G1 heat gate exists to prevent"
+        ),
+    }
+}
+
+// Per-THREAD, for `COUNT_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run several arms in one process, so one test's arm selection must not
+// reach another's compile. `None` leaves a fixture reading the ambient knob, which is 1.
+#[cfg(test)]
+thread_local! {
+    static LANE_TRIAL_BUDGET_OVERRIDE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the lane-trial budget arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_SMC_LANE_TRIAL_BUDGET` reading.
+#[cfg(test)]
+pub(crate) fn set_lane_trial_budget_for_test(forced: Option<u32>) {
+    LANE_TRIAL_BUDGET_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `lane_trial_budget` caches its env reading in
+/// a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
+/// never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_lane_trial_budget_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> u32 {
+    parse_lane_trial_budget_arm(value)
 }
 
 /// Whether `disp_lane_for` admits the `0x8A` displacement-lane family (`IZARRAVM_DISP_LANES`).
@@ -28787,6 +29110,54 @@ pub(crate) struct DirectStallTally {
     /// this struct's doc.
     pub lane_trials: u64,
     pub lane_trial_installs: u64,
+    /// `lane_trials` split by which arm of `lane_trial_spend` granted it, plus the refusals.
+    /// **All three are REAL counters**, and `lane_trial_first_grants` deliberately so rather than
+    /// derived as `lane_trials - lane_trial_regrants`: the identity
+    /// `lane_trials == first_grants + regrants` is a tautology under the derived form, so the
+    /// fixture that asserts it would test nothing.
+    ///
+    /// `lane_trial_regrants <= (lane_trial_budget() - 1) * lane_trial_first_grants` is INV-B1's
+    /// checkable form — an EXACT stop floor that needs no base arm and is evaluable on every arm of
+    /// every run, which is why both live in the plain build.
+    pub lane_trial_first_grants: u64,
+    pub lane_trial_regrants: u64,
+    /// Grants refused because the epoch's budget was spent or the previous grant did not install.
+    /// A first ask of an epoch is never counted here.
+    pub lane_trial_budget_refusals: u64,
+    /// Entry-gate heat demotes whose key had already spent a trial this epoch, and the subset
+    /// whose spent trial INSTALLED — the population an earned re-grant can convert, against the
+    /// union of it with the compiles that died at `Retry` / `StructuralReject` / cover / install.
+    ///
+    /// **PLAIN fields, not census-gated, and that is load-bearing.** Both are read by the ladder's
+    /// non-vacuity criterion and by its stop floor, which are evaluated on wall arms and therefore
+    /// on plain builds; and both are heat-coupled by construction (they sit on the heat demote
+    /// arm), so the census build is the one build the standing rule says would give the wrong sign.
+    /// The cost is two increments on an arm reached ~15 K (duke) / ~25 K (nascar) times per run.
+    pub heat_demote_trial_spent: u64,
+    pub heat_demote_trial_spent_earned: u64,
+    /// `heat_demote_trial_spent_earned` restricted to `DORMANT_HEAT_HEAD3_LINEARS`. Answers
+    /// whether a head-only lever can reach duke's 79% cluster, which the run-wide ratio cannot:
+    /// convertible heads in the 34-site tail and convertible heads in the cluster give the same
+    /// ratio and opposite verdicts.
+    #[cfg(feature = "direct-admission-census")]
+    pub heat_demote_trial_spent_earned_head3: u64,
+    /// Pre-install span-gate demotes, split by whether the refused compilation carried a mutable
+    /// lane at all. `no_lanes` spent no trial (the predicate short-circuits), so it is the part of
+    /// the class no trial-budget lever can ever convert.
+    #[cfg(feature = "direct-admission-census")]
+    pub lane_install_demote_no_lanes: u64,
+    #[cfg(feature = "direct-admission-census")]
+    pub lane_install_demote_trial_spent: u64,
+    /// Park LENGTH: heat epochs summed across every `Dormant(SpanHot)` park that LIFTED, and how
+    /// many parks that was. `dormant_heat_park_epochs / park_lifts` is a **LOWER BOUND** on the
+    /// mean park length — never-lifted and reset-ended parks contribute nothing and they are the
+    /// longest — so it must be published with the censoring rate
+    /// `(smc_heat_demotions - park_lifts) / smc_heat_demotions` beside it. A high censoring rate is
+    /// itself evidence that the lift side, not the trial budget, is where the class lives.
+    #[cfg(feature = "direct-admission-census")]
+    pub dormant_heat_park_epochs: u64,
+    #[cfg(feature = "direct-admission-census")]
+    pub park_lifts: u64,
     /// Displacement lanes registered at install (the `0x8A` family), the disp share of the
     /// aggregate `PerfCounters::smc_lane_registrations`. The split is what the A/B needs:
     /// `smc_lane_accepts` moving with this counter flat would say the imm lanes did the work.
@@ -30635,6 +31006,21 @@ impl crate::jit::JitState {
             segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
+            lane_trial_first_grants: self.stalls.lane_trial_first_grants,
+            lane_trial_regrants: self.stalls.lane_trial_regrants,
+            lane_trial_budget_refusals: self.stalls.lane_trial_budget_refusals,
+            heat_demote_trial_spent: self.stalls.heat_demote_trial_spent,
+            heat_demote_trial_spent_earned: self.stalls.heat_demote_trial_spent_earned,
+            #[cfg(feature = "direct-admission-census")]
+            heat_demote_trial_spent_earned_head3: self.stalls.heat_demote_trial_spent_earned_head3,
+            #[cfg(feature = "direct-admission-census")]
+            lane_install_demote_no_lanes: self.stalls.lane_install_demote_no_lanes,
+            #[cfg(feature = "direct-admission-census")]
+            lane_install_demote_trial_spent: self.stalls.lane_install_demote_trial_spent,
+            #[cfg(feature = "direct-admission-census")]
+            dormant_heat_park_epochs: self.stalls.dormant_heat_park_epochs,
+            #[cfg(feature = "direct-admission-census")]
+            park_lifts: self.stalls.park_lifts,
             disp_lane_registrations: self.stalls.disp_lane_registrations,
             imm8_lane_registrations: self.stalls.imm8_lane_registrations,
             count_lane_registrations: self.stalls.count_lane_registrations,
@@ -32143,25 +32529,25 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("key_for_phys_none", 1506),
     ("probe_interpret", 1519),
     ("probe_rejected", 1576),
-    ("link_line_not_live", 1804),
-    ("revalidate_none", 1810),
-    ("dispatch_deferred_short", 1826),
-    ("observer_or_diff_trace", 2424),
-    ("interrupt_shadow", 2431),
-    ("aggregate_accounting", 2438),
-    ("native_fetch_trace", 2452),
-    ("mode_key", 2460),
-    ("x87_top", 2474),
-    ("segment_layout_none", 2489),
-    ("cs_layout", 2497),
-    ("cpl", 2505),
-    ("callout_privileged", 2586),
-    ("data_segment", 2704),
-    ("alignment", 2713),
-    ("fetch_limit", 2728),
-    ("entry_deferred_short", 2742),
-    ("zero_budget", 2850),
-    ("block_regenerated_none", 2886),
+    ("link_line_not_live", 1819),
+    ("revalidate_none", 1825),
+    ("dispatch_deferred_short", 1841),
+    ("observer_or_diff_trace", 2439),
+    ("interrupt_shadow", 2446),
+    ("aggregate_accounting", 2453),
+    ("native_fetch_trace", 2467),
+    ("mode_key", 2475),
+    ("x87_top", 2489),
+    ("segment_layout_none", 2504),
+    ("cs_layout", 2512),
+    ("cpl", 2520),
+    ("callout_privileged", 2601),
+    ("data_segment", 2719),
+    ("alignment", 2728),
+    ("fetch_limit", 2743),
+    ("entry_deferred_short", 2757),
+    ("zero_budget", 2865),
+    ("block_regenerated_none", 2901),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -32229,13 +32615,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1615),
-    ("structural_reject", 1634),
-    ("compile_retry", 1645),
-    ("page_cover_failed", 1669),
-    ("lane_install_demote", 1697),
-    ("install_failed", 1707),
-    ("installed_fall_through", 1789),
+    ("heat_demote", 1622),
+    ("structural_reject", 1641),
+    ("compile_retry", 1652),
+    ("page_cover_failed", 1676),
+    ("lane_install_demote", 1712),
+    ("install_failed", 1722),
+    ("installed_fall_through", 1804),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {

@@ -3352,7 +3352,7 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
 }
 
 fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json::Value {
-    json!({
+    let report = json!({
         "dormant": snapshot
             .dormant
             .iter()
@@ -3460,6 +3460,15 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "segment_write_block_head_insns": snapshot.segment_write_block_head_insns,
         "smc_lane_trials": snapshot.lane_trials,
         "smc_lane_trial_installs": snapshot.lane_trial_installs,
+        // Lever B's grant split and Task 0's two F2 counters, in PLAIN builds and deliberately:
+        // the exact stop floor `regrants <= (budget - 1) * first_grants` and the non-vacuity
+        // criterion "heat_demote_trial_spent falls" are read on the WALL arms, and both counters
+        // are heat-coupled, so a census binary would give the wrong sign.
+        "smc_lane_trial_first_grants": snapshot.lane_trial_first_grants,
+        "smc_lane_trial_regrants": snapshot.lane_trial_regrants,
+        "smc_lane_trial_budget_refusals": snapshot.lane_trial_budget_refusals,
+        "heat_demote_trial_spent": snapshot.heat_demote_trial_spent,
+        "heat_demote_trial_spent_earned": snapshot.heat_demote_trial_spent_earned,
         "smc_disp_lane_registrations": snapshot.disp_lane_registrations,
         "smc_imm8_lane_registrations": snapshot.imm8_lane_registrations,
         "smc_count_lane_registrations": snapshot.count_lane_registrations,
@@ -3541,7 +3550,22 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_poll_skip_raw_bus_clocks": snapshot.poll_skip_raw_bus_clocks,
         "jit_direct_poll_skip_max_span": snapshot.poll_skip_max_span,
         "jit_direct_poll_skip_last_head": snapshot.poll_skip_last_head,
-    })
+    });
+    // Task 0's census-gated half. The park pair is read as a mean WITH its censoring rate
+    // `(smc_heat_demotions - park_lifts) / smc_heat_demotions`: never-lifted and reset-ended parks
+    // contribute nothing and are the longest, so the mean is a LOWER bound on park length.
+    #[cfg(feature = "direct-admission-census")]
+    let report = {
+        let mut report = report;
+        report["heat_demote_trial_spent_earned_head3"] =
+            snapshot.heat_demote_trial_spent_earned_head3.into();
+        report["lane_install_demote_no_lanes"] = snapshot.lane_install_demote_no_lanes.into();
+        report["lane_install_demote_trial_spent"] = snapshot.lane_install_demote_trial_spent.into();
+        report["dormant_heat_park_epochs"] = snapshot.dormant_heat_park_epochs.into();
+        report["dormant_heat_park_lifts"] = snapshot.park_lifts.into();
+        report
+    };
+    report
 }
 
 fn direct_barrier_census_row_json(row: &izarravm_cpu::DirectBarrierCensusRow) -> serde_json::Value {

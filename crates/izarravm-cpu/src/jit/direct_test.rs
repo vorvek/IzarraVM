@@ -1989,6 +1989,334 @@ fn lift_cold_smc_dormant_reports_which_of_its_three_shapes_it_took() {
     );
 }
 
+/// A lane-trial cache with both arms of the mechanism STATED rather than inherited: the trial
+/// knob forced on, and the budget forced to `budget`. Neither fixture below may lean on a default.
+fn lane_trial_cache(budget: u32) -> JitState {
+    let mut cache = BlockCache::default();
+    cache.set_lane_trial_for_test(true);
+    set_lane_trial_budget_for_test(Some(budget));
+    cache
+}
+
+/// INV-B1 and INV-B2. The budget is a HARD per-`(key, epoch)` count, and the ONLY thing that
+/// restores it is the epoch turning over — not a probe, not a kill, not a demote. A per-probe reset
+/// would make the budget unbounded per epoch, which IS the recompile storm the G1 gate exists to
+/// prevent.
+///
+/// RED before this slice: `lane_trial_spend` granted once per key per epoch unconditionally, so the
+/// second grant here was refused.
+#[test]
+fn lane_trial_budget_is_exactly_the_configured_number_per_epoch() {
+    let mut cache = lane_trial_cache(2);
+    let hot = key(0x4000);
+
+    assert!(
+        cache.lane_trial_spend(hot, 5),
+        "the first ask of an epoch is always granted, exactly as before this slice"
+    );
+    cache.note_lane_trial_install(hot);
+    assert!(
+        cache.lane_trial_spend(hot, 5),
+        "an EARNED second grant is what budget 2 buys"
+    );
+    cache.note_lane_trial_install(hot);
+    assert!(
+        !cache.lane_trial_spend(hot, 5),
+        "the budget is a hard count: a third grant at budget 2 is refused however well it earned"
+    );
+    assert_eq!(cache.stalls.lane_trial_budget_refusals, 1);
+    assert_eq!(cache.lane_trial_record_for_test(hot), Some((5, 2, true)));
+    assert_eq!(
+        cache.stalls.lane_trial_installs, 2,
+        "a re-grant's install is ONE install; the counter keeps its historical meaning so its \
+         series stays comparable across the flip"
+    );
+
+    // The epoch turning over is the only reset, and it restarts `spent` rather than decrementing.
+    assert!(cache.lane_trial_spend(hot, 6));
+    assert_eq!(
+        cache.lane_trial_record_for_test(hot),
+        Some((6, 1, false)),
+        "a new epoch RESTARTS the record; it does not decrement or age the old one"
+    );
+    assert_eq!(cache.stalls.lane_trial_first_grants, 2);
+    assert_eq!(cache.stalls.lane_trials, 3);
+    set_lane_trial_budget_for_test(None);
+}
+
+/// INV-B3, the nascar guard, in both halves. 86.1% of nascar's trials never install: its parked
+/// keys are overwhelmingly compilations that registered no lane at all, and re-granting there would
+/// recompile identical code to fail identically — a recompile storm with extra steps. The earned
+/// gate is what makes a raised budget worth nothing to that population.
+///
+/// The SECOND half is what pins the per-GRANT clear rather than a sticky `earned`: without it, one
+/// earned install would let a key spend grants 2, 3 and 4 with none of them installing, and the
+/// mutation "drop the `slot.earned &&` conjunct" would be unkillable because the conjunct is a
+/// constant after the first earn.
+#[test]
+fn an_unearned_trial_gets_no_regrant_even_under_a_raised_budget() {
+    let mut cache = lane_trial_cache(3);
+
+    // Half one: a trial that never installed buys nothing, budget or no budget.
+    let never = key(0x5000);
+    assert!(cache.lane_trial_spend(never, 9));
+    assert!(
+        !cache.lane_trial_spend(never, 9),
+        "an unearned key gets exactly one trial per epoch, unchanged from before this slice"
+    );
+
+    // Half two: earning ONE install buys exactly ONE re-grant, not the rest of the budget.
+    let earner = key(0x6000);
+    assert!(cache.lane_trial_spend(earner, 9));
+    cache.note_lane_trial_install(earner);
+    assert!(cache.lane_trial_spend(earner, 9), "the earned re-grant");
+    assert!(
+        !cache.lane_trial_spend(earner, 9),
+        "the re-grant did NOT install, so probation is back on even with budget left"
+    );
+    assert_eq!(
+        cache.lane_trial_record_for_test(earner),
+        Some((9, 2, false))
+    );
+    assert_eq!(cache.stalls.lane_trial_regrants, 1);
+    set_lane_trial_budget_for_test(None);
+}
+
+/// INV-B5. All three of `lane_trials`, `lane_trial_first_grants` and `lane_trial_regrants` are REAL
+/// counters, and this asserts the identity between them. It is a real test only because
+/// `first_grants` is counted rather than derived as `lane_trials - regrants`: under the derived
+/// form the identity holds by construction and the fixture tests nothing.
+#[test]
+fn regrants_are_counted_apart_from_first_trials() {
+    let mut cache = lane_trial_cache(3);
+    let hot = key(0x7000);
+
+    assert!(cache.lane_trial_spend(hot, 2));
+    assert_eq!(
+        (
+            cache.stalls.lane_trial_first_grants,
+            cache.stalls.lane_trial_regrants
+        ),
+        (1, 0),
+        "a first grant moves first_grants and not regrants"
+    );
+
+    cache.note_lane_trial_install(hot);
+    assert!(cache.lane_trial_spend(hot, 2));
+    assert_eq!(
+        (
+            cache.stalls.lane_trial_first_grants,
+            cache.stalls.lane_trial_regrants
+        ),
+        (1, 1),
+        "a re-grant moves the reverse"
+    );
+
+    assert!(!cache.lane_trial_spend(hot, 2));
+    assert_eq!(
+        (
+            cache.stalls.lane_trial_first_grants,
+            cache.stalls.lane_trial_regrants
+        ),
+        (1, 1),
+        "a REFUSED grant moves neither"
+    );
+    assert_eq!(
+        cache.stalls.lane_trials,
+        cache.stalls.lane_trial_first_grants + cache.stalls.lane_trial_regrants
+    );
+    // INV-B1's checkable form, the exact stop floor the ladder reads on every arm.
+    assert!(
+        cache.stalls.lane_trial_regrants
+            <= u64::from(lane_trial_budget() - 1) * cache.stalls.lane_trial_first_grants
+    );
+    set_lane_trial_budget_for_test(None);
+}
+
+/// INV-B4, across the value-type change AND across Task 0's park-epoch side map. A census map that
+/// outlives its keys is a stale-key bug in the diagnostic that decides the campaign.
+///
+/// Host-gated with the other `reset_storage` fixtures: only a NON-EMPTY clear routes through
+/// `reset_storage`, so the block install below is load-bearing and it needs a real emitter.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn lane_trial_records_are_cleared_with_cache_storage() {
+    let mut cache = lane_trial_cache(2);
+    let mut heat = SmcHeatMap::default();
+    let hot = key(0x8000);
+    install_trivial(&mut cache, key(0x8100), 16);
+
+    assert!(cache.lane_trial_spend(hot, 3));
+    cache.demote_smc_hot(&mut heat, hot, 3);
+    assert_eq!(cache.lane_trial_records_len_for_test(), 1);
+    #[cfg(feature = "direct-admission-census")]
+    assert_eq!(cache.park_epochs_len_for_test(), 1);
+
+    cache.clear();
+    assert_eq!(
+        cache.lane_trial_records_len_for_test(),
+        0,
+        "the trial records are keyed by BlockKey and every key is gone after a storage reset"
+    );
+    #[cfg(feature = "direct-admission-census")]
+    assert_eq!(
+        cache.park_epochs_len_for_test(),
+        0,
+        "and so is the park-length side map, or the census outlives its keys"
+    );
+    set_lane_trial_budget_for_test(None);
+}
+
+/// Task 0's gross/earned split. Without this the two counters could both be the union, and the
+/// go/no-go rule they gate would pass on a population Lever B refuses by design: a trial spent on a
+/// compile that died at `Retry` / `StructuralReject` / cover / install is never re-granted.
+#[test]
+fn task0_counters_split_the_spent_population() {
+    let mut cache = lane_trial_cache(1);
+
+    // One key whose trial INSTALLED and was then killed — convertible.
+    let earner = key(0x9000);
+    assert!(cache.lane_trial_spend(earner, 4));
+    cache.note_lane_trial_install(earner);
+    assert!(!cache.lane_trial_spend(earner, 4));
+    cache.note_heat_demote_trial_spent(earner, 4);
+
+    // One key whose trial's compile FAILED — spent, unconvertible.
+    let failed = key(0xa000);
+    assert!(cache.lane_trial_spend(failed, 4));
+    assert!(!cache.lane_trial_spend(failed, 4));
+    cache.note_heat_demote_trial_spent(failed, 4);
+
+    // And one that never asked this epoch: a first-ask or knob-off refusal counts nothing.
+    cache.note_heat_demote_trial_spent(key(0xb000), 4);
+    cache.note_heat_demote_trial_spent(earner, 5);
+
+    assert_eq!(cache.stalls.heat_demote_trial_spent, 2);
+    assert_eq!(cache.stalls.heat_demote_trial_spent_earned, 1);
+    set_lane_trial_budget_for_test(None);
+}
+
+/// The park-LENGTH diagnostic, in EPOCHS and honest about what it cannot see. The second half is
+/// what makes "record an unlifted park as length 0" killable — a mutation that would bias the
+/// campaign's steering number toward the answer §1.5 says is most dangerous to get wrong.
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn park_length_counts_epochs_and_censors_honestly() {
+    let mut cache = BlockCache::default();
+    let mut heat = SmcHeatMap::default();
+
+    let lifted = key(0xc000);
+    assert!(matches!(cache.probe(lifted), BlockProbe::Interpret));
+    cache.demote_smc_hot(&mut heat, lifted, 4);
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, lifted, 7),
+        DormantLift::Lifted
+    );
+    assert_eq!(
+        cache.stalls.dormant_heat_park_epochs, 3,
+        "the span is the EPOCH delta, not a count of parks"
+    );
+    assert_eq!(cache.stalls.park_lifts, 1);
+
+    // A park that never lifts contributes NOTHING to the sum and one to the censoring count
+    // `smc_heat_demotions - park_lifts`. Those are the LONGEST parks, so the mean over the lifted
+    // ones is a lower bound and is published with the censoring rate beside it.
+    let stuck = key(0xd000);
+    assert!(matches!(cache.probe(stuck), BlockProbe::Interpret));
+    cache.demote_smc_hot(&mut heat, stuck, 4);
+    assert_eq!(
+        cache.lift_cold_smc_dormant(&mut heat, stuck, 4),
+        DormantLift::StillDormant
+    );
+    assert_eq!(cache.stalls.dormant_heat_park_epochs, 3);
+    assert_eq!(cache.stalls.park_lifts, 1);
+    assert_eq!(
+        cache.park_epochs_len_for_test(),
+        1,
+        "still parked, uncounted"
+    );
+}
+
+/// INV-B7: the stale-epoch reset runs ABOVE the grant decision, never below it. This is the ENTIRE
+/// defence against cross-epoch `earned` leakage — with the reset below the decision, a key that
+/// earned an install at epoch E arrives at E+1 and is granted as an earned RE-grant rather than as
+/// a first trial, silently doubling the per-epoch budget for every key that ever earns.
+#[test]
+fn an_earn_at_epoch_e_does_not_buy_a_regrant_at_epoch_e_plus_1() {
+    let mut cache = lane_trial_cache(3);
+    let hot = key(0xe000);
+
+    assert!(cache.lane_trial_spend(hot, 11));
+    cache.note_lane_trial_install(hot);
+    assert_eq!(cache.lane_trial_record_for_test(hot), Some((11, 1, true)));
+
+    assert!(cache.lane_trial_spend(hot, 12));
+    assert_eq!(
+        cache.lane_trial_record_for_test(hot),
+        Some((12, 1, false)),
+        "the earn from epoch 11 is cleared by the reset before the decision can read it"
+    );
+    assert_eq!(
+        (
+            cache.stalls.lane_trial_first_grants,
+            cache.stalls.lane_trial_regrants
+        ),
+        (2, 0),
+        "the grant at E+1 is a FIRST trial, not an earned re-grant"
+    );
+    set_lane_trial_budget_for_test(None);
+}
+
+/// R2-G's other seam. `note_lane_trial_install` on a key with no slot is a SILENT no-op, never an
+/// `expect` and never an insert. A slot always exists in production (`lane_trial` implies a prior
+/// grant), so an `expect` would be "correct" today and would turn a diagnostic into a crash the
+/// first time a `reset_storage` landed between the grant and the install.
+#[test]
+fn note_lane_trial_install_on_a_missing_slot_is_a_silent_no_op() {
+    let mut cache = BlockCache::default();
+    cache.note_lane_trial_install(key(0xf000));
+    assert_eq!(cache.stalls.lane_trial_installs, 1);
+    assert_eq!(
+        cache.lane_trial_records_len_for_test(),
+        0,
+        "no slot is fabricated: a fabricated one would hold epoch 0 and could be read as earned"
+    );
+}
+
+/// The knob's spelling table. A PARAMETER has no `0` or `off` spelling — `1` is how the pre-slice
+/// arm is named — and a typo must PANIC rather than fall through to the default, which a ladder leg
+/// would read as "the arm I asked for changed nothing".
+///
+/// The unset row MOVED with the 2026-08-29 flip (1 -> 4). It is asserted against the constant and
+/// not against a literal `4`, so the default and its ceiling cannot drift apart silently.
+#[test]
+fn lane_trial_budget_spelling_table() {
+    use std::env::VarError;
+
+    assert_eq!(
+        parse_lane_trial_budget_arm_for_test(Err(VarError::NotPresent)),
+        MAX_LANE_TRIAL_BUDGET,
+        "unset is the shipped default, which the ladder moved to the ceiling"
+    );
+    for (spelling, budget) in [("1", 1), ("2", 2), (" 3 ", 3), ("4", 4)] {
+        assert_eq!(
+            parse_lane_trial_budget_arm_for_test(Ok(spelling.to_string())),
+            budget,
+            "{spelling:?}"
+        );
+    }
+    for typo in ["", "0", "off", "5", "yes", "true", "-1", "2.0"] {
+        assert!(
+            std::panic::catch_unwind(|| parse_lane_trial_budget_arm_for_test(Ok(typo.to_string())))
+                .is_err(),
+            "{typo:?} names no arm and must panic rather than run the default"
+        );
+    }
+}
+
 #[test]
 fn smc_heat_span_hot_only_flags_overlapping_chunks() {
     let mut heat = SmcHeatMap::default();
