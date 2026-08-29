@@ -4532,6 +4532,32 @@ pub(crate) enum DirectKind {
     MulReg {
         src: u8,
     },
+    /// MUL r/m32, one-operand UNSIGNED multiply, MEMORY form (0xF7 /4). Writes guest EAX and EDX
+    /// regardless of the address, the same implicit destination `MulReg` has. Behind
+    /// `IZARRAVM_MUL_MEM_ROWS`.
+    ///
+    /// The 2026-08-29 evening census sweep's gp2-586 row: `0xF7 /4` r/m32 MEMORY is 13.1 M
+    /// interpreted hits and the second head of that fixture's rejected class (101.4 M exits, 65%
+    /// of its 156.4 M unbound). A rejected-class hit is a block TERMINATION, so the admission
+    /// buys the extension rather than the multiply.
+    ///
+    /// **The SIGNED sibling `ImulMemAcc` is this variant's whole safety argument, bar one thing.**
+    /// The address handling, the side-exit plumbing, the segment declaration and the flag contract
+    /// are that variant's verbatim. What is NOT shared is the overflow predicate: host `mul` sets
+    /// CF = OF = (high half nonzero) and host `imul` sets CF = OF = (the full product does not
+    /// sign-extend back from the low half). Those are different predicates over the same operands,
+    /// which is why `emit_mul_mem_acc` is written out rather than parameterising
+    /// `emit_imul_mem_acc` on a bool -- the encoder keeps `mul_r32` and `imul_r32` apart for
+    /// exactly that reason, and a shared body would make picking the wrong one a one-character
+    /// edit.
+    ///
+    /// No `raw_clocks` field and no `width` field, for `ImulMemAcc`'s reasons exactly: the whole
+    /// group-3 arm returns `clocks(2)`, which IS the `raw_clocks` default, and the
+    /// `OperandSize::Word` gate routes every `0xf7 /2../7` Word form to an `InterpretOne` call-out
+    /// before this arm is reached, so the kind is dword-only by construction.
+    MulMemAcc {
+        addr: DirectAddr,
+    },
     /// IMUL r/m32, one-operand SIGNED multiply, MEMORY form (0xF7 /5). Writes guest EAX and EDX
     /// regardless of the address, the same implicit destination `MulReg` has.
     ///
@@ -5490,6 +5516,10 @@ impl DirectKind {
                 } | Self::DoubleShiftMem { .. }
                     | Self::ImulMem { .. }
                     | Self::ImulMemAcc { .. }
+                    // The multiplicand. ONE dword read, the same one `ImulMemAcc` registers: the
+                    // multiplier is EAX and the destination is the EDX:EAX pair, so neither
+                    // touches memory.
+                    | Self::MulMemAcc { .. }
                     // The divisor. ONE dword read, the same one `ImulMemAcc` registers: the
                     // dividend is EDX:EAX and never touches memory.
                     | Self::DivMem { .. }
@@ -5665,6 +5695,7 @@ impl DirectKind {
             | Self::LoadExtend { addr, .. }
             | Self::ImulMem { addr, .. }
             | Self::ImulMemAcc { addr, .. }
+            | Self::MulMemAcc { addr, .. }
             | Self::AluMemSource { addr, .. }
             | Self::AluMemDest { addr, .. }
             | Self::DoubleShiftMem { addr, .. }
@@ -10742,6 +10773,94 @@ pub(crate) fn parse_fpu_loop_rows_arm_for_test(value: Result<String, std::env::V
     parse_fpu_loop_rows_arm(value)
 }
 
+/// Whether the backend admits `0xF7 /4` MUL r/m32 in its MEMORY form (`DirectKind::MulMemAcc`).
+/// **DEFAULT OFF.** The register form is not gated and never was.
+///
+/// The row: the 2026-08-29 evening census sweep measured `0xF7 /4` r/m32 MEMORY at 13.1 M
+/// interpreted hits on gp2-586, the second head of that fixture's rejected class (101.4 M exits,
+/// 65% of its 156.4 M unbound). A rejected-class hit is a block TERMINATION, so what the admission
+/// buys is the extension past the multiply, not the multiply.
+///
+/// **OFF is the shipped default until a gp2-586 ladder says otherwise, and the knob exists for
+/// that ladder rather than for the escape.** Both arms have to come from ONE binary: this box
+/// measures 3.7% binary-layout variance, which is larger than most levers, so a cross-binary wall
+/// is not evidence. Flip the default here, in its own commit, if and only if the ladder wins.
+///
+/// THE SPELLING TABLE, trimmed and case-folded on the way in, matching `IZARRAVM_FPU_LOOP_ROWS`:
+///
+/// * **unset**, `` (empty), `0` or `off` -> OFF. The shipped default and the A/B base.
+/// * `1` / `on` -> ON. The candidate arm.
+/// * **anything else PANICS**, for `parse_fpu_loop_rows_arm`'s reason: a mistyped ladder leg that
+///   fell through to the default would be read as "the arm I asked for changed nothing".
+///
+/// Note which way the [[env-null-empty-is-off-trap]] points here. This knob's default and its
+/// empty spelling AGREE, both OFF, so an off leg may unset the variable or export `0` and get the
+/// same arm. That is only true while the default is OFF: the day it flips ON, an off leg must
+/// EXPORT `0` and unsetting becomes the on arm, exactly as `IZARRAVM_FPU_LOOP_ROWS` warns.
+pub(crate) fn mul_mem_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MUL_MEM_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_mul_mem_rows_arm(std::env::var("IZARRAVM_MUL_MEM_ROWS")))
+}
+
+/// The `IZARRAVM_MUL_MEM_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `mul_mem_rows_enabled` for the contract.
+fn parse_mul_mem_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_MUL_MEM_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `0` / `off` (the shipped default: `0xF7 /4` MUL r/m32 \
+                 stays register-only), and `1` / `on` (the candidate: the memory form lowers too)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_MUL_MEM_ROWS={other:?} names no arm; accepted spellings are unset or `0` / \
+             `off` (the shipped default: `0xF7 /4` MUL r/m32 stays register-only, which is the \
+             A/B base), and `1` / `on` (the candidate: the MEMORY form lowers through \
+             `DirectKind::MulMemAcc`). Refusing to guess: a mistyped ladder leg would silently \
+             run the DEFAULT and be read as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `FPU_LOOP_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run both arms in one process, so one test's arm selection must not
+// reach another's compile. Every fixture for this row states its arm through here in BOTH
+// directions -- the refusal fixture needs the off arm explicitly, so that it does not go vacuous
+// the day the default flips.
+#[cfg(test)]
+thread_local! {
+    static MUL_MEM_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the MUL-memory-row arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_MUL_MEM_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_mul_mem_rows_for_test(forced: Option<bool>) {
+    MUL_MEM_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `mul_mem_rows_enabled` caches its env reading
+/// in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process
+/// and never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_mul_mem_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_mul_mem_rows_arm(value)
+}
+
 /// Whether the backend admits the SIX rows the tombraid FMV census's loop A names, plus the two
 /// collateral forms the same code path needs (`IZARRAVM_V86_LOOP_ROWS`). **DEFAULT ON since
 /// 2026-08-20** (the slice shipped OFF for three commits; the flip is priced in the spelling table
@@ -15680,34 +15799,65 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     };
                     return Some(DirectKind::NegReg { dst });
                 }
-                // MUL r/m32, register form. `reg == 4` is the UNSIGNED multiply; /5 next to it is
-                // the signed IMUL, whose overflow rule is different (the product not sign-extending
-                // back from the low half rather than the high half being nonzero), so this must not
-                // widen to `4..=5`. Carries no width field for the same reason NegReg does not: the
-                // OperandSize::Word gate above is the only thing keeping a 586-mode `66 F7 /4` out,
-                // and a 16-bit MUL writes DX and AX as halves of the existing EDX and EAX rather
-                // than replacing them.
+                // MUL r/m32, BOTH operand forms. `reg == 4` is the UNSIGNED multiply; /5 next to it
+                // is the signed IMUL, whose overflow rule is different (the product not
+                // sign-extending back from the low half rather than the high half being nonzero),
+                // so this must not widen to `4..=5`. Carries no width field for the same reason
+                // NegReg does not: the OperandSize::Word gate above is the only thing keeping a
+                // 586-mode `66 F7 /4` out, and a 16-bit MUL writes DX and AX as halves of the
+                // existing EDX and EAX rather than replacing them.
+                //
+                // `opcode == 0xf7` is load-bearing on the MEMORY form for the reason it is
+                // load-bearing on the /5 arm below: `0xF6 /4` is the BYTE MUL, which multiplies AL
+                // and writes only AX. Without the test it would be read as a dword and lowered as
+                // the dword multiply, writing EAX and EDX whole.
+                //
+                // The MEMORY form is the 2026-08-29 gp2-586 census's `0xF7 /4 memory dword` row at
+                // 13.1 M interpreted hits, the second head of that fixture's rejected class, and it
+                // sits behind `IZARRAVM_MUL_MEM_ROWS`. The register form rides no gate: it has
+                // shipped since the rejected-row campaign's F7 slice.
                 if opcode == 0xf7 && m.reg == 4 {
-                    let DecodedOperand::Reg(src) = insn.operand? else {
-                        return None;
+                    return match insn.operand? {
+                        DecodedOperand::Reg(src) => Some(DirectKind::MulReg { src }),
+                        DecodedOperand::Mem(addr) => {
+                            if !mul_mem_rows_enabled() {
+                                return None;
+                            }
+                            Some(DirectKind::MulMemAcc {
+                                addr: direct_addr(addr)?,
+                            })
+                        }
                     };
-                    return Some(DirectKind::MulReg { src });
                 }
                 // IMUL r/m32, one-operand SIGNED multiply, memory form. `reg == 5`, the signed
                 // sibling of the /4 above, whose overflow rule is different: the product failing to
                 // sign-extend back from the low half, rather than the high half being nonzero.
                 //
                 // ORDERING INVARIANT, and it is load-bearing rather than cosmetic. This arm MUST
-                // stay BELOW the /4 arm. That arm's `else { return None }` returns from `classify`,
-                // not from the arm, so a /4 with a MEMORY operand is already unreachable by the time
-                // control gets here. Move this arm above it and widen either to `4..=5` and an
-                // unsigned `mul dword [mem]` is emitted as a signed multiply, with the wrong EDX and
-                // the wrong CF and OF. `mul_memory_form_stays_interpreter_only` is what catches it.
+                // stay BELOW the /4 arm. That arm `return`s from `classify` on EVERY path -- both
+                // operand forms, and the knob-off memory form too -- so a /4 is already
+                // unreachable by the time control gets here. Move this arm above it and widen
+                // either to `4..=5` and an unsigned `mul dword [mem]` is emitted as a signed
+                // multiply, with the wrong EDX and the wrong CF and OF.
+                //
+                // The MUL memory admission (2026-08-29, `DirectKind::MulMemAcc`) STRENGTHENED this
+                // invariant rather than weakening it. Before it, the /4 arm returned from
+                // `classify` through an `else { return None }` that only a memory operand reached;
+                // now the whole arm is one `return match`. What the admission did change is the
+                // consequence of getting it wrong: a /4 memory form reaching this arm used to be
+                // refused downstream for want of a memory lowering, and now there is one.
+                //
+                // `grp3_imul_neighbouring_forms_remain_interpreter_only` is what catches a
+                // widening, and it holds the /4 memory case knob-OFF for exactly this purpose.
+                // (It formerly cited a `mul_memory_form_stays_interpreter_only` that has never
+                // existed in this tree; the citation is repaired here rather than left dangling.)
                 //
                 // `opcode == 0xf7` is equally load-bearing: this arm sits inside the shared
                 // `0xf6 | 0xf7` group arm, and 0xF6 /5 is the BYTE IMUL, which multiplies AL and
                 // writes only AX. Without the test it would be read as a dword and lowered as the
-                // dword multiply. `imul_byte_form_stays_interpreter_only` is what catches that.
+                // dword multiply. `grp3_imul_neighbouring_forms_remain_interpreter_only`'s byte
+                // case is what catches that. (It formerly cited an
+                // `imul_byte_form_stays_interpreter_only` that has never existed in this tree.)
                 //
                 // No width field and no raw_clocks field. The OperandSize::Word gate above keeps a
                 // 66-prefixed form out, and the whole group-3 arm returns clocks(2), which is
@@ -16825,6 +16975,22 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.cpl3,
                     // Read-only. The destination is the implicit EAX and EDX pair, not memory, so
                     // nothing here writes through the fast map.
+                    false,
+                );
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+            }
+            // `ImulMemAcc`'s arm verbatim, including the read-only `false` at the end: the
+            // destination is the implicit EAX and EDX pair, not memory, so nothing here writes
+            // through the fast map.
+            DirectKind::MulMemAcc { addr } => {
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_mul_mem_acc(&mut e, addr, memory, reasons);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    MemoryWidth::Dword.needs_alignment_guard(),
+                    memory.cpl3,
                     false,
                 );
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
@@ -19401,6 +19567,58 @@ fn emit_imul_mem_acc(
     emit_clear_pending(e);
 }
 
+/// MUL r/m32, one-operand UNSIGNED multiply, MEMORY form (0xF7 /4).
+///
+/// `emit_imul_mem_acc`'s body with the UNSIGNED primitive, written out separately for the reason
+/// `mul_r32` and `imul_r32` are separate encoder functions: the overflow rules differ (the high
+/// half being nonzero, against the full product failing to sign-extend back from the low half), so
+/// a shared body parameterised on the sub-opcode would make picking the wrong one a one-character
+/// edit that no encoder-level test could see. Host `mul` sets CF = OF = `product >> 32 != 0`,
+/// which is the interpreter's `significant` for the unsigned case exactly (core.rs), so the flags
+/// are right by construction rather than by a recomputation that could drift.
+///
+/// Four properties are `emit_imul_mem_acc`'s and hold here unchanged:
+///
+/// * **Fault ordering.** Every side exit resolves inside `emit_ram_read_pointer`, before any guest
+///   home or flag is written, so a faulting MUL leaves EAX, EDX and the flags untouched. That is
+///   what the interpreter does: it faults inside `read_operand_sized`, before the multiply.
+/// * **Aliasing.** This form has a LARGER aliasing surface than the register form, not a smaller
+///   one: the address base and index are read from guest homes and either may be EAX or EDX, the
+///   two registers this instruction implicitly overwrites. It is safe only because
+///   `emit_ram_read_pointer` resolves the whole effective address before anything below writes a
+///   home.
+/// * **RCX after, not before.** `emit_mode13_read_completion` clobbers RCX and RDX while leaving
+///   RDI holding the pointer, so the operand load has to sit after `emit_ram_read_pointer`.
+/// * **The two write-back movs sit between the multiply and `emit_capture_flags`'s pushfq.** That
+///   is safe because `mov r32, r32` writes no EFLAGS, and it is `emit_mul_reg`'s shipped ordering.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_mul_mem_acc(
+    e: &mut Encoder,
+    addr: DirectAddr,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
+    emit_ram_read_pointer(
+        e,
+        MemoryWidth::Dword,
+        addr,
+        memory,
+        sides,
+        memory.address_wrap,
+    );
+    e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
+    e.mov_r32_r32(Reg::RAX, home(0));
+    e.mul_r32(Reg::RCX);
+    e.mov_r32_r32(home(0), Reg::RAX);
+    e.mov_r32_r32(home(2), Reg::RDX);
+    emit_capture_flags(e, crate::FLAG_CF | crate::FLAG_OF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+    emit_clear_pending(e);
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -19726,6 +19944,14 @@ fn emit_imul_mem(_: &mut Encoder, _: u8, _: DirectAddr, _: MemoryEmitContext, _:
     any(target_os = "windows", target_os = "linux")
 )))]
 fn emit_imul_mem_acc(_: &mut Encoder, _: DirectAddr, _: MemoryEmitContext, _: MemorySideExits) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_mul_mem_acc(_: &mut Encoder, _: DirectAddr, _: MemoryEmitContext, _: MemorySideExits) {
     unreachable!("direct memory lowering is x86-64-only")
 }
 
