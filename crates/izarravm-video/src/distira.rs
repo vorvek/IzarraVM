@@ -13,6 +13,7 @@ mod registers;
 mod texture_combine;
 mod texture_raster;
 
+use crate::{DistiraCensus, DistiraCensusKey};
 use ncc::NccState;
 use raster_math::*;
 pub use registers::*;
@@ -127,6 +128,11 @@ struct PendingSwap {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distira {
+    /// Every frame size this guest gave Distira, against its count. Distira
+    /// had register-level unit tests only until 2026-08-29 and no game had
+    /// ever driven it, so this is the first instrument that says whether a
+    /// real title reached the 3D unit at all.
+    census: DistiraCensus,
     fb: Vec<u8>,
     texture: [Vec<u8>; 2],
     fifo: VecDeque<DistiraFifoEntry>,
@@ -253,6 +259,7 @@ impl Distira {
         let display = DistiraDisplay::default();
         let buffer_stride = display.pitch * display.height;
         let mut distira = Self {
+            census: DistiraCensus::default(),
             fb: vec![0; DISTIRA_FB_SIZE],
             texture: std::array::from_fn(|_| vec![0; DISTIRA_TEX_SIZE]),
             fifo: VecDeque::new(),
@@ -568,6 +575,11 @@ impl Distira {
         [BIG_DISTIRA_CHIP_NAME, SMALL_DISTIRA_CHIP_NAME]
     }
 
+    /// Every frame size this guest programmed, against its count.
+    pub fn census(&self) -> &DistiraCensus {
+        &self.census
+    }
+
     pub fn display(&self) -> DistiraDisplay {
         self.display
     }
@@ -587,6 +599,9 @@ impl Distira {
     pub fn set_frame_size(&mut self, width: u32, height: u32) {
         let width = width.clamp(1, DISTIRA_MAX_WIDTH);
         let height = height.clamp(1, DISTIRA_MAX_HEIGHT);
+        // Recorded AFTER the clamp: the census reports the geometry the device
+        // ended up in, which is the same contract the VGA census keeps.
+        self.census.record(DistiraCensusKey { width, height });
         let pitch = width * 2;
         let frame = pitch.saturating_mul(height);
         self.display = DistiraDisplay {

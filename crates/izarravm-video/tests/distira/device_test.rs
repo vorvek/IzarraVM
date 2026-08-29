@@ -1196,3 +1196,49 @@ fn lfb_physical_addresses_past_two_megabytes_are_open_bus() {
         "the 800x600 auxiliary buffer starts near the end of installed memory"
     );
 }
+
+#[test]
+fn the_census_counts_every_frame_size_distira_is_given() {
+    // Distira had register-level unit tests only until 2026-08-29 and no game
+    // had ever driven it. This census is the first instrument that answers
+    // whether a real title reached it at all.
+    use izarravm_video::DistiraCensusKey;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(640, 480);
+    distira.set_frame_size(640, 480);
+    distira.set_frame_size(512, 384);
+
+    let rows: Vec<_> = distira
+        .census()
+        .entries()
+        .map(|(key, count)| (*key, *count))
+        .collect();
+    assert_eq!(rows.len(), 2, "two distinct sizes");
+    assert_eq!(
+        rows[0].0,
+        DistiraCensusKey {
+            width: 512,
+            height: 384
+        }
+    );
+    assert_eq!(rows[1].1, 2, "640x480 was set twice");
+}
+
+#[test]
+fn the_census_records_the_clamped_size_distira_actually_used() {
+    // set_frame_size clamps to the device maximum. The census records what the
+    // device ENDED UP in, not what the guest asked for, which is the same
+    // contract the VGA census keeps: it reports effective geometry.
+    let mut distira = Distira::new();
+    distira.set_frame_size(u32::MAX, u32::MAX);
+
+    let (key, _) = distira
+        .census()
+        .entries()
+        .map(|(key, count)| (*key, *count))
+        .next()
+        .expect("a frame size was recorded");
+    assert_eq!(key.width, distira.display().width);
+    assert_eq!(key.height, distira.display().height);
+}
