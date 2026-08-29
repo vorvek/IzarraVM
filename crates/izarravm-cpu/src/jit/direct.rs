@@ -11254,7 +11254,7 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 
 /// Whether `classify` admits the four UNPREFIXED STRING FAMILIES -- `0xA4`/`0xA5` MOVS,
 /// `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS -- as
-/// `InterpretOne` call-outs (`IZARRAVM_GENERIC_CALLOUT`, default OFF).
+/// `InterpretOne` call-outs (`IZARRAVM_GENERIC_CALLOUT`, default ON since the 2026-08-29 ladder).
 ///
 /// # The rows, from the census that ranked them
 ///
@@ -11346,24 +11346,49 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 /// decode line through the interpreter, so there is no width field to get wrong and the Word entry
 /// would be one line away the day a census asks for it.
 ///
+/// # WHAT PRICED THE FLIP
+///
+/// ON since the 2026-08-29 ladder, whose evidence is one row and its control:
+///
+/// * **nascar-586 wall ladder**: **-2.9% min-wall**, 56.16 s -> 54.55 s. `entries` down **10%** and
+///   unbound exits down **15.4 M**, which is the mass the census predicted these four rows carry
+///   (`0xAD` 17.2 M + `0xAB` 8.0 M runtime hits against a 40.67 M `rejected` class) arriving in the
+///   currency a wall leg can see.
+/// * **duke3d-586, the expected-NEAR-ZERO control**: **+0.16% wall, guest instruction counts
+///   IDENTICAL.** That row is the one gate that could have failed while every other counter looked
+///   good -- duke's rejected heads are integer ALU and this slice admits none of them, so a duke
+///   that MOVED would have meant something other than the designed mechanism was firing. It did
+///   not move.
+///
+/// The band the design refused to predict (its cost model has three terms and two were unmeasured)
+/// is therefore -2.9% MEASURED, comfortably outside the ~1-2% noise floor on a quiet host.
+///
+/// **This flip is STANDING AUTHORITY, not an owner ruling.** It is the campaign's ordinary
+/// "ladder priced it, so the default moves" pattern -- the same authority the
+/// `IZARRAVM_BYTE_SHIFT_ROWS` and `IZARRAVM_TEST_WORD_ROWS` flips ship under. No owner decision was
+/// sought or given for it, and nothing here should be cited as one.
+///
 /// # The spelling table
 ///
 /// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
-/// whitespace and one set from a PowerShell ladder picks up capitalisation. DEFAULT OFF, so `""`
-/// folds in with `0`/`off` rather than naming the default separately -- the two arms coincide
-/// today and the empty string must keep meaning OFF if the default ever flips, which is the
-/// [[env-null-empty-is-off-trap]] shape and the reason an OFF ladder leg must EXPORT `0` rather
-/// than null the variable.
+/// whitespace and one set from a PowerShell ladder picks up capitalisation.
 ///
-/// * unset, `` (empty), `0` or `off` -> OFF, the pre-slice refusal, the escape and the A/B base.
-///   With the knob off the allowlist term collapses to `&& !false` and both classifier arms return
-///   from their first line, so the off tree is the pre-slice one by inspection.
-/// * `1` / `on` -> the four string rows are `InterpretOne` call-outs.
+/// * unset or `` (empty) -> the shipped default, **ON since the 2026-08-29 ladder**.
+/// * `0` / `off` -> the pre-slice refusal, the escape and the A/B base. With the knob off the
+///   allowlist term collapses to `&& !false` and all four classifier arms return from their first
+///   line, so the off tree is the pre-slice one by inspection rather than by argument.
+/// * `1` / `on` -> the four string rows are `InterpretOne` call-outs, and the explicit spelling of
+///   today's default.
 /// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
 ///   fell through to the default would be read as "the rows I asked for changed nothing", the one
 ///   wrong conclusion an A/B exists to avoid.
 ///
-/// The default flip is a SEPARATE commit with its own ladder leg.
+/// **The flip CHANGES WHAT `IZARRAVM_GENERIC_CALLOUT=` (the empty string) MEANS, from OFF to ON**,
+/// because `""` names the same arm as unset. It is stated here, in `parse_generic_callout_arm` and
+/// in the flip commit. Every ladder leg exports an explicit `0` or `1` and records the RESOLVED
+/// arm, so no recorded leg is affected -- which is the whole reason that rule exists, and the
+/// [[env-null-empty-is-off-trap]] shape it exists to survive: nulling the variable is not unsetting
+/// it, PowerShell leaves it present and empty, and before this flip that spelled OFF.
 pub(crate) fn generic_callout_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = GENERIC_CALLOUT_OVERRIDE.with(std::cell::Cell::get) {
@@ -11373,21 +11398,25 @@ pub(crate) fn generic_callout_enabled() -> bool {
     *ENABLED.get_or_init(|| parse_generic_callout_arm(std::env::var("IZARRAVM_GENERIC_CALLOUT")))
 }
 
+/// The arm an unset -- and an EMPTY -- `IZARRAVM_GENERIC_CALLOUT` names. Named rather than spelled
+/// twice so the two cannot drift apart the day the default moves, and it HAS moved once: ON since
+/// the 2026-08-29 ladder (nascar-586 min-wall -2.9%, 56.16 s -> 54.55 s, entries -10%). The
+/// fixtures reach it through `generic_callout_default_arm_for_test`, so the empty-string assertion
+/// tracks this constant instead of restating it and going stale at the next flip.
+const GENERIC_CALLOUT_DEFAULT_ARM: bool = true;
+
 /// The `IZARRAVM_GENERIC_CALLOUT` spelling table, lifted out of the `OnceLock` closure so it can be
 /// unit-tested without a process-global env write. See `generic_callout_enabled` for the contract.
 fn parse_generic_callout_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        // Unset is OFF, and so is the empty string two arms down. They coincide because the
-        // shipped default is OFF; if the default ever flips they must NOT be unified, because a
-        // wrapper that computes a leg value and produces "" has missed a lookup rather than said
-        // "on". `parse_byte_shift_rows_arm` is the shape to copy on that day.
-        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotPresent) => return GENERIC_CALLOUT_DEFAULT_ARM,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
         // than the same silence as "unset": someone set the variable and meant something by it.
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_GENERIC_CALLOUT is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `` / `0` / `off` (the shipped default: the four unprefixed \
+                 spellings are unset or `` (both the shipped default, ON since the 2026-08-29 \
+                 ladder), `0` / `off` (the pre-slice refusal, under which the four unprefixed \
                  string families stay barriers) and `1` / `on` (they become `InterpretOne` \
                  call-outs)"
             )
@@ -11395,12 +11424,23 @@ fn parse_generic_callout_arm(value: Result<String, std::env::VarError>) -> bool 
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" => false,
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT
+        // `parse_rotate_rows_arm`'s shape, which folds "" in with `0`/`off`. A wrapper that
+        // computes a leg value and produces "" has MISSED a lookup; it has not said "off". The
+        // ladder's defence against that is that every leg exports an explicit `0` or `1` and
+        // records the RESOLVED arm in its artifact, not a guess about what "" meant.
+        //
+        // THIS ARM'S MEANING MOVED WITH THE 2026-08-29 FLIP, from OFF to ON, and it will move
+        // again if the default does. That is stated here, in the parse function, because it is the
+        // only place a reader will look.
+        "" => GENERIC_CALLOUT_DEFAULT_ARM,
+        "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_GENERIC_CALLOUT={other:?} names no arm; accepted spellings are unset or `` \
-             / `0` / `off` (the shipped default: `0xA4`-`0xA7` and `0xAA`-`0xAF` stay barriers) \
-             and `1` / `on` (they become `InterpretOne` call-outs). \
+             (both the shipped default, ON since the 2026-08-29 ladder), `0` / `off` (the \
+             pre-slice refusal, the escape and the A/B base, under which `0xA4`-`0xA7` and \
+             `0xAA`-`0xAF` stay barriers) and `1` / `on` (they become `InterpretOne` call-outs). \
              Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
              as the arm it named doing nothing"
         ),
@@ -11409,8 +11449,14 @@ fn parse_generic_callout_arm(value: Result<String, std::env::VarError>) -> bool 
 
 // Per-THREAD, for `BYTE_SHIFT_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
 // `OnceLock` and the fixtures have to run both arms in one process, so one test's arm selection
-// must not reach another's compile. While the arm is default-OFF it is the POSITIVE fixtures that
-// must force it on, or they would test the refusal and call it an admission.
+// must not reach another's compile.
+//
+// The direction that matters flipped on 2026-08-29 and no fixture had to move, because every one
+// of them already stated its arm rather than inheriting it. While the arm was default-OFF it was
+// the POSITIVE fixtures that had to force it on, or they would have tested the refusal and called
+// it an admission; now it is the REFUSAL fixtures that must force `Some(false)`, or they would
+// admit the rows and pass for the wrong reason. The default pin is the one fixture that reads the
+// ambient knob, and it is supposed to.
 #[cfg(test)]
 thread_local! {
     static GENERIC_CALLOUT_OVERRIDE: std::cell::Cell<Option<bool>> =
@@ -11432,6 +11478,13 @@ pub(crate) fn parse_generic_callout_arm_for_test(
     value: Result<String, std::env::VarError>,
 ) -> bool {
     parse_generic_callout_arm(value)
+}
+
+/// The shipped default arm, reachable from the fixtures so the `""` assertion tracks the default
+/// instead of restating it as a constant that goes stale at the next flip.
+#[cfg(test)]
+pub(crate) fn generic_callout_default_arm_for_test() -> bool {
+    GENERIC_CALLOUT_DEFAULT_ARM
 }
 
 /// Whether `classify` admits **`0xE4` IN AL,imm8, for ANY immediate port** as a `PortReadAlImm8`
@@ -15228,7 +15281,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 });
             }
             // THE FOUR UNPREFIXED STRING FAMILIES, as `InterpretOne` call-outs, behind
-            // `IZARRAVM_GENERIC_CALLOUT` (default OFF). See `generic_callout_enabled` for the
+            // `IZARRAVM_GENERIC_CALLOUT` (default ON since the 2026-08-29 ladder: nascar-586
+            // min-wall -2.9%, entries -10%, duke3d-586 the expected-zero control at +0.16% with
+            // guest instruction counts identical). See `generic_callout_enabled` for the
             // nascar-586 census that ranked them (`0xAD` LODSD 17.2 M runtime hits, `0xAB` STOSD
             // 8.0 M, together 89.7% of that fixture's call-out-shaped rejected mass) and for the
             // per-obligation discharge.

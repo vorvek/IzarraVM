@@ -3,7 +3,9 @@
 
 //! The four UNPREFIXED STRING FAMILIES as `InterpretOne` call-out rows -- `0xA4`/`0xA5` MOVS,
 //! `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS -- behind
-//! `IZARRAVM_GENERIC_CALLOUT`, default OFF.
+//! `IZARRAVM_GENERIC_CALLOUT`, **default ON since the 2026-08-29 ladder** (nascar-586 min-wall
+//! -2.9%, 56.16 s -> 54.55 s, entries -10%, unbound exits -15.4 M; duke3d-586 the expected-zero
+//! control at +0.16% wall with identical guest instruction counts).
 //!
 //! # The rows, from the census that ranked them
 //!
@@ -76,8 +78,9 @@
 //! | M6 | delete the memory-eflags half of `emit_direction_flag` | RED, `a_string_slot_reads_the_direction_flag_from_a_cld_std_slot` |
 //! | M7 | delete the call-out's runtime clock add | RED, 5 rows incl. BOTH differential positions -- **but only after the `timing_rem` fix below** |
 //! | M8 | the `0xa6/0xa7/0xae/0xaf` arm charges `StringLoad` instead | RED, `each_string_execution_is_attributed_to_its_own_row` |
-//! | M9 | `generic_callout_enabled()`'s ENV path returns `true` | RED, `generic_callout_ships_the_off_arm_by_default` + the spelling table |
-//! | M10 | `"" => false` -> `"" => true` in the parse table | RED, `generic_callout_spelling_table_names_every_arm` |
+//! | M9 | `generic_callout_enabled()`'s ENV path returns a literal `true` | **SURVIVES since the flip** -- see below |
+//! | M9b | the WHOLE of `generic_callout_enabled()` returns `true`, override bypassed | RED, every refusal row |
+//! | M10 | `"" => GENERIC_CALLOUT_DEFAULT_ARM` -> `"" => false` | RED, `generic_callout_spelling_table_names_every_arm` |
 //!
 //! **M2 SURVIVES, and it refutes the mutation the design specified for T2.** The design's T2 says
 //! *"widen the classify arm to `0x6C..=0x6F` -> INS/OUTS compile -> red"*. They do not compile,
@@ -98,6 +101,26 @@
 //! present term from an absent one while the term is dominated. Pinning it would mean asserting
 //! the text of the constant, which is a shape test dressed as a behaviour test. The term is in the
 //! fold, the reason is in its doc, and M3/M3b cover the two ways the VALUE can move.
+//!
+//! **The 2026-08-29 default flip traded two mutants, and neither trade is left silent.** M9 was
+//! written against a default-OFF knob, where a literal `true` on the env path contradicted it and
+//! the default pin died. Now that the default IS `true` the two coincide and the mutant is inert:
+//! it changes no behaviour any fixture can observe. It is recorded at its CURRENT outcome rather
+//! than at the one the pre-flip run measured, and M9b is what covers the ground it used to --
+//! bypassing the thread-local override entirely, which every refusal row then catches, because
+//! `force_generic_callout` asserts its own selection took. M10 was the mirror case: before the
+//! flip the parse table spelled `"" => false` and the mutant flipping it to `true` died on the
+//! spelling row; the flip inverted the arm, so the mutant is now the reverse edit and dies on the
+//! same row. That row asserts against `generic_callout_default_arm_for_test()` rather than a
+//! literal, which is why it moved with the default instead of being rewritten to match it.
+//!
+//! **A worked example of [[worktree-outputs-die-with-the-worktree]]'s sibling trap, paid for
+//! during this slice.** The mutation loop restores with `git checkout -- <file>`, which discards
+//! EVERY uncommitted change to that file and not only the mutation. Running the flip's mutants
+//! against an UNCOMMITTED flip ate the whole flip out of `direct.rs` mid-loop; the fixture file
+//! survived only because it was a different path. The rule the byte-shift header already states --
+//! apply mutations to a COMMITTED tree - is the reason, and it now has two independent scars
+//! behind it.
 //!
 //! **M7 caught a real hole in this file on its first run, and the hole is the more useful
 //! finding.** With only `elapsed_clocks` compared, deleting the runtime clock add survived every
@@ -203,9 +226,10 @@ impl Drop for ArmOverride {
     }
 }
 
-/// Force the string-call-out arm and PROVE the selection took. While the shipped default is OFF it
-/// is the POSITIVE rows that need this; the refusal rows state their arm too, so that they keep
-/// meaning what they say the day the default moves.
+/// Force the string-call-out arm and PROVE the selection took. Every row states its arm rather
+/// than inheriting one, which is why the 2026-08-29 default flip moved no fixture in this file:
+/// while the default was OFF it was the POSITIVE rows that needed this, and now it is the REFUSAL
+/// rows that do.
 #[must_use]
 fn force_generic_callout(on: bool) -> ArmOverride {
     jit::direct::set_generic_callout_for_test(Some(on));
@@ -1329,19 +1353,31 @@ fn the_gate_admits_exactly_the_ten_string_opcodes() {
 /// Every accepted spelling, and the panic on a typo.
 ///
 /// The panic is the load-bearing half: a mistyped ladder leg that fell through to the default
-/// would run the OFF arm and be read as "the rows I asked for changed nothing", which is the one
-/// wrong conclusion an A/B exists to avoid.
+/// would run the arm it did not name and be read as "the rows I asked for changed nothing", which
+/// is the one wrong conclusion an A/B exists to avoid.
+///
+/// **`""` tracks the DEFAULT rather than restating it.** The 2026-08-29 flip moved that arm from
+/// OFF to ON, and the assertion reads `generic_callout_default_arm_for_test()` so it moved with it
+/// instead of going stale -- which is also what keeps the row honest the next time the default
+/// moves in either direction.
 #[test]
 fn generic_callout_spelling_table_names_every_arm() {
     use jit::direct::parse_generic_callout_arm_for_test as parse;
-    assert!(
-        !parse(Err(std::env::VarError::NotPresent)),
-        "unset is the shipped default, which is OFF"
+    let default = jit::direct::generic_callout_default_arm_for_test();
+    assert_eq!(
+        parse(Err(std::env::VarError::NotPresent)),
+        default,
+        "unset must name the shipped default arm"
     );
-    for spelling in ["", "0", "off", "OFF", " off ", "Off"] {
+    assert_eq!(
+        parse(Ok(String::new())),
+        default,
+        "the EMPTY string names the same arm as unset, not the OFF arm; nulling the variable is          not unsetting it, and this is the assertion that moves when the default does"
+    );
+    for spelling in ["0", "off", "OFF", " off ", "Off"] {
         assert!(
             !parse(Ok(spelling.to_string())),
-            "{spelling:?} must name the OFF arm"
+            "{spelling:?} must name the OFF arm -- the escape and the A/B base, which the flip              did NOT move"
         );
     }
     for spelling in ["1", "on", "ON", " On "] {
@@ -1362,17 +1398,26 @@ fn generic_callout_spelling_table_names_every_arm() {
 /// The shipped default arm, read through the ambient knob rather than through the override.
 ///
 /// This is the ONE row in the file that does not force its arm, and it is supposed to be: it is
-/// what would catch `generic_callout_enabled`'s env path being changed to return `true` while
-/// every forcing fixture kept passing. The slice ships default OFF and the flip is its own commit
-/// with its own ladder leg.
+/// what would catch `generic_callout_enabled`'s env path disagreeing with the parse table while
+/// every forcing fixture kept passing.
+///
+/// **ON since the 2026-08-29 ladder** -- nascar-586 min-wall -2.9% (56.16 s -> 54.55 s), entries
+/// -10%, unbound exits -15.4 M, with duke3d-586 holding its expected-near-zero control at +0.16%
+/// wall and IDENTICAL guest instruction counts. Asserted against the named constant rather than
+/// against a literal, so this row states the default instead of duplicating it.
 #[test]
-fn generic_callout_ships_the_off_arm_by_default() {
+fn generic_callout_ships_the_default_arm() {
     assert!(
         std::env::var("IZARRAVM_GENERIC_CALLOUT").is_err(),
         "this row reads the ambient knob, so the harness must not have it set"
     );
+    assert_eq!(
+        jit::direct::generic_callout_enabled(),
+        jit::direct::generic_callout_default_arm_for_test(),
+        "the ambient reading must agree with the parse table's default arm"
+    );
     assert!(
-        !jit::direct::generic_callout_enabled(),
-        "the slice ships default OFF; the flip is a separate commit with its own ladder leg"
+        jit::direct::generic_callout_default_arm_for_test(),
+        "the slice ships default ON since the 2026-08-29 ladder"
     );
 }
