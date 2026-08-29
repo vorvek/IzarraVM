@@ -1119,6 +1119,21 @@ pub(crate) struct BlockCache {
     /// allows, so the OFF arm's claimed cost-identity would have been unmeasurable. As a field
     /// load next to the `cs()` read the screen already does, it is free.
     block_poll_skip_16_armed: bool,
+    /// ONE-ENTRY sticky memo for the D1b mask-value decline (review round-2 MAJOR-7).
+    ///
+    /// `(slot_linear, ah, page_gen)`. A `Found` is never written to the negative cache --
+    /// positives are rebuilt on every call so an SMC restamp replaces the descriptor -- so a
+    /// site whose shape certifies STRUCTURALLY but whose live AH is not `0x01`/`0x08` would
+    /// otherwise pay a negative-cache miss plus a full ten-probe backward scan, each probe
+    /// decoding a block and allocating a `Vec<Slot>`, ON EVERY READ. That is precisely the
+    /// cost profile PR #761 was merged to remove, and one constant `MOV AH,0x20` reproduces it
+    /// forever without the guest being adversarial.
+    ///
+    /// Sound by construction: it is a pure REFUSAL, it re-reads AH so a changed mask re-enters
+    /// the scan, and it carries the page insert generation so an SMC restamp does too. The
+    /// worst case becomes one `u64`-shaped compare per read instead of one scan per read.
+    /// Consulted only on the 16-bit arm, so the 32-bit path (gp2-586, the control) is untouched.
+    poll_mask_decline_memo: Option<(u32, u8, u32)>,
     /// Set when the boundary above CLEARED the shadow, i.e. the block consumed an STI's
     /// one-instruction reprieve inside itself. `run_budgeted_inner` reads it to run the
     /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
@@ -1323,6 +1338,7 @@ impl BlockCache {
             direct_poll_skip_override: None,
             direct_poll_skip_16_override: None,
             block_poll_skip_16_armed: false,
+            poll_mask_decline_memo: None,
             interrupt_shadow_consumed: false,
             lane_trial_override: None,
             block_portals: Vec::new(),
@@ -2305,6 +2321,17 @@ impl BlockCache {
 
     pub(crate) fn block_poll_skip_16_armed(&self) -> bool {
         self.block_poll_skip_16_armed
+    }
+
+    /// Whether the D1b mask-decline memo already refused this exact `(slot, AH, page
+    /// generation)`. See the field's doc: a pure refusal, so a false positive is impossible
+    /// and a false negative only costs the scan that would have run anyway.
+    pub(crate) fn poll_mask_decline_memo_hit(&self, slot: u32, ah: u8, page_gen: u32) -> bool {
+        self.poll_mask_decline_memo == Some((slot, ah, page_gen))
+    }
+
+    pub(crate) fn record_poll_mask_decline(&mut self, slot: u32, ah: u8, page_gen: u32) {
+        self.poll_mask_decline_memo = Some((slot, ah, page_gen));
     }
 
     pub(crate) fn block_entry_interrupt_shadow(&self) -> bool {
@@ -24658,38 +24685,81 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
             && !crate::run::diff_trace_enabled())
         {
             cpu.jit_direct.note_poll_declined_eligibility();
-        } else if !cpu.registers.cs().default_size_32 {
-            // The 16-bit screen, BEFORE the scan. Every shape is 32-bit by
-            // construction (`poll_head_possible` requires `d`), so a 16-bit
-            // cs can never certify and the scan below would burn a block
-            // decode plus its `Vec` allocations to say no. Tyrian 2000 spins
-            // on 0x3DA from 16-bit native blocks: 1.5e9 doomed scans, ~80%
-            // of its wall, until this screen existed (2026-08-29; OFF-arm
-            // A/B: 5.2x at 586, 4.0x at 486, identical retired
-            // instructions). The interpreter path has carried the same
-            // screen inside `poll_head_possible` all along.
+        } else if !cpu.registers.cs().default_size_32
+            && !(cpu.jit_direct.block_poll_skip_16_armed() && cpu.registers.cs().limit <= 0xffff)
+        {
+            // The 16-bit screen, BEFORE the scan -- and THE KNOB IS TESTED INSIDE IT,
+            // which is what makes the OFF arm bit-identical to `main` rather than
+            // merely equivalent. A 16-bit read on the default arm costs exactly what it
+            // costs on `main`: this one bool test plus a counter bump, no cache probe,
+            // no scan. Ordering matters both ways: a 32-bit read short-circuits on
+            // `default_size_32` and never reads the arm at all, and the arm itself is a
+            // plain field published once per native entry rather than an `Option` +
+            // `OnceLock` read on 1.52e9 reads (review round-2 MAJOR-10).
+            //
+            // Tyrian 2000 spins on 0x3DA from 16-bit native blocks: 1.5e9 doomed scans,
+            // ~80% of its wall, until this screen existed (2026-08-29; OFF-arm A/B: 5.2x
+            // at 586, 4.0x at 486, identical retired instructions). The screen stays;
+            // the 16-bit slice opens it only under `IZARRAVM_DIRECT_POLL_SKIP_16`.
+            //
+            // `cs.limit <= 0xFFFF` rides beside the arm as a pure optimisation (review
+            // round-2 MINOR-9). `build_poll_loop_at` carries the same term as its own
+            // admission condition, which is what makes the `sixteen_bit_ok` parameter
+            // sound on its own terms -- but that one refuses VOLATILE, and a volatile is
+            // never cached, so a `CS.D = 0, limit > 0xFFFF` guest on the ON arm would pay
+            // a full scan per read to reach it. One compare here avoids the scan
+            // entirely. C0 measured this state as unreached on tyrian; it is a
+            // fail-closed guard, not a coverage cost.
+            //
+            // The interpreter path has carried its own 16-bit screen inside
+            // `poll_head_possible` all along, and this slice does NOT touch it.
             cpu.jit_direct.note_poll_declined_sixteen_bit();
         } else {
+            // Live `d` from here down, replacing a hardcoded `true`. Inert on `main` --
+            // those lines sat inside the `else` arm of an unconditional 16-bit screen, so
+            // `d` was provably `true` there -- but it is no longer provable now that the
+            // arm admits 16-bit code, and the negative cache is keyed on `(lin, d)`.
+            let d = cpu.registers.cs().default_size_32;
+            // The 16-bit arm is the only one that consults the mask-decline memo and the
+            // only one that can produce a D1b shape, so `sixteen_bit_ok` and every piece
+            // of D1b bookkeeping below are gated on `!d`. The 32-bit path is byte-for-byte
+            // unchanged, which is what keeps gp2-586 a clean control for the ladder.
+            let sixteen_bit_ok = !d;
             let slot_linear = cpu
                 .registers
                 .cs()
                 .base
                 .wrapping_add(cpu.registers.eip.wrapping_add(slot_delta as u32));
-            // The interpreter path's negative cache, on the same key
-            // discipline: the scan ANCHOR (its `current`), a structural
-            // negative only, guarded by the page insert generation. `d` is
-            // `true` on every path past the screen above. Without this a
-            // 32-bit loop that never certifies re-scans on every iteration.
-            if cpu.poll_neg_cache_enabled && cpu.decode_cache.poll_negative_live(slot_linear, true)
+            // The D1b mask-decline memo, tested BEFORE the negative-cache probe. A
+            // structurally-certified register-mask shape whose live AH is not `0x01`/`0x08`
+            // declines from a `Found`, and a `Found` is never cached (positives are rebuilt
+            // every call so an SMC restamp replaces the descriptor), so without this a
+            // constant wrong `MOV AH,imm8` re-creates the exact per-read scan storm the
+            // 16-bit screen was merged to remove. A pure refusal keyed on AH and the page
+            // generation, so a changed mask or a restamp re-enters the scan.
+            let memo_key = sixteen_bit_ok
+                .then(|| (cpu.read_gpr8(4), cpu.decode_cache.poll_neg_gen(slot_linear)));
+            if let Some((ah, page_gen)) = memo_key
+                && cpu
+                    .jit_direct
+                    .poll_mask_decline_memo_hit(slot_linear, ah, page_gen)
             {
+                cpu.jit_direct.note_poll_declined_mask_source();
+            } else if cpu.poll_neg_cache_enabled
+                && cpu.decode_cache.poll_negative_live(slot_linear, d)
+            {
+                // The interpreter path's negative cache, on the same key
+                // discipline: the scan ANCHOR (its `current`), a structural
+                // negative only, guarded by the page insert generation. Without
+                // this a loop that never certifies re-scans on every iteration.
                 cpu.perf.poll_neg_cache_hits += 1;
                 cpu.jit_direct.note_poll_declined_shape();
             } else {
-                match build_poll_loop_from(cpu, slot_linear, false) {
+                match build_poll_loop_from(cpu, slot_linear, sixteen_bit_ok) {
                     PollScanOutcome::NegativeCacheable => {
                         if cpu.poll_neg_cache_enabled {
                             cpu.perf.poll_neg_cache_stores += 1;
-                            cpu.decode_cache.record_poll_negative(slot_linear, true);
+                            cpu.decode_cache.record_poll_negative(slot_linear, d);
                         }
                         cpu.jit_direct.note_poll_declined_shape();
                     }
@@ -24716,8 +24786,34 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                                 .is_some_and(|(linear, _, len)| linear == slot_linear && len == 1)),
                             "the certified shape does not contain this call-out's own IN slot"
                         );
+                        // Resolve the symbolic mask ONCE, here, where the registers are
+                        // live -- the exact place and the exact discipline `resolved_port`
+                        // already uses. Everything below reads the RESOLVED copy, so
+                        // `req.status_mask` and `spins_when_bit_set` come from one value
+                        // structurally rather than from two independent derivations. On a
+                        // D1 (`Immediate`) shape this is the identity.
+                        let poll = poll.with_resolved_mask(cpu);
                         if poll.family() != PollFamily::Io || poll.resolved_port(cpu) != 0x03da {
                             cpu.jit_direct.note_poll_declined_port_source();
+                        } else if !matches!(poll.status_mask(), 0x01 | 0x08) {
+                            // The mask VALUE check, in the same place and for the same
+                            // reason the port-source check is here: it is the half of the
+                            // shape that lives in a register, so it can only be answered
+                            // against live state and must never become a cached negative.
+                            // `callout_poll_skip` depends on this range -- it takes
+                            // `status_mask.trailing_zeros()` and the analytic edge oracle
+                            // understands only status1 bits 0 and 3 -- so a shape outside it
+                            // is refused rather than approximated. For a D1 shape the same
+                            // condition was already checked at certification from a code
+                            // byte, so only a D1b shape can reach this arm.
+                            //
+                            // Memoised, because a `Found` is never cached: without the memo
+                            // a persistent wrong-AH site rescans on every read.
+                            cpu.jit_direct.note_poll_declined_mask_source();
+                            if let Some((ah, page_gen)) = memo_key {
+                                cpu.jit_direct
+                                    .record_poll_mask_decline(slot_linear, ah, page_gen);
+                            }
                         } else {
                             bus.publish_core_clocks(now);
                             let mut fetches = [(0u32, 0u32, 0u8); 6];
@@ -28613,6 +28709,23 @@ pub(crate) struct DirectStallTally {
     pub poll_attempts: u64,
     pub poll_declined_port: u64,
     pub poll_declined_port_source: u64,
+    /// The D1b mask-source lane: a shape that certified STRUCTURALLY as the register-mask
+    /// 3-slot form (`TEST AL,AH`) but whose mask VALUE, resolved from live AH at the call-out,
+    /// is not one of the two bits the analytic edge oracle understands (`0x01` / `0x08`).
+    ///
+    /// **Its own lane, deliberately, and it is the single most important signal in the 16-bit
+    /// ladder.** It is what distinguishes "the shape did not certify" from "the shape certified
+    /// and then declined semantically" -- and the second of those is a COST, because a `Found`
+    /// is never written to the negative cache (positives are rebuilt every call so an SMC
+    /// restamp replaces the descriptor). Folding it into `poll_declined_port_source` would have
+    /// hidden exactly that signature behind a lane whose own cause `port != 0x03da` has already
+    /// made impossible.
+    ///
+    /// **LADDER STOP ROW: if this exceeds 1% of `poll_attempts` on any arm, the mask-decline
+    /// path is a scan storm -- stop and fix it before reading the wall number.** Counts memo
+    /// hits as well as fresh declines, so the rate it reports is the true decline rate rather
+    /// than the rate of scans the memo failed to absorb.
+    pub poll_declined_mask_source: u64,
     pub poll_declined_knob: u64,
     pub poll_declined_eligibility: u64,
     /// The 16-bit-code screen, BEFORE the scan: every shape is 32-bit, so a
@@ -30187,6 +30300,7 @@ impl crate::jit::JitState {
             poll_attempts: self.stalls.poll_attempts,
             poll_declined_port: self.stalls.poll_declined_port,
             poll_declined_port_source: self.stalls.poll_declined_port_source,
+            poll_declined_mask_source: self.stalls.poll_declined_mask_source,
             poll_declined_knob: self.stalls.poll_declined_knob,
             poll_declined_eligibility: self.stalls.poll_declined_eligibility,
             poll_declined_sixteen_bit: self.stalls.poll_declined_sixteen_bit,
@@ -30274,6 +30388,10 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_poll_declined_port_source(&mut self) {
         self.stalls.poll_declined_port_source += 1;
+    }
+
+    pub(crate) fn note_poll_declined_mask_source(&mut self) {
+        self.stalls.poll_declined_mask_source += 1;
     }
 
     pub(crate) fn note_poll_declined_knob(&mut self) {

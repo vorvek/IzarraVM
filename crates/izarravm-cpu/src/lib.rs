@@ -1039,6 +1039,9 @@ impl PollLoop {
         self.status_mask
     }
 
+    /// The symbolic mask source, for the fixtures that pin the D1/D1b split. Production
+    /// code goes through `with_resolved_mask` / `mask_is_resolved` instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mask_source(self) -> PollMaskSource {
         self.mask_source
     }
@@ -2251,6 +2254,12 @@ pub struct DirectStallSnapshot {
     pub poll_attempts: u64,
     pub poll_declined_port: u64,
     pub poll_declined_port_source: u64,
+    /// A structurally-certified D1b register-mask shape whose mask VALUE (live AH) is not
+    /// `0x01` or `0x08`. See `DirectStallTally`'s field doc: its own lane because it is the
+    /// one signal that separates "did not certify" from "certified then declined", and the
+    /// second of those costs a scan unless the sticky memo absorbs it. Ladder STOP row at 1%
+    /// of `poll_attempts`.
+    pub poll_declined_mask_source: u64,
     pub poll_declined_knob: u64,
     pub poll_declined_eligibility: u64,
     /// A 16-bit code segment can never certify a shape (every shape is

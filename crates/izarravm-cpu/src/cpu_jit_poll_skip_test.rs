@@ -477,3 +477,46 @@ fn direct_poll_skip_16_ships_off_by_default() {
         );
     }
 }
+
+/// The D1b mask-decline memo's key discipline (review round-2 MAJOR-7's recommended
+/// mitigation). It is a ONE-ENTRY, pure-refusal memo, and all three key components must
+/// be load-bearing: a changed AH, an SMC restamp (page insert generation), or a different
+/// slot must each re-enter the scan rather than inherit a stale refusal.
+///
+/// The memo exists because a `Found` is never written to the negative cache -- positives
+/// are rebuilt on every call so an SMC restamp replaces the descriptor -- so a site whose
+/// shape certifies structurally but whose live AH is not `0x01`/`0x08` would otherwise pay
+/// a full ten-probe backward scan on EVERY read. There is no scan counter to assert
+/// against, so the mechanism is pinned here structurally and its RATE is pinned at runtime
+/// by the ladder STOP row on `poll_declined_mask_source` (1% of `poll_attempts`).
+#[test]
+fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
+    let (mut cpu, _bus) = warm_poll_code(D1B_CODE, POLL3_STARTS, false, 0x0000_ffff, 0x40);
+    assert!(
+        !cpu.jit_direct
+            .poll_mask_decline_memo_hit(POLL16_ENTRY, 0x40, 7),
+        "an empty memo must refuse nothing"
+    );
+    cpu.jit_direct
+        .record_poll_mask_decline(POLL16_ENTRY, 0x40, 7);
+    assert!(
+        cpu.jit_direct
+            .poll_mask_decline_memo_hit(POLL16_ENTRY, 0x40, 7),
+        "the recorded triple must be refused without a scan"
+    );
+    assert!(
+        !cpu.jit_direct
+            .poll_mask_decline_memo_hit(POLL16_ENTRY, 0x08, 7),
+        "a changed AH must re-enter the scan -- the memo may not outlive the mask it          refused"
+    );
+    assert!(
+        !cpu.jit_direct
+            .poll_mask_decline_memo_hit(POLL16_ENTRY, 0x40, 8),
+        "an SMC restamp bumps the page insert generation and must re-enter the scan"
+    );
+    assert!(
+        !cpu.jit_direct
+            .poll_mask_decline_memo_hit(POLL16_ENTRY + 1, 0x40, 7),
+        "a different slot must re-enter the scan"
+    );
+}

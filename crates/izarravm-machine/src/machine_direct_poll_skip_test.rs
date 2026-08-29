@@ -1080,3 +1080,235 @@ fn poll_skip_upper_bound_never_lets_the_32_bit_lane_overflow() {
         "cap=100, spent=0 must bound `upper` to 99 (cap - spent - 1) regardless of max_skipped_raw"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The 16-bit poll certification slice (IZARRAVM_DIRECT_POLL_SKIP_16, D1 + D1b).
+// ---------------------------------------------------------------------------
+
+/// Build the 16-bit spin fixture: `program` at guest offset 0x100 in the raw loader's own
+/// 16-bit code segment, the Direct backend armed, both poll knobs overridden per-CPU, and
+/// the beam positioned so the shape is CURRENTLY spinning.
+#[cfg(feature = "jit")]
+fn sixteen_bit_spin_machine(program: &[u8], ax: u32, poll_skip_16: bool) -> Machine {
+    sixteen_bit_spin_machine_for_mask(program, ax, poll_skip_16, 0x08)
+}
+
+/// `sixteen_bit_spin_machine` with an explicit status1 mask to position the beam against.
+/// Both `0x01` (display enable) and `0x08` (vretrace) are exercised, because they are the
+/// only two bits the analytic edge oracle understands and because a fixture stuck on one
+/// of them cannot tell a correctly-resolved mask from a hardcoded one.
+#[cfg(feature = "jit")]
+fn sixteen_bit_spin_machine_for_mask(
+    program: &[u8],
+    ax: u32,
+    poll_skip_16: bool,
+    mask: u8,
+) -> Machine {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, program).unwrap();
+    machine.set_jit_auto_admit(true);
+    machine.cpu.set_native_backend_enabled(true);
+    machine.cpu.set_direct_poll_skip_override(Some(true));
+    machine
+        .cpu
+        .set_direct_poll_skip_16_override(Some(poll_skip_16));
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    // The loader's own cs is left alone: 16-bit, limit 0xFFFF -- the state the slice is for.
+    assert!(!machine.cpu.registers.cs().default_size_32);
+    assert!(machine.cpu.registers.cs().limit <= 0xffff);
+    machine.cpu.registers.set_edx(0x03da);
+    machine.cpu.registers.set_eax(ax);
+    machine.cpu.registers.eip = 0x100;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    set_status1_bit(&mut machine, mask, true);
+    machine
+}
+
+/// **T-D5, the D1 half.** A 16-bit certified 3-slot loop with the new knob ON commits a
+/// span through the REAL bus, from the EMITTED call-out: `poll_skip_spans.sum() > 0`,
+/// `poll_skip_last_head` equal to the shape's own head linear, and
+/// `skipped_raw_core_clocks == 17 * iterations` -- the same arithmetic identity the
+/// 32-bit slice shipped with.
+///
+/// It also pins round-2 MINOR-6: with knob-first ordering the 16-bit screen's condition is
+/// `!d && !armed`, so on the ON arm `poll_declined_sixteen_bit` reads exactly ZERO. A
+/// ladder leg reading zero there is the mechanism working, not a broken build.
+#[cfg(feature = "jit")]
+#[test]
+fn a_sixteen_bit_poll_loop_commits_a_span_with_the_knob_on() {
+    let mut machine = sixteen_bit_spin_machine(&[0xec, 0xa8, 0x08, 0x75, 0xfb], 0, true);
+    let head = machine.cpu.registers.cs().base + 0x100;
+    machine
+        .run_cycles(2_000_000)
+        .expect("the fixture must not stop the machine");
+    let snapshot = machine.cpu.direct_stall_snapshot();
+    let spans: u64 = snapshot.poll_skip_spans.iter().sum();
+    assert!(
+        spans > 0,
+        "a 16-bit 3-slot loop must commit a span with the knob ON; attempts={} declined(\
+         port={} port_source={} mask_source={} knob={} eligibility={} sixteen_bit={} shape={} \
+         cap={} seam={}) blocks_installed={}",
+        snapshot.poll_attempts,
+        snapshot.poll_declined_port,
+        snapshot.poll_declined_port_source,
+        snapshot.poll_declined_mask_source,
+        snapshot.poll_declined_knob,
+        snapshot.poll_declined_eligibility,
+        snapshot.poll_declined_sixteen_bit,
+        snapshot.poll_declined_shape,
+        snapshot.poll_declined_cap,
+        snapshot.poll_declined_seam,
+        machine.cpu.perf_counters().jit_direct_blocks_installed,
+    );
+    assert_eq!(
+        snapshot.poll_declined_sixteen_bit, 0,
+        "on the ON arm the 16-bit lane GOES TO ZERO -- the screen's condition is \
+         `!d && !armed`, so it can never be true"
+    );
+    assert_eq!(
+        snapshot.poll_skip_last_head, head,
+        "the committed span's head must be the shape's own head linear"
+    );
+    let iterations: u64 = snapshot.poll_skip_iterations.iter().sum();
+    assert_eq!(
+        snapshot.poll_skip_raw_core_clocks,
+        17 * iterations,
+        "the 3-slot shape's raw core charge must be exactly 17 per iteration in 16-bit \
+         code, the same constant the 32-bit arm charges"
+    );
+    assert_eq!(
+        machine.cpu.perf_counters().poll_skip_spans,
+        0,
+        "the interpreter's own poll-skip commit must stay zero on a Direct row"
+    );
+}
+
+/// **T-D5, the D1b half.** The same, for the register-mask form `IN AL,DX / TEST AL,AH /
+/// JNZ` with `MOV AH,8`'s effect preloaded into AH. This is the shape that carries 81.68%
+/// of tyrian's declines and the single hottest site.
+#[cfg(feature = "jit")]
+#[test]
+fn a_sixteen_bit_register_mask_poll_loop_commits_a_span_with_the_knob_on() {
+    let mut machine = sixteen_bit_spin_machine(&[0xec, 0x84, 0xe0, 0x75, 0xfb], 0x0800, true);
+    let head = machine.cpu.registers.cs().base + 0x100;
+    machine
+        .run_cycles(2_000_000)
+        .expect("the fixture must not stop the machine");
+    let snapshot = machine.cpu.direct_stall_snapshot();
+    let spans: u64 = snapshot.poll_skip_spans.iter().sum();
+    assert!(
+        spans > 0,
+        "a 16-bit TEST AL,AH loop must commit a span with the knob ON; attempts={} declined(\
+         port_source={} mask_source={} sixteen_bit={} shape={} cap={} seam={})",
+        snapshot.poll_attempts,
+        snapshot.poll_declined_port_source,
+        snapshot.poll_declined_mask_source,
+        snapshot.poll_declined_sixteen_bit,
+        snapshot.poll_declined_shape,
+        snapshot.poll_declined_cap,
+        snapshot.poll_declined_seam,
+    );
+    assert_eq!(snapshot.poll_skip_last_head, head);
+    let iterations: u64 = snapshot.poll_skip_iterations.iter().sum();
+    assert_eq!(
+        snapshot.poll_skip_raw_core_clocks,
+        17 * iterations,
+        "D1b shares the 3-slot constant unchanged: 0x84 charges clocks(2) exactly as 0xA8 \
+         does, so raw_core_clocks stays 17"
+    );
+    assert_eq!(
+        snapshot.poll_skip_spans[0], spans,
+        "D1b keeps diagnostic_class 0 -- it changes neither the port source nor the branch \
+         shape, so no fourth poll_skip_spans class is needed"
+    );
+}
+
+/// **T-D1b-3.** A structurally-certified D1b shape whose live AH is NOT `0x01`/`0x08`
+/// declines through its OWN counted lane and writes NO negative-cache entry.
+///
+/// Both halves matter. The dedicated lane is what lets a ladder tell "the shape did not
+/// certify" (`_shape`) from "the shape certified and then declined semantically"
+/// (`_mask_source`) -- and the second is the storm-class signature, because a `Found` is
+/// never cached. The absent cache entry is what keeps the register half of the shape out
+/// of a `(lin, d)`-keyed structure it does not belong in: the SAME BYTES with `AH = 8`
+/// must still certify, which the sibling fixture above proves.
+#[cfg(feature = "jit")]
+#[test]
+fn a_wrong_mask_value_declines_through_its_own_lane_without_caching() {
+    // `in al,dx; test al,ah; JZ $-5` with `AH = 0x40`. The branch sense is inverted from the
+    // sibling fixtures deliberately: status1 never sets bit 6, so this spins FOREVER on a mask
+    // the analytic edge oracle cannot read -- which is exactly the persistent wrong-mask site
+    // the sticky memo exists for. With `JNZ` the loop would fall out after one iteration and
+    // the call-out would never run enough to say anything.
+    let mut machine = sixteen_bit_spin_machine(&[0xec, 0x84, 0xe0, 0x74, 0xfb], 0x4000, true);
+    machine
+        .run_cycles(2_000_000)
+        .expect("the fixture must not stop the machine");
+    let snapshot = machine.cpu.direct_stall_snapshot();
+    let perf = machine.cpu.perf_counters();
+    assert!(
+        snapshot.poll_declined_mask_source > 0,
+        "AH=0x40 must decline through the mask-source lane; attempts={} shape={} \
+         port_source={}",
+        snapshot.poll_attempts,
+        snapshot.poll_declined_shape,
+        snapshot.poll_declined_port_source,
+    );
+    assert_eq!(
+        snapshot.poll_skip_spans.iter().sum::<u64>(),
+        0,
+        "a mask the edge oracle cannot read must never commit a span"
+    );
+    assert_eq!(
+        perf.poll_neg_cache_stores, 0,
+        "the register half of a shape must never become a cached negative: the same bytes \
+         certify once AH holds 0x08"
+    );
+    assert_eq!(
+        snapshot.poll_declined_shape, 0,
+        "the mask decline must not be misattributed to the structural lane"
+    );
+}
+
+/// The 16-bit slice's OFF arm, and the ladder's A arm: with the new knob unset, a 16-bit
+/// call-out is screened out exactly as on `main` -- into `poll_declined_sixteen_bit`, with
+/// no scan and no span. This is what makes the rollback claim ("unset restores the current
+/// behaviour exactly") true rather than aspirational.
+#[cfg(feature = "jit")]
+#[test]
+fn the_sixteen_bit_off_arm_screens_before_the_scan() {
+    for (name, program, ax) in [
+        ("D1", [0xec, 0xa8, 0x08, 0x75, 0xfb], 0),
+        ("D1b", [0xec, 0x84, 0xe0, 0x75, 0xfb], 0x0800),
+    ] {
+        let mut machine = sixteen_bit_spin_machine(&program, ax, false);
+        machine
+            .run_cycles(2_000_000)
+            .expect("the fixture must not stop the machine");
+        let snapshot = machine.cpu.direct_stall_snapshot();
+        assert!(
+            snapshot.poll_declined_sixteen_bit > 0,
+            "{name}: the OFF arm must land in the sixteen-bit lane; attempts={}",
+            snapshot.poll_attempts,
+        );
+        assert_eq!(
+            snapshot.poll_declined_shape, 0,
+            "{name}: no scan may run on the OFF arm -- the shape lane counts scans that ran"
+        );
+        assert_eq!(
+            snapshot.poll_declined_mask_source, 0,
+            "{name}: the OFF arm never reaches the mask check"
+        );
+        assert_eq!(
+            snapshot.poll_skip_spans.iter().sum::<u64>(),
+            0,
+            "{name}: the OFF arm must commit nothing"
+        );
+        assert_eq!(
+            machine.cpu.perf_counters().poll_neg_cache_stores,
+            0,
+            "{name}: the OFF arm must not probe or store the negative cache"
+        );
+    }
+}
