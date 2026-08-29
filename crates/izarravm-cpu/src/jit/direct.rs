@@ -11252,6 +11252,241 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
     BYTE_SHIFT_ROWS_DEFAULT_ARM
 }
 
+/// Whether `classify` admits the four UNPREFIXED STRING FAMILIES -- `0xA4`/`0xA5` MOVS,
+/// `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS -- as
+/// `InterpretOne` call-outs (`IZARRAVM_GENERIC_CALLOUT`, default ON since the 2026-08-29 ladder).
+///
+/// # The rows, from the census that ranked them
+///
+/// nascar-586 at main `f777010c`, `IZARRAVM_DIRECT_BARRIER_CENSUS=1`, plain release build per
+/// [[census-grade-on-plain-builds]]. Entries 162.1 M, unbound 115.8 M (71% of entries), and the
+/// `rejected` class -- the one this knob converts -- is 40,666,390 unbound exits, 35.1% of unbound.
+/// Its two largest heads are string primitives:
+///
+/// | head | `runtime_hits` | native prefix / suffix | stop |
+/// |---|---:|---|---|
+/// | `0xAD` LODSD dword | **17,202,631** | 9 / 8 | `hard_boundary` |
+/// | `0xAB` STOSD dword | **7,984,903** | 12 / 3 | `hard_boundary` |
+///
+/// 25.2 M of the 28.1 M call-out-shaped mass on that fixture, **89.7%**. The rest of the class is
+/// out of this knob's reach on purpose: `0xE2`/`0xE1` LOOP/LOOPE (9.2 M) are control transfers and
+/// can never take a call-out slot at all, because R1 refuses resume unless `eip == start + len`
+/// after the step; `0xD1 /2` RCL r32,1 (8.7 M) is reachable but wants a native lowering, not a
+/// ~40-host-instruction frame.
+///
+/// The prefix/suffix columns are what makes the row expensive rather than merely common. `0xAD`'s
+/// prefix of 9 means the block BEFORE it compiles and installs fine; the damage is the SECOND
+/// unit, LODSD plus the eight instructions behind it, which forms fewer than three slots, becomes
+/// a `StructuralReject`, and runs the whole span interpreted with one dispatcher round trip per
+/// iteration. Note what that implies and what the fixtures act on: **in the production population
+/// the converted call-out is at SLOT 0**, not mid-block.
+///
+/// # Why these four and nothing else
+///
+/// The obligations an `InterpretOne` row inherits are discharged for these rows by code that
+/// already exists, which is the whole reason this slice needs no ceiling, no deny-list and no
+/// runtime over-budget clause:
+///
+/// * **Core clocks.** ONE interpreter arm, `execute_string_decoded`, with ONE exit returning
+///   `clocks(4)` for all ten opcodes. `STRING_CORE_CLOCKS` is that 4, and 4 < 7, so
+///   `INTERPRET_ONE_MAX_CORE_CLOCKS` stays 7 and `MAX_CALL_OUT_CORE_CLOCKS` stays 18. **The
+///   folded values do not move, so the chain quota is identical with this knob off and on and the
+///   OFF leg of a ladder IS main.** `interpret_one_fold_is_unmoved_by_the_string_rows` is the
+///   fixture; its failure means "the OFF leg moved; re-ladder", not "update the constant".
+/// * **Data accesses.** `rep_memory_accesses`: MOVS/CMPS 2, STOS/LODS/SCAS 1. All at or below the
+///   two the ordinary memory rows already present, so `INTERPRET_ONE_MAX_DATA_ACCESSES` stays 4.
+/// * **R1 (EIP).** No string primitive writes EIP; `end_eip = start + len` always.
+/// * **R2 (segments).** None writes a segment register, so `may_write_segment` is false and R2
+///   compares all six records -- the STRICT side. They READ DS (overridable) and ES; a moved record
+///   resyncs, which is correct and conservative.
+/// * **R3.** None arms the shadow, none writes IF or TF, none touches CR*. Both per-row
+///   relaxations stay false and R3 is unconditional for these rows.
+/// * **R5.** A STOS into the running block's own page leaves `deferred_code_writes` non-empty and
+///   R5 refuses resume. That is correct behaviour and one of the two resyncs these rows expect.
+/// * **DF, the class's one implicit flag INPUT.** `string_step` reads DF out of
+///   `registers.eflags`, and DF is outside the lazy descriptor's ARITH mask, so it is never
+///   deferred and `materialize_flags` passes it through untouched. The invariant that makes the
+///   memory copy current at any point inside a block is **RBP.DF == memory.DF**: RBP is loaded at
+///   entry from the materialized eflags, and the only writer of either copy is
+///   `emit_direction_flag`, which writes BOTH. `a_string_slot_reads_the_direction_flag_*` pins it
+///   from both ends, including the production shape where the block contains no `DirectionFlag`
+///   slot at all and a wholesale RBP publish runs ahead of the string slot.
+///
+/// **`0x6C`-`0x6F` INS/OUTS are NOT admitted, and the exclusion is enforced three independent
+/// ways.** They are members of the same `StringOp` family and would be swept in by any rule
+/// phrased as "the string opcodes" or written as a `StringOp` match; they perform PORT I/O, so
+/// they bypass both the port helper's two-phase TSS-bitmap probe and `run_direct_block`'s entry
+/// privilege gate on `callout_port_slots()`, and they break the batch premise. FOUR bars, in the
+/// order the mutation record established rather than the order the design assumed:
+///
+/// 1. **`block_continuable`, ABOVE `classify`.** `route_group` puts INS/OUTS in
+///    `DecodeGroup::Misc`, whose arm admits only `0xa8`/`0xa9`, so the compile walk refuses them
+///    before the classifier is reached and their census arm is `non_continuable`. This is the bar
+///    that holds today, and it is why widening the classify arm alone changes nothing.
+/// 2. `classify`'s arms are the two explicit byte ranges `0xA4..=0xA7` and `0xAA..=0xAF`, which
+///    cannot reach `0x6C..=0x6F`.
+/// 3. `execute_string_decoded`'s match is `unreachable!` outside `0xa4..=0xaf`, so they could
+///    never pick up the flat `clocks(4)` even if admitted.
+/// 4. Their charge (12/10 through the port arm, 15/14 through the REP model) would raise the fold
+///    past 7 and move `INTERPRET_ONE_MAX_CORE_CLOCKS`.
+///
+/// Two fixtures catch the same hole from opposite ends.
+///
+/// **REP/REPNE forms are refused upstream** by `prefixes_supported_for` and stop as
+/// `BarrierStop::PrefixUnsupported`, a different census arm from these rows'. R8 refuses resume on
+/// `rep_resume_active` independently. A REP string is a multi-iteration object with its own
+/// yielding machinery; `run_string`'s `prefixes.rep == None` arm is exactly one `string_step` with
+/// no yield, which is what makes the unprefixed form a single-step object at all.
+///
+/// # NOT on the `OperandSize::Word` allowlist, deliberately
+///
+/// The census rows are 32-bit (LODSD, STOSD) and no fixture measures a 16-bit string row, so the
+/// Word gate above keeps these arms unreachable in a CS.D = 0 segment. That is the campaign's
+/// standing refusal on unmeasured admissions rather than a width hazard: the helper runs the
+/// decode line through the interpreter, so there is no width field to get wrong and the Word entry
+/// would be one line away the day a census asks for it.
+///
+/// # WHAT PRICED THE FLIP
+///
+/// ON since the 2026-08-29 ladder, whose evidence is one row and its control:
+///
+/// * **nascar-586 wall ladder**: **-2.9% min-wall**, 56.16 s -> 54.55 s. `entries` down **10%** and
+///   unbound exits down **15.4 M**, which is the mass the census predicted these four rows carry
+///   (`0xAD` 17.2 M + `0xAB` 8.0 M runtime hits against a 40.67 M `rejected` class) arriving in the
+///   currency a wall leg can see.
+/// * **duke3d-586, the expected-NEAR-ZERO control**: **+0.16% wall, guest instruction counts
+///   IDENTICAL.** That row is the one gate that could have failed while every other counter looked
+///   good -- duke's rejected heads are integer ALU and this slice admits none of them, so a duke
+///   that MOVED would have meant something other than the designed mechanism was firing. It did
+///   not move.
+///
+/// The band the design refused to predict (its cost model has three terms and two were unmeasured)
+/// is therefore -2.9% MEASURED, comfortably outside the ~1-2% noise floor on a quiet host.
+///
+/// **This flip is STANDING AUTHORITY, not an owner ruling.** It is the campaign's ordinary
+/// "ladder priced it, so the default moves" pattern -- the same authority the
+/// `IZARRAVM_BYTE_SHIFT_ROWS` and `IZARRAVM_TEST_WORD_ROWS` flips ship under. No owner decision was
+/// sought or given for it, and nothing here should be cited as one.
+///
+/// # The spelling table
+///
+/// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
+/// whitespace and one set from a PowerShell ladder picks up capitalisation.
+///
+/// * unset or `` (empty) -> the shipped default, **ON since the 2026-08-29 ladder**.
+/// * `0` / `off` -> the pre-slice refusal, the escape and the A/B base. With the knob off the
+///   allowlist term collapses to `&& !false` and all four classifier arms return from their first
+///   line, so the off tree is the pre-slice one by inspection rather than by argument.
+/// * `1` / `on` -> the four string rows are `InterpretOne` call-outs, and the explicit spelling of
+///   today's default.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
+///   fell through to the default would be read as "the rows I asked for changed nothing", the one
+///   wrong conclusion an A/B exists to avoid.
+///
+/// **The flip CHANGES WHAT `IZARRAVM_GENERIC_CALLOUT=` (the empty string) MEANS, from OFF to ON**,
+/// because `""` names the same arm as unset. It is stated here, in `parse_generic_callout_arm` and
+/// in the flip commit. Every ladder leg exports an explicit `0` or `1` and records the RESOLVED
+/// arm, so no recorded leg is affected -- which is the whole reason that rule exists, and the
+/// [[env-null-empty-is-off-trap]] shape it exists to survive: nulling the variable is not unsetting
+/// it, PowerShell leaves it present and empty, and before this flip that spelled OFF.
+pub(crate) fn generic_callout_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = GENERIC_CALLOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_generic_callout_arm(std::env::var("IZARRAVM_GENERIC_CALLOUT")))
+}
+
+/// The arm an unset -- and an EMPTY -- `IZARRAVM_GENERIC_CALLOUT` names. Named rather than spelled
+/// twice so the two cannot drift apart the day the default moves, and it HAS moved once: ON since
+/// the 2026-08-29 ladder (nascar-586 min-wall -2.9%, 56.16 s -> 54.55 s, entries -10%). The
+/// fixtures reach it through `generic_callout_default_arm_for_test`, so the empty-string assertion
+/// tracks this constant instead of restating it and going stale at the next flip.
+const GENERIC_CALLOUT_DEFAULT_ARM: bool = true;
+
+/// The `IZARRAVM_GENERIC_CALLOUT` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `generic_callout_enabled` for the contract.
+fn parse_generic_callout_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return GENERIC_CALLOUT_DEFAULT_ARM,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_GENERIC_CALLOUT is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `` (both the shipped default, ON since the 2026-08-29 \
+                 ladder), `0` / `off` (the pre-slice refusal, under which the four unprefixed \
+                 string families stay barriers) and `1` / `on` (they become `InterpretOne` \
+                 call-outs)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT
+        // `parse_rotate_rows_arm`'s shape, which folds "" in with `0`/`off`. A wrapper that
+        // computes a leg value and produces "" has MISSED a lookup; it has not said "off". The
+        // ladder's defence against that is that every leg exports an explicit `0` or `1` and
+        // records the RESOLVED arm in its artifact, not a guess about what "" meant.
+        //
+        // THIS ARM'S MEANING MOVED WITH THE 2026-08-29 FLIP, from OFF to ON, and it will move
+        // again if the default does. That is stated here, in the parse function, because it is the
+        // only place a reader will look.
+        "" => GENERIC_CALLOUT_DEFAULT_ARM,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_GENERIC_CALLOUT={other:?} names no arm; accepted spellings are unset or `` \
+             (both the shipped default, ON since the 2026-08-29 ladder), `0` / `off` (the \
+             pre-slice refusal, the escape and the A/B base, under which `0xA4`-`0xA7` and \
+             `0xAA`-`0xAF` stay barriers) and `1` / `on` (they become `InterpretOne` call-outs). \
+             Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read \
+             as the arm it named doing nothing"
+        ),
+    }
+}
+
+// Per-THREAD, for `BYTE_SHIFT_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
+// `OnceLock` and the fixtures have to run both arms in one process, so one test's arm selection
+// must not reach another's compile.
+//
+// The direction that matters flipped on 2026-08-29 and no fixture had to move, because every one
+// of them already stated its arm rather than inheriting it. While the arm was default-OFF it was
+// the POSITIVE fixtures that had to force it on, or they would have tested the refusal and called
+// it an admission; now it is the REFUSAL fixtures that must force `Some(false)`, or they would
+// admit the rows and pass for the wrong reason. The default pin is the one fixture that reads the
+// ambient knob, and it is supposed to.
+#[cfg(test)]
+thread_local! {
+    static GENERIC_CALLOUT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the string-call-out arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_GENERIC_CALLOUT` reading.
+#[cfg(test)]
+pub(crate) fn set_generic_callout_for_test(forced: Option<bool>) {
+    GENERIC_CALLOUT_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `generic_callout_enabled` caches its env
+/// reading in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per
+/// process and never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_generic_callout_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_generic_callout_arm(value)
+}
+
+/// The shipped default arm, reachable from the fixtures so the `""` assertion tracks the default
+/// instead of restating it as a constant that goes stale at the next flip.
+#[cfg(test)]
+pub(crate) fn generic_callout_default_arm_for_test() -> bool {
+    GENERIC_CALLOUT_DEFAULT_ARM
+}
+
 /// Whether `classify` admits **`0xE4` IN AL,imm8, for ANY immediate port** as a `PortReadAlImm8`
 /// call-out (`IZARRAVM_DIRECT_IN_IMM8_CALLOUT`, gp2 in-imm8 callout design rev 3).
 ///
@@ -15043,6 +15278,77 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         disp_lane: None,
                     },
                     raw_clocks: 4,
+                });
+            }
+            // THE FOUR UNPREFIXED STRING FAMILIES, as `InterpretOne` call-outs, behind
+            // `IZARRAVM_GENERIC_CALLOUT` (default ON since the 2026-08-29 ladder: nascar-586
+            // min-wall -2.9%, entries -10%, duke3d-586 the expected-zero control at +0.16% with
+            // guest instruction counts identical). See `generic_callout_enabled` for the
+            // nascar-586 census that ranked them (`0xAD` LODSD 17.2 M runtime hits, `0xAB` STOSD
+            // 8.0 M, together 89.7% of that fixture's call-out-shaped rejected mass) and for the
+            // per-obligation discharge.
+            //
+            // TWO EXPLICIT BYTE RANGES, and the shape is load-bearing rather than stylistic.
+            // `0x6C`-`0x6F` INS/OUTS are members of the same `StringOp` family and would be swept
+            // in by a `StringOp` match or by any arm phrased as "the string opcodes"; they perform
+            // PORT I/O, so they would bypass the port helper's two-phase TSS-bitmap probe and
+            // `run_direct_block`'s entry privilege gate on `callout_port_slots()`, neither of which
+            // an `InterpretOne` slot carries. `0xA4..=0xA7` and `0xAA..=0xAF` cannot reach them.
+            // That is structural rather than a judgement call, and it is the SECOND of the four
+            // independent bars the knob's doc enumerates. It is not the first, and the difference
+            // was measured rather than assumed: `block_continuable` refuses INS/OUTS above this
+            // function entirely, so widening this arm to `0x6c..=0x6f` changes nothing observable
+            // and is a mutation that SURVIVES. Do not read that survival as the arm being
+            // decorative -- read it as this bar being the one that still holds if the walk's
+            // continuable rule ever moves.
+            //
+            // A CALL-OUT rather than a lowering, and the reason is the operand path rather than the
+            // census. A string primitive reads DF, picks a segment that may be overridden, indexes
+            // through ESI/EDI at an address size the decode line chose, moves one to four bytes and
+            // then adjusts one or two index registers by a signed width. Every one of those is a
+            // decision the interpreter already makes in one arm; emitting it would be a second
+            // derivation of the same decision with a second chance to disagree.
+            //
+            // NO REP FORM reaches here: `prefixes_supported_for` refuses the prefix upstream and
+            // the walk stops as `BarrierStop::PrefixUnsupported`, a different census arm. That is
+            // what makes the admitted form a SINGLE-STEP object -- `run_string`'s
+            // `prefixes.rep == None` arm is one `string_step` with no yielding and no
+            // `rep_execution` bookkeeping.
+            //
+            // NO WIDTH to get wrong and none carried: the helper runs the decode line, so the
+            // element width is `execute_string_decoded`'s own choice from the opcode's low bit and
+            // `insn.operand_size`. These opcodes are deliberately NOT on the `OperandSize::Word`
+            // allowlist above, so a 16-bit code segment never reaches this arm at all; the measured
+            // rows are 32-bit and an unmeasured Word admission is the campaign's standing refusal.
+            0xa4 | 0xa5 if generic_callout_enabled() => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::StringMove,
+                    },
+                });
+            }
+            // CMPS and SCAS share ONE row for the reason the row's own doc gives: one execute arm,
+            // one access answer per family, one flag effect, and a census that split them would
+            // rank two shares of one decision.
+            0xa6 | 0xa7 | 0xae | 0xaf if generic_callout_enabled() => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::StringCompare,
+                    },
+                });
+            }
+            0xaa | 0xab if generic_callout_enabled() => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::StringStore,
+                    },
+                });
+            }
+            0xac | 0xad if generic_callout_enabled() => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::StringLoad,
+                    },
                 });
             }
             0xb0..=0xb7 => {
@@ -24412,17 +24718,23 @@ fn emit_x87_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
 // Interpreter CALL-OUT slots: running one instruction through the interpreter from inside a
 // native block, then resuming the same block.
 //
-// Three opcodes live here: `0xEC` (IN AL,DX), `0x60` (PUSHAD) and `0x61` (POPAD). Every other
-// barrier opcode still ends its block; this section is the mechanism, `classify`'s three arms are
-// the policy.
+// This section is the MECHANISM; `classify`'s arms are the policy. Every barrier opcode that is
+// not on one of those arms still ends its block.
 //
-// The three fall into TWO CLASSES with different reachable sets, and almost every design decision
-// below is really a decision about which class an opcode is in:
+// The admitted opcodes fall into THREE CLASSES with different reachable sets, and almost every
+// design decision below is really a decision about which class an opcode is in:
 //
 // | class | member | why a call-out rather than a lowering | touches |
 // |---|---|---|---|
-// | port | `0xEC` | emitted code cannot reach `CpuBus::read_io` at all | one device, one GPR byte |
+// | port | `0xEC`, and `0xE4` behind its knob | emitted code cannot reach `CpuBus::read_io` at all | one device, one GPR byte |
 // | memory | `0x60`, `0x61` | code size: eight guarded accesses per instruction | eight stack dwords, eight GPRs |
+// | `InterpretOne` | the `InterpretOneRow` allowlist | one helper call against a per-row argument the emitter would have to re-derive | whatever the row's interpreter arm touches |
+//
+// The header used to say "three opcodes live here: `0xEC`, `0x60` and `0x61`", which stopped
+// being true when the S2 slice added the first `InterpretOne` row and was wrong by twelve rows and
+// one port opcode before this line replaced it. It is restated as a CLASS table rather than an
+// opcode list for that reason: an opcode list in a header is a thing that goes stale silently,
+// and the allowlist that actually decides is `InterpretOneRow`, which is enumerated in one place.
 //
 // The memory class is the one that justifies the mechanism beyond port IO, and the justification
 // is a SIZE argument, not a reachability one: emitted code can reach guest memory perfectly well.
@@ -24850,13 +25162,39 @@ pub(crate) enum InterpretOneRow {
     MovSsReg,
     /// `0x17` POP SS, every form and every mode.
     PopSs,
+    /// `0xA4`/`0xA5` MOVS, UNPREFIXED, behind `IZARRAVM_GENERIC_CALLOUT`.
+    ///
+    /// The four string rows below are FAMILY rows in the strongest sense this enum has: all ten
+    /// opcodes are one interpreter arm (`execute_string_decoded`) with one exit, so they could
+    /// have been one row. They are four because the census is what ranks them and the nascar-586
+    /// evidence is per family -- `0xAD` LODSD at 17,202,631 runtime hits and `0xAB` STOSD at
+    /// 7,984,903, against a whole `rejected` class of 40,666,390 -- and a single `String` row
+    /// would have averaged the one that pays with three that may not.
+    StringMove,
+    /// `0xA6`/`0xA7` CMPS and `0xAE`/`0xAF` SCAS, unprefixed.
+    ///
+    /// SCAS rides with CMPS rather than taking a fifth row, because the census's own rule is
+    /// FAMILY and not opcode (see this type's doc) and the two are one decision at every level
+    /// that matters here: the same execute arm, the same one-or-two accesses, and the same
+    /// ordinary arithmetic flag set. Splitting them would rank two shares of one answer.
+    StringCompare,
+    /// `0xAA`/`0xAB` STOS, unprefixed. The nascar-586 `0xAB` STOSD row, 7,984,903 runtime hits.
+    ///
+    /// The one row of the four that WRITES guest memory, and therefore the one that can leave
+    /// `deferred_code_writes` non-empty by storing into the running block's own page. R5 refuses
+    /// resume there, which is correct and is one of the two resyncs these rows are expected to
+    /// take at all.
+    StringStore,
+    /// `0xAC`/`0xAD` LODS, unprefixed. The nascar-586 `0xAD` LODSD row, 17,202,631 runtime hits --
+    /// the largest single rejected head on that fixture.
+    StringLoad,
 }
 
 impl InterpretOneRow {
     /// Every row, in discriminant order. The census array is indexed by `as usize`, so this is
     /// what keeps the two in step: a variant added without an entry here fails the length pin in
     /// `interpret_one_row_labels_cover_every_variant`.
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::PopRm,
         Self::MovRmSreg,
         Self::Xchg,
@@ -24869,6 +25207,10 @@ impl InterpretOneRow {
         Self::Sti,
         Self::MovSsReg,
         Self::PopSs,
+        Self::StringMove,
+        Self::StringCompare,
+        Self::StringStore,
+        Self::StringLoad,
     ];
 
     /// How many rows the census array holds.
@@ -24890,6 +25232,10 @@ impl InterpretOneRow {
             Self::Sti => "0xfb_sti",
             Self::MovSsReg => "0x8e2_mov_ss",
             Self::PopSs => "0x17_pop_ss",
+            Self::StringMove => "0xa4_a5_movs",
+            Self::StringCompare => "0xa6_a7_cmps",
+            Self::StringStore => "0xaa_ab_stos",
+            Self::StringLoad => "0xac_ad_lods",
         }
     }
 
@@ -24940,8 +25286,35 @@ impl InterpretOneRow {
     ///
     /// The near misses. `MovRmSreg` (`0x8C`) READS a selector into memory and writes no register.
     /// `PopRm` (`0x8F`) pops into an r/m operand, which the classifier's `/0`-only arm keeps clear
-    /// of the segment encodings. `Xchg` cannot name a segment register at all. The three that say
-    /// yes are the three that call `load_segment_checked`.
+    /// of the segment encodings. `Xchg` cannot name a segment register at all. The four string
+    /// rows READ DS (overridable) and ES and write neither. The three that say yes are the three
+    /// that call `load_segment_checked`.
+    ///
+    /// # A DENY INVARIANT, not a list of near misses
+    ///
+    /// The paragraph above used to be the whole of this doc, and read as a courtesy note about
+    /// three opcodes that happened to be nearby. It is not: it is the statement of a bar, and the
+    /// class it has to bar is one no reader derives from `0x8C`/`0x8F`/XCHG.
+    ///
+    /// **The FAR-POINTER LOADS -- `0xC4` LES, `0xC5` LDS, `0x0F B2` LSS, `0x0F B4` LFS, `0x0F B5`
+    /// LGS -- must never reach this enum without a row of their own that answers TRUE**, and
+    /// admitting them is a slice rather than a list entry, for two independent reasons:
+    ///
+    /// * **LSS ARMS the interrupt shadow.** Carried as a non-arming row it would leave
+    ///   `cpu.interrupt_shadow` set; R3's `(!arming && shadow && !shadow_before_step)` clause would
+    ///   resync, and the boundary would then clear a shadow an EARLIER `Sti` slot latched --
+    ///   delivering an interrupt ONE INSTRUCTION EARLY, which is review finding F1's exact shape
+    ///   and outside the caveat the owner approved. The `debug_assert_eq!` on the arming counts at
+    ///   the boundary cannot see it, because `note_interrupt_shadow_arm` only runs for arming rows,
+    ///   so both counts stay equal while the state diverges.
+    /// * **The protected-mode forms present FIVE data accesses.** A six-byte far pointer is two,
+    ///   and the three descriptor accesses that already put `0x8E` AT the bound are three more.
+    ///   `INTERPRET_ONE_MAX_DATA_ACCESSES` is 4, so the chain quota would be under-budgeted, and
+    ///   it would be under-budgeted SILENTLY in release.
+    ///
+    /// None of the five is `classify`-admitted today, so the invariant costs nothing to hold and is
+    /// written here because the day it costs something is the day someone widens the allowlist by
+    /// class rather than by row.
     pub(crate) fn may_write_segment(self) -> bool {
         match self {
             Self::MovSreg | Self::MovSsReg | Self::PopSs => true,
@@ -24953,7 +25326,11 @@ impl InterpretOneRow {
             | Self::IncDecRm8
             | Self::PushRm
             | Self::Cli
-            | Self::Sti => false,
+            | Self::Sti
+            | Self::StringMove
+            | Self::StringCompare
+            | Self::StringStore
+            | Self::StringLoad => false,
         }
     }
 
@@ -26706,6 +27083,23 @@ fn interpret_one_step<B: CpuBus>(
     // cannot make an interrupt newly deliverable inside the batch either. A port whose read DOES
     // set `io_touched` needs no separate argument here -- `requires_step_break()` ends the block
     // at that slot regardless, so no LATER instruction in the block can observe a stale answer.
+    //
+    // DEVICE-MAPPED MEMORY needs its own derivation, and "no row writes a port" is not it. The
+    // string rows (`0xA4`-`0xA7`, `0xAA`-`0xAF`) write and read ORDINARY guest memory, and on this
+    // machine some ordinary guest addresses are devices -- the Mode 13h aperture and the linear
+    // frame buffer are the two that matter -- so an access that is not a port can still mutate
+    // device state. The premise for that class is the LAST sentence of the paragraph above rather
+    // than the port argument: `bus.requires_step_break()` is read on the resume path below and
+    // returned in the status word's bit 32, so an access that touched device state ENDS THE BLOCK
+    // AT THAT SLOT and no later instruction in the block can observe a stale pendency answer. It
+    // is the same shape as the `io_touched` half of the port argument, reached through the same
+    // bit, and it is written out here because the port sentence alone does not cover it and a
+    // future row that writes memory would inherit a proof that was never about it.
+    //
+    // INS/OUTS (`0x6C`-`0x6F`) are excluded from the allowlist partly to keep the port sentence
+    // above literally true. They are members of the same `StringOp` family as the four admitted
+    // rows and would be swept in by any rule phrased as "the string opcodes"; `classify`'s arms are
+    // the two explicit byte ranges instead, which cannot reach them.
     //
     // So: nothing pending here means nothing pending at the boundary either, and the delivery
     // point does not move at all. Something pending means RESYNC with the shadow armed, which is
@@ -32532,22 +32926,22 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("link_line_not_live", 1819),
     ("revalidate_none", 1825),
     ("dispatch_deferred_short", 1841),
-    ("observer_or_diff_trace", 2439),
-    ("interrupt_shadow", 2446),
-    ("aggregate_accounting", 2453),
-    ("native_fetch_trace", 2467),
-    ("mode_key", 2475),
-    ("x87_top", 2489),
-    ("segment_layout_none", 2504),
-    ("cs_layout", 2512),
-    ("cpl", 2520),
-    ("callout_privileged", 2601),
-    ("data_segment", 2719),
-    ("alignment", 2728),
-    ("fetch_limit", 2743),
-    ("entry_deferred_short", 2757),
-    ("zero_budget", 2865),
-    ("block_regenerated_none", 2901),
+    ("observer_or_diff_trace", 2447),
+    ("interrupt_shadow", 2454),
+    ("aggregate_accounting", 2461),
+    ("native_fetch_trace", 2475),
+    ("mode_key", 2483),
+    ("x87_top", 2497),
+    ("segment_layout_none", 2512),
+    ("cs_layout", 2520),
+    ("cpl", 2528),
+    ("callout_privileged", 2609),
+    ("data_segment", 2727),
+    ("alignment", 2736),
+    ("fetch_limit", 2751),
+    ("entry_deferred_short", 2765),
+    ("zero_budget", 2873),
+    ("block_regenerated_none", 2909),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
