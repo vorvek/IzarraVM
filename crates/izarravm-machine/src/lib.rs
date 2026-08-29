@@ -1349,13 +1349,11 @@ impl OplProbe {
                 mpu.uart_enters += 1;
                 *self.mpu_uart_mut(wavetable) = true;
             }
-            0x00..=0x2f if value & 0x0f < 0x0c => {
-                match value & 0x0c {
-                    0x08 => mpu.start_playbacks += 1,
-                    0x04 => mpu.stop_playbacks += 1,
-                    _ => {}
-                }
-            }
+            0x00..=0x2f if value & 0x0f < 0x0c => match value & 0x0c {
+                0x08 => mpu.start_playbacks += 1,
+                0x04 => mpu.stop_playbacks += 1,
+                _ => {}
+            },
             _ => {}
         }
         self.midi_push(MidiTraceKind::CommandWrite, wavetable, value, master_ticks);

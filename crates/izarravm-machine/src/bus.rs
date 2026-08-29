@@ -2301,7 +2301,8 @@ impl CpuBus for MachineBus<'_> {
             let guest_tick = self.guest_tick_now();
             self.pic.set_irq_level(9, self.wavetable_mpu.irq_level());
             let value = self.midi_mpu.read_data_at(guest_tick);
-            self.opl_probe.record_mpu_data_read(false, value, guest_tick);
+            self.opl_probe
+                .record_mpu_data_read(false, value, guest_tick);
             self.sync_mpu_irq();
             return Ok(u32::from(value));
         }
