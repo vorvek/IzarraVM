@@ -151,6 +151,21 @@ struct Cli {
     /// For headless benchmark/timedemo runs whose result lands in graphics mode.
     #[arg(long)]
     result_ppm: Option<PathBuf>,
+    /// With --hdd-folder, write the last COMPLETED raster to this PPM (P6) path.
+    ///
+    /// Not the same picture as --result-ppm, and the difference is the point.
+    /// `--result-ppm` re-renders the whole frame at stop-time register state,
+    /// so it reports what video memory holds. This writes the frame the scanout
+    /// actually published, which is what a user sees. A defect that fills video
+    /// memory correctly but never publishes it is INVISIBLE to --result-ppm and
+    /// plain in this one: measured on Psycho Pinball, the re-render read 80.8%
+    /// non-black while the screen was black.
+    ///
+    /// Writes nothing and says so when no frame has completed yet -- between a
+    /// mode set and the first raster of the new mode there is genuinely no
+    /// published frame, and a substitute would read as a measurement.
+    #[arg(long)]
+    presented_ppm: Option<PathBuf>,
     /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
     #[arg(long, requires = "hdd_folder")]
     expect_test_exit: bool,
@@ -367,6 +382,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             hardware,
             cli.dump_result,
             cli.result_ppm.as_deref(),
+            cli.presented_ppm.as_deref(),
             cli.profile_json.as_deref(),
             cli.expect_test_exit,
             cli.inject_keys.as_deref(),
@@ -1513,6 +1529,7 @@ fn run_boot_hdd_folder(
     hardware: &HardwareProfile,
     dump_result: bool,
     result_ppm: Option<&Path>,
+    presented_ppm: Option<&Path>,
     profile_json: Option<&Path>,
     expect_test_exit: bool,
     inject_keys: Option<&str>,
@@ -1906,6 +1923,13 @@ fn run_boot_hdd_folder(
     if let Some(path) = result_ppm {
         write_framebuffer_ppm(&mut machine, path)?;
         println!("screenshot: {}", path.display());
+    }
+    if let Some(path) = presented_ppm {
+        if write_presented_ppm(&machine, path)? {
+            println!("presented: {}", path.display());
+        } else {
+            println!("presented: none (no completed raster)");
+        }
     }
     // Final reconcile. Katea projects completed write commands to the host as
     // they happen, but a write whose FAT, directory or path was still
@@ -3991,6 +4015,27 @@ fn print_dump_result(machine: &mut Machine, stop_reason: &StopReason) {
 /// Write the current framebuffer to a binary PPM (P6) file: the full raw
 /// pixel dump a graphics-mode benchmark result (e.g. 3DBench2's fps readout)
 /// lands in. Resolves DAC indices through the active 6-bit or 8-bit palette.
+/// Write the last COMPLETED raster as a P6 PPM. Returns false when no frame has
+/// been published yet, in which case nothing is written: see the
+/// `presented_ppm` flag comment for why an absent frame is reported rather than
+/// substituted.
+fn write_presented_ppm(machine: &Machine, path: &Path) -> Result<bool, Box<dyn Error>> {
+    use std::io::Write;
+
+    let Some((pixels, width, height)) = machine.presented_frame_argb() else {
+        return Ok(false);
+    };
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    write!(out, "P6
+{width} {height}
+255
+")?;
+    for color in pixels {
+        out.write_all(&[(color >> 16) as u8, (color >> 8) as u8, color as u8])?;
+    }
+    Ok(true)
+}
+
 fn write_framebuffer_ppm(machine: &mut Machine, path: &Path) -> Result<(), Box<dyn Error>> {
     use std::io::Write;
 

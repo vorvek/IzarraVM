@@ -8,8 +8,8 @@
     "dukemark_samples_tolerance": 0.02
   },
   "duke3d-586-short": {
-    "dukemark_samples_tolerance": 0.02,
-    "dukemark_samples": 404
+    "dukemark_samples": 404,
+    "dukemark_samples_tolerance": 0.02
   },
   "gp2-586": {
     "frame_sha256": "ac11e66ab796551bcddc8c9108b9e804faa6ccd62dc105611bb64a6cbfe77fe0"
@@ -18,26 +18,37 @@
     "anchor_frame_sha256": [
       "383cfebd4a68a669ab4908764205232b4e02c8d0976ab2cc575f032184d529d5"
     ],
-    "final_nonblack_percent_min": 84.0,
-    "final_nonblack_percent_max": 100.0,
-    "final_distinct_colors_min": 45,
     "final_distinct_colors_max": 256,
+    "final_distinct_colors_min": 45,
     "final_instructions": 6337150214,
-    "final_instructions_tolerance": 0.05
+    "final_instructions_tolerance": 0.05,
+    "final_nonblack_percent_max": 100.0,
+    "final_nonblack_percent_min": 84.0
   },
   "prince-486": {
     "frame_sha256": "04fd85582f7c041bfc4d873b7c115cb36ce6c522d8060e91506a67ecc8a9e580"
+  },
+  "psycho-486": {
+    "anchor_frame_sha256": [
+      "1a0804f8c4b003f1ce1ecc0aa8f490b052329928ade53afd662ccb80b4b35f7d"
+    ],
+    "final_distinct_colors_max": 256,
+    "final_distinct_colors_min": 40,
+    "final_instructions": 3734683259,
+    "final_instructions_tolerance": 0.05,
+    "final_nonblack_percent_max": 95.0,
+    "final_nonblack_percent_min": 60.0
   },
   "tombraid-586": {
     "anchor_frame_sha256": [
       "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
     ],
-    "final_nonblack_percent_min": 89.0,
-    "final_nonblack_percent_max": 100.0,
-    "final_distinct_colors_min": 79,
     "final_distinct_colors_max": 256,
+    "final_distinct_colors_min": 79,
     "final_instructions": 18136220051,
-    "final_instructions_tolerance": 0.05
+    "final_instructions_tolerance": 0.05,
+    "final_nonblack_percent_max": 100.0,
+    "final_nonblack_percent_min": 89.0
   },
   "tyrian-setup-486": {
     "frame_sha256": "479a10ea0c16837ec1d2b8018a2641bd8c1820d291e0092bf1f13ee8e2edf5eb"

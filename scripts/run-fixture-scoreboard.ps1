@@ -1413,6 +1413,55 @@ function Get-FixtureTable {
             # Mounted read-only from the shared tree, never copied per run.
             cdImage = "tombraid_cd\tombeng.cue"
         }
+        [pscustomobject]@{
+            name = "psycho-486"; folder = "psycho_c"
+            # 486 / 64 MiB / Vega, the machine the fault was reported on. A 1995
+            # game does not need 166 MHz, and at 66 MHz the same guest time costs
+            # a third of the cycles.
+            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
+            # 8e9 clocks is 121 guest seconds: past the language menu, the title,
+            # the attract tables and the load, and roughly 60 seconds into a
+            # table in play. Gameplay is where this row earns its place.
+            cycles = [uint64]8000000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            qconsole = $false; resultPpm = $true; injection = @(); dukemark = $null
+            # THE POINT OF THIS ROW. It grades the PUBLISHED frame, not a
+            # re-render, because the defect it exists to catch is invisible to a
+            # re-render. With the `resize_work` raster wipe restored, the same
+            # run reads 82.9% non-black and 127 colours through --result-ppm and
+            # 0.0% / 1 colour through --presented-ppm. No other row in this table
+            # would have failed.
+            #
+            # WHAT IT CATCHES, both arms measured by restoring the defect and
+            # re-running rather than by argument:
+            #   raster wipe restored -> FAIL, "non-black coverage % is 0, outside
+            #     the band [60, 95]" plus "distinct colours is 1".
+            #   mode X CRTC reseed restored -> PASS. It does NOT catch that one.
+            #     The reseed only damages the FIRST mode set, which is the menu
+            #     phase; by the budget the game has re-entered its gameplay mode
+            #     from inside mode X, so the geometry is 320x368 either way. A
+            #     menu-phase anchor cannot cover it either, because the menu
+            #     animates continuously. Geometry regressions are covered by the
+            #     video-crate unit tests instead, which is where they belong.
+            gradePresentedFrame = $true
+            # No end-of-budget HASH, for the reason Duke3D and Tomb Raider lost
+            # theirs: the picture animates continuously, so any cadence-adjacent
+            # change moves it legitimately. Three repeat runs are bit-identical
+            # (82.92%, 127 colours, 3734683259 instructions), so the determinism
+            # is real; it is robustness to CODE change that a hash would lack.
+            #
+            # There is no early static anchor either, and that was measured
+            # rather than assumed: at 250 ms sampling over the first 25 guest
+            # seconds the ONLY run of four identical frames is the DOS boot text
+            # at 250-1000 ms, which exercises no graphics at all.
+            # The anchor is the Toka-DOS boot text at 0.6 guest seconds, the one
+            # place in this title's first 25 seconds where four consecutive
+            # 250 ms samples are bit-identical. It pins boot determinism only;
+            # the graphics evidence is the content bands at the budget.
+            frameContract = (New-FrameContract -AnchorCycles ([uint64]40000000) `
+                    -AnchorDisplay "VgaRaster" -AnchorPhases 1 `
+                    -Display "VgaRaster" -Width 320 -Height 368 -Bpp 8 -Mode "ModeX")
+        }
     )
 }
 
@@ -1862,7 +1911,22 @@ function Get-FixtureArguments($Fixture, [string]$WorkingCopy, [uint64]$Cycles,
     $arguments += @("--cycles", $Cycles.ToString())
     $arguments += @("--profile-json", $ProfilePath)
     if (-not [string]::IsNullOrWhiteSpace($PpmPath)) {
-        $arguments += @("--result-ppm", $PpmPath)
+        # `--result-ppm` RE-RENDERS the whole frame at stop-time register state,
+        # so it reports what video memory holds. `--presented-ppm` writes the
+        # frame the scanout actually published, which is what a user sees. The
+        # difference is not cosmetic: a defect that fills video memory correctly
+        # and never publishes it reads 82.9% non-black through --result-ppm and
+        # 0.0% through --presented-ppm, measured on psycho-486 with the
+        # `resize_work` raster wipe restored. A row that grades CONTENT bands
+        # wants the published frame; the rows that pin a re-render keep it,
+        # because their pins were taken that way. Same path either way, so every
+        # consumer downstream -- hash, bands, width and height -- is unchanged.
+        $presentedProperty = $Fixture.PSObject.Properties['gradePresentedFrame']
+        if ($null -ne $presentedProperty -and $presentedProperty.Value) {
+            $arguments += @("--presented-ppm", $PpmPath)
+        } else {
+            $arguments += @("--result-ppm", $PpmPath)
+        }
     }
     # A fixture that names a cdImage mounts it straight from the shared .bench
     # tree: the emulator reads the image into memory and never writes it, so a
@@ -2786,8 +2850,24 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
             $failures += ("the final frame came from display path " +
                 "'$($profile.active_display)', expected '$($contract.display)'")
         }
-        $margo = $profile.PSObject.Properties['margo_display']
-        if ($null -eq $margo -or $null -eq $margo.Value) {
+        # Depth and mode come from a different profile block per display path.
+        # Margo publishes a `margo_display` block; the legacy VGA scanout has no
+        # such block and reports `legacy_video_mode` instead, so demanding
+        # margo_display of every contract row locked this mechanism to Margo.
+        # psycho-486 is the first legacy-VGA contract row.
+        if ($contract.display -ne "MargoLfb") {
+            $legacy = $profile.PSObject.Properties['legacy_video_mode']
+            if ($null -eq $legacy -or $null -eq $legacy.Value) {
+                $failures += "the profile carries no legacy_video_mode for the final frame"
+            } else {
+                $result.final_mode = $legacy.Value
+                if ($legacy.Value -ne $contract.mode) {
+                    $failures += ("the final frame is legacy video mode " +
+                        "'$($legacy.Value)', expected '$($contract.mode)'")
+                }
+            }
+        } elseif ($null -eq ($margo = $profile.PSObject.Properties['margo_display']) -or
+            $null -eq $margo.Value) {
             $failures += "the profile carries no margo_display block for the final frame"
         } else {
             $result.final_bpp = $margo.Value.bpp
