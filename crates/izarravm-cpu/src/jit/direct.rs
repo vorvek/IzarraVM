@@ -11769,7 +11769,9 @@ pub(crate) fn direct_poll_skip_max_raw() -> u64 {
 ///   would run the DEFAULT and be read as "the arm I asked for changed nothing", the one wrong
 ///   conclusion an arm ladder exists to avoid.
 ///
-/// **Default is ON since 2026-08-29, on the owner's approval.** The evidence: tyrian-586
+/// **Default is ON since 2026-08-29, flipped by the overnight campaign under its standing
+/// merge authority (not an explicit owner ruling; revert is one `git revert` away).**
+/// The evidence: tyrian-586
 /// **2.78x** (63.4 s -> 22.8 s min-wall), `jit_direct_poll_decline_sixteen_bit` -> 0,
 /// `jit_direct_poll_skip_spans` 29,120, `jit_direct_poll_decline_mask_source` **0** (so the
 /// MAJOR-7 storm class never fired and the sticky memo was never load-bearing on this row), and
