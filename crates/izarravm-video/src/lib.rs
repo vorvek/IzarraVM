@@ -8,7 +8,11 @@ use thiserror::Error;
 pub mod distira;
 pub mod font;
 pub mod margo;
+mod mode_census;
 pub mod vga;
+pub use mode_census::{
+    DistiraCensus, DistiraCensusKey, ModeCensus, ModeCensusKey, bits_per_pixel,
+};
 pub use vga::{CGA_FB_SIZE, HGC_FB_SIZE, VGA_PLANAR_SIZE, Vga, VgaRaster};
 
 pub use distira::*;
@@ -78,7 +82,7 @@ impl Framebuffer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum VideoMode {
     #[default]
     Text,
