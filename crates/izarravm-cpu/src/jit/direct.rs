@@ -10730,6 +10730,156 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
     parse_test_word_rows_arm(value)
 }
 
+/// Whether `classify` admits the **BYTE shift/rotate register rows `0xD0 /4..=7` and
+/// `0xC0 /5,/6,/7`**, and whether `0xC0`/`0xD0` reach the `OperandSize::Word` decode path at all
+/// (`IZARRAVM_BYTE_SHIFT_ROWS`).
+///
+/// **DEFAULT OFF.** The slice lands with the knob off so the A leg of its ladder is
+/// byte-identical to the pre-slice tree by inspection: with the knob off the allowlist term
+/// collapses to `&& !false` and every new classifier arm returns `None` from its first line. The
+/// default moves only on the ladder, in a commit of its own, exactly as `IZARRAVM_FPU_LOOP_ROWS`
+/// did.
+///
+/// # The rows, from the census that ranked them
+///
+/// tyrian-586 at main `0333d956`, `IZARRAVM_DIRECT_BARRIER_CENSUS=1`, plain release build per
+/// [[census-grade-on-plain-builds]]. The static-unbound `rejected` class is 22.23 M runtime hits
+/// and two rows of one instruction family are 14,540,543 of them -- **65.4%**:
+///
+/// | row | form | operand_size | prefix_mask | `runtime_hits` |
+/// |---|---|---|---:|---:|
+/// | `0xD0 /5` SHR r8, 1 | register | word | 0 | **13,933,316** |
+/// | `0xC0 /5` SHR r8, imm8 | register | word AND dword, MERGED | 0 | 607,227 |
+///
+/// `0xD0 /5` is the hottest single rejected row on the fixture by 4x. The `0xC0 /5` figure is a
+/// MERGED word/dword row and the two halves are refused by different mechanisms -- the Word half
+/// by the allowlist, the Dword half by the `m.reg != 4` test inside the `0xc0` arm -- so no ladder
+/// on this knob can attribute a shortfall between them.
+///
+/// tyrian's code segment is CS.D = 0, so its byte shifts decode at `OperandSize::Word` with
+/// `prefix_mask 0` and were refused by the Word allowlist BEFORE any arm was reached. That is why
+/// the `0xD0 /5` row is tagged `operand_size: word` even though the instruction has no 16-bit
+/// anything about it.
+///
+/// # Two axes, not one, and `0xC0 /4` at Word needs both
+///
+/// `IZARRAVM_ROTATE_ROWS` gates whether `0xC0 /4` is a lowering at all -- a ROW axis. This knob
+/// gates whether `0xC0`/`0xD0` reach the Word decode path -- a REACHABILITY axis, which did not
+/// exist before this slice. `0xC0 /4` at Word sits at the intersection and therefore needs BOTH
+/// arms on. That is a conjunction rather than two knobs on one row: each knob still restores its
+/// own pre-slice world when turned off. It is an UNMEASURED CLOSURE admission -- no census row
+/// asks for it -- and it is admitted rather than screened out because refusing one sub-opcode of a
+/// shared arm at one width alone would put a byte-SHL boundary in the middle of admitted byte-SHRs,
+/// against this file's own contiguity rule.
+///
+/// # What is deliberately NOT behind this knob
+///
+/// * **`0xD0 /0,/1` and `0xC0 /0,/1` (ROL/ROR r8).** `DirectKind::RotateReg` has no `width` field
+///   and `emit_rotate_reg` is `shift_r32_imm8(op, home(dst), count)` -- a 32-bit host rotate over a
+///   32-bit guest home. A byte rotate through it rotates 32 bits where the guest rotates 8, takes
+///   CF from bit 31 instead of bit 7, and for byte indices 4..7 reaches a guest ESP/EBP/ESI/EDI
+///   home instead of AH/CH/DH/BH. Admitting them is a real slice, not a list entry.
+/// * **`0xD0 /2,/3` and `0xC0 /2,/3` (RCL/RCR r8)**, for the standing structural reason the
+///   `0xc1 | 0xd1` arm gives: both take the incoming CF as a rotate INPUT.
+/// * **Memory forms of either opcode**, refused by the shared `DecodedOperand::Reg` bind.
+/// * **`0xD2` (byte shift by CL)**: `emit_shift_cl` is Dword-only, exactly as `0xD3`'s arm says.
+///
+/// # The spelling table
+///
+/// Trimmed and case-folded on the way in, because a knob set from a shell script picks up
+/// whitespace and one set from a PowerShell ladder picks up capitalisation.
+///
+/// * unset or `` (empty) -> the shipped default, which is OFF today.
+/// * `0` / `off` -> the pre-slice refusal. `1` / `on` -> the byte-shift admission.
+/// * **anything else PANICS**, for `parse_rotate_rows_arm`'s reason: a mistyped ladder leg that
+///   fell through to the default would be read as "the rows I asked for changed nothing", the one
+///   wrong conclusion an A/B exists to avoid.
+pub(crate) fn byte_shift_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = BYTE_SHIFT_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_byte_shift_rows_arm(std::env::var("IZARRAVM_BYTE_SHIFT_ROWS")))
+}
+
+/// The arm an unset -- and an EMPTY -- `IZARRAVM_BYTE_SHIFT_ROWS` names. Named rather than spelled
+/// twice so the two cannot drift apart the day the default moves.
+const BYTE_SHIFT_ROWS_DEFAULT_ARM: bool = false;
+
+/// The `IZARRAVM_BYTE_SHIFT_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `byte_shift_rows_enabled` for the contract.
+fn parse_byte_shift_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return BYTE_SHIFT_ROWS_DEFAULT_ARM,
+        // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
+        // than the same silence as "unset": someone set the variable and meant something by it.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_BYTE_SHIFT_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `` (both the shipped default), `0` / `off` (the \
+                 pre-slice refusal) and `1` / `on` (the byte-shift admission)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT
+        // `parse_rotate_rows_arm`'s shape, which folds "" in with `0`/`off`. A wrapper that
+        // computes a leg value and produces "" has MISSED a lookup; it has not said "off". The
+        // ladder's defence against that is that every leg exports an explicit `0` or `1` and
+        // records the RESOLVED arm in its artifact, not a guess about what "" meant.
+        //
+        // THIS ARM'S MEANING MOVES WHEN THE DEFAULT MOVES. That is stated here, in the parse
+        // function, because it is the only place a reader will look.
+        "" => BYTE_SHIFT_ROWS_DEFAULT_ARM,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_BYTE_SHIFT_ROWS={other:?} names no arm; accepted spellings are unset or `` \
+             (both the shipped default), `0` / `off` (the pre-slice refusal) and `1` / `on` (the \
+             byte-shift admission). Refusing to guess: a mistyped ladder leg that silently ran \
+             the default would be read as the arm it did not run"
+        ),
+    }
+}
+
+// Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
+// `OnceLock` and the fixtures have to run both arms in one process, so one test's arm selection
+// must not reach another's compile. Since the arm is default-OFF, every positive fixture for these
+// rows MUST force it on through here or it would test the refusal and call it a lowering; and
+// every refusal fixture states the off arm rather than inheriting it, so that it keeps meaning
+// what it says the day the default moves.
+#[cfg(test)]
+thread_local! {
+    static BYTE_SHIFT_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the byte-shift-row arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_BYTE_SHIFT_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_byte_shift_rows_for_test(forced: Option<bool>) {
+    BYTE_SHIFT_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures. `byte_shift_rows_enabled` caches its env
+/// reading in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per
+/// process and never in an order the harness controls.
+#[cfg(test)]
+pub(crate) fn parse_byte_shift_rows_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_byte_shift_rows_arm(value)
+}
+
+/// The shipped default arm, reachable from the fixtures so the `""` assertion tracks the default
+/// instead of restating it as a constant that goes stale at the flip.
+#[cfg(test)]
+pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
+    BYTE_SHIFT_ROWS_DEFAULT_ARM
+}
+
 /// Whether `classify` admits **`0xE4` IN AL,imm8, for ANY immediate port** as a `PortReadAlImm8`
 /// call-out (`IZARRAVM_DIRECT_IN_IMM8_CALLOUT`, gp2 in-imm8 callout design rev 3).
 ///
@@ -13076,6 +13226,39 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // Operand-size-invariant for the same reason `0xec` is (the classifier arm's own comment):
         // the interpreter's `0xe4` arm always reads and writes a byte regardless of `operand_size`.
         && !(direct_in_imm8_callout_armed() && insn.opcode == 0xe4)
+        // THE BYTE-SHIFT ROWS (`IZARRAVM_BYTE_SHIFT_ROWS`, default OFF until its ladder) are a
+        // FIFTH allowlist term, written as its own term for the reason the V86 and TEST terms
+        // above are: the gate-off arm stays byte-identical to the pre-slice tree by inspection
+        // rather than by reading a hundred-line `matches!`. With the knob off this whole term
+        // collapses to `&& !false`.
+        //
+        // KEYED ON THE SUB-OPCODE as well as the opcode, and the key is stated rather than
+        // implied. `/0..=/3` are the byte ROTATES, which have no arm and no emitter at this width;
+        // their own arm refuses them one step later either way, so the key changes no outcome
+        // today. It is here because it keeps BOTH halves of the refusal in one place: a later
+        // widening of the arms would otherwise silently widen what the Word gate admits too.
+        //
+        // THIS TERM IS THE REACHABILITY AXIS AND CARRIES ONE KNOB. The ROW axis is inside the
+        // arms: `0xC0 /4` is still gated on `rotate_rows_enabled()` there, so that row needs BOTH
+        // knobs and is a new admission this slice names rather than smuggles. `/5`, `/6`, `/7` and
+        // all of `0xD0` need only this one, because they have no row on the other axis.
+        //
+        // Why the Word entry is sound, in one line each. The guest semantics do not depend on the
+        // decoded operand size: `execute.rs` selects `BusWidth::Byte` from the OPCODE and
+        // `shift_rotate` derives mask, msb and bits from that argument alone, so `c0 e8 03` in a
+        // CS.D = 0 segment and the same three bytes in a CS.D = 1 segment are the same instruction
+        // with the same result and the same flags. The emitted code does not read `operand_width`:
+        // both arms hard-code `MemoryWidth::Byte`, as `0xC6`'s does. And this is the byte set's own
+        // CLOSURE rule rather than an exception to it -- two byte-form opcodes whose arms produce a
+        // kind carrying a literal `MemoryWidth::Byte`, which is exactly the property the ungated
+        // list above is built on.
+        //
+        // NOT the `0xa1`/`0xa3` hazard the header names: those hard-coded `MemoryWidth::Dword` and
+        // would have moved four bytes where the guest moves two. `Shift` HAS a width field and
+        // these arms set it to a literal `Byte`.
+        && !(byte_shift_rows_enabled()
+            && matches!(insn.opcode, 0xc0 | 0xd0)
+            && insn.modrm.is_some_and(|m| matches!(m.reg, 4..=7)))
     {
         return None;
     }
@@ -14565,34 +14748,100 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // in this file refuses it, and it is a separate census row this slice does not claim.
             0xc0 => {
                 let m = insn.modrm?;
-                // The off arm (`IZARRAVM_ROTATE_ROWS=0`, the opt-out from the shipped default since
-                // the 2026-08-19/20 flip). Read HERE rather than in the
-                // emitter so the off arm is the pre-slice refusal byte for byte: this whole
-                // opcode had no arm before the slice, so returning None from the top of it puts
-                // the row back in the census as the same `hard_boundary` it was ranked as.
+                // EACH SUB-OPCODE CARRIES ITS OWN ROW-AXIS KNOB, and the split is what makes
+                // either off arm reproduce its own pre-slice world exactly rather than a "no byte
+                // shifts" world.
                 //
-                // `rotate_rows_enabled` is true on BOTH admitting arms (`on` and `heat_gated`).
-                // The heat gate cannot live here -- it needs the physical address and the heat
+                // `/4` predates this slice and stays on `IZARRAVM_ROTATE_ROWS`. Read HERE rather
+                // than in the emitter so that off arm is the pre-slice refusal byte for byte: this
+                // whole opcode had no arm before that slice, so returning None from the top of it
+                // puts the row back in the census as the same `hard_boundary` it was ranked as.
+                // `rotate_rows_enabled` is true on BOTH admitting arms (`on` and `heat_gated`);
+                // the heat gate cannot live here -- it needs the physical address and the heat
                 // map, neither of which is in this function's signature -- so it runs one step
                 // later, in the compile loop, and downgrades this admission to the very same
                 // `HardBoundary` the `!enabled` return produces. See `rotate_rows_arm`.
-                if !rotate_rows_enabled() {
-                    return None;
-                }
-                if m.reg != 4 {
-                    return None;
+                //
+                // `/5`, `/6` and `/7` are the byte-shift slice and are on
+                // `IZARRAVM_BYTE_SHIFT_ROWS`. A single shared knob would price two slices as one,
+                // which is the mistake the `0xc1 | 0xd1` arm below records for the ROR case.
+                //
+                // THE WORD REACHABILITY AXIS IS SEPARATE and lives in the allowlist term at the
+                // top of this file, on `IZARRAVM_BYTE_SHIFT_ROWS` alone. `0xC0 /4` at Word
+                // therefore needs BOTH knobs; see `byte_shift_rows_enabled` for the full matrix
+                // and for why that row is an unmeasured CLOSURE admission rather than a smuggled
+                // one.
+                match m.reg {
+                    4 if !rotate_rows_enabled() => return None,
+                    5..=7 if !byte_shift_rows_enabled() => return None,
+                    4..=7 => {}
+                    _ => return None,
                 }
                 let DecodedOperand::Reg(dst) = insn.operand? else {
                     return None;
                 };
                 return Some(DirectKind::Shift {
-                    op: 4,
+                    // `/6` is the undocumented SAL alias of `/4` and is NORMALISED here rather
+                    // than passed through, so `DirectKind::Shift` only ever carries a documented
+                    // sub-opcode and no part of this lowering depends on undocumented host
+                    // behaviour -- the encoders pass `op` into the ModRM `/op` slot verbatim, so
+                    // without this the host would execute a real `C0 /6`. `core.rs`'s
+                    // `4 | 6 => // SHL` and `4 | 6 => top ^ cf` already treat the two as one arm,
+                    // so nothing observable changes. The CENSUS still bins by `insn.modrm.reg` and
+                    // still reports `/6`; normalisation is a kind-level fact.
+                    op: if m.reg == 6 { 4 } else { m.reg },
                     dst,
                     count: insn.imm as u8,
                     width: MemoryWidth::Byte,
                     // `classify` never attaches a lane: it has neither the physical address nor
                     // the cpu in scope. `count_lane_for` fills this in from the compile walk, at
                     // the last point before the slot is committed.
+                    lane: None,
+                });
+            }
+            // SHL/SHR/SAL/SAR r8, 1 (0xD0 /4,/5,/6,/7), REGISTER form. The hottest single rejected
+            // row on tyrian-586: `/5` alone is 13,933,316 runtime hits, 62.7% of the static-unbound
+            // class and 4x the next row. Before this slice `0xD0` had no arm at all and was a
+            // `hard_boundary` at every width and every sub-opcode.
+            //
+            // A SEPARATE ARM rather than an extension of `0xc1 | 0xd1`, and that is a correctness
+            // requirement rather than a style choice: that arm produces `width: operand_width`, the
+            // DECODED width. `0xD0` is a byte instruction whose width comes from the opcode's low
+            // bit, so routing it there would shift 16 or 32 bits in a byte instruction.
+            //
+            // ROL (/0), ROR (/1), RCL (/2), RCR (/3) stay out. The first two are not a missing
+            // census row: `RotateReg` carries no `width` field at all and `emit_rotate_reg` is
+            // `shift_r32_imm8(op, home(dst), ..)`, so a byte rotate through it rotates 32 bits,
+            // takes CF from bit 31 instead of bit 7, and for byte indices 4..7 reaches a guest
+            // ESP/EBP/ESI/EDI home instead of AH/CH/DH/BH (`home` is `GUEST_HOMES[index & 7]`).
+            // RCL/RCR are out for the standing structural reason the arm below gives: both take
+            // the incoming CF as a rotate INPUT.
+            //
+            // NO IMMEDIATE: the count is the literal 1 baked into the opcode, so `count: 1` here is
+            // the encoding rather than a decode field. `insn.imm` is not read and must not be --
+            // `0xD0` has `imm_len == 0` and `insn.imm` carries whatever the decoder last left
+            // there.
+            0xd0 => {
+                let m = insn.modrm?;
+                // The knob read sits at the TOP of the arm, above every other test, on the
+                // `rotate_rows_enabled` discipline: since `0xD0` had no arm at all before this
+                // commit, an early `None` puts every one of its rows back in the census as the
+                // same `hard_boundary` they were ranked as.
+                if !byte_shift_rows_enabled() {
+                    return None;
+                }
+                if !matches!(m.reg, 4..=7) {
+                    return None;
+                }
+                let DecodedOperand::Reg(dst) = insn.operand? else {
+                    return None;
+                };
+                return Some(DirectKind::Shift {
+                    // See the `0xc0` arm for why `/6` is normalised rather than passed through.
+                    op: if m.reg == 6 { 4 } else { m.reg },
+                    dst,
+                    count: 1,
+                    width: MemoryWidth::Byte,
                     lane: None,
                 });
             }
