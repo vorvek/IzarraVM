@@ -1608,6 +1608,13 @@ impl CpuGsw {
                     if jit.direct.lane_trial_spend(key, heat_epoch) {
                         lane_trial = true;
                     } else {
+                        // Task 0's F2 split, before the demote and on the demote's own arm: this
+                        // key was refused because it had ALREADY spent a trial this epoch, and the
+                        // `_earned` half says whether that trial's block installed and was then
+                        // killed — the only population an earned re-grant can convert.
+                        self.jit_direct
+                            .direct
+                            .note_heat_demote_trial_spent(key, heat_epoch);
                         self.smc_heat_demote(key, heat_epoch);
                         ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::HEAT_DEMOTE);
@@ -1690,6 +1697,14 @@ impl CpuGsw {
                         }
                     };
                     if !lane_install {
+                        // Task 0's span-gate split: a zero-lane compilation short-circuits the
+                        // predicate above and spends no trial, so it is the part of the class no
+                        // trial-budget lever can convert. The complement is the one where the
+                        // trial, not the lane, was the refusal.
+                        #[cfg(feature = "direct-admission-census")]
+                        self.jit_direct
+                            .direct
+                            .note_lane_install_demote(compilation.imm_lane_count() > 0);
                         self.smc_heat_demote(key, heat_epoch);
                         ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::LANE_INSTALL_DEMOTE);
@@ -1714,7 +1729,7 @@ impl CpuGsw {
                 // AFTER `install` succeeded, so an `InstallFailed` dormant park is never counted
                 // as the trial's success half (review note on the first placement).
                 if lane_trial {
-                    self.jit_direct.direct.note_lane_trial_install();
+                    self.jit_direct.direct.note_lane_trial_install(key);
                 }
                 // The three per-family lane REGISTRATIONS below are charged here, on the success
                 // arm of `install`. Their counterparts, the per-family lane-budget REFUSALS, are

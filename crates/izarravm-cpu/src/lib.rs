@@ -2157,6 +2157,26 @@ pub struct DirectStallSnapshot {
     /// span. See `DirectStallTally`.
     pub lane_trials: u64,
     pub lane_trial_installs: u64,
+    /// The grant split (`lane_trials == first_grants + regrants`, all three real counters), the
+    /// budget/probation refusals, and Task 0's two plain F2 counters. See `DirectStallTally`.
+    pub lane_trial_first_grants: u64,
+    pub lane_trial_regrants: u64,
+    pub lane_trial_budget_refusals: u64,
+    pub heat_demote_trial_spent: u64,
+    pub heat_demote_trial_spent_earned: u64,
+    /// Task 0's census-gated half: the head-cluster split, the span-gate demote split, and the
+    /// park-length pair. See `DirectStallTally` — the park mean is a LOWER bound and is read with
+    /// its censoring rate.
+    #[cfg(feature = "direct-admission-census")]
+    pub heat_demote_trial_spent_earned_head3: u64,
+    #[cfg(feature = "direct-admission-census")]
+    pub lane_install_demote_no_lanes: u64,
+    #[cfg(feature = "direct-admission-census")]
+    pub lane_install_demote_trial_spent: u64,
+    #[cfg(feature = "direct-admission-census")]
+    pub dormant_heat_park_epochs: u64,
+    #[cfg(feature = "direct-admission-census")]
+    pub park_lifts: u64,
     /// Displacement lanes registered at install — the disp share of
     /// `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
     pub disp_lane_registrations: u64,
