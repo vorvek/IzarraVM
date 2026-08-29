@@ -11754,22 +11754,38 @@ pub(crate) fn direct_poll_skip_max_raw() -> u64 {
 ///
 /// # THE SPELLING TABLE
 ///
-/// A **DEFAULT-OFF** boolean ARM knob on the `IZARRAVM_JCC_SHADOW` /
-/// `IZARRAVM_CHAIN_ENTRY_CHECK` construction -- explicitly NOT `IZARRAVM_ATA_POLL_SKIP`'s
-/// inverted shape, and explicitly NOT a PARAMETER knob (those have no OFF spelling at all:
-/// UNSET, never `=0`).
+/// A boolean ARM knob on the `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK`
+/// construction -- explicitly NOT `IZARRAVM_ATA_POLL_SKIP`'s inverted shape, and explicitly
+/// NOT a PARAMETER knob (those have no OFF spelling at all: UNSET, never `=0`).
 ///
-/// * **unset**, the EMPTY STRING, `0` or `off` -> OFF: the shipped default and the ladder's A
-///   arm, under which a 16-bit call-out is screened out before any cache probe or scan,
-///   bit-identical to `main`.
-/// * `1` / `on` -> ON: the 16-bit arm reaches the negative-cache probe and the scan.
+/// * **unset** and the EMPTY STRING -> ON: the same arm, and since the flip below that arm is
+///   THE DEFAULT. The 16-bit call-out reaches the negative-cache probe and the scan, so the D1
+///   and D1b shapes can certify.
+/// * `0` / `off` -> OFF, stated: the pre-flip behaviour, under which a 16-bit call-out is
+///   screened out before any cache probe or scan, bit-identical to `main` @ `0333d956`. This is
+///   the escape hatch and the ladder's A arm.
+/// * `1` / `on` -> ON, stated.
 /// * **anything else PANICS**, naming the variable. A mistyped ladder leg that fell through
 ///   would run the DEFAULT and be read as "the arm I asked for changed nothing", the one wrong
 ///   conclusion an arm ladder exists to avoid.
 ///
-/// Nulling a variable in PowerShell leaves it PRESENT and EMPTY; this table spells that OFF,
-/// the same arm as unset, so the trap cannot silently disarm a leg that meant to run the base.
-/// The mirror-image cost is that **an ON leg must EXPORT `1`**.
+/// **Default is ON since 2026-08-29, on the owner's approval.** The evidence: tyrian-586
+/// **2.78x** (63.4 s -> 22.8 s min-wall), `jit_direct_poll_decline_sixteen_bit` -> 0,
+/// `jit_direct_poll_skip_spans` 29,120, `jit_direct_poll_decline_mask_source` **0** (so the
+/// MAJOR-7 storm class never fired and the sticky memo was never load-bearing on this row), and
+/// `timer.irq0_edges` / MPU `data_writes` / DSP `command_bytes` / guest seconds all
+/// BIT-IDENTICAL across the arms -- the skip moved wall, not guest-visible state. gp2-586, the
+/// 32-bit control, passes with the mechanism idle. wolf3d-586 is neutral: its apparent +3.7% was
+/// binary-layout variance, ON equals OFF on one binary, and it records zero 16-bit declines.
+/// **The flip changes exactly the two `return` arms below the `NotPresent` and `""` matches
+/// below, and nothing else** -- every other spelling row is untouched.
+///
+/// **THE NULLING TRAP REVERSES WITH THE FLIP, and that is the cost of it.** Nulling a variable
+/// in PowerShell leaves it PRESENT and EMPTY, and this table now spells that ON, the same arm
+/// as unset. Before the flip the trap pointed at the ON leg and an ON leg had to export `1`;
+/// **now it points at the OFF leg, and an OFF leg must EXPORT `0`.** A ladder leg that merely
+/// fails to set the variable runs the CANDIDATE, not the base. Same direction as
+/// `IZARRAVM_DIRECT_POLL_SKIP` after its own 2026-08-27 flip, for the same reason.
 ///
 /// # THE HOT READ IS NOT HERE
 ///
@@ -11791,20 +11807,25 @@ pub(crate) fn direct_poll_skip_16_armed() -> bool {
 /// The `IZARRAVM_DIRECT_POLL_SKIP_16` spelling table, lifted out of the `OnceLock` closure so it
 /// can be unit-tested without a process-global env write. See `direct_poll_skip_16_armed`.
 fn parse_direct_poll_skip_16_arm(value: Result<String, std::env::VarError>) -> bool {
-    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
-                            default: a 16-bit code segment is screened out before the poll \
-                            scan, exactly as on main), and `1` / `on` (the 16-bit arm: the \
-                            call-out may certify the D1 and D1b 3-slot shapes)";
+    const ACCEPTED: &str = "accepted spellings are unset or `` (the shipped default: ON since \
+                            the 2026-08-29 owner approval, the call-out may certify the D1 and \
+                            D1b 3-slot shapes in a 16-bit code segment) and `0` / `off` (the \
+                            OFF arm, stated: a 16-bit code segment is screened out before the \
+                            poll scan, exactly as on main) or `1` / `on` (the same ON arm, \
+                            stated)";
     let raw = match value {
-        // Unset = OFF, and so is the empty string one arm down: an ON leg must EXPORT `1`.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the default, and the default is ON since 2026-08-29.
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => panic!(
             "IZARRAVM_DIRECT_POLL_SKIP_16 is set to a value that is not valid UTF-8; {ACCEPTED}"
         ),
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" => false,
+        // Empty names the SAME arm as unset -- the default. Post-flip the nulling trap points at
+        // the OFF leg: an OFF leg must EXPORT `0`.
+        "" => true,
+        "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_DIRECT_POLL_SKIP_16={other:?} names no arm; {ACCEPTED}. Refusing to guess: \

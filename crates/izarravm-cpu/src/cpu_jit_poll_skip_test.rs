@@ -412,23 +412,28 @@ fn the_register_mask_test_slot_is_exempt_from_the_head_prefilter_set() {
     );
 }
 
-/// **T-D7.** The `IZARRAVM_DIRECT_POLL_SKIP_16` spelling table. A DEFAULT-OFF boolean
-/// arm knob on the `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK` construction:
-/// unset and `""` name the SAME arm and that arm is OFF, so PowerShell's nulling trap
-/// (a variable left present and empty) cannot silently ARM the slice. The mirror-image
-/// cost is stated in the knob's own doc: an ON leg must export `1`.
+/// **T-D7.** The `IZARRAVM_DIRECT_POLL_SKIP_16` spelling table. A boolean arm knob on the
+/// `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK` construction: unset and `""` name
+/// the SAME arm, and since the 2026-08-29 flip that arm is ON.
+///
+/// **The `""` row moves WITH the default arm, deliberately, and that is why it is written
+/// as "the same arm as unset" rather than as a literal.** The invariant it defends is the
+/// AGREEMENT between the two spellings -- what stops a nulled PowerShell variable (present
+/// and empty) from naming a different arm than an unset one. The flip moves both together;
+/// it does not weaken the row. The cost is that the nulling trap now points at the OFF
+/// leg: an OFF leg must export `0`.
 #[test]
 fn direct_poll_skip_16_spelling_table() {
     use std::env::VarError;
     let parse = jit::direct::parse_direct_poll_skip_16_arm_for_test;
     assert!(
-        !parse(Err(VarError::NotPresent)),
-        "unset must name the OFF arm: this slice ships default OFF"
+        parse(Err(VarError::NotPresent)),
+        "unset must name the ON arm: this knob ships default ON since 2026-08-29"
     );
     assert!(
-        !parse(Ok(String::new())),
-        "the empty string must name the SAME arm as unset -- OFF -- so a nulled ladder \
-         leg runs the base rather than the candidate"
+        parse(Ok(String::new())),
+        "the empty string must name the SAME arm as unset -- ON since the flip -- so a \
+         nulled ladder leg cannot disagree with an unset one"
     );
     for off in ["0", "off", "OFF", " off ", "Off"] {
         assert!(!parse(Ok(off.to_string())), "{off:?} must name the OFF arm");
@@ -457,10 +462,10 @@ fn non_utf8_direct_poll_skip_16_arm_panics() {
 
 /// THE DEFAULT PIN: with the ambient variable read exactly as `direct_poll_skip_16_armed`
 /// reads it, the process-wide reading must agree with the spelling table, and with the
-/// variable unset the arm must be OFF. Reads the AMBIENT knob deliberately, on the
+/// variable unset the arm must be ON. Reads the AMBIENT knob deliberately, on the
 /// `direct_poll_skip_ships_on_by_default` model, so the suite stays runnable on either arm.
 #[test]
-fn direct_poll_skip_16_ships_off_by_default() {
+fn direct_poll_skip_16_ships_on_by_default() {
     let ambient = std::env::var("IZARRAVM_DIRECT_POLL_SKIP_16");
     let expected = jit::direct::parse_direct_poll_skip_16_arm_for_test(ambient.clone());
     assert_eq!(
@@ -471,9 +476,10 @@ fn direct_poll_skip_16_ships_off_by_default() {
     );
     if matches!(ambient, Err(std::env::VarError::NotPresent)) {
         assert!(
-            !expected,
-            "IZARRAVM_DIRECT_POLL_SKIP_16 must default OFF: the slice ships behind a knob \
-             and flipping it is a separate owner decision"
+            expected,
+            "IZARRAVM_DIRECT_POLL_SKIP_16 must default ON: the ladder priced the arm \
+             (tyrian-586 2.78x, 63.4 s -> 22.8 s min-wall, guest-visible state \
+             bit-identical) and the owner approved the flip on 2026-08-29"
         );
     }
 }

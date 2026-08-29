@@ -457,6 +457,12 @@ fn a_sixteen_bit_callout_declines_before_the_scan() {
     machine.set_jit_auto_admit(true);
     machine.cpu.set_native_backend_enabled(true);
     machine.cpu.set_direct_poll_skip_override(Some(true));
+    // Pin the OFF arm EXPLICITLY. Until 2026-08-29 this fixture relied on
+    // `IZARRAVM_DIRECT_POLL_SKIP_16` being unset, and unset meaning OFF; the flip made unset
+    // mean ON, which would have turned this row into a test of the opposite arm while still
+    // passing its `poll_attempts > 0` assertion. The screen it exists to prove is still there,
+    // and this is the spelling that still asks for it.
+    machine.cpu.set_direct_poll_skip_16_override(Some(false));
     machine.cpu.registers.set_edx(0x03da);
     machine.cpu.registers.eip = 0x100;
     machine.trace.set_tracing_mode(TracingMode::Off);
@@ -1311,4 +1317,55 @@ fn the_sixteen_bit_off_arm_screens_before_the_scan() {
             "{name}: the OFF arm must not probe or store the negative cache"
         );
     }
+}
+
+/// **THE FLIP PIN.** With the per-CPU override left at `None` -- i.e. reading the AMBIENT
+/// `IZARRAVM_DIRECT_POLL_SKIP_16` exactly as a shipped build does -- a 16-bit certified loop
+/// must commit a span. That is the 2026-08-29 default-ON flip, asserted end to end through
+/// the emitted call-out rather than only at the spelling table.
+///
+/// Skipped, not failed, when the suite is run with the variable explicitly set to the OFF arm:
+/// the ladder legs that do that are legitimate, and a row that cannot be run on both arms is
+/// worse than one that says which arm it saw.
+#[cfg(feature = "jit")]
+#[test]
+fn the_sixteen_bit_arm_is_on_by_default_end_to_end() {
+    let ambient = std::env::var("IZARRAVM_DIRECT_POLL_SKIP_16");
+    let armed = match ambient.as_deref() {
+        Err(_) | Ok("") => true,
+        Ok(raw) => !matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "off"),
+    };
+    if !armed {
+        return;
+    }
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &[0xec, 0xa8, 0x08, 0x75, 0xfb]).unwrap();
+    machine.set_jit_auto_admit(true);
+    machine.cpu.set_native_backend_enabled(true);
+    machine.cpu.set_direct_poll_skip_override(Some(true));
+    // NO `set_direct_poll_skip_16_override` -- the ambient reading is the point of this row.
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    assert!(!machine.cpu.registers.cs().default_size_32);
+    machine.cpu.registers.set_edx(0x03da);
+    machine.cpu.registers.eip = 0x100;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    set_status1_bit(&mut machine, 0x08, true);
+
+    machine
+        .run_cycles(2_000_000)
+        .expect("the fixture must not stop the machine");
+    let snapshot = machine.cpu.direct_stall_snapshot();
+    assert!(
+        snapshot.poll_skip_spans.iter().sum::<u64>() > 0,
+        "the shipped default must certify a 16-bit poll loop; attempts={} sixteen_bit={}          shape={} mask_source={}",
+        snapshot.poll_attempts,
+        snapshot.poll_declined_sixteen_bit,
+        snapshot.poll_declined_shape,
+        snapshot.poll_declined_mask_source,
+    );
+    assert_eq!(
+        snapshot.poll_declined_sixteen_bit, 0,
+        "on the default arm the 16-bit screen can never be true"
+    );
 }
