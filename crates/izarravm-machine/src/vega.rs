@@ -1595,6 +1595,18 @@ impl Vega {
     /// BAR0. Any aperture added to `may_own_memory` above 1 MB MUST be added
     /// here as well; `may_own_memory_agrees_with_the_extended_floor` is the test
     /// that fails when one is not.
+    ///
+    /// WHAT WOULD ACTUALLY BREAK THIS, since "any aperture" is too broad to be
+    /// useful. Because this returns the LOWEST claimant above 1 MB, a new
+    /// claimant placed ABOVE `MARGO_LFB_BASE` costs nothing: the screen already
+    /// declines everything up there and hands it to the gauntlet. That covers
+    /// the top-of-4GB BIOS alias (0xFFFF_0000) and would equally cover an APIC
+    /// at 0xFEC0_0000 or 0xFEE0_0000 if this machine ever modelled one -- it
+    /// does not today (no SMP, PIC-only interrupts), and it would not matter
+    /// here if it did. The ONLY dangerous addition is a claimant BETWEEN 1 MB
+    /// and `MARGO_LFB_BASE`, which is exactly the window the sweep covers.
+    /// Raised in review of PR #768 by the dynarec campaign; recorded because the
+    /// reasoning is the useful part, not the answer.
     pub(crate) fn device_free_extended_floor(&self) -> u32 {
         if self.distira_memory_enabled() && self.distira_mem_base < MARGO_LFB_BASE {
             self.distira_mem_base
