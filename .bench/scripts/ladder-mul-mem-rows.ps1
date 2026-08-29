@@ -94,6 +94,16 @@ param(
     # becomes REQUIRED, and probes that moved mean the switch failed to pin the
     # arm.
     [switch]$NullControl,
+    # Per-round validity gate, in PERCENT. A round whose WITHIN-ARM spread exceeds this is
+    # excluded from the gated result and should be re-run. Pick it BEFORE the run, from the
+    # size of the effect expected: a round where one arm disagrees with itself by more than
+    # the effect has not measured the effect.
+    #
+    # The default is 1.0 because that is roughly what a quiet round on this box delivers --
+    # the 2026-08-29 MUL ladder's round 1 read 0.45% and 0.54%, while its round 3 read 16.12%.
+    # Gating on this CANNOT bias the answer: the within-arm spread is zero-effect by
+    # construction and blind to the arm comparison.
+    [double]$NullThreshold = 1.0,
     # Resolve -Rows, print the selection, exit 0. Exists so the self-test's
     # green control can prove a well-formed invocation binds without running a
     # leg. Run-set arguments still have to be supplied; dummies are fine.
@@ -361,12 +371,25 @@ function Get-BuilderCount {
 # WAY whether such a thing is present or absent, which is the definition of a non-instrument
 # ([[asymmetric-probes-are-not-evidence]]).
 #
-# TO ATTRIBUTE a fifth excursion rather than merely notice it, sample TOTAL SYSTEM CPU across
-# the leg -- e.g. the `\Processor(_Total)\% Processor Time` counter, or a CPU-delta sample of
-# every process either side of the leg -- and record it on the row beside the builder count.
-# Deliberately NOT added mid-campaign: it changes what every row carries, and the legs already
-# taken would not have it. Add it in its own commit, with an A/A to show the sampling itself
-# costs nothing.
+# ADDED 2026-08-29 in answer to that gap: `Get-SystemCpuSeconds` below, and the per-leg
+# `cpu_s` / `foreign_s` columns. The builder count is kept because it names WHAT was running
+# when it fires; the CPU columns say HOW MUCH ran when nothing is named.
+
+# Total CPU seconds consumed by every process this session can see. Sampled either side of a
+# leg, the DELTA is the whole box's CPU consumption across that leg; subtract the emulator's
+# own `cpu_s` and what is left is FOREIGN CPU -- an indexer, an antivirus pass, an update
+# worker, a differently-named child, anything.
+#
+# Protected processes (System, Idle, and anything this session cannot open) throw on the
+# property read and are skipped. They are skipped in BOTH samples, so the delta stays
+# meaningful for everything visible; it is a lower bound on foreign work, never an upper one.
+function Get-SystemCpuSeconds {
+    $total = 0.0
+    foreach ($process in (Get-Process -ErrorAction SilentlyContinue)) {
+        try { $total += $process.TotalProcessorTime.TotalSeconds } catch { }
+    }
+    return $total
+}
 
 function Invoke-Leg([string]$Row, [string]$Arm, [int]$Round) {
     $fixture = $fixtures[$Row]
@@ -390,12 +413,40 @@ function Invoke-Leg([string]$Row, [string]$Arm, [int]$Round) {
     $arguments += @("--profile-json", $profilePath)
     $arguments += $fixture.injection
 
+    # LAUNCHED THROUGH ProcessStartInfo RATHER THAN `& $Executable`, and the reason is the
+    # measurement rather than style: only a retained `Process` object exposes
+    # `TotalProcessorTime` after exit, and that is the estimator this run exists to test.
+    # `ArgumentList` (not a joined string) so the gp2 mouse schedule's semicolons and colons
+    # need no quoting rules.
+    #
+    # stdout goes to a FILE, never to an undrained pipe. A redirected pipe nobody reads
+    # deadlocks the child as soon as it fills, and the emulator does write.
+    $stdoutPath = Join-Path $OutDir "$stamp.stdout.txt"
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    foreach ($argument in $arguments) { $startInfo.ArgumentList.Add([string]$argument) }
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+
     $buildersBefore = Get-BuilderCount
+    $systemBefore = Get-SystemCpuSeconds
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    & $Executable @arguments | Out-Null
+    $process = [Diagnostics.Process]::Start($startInfo)
+    # Drain on a background task so a chatty child cannot fill the pipe and block.
+    $drain = $process.StandardOutput.ReadToEndAsync()
+    $process.WaitForExit()
     $watch.Stop()
+    $cpuSeconds = $process.TotalProcessorTime.TotalSeconds
+    $exitCode = $process.ExitCode
+    $systemAfter = Get-SystemCpuSeconds
     $buildersAfter = Get-BuilderCount
-    if ($LASTEXITCODE -ne 0) { throw "$stamp exited $LASTEXITCODE" }
+    Set-Content -LiteralPath $stdoutPath -Value $drain.GetAwaiter().GetResult()
+    $process.Dispose()
+    if ($exitCode -ne 0) { throw "$stamp exited $exitCode" }
+    # A lower bound on foreign CPU: everything the box burned across the leg, less the
+    # emulator's own. Clamped at 0 because the two system samples are taken microseconds
+    # outside the stopwatch and can round the wrong way on a quiet box.
+    $foreignSeconds = [math]::Max(0.0, ($systemAfter - $systemBefore) - $cpuSeconds)
 
     # duke3d writes its own scorecard into the working copy and then ends the VM
     # with EXITVM. Keep it before the copy goes: its sample count and Info String
@@ -413,6 +464,12 @@ function Invoke-Leg([string]$Row, [string]$Arm, [int]$Round) {
         round    = $Round
         dirty    = ($buildersBefore -gt 0 -or $buildersAfter -gt 0)
         wall_s   = [math]::Round($watch.Elapsed.TotalSeconds, 3)
+        # The candidate estimator. The emulator is single-threaded, so this is wall MINUS
+        # time the scheduler gave to something else -- which is exactly what an indexer or an
+        # antivirus pass takes and what no name-list detector can see.
+        cpu_s    = [math]::Round($cpuSeconds, 3)
+        # Foreign CPU seconds across the leg, a lower bound. Non-zero means something else ran.
+        foreign_s = [math]::Round($foreignSeconds, 3)
         guest_s  = $report.guest_seconds
         insns    = $report.perf.instructions
         bus      = $report.raw_bus_clocks
@@ -432,8 +489,8 @@ foreach ($row in $Rows) {
             $leg = Invoke-Leg $row $arm $round
             $legs.Add($leg)
             $flag = if ($leg.dirty) { "  <-- BUILDER ACTIVE, leg suspect" } else { "" }
-            "{0,-16} arm {1}  r{2}  wall {3,8:N3}s  guest {4,8:N3}  rt {5,6:N3}{6}" -f `
-                $leg.row, $leg.arm, $leg.round, $leg.wall_s, $leg.guest_s, $leg.rt, $flag | Write-Host
+            "{0,-16} arm {1}  r{2}  wall {3,8:N3}s  cpu {4,8:N3}s  foreign {5,7:N1}s  rt {6,6:N3}{7}" -f `
+                $leg.row, $leg.arm, $leg.round, $leg.wall_s, $leg.cpu_s, $leg.foreign_s, $leg.rt, $flag | Write-Host
         }
     }
 }
@@ -492,19 +549,123 @@ foreach ($row in $Rows) {
 }
 
 Write-Host ""
-Write-Host "=== WALL (OFF = main's refusal, ON = MulMemAcc; ratio > 1 means ON is faster) ==="
+Write-Host "=== RESULT, BOTH ESTIMATORS (OFF = main's refusal, ON = MulMemAcc) ==="
+Write-Host "    ratio > 1 means ON is faster. Under -NullControl BOTH numbers are FLOORS,"
+Write-Host "    not effects, and the smaller one names the better estimator."
 foreach ($row in $Rows) {
-    $off = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "0" } | Measure-Object wall_s -Minimum).Minimum
-    $on = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "1" } | Measure-Object wall_s -Minimum).Minimum
-    $pairsAbove = 0
+    foreach ($metric in @("wall_s", "cpu_s")) {
+        $off = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "0" } | Measure-Object $metric -Minimum).Minimum
+        $on = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "1" } | Measure-Object $metric -Minimum).Minimum
+        $pairsAbove = 0
+        for ($round = 1; $round -le $Rounds; $round++) {
+            $o = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "0" -and $_.round -eq $round } | Measure-Object $metric -Minimum).Minimum
+            $n = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "1" -and $_.round -eq $round } | Measure-Object $metric -Minimum).Minimum
+            if ($o -gt $n) { $pairsAbove++ }
+        }
+        $ratio = if ($on -gt 0) { $off / $on } else { [double]::NaN }
+        "{0,-16} min-{1,-6} OFF {2,8:N3}s  ON {3,8:N3}s  ratio {4,6:N4}  pairs above 1: {5}/{6}" -f `
+            $row, $metric.Replace("_s", ""), $off, $on, $ratio, $pairsAbove, $Rounds | Write-Host
+    }
+    foreach ($metric in @("wall_s", "cpu_s")) {
+        $values = @($legs | Where-Object row -eq $row | ForEach-Object { $_.$metric })
+        $low = ($values | Measure-Object -Minimum).Minimum
+        $high = ($values | Measure-Object -Maximum).Maximum
+        "{0,-16} {1,-6} spread over all legs: {2,8:N3} .. {3,8:N3}  = {4,6:N2}%" -f `
+            $row, $metric.Replace("_s", ""), $low, $high, (100 * ($high - $low) / $low) | Write-Host
+    }
+    $foreign = @($legs | Where-Object row -eq $row | ForEach-Object foreign_s | Measure-Object -Maximum).Maximum
+    "{0,-16} worst foreign CPU on any leg: {1,7:N1}s" -f $row, $foreign | Write-Host
+}
+
+# THE IN-SESSION NULL, and it costs nothing because every A/B/B/A round already contains it.
+#
+# WHY THIS EXISTS. Two A/A null controls on gp2-586 -- same fixture, same estimator, same
+# binary, two hours apart on 2026-08-29 -- returned min-wall ratios of 1.0290 and 0.9993. A
+# SINGLE A/A IS ONE SAMPLE OF THE NULL DISTRIBUTION, NOT A FLOOR, and running one before or
+# after the effect measures a different box from the one the effect was measured on.
+#
+# Each round runs each arm TWICE. The spread between one arm's two legs is a NULL PAIR taken
+# under exactly the conditions of that round: same minute, same box state, same everything,
+# and by construction zero effect. That is the number the between-arm ratio has to beat.
+#
+# READ IT THIS WAY: if the between-arm effect is not comfortably larger than the worst
+# within-arm null in the same run, the ladder has not resolved anything, whatever the
+# headline ratio says. On the 2026-08-29 MUL slice the within-arm nulls ran 0.45% to 16.1%
+# with a median near 2%, against a 2.3% effect -- which is the park verdict, reached without
+# spending one extra leg.
+Write-Host ""
+Write-Host "=== IN-SESSION NULL: within-arm spread per round (zero effect by construction) ==="
+foreach ($row in $Rows) {
+    $worst = 0.0
     for ($round = 1; $round -le $Rounds; $round++) {
+        $line = "  round {0}:" -f $round
+        foreach ($arm in @("0", "1")) {
+            $values = @($legs | Where-Object {
+                    $_.row -eq $row -and $_.arm -eq $arm -and $_.round -eq $round
+                } | ForEach-Object wall_s)
+            if ($values.Count -lt 2) { continue }
+            $low = ($values | Measure-Object -Minimum).Minimum
+            $high = ($values | Measure-Object -Maximum).Maximum
+            $spread = 100 * ($high - $low) / $low
+            if ($spread -gt $worst) { $worst = $spread }
+            $line += "  arm {0} null {1,6:N2}%" -f $arm, $spread
+        }
+        Write-Host $line
+    }
+    "{0,-16} WORST within-arm null: {1,6:N2}%   <-- the between-arm effect must beat this" -f `
+        $row, $worst | Write-Host
+}
+
+# PER-ROUND VALIDITY, and this is the part that turns the null into a usable protocol rather
+# than a warning label.
+#
+# The within-arm null is ZERO EFFECT BY CONSTRUCTION, so gating a round on it CANNOT leak the
+# effect into the selection. That is what separates this from choosing the sample after seeing
+# it, which this campaign's memory rightly forbids: the criterion is blind to the arm
+# comparison. A round where one arm disagrees with ITSELF by more than the effect being
+# measured has not measured the effect, whatever its between-arm ratio says.
+#
+# Measured on the 2026-08-29 MUL ladder, the four rounds' worst within-arm nulls were 0.54%,
+# 4.38%, 16.12% and 2.26%. The box is not uniformly noisy -- round 1 was quiet enough to
+# resolve well under 1% -- so the failure was mixing quiet and contaminated rounds into one
+# min-wall figure, not the rig being hopeless.
+#
+# HOW TO USE IT: pick -NullThreshold BEFORE the run, from the size of the effect you expect;
+# a round whose null exceeds it is excluded and RE-RUN, not averaged in. Report how many
+# rounds survived. Fewer than three surviving rounds is not a result.
+Write-Host ""
+"=== PER-ROUND EFFECT, gated on the null (-NullThreshold {0:N2}%) ===" -f $NullThreshold | Write-Host
+foreach ($row in $Rows) {
+    $valid = @()
+    for ($round = 1; $round -le $Rounds; $round++) {
+        $nulls = @()
+        foreach ($arm in @("0", "1")) {
+            $values = @($legs | Where-Object {
+                    $_.row -eq $row -and $_.arm -eq $arm -and $_.round -eq $round
+                } | ForEach-Object wall_s)
+            if ($values.Count -lt 2) { continue }
+            $low = ($values | Measure-Object -Minimum).Minimum
+            $nulls += 100 * (($values | Measure-Object -Maximum).Maximum - $low) / $low
+        }
+        $worstNull = if ($nulls.Count -gt 0) { ($nulls | Measure-Object -Maximum).Maximum } else { 0 }
         $o = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "0" -and $_.round -eq $round } | Measure-Object wall_s -Minimum).Minimum
         $n = ($legs | Where-Object { $_.row -eq $row -and $_.arm -eq "1" -and $_.round -eq $round } | Measure-Object wall_s -Minimum).Minimum
-        if ($o -gt $n) { $pairsAbove++ }
+        $ratio = if ($n -gt 0) { $o / $n } else { [double]::NaN }
+        $ok = $worstNull -le $NullThreshold
+        if ($ok) { $valid += $ratio }
+        "  round {0}  ratio {1,6:N4}   worst null {2,6:N2}%   {3}" -f `
+            $round, $ratio, $worstNull, $(if ($ok) { "VALID" } else { "EXCLUDED -- re-run this round" }) | Write-Host
     }
-    $ratio = if ($on -gt 0) { $off / $on } else { [double]::NaN }
-    "{0,-16} min-wall OFF {1,8:N3}s  ON {2,8:N3}s  ratio {3,6:N4}  pairs above 1: {4}/{5}" -f `
-        $row, $off, $on, $ratio, $pairsAbove, $Rounds | Write-Host
+    if ($valid.Count -eq 0) {
+        "{0,-16} NO VALID ROUNDS. This ladder measured nothing; re-run on a quieter box." -f $row | Write-Host
+    }
+    else {
+        $mean = ($valid | Measure-Object -Average).Average
+        $above = @($valid | Where-Object { $_ -gt 1 }).Count
+        "{0,-16} {1} of {2} rounds valid   mean ratio {3,6:N4}   above 1: {4}/{5}{6}" -f `
+            $row, $valid.Count, $Rounds, $mean, $above, $valid.Count,
+        $(if ($valid.Count -lt 3) { "   <-- FEWER THAN THREE VALID ROUNDS IS NOT A RESULT" } else { "" }) | Write-Host
+    }
 }
 
 $dirtyLegs = @($legs | Where-Object dirty)
