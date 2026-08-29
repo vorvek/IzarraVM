@@ -4,66 +4,63 @@
 
 <#
 .SYNOPSIS
-The MUL-memory-row ladder: gp2-586 plus controls, both arms from ONE binary.
+A two-arm knob ladder: one binary, both arms, with the null measured in-session.
 
 .DESCRIPTION
+THE NAME IS HISTORICAL. This began as the MUL-memory ladder and is now the
+general two-arm ladder; `-Knob` names which knob the arms select and defaults
+to that first slice. The file keeps its name so the commits and memories that
+cite it do not become dangling references -- the same reason the classify arm's
+repaired test citations matter.
+
 `run-fixture-scoreboard.ps1` REMOVES every IZARRAVM_* variable from the child
 (see its Get-RowEnvironment), so it can only ever run a knob's DEFAULT arm. Arm
 work therefore needs a direct invocation, and this is it.
 
-WHAT IS BEING MEASURED. `0xF7 /4` MUL r/m32 in its MEMORY form had no lowering,
-while the signed `/5` sibling has had one since the rejected-row campaign. The
-2026-08-29 evening census measured that row at 13.1 M interpreted hits on
-gp2-586 -- the second head of that fixture's rejected class, which is 101.4 M
-exits and 65% of its 156.4 M unbound. A rejected-class hit is a block
-TERMINATION, so what the admission buys is the EXTENSION past the multiply, not
-the multiply. Design: `dev_docs/gp2-mul-mem-slice-design-2026-08-29.md`.
-
 WHY ONE BINARY. Layout variance between two builds of this workspace has been
 measured at 3.7% on this box -- larger than most levers. A two-binary comparison
-cannot carry a claim this size, so the knob exists and both arms come out of the
+cannot carry a claim that size, so the knob exists and both arms come out of the
 same executable.
 
-Arms, both reachable in one binary:
-  IZARRAVM_MUL_MEM_ROWS=0  the OFF arm, main's refusal, the A/B base and the
-                           shipped default
-  IZARRAVM_MUL_MEM_ROWS=1  the ON arm, `DirectKind::MulMemAcc`
+THE KNOB CONTRACT. `-Knob` must name a knob spelling its arms "0" and "1" and
+DEFAULTING OFF, because arm 0 is always the A/B base here. A knob defaulting ON
+would make arm 0 the candidate and silently invert every ratio printed below.
+Both slice knobs are pinned OFF in `Set-BaseEnvironment`, so a stray
+parent-shell value for the one NOT under test cannot ride along in both arms.
 
-THE IDENTITY GATE, and why this slice predicts identity where a lowering
-normally would not. The whole group-3 interpreter arm returns `clocks(2)` for
-every sub-opcode and both operand forms, which IS the `DirectKind::raw_clocks`
-default the emitted form charges; the memory read is declared through
-`dword_reads`, so the bus charge matches too. gp2 is deterministic and the
-budget is a fixed cycle count, so the two arms must execute the SAME guest
-instruction stream and charge the SAME clocks. `guest_s`, `insns`, `bus` and
-`ticks` are therefore checked as a HARD gate.
+THREE GATES, and each answers a different way of being wrong.
 
-`decode_probes` is NOT in the gate and must not be added to it. Block formation
-is exactly what this slice changes, so that column is EXPECTED to move; it is
-reported for information, and a probe count that did NOT move would mean the
-arm never took.
+* IDENTITY. `guest_s`, `insns`, `bus` and `ticks` must be single-valued across
+  every leg. Both slices so far predict this: their emitted forms charge what
+  the interpreter charges, so the arms execute the same guest stream. A
+  divergence is a real finding, not noise.
+* NON-VACUITY. `decode_probes` moving proves the arm reached block formation.
+  Probes that did NOT move mean EITHER the knob never took OR this fixture has
+  no population for the row -- and wall data cannot separate those, so the gate
+  reports both and says a census settles it.
+* THE IN-SESSION NULL. Every A/B/B/A round runs each arm TWICE, so the spread
+  between one arm's own two legs is a null pair from that round, with zero
+  effect by construction. `-NullThreshold` excludes a round that exceeds it.
+  This exists because two A/A controls on gp2-586, same binary and estimator,
+  two hours apart, read 1.0290 and 0.9993: ONE A/A IS ONE SAMPLE OF THE NULL
+  DISTRIBUTION, NOT A FLOOR.
 
-PROVING THE OFF ARM IS OFF. Not from this script, and not from a counter that
-reads zero -- a zero counter is equally consistent with "the knob is off" and
-with "the instrument is not wired up". Take a barrier-census leg per arm
-(`IZARRAVM_DIRECT_BARRIER_CENSUS=1`, plain release build) and read the
-`0xF7 /4` memory row: it must be present at roughly 13 M hits in the OFF leg and
-ABSENT in the ON leg. That instrument answers differently under each hypothesis,
-which a zero counter does not.
+PROVING AN OFF ARM IS OFF. Not from this script, and not from a counter reading
+zero -- that is equally consistent with "the knob is off" and "the instrument is
+unwired". Take a barrier-census leg per arm (`IZARRAVM_DIRECT_BARRIER_CENSUS=1`,
+plain release build) and read the row: present in one arm, ABSENT in the other.
+That instrument answers differently under each hypothesis.
 
-Pre-registered bars, written before the first graded leg:
-  gp2-586           min-wall ratio >= 1.02 AND pairs above 1 in at least 3 of 4
-                    rounds. This is the magnitude claim and the only one.
-  duke3d-586-short  CONTROL. Must stay inside +/-2%.
-  nascar-586        CONTROL. Must stay inside +/-2%. Its own census re-ranked
-                    RCL and LOOP above this row after PR #766, so a large move
-                    here would need explaining, not celebrating.
-A ratio below the bar is a PARK, not a fail. The most likely null is
-RELOCATION: the exits move onto the next rejected-class head (LOOP at 20.9 M,
-`0xC1 /4` SHL memory at 2.1 M) instead of disappearing, so the block still
-terminates and the slice bought a shorter interpreter visit rather than an
-extension. That is what the #764 ladder saw. Read the post-ladder census before
-calling a null a mystery.
+ESTIMATOR: min-wall. Process CPU time was TESTED as an alternative on
+2026-08-30 and REJECTED -- it tracked wall within 1% (the emulator was never
+descheduled, so there was nothing to remove) and its floor was worse. `cpu_s`
+and `foreign_s` are still recorded: `foreign_s` is what explains a 15%
+between-run difference that the four-name builder count called clean.
+
+READ A NULL RESULT AS A PARK, NOT A FAIL. The most likely null for an admission
+slice is RELOCATION -- the exits moving onto the next census head instead of
+disappearing, so the block still terminates. Check that row by row against a
+two-arm census before calling a null a mystery.
 #>
 
 # POSITIONAL BINDING IS OFF for the whole param block. Under `pwsh -File`, a
@@ -104,6 +101,14 @@ param(
     # Gating on this CANNOT bias the answer: the within-arm spread is zero-effect by
     # construction and blind to the arm comparison.
     [double]$NullThreshold = 1.0,
+    # WHICH KNOB the arms select. Defaults to the slice this script was written for; naming
+    # another makes it a general two-arm ladder rather than a copy-paste per slice.
+    #
+    # The knob must spell its arms "0" and "1" and must DEFAULT OFF, because the OFF arm here is
+    # always the A/B base. A knob that defaults ON would make arm 0 the candidate and silently
+    # invert every ratio this script prints.
+    [ValidateSet("IZARRAVM_MUL_MEM_ROWS", "IZARRAVM_LOOP_ROWS")]
+    [string]$Knob = "IZARRAVM_MUL_MEM_ROWS",
     # Resolve -Rows, print the selection, exit 0. Exists so the self-test's
     # green control can prove a well-formed invocation binds without running a
     # leg. Run-set arguments still have to be supplied; dummies are fine.
@@ -321,8 +326,8 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 # Every knob the board sets explicitly, so a stray parent-shell value cannot
-# turn an observation into a different arm. IZARRAVM_MUL_MEM_ROWS is set per leg
-# below and is the ONLY variable that differs between arms.
+# turn an observation into a different arm. The knob named by -Knob is set per
+# leg below and is the ONLY variable that differs between arms.
 function Set-BaseEnvironment {
     $env:IZARRAVM_JIT = "1"
     $env:IZARRAVM_JIT16 = "1"
@@ -330,6 +335,11 @@ function Set-BaseEnvironment {
     $env:IZARRAVM_ONE_LOOKUP_STORE = "1"
     $env:IZARRAVM_ONE_LOOKUP_LOAD = "1"
     $env:IZARRAVM_DIRECT_BARRIER_CENSUS = "0"
+    # Both slice knobs pinned OFF here; the one under test is set per leg AFTER this.
+    # Without this a stray parent-shell value for the OTHER slice would ride along in
+    # both arms and quietly change what the base is.
+    $env:IZARRAVM_MUL_MEM_ROWS = "0"
+    $env:IZARRAVM_LOOP_ROWS = "0"
     foreach ($observer in @(
             "IZARRAVM_CPU_PROFILE", "IZARRAVM_CPU_PROFILE_ADDRS",
             "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_RIP_PROFILE",
@@ -404,7 +414,7 @@ function Invoke-Leg([string]$Row, [string]$Arm, [int]$Round) {
     Set-BaseEnvironment
     # Under -NullControl both arms get "0" while keeping their labels, so the
     # reported ratio is the noise floor rather than an effect.
-    $env:IZARRAVM_MUL_MEM_ROWS = if ($NullControl) { "0" } else { $Arm }
+    Set-Item -Path "Env:$Knob" -Value $(if ($NullControl) { "0" } else { $Arm })
 
     $arguments = @()
     $arguments += $fixture.arguments
