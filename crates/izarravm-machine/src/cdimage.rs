@@ -155,6 +155,61 @@ impl Track {
     }
 }
 
+/// Cap on cached open host READ handles for a folder mount. Smaller than the
+/// HDD's eight ([`crate::katea_tree`]'s `MAX_HOST_READ_HANDLES`) because a disc
+/// is read by fewer streams at once: a game reading an FMV while its loader
+/// pulls data is two, and the linear scan below stays trivially short.
+const MAX_CD_READ_HANDLES: usize = 4;
+
+/// Open host handles for a folder mount, so a sequential read pays one
+/// `File::open` instead of one per 2048-byte sector.
+///
+/// The exact counterpart of the HDD's `host_read_cache`, and it exists for the
+/// same reason: `read_data_sector` takes `&self`, the emulation thread owns the
+/// image, so interior mutability is the shape. MRU is the last element.
+///
+/// NO INVALIDATION, and that is a deliberate difference from the HDD side. The
+/// HDD clears its handles on every host mutation because the guest writes
+/// through it and a replaced file must not keep reading its pre-write bytes. A
+/// mounted disc is read-only to the guest, and the ISO metadata the mount
+/// synthesized -- the extent table this cache is keyed by -- was computed once
+/// at mount time. If a host file is replaced underneath a live mount, that
+/// extent table is ALREADY stale about its length and layout, so a stale handle
+/// tells the guest nothing the mount was not telling it anyway. Adding
+/// invalidation here would imply a freshness guarantee the mount does not have.
+#[derive(Debug, Default)]
+struct FolderReadCache {
+    handles: std::cell::RefCell<Vec<(std::path::PathBuf, std::fs::File)>>,
+    /// Host `File::open` calls served by this mount. The mechanism this cache
+    /// exists for is invisible to a value comparison -- the bytes are identical
+    /// either way -- so this counter is what a test can actually grade.
+    host_file_opens: std::cell::Cell<u64>,
+    /// Handle slots. `MAX_CD_READ_HANDLES` in production; a test sets it to 0
+    /// to get the UNCACHED arm out of the same binary, which is what makes the
+    /// counter evidence rather than a number with nothing to compare against.
+    capacity: std::cell::Cell<usize>,
+}
+
+impl FolderReadCache {
+    fn new() -> Self {
+        let cache = Self::default();
+        cache.capacity.set(MAX_CD_READ_HANDLES);
+        cache
+    }
+}
+
+impl Clone for FolderReadCache {
+    /// A clone is a SEPARATE mount, not a shared one, so it starts with no open
+    /// handles and its own counter. `File` is not `Clone` in any case, and
+    /// duplicating handles the original still owns would be the wrong answer
+    /// even if it were.
+    fn clone(&self) -> Self {
+        let cache = Self::new();
+        cache.capacity.set(self.capacity.get());
+        cache
+    }
+}
+
 /// Where a `CdImage`'s sector bytes actually live.
 #[derive(Debug, Clone)]
 enum Backing {
@@ -167,6 +222,7 @@ enum Backing {
     Folder {
         meta: Vec<u8>,
         extents: Vec<crate::iso9660::FileExtent>,
+        cache: FolderReadCache,
     },
 }
 
@@ -273,7 +329,11 @@ impl CdImage {
             byte_swapped: false,
         };
         Ok(Self {
-            backing: Backing::Folder { meta, extents },
+            backing: Backing::Folder {
+                meta,
+                extents,
+                cache: FolderReadCache::new(),
+            },
             tracks: vec![track],
             audio_sources: Default::default(),
             total_sectors,
@@ -738,7 +798,11 @@ impl CdImage {
                 out.copy_from_slice(slice);
                 Some(out)
             }
-            Backing::Folder { meta, extents } => Some(read_folder_sector(meta, extents, lba)),
+            Backing::Folder {
+                meta,
+                extents,
+                cache,
+            } => Some(read_folder_sector(meta, extents, cache, lba)),
         }
     }
 
@@ -785,6 +849,37 @@ impl CdImage {
         Some(out)
     }
 
+    /// Host `File::open` calls this mount has made, or `None` for a backing that
+    /// never opens a file (a resident ISO or CUE+BIN reads from memory).
+    ///
+    /// The grading instrument for the folder read cache. The cache is invisible
+    /// to a value comparison — the sectors are byte-identical with it and
+    /// without it — so the open count is the only thing that can show it works.
+    pub fn host_file_opens(&self) -> Option<u64> {
+        match &self.backing {
+            Backing::Bytes(_) => None,
+            Backing::Folder { cache, .. } => Some(cache.host_file_opens.get()),
+        }
+    }
+
+    /// Disable the folder read cache, for the UNCACHED arm of a measurement.
+    ///
+    /// Exists so the open count can be taken twice from ONE binary, one flag
+    /// apart: without a number to compare against, "K sequential sectors cost
+    /// one open" reads the same whether the cache works or the path never ran.
+    /// Returns false for a backing that has no cache to disable.
+    #[cfg(test)]
+    pub fn disable_read_cache_for_test(&self) -> bool {
+        match &self.backing {
+            Backing::Bytes(_) => false,
+            Backing::Folder { cache, .. } => {
+                cache.handles.borrow_mut().clear();
+                cache.capacity.set(0);
+                true
+            }
+        }
+    }
+
     pub fn track_count(&self) -> u8 {
         self.tracks.len() as u8
     }
@@ -799,6 +894,7 @@ impl CdImage {
 fn read_folder_sector(
     meta: &[u8],
     extents: &[crate::iso9660::FileExtent],
+    cache: &FolderReadCache,
     lba: u32,
 ) -> [u8; DATA_SECTOR] {
     let meta_sectors = (meta.len() / DATA_SECTOR) as u32;
@@ -823,8 +919,8 @@ fn read_folder_sector(
         return out;
     }
     let want = (extent.len - byte_off).min(DATA_SECTOR as u64) as usize;
-    match read_file_range(&extent.host_path, byte_off, want) {
-        Ok(data) => out[..data.len()].copy_from_slice(&data),
+    match read_cached(cache, &extent.host_path, byte_off, &mut out[..want]) {
+        Ok(()) => {}
         Err(err) => {
             eprintln!(
                 "cdimage: failed to read {} at offset {byte_off}: {err}",
@@ -835,15 +931,57 @@ fn read_folder_sector(
     out
 }
 
-/// Read exactly `want` bytes from `path` starting at `offset`, without
-/// loading the whole file into memory.
-fn read_file_range(path: &std::path::Path, offset: u64, want: usize) -> std::io::Result<Vec<u8>> {
+/// Read exactly `out.len()` bytes from `path` starting at `offset`, reusing an
+/// already-open handle when this mount has one.
+///
+/// This is the whole slice. Before it, every 2048-byte sector of a folder mount
+/// paid a `File::open`, a `seek`, a `Vec` allocation and a copy -- so a game
+/// streaming an FMV from a folder-mounted disc opened the same file thousands of
+/// times a second. The HDD path solved exactly this with a handle LRU; this is
+/// the same fix one device over.
+///
+/// Reads STRAIGHT INTO `out` rather than into a fresh `Vec` that is then copied:
+/// the caller already owns a zeroed sector buffer, and the tail past a file's
+/// end must stay zero, which slicing `out` to `want` gives for free.
+fn read_cached(
+    cache: &FolderReadCache,
+    path: &std::path::Path,
+    offset: u64,
+    out: &mut [u8],
+) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
+
+    let capacity = cache.capacity.get();
+    let mut handles = cache.handles.borrow_mut();
+    match handles.iter().position(|(cached, _)| cached == path) {
+        // Promote to MRU so the eviction below takes the coldest path.
+        Some(index) => {
+            let entry = handles.remove(index);
+            handles.push(entry);
+        }
+        None => {
+            let file = std::fs::File::open(path)?;
+            cache
+                .host_file_opens
+                .set(cache.host_file_opens.get().saturating_add(1));
+            if capacity == 0 {
+                // The uncached arm, which exists so a test can take the SAME
+                // measurement with the cache off and get a number to compare
+                // against. Serve this read from the fresh handle and keep
+                // nothing.
+                let mut file = file;
+                file.seek(SeekFrom::Start(offset))?;
+                return file.read_exact(out);
+            }
+            if handles.len() >= capacity {
+                handles.remove(0);
+            }
+            handles.push((path.to_path_buf(), file));
+        }
+    }
+    let (_, file) = handles.last_mut().expect("just promoted or inserted");
     file.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; want];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+    file.read_exact(out)
 }
 
 /// A track as read from the CUE before sector counts are derived.
