@@ -348,7 +348,21 @@ pub(crate) enum PollScanOutcome {
 /// interpreter's own caller (`build_poll_loop`) passes `cpu.linear_eip()`, so its
 /// `at_head` reads exactly as before; a call-out helper passes the slot's own linear
 /// EIP instead (GP2 poll-skip design, obligation 1).
-fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome {
+///
+/// `sixteen_bit_ok` is the 16-bit poll certification slice's admission parameter
+/// (design D1/D1b, review round-1 MAJOR-5). It is `false` at every INTERPRETER call
+/// site and `true` only at the Direct call-out under `IZARRAVM_DIRECT_POLL_SKIP_16`,
+/// which is what keeps `CpuGsw::poll_loop`'s path byte-for-byte unchanged. A parameter
+/// rather than a shared screen, deliberately: dropping `poll_head_possible`'s `!d`
+/// would have widened the interpreter's poll path, and no ladder arm runs the
+/// interpreter.
+fn build_poll_loop_at(
+    cpu: &CpuGsw,
+    entry: u32,
+    current: u32,
+    sixteen_bit_ok: bool,
+) -> PollScanOutcome {
+    let _ = sixteen_bit_ok;
     let d = cpu.registers.cs().default_size_32;
     let Some((slots, is_loop)) = build_block(cpu, entry, d) else {
         return PollScanOutcome::NegativeCacheable;
@@ -566,7 +580,11 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome
 ///
 /// `build_poll_loop(cpu)` is this with `cpu.linear_eip()`, so the interpreter path is
 /// byte-for-byte unchanged.
-pub(crate) fn build_poll_loop_from(cpu: &CpuGsw, current: u32) -> PollScanOutcome {
+pub(crate) fn build_poll_loop_from(
+    cpu: &CpuGsw,
+    current: u32,
+    sixteen_bit_ok: bool,
+) -> PollScanOutcome {
     let page = current & !0x0fff;
     let mut volatile_seen = false;
     for back in 0..=9u32 {
@@ -576,7 +594,7 @@ pub(crate) fn build_poll_loop_from(cpu: &CpuGsw, current: u32) -> PollScanOutcom
         if entry & !0x0fff != page {
             break;
         }
-        match build_poll_loop_at(cpu, entry, current) {
+        match build_poll_loop_at(cpu, entry, current, sixteen_bit_ok) {
             PollScanOutcome::Found(poll) => {
                 if (0..poll.fetch_count()).any(|index| {
                     poll.fetch(index)
@@ -603,7 +621,10 @@ pub(crate) fn build_poll_loop_from(cpu: &CpuGsw, current: u32) -> PollScanOutcom
 /// `build_poll_loop_from(cpu, cpu.linear_eip())` -- see that function's doc for why the
 /// origin is a parameter rather than an internal read.
 pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
-    build_poll_loop_from(cpu, cpu.linear_eip())
+    // `sixteen_bit_ok: false` -- the INTERPRETER's value, unconditionally. See
+    // `build_poll_loop_at`'s doc: 16-bit admission is scoped to the Direct call-out,
+    // and a partial revert of that slice cannot silently open this path.
+    build_poll_loop_from(cpu, cpu.linear_eip(), false)
 }
 
 /// Loop-head prefilter: whether the current boundary could possibly be

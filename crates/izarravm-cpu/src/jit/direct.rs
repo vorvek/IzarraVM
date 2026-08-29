@@ -24570,7 +24570,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                 cpu.perf.poll_neg_cache_hits += 1;
                 cpu.jit_direct.note_poll_declined_shape();
             } else {
-                match build_poll_loop_from(cpu, slot_linear) {
+                match build_poll_loop_from(cpu, slot_linear, false) {
                     PollScanOutcome::NegativeCacheable => {
                         if cpu.poll_neg_cache_enabled {
                             cpu.perf.poll_neg_cache_stores += 1;
