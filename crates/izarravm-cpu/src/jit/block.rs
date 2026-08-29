@@ -29,7 +29,8 @@
 
 use crate::{
     AddressSize, CpuGsw, CpuPersona, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize,
-    PollBranchShape, PollLoop, PollMemoryFields, PollPortSource, Prefixes, SegmentIndex,
+    PollBranchShape, PollLoop, PollMaskSource, PollMemoryFields, PollPortSource, Prefixes,
+    SegmentIndex,
 };
 
 use super::step::Slot;
@@ -286,6 +287,17 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
     Some((slots, is_loop))
 }
 
+/// Whether every slot's last byte is inside the LIVE code segment's limit.
+///
+/// **Under the 16-bit slice (design D1) this is also the IP-WRAP catcher**, and that role
+/// is load-bearing rather than incidental. `build_block` walks LINEARLY, so a shape that
+/// wraps IP produces a slot at `cs.base + 0x10000 + k`, whose `slot_eip` is `>= 0x10000`.
+/// `fetch_within_limit` is `eip <= limit - (len - 1)`, so with the `cs.limit <= 0xFFFF`
+/// admission term in force (the 3-slot arm's `!d` branch) that slot fails here and the
+/// shape refuses `NegativeVolatile`. No certified slot can then start at or past
+/// `0x10000`, and none can have a last byte above `0xFFFF` -- which is why the admission
+/// term delegates the boundary arithmetic here instead of carrying its own `slot_eip +
+/// len` compare, and why it has no off-by-one at the segment top.
 fn poll_slots_within_live_cs(cpu: &CpuGsw, slots: &[Slot]) -> bool {
     let cs = cpu.registers.cs();
     slots.iter().all(|slot| {
@@ -319,6 +331,57 @@ fn exact_poll_test_branch(test: &Slot, branch: &Slot) -> Option<(u8, bool)> {
     Some((mask, branch.insn.opcode == 0x74))
 }
 
+/// The 3-slot IO shape's OWN test/branch classifier, and the only place the D1b
+/// register-mask form (`TEST AL,AH`, `84 E0`) is admitted.
+///
+/// Deliberately not an arm inside `exact_poll_test_branch`: that helper is shared with
+/// the 5/6-slot setup shapes, which would otherwise silently gain a register-mask
+/// variant nothing measures and no ladder prices.
+///
+/// **Certification is a pure function of the code bytes**, which is what keeps the
+/// forward rule at `PollScanOutcome` satisfied by construction rather than by a
+/// `NegativeVolatile` classification: the `0x84` arm checks the opcode, the length, the
+/// ModRM `(mode, reg, rm)` triple and that the r/m operand is a REGISTER (excluding the
+/// memory form), and never reads AH. So a `0x84` shape with the wrong `reg`, the wrong
+/// `rm`, or a memory operand is a structural negative like any other non-shape, and the
+/// negative cache absorbs it -- that is what stops a hot site from rescanning per read.
+/// The mask VALUE is resolved later, at the call-out, where the registers are live.
+///
+/// Exactly ONE `0x84` encoding is accepted, `84 E0` (`mod=3, reg=4 (AH), rm=0 (AL)`).
+/// The mirrored `84 C4` (`TEST AH,AL`) is the same test with identical flags -- AND is
+/// commutative -- and is still refused. Fail-closed on purpose: a site using the
+/// mirrored form is a coverage gap to diagnose, not a defect to hunt.
+fn three_slot_poll_test_branch(
+    test: &Slot,
+    branch: &Slot,
+    sixteen_bit_ok: bool,
+) -> Option<(PollMaskSource, u8, bool)> {
+    if let Some((mask, branch_when_zero)) = exact_poll_test_branch(test, branch) {
+        return Some((PollMaskSource::Immediate(mask), mask, branch_when_zero));
+    }
+    if !sixteen_bit_ok
+        || test.insn.opcode != 0x84
+        || test.insn.len != 2
+        || branch.insn.len != 2
+        || !matches!(branch.insn.opcode, 0x74 | 0x75)
+    {
+        return None;
+    }
+    let modrm = test.insn.modrm?;
+    // Two terms, each load-bearing on its own. `modrm.reg == 4` names AH as the r8
+    // source (`read_gpr8(4)` is `gpr[0] >> 8` in this emulator's index space). The
+    // operand term names AL as the r/m8 destination AND excludes the memory form in one
+    // step: `parse_addressing_mode` yields `DecodedOperand::Reg` only for `mod = 3`, so
+    // matching the `Reg` arm specifically is what refuses `84 20` (`TEST [BX+SI],AH`),
+    // whose ModRM `reg`/`rm` fields are otherwise indistinguishable from `84 E0`'s.
+    if modrm.reg != 4 || !matches!(test.insn.operand, Some(DecodedOperand::Reg(0))) {
+        return None;
+    }
+    // `status_mask` stays a PLACEHOLDER here: `PollMaskSource::Ah` is the whole record,
+    // and `PollLoop::with_resolved_mask` settles the value at the call-out.
+    Some((PollMaskSource::Ah, 0, branch.insn.opcode == 0x74))
+}
+
 /// One backward-scan probe's outcome, split so the negative cache only ever
 /// stores results that are pure functions of the page's warm decode lines
 /// and the code-segment d bit.
@@ -339,7 +402,21 @@ pub(crate) enum PollScanOutcome {
 /// view used by compiled blocks. Re-running this before every span makes an SMC
 /// restamp replace the descriptor rather than reusing stale bytes or addresses.
 /// Slot opcodes here are mirrored in poll_head_possible's set; extending the
-/// shapes requires extending that set.
+/// shapes requires extending that set -- with ONE documented exemption, the
+/// `sixteen_bit_ok`-only D1b test slot (`0x84`), which cannot reach that
+/// prefilter at all. See `poll_head_possible`'s own doc.
+///
+/// The 3-slot IO arm is the only one that admits a 16-bit code segment, and only
+/// when the caller passes `sixteen_bit_ok` (the Direct call-out under
+/// `IZARRAVM_DIRECT_POLL_SKIP_16`). No byte of that shape decodes differently
+/// under `CS.D = 0`: `0xEC` is fixed 1 byte and always an 8-bit port read into
+/// AL, the accumulator `TEST` forms and `Jcc rel8` are operand-size-invariant
+/// encodings of fixed length, and `raw_core_clocks: 17` is likewise
+/// operand-size independent (`IN_PORT_CORE_CLOCKS` 12 + `TEST` 2 + taken `Jcc`
+/// 3, from the same constants the interpreter charges). The other two shape
+/// families carry real `OperandSize::Dword` / `AddressSize::Dword` terms, whose
+/// unprefixed 16-bit forms are DIFFERENT instructions with different lengths, so
+/// they stay 32-bit-only.
 ///
 /// `current` is the scan's ORIGIN -- the instruction start every `at_head` computed
 /// here is measured against -- and it is a caller-supplied value rather than a fresh
@@ -348,7 +425,20 @@ pub(crate) enum PollScanOutcome {
 /// interpreter's own caller (`build_poll_loop`) passes `cpu.linear_eip()`, so its
 /// `at_head` reads exactly as before; a call-out helper passes the slot's own linear
 /// EIP instead (GP2 poll-skip design, obligation 1).
-fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome {
+///
+/// `sixteen_bit_ok` is the 16-bit poll certification slice's admission parameter
+/// (design D1/D1b, review round-1 MAJOR-5). It is `false` at every INTERPRETER call
+/// site and `true` only at the Direct call-out under `IZARRAVM_DIRECT_POLL_SKIP_16`,
+/// which is what keeps `CpuGsw::poll_loop`'s path byte-for-byte unchanged. A parameter
+/// rather than a shared screen, deliberately: dropping `poll_head_possible`'s `!d`
+/// would have widened the interpreter's poll path, and no ladder arm runs the
+/// interpreter.
+fn build_poll_loop_at(
+    cpu: &CpuGsw,
+    entry: u32,
+    current: u32,
+    sixteen_bit_ok: bool,
+) -> PollScanOutcome {
     let d = cpu.registers.cs().default_size_32;
     let Some((slots, is_loop)) = build_block(cpu, entry, d) else {
         return PollScanOutcome::NegativeCacheable;
@@ -357,15 +447,29 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome
     // 3-slot direct shape. Structure first, register check second, so a
     // register failure is reported volatile instead of cached.
     if let [input, test, branch] = slots.as_slice()
-        && d
+        && (d || sixteen_bit_ok)
         && is_loop
         && input.insn.opcode == 0xec
         && input.insn.len == 1
         && loop_back_edge_target(&branch.insn, branch.lin) == Some(entry)
     {
-        let Some((mask, branch_when_zero)) = exact_poll_test_branch(test, branch) else {
+        let Some((mask_source, mask, branch_when_zero)) =
+            three_slot_poll_test_branch(test, branch, sixteen_bit_ok)
+        else {
             return PollScanOutcome::NegativeCacheable;
         };
+        // D-O1, the 16-bit slice's ONE added admission term. `CS.D = 0` with a limit
+        // above 0xFFFF -- a 16-bit protected-mode code segment with G=1, or any
+        // descriptor whose D bit and limit disagree -- is the single reachable state
+        // where IP wraps at 0xFFFF and the limit check does NOT catch it. It is also
+        // what makes the call-out's unmasked scan anchor (`cs.base + eip + slot_delta`)
+        // exact, because the compile walk's own guarantee is written in terms of
+        // `cs.limit`. VOLATILE, never cacheable: `cs.limit` is a segment fact and the
+        // negative cache is keyed on `(lin, d)` alone, so a cached refusal here would
+        // poison the entry for every other segment state over the same bytes.
+        if !d && cpu.registers.cs().limit > 0xffff {
+            return PollScanOutcome::NegativeVolatile;
+        }
         if cpu.registers.edx() as u16 != 0x03da {
             return PollScanOutcome::NegativeVolatile;
         }
@@ -381,6 +485,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome
             port_source: PollPortSource::CurrentDx,
             branch_shape: PollBranchShape::Direct,
             status_mask: mask,
+            mask_source,
             branch_when_zero,
             raw_core_clocks: 17,
             at_head: current == entry,
@@ -434,6 +539,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome
             port_source: PollPortSource::CurrentDx,
             branch_shape: PollBranchShape::Direct,
             status_mask: 0,
+            mask_source: PollMaskSource::Immediate(0),
             branch_when_zero: false,
             raw_core_clocks: MEMORY_POLL_RAW_CORE_CLOCKS,
             at_head: current == entry,
@@ -496,6 +602,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome
             port_source,
             branch_shape: PollBranchShape::Direct,
             status_mask: mask,
+            mask_source: PollMaskSource::Immediate(mask),
             branch_when_zero,
             raw_core_clocks: 21,
             at_head: current == entry,
@@ -544,6 +651,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome
         port_source,
         branch_shape: PollBranchShape::PairedJmp,
         status_mask: mask,
+        mask_source: PollMaskSource::Immediate(mask),
         branch_when_zero,
         raw_core_clocks: 28,
         at_head: current == entry,
@@ -566,7 +674,11 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32, current: u32) -> PollScanOutcome
 ///
 /// `build_poll_loop(cpu)` is this with `cpu.linear_eip()`, so the interpreter path is
 /// byte-for-byte unchanged.
-pub(crate) fn build_poll_loop_from(cpu: &CpuGsw, current: u32) -> PollScanOutcome {
+pub(crate) fn build_poll_loop_from(
+    cpu: &CpuGsw,
+    current: u32,
+    sixteen_bit_ok: bool,
+) -> PollScanOutcome {
     let page = current & !0x0fff;
     let mut volatile_seen = false;
     for back in 0..=9u32 {
@@ -576,7 +688,7 @@ pub(crate) fn build_poll_loop_from(cpu: &CpuGsw, current: u32) -> PollScanOutcom
         if entry & !0x0fff != page {
             break;
         }
-        match build_poll_loop_at(cpu, entry, current) {
+        match build_poll_loop_at(cpu, entry, current, sixteen_bit_ok) {
             PollScanOutcome::Found(poll) => {
                 if (0..poll.fetch_count()).any(|index| {
                     poll.fetch(index)
@@ -603,7 +715,10 @@ pub(crate) fn build_poll_loop_from(cpu: &CpuGsw, current: u32) -> PollScanOutcom
 /// `build_poll_loop_from(cpu, cpu.linear_eip())` -- see that function's doc for why the
 /// origin is a parameter rather than an internal read.
 pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
-    build_poll_loop_from(cpu, cpu.linear_eip())
+    // `sixteen_bit_ok: false` -- the INTERPRETER's value, unconditionally. See
+    // `build_poll_loop_at`'s doc: 16-bit admission is scoped to the Direct call-out,
+    // and a partial revert of that slice cannot silently open this path.
+    build_poll_loop_from(cpu, cpu.linear_eip(), false)
 }
 
 /// Loop-head prefilter: whether the current boundary could possibly be
@@ -621,6 +736,23 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
 /// exact_setup_poll_shapes_cover_sources_senses_and_every_phase and
 /// exact_memory_poll_shape_covers_senses_and_every_phase fail if any slot
 /// opcode goes missing here.
+///
+/// **ONE DOCUMENTED EXEMPTION: the D1b test slot `0x84` (`TEST AL,AH`) is deliberately
+/// NOT in this set.** The rule above exists because every certified shape's slots can be
+/// the `current` this prefilter is asked about -- but the D1b arm of
+/// `three_slot_poll_test_branch` is reachable only with `sixteen_bit_ok == true`, and
+/// this function's only callers (`poll_loop`, `probe_poll_head`) are the interpreter's,
+/// which pass `false`. A D1b shape therefore cannot exist on any path that reaches here,
+/// so the set cannot cost a certification by omitting `0x84`. The Direct call-out, which
+/// is where D1b shapes DO form, never calls this function at all: it goes straight from
+/// its own screens to the negative-cache probe and the scan.
+///
+/// Adding `0x84` anyway would not be free. `TEST r/m8, r8` is a common instruction, and
+/// widening the set turns a free prefilter reject at every such interpreter boundary into
+/// a negative-cache probe plus, once per page generation, a full ten-probe backward
+/// scan -- new per-boundary cost on a path no ladder arm exercises
+/// (`poll_skip_eligible` requires the Direct backend OFF). Pinned by
+/// `the_register_mask_test_slot_is_exempt_from_the_head_prefilter_set`.
 fn poll_head_possible(cpu: &CpuGsw, lin: u32, d: bool) -> bool {
     if !d {
         return false;

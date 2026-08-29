@@ -489,6 +489,16 @@ pub(super) fn try_poll_skip(
     batch_core: u32,
     cap: u64,
 ) -> Option<u32> {
+    // I-D1b clause 2: no register-mask (D1b) shape can reach the interpreter. It is true by
+    // double gating -- `build_poll_loop` passes `sixteen_bit_ok: false` at every interpreter
+    // call site, and `poll_head_possible` still refuses a 16-bit head -- and it is load-bearing
+    // rather than decorative: `fresh_iteration_spins` below and `req.status_mask
+    // .trailing_zeros()` in the seam both assume a mask that already passed the
+    // `0x01 | 0x08` check, which for an `Ah` shape happens only at the Direct call-out.
+    debug_assert!(
+        poll.mask_is_resolved(),
+        "an unresolved register-mask poll shape reached the interpreter's poll skip"
+    );
     if !cpu.poll_skip_eligible() {
         diagnostics.cpu_eligibility_rejection();
         return None;

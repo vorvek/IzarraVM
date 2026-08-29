@@ -1101,6 +1101,39 @@ pub(crate) struct BlockCache {
     /// `izarravm-machine` links against. `set_native_backend_enabled` and `set_jit_auto_admit`
     /// are the precedent for a plain `pub` per-CPU setter crossing this exact boundary.
     direct_poll_skip_override: Option<bool>,
+    /// Per-CPU override of `direct_poll_skip_16_armed()`'s ambient reading, for the reason
+    /// `direct_poll_skip_override` above is a field: the acceptance fixture lives in
+    /// `izarravm-machine` and cannot reach a `#[cfg(test)]` item in this crate.
+    direct_poll_skip_16_override: Option<bool>,
+    /// `IZARRAVM_DIRECT_POLL_SKIP_16`'s arm, RESOLVED ONCE PER NATIVE BLOCK ENTRY.
+    ///
+    /// Matched pair with `block_batch_cap`: `run_direct_block` publishes it beside the batch cap
+    /// at entry and clears it (`false`) beside that cap's clear after the native return, on the
+    /// same "nothing published refuses everything" convention.
+    ///
+    /// A plain `bool` rather than a call to `direct_poll_skip_16_armed_for()` from inside the
+    /// call-out, and the reason is a measurement one (review round-2 MAJOR-10). The 16-bit screen
+    /// runs on EVERY 0x3DA read from 16-bit code -- ~1.52e9 of them in one tyrian window -- and
+    /// an `Option<bool>` load plus a `OnceLock` acquire-load there is roughly 1-2.5% of that
+    /// row's wall. That is the whole +/-2% band the ladder's "the A arm equals `main`" check
+    /// allows, so the OFF arm's claimed cost-identity would have been unmeasurable. As a field
+    /// load next to the `cs()` read the screen already does, it is free.
+    block_poll_skip_16_armed: bool,
+    /// ONE-ENTRY sticky memo for the D1b mask-value decline (review round-2 MAJOR-7).
+    ///
+    /// `(slot_linear, ah, page_gen)`. A `Found` is never written to the negative cache --
+    /// positives are rebuilt on every call so an SMC restamp replaces the descriptor -- so a
+    /// site whose shape certifies STRUCTURALLY but whose live AH is not `0x01`/`0x08` would
+    /// otherwise pay a negative-cache miss plus a full ten-probe backward scan, each probe
+    /// decoding a block and allocating a `Vec<Slot>`, ON EVERY READ. That is precisely the
+    /// cost profile PR #761 was merged to remove, and one constant `MOV AH,0x20` reproduces it
+    /// forever without the guest being adversarial.
+    ///
+    /// Sound by construction: it is a pure REFUSAL, it re-reads AH so a changed mask re-enters
+    /// the scan, and it carries the page insert generation so an SMC restamp does too. The
+    /// worst case becomes one `u64`-shaped compare per read instead of one scan per read.
+    /// Consulted only on the 16-bit arm, so the 32-bit path (gp2-586, the control) is untouched.
+    poll_mask_decline_memo: Option<(u32, u8, u32)>,
     /// Set when the boundary above CLEARED the shadow, i.e. the block consumed an STI's
     /// one-instruction reprieve inside itself. `run_budgeted_inner` reads it to run the
     /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
@@ -1303,6 +1336,9 @@ impl BlockCache {
             block_batch_cap: 0,
             block_bus_at_entry: 0,
             direct_poll_skip_override: None,
+            direct_poll_skip_16_override: None,
+            block_poll_skip_16_armed: false,
+            poll_mask_decline_memo: None,
             interrupt_shadow_consumed: false,
             lane_trial_override: None,
             block_portals: Vec::new(),
@@ -2263,6 +2299,39 @@ impl BlockCache {
 
     pub(crate) fn set_direct_poll_skip_override(&mut self, forced: Option<bool>) {
         self.direct_poll_skip_override = forced;
+    }
+
+    /// `direct_poll_skip_16_armed()`'s ambient reading, unless this CPU overrides it. Read ONCE
+    /// per native block entry (`run_direct_block`), never per call-out -- see
+    /// `block_poll_skip_16_armed`'s doc for why that distinction is load-bearing.
+    pub(crate) fn direct_poll_skip_16_armed_for(&self) -> bool {
+        self.direct_poll_skip_16_override
+            .unwrap_or_else(direct_poll_skip_16_armed)
+    }
+
+    pub(crate) fn set_direct_poll_skip_16_override(&mut self, forced: Option<bool>) {
+        self.direct_poll_skip_16_override = forced;
+    }
+
+    /// Publish the 16-bit poll arm for this native entry, matched pair with
+    /// `set_block_batch_cap`.
+    pub(crate) fn set_block_poll_skip_16_armed(&mut self, armed: bool) {
+        self.block_poll_skip_16_armed = armed;
+    }
+
+    pub(crate) fn block_poll_skip_16_armed(&self) -> bool {
+        self.block_poll_skip_16_armed
+    }
+
+    /// Whether the D1b mask-decline memo already refused this exact `(slot, AH, page
+    /// generation)`. See the field's doc: a pure refusal, so a false positive is impossible
+    /// and a false negative only costs the scan that would have run anyway.
+    pub(crate) fn poll_mask_decline_memo_hit(&self, slot: u32, ah: u8, page_gen: u32) -> bool {
+        self.poll_mask_decline_memo == Some((slot, ah, page_gen))
+    }
+
+    pub(crate) fn record_poll_mask_decline(&mut self, slot: u32, ah: u8, page_gen: u32) {
+        self.poll_mask_decline_memo = Some((slot, ah, page_gen));
     }
 
     pub(crate) fn block_entry_interrupt_shadow(&self) -> bool {
@@ -11678,6 +11747,102 @@ pub(crate) fn direct_poll_skip_max_raw() -> u64 {
             panic!("IZARRAVM_DIRECT_POLL_MAX_RAW is not valid UTF-8")
         }
     })
+}
+
+/// Whether the `PortReadAlDx` call-out lets a 16-bit code segment reach the poll-shape scan
+/// (`IZARRAVM_DIRECT_POLL_SKIP_16`, the 16-bit poll certification slice, design D1 + D1b).
+///
+/// # THE SPELLING TABLE
+///
+/// A boolean ARM knob on the `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK`
+/// construction -- explicitly NOT `IZARRAVM_ATA_POLL_SKIP`'s inverted shape, and explicitly
+/// NOT a PARAMETER knob (those have no OFF spelling at all: UNSET, never `=0`).
+///
+/// * **unset** and the EMPTY STRING -> ON: the same arm, and since the flip below that arm is
+///   THE DEFAULT. The 16-bit call-out reaches the negative-cache probe and the scan, so the D1
+///   and D1b shapes can certify.
+/// * `0` / `off` -> OFF, stated: the pre-flip behaviour, under which a 16-bit call-out is
+///   screened out before any cache probe or scan, bit-identical to `main` @ `0333d956`. This is
+///   the escape hatch and the ladder's A arm.
+/// * `1` / `on` -> ON, stated.
+/// * **anything else PANICS**, naming the variable. A mistyped ladder leg that fell through
+///   would run the DEFAULT and be read as "the arm I asked for changed nothing", the one wrong
+///   conclusion an arm ladder exists to avoid.
+///
+/// **Default is ON since 2026-08-29, flipped by the overnight campaign under its standing
+/// merge authority (not an explicit owner ruling; revert is one `git revert` away).**
+/// The evidence: tyrian-586
+/// **2.78x** (63.4 s -> 22.8 s min-wall), `jit_direct_poll_decline_sixteen_bit` -> 0,
+/// `jit_direct_poll_skip_spans` 29,120, `jit_direct_poll_decline_mask_source` **0** (so the
+/// MAJOR-7 storm class never fired and the sticky memo was never load-bearing on this row), and
+/// `timer.irq0_edges` / MPU `data_writes` / DSP `command_bytes` / guest seconds all
+/// BIT-IDENTICAL across the arms -- the skip moved wall, not guest-visible state. gp2-586, the
+/// 32-bit control, passes with the mechanism idle. wolf3d-586 is neutral: its apparent +3.7% was
+/// binary-layout variance, ON equals OFF on one binary, and it records zero 16-bit declines.
+/// **The flip changes exactly the two `return` arms below the `NotPresent` and `""` matches
+/// below, and nothing else** -- every other spelling row is untouched.
+///
+/// **THE NULLING TRAP REVERSES WITH THE FLIP, and that is the cost of it.** Nulling a variable
+/// in PowerShell leaves it PRESENT and EMPTY, and this table now spells that ON, the same arm
+/// as unset. Before the flip the trap pointed at the ON leg and an ON leg had to export `1`;
+/// **now it points at the OFF leg, and an OFF leg must EXPORT `0`.** A ladder leg that merely
+/// fails to set the variable runs the CANDIDATE, not the base. Same direction as
+/// `IZARRAVM_DIRECT_POLL_SKIP` after its own 2026-08-27 flip, for the same reason.
+///
+/// # THE HOT READ IS NOT HERE
+///
+/// `port_read_al_dx` does NOT call this per read. Tyrian executes ~1.52e9 16-bit 0x3DA reads in
+/// one 48-second window, and an `Option<bool>` field load plus a `OnceLock` acquire-load on each
+/// of them is roughly 1-2.5% of that row's wall -- enough on its own to consume the +/-2% band
+/// the ladder's "A arm equals `main`" check allows, which would make the ladder unreadable.
+/// The arm is resolved ONCE per native block entry into a plain `bool` on `BlockCache`
+/// (`set_block_poll_skip_16_armed`, published beside `set_block_batch_cap`), and the call-out
+/// screen tests that field. This function and the per-CPU override below stay as the plumbing
+/// that feeds the publish and the spelling table.
+pub(crate) fn direct_poll_skip_16_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        parse_direct_poll_skip_16_arm(std::env::var("IZARRAVM_DIRECT_POLL_SKIP_16"))
+    })
+}
+
+/// The `IZARRAVM_DIRECT_POLL_SKIP_16` spelling table, lifted out of the `OnceLock` closure so it
+/// can be unit-tested without a process-global env write. See `direct_poll_skip_16_armed`.
+fn parse_direct_poll_skip_16_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` (the shipped default: ON since \
+                            the 2026-08-29 owner approval, the call-out may certify the D1 and \
+                            D1b 3-slot shapes in a 16-bit code segment) and `0` / `off` (the \
+                            OFF arm, stated: a 16-bit code segment is screened out before the \
+                            poll scan, exactly as on main) or `1` / `on` (the same ON arm, \
+                            stated)";
+    let raw = match value {
+        // Unset is the default, and the default is ON since 2026-08-29.
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_DIRECT_POLL_SKIP_16 is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Empty names the SAME arm as unset -- the default. Post-flip the nulling trap points at
+        // the OFF leg: an OFF leg must EXPORT `0`.
+        "" => true,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_DIRECT_POLL_SKIP_16={other:?} names no arm; {ACCEPTED}. Refusing to guess: \
+             a mistyped ladder leg would silently run the DEFAULT and be read as the arm it \
+             named doing nothing"
+        ),
+    }
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_direct_poll_skip_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_direct_poll_skip_16_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_direct_poll_skip_16_arm(value)
 }
 
 /// Whether `DirectKind::Jcc` computes its branch predicate by TESTING the RBP EFLAGS shadow
@@ -24543,38 +24708,81 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
             && !crate::run::diff_trace_enabled())
         {
             cpu.jit_direct.note_poll_declined_eligibility();
-        } else if !cpu.registers.cs().default_size_32 {
-            // The 16-bit screen, BEFORE the scan. Every shape is 32-bit by
-            // construction (`poll_head_possible` requires `d`), so a 16-bit
-            // cs can never certify and the scan below would burn a block
-            // decode plus its `Vec` allocations to say no. Tyrian 2000 spins
-            // on 0x3DA from 16-bit native blocks: 1.5e9 doomed scans, ~80%
-            // of its wall, until this screen existed (2026-08-29; OFF-arm
-            // A/B: 5.2x at 586, 4.0x at 486, identical retired
-            // instructions). The interpreter path has carried the same
-            // screen inside `poll_head_possible` all along.
+        } else if !cpu.registers.cs().default_size_32
+            && !(cpu.jit_direct.block_poll_skip_16_armed() && cpu.registers.cs().limit <= 0xffff)
+        {
+            // The 16-bit screen, BEFORE the scan -- and THE KNOB IS TESTED INSIDE IT,
+            // which is what makes the OFF arm bit-identical to `main` rather than
+            // merely equivalent. A 16-bit read on the default arm costs exactly what it
+            // costs on `main`: this one bool test plus a counter bump, no cache probe,
+            // no scan. Ordering matters both ways: a 32-bit read short-circuits on
+            // `default_size_32` and never reads the arm at all, and the arm itself is a
+            // plain field published once per native entry rather than an `Option` +
+            // `OnceLock` read on 1.52e9 reads (review round-2 MAJOR-10).
+            //
+            // Tyrian 2000 spins on 0x3DA from 16-bit native blocks: 1.5e9 doomed scans,
+            // ~80% of its wall, until this screen existed (2026-08-29; OFF-arm A/B: 5.2x
+            // at 586, 4.0x at 486, identical retired instructions). The screen stays;
+            // the 16-bit slice opens it only under `IZARRAVM_DIRECT_POLL_SKIP_16`.
+            //
+            // `cs.limit <= 0xFFFF` rides beside the arm as a pure optimisation (review
+            // round-2 MINOR-9). `build_poll_loop_at` carries the same term as its own
+            // admission condition, which is what makes the `sixteen_bit_ok` parameter
+            // sound on its own terms -- but that one refuses VOLATILE, and a volatile is
+            // never cached, so a `CS.D = 0, limit > 0xFFFF` guest on the ON arm would pay
+            // a full scan per read to reach it. One compare here avoids the scan
+            // entirely. C0 measured this state as unreached on tyrian; it is a
+            // fail-closed guard, not a coverage cost.
+            //
+            // The interpreter path has carried its own 16-bit screen inside
+            // `poll_head_possible` all along, and this slice does NOT touch it.
             cpu.jit_direct.note_poll_declined_sixteen_bit();
         } else {
+            // Live `d` from here down, replacing a hardcoded `true`. Inert on `main` --
+            // those lines sat inside the `else` arm of an unconditional 16-bit screen, so
+            // `d` was provably `true` there -- but it is no longer provable now that the
+            // arm admits 16-bit code, and the negative cache is keyed on `(lin, d)`.
+            let d = cpu.registers.cs().default_size_32;
+            // The 16-bit arm is the only one that consults the mask-decline memo and the
+            // only one that can produce a D1b shape, so `sixteen_bit_ok` and every piece
+            // of D1b bookkeeping below are gated on `!d`. The 32-bit path is byte-for-byte
+            // unchanged, which is what keeps gp2-586 a clean control for the ladder.
+            let sixteen_bit_ok = !d;
             let slot_linear = cpu
                 .registers
                 .cs()
                 .base
                 .wrapping_add(cpu.registers.eip.wrapping_add(slot_delta as u32));
-            // The interpreter path's negative cache, on the same key
-            // discipline: the scan ANCHOR (its `current`), a structural
-            // negative only, guarded by the page insert generation. `d` is
-            // `true` on every path past the screen above. Without this a
-            // 32-bit loop that never certifies re-scans on every iteration.
-            if cpu.poll_neg_cache_enabled && cpu.decode_cache.poll_negative_live(slot_linear, true)
+            // The D1b mask-decline memo, tested BEFORE the negative-cache probe. A
+            // structurally-certified register-mask shape whose live AH is not `0x01`/`0x08`
+            // declines from a `Found`, and a `Found` is never cached (positives are rebuilt
+            // every call so an SMC restamp replaces the descriptor), so without this a
+            // constant wrong `MOV AH,imm8` re-creates the exact per-read scan storm the
+            // 16-bit screen was merged to remove. A pure refusal keyed on AH and the page
+            // generation, so a changed mask or a restamp re-enters the scan.
+            let memo_key = sixteen_bit_ok
+                .then(|| (cpu.read_gpr8(4), cpu.decode_cache.poll_neg_gen(slot_linear)));
+            if let Some((ah, page_gen)) = memo_key
+                && cpu
+                    .jit_direct
+                    .poll_mask_decline_memo_hit(slot_linear, ah, page_gen)
             {
+                cpu.jit_direct.note_poll_declined_mask_source();
+            } else if cpu.poll_neg_cache_enabled
+                && cpu.decode_cache.poll_negative_live(slot_linear, d)
+            {
+                // The interpreter path's negative cache, on the same key
+                // discipline: the scan ANCHOR (its `current`), a structural
+                // negative only, guarded by the page insert generation. Without
+                // this a loop that never certifies re-scans on every iteration.
                 cpu.perf.poll_neg_cache_hits += 1;
                 cpu.jit_direct.note_poll_declined_shape();
             } else {
-                match build_poll_loop_from(cpu, slot_linear) {
+                match build_poll_loop_from(cpu, slot_linear, sixteen_bit_ok) {
                     PollScanOutcome::NegativeCacheable => {
                         if cpu.poll_neg_cache_enabled {
                             cpu.perf.poll_neg_cache_stores += 1;
-                            cpu.decode_cache.record_poll_negative(slot_linear, true);
+                            cpu.decode_cache.record_poll_negative(slot_linear, d);
                         }
                         cpu.jit_direct.note_poll_declined_shape();
                     }
@@ -24601,8 +24809,34 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                                 .is_some_and(|(linear, _, len)| linear == slot_linear && len == 1)),
                             "the certified shape does not contain this call-out's own IN slot"
                         );
+                        // Resolve the symbolic mask ONCE, here, where the registers are
+                        // live -- the exact place and the exact discipline `resolved_port`
+                        // already uses. Everything below reads the RESOLVED copy, so
+                        // `req.status_mask` and `spins_when_bit_set` come from one value
+                        // structurally rather than from two independent derivations. On a
+                        // D1 (`Immediate`) shape this is the identity.
+                        let poll = poll.with_resolved_mask(cpu);
                         if poll.family() != PollFamily::Io || poll.resolved_port(cpu) != 0x03da {
                             cpu.jit_direct.note_poll_declined_port_source();
+                        } else if !matches!(poll.status_mask(), 0x01 | 0x08) {
+                            // The mask VALUE check, in the same place and for the same
+                            // reason the port-source check is here: it is the half of the
+                            // shape that lives in a register, so it can only be answered
+                            // against live state and must never become a cached negative.
+                            // `callout_poll_skip` depends on this range -- it takes
+                            // `status_mask.trailing_zeros()` and the analytic edge oracle
+                            // understands only status1 bits 0 and 3 -- so a shape outside it
+                            // is refused rather than approximated. For a D1 shape the same
+                            // condition was already checked at certification from a code
+                            // byte, so only a D1b shape can reach this arm.
+                            //
+                            // Memoised, because a `Found` is never cached: without the memo
+                            // a persistent wrong-AH site rescans on every read.
+                            cpu.jit_direct.note_poll_declined_mask_source();
+                            if let Some((ah, page_gen)) = memo_key {
+                                cpu.jit_direct
+                                    .record_poll_mask_decline(slot_linear, ah, page_gen);
+                            }
                         } else {
                             bus.publish_core_clocks(now);
                             let mut fetches = [(0u32, 0u32, 0u8); 6];
@@ -28498,6 +28732,23 @@ pub(crate) struct DirectStallTally {
     pub poll_attempts: u64,
     pub poll_declined_port: u64,
     pub poll_declined_port_source: u64,
+    /// The D1b mask-source lane: a shape that certified STRUCTURALLY as the register-mask
+    /// 3-slot form (`TEST AL,AH`) but whose mask VALUE, resolved from live AH at the call-out,
+    /// is not one of the two bits the analytic edge oracle understands (`0x01` / `0x08`).
+    ///
+    /// **Its own lane, deliberately, and it is the single most important signal in the 16-bit
+    /// ladder.** It is what distinguishes "the shape did not certify" from "the shape certified
+    /// and then declined semantically" -- and the second of those is a COST, because a `Found`
+    /// is never written to the negative cache (positives are rebuilt every call so an SMC
+    /// restamp replaces the descriptor). Folding it into `poll_declined_port_source` would have
+    /// hidden exactly that signature behind a lane whose own cause `port != 0x03da` has already
+    /// made impossible.
+    ///
+    /// **LADDER STOP ROW: if this exceeds 1% of `poll_attempts` on any arm, the mask-decline
+    /// path is a scan storm -- stop and fix it before reading the wall number.** Counts memo
+    /// hits as well as fresh declines, so the rate it reports is the true decline rate rather
+    /// than the rate of scans the memo failed to absorb.
+    pub poll_declined_mask_source: u64,
     pub poll_declined_knob: u64,
     pub poll_declined_eligibility: u64,
     /// The 16-bit-code screen, BEFORE the scan: every shape is 32-bit, so a
@@ -30072,6 +30323,7 @@ impl crate::jit::JitState {
             poll_attempts: self.stalls.poll_attempts,
             poll_declined_port: self.stalls.poll_declined_port,
             poll_declined_port_source: self.stalls.poll_declined_port_source,
+            poll_declined_mask_source: self.stalls.poll_declined_mask_source,
             poll_declined_knob: self.stalls.poll_declined_knob,
             poll_declined_eligibility: self.stalls.poll_declined_eligibility,
             poll_declined_sixteen_bit: self.stalls.poll_declined_sixteen_bit,
@@ -30159,6 +30411,10 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_poll_declined_port_source(&mut self) {
         self.stalls.poll_declined_port_source += 1;
+    }
+
+    pub(crate) fn note_poll_declined_mask_source(&mut self) {
+        self.stalls.poll_declined_mask_source += 1;
     }
 
     pub(crate) fn note_poll_declined_knob(&mut self) {
@@ -31527,36 +31783,36 @@ pub const N_REFUSAL_SITES: usize = 30;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1278),
-    ("skip_backend_or_skip_once", 1286),
-    ("skip_approximate_timing", 1292),
-    ("jit16_level_zero", 1417),
-    ("approximate_timing", 1423),
-    ("auto_admit", 1434),
-    ("direct_hot_at", 1448),
-    ("decline_memo_hit", 1474),
-    ("key_for_phys_none", 1486),
-    ("probe_interpret", 1499),
-    ("probe_rejected", 1556),
-    ("link_line_not_live", 1772),
-    ("revalidate_none", 1778),
-    ("dispatch_deferred_short", 1794),
-    ("observer_or_diff_trace", 2392),
-    ("interrupt_shadow", 2399),
-    ("aggregate_accounting", 2406),
-    ("native_fetch_trace", 2420),
-    ("mode_key", 2428),
-    ("x87_top", 2442),
-    ("segment_layout_none", 2457),
-    ("cs_layout", 2465),
-    ("cpl", 2473),
-    ("callout_privileged", 2554),
-    ("data_segment", 2672),
-    ("alignment", 2681),
-    ("fetch_limit", 2696),
-    ("entry_deferred_short", 2710),
-    ("zero_budget", 2818),
-    ("block_regenerated_none", 2854),
+    ("skip_native_continuations_inactive", 1298),
+    ("skip_backend_or_skip_once", 1306),
+    ("skip_approximate_timing", 1312),
+    ("jit16_level_zero", 1437),
+    ("approximate_timing", 1443),
+    ("auto_admit", 1454),
+    ("direct_hot_at", 1468),
+    ("decline_memo_hit", 1494),
+    ("key_for_phys_none", 1506),
+    ("probe_interpret", 1519),
+    ("probe_rejected", 1576),
+    ("link_line_not_live", 1804),
+    ("revalidate_none", 1810),
+    ("dispatch_deferred_short", 1826),
+    ("observer_or_diff_trace", 2424),
+    ("interrupt_shadow", 2431),
+    ("aggregate_accounting", 2438),
+    ("native_fetch_trace", 2452),
+    ("mode_key", 2460),
+    ("x87_top", 2474),
+    ("segment_layout_none", 2489),
+    ("cs_layout", 2497),
+    ("cpl", 2505),
+    ("callout_privileged", 2586),
+    ("data_segment", 2704),
+    ("alignment", 2713),
+    ("fetch_limit", 2728),
+    ("entry_deferred_short", 2742),
+    ("zero_budget", 2850),
+    ("block_regenerated_none", 2886),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -31597,7 +31853,7 @@ pub(crate) mod site {
 #[cfg(feature = "direct-entry-attribution")]
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1476;
+pub const P0_MARK_LINE: u32 = 1496;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
@@ -31624,13 +31880,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1595),
-    ("structural_reject", 1614),
-    ("compile_retry", 1625),
-    ("page_cover_failed", 1649),
-    ("lane_install_demote", 1677),
-    ("install_failed", 1687),
-    ("installed_fall_through", 1757),
+    ("heat_demote", 1615),
+    ("structural_reject", 1634),
+    ("compile_retry", 1645),
+    ("page_cover_failed", 1669),
+    ("lane_install_demote", 1697),
+    ("install_failed", 1707),
+    ("installed_fall_through", 1789),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {

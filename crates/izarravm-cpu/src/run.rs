@@ -1211,6 +1211,18 @@ impl CpuGsw {
         self.jit_direct.set_direct_poll_skip_override(forced);
     }
 
+    /// Override `IZARRAVM_DIRECT_POLL_SKIP_16`'s reading for this CPU (`None` restores the
+    /// ambient env-cached reading). A per-CPU field for `set_direct_poll_skip_override`'s reason:
+    /// the acceptance fixture is an `izarravm-machine` integration test and cannot reach a
+    /// `#[cfg(test)]` item in this crate.
+    ///
+    /// Takes effect at the NEXT native block entry, which is where the arm is published
+    /// (`run_direct_block`).
+    #[cfg(feature = "jit")]
+    pub fn set_direct_poll_skip_16_override(&mut self, forced: Option<bool>) {
+        self.jit_direct.set_direct_poll_skip_16_override(forced);
+    }
+
     #[cfg(feature = "jit")]
     fn finish_direct_execution_transition(&mut self, was_enabled: bool) {
         let enabled = self.jit_direct.execution_enabled();
@@ -2945,6 +2957,12 @@ impl CpuGsw {
         // run-remaining cap actually bounds.
         self.jit_direct.set_block_batch_cap(cap);
         self.jit_direct.set_block_bus_at_entry(bus_at_entry);
+        // The 16-bit poll arm, resolved ONCE here rather than per call-out. Same matched-pair
+        // model as the two publishes above, and for a measurement reason: the 16-bit screen runs
+        // on every 0x3DA read from 16-bit code, and reading an `Option<bool>` plus a `OnceLock`
+        // there would cost enough of tyrian's wall to swallow the ladder's A-arm identity band.
+        let poll_skip_16 = self.jit_direct.direct_poll_skip_16_armed_for();
+        self.jit_direct.set_block_poll_skip_16_armed(poll_skip_16);
         // H9's pin, taken at the P8 mark: `run_direct_block` has no `d`, so the block's own
         // mode-key bit 0 is the term available here.
         ea_pin_lane_bit0!(span.key.mode_key & 1);
@@ -2968,6 +2986,7 @@ impl CpuGsw {
         self.jit_direct.set_block_entry_interrupt_shadow(false);
         self.jit_direct.set_block_batch_cap(0);
         self.jit_direct.set_block_bus_at_entry(0);
+        self.jit_direct.set_block_poll_skip_16_armed(false);
         self.native_callout = jit::direct::CallOutTable::default();
         ea_mark!(Phase::NativePreamble);
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
