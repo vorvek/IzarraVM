@@ -1518,6 +1518,7 @@ impl Machine {
                     )),
                     cache: cache_model,
                     flat_data_cost: active_mode.uses_approximate_timing(),
+                    extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
                     lazy_port_reads: active_mode.uses_approximate_timing(),
                     lazy_ports_386: crate::bus::lazy_ports_386_for(*active_mode),
                     io_touched,

@@ -44,6 +44,32 @@ fn lazy_port_reads_386_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether the bus screens extended RAM out of the device-window classification
+/// instead of walking the aperture gauntlet for it. `IZARRAVM_EXTENDED_RAM_SCREEN`.
+///
+/// DEFAULT ON. The screen changes no charged wait-state and no guest-visible
+/// value -- it only removes work -- so there is no fidelity reason to ship it
+/// off. The knob exists for MEASUREMENT: the win it claims is a few percent of
+/// wall, which is close enough to this box's noise floor that a two-binary
+/// comparison cannot carry it (layout variance between two builds has been
+/// measured at 3.7% here). One binary, two arms, interleaved, is the only way to
+/// grade it honestly.
+///
+/// UNSET means ON, so a recorded run with the variable absent is the ON arm.
+/// `0`, `off`, `false`, `no` and the empty string are the escape; every other
+/// spelling is ON.
+///
+/// Read once per process; the bus stores the resolved bool, so the hot path
+/// never touches the environment or a lazy static.
+pub(super) fn extended_ram_screen_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("IZARRAVM_EXTENDED_RAM_SCREEN")
+            .map(|value| !matches!(value.trim(), "0" | "off" | "false" | "no" | ""))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
 /// The whole composition rule for `MachineBus::lazy_ports_386`, split out from
 /// the environment read so it is testable without touching process state.
 ///
@@ -128,6 +154,7 @@ impl Machine {
             cache: &mut self.cache_model,
             icache_fetch_clocks,
             flat_data_cost: self.active_mode.uses_approximate_timing(),
+            extended_ram_screen: extended_ram_screen_enabled(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
@@ -4010,7 +4037,8 @@ impl MachineBus<'_> {
             address,
             "the extended-RAM screen needs a POST-A20 address; {address:#x} is not folded"
         );
-        address >= 0x0010_0000
+        self.extended_ram_screen
+            && address >= 0x0010_0000
             && address.saturating_add(bytes as u32) <= self.vega.device_free_extended_floor()
     }
 

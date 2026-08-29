@@ -4352,6 +4352,14 @@ fn a_direct_system_read_charges_exactly_what_the_general_read_charges() {
     }
 }
 
+/// THE FOUR TESTS BELOW PIN THE DEFAULT (`IZARRAVM_EXTENDED_RAM_SCREEN` unset,
+/// i.e. ON). Run the suite with the knob at `0` and exactly these four fail and
+/// nothing else does -- verified 2026-08-29, 1693 passed / 4 failed. That is not
+/// a defect to paper over with a skip: it IS the OFF-arm verification, and it
+/// says two things at once. The screen changes nothing any other test can see,
+/// and the knob really does restore the old path rather than merely renaming it.
+/// A conditional skip here would throw both statements away.
+///
 /// A 32-bit game runs its code and keeps its data ABOVE 1 MB, and the bus's only
 /// screen against the device-window gauntlet was `< 0x000A_0000`. So every
 /// instruction-fetch run and every data access such a game makes used to walk
@@ -4413,12 +4421,12 @@ fn the_screen_declines_every_address_a_window_can_claim() {
     let mut machine = test_machine();
     with_bus(&mut machine, |bus| {
         for (address, width, claimed) in [
-            (0x0000_2000, BusWidth::Dword, false),   // conventional RAM
+            (0x0000_2000, BusWidth::Dword, false),    // conventional RAM
             (VGA_MODE13H_BASE, BusWidth::Byte, true), // the VGA aperture
-            (LOW_BIOS_BASE, BusWidth::Byte, true),   // the low BIOS image
-            (MARGO_LFB_BASE, BusWidth::Byte, true),  // Margo's framebuffer
-            (MARGO_MMIO_BASE, BusWidth::Byte, true), // Margo's registers
-            (HIGH_ROM_BASE, BusWidth::Byte, true),   // the BIOS alias at 4 GB
+            (LOW_BIOS_BASE, BusWidth::Byte, true),    // the low BIOS image
+            (MARGO_LFB_BASE, BusWidth::Byte, true),   // Margo's framebuffer
+            (MARGO_MMIO_BASE, BusWidth::Byte, true),  // Margo's registers
+            (HIGH_ROM_BASE, BusWidth::Byte, true),    // the BIOS alias at 4 GB
         ] {
             let before = bus.vega.device_window_gauntlet_entries();
             assert_eq!(
@@ -4561,7 +4569,8 @@ fn a_masked_a20_folds_a_fetch_run_into_the_vga_aperture_and_must_not_take_the_fa
         assert!(bus.keyboard.a20_enabled(), "A20 is open");
         let questions = bus.vega.device_window_questions();
         let clocks = bus.trace.elapsed_clocks();
-        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4).unwrap();
+        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4)
+            .unwrap();
         assert_eq!(
             bus.vega.device_window_questions(),
             questions,
@@ -4583,7 +4592,8 @@ fn a_masked_a20_folds_a_fetch_run_into_the_vga_aperture_and_must_not_take_the_fa
         );
         let questions = bus.vega.device_window_questions();
         let clocks = bus.trace.elapsed_clocks();
-        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4).unwrap();
+        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4)
+            .unwrap();
         assert!(
             bus.vega.device_window_questions() > questions,
             "a masked gate must send the run to the tail, which folds the address first"
