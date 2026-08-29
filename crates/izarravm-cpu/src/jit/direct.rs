@@ -1101,6 +1101,24 @@ pub(crate) struct BlockCache {
     /// `izarravm-machine` links against. `set_native_backend_enabled` and `set_jit_auto_admit`
     /// are the precedent for a plain `pub` per-CPU setter crossing this exact boundary.
     direct_poll_skip_override: Option<bool>,
+    /// Per-CPU override of `direct_poll_skip_16_armed()`'s ambient reading, for the reason
+    /// `direct_poll_skip_override` above is a field: the acceptance fixture lives in
+    /// `izarravm-machine` and cannot reach a `#[cfg(test)]` item in this crate.
+    direct_poll_skip_16_override: Option<bool>,
+    /// `IZARRAVM_DIRECT_POLL_SKIP_16`'s arm, RESOLVED ONCE PER NATIVE BLOCK ENTRY.
+    ///
+    /// Matched pair with `block_batch_cap`: `run_direct_block` publishes it beside the batch cap
+    /// at entry and clears it (`false`) beside that cap's clear after the native return, on the
+    /// same "nothing published refuses everything" convention.
+    ///
+    /// A plain `bool` rather than a call to `direct_poll_skip_16_armed_for()` from inside the
+    /// call-out, and the reason is a measurement one (review round-2 MAJOR-10). The 16-bit screen
+    /// runs on EVERY 0x3DA read from 16-bit code -- ~1.52e9 of them in one tyrian window -- and
+    /// an `Option<bool>` load plus a `OnceLock` acquire-load there is roughly 1-2.5% of that
+    /// row's wall. That is the whole +/-2% band the ladder's "the A arm equals `main`" check
+    /// allows, so the OFF arm's claimed cost-identity would have been unmeasurable. As a field
+    /// load next to the `cs()` read the screen already does, it is free.
+    block_poll_skip_16_armed: bool,
     /// Set when the boundary above CLEARED the shadow, i.e. the block consumed an STI's
     /// one-instruction reprieve inside itself. `run_budgeted_inner` reads it to run the
     /// interrupt-transition test the interpreter runs after a shadowed instruction; see the fold
@@ -1303,6 +1321,8 @@ impl BlockCache {
             block_batch_cap: 0,
             block_bus_at_entry: 0,
             direct_poll_skip_override: None,
+            direct_poll_skip_16_override: None,
+            block_poll_skip_16_armed: false,
             interrupt_shadow_consumed: false,
             lane_trial_override: None,
             block_portals: Vec::new(),
@@ -2263,6 +2283,28 @@ impl BlockCache {
 
     pub(crate) fn set_direct_poll_skip_override(&mut self, forced: Option<bool>) {
         self.direct_poll_skip_override = forced;
+    }
+
+    /// `direct_poll_skip_16_armed()`'s ambient reading, unless this CPU overrides it. Read ONCE
+    /// per native block entry (`run_direct_block`), never per call-out -- see
+    /// `block_poll_skip_16_armed`'s doc for why that distinction is load-bearing.
+    pub(crate) fn direct_poll_skip_16_armed_for(&self) -> bool {
+        self.direct_poll_skip_16_override
+            .unwrap_or_else(direct_poll_skip_16_armed)
+    }
+
+    pub(crate) fn set_direct_poll_skip_16_override(&mut self, forced: Option<bool>) {
+        self.direct_poll_skip_16_override = forced;
+    }
+
+    /// Publish the 16-bit poll arm for this native entry, matched pair with
+    /// `set_block_batch_cap`.
+    pub(crate) fn set_block_poll_skip_16_armed(&mut self, armed: bool) {
+        self.block_poll_skip_16_armed = armed;
+    }
+
+    pub(crate) fn block_poll_skip_16_armed(&self) -> bool {
+        self.block_poll_skip_16_armed
     }
 
     pub(crate) fn block_entry_interrupt_shadow(&self) -> bool {
@@ -11678,6 +11720,79 @@ pub(crate) fn direct_poll_skip_max_raw() -> u64 {
             panic!("IZARRAVM_DIRECT_POLL_MAX_RAW is not valid UTF-8")
         }
     })
+}
+
+/// Whether the `PortReadAlDx` call-out lets a 16-bit code segment reach the poll-shape scan
+/// (`IZARRAVM_DIRECT_POLL_SKIP_16`, the 16-bit poll certification slice, design D1 + D1b).
+///
+/// # THE SPELLING TABLE
+///
+/// A **DEFAULT-OFF** boolean ARM knob on the `IZARRAVM_JCC_SHADOW` /
+/// `IZARRAVM_CHAIN_ENTRY_CHECK` construction -- explicitly NOT `IZARRAVM_ATA_POLL_SKIP`'s
+/// inverted shape, and explicitly NOT a PARAMETER knob (those have no OFF spelling at all:
+/// UNSET, never `=0`).
+///
+/// * **unset**, the EMPTY STRING, `0` or `off` -> OFF: the shipped default and the ladder's A
+///   arm, under which a 16-bit call-out is screened out before any cache probe or scan,
+///   bit-identical to `main`.
+/// * `1` / `on` -> ON: the 16-bit arm reaches the negative-cache probe and the scan.
+/// * **anything else PANICS**, naming the variable. A mistyped ladder leg that fell through
+///   would run the DEFAULT and be read as "the arm I asked for changed nothing", the one wrong
+///   conclusion an arm ladder exists to avoid.
+///
+/// Nulling a variable in PowerShell leaves it PRESENT and EMPTY; this table spells that OFF,
+/// the same arm as unset, so the trap cannot silently disarm a leg that meant to run the base.
+/// The mirror-image cost is that **an ON leg must EXPORT `1`**.
+///
+/// # THE HOT READ IS NOT HERE
+///
+/// `port_read_al_dx` does NOT call this per read. Tyrian executes ~1.52e9 16-bit 0x3DA reads in
+/// one 48-second window, and an `Option<bool>` field load plus a `OnceLock` acquire-load on each
+/// of them is roughly 1-2.5% of that row's wall -- enough on its own to consume the +/-2% band
+/// the ladder's "A arm equals `main`" check allows, which would make the ladder unreadable.
+/// The arm is resolved ONCE per native block entry into a plain `bool` on `BlockCache`
+/// (`set_block_poll_skip_16_armed`, published beside `set_block_batch_cap`), and the call-out
+/// screen tests that field. This function and the per-CPU override below stay as the plumbing
+/// that feeds the publish and the spelling table.
+pub(crate) fn direct_poll_skip_16_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        parse_direct_poll_skip_16_arm(std::env::var("IZARRAVM_DIRECT_POLL_SKIP_16"))
+    })
+}
+
+/// The `IZARRAVM_DIRECT_POLL_SKIP_16` spelling table, lifted out of the `OnceLock` closure so it
+/// can be unit-tested without a process-global env write. See `direct_poll_skip_16_armed`.
+fn parse_direct_poll_skip_16_arm(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` / `off` (the shipped \
+                            default: a 16-bit code segment is screened out before the poll \
+                            scan, exactly as on main), and `1` / `on` (the 16-bit arm: the \
+                            call-out may certify the D1 and D1b 3-slot shapes)";
+    let raw = match value {
+        // Unset = OFF, and so is the empty string one arm down: an ON leg must EXPORT `1`.
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_DIRECT_POLL_SKIP_16 is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_DIRECT_POLL_SKIP_16={other:?} names no arm; {ACCEPTED}. Refusing to guess: \
+             a mistyped ladder leg would silently run the DEFAULT and be read as the arm it \
+             named doing nothing"
+        ),
+    }
+}
+
+/// The spelling table, reachable from the fixtures. See `parse_direct_poll_skip_arm_for_test`.
+#[cfg(test)]
+pub(crate) fn parse_direct_poll_skip_16_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_direct_poll_skip_16_arm(value)
 }
 
 /// Whether `DirectKind::Jcc` computes its branch predicate by TESTING the RBP EFLAGS shadow

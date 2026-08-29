@@ -411,3 +411,69 @@ fn the_register_mask_test_slot_is_exempt_from_the_head_prefilter_set() {
         outcome_name(&outcome)
     );
 }
+
+/// **T-D7.** The `IZARRAVM_DIRECT_POLL_SKIP_16` spelling table. A DEFAULT-OFF boolean
+/// arm knob on the `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK` construction:
+/// unset and `""` name the SAME arm and that arm is OFF, so PowerShell's nulling trap
+/// (a variable left present and empty) cannot silently ARM the slice. The mirror-image
+/// cost is stated in the knob's own doc: an ON leg must export `1`.
+#[test]
+fn direct_poll_skip_16_spelling_table() {
+    use std::env::VarError;
+    let parse = jit::direct::parse_direct_poll_skip_16_arm_for_test;
+    assert!(
+        !parse(Err(VarError::NotPresent)),
+        "unset must name the OFF arm: this slice ships default OFF"
+    );
+    assert!(
+        !parse(Ok(String::new())),
+        "the empty string must name the SAME arm as unset -- OFF -- so a nulled ladder \
+         leg runs the base rather than the candidate"
+    );
+    for off in ["0", "off", "OFF", " off ", "Off"] {
+        assert!(!parse(Ok(off.to_string())), "{off:?} must name the OFF arm");
+    }
+    for on in ["1", "on", "ON", " On "] {
+        assert!(parse(Ok(on.to_string())), "{on:?} must name the ON arm");
+    }
+}
+
+/// A mistyped ladder leg must PANIC rather than silently run the default.
+#[test]
+#[should_panic(expected = "IZARRAVM_DIRECT_POLL_SKIP_16")]
+fn a_mistyped_direct_poll_skip_16_arm_panics() {
+    let _ = jit::direct::parse_direct_poll_skip_16_arm_for_test(Ok("yes".to_string()));
+}
+
+/// Non-UTF-8 is not a spelling of either arm -- it reaches the panic, not the unset
+/// silence.
+#[test]
+#[should_panic(expected = "IZARRAVM_DIRECT_POLL_SKIP_16")]
+fn non_utf8_direct_poll_skip_16_arm_panics() {
+    let _ = jit::direct::parse_direct_poll_skip_16_arm_for_test(Err(
+        std::env::VarError::NotUnicode(std::ffi::OsString::from("x")),
+    ));
+}
+
+/// THE DEFAULT PIN: with the ambient variable read exactly as `direct_poll_skip_16_armed`
+/// reads it, the process-wide reading must agree with the spelling table, and with the
+/// variable unset the arm must be OFF. Reads the AMBIENT knob deliberately, on the
+/// `direct_poll_skip_ships_on_by_default` model, so the suite stays runnable on either arm.
+#[test]
+fn direct_poll_skip_16_ships_off_by_default() {
+    let ambient = std::env::var("IZARRAVM_DIRECT_POLL_SKIP_16");
+    let expected = jit::direct::parse_direct_poll_skip_16_arm_for_test(ambient.clone());
+    assert_eq!(
+        jit::direct::direct_poll_skip_16_armed(),
+        expected,
+        "the process-wide reading must agree with the spelling table applied to \
+         IZARRAVM_DIRECT_POLL_SKIP_16={ambient:?}"
+    );
+    if matches!(ambient, Err(std::env::VarError::NotPresent)) {
+        assert!(
+            !expected,
+            "IZARRAVM_DIRECT_POLL_SKIP_16 must default OFF: the slice ships behind a knob \
+             and flipping it is a separate owner decision"
+        );
+    }
+}
