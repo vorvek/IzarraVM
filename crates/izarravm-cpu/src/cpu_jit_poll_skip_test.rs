@@ -114,6 +114,9 @@ fn warm_poll_code(code: &[u8], starts: &[u32], d: bool, limit: u32, ah: u8) -> (
     cpu.set_fast_map_enabled_for_test(true);
     cpu.set_mode(GswMode::Gsw586);
     cpu.control.cr0 |= CR0_PE;
+    // `poll_skip_eligible` (the interpreter's own gate) requires the Direct backend OFF,
+    // so the rows that go through `poll_loop()` need this explicitly.
+    cpu.set_native_backend_enabled(false);
     let mut cs = SegmentRegister::flat(0x08, 0x9b);
     cs.default_size_32 = d;
     cs.limit = limit;
@@ -199,6 +202,13 @@ fn a_sixteen_bit_shape_over_a_big_limit_segment_is_volatile() {
 /// **T-D2b.** The parameter actually gates: the same certified bytes, under the
 /// INTERPRETER's `sixteen_bit_ok == false`, are a negative. This is what keeps
 /// `CpuGsw::poll_loop` byte-for-byte unchanged by the slice.
+///
+/// The second half drives the INTERPRETER's own entry point rather than the raw scanner,
+/// and it is the row that catches a hardcoded `true` at `build_poll_loop`'s call: a
+/// 32-bit D1b shape must NOT certify there. That is also D1b-6's scope decision as an
+/// assertion -- the `0x84` test slot is not inherently 16-bit, and admitting it for
+/// 32-bit code would move gp2-586, which is this slice's control. A control that moves
+/// is not a control.
 #[test]
 fn the_sixteen_bit_parameter_gates_the_three_slot_shape() {
     let (cpu, _bus) = warm_poll_code(D1_CODE, POLL3_STARTS, false, 0x0000_ffff, 0);
@@ -207,6 +217,13 @@ fn the_sixteen_bit_parameter_gates_the_three_slot_shape() {
         !matches!(outcome, PollScanOutcome::Found(_)),
         "sixteen_bit_ok == false must refuse the 16-bit shape; got {}",
         outcome_name(&outcome)
+    );
+
+    let (mut cpu, _bus) = warm_poll_code(D1B_CODE, POLL3_STARTS, true, 0xffff_ffff, 0x08);
+    cpu.set_eip(POLL16_ENTRY);
+    assert!(
+        cpu.poll_loop().is_none(),
+        "the D1b register-mask slot must stay refused in 32-bit code -- widening it          there would move gp2-586, the control"
     );
 }
 
@@ -299,4 +316,98 @@ fn the_two_test_encodings_charge_and_flag_identically() {
             );
         }
     }
+}
+
+/// **T-D1b-1.** The register-mask variant of the 3-slot shape -- `IN AL,DX` /
+/// `TEST AL,AH` (`84 E0`) / `Jcc rel8` -- certifies in a 16-bit code segment with the
+/// SAME descriptor as the immediate form: `raw_core_clocks == 17`, three fetches. Its
+/// mask is recorded SYMBOLICALLY (`PollMaskSource::Ah`) and is not read at
+/// certification. This is 81.68% of tyrian's declines, including the single hottest
+/// site (0x1604fb, 965 M declines, 63% of all declines).
+#[test]
+fn the_register_mask_poll_shape_certifies_with_a_symbolic_mask() {
+    let (cpu, _bus) = warm_poll_code(D1B_CODE, POLL3_STARTS, false, 0x0000_ffff, 0x08);
+    let outcome = build_poll_loop_from(&cpu, POLL16_ENTRY, true);
+    let PollScanOutcome::Found(poll) = outcome else {
+        panic!(
+            "the 16-bit TEST AL,AH shape must certify with sixteen_bit_ok; got {}",
+            outcome_name(&outcome)
+        );
+    };
+    assert_eq!(poll.family(), PollFamily::Io);
+    assert_eq!(poll.raw_core_clocks(), 17);
+    assert_eq!(poll.fetch_count(), 3);
+    assert_eq!(poll.mask_source(), PollMaskSource::Ah);
+    assert!(
+        !poll.mask_is_resolved(),
+        "an Ah shape is unresolved until the call-out reads AH"
+    );
+    let resolved = poll.with_resolved_mask(&cpu);
+    assert_eq!(resolved.status_mask(), 0x08);
+    assert!(resolved.mask_is_resolved());
+}
+
+/// **T-D1b-2.** The structural/register split, which is what keeps the 965 M-decline
+/// site from rescanning: every `0x84` form that is NOT exactly `84 E0` refuses
+/// CACHEABLY, because each rejection is a pure code-byte fact.
+///
+/// `84 C4` (`TEST AH,AL`) is included deliberately. AND is commutative, so it is the
+/// SAME test with identical flags -- and it is still refused. The accepted set is
+/// exactly one encoding, on purpose and fail-closed; a future site using the mirrored
+/// form is a coverage gap to be diagnosed, not a bug to be hunted.
+#[test]
+fn every_other_register_mask_encoding_refuses_cacheably() {
+    for (name, modrm) in [
+        ("TEST AL,BH (reg != AH)", 0xf8u8),
+        ("TEST BL,AH (rm != AL)", 0xe3),
+        ("TEST [BX],AH (memory operand)", 0x27),
+        (
+            "TEST [BX+SI],AH (memory, same reg/rm fields as 84 E0)",
+            0x20,
+        ),
+        ("TEST AH,AL (the mirrored encoding)", 0xc4),
+    ] {
+        let code = [0xec, 0x84, modrm, 0x75, 0xfb];
+        let (cpu, _bus) = warm_poll_code(&code, POLL3_STARTS, false, 0x0000_ffff, 0x08);
+        let outcome = build_poll_loop_from(&cpu, POLL16_ENTRY, true);
+        assert!(
+            matches!(outcome, PollScanOutcome::NegativeCacheable),
+            "{name} must refuse CACHEABLY -- a structural negative is what stops a hot \
+             site from rescanning per read; got {}",
+            outcome_name(&outcome)
+        );
+    }
+}
+
+/// **T-D1b-6** (round-2 MAJOR-9's inverted form). `0x84` is deliberately NOT in
+/// `poll_head_possible`'s opcode set, and the D1b arm carries a documented exemption
+/// from the "every shape slot opcode is in the set" rule instead.
+///
+/// Adding it would have widened the INTERPRETER's cheap early-out on a common
+/// instruction -- `TEST r/m8,r8` -- turning a free prefilter reject into a negative-cache
+/// probe and, once per page generation, a full ten-probe scan, on a path no ladder arm
+/// exercises. The exemption is sound because `poll_head_possible` is reachable only with
+/// `sixteen_bit_ok == false`, under which the D1b arm cannot produce a shape at all.
+/// Both halves are asserted here.
+#[test]
+fn the_register_mask_test_slot_is_exempt_from_the_head_prefilter_set() {
+    // Half one: the prefilter rejects a 0x84 boundary, so 0x84 is not in the set.
+    let (mut cpu, _bus) = warm_poll_code(D1B_CODE, POLL3_STARTS, true, 0xffff_ffff, 0x08);
+    let before = cpu.perf_counters().poll_head_prefilter_rejects;
+    cpu.set_eip(POLL16_ENTRY + 1); // the TEST slot
+    assert!(cpu.poll_loop().is_none());
+    assert_eq!(
+        cpu.perf_counters().poll_head_prefilter_rejects,
+        before + 1,
+        "a 0x84 boundary must be answered by the prefilter, not by a scan"
+    );
+
+    // Half two: with the interpreter's own sixteen_bit_ok, the D1b arm produces nothing,
+    // so the exemption cannot cost a certification that the prefilter would have allowed.
+    let outcome = build_poll_loop_from(&cpu, POLL16_ENTRY, false);
+    assert!(
+        !matches!(outcome, PollScanOutcome::Found(_)),
+        "the D1b arm must be unreachable without sixteen_bit_ok; got {}",
+        outcome_name(&outcome)
+    );
 }
