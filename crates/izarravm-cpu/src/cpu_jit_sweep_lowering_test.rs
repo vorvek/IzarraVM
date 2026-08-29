@@ -239,6 +239,12 @@ mod misaligned_memory;
 #[path = "cpu_jit_word_shift_test.rs"]
 mod word_shift;
 
+/// The BYTE shift/rotate register rows (`0xD0 /4..=7` and `0xC0 /5,/6,/7`), behind
+/// `IZARRAVM_BYTE_SHIFT_ROWS`. Nested here for the reason the modules above are: it wants this
+/// module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than another copy of it.
+#[path = "cpu_jit_byte_shift_test.rs"]
+mod byte_shift;
+
 /// The sixteen-bit INC/DEC lazy-flag descriptor, the survivor `word_memory`'s header recorded and
 /// left for its own change. Nested here for the reason the four modules above are: it wants this
 /// module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a sixth copy.

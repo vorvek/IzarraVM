@@ -4454,12 +4454,15 @@ pub(crate) enum DirectKind {
     /// miscompile, not a missed lowering, which is why the Word allowlist refused 0xC1 until this
     /// field existed.
     ///
-    /// **At Byte the field is not `operand_width` and must never become it.** 0xC0 is a byte
-    /// opcode whose width is fixed by the OPCODE, not by the operand-size prefix: an unprefixed
-    /// 0xC0 in a 32-bit segment decodes with `OperandSize::Dword`, which the duke3d-586 census
-    /// reports verbatim on the `0xC0 /4 register dword` row. The classify arm therefore hard-codes
+    /// **At Byte the field is not `operand_width` and must never become it.** 0xC0 and 0xD0 are
+    /// byte opcodes whose width is fixed by the OPCODE, not by the operand-size prefix: an
+    /// unprefixed 0xC0 in a 32-bit segment decodes with `OperandSize::Dword`, which the duke3d-586
+    /// census reports verbatim on the `0xC0 /4 register dword` row, and the same encoding in a
+    /// 16-bit segment decodes with `OperandSize::Word`, which is what the tyrian-586 census
+    /// reports on the `0xD0 /5 register word` row. Both classify arms therefore hard-code
     /// `MemoryWidth::Byte`, the way 0xC6's arm does, and passing `operand_width` there would
-    /// silently emit a 32-bit shift of the whole home register.
+    /// silently emit a 16- or 32-bit shift of the whole home register. That is also why 0xD0 is an
+    /// arm of its OWN rather than a member of `0xc1 | 0xd1`, which produces `operand_width`.
     ///
     /// **`dst` is a BYTE-register index at Byte width**, where 4..7 name AH/CH/DH/BH rather than
     /// the homes of EBP/ESI/EDI. `emit_shift`'s Byte arm therefore goes through
@@ -4485,7 +4488,8 @@ pub(crate) enum DirectKind {
         count: u8,
         width: MemoryWidth,
         /// Present only for the shapes `count_lane_for` admits: the register-destination `0xC1
-        /// /4..=7` (Dword) and `0xC0 /4` (Byte) forms, no prefixes, `imm_len == 1`, `len == 3`.
+        /// /4..=7` (Dword) and `0xC0 /4..=7` (Byte) forms, no prefixes, `imm_len == 1`,
+        /// `len == 3`. `0xD0` is admitted as a kind but never as a lane: it has no immediate.
         /// See `RotateReg::lane` for why a runtime count costs a three-way branch, and
         /// `emit_shift_lane` for the branch itself.
         ///
@@ -6467,8 +6471,9 @@ fn imm8_lane_for(
 }
 
 /// The GROUP-2 COUNT twin of `imm8_lane_for`: the count byte of `0xC1 /0` ROL, `0xC1 /1` ROR,
-/// `0xC1 /4..=7` (SHL/SHR/SAL/SAR at Dword) and `0xC0 /4` SHL r8 — register destinations, no
-/// prefixes. The second user of the `IMM8_LANE_WIDTH` class, behind `IZARRAVM_COUNT_LANES`.
+/// `0xC1 /4..=7` (SHL/SHR/SAL/SAR at Dword) and `0xC0 /4..=7` (the byte shifts) — register
+/// destinations, no prefixes. The second user of the `IMM8_LANE_WIDTH` class, behind
+/// `IZARRAVM_COUNT_LANES`.
 ///
 /// # Why this family, and why it comes second
 ///
@@ -6626,6 +6631,22 @@ fn count_lane_for(
 /// gates -- `0xC1`/`0xD1` `/0` ROL and `0xC0 /4` SHL r8 -- or `None` for anything else, including
 /// the rows that were lowered before the 2026-08-09 slice (`/1` ROR, `/4..=7` at Dword) and which
 /// the knob deliberately does not cover.
+///
+/// **`IZARRAVM_BYTE_SHIFT_ROWS`'s rows are deliberately NOT gated here**, and "we did not touch
+/// it" is not the argument. This gate exists for a MEASURED amplification -- duke3d patches the
+/// count byte of its group-2 SMC shape table (`0xC1 /0,/4,/5`, ~1.97 M events) -- so it defends a
+/// known patched byte rather than stating a policy for group 2. No fixture measures SMC on
+/// tyrian's `0xC0 /5` sites, and extending the gate on inspection would be the unmeasured
+/// admission's mirror image: an unmeasured REFUSAL. The rows are also under a different knob, and
+/// coupling them to this one's third arm would make the byte-shift ladder unattributable, which is
+/// the recorded lesson for CLD/STD. `0xD0` has no immediate at all, so there is no count byte to
+/// gate: its only count-bearing byte is the opcode, and a `D0 -> C0` patch changes the instruction
+/// LENGTH as well as the count -- an ordinary code write the block-kill machinery already handles.
+/// Note also that this function reads `insn.modrm.reg`, not the kind's `op`, so a `/6` site is not
+/// gated even though it emits identically to `/4`.
+///
+/// If a ladder shows SMC damage (`smc_lane_accepts` falls or `smc_heat_demotions` rises), the
+/// ready-made second arm is `0xc0 if matches!(reg, 5..=7)` under the new knob. A follow-on.
 ///
 /// `physical` is the instruction's start and the instruction is already known page-local in
 /// physical (`physical_page_local` in the compile loop), so start-relative arithmetic over its own
@@ -12885,8 +12906,11 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // arms `operand_width` -- the same fix MOVZX/MOVSX got with `dst_width` rather than being kept
     // off the list -- and put them on the GATED allowlist below. The hazard the paragraph named was
     // real and is now expressed instead of avoided; see the two arms for the width argument at each
-    // end. `0xd0` does still stay refused, and not for a width reason: no classify arm exists for
-    // it, which makes listing it a no-op that reads like a lowering.
+    // end. `0xd0` USED to stay refused here, and not for a width reason: no classify arm existed
+    // for it, which made listing it a no-op that read like a lowering. It has an arm as of the
+    // byte-shift-rows slice and its allowlist entry is load-bearing rather than decorative -- the
+    // tyrian-586 row it claims is 13,933,316 runtime hits at `operand_size: word`, so the entry is
+    // the whole admission. It sits on the GATED term below with `0xc0` rather than on this list.
     //
     // `0x8c` is the one non-byte member and it is here for the same structural reason rather than
     // as an exception: its interpreter arm writes `OperandSize::Word` unconditionally, so the
@@ -14263,7 +14287,15 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // ADC (/2) and SBB (/3) are refused at Word size and only there. They consume the
                 // incoming CF as an operand, which the Dword path handles with a branch on the
                 // EFLAGS shadow (`emit_carry_alu_preloaded`) that has no sixteen-bit twin. Refusing
-                // is a missed lowering; the census measures zero Word `0x83 /2` and `/3`.
+                // is a missed lowering, and it is now a MEASURED one: an older version of this
+                // comment said "the census measures zero Word `0x83 /2` and `/3`", which was true
+                // of the census it was written against and is false of tyrian-586 at main
+                // 0333d956, where `/3` is 3,223,263 runtime hits -- 14.5% of the static-unbound
+                // rejected class and its second-largest row. Lowering it is a slice rather than a
+                // guard relaxation: `emit_carry_alu_preloaded` is Dword throughout (`alu_r32_r32`
+                // on both arms) and its pending tags 0x8000_0200 / 0x8000_0201 encode op and width
+                // TOGETHER, so a Word carry-ALU needs a new descriptor class, not a width
+                // parameter. `0x81 /2,/3` and the `0x15`/`0x1d` accumulator forms come with it.
                 if insn.operand_size == OperandSize::Word && matches!(m.reg, 2 | 3) {
                     return None;
                 }
@@ -14722,27 +14754,35 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     }),
                 };
             }
-            // SHL r8, imm8 (0xC0 /4), REGISTER form. Second in the duke3d-586 re-census's
-            // refused-row ranking behind the ROL above: 32,839,852 runtime hits and 31,743,121
-            // static unbound exits, the latter up from 5.7M for the same reason ROL's grew.
+            // SHL/SHR/SAL/SAR r8, imm8 (0xC0 /4,/5,/6,/7), REGISTER form. `/4` is second in the
+            // duke3d-586 re-census's refused-row ranking behind the ROL above: 32,839,852 runtime
+            // hits and 31,743,121 static unbound exits, the latter up from 5.7M for the same
+            // reason ROL's grew.
             //
-            // ONE sub-opcode, and the narrowness is the point rather than laziness. The census
-            // measures `/4` alone; `/6` is its undocumented SAL alias and would be free to add,
-            // but no row asks for it and an alias admitted on inspection is exactly the unmeasured
-            // admission this file refuses elsewhere. `/5` SHR and `/7` SAR have no byte row at
-            // all, the four byte rotates have neither a row nor an emitter, and 0xD0 (the same
-            // group by an implicit 1) tops out at 49,021 runtime hits across every sub-opcode --
-            // three orders below the floor this slice is working to.
+            // `/5`, `/6` and `/7` are the byte-shift-rows slice, and the census that asked for
+            // them is tyrian-586 at main 0333d956 rather than duke: `0xC0 /5` is 607,227 runtime
+            // hits there -- a MERGED word/dword row, the two halves refused by different
+            // mechanisms -- alongside the `0xD0 /5` row the arm below claims. An older version of
+            // this comment said `/5` and `/7` "have no byte row at all" and that `0xD0` "tops out
+            // at 49,021 runtime hits across every sub-opcode"; both were true of the duke census
+            // and are false of tyrian's, which is what a 16-bit workload changes.
+            //
+            // `/6` is admitted for CLOSURE over a shared arm rather than because a row asks for
+            // it: it is the undocumented SAL alias of `/4`, `core.rs` answers the two in one arm,
+            // and refusing it while admitting `/5` and `/7` would break exactly the contiguity the
+            // byte set's closure rule at the top of this file exists to protect. It is normalised
+            // to `op: 4` below.
             //
             // The width is the OPCODE's, not the prefix's. An unprefixed 0xC0 in a 32-bit segment
-            // decodes with `OperandSize::Dword`, which is verbatim what the census row says
-            // (`operand_form: register`, `operand_size: dword`, `prefix_mask: 0`), so this arm
-            // hard-codes `MemoryWidth::Byte` the way 0xC6's does and must never read
-            // `operand_width`. The consequence at the other end is a MISSED lowering, not a
-            // hazard: 0xC0 is absent from the `OperandSize::Word` allowlist at the top of this
-            // file, so a 66-prefixed encoding and a 16-bit code segment both refuse before
-            // reaching here even though the guest semantics would be identical. Adding the entry
-            // is safe on its own terms but has no measured row behind it.
+            // decodes with `OperandSize::Dword`, which is verbatim what the duke census row says
+            // (`operand_form: register`, `operand_size: dword`, `prefix_mask: 0`), and the same
+            // encoding in a 16-bit segment decodes with `OperandSize::Word`, which is verbatim
+            // what tyrian's says. This arm hard-codes `MemoryWidth::Byte` the way 0xC6's does and
+            // must never read `operand_width`. Both opcodes are on the `OperandSize::Word`
+            // allowlist as of this slice, under `IZARRAVM_BYTE_SHIFT_ROWS` and keyed on the
+            // sub-opcode; the paragraph that used to say the entry "is safe on its own terms but
+            // has no measured row behind it" is discharged by the tyrian census, where the Word
+            // half is the whole of the 13.9 M `0xD0 /5` row.
             //
             // The MEMORY form is refused by the `let-else` below, as every other register-only arm
             // in this file refuses it, and it is a separate census row this slice does not claim.
@@ -20884,12 +20924,23 @@ fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidt
     emit_commit_shift_flags(e, count);
 }
 
-/// SHL r8, imm8 (0xC0 /4). The masked count is already known non-zero; `emit_shift` owns that
-/// case for every width so the no-op shape cannot diverge between the lanes.
+/// THE BYTE SHIFT LANE: `0xC0 /4..=7` and `0xD0 /4..=7`, register form. The masked count is
+/// already known non-zero; `emit_shift` owns that case for every width so the no-op shape cannot
+/// diverge between the lanes.
+///
+/// **Sub-opcode-generic by construction rather than by widening.** The only dependence this
+/// function ever had on `op` was the assert below: `shift_r8_imm8` encodes `C0 /op ib` for any
+/// `op < 8` and pushes `op` straight into the ModRM `/op` slot with no translation and no table.
+/// So admitting `/5` SHR and `/7` SAR here cost the assert and nothing else. `/6` never arrives:
+/// `classify` normalises the SAL alias to `4`, so this lane only ever sees a documented
+/// sub-opcode. The assert still says `4..=7` rather than the tighter `4 | 5 | 7`, so that it reads
+/// identically to `emit_shift`'s own and a later reader does not have to hold two different
+/// sub-opcode sets in mind for the same family.
 ///
 /// Modelled on `emit_inc_dec_reg8` rather than on the body above, and for the same reason: `dst`
-/// is a BYTE-register index where 4..7 name AH/CH/DH/BH, so `home(dst)` would reach the guest EBP,
-/// ESI or EDI home and shift the wrong register by 32 bits. The read/modify/write-back through
+/// is a BYTE-register index where 4..7 name AH/CH/DH/BH, so `home(dst)` -- which is
+/// `GUEST_HOMES[index & 7]` -- would reach the guest ESP, EBP, ESI or EDI home and shift the wrong
+/// register by 32 bits. The read/modify/write-back through
 /// `emit_read_store_value` and `emit_write_gpr8` touches exactly the destination lane's eight
 /// bits, which is `write_gpr8`'s contract and the one the interpreter's
 /// `write_operand_sized(.., Byte, ..)` reaches.
@@ -20901,23 +20952,36 @@ fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidt
 ///   - `emit_write_gpr8` runs after, because it also shifts its value register IN PLACE, and a
 ///     later reader of RDX would see the lane-positioned copy rather than the byte result.
 ///
-/// The arithmetic is a genuine 8-bit `shl`, not a 32-bit shift of the zero-extended byte. That is
+/// The arithmetic is a genuine 8-bit shift, not a 32-bit shift of the zero-extended byte. That is
 /// what makes the flags the host's rather than something this function has to reconstruct:
-/// `shift_rotate` at `BusWidth::Byte` takes CF from bit 7, SF from bit 7 and ZF/PF from the 8-bit
-/// result, which an 8-bit host shift does by construction and a 32-bit one gets wrong in all
-/// three. `0x80 shl 1` is the shortest witness -- 8 bits gives 0x00 with CF set and ZF set, 32
-/// bits gives 0x100 with CF clear and ZF clear.
+/// `shift_rotate` at `BusWidth::Byte` takes CF from the last bit shifted out of eight, SF from
+/// bit 7 and ZF/PF from the 8-bit result, which an 8-bit host shift does by construction and a
+/// 32-bit one gets wrong in all three. `0x80 shl 1` is the shortest witness -- 8 bits gives 0x00
+/// with CF set and ZF set, 32 bits gives 0x100 with CF clear and ZF clear. At `/7` the wrong shape
+/// is wrong in the VALUE and not merely the flags: a 32-bit arithmetic shift of a zero-extended
+/// byte shifts in zeros where the guest shifts in bit 7, which is why the genuine `C0 /7` matters
+/// and why a "just use `shift_r32_imm8` and mask" suggestion has to be refused.
 ///
 /// **Counts of 8 to 31 are lowered too, and that part is MEASURED rather than derived.** x86 masks
 /// the count to five bits at every operand size, so a byte shift by 8 or more shifts the operand
 /// entirely away, and the SDM leaves CF undefined once the count reaches the operand width. The
-/// reference this tree matches is its own interpreter, not the manual: a 48-case host probe over
-/// this lane's seeds and counts reproduced `shift_rotate`'s single-bit loop exactly -- result, CF,
-/// OF, SF, ZF and PF -- and `BYTE_SHIFT_COUNTS` pins 8 and 31 as cases so a host that disagreed
-/// would fail the suite loudly instead of miscompiling quietly. That is the same argument, and the
-/// same kind of evidence, that `emit_shift`'s Word lane makes for its counts of 16 to 31.
+/// reference this tree matches is its own interpreter, not the manual.
+///
+/// **The evidence differs by sub-opcode and the difference is stated, because an earlier version
+/// of this paragraph claimed one measurement for all four.** For `/4` it is the original 48-case
+/// host probe over this lane's seeds and counts, plus `BYTE_SHIFT_COUNTS`, which pins 8 and 31.
+/// That probe covered SHL ALONE. For `/5` and `/7` the evidence is
+/// `cpu_jit_byte_shift_test.rs`'s differential sweep, which runs counts 0, 1, 2, 7, 8, 9, 16, 31,
+/// 32 and 33 at every admitted sub-opcode against the interpreter with the flags read back through
+/// emitted `SETcc` slots. That sweep is the ONLY evidence for the undefined range at `/5` and
+/// `/7`, so it may not be trimmed without rewriting this paragraph. Either way a host that
+/// disagreed with `shift_rotate` would fail the suite loudly instead of miscompiling quietly,
+/// which is the same argument `emit_shift`'s Word lane makes for its counts of 16 to 31.
 fn emit_shift_reg8(e: &mut Encoder, op: u8, dst: u8, count: u8) {
-    debug_assert_eq!(op, 4, "only SHL r8 (0xC0 /4) has a byte lane");
+    debug_assert!(
+        matches!(op, 4..=7),
+        "emit_shift_reg8 is the BYTE shift lane; rotates have no byte lane at all"
+    );
     debug_assert!(count != 0, "emit_shift owns the no-op count");
     emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RDX);
     e.shift_r8_imm8(op, Reg::RDX, count);
@@ -21144,7 +21208,12 @@ fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, lane: ImmLane) {
     e.place(done);
 }
 
-/// The COUNT-LANE form of the group-2 SHIFTS: `0xC1 /4..=7` at Dword and `0xC0 /4` at Byte.
+/// The COUNT-LANE form of the group-2 SHIFTS: `0xC1 /4..=7` at Dword and `0xC0 /4..=7` at Byte.
+///
+/// The Byte arm reaches `/5` and `/7` as of the byte-shift-rows slice, and it does so on the
+/// SHIPPED count-lane arm rather than in some corner: `count_lane_for` bars on
+/// `matches!(insn.opcode, 0xc0 | 0xc1)`, `imm_len == 1` and `len == 3`, all of which the new rows
+/// pass at BOTH segment kinds. `0xD0` takes no lane at all -- no immediate byte, and `len == 2`.
 ///
 /// The same runtime three-way branch `emit_rotate_reg_lane` carries, over the same masked loaded
 /// byte, and for the same reason — but the two upper arms differ only in ONE bit of the `defined`
@@ -21188,7 +21257,10 @@ fn emit_shift_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, lane: I
         // count is safely in RCX; `dst` is a BYTE-register index, so `home(dst)` would reach the
         // wrong register for indices 4..7 and the helpers exist precisely to avoid it.
         MemoryWidth::Byte => {
-            debug_assert_eq!(op, 4, "only SHL r8 (0xC0 /4) has a byte lane");
+            debug_assert!(
+                matches!(op, 4..=7),
+                "emit_shift_lane's byte arm is the BYTE shift lane; rotates have no byte lane"
+            );
             emit_read_store_value(e, StoreSource::Reg(dst), MemoryWidth::Byte, Reg::RDX);
             e.cmp_r32_imm32(Reg::RCX, 1);
             e.jz(one);
