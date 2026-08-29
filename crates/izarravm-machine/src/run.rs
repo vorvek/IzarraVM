@@ -1145,6 +1145,22 @@ impl Machine {
             cs_register.limit,
             cs_base.wrapping_add(eip),
         );
+        // The descriptor tables. A delivery fault names a vector and nothing
+        // else, which leaves the reader unable to tell WHOSE tables are loaded --
+        // the monitor's, a VCPI client's, or the ones a guest built for a V86
+        // task of its own. Added 2026-08-30 while diagnosing a Zone 66 crash on
+        // INT 0FDh, where exactly that question was the whole investigation: the
+        // IDTR read 49 vectors at an address beside the guest's own code, which
+        // is what identified the tables as the game's rather than TOKAEMM's.
+        let _ = writeln!(
+            out,
+            "fault trace: IDTR base={:#010x} limit={:#06x} (covers {} vectors)               GDTR base={:#010x} limit={:#06x}",
+            self.cpu.idtr.base,
+            self.cpu.idtr.limit,
+            (u32::from(self.cpu.idtr.limit) + 1) / 8,
+            self.cpu.gdtr.base,
+            self.cpu.gdtr.limit,
+        );
         let linear_eip = cs_base.wrapping_add(eip);
         let start = linear_eip.saturating_sub(32);
         // Count derived from the clamped start, not a fixed 32. Near the bottom

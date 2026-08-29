@@ -119,8 +119,14 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
 
     let result = cpu.run_budgeted(&mut bus, 10_000);
 
+    // TripleFault, not IdtLimit, since 2026-08-30: an out-of-limit vector is a
+    // deliverable #GP(vector*8+2) per the PRM, so #DE escalates to #GP, which is
+    // also out of limit here, then to #DF, and delivering THAT is the PRM's
+    // shutdown. The point of this test is unchanged -- a hard CpuError
+    // propagates out of run_budgeted and brk_fatal counts it -- only the way the
+    // fixture reaches one is now the architectural chain.
     assert!(
-        matches!(result, Err(CpuError::IdtLimit { vector: 0 })),
+        matches!(result, Err(CpuError::TripleFault { .. })),
         "{result:?}"
     );
     let p = cpu.perf_counters();

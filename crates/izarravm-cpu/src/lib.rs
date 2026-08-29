@@ -361,8 +361,6 @@ pub enum CpuError {
     },
     #[error("general protection fault while loading selector {selector:#06x}")]
     GeneralProtection { selector: u16 },
-    #[error("IDT vector {vector} is outside IDTR limit")]
-    IdtLimit { vector: u8 },
     #[error("divide error (#DE): divide by zero or quotient overflow")]
     DivideError,
     #[error(
@@ -5378,6 +5376,10 @@ const fn vector_pushes_error_code(vector: u8) -> bool {
 
 /// Vector 8, #DF.
 const DOUBLE_FAULT_VECTOR: u8 = 8;
+
+/// Vector 13, #GP. The escalation target for a delivery whose vector lies
+/// outside the IDT limit; see `deliver_exception_body`.
+const GENERAL_PROTECTION_VECTOR: u8 = 13;
 
 /// How many times one delivery may escalate before the core reports shutdown.
 /// This is not an architectural number. Every fault a frame build can raise is

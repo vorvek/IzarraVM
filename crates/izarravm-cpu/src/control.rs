@@ -334,25 +334,25 @@ impl CpuGsw {
     /// it. The first fault is then raised again, in order, exactly as the PRM's
     /// "handled in succession" requires.
     ///
-    /// Two faults deliberately stay outside the table, both of them raised as
-    /// `InternalFault::Cpu` and so returned to the caller as a stop:
+    /// ONE fault deliberately stays outside the table, raised as
+    /// `InternalFault::Cpu` and so returned to the caller as a stop: a committed
+    /// task switch (`CpuError::FaultAfterTaskSwitchCommit`). There is no
+    /// interrupted state left to escalate from; see `commit_task_switch`.
     ///
-    /// - A committed task switch (`CpuError::FaultAfterTaskSwitchCommit`). There
-    ///   is no interrupted state left to escalate from; see `commit_task_switch`.
-    /// - An IDT that does not cover the vector (`CpuError::IdtLimit`).
-    ///   Architecturally that is a contributory `#GP(vector*8+2)` and would
-    ///   escalate, but this core reports it as a named stop at every level, which
-    ///   an existing test pins for the first-level case. An IDT limit is one
-    ///   contiguous bound and every escalation target is vector 8 or higher, so
-    ///   "the IDT covers the target" implies "it covers vector 8": escalating
-    ///   would change the outcome only for a guest that keeps a short IDT AND a
-    ///   real #DF handler, which would then get its #DF delivered instead of a
-    ///   stop. No DOS-era guest does that, and every other layout ends in a stop
-    ///   either way -- with the precise "IDT does not cover vector N" diagnostic
-    ///   instead of a generic triple fault. (The gate-P-bit check this note used
-    ///   to be paired with now exists, in `deliver_exception_body`; it raises an
-    ///   ordinary #NP and escalates through the table like any other fault. The
-    ///   IDT-limit stop is deliberately still outside it.)
+    /// An IDT that does not cover the vector used to be the second one, reported
+    /// as `CpuError::IdtLimit` at every level. It is now the contributory
+    /// `#GP(vector*8+2+EXT)` the PRM specifies and escalates through this table
+    /// like any other fault; the variant is gone. The argument for the old stop
+    /// was that "escalating would change the outcome only for a guest that keeps
+    /// a short IDT AND a real #DF handler, which no DOS-era guest does". That
+    /// skipped a step. The FIRST escalation from an out-of-limit vector is #GP,
+    /// not #DF, so a short IDT with a real #GP handler is enough to change the
+    /// outcome -- and Zone 66 is one: it enters protected mode through VCPI,
+    /// builds a 49-vector IDT, runs a V86 task of its own under it and issues
+    /// `INT 0FDh`, which its own vector-13 handler exists to take. Under the old
+    /// stop the machine died three guest seconds in. Every layout that really is
+    /// unrecoverable still ends in a stop, now as `TripleFault` by the
+    /// architectural route rather than a bespoke error.
     ///
     /// One known wart, inherited rather than introduced: in REAL mode
     /// `deliver_exception` routes through `software_interrupt`, which posts
@@ -568,7 +568,29 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         let gate_address = self.idtr.base + u32::from(vector) * 8;
         if u32::from(self.idtr.limit) < u32::from(vector) * 8 + 7 {
-            return Err(CpuError::IdtLimit { vector }.into());
+            // 386 PRM, INT n / INT 3 / INTO, protected-mode arm:
+            //
+            //     IF vector*8+7 > IDT limit THEN #GP(vector*8+2+EXT);
+            //
+            // A DELIVERABLE #GP, not a processor abort. The IDT bit (2) is set
+            // because the selector index names the IDT, and EXT is set only for
+            // an external interrupt. `escalate_delivery` takes it from here: if
+            // vector 13 is out of limit too the #GP escalates to #DF and then to
+            // shutdown, which is the same architectural chain.
+            //
+            // This was `CpuError::IdtLimit`, a hard stop at every level, until
+            // 2026-08-30. The comment on `escalate_delivery` argued the stop was
+            // harmless because escalating "would change the outcome only for a
+            // guest that keeps a short IDT AND a real #DF handler". That skips a
+            // step: the FIRST escalation is #GP, not #DF, so a short IDT with a
+            // real #GP handler is enough. Zone 66 is one -- it runs a V86 task
+            // under its own 49-vector IDT and issues INT 0FDh from it, which its
+            // own vector-13 handler is there to take.
+            let ext = u32::from(source == DeliverySource::External);
+            return Err(InternalFault::Exception {
+                vector: GENERAL_PROTECTION_VECTOR,
+                error_code: Some(u32::from(vector) * 8 + 2 + ext),
+            });
         }
 
         let gate_low = self.read_system_linear_u32(bus, gate_address)?;
@@ -783,8 +805,26 @@ impl CpuGsw {
             // tables, which TOKAEMM's are not, so this has never been observed -- but
             // the invariant now rests on the monitor's tables being well formed, not
             // on an enumeration of raise sites.
+            //
+            // ONE EXEMPTION, added 2026-08-30. `deliver_exception_body` now
+            // raises #GP(vector*8+2+EXT) when a vector lies outside the IDT
+            // limit, per the PRM, and that code is nonzero. It cannot reach
+            // TOKAEMM's vec13_entry, and the reason is structural rather than
+            // observational: TOKAEMM's own IDT carries all 256 gates, so a
+            // vector outside its limit does not exist. Such a #GP can only be
+            // raised while some OTHER IDT is loaded -- a VCPI client's, or the
+            // one a guest built for a V86 task of its own -- and it is delivered
+            // through that IDT, never TOKAEMM's. The predicate below says
+            // exactly that: the code names a vector THIS IDT does not cover, so
+            // THIS IDT is not TOKAEMM's.
+            let names_an_uncovered_vector = error_code.is_some_and(|code| {
+                code & 2 != 0 && u32::from(self.idtr.limit) < (code >> 3) * 8 + 7
+            });
             debug_assert!(
-                !source_v86 || vector != 13 || error_code.unwrap_or(0) == 0,
+                !source_v86
+                    || vector != 13
+                    || error_code.unwrap_or(0) == 0
+                    || names_an_uncovered_vector,
                 "V86-origin vector-13 #GP with a nonzero error code ({error_code:?}) \
                  breaks the TOKAEMM vec13 frame-shape discriminator"
             );

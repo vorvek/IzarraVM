@@ -1673,8 +1673,14 @@ fn a_fatal_fault_delivering_an_irq_reports_the_boundary_it_was_taken_at() {
     let boundary_cs = cpu.registers.cs().selector;
     let result = cpu.service_pending_interrupt(&mut bus);
 
+    // TripleFault, not IdtLimit, since 2026-08-30: see
+    // `a_software_interrupt_past_the_idt_limit_raises_gp_rather_than_stopping`.
+    // A limit of 0x20 covers neither vector 0x30 nor vector 13, so the #GP the
+    // PRM raises is itself undeliverable and the chain ends in shutdown. The
+    // fault-site assertions below are what this test exists for and they are
+    // unchanged.
     assert!(
-        matches!(result, Err(CpuError::IdtLimit { vector: 0x30 })),
+        matches!(result, Err(CpuError::TripleFault { .. })),
         "{result:?}"
     );
     let site = cpu
@@ -2089,5 +2095,67 @@ fn v86_int3_through_a_dpl0_gate_general_protection_faults() {
             }) if code == idt_error_code(3, false)
         ),
         "INT3 from CPL 3 through a DPL-0 gate must #GP(3*8+2), got {result:?}"
+    );
+}
+
+#[test]
+fn a_software_interrupt_past_the_idt_limit_raises_gp_rather_than_stopping() {
+    // 386 PRM, INT n / INT 3 / INTO, protected-mode arm:
+    //
+    //     IF vector*8+7 > IDT limit THEN #GP(vector*8+2+EXT);
+    //
+    // An out-of-limit vector is a DELIVERABLE #GP, not a processor abort. A
+    // guest whose IDT is short but which covers vector 13 gets its own handler.
+    //
+    // FOUND BY Zone 66, 2026-08-30. It enters protected mode through VCPI, loads
+    // its own 7-entry GDT and 49-vector IDT at ring 0, runs a V86 task of its
+    // own, and issues INT 0FDh from it. Its IDT covers vector 13, so on real
+    // silicon its own #GP handler runs. This core stopped the machine instead
+    // and the game died 3 guest seconds in.
+    //
+    // `escalate_delivery`'s comment argued the stop was harmless because
+    // "escalating would change the outcome only for a guest that keeps a short
+    // IDT AND a real #DF handler". That reasoning skips a step: the FIRST
+    // escalation from an out-of-limit vector is #GP, not #DF, so a short IDT
+    // with a real #GP handler is enough -- and Zone 66 is one.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0xfd, 0xf4], &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+    // IOPL 3, which `enter_v86_direct` does not set. INT n is IOPL-sensitive in
+    // V86: at IOPL < 3 it raises #GP(0) and never reaches the IDT limit check at
+    // all, so this test would pass for the wrong reason and read error code 0.
+    // TOKAEMM runs its guest at real IOPL 3 for exactly this reason, so IOPL 3
+    // is also what Zone 66 actually runs at.
+    cpu.registers.eflags |= 0x3000;
+    // Covers vector 13 (needs 13*8+7 = 111 = 0x6f) but NOT vector 0xfd.
+    cpu.idtr.limit = 0x6f;
+
+    cpu.run_budgeted(&mut bus, 10_000).expect("no hard stop");
+
+    assert!(!cpu.is_v86_mode(), "the #GP handler runs at ring 0");
+    assert_eq!(cpu.registers.eip, MON_CODE, "the guest's own #GP gate ran");
+    let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, cpu.registers.esp() + o));
+    assert_eq!(
+        rd(0),
+        0xfd * 8 + 2,
+        "error code is vector*8+2: the IDT bit set, EXT clear for a software INT"
+    );
+}
+
+#[test]
+fn an_out_of_limit_vector_whose_gp_gate_is_also_missing_ends_in_a_triple_fault() {
+    // The other arm, and the reason the old stop looked adequate. When the IDT
+    // is too short to hold vector 13 either, the #GP escalates to #DF, the #DF
+    // cannot be delivered, and the processor shuts down. The machine still
+    // stops -- but through the architectural chain, not a bespoke error.
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0xfd, 0xf4], &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+    cpu.registers.eflags |= 0x3000; // IOPL 3; see the test above
+    cpu.idtr.limit = 0x20;
+
+    let result = cpu.run_budgeted(&mut bus, 10_000);
+
+    assert!(
+        matches!(result, Err(CpuError::TripleFault { .. })),
+        "{result:?}"
     );
 }
