@@ -3,6 +3,15 @@
 
 use super::*;
 
+// B3 FAT-position request-block offsets (design:
+// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.3's 16-byte layout). Named
+// the way cddriver.rs's `RH_*` request-header offsets are, and shared by
+// `perform_hdd_map_lookup` and its tests (`machine_device_integration_test.rs`).
+pub(crate) const HDD_MAP_UNIT: u32 = 1; // u8, guest writes: DOS unit (A=0; the Katea HDD is 2)
+pub(crate) const HDD_MAP_START: u32 = 4; // u32, guest writes: walk's starting cluster
+pub(crate) const HDD_MAP_STEPS: u32 = 8; // u32, guest writes: hops forward along the chain
+pub(crate) const HDD_MAP_RESULT: u32 = 12; // u32, host writes: the landing cluster
+
 impl Machine {
     /// Enter or leave booter-inert mode. When set, the Toka-DOS HLE and IZEMM stop
     /// intercepting the DOS/memory-manager interrupts (0x20/0x21/0x25/0x26/0x29/
@@ -745,36 +754,99 @@ impl Machine {
     /// holds the DOS data segment, and the host arms the CD redirector with
     /// it (see cdredir.rs).
     ///
+    /// Command 3 registers the B3 FAT-position request block (design:
+    /// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.2), borrowing the same
+    /// mailbox and far-pointer layout as command 1. Command 4 answers a
+    /// lookup from that block (`perform_hdd_map_lookup`).
+    ///
     /// A ring with any other command, or with a null mailbox, only parks the
     /// status: port 0xE8 was open bus before this port existed, so a stray
     /// OUT must stay inert instead of decoding low memory as a request.
     pub(super) fn perform_cd_doorbell(&mut self, command: u8) {
-        if command == 0x02 {
-            let dos_ds = u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
-                | (u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
-            if dos_ds == 0 {
-                self.cd_doorbell_status = 0xFE;
-                return;
+        match command {
+            0x01 => {
+                let Some(header) = self.mailbox_far_pointer() else {
+                    self.cd_doorbell_status = 0xFE; // no request stored
+                    return;
+                };
+                self.cd_device_request(header);
+                self.cd_doorbell_status = 0;
             }
-            self.arm_cd_redirector(dos_ds);
-            self.cd_doorbell_status = 0;
-            return;
+            0x02 => {
+                let dos_ds = u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
+                    | (u16::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
+                if dos_ds == 0 {
+                    self.cd_doorbell_status = 0xFE;
+                    return;
+                }
+                self.arm_cd_redirector(dos_ds);
+                self.cd_doorbell_status = 0;
+            }
+            0x03 => {
+                let Some(block) = self.mailbox_far_pointer() else {
+                    self.cd_doorbell_status = 0xFE; // probe: parsed, nothing registered
+                    return;
+                };
+                self.hdd_map_block = Some(block);
+                self.cd_doorbell_status = 0;
+            }
+            0x04 => self.perform_hdd_map_lookup(),
+            _ => self.cd_doorbell_status = 0xFF, // unknown command
         }
-        if command != 0x01 {
-            self.cd_doorbell_status = 0xFF; // unknown command
-            return;
-        }
+    }
+
+    /// Read the mailbox's far pointer (offset word then segment word, both
+    /// commands 1 and 3's layout) and resolve it to a physical address, or
+    /// `None` for the null 0:0 pointer -- the "nothing stored" sentinel both
+    /// callers treat as a refusal.
+    fn mailbox_far_pointer(&mut self) -> Option<u32> {
         let off = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
             | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 1)) << 8);
         let seg = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 2))
             | (u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32 + 3)) << 8);
         if seg == 0 && off == 0 {
-            self.cd_doorbell_status = 0xFE; // no request stored
+            return None;
+        }
+        Some((seg << 4).wrapping_add(off))
+    }
+
+    /// Doorbell command 4: answer the registered B3 FAT-position request.
+    /// Status codes and the block layout are the design's §2.3. The unit
+    /// check is one half of a two-sided guard: the kernel gates drive
+    /// selection (boot HDD only, `BootDrive >= 3`), and the host refuses
+    /// any unit that is not the Katea HDD -- on a floppy boot the kernel's
+    /// `dpb_unit == BootDrive - 1` test would otherwise name drive A: and
+    /// this answer would come from the wrong volume's FAT.
+    fn perform_hdd_map_lookup(&mut self) {
+        // DOS block units count A=0, B=1, first hard disk=2; the Katea
+        // volume is always the machine's only HDD, C:.
+        const KATEA_HDD_DOS_UNIT: u8 = 2;
+        let Some(block) = self.hdd_map_block else {
+            self.cd_doorbell_status = 0xFE;
+            return;
+        };
+        if self.read_physical_u8(block + HDD_MAP_UNIT) != KATEA_HDD_DOS_UNIT {
+            self.cd_doorbell_status = 0xFE;
             return;
         }
-        let header = (seg << 4).wrapping_add(off);
-        self.cd_device_request(header);
-        self.cd_doorbell_status = 0;
+        let start = self.read_physical_u32(block + HDD_MAP_START);
+        let steps = self.read_physical_u32(block + HDD_MAP_STEPS);
+        let outcome = self
+            .ata
+            .as_ref()
+            .and_then(|disk| disk.map_fat_chain(start, steps));
+        let status = match outcome {
+            Some(crate::katea_tree::ChainMapOutcome::Cluster(cluster)) => {
+                self.write_physical_u32(block + HDD_MAP_RESULT, cluster);
+                0
+            }
+            Some(crate::katea_tree::ChainMapOutcome::EndBeforeTarget) => 2,
+            Some(crate::katea_tree::ChainMapOutcome::Refused) | None => 0xFE,
+        };
+        // Charge guest time the way HLE INT 13h does: a base plus a term for
+        // the walk the guest did not run (design §2.4).
+        self.stall_for_master_ticks(64 + u64::from(steps) / 16);
+        self.cd_doorbell_status = status;
     }
 
     /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the

@@ -373,6 +373,19 @@ impl AtaDisk {
         }
     }
 
+    /// Answer a B3 FAT-position hypercall, or None for an image-backed disk —
+    /// the hypercall serves only the Katea host-folder volume.
+    pub fn map_fat_chain(
+        &self,
+        start: u32,
+        steps: u32,
+    ) -> Option<crate::katea_tree::ChainMapOutcome> {
+        match &self.backing {
+            Backing::Image(_) => None,
+            Backing::HostFolder(volume) => Some(volume.map_chain(start, steps)),
+        }
+    }
+
     /// Run the host-folder reconcile pass. A no-op for an image-backed disk.
     /// The machine calls this at eject/flush so anything held in the overlay is a
     /// final-pass materialized to the host folder.

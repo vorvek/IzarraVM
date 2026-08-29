@@ -135,6 +135,12 @@ impl Machine {
         self.cd_redirector_dos_ds = None;
     }
 
+    /// INT 19h forgets the B3 FAT-position registration: the rebooting
+    /// kernel's block is gone, and the next kernel re-registers.
+    pub fn disarm_hdd_map(&mut self) {
+        self.hdd_map_block = None;
+    }
+
     /// Bytes the redirector Read handler has delivered. The CD-path
     /// equivalent of `cd_pio_byte_count` for the retired PIO path.
     pub fn cd_redirector_read_bytes(&self) -> u64 {

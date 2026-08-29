@@ -681,3 +681,9 @@ fn pio_host_failure_aborts_the_guest_command_and_retains_the_overlay() {
     drop(disk);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn image_backed_drive_refuses_fat_chain_mapping() {
+    let disk = marked_disk(8);
+    assert_eq!(disk.map_fat_chain(2, 1), None);
+}

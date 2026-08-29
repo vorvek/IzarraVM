@@ -131,6 +131,19 @@ struct FatWalk {
     degraded: bool,
 }
 
+/// The answer to one guest FAT-position hypercall (doorbell command 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainMapOutcome {
+    /// The physical cluster after `steps` hops from `start`.
+    Cluster(u32),
+    /// The chain ends (EOC, BAD, or a free/reserved link) before the target.
+    /// The guest turns this into DE_SEEK, the native walk's answer.
+    EndBeforeTarget,
+    /// Out-of-range input. The guest falls back to the native walk and
+    /// disarms; a well-formed kernel never sends this.
+    Refused,
+}
+
 /// A memoized cluster chain, and exactly what would have to change to make it
 /// wrong.
 ///
@@ -2660,6 +2673,49 @@ impl KateaTreeVolume {
             entry.data_seq = self.store.seq();
         }
         Some((chain, entry.all_in_range, entry.data_written))
+    }
+
+    /// Walk `steps` FAT hops from `start` and return the landing cluster.
+    ///
+    /// Serves the B3 doorbell hypercall (design:
+    /// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.4). Uses the same
+    /// overlay-shadowed FAT view as `chain_of`, through a `FatWalk` cursor so a
+    /// long walk does not materialize a sector per entry. The step cap is
+    /// `max_chain()` -- the same corrupt-chain ceiling `chain_with_token`
+    /// enforces, since a chain can never have more links than there are
+    /// clusters. Refusal is decided entirely up front from `steps` against that
+    /// cap, so the loop below runs at most `max_chain()` iterations on any
+    /// input; a circular FAT does not extend the walk, it just makes every
+    /// iteration land back on a cluster already seen.
+    ///
+    /// A `walk.degraded` read (a spilled FAT sector the store could not read
+    /// back) is not special-cased: it yields entry `0` for the affected
+    /// cluster, which classifies as `EndBeforeTarget` -- the same conclusion a
+    /// native guest walk would reach hitting the same failed sector.
+    pub(crate) fn map_chain(&self, start: u32, steps: u32) -> ChainMapOutcome {
+        if !self.cluster_in_range(start) || steps as usize > self.max_chain() {
+            return ChainMapOutcome::Refused;
+        }
+        let mut walk = FatWalk::default();
+        let mut cluster = start;
+        for _ in 0..steps {
+            let entry = self.fat_entry_walked(cluster, &mut walk);
+            // 0x0FFF_FFF7 covers BAD and every EOC value of a 28-bit entry. Katea
+            // never synthesizes BAD clusters, so folding it into EndBeforeTarget
+            // is a design-accepted divergence, not a real ambiguity.
+            if !(2..0x0FFF_FFF7).contains(&entry) {
+                return ChainMapOutcome::EndBeforeTarget;
+            }
+            // A link can point outside the data region (corrupt or guest-crafted).
+            // Out-of-range is Refused, not EndBeforeTarget: the guest's answer for
+            // "walk failed" is to fall back to its native walk, not to accept a
+            // landing cluster reconcile itself would refuse to materialize from.
+            if !self.cluster_in_range(entry) {
+                return ChainMapOutcome::Refused;
+            }
+            cluster = entry;
+        }
+        ChainMapOutcome::Cluster(cluster)
     }
 
     /// Follow the cluster chain starting at `first`, memoized.

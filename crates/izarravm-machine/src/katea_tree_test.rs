@@ -5225,3 +5225,91 @@ fn retracting_one_claim_leaves_a_directory_cluster_still_flagged() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// `map_chain` must answer the same cluster a real chain walk lands on after
+/// the same number of hops -- including the zero-hop case, which is the start
+/// cluster itself.
+#[test]
+fn map_chain_matches_a_real_chain_walk() {
+    let root = scratch("map_chain_contiguous");
+    // Three clusters' worth of host bytes, so the mounted chain has 3+ links.
+    fs::write(root.join("BIG.BIN"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+    let vol = mount(&root);
+    let first = first_cluster_of(&vol, &root.join("BIG.BIN"));
+
+    let chain = vol.chain_via_walk(first).expect("file has a chain");
+    assert!(chain.len() >= 3, "fixture file must span 3+ clusters");
+    assert_eq!(
+        vol.map_chain(chain[0], 2),
+        ChainMapOutcome::Cluster(chain[2])
+    );
+    // Zero steps answers the start cluster itself.
+    assert_eq!(
+        vol.map_chain(chain[0], 0),
+        ChainMapOutcome::Cluster(chain[0])
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Asking for one hop past the chain's last cluster must report the chain
+/// ending before the target, not synthesize a cluster past EOC.
+#[test]
+fn map_chain_reports_end_before_target() {
+    let root = scratch("map_chain_end_before_target");
+    fs::write(root.join("BIG.BIN"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+    let vol = mount(&root);
+    let first = first_cluster_of(&vol, &root.join("BIG.BIN"));
+
+    let chain = vol.chain_via_walk(first).expect("file has a chain");
+    let n = chain.len() as u32;
+    assert_eq!(vol.map_chain(chain[0], n), ChainMapOutcome::EndBeforeTarget);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Out-of-range input -- a start cluster below the first valid cluster
+/// (0 or 1, never allocatable), or a step count past the step cap -- is
+/// refused rather than walked. A well-formed kernel never sends either; a
+/// crafted one must not be able to run the loop past `max_chain()`
+/// iterations, the same corrupt-chain ceiling `chain_with_token` enforces.
+#[test]
+fn map_chain_refuses_absurd_input() {
+    let root = scratch("map_chain_refuses_absurd_input");
+    fs::write(root.join("SMALL.BIN"), vec![7u8; 512]).unwrap();
+    let vol = mount(&root);
+
+    assert_eq!(vol.map_chain(0, 1), ChainMapOutcome::Refused);
+    assert_eq!(vol.map_chain(1, 1), ChainMapOutcome::Refused);
+    let cap = vol.max_chain() as u32;
+    assert_eq!(
+        vol.map_chain(2, cap.saturating_add(1)),
+        ChainMapOutcome::Refused
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A FAT link that points outside the data region -- corrupt, or a guest
+/// crafting a bogus chain -- must be refused, not answered with a landing
+/// cluster reconcile itself would never materialize from. The guest's
+/// response to `Refused` is to fall back to its native walk, which is why
+/// this is `Refused` and not `EndBeforeTarget`: the difference matters to the
+/// caller.
+#[test]
+fn map_chain_refuses_an_out_of_range_link() {
+    let root = scratch("map_chain_refuses_an_out_of_range_link");
+    fs::write(root.join("BIG.BIN"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+    let mut vol = mount(&root);
+    let first = first_cluster_of(&vol, &root.join("BIG.BIN"));
+    let chain = vol.chain_via_walk(first).expect("file has a chain");
+    assert!(chain.len() >= 2, "fixture file must span 2+ clusters");
+
+    // Point the first hop past the last valid data cluster.
+    let bogus = vol.geo.count_of_clusters + 100;
+    write_fat_link(&mut vol, chain[0], bogus);
+
+    assert_eq!(vol.map_chain(chain[0], 1), ChainMapOutcome::Refused);
+
+    fs::remove_dir_all(&root).ok();
+}

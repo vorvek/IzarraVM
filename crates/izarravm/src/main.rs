@@ -1802,6 +1802,27 @@ fn run_boot_hdd_folder(
                 .unwrap_or(0x180);
             Some((addr, len))
         });
+        // Full-histogram sidecar (IZARRAVM_CPU_PROFILE_ADDRS=<path>): every sampled
+        // `(linear, samples)` row as CSV, not the top-64 head the print shows. Two
+        // deterministic runs with budgets at a window's two boundaries difference
+        // into that window's histogram, which is how the DOS-kernel-vs-game split
+        // is cut without a per-mark serialization of the whole address map.
+        if let Ok(path) = std::env::var("IZARRAVM_CPU_PROFILE_ADDRS") {
+            let mut out = String::with_capacity(snapshot.hot_addrs.len() * 20 + 64);
+            out.push_str(&format!(
+                "# sample_stride={} rows={}\nlinear_hex,samples\n",
+                snapshot.sample_stride,
+                snapshot.hot_addrs.len()
+            ));
+            for &(lin, samples) in &snapshot.hot_addrs {
+                out.push_str(&format!("{lin:08X},{samples}\n"));
+            }
+            std::fs::write(&path, out)?;
+            println!(
+                "cpu-profile addrs sidecar: {} rows -> {path}",
+                snapshot.hot_addrs.len()
+            );
+        }
         let target = dump_override.or_else(|| snapshot.hot_addrs.first().map(|&(t, _)| (t, 0x180)));
         if let Some((top, dump_len)) = target {
             let start = top.saturating_sub(0x40) & !0xf;

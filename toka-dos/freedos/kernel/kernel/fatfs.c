@@ -34,6 +34,12 @@
 BYTE *RcsId = "$Id: fatfs.c 1632 2011-06-13 16:29:14Z bartoldeman $";
 #endif
 
+/* Toka-DOS 2026, Tier B B3: minimum forward-walk distance (in clusters)
+   before map_cluster tries the IzarraVM FAT-position hypercall. Below
+   this the dirty-buffer guard scan in izarra_map_lookup would cost more
+   than the native walk it replaces (design 2.6). */
+#define IZARRA_MAP_MIN_STEPS 64
+
 /*                                                                      */
 /*      function prototypes                                             */
 /*                                                                      */
@@ -997,6 +1003,35 @@ COUNT map_cluster(REG f_node_ptr fnp, COUNT mode)
     fnp->f_cluster = fnp->f_sft_idx == 0xff ? fnp->f_dmp->dm_dircluster :
         getdstart(fnp->f_dpb, &fnp->f_dir);
     fnp->f_cluster_offset = 0;
+  }
+
+  /* Toka-DOS 2026, Tier B B3: a long read-mode walk on an armed IzarraVM
+     host is one hypercall instead of an entry-by-entry FAT scan. Only
+     the boot HDD (the Katea volume) qualifies; short hops keep the
+     native path (the guard scan would cost more than they do). All
+     guard logic beyond these tests lives in izarra_map_lookup. BootDrive
+     is the bare global (globals.h), 1-based, the same value LoL->BootDrive
+     aliases -- LoL itself is not visible in this file. BootDrive >= 3
+     rejects a floppy boot outright: on one, dpb_unit == BootDrive - 1
+     names drive A:, and the host would answer from the HDD's FAT. */
+  if (mode == XFR_READ && IzarraMapArmed && BootDrive >= 3
+      && fnp->f_dpb->dpb_unit == BootDrive - 1
+      && relcluster > fnp->f_cluster_offset
+      && relcluster - fnp->f_cluster_offset >= IZARRA_MAP_MIN_STEPS)
+  {
+    CLUSTER mapped;
+    COUNT rc = izarra_map_lookup(fnp->f_dpb->dpb_unit, fnp->f_cluster,
+                                 relcluster - fnp->f_cluster_offset,
+                                 &mapped);
+    if (rc == SUCCESS)
+    {
+      fnp->f_cluster = mapped;
+      fnp->f_cluster_offset = relcluster;
+      return SUCCESS;
+    }
+    if (rc == DE_SEEK)
+      return DE_SEEK;
+    /* rc == -1: fall through to the native walk */
   }
 
   /* Now begin the linear search. The relative cluster is         */
