@@ -4351,3 +4351,360 @@ fn a_direct_system_read_charges_exactly_what_the_general_read_charges() {
         });
     }
 }
+
+/// THE FOUR TESTS BELOW PIN THE DEFAULT (`IZARRAVM_EXTENDED_RAM_SCREEN` unset,
+/// i.e. ON). Run the suite with the knob at `0` and exactly these four fail and
+/// nothing else does -- verified 2026-08-29, 1693 passed / 4 failed. That is not
+/// a defect to paper over with a skip: it IS the OFF-arm verification, and it
+/// says two things at once. The screen changes nothing any other test can see,
+/// and the knob really does restore the old path rather than merely renaming it.
+/// A conditional skip here would throw both statements away.
+///
+/// A 32-bit game runs its code and keeps its data ABOVE 1 MB, and the bus's only
+/// screen against the device-window gauntlet was `< 0x000A_0000`. So every
+/// instruction-fetch run and every data access such a game makes used to walk
+/// the whole gauntlet -- `rom_offset`, then Vega's ten aperture predicates --
+/// to be told what the address range already guarantees: nothing claims it.
+///
+/// This pins the screen that answers it directly. The counter is the only way to
+/// see it: `is_device_window` returns false either way, and a wait-state
+/// comparison cannot separate "answered cheaply" from "answered expensively".
+/// Both entry points are covered, because they are separate screens on separate
+/// callers -- `is_device_window` serves the fetch and data-access classification,
+/// `memory_wait_states_device` serves the byte-cost path.
+#[test]
+fn extended_ram_is_classified_without_entering_the_device_window_gauntlet() {
+    // 2 MB: real RAM in a 16 MiB test machine, above the 1 MB line, and far
+    // below `MARGO_LFB_BASE`, which is where the device-free window ends.
+    const EXTENDED: u32 = 0x0020_0000;
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+            let before = bus.vega.device_window_gauntlet_entries();
+            assert!(
+                !bus.is_device_window(EXTENDED, width),
+                "extended RAM at {EXTENDED:#x} is not a device window"
+            );
+            assert_eq!(
+                bus.vega.device_window_gauntlet_entries(),
+                before,
+                "classifying extended RAM at width {width:?} must not enter the gauntlet"
+            );
+        }
+
+        let before = bus.vega.device_window_gauntlet_entries();
+        assert_eq!(
+            bus.memory_wait_states(EXTENDED),
+            bus.wait_states.ram,
+            "extended RAM is charged the RAM wait-state"
+        );
+        assert_eq!(
+            bus.vega.device_window_gauntlet_entries(),
+            before,
+            "the byte-cost path must not enter the gauntlet for extended RAM either"
+        );
+    });
+}
+
+/// The other half of the screen: an address a window really does claim must
+/// still reach the gauntlet and be classified by it. Without this the test above
+/// is satisfied by a screen that swallows everything.
+///
+/// Each address is one that the screen must DECLINE, and for a different reason:
+/// conventional memory and the VGA aperture are below the 1 MB floor, the Margo
+/// LFB and MMIO block and the BIOS alias at the top of the address space are at
+/// or above the ceiling, and the byte before `MARGO_LFB_BASE` is the last
+/// address the screen may accept -- a Dword there straddles the boundary, which
+/// is what the width term in the screen is for.
+#[test]
+fn the_screen_declines_every_address_a_window_can_claim() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        for (address, width, claimed) in [
+            (0x0000_2000, BusWidth::Dword, false),    // conventional RAM
+            (VGA_MODE13H_BASE, BusWidth::Byte, true), // the VGA aperture
+            (LOW_BIOS_BASE, BusWidth::Byte, true),    // the low BIOS image
+            (MARGO_LFB_BASE, BusWidth::Byte, true),   // Margo's framebuffer
+            (MARGO_MMIO_BASE, BusWidth::Byte, true),  // Margo's registers
+            (HIGH_ROM_BASE, BusWidth::Byte, true),    // the BIOS alias at 4 GB
+        ] {
+            let before = bus.vega.device_window_gauntlet_entries();
+            assert_eq!(
+                bus.is_device_window(address, width),
+                claimed,
+                "{address:#x} width {width:?} classification"
+            );
+            assert!(
+                bus.vega.device_window_gauntlet_entries() > before,
+                "{address:#x} must be decided by the gauntlet, not by the screen"
+            );
+        }
+
+        // The last byte below the ceiling is inside the window; a Dword based
+        // there is not, because it reaches the framebuffer's first byte.
+        let before = bus.vega.device_window_gauntlet_entries();
+        assert!(!bus.is_device_window(MARGO_LFB_BASE - 1, BusWidth::Byte));
+        assert_eq!(
+            bus.vega.device_window_gauntlet_entries(),
+            before,
+            "the byte below the ceiling is still screened"
+        );
+        assert!(!bus.is_device_window(MARGO_LFB_BASE - 1, BusWidth::Dword));
+        assert!(
+            bus.vega.device_window_gauntlet_entries() > before,
+            "a Dword that straddles the ceiling must reach the gauntlet"
+        );
+    });
+}
+
+/// The ceiling is not a constant: Distira's BAR moves wherever the guest writes
+/// BAR0, and a guest that maps it low shrinks the device-free window. The screen
+/// reads the live floor, so relocating the BAR into what was screened memory
+/// must pull the ceiling down with it.
+///
+/// `debug_assert` inside the screen would catch the opposite mistake (a screen
+/// that kept the old ceiling and swallowed the relocated BAR) on any debug run;
+/// this test states the intent in one place and covers release builds too.
+#[test]
+fn relocating_the_distira_bar_lowers_the_device_free_ceiling() {
+    // BAR0 decodes its top byte only (`pci_write_config_byte` offset 0x13), so
+    // 0x40 places the 16 MB BAR at 0x4000_0000 -- well below MARGO_LFB_BASE and
+    // inside what the default configuration screens as plain RAM.
+    const RELOCATED: u32 = 0x4000_0000;
+    let mut machine = test_machine();
+    assert_eq!(
+        machine.vega.device_free_extended_floor(),
+        MARGO_LFB_BASE,
+        "the default ceiling is Margo's framebuffer"
+    );
+    with_bus(&mut machine, |bus| {
+        assert!(
+            !bus.is_device_window(RELOCATED, BusWidth::Byte),
+            "nothing claims {RELOCATED:#x} before the BAR moves"
+        );
+    });
+
+    machine.vega.pci_write_config_byte(0x13, 0x40);
+    assert_eq!(
+        machine.vega.device_free_extended_floor(),
+        RELOCATED,
+        "the relocated BAR is now the lowest claimant above 1 MB"
+    );
+    with_bus(&mut machine, |bus| {
+        let before = bus.vega.device_window_gauntlet_entries();
+        assert!(
+            bus.is_device_window(RELOCATED, BusWidth::Byte),
+            "the relocated BAR is a device window"
+        );
+        assert!(
+            bus.vega.device_window_gauntlet_entries() > before,
+            "an address at or above the ceiling reaches the gauntlet"
+        );
+    });
+}
+
+/// The fetch-charging fast path had one screen, `end < 0x000A_0000`, and a
+/// 32-bit game's code is nowhere near it. Every fetch run such a game makes fell
+/// through to `charge_classified_instruction_fetch_run` -- two A20 folds, two
+/// wait-state lookups through the device gauntlet, and a uniformity test -- to
+/// reach the conclusion the address range already guarantees.
+///
+/// The signal is the QUESTION counter, not the gauntlet counter. The screen in
+/// the previous commit already stops an extended-RAM question from reaching the
+/// gauntlet, so a gauntlet counter reads zero either way and would pass whether
+/// or not the tail ran. What this commit removes is the question itself: the
+/// fast arm never calls `code_fetch_wait_states`, so the bus never asks.
+///
+/// `elapsed_clocks` is asserted beside it, because a fast arm that skipped the
+/// question AND the charge would otherwise satisfy the counter.
+#[test]
+fn an_extended_ram_fetch_run_skips_the_cold_classification_tail() {
+    // 2 MB: real RAM in a 16 MiB test machine, above 1 MB, far below the
+    // device-free ceiling at MARGO_LFB_BASE.
+    const EXTENDED: u32 = 0x0020_0000;
+    let mut machine = test_machine();
+    machine.set_bus_trace_detailed(false);
+    with_bus(&mut machine, |bus| {
+        // A real machine powers on with A20 masked, and the extended arm
+        // requires it open. Port 0x92 bit 1 is the fast gate.
+        bus.write_io(0x92, BusWidth::Byte, 0x02, false).unwrap();
+        assert!(bus.keyboard.a20_enabled(), "A20 is open for this test");
+
+        let questions = bus.vega.device_window_questions();
+        let clocks = bus.trace.elapsed_clocks();
+        bus.charge_instruction_fetch_run(EXTENDED, 5).unwrap();
+        assert_eq!(
+            bus.vega.device_window_questions(),
+            questions,
+            "an extended-RAM run takes the fast arm, which never asks the classification"
+        );
+        assert_eq!(
+            bus.trace.elapsed_clocks() - clocks,
+            bus.icache_fetch_clocks,
+            "and charges exactly one I-cache access for the whole run"
+        );
+    });
+}
+
+/// The extended arm's own precondition, and the one that separates it from the
+/// conventional arm above it: below 1 MB the A20 mask is the identity, so that
+/// arm may ignore the gate, but up here a masked gate folds the run DOWN into
+/// conventional memory, where a window can claim it.
+///
+/// `A20_MASK` clears bit 20 and nothing else, so `0x001A_0000` folds to
+/// `0x000A_0000` -- the VGA aperture. That is not a hypothetical: a run there
+/// must be charged as a device window, per byte, and the fast arm would charge
+/// it as one I-cache access out of cacheable RAM. The clock delta is asserted,
+/// not just the counter, because the counter alone would not say the charge
+/// came out right.
+#[test]
+fn a_masked_a20_folds_a_fetch_run_into_the_vga_aperture_and_must_not_take_the_fast_arm() {
+    // Folds to VGA_MODE13H_BASE when the gate is masked; ordinary extended RAM
+    // when it is open.
+    const ALIASES_ONTO_VGA: u32 = 0x001A_0000;
+    let mut machine = test_machine();
+    machine.set_bus_trace_detailed(false);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x92, BusWidth::Byte, 0x02, false).unwrap();
+        assert!(bus.keyboard.a20_enabled(), "A20 is open");
+        let questions = bus.vega.device_window_questions();
+        let clocks = bus.trace.elapsed_clocks();
+        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4)
+            .unwrap();
+        assert_eq!(
+            bus.vega.device_window_questions(),
+            questions,
+            "with the gate open this is ordinary extended RAM and takes the fast arm"
+        );
+        assert_eq!(
+            bus.trace.elapsed_clocks() - clocks,
+            bus.icache_fetch_clocks,
+            "charged as one I-cache access"
+        );
+
+        // Close the gate. The same run now aliases onto the VGA aperture.
+        bus.write_io(0x92, BusWidth::Byte, 0x00, false).unwrap();
+        assert!(!bus.keyboard.a20_enabled(), "A20 is masked again");
+        assert_eq!(
+            bus.apply_a20(ALIASES_ONTO_VGA),
+            VGA_MODE13H_BASE,
+            "the masked run folds onto the aperture this test is about"
+        );
+        let questions = bus.vega.device_window_questions();
+        let clocks = bus.trace.elapsed_clocks();
+        bus.charge_instruction_fetch_run(ALIASES_ONTO_VGA, 4)
+            .unwrap();
+        assert!(
+            bus.vega.device_window_questions() > questions,
+            "a masked gate must send the run to the tail, which folds the address first"
+        );
+        assert!(
+            bus.trace.elapsed_clocks() - clocks > bus.icache_fetch_clocks,
+            "and the tail must charge it as the device window it folded onto"
+        );
+    });
+}
+
+/// The test `Vega::device_free_extended_floor`'s doc comment names, and the one
+/// that has to exist for its claim to mean anything: the floor is a HAND-DERIVED
+/// summary of `may_own_memory` plus `rom_offset`, and a hand-derived claim is
+/// only as good as the thing that re-checks it. Add an aperture above 1 MB to
+/// `may_own_memory` and forget the floor, and the screen starts answering "plain
+/// RAM" for a window -- which charges the wrong wait-state, silently, on a path
+/// that runs millions of times a second.
+///
+/// The comparison is against `device_window_uncached`, the gauntlet with the
+/// screen bypassed. Asking `is_device_window` instead would be circular: it
+/// answers `false` BY returning early, so it would agree with the screen by
+/// construction and pass forever.
+///
+/// BOTH BAR configurations, and the first draft of this test got that wrong in a
+/// way worth recording. It relocated Distira's BAR low in order to exercise the
+/// variable half of the floor -- and by doing so took the `distira_mem_base` arm
+/// on EVERY probe, so the constant `MARGO_LFB_BASE` arm was never evaluated at
+/// all. Breaking that arm deliberately (returning `HIGH_ROM_BASE`, which makes
+/// the screen swallow Margo's whole framebuffer) left the test GREEN. A sweep
+/// that covers one arm of a two-arm function is not a sweep. Both are covered
+/// now, and the deliberate break was re-run against them to confirm it goes red.
+///
+/// The probe list is a coarse stride plus every boundary the derivation actually
+/// leans on, because a pure stride is overwhelmingly likely to step straight over
+/// a 64 KB register block. The boundaries are the claim; the stride is there to
+/// catch a region nobody thought to name.
+#[test]
+fn may_own_memory_agrees_with_the_extended_floor() {
+    let mut probes: Vec<u32> = Vec::new();
+    // Every boundary the derivation names, and the byte either side of it.
+    for anchor in [
+        0x0000_0000u32,
+        0x000A_0000,
+        0x000C_0000,
+        LOW_BIOS_BASE,
+        0x0010_0000,
+        0x0011_0000,
+        0x4000_0000,
+        0x4100_0000,
+        MARGO_LFB_BASE,
+        MARGO_MMIO_BASE,
+        0xE041_0000,
+        HIGH_ROM_BASE,
+    ] {
+        for delta in [0u32, 1, 4] {
+            probes.push(anchor.saturating_sub(delta));
+            probes.push(anchor.saturating_add(delta));
+        }
+    }
+    // A coarse sweep of the whole 32-bit space on top, for a region nobody named.
+    let mut address = 0u32;
+    loop {
+        probes.push(address);
+        let Some(next) = address.checked_add(0x0080_0000) else {
+            break;
+        };
+        address = next;
+    }
+    probes.push(u32::MAX);
+
+    // `None` leaves Distira's BAR where it powers on (0xE100_0000, ABOVE Margo),
+    // so the floor takes its constant arm. `Some(top)` writes BAR0's decoded top
+    // byte, putting the BAR below Margo so the floor takes its variable arm.
+    for relocation in [None, Some(0x40u8)] {
+        let mut machine = test_machine();
+        if let Some(top) = relocation {
+            machine.vega.pci_write_config_byte(0x13, top);
+        }
+        let floor = machine.vega.device_free_extended_floor();
+        let expected = match relocation {
+            None => MARGO_LFB_BASE,
+            Some(top) => u32::from(top) << 24,
+        };
+        assert_eq!(
+            floor, expected,
+            "the {relocation:?} configuration must exercise the arm this iteration is for"
+        );
+
+        // The screen has to actually ACCEPT things, or every assertion below is
+        // skipped by the `continue` and the test proves nothing.
+        let mut accepted = 0u32;
+        with_bus(&mut machine, |bus| {
+            for probe in &probes {
+                for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                    if !bus.is_device_free_extended_ram(*probe, width.bytes() as usize) {
+                        // Declining costs only speed, never correctness: the
+                        // gauntlet decides it, exactly as before the screen.
+                        continue;
+                    }
+                    accepted += 1;
+                    assert!(
+                        !bus.device_window_uncached(*probe, width),
+                        "floor {floor:#x}: the screen accepted {probe:#x} width {width:?}, but a                          window claims it -- device_free_extended_floor is out of date with                          may_own_memory or rom_offset"
+                    );
+                }
+            }
+        });
+        assert!(
+            accepted > 100,
+            "floor {floor:#x}: only {accepted} probes were screened in, so this sweep is              close to vacuous"
+        );
+    }
+}

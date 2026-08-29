@@ -44,6 +44,32 @@ fn lazy_port_reads_386_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether the bus screens extended RAM out of the device-window classification
+/// instead of walking the aperture gauntlet for it. `IZARRAVM_EXTENDED_RAM_SCREEN`.
+///
+/// DEFAULT ON. The screen changes no charged wait-state and no guest-visible
+/// value -- it only removes work -- so there is no fidelity reason to ship it
+/// off. The knob exists for MEASUREMENT: the win it claims is a few percent of
+/// wall, which is close enough to this box's noise floor that a two-binary
+/// comparison cannot carry it (layout variance between two builds has been
+/// measured at 3.7% here). One binary, two arms, interleaved, is the only way to
+/// grade it honestly.
+///
+/// UNSET means ON, so a recorded run with the variable absent is the ON arm.
+/// `0`, `off`, `false`, `no` and the empty string are the escape; every other
+/// spelling is ON.
+///
+/// Read once per process; the bus stores the resolved bool, so the hot path
+/// never touches the environment or a lazy static.
+pub(super) fn extended_ram_screen_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("IZARRAVM_EXTENDED_RAM_SCREEN")
+            .map(|value| !matches!(value.trim(), "0" | "off" | "false" | "no" | ""))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
 /// The whole composition rule for `MachineBus::lazy_ports_386`, split out from
 /// the environment read so it is testable without touching process state.
 ///
@@ -128,6 +154,7 @@ impl Machine {
             cache: &mut self.cache_model,
             icache_fetch_clocks,
             flat_data_cost: self.active_mode.uses_approximate_timing(),
+            extended_ram_screen: extended_ram_screen_enabled(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
@@ -1951,8 +1978,29 @@ impl CpuBus for MachineBus<'_> {
         // cacheable-RAM arm and charge ONE I-cache access at the constant
         // wait-state, so charge exactly that in one step. ROM/device/A20-edge
         // runs keep the full classification, byte-for-byte.
+        // The same argument, one region up. A 32-bit game's code lives in
+        // extended RAM, so the screen above never fires for it and every fetch
+        // run pays the `#[cold]` tail: two A20 folds, two wait-state lookups
+        // through the device gauntlet, and the uniformity test. A run that lies
+        // wholly inside `0x0010_0000 .. device_free_extended_floor()` reaches
+        // exactly the same conclusion as that tail -- cacheable RAM, uniform,
+        // one I-cache access -- because no window claims any byte of it (see
+        // `is_device_free_extended_ram`) and a contiguous run inside one region
+        // is uniform by construction.
+        //
+        // A20 has to be OPEN for this arm, and that is not the same requirement
+        // the conventional arm carries. Below 1 MB the mask is the identity, so
+        // that arm can ignore the gate; up here a masked gate folds the run down
+        // into conventional memory, where a window may well claim it. Testing
+        // the gate first also makes `physical_start` a post-A20 address, which
+        // is what `is_device_free_extended_ram` asserts it is given.
+        // Written as one short-circuiting condition on purpose: a run below the
+        // video aperture must not pay for the extended test, so the gate read
+        // and the floor comparison sit behind the `||`.
         if let Some(end) = physical_start.checked_add(count - 1)
-            && end < 0x000A_0000
+            && (end < 0x000A_0000
+                || (self.keyboard.a20_enabled()
+                    && self.is_device_free_extended_ram(physical_start, count as usize)))
         {
             debug_assert_eq!(
                 self.icache_fetch_clocks,
@@ -3918,13 +3966,99 @@ impl MachineBus<'_> {
     /// `memory_wait_states_device` (the `wait_states.rom`/`wait_states.video`
     /// branches); the fall-through (cacheable RAM) returns false. Only called for
     /// `address >= 0xA0000`, so conventional RAM never reaches here.
-    fn is_device_window(&self, address: u32, width: BusWidth) -> bool {
+    pub(super) fn is_device_window(&self, address: u32, width: BusWidth) -> bool {
+        let bytes = width.bytes() as usize;
+        #[cfg(test)]
+        self.vega.note_device_window_question();
+        if self.is_device_free_extended_ram(address, bytes) {
+            // The screen is a hand-derived claim about the two claimants below,
+            // so prove it on every debug run rather than trusting the
+            // derivation -- the same discipline `Vega::owns_memory` applies to
+            // its own `may_own_memory` prefilter. If this ever fires, a window
+            // moved above 1 MB without `device_free_extended_floor` learning
+            // about it, and the cost of believing the screen is a wrong charged
+            // wait-state, not a crash.
+            debug_assert!(
+                !(rom_offset(address, bytes).is_some() || self.vega.owns_memory(address, bytes)),
+                "extended-RAM screen accepted {address:#x} width {bytes}, which a window claims"
+            );
+            return false;
+        }
+        #[cfg(test)]
+        self.vega.note_device_window_gauntlet_entry();
+        rom_offset(address, bytes).is_some() || self.vega.owns_memory(address, bytes)
+    }
+
+    /// The device-window gauntlet with the extended-RAM screen BYPASSED: what
+    /// `is_device_window` would answer if the screen did not exist.
+    ///
+    /// Test-only, and the exact sibling of `Vega::owns_memory_uncached`, which
+    /// exists for the same reason one region down. A test that asked
+    /// `is_device_window` whether the screen is safe would be circular: the
+    /// screen returns `false` by returning early, so the answer would agree
+    /// with itself. This is the independent second opinion the sweep compares
+    /// against.
+    #[cfg(test)]
+    pub(super) fn device_window_uncached(&self, address: u32, width: BusWidth) -> bool {
         let bytes = width.bytes() as usize;
         rom_offset(address, bytes).is_some() || self.vega.owns_memory(address, bytes)
     }
 
+    /// True when `address` (post-A20, `bytes` wide) is extended RAM that NO
+    /// window can claim, so the gauntlet below would answer `false` after
+    /// running every predicate in it.
+    ///
+    /// This is the hot screen for a 32-bit game. Its code and its data both live
+    /// above 1 MB, so every instruction-fetch run and every data access it makes
+    /// arrives at the device classification, which the `< 0x000A_0000` screen
+    /// above was written for conventional memory and cannot help with. Measured
+    /// on 2026-08-29 riprofile reports: `charge_classified_instruction_fetch_run`
+    /// plus `Vega::owns_memory` carried 4.65% of duke3d-586 wall, 2.88% of
+    /// gp2-586 and 2.49% of nascar-586.
+    ///
+    /// EXACTNESS, which is the whole contract -- this must not change a single
+    /// charged wait-state. Two claimants exist above 1 MB. `rom_offset` claims
+    /// `HIGH_ROM_BASE ..= u32::MAX` (its other region, `LOW_BIOS_BASE`, ends at
+    /// 1 MB), and `Vega::may_own_memory` claims Margo's LFB+MMIO block and
+    /// Distira's BAR. `device_free_extended_floor` is the lowest of those two
+    /// Vega regions, and `HIGH_ROM_BASE` (0xFFFF_0000) is above `MARGO_LFB_BASE`
+    /// (0xE000_0000), so it can never be the lowest. The window this returns
+    /// true for therefore touches no claimant.
+    ///
+    /// The `bytes` term is belt-and-braces: both claimants decide from the BASE
+    /// address alone, so a straddling access at the very top of the window is
+    /// already classified by its base. Including the width can only make the
+    /// screen decline more often, never wrongly accept.
+    ///
+    /// A20 is the way this screen could be wrong without ever looking wrong:
+    /// with the gate masked, `0x0010_0000..0x0010_FFEF` aliases DOWN into
+    /// conventional memory, so an address that reads as extended RAM can land in
+    /// a claimed window. Every caller already folds the address first -- the
+    /// whole wait-state family is documented "at the post-A20 physical
+    /// `address`", and every call site was checked against that -- and the
+    /// assertion below is what stops a future caller from quietly breaking it.
+    /// The assertion is exact rather than approximate: a post-A20 address has
+    /// bit 20 already resolved, so folding it a second time is the identity
+    /// whatever the gate is doing.
+    ///
+    /// The window is NOT protected-mode-only. TokaDOS loads DOS=HIGH, so
+    /// real-mode fetches out of the HMA (`0x0010_0000..0x0010_FFEF` with A20
+    /// open) are extended RAM by this test and take the fast path on every boot.
+    /// That is deliberate, not incidental.
     #[inline]
-    fn memory_wait_states(&self, address: u32) -> u8 {
+    pub(super) fn is_device_free_extended_ram(&self, address: u32, bytes: usize) -> bool {
+        debug_assert_eq!(
+            self.apply_a20(address),
+            address,
+            "the extended-RAM screen needs a POST-A20 address; {address:#x} is not folded"
+        );
+        self.extended_ram_screen
+            && address >= 0x0010_0000
+            && address.saturating_add(bytes as u32) <= self.vega.device_free_extended_floor()
+    }
+
+    #[inline]
+    pub(super) fn memory_wait_states(&self, address: u32) -> u8 {
         // Conventional RAM (below the 0xA0000 video aperture) is never overlapped
         // by a ROM, VGA, Margo, or Distira window, so it always runs at RAM speed.
         // The hot fetch/data path hits this on every access, so keep it a tiny
@@ -3939,6 +4073,20 @@ impl MachineBus<'_> {
 
     #[cold]
     fn memory_wait_states_device(&self, address: u32) -> u8 {
+        #[cfg(test)]
+        self.vega.note_device_window_question();
+        // Extended RAM reaches here because the caller's screen is `< 0xA0000`,
+        // and it would fall all the way through to the `wait_states.ram` arm at
+        // the bottom. Answer it here instead. See `is_device_free_extended_ram`.
+        if self.is_device_free_extended_ram(address, 1) {
+            debug_assert!(
+                !(rom_offset(address, 1).is_some() || self.vega.owns_memory(address, 1)),
+                "extended-RAM screen accepted {address:#x}, which a window claims"
+            );
+            return self.wait_states.ram;
+        }
+        #[cfg(test)]
+        self.vega.note_device_window_gauntlet_entry();
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
         } else if self.vega.owns_memory(address, 1) {

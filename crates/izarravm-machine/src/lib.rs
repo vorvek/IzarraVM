@@ -3687,6 +3687,12 @@ struct MachineBus<'a> {
     /// 386 class and forced false by the bandwidth diagnostic so its tier
     /// curve stays on the accurate model.
     flat_data_cost: bool,
+    /// Whether `is_device_free_extended_ram` may screen a classification, i.e.
+    /// `IZARRAVM_EXTENDED_RAM_SCREEN` (default ON). Resolved once per process
+    /// and carried here so the hot path reads a field, not the environment.
+    /// It exists to make the screen's wall win gradeable on ONE binary; see
+    /// `bus::extended_ram_screen_enabled`.
+    extended_ram_screen: bool,
     /// True for the approximate-timing 486/586 modes, computed identically to
     /// `flat_data_cost` (same `active_mode.uses_approximate_timing()` check, same
     /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`:

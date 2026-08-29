@@ -177,6 +177,29 @@ pub(crate) struct Vega {
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
+    /// The two halves of the device-window classification, counted separately
+    /// so a test can tell which of them a change removed.
+    ///
+    /// `questions` counts every time the BUS asks whether an address is a device
+    /// window (`MachineBus::is_device_window` and `memory_wait_states_device`).
+    /// `gauntlet_entries` counts the subset that got past the extended-RAM
+    /// screen and actually walked `rom_offset` plus Vega's ten predicates. The
+    /// fetch fast path removes QUESTIONS; the screen removes GAUNTLET ENTRIES.
+    /// One counter could not separate those, and a test that cannot separate
+    /// them passes for the wrong reason.
+    ///
+    /// Test-only, and deliberately NOT counted inside `owns_memory`: the
+    /// debug-only `claims_no_byte_in` assertion also calls `owns_memory`, so a
+    /// counter there would move for a reason that has nothing to do with the
+    /// path under test.
+    ///
+    /// They exist because what they pin is a mechanism no value comparison can
+    /// see: an extended-RAM address classifies as "not a device window" either
+    /// way, and only the cost of reaching that answer changes.
+    #[cfg(test)]
+    device_window_questions: Cell<u64>,
+    #[cfg(test)]
+    device_window_gauntlet_entries: Cell<u64>,
 }
 
 impl Default for Vega {
@@ -200,6 +223,10 @@ impl Default for Vega {
             distira_command: 0x0002,
             distira_mem_base: DISTIRA_MMIO_BASE & !(DISTIRA_PCI_BAR_SIZE - 1),
             distira_init_enable: 0,
+            #[cfg(test)]
+            device_window_questions: Cell::new(0),
+            #[cfg(test)]
+            device_window_gauntlet_entries: Cell::new(0),
         }
     }
 }
@@ -1554,6 +1581,65 @@ impl Vega {
         self.distira_memory_enabled()
             && (self.distira_mem_base..self.distira_mem_base.saturating_add(DISTIRA_PCI_BAR_SIZE))
                 .contains(&address)
+    }
+
+    /// The lowest address at or above 1 MB that any aperture in this card can
+    /// claim. Every address in `0x0010_0000 .. floor` is therefore plain memory
+    /// as far as `owns_memory` is concerned, and the bus uses that to skip the
+    /// gauntlet for the extended RAM a 32-bit game runs in.
+    ///
+    /// DERIVED FROM `may_own_memory`, which is the hand-written superset of every
+    /// aperture: of its three regions, the legacy one ends at 0x000C_0000 (below
+    /// 1 MB, so it cannot bound this), Margo's LFB+MMIO block starts at
+    /// `MARGO_LFB_BASE`, and Distira's BAR starts wherever the guest last wrote
+    /// BAR0. Any aperture added to `may_own_memory` above 1 MB MUST be added
+    /// here as well; `may_own_memory_agrees_with_the_extended_floor` is the test
+    /// that fails when one is not.
+    ///
+    /// WHAT WOULD ACTUALLY BREAK THIS, since "any aperture" is too broad to be
+    /// useful. Because this returns the LOWEST claimant above 1 MB, a new
+    /// claimant placed ABOVE `MARGO_LFB_BASE` costs nothing: the screen already
+    /// declines everything up there and hands it to the gauntlet. That covers
+    /// the top-of-4GB BIOS alias (0xFFFF_0000) and would equally cover an APIC
+    /// at 0xFEC0_0000 or 0xFEE0_0000 if this machine ever modelled one -- it
+    /// does not today (no SMP, PIC-only interrupts), and it would not matter
+    /// here if it did. The ONLY dangerous addition is a claimant BETWEEN 1 MB
+    /// and `MARGO_LFB_BASE`, which is exactly the window the sweep covers.
+    /// Raised in review of PR #768 by the dynarec campaign; recorded because the
+    /// reasoning is the useful part, not the answer.
+    pub(crate) fn device_free_extended_floor(&self) -> u32 {
+        if self.distira_memory_enabled() && self.distira_mem_base < MARGO_LFB_BASE {
+            self.distira_mem_base
+        } else {
+            MARGO_LFB_BASE
+        }
+    }
+
+    /// Called by the bus each time it ASKS whether an address is a device
+    /// window, before the extended-RAM screen runs. See
+    /// [`Vega::device_window_questions`].
+    #[cfg(test)]
+    pub(crate) fn note_device_window_question(&self) {
+        self.device_window_questions
+            .set(self.device_window_questions.get() + 1);
+    }
+
+    /// Called by the bus each time a question got past the screen and entered
+    /// the gauntlet itself.
+    #[cfg(test)]
+    pub(crate) fn note_device_window_gauntlet_entry(&self) {
+        self.device_window_gauntlet_entries
+            .set(self.device_window_gauntlet_entries.get() + 1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_window_questions(&self) -> u64 {
+        self.device_window_questions.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_window_gauntlet_entries(&self) -> u64 {
+        self.device_window_gauntlet_entries.get()
     }
 
     pub(crate) fn owns_memory(&self, address: u32, width: usize) -> bool {
