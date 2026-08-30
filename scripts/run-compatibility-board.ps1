@@ -152,8 +152,28 @@ function Get-RowTable {
             # chose. An out-of-memory exit and a crash look alike on a screen
             # dump, so check this before blaming the emulator.
             arguments = @("--cpu", "486", "--memory-mib", "8", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
-            targetMode = "ModeX"; targetNote = ""
+            # 12e9 clocks is 182 guest seconds: the story pages take a while to
+            # skip even with ESC, and the mission itself starts around 60 s.
+            cycles = [uint64]12000000000
+            # ESC skips the story pages, Enter takes the default ship and answers
+            # the launch prompt, then space fires through the mission.
+            injectKeys = "264000000:{esc};363000000:{esc};462000000:{esc};561000000:{esc};660000000:{esc};759000000:{esc};858000000:{esc};957000000:{esc};1056000000:{esc};1155000000:{esc};1320000000:{enter};1452000000:{enter};1584000000:{enter};1716000000:{enter};1848000000:{enter};1980000000:{enter};2112000000:{enter};2244000000:{enter};2376000000:{space};2508000000:{space};2640000000:{space};2772000000:{space};2904000000:{space};3036000000:{space};3300000000:{space};3630000000:{space};3960000000:{space};4290000000:{space};4620000000:{space};4950000000:{space};5280000000:{space};5610000000:{space};5940000000:{space};6270000000:{space};6600000000:{space};6930000000:{space};7260000000:{space};7590000000:{space};7920000000:{space};8250000000:{space};8580000000:{space};8910000000:{space};9240000000:{space};9570000000:{space};9900000000:{space};10230000000:{space};10560000000:{space};10890000000:{space};11220000000:{space}"
+            injectMouse = $null
+            # NOT ModeX. The survey calls this title "unchained mode X with its
+            # own rasteriser" and that is why it was shortlisted. MEASURED over
+            # four runs, one of them into a flown mission: the census holds
+            # exactly ONE graphics geometry, Mode13h 320x400 double-scanned, 200
+            # source rows. Chained mode 13h. The custom rasteriser is real but it
+            # is software, which no census can see.
+            #
+            # THE ROW STAYS FOR A DIFFERENT REASON, and a better one. Zone 66 is
+            # the only fixture anywhere that runs a guest under its OWN
+            # descriptor tables: it enters protected mode through VCPI, builds a
+            # 7-entry GDT and a 49-vector IDT at ring 0, and runs a V86 task
+            # beneath them. That path crashed the emulator at 3 guest seconds
+            # until commit 081293d8, and this row is what would catch it coming
+            # back.
+            targetMode = "Mode13h"; targetNote = ""
         }
         [pscustomobject]@{
             name = "cabal-486"; folder = "cabal_c"
@@ -609,6 +629,27 @@ function Test-BoardRow {
 }
 
 <#
+Build a row's pin from a measured result.
+
+Bands are set from the measurement with HEADROOM, the way psycho-486's [60, 95]
+sits around a measured 82.9%. The asymmetry is deliberate: a graphics defect
+drives coverage DOWN (a wiped raster reads 0.0%) far more often than up, so the
+lower skirt is wider than the upper one. Colours only get a lower bound worth
+having; the upper bound is the palette size, because "more colours than measured"
+is not a defect shape.
+#>
+function New-BoardPin($Stats, [uint64]$Instructions, $Census) {
+    [ordered]@{
+        colors_min   = [math]::Max(1, [int]($Stats.distinct_colors * 0.5))
+        colors_max   = 256
+        nonblack_min = [math]::Round([math]::Max(0.0, $Stats.non_black_pct - 20.0), 1)
+        nonblack_max = [math]::Round([math]::Min(100.0, $Stats.non_black_pct + 12.0), 1)
+        instructions = $Instructions
+        census       = $Census
+    }
+}
+
+<#
 Run one row and grade it.
 
 Copy the tree FRESH every run. Several fixtures mutate their own tree, so a
@@ -911,6 +952,56 @@ if ($SelfTest) {
         throw "self-test: the failure must say the census never showed the mode"
     }
 
+    # ---- The pin shape, which has never run until the first row is pinned. ----
+
+    $measured = [pscustomobject]@{ distinct_colors = 127; non_black_pct = 82.9 }
+    $pin = New-BoardPin $measured ([uint64]3734683259) $census
+    # The psycho-486 row's own recorded band is [60, 95] around 82.9%, so a pin
+    # built from the same measurement must contain that measurement comfortably.
+    if (-not (Test-ContentBands -Colors 127 -NonBlackPercent 82.9 -Pin $pin).Pass) {
+        throw "self-test: a pin must accept the measurement it was built from"
+    }
+    # And must still reject the shapes the bands exist for.
+    if ((Test-ContentBands -Colors 1 -NonBlackPercent 0.0 -Pin $pin).Pass) {
+        throw "self-test: a pin must still reject a wiped frame"
+    }
+    if ((Test-ContentBands -Colors 1 -NonBlackPercent 100.0 -Pin $pin).Pass) {
+        throw "self-test: a pin must still reject a solid fill"
+    }
+    if ($pin.instructions -ne 3734683259) { throw "self-test: the pin lost its instruction count" }
+    if ($null -eq $pin.census) { throw "self-test: the pin lost its census" }
+
+    # A nearly-black frame must not produce a band whose floor is below zero.
+    $dark = New-BoardPin ([pscustomobject]@{ distinct_colors = 2; non_black_pct = 3.0 }) `
+        ([uint64]1) $census
+    if ($dark.nonblack_min -lt 0.0) { throw "self-test: a band floor went negative" }
+    if ($dark.colors_min -lt 1) { throw "self-test: a colour floor went below one" }
+    # A full-coverage frame must not produce a ceiling above 100%.
+    $full = New-BoardPin ([pscustomobject]@{ distinct_colors = 200; non_black_pct = 99.6 }) `
+        ([uint64]1) $census
+    if ($full.nonblack_max -gt 100.0) { throw "self-test: a band ceiling exceeded 100%" }
+
+    # ---- The report, likewise never run until a board runs. ----
+
+    $reportRows = @(
+        [pscustomobject]@{ name = "row-pass"; reached = "ModeX"; instructions = [uint64]10
+            stats = $measured; verdict = [pscustomobject]@{ Pass = $true; Reasons = @() } }
+        [pscustomobject]@{ name = "row-fail"; reached = "-"; instructions = $null; stats = $null
+            verdict = [pscustomobject]@{ Pass = $false; Reasons = @("no published frame") } }
+    )
+    $markdown = Get-BoardMarkdown -Results $reportRows -BoardLabel "self-test"
+    foreach ($needle in @("row-pass", "row-fail", "PASS", "no published frame",
+            "NO FIGURE IN THIS TABLE IS A PERFORMANCE MEASUREMENT")) {
+        if ($markdown -notlike "*$needle*") {
+            throw "self-test: the report omits '$needle'"
+        }
+    }
+    # A row with no frame must render its cells as placeholders rather than
+    # crashing on a null, which is the shape a StrictMode board dies on.
+    if ($markdown -notlike "*| row-fail | - | - | - | - |*") {
+        throw "self-test: a frameless row must render placeholder cells"
+    }
+
     Assert-BoardFrameStatsSelfTest
     Assert-BoardEnvironmentSelfTest
 
@@ -964,14 +1055,7 @@ if ($RecordInvariants) {
             throw ("Refusing to record a pin for '$($result.name)': its census never shows " +
                 "$($row.targetMode). Debug the row; do not pin it.")
         }
-        $pins[$result.name] = [ordered]@{
-            colors_min   = [math]::Max(1, [int]($result.stats.distinct_colors * 0.5))
-            colors_max   = 256
-            nonblack_min = [math]::Round([math]::Max(0.0, $result.stats.non_black_pct - 20.0), 1)
-            nonblack_max = [math]::Round([math]::Min(100.0, $result.stats.non_black_pct + 12.0), 1)
-            instructions = $result.instructions
-            census       = $result.census
-        }
+        $pins[$result.name] = New-BoardPin $result.stats $result.instructions $result.census
     }
     $pins | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $pinPath
     Write-Host "recorded pins for: $($selected -join ', ')"
