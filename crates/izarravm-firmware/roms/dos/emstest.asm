@@ -9,10 +9,12 @@
 ; back through OTHER slots (the runtime-remap proof: the same backing page is
 ; visible wherever it is mapped) -> save context -> unmap -> restore context
 ; (the mapping comes back) -> map/unmap multiple pages in one call (50h, both
-; the page-number and the segment form, plus its error answers) -> free and
+; the page-number and the segment form, plus its error answers) -> get/set
+; handle names (53h: fresh name is zeros, set/get round-trip, duplicate ->
+; A1h, bad handle/subfunction, the name dies with the handle) -> free and
 ; watch the counts recover -> then signal 0xA5 (success) via the unit-tester
 ; exit port. Any other code names the step that broke (0xEn, 0xDn for the 50h
-; steps).
+; steps, 0xCn for the 53h steps).
 ;
 ; Build: nasm -f bin emstest.asm -o emstest.com
 cpu 386
@@ -234,6 +236,124 @@ start:
     cmp ah, 0x8B
     jne f_merr
 
+    ; 11e. handle name, get (5300h): a fresh handle's name is 8 zero bytes.
+    ;      1830.EXE opens EMMXXXX0, allocates one page, then REQUIRES 5301h
+    ;      to succeed; an 84h answer makes it print "You must have at least
+    ;      2700K of expanded memory." and exit before any page math.
+    push ds
+    pop es
+    mov di, name_buf
+    mov ax, 0x5300
+    mov dx, [handle]
+    int 0x67
+    or ah, ah
+    jnz f_name
+    mov si, name_buf
+    mov cx, 8
+nm_zero:
+    lodsb
+    or al, al
+    jnz f_name
+    loop nm_zero
+
+    ; 11f. set a name (5301h), then read it back through 5300h
+    mov ax, 0x5301
+    mov dx, [handle]
+    mov si, name_a
+    int 0x67
+    or ah, ah
+    jnz f_name2
+    mov ax, 0x5300
+    mov dx, [handle]
+    mov di, name_buf
+    int 0x67
+    or ah, ah
+    jnz f_name2
+    mov si, name_a
+    mov di, name_buf
+    mov cx, 8
+    repe cmpsb
+    jne f_name2
+
+    ; 11g. a second handle may not take the same name (A1h); a different
+    ;      name is accepted
+    mov ah, 0x43
+    mov bx, 1
+    int 0x67
+    or ah, ah
+    jnz f_name3
+    mov [handle2], dx
+    mov ax, 0x5301
+    mov dx, [handle2]
+    mov si, name_a
+    int 0x67
+    cmp ah, 0xA1
+    jne f_name3
+    mov ax, 0x5301
+    mov dx, [handle2]
+    mov si, name_b
+    int 0x67
+    or ah, ah
+    jnz f_name3
+
+    ; 11h. error answers: unknown handle -> 83h, subfunction 2 -> 8Fh
+    mov ax, 0x5300
+    mov dx, 0x00FF
+    mov di, name_buf
+    int 0x67
+    cmp ah, 0x83
+    jne f_name4
+    mov ax, 0x5302
+    mov dx, [handle]
+    int 0x67
+    cmp ah, 0x8F
+    jne f_name4
+    mov ax, 0x5302                ; subfunction outranks handle: a bad
+    mov dx, 0x00FF                ; handle must not turn 8Fh into 83h
+    int 0x67
+    cmp ah, 0x8F
+    jne f_name4
+
+    ; 11i. the name dies with the handle: release handle2, reallocate, and
+    ;      5300h on the fresh handle must return 8 ZERO bytes -- this read is
+    ;      the step's red proof (the dup scan skips free slots and a handle's
+    ;      own entry, so a stale name could never answer A1h here). Then take
+    ;      name_b again, and release so steps 12-14 see only the main handle.
+    mov ah, 0x45
+    mov dx, [handle2]
+    int 0x67
+    or ah, ah
+    jnz f_name5
+    mov ah, 0x43
+    mov bx, 1
+    int 0x67
+    or ah, ah
+    jnz f_name5
+    mov [handle2], dx
+    mov ax, 0x5300
+    mov di, name_buf              ; ES = DS since 11e
+    int 0x67
+    or ah, ah
+    jnz f_name5
+    mov si, name_buf
+    mov cx, 8
+nm_zero2:
+    lodsb
+    or al, al
+    jnz f_name5
+    loop nm_zero2
+    mov ax, 0x5301
+    mov dx, [handle2]
+    mov si, name_b
+    int 0x67
+    or ah, ah
+    jnz f_name5
+    mov ah, 0x45
+    mov dx, [handle2]
+    int 0x67
+    or ah, ah
+    jnz f_name5
+
     ; 12. counts reflect the allocation (42h): free dropped by exactly the 4
     ; pages this program holds, from the baseline step 3 recorded.
     mov ah, 0x42
@@ -313,6 +433,16 @@ f_mmapu:  mov al, 0xD2
 f_mseg:   mov al, 0xD3
           jmp sig
 f_merr:   mov al, 0xD4
+          jmp sig
+f_name:   mov al, 0xC1
+          jmp sig
+f_name2:  mov al, 0xC2
+          jmp sig
+f_name3:  mov al, 0xC3
+          jmp sig
+f_name4:  mov al, 0xC4
+          jmp sig
+f_name5:  mov al, 0xC5
 
 sig:
     mov ah, al
@@ -325,7 +455,11 @@ sig:
 .h: jmp .h
 
 handle: dw 0
+handle2: dw 0
 ems_free0: dw 0
+name_a:   db '1830RAIL'
+name_b:   db 'ZUGZWANG'
+name_buf: times 8 db 0xAA         ; prefilled: 11e proves 5300h wrote zeros
 ; 50h arrays: (logical, physical) word pairs
 map50:     dw 0, 2, 1, 3
 unmap50:   dw 0xFFFF, 2, 0xFFFF, 3
