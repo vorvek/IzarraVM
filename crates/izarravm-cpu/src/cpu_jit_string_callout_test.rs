@@ -719,10 +719,16 @@ fn the_denied_neighbours_stay_barriers_in_their_own_census_arm() {
         ("lds eax,[ecx]", &[0xc5, 0x01], 0xc5, "non_continuable"),
         // POPF: one stack read, no transfer, not privileged -- and it writes IOPL.
         ("popfd", &[0x9d], 0x9d, "hard_boundary"),
-        // A control transfer. R1 refuses resume for every one of them, forever.
+        // A control transfer. R1 refuses resume for every one of them, forever -- so LOOP can
+        // never be a CALL-OUT, which is this fixture's claim. It stopped being a BARRIER on
+        // 2026-08-30: `IZARRAVM_LOOP_ROWS` (default ON) lowers it as a native TERMINAL through
+        // `DirectKind::Loop`, a different mechanism from the one this gate guards. The arm is
+        // forced OFF below so this row keeps asserting what it was written to assert -- that the
+        // STRING gate does not admit it -- rather than silently testing the other slice's knob.
         ("loop", &[0xe2, 0x00], 0xe2, "hard_boundary"),
     ];
     let _arm = force_generic_callout(true);
+    jit::direct::set_loop_rows_for_test(Some(false));
     assert_eq!(
         compile_body(&CONTROL).slots,
         Some(3),

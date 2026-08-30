@@ -10914,7 +10914,17 @@ pub(crate) fn parse_mul_mem_rows_arm_for_test(value: Result<String, std::env::Va
     parse_mul_mem_rows_arm(value)
 }
 
-/// Whether the backend lowers `0xE2` LOOP natively (`DirectKind::Loop`). **DEFAULT OFF.**
+/// Whether the backend lowers `0xE2` LOOP natively (`DirectKind::Loop`). **DEFAULT ON since
+/// the 2026-08-30 flip.** `0` / `off` is the escape, the pre-slice barrier and the A/B base
+/// every measurement below was read against. **An OFF leg must now EXPORT `0`** -- the trap
+/// the whole knob family carries.
+///
+/// WHAT PRICED THE FLIP (`.bench/results/loop-ladder-20260830/`, quiet box, `foreign_s` 0.0
+/// on all 28 legs): gp2-586 pooled min-wall **1.0238** (OFF 79.311 s / ON 77.464 s), min-cpu
+/// independently 1.0239, **7 of 7 quiet rounds above 1** (11/11 counting the contaminated
+/// first run), the between-arm effect beating its own round's within-arm null in EVERY
+/// round, and nascar-586 -- a second effect row with 6.6 M LOOP hits of its own -- above 1
+/// in both its rounds. Implied 32-bit entry cost 101-111 ns.
 ///
 /// The row: the gp2-586 barrier census at `ce4fd221` measures `0xE2` at 20,918,551 `runtime_hits`
 /// and 18,374,120 unbound exits across 294 sites -- the LARGEST head of that fixture's rejected
@@ -10942,12 +10952,14 @@ pub(crate) fn loop_rows_enabled() -> bool {
 /// unit-tested without a process-global env write. See `loop_rows_enabled` for the contract.
 fn parse_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset = ON since the 2026-08-30 flip; `0` / `off` is the escape. An off leg must
+        // EXPORT `0`, not unset the variable -- the same trap the whole knob family carries.
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_LOOP_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `0` / `off` (the shipped default: `0xE2` LOOP stays a \
-                 barrier), and `1` / `on` (the candidate: LOOP lowers as a native terminal)"
+                 spellings are unset or `1` / `on` (the shipped default since 2026-08-30: LOOP \
+                 lowers as a native terminal), and `0` / `off` (the escape and the A/B base)"
             )
         }
         Ok(raw) => raw,
@@ -10956,11 +10968,11 @@ fn parse_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
         "" | "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `0` / \
-             `off` (the shipped default: `0xE2` LOOP stays a barrier, which is the A/B base), \
-             and `1` / `on` (the candidate: `DirectKind::Loop`). Refusing to guess: a mistyped \
-             ladder leg would silently run the DEFAULT and be read as the arm it named doing \
-             nothing"
+            "IZARRAVM_LOOP_ROWS={other:?} names no arm; accepted spellings are unset or `1` / \
+             `on` (the shipped default since the 2026-08-30 flip: `DirectKind::Loop`), and \
+             `0` / `off` (the escape, the pre-slice barrier and the A/B base). Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the \
+             arm it named doing nothing"
         ),
     }
 }

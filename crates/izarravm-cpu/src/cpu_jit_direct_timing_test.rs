@@ -2540,14 +2540,16 @@ fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
     }
 }
 
-/// The shipped default, read AMBIENT on purpose so it also fails if `IZARRAVM_LOOP_ROWS=1` is
-/// exported in the environment running the suite.
+/// The shipped default, read AMBIENT on purpose so it also fails if `IZARRAVM_LOOP_ROWS=0` is
+/// exported in the environment running the suite -- which is the correct outcome: the rest of
+/// these fixtures state their arm, and a fixture that means to pin the shipped default has
+/// nowhere else to read it from.
 #[test]
-fn loop_rows_ships_off_by_default() {
+fn loop_rows_ships_on_by_default() {
     jit::direct::set_loop_rows_for_test(None);
     assert!(
-        !jit::direct::loop_rows_enabled(),
-        "IZARRAVM_LOOP_ROWS must default OFF until a gp2-586 ladder prices the flip"
+        jit::direct::loop_rows_enabled(),
+        "IZARRAVM_LOOP_ROWS must default ON since the 2026-08-30 flip; see loop_rows_enabled          for the ladder that priced it (gp2 1.0238 pooled min-wall, 7/7 quiet rounds)"
     );
 }
 
@@ -2556,8 +2558,8 @@ fn loop_rows_ships_off_by_default() {
 fn loop_rows_spelling_table_names_both_arms() {
     use std::env::VarError;
     assert!(
-        !jit::direct::parse_loop_rows_arm_for_test(Err(VarError::NotPresent)),
-        "unset must name the OFF arm"
+        jit::direct::parse_loop_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the ON arm since the 2026-08-30 flip"
     );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
         assert!(

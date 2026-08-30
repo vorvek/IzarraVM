@@ -104,9 +104,12 @@ param(
     # WHICH KNOB the arms select. Defaults to the slice this script was written for; naming
     # another makes it a general two-arm ladder rather than a copy-paste per slice.
     #
-    # The knob must spell its arms "0" and "1" and must DEFAULT OFF, because the OFF arm here is
-    # always the A/B base. A knob that defaults ON would make arm 0 the candidate and silently
-    # invert every ratio this script prints.
+    # The knob must spell its arms "0" and "1". Its DEFAULT is irrelevant here and that is a
+    # property of this script, not an accident: the variable is set EXPLICITLY on every leg
+    # (Set-BaseEnvironment pins both slice knobs to "0", then the per-leg set overrides the one
+    # under test), so arm 0 is the pre-slice base whatever ships. IZARRAVM_LOOP_ROWS defaulted
+    # OFF when measured here and flipped ON on 2026-08-30; the recorded arms did not change
+    # meaning.
     [ValidateSet("IZARRAVM_MUL_MEM_ROWS", "IZARRAVM_LOOP_ROWS")]
     [string]$Knob = "IZARRAVM_MUL_MEM_ROWS",
     # Resolve -Rows, print the selection, exit 0. Exists so the self-test's
@@ -700,10 +703,15 @@ if ($gateFailed) {
 
 if ($identityFailed) {
     Write-Host ""
-    Write-Host "IDENTITY GATE FAILED. The admission moved guest time or the guest instruction"
-    Write-Host "stream. The design predicts it cannot: group 3 charges clocks(2) in both the"
-    Write-Host "interpreter and the emitted form, and the dword read is declared. Explain the"
-    Write-Host "divergence before quoting any wall number -- and re-check the gp2 frame pin,"
-    Write-Host "which is a cutoff-phase sample and moves with ppm timing shifts."
+    Write-Host "IDENTITY DIVERGED. Two hypotheses, and this script cannot pick between them:"
+    Write-Host "(a) a charging defect -- the emitted form charges differently from the"
+    Write-Host "interpreter; or (b) the PROTOCOL.md:199 class -- block formation moved"
+    Write-Host "fetch-run charging, so a fixed cycle budget cuts off ppm later. (b) is"
+    Write-Host "DETERMINISTIC: every leg of one arm shows the SAME totals, the magnitude is"
+    Write-Host "1e-7-class, and it has an accepted precedent (the +4,465 case, and"
+    Write-Host "IZARRAVM_LOOP_ROWS' +1,466). (a) is neither. Check determinism and magnitude"
+    Write-Host "in legs.json, explain the divergence in the slice's design doc before quoting"
+    Write-Host "any wall number, and expect cutoff-phase frame pins (gp2's hash, nascar's"
+    Write-Host "contract) to move legitimately -- judge those by band signature, not hex."
     exit 1
 }
