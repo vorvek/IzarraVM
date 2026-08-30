@@ -450,13 +450,13 @@ fn find_run_until_tick(process: windows_sys::Win32::Foundation::HANDLE) -> Optio
 }
 
 #[test]
-fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1715() {
+fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapses() {
     if std::env::var_os("IZARRAVM_RIPROFILE_INLINE_CHILD").is_some() {
         inline_chain_check_in_this_process();
         return;
     }
     let output = spawn_riprofile_child(
-        "riprofile::tests::inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1715",
+        "riprofile::tests::inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapses",
         "IZARRAVM_RIPROFILE_INLINE_CHILD",
     );
     assert!(
@@ -569,9 +569,11 @@ fn inline_chain_check_in_this_process() {
     };
 
     // Scan the function's own recorded extent for an address where the OLD
-    // resolver collapses to exactly `run_until_tick` @
-    // `machine/src/run.rs:1715` (the `cpu.run_budgeted(&mut bus, run_budget)`
-    // call site, as the compiler attributes it -- see the +5 note below --
+    // resolver collapses to `run_until_tick` @ machine/src/run.rs inside
+    // OLD_COLLAPSE_SPAN (the budgeted-run statement group around the
+    // `cpu.run_budgeted(&mut bus, run_budget)` call site; the EXACT line is
+    // dbghelp/codegen-environment-dependent -- this box says 1715, the
+    // 2026-08-30 CI runner said otherwise and failed the exact pin --
     // the specific defect example this instrument exists to
     // fix — 1677 -> 1683 as the IzarraCD doorbell and claim fields joined run.rs
     // above it, then 1683 -> 1693 as the 16-bit poll slice's I-D1b assertion
@@ -612,6 +614,24 @@ fn inline_chain_check_in_this_process() {
     // function (`next_timer_wake` down to `div_ceil`) that establishes
     // dbghelp's context order is INNERMOST-first, not outermost-first as the
     // design assumed -- a real correctness fix this test's existence found.
+    // The OLD resolver's collapse target, as a SPAN rather than one line. The exact line is
+    // dbghelp- and codegen-environment-dependent: this box attributes the collapsed address to
+    // machine/src/run.rs:1715 (the `let run_budget = remaining;` statement), while the
+    // 2026-08-30 CI runner attributed the same collapse to a neighbouring line of the same
+    // budgeted-run statement group and failed the exact-line pin (#776's first CI run). The
+    // defect being demonstrated is "OLD collapses into machine run.rs, NEW reveals the
+    // izarravm-cpu chain"; the specific line inside the statement group is incidental, so the
+    // pin covers the group. Widen deliberately, never past the enclosing function.
+    const OLD_COLLAPSE_SPAN: std::ops::RangeInclusive<u32> = 1700..=1730;
+    fn old_collapse_in_span(site: &str) -> bool {
+        let Some(idx) = site.rfind("run.rs:") else {
+            return false;
+        };
+        site[idx + "run.rs:".len()..]
+            .trim_end()
+            .parse::<u32>()
+            .is_ok_and(|line| OLD_COLLAPSE_SPAN.contains(&line))
+    }
     const STRIDE: u64 = 8;
     let mut best: Option<(u64, Frame, String)> = None;
     let mut offset = 0u64;
@@ -621,7 +641,7 @@ fn inline_chain_check_in_this_process() {
         let Some(old_line) = super::resolve_line(process, addr) else {
             continue;
         };
-        if !old_line.contains("run.rs:1715") {
+        if !old_collapse_in_span(&old_line) {
             continue;
         }
         let chain = resolve_inline_chain(process, addr);
@@ -631,7 +651,7 @@ fn inline_chain_check_in_this_process() {
         if !innermost.name.contains("run_until_tick")
             && innermost.site.contains("izarravm-cpu")
             && innermost.site.contains("run.rs")
-            && !innermost.site.contains(":1715")
+            && !old_collapse_in_span(&innermost.site)
         {
             best = Some((addr, innermost.clone(), old_line));
             break;
@@ -645,16 +665,17 @@ fn inline_chain_check_in_this_process() {
     let (addr, innermost, old_line) = best.unwrap_or_else(|| {
         panic!(
             "no address in run_until_tick's {size:#x}-byte extent reproduced the \
-             defect example: OLD resolver collapsing to machine/src/run.rs:1715 while \
-             NEW resolver names a different izarravm-cpu run.rs line. Either the OLD \
-             resolver no longer collapses there (recheck the claim in the module doc) \
-             or the NEW resolver regressed."
+             defect example: OLD resolver collapsing into machine/src/run.rs's \
+             budgeted-run span ({OLD_COLLAPSE_SPAN:?}) while NEW resolver names a \
+             different izarravm-cpu run.rs line. Either the OLD resolver no longer \
+             collapses there (recheck the claim in the module doc) or the NEW \
+             resolver regressed."
         )
     });
 
-    assert_eq!(
-        old_line, "crates\\izarravm-machine\\src\\run.rs:1715",
-        "the defect's OLD side must be exactly the documented collapse"
+    assert!(
+        old_collapse_in_span(&old_line) && old_line.contains("izarravm-machine"),
+        "the defect's OLD side must sit in the documented collapse span, got {old_line:?}"
     );
     // The physical symbol itself is NEVER a member of the inline chain (a
     // reviewer rejected a guard that assumed otherwise).
