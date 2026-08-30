@@ -1980,6 +1980,10 @@ fn run_boot_hdd_folder(
             machine.mode_census(),
             machine.distira_census(),
             Some(machine.distira_scanout_state()),
+            &machine.distira_register_writes(),
+            &machine.distira_register_reads(),
+            machine.distira_aperture_traffic(),
+            machine.distira_offset_bits_or(),
         );
         std::fs::write(
             path,

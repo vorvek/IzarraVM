@@ -2432,6 +2432,22 @@ impl Machine {
         self.vega.distira_scanout_state()
     }
 
+    pub fn distira_register_writes(&self) -> Vec<(usize, u64)> {
+        self.vega.distira_register_writes()
+    }
+
+    pub fn distira_register_reads(&self) -> Vec<(usize, u64)> {
+        self.vega.distira_register_reads()
+    }
+
+    pub fn distira_aperture_traffic(&self) -> izarravm_video::DistiraApertureTraffic {
+        self.vega.distira_aperture_traffic()
+    }
+
+    pub fn distira_offset_bits_or(&self) -> usize {
+        self.vega.distira_offset_bits_or()
+    }
+
     pub fn margo_display(&self) -> Option<crate::MargoDisplay> {
         self.vega.margo_active().then(|| self.vega.margo_display())
     }

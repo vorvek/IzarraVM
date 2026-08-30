@@ -29,6 +29,99 @@ const SWAPBUFFER_INTERVAL_MASK: u32 = 0xff;
 const DISTIRA_TMU_CONFIG: u8 = 1 | (1 << 6) | (1 << 7);
 const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
+/// Why the triangle rasteriser did not store a colour pixel. One counter per
+/// exit, so a run that submits geometry and paints nothing names the predicate
+/// that ate it instead of leaving a choice of five.
+///
+/// These are CUMULATIVE and the guest cannot reset them. The SST-1 statistics
+/// registers (`fbi_pixels_in` and friends) share the same event sites, but the
+/// guest clears those with `nopCMD` bit 0, so they cannot answer a
+/// whole-run question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DistiraTriangleCensus {
+    /// Submitted, before any test.
+    pub submitted: u64,
+    /// Refused for zero signed area.
+    pub reject_zero_area: u64,
+    /// Of those, how many had all three vertices at the SAME point. That is
+    /// the signature of vertex registers the guest never wrote, wrote
+    /// somewhere this device does not decode, or converted wrongly.
+    pub zero_area_degenerate: u64,
+    /// Of those, how many had three DISTINCT collinear points. That is a
+    /// scaling or rounding fault, not a missing write.
+    pub zero_area_collinear: u64,
+    /// Refused because the clipped bounding box held no pixel.
+    pub reject_empty_box: u64,
+
+    /// Pixels that reached the per-pixel tests.
+    pub pixels_in: u64,
+    pub reject_stipple: u64,
+    pub reject_depth: u64,
+    pub reject_alpha_mask: u64,
+    pub reject_chroma: u64,
+    pub reject_alpha_test: u64,
+    /// Passed every test, so the colour store was attempted.
+    pub pixels_out: u64,
+
+    /// Colour actually stored.
+    pub color_written: u64,
+    /// Of those, how many were NOT black. `painted_bytes` counts non-zero
+    /// bytes, so a rasteriser that stores eight million BLACK pixels is
+    /// indistinguishable from one that stores none. This separates them.
+    pub color_written_nonblack: u64,
+    /// Colour dropped because `fbzMode` has the RGB write mask clear.
+    pub reject_rgb_wmask: u64,
+    /// Colour dropped because the address fell outside the frame store.
+    pub reject_offscreen: u64,
+    pub depth_written: u64,
+    /// The frame-store byte range the triangle path wrote colour into. Says
+    /// whether the paint landed in a buffer the scanout reads.
+    pub color_offset_min: u32,
+    pub color_offset_max: u32,
+
+    /// Byte writes that reached the fixed and the float vertex registers.
+    /// Says which of the two vertex protocols the guest drives, and a guest
+    /// may drive BOTH: Tomb Raider's splash uses the fixed path and its
+    /// engine the float one.
+    pub fixed_vertex_writes: u64,
+    pub float_vertex_writes: u64,
+    /// The first few REJECTED triangles, as the 12.4 fixed point the device
+    /// derived, and as the raw bits of the float registers they came from.
+    /// The pair is what separates a bad conversion from a bad write.
+    pub zero_area_samples: [[(i16, i16); 3]; 4],
+    pub zero_area_float_samples: [[(u32, u32); 3]; 4],
+    /// The first few ACCEPTED triangles, for comparison.
+    pub drawn_samples: [[(i16, i16); 3]; 4],
+}
+
+/// Traffic through the three non-register apertures. A guest can look idle in
+/// the register histogram and still be hammering one of these, so a "the device
+/// is untouched" reading is not safe without them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DistiraApertureTraffic {
+    pub texture_writes: u64,
+    /// Texture writes the aperture decode REFUSED, split by which test refused
+    /// them. A refused write reaches no texture memory at all, so the texel it
+    /// carried is simply lost and the guest is never told.
+    pub texture_writes_refused: u64,
+    /// Refused because the aperture address selects a TMU this board does not
+    /// have (bit 22, so TMU 2 or 3).
+    pub texture_refused_tmu_select: u64,
+    /// Refused because the address names a level of detail above 8.
+    pub texture_refused_lod: u64,
+    /// The OR of every refused aperture offset. Names the bits in play.
+    pub texture_refused_bits_or: usize,
+    pub lfb_writes: u64,
+    pub lfb_reads: u64,
+    pub command_fifo_writes: u64,
+    /// Filled in by the bus, not the device: a texture-aperture READ is
+    /// answered with all-ones before it reaches Distira, and a texture write
+    /// NARROWER than a dword is dropped there. Neither is visible to any
+    /// counter inside the device, which is exactly why they are here.
+    pub texture_reads: u64,
+    pub texture_narrow_writes: u64,
+}
+
 /// See [`Distira::scanout_state`]. A diagnostic, not part of the device model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistiraScanoutState {
@@ -44,6 +137,10 @@ pub struct DistiraScanoutState {
     pub swaps_issued: u64,
     pub triangles_drawn: u64,
     pub color_pixels_stored: u64,
+    /// `color_pixels_stored` counts the LFB write path ONLY. The triangle
+    /// rasteriser stores through a different function and is counted here.
+    pub triangles: DistiraTriangleCensus,
+    pub fastfill_pixels: u64,
     pub retrace_count: u64,
     pub painted_bytes: usize,
     pub painted_by_buffer: [usize; 3],
@@ -263,7 +360,24 @@ pub struct Distira {
     /// written, because both are zero -- so it cannot answer whether geometry
     /// reached the rasteriser. These can.
     triangles_drawn: u64,
+    /// LFB writes only; the triangle path is counted in `triangle_census`.
     color_pixels_stored: u64,
+    triangle_census: DistiraTriangleCensus,
+    fastfill_pixels: u64,
+    /// Diagnostic: byte writes per SST-1 register index, and the OR of every
+    /// MMIO offset seen. Together they say which register protocol a guest
+    /// drives and which aperture bits it sets.
+    register_writes: Box<[u64; 256]>,
+    /// Reads are taken through `&self`, so the counters need a `Cell`. A guest
+    /// that stops rendering and never writes again may still be POLLING, and
+    /// only the read side shows it.
+    register_reads: Box<[std::cell::Cell<u64>; 256]>,
+    offset_bits_or: usize,
+    /// The three apertures a guest reaches that are NOT register writes. The
+    /// register histogram misses all of them, so a guest that looks idle there
+    /// can still be hammering texture memory or the LFB.
+    aperture_traffic: DistiraApertureTraffic,
+    lfb_reads: std::cell::Cell<u64>,
     pending_swap: Option<PendingSwap>,
     swap_commands: VecDeque<u32>,
     texture_mode: u32,
@@ -380,6 +494,16 @@ impl Distira {
             swaps_issued: 0,
             triangles_drawn: 0,
             color_pixels_stored: 0,
+            triangle_census: DistiraTriangleCensus {
+                color_offset_min: u32::MAX,
+                ..DistiraTriangleCensus::default()
+            },
+            fastfill_pixels: 0,
+            register_writes: Box::new([0; 256]),
+            register_reads: Box::new(std::array::from_fn(|_| std::cell::Cell::new(0))),
+            offset_bits_or: 0,
+            aperture_traffic: DistiraApertureTraffic::default(),
+            lfb_reads: std::cell::Cell::new(0),
             pending_swap: None,
             swap_commands: VecDeque::new(),
             texture_mode: 0,
@@ -636,6 +760,36 @@ impl Distira {
     /// this exists to catch, and counting only the window would hide them.
     /// A run that reports painted_bytes 0 never rendered; one that reports a
     /// large count with a black picture rendered somewhere nobody is looking.
+    /// Diagnostic: `(register index, byte writes)`, busiest first.
+    pub fn register_write_histogram(&self) -> Vec<(usize, u64)> {
+        let mut rows: Vec<(usize, u64)> = self
+            .register_writes
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(index, count)| (index * 4, *count))
+            .collect();
+        rows.sort_by_key(|&(register, count)| (std::cmp::Reverse(count), register));
+        rows
+    }
+
+    /// Diagnostic: `(register index, byte reads)`, busiest first.
+    pub fn register_read_histogram(&self) -> Vec<(usize, u64)> {
+        let mut rows: Vec<(usize, u64)> = self
+            .register_reads
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| count.get() != 0)
+            .map(|(index, count)| (index * 4, count.get()))
+            .collect();
+        rows.sort_by_key(|&(register, count)| (std::cmp::Reverse(count), register));
+        rows
+    }
+
+    pub fn mmio_offset_bits_or(&self) -> usize {
+        self.offset_bits_or
+    }
+
     pub fn scanout_state(&self) -> DistiraScanoutState {
         DistiraScanoutState {
             width: self.display.width,
@@ -650,6 +804,8 @@ impl Distira {
             swaps_issued: self.swaps_issued,
             triangles_drawn: self.triangles_drawn,
             color_pixels_stored: self.color_pixels_stored,
+            triangles: self.triangle_census,
+            fastfill_pixels: self.fastfill_pixels,
             retrace_count: self.retrace_count,
             painted_bytes: self.fb.iter().filter(|&&byte| byte != 0).count(),
             // Per BUFFER, so a black picture says WHICH buffer holds the paint.
@@ -744,10 +900,37 @@ impl Distira {
         coverage: Option<SstTriangleCoverage>,
     ) -> u64 {
         let count_fbi_pixels = coverage.is_some();
+        if count_fbi_pixels {
+            self.triangle_census.submitted += 1;
+        }
         let [a, b, c] = vertices;
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
         if area == 0.0 {
+            if count_fbi_pixels {
+                let census = &mut self.triangle_census;
+                census.reject_zero_area += 1;
+                let points = [(a.x, a.y), (b.x, b.y), (c.x, c.y)];
+                if points[0] == points[1] && points[1] == points[2] {
+                    census.zero_area_degenerate += 1;
+                } else if points[0] != points[1] && points[1] != points[2] && points[0] != points[2]
+                {
+                    census.zero_area_collinear += 1;
+                }
+                let slot = (census.reject_zero_area - 1) as usize;
+                if slot < census.zero_area_samples.len() {
+                    census.zero_area_samples[slot] = raw_vertex_sample(self.triangle_vertices);
+                    census.zero_area_float_samples[slot] = self.ftriangle_vertices;
+                }
+            }
             return 0;
+        }
+        if count_fbi_pixels {
+            let slot = (self.triangle_census.submitted - self.triangle_census.reject_zero_area - 1)
+                as usize;
+            if slot < self.triangle_census.drawn_samples.len() {
+                self.triangle_census.drawn_samples[slot] =
+                    raw_vertex_sample(self.triangle_vertices);
+            }
         }
 
         let mut min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as u32;
@@ -763,6 +946,10 @@ impl Distira {
             max_x = max_x.min(self.clip_right);
             min_y = min_y.max(self.clip_low_y);
             max_y = max_y.min(self.clip_high_y);
+        }
+
+        if count_fbi_pixels && (min_x >= max_x || min_y >= max_y) {
+            self.triangle_census.reject_empty_box += 1;
         }
 
         let affine_lods = [self.texture_lod, self.texture_lod_tmu1];
@@ -796,9 +983,13 @@ impl Distira {
                 }
                 if count_fbi_pixels {
                     self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(1);
+                    self.triangle_census.pixels_in += 1;
                 }
                 let draw_y = self.draw_y(y);
                 if !self.stipple_test_passes(x, draw_y) {
+                    if count_fbi_pixels {
+                        self.triangle_census.reject_stipple += 1;
+                    }
                     continue;
                 }
 
@@ -812,6 +1003,9 @@ impl Distira {
                     && !self.depth_test_passes(x, draw_y, depth)
                 {
                     self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(1);
+                    if count_fbi_pixels {
+                        self.triangle_census.reject_depth += 1;
+                    }
                     continue;
                 }
 
@@ -835,12 +1029,18 @@ impl Distira {
                 let texture_alpha = self.texture_alpha_factor(texture.alpha);
                 let aother = self.texture_alpha_or_source(alpha, texture.alpha);
                 if self.fbz_mode & FBZ_ALPHA_MASK != 0 && aother & 1 == 0 {
+                    if count_fbi_pixels {
+                        self.triangle_census.reject_alpha_mask += 1;
+                    }
                     continue;
                 }
 
                 let selected = self.selected_color_or_source((x, draw_y), (r, g, blue), texture);
                 if !self.chroma_key_passes(selected.0, selected.1, selected.2) {
                     self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
+                    if count_fbi_pixels {
+                        self.triangle_census.reject_chroma += 1;
+                    }
                     continue;
                 }
                 let (r, g, blue) =
@@ -848,21 +1048,53 @@ impl Distira {
                 let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
+                    if count_fbi_pixels {
+                        self.triangle_census.reject_alpha_test += 1;
+                    }
                     continue;
                 }
                 if count_fbi_pixels {
                     self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(1);
+                    self.triangle_census.pixels_out += 1;
                 }
                 let (r, g, blue) = self.apply_fog_color(r, g, blue);
                 let (r, g, blue) = self.alpha_blend_color(x, draw_y, r, g, blue, alpha);
                 let pixel = pack_rgb565_for_pixel(r, g, blue, x, draw_y, self.dither_enabled);
                 let wrote_color = if depths.is_none() {
                     self.write_pixel_at_base(self.display.back_base, x, draw_y, pixel)
+                } else if self.fbz_mode & FBZ_RGB_WMASK == 0 {
+                    if count_fbi_pixels {
+                        self.triangle_census.reject_rgb_wmask += 1;
+                    }
+                    false
                 } else {
-                    self.fbz_mode & FBZ_RGB_WMASK != 0 && self.write_draw_pixel(x, draw_y, pixel)
+                    let stored = self.write_draw_pixel(x, draw_y, pixel);
+                    if count_fbi_pixels && !stored {
+                        self.triangle_census.reject_offscreen += 1;
+                    }
+                    stored
                 };
+                if count_fbi_pixels && wrote_color {
+                    self.triangle_census.color_written += 1;
+                    if pixel != 0 {
+                        self.triangle_census.color_written_nonblack += 1;
+                    }
+                    let base = match self.fbz_mode & FBZ_DRAW_MASK {
+                        FBZ_DRAW_FRONT => self.display.front_base,
+                        _ => self.display.back_base,
+                    };
+                    if let Some(offset) = self.framebuffer_pixel_offset(base, x, draw_y) {
+                        let offset = offset as u32;
+                        let range = &mut self.triangle_census;
+                        range.color_offset_min = range.color_offset_min.min(offset);
+                        range.color_offset_max = range.color_offset_max.max(offset);
+                    }
+                }
                 let wrote_depth =
                     depth.is_some_and(|depth| self.write_depth_pixel(x, draw_y, depth));
+                if count_fbi_pixels && wrote_depth {
+                    self.triangle_census.depth_written += 1;
+                }
                 if wrote_color || wrote_depth {
                     written += 1;
                 }
@@ -936,6 +1168,8 @@ impl Distira {
     }
 
     pub fn read_lfb_u8(&self, offset: usize) -> u8 {
+        let slot = &self.lfb_reads;
+        slot.set(slot.get() + 1);
         self.lfb_byte_offset(self.lfb_read_base(), offset)
             .and_then(|offset| self.fb.get(offset).copied())
             .unwrap_or(0xff)
@@ -949,7 +1183,16 @@ impl Distira {
         u32::from_le_bytes(self.read_lfb_bytes::<4>(offset & !1))
     }
 
+    /// Diagnostic: the aperture counters. See [`DistiraApertureTraffic`].
+    pub fn aperture_traffic(&self) -> DistiraApertureTraffic {
+        DistiraApertureTraffic {
+            lfb_reads: self.lfb_reads.get(),
+            ..self.aperture_traffic
+        }
+    }
+
     pub fn write_lfb_u8(&mut self, offset: usize, value: u8) {
+        self.aperture_traffic.lfb_writes += 1;
         let base = if self.lfb_mode & LFB_FORMAT_MASK == LFB_FORMAT_DEPTH {
             self.aux_base
         } else {
@@ -964,6 +1207,7 @@ impl Distira {
     }
 
     pub fn write_lfb_u16(&mut self, offset: usize, value: u16) {
+        self.aperture_traffic.lfb_writes += 1;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
         let write_depth = self.lfb_pipeline_writes_depth();
@@ -1014,6 +1258,7 @@ impl Distira {
     }
 
     pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
+        self.aperture_traffic.lfb_writes += 1;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
         let write_depth = self.lfb_pipeline_writes_depth();
@@ -1200,6 +1445,7 @@ impl Distira {
     }
 
     pub fn write_command_fifo_u32(&mut self, aperture_offset: usize, value: u32) -> bool {
+        self.aperture_traffic.command_fifo_writes += 1;
         if self.fbi_init[7] & FBIINIT7_CMDFIFO_ENABLE == 0 || self.fifo_is_full() {
             return false;
         }
@@ -1236,6 +1482,8 @@ impl Distira {
     }
 
     pub fn read_mmio_u8(&self, offset: usize) -> u8 {
+        let slot = &self.register_reads[(offset >> 2) & 0xff];
+        slot.set(slot.get() + 1);
         let reg = offset & !0x3;
         let voodoo_reg = offset & 0x3fc;
         let byte = offset & 0x3;
@@ -1253,6 +1501,8 @@ impl Distira {
     }
 
     pub fn write_mmio_u8(&mut self, offset: usize, value: u8) {
+        self.register_writes[(offset >> 2) & 0xff] += 1;
+        self.offset_bits_or |= offset;
         let voodoo_reg = offset & 0x3fc;
         let register = canonical_write_register(offset, self.fbi_init[3]);
         let byte = offset & 0x3;
@@ -1269,12 +1519,30 @@ impl Distira {
         }
         match register {
             SST_INTR_CTRL => merge_byte(&mut self.intr_ctrl, byte, value),
-            SST_VERTEX_AX => merge_vertex_component(&mut self.triangle_vertices[0].0, byte, value),
-            SST_VERTEX_AY => merge_vertex_component(&mut self.triangle_vertices[0].1, byte, value),
-            SST_VERTEX_BX => merge_vertex_component(&mut self.triangle_vertices[1].0, byte, value),
-            SST_VERTEX_BY => merge_vertex_component(&mut self.triangle_vertices[1].1, byte, value),
-            SST_VERTEX_CX => merge_vertex_component(&mut self.triangle_vertices[2].0, byte, value),
-            SST_VERTEX_CY => merge_vertex_component(&mut self.triangle_vertices[2].1, byte, value),
+            SST_VERTEX_AX => {
+                self.triangle_census.fixed_vertex_writes += 1;
+                merge_vertex_component(&mut self.triangle_vertices[0].0, byte, value);
+            }
+            SST_VERTEX_AY => {
+                self.triangle_census.fixed_vertex_writes += 1;
+                merge_vertex_component(&mut self.triangle_vertices[0].1, byte, value);
+            }
+            SST_VERTEX_BX => {
+                self.triangle_census.fixed_vertex_writes += 1;
+                merge_vertex_component(&mut self.triangle_vertices[1].0, byte, value);
+            }
+            SST_VERTEX_BY => {
+                self.triangle_census.fixed_vertex_writes += 1;
+                merge_vertex_component(&mut self.triangle_vertices[1].1, byte, value);
+            }
+            SST_VERTEX_CX => {
+                self.triangle_census.fixed_vertex_writes += 1;
+                merge_vertex_component(&mut self.triangle_vertices[2].0, byte, value);
+            }
+            SST_VERTEX_CY => {
+                self.triangle_census.fixed_vertex_writes += 1;
+                merge_vertex_component(&mut self.triangle_vertices[2].1, byte, value);
+            }
             SST_START_R => merge_color_component(&mut self.triangle_color[0], byte, value),
             SST_START_G => merge_color_component(&mut self.triangle_color[1], byte, value),
             SST_START_B => merge_color_component(&mut self.triangle_color[2], byte, value),
@@ -1297,26 +1565,32 @@ impl Distira {
                 }
             }
             SST_FVERTEX_AX => {
+                self.triangle_census.float_vertex_writes += 1;
                 merge_byte(&mut self.ftriangle_vertices[0].0, byte, value);
                 self.triangle_vertices[0].0 = float_vertex_to_fixed(self.ftriangle_vertices[0].0);
             }
             SST_FVERTEX_AY => {
+                self.triangle_census.float_vertex_writes += 1;
                 merge_byte(&mut self.ftriangle_vertices[0].1, byte, value);
                 self.triangle_vertices[0].1 = float_vertex_to_fixed(self.ftriangle_vertices[0].1);
             }
             SST_FVERTEX_BX => {
+                self.triangle_census.float_vertex_writes += 1;
                 merge_byte(&mut self.ftriangle_vertices[1].0, byte, value);
                 self.triangle_vertices[1].0 = float_vertex_to_fixed(self.ftriangle_vertices[1].0);
             }
             SST_FVERTEX_BY => {
+                self.triangle_census.float_vertex_writes += 1;
                 merge_byte(&mut self.ftriangle_vertices[1].1, byte, value);
                 self.triangle_vertices[1].1 = float_vertex_to_fixed(self.ftriangle_vertices[1].1);
             }
             SST_FVERTEX_CX => {
+                self.triangle_census.float_vertex_writes += 1;
                 merge_byte(&mut self.ftriangle_vertices[2].0, byte, value);
                 self.triangle_vertices[2].0 = float_vertex_to_fixed(self.ftriangle_vertices[2].0);
             }
             SST_FVERTEX_CY => {
+                self.triangle_census.float_vertex_writes += 1;
                 merge_byte(&mut self.ftriangle_vertices[2].1, byte, value);
                 self.triangle_vertices[2].1 = float_vertex_to_fixed(self.ftriangle_vertices[2].1);
             }
@@ -1618,7 +1892,16 @@ impl Distira {
     }
 
     pub fn write_texture_u32(&mut self, aperture_offset: usize, value: u32) {
+        self.aperture_traffic.texture_writes += 1;
         let Some((tmu, offset)) = self.texture_write_offset(aperture_offset) else {
+            let traffic = &mut self.aperture_traffic;
+            traffic.texture_writes_refused += 1;
+            traffic.texture_refused_bits_or |= aperture_offset;
+            if aperture_offset & (1 << 22) != 0 {
+                traffic.texture_refused_tmu_select += 1;
+            } else {
+                traffic.texture_refused_lod += 1;
+            }
             return;
         };
         let mask = DISTIRA_TEX_SIZE - 1;
@@ -2178,6 +2461,7 @@ impl Distira {
                 if write_color && color_offset + 1 < len {
                     self.fb[color_offset as usize] = color[0];
                     self.fb[color_offset as usize + 1] = color[1];
+                    self.fastfill_pixels += 1;
                 }
                 let depth_offset = u64::from(self.aux_base).saturating_add(pixel_offset);
                 if write_depth && depth_offset + 1 < len {
@@ -2948,3 +3232,8 @@ fn lfb_position(aperture_offset: usize, packed_32_bit: bool) -> (u32, u32) {
 #[cfg(test)]
 #[path = "distira_test.rs"]
 mod tests;
+
+/// Diagnostic only: the raw 12.4 fixed-point vertex registers, as signed.
+fn raw_vertex_sample(vertices: [(u32, u32); 3]) -> [(i16, i16); 3] {
+    vertices.map(|(x, y)| (x as i16, y as i16))
+}

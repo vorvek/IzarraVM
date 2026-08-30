@@ -10,10 +10,10 @@ use std::sync::Arc;
 use izarravm_bus::{BusWidth, Memory};
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 use izarravm_video::{
-    CGA_FB_SIZE, DAC_ENTRIES, Distira, DistiraCensus, DistiraScanoutState, HGC_FB_SIZE,
-    MARGO_FRAME_HZ, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, Margo, MargoDisplay, MargoScanTiming,
-    ModeCensus, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE,
-    VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode,
+    CGA_FB_SIZE, DAC_ENTRIES, Distira, DistiraApertureTraffic, DistiraCensus, DistiraScanoutState,
+    HGC_FB_SIZE, MARGO_FRAME_HZ, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, Margo, MargoDisplay,
+    MargoScanTiming, ModeCensus, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
+    VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode,
 };
 
 use crate::video_params::{
@@ -147,6 +147,11 @@ pub(crate) struct Vega {
     vga: Box<Vga>,
     margo: Margo,
     distira: Distira,
+    /// Diagnostic: texture-aperture traffic the DEVICE never sees. A read is
+    /// answered here with all-ones, and a write narrower than a dword is
+    /// dropped here, so neither reaches a Distira counter.
+    distira_texture_reads: u64,
+    distira_texture_narrow_writes: u64,
     margo_active: bool,
     margo_linear: bool,
     margo_bank: u16,
@@ -209,6 +214,8 @@ impl Default for Vega {
             vga: Box::new(Vga::default()),
             margo: Margo::default(),
             distira: Distira::new(),
+            distira_texture_reads: 0,
+            distira_texture_narrow_writes: 0,
             margo_active: false,
             margo_linear: false,
             margo_bank: 0,
@@ -515,6 +522,26 @@ impl Vega {
 
     pub(crate) fn distira_scanout_state(&self) -> DistiraScanoutState {
         self.distira.scanout_state()
+    }
+
+    pub(crate) fn distira_register_writes(&self) -> Vec<(usize, u64)> {
+        self.distira.register_write_histogram()
+    }
+
+    pub(crate) fn distira_register_reads(&self) -> Vec<(usize, u64)> {
+        self.distira.register_read_histogram()
+    }
+
+    pub(crate) fn distira_aperture_traffic(&self) -> DistiraApertureTraffic {
+        DistiraApertureTraffic {
+            texture_reads: self.distira_texture_reads,
+            texture_narrow_writes: self.distira_texture_narrow_writes,
+            ..self.distira.aperture_traffic()
+        }
+    }
+
+    pub(crate) fn distira_offset_bits_or(&self) -> usize {
+        self.distira.mmio_offset_bits_or()
     }
 
     pub(crate) fn mode13_direct_page_available(&self) -> bool {
@@ -1318,6 +1345,11 @@ impl Vega {
             });
         }
         if self.distira_texture_offset(address, bytes).is_some() {
+            // The SST-1 texture aperture is write-only; a read is undefined and
+            // real hardware floats the bus high. Counted because the read never
+            // reaches the device, so no Distira instrument can see it, and a
+            // guest verifying its own texture upload would spin here unseen.
+            self.distira_texture_reads += 1;
             return Some(match width {
                 BusWidth::Byte => 0xff,
                 BusWidth::Word => 0xffff,
@@ -1345,6 +1377,11 @@ impl Vega {
         if let Some(offset) = self.distira_texture_offset(address, bytes) {
             if width == BusWidth::Dword {
                 self.distira.write_texture_u32(offset, value);
+            } else {
+                // Narrower than a dword: this device stores nothing. Counted
+                // so a guest that downloads textures a word at a time is not
+                // read as a guest that downloads none.
+                self.distira_texture_narrow_writes += 1;
             }
             return true;
         }
@@ -1460,6 +1497,7 @@ impl Vega {
             return true;
         }
         if self.distira_texture_offset(address, width).is_some() {
+            self.distira_texture_reads += 1;
             out.fill(0xff);
             return true;
         }
