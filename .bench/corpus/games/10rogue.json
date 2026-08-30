@@ -1,0 +1,10 @@
+{
+  "game": "10Rogue",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "10ROGUE.EXE",
+  "inject_keys": "330000000:Rogue\\r;990000000:h;1320000000:j;1650000000:k;1980000000:l;2310000000:h;2640000000:j;2970000000:k;3300000000:l",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "Text-mode Rogue clone. Title screen prompts 'Rogue's Name?' immediately; schedule types a name + Enter at 5s to reach the dungeon (visible by ~10s guest time). Remaining hjkl taps at 5s intervals (15s-50s, all inside the first half of the 120s window) walk the @ around the starting room, confirmed by comparing screen hashes/position across the probe run. Window covers: title/name-entry (0-10s) then continuous dungeon gameplay (10-120s) at Level 1, Hits 12(12), Str 16(16), Armor 5. rt on this run was 1.41 (486 target 5.0) -- reported as a finding below with barrier-census evidence."
+}

@@ -23,6 +23,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 4 | 007 - License to Kill | 007-license-to-kill | 486 | BLOCKED | 0.61 | 0.073 | FiRM cracktro only; BOND.COM has no path into the game. An agent-reported JIT-vs-interpreter divergence did NOT reproduce: a controlled 3-arm A/B (arm on / arm off / --interpreter, equal key schedule) produced bit-identical end frames, sha ad1bd224 |
 | 5 | 1 Ton | 1-ton | 486 | PROFILED | 17.91 | 0.787 | Mouse-only arcade; needs TOKAMOUS (-Mouse); real weight-drag interaction in window; mostly idle (~1M insns/guest-s) |
 | 6 | 1000 Miglia | 1000-miglia | 486 | FLAGGED | 0.60 | 0.382 | Simulmondo racer; live driving 213-350s behind code-wheel; PIT latch-poll STORM 1.28M writes/guest-s + IRET domination, see F2 |
+| 7 | 10Rogue | 10rogue | 486 | FLAGGED | 1.41 | 0.787 | Text-mode roguelike; dungeon gameplay; F1 class: dword IRET 16.0M of 19.4M census total, single site; no PIT storm |
 
 ## Findings for the performance campaign
 
@@ -61,6 +62,11 @@ one shared handler worth attribution.
 
 +K Cheiw (at target, coverage 0.967) has census total 59,807 - three
 orders of magnitude lower - which corroborates the diagnosis.
+
+Members so far (games whose census the dword-IRET site dominates):
+100-000-pyramid (26.4M), 21-for-1-to-4 (23.3M), 1000-miglia (8.25M, see
+F2), 10rogue (16.0M). The population grows with nearly every below-target
+real-mode game; new members get a ledger-row note instead of a new finding.
 
 **Attribution (2026-08-30, control run):** the dword IRET is the TOKAEMM
 V86 monitor. A rerun of Pyramid with TOKAEMM removed from CONFIG.SYS
