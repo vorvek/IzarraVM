@@ -21,6 +21,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 2 | ''21'' For 1 to 4 | 21-for-1-to-4 | 486 | FLAGGED | 1.50 | 0.778 | QuickBASIC blackjack; below the 486 target; INT/IRET-dominated, see findings |
 | 3 | +K Cheiw | k-cheiw | 486 | PROFILED | 4.92 | 0.967 | Spanish VGA platformer; at target; census total_unbound only 60K; game-port probe on open bus 0x216-0x21e |
 | 4 | 007 - License to Kill | 007-license-to-kill | 486 | BLOCKED | 0.61 | 0.073 | FiRM cracktro only; BOND.COM has no path into the game. An agent-reported JIT-vs-interpreter divergence did NOT reproduce: a controlled 3-arm A/B (arm on / arm off / --interpreter, equal key schedule) produced bit-identical end frames, sha ad1bd224 |
+| 5 | 1 Ton | 1-ton | 486 | PROFILED | 17.91 | 0.787 | Mouse-only arcade; needs TOKAMOUS (-Mouse); real weight-drag interaction in window; mostly idle (~1M insns/guest-s) |
 
 ## Findings for the performance campaign
 

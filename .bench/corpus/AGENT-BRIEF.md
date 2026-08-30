@@ -23,6 +23,9 @@ The runner: `pwsh D:\dev\IzarraVM\.bench\corpus\scripts\run-corpus-game.ps1`
 | `-Label <word>` | names the result directory |
 | `-NoLoop` | do not restart the game when it exits |
 | `-ConfigExtra @('...')` | extra CONFIG.SYS lines |
+| `-Mouse` | load C:\DOS\TOKAMOUS.COM before the game; REQUIRED for any `-InjectMouse` schedule (no driver loads by default, and without one the packets go nowhere); recipe field `mouse_driver: true` |
+| `-NoEmm` | omit TOKAEMM from CONFIG.SYS (control runs) |
+| `-EmuExtra @('...')` | extra emulator flags, e.g. `--interpreter` for an A/B |
 | `-CdImage <path>` | mount a CD image |
 
 Results: `D:\dev\IzarraVM\.bench\corpus\results\<slug>\<stamp>-<label>\` with

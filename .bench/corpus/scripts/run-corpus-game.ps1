@@ -33,6 +33,7 @@ param(
     [string[]]$ConfigExtra = @(),
     [switch]$NoLoop,
     [switch]$NoEmm,
+    [switch]$Mouse,
     [string[]]$EmuExtra = @(),
     [switch]$KeepScratch
 )
@@ -49,6 +50,7 @@ if ($Recipe) {
     if (-not $CdImage -and $r.cd_image) { $CdImage = $r.cd_image }
     if ($ConfigExtra.Count -eq 0 -and $r.config_extra) { $ConfigExtra = @($r.config_extra) }
     if (-not $PSBoundParameters.ContainsKey('NoLoop') -and $r.no_loop) { $NoLoop = $true }
+    if (-not $PSBoundParameters.ContainsKey('Mouse') -and $r.mouse_driver) { $Mouse = $true }
 }
 
 $gameSource = Join-Path $Dosroot $Game
@@ -91,7 +93,9 @@ $configLines += $ConfigExtra + @(
 )
 Set-Content -LiteralPath (Join-Path $scratch 'CONFIG.SYS') -Value ($configLines -join "`r`n") -Encoding ascii
 
-$autoexecLines = @('@echo off', 'cd \GAME')
+$autoexecLines = @('@echo off')
+if ($Mouse) { $autoexecLines += 'C:\DOS\TOKAMOUS.COM' }
+$autoexecLines += 'cd \GAME'
 if ($NoLoop) {
     $autoexecLines += $Entry
 } else {
