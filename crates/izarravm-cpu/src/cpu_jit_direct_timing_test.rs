@@ -2499,6 +2499,12 @@ fn loop_is_lowered_with_the_gate_on() {
 fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
     const ENTRY: u32 = 0x101;
     select_loop_rows(true);
+    // STATED, not inherited, since the 2026-08-30 LOOPcc flip: 0xE0/0xE1 now lower through
+    // their OWN knob (`DirectKind::LoopCc`, default ON). This fixture's claim was always that
+    // the LOOP arm does not admit them -- the flag contract splits the family -- and it keeps
+    // meaning that only with the other slice's arm forced off. The same repair the
+    // string-callout fixture's LOOP row needed when #771 flipped ITS default.
+    jit::direct::set_loopcc_rows_for_test(Some(false));
     for (code, why) in [
         (
             vec![0x89u8, 0xf6, 0x89, 0xff, 0x67, 0xe2, 0x02, 0xf4],
