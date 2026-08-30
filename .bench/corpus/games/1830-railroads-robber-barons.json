@@ -1,0 +1,10 @@
+{
+  "game": "1830 - Railroads & Robber Barons",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "C:\\DOS\\TOKAMOUS.COM\r\n1830.EXE",
+  "inject_keys": "",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "UNBLOCKED 2026-08-30. The old 'You must have at least 2700K of expanded memory.' hard-fail was NOT a page-count or sizing problem: INT 67h tracing (IZARRAVM_INT_TRACE=67,21 on an int-trace build) showed the loader opens the EMMXXXX0 device (INT 21h 3D00h), checks IOCTL 4400h/4407h, reads version 46h, frame 41h, handle count 4Bh, allocates one probe page (43h) -- all of which TOKAEMM answered correctly -- and then issues 5301h SET HANDLE NAME, which TOKAEMM answered with AH=84h (undefined function). The loader treats any nonzero AH there as 'no expanded memory' and exits with code 24h before any page math, which is why EMS-on, -NoEmm, 16 vs 64 MiB and interpreter vs JIT all failed identically. Fixed by implementing LIM 4.0 function 53h (get/set handle name, duplicate -> A1h, name cleared on free) in tokaemm.asm and rebuilding tokados-hdd.img (the corpus boot pulls C:\\DOS\\TOKAEMM.SYS from the committed image, NOT from the firmware crate's loose tokaemm.sys -- retest against the image, not just the EMSTEST fixture). After the fix the game runs its full intro cartoon and reaches the main menu (Continue/Load/New Game/Multi-Player/Hall of Fame/Quit) with heavy EMS traffic (25k+ INT 67h calls in 30s). Menus are mouse-driven per ReadMe.txt, hence TOKAMOUS in the entry. Copy protection: a manual word-lookup prompt after the first stock round; ReadMe.txt says ENTER bypasses it. No key/mouse schedule recorded yet -- the attract/menu screen is the current pin point."
+}

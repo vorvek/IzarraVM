@@ -13,6 +13,8 @@
 # anything under it.
 /.bench/*
 !/.bench/scripts/
+!/.bench/corpus/
+/.bench/corpus/results/
 !/.bench/PROTOCOL.md
 !/.bench/HARNESS.md
 !/.bench/README.md

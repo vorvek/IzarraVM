@@ -1,0 +1,10 @@
+{
+  "game": "15 Move Hole Puzzle",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "MOVEHOLE.EXE",
+  "inject_keys": "660000000:{enter};1320000000:{enter};1980000000:{down};2310000000:{up};2640000000:{left};2970000000:{right};3300000000:{down};3630000000:{up}",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "No game.bat; MOVEHOLE.EXE is the only game executable (CRACK.EXE inspected separately -- a 4896-byte scene-crack utility, not part of gameplay, not used). This is a 1994 shareware 15-puzzle ('move the hole') with a censored-nude reveal image behind the 4x4 tile grid; VGA mode13h throughout. Title screen (ABOUT.BIF-style splash) is a static frozen frame waiting for a key -- one {enter} at 10s advances it to the main menu (Start/Difficulty/Options/About/Quit over a background photo), a second {enter} at 20s activates the already-highlighted 'Start' entry and drops straight into the numbered 4x4 puzzle board (tiles 1-15 plus a black hole tile, 'Level: 1  Moves: 0' readout at the bottom). Despite the README's own instructions describing a 3-digit numeric-code+ENTER move scheme (a table mapping codes like '123'/'136' to letter-coded moves), the game also accepts direct arrow keys: {down}/{up}/{left}/{right} slide the hole and increment the Moves counter (confirmed 0->1->3->5 across successive presses in probing), so the brief's assumed arrow-key control scheme works and was used instead of the code table. Six arrow presses 30s-55s (5s apart, all within the first half of the 120s window) produce 5 accepted moves (one press was a no-op at a board edge) and leave the puzzle sitting on the resulting board state, visibly changed from the start (hole relocated, one tile-of-the-picture piece revealed at a different cell) for the remaining ~65s -- this is genuine engine gameplay, not an attract demo, and the post-schedule idle stretch is an expected near-idle workload for a turn-based tile puzzle, recorded as a valid result per the brief rather than treated as a hang. 486 chosen: real-mode-era 2D shareware title, no protected-mode/3D need."
+}

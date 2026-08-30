@@ -1,4 +1,16 @@
 path	class	origin	license	sha256
+.bench/corpus/games/007-license-to-kill.json	test-fixture	IzarraVM project	GPL-3.0-only	1b71968ceafa06d22b0bb38939eba5c6ed52700ad0437cdc5ec7e11a4b17c3fd
+.bench/corpus/games/1-ton.json	test-fixture	IzarraVM project	GPL-3.0-only	82dc4d17de286914c8cead1306fbc9efa9713ab3892bf135dfe1f291ede25d37
+.bench/corpus/games/100-000-pyramid.json	test-fixture	IzarraVM project	GPL-3.0-only	1736bdbfb5b2c9099fab33827ba8fe934e0a8a5a43d132d9af3b3d3494916b17
+.bench/corpus/games/1000-miglia.json	test-fixture	IzarraVM project	GPL-3.0-only	0252cb093d94fa7c4c11edac59e086d6893b755d70687120423ffd55d0944465
+.bench/corpus/games/10rogue.json	test-fixture	IzarraVM project	GPL-3.0-only	e2d5b1288a9d83825cb7364499d5b657b0b5c40357ab0752cf7610adf8bed40c
+.bench/corpus/games/10th-frame.json	test-fixture	IzarraVM project	GPL-3.0-only	aeaada028c8e8572e67217f2f580a5b0e3dada3a1ec6eb6c597e6db26f5e109b
+.bench/corpus/games/123-talk-shareware.json	test-fixture	IzarraVM project	GPL-3.0-only	cfd72584bfa3a3a0f377b3cc0f847fef338689b993318eef29160579e9b82472
+.bench/corpus/games/15-move-hole-puzzle.json	test-fixture	IzarraVM project	GPL-3.0-only	3f9cbb2d7443165ed141ce2ef6038d958d86976a940dd203e382109c512bba27
+.bench/corpus/games/15x15.json	test-fixture	IzarraVM project	GPL-3.0-only	dd249c65d0c092d68fbdd10d62c83068d21413d25251150e31c269d23beeff56
+.bench/corpus/games/1830-railroads-robber-barons.json	test-fixture	IzarraVM project	GPL-3.0-only	088acc8c2f35428c12879dfed79a50efa4250942b5d43e9ef09369bc57029f4f
+.bench/corpus/games/21-for-1-to-4.json	test-fixture	IzarraVM project	GPL-3.0-only	3a976e95b3be8c1ca605bdac7f893594dd3458d0b1c3d6d67f972922798eb0b6
+.bench/corpus/games/k-cheiw.json	test-fixture	IzarraVM project	GPL-3.0-only	52e64204119120c1bd292660b65b74461efdee515597872ff741a48c7c64ac06
 Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	6d35e4c0c317936bcbaf4656b02b2532d5a3afac1b9e4b954fd0ab76fa803bd2
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	bbae07fb98e8140d0330645ffeccdb637b4a62ff8300e4fdfbc539e08e25a1b7
