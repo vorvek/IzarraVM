@@ -27,6 +27,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 8 | 10th Frame | 10th-frame | 486 | FLAGGED | 3.71 | 0.960 | CGA bowling; frames 1-2 played; F1 class: dword IRET 10.4M, near-total; coverage healthy, so F1 is the whole story |
 | 9 | 123-TALK (Shareware) | 123-talk-shareware | 486 | FLAGGED | 2.59 | 0.852 | Counting edutainment, EGA 640x350; two rounds played with speech; below target with a SMALL census (IRET 340K) - the load is the 2 kHz IRQ0 speech clock (240,709 edges/120s) plus OUT DX,AL sample writes; pit 32K/s, no storm |
 | 10 | 15 Move Hole Puzzle | 15-move-hole-puzzle | 486 | FLAGGED | 1.10 | 0.686 | Mode-13h sliding puzzle; 5 moves played then idle board; F1 class: IRET 23.5M of 24.6M; far-CALL word row 1.08M second |
+| 11 | 15x15 | 15x15 | 486 | BLOCKED | 71.16 | 0.616 | Never-installed dump: NIKITA.CFG is an unfilled installer placeholder; menu carousel, no gameplay handoff; benign game-port probe on 0x216-0x21e |
 
 ## Findings for the performance campaign
 
