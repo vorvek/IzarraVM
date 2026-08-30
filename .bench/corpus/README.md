@@ -36,7 +36,10 @@ performance merge lands on main: fetch, rebase this branch, rebuild
 (`CARGO_TARGET_DIR=D:\ctd\cep cargo build --release -j8`), and re-run the
 FLAGGED ledger rows against the new binary before profiling new games.
 Every run records `exe_sha256`, so rows from different binaries stay
-distinguishable. When `IZARRAVM_ISA_IO_WAIT` lands, re-run the two F1
+distinguishable. That hash also pins the Toka-DOS image era: the corpus
+C: trees boot `tokados-hdd.img`, which is `include_bytes!` into the
+binary (`crates/izarravm-firmware/src/lib.rs`), so an image rebuild
+changes the exe sha on the next build. When `IZARRAVM_ISA_IO_WAIT` lands, re-run the two F1
 games with it set to 1 before sizing any IRET lever.
 
 ## Contact
