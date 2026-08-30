@@ -4959,6 +4959,39 @@ pub(crate) enum DirectKind {
     Loop {
         taken_delta: u32,
     },
+    /// `0xE0` LOOPNE / `0xE1` LOOPE: `ECX -= 1`, branch while the result is non-zero AND the
+    /// guest ZF matches `wanted_zf` (`true` for LOOPE). Behind `IZARRAVM_LOOPCC_ROWS`.
+    ///
+    /// The nascar-586 census at merged main `a836b309`: the `0xE1` dword row is 2,639,630
+    /// `runtime_hits` and 2,638,564 unbound exits across NINE sites -- hits equal exits to
+    /// 99.96%, the densest termination row on the board: every single execution ended its
+    /// block. `0xE0` appears only at Word width there (380 exits), which the address-size gate
+    /// refuses anyway.
+    ///
+    /// **The wall claim is PRE-DECLARED EXPECTED-NULL** (design doc
+    /// `dev_docs/nascar-loopcc-slice-design-2026-08-30.md` section 1): 2.64 M exits at the
+    /// corrected 101-111 ns/entry is ~0.5% of the nascar run, under that fixture's measured
+    /// floor. The slice's case is the mechanism -- census exits removed with zero relocation,
+    /// guest identity, clean controls -- not a wall number.
+    ///
+    /// What separates this from `Loop`, and it is ONE thing: **it READS the guest ZF.** The
+    /// read must see the PRE-instruction guest flag, possibly still in a live pending
+    /// descriptor, and the emitted decrement must not corrupt that read. The emitter tests the
+    /// counter FIRST off the decrement's own host ZF (the same adjacency `Loop`'s invariant
+    /// names), then rebuilds host flags from the guest state through the EXACT
+    /// `emit_load_host_flags(); e.jcc(cond)` sequence `Jcc`'s non-shadow arm uses at the same
+    /// slot position -- whatever contract makes that correct against a live pending descriptor
+    /// for `Jcc` makes it correct here, and this kind deliberately re-derives nothing about the
+    /// lazy-flag machinery. Like `Loop`, it PUBLISHES no flag.
+    ///
+    /// `raw_clocks` carries the same explicit 11 (`execute.rs` charges one `Ok(clocks(11))` for
+    /// the whole `0xe0 | 0xe1` arm, taken or not). Width refusals are `Loop`'s exactly: the
+    /// counter is CX at Word ADDRESS size (a 32-bit decrement would clear ECX's high half) and
+    /// the target wraps at 64K at Word OPERAND size.
+    LoopCc {
+        wanted_zf: bool,
+        taken_delta: u32,
+    },
     /// NOP (0x90, architecturally XCHG (E)AX, (E)AX). Emits ZERO bytes.
     ///
     /// It exists only so block growth continues through it. The interpreter's arms are
@@ -5372,7 +5405,7 @@ impl DirectKind {
             // undercharges every lowered LOOP by NINE core clocks, and nothing inside the
             // emitter can see it: `completed_raw` sums this same accessor, so the end-of-emit
             // assertion agrees with itself whatever this returns. Only a fixture catches it.
-            Self::Loop { .. } => 11,
+            Self::Loop { .. } | Self::LoopCc { .. } => 11,
             // Both widths charge the same: the interpreter returns clocks(4) for 0x58..=0x5f
             // irrespective of operand size. Unlike Push, which correctly rides the `_ => 2`
             // default, an omitted arm here undercharges every pop by 2 core clocks and no test
@@ -6001,6 +6034,7 @@ impl DirectKind {
                 | Self::RetFar16 { .. }
                 | Self::Jcc { .. }
                 | Self::Loop { .. }
+                | Self::LoopCc { .. }
                 | Self::CallReg { .. }
                 | Self::CallMem { .. }
         )
@@ -8051,7 +8085,11 @@ fn compile_with_budget(
         && segment_writes == 0
         && matches!(
             slots.last().map(|slot| slot.kind),
-            Some(DirectKind::Jcc { taken_delta: 0, .. } | DirectKind::Loop { taken_delta: 0 })
+            Some(
+                DirectKind::Jcc { taken_delta: 0, .. }
+                    | DirectKind::Loop { taken_delta: 0 }
+                    | DirectKind::LoopCc { taken_delta: 0, .. }
+            )
         );
     if self_loop && x87_slots != 0 && x87_entry_top != x87_exit_top {
         return CompileOutcome::Retry(RetryCause::PostWalk);
@@ -8263,19 +8301,21 @@ fn compile_with_budget(
     }
     #[cfg(feature = "direct-link-refusal-census")]
     let terminal_links = match slots.last().map(|slot| slot.kind) {
-        Some(DirectKind::Jcc { taken_delta, .. } | DirectKind::Loop { taken_delta }) => {
-            TerminalLinks {
-                targets: [
-                    Some(fallthrough),
-                    Some(LinkTarget {
-                        linear: entry_lin.wrapping_add(taken_delta),
-                        mode_key: key.mode_key,
-                    }),
-                ],
-                successor_mask: [true, !self_loop],
-                emitted_mask: [!self_loop; 2],
-            }
-        }
+        Some(
+            DirectKind::Jcc { taken_delta, .. }
+            | DirectKind::Loop { taken_delta }
+            | DirectKind::LoopCc { taken_delta, .. },
+        ) => TerminalLinks {
+            targets: [
+                Some(fallthrough),
+                Some(LinkTarget {
+                    linear: entry_lin.wrapping_add(taken_delta),
+                    mode_key: key.mode_key,
+                }),
+            ],
+            successor_mask: [true, !self_loop],
+            emitted_mask: [!self_loop; 2],
+        },
         Some(
             DirectKind::Call { target_delta, .. }
             | DirectKind::Call16 { target_delta, .. }
@@ -8331,7 +8371,11 @@ fn compile_with_budget(
     #[cfg(not(feature = "direct-link-refusal-census"))]
     let successors = match slots.last().map(|slot| slot.kind) {
         _ if segment_write_block => [None, None],
-        Some(DirectKind::Jcc { taken_delta, .. } | DirectKind::Loop { taken_delta }) => [
+        Some(
+            DirectKind::Jcc { taken_delta, .. }
+            | DirectKind::Loop { taken_delta }
+            | DirectKind::LoopCc { taken_delta, .. },
+        ) => [
             Some(fallthrough),
             (!self_loop).then_some(LinkTarget {
                 linear: entry_lin.wrapping_add(taken_delta),
@@ -8519,7 +8563,9 @@ fn static_control_target(kind: DirectKind) -> Option<u32> {
         DirectKind::Call { target_delta, .. }
         | DirectKind::Call16 { target_delta, .. }
         | DirectKind::Jmp { target_delta } => Some(target_delta),
-        DirectKind::Jcc { taken_delta, .. } | DirectKind::Loop { taken_delta } => Some(taken_delta),
+        DirectKind::Jcc { taken_delta, .. }
+        | DirectKind::Loop { taken_delta }
+        | DirectKind::LoopCc { taken_delta, .. } => Some(taken_delta),
         _ => None,
     }
 }
@@ -10994,6 +11040,78 @@ pub(crate) fn set_loop_rows_for_test(forced: Option<bool>) {
 #[cfg(test)]
 pub(crate) fn parse_loop_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
     parse_loop_rows_arm(value)
+}
+
+/// Whether the backend lowers `0xE0`/`0xE1` LOOPNE/LOOPE natively (`DirectKind::LoopCc`).
+/// **DEFAULT ON since the 2026-08-30 flip, on the owner's call.** The wall half of the
+/// measurement was PRE-DECLARED EXPECTED-NULL (see the `DirectKind::LoopCc` comment), so
+/// the flip was decided against the MECHANISM evidence: 2,638,564 terminations removed with
+/// zero relocation (the reconciliation closes to -9), entries -3,117,042 on the board's
+/// worst row, guest identity at 44 ppm (the accepted PROTOCOL.md:199 cutoff class). The
+/// precedent is #766's small cross-checked merge, not a wall figure. `0` / `off` is the
+/// escape and the A/B base; **an OFF leg must EXPORT `0`.** Its own knob rather than a widening of `IZARRAVM_LOOP_ROWS`, because it is
+/// its own slice with its own measurement -- and that measurement's wall half is PRE-DECLARED
+/// EXPECTED-NULL (see the `DirectKind::LoopCc` comment), so the default decision is the
+/// owner's, made against the mechanism evidence rather than a wall number.
+///
+/// Spelling table identical to the family: unset / `` / `0` / `off` -> OFF (the shipped
+/// default and the A/B base), `1` / `on` -> ON, anything else PANICS.
+pub(crate) fn loopcc_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = LOOPCC_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_loopcc_rows_arm(std::env::var("IZARRAVM_LOOPCC_ROWS")))
+}
+
+/// The `IZARRAVM_LOOPCC_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `loopcc_rows_enabled` for the contract.
+fn parse_loopcc_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset = ON since the 2026-08-30 flip (the owner's call against the mechanism
+        // evidence; the wall was pre-declared expected-null). An off leg must EXPORT `0`.
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_LOOPCC_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `1` / `on` (the shipped default since 2026-08-30: \
+                 `DirectKind::LoopCc`), and `0` / `off` (the escape and the A/B base)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_LOOPCC_ROWS={other:?} names no arm; accepted spellings are unset or `1` \
+             / `on` (the shipped default since the 2026-08-30 flip: `DirectKind::LoopCc`), and \
+             `0` / `off` (the escape, the pre-slice barriers and the A/B base). Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the \
+             arm it named doing nothing"
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOOPCC_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the LOOPcc arm on this thread for the length of a fixture; `None` restores the ambient
+/// `IZARRAVM_LOOPCC_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_loopcc_rows_for_test(forced: Option<bool>) {
+    LOOPCC_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures; the `OnceLock` cache makes the contract
+/// otherwise assertable exactly once per process.
+#[cfg(test)]
+pub(crate) fn parse_loopcc_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_loopcc_rows_arm(value)
 }
 
 /// Whether the backend admits the SIX rows the tombraid FMV census's loop A names, plus the two
@@ -16338,6 +16456,26 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //   would send the block outside the segment.
             // * `0xE0`/`0xE1`. They read ZF; see the `DirectKind::Loop` comment for why the flag
             //   contract is what splits the family rather than the opcode.
+            // `0xE0` LOOPNE / `0xE1` LOOPE. `taken_delta` is computed by the same three
+            // lines the Jcc and 0xE2 arms use, deliberately unshared for the reason the 0xE2
+            // arm gives. The refusals are 0xE2's exactly (the counter/target width argument is
+            // identical); what differs is only which knob gates the admission -- its own,
+            // because it is its own slice with its own measurement.
+            0xe0 | 0xe1 if insn.group == DecodeGroup::Branch => {
+                if insn.address_size != AddressSize::Dword
+                    || insn.operand_size != OperandSize::Dword
+                    || !loopcc_rows_enabled()
+                {
+                    return None;
+                }
+                let end_delta = lin
+                    .wrapping_add(u32::from(insn.len))
+                    .wrapping_sub(entry_lin);
+                return Some(DirectKind::LoopCc {
+                    wanted_zf: opcode == 0xe1,
+                    taken_delta: end_delta.wrapping_add(insn.imm),
+                });
+            }
             0xe2 if insn.group == DecodeGroup::Branch => {
                 if insn.address_size != AddressSize::Dword
                     || insn.operand_size != OperandSize::Dword
@@ -18369,6 +18507,74 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // primitive avoids a second encoder entry point. `home(1)` IS the guest ECX during
             // native execution, so the subtract is the architectural write-back; there is no
             // separate store.
+            // `Loop`'s arm with ONE insertion: the guest-ZF test between the counter test
+            // and the taken label. Ordering is the whole correctness argument (see the
+            // DirectKind::LoopCc comment): the counter test consumes the decrement's OWN host
+            // ZF first -- nothing between them, `Loop`'s adjacency invariant -- and only then
+            // is the host state rebuilt from the guest's, so the guest read cannot see the
+            // decrement and the counter test cannot see the guest. Swapping the two hands the
+            // counter test the GUEST's ZF, which the differential fixture catches on its first
+            // seed.
+            DirectKind::LoopCc {
+                wanted_zf,
+                taken_delta,
+            } => {
+                completed.retire(slot);
+                let taken = e.label();
+                let counter_dead = e.label();
+                e.alu_r32_imm32(5, home(1), 1);
+                // JZ, condition 4: the counter reached zero, so the branch is never taken and
+                // the guest flags need not even be loaded -- the interpreter's `&&`
+                // short-circuit, in the same order.
+                e.jcc(4, counter_dead);
+                emit_load_host_flags(&mut e);
+                // LOOPE (wanted_zf) takes on ZF set -- guest condition 4, JZ; LOOPNE on ZF
+                // clear -- condition 5, JNZ. Passed straight through as Jcc passes its own.
+                e.jcc(if wanted_zf { 4 } else { 5 }, taken);
+                e.place(counter_dead);
+                if self_loop {
+                    emit_dynamic_increment(&mut e, STACK_ITERATIONS);
+                    emit_advance_eip(&mut e, u32::from(span.guest_len));
+                    e.jmp(self_loop_return.expect("self loop must have a return stub"));
+                } else {
+                    emit_completed_path(
+                        &mut e,
+                        span,
+                        false,
+                        u32::from(span.guest_len),
+                        Some(link_cell_ptrs[0]),
+                        shared_return,
+                        full_accounting,
+                        x87_entry_top.is_some(),
+                        fetch_trace,
+                    );
+                }
+                e.place(taken);
+                if self_loop {
+                    emit_dynamic_increment(&mut e, STACK_ITERATIONS);
+                    debug_assert_eq!(taken_delta, 0);
+                    e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_QUOTA);
+                    e.sub_r64_imm32(Reg::RAX, 1);
+                    e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
+                    e.jnz(loop_entry);
+                    emit_advance_eip(&mut e, taken_delta);
+                    e.jmp(self_loop_return.expect("self loop must have a return stub"));
+                } else {
+                    emit_completed_path(
+                        &mut e,
+                        span,
+                        false,
+                        taken_delta,
+                        Some(link_cell_ptrs[1]),
+                        shared_return,
+                        full_accounting,
+                        x87_entry_top.is_some(),
+                        fetch_trace,
+                    );
+                }
+                terminal = true;
+                break;
+            }
             DirectKind::Loop { taken_delta } => {
                 completed.retire(slot);
                 let taken = e.label();
