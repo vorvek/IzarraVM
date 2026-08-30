@@ -189,8 +189,18 @@ fn sign_extend_24(raw: u32) -> i32 {
     }
 }
 
+/// The SST-1 latches a 12.4 fixed-point vertex. A float vertex register is
+/// converted to a 28.4 integer and the LOW 16 BITS are kept.
+///
+/// The truncation is load-bearing, not a detail. Glide and its games snap a
+/// coordinate to the subpixel grid by adding a magic constant of 2^19, which
+/// gives the sum an ulp of exactly 1/16 and leaves the 12.4 value in the low
+/// mantissa bits, then write the whole biased float. The register sees a value
+/// near 524288 and must return the low 16 bits of its 28.4 form. A conversion
+/// that SATURATES returns 32767 for every such vertex, which collapses every
+/// triangle to a point.
 pub(super) fn float_vertex_to_fixed(raw: u32) -> u32 {
-    ((f32::from_bits(raw) * 16.0) as i16 as u16).into()
+    (((f32::from_bits(raw) * 16.0) as i32 as i16) as u16).into()
 }
 
 pub(super) fn float_color_to_fixed(raw: u32) -> u32 {
