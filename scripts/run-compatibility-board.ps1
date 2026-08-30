@@ -124,11 +124,16 @@ function Get-RowTable {
             name = "jazz-486"; folder = "jazzjack_c"
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
             cycles = $null; injectKeys = $null; injectMouse = $null
+            # MEASURED 2026-08-30: the mode is ModeX, not Mode13h, and it reads
+            # 320x398 with double_scan set -- 199 SOURCE rows. The survey reported
+            # "mode 13h 320x400" for this title and concluded the non-standard
+            # line count was NOT reached; both halves of that are wrong. It is
+            # reached, in mode X, within 76 guest seconds and with no input.
+            #
             # 199 SOURCE rows, not 199 raster lines. vdisp_end counts raster
-            # lines: standard mode 13h reads 400 there with double_scan set, so a
-            # rule reading vdisp_end could never match. Measured on Psycho
-            # Pinball 2026-08-29.
-            targetMode = "Mode13h"; targetNote = "source_lines 199"
+            # lines, so this geometry reads vdisp_end 398 and a rule written
+            # against vdisp_end could never match.
+            targetMode = "ModeX"; targetNote = "source_lines 199"
         }
         [pscustomobject]@{
             name = "koreatetris-486"; folder = "koreatet_c"
@@ -356,6 +361,123 @@ function Assert-BoardFrameStatsSelfTest {
 }
 
 <#
+The environment every row runs under.
+
+WHY THIS EXISTS. A board that does not scrub the environment pins invariants
+measured under whatever the parent shell happened to hold. That failure is
+silent, it is DURABLE -- the pins outlive the shell that made them -- and
+nothing downstream can detect it, because every later run reproduces the wrong
+number faithfully. This board sets no knobs of its own, so the correct
+environment is simply "no observer at all".
+
+AN ALLOWLIST, NOT A DENYLIST. Every `IZARRAVM_*` name found in the parent is
+cleared, rather than a named list of the ones this script's author happened to
+know about. A named list only removes what was already known, so the next knob
+somebody adds is exactly the one that rides through. `RUST_LOG` is named
+explicitly because it does not carry the prefix.
+
+$null, NEVER "". A set-but-empty variable is not "off": readers that use
+`var_os().is_some()` arm on the empty string. `Start-Process -Environment`
+omits a $null entry from the child block entirely, which is what "absent"
+means; see `Get-ChildEnvironmentSnapshot`.
+#>
+function Get-BoardEnvironment {
+    $environment = @{}
+    foreach ($name in [Environment]::GetEnvironmentVariables().Keys) {
+        if ([string]$name -like "IZARRAVM_*") { $environment[[string]$name] = $null }
+    }
+    $environment["RUST_LOG"] = $null
+    return $environment
+}
+
+<#
+Read a CHILD PROCESS's own environment block back.
+
+Asserting about the hashtable `Get-BoardEnvironment` returns would be a test
+that cannot fail for the only thing that matters -- whether the variable
+actually reaches the emulator. `cmd /c set` is the cheapest faithful observer on
+this host: it lists a PRESENT-BUT-EMPTY variable as `NAME=` and omits an ABSENT
+one entirely, which is exactly the distinction that matters here.
+
+Copied from scripts/run-fixture-scoreboard.ps1, which paid for the technique.
+#>
+function Get-ChildEnvironmentSnapshot($Environment) {
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ("izarravm-compat-env-" +
+        [Guid]::NewGuid().ToString("N").Substring(0, 10))
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    try {
+        $outputPath = Join-Path $scratch "environment.txt"
+        $start = @{
+            FilePath               = "cmd.exe"
+            ArgumentList           = @("/c", "set")
+            NoNewWindow            = $true
+            PassThru               = $true
+            RedirectStandardOutput = $outputPath
+            Environment            = $Environment
+        }
+        $process = Start-Process @start
+        if (-not $process.WaitForExit(60000)) {
+            try { $process.Kill($true) } catch { }
+            throw "compatibility board self-test: the environment observer never exited"
+        }
+        $snapshot = @{}
+        foreach ($line in @(Get-Content -LiteralPath $outputPath)) {
+            $separator = ([string]$line).IndexOf('=')
+            if ($separator -lt 1) { continue }
+            $snapshot[([string]$line).Substring(0, $separator)] =
+                ([string]$line).Substring($separator + 1)
+        }
+        return $snapshot
+    } finally {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# The scrub self-test. It plants a variable in THIS process, then reads a real
+# child's block back, so it proves the mechanism rather than the intent. The
+# negative half is the point: an unscrubbed name must be OBSERVED in the child,
+# or the positive half is a gate that cannot fail.
+function Assert-BoardEnvironmentSelfTest {
+    $planted = "IZARRAVM_COMPAT_BOARD_SELFTEST"
+    $control = "IZARRAVM_CONTROL_SELFTEST"
+    [Environment]::SetEnvironmentVariable($planted, "1")
+    [Environment]::SetEnvironmentVariable($control, "1")
+    try {
+        $environment = Get-BoardEnvironment
+        if (-not $environment.ContainsKey($planted)) {
+            throw "self-test: the scrub did not notice $planted"
+        }
+        if ($null -ne $environment[$planted]) {
+            throw "self-test: $planted must be cleared with `$null, never an empty string"
+        }
+
+        $child = Get-ChildEnvironmentSnapshot $environment
+        if ($child.ContainsKey($planted)) {
+            throw "self-test: $planted survived into the child block"
+        }
+        if ($child.ContainsKey("RUST_LOG")) {
+            throw "self-test: RUST_LOG survived into the child block"
+        }
+
+        # THE NEGATIVE HALF. Hand the same child an environment that does NOT
+        # clear the control name, and it must be observed. Without this the
+        # assertion above passes just as happily against a `cmd /c set` that
+        # printed nothing at all.
+        $leaky = @{}
+        foreach ($entry in $environment.GetEnumerator()) { $leaky[$entry.Key] = $entry.Value }
+        $leaky.Remove($control)
+        $leakyChild = Get-ChildEnvironmentSnapshot $leaky
+        if (-not $leakyChild.ContainsKey($control)) {
+            throw ("self-test: the observer cannot see an UNSCRUBBED variable, so it " +
+                "cannot prove a scrubbed one is gone")
+        }
+    } finally {
+        [Environment]::SetEnvironmentVariable($planted, $null)
+        [Environment]::SetEnvironmentVariable($control, $null)
+    }
+}
+
+<#
 Grade a published frame's content against a row's pinned bands.
 
 Bands, not a hash, for the reason Duke3D and Tomb Raider lost their hashes: a
@@ -536,9 +658,22 @@ function Invoke-BoardRow {
     $cd = Get-RowField -Row $Row -Name "cdImage"
     if ($null -ne $cd) { $arguments += @("--cd-image", (Join-Path $FixtureRoot $cd)) }
 
-    & $Executable @arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Row '$($Row.name)' exited $LASTEXITCODE"
+    # Start-Process, not `& $Executable`, because only the former takes an
+    # explicit environment block. See Get-BoardEnvironment for why running under
+    # the parent's environment would silently poison every pin.
+    $log = Join-Path $OutDir "$($Row.name)-run.log"
+    $start = @{
+        FilePath               = $Executable
+        ArgumentList           = $arguments
+        NoNewWindow            = $true
+        PassThru               = $true
+        RedirectStandardOutput = $log
+        Environment            = Get-BoardEnvironment
+    }
+    $process = Start-Process @start
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) {
+        throw "Row '$($Row.name)' exited $($process.ExitCode); see $log"
     }
 
     $stats = Get-PpmFrameStats $ppm
@@ -777,6 +912,7 @@ if ($SelfTest) {
     }
 
     Assert-BoardFrameStatsSelfTest
+    Assert-BoardEnvironmentSelfTest
 
     Write-Host "compatibility board self-test passed"
     return
