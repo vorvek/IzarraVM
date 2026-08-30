@@ -2586,6 +2586,269 @@ fn loop_rows_spelling_table_names_both_arms() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `0xE0`/`0xE1` LOOPNE/LOOPE as native terminals (`DirectKind::LoopCc`), behind
+// `IZARRAVM_LOOPCC_ROWS`. nascar-586's `0xE1` dword row at merged main: 2,639,630 hits /
+// 2,638,564 exits / NINE sites -- hits equal exits to 99.96%, every execution a termination.
+// Design: dev_docs/nascar-loopcc-slice-design-2026-08-30.md. The WALL claim is pre-declared
+// expected-null there; these fixtures carry the slice's whole case.
+//
+// WHAT THE DIFFERENTIAL COVERS IN ONE FIXTURE, by construction: slot 0 is an ADD that both
+// STAGES the guest ZF (the seeds choose whether the sum is zero) and leaves a LIVE PENDING
+// descriptor across the LOOPcc -- so every seed simultaneously tests the ZF axis, the
+// lazy-flag read, and flag preservation. The emitter defects it catches, each a named
+// mutation: the LOOPE/LOOPNE condition swapped; `emit_load_host_flags` dropped (the ZF test
+// then reads the DECREMENT's host ZF); the load moved BEFORE the decrement (the counter test
+// then reads the GUEST's ZF); the counter short-circuit dropped (ZF alone decides).
+// ---------------------------------------------------------------------------
+
+/// Select the arm for this thread and PROVE the selection took, the family shape.
+fn select_loopcc_rows(enabled: bool) {
+    jit::direct::set_loopcc_rows_for_test(Some(enabled));
+    assert_eq!(
+        jit::direct::loopcc_rows_enabled(),
+        enabled,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_LOOPCC_ROWS"
+    );
+}
+
+/// `add eax,ecx; mov esi,esi; loopcc +2`, HLT on each path. The ADD stages ZF AND leaves a
+/// pending descriptor; the filler keeps three slots. Taken lands at ENTRY+8, fallthrough at
+/// ENTRY+6, so the two paths differ in EIP and need no extra assertion.
+fn loopcc_case(opcode: u8) -> Vec<u8> {
+    vec![
+        0x01, 0xc8, // add eax, ecx
+        0x89, 0xf6, // mov esi, esi
+        opcode, 0x02, // loopne/loope +2 -> ENTRY+8
+        0xf4, 0x90, // ENTRY+6: hlt (not taken), pad
+        0xf4, // ENTRY+8: hlt (taken)
+    ]
+}
+
+/// THE DIFFERENTIAL, crossing the counter boundary and the ZF condition independently, for
+/// both opcodes, with the guest ZF living in a PENDING descriptor throughout.
+#[test]
+fn loopcc_matches_the_interpreter_across_both_conditions() {
+    const ENTRY: u32 = 0x101;
+    select_loopcc_rows(true);
+    for opcode in [0xe1u8, 0xe0] {
+        let wanted_zf = opcode == 0xe1;
+        // (seed_ecx, make_zf): the ADD's sum is zero exactly when make_zf, because
+        // seed_eax = -seed_ecx (wrapping) in that case and 5 otherwise.
+        for (seed_ecx, make_zf) in [
+            (2u32, true), // LOOPE taken; LOOPNE not -- the pair that separates the opcodes
+            (2, false),   // LOOPNE taken; LOOPE not
+            (1, true),    // counter dies: NOT taken even when ZF matches LOOPE
+            (1, false),   // counter dies, ZF matches LOOPNE: still not taken
+            (0, true),    // wrap to 0xFFFFFFFF, NON-zero: LOOPE taken
+            (0, false),   // wrap: LOOPNE taken
+        ] {
+            let seed_eax = if make_zf {
+                0u32.wrapping_sub(seed_ecx)
+            } else {
+                5
+            };
+            let code = loopcc_case(opcode);
+            let mut memory = vec![0; 0x0004_0000];
+            memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+            let mut native = fresh();
+            let mut interp = fresh();
+            make_data_segments_flat(&mut native);
+            make_data_segments_flat(&mut interp);
+            let mut native_bus = TestBus::with_memory(memory.clone());
+            let mut interp_bus = TestBus::with_memory(memory);
+            for bus in [&mut native_bus, &mut interp_bus] {
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                bus.uniform_native_fetches = true;
+            }
+            let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+            decode_fixture(&mut native, &mut native_bus, &starts);
+            decode_fixture(&mut interp, &mut interp_bus, &starts);
+            let block = install_fixture_block(&mut native, ENTRY);
+
+            for cpu in [&mut native, &mut interp] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                cpu.registers.gpr.fill(0);
+                cpu.registers.set_esp(0xc000);
+                cpu.registers.set_eax(seed_eax);
+                cpu.registers.set_ecx(seed_ecx);
+                // AF and the reserved bit seeded set; the ADD rewrites the arithmetic flags
+                // and the LOOPcc must publish NOTHING on top of them.
+                cpu.registers.eflags = 0x0296;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.registers.eip = ENTRY;
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.core_clocks_so_far = 0;
+            }
+
+            let label = format!("op={opcode:#04x} ecx={seed_ecx} zf={make_zf}");
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap(),
+                "{label}: must run natively"
+            );
+            for _ in 0..3 {
+                interp.cycle(&mut interp_bus).unwrap();
+            }
+
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp),
+                "{label}: registers"
+            );
+            assert_eq!(
+                native.eflags(),
+                interp.eflags(),
+                "{label}: eflags -- LOOPcc must publish NO flag over the ADD's"
+            );
+            // The clock equality IS the raw_clocks pin: a kind riding the `_ => 2` default
+            // shows a nine-clock shortfall on every seed.
+            assert_eq!(
+                native.elapsed_clocks, interp.elapsed_clocks,
+                "{label}: core clocks -- 11 per LOOPcc, taken or not"
+            );
+
+            // The concrete answers, so agreement with a wrong interpreter still fails.
+            assert_eq!(
+                native.registers.ecx(),
+                seed_ecx.wrapping_sub(1),
+                "{label}: ECX decremented exactly once"
+            );
+            let counter_lives = seed_ecx.wrapping_sub(1) != 0;
+            let taken = counter_lives && (make_zf == wanted_zf);
+            let expected_eip = if taken { ENTRY + 8 } else { ENTRY + 6 };
+            assert_eq!(
+                native.registers.eip, expected_eip,
+                "{label}: taken iff the DECREMENTED counter lives AND the PRE-instruction \
+                 guest ZF matches"
+            );
+        }
+    }
+}
+
+/// The positive admission pin, without which every refusal passes vacuously.
+#[test]
+fn loopcc_is_lowered_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    select_loopcc_rows(true);
+    for opcode in [0xe1u8, 0xe0] {
+        let code = loopcc_case(opcode);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        let instructions = outcome
+            .is_some()
+            .then(|| outcome.unwrap().span.instructions);
+        assert_eq!(
+            instructions,
+            Some(3),
+            "{opcode:#04x} must terminate and carry the whole three-slot block with the gate on"
+        );
+    }
+}
+
+/// The refusals, knob forced ON so the refusal cannot be the knob's doing: the two width
+/// prefixes (Loop's argument verbatim), and `0xE2`, which must route to `DirectKind::Loop`
+/// under ITS knob and never to this arm -- asserted by forcing THIS knob on and LOOP's OFF,
+/// under which a dword `0xE2` must not compile a terminal.
+#[test]
+fn loopcc_neighbouring_forms_remain_refused_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    select_loopcc_rows(true);
+    jit::direct::set_loop_rows_for_test(Some(false));
+    for (code, why) in [
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0x67, 0xe1, 0x02, 0xf4],
+            "67 E1: a 16-bit COUNTER; a 32-bit decrement would clear ECX's high half",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0x66, 0xe1, 0x02, 0xf4],
+            "66 E1: a 16-bit TARGET, which relative_jump wraps at 64K and taken_delta does not",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0xe2, 0x02, 0xf4],
+            "E2 belongs to DirectKind::Loop under IZARRAVM_LOOP_ROWS, forced off here",
+        ),
+    ] {
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        let instructions = outcome
+            .is_some()
+            .then(|| outcome.unwrap().span.instructions);
+        assert_ne!(
+            instructions,
+            Some(3),
+            "{code:02x?} must not lower its terminal: {why}"
+        );
+    }
+    jit::direct::set_loop_rows_for_test(None);
+}
+
+/// The shipped default, read AMBIENT on purpose.
+#[test]
+fn loopcc_rows_ship_off_by_default() {
+    jit::direct::set_loopcc_rows_for_test(None);
+    assert!(
+        !jit::direct::loopcc_rows_enabled(),
+        "IZARRAVM_LOOPCC_ROWS must default OFF; the wall case is pre-declared expected-null \
+         and the default decision is the owner's against the mechanism evidence"
+    );
+}
+
+/// The spelling table, both arms and the refusal.
+#[test]
+fn loopcc_rows_spelling_table_names_both_arms() {
+    use std::env::VarError;
+    assert!(
+        !jit::direct::parse_loopcc_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the OFF arm"
+    );
+    for off in ["", "0", "off", "OFF", " off ", "Off"] {
+        assert!(
+            !jit::direct::parse_loopcc_rows_arm_for_test(Ok(off.to_string())),
+            "{off:?} must name the off arm"
+        );
+    }
+    for on in ["1", "on", "ON", " on ", "On"] {
+        assert!(
+            jit::direct::parse_loopcc_rows_arm_for_test(Ok(on.to_string())),
+            "{on:?} must name the on arm"
+        );
+    }
+    for typo in ["yes", "true", "2", "loopcc", "rows"] {
+        let panicked = std::panic::catch_unwind(|| {
+            jit::direct::parse_loopcc_rows_arm_for_test(Ok(typo.to_string()))
+        })
+        .is_err();
+        assert!(
+            panicked,
+            "IZARRAVM_LOOPCC_ROWS={typo:?} names no arm and must panic rather than silently \
+             running the default"
+        );
+    }
+}
+
 struct DirectTimingCase {
     name: &'static str,
     opcode: &'static [u8],
