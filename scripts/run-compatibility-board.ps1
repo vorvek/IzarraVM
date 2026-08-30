@@ -114,16 +114,41 @@ function Get-RowTable {
         }
         [pscustomobject]@{
             name = "keen4-486"; folder = "ckeen4_c"
-            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
-            # EGA smooth scroll with a split-screen status panel. The corpus
-            # records it as svga_s3, so no census could have found it.
-            targetMode = "Planar"; targetNote = "line_compare_active"
+            # 16 MiB, from its own conf.
+            arguments = @("--cpu", "486", "--memory-mib", "16", "--video", "vega")
+            # 10e9 clocks is 151 guest seconds. MEASURED: one key clears
+            # "Ready - Press a Key" at 5 s, the title cycles, and the ATTRACT
+            # DEMO plays a real level well before the budget.
+            cycles = [uint64]10000000000
+            # ONE key, then nothing. Walking to a level entrance was tried twice
+            # -- a square with {ctrl} presses, then long single-direction legs --
+            # and both left Keen on the world map. Sending nothing lets the title
+            # cycle to its demo, which plays a level by itself.
+            injectKeys = "330000000:{enter}"
+            injectMouse = $null
+            # NOT line_compare_active. The survey calls this "EGA smooth scroll
+            # with a split-screen status panel"; MEASURED at the title, on the
+            # world map and inside a demo level, line compare is never active.
+            # The Galaxy engine draws its level full-screen and its status into
+            # the same buffer.
+            #
+            # THIS ROW'S CENSUS TARGET IS THE WEAKEST ON THE BOARD, and that is
+            # stated rather than hidden: Planar is set ONCE for the whole run, so
+            # geometry cannot separate the title from gameplay. Its gameplay
+            # evidence is the content bands and the instruction count, not the
+            # census. It earns its place as the only row whose gameplay is
+            # reached with a single keystroke and no schedule to rot.
+            targetMode = "Planar"; targetNote = ""
         }
         [pscustomobject]@{
             name = "jazz-486"; folder = "jazzjack_c"
-            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
+            # 16 MiB, from its own conf.
+            arguments = @("--cpu", "486", "--memory-mib", "16", "--video", "vega")
+            # 8e9 clocks is 121 guest seconds. NO INPUT SCHEDULE AT ALL: this
+            # title reaches its target geometry within 76 guest seconds on its
+            # own, which makes it the one row with nothing to rot.
+            cycles = [uint64]8000000000
+            injectKeys = $null; injectMouse = $null
             # MEASURED 2026-08-30: the mode is ModeX, not Mode13h, and it reads
             # 320x398 with double_scan set -- 199 SOURCE rows. The survey reported
             # "mode 13h 320x400" for this title and concluded the non-standard
@@ -137,8 +162,16 @@ function Get-RowTable {
         }
         [pscustomobject]@{
             name = "koreatetris-486"; folder = "koreatet_c"
+            # 64 MiB: its conf asks for 61, which translate clamps up to 64.
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
+            # 8e9 clocks is 121 guest seconds, well inside a played board.
+            cycles = [uint64]8000000000
+            # THE ARROW KEYS, and nothing else works. {enter}, {space}, 1,
+            # {ctrl}, {alt}, s, g, {f1} and y were each tried five seconds apart
+            # and all nine left the menu exactly where it was. {down} and {up}
+            # move the cursor and start the game.
+            injectKeys = "660000000:{down};924000000:{down};1188000000:{down};1452000000:{up};1716000000:{up};1980000000:{up};2244000000:{enter};2508000000:{space}"
+            injectMouse = $null
             # The corpus records machine=hercules and the 2026-08-29 sweep
             # measured CGA 320x200. The corpus records what DOSBox was TOLD, not
             # what the guest chose. If the census reports Hercules instead, that
@@ -177,8 +210,17 @@ function Get-RowTable {
         }
         [pscustomobject]@{
             name = "cabal-486"; folder = "cabal_c"
-            arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
+            # 16 MiB, from its own conf.
+            arguments = @("--cpu", "486", "--memory-mib", "16", "--video", "vega")
+            # 8e9 clocks is 121 guest seconds, inside real play.
+            cycles = [uint64]8000000000
+            # Its FIRST screen is a video-mode prompt: "Press F1 for CGA video
+            # mode, or any other key for default mode". The default is EGA, which
+            # is this row's target, so any key will do and Enter is the key sent.
+            # This was read as a launch failure before it was looked at; it was
+            # never a defect.
+            injectKeys = "528000000:{enter};726000000:{enter};924000000:{enter};1122000000:{enter};1320000000:{enter};1518000000:{enter};1716000000:{enter};1914000000:{enter};2112000000:{enter};2640000000:{space};2904000000:{space};3168000000:{space};3432000000:{space};3696000000:{space};3960000000:{space};4224000000:{space};4488000000:{space};4752000000:{space};5016000000:{space};5280000000:{space};5544000000:{space};5808000000:{space};6072000000:{space};6336000000:{space};6600000000:{space};6864000000:{space};7128000000:{space}"
+            injectMouse = $null
             # RECOVERABLE for `pause-prompt`: its AUTOEXEC prints "Press M for
             # music in game" and calls pause. The schedule has to answer it.
             targetMode = "Planar"; targetNote = ""
