@@ -2805,14 +2805,15 @@ fn loopcc_neighbouring_forms_remain_refused_with_the_gate_on() {
     jit::direct::set_loop_rows_for_test(None);
 }
 
-/// The shipped default, read AMBIENT on purpose.
+/// The shipped default, read AMBIENT on purpose so it also fails if `IZARRAVM_LOOPCC_ROWS=0`
+/// is exported in the environment running the suite.
 #[test]
-fn loopcc_rows_ship_off_by_default() {
+fn loopcc_rows_ship_on_by_default() {
     jit::direct::set_loopcc_rows_for_test(None);
     assert!(
-        !jit::direct::loopcc_rows_enabled(),
-        "IZARRAVM_LOOPCC_ROWS must default OFF; the wall case is pre-declared expected-null \
-         and the default decision is the owner's against the mechanism evidence"
+        jit::direct::loopcc_rows_enabled(),
+        "IZARRAVM_LOOPCC_ROWS must default ON since the 2026-08-30 flip -- the owner's call \
+         against the mechanism evidence; see loopcc_rows_enabled for the numbers"
     );
 }
 
@@ -2821,8 +2822,8 @@ fn loopcc_rows_ship_off_by_default() {
 fn loopcc_rows_spelling_table_names_both_arms() {
     use std::env::VarError;
     assert!(
-        !jit::direct::parse_loopcc_rows_arm_for_test(Err(VarError::NotPresent)),
-        "unset must name the OFF arm"
+        jit::direct::parse_loopcc_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the ON arm since the 2026-08-30 flip"
     );
     for off in ["", "0", "off", "OFF", " off ", "Off"] {
         assert!(

@@ -11043,7 +11043,13 @@ pub(crate) fn parse_loop_rows_arm_for_test(value: Result<String, std::env::VarEr
 }
 
 /// Whether the backend lowers `0xE0`/`0xE1` LOOPNE/LOOPE natively (`DirectKind::LoopCc`).
-/// **DEFAULT OFF.** Its own knob rather than a widening of `IZARRAVM_LOOP_ROWS`, because it is
+/// **DEFAULT ON since the 2026-08-30 flip, on the owner's call.** The wall half of the
+/// measurement was PRE-DECLARED EXPECTED-NULL (see the `DirectKind::LoopCc` comment), so
+/// the flip was decided against the MECHANISM evidence: 2,638,564 terminations removed with
+/// zero relocation (the reconciliation closes to -9), entries -3,117,042 on the board's
+/// worst row, guest identity at 44 ppm (the accepted PROTOCOL.md:199 cutoff class). The
+/// precedent is #766's small cross-checked merge, not a wall figure. `0` / `off` is the
+/// escape and the A/B base; **an OFF leg must EXPORT `0`.** Its own knob rather than a widening of `IZARRAVM_LOOP_ROWS`, because it is
 /// its own slice with its own measurement -- and that measurement's wall half is PRE-DECLARED
 /// EXPECTED-NULL (see the `DirectKind::LoopCc` comment), so the default decision is the
 /// owner's, made against the mechanism evidence rather than a wall number.
@@ -11063,12 +11069,14 @@ pub(crate) fn loopcc_rows_enabled() -> bool {
 /// unit-tested without a process-global env write. See `loopcc_rows_enabled` for the contract.
 fn parse_loopcc_rows_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset = ON since the 2026-08-30 flip (the owner's call against the mechanism
+        // evidence; the wall was pre-declared expected-null). An off leg must EXPORT `0`.
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_LOOPCC_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset or `0` / `off` (the shipped default: LOOPNE/LOOPE stay \
-                 barriers), and `1` / `on` (the candidate: `DirectKind::LoopCc`)"
+                 spellings are unset or `1` / `on` (the shipped default since 2026-08-30: \
+                 `DirectKind::LoopCc`), and `0` / `off` (the escape and the A/B base)"
             )
         }
         Ok(raw) => raw,
@@ -11077,11 +11085,11 @@ fn parse_loopcc_rows_arm(value: Result<String, std::env::VarError>) -> bool {
         "" | "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
-            "IZARRAVM_LOOPCC_ROWS={other:?} names no arm; accepted spellings are unset or `0` \
-             / `off` (the shipped default: LOOPNE/LOOPE stay barriers, which is the A/B base), \
-             and `1` / `on` (the candidate: `DirectKind::LoopCc`). Refusing to guess: a \
-             mistyped ladder leg would silently run the DEFAULT and be read as the arm it \
-             named doing nothing"
+            "IZARRAVM_LOOPCC_ROWS={other:?} names no arm; accepted spellings are unset or `1` \
+             / `on` (the shipped default since the 2026-08-30 flip: `DirectKind::LoopCc`), and \
+             `0` / `off` (the escape, the pre-slice barriers and the A/B base). Refusing to \
+             guess: a mistyped ladder leg would silently run the DEFAULT and be read as the \
+             arm it named doing nothing"
         ),
     }
 }
