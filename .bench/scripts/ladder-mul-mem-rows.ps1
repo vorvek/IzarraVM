@@ -110,7 +110,8 @@ param(
     # under test), so arm 0 is the pre-slice base whatever ships. IZARRAVM_LOOP_ROWS defaulted
     # OFF when measured here and flipped ON on 2026-08-30; the recorded arms did not change
     # meaning.
-    [ValidateSet("IZARRAVM_MUL_MEM_ROWS", "IZARRAVM_LOOP_ROWS")]
+    [ValidateSet("IZARRAVM_MUL_MEM_ROWS", "IZARRAVM_LOOP_ROWS", "IZARRAVM_RETRY_LIFT",
+        "IZARRAVM_OUT_IMM8_ROWS")]
     [string]$Knob = "IZARRAVM_MUL_MEM_ROWS",
     # Resolve -Rows, print the selection, exit 0. Exists so the self-test's
     # green control can prove a well-formed invocation binds without running a
@@ -341,8 +342,13 @@ function Set-BaseEnvironment {
     # Both slice knobs pinned OFF here; the one under test is set per leg AFTER this.
     # Without this a stray parent-shell value for the OTHER slice would ride along in
     # both arms and quietly change what the base is.
+    # Pins follow the SHIPPED defaults so arm 0 is the base a user runs. LOOP flipped ON in
+    # PR #771 (main a836b309), so its pin moved 0 -> 1 with it on 2026-08-30. The knob under
+    # test still gets an explicit 0/1 per leg AFTER this, overriding its pin.
     $env:IZARRAVM_MUL_MEM_ROWS = "0"
-    $env:IZARRAVM_LOOP_ROWS = "0"
+    $env:IZARRAVM_LOOP_ROWS = "1"
+    $env:IZARRAVM_RETRY_LIFT = "0"
+    $env:IZARRAVM_OUT_IMM8_ROWS = "0"
     foreach ($observer in @(
             "IZARRAVM_CPU_PROFILE", "IZARRAVM_CPU_PROFILE_ADDRS",
             "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_RIP_PROFILE",
