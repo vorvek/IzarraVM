@@ -22,6 +22,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 3 | +K Cheiw | k-cheiw | 486 | PROFILED | 4.92 | 0.967 | Spanish VGA platformer; at target; census total_unbound only 60K; game-port probe on open bus 0x216-0x21e |
 | 4 | 007 - License to Kill | 007-license-to-kill | 486 | BLOCKED | 0.61 | 0.073 | FiRM cracktro only; BOND.COM has no path into the game. An agent-reported JIT-vs-interpreter divergence did NOT reproduce: a controlled 3-arm A/B (arm on / arm off / --interpreter, equal key schedule) produced bit-identical end frames, sha ad1bd224 |
 | 5 | 1 Ton | 1-ton | 486 | PROFILED | 17.91 | 0.787 | Mouse-only arcade; needs TOKAMOUS (-Mouse); real weight-drag interaction in window; mostly idle (~1M insns/guest-s) |
+| 6 | 1000 Miglia | 1000-miglia | 486 | FLAGGED | 0.60 | 0.382 | Simulmondo racer; live driving 213-350s behind code-wheel; PIT latch-poll STORM 1.28M writes/guest-s + IRET domination, see F2 |
 
 ## Findings for the performance campaign
 
@@ -68,6 +69,24 @@ the census total from 26,374,252 to 7,223 and the dword IRET row to zero.
 So the cost is the ring-0 IRETD that reflects each software interrupt back
 into V86 - the same family as the wolf3d V86 RETF far-transfer lever.
 Games that poll DOS/BIOS from V86 pay it 100-220K times per guest second.
+
+### F2: 1000 Miglia - the corpus's first PIT latch-poll storm (2026-08-30)
+
+Deep census run `1000-miglia/20260830-200959-deepcensus` (350 guest
+seconds, ~137 of them live driving, 486, mode 13h):
+
+- rt 0.598 against the 5.0 target; coverage 0.382.
+- `timer.pit_writes` 448,720,210 = **1,282,058 per guest second**, 4.3x
+  the storm threshold. `irq0_edges` 179,747 (~514/s - the game runs a
+  fast timer).
+- Census total 8.60M unbound exits; the dword IRET again dominates
+  (8,250,532 across 4 sites - the TOKAEMM V86 reflection path of F1).
+- `brk_cont_not_continuable` 492M over 6.16B instructions - 8%.
+
+So the game hammers the PIT latch while running a 514 Hz timer, and every
+resulting service crosses the V86 reflection boundary. This is the exact
+workload class the ISA I/O wait-state slice reprices; re-run this row
+first when the flip lands.
 
 ## Write-backs from the performance campaign
 
