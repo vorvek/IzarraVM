@@ -29,6 +29,16 @@ Results land in `.bench/corpus/results/<slug>/<stamp>-<label>/` with
 `profile.json`, `end-frame.ppm`, `emulator.log`, and `run-meta.json`.
 The results directory is not tracked in git. The recipes and the ledger are.
 
+## Keeping the binary current
+
+The profiled binary must follow the performance campaign. When a
+performance merge lands on main: fetch, rebase this branch, rebuild
+(`CARGO_TARGET_DIR=D:\ctd\cep cargo build --release -j8`), and re-run the
+FLAGGED ledger rows against the new binary before profiling new games.
+Every run records `exe_sha256`, so rows from different binaries stay
+distinguishable. When `IZARRAVM_ISA_IO_WAIT` lands, re-run the two F1
+games with it set to 1 before sizing any IRET lever.
+
 ## Contact
 
 The campaign session is `corpus-evidence-profiling-042def`. The performance

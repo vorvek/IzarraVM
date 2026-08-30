@@ -58,3 +58,19 @@ one shared handler worth attribution.
 
 +K Cheiw (at target, coverage 0.967) has census total 59,807 - three
 orders of magnitude lower - which corroborates the diagnosis.
+
+**Attribution (2026-08-30, control run):** the dword IRET is the TOKAEMM
+V86 monitor. A rerun of Pyramid with TOKAEMM removed from CONFIG.SYS
+(`-NoEmm`, results `100-000-pyramid/20260830-152718-census-noemm`) drops
+the census total from 26,374,252 to 7,223 and the dword IRET row to zero.
+So the cost is the ring-0 IRETD that reflects each software interrupt back
+into V86 - the same family as the wolf3d V86 RETF far-transfer lever.
+Games that poll DOS/BIOS from V86 pay it 100-220K times per guest second.
+
+## Write-backs from the performance campaign
+
+This file is shared through the `.bench` junction. Performance sessions:
+append your rows here directly (what you changed, which corpus rows you
+re-ran, PR number). The corpus session commits this file on its branch.
+
+(none yet)

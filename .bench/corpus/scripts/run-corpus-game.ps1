@@ -32,6 +32,7 @@ param(
     [switch]$BarrierCensus,
     [string[]]$ConfigExtra = @(),
     [switch]$NoLoop,
+    [switch]$NoEmm,
     [switch]$KeepScratch
 )
 
@@ -81,12 +82,10 @@ if (-not $Entry) {
     }
 }
 
-$configLines = @(
-    'FILES=40'
-    'LASTDRIVE=D'
-    'DEVICE=C:\DOS\TOKAEMM.SYS'
-    'DOS=HIGH,UMB'
-) + $ConfigExtra + @(
+$configLines = @('FILES=40', 'LASTDRIVE=D')
+if (-not $NoEmm) { $configLines += 'DEVICE=C:\DOS\TOKAEMM.SYS' }
+$configLines += 'DOS=HIGH,UMB'
+$configLines += $ConfigExtra + @(
     'SHELL=C:\DOS\COMMAND.COM C:\DOS /E:2048 /P=C:\AUTOEXEC.BAT'
 )
 Set-Content -LiteralPath (Join-Path $scratch 'CONFIG.SYS') -Value ($configLines -join "`r`n") -Encoding ascii
