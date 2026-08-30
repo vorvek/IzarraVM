@@ -1379,8 +1379,23 @@ function Get-FixtureTable {
             # screen this anchor contains. Bit-identical ON and OFF
             # IZARRAVM_TEST_WORD_ROWS on this binary (hash AND 18,136,142,698
             # retired instructions).
+            #
+            # REPINNED 2026-08-30 to 075cc2bb alone. The dead TOKACD/IZCDEX
+            # lines were removed from all four hand-made fixture trees: both
+            # `DEVICEHIGH=C:\DOS\TOKACD.SYS` and `IZCDEX /I /D:TOKACD01 /L:D /T`
+            # named files that stopped shipping with the IzarraCD consolidation
+            # in PRs #755/#756, so the boot screen this row GRADES carried three
+            # lines of CONFIG.SYS error plus one `Bad command or filename` that
+            # should never have been there. Four text rows leave the page;
+            # 8,251 of 288,000 pixels differ, all in rows 272-382, and the CD
+            # still reaches D: because the BIOS serves it.
+            #
+            # The move is legitimate and was established, not assumed: two
+            # sessions reproduced 075cc2bb independently on two different
+            # binaries, and the frame was READ before it was hashed rather than
+            # trusted because it was stable.
             frame_sha256_allowed = @(
-                "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
+                "075cc2bb62c055d6be98a3cc6a7c9076de07d197386622d11cde487ac36b0901"
             )
             stdout_contains = "DOS/4GW Protected Mode Run-time  Version 1.97"
             expected_display = "VgaRaster"; expected_video_mode = "Text"
