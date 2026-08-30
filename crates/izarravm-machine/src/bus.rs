@@ -116,31 +116,34 @@ pub(super) fn isa_io_wait_armed() -> bool {
 /// unit-tested without a process-global env write. See `isa_io_wait_armed`.
 fn parse_isa_io_wait_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        // Unset is the default, and the default is OFF: no ladder has priced this charge yet,
-        // and it moves instruction-count identity on every fixture that touches a listed port
-        // (see the research note's section 5.3), so the shipped arm has to stay the base until
-        // a re-pin lands with it.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the default. The default flipped ON on 2026-08-30, owner-directed, on the
+        // three-row ladder slate (.bench/results/isa-io-wait-ladder-20260830): gp2-586 min-wall
+        // 1.7818 with every round's effect ~30x its own within-arm null (armed legs rt
+        // 2.11-2.17), descent2-3dfx-586 1.0840 min-wall / 1.1019 mean at 4/4 valid rounds under
+        // a pre-declared 4% bar, wolf3d-586 0.9991 as the uncharged-row null control. The flip
+        // is an ERA BOUNDARY for instruction-count and rt series; the four final_instructions
+        // pins moved with it (dev_docs/isa-io-wait-results-2026-08-30.md).
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_ISA_IO_WAIT is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset (the shipped default: OFF), `0` or `off` (the same arm, \
-                 stated), and `1` or `on` (charge legacy X-bus port accesses their ISA bus time)"
+                 spellings are unset (the shipped default since the 2026-08-30 flip: ON), `1` \
+                 or `on` (the same arm, stated), and `0` or `off` (the pre-slice charging)"
             )
         }
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         // Empty names the SAME arm as unset -- the default.
-        "" => false,
+        "" => true,
         "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_ISA_IO_WAIT={other:?} names no arm; accepted spellings are unset (the \
-             shipped default: OFF), `0` or `off` (the same arm, stated -- today's charging) and \
-             `1` or `on` (charge every legacy X-bus port access, both directions, one ISA bus \
-             period). Refusing to guess: a mistyped ladder leg that silently ran the default \
-             would be read as the arm it did not run"
+             shipped default since the 2026-08-30 flip: ON -- charge every legacy X-bus port \
+             access, both directions, one ISA bus period), `1` or `on` (the same arm, stated) \
+             and `0` or `off` (the pre-slice charging). Refusing to guess: a mistyped ladder \
+             leg that silently ran the default would be read as the arm it did not run"
         ),
     }
 }

@@ -369,7 +369,10 @@ function Set-BaseEnvironment {
     # their arms shared it, and duke3d-586-short carries no 0xE6 population, so those results
     # stand.
     $env:IZARRAVM_OUT_IMM8_ROWS = "1"
-    $env:IZARRAVM_ISA_IO_WAIT = "0"
+    # Flipped ON 2026-08-30 (owner-directed, the isa-io-wait ladder slate); pinned to the
+    # shipped arm. The ladders that MEASURED the flip ran with this pin at "0" -- correct then:
+    # arm 0 was the pre-flip shipped base.
+    $env:IZARRAVM_ISA_IO_WAIT = "1"
     foreach ($observer in @(
             "IZARRAVM_CPU_PROFILE", "IZARRAVM_CPU_PROFILE_ADDRS",
             "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_RIP_PROFILE",

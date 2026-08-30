@@ -510,6 +510,17 @@ fn read_speaker_port(machine: &mut Machine) -> u8 {
     u8::try_from(bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap()).unwrap()
 }
 
+/// Run `body` with the `IZARRAVM_ISA_IO_WAIT` arm forced on this thread, then restore the
+/// ambient reading. Mirrors `with_isa_io_wait` in `machine_bus_timing_test.rs` -- the shipped
+/// knob is a process-wide `OnceLock`, so both arms can only be exercised in one process
+/// through the per-thread override.
+fn with_isa_io_wait<R>(armed: bool, body: impl FnOnce() -> R) -> R {
+    crate::bus::set_isa_io_wait_for_test(Some(armed));
+    let result = body();
+    crate::bus::set_isa_io_wait_for_test(None);
+    result
+}
+
 fn write_pci_port(machine: &mut Machine, port: u16, width: BusWidth, value: u32) {
     let mut bus = machine.make_bus();
     bus.write_io(port, width, value, false).unwrap();
@@ -1561,31 +1572,41 @@ fn dma_semantic_state_and_event_totals_share_one_read_only_capture() {
 
 #[test]
 fn rtc_pic_and_timeline_payloads_share_one_read_only_capture() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
-    machine.seed_rtc(2026, 7, 19, 1, 23, 58, 41);
-    initialize_pic_pair(&mut machine, false);
-    write_rtc_port(&mut machine, 0x70, 0x0b);
-    write_rtc_port(&mut machine, 0x71, 0x40);
-    let deadline = machine.rtc.ticks_until_periodic_irq().unwrap();
-    machine.advance_devices_ticks(deadline / 3);
+    // Subject is capture/restore semantics of the RTC/PIC/timeline payloads at one
+    // capture boundary, not ISA batch-timing accounting -- the `write_rtc_port` calls
+    // below are setup, going through `machine.make_bus()` directly rather than a CPU
+    // batch. Pin the ISA-wait arm OFF for this test so those raw setup pokes don't
+    // leave an uncommitted charge sitting on `isa_io_batch_clocks`, which would refuse
+    // the capture below with `UncommittedBatchTiming` for a reason unrelated to what
+    // this test pins. The armed arm's capture-after-a-charged-batch behavior is
+    // covered by `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
+    with_isa_io_wait(false, || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        machine.seed_rtc(2026, 7, 19, 1, 23, 58, 41);
+        initialize_pic_pair(&mut machine, false);
+        write_rtc_port(&mut machine, 0x70, 0x0b);
+        write_rtc_port(&mut machine, 0x71, 0x40);
+        let deadline = machine.rtc.ticks_until_periodic_irq().unwrap();
+        machine.advance_devices_ticks(deadline / 3);
 
-    let capture = machine.canonical_state_capture().unwrap();
-    let first_rtc = rtc_payload_from_capture(&capture);
-    let first_pic = pic_payload_from_capture(&capture);
-    let first_timeline = machine_control_timing_payload_from_capture(&capture);
-    let second_timeline = machine_control_timing_payload_from_capture(&capture);
-    let second_pic = pic_payload_from_capture(&capture);
-    let second_rtc = rtc_payload_from_capture(&capture);
+        let capture = machine.canonical_state_capture().unwrap();
+        let first_rtc = rtc_payload_from_capture(&capture);
+        let first_pic = pic_payload_from_capture(&capture);
+        let first_timeline = machine_control_timing_payload_from_capture(&capture);
+        let second_timeline = machine_control_timing_payload_from_capture(&capture);
+        let second_pic = pic_payload_from_capture(&capture);
+        let second_rtc = rtc_payload_from_capture(&capture);
 
-    assert_eq!(first_rtc.len(), RTC_PAYLOAD_LEN);
-    assert_eq!(first_rtc, second_rtc);
-    assert_eq!(first_pic, second_pic);
-    assert_eq!(first_timeline, second_timeline);
-    assert_eq!(
-        machine.rtc.ticks_until_periodic_irq(),
-        Some(deadline - deadline / 3)
-    );
+        assert_eq!(first_rtc.len(), RTC_PAYLOAD_LEN);
+        assert_eq!(first_rtc, second_rtc);
+        assert_eq!(first_pic, second_pic);
+        assert_eq!(first_timeline, second_timeline);
+        assert_eq!(
+            machine.rtc.ticks_until_periodic_irq(),
+            Some(deadline - deadline / 3)
+        );
+    });
 }
 
 #[test]
@@ -1682,38 +1703,55 @@ fn serviced_unit_tester_noop_commands_leave_the_payload_stable() {
 
 #[test]
 fn speaker_payload_pins_every_port_61_latch_value() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
+    // Subject is the speaker payload's pinned encoding of every port 0x61 latch
+    // value, not ISA batch-timing accounting -- `write_speaker_port`/`read_speaker_port`
+    // are raw `machine.make_bus()` probes, not CPU batches, so each one leaves an
+    // uncommitted charge that would refuse the capture inside `speaker_payload` for a
+    // reason unrelated to what this test pins. Pin the arm OFF; the armed arm's
+    // capture-after-a-charged-batch behavior is covered by
+    // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
+    with_isa_io_wait(false, || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
 
-    for value in u8::MIN..=u8::MAX {
-        write_speaker_port(&mut machine, value);
-        let expected = value & 0x03;
+        for value in u8::MIN..=u8::MAX {
+            write_speaker_port(&mut machine, value);
+            let expected = value & 0x03;
 
-        assert_eq!(speaker_payload(&machine), [expected]);
-        assert_eq!(read_speaker_port(&mut machine) & 0x03, expected);
-        assert_eq!(
-            pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET],
-            u8::from(expected & 1 != 0)
-        );
-    }
+            assert_eq!(speaker_payload(&machine), [expected]);
+            assert_eq!(read_speaker_port(&mut machine) & 0x03, expected);
+            assert_eq!(
+                pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET],
+                u8::from(expected & 1 != 0)
+            );
+        }
+    });
 }
 
 #[test]
 fn speaker_latch_and_pit_gate_remain_independent_owners() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
+    // Subject is that the speaker latch and the PIT channel-2 gate are independently
+    // owned, not ISA batch-timing accounting -- `write_speaker_port`/`read_speaker_port`
+    // are raw bus probes outside any CPU batch, so pin the arm OFF here (see
+    // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
+    // armed arm's capture-after-a-charged-batch behavior is covered by
+    // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
+    with_isa_io_wait(false, || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
 
-    write_speaker_port(&mut machine, 0x00);
-    machine.set_timer_gate(2, true);
-    assert_eq!(speaker_payload(&machine), [0]);
-    assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
-    assert_eq!(read_speaker_port(&mut machine) & 0x03, 0);
+        write_speaker_port(&mut machine, 0x00);
+        machine.set_timer_gate(2, true);
+        assert_eq!(speaker_payload(&machine), [0]);
+        assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
+        assert_eq!(read_speaker_port(&mut machine) & 0x03, 0);
 
-    write_speaker_port(&mut machine, 0x01);
-    machine.set_timer_gate(2, false);
-    assert_eq!(speaker_payload(&machine), [1]);
-    assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 0);
-    assert_eq!(read_speaker_port(&mut machine) & 0x03, 1);
+        write_speaker_port(&mut machine, 0x01);
+        machine.set_timer_gate(2, false);
+        assert_eq!(speaker_payload(&machine), [1]);
+        assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 0);
+        assert_eq!(read_speaker_port(&mut machine) & 0x03, 1);
+    });
 }
 
 #[test]
@@ -2601,71 +2639,87 @@ fn pci_config_capture_is_read_only_and_excludes_connected_device_state() {
 
 #[test]
 fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
-    let mut whole = test_machine();
-    let mut split = test_machine();
-    for machine in [&mut whole, &mut split] {
-        machine.set_mode(GswMode::Gsw586);
-        machine.seed_rtc(2026, 7, 19, 1, 10, 30, 44);
-        initialize_pic_pair(machine, false);
-        for (index, value) in [
-            (0x0a, 0x2f),
-            (0x01, 45),
-            (0x03, 30),
-            (0x05, 10),
-            (0x0b, 0x70),
-        ] {
-            write_rtc_port(machine, 0x70, index);
-            write_rtc_port(machine, 0x71, value);
+    // "Batch" here means splitting device-tick advancement into one call versus two
+    // (whole vs. split), not the ISA I/O batch this knob accrues against -- the subject
+    // is RTC/PIC state equality across that split, and the `write_rtc_port` calls are
+    // setup via a raw bus probe. Pin the arm OFF so setup doesn't leave an uncommitted
+    // charge; the armed arm's capture-after-a-charged-batch behavior is covered by
+    // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
+    with_isa_io_wait(false, || {
+        let mut whole = test_machine();
+        let mut split = test_machine();
+        for machine in [&mut whole, &mut split] {
+            machine.set_mode(GswMode::Gsw586);
+            machine.seed_rtc(2026, 7, 19, 1, 10, 30, 44);
+            initialize_pic_pair(machine, false);
+            for (index, value) in [
+                (0x0a, 0x2f),
+                (0x01, 45),
+                (0x03, 30),
+                (0x05, 10),
+                (0x0b, 0x70),
+            ] {
+                write_rtc_port(machine, 0x70, index);
+                write_rtc_port(machine, 0x71, value);
+            }
         }
-    }
 
-    whole.advance_devices_ticks(MASTER_CLOCK_HZ);
-    let first_split = MASTER_CLOCK_HZ * 2 / 3;
-    split.advance_devices_ticks(first_split);
-    assert_eq!(rtc_payload(&split)[0x0c] & 0xf0, 0xc0);
-    assert!(split.pic.irr_bit(8));
-    let pic_after_periodic = pic_payload(&split);
-    split.advance_devices_ticks(MASTER_CLOCK_HZ - first_split);
-    assert_eq!(pic_payload(&split), pic_after_periodic);
+        whole.advance_devices_ticks(MASTER_CLOCK_HZ);
+        let first_split = MASTER_CLOCK_HZ * 2 / 3;
+        split.advance_devices_ticks(first_split);
+        assert_eq!(rtc_payload(&split)[0x0c] & 0xf0, 0xc0);
+        assert!(split.pic.irr_bit(8));
+        let pic_after_periodic = pic_payload(&split);
+        split.advance_devices_ticks(MASTER_CLOCK_HZ - first_split);
+        assert_eq!(pic_payload(&split), pic_after_periodic);
 
-    assert_eq!(rtc_payload(&whole), rtc_payload(&split));
-    assert_eq!(pic_payload(&whole), pic_payload(&split));
-    assert_eq!(
-        machine_control_timing_payload(&whole),
-        machine_control_timing_payload(&split)
-    );
-    assert_eq!(whole.rtc.clock(), split.rtc.clock());
-    assert_eq!(rtc_payload(&whole)[0x0c] & 0xf0, 0xf0);
-    assert!(whole.pic.irr_bit(8));
-    assert!(split.pic.irr_bit(8));
+        assert_eq!(rtc_payload(&whole), rtc_payload(&split));
+        assert_eq!(pic_payload(&whole), pic_payload(&split));
+        assert_eq!(
+            machine_control_timing_payload(&whole),
+            machine_control_timing_payload(&split)
+        );
+        assert_eq!(whole.rtc.clock(), split.rtc.clock());
+        assert_eq!(rtc_payload(&whole)[0x0c] & 0xf0, 0xf0);
+        assert!(whole.pic.irr_bit(8));
+        assert!(split.pic.irr_bit(8));
+    });
 }
 
 #[test]
 fn rtc_and_pic_commit_the_irq8_deadline_at_one_capture_boundary() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
-    initialize_pic_pair(&mut machine, false);
-    write_rtc_port(&mut machine, 0x70, 0x0b);
-    write_rtc_port(&mut machine, 0x71, 0x40);
-    let deadline = machine.rtc.ticks_until_periodic_irq().unwrap();
+    // Subject is the RTC/PIC IRQ8 deadline commit at a capture boundary, not ISA
+    // batch-timing accounting -- the `write_rtc_port`/`read_rtc_port` calls are raw
+    // bus probes, not CPU batches, so pin the arm OFF (see
+    // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
+    // armed arm's capture-after-a-charged-batch behavior is covered by
+    // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
+    with_isa_io_wait(false, || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        initialize_pic_pair(&mut machine, false);
+        write_rtc_port(&mut machine, 0x70, 0x0b);
+        write_rtc_port(&mut machine, 0x71, 0x40);
+        let deadline = machine.rtc.ticks_until_periodic_irq().unwrap();
 
-    machine.advance_devices_ticks(deadline - 1);
-    let before = machine.canonical_state_capture().unwrap();
-    assert_eq!(rtc_payload_from_capture(&before)[0x0c] & 0xc0, 0);
-    assert_eq!(pic_payload_from_capture(&before)[17] & 0x01, 0);
-    drop(before);
+        machine.advance_devices_ticks(deadline - 1);
+        let before = machine.canonical_state_capture().unwrap();
+        assert_eq!(rtc_payload_from_capture(&before)[0x0c] & 0xc0, 0);
+        assert_eq!(pic_payload_from_capture(&before)[17] & 0x01, 0);
+        drop(before);
 
-    machine.advance_devices_ticks(1);
-    let at_edge = machine.canonical_state_capture().unwrap();
-    assert_eq!(rtc_payload_from_capture(&at_edge)[0x0c] & 0xc0, 0xc0);
-    assert_eq!(pic_payload_from_capture(&at_edge)[17] & 0x01, 0x01);
-    drop(at_edge);
+        machine.advance_devices_ticks(1);
+        let at_edge = machine.canonical_state_capture().unwrap();
+        assert_eq!(rtc_payload_from_capture(&at_edge)[0x0c] & 0xc0, 0xc0);
+        assert_eq!(pic_payload_from_capture(&at_edge)[17] & 0x01, 0x01);
+        drop(at_edge);
 
-    write_rtc_port(&mut machine, 0x70, 0x0c);
-    assert_eq!(read_rtc_port(&mut machine, 0x71) & 0xc0, 0xc0);
-    assert_eq!(rtc_payload(&machine)[0x0c], 0);
-    assert!(machine.pic.irr_bit(8));
-    assert_eq!(pic_payload(&machine)[17] & 0x01, 0x01);
+        write_rtc_port(&mut machine, 0x70, 0x0c);
+        assert_eq!(read_rtc_port(&mut machine, 0x71) & 0xc0, 0xc0);
+        assert_eq!(rtc_payload(&machine)[0x0c], 0);
+        assert!(machine.pic.irr_bit(8));
+        assert_eq!(pic_payload(&machine)[17] & 0x01, 0x01);
+    });
 }
 
 #[test]
@@ -2813,115 +2867,132 @@ fn pit_capture_preserves_status_and_count_latch_read_order() {
 
 #[test]
 fn pit_capture_preserves_the_exact_586_irq0_deadline() {
-    fn configured() -> Machine {
-        let mut machine = test_machine();
-        machine.set_mode(GswMode::Gsw586);
-        initialize_pic_pair(&mut machine, false);
-        write_pit_port(&mut machine, 0x43, 0x34);
-        // The control word raised channel 0's OUT from its power-on low, and
-        // that write-side move is a real IRQ0 edge (the 8254 forces OUT with
-        // no CLK). Consume it here: this test pins the NEXT, counted edge.
-        assert!(machine.pic.irr_bit(0));
-        assert_eq!(machine.pic.acknowledge(), Some(0x20));
-        write_pic_port(&mut machine, 0x20, 0x20);
-        write_pit_port(&mut machine, 0x40, 4);
-        write_pit_port(&mut machine, 0x40, 0);
-        machine
-    }
+    // Subject is the exact IRQ0 deadline the PIT payload pins across capture, not ISA
+    // batch-timing accounting -- `configured()`'s `write_pit_port`/`write_pic_port`
+    // calls are raw bus probes, not CPU batches, so pin the arm OFF (see
+    // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
+    // armed arm's capture-after-a-charged-batch behavior is covered by
+    // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
+    with_isa_io_wait(false, || {
+        fn configured() -> Machine {
+            let mut machine = test_machine();
+            machine.set_mode(GswMode::Gsw586);
+            initialize_pic_pair(&mut machine, false);
+            write_pit_port(&mut machine, 0x43, 0x34);
+            // The control word raised channel 0's OUT from its power-on low, and
+            // that write-side move is a real IRQ0 edge (the 8254 forces OUT with
+            // no CLK). Consume it here: this test pins the NEXT, counted edge.
+            assert!(machine.pic.irr_bit(0));
+            assert_eq!(machine.pic.acknowledge(), Some(0x20));
+            write_pic_port(&mut machine, 0x20, 0x20);
+            write_pit_port(&mut machine, 0x40, 4);
+            write_pit_port(&mut machine, 0x40, 0);
+            machine
+        }
 
-    let mut captured = configured();
-    let mut twin = configured();
-    let pit_clocks = captured.clocks_until_timer0_irq().unwrap();
-    let deadline = captured
-        .timeline
-        .cpu_clocks_until(
-            crate::timeline::DeviceClock::Pit,
-            pit_clocks,
-            u64::from(crate::PIT_INPUT_HZ),
-        )
-        .unwrap();
-    assert!(deadline > 1);
+        let mut captured = configured();
+        let mut twin = configured();
+        let pit_clocks = captured.clocks_until_timer0_irq().unwrap();
+        let deadline = captured
+            .timeline
+            .cpu_clocks_until(
+                crate::timeline::DeviceClock::Pit,
+                pit_clocks,
+                u64::from(crate::PIT_INPUT_HZ),
+            )
+            .unwrap();
+        assert!(deadline > 1);
 
-    let before = pit_payload(&captured);
-    assert_eq!(before, pit_payload(&captured));
-    assert_eq!(captured.pit, twin.pit);
-    assert_eq!(captured.timeline, twin.timeline);
-    assert_eq!(captured.pic, twin.pic);
+        let before = pit_payload(&captured);
+        assert_eq!(before, pit_payload(&captured));
+        assert_eq!(captured.pit, twin.pit);
+        assert_eq!(captured.timeline, twin.timeline);
+        assert_eq!(captured.pic, twin.pic);
 
-    captured.advance_devices_clocks(deadline - 1);
-    twin.advance_devices_clocks(deadline - 1);
-    assert!(!captured.pic.irr_bit(0));
-    assert!(!twin.pic.irr_bit(0));
-    assert_eq!(pit_payload(&captured), pit_payload(&twin));
-    assert_eq!(
-        machine_control_timing_payload(&captured),
-        machine_control_timing_payload(&twin)
-    );
-    assert_eq!(pic_payload(&captured), pic_payload(&twin));
+        captured.advance_devices_clocks(deadline - 1);
+        twin.advance_devices_clocks(deadline - 1);
+        assert!(!captured.pic.irr_bit(0));
+        assert!(!twin.pic.irr_bit(0));
+        assert_eq!(pit_payload(&captured), pit_payload(&twin));
+        assert_eq!(
+            machine_control_timing_payload(&captured),
+            machine_control_timing_payload(&twin)
+        );
+        assert_eq!(pic_payload(&captured), pic_payload(&twin));
 
-    captured.advance_devices_clocks(1);
-    twin.advance_devices_clocks(1);
-    assert!(captured.pic.irr_bit(0));
-    assert!(twin.pic.irr_bit(0));
-    assert_eq!(captured.pit, twin.pit);
-    assert_eq!(captured.timeline, twin.timeline);
-    assert_eq!(captured.pic, twin.pic);
-    assert_eq!(pit_payload(&captured), pit_payload(&twin));
-    assert_eq!(
-        machine_control_timing_payload(&captured),
-        machine_control_timing_payload(&twin)
-    );
-    assert_eq!(pic_payload(&captured), pic_payload(&twin));
-    assert_eq!(captured.pic.acknowledge(), Some(0x20));
-    assert_eq!(twin.pic.acknowledge(), Some(0x20));
+        captured.advance_devices_clocks(1);
+        twin.advance_devices_clocks(1);
+        assert!(captured.pic.irr_bit(0));
+        assert!(twin.pic.irr_bit(0));
+        assert_eq!(captured.pit, twin.pit);
+        assert_eq!(captured.timeline, twin.timeline);
+        assert_eq!(captured.pic, twin.pic);
+        assert_eq!(pit_payload(&captured), pit_payload(&twin));
+        assert_eq!(
+            machine_control_timing_payload(&captured),
+            machine_control_timing_payload(&twin)
+        );
+        assert_eq!(pic_payload(&captured), pic_payload(&twin));
+        assert_eq!(captured.pic.acknowledge(), Some(0x20));
+        assert_eq!(twin.pic.acknowledge(), Some(0x20));
+    });
 }
 
 #[test]
 fn pit_timeline_and_pic_payloads_match_split_586_advancement() {
-    fn configured() -> Machine {
-        let mut machine = test_machine();
-        machine.set_mode(GswMode::Gsw586);
-        initialize_pic_pair(&mut machine, false);
-        write_pit_port(&mut machine, 0x43, 0x34);
-        // Consume the write-side edge (the control word raised OUT from its
-        // power-on low), so the irr assertion below proves the COUNTED edge
-        // of the advance arrived, not this configure-time one.
-        assert_eq!(machine.pic.acknowledge(), Some(0x20));
-        write_pic_port(&mut machine, 0x20, 0x20);
-        write_pit_port(&mut machine, 0x40, 7);
-        write_pit_port(&mut machine, 0x40, 0);
-        machine
-    }
+    // "Split" here means splitting device-clock advancement into several calls versus
+    // one (whole vs. split), not the ISA I/O batch this knob accrues against -- the
+    // subject is PIT/timeline/PIC payload equality across that split, and
+    // `configured()`'s port writes are raw bus probes. Pin the arm OFF (see
+    // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
+    // armed arm's capture-after-a-charged-batch behavior is covered by
+    // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
+    with_isa_io_wait(false, || {
+        fn configured() -> Machine {
+            let mut machine = test_machine();
+            machine.set_mode(GswMode::Gsw586);
+            initialize_pic_pair(&mut machine, false);
+            write_pit_port(&mut machine, 0x43, 0x34);
+            // Consume the write-side edge (the control word raised OUT from its
+            // power-on low), so the irr assertion below proves the COUNTED edge
+            // of the advance arrived, not this configure-time one.
+            assert_eq!(machine.pic.acknowledge(), Some(0x20));
+            write_pic_port(&mut machine, 0x20, 0x20);
+            write_pit_port(&mut machine, 0x40, 7);
+            write_pit_port(&mut machine, 0x40, 0);
+            machine
+        }
 
-    let mut whole = configured();
-    let mut split = configured();
-    let pit_clocks = whole.clocks_until_timer0_irq().unwrap();
-    let first_deadline = whole
-        .timeline
-        .cpu_clocks_until(
-            crate::timeline::DeviceClock::Pit,
-            pit_clocks,
-            u64::from(crate::PIT_INPUT_HZ),
-        )
-        .unwrap();
-    let total = first_deadline * 5 + 17;
-    whole.advance_devices_clocks(total);
-    let parts = [1, 17, first_deadline, first_deadline * 2];
-    for clocks in parts {
-        split.advance_devices_clocks(clocks);
-    }
-    split.advance_devices_clocks(total - parts.into_iter().sum::<u64>());
+        let mut whole = configured();
+        let mut split = configured();
+        let pit_clocks = whole.clocks_until_timer0_irq().unwrap();
+        let first_deadline = whole
+            .timeline
+            .cpu_clocks_until(
+                crate::timeline::DeviceClock::Pit,
+                pit_clocks,
+                u64::from(crate::PIT_INPUT_HZ),
+            )
+            .unwrap();
+        let total = first_deadline * 5 + 17;
+        whole.advance_devices_clocks(total);
+        let parts = [1, 17, first_deadline, first_deadline * 2];
+        for clocks in parts {
+            split.advance_devices_clocks(clocks);
+        }
+        split.advance_devices_clocks(total - parts.into_iter().sum::<u64>());
 
-    assert!(whole.pic.irr_bit(0));
-    assert_eq!(whole.pit, split.pit);
-    assert_eq!(whole.timeline, split.timeline);
-    assert_eq!(whole.pic, split.pic);
-    assert_eq!(pit_payload(&whole), pit_payload(&split));
-    assert_eq!(
-        machine_control_timing_payload(&whole),
-        machine_control_timing_payload(&split)
-    );
-    assert_eq!(pic_payload(&whole), pic_payload(&split));
+        assert!(whole.pic.irr_bit(0));
+        assert_eq!(whole.pit, split.pit);
+        assert_eq!(whole.timeline, split.timeline);
+        assert_eq!(whole.pic, split.pic);
+        assert_eq!(pit_payload(&whole), pit_payload(&split));
+        assert_eq!(
+            machine_control_timing_payload(&whole),
+            machine_control_timing_payload(&split)
+        );
+        assert_eq!(pic_payload(&whole), pic_payload(&split));
+    });
 }
 
 #[test]
@@ -3119,6 +3190,37 @@ fn construction_seed_writes_never_accrue_isa_bus_time() {
     assert!(
         machine.canonical_state_capture().is_ok(),
         "a freshly constructed machine must be capturable with the ISA charge armed"
+    );
+}
+
+#[test]
+fn armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary() {
+    // The shipped default (armed, since the 2026-08-30 flip) must not leave a machine
+    // permanently uncaptureable: a guest OUT to a charged port inside a normal CPU
+    // batch is flushed by the run loop's own batch-end step
+    // (`std::mem::take(&mut self.isa_io_batch_clocks)` in `run_until_tick`) before the
+    // run call returns, so canonical capture succeeds right after. No per-thread
+    // override is used here -- this is the armed arm's OWN contract, complementing the
+    // arm-pinned-OFF sibling tests elsewhere in this module that isolate PIT/RTC/
+    // speaker capture semantics from a raw, batch-external port probe.
+    let rom = rom_with_code(&[
+        0xb0, 0x34, 0xe6, 0x43, // OUT 0x43, AL -- a charged PIT control-word write
+        0xf4, // HLT
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+    machine.set_mode(GswMode::Gsw586);
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    assert_eq!(
+        machine.isa_io_batch_clocks, 0,
+        "the batch-end step must flush the charge before the run call returns"
+    );
+    assert!(
+        machine.canonical_state_capture().is_ok(),
+        "a charged PIT access consumed at its own batch boundary must be captureable \
+         under the shipped (armed) default"
     );
 }
 
@@ -3566,26 +3668,39 @@ fn unit_tester_exit_zero_is_a_captureable_batch_boundary() {
 
 #[test]
 fn speaker_latch_survives_a_real_586_test_exit_boundary() {
-    let rom = rom_with_code(&[
-        0xb0, 0xff, 0xe6, 0x61, // latch both speaker bits; upper bits normalize
-        0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
-        0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
-        0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
-        0xf4, // must not execute
-    ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
-    machine.set_mode(GswMode::Gsw586);
+    // Subject is that the speaker latch survives capture at a real TestExit boundary,
+    // not ISA batch-timing accounting. The guest OUT 0x61 inside the ROM is charged and
+    // properly flushed by the run loop's own batch-end step (TestExit is itself a
+    // captureable batch boundary -- see `unit_tester_exit_zero_is_a_captureable_batch_
+    // boundary`), so that part needs no override. But the trailing `read_speaker_port`
+    // probe below is a raw `machine.make_bus()` access with no batch to flush its
+    // charge into, which would refuse the final capture with `UncommittedBatchTiming`
+    // for a reason unrelated to what this test pins. Pin the arm OFF for the whole test
+    // rather than split it, so the guest-side charge and the probe-side charge are both
+    // absent uniformly; the armed arm's capture-after-a-charged-batch behavior is
+    // covered by `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
+    with_isa_io_wait(false, || {
+        let rom = rom_with_code(&[
+            0xb0, 0xff, 0xe6, 0x61, // latch both speaker bits; upper bits normalize
+            0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
+            0xb0, 0x00, 0xe6, 0xe5, // write exit code zero
+            0xb0, 0x03, 0xe6, 0xe6, // issue CMD_EXIT
+            0xf4, // must not execute
+        ]);
+        let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+        machine.set_mode(GswMode::Gsw586);
 
-    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
-    assert_eq!(reason, StopReason::TestExit { code: 0 });
-    assert_eq!(machine.cpu.registers.eip, 16);
-    assert!(!machine.cpu.halted);
-    assert_eq!(machine.unittester.pending_command(), None);
-    assert_eq!(speaker_payload(&machine), [3]);
-    assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
-    assert_eq!(read_speaker_port(&mut machine) & 0x03, 3);
-    assert_eq!(speaker_payload(&machine), [3]);
+        assert_eq!(reason, StopReason::TestExit { code: 0 });
+        assert_eq!(machine.cpu.registers.eip, 16);
+        assert!(!machine.cpu.halted);
+        assert_eq!(machine.unittester.pending_command(), None);
+        assert_eq!(speaker_payload(&machine), [3]);
+        assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
+        assert_eq!(read_speaker_port(&mut machine) & 0x03, 3);
+        assert_eq!(speaker_payload(&machine), [3]);
+    });
 }
 
 #[test]

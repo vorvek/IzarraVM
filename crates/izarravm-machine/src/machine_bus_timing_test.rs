@@ -4728,10 +4728,12 @@ fn with_isa_io_wait<R>(armed: bool, body: impl FnOnce() -> R) -> R {
 #[test]
 fn isa_io_wait_knob_names_exactly_two_arms_and_refuses_to_guess() {
     use crate::bus::parse_isa_io_wait_arm_for_test as parse;
-    // Unset and empty name the SAME arm -- the shipped default, OFF.
-    assert!(!parse(Err(std::env::VarError::NotPresent)));
-    assert!(!parse(Ok(String::new())));
-    assert!(!parse(Ok("   ".to_string())));
+    // Unset and empty name the SAME arm -- the shipped default, ON since the 2026-08-30 flip
+    // (gp2 1.7818 / descent2 1.1019 / wolf3d 0.9991 null control; the flip commit carries the
+    // evidence). A default moved back without a ladder of that grade would ship silently.
+    assert!(parse(Err(std::env::VarError::NotPresent)));
+    assert!(parse(Ok(String::new())));
+    assert!(parse(Ok("   ".to_string())));
     for off in ["0", "off", "OFF", " Off "] {
         assert!(
             !parse(Ok(off.to_string())),
