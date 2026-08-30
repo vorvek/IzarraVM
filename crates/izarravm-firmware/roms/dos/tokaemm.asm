@@ -187,6 +187,13 @@ ems_category_kb: dw 0             ; private F0 query, pages converted to KB
 ems_disp:    dw 0                 ; dispatch scratch (mirrors xms_disp)
 umb_win_end: dw 0xF000            ; UMB window end segment (0xE000 with EMS on)
 ems_table: times EMS_HANDLES*EMS_SLOT db 0
+; 53h handle names, 8 bytes per handle, parallel to ems_table (the slot's
+; 2-byte pad cannot hold one). All-zeros = unnamed (LIM 4.0's convention);
+; ef_free zeroes the entry so a reused slot reads as unnamed.
+ems_names: times EMS_HANDLES*8 db 0
+ems_name_tmp: times 8 db 0        ; 5301h candidate, staged out of guest DS:SI
+                                  ; so the duplicate scan walks one resident
+                                  ; buffer instead of guest memory per handle
 ; live frame map: backing page index per physical slot, 0xFFFF = unmapped
 ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 ; INT 0xC0 'PM' remap args (monitor reads via FS): slot linear base + backing
@@ -841,6 +848,8 @@ init:
 ems_int67:
     cmp ah, 0x50                  ; 50h sits past the 40h-4Dh table
     je ef_map_multi
+    cmp ah, 0x53                  ; 53h too: get/set handle name
+    je ef_name
     cmp ah, 0x40
     jb ef_undef
     cmp ah, 0x4D
@@ -911,6 +920,132 @@ ef_version:                       ; 46h get version -> AL = BCD 4.0
     mov al, 0x40
     xor ah, ah
     iret
+
+; 53h handle names (LIM 4.0). AL=0 get: DX = handle -> the 8-byte name at
+; ES:DI. AL=1 set: DX = handle, DS:SI = the 8-byte name; a nonzero name
+; already carried by ANOTHER handle answers A1h, and all-zeros un-names the
+; handle. Only AH (and the AL=0 buffer) are outputs; everything else is
+; preserved. This is not optional polish: 1830.EXE allocates a probe handle
+; and names it with 5301h before it will believe any page count -- the 84h
+; this function used to answer read as "no expanded memory" with EMS healthy.
+ef_name:
+    push si
+    call ems_slot_of              ; validates DX, we recompute the entry below
+    jc .badh
+    cmp al, 1
+    je .set
+    cmp al, 0
+    jne .badsub
+    ; get: names[DX] -> ES:DI
+    push ax
+    push cx
+    push di
+    call ems_name_entry           ; SI = names entry (slot offset is dead)
+    mov cx, 8
+.gcp:
+    mov al, [cs:si]
+    mov [es:di], al
+    inc si
+    inc di
+    loop .gcp
+    pop di
+    pop cx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.set:
+    push ax
+    push bx
+    push cx
+    push di
+    ; stage the candidate out of guest DS:SI; OR the bytes to learn whether
+    ; it names the handle (nonzero) or un-names it (all zeros, no dup scan).
+    ; ems_slot_of left the SLOT in SI -- the caller's SI, which addresses the
+    ; name, is the word the entry push saved; read it back off the stack.
+    push bp
+    mov bp, sp
+    mov si, [bp+10]               ; bp,di,cx,bx,ax then the entry-pushed SI
+    pop bp
+    mov di, ems_name_tmp
+    mov cx, 8
+    xor bl, bl
+.scp:
+    lodsb                         ; guest DS:SI, the caller's own buffer
+    mov [cs:di], al
+    or bl, al
+    inc di
+    loop .scp
+    test bl, bl
+    jz .store                     ; zeros: un-name, duplicates are impossible
+    ; dup scan: any OTHER inuse handle already carrying this name -> A1h
+    mov bx, ems_table
+    mov di, ems_names
+    xor cx, cx                    ; CX = handle-1 being examined
+.dsh:
+    cmp byte [cs:bx], 0           ; inuse?
+    je .dsn
+    mov ax, cx
+    inc ax
+    cmp ax, dx                    ; the handle being named is allowed to
+    je .dsn                       ; keep (re-set) its own name
+    push si
+    push di
+    push cx
+    mov si, ems_name_tmp
+    mov cx, 8
+.dcb:
+    mov al, [cs:si]
+    cmp al, [cs:di]
+    jne .dne
+    inc si
+    inc di
+    loop .dcb
+    pop cx
+    pop di
+    pop si
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    pop si
+    mov ah, 0xA1                  ; duplicate handle name (AFTER the AX pop,
+    iret                          ; which would overwrite AH)
+.dne:
+    pop cx
+    pop di
+    pop si
+.dsn:
+    add bx, EMS_SLOT
+    add di, 8
+    inc cx
+    cmp cx, EMS_HANDLES
+    jb .dsh
+.store:
+    call ems_name_entry           ; SI = names entry for DX
+    mov di, si
+    mov si, ems_name_tmp
+    mov cx, 8
+.stb:
+    mov al, [cs:si]
+    mov [cs:di], al
+    inc si
+    inc di
+    loop .stb
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.badsub:
+    pop si
+    mov ah, 0x8F                  ; undefined subfunction
+    iret
+.badh:
+    pop si
+    iret                          ; AH = 0x83 from ems_slot_of
 
 ; 43h allocate: BX = pages -> DX = handle. Pages come one at a time from the
 ; shared arena and are linked in logical order (386MAX ALLOCEMS), so backing is
@@ -1240,6 +1375,11 @@ ef_free:
     mov word [cs:si+16], 0        ; cold cache (0 = cold; see ems_backing_of)
     mov byte [cs:si], 0
     mov byte [cs:si+1], 0
+    call ems_name_entry           ; the name dies with the handle: a reused
+    mov word [cs:si], 0           ; slot must read as unnamed and must not
+    mov word [cs:si+2], 0         ; block its old name with A1h (SI's slot
+    mov word [cs:si+4], 0         ; use is over; the pop below restores the
+    mov word [cs:si+6], 0         ; caller's SI)
     pop di
     pop dx
     pop cx
@@ -1421,6 +1561,14 @@ ems_slot_of:
 .bad:
     mov ah, 0x83                  ; invalid handle
     stc
+    ret
+
+; DX = VALIDATED EMS handle -> SI = its ems_names entry offset. Clobbers SI
+; only; callers hand it a dead SI (ems_slot_of's answer, once the slot is
+; done with).
+ems_name_entry:
+    imul si, dx, 8                ; (handle-1) * 8, the dec folded into the
+    lea si, [si + ems_names - 8]  ; displacement
     ret
 
 ; Take one 16 KB EMS page from the shared arena. out: AX = EMS page index,
