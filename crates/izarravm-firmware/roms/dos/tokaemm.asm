@@ -929,13 +929,13 @@ ef_version:                       ; 46h get version -> AL = BCD 4.0
 ; and names it with 5301h before it will believe any page count -- the 84h
 ; this function used to answer read as "no expanded memory" with EMS healthy.
 ef_name:
+    cmp al, 1                     ; subfunction BEFORE handle: 5302h with a
+    ja .badsub                    ; bad handle is 8Fh, the EMM386 precedence
     push si
     call ems_slot_of              ; validates DX, we recompute the entry below
     jc .badh
     cmp al, 1
     je .set
-    cmp al, 0
-    jne .badsub
     ; get: names[DX] -> ES:DI
     push ax
     push cx
@@ -955,26 +955,25 @@ ef_name:
     xor ah, ah
     iret
 .set:
+    ; ems_slot_of left the SLOT in SI; the caller's SI, which addresses the
+    ; name, is the word the entry push saved and still tops the stack here.
+    pop si
+    push si
     push ax
     push bx
     push cx
     push di
     ; stage the candidate out of guest DS:SI; OR the bytes to learn whether
-    ; it names the handle (nonzero) or un-names it (all zeros, no dup scan).
-    ; ems_slot_of left the SLOT in SI -- the caller's SI, which addresses the
-    ; name, is the word the entry push saved; read it back off the stack.
-    push bp
-    mov bp, sp
-    mov si, [bp+10]               ; bp,di,cx,bx,ax then the entry-pushed SI
-    pop bp
+    ; it names the handle (nonzero) or un-names it (all zeros, no dup scan)
     mov di, ems_name_tmp
     mov cx, 8
     xor bl, bl
 .scp:
-    lodsb                         ; guest DS:SI, the caller's own buffer
-    mov [cs:di], al
+    mov al, [si]                  ; guest DS:SI; the explicit inc (not lodsb)
+    mov [cs:di], al               ; keeps the copy immune to the caller's
+    inc si                        ; direction flag, which INT delivery
+    inc di                        ; preserves into this handler
     or bl, al
-    inc di
     loop .scp
     test bl, bl
     jz .store                     ; zeros: un-name, duplicates are impossible
@@ -989,9 +988,8 @@ ef_name:
     inc ax
     cmp ax, dx                    ; the handle being named is allowed to
     je .dsn                       ; keep (re-set) its own name
-    push si
-    push di
-    push cx
+    push di                       ; SI needs no save: the compare reloads it
+    push cx                       ; and .store recomputes it via ems_name_entry
     mov si, ems_name_tmp
     mov cx, 8
 .dcb:
@@ -1003,7 +1001,6 @@ ef_name:
     loop .dcb
     pop cx
     pop di
-    pop si
     pop di
     pop cx
     pop bx
@@ -1014,7 +1011,6 @@ ef_name:
 .dne:
     pop cx
     pop di
-    pop si
 .dsn:
     add bx, EMS_SLOT
     add di, 8
@@ -1040,9 +1036,8 @@ ef_name:
     xor ah, ah
     iret
 .badsub:
-    pop si
-    mov ah, 0x8F                  ; undefined subfunction
-    iret
+    mov ah, 0x8F                  ; undefined subfunction (SI never pushed:
+    iret                          ; this exit sits before the entry push)
 .badh:
     pop si
     iret                          ; AH = 0x83 from ems_slot_of
@@ -1375,11 +1370,13 @@ ef_free:
     mov word [cs:si+16], 0        ; cold cache (0 = cold; see ems_backing_of)
     mov byte [cs:si], 0
     mov byte [cs:si+1], 0
+%ifndef RED_PROOF_NO_NAME_CLEAR
     call ems_name_entry           ; the name dies with the handle: a reused
     mov word [cs:si], 0           ; slot must read as unnamed and must not
     mov word [cs:si+2], 0         ; block its old name with A1h (SI's slot
     mov word [cs:si+4], 0         ; use is over; the pop below restores the
     mov word [cs:si+6], 0         ; caller's SI)
+%endif
     pop di
     pop dx
     pop cx

@@ -308,10 +308,17 @@ nm_zero:
     int 0x67
     cmp ah, 0x8F
     jne f_name4
+    mov ax, 0x5302                ; subfunction outranks handle: a bad
+    mov dx, 0x00FF                ; handle must not turn 8Fh into 83h
+    int 0x67
+    cmp ah, 0x8F
+    jne f_name4
 
     ; 11i. the name dies with the handle: release handle2, reallocate, and
-    ;      the new handle may take name_b again (a stale name would answer
-    ;      A1h); release it again so steps 12-14 see only the main handle
+    ;      5300h on the fresh handle must return 8 ZERO bytes -- this read is
+    ;      the step's red proof (the dup scan skips free slots and a handle's
+    ;      own entry, so a stale name could never answer A1h here). Then take
+    ;      name_b again, and release so steps 12-14 see only the main handle.
     mov ah, 0x45
     mov dx, [handle2]
     int 0x67
@@ -323,6 +330,18 @@ nm_zero:
     or ah, ah
     jnz f_name5
     mov [handle2], dx
+    mov ax, 0x5300
+    mov di, name_buf              ; ES = DS since 11e
+    int 0x67
+    or ah, ah
+    jnz f_name5
+    mov si, name_buf
+    mov cx, 8
+nm_zero2:
+    lodsb
+    or al, al
+    jnz f_name5
+    loop nm_zero2
     mov ax, 0x5301
     mov dx, [handle2]
     mov si, name_b
