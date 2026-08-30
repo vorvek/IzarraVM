@@ -25,6 +25,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 6 | 1000 Miglia | 1000-miglia | 486 | FLAGGED | 0.60 | 0.382 | Simulmondo racer; live driving 213-350s behind code-wheel; PIT latch-poll STORM 1.28M writes/guest-s + IRET domination, see F2 |
 | 7 | 10Rogue | 10rogue | 486 | FLAGGED | 1.41 | 0.787 | Text-mode roguelike; dungeon gameplay; F1 class: dword IRET 16.0M of 19.4M census total, single site; no PIT storm |
 | 8 | 10th Frame | 10th-frame | 486 | FLAGGED | 3.71 | 0.960 | CGA bowling; frames 1-2 played; F1 class: dword IRET 10.4M, near-total; coverage healthy, so F1 is the whole story |
+| 9 | 123-TALK (Shareware) | 123-talk-shareware | 486 | FLAGGED | 2.59 | 0.852 | Counting edutainment, EGA 640x350; two rounds played with speech; below target with a SMALL census (IRET 340K) - the load is the 2 kHz IRQ0 speech clock (240,709 edges/120s) plus OUT DX,AL sample writes; pit 32K/s, no storm |
 
 ## Findings for the performance campaign
 
@@ -74,9 +75,25 @@ real-mode game; new members get a ledger-row note instead of a new finding.
 V86 monitor. A rerun of Pyramid with TOKAEMM removed from CONFIG.SYS
 (`-NoEmm`, results `100-000-pyramid/20260830-152718-census-noemm`) drops
 the census total from 26,374,252 to 7,223 and the dword IRET row to zero.
-So the cost is the ring-0 IRETD that reflects each software interrupt back
-into V86 - the same family as the wolf3d V86 RETF far-transfer lever.
-Games that poll DOS/BIOS from V86 pay it 100-220K times per guest second.
+
+**Corrections from the design research (2026-08-30 evening,
+`dev_docs/v86-reflection-fastpath-design-2026-08-30.md`):**
+
+* The `-NoEmm` control proves ATTRIBUTION, not cost. Removing TOKAEMM
+  SLOWED Pyramid (rt 1.2743 -> 1.0984, instructions +11.7%, verified from
+  this campaign's own runs): a cheaper idle poll in guest clocks buys the
+  guest MORE polls at a fixed budget.
+* The dword-IRET census row itself (`popad; iretd`) is a wash as a lever:
+  ~1.8% of wall. The real cost is `monitor_resident_core_clocks` =
+  25.9-42.8% of guest clocks on the three measured games, ~2.0 JIT
+  entries per software interrupt - the whole ring-0 reflection half is
+  20-36% of wall. Candidate designs: HLE of the round trip, or CR4.VME
+  (86Box parity). Ceiling estimate: rt 1.27 -> 1.6-2.0 on Pyramid.
+* "ONE static site" was an over-read: census `hits` counts a row SHAPE
+  and carries no address field. `-NoEmm` remains the attribution tool.
+
+Games that poll DOS/BIOS from V86 enter the monitor 100-220K times per
+guest second; that population, not the IRET instruction, is the lever.
 
 ### F2: 1000 Miglia - the corpus's first PIT latch-poll storm (2026-08-30)
 
@@ -95,6 +112,12 @@ So the game hammers the PIT latch while running a 514 Hz timer, and every
 resulting service crosses the V86 reflection boundary. This is the exact
 workload class the ISA I/O wait-state slice reprices; re-run this row
 first when the flip lands.
+
+**STALE pending PR #776:** 448.7M PIT writes x 166 clocks cannot fit this
+row's budget, so the wait-state flip rewrites every 1000 Miglia number.
+The other flagged games (pyramid 17K pit writes, 21 and 10rogue near
+zero) are predicted INERT to the flip - more than 1% instruction movement
+on their post-flip re-runs refutes the prediction.
 
 ## Write-backs from the performance campaign
 

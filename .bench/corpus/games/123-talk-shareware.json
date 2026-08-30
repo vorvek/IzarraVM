@@ -1,0 +1,10 @@
+{
+  "game": "123-TALK (Shareware)",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "123-TALK.EXE",
+  "inject_keys": "660000000:5\\r;1980000000:{space};2640000000:2",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "RUNME.BAT is an ad wall with PAUSE; entry skips straight to 123-TALK.EXE. Schedule: '5\\r' at guest 10s picks 'EASY COUNTING GAME' from the main menu; '{space}' at 30s dismisses the 'COUNT THE BALLOONS WITH ME' intro and starts round 1; '2' at 40s answers the first balloon-count question (2 balloons) which scores RIGHT and advances to round 2 (3 balloons) with PC-speaker speech playing throughout. Profile window covers menu navigation through two rounds of the Easy Counting Game activity; end-frame confirms round 2's question is on screen with round 1's RIGHT feedback still visible."
+}
