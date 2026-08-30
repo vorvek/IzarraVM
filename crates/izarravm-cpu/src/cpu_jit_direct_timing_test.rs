@@ -1617,6 +1617,14 @@ fn grp3_imul_neighbouring_forms_remain_interpreter_only() {
     //
     // The two cases left are the ones that must NOT reach either /5 arm and have no call-out to
     // take instead.
+    //
+    // **The arm is FORCED, not inherited.** `IZARRAVM_MUL_MEM_ROWS` gates the MUL /4 memory case
+    // below (2026-08-29, `DirectKind::MulMemAcc`), and this fixture is about the /5 arm rather
+    // than about the gate: the claim it makes -- that a /4 never reaches /5 -- has to hold in the
+    // world where /4 memory has no lowering at all. Reading the ambient knob would also make this
+    // test order-dependent, because the positive MUL fixtures in this file force the arm ON on
+    // whatever libtest thread they land on.
+    select_mul_mem_rows(false);
     for (code, why) in [
         (
             mul_mem,
@@ -1694,6 +1702,888 @@ fn grp3_imul_memory_form_is_lowered() {
         Some(3),
         "the group-3 memory IMUL must admit and carry the whole three-slot block"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `0xF7 /4` MUL r/m32, MEMORY form (`DirectKind::MulMemAcc`), behind
+// `IZARRAVM_MUL_MEM_ROWS`. The gp2-586 census's second rejected-class head, 13.1 M interpreted
+// hits (2026-08-29 evening sweep at `4e7a2d7c`; `dev_docs/gp2-mul-mem-slice-design-2026-08-29.md`).
+//
+// Deliberately the `grp3_imul_*` family above, case for case. That family is the SIGNED sibling of
+// this exact shape and it is what makes the address handling, the side exits, the segment
+// declaration and the flag contract admissible here at all -- so anything it pins, this must pin
+// too, and a MUL fixture the IMUL family has no counterpart for would be a claim nobody has
+// checked on the shipped form.
+//
+// WHAT THESE CATCH THAT THE IMUL FAMILY CANNOT: `emit_mul_mem_acc` calling `imul_r32`. That single
+// character passes every structural assertion -- same block length, same read declaration, same
+// segment, same clocks -- and is wrong only in EDX and in CF/OF, and only on operands where the
+// signed and unsigned answers differ. The differential fixture's first pair exists for it.
+// ---------------------------------------------------------------------------
+
+/// Select the arm for this thread and PROVE the selection took, the shape
+/// `cpu_jit_fpu_loop_rows_test.rs`'s `select_fpu_loop_rows` uses. Every MUL-memory fixture in this
+/// file states its arm through here in BOTH directions rather than reading the ambient knob: a
+/// positive fixture riding the default would go vacuous the day the default flips ON, and the
+/// refusal case in `grp3_imul_neighbouring_forms_remain_interpreter_only` would go vacuous the
+/// same day from the other side.
+fn select_mul_mem_rows(enabled: bool) {
+    jit::direct::set_mul_mem_rows_for_test(Some(enabled));
+    assert_eq!(
+        jit::direct::mul_mem_rows_enabled(),
+        enabled,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_MUL_MEM_ROWS"
+    );
+}
+
+/// `mul dword [esi + disp32]`, then two register moves and a HLT. `grp3_imul_mem_case`'s bytes
+/// with the ModRM `reg` field 4 instead of 5.
+fn grp3_mul_mem_case(target: u32) -> Vec<u8> {
+    let mut code = vec![0xf7u8, 0xa6];
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    code
+}
+
+/// THE REGISTRATION TEST. `dword_reads` and `read_segment` are the two bookkeeping sites this kind
+/// had to be added to, and both are correctness sites rather than accounting: a missing
+/// `dword_reads` under-charges the bus and the mode-13 read counter, and a missing `read_segment`
+/// keeps DS out of the block's `SegmentLayout`, so `data_matches` skips it and a cached block
+/// keeps matching after a guest DS reload -- reading through a STALE BASE.
+///
+/// The raw-clocks assertion runs the same way the /5 one does: the whole group-3 arm returns
+/// `clocks(2)` for every sub-opcode and both operand forms, which is already the `DirectKind`
+/// default, so this form must NOT carry a `raw_clocks` field. Asserting 2 + 2 + 2 catches an edit
+/// that adds one by analogy with `ImulMem`'s 9.
+#[test]
+fn grp3_mul_memory_form_declares_its_read_and_its_segment() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    select_mul_mem_rows(true);
+    let code = grp3_mul_mem_case(TARGET);
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    let starts = [ENTRY, ENTRY + 6, ENTRY + 8];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let block = install_fixture_block(&mut cpu, ENTRY);
+
+    assert_eq!(block.span().instructions, 3, "whole block admitted");
+    assert_eq!(block.byte_reads(), 0, "no byte read");
+    assert_eq!(block.word_reads(), 0, "no word read");
+    assert_eq!(block.dword_reads(), 1, "dword-read declaration");
+    assert!(block.has_wide_accesses(), "wide-access declaration");
+    assert_eq!(block.raw_clocks(), 2 + 2 + 2, "charged core clocks");
+
+    assert!(
+        cpu.jit_direct
+            .segment_layout(block.id())
+            .expect("live block layout")
+            .data_matches(&cpu),
+        "matches at compile time"
+    );
+    let mut reloaded = cpu.registers.segment(SegmentIndex::Ds);
+    reloaded.base = 0x1_0000;
+    cpu.registers.set_segment(SegmentIndex::Ds, reloaded);
+    assert!(
+        !cpu.jit_direct
+            .segment_layout(block.id())
+            .expect("live block layout")
+            .data_matches(&cpu),
+        "reloading DS must invalidate a block that reads through DS"
+    );
+}
+
+/// THE DIFFERENTIAL, and the only fixture that can tell `mul_r32` from `imul_r32`.
+#[test]
+fn grp3_mul_memory_form_matches_the_interpreter_and_its_bus_clocks() {
+    const ENTRY: u32 = 0x101;
+    const RAM: u32 = 0x0003_0000;
+    const MODE13: u32 = 0x000a_0000;
+    select_mul_mem_rows(true);
+    // The first pair is THE discriminating one, and it is the /5 fixture's first pair read the
+    // other way round. 0xFFFFFFFF * 2 UNSIGNED is 0x00000001_FFFFFFFE: the high half is nonzero,
+    // so EDX is 1 and CF and OF are SET. Signed it is -2, so EDX would be 0xFFFFFFFF and CF and OF
+    // CLEAR. A /5 encoding therefore differs in both EDX and the flags here, and agrees on every
+    // small positive pair below it.
+    //
+    // The last pair is the second discriminator and it moves EDX alone: 0x80000000 * 2 unsigned is
+    // 0x00000001_00000000 (EDX 1), signed is -2^32 (EDX 0xFFFFFFFF). CF and OF are set either way,
+    // so a fixture that only watched the flags would miss it.
+    for (seed_eax, seed_src) in [
+        (0xffff_ffffu32, 0x0000_0002u32),
+        (0x0000_0003, 0x0000_0007),
+        (0x0001_0000, 0x0001_0000),
+        (0x8000_0000, 0x8000_0000),
+        (0xffff_ffff, 0xffff_ffff),
+        (0x7fff_ffff, 0x0000_0002),
+        (0x8000_0000, 0x0000_0002),
+    ] {
+        for target in [RAM, MODE13] {
+            let code = grp3_mul_mem_case(target);
+            let mut memory = vec![0; 0x000b_0000];
+            memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+            memory[target as usize..target as usize + 4].copy_from_slice(&seed_src.to_le_bytes());
+
+            let mut native = fresh();
+            let mut interp = fresh();
+            make_data_segments_flat(&mut native);
+            make_data_segments_flat(&mut interp);
+            let mut native_bus = TestBus::with_memory(memory.clone());
+            let mut interp_bus = TestBus::with_memory(memory);
+            for bus in [&mut native_bus, &mut interp_bus] {
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                bus.uniform_native_fetches = true;
+            }
+            let starts = [ENTRY, ENTRY + 6, ENTRY + 8];
+            decode_fixture(&mut native, &mut native_bus, &starts);
+            decode_fixture(&mut interp, &mut interp_bus, &starts);
+            for (cpu, bus) in [
+                (&mut native, &mut native_bus),
+                (&mut interp, &mut interp_bus),
+            ] {
+                map_direct_page(
+                    cpu,
+                    bus,
+                    target,
+                    target,
+                    jit::fast_map::PagePermissions::UNPAGED,
+                    true,
+                    false,
+                );
+            }
+            let block = install_fixture_block(&mut native, ENTRY);
+
+            for cpu in [&mut native, &mut interp] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                cpu.registers.gpr.fill(0xdead_beef);
+                cpu.registers.set_esp(0xc000);
+                cpu.registers.set_esi(0);
+                cpu.registers.set_eax(seed_eax);
+                // EDX seeded to a recognisable non-zero value: the instruction must REPLACE it
+                // with the product's high half, not merge into it.
+                cpu.registers.set_edx(0x1234_5678);
+                // AF and the reserved bit seeded SET. One-operand MUL writes only CF and OF.
+                cpu.registers.eflags = 0x0296;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.registers.eip = ENTRY;
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.core_clocks_so_far = 0;
+            }
+            native_bus.trace = BusTrace::default();
+            interp_bus.trace = BusTrace::default();
+
+            let label = format!("eax={seed_eax:#010x} src={seed_src:#010x} target={target:#x}");
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap(),
+                "{label}: must run natively"
+            );
+            for _ in 0..3 {
+                interp.cycle(&mut interp_bus).unwrap();
+            }
+
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp),
+                "{label}: registers"
+            );
+            assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+            assert_eq!(
+                native.elapsed_clocks, interp.elapsed_clocks,
+                "{label}: core clocks"
+            );
+            assert_eq!(
+                native_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks(),
+                "{label}: BUS clocks, the registration check"
+            );
+
+            // Pin the concrete UNSIGNED product and the concrete CF and OF, so a SIGNED lowering
+            // fails here even if both sides agreed with each other -- which they would not, but
+            // the pin is what names the defect instead of reporting a register mismatch.
+            let product = u64::from(seed_eax) * u64::from(seed_src);
+            assert_eq!(native.registers.eax(), product as u32, "{label}: low half");
+            assert_eq!(
+                native.registers.edx(),
+                (product >> 32) as u32,
+                "{label}: high half"
+            );
+            let significant = product >> 32 != 0;
+            assert_eq!(
+                native.eflags() & (crate::FLAG_CF | crate::FLAG_OF) != 0,
+                significant,
+                "{label}: CF and OF use the UNSIGNED rule, not the signed one"
+            );
+        }
+    }
+}
+
+/// The address is built from EAX and EDX, the two registers the instruction implicitly overwrites,
+/// and through the scaled-index path rather than a bare base. The read must complete before either
+/// home is written. This form has a LARGER aliasing surface than the register form, not a smaller
+/// one, and it is safe only because `emit_ram_read_pointer` resolves the whole effective address
+/// first.
+#[test]
+fn grp3_mul_memory_form_handles_an_address_built_from_its_own_destinations() {
+    const ENTRY: u32 = 0x101;
+    const BASE: u32 = 0x0003_0000;
+    select_mul_mem_rows(true);
+    // F7 /4 with mod=10 rm=100 (SIB) -> modrm 0b10_100_100 = 0xa4. SIB scale=2 (x4), index=edx(2),
+    // base=eax(0) -> 0b10_010_000 = 0x90. So `mul dword [eax + edx*4 + disp32]`.
+    let mut code = vec![0xf7u8, 0xa4, 0x90];
+    code.extend_from_slice(&0u32.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0xff, 0x89, 0xff, 0xf4]);
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    // EAX = BASE, EDX = 4, so the address is BASE + 16.
+    memory[BASE as usize + 16..BASE as usize + 20].copy_from_slice(&7u32.to_le_bytes());
+
+    let mut native = fresh();
+    let mut interp = fresh();
+    make_data_segments_flat(&mut native);
+    make_data_segments_flat(&mut interp);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        bus.report_batch_clocks = true;
+        bus.uniform_native_fetches = true;
+    }
+    let starts = [ENTRY, ENTRY + 7, ENTRY + 9];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interp, &mut interp_bus, &starts);
+    for (cpu, bus) in [
+        (&mut native, &mut native_bus),
+        (&mut interp, &mut interp_bus),
+    ] {
+        map_direct_page(
+            cpu,
+            bus,
+            BASE,
+            BASE,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            false,
+        );
+    }
+    let block = install_fixture_block(&mut native, ENTRY);
+    for cpu in [&mut native, &mut interp] {
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0xc000);
+        cpu.registers.set_eax(BASE);
+        cpu.registers.set_edx(4);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.registers.eip = ENTRY;
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    for _ in 0..3 {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "aliased base and index"
+    );
+    assert_eq!(
+        native.registers.eax(),
+        BASE.wrapping_mul(7),
+        "the address must be resolved before either destination home is written"
+    );
+}
+
+/// Materialize-then-write, and the catcher for `emit_clear_pending`. Slot 0 is an ADD, which leaves
+/// a live pending descriptor; the MUL writes CF and OF only, so SF, ZF, AF and PF must come out of
+/// the ADD.
+#[test]
+fn grp3_mul_memory_form_materializes_a_live_descriptor_first() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    select_mul_mem_rows(true);
+    for (seed_eax, seed_add, seed_src) in [
+        (0x0000_0005u32, 0x0000_0003u32, 0x0000_0007u32),
+        (0xffff_fffdu32, 0x0000_0002u32, 0x0000_0002u32),
+        (0x8000_0000u32, 0x8000_0000u32, 0x0000_0003u32),
+    ] {
+        // 01 c8 = add eax, ecx, then the MUL, then one register move.
+        let mut code = vec![0x01u8, 0xc8];
+        code.extend_from_slice(&grp3_mul_mem_case(TARGET)[..6]);
+        code.extend_from_slice(&[0x89, 0xf6, 0xf4]);
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&seed_src.to_le_bytes());
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 8];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                TARGET,
+                TARGET,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                false,
+            );
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_esi(0);
+            cpu.registers.set_eax(seed_eax);
+            cpu.registers.set_ecx(seed_add);
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        let label = format!("eax={seed_eax:#010x} add={seed_add:#010x} src={seed_src:#010x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
+        assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+    }
+}
+
+/// The positive admission pin. Without it every refusal assertion elsewhere passes whenever the
+/// classify arm is unreachable or the fixture cannot compile anything at all.
+#[test]
+fn grp3_mul_memory_form_is_lowered_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    select_mul_mem_rows(true);
+    let code = grp3_mul_mem_case(TARGET);
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [ENTRY, ENTRY + 6, ENTRY + 8];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    let instructions = outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions);
+    assert_eq!(
+        instructions,
+        Some(3),
+        "the group-3 memory MUL must admit and carry the whole three-slot block with the gate on"
+    );
+}
+
+/// THE BYTE NEIGHBOUR, and it must stay refused with the gate ON. `0xF6 /4` is the BYTE MUL: it
+/// multiplies AL and writes only AX. Reaching the dword arm would read four bytes and replace EAX
+/// and EDX whole. `opcode == 0xf7` in the classify arm is the only thing stopping it, and this is
+/// the fixture that holds that test in place -- the gate is forced ON precisely so that the
+/// refusal cannot be the gate's doing.
+#[test]
+fn byte_mul_memory_form_stays_interpreter_only_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    select_mul_mem_rows(true);
+    let mut code = vec![0xf6u8, 0xa6]; // F6 /4 mod=10 rm=110: MUL byte [esi+disp32]
+    code.extend_from_slice(&TARGET.to_le_bytes());
+    let mut memory = vec![0; 0x0004_0000];
+    let mut block = code.clone();
+    block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [
+        ENTRY,
+        ENTRY + code.len() as u32,
+        ENTRY + code.len() as u32 + 2,
+    ];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    // Mapped on purpose. Not mapping the target page is exactly how an earlier IMUL guard rail in
+    // this repository passed vacuously for two slices.
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    assert!(
+        jit::direct::compile(&mut cpu, ENTRY, true).is_none(),
+        "F6 /4 byte MUL: reaching the dword arm would read a dword and write EAX and EDX"
+    );
+}
+
+/// The shipped default, read AMBIENT on purpose -- no override -- so it also fails if
+/// `IZARRAVM_MUL_MEM_ROWS=1` is exported in the environment running the suite. Every other MUL
+/// fixture here states its arm, so a fixture that means to pin the default has nowhere else to
+/// read it from.
+///
+/// Catches: a flip of `parse_mul_mem_rows_arm`'s `NotPresent` arm. OFF is the A/B base a gp2-586
+/// ladder is measured against; a default that moved to ON without that ladder would change every
+/// shipped binary's admission silently, and would make the ladder's own off leg the on arm.
+#[test]
+fn mul_mem_rows_ships_off_by_default() {
+    jit::direct::set_mul_mem_rows_for_test(None);
+    assert!(
+        !jit::direct::mul_mem_rows_enabled(),
+        "IZARRAVM_MUL_MEM_ROWS must default OFF until a gp2-586 ladder prices the flip; see \
+         mul_mem_rows_enabled for the contract"
+    );
+}
+
+/// The spelling table, both arms and the refusal.
+///
+/// Catches: a `_ => false` fallthrough replacing the panic. A mistyped ladder leg
+/// (`IZARRAVM_MUL_MEM_ROWS=yes`) that fell through would run exactly what an unset environment
+/// runs and be read as "the arm I asked for changed nothing", which is the single wrong conclusion
+/// an arm ladder exists to avoid.
+#[test]
+fn mul_mem_rows_spelling_table_names_both_arms() {
+    use std::env::VarError;
+    assert!(
+        !jit::direct::parse_mul_mem_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the OFF arm"
+    );
+    for off in ["", "0", "off", "OFF", " off ", "Off"] {
+        assert!(
+            !jit::direct::parse_mul_mem_rows_arm_for_test(Ok(off.to_string())),
+            "{off:?} must name the off arm"
+        );
+    }
+    for on in ["1", "on", "ON", " on ", "On"] {
+        assert!(
+            jit::direct::parse_mul_mem_rows_arm_for_test(Ok(on.to_string())),
+            "{on:?} must name the on arm"
+        );
+    }
+    for typo in ["yes", "true", "2", "mul", "rows"] {
+        let panicked = std::panic::catch_unwind(|| {
+            jit::direct::parse_mul_mem_rows_arm_for_test(Ok(typo.to_string()))
+        })
+        .is_err();
+        assert!(
+            panicked,
+            "IZARRAVM_MUL_MEM_ROWS={typo:?} names no arm and must panic rather than silently \
+             running the default"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `0xE2` LOOP as a native terminal (`DirectKind::Loop`), behind `IZARRAVM_LOOP_ROWS`.
+// The gp2-586 census's LARGEST rejected head: 20,918,551 runtime_hits, 18,374,120 unbound exits,
+// 294 sites. Design: dev_docs/gp2-loop-slice-design-2026-08-29.md.
+//
+// WHAT THESE CATCH THAT A JCC FIXTURE CANNOT:
+//  * a published host flag. LOOP touches NO guest flag, and the emitter clobbers host flags with
+//    its own decrement, so a stray capture or an `emit_load_host_flags` ported over from the Jcc
+//    arm corrupts the guest's eflags. `loop_preserves_every_flag` is the catcher.
+//  * the ECX == 0 entry. The decrement wraps to 0xFFFFFFFF, which is NON-ZERO, so the branch is
+//    TAKEN. A pre-decrement test, or a `jz`/`jnz` inversion, gets this one case wrong and every
+//    other case right.
+//  * the `raw_clocks` arm. The interpreter charges 11 taken or not; the default is 2.
+// ---------------------------------------------------------------------------
+
+/// Select the arm for this thread and PROVE the selection took. Every LOOP fixture states its arm
+/// in BOTH directions rather than reading the ambient knob: a positive fixture riding the default
+/// would go vacuous the day the default flips, and the refusal fixtures would go vacuous from the
+/// other side.
+fn select_loop_rows(enabled: bool) {
+    jit::direct::set_loop_rows_for_test(Some(enabled));
+    assert_eq!(
+        jit::direct::loop_rows_enabled(),
+        enabled,
+        "the fixture override must decide the arm, not the ambient IZARRAVM_LOOP_ROWS"
+    );
+}
+
+/// `mov esi,esi; mov edi,edi; loop +2`, then a HLT on each of the two paths. The LOOP target is
+/// ENTRY+8 and the fallthrough is ENTRY+6, so the two are distinguishable in EIP -- a lowering
+/// that took the wrong path fails on the register comparison rather than needing its own
+/// assertion.
+fn loop_case() -> Vec<u8> {
+    vec![
+        0x89, 0xf6, // mov esi, esi
+        0x89, 0xff, // mov edi, edi
+        0xe2, 0x02, // loop +2  -> ENTRY+8
+        0xf4, 0x90, // ENTRY+6: hlt (the not-taken path), pad
+        0xf4, // ENTRY+8: hlt (the taken path)
+    ]
+}
+
+/// THE DIFFERENTIAL, and the counter boundary is the whole point of the seed list.
+#[test]
+fn loop_matches_the_interpreter_across_the_counter_boundary() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    // 1 -> 0, NOT taken. 2 -> 1, taken. 3 -> 2, taken.
+    // 0 -> 0xFFFFFFFF, TAKEN -- the wrap, and the case a pre-decrement test gets wrong.
+    for seed_ecx in [1u32, 2, 3, 0, 0xffff_ffff] {
+        let code = loop_case();
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        let block = install_fixture_block(&mut native, ENTRY);
+
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_ecx(seed_ecx);
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+
+        let label = format!("ecx={seed_ecx:#010x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
+        assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+        // The clock comparison IS the raw_clocks pin: an arm charging the `_ => 2` default
+        // instead of 11 shows up here as a nine-clock shortfall on every seed.
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks -- 11 per LOOP, taken or not"
+        );
+
+        // Pin the concrete answers, so a lowering that agreed with a WRONG interpreter still
+        // fails, and so the wrap case names itself.
+        assert_eq!(
+            native.registers.ecx(),
+            seed_ecx.wrapping_sub(1),
+            "{label}: ECX must be decremented exactly once"
+        );
+        let expected_eip = if seed_ecx.wrapping_sub(1) != 0 {
+            ENTRY + 8
+        } else {
+            ENTRY + 6
+        };
+        assert_eq!(
+            native.registers.eip, expected_eip,
+            "{label}: the branch is taken when the DECREMENTED counter is non-zero"
+        );
+    }
+}
+
+/// THE FLAG FIXTURE, and the reason this slice needs one at all. LOOP writes no guest flag, while
+/// the emitter clobbers HOST flags with its own decrement. Slot 0 is an ADD, so a live pending
+/// descriptor is in flight across the LOOP; every arithmetic flag must come out of the ADD.
+#[test]
+fn loop_preserves_every_flag() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    for (seed_eax, seed_add, seed_ecx, seed_eflags) in [
+        (0x0000_0005u32, 0x0000_0003u32, 2u32, 0x0202u32),
+        // Carry, overflow and sign all set by the ADD itself.
+        (0x8000_0000, 0x8000_0000, 1, 0x0202),
+        // Every arithmetic flag seeded SET on the way in, and AF seeded set too.
+        (0x0000_0001, 0x0000_0001, 3, 0x0ed7),
+        // The counter wrap, with flags live.
+        (0xffff_ffff, 0x0000_0001, 0, 0x0202),
+    ] {
+        // 01 c8 = add eax, ecx, then the LOOP. Two slots plus the terminal.
+        let code = vec![
+            0x01, 0xc8, // add eax, ecx
+            0x89, 0xf6, // mov esi, esi
+            0xe2, 0x02, // loop +2
+            0xf4, 0x90, 0xf4,
+        ];
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh();
+        let mut interp = fresh();
+        make_data_segments_flat(&mut native);
+        make_data_segments_flat(&mut interp);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        let block = install_fixture_block(&mut native, ENTRY);
+
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_eax(seed_eax);
+            cpu.registers.set_ecx(seed_ecx);
+            cpu.registers.eflags = seed_eflags;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+
+        let label = format!(
+            "eax={seed_eax:#010x} add={seed_add:#010x} ecx={seed_ecx} fl={seed_eflags:#06x}"
+        );
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
+        assert_eq!(
+            native.eflags(),
+            interp.eflags(),
+            "{label}: eflags -- LOOP must publish NO host flag"
+        );
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+    }
+}
+
+/// The positive admission pin. Without it every refusal below passes whenever the classify arm is
+/// unreachable or the fixture cannot compile anything at all.
+#[test]
+fn loop_is_lowered_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    let code = loop_case();
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+    let instructions = outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions);
+    assert_eq!(
+        instructions,
+        Some(3),
+        "LOOP must terminate and carry the whole three-slot block with the gate on"
+    );
+}
+
+/// THE REFUSALS, every one forced knob-ON so the refusal cannot be the knob's doing.
+///
+/// `0x67` makes the COUNTER 16-bit: a decrement through `alu_r32_imm32` would clear the high half
+/// of ECX. `0x66` makes the TARGET wrap at 64K in `relative_jump`, which `taken_delta` does not
+/// model. `0xE0`/`0xE1` read ZF and belong to a different flag contract.
+#[test]
+fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    for (code, why) in [
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0x67, 0xe2, 0x02, 0xf4],
+            "67 E2: a 16-bit COUNTER, and a 32-bit decrement would clear the high half of ECX",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0x66, 0xe2, 0x02, 0xf4],
+            "66 E2: a 16-bit TARGET, which relative_jump wraps at 64K and taken_delta does not",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0xe1, 0x02, 0xf4],
+            "E1 LOOPE: reads ZF, a different flag contract",
+        ),
+        (
+            vec![0x89u8, 0xf6, 0x89, 0xff, 0xe0, 0x02, 0xf4],
+            "E0 LOOPNE: reads ZF, a different flag contract",
+        ),
+    ] {
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        let outcome = jit::direct::compile(&mut cpu, ENTRY, true);
+        // The block may still compile its first two slots; what must NOT happen is the terminal
+        // being admitted, which would carry all three.
+        let instructions = outcome
+            .is_some()
+            .then(|| outcome.unwrap().span.instructions);
+        assert_ne!(
+            instructions,
+            Some(3),
+            "{code:02x?} must not lower its terminal: {why}"
+        );
+    }
+}
+
+/// The shipped default, read AMBIENT on purpose so it also fails if `IZARRAVM_LOOP_ROWS=0` is
+/// exported in the environment running the suite -- which is the correct outcome: the rest of
+/// these fixtures state their arm, and a fixture that means to pin the shipped default has
+/// nowhere else to read it from.
+#[test]
+fn loop_rows_ships_on_by_default() {
+    jit::direct::set_loop_rows_for_test(None);
+    assert!(
+        jit::direct::loop_rows_enabled(),
+        "IZARRAVM_LOOP_ROWS must default ON since the 2026-08-30 flip; see loop_rows_enabled          for the ladder that priced it (gp2 1.0238 pooled min-wall, 7/7 quiet rounds)"
+    );
+}
+
+/// The spelling table, both arms and the refusal.
+#[test]
+fn loop_rows_spelling_table_names_both_arms() {
+    use std::env::VarError;
+    assert!(
+        jit::direct::parse_loop_rows_arm_for_test(Err(VarError::NotPresent)),
+        "unset must name the ON arm since the 2026-08-30 flip"
+    );
+    for off in ["", "0", "off", "OFF", " off ", "Off"] {
+        assert!(
+            !jit::direct::parse_loop_rows_arm_for_test(Ok(off.to_string())),
+            "{off:?} must name the off arm"
+        );
+    }
+    for on in ["1", "on", "ON", " on ", "On"] {
+        assert!(
+            jit::direct::parse_loop_rows_arm_for_test(Ok(on.to_string())),
+            "{on:?} must name the on arm"
+        );
+    }
+    for typo in ["yes", "true", "2", "loop", "rows"] {
+        let panicked = std::panic::catch_unwind(|| {
+            jit::direct::parse_loop_rows_arm_for_test(Ok(typo.to_string()))
+        })
+        .is_err();
+        assert!(
+            panicked,
+            "IZARRAVM_LOOP_ROWS={typo:?} names no arm and must panic rather than silently \
+             running the default"
+        );
+    }
 }
 
 struct DirectTimingCase {
