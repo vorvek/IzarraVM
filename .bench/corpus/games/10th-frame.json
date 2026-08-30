@@ -1,0 +1,10 @@
+{
+  "game": "10th Frame",
+  "cpu": "486",
+  "guest_seconds": 240,
+  "entry": "BOWL.EXE",
+  "inject_keys": "990000000:O;1650000000:1;2112000000:BOWLER\\r;2640000000:A;3102000000:1;3630000000:{space};3828000000:{space};4026000000:{space};5280000000:{space};5478000000:{space};5676000000:{space};6930000000:{space};7128000000:{space};7326000000:{space}",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "Select-League-or-Open-Bowling menu needs 'O' (open bowling); the following 'Select number of players' prompt needs a DIGIT ('1'), not Enter -- Enter alone leaves it stuck indefinitely. Then: player name 'BOWLER'+Enter, ability level 'A' (amateur), number-of-games digit '1'. Three throw attempts follow (each a start/speed/hook space-bar triplet spaced ~3s apart, one triplet per scheduled frame) to exercise the aim-swing-throw engine, pin redraw, and scoreboard update repeatedly. Profile window covers open-bowling setup through live gameplay of frames 1-2+ (end-frame shows frame 1 score 9, frame 2 running total 28, bowler repositioned for the next throw) -- genuine engine-driven bowling, not just menus."
+}

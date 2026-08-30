@@ -24,6 +24,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 5 | 1 Ton | 1-ton | 486 | PROFILED | 17.91 | 0.787 | Mouse-only arcade; needs TOKAMOUS (-Mouse); real weight-drag interaction in window; mostly idle (~1M insns/guest-s) |
 | 6 | 1000 Miglia | 1000-miglia | 486 | FLAGGED | 0.60 | 0.382 | Simulmondo racer; live driving 213-350s behind code-wheel; PIT latch-poll STORM 1.28M writes/guest-s + IRET domination, see F2 |
 | 7 | 10Rogue | 10rogue | 486 | FLAGGED | 1.41 | 0.787 | Text-mode roguelike; dungeon gameplay; F1 class: dword IRET 16.0M of 19.4M census total, single site; no PIT storm |
+| 8 | 10th Frame | 10th-frame | 486 | FLAGGED | 3.71 | 0.960 | CGA bowling; frames 1-2 played; F1 class: dword IRET 10.4M, near-total; coverage healthy, so F1 is the whole story |
 
 ## Findings for the performance campaign
 
@@ -65,7 +66,8 @@ orders of magnitude lower - which corroborates the diagnosis.
 
 Members so far (games whose census the dword-IRET site dominates):
 100-000-pyramid (26.4M), 21-for-1-to-4 (23.3M), 1000-miglia (8.25M, see
-F2), 10rogue (16.0M). The population grows with nearly every below-target
+F2), 10rogue (16.0M), 10th-frame (10.4M at coverage 0.96 - the clean
+demonstration that F1 alone can hold a game under target). The population grows with nearly every below-target
 real-mode game; new members get a ledger-row note instead of a new finding.
 
 **Attribution (2026-08-30, control run):** the dword IRET is the TOKAEMM
