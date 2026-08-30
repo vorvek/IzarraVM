@@ -1,4 +1,15 @@
 {
+  "descent2-3dfx-586": {
+    "anchor_frame_sha256": [
+      "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
+    ],
+    "final_distinct_colors_max": 20000,
+    "final_distinct_colors_min": 120,
+    "final_instructions": 8579000326,
+    "final_instructions_tolerance": 0.05,
+    "final_nonblack_percent_max": 100.0,
+    "final_nonblack_percent_min": 60.0
+  },
   "duke3d-486": {
     "dukemark_samples": 940,
     "dukemark_samples_tolerance": 0.02
@@ -49,6 +60,17 @@
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
     "final_nonblack_percent_min": 89.0
+  },
+  "tombraid3d-586": {
+    "anchor_frame_sha256": [
+      "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
+    ],
+    "final_distinct_colors_max": 3000,
+    "final_distinct_colors_min": 80,
+    "final_instructions": 19864778122,
+    "final_instructions_tolerance": 0.05,
+    "final_nonblack_percent_max": 100.0,
+    "final_nonblack_percent_min": 95.0
   },
   "tyrian-setup-486": {
     "frame_sha256": "479a10ea0c16837ec1d2b8018a2641bd8c1820d291e0092bf1f13ee8e2edf5eb"

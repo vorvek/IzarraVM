@@ -2880,6 +2880,10 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
                 $failures += ("the final video mode is '$($profile.legacy_video_mode)', " +
                     "expected '$($Fixture.expected_video_mode)'")
             }
+            # See the frame-contract block below for why `stop.requested` is the
+            # wrong field for a row with an INPUT SCHEDULE. No row grading this
+            # way carries one today; give this the same treatment before adding
+            # the first that does.
             if ($profile.stop.kind -ne "cycle_limit" -or
                 [uint64]$profile.stop.requested -ne $Fixture.cycles) {
                 $failures += ("the run stopped as '$($profile.stop.kind)' at " +
@@ -2971,12 +2975,28 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         # the guest quit to DOS and poked the exit port, i.e. the game died;
         # anything else means it never reached the budget at all.
         $result.stop_kind = $profile.stop.kind
+        #
+        # NOT `stop.requested`. An input schedule SLICES the run: the emulator
+        # runs to the first key, then to the second, and `stop.requested` holds
+        # the LAST SLICE's budget, not the total. MEASURED 2026-08-30 on
+        # tombraid3d-586, whose one key at 5e9 made a complete 19e9 run report
+        # `requested: 13999336000` and fail a check it had every right to pass.
+        # The two Glide rows are the first frame-contract rows to carry a
+        # schedule, which is why this sat here unhit.
+        #
+        # `cycle_budget` is the total the run was GIVEN and `elapsed_budget_clocks`
+        # is what it actually spent, so the pair is strictly stronger than the
+        # single field it replaces: it catches a wrong budget AND a run that
+        # ended early, where `stop.requested` only ever spoke to the first.
         if ($profile.stop.kind -ne "cycle_limit") {
             $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
                 "'cycle_limit' -- the guest did not run the whole budget")
-        } elseif ([uint64]$profile.stop.requested -ne $Fixture.cycles) {
-            $failures += ("the run stopped at $($profile.stop.requested) cycles, " +
-                "expected the fixture's $($Fixture.cycles)")
+        } elseif ([uint64]$profile.cycle_budget -ne $Fixture.cycles) {
+            $failures += ("the run was given a budget of $($profile.cycle_budget) " +
+                "cycles, expected the fixture's $($Fixture.cycles)")
+        } elseif ([uint64]$profile.elapsed_budget_clocks -lt [uint64]$profile.cycle_budget) {
+            $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
+                "$($profile.cycle_budget) cycle budget -- it ended early")
         }
 
         $anchor = Invoke-AnchorRun $Fixture $ExecutablePath $ScratchRoot
