@@ -72,6 +72,17 @@ fn admission_declines(cpu: &CpuGsw) -> [u64; 4] {
     std::array::from_fn(|index| snapshot.admission_declines[index].1)
 }
 
+/// The `RetryCause::AdmissionMatrix` per-reason split, as a label -> count map. See
+/// `dev_docs/descent2-l1-stack-width-design-2026-08-30.md` §2(H): `stack_width_kind` has two
+/// producers, and this is the instrument that tells them apart.
+#[cfg(feature = "direct-admission-census")]
+fn stack_width_declines(cpu: &CpuGsw) -> std::collections::HashMap<&'static str, u64> {
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("stack-width census must be enabled");
+    snapshot.stack_width_declines.into_iter().collect()
+}
+
 fn warm(cpu: &mut CpuGsw, bus: &mut TestBus, addresses: &[u32]) {
     for &linear in addresses {
         cpu.registers.eip = linear;
@@ -2371,6 +2382,164 @@ fn a_word_jcc_above_the_wrap_is_refused_while_the_same_block_below_it_compiles()
     let high_perf = cpu.perf_counters();
     assert_eq!(high_perf.jit_direct_word_control_admitted, 0);
     assert_eq!(high_perf.jit_direct_word_control_refused, 1);
+}
+
+/// The §2(H) instrument, first producer: `stack_width_kind`'s own matrix. `PUSH EAX` (0x50) has
+/// no prefix at all, so the operand size comes straight from CS.D (32-bit here, so Dword), and
+/// SS.B is forced to 0 (16-bit stack) after the fixture's default 32-bit setup -- exactly the
+/// DOS/4GW shape the design note's own prediction names: a 32-bit client on a 16-bit kernel
+/// stack. That is cell A, `PushDwordSs16`, and it has no emitter, so the walk must decline it and
+/// the census must name the reason `push_dword_ss16`.
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn push_dword_on_a_16bit_stack_declines_the_matrix_cell_by_name() {
+    let (mut cpu, mut bus) = fixture(&[0x50]); // PUSH EAX
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+
+    assert!(matches!(
+        jit::direct::compile(&mut cpu, ENTRY, true),
+        jit::direct::CompileOutcome::Retry(jit::direct::RetryCause::AdmissionMatrix)
+    ));
+
+    let declines = stack_width_declines(&cpu);
+    assert_eq!(declines.get("push_dword_ss16").copied(), Some(1));
+    assert_eq!(declines.get("control_target_limit").copied(), Some(0));
+    assert_eq!(declines.get("segment_access").copied(), Some(0));
+    assert_eq!(declines.values().sum::<u64>(), 1);
+
+    let snapshot = cpu
+        .direct_barrier_census_snapshot()
+        .expect("census must be enabled");
+    assert_eq!(snapshot.stack_width_decline_distinct_sites, 1);
+    assert_eq!(snapshot.stack_width_decline_sites.len(), 1);
+    let site = &snapshot.stack_width_decline_sites[0];
+    assert_eq!(site.linear, ENTRY);
+    assert_eq!(site.reason, "push_dword_ss16");
+    assert_eq!(site.count, 1);
+}
+
+/// The §2(H) instrument, second producer: the `control_target`/`segment_access` check that runs
+/// AFTER `stack_width_kind` in the compile walk. Same fixture as
+/// `a_word_jcc_above_the_wrap_is_refused_while_the_same_block_below_it_compiles`, which already
+/// proves this exact site refuses the block -- this test additionally proves the census names it
+/// `control_target_limit` rather than folding it into a stack-matrix cell, which is precisely the
+/// correction the design note's §0(c) makes over the research note.
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn word_control_target_above_the_wrap_declines_via_the_second_producer() {
+    // inc eax; inc ecx; inc edx; 66 0f 85 10 00 (jnz +0x10 at Word operand size).
+    const CODE: [u8; 8] = [0x40, 0x41, 0x42, 0x66, 0x0f, 0x85, 0x10, 0x00];
+    const HIGH: u32 = 0x1_0100;
+    let (mut cpu, mut bus) = flat_fixture(HIGH, &CODE);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &[HIGH, HIGH + 1, HIGH + 2, HIGH + 3]);
+
+    // The block still compiles -- a truncated 3-instruction prefix, per the existing fixture --
+    // because the decline lands after >= 3 admitted slots. The census records the refusal at the
+    // moment it happens regardless of what the walk does with the rest of the block.
+    let compilation = compiled(jit::direct::compile(&mut cpu, HIGH, true));
+    assert_eq!(compilation.span.instructions, 3);
+
+    let declines = stack_width_declines(&cpu);
+    assert_eq!(declines.get("control_target_limit").copied(), Some(1));
+    assert_eq!(declines.get("push_dword_ss16").copied(), Some(0));
+    assert_eq!(declines.get("segment_access").copied(), Some(0));
+    assert_eq!(declines.values().sum::<u64>(), 1);
+}
+
+/// The second producer's other half: `kind_segment_access_supported` refusing a descriptor, not
+/// a control-target mask. Reuses
+/// `live_segment_state_failure_retries_and_recovers_without_a_write`'s exact setup (a `MOV
+/// EAX,[EAX]` with DS's access byte zeroed under CR0.PE) because that fixture already proves this
+/// site is the one that refuses; this test proves the census names it `segment_access` and not
+/// `control_target_limit` or any stack-matrix cell.
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn invalid_segment_descriptor_declines_via_the_second_producer() {
+    let (mut cpu, mut bus) = fixture(&[0x8b, 0x00, 0xc3]);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+    cpu.control.cr0 |= CR0_PE;
+    let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+    ds.access = 0;
+    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+
+    assert!(matches!(
+        jit::direct::compile(&mut cpu, ENTRY, true),
+        jit::direct::CompileOutcome::Retry(jit::direct::RetryCause::AdmissionMatrix)
+    ));
+
+    let declines = stack_width_declines(&cpu);
+    assert_eq!(declines.get("segment_access").copied(), Some(1));
+    assert_eq!(declines.get("control_target_limit").copied(), Some(0));
+    assert_eq!(declines.get("push_dword_ss16").copied(), Some(0));
+    assert_eq!(declines.values().sum::<u64>(), 1);
+}
+
+/// The full-length-pass gate (design note §2(H).4): `compile_with_page_len` re-enters the compile
+/// walk once per binary-search step at an `instruction_limit` below `MAX_BLOCK_INSTRUCTIONS`, and
+/// a shorter walk that happens to reach the same refusing instruction must NOT tally it again, or
+/// the total multiplies with the search depth instead of counting real compile attempts.
+///
+/// Drives `compile_with_instruction_limit` directly at both a short and the full limit, on a
+/// fixture (`PUSH EAX` on a 16-bit stack) that declines on its very first instruction regardless
+/// of the limit -- so the SAME refusal is reachable at every limit, and only the gate keeps the
+/// short pass from counting.
+#[cfg(feature = "direct-admission-census")]
+#[test]
+fn stack_width_decline_is_not_counted_below_the_full_length_pass() {
+    let (mut cpu, mut bus) = fixture(&[0x50]); // PUSH EAX
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    ss.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+    cpu.enable_direct_barrier_census(true);
+    warm(&mut cpu, &mut bus, &[ENTRY]);
+
+    // A short-limit pass, the shape of one binary-search step: it reaches the same declining
+    // instruction (it is the block's first) but must not be tallied.
+    assert!(matches!(
+        jit::direct::compile_outcome_with_instruction_limit_for_test(&mut cpu, ENTRY, true, 2),
+        jit::direct::CompileOutcome::Retry(jit::direct::RetryCause::AdmissionMatrix)
+    ));
+    assert_eq!(stack_width_declines(&cpu).values().sum::<u64>(), 0);
+
+    // The full-length pass: this one counts.
+    assert!(matches!(
+        jit::direct::compile_outcome_with_instruction_limit_for_test(
+            &mut cpu,
+            ENTRY,
+            true,
+            jit::direct::MAX_BLOCK_INSTRUCTIONS
+        ),
+        jit::direct::CompileOutcome::Retry(jit::direct::RetryCause::AdmissionMatrix)
+    ));
+    assert_eq!(
+        stack_width_declines(&cpu).get("push_dword_ss16").copied(),
+        Some(1)
+    );
+    assert_eq!(stack_width_declines(&cpu).values().sum::<u64>(), 1);
+
+    // A second genuine full-length observation is a real, separate compile attempt and must
+    // count again -- the gate suppresses the SEARCH's inner re-walks, not repeated top-level
+    // compiles of the same key.
+    assert!(matches!(
+        jit::direct::compile_outcome_with_instruction_limit_for_test(
+            &mut cpu,
+            ENTRY,
+            true,
+            jit::direct::MAX_BLOCK_INSTRUCTIONS
+        ),
+        jit::direct::CompileOutcome::Retry(jit::direct::RetryCause::AdmissionMatrix)
+    ));
+    assert_eq!(
+        stack_width_declines(&cpu).get("push_dword_ss16").copied(),
+        Some(2)
+    );
+    assert_eq!(stack_width_declines(&cpu).values().sum::<u64>(), 2);
 }
 
 /// The same block at Dword operand size MUST still compile above 0xFFFF. Every other Jcc

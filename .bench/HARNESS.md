@@ -612,3 +612,25 @@ periodic rows carry their own id; difference only those.
   is not. Do not set it.
 * `--bios` is silently ignored with `--hdd-folder`; that path always uses the
   built-in Izarra BIOS.
+
+## Multi-session box coordination (adopted 2026-08-30)
+
+Several Claude sessions share this box. Before any TIMED measurement
+(a ladder, a board run for wall/rt), the measuring session sends
+"BENCH START (WALL)" to every ACTIVE session and waits for holds; for
+counter-only legs, "BENCH START (COUNTERS)" holds builds only. "BENCH
+DONE" releases. Give a few minutes of notice so in-flight probes can
+drain.
+
+**The announcement list is a promise; the process table is a fact.**
+Open a WALL window with BOTH: after the holds, gate the first leg on
+
+    Get-CimInstance Win32_Process -Filter "Name='izarravm.exe'"
+
+reading empty (the CommandLine's binary path and --hdd-folder identify
+whose process it is). An honest drain-time misjudgement passes every
+announcement and still pollutes a window; the gate catches it. Earned
+twice on 2026-08-30: one full three-ladder window lost to an
+unannounced rebuild sweep, one saved by a process check a peer ran
+unprompted. The harness's per-leg `foreign_s` remains the last line:
+re-run any leg it flags.
