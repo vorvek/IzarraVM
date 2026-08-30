@@ -1099,7 +1099,13 @@ if ($RecordInvariants) {
         }
         $pins[$result.name] = New-BoardPin $result.stats $result.instructions $result.census
     }
-    $pins | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $pinPath
+    # LF, not CRLF. Set-Content writes CRLF on Windows, but .gitattributes
+    # declares `* text=auto eol=lf`, so any checkout sees LF -- and
+    # check_file_policy.py hashes the WORKING TREE. A CRLF file here means the
+    # manifest carries a sha no CI checkout can reproduce, and the file policy
+    # is CI step 1, so it would hide every later gate. Measured: the same pins
+    # hashed 2c1a54c0 as CRLF and d93ed2f6 as LF.
+    [IO.File]::WriteAllText($pinPath, (($pins | ConvertTo-Json -Depth 8) -replace "`r`n", "`n") + "`n")
     Write-Host "recorded pins for: $($selected -join ', ')"
     Write-Host "NOW MOVE THE SHA in LICENSE_MANIFEST.tsv, in this same commit."
 }
