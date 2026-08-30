@@ -1242,3 +1242,24 @@ fn the_census_records_the_clamped_size_distira_actually_used() {
     assert_eq!(key.width, distira.display().width);
     assert_eq!(key.height, distira.display().height);
 }
+
+#[test]
+fn the_census_records_the_video_dimensions_register_a_real_driver_writes() {
+    // THE PATH THAT MATTERS. DISTIRA_REG_FB_WIDTH/HEIGHT are this chip's private
+    // interface and no period Glide driver writes them; videoDimensions is the
+    // SST-1 register a real one uses. Hooking only the private path made the
+    // census read EMPTY for Tomb Raider Gold's 3dfx build while its presented
+    // frame was 640x480 -- an instrument that answers the same way whether the
+    // guest reached Distira or not is not evidence.
+    let mut distira = Distira::new();
+    write_reg(&mut distira, SST_VIDEO_DIMENSIONS, (480 << 16) | 639);
+
+    let rows: Vec<_> = distira
+        .census()
+        .entries()
+        .map(|(key, count)| (*key, *count))
+        .collect();
+    assert_eq!(rows.len(), 1, "one geometry, one row");
+    assert_eq!(rows[0].0.width, 640, "639 in the register means 640 pixels");
+    assert_eq!(rows[0].0.height, 480);
+}

@@ -29,6 +29,30 @@ const SWAPBUFFER_INTERVAL_MASK: u32 = 0xff;
 const DISTIRA_TMU_CONFIG: u8 = 1 | (1 << 6) | (1 << 7);
 const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
+/// See [`Distira::scanout_state`]. A diagnostic, not part of the device model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistiraScanoutState {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub front_base: u32,
+    pub back_base: u32,
+    pub scanout_base: u32,
+    pub buffer_stride: u32,
+    pub display_enabled: bool,
+    pub pending_swaps: usize,
+    pub swaps_issued: u64,
+    pub triangles_drawn: u64,
+    pub color_pixels_stored: u64,
+    pub retrace_count: u64,
+    pub painted_bytes: usize,
+    pub painted_by_buffer: [usize; 3],
+    pub fbz_mode: u32,
+    pub lfb_mode: u32,
+    pub aux_base: u32,
+    pub frame_store_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistiraDisplay {
     pub width: u32,
@@ -230,6 +254,16 @@ pub struct Distira {
     frame_phase_line: u32,
     retrace_count: u64,
     swapbuffer_command: u32,
+    /// Diagnostic: how many swapbufferCMD writes the guest has issued.
+    /// See `scanout_state`; it answers whether a black front buffer is a
+    /// swap that did not land or a swap that was never asked for.
+    swaps_issued: u64,
+    /// Diagnostic: triangles rasterised, and colour pixels actually stored.
+    /// `painted_bytes` cannot tell a buffer CLEARED TO BLACK from one never
+    /// written, because both are zero -- so it cannot answer whether geometry
+    /// reached the rasteriser. These can.
+    triangles_drawn: u64,
+    color_pixels_stored: u64,
     pending_swap: Option<PendingSwap>,
     swap_commands: VecDeque<u32>,
     texture_mode: u32,
@@ -343,6 +377,9 @@ impl Distira {
             frame_phase_line: 0,
             retrace_count: 0,
             swapbuffer_command: 0,
+            swaps_issued: 0,
+            triangles_drawn: 0,
+            color_pixels_stored: 0,
             pending_swap: None,
             swap_commands: VecDeque::new(),
             texture_mode: 0,
@@ -549,6 +586,7 @@ impl Distira {
     }
 
     fn issue_swapbuffer_command(&mut self, value: u32) {
+        self.swaps_issued = self.swaps_issued.saturating_add(1);
         self.swap_commands.push_back(value);
         self.start_next_swap();
     }
@@ -586,6 +624,55 @@ impl Distira {
 
     pub fn display_enabled(&self) -> bool {
         self.display_enabled
+    }
+
+    /// A scanout snapshot, for answering ONE question: when a game drives this
+    /// unit and the screen is black, did it render and we fail to show it, or
+    /// did it never render?
+    ///
+    /// `painted_bytes` is what splits those. It counts non-zero bytes in the
+    /// whole frame store, not in the scanned-out window, deliberately: pixels
+    /// written at a base or pitch the scanout does not read are exactly the case
+    /// this exists to catch, and counting only the window would hide them.
+    /// A run that reports painted_bytes 0 never rendered; one that reports a
+    /// large count with a black picture rendered somewhere nobody is looking.
+    pub fn scanout_state(&self) -> DistiraScanoutState {
+        DistiraScanoutState {
+            width: self.display.width,
+            height: self.display.height,
+            pitch: self.display.pitch,
+            front_base: self.display.front_base,
+            back_base: self.display.back_base,
+            scanout_base: self.scanout_base,
+            buffer_stride: self.buffer_stride,
+            display_enabled: self.display_enabled,
+            pending_swaps: usize::from(self.pending_swap.is_some()) + self.swap_commands.len(),
+            swaps_issued: self.swaps_issued,
+            triangles_drawn: self.triangles_drawn,
+            color_pixels_stored: self.color_pixels_stored,
+            retrace_count: self.retrace_count,
+            painted_bytes: self.fb.iter().filter(|&&byte| byte != 0).count(),
+            // Per BUFFER, so a black picture says WHICH buffer holds the paint.
+            // A swap alternates the scanout between buffer 0 and buffer 1, so
+            // paint in only one of them plus an unchanging picture is the
+            // signature of a scanout that is not following the swap.
+            fbz_mode: self.fbz_mode,
+            lfb_mode: self.lfb_mode,
+            aux_base: self.aux_base,
+            painted_by_buffer: {
+                let stride = self.buffer_stride.max(1) as usize;
+                let mut counts = [0usize; 3];
+                for (index, slot) in counts.iter_mut().enumerate() {
+                    let start = index * stride;
+                    let end = (start + stride).min(self.fb.len());
+                    if start < end {
+                        *slot = self.fb[start..end].iter().filter(|&&b| b != 0).count();
+                    }
+                }
+                counts
+            },
+            frame_store_bytes: self.fb.len(),
+        }
     }
 
     pub fn set_dither_enabled(&mut self, enabled: bool) {
@@ -1365,6 +1452,25 @@ impl Distira {
             SST_VIDEO_DIMENSIONS => {
                 merge_byte(&mut self.video_dimensions, byte, value);
                 self.update_video_dimensions();
+                // Census on the COMPLETING byte only, the same convention
+                // SST_DAC_DATA uses below. A dword register arrives as four byte
+                // writes, and counting each one would record three intermediate
+                // geometries the guest never asked for.
+                //
+                // Recorded here as well as in set_frame_size because THIS is the
+                // path a real Glide driver takes: videoDimensions is an SST-1
+                // register, while DISTIRA_REG_FB_WIDTH/HEIGHT are this chip's
+                // private interface that no period driver writes. Hooking only
+                // the private path made the census read EMPTY for Tomb Raider
+                // Gold's 3dfx build while its presented frame was plainly
+                // 640x480 -- an instrument that answers the same way whether the
+                // guest reached Distira or not is not evidence.
+                if byte == 3 {
+                    self.census.record(DistiraCensusKey {
+                        width: self.display.width,
+                        height: self.display.height,
+                    });
+                }
             }
             SST_FBI_INIT0 => self.write_fbi_init0(byte, value),
             SST_FBI_INIT1 => self.write_fbi_init1(byte, value),
@@ -2030,6 +2136,7 @@ impl Distira {
     }
 
     fn write_color_pixel(&mut self, base: u32, position: (u32, u32), value: u16) {
+        self.color_pixels_stored = self.color_pixels_stored.saturating_add(1);
         let Some(offset) = self.framebuffer_pixel_offset(base, position.0, position.1) else {
             return;
         };
@@ -2082,6 +2189,7 @@ impl Distira {
     }
 
     fn run_triangle_command(&mut self) {
+        self.triangles_drawn = self.triangles_drawn.saturating_add(1);
         let coords = self
             .triangle_vertices
             .map(|(x, y)| (fixed_vertex_to_f32(x), fixed_vertex_to_f32(y)));

@@ -2427,6 +2427,11 @@ impl Machine {
         self.vega.distira_census()
     }
 
+    /// A Distira scanout snapshot. See `Distira::scanout_state`.
+    pub fn distira_scanout_state(&self) -> DistiraScanoutState {
+        self.vega.distira_scanout_state()
+    }
+
     pub fn margo_display(&self) -> Option<crate::MargoDisplay> {
         self.vega.margo_active().then(|| self.vega.margo_display())
     }

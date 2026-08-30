@@ -1976,7 +1976,11 @@ fn run_boot_hdd_folder(
         }
     }
     if let Some(path) = mode_census {
-        let census = mode_census_json(machine.mode_census(), machine.distira_census());
+        let census = mode_census_json(
+            machine.mode_census(),
+            machine.distira_census(),
+            Some(machine.distira_scanout_state()),
+        );
         std::fs::write(
             path,
             serde_json::to_string_pretty(&census)?

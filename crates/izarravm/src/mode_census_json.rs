@@ -8,10 +8,14 @@
 //! went there". The compatibility board grades on that difference, so the
 //! shape must not collapse.
 
-use izarravm_video::{DistiraCensus, ModeCensus};
+use izarravm_video::{DistiraCensus, DistiraScanoutState, ModeCensus};
 use serde_json::{Value, json};
 
-pub fn mode_census_json(vga: &ModeCensus, distira: &DistiraCensus) -> Value {
+pub fn mode_census_json(
+    vga: &ModeCensus,
+    distira: &DistiraCensus,
+    distira_state: Option<DistiraScanoutState>,
+) -> Value {
     let vga: Vec<Value> = vga
         .entries()
         .map(|(key, count)| {
@@ -49,10 +53,40 @@ pub fn mode_census_json(vga: &ModeCensus, distira: &DistiraCensus) -> Value {
             })
         })
         .collect();
+    // The scanout snapshot answers the one question a black Distira frame
+    // raises: did the guest render and we fail to show it, or did it never
+    // render at all? `painted_bytes` is the discriminator, and it counts the
+    // WHOLE frame store rather than the scanned-out window on purpose: pixels
+    // written at a base or pitch the scanout does not read are exactly the case
+    // it exists to catch.
+    let state = distira_state.map(|state| {
+        json!({
+            "width": state.width,
+            "height": state.height,
+            "pitch": state.pitch,
+            "front_base": state.front_base,
+            "back_base": state.back_base,
+            "scanout_base": state.scanout_base,
+            "buffer_stride": state.buffer_stride,
+            "display_enabled": state.display_enabled,
+            "pending_swaps": state.pending_swaps,
+            "swaps_issued": state.swaps_issued,
+            "triangles_drawn": state.triangles_drawn,
+            "color_pixels_stored": state.color_pixels_stored,
+            "retrace_count": state.retrace_count,
+            "painted_bytes": state.painted_bytes,
+            "painted_by_buffer": state.painted_by_buffer,
+            "fbz_mode": state.fbz_mode,
+            "lfb_mode": state.lfb_mode,
+            "aux_base": state.aux_base,
+            "frame_store_bytes": state.frame_store_bytes,
+        })
+    });
     json!({
         "schema": "izarravm-mode-census-v1",
         "vga": vga,
         "distira": distira,
+        "distira_scanout": state,
     })
 }
 
