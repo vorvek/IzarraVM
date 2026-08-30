@@ -1641,6 +1641,10 @@ pub struct DirectBarrierCensusRow {
     pub native_suffix_instructions: u64,
     pub max_native_prefix: u8,
     pub max_native_suffix: u8,
+    /// The immediate port byte for the `PortIo` immediate forms (`0xE4`-`0xE7`); `None` for every
+    /// other shape. First writer wins across a shape's sites, so a multi-port shape reports its
+    /// first-recorded port only.
+    pub port: Option<u16>,
 }
 
 /// One block entry parked `Dormant(SpanHot)` by the G1 SMC-heat gate, with the lane-match answer
@@ -2108,6 +2112,8 @@ pub struct DirectStallSnapshot {
     pub callout_port_v86_served: u64,
     /// The `PortReadAlImm8` (`0xE4`) engagement numerator. See `BlockCacheStats`.
     pub callout_port_imm8_served: u64,
+    /// The `PortWriteAlImm8` (`0xE6`) engagement numerator. See `BlockCacheStats`.
+    pub callout_port_out_imm8_served: u64,
     /// The `InterpretOne` call-out family; see `DirectStallTally` for what each one denominates.
     pub callout_interpret_one_executed: u64,
     pub callout_interpret_one_resync: u64,
@@ -4778,6 +4784,16 @@ pub fn linear_address(segment: u16, offset: u16) -> usize {
 /// notice.
 pub(crate) const IN_PORT_CORE_CLOCKS: u32 = 12;
 
+/// What every `OUT` port-write form charges -- `0xE6`, `0xE7`, `0xEE` and `0xEF`, all four of
+/// which read this constant, so the sentence is a contract over the family rather than a
+/// description of the one arm the call-out needed. Named for the reason `IN_PORT_CORE_CLOCKS`
+/// above is and NOT equal to it: the write forms charge 10 where the reads charge 12, so a
+/// `PortWriteAlImm8` call-out that reached for the IN constant would overcharge every admitted
+/// `0xE6` by two core clocks, and the census identity gate (guest_s / insns / bus / ticks) is the
+/// only thing that would ever have noticed. Converting the other three arms was charge-neutral:
+/// each was already a literal 10.
+pub(crate) const OUT_PORT_CORE_CLOCKS: u32 = 10;
+
 /// What `PUSHA`/`PUSHAD` (0x60) charges, named for the same reason `IN_PORT_CORE_CLOCKS` is: the
 /// interpreter's `execute_decoded` arm and the JIT's `PushAllDword` call-out slot must charge the
 /// same number, and both read this constant rather than a literal of their own.
@@ -5101,8 +5117,17 @@ pub(crate) const INTERPRET_ONE_MAX_DATA_ACCESSES: u64 = 4;
 /// fourth helper with a bigger charge raises it by construction instead of silently under-budgeting
 /// the block that carries it.
 pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
-    let a = if IN_PORT_CORE_CLOCKS > PUSH_ALL_CORE_CLOCKS {
+    // `OUT_PORT_CORE_CLOCKS` (10) cannot be the maximum today -- it is under all three of the
+    // others -- and it is folded in anyway, because the property this constant claims is
+    // "derived, not written down": a port class whose write charge one day exceeds its read charge
+    // must raise this bound without anyone remembering to.
+    let port = if IN_PORT_CORE_CLOCKS > OUT_PORT_CORE_CLOCKS {
         IN_PORT_CORE_CLOCKS
+    } else {
+        OUT_PORT_CORE_CLOCKS
+    };
+    let a = if port > PUSH_ALL_CORE_CLOCKS {
+        port
     } else {
         PUSH_ALL_CORE_CLOCKS
     };

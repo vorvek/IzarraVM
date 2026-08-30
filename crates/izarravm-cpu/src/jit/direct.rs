@@ -39,9 +39,10 @@ use super::x87_avx2_emit::{
 };
 use crate::{
     AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, DirectBarrierCensusRow,
-    DirectBarrierCensusSnapshot, FLAG_IF, FLAG_TF, FLAG_VM, IN_PORT_CORE_CLOCKS, OperandSize,
-    POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags, PodKeyBuildHasher, PollFamily,
-    Prefixes, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
+    DirectBarrierCensusSnapshot, FLAG_IF, FLAG_TF, FLAG_VM, IN_PORT_CORE_CLOCKS,
+    OUT_PORT_CORE_CLOCKS, OperandSize, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags,
+    PodKeyBuildHasher, PollFamily, Prefixes, Registers, SegmentIndex, SegmentRegister,
+    U32BuildHasher,
 };
 
 use super::block::{PollScanOutcome, build_poll_loop_from};
@@ -6020,10 +6021,27 @@ impl DirectKind {
         )
     }
 
+    /// Whether the compile walk must STOP after this slot.
+    ///
+    /// Every other member is a control transfer, which cannot be followed statically. The one
+    /// member that is not is `CallOut { PortWriteAlImm8 }`, and it is here for a different reason
+    /// that reaches the same answer: that helper returns its step-break bit UNCONDITIONALLY, so
+    /// the block's side exit at the OUT is taken on every execution and any slot the walk appended
+    /// after it is emitted dead -- paid for in compile time, in the page budget, in the block's
+    /// static accounting and in its budget bound, and then never executed. Terminating the walk is
+    /// strictly less work with no behavioural difference (`is_terminal` is read by the walk, the
+    /// min-length rule, the size estimate and the census suffix scan -- never by the emitter, which
+    /// ends a non-control block by advancing EIP past its slots exactly as it does for a block that
+    /// ran out of instruction budget).
+    ///
+    /// The other three call-out helpers are NOT terminal: their step break is the bus's answer and
+    /// is usually false, so their blocks really do continue.
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Call { .. }
+            Self::CallOut {
+                helper: CallOutHelper::PortWriteAlImm8 { .. }
+            } | Self::Call { .. }
                 | Self::Call16 { .. }
                 | Self::Jmp { .. }
                 | Self::JmpMem { .. }
@@ -6285,8 +6303,47 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 /// always sets it, so an admitted OUT would end the native run at the very next boundary and buy
 /// only the block's prefix plus its own compilation. It stays refused, and the reason is written
 /// down so the next slice re-opens it on the device-write proof rather than on the census rank.
-const fn jit_admits_non_continuable(opcode: u16) -> bool {
-    matches!(opcode, 0x69 | 0x6b)
+///
+/// ## The re-opening, for `0xE6` only (`IZARRAVM_OUT_IMM8_ROWS`, default OFF)
+///
+/// The audit above is discharged on its own terms rather than overruled. Its two live objections
+/// were the `CpuBus::write_io` device-write proof and the `io_touched` bound, and the second is
+/// what answers the first: `PortWriteAlImm8` reports a step break UNCONDITIONALLY, so the native
+/// block ends at the write, so no LATER slot in the same native block can act on a pendency
+/// answer the write invalidated. It does NOT make the interrupt deliverable any sooner than the
+/// interpreter makes it -- see `port_write_al_imm8`, which states exactly what the bit buys and
+/// what it does not. That scope is still what discharges the audit's device-write objection
+/// per-opcode instead of per-device: the family's pendency premise ("`interrupt_pending()` cannot
+/// change inside a batch, because no `InterpretOne` row writes a port") is false for an OUT, and
+/// the block ending at the OUT is what makes its falsity unobservable from inside the block.
+///
+/// The audit's benefit bound is ALSO wrong for the guest this row was measured on, and that is the
+/// reason to spend the slice: `MachineBus::write_io`'s `skip_io_touched` exemption means a ring-0
+/// protected-mode guest's port writes set NOTHING, so gp2 reads `brk_step` 17,677 against
+/// 59,968,424 OUTs. The boundary the audit assumed already existed does not exist there -- today
+/// the only boundary is the one BEFORE the OUT, from this predicate's own refusal.
+///
+/// `0xEE` OUT DX,AL, `0xE7` and `0xEF` stay refused: no fixture measures them (quake's 1.2 M
+/// `0xEE` row is three orders of magnitude under gp2's), and an unmeasured admission is this
+/// campaign's standing refusal. `block_continuable` is NOT touched by any of it, so the
+/// interpreter's batch structure stays byte-identical and the doom/quake oracles cannot move.
+///
+/// ## Why this takes the whole `DecodedInsn` since the `0xE6` row joined
+///
+/// `retf_admitted_here` states the rule: a refusal that this predicate does not make itself gets
+/// made LATER, by `classify` returning `None`, and the block then stops with
+/// `BarrierStop::HardBoundary` where main stopped it with `NonContinuable`. That is a census row
+/// relocating between arms -- the exact reading error the two-arm reconciliation exists to detect
+/// -- for an instruction neither arm ever compiles. `classify` has no `0xE6` Word arm and must not
+/// grow one, so the Word refusal belongs HERE, where it leaves the OFF arm's row untouched.
+/// (`0x69`/`0x6B` need no such term: they are on `classify`'s Word allowlist and are admitted at
+/// both sizes, so admitting them here relocates nothing.)
+fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
+    matches!(insn.opcode, 0x69 | 0x6b)
+        || (insn.opcode == 0xe6
+            // Dword only, and refused HERE rather than in `classify`: see the note above.
+            && insn.operand_size != OperandSize::Word
+            && out_imm8_rows_armed())
 }
 
 pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> CompileOutcome {
@@ -7182,9 +7239,8 @@ fn compile_with_budget(
         // what the classifier could lower. That is why this has to be fixed before any of the
         // 16-bit admission work can produce a single native instruction.
         let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
-        let continuable = insn.continuable
-            || jit_admits_non_continuable(insn.opcode)
-            || retf_admitted_here(cpu, &insn);
+        let continuable =
+            insn.continuable || jit_admits_non_continuable(&insn) || retf_admitted_here(cpu, &insn);
         if !prefixes_supported || !continuable {
             // Attributed since the completeness slice. The two conditions are split rather than
             // folded, because they are different work: a prefix refusal names a prefix the
@@ -10445,9 +10501,12 @@ pub(crate) fn parse_direct_retf_v86_arm_for_test(
 
 /// Whether the compile walk may carry on THROUGH this `0xCA`/`0xCB` RETF and lower it natively.
 ///
-/// The mode-dependent half of `jit_admits_non_continuable`, which stays a pure `const fn` on the
-/// opcode. It lives here rather than there for `stack_width_kind`'s reason: the question needs a
-/// `&CpuGsw` and `classify` has none.
+/// The CPU-STATE-dependent half of `jit_admits_non_continuable`. That predicate reads the decoded
+/// instruction -- opcode and operand size, since the `0xE6` row joined it -- and this one reads
+/// the CPU as well; it lives here rather than there for `stack_width_kind`'s reason: the question
+/// needs a `&CpuGsw` and `classify` has none. (It was a pure `const fn` on the opcode alone until
+/// the `0xE6` admission, whose Word refusal has to be made in the predicate for the reason stated
+/// four paragraphs down and repeated in `jit_admits_non_continuable`'s own doc.)
 ///
 /// THE ARM IS TESTED FIRST, and that ordering is load-bearing rather than stylistic. On the `0`
 /// ESCAPE this returns after one `OnceLock` load and one compare, having read no CPU state, on
@@ -11941,6 +12000,84 @@ pub(crate) fn parse_direct_in_imm8_callout_arm_for_test(
     value: Result<String, std::env::VarError>,
 ) -> bool {
     parse_direct_in_imm8_callout_arm(value)
+}
+
+/// Whether `0xE6` OUT imm8,AL is admitted as a `PortWriteAlImm8` call-out
+/// (`IZARRAVM_OUT_IMM8_ROWS`, `dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+///
+/// **DEFAULT OFF.** No ladder has priced this row: what is measured is the census, where gp2-586's
+/// single `0xE6` site at linear 0x00532951 takes 59,968,424 static-unbound exits in an 80-second
+/// run -- 97% of that fixture's `brk_cont_not_continuable` -- and where no other fixture on the
+/// board carries a non-trivial `0xE6` row at all. The OFF arm is therefore byte-identical to the
+/// pre-slice tree by construction (this predicate gates BOTH edits: the `jit_admits_non_continuable`
+/// term and the `classify` arm), which is what makes the census row PRESENT off / ABSENT on the
+/// pair that proves the admission took.
+///
+/// THE CONVENTION: unset and `""` name the SAME (default) arm, `0`/`off` state it, `1`/`on` name
+/// the admission, and anything else panics rather than silently running the base.
+pub(crate) fn out_imm8_rows_armed() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = OUT_IMM8_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_out_imm8_rows_arm(std::env::var("IZARRAVM_OUT_IMM8_ROWS")))
+}
+
+/// The `IZARRAVM_OUT_IMM8_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `out_imm8_rows_armed`.
+fn parse_out_imm8_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset is the default. The default flipped ON on 2026-08-30: the gp2-586 ladder read
+        // min-wall ratio 1.2127 with 4/4 rounds valid, every round's effect 20x its own
+        // within-arm null, foreign_s 0.0 on all rounds past the first, and the two-arm census
+        // reconciliation removed the whole 59,968,424-exit row with ZERO relocation
+        // (.bench/results/out-imm8-ladder-20260830, gp2-out-census-20260830).
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_OUT_IMM8_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset (the shipped default since the 2026-08-30 ladder: ON), `1` \
+                 or `on` (the same arm, stated), and `0` or `off` (the pre-slice base -- `0xE6` \
+                 stays a barrier)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        "" => true,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_OUT_IMM8_ROWS={other:?} names no arm; accepted spellings are unset (the \
+             shipped default since the 2026-08-30 ladder: ON), `1` or `on` (the same arm, \
+             stated -- the `0xE6` OUT imm8,AL call-out admission, any immediate port) and `0` \
+             or `off` (the pre-slice base). Refusing to guess: a mistyped ladder leg that \
+             silently ran the default would be read as the arm it did not run"
+        ),
+    }
+}
+
+// Per-THREAD, for `DIRECT_IN_IMM8_CALLOUT_OVERRIDE`'s reason: the shipped knob is a process-wide
+// `OnceLock` and the fixtures have to run both arms in one process.
+#[cfg(test)]
+thread_local! {
+    static OUT_IMM8_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the `IZARRAVM_OUT_IMM8_ROWS` arm on this thread for the length of a fixture; `None`
+/// restores the ambient reading.
+#[cfg(test)]
+pub(crate) fn set_out_imm8_rows_for_test(forced: Option<bool>) {
+    OUT_IMM8_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures; `out_imm8_rows_armed` caches its env reading
+/// in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process.
+#[cfg(test)]
+pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_out_imm8_rows_arm(value)
 }
 
 /// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and
@@ -14906,6 +15043,41 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             0xe4 if direct_in_imm8_callout_armed() => {
                 return Some(DirectKind::CallOut {
                     helper: CallOutHelper::PortReadAlImm8 {
+                        port: insn.imm as u8,
+                    },
+                });
+            }
+            // OUT imm8, AL -- gp2's 59,968,424-exit row, behind `IZARRAVM_OUT_IMM8_ROWS`
+            // (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B). The WRITE twin of the arm
+            // above: same `port_permission_resident` two-phase probe, same privilege gate, same
+            // compile-time port immediate riding the fourth-argument channel, no poll-skip scan.
+            //
+            // TWO DIFFERENCES from `0xE4`, and both are the whole design:
+            //
+            // 1. THE CHARGE is `OUT_PORT_CORE_CLOCKS` (10), not `IN_PORT_CORE_CLOCKS` (12). The
+            //    interpreter's `0xE6` arm charges 10, and the exact-clocks claim is what the
+            //    census identity gate reads.
+            // 2. THE STEP BREAK IS UNCONDITIONAL, not `bus.requires_step_break()`. A port WRITE can
+            //    make an interrupt newly deliverable from inside `write_io` -- the PIT arm's
+            //    `pic.request(0)` on a channel-0 control word raising OUT -- and on a ring-0
+            //    protected-mode guest `io_touched` is never set, so the bus's own answer is false
+            //    for exactly the guest class that carries this row. The bit ends the BLOCK, not
+            //    the run, and buys no earlier delivery than the interpreter's; read
+            //    `port_write_al_imm8`'s doc for the exact scope before relying on it. The slot is
+            //    also `is_terminal`, so the walk stops here and there is no dead tail to emit.
+            //
+            // ANY immediate port, unconditionally, for the reason the arm above admits any: the
+            // forced break discharges the pendency obligation for every port at once, so a
+            // per-port allowlist would exclude nothing that needed excluding. The Word gate above
+            // does NOT carry a `0xE6` term, so a 16-bit segment refuses this on both arms of the
+            // knob -- 32-bit gp2 is the only measured population and an unmeasured widening is the
+            // campaign's standing refusal.
+            //
+            // No ModRM: byte-wide and immediate-implicit, with `decode`'s `PortIo` arm having
+            // already fetched the port byte into `insn.imm`.
+            0xe6 if out_imm8_rows_armed() => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::PortWriteAlImm8 {
                         port: insn.imm as u8,
                     },
                 });
@@ -18063,10 +18235,10 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 });
                 let slot_delta = matches!(helper, CallOutHelper::PortReadAlDx)
                     .then(|| u64::from(slot.lin.wrapping_sub(span.key.linear)));
-                let port_imm8 = if let CallOutHelper::PortReadAlImm8 { port } = helper {
-                    Some(u64::from(port))
-                } else {
-                    None
+                let port_imm8 = match helper {
+                    CallOutHelper::PortReadAlImm8 { port }
+                    | CallOutHelper::PortWriteAlImm8 { port } => Some(u64::from(port)),
+                    _ => None,
                 };
                 let exit_arg = interpret_one_cell
                     .map(|cell| cell as u64)
@@ -25715,6 +25887,8 @@ pub(crate) struct CallOutTable {
     pub(crate) port_read_al_dx: usize,
     /// `CallOutHelper::PortReadAlImm8`.
     pub(crate) port_read_al_imm8: usize,
+    /// `CallOutHelper::PortWriteAlImm8`.
+    pub(crate) port_write_al_imm8: usize,
     /// `CallOutHelper::PushAllDword`.
     pub(crate) push_all_dword: usize,
     /// `CallOutHelper::PopAllDword`.
@@ -25729,6 +25903,7 @@ impl Default for CallOutTable {
             bus: core::ptr::null_mut(),
             port_read_al_dx: 0,
             port_read_al_imm8: 0,
+            port_write_al_imm8: 0,
             push_all_dword: 0,
             pop_all_dword: 0,
             interpret_one: 0,
@@ -25768,6 +25943,9 @@ impl CallOutTable {
             // `CallOutSlotFn` too, for a third reason: its fourth argument is the compile-time
             // PORT immediate, not a `slot_delta` or a cell address (gp2 in-imm8 callout design).
             port_read_al_imm8: port_read_al_imm8::<B> as CallOutSlotFn as usize,
+            // `CallOutSlotFn` for the same reason as the line above: its fourth argument is the
+            // compile-time PORT immediate.
+            port_write_al_imm8: port_write_al_imm8::<B> as CallOutSlotFn as usize,
             push_all_dword: push_all_dword::<B> as CallOutFn as usize,
             pop_all_dword: pop_all_dword::<B> as CallOutFn as usize,
             interpret_one: interpret_one::<B> as CallOutSlotFn as usize,
@@ -26022,6 +26200,17 @@ pub(crate) enum CallOutHelper {
     /// table is a PROOF that every reachable class is safe, not a `classify`-arm filter), so there
     /// is no allowlist to consult and the port only has to be carried, never matched against one.
     PortReadAlImm8 { port: u8 },
+    /// `0xE6` OUT imm8,AL, behind `IZARRAVM_OUT_IMM8_ROWS`
+    /// (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+    ///
+    /// The WRITE twin of `PortReadAlImm8`: same two-phase TSS-bitmap probe, same compile-time port
+    /// immediate on the fourth-argument channel, no poll-skip scan and no cell. It differs in
+    /// exactly two places, and both are load-bearing rather than incidental -- it charges
+    /// `OUT_PORT_CORE_CLOCKS` (10, not the reads' 12), and it reports a step break
+    /// UNCONDITIONALLY, because a port write can raise an IRQ from inside `write_io` while the
+    /// bus's own `requires_step_break()` stays false for the ring-0 protected-mode guests that
+    /// carry this row.
+    PortWriteAlImm8 { port: u8 },
     /// `0x60` PUSHAD.
     PushAllDword,
     /// `0x61` POPAD.
@@ -26045,7 +26234,7 @@ impl CallOutHelper {
     /// the two call sites is what makes a fourth helper choose its class deliberately.
     pub(crate) fn probes_io_permission(self) -> bool {
         match self {
-            Self::PortReadAlDx | Self::PortReadAlImm8 { .. } => true,
+            Self::PortReadAlDx | Self::PortReadAlImm8 { .. } | Self::PortWriteAlImm8 { .. } => true,
             Self::PushAllDword | Self::PopAllDword | Self::InterpretOne { .. } => false,
         }
     }
@@ -26055,7 +26244,10 @@ impl CallOutHelper {
     /// access counters do not contain.
     pub(crate) fn moves_a_stack_frame(self) -> bool {
         match self {
-            Self::PortReadAlDx | Self::PortReadAlImm8 { .. } | Self::InterpretOne { .. } => false,
+            Self::PortReadAlDx
+            | Self::PortReadAlImm8 { .. }
+            | Self::PortWriteAlImm8 { .. }
+            | Self::InterpretOne { .. } => false,
             Self::PushAllDword | Self::PopAllDword => true,
         }
     }
@@ -26080,6 +26272,7 @@ impl CallOutHelper {
         match self {
             Self::PortReadAlDx
             | Self::PortReadAlImm8 { .. }
+            | Self::PortWriteAlImm8 { .. }
             | Self::PushAllDword
             | Self::PopAllDword => false,
             Self::InterpretOne { .. } => true,
@@ -26099,7 +26292,10 @@ impl CallOutHelper {
     /// nowhere to put it (gp2 in-imm8 callout design rev 3 §1.1).
     pub(crate) fn carries_a_cell(self) -> bool {
         match self {
-            Self::PortReadAlDx | Self::PortReadAlImm8 { .. } | Self::InterpretOne { .. } => true,
+            Self::PortReadAlDx
+            | Self::PortReadAlImm8 { .. }
+            | Self::PortWriteAlImm8 { .. }
+            | Self::InterpretOne { .. } => true,
             Self::PushAllDword | Self::PopAllDword => false,
         }
     }
@@ -26117,6 +26313,7 @@ impl CallOutHelper {
             Self::InterpretOne { .. } => true,
             Self::PortReadAlDx
             | Self::PortReadAlImm8 { .. }
+            | Self::PortWriteAlImm8 { .. }
             | Self::PushAllDword
             | Self::PopAllDword => false,
         }
@@ -26205,6 +26402,9 @@ fn helper_offset(helper: CallOutHelper) -> i32 {
         CallOutHelper::PortReadAlDx => core::mem::offset_of!(CallOutTable, port_read_al_dx),
         CallOutHelper::PortReadAlImm8 { .. } => {
             core::mem::offset_of!(CallOutTable, port_read_al_imm8)
+        }
+        CallOutHelper::PortWriteAlImm8 { .. } => {
+            core::mem::offset_of!(CallOutTable, port_write_al_imm8)
         }
         CallOutHelper::PushAllDword => core::mem::offset_of!(CallOutTable, push_all_dword),
         CallOutHelper::PopAllDword => core::mem::offset_of!(CallOutTable, pop_all_dword),
@@ -26915,6 +27115,225 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
         i64::from(IN_PORT_CORE_CLOCKS)
             | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
     }
+}
+
+/// `0xE6` OUT imm8,AL through the interpreter's own port path, behind `IZARRAVM_OUT_IMM8_ROWS`
+/// (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+///
+/// The WRITE twin of `port_read_al_imm8`: phase P (`port_permission_resident`), phase C's charged
+/// re-reads, the `preview_scale_clocks` remainder carry and the fourth-argument PORT immediate are
+/// that helper's, verbatim, and are not re-derived here. Two things are its own.
+///
+/// **THE CHARGE.** `OUT_PORT_CORE_CLOCKS` (10), not `IN_PORT_CORE_CLOCKS` (12). The interpreter's
+/// `0xE6` arm charges 10; reaching for the sibling's constant because the code is otherwise
+/// identical would overcharge every admitted execution by two core clocks, and the only instrument
+/// that would ever see it is the census identity gate.
+///
+/// **THE STEP BREAK IS UNCONDITIONAL, and it is the reason this helper may exist at all.** The
+/// call-out family's pendency proof rests on `bus.interrupt_pending()` not changing inside a
+/// batch, and its stated premise is that no admitted call-out writes a port (`interpret_one`'s
+/// STEP 8). `MachineBus`'s PIT arm is the live counterexample: a channel-0 control word that
+/// raises OUT calls `pic.request(0)` from inside `write_io`, so an interrupt can become
+/// deliverable in the middle of a block. Taking the bus's own `requires_step_break()` answer would
+/// not cover it -- `MachineBus::write_io`'s `skip_io_touched` exemption means a ring-0
+/// protected-mode guest's port writes set `io_touched` for nothing but 0x60/0x64/0x92/0xE7 and PCI
+/// config, which is why gp2 reads `brk_step` 17,677 against 59,968,424 OUTs.
+///
+/// **WHAT THE BIT BUYS, exactly.** It ends the NATIVE BLOCK at this slot -- `e.jnz` to the
+/// step-break stub, `SideExitReason::CallOutStepBreak`, `DirectBlockOutcome::Complete` with EIP
+/// past the OUT -- so no LATER slot in this block executes against a pendency answer this write
+/// invalidated. Paired with `DirectKind::is_terminal`, which stops the compile walk here, there is
+/// no later slot at all.
+///
+/// **WHAT IT DOES NOT BUY, stated because the first draft of this comment claimed it.** It does
+/// NOT end the RUN and it does NOT deliver the interrupt any sooner. `run_budgeted_inner`'s run
+/// break reads `bus.requires_step_break()` (run.rs), which is exactly the predicate the
+/// `skip_io_touched` regime leaves false, and `can_take_interrupt` never consults the bus at all.
+/// So on the guest class this row was measured on the run carries on past the block boundary and
+/// the IRQ is taken wherever it would have been taken anyway. **That is parity, not a gap**: the
+/// INTERPRETED `0xE6` delivers no earlier either, for the same two reasons, so both paths reach
+/// the same guest instruction with the same pendency answer. The bit buys the block-scoped
+/// property above and nothing more, and the fixtures assert that scope rather than a delivery
+/// point.
+///
+/// **PRIVILEGE, pre-declared.** `probes_io_permission()` is true for this helper, so
+/// `run_direct_block`'s entry gate applies: a V86 or CPL > IOPL guest reaching a block that
+/// carries this slot goes through `callout_admission`, and a 32-bit ring-3 protected-mode guest
+/// with IOPL < 3 has its blocks classified `IoTouching` on the first trial and is then never
+/// entered natively -- the shape that made the wolf3d `0xEC` admission a total loss
+/// (`classify`'s `0xec` arm records that measurement). That is inert for gp2, which is CPL 0 =
+/// IOPL 0 and never takes the gate at all, and it is accepted for now rather than solved: this row
+/// is priced as a gp2-only lever and any ring-3 population is a separate slice with its own
+/// census.
+///
+/// The cost is stated rather than hidden: the block cannot chain past the OUT, so this slice buys
+/// the block's prefix and the write's own retirement, not an extended chain.
+///
+/// # Safety
+///
+/// Same contract as `port_read_al_imm8`.
+unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    prefix_raw_clocks: u64,
+    prefix_weighted_fp_clocks: u64,
+    port_imm: u64,
+) -> i64 {
+    // SAFETY: by the contract above, `cpu` is the live CPU and no other reference to it is alive
+    // across the call (emitted code holds only its ADDRESS, in R15).
+    let cpu = unsafe { &mut *cpu };
+    let bus_ptr = cpu.native_callout.bus;
+    debug_assert!(
+        !bus_ptr.is_null(),
+        "a call-out slot ran without a published bus"
+    );
+    if bus_ptr.is_null() {
+        return STATUS_ABNORMAL;
+    }
+    // SAFETY: `publish::<B>` stored a `*mut B` derived from the `&mut B` that `run_direct_block`
+    // holds for the whole native entry, and this instantiation was selected by that same call.
+    let bus = unsafe { &mut *bus_ptr.cast::<B>() };
+    // The denominator, counted before the refusal below, exactly as the read helpers count theirs.
+    cpu.jit_direct.note_callout_executed();
+    #[cfg(feature = "direct-callout-attribution")]
+    let original_port = port_imm as u16;
+
+    let port = port_imm as u16;
+
+    // PHASE P, verbatim from `port_read_al_imm8` -- the gate is the READ helper's and not a wider
+    // one. A write the interpreter would fault on (V86, or CPL > IOPL with the bitmap bit set)
+    // must refuse HERE, before any effect, and a TSS bitmap that is not already TLB-resident is
+    // refused rather than page-walked from inside a live block.
+    let permission = if cpu.is_v86_mode() || cpu.current_privilege_level() > cpu.iopl() {
+        let Some(probe) = port_permission_resident(cpu, bus, port) else {
+            #[cfg(feature = "direct-callout-attribution")]
+            cpu.jit_direct.note_callout_attribution(
+                CallOutHelper::PortWriteAlImm8 { port: port as u8 },
+                Some(original_port),
+                CallOutOutcome::Abnormal,
+            );
+            return STATUS_ABNORMAL;
+        };
+        Some(probe)
+    } else {
+        None
+    };
+
+    // The SMC assertion, verbatim from the read helpers: `write_io` reaches a DEVICE, never guest
+    // memory, so the call-out contract's "no watched guest memory write while a block is live"
+    // clause is discharged by construction here and this assertion is what says so out loud.
+    #[cfg(debug_assertions)]
+    let written_before = (cpu.written_count, cpu.written_pages_overflow);
+
+    let fp =
+        crate::jit::native_x87::scale_weighted_fp_clocks(prefix_weighted_fp_clocks, cpu.fp_rem);
+    let now = cpu
+        .core_clocks_so_far
+        .saturating_add(cpu.preview_scale_clocks(prefix_raw_clocks.saturating_add(fp.clocks)));
+
+    let ring0 = cpu.is_ring0_protected();
+    // PHASE C, verbatim from `port_read_al_imm8`: the interpreter's own charge order, and nothing
+    // below may refuse.
+    match permission {
+        None => {
+            if cpu.check_io_permission(bus, port, BusWidth::Byte).is_err() {
+                #[cfg(feature = "direct-callout-attribution")]
+                cpu.jit_direct.note_callout_attribution(
+                    CallOutHelper::PortWriteAlImm8 { port: port as u8 },
+                    Some(original_port),
+                    CallOutOutcome::Abnormal,
+                );
+                return STATUS_ABNORMAL;
+            }
+        }
+        Some(probe) => {
+            let Ok(io_base) = bus.read_memory_direct(
+                probe.io_base_physical,
+                BusWidth::Word,
+                BusAccessKind::DataRead,
+            ) else {
+                debug_assert!(false, "phase C re-read of a peeked io_base word failed");
+                #[cfg(feature = "direct-callout-attribution")]
+                cpu.jit_direct.note_callout_attribution(
+                    CallOutHelper::PortWriteAlImm8 { port: port as u8 },
+                    Some(original_port),
+                    CallOutOutcome::Abnormal,
+                );
+                return STATUS_ABNORMAL;
+            };
+            debug_assert_eq!(
+                io_base.value, probe.io_base,
+                "the charged io_base re-read disagreed with the pure peek"
+            );
+            let Ok(bits) = bus.read_memory_direct(
+                probe.bitmap_physical,
+                BusWidth::Byte,
+                BusAccessKind::DataRead,
+            ) else {
+                debug_assert!(false, "phase C re-read of a peeked bitmap byte failed");
+                #[cfg(feature = "direct-callout-attribution")]
+                cpu.jit_direct.note_callout_attribution(
+                    CallOutHelper::PortWriteAlImm8 { port: port as u8 },
+                    Some(original_port),
+                    CallOutOutcome::Abnormal,
+                );
+                return STATUS_ABNORMAL;
+            };
+            debug_assert_eq!(
+                bits.value, probe.bits,
+                "the charged bitmap re-read disagreed with the pure peek"
+            );
+        }
+    }
+    // AL, zero-extended, exactly as the interpreter's arm hands it over. The `Err` arm is the
+    // machine bus's `UnsupportedPort`, and it returns abnormal so the interpreter re-executes the
+    // whole instruction and raises whatever the real path raises.
+    if bus
+        .write_io(
+            port,
+            BusWidth::Byte,
+            u32::from(cpu.read_gpr8(0)),
+            now,
+            ring0,
+        )
+        .is_err()
+    {
+        #[cfg(feature = "direct-callout-attribution")]
+        cpu.jit_direct.note_callout_attribution(
+            CallOutHelper::PortWriteAlImm8 { port: port as u8 },
+            Some(original_port),
+            CallOutOutcome::Abnormal,
+        );
+        return STATUS_ABNORMAL;
+    }
+    // NO REGISTER AND NO FLAG IS WRITTEN. That is the whole of OUT's effect on the CPU, and it is
+    // why `republishes_flags` is false for this helper: there is no EFLAGS republication to make,
+    // so the emitted slot must not reload RBP over the block's live flag shadow.
+    //
+    // The dedicated always-on engagement numerator, bumped last on the success-only path for the
+    // reason `callout_port_imm8_served` is: `callout_executed` sums every helper class, so on a
+    // guest that runs both `0xE4` and `0xE6` call-outs it cannot say whether THIS arm served
+    // anything -- which is the acceptance question for a default-OFF row.
+    cpu.jit_direct.note_callout_port_out_imm8_served();
+
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        written_before,
+        (cpu.written_count, cpu.written_pages_overflow),
+        "a call-out slot must never write guest memory"
+    );
+
+    // THE UNCONDITIONAL STEP BREAK. `bus.requires_step_break()` is deliberately not consulted:
+    // see this function's doc for why its answer is false on exactly the guest class that carries
+    // this row, why an OR with it would therefore be dead code that reads as a safety net, and --
+    // the part worth re-reading before quoting this bit as a safety property -- what ending the
+    // BLOCK does and does not do about interrupt delivery.
+    #[cfg(feature = "direct-callout-attribution")]
+    cpu.jit_direct.note_callout_attribution(
+        CallOutHelper::PortWriteAlImm8 { port: port as u8 },
+        Some(original_port),
+        CallOutOutcome::StepBreak,
+    );
+    i64::from(OUT_PORT_CORE_CLOCKS) | (1 << STATUS_STEP_BREAK_BIT)
 }
 
 /// Resolve the published bus for a helper instantiation, or `None` if the window is not open.
@@ -27736,16 +28155,29 @@ fn interpret_one_step<B: CpuBus>(
     // deliverable in between, and the premise that makes it so is the batch rule stated at
     // `cycle`: `bus.interrupt_pending()` is driven by the PIC and cannot change inside a batch,
     // because devices advance only after the batch and any guest PIC access ends it. No
-    // `InterpretOne` row writes a port; the call-outs that touch a port at all are `0xEC` and, as
-    // of gp2's in-imm8 callout design, `0xE4` -- both READS, and NEITHER is guaranteed to end the
-    // block through the step-break bit (that bit mirrors `bus.requires_step_break()`, which
-    // mirrors `io_touched`, and a lazy VGA-status read or a PIT counter peek never sets it). What
-    // keeps this premise sound for those non-touching classes is not the step-break bit, it is the
-    // per-port-class safety proof the design carries (`classify`'s `0xe4` arm, above): a PIT read
-    // is a pure peek against `elapsed_pit_clocks` that mutates nothing the PIC observes, so it
-    // cannot make an interrupt newly deliverable inside the batch either. A port whose read DOES
-    // set `io_touched` needs no separate argument here -- `requires_step_break()` ends the block
-    // at that slot regardless, so no LATER instruction in the block can observe a stale answer.
+    // `InterpretOne` row writes a port. TWO call-out helpers READ one (`0xEC` and, as of gp2's
+    // in-imm8 callout design, `0xE4`) and NEITHER is guaranteed to end the block through the
+    // step-break bit (that bit mirrors `bus.requires_step_break()`, which mirrors `io_touched`,
+    // and a lazy VGA-status read or a PIT counter peek never sets it). What keeps this premise
+    // sound for those non-touching classes is not the step-break bit, it is the per-port-class
+    // safety proof the design carries (`classify`'s `0xe4` arm, above): a PIT read is a pure peek
+    // against `elapsed_pit_clocks` that mutates nothing the PIC observes, so it cannot make an
+    // interrupt newly deliverable inside the batch either. A port whose read DOES set `io_touched`
+    // needs no separate argument here -- `requires_step_break()` ends the block at that slot
+    // regardless, so no LATER instruction in the block can observe a stale answer.
+    //
+    // ONE helper WRITES a port, and the sentence above is false for it: `PortWriteAlImm8`
+    // (`0xE6`, `IZARRAVM_OUT_IMM8_ROWS`, default OFF). `MachineBus::write_io`'s PIT arm calls
+    // `pic.request(0)` from inside the write when a channel-0 control word raises OUT, so that one
+    // helper CAN make an interrupt newly deliverable mid-block, and on a ring-0 protected-mode
+    // guest `io_touched` is not even set, so the `requires_step_break()` half of the argument
+    // above does not cover it either. It is sound here for a THIRD reason, which is why it is a
+    // port-class helper and deliberately not an `InterpretOne` row -- keeping this paragraph's
+    // opening sentence literally true is half the point: that helper returns the step-break bit
+    // UNCONDITIONALLY and `DirectKind::is_terminal` stops the compile walk at it, so it is the
+    // LAST slot of its block and there is no later instruction to observe anything. It buys no
+    // earlier delivery than the interpreter's (`port_write_al_imm8` says exactly what it does and
+    // does not buy); what it buys is that this clause never has to reason about it.
     //
     // DEVICE-MAPPED MEMORY needs its own derivation, and "no row writes a port" is not it. The
     // string rows (`0xA4`-`0xA7`, `0xAA`-`0xAF`) write and read ORDINARY guest memory, and on this
@@ -27997,6 +28429,31 @@ pub(crate) fn port_read_al_imm8_for_test<B: CpuBus>(
     // borrowed across the call.
     let status = unsafe {
         port_read_al_imm8::<B>(
+            cpu as *mut CpuGsw,
+            prefix_raw_clocks,
+            prefix_weighted_fp_clocks,
+            u64::from(port),
+        )
+    };
+    cpu.native_callout = CallOutTable::default();
+    status
+}
+
+/// Drive `port_write_al_imm8` exactly as an emitted slot does -- publish, call, clear -- so a test
+/// can assert the CONTRACT (the forced step break, the charge, zero partial effects) without an
+/// emitter in the picture. `port` is the compile-time immediate the slot would have baked.
+#[cfg(test)]
+pub(crate) fn port_write_al_imm8_for_test<B: CpuBus>(
+    cpu: &mut CpuGsw,
+    bus: &mut B,
+    prefix_raw_clocks: u64,
+    prefix_weighted_fp_clocks: u64,
+    port: u16,
+) -> i64 {
+    cpu.native_callout = CallOutTable::publish(bus);
+    // SAFETY: as `port_read_al_imm8_for_test`.
+    let status = unsafe {
+        port_write_al_imm8::<B>(
             cpu as *mut CpuGsw,
             prefix_raw_clocks,
             prefix_weighted_fp_clocks,
@@ -29692,7 +30149,7 @@ fn record_structural_barrier(
 ///   error in the column and it is the one the 32-bit rows were ranked on.
 /// * CLOSED, the call-out slot cap.
 /// * CLOSED, `jit_admits_non_continuable`. The compile walk takes `insn.continuable ||
-///   jit_admits_non_continuable(opcode)`; this scan took the bare flag, truncating any suffix that
+///   jit_admits_non_continuable(&insn)`; this scan took the bare flag, truncating any suffix that
 ///   reached an IMUL-with-immediate.
 /// * PARTLY CLOSED, x87. The `kind.is_x87()` break below still refuses EVERY x87 slot in the
 ///   SUFFIX, a deliberate conservative floor for the kinds themselves. But both x87 gates in the
@@ -29785,7 +30242,7 @@ fn census_native_suffix(
             // the population the ladder will be read against. Inert on the OFF arm, where
             // `retf_admitted_here` returns after one `OnceLock` load.
             || !(insn.continuable
-                || jit_admits_non_continuable(insn.opcode)
+                || jit_admits_non_continuable(&insn)
                 || retf_admitted_here(cpu, &insn))
             || (insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu))
         {
@@ -30070,6 +30527,12 @@ pub(crate) struct DirectStallTally {
     /// call-outs it cannot say whether this NEW arm ever served anything. Reads zero whichever way
     /// the knob is set until the arm actually serves a port.
     pub callout_port_imm8_served: u64,
+    /// The dedicated always-on numerator for `PortWriteAlImm8` (`0xE6`, `IZARRAVM_OUT_IMM8_ROWS`),
+    /// mirroring `callout_port_imm8_served`'s reasoning one opcode over: a guest that runs both the
+    /// `0xE4` read and the `0xE6` write call-outs cannot be read out of `callout_executed`, which
+    /// sums every helper class. Reads zero whichever way the knob is set until the arm serves a
+    /// port -- which is the acceptance question for a row that ships default OFF.
+    pub callout_port_out_imm8_served: u64,
     /// The `InterpretOne` family, five counters that price the mechanism on its own terms.
     ///
     /// `executed` is every slot the helper ENTERED, the denominator the rest need.
@@ -31363,6 +31826,11 @@ struct BarrierStats {
     /// classified without ever looking the entry linear back up. Ranking a row on the static
     /// column alone under-prices it by whatever this column holds.
     dynamic_unbound_exits: u64,
+    /// The immediate port byte, recorded for the `PortIo` immediate forms (`0xE4`-`0xE7`) only.
+    /// First writer wins: the row aggregates by SHAPE, so a shape whose sites address two
+    /// different ports reports the first and the reader must fall back to the per-site
+    /// histogram. Set on the COMPILE walk; the hot path never touches it.
+    port: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31646,6 +32114,9 @@ impl DirectBarrierCensus {
             self.runtime_hits.entry(key.shape).or_default();
         }
         let row = self.rows.entry(key).or_default();
+        if row.port.is_none() && (0xe4..=0xe7).contains(&insn.opcode) {
+            row.port = Some(insn.imm as u16);
+        }
         row.hits = row.hits.saturating_add(1);
         row.native_prefix_instructions = row
             .native_prefix_instructions
@@ -31854,6 +32325,7 @@ fn census_row(key: BarrierKey, stats: BarrierStats, runtime_hits: u64) -> Direct
         native_suffix_instructions: stats.native_suffix_instructions,
         max_native_prefix: stats.max_native_prefix,
         max_native_suffix: stats.max_native_suffix,
+        port: stats.port,
     }
 }
 
@@ -32012,6 +32484,7 @@ impl crate::jit::JitState {
             callout_executed: self.stalls.callout_executed,
             callout_port_v86_served: self.stalls.callout_port_v86_served,
             callout_port_imm8_served: self.stalls.callout_port_imm8_served,
+            callout_port_out_imm8_served: self.stalls.callout_port_out_imm8_served,
             callout_interpret_one_executed: self.stalls.callout_interpret_one_executed,
             callout_interpret_one_resync: self.stalls.callout_interpret_one_resync,
             callout_interpret_one_resume_refused_prefix_use: self
@@ -32189,6 +32662,12 @@ impl crate::jit::JitState {
     /// is ungated: the gate would cost as much as the work.
     pub(crate) fn note_callout_port_imm8_served(&mut self) {
         self.stalls.callout_port_imm8_served += 1;
+    }
+
+    /// The `PortWriteAlImm8` engagement numerator, ungated for `note_callout_port_imm8_served`'s
+    /// reason: the gate would cost as much as the work.
+    pub(crate) fn note_callout_port_out_imm8_served(&mut self) {
+        self.stalls.callout_port_out_imm8_served += 1;
     }
 
     /// GP2 call-out-site poll skip. All on the port call-out's already-off-native path, for the
@@ -33125,7 +33604,7 @@ impl BlockCache {
 // call site fails in CI rather than in a census.
 
 #[cfg(feature = "direct-callout-attribution")]
-const HELPER_COUNT: usize = 5;
+const HELPER_COUNT: usize = 6;
 #[cfg(feature = "direct-callout-attribution")]
 const PORT_COUNT: usize = 1 << 16;
 
@@ -33151,6 +33630,7 @@ impl CallOutHelper {
             // the same census under a feature flag.
             Self::InterpretOne { .. } => 3,
             Self::PortReadAlImm8 { .. } => 4,
+            Self::PortWriteAlImm8 { .. } => 5,
         }
     }
 
@@ -33161,6 +33641,7 @@ impl CallOutHelper {
             Self::PopAllDword => "popad",
             Self::InterpretOne { .. } => "interpret_one",
             Self::PortReadAlImm8 { .. } => "in_al_imm8",
+            Self::PortWriteAlImm8 { .. } => "out_al_imm8",
         }
     }
 }
@@ -33239,7 +33720,9 @@ impl CallOutAttribution {
             // nothing in the type enforces that, so the shared table is keyed by the live port
             // value regardless of which opcode produced it. `port_totals` below sums both rows,
             // not `helpers[0]` alone, for the same reason.
-            CallOutHelper::PortReadAlDx | CallOutHelper::PortReadAlImm8 { .. } => {
+            CallOutHelper::PortReadAlDx
+            | CallOutHelper::PortReadAlImm8 { .. }
+            | CallOutHelper::PortWriteAlImm8 { .. } => {
                 self.ports[usize::from(port.expect("a port call-out attribution needs its port"))]
                     .note(outcome);
             }
@@ -33270,6 +33753,9 @@ impl CallOutAttribution {
             // because `attribution_index` and `attribution_label` both match `PortReadAlImm8 { .. }`
             // without reading it. Index 4, matching `attribution_index`'s assignment.
             CallOutHelper::PortReadAlImm8 { port: 0 },
+            // Index 5, matching `attribution_index`. The port carried here is unused for the same
+            // reason the row above's is.
+            CallOutHelper::PortWriteAlImm8 { port: 0 },
         ];
         let helpers = helper_kinds
             .into_iter()

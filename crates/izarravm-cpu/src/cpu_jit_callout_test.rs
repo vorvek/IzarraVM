@@ -1503,12 +1503,12 @@ fn callout_attribution_splits_every_port_outcome() {
         );
 
         let snapshot = fixture.cpu.direct_callout_attribution_snapshot().unwrap();
-        // FIVE helper rows since the gp2 in-imm8 callout design gave `CallOutHelper` its
-        // `PortReadAlImm8` arm (was four since S2's `InterpretOne` arm). The count moved when this
-        // file's `--all-features` build was repaired: the attribution matched three arms against a
-        // four-arm enum and had not compiled since, so the pin had been asserting a shape no build
-        // could reach.
-        assert_eq!(snapshot.helpers.len(), 5);
+        // SIX helper rows since the gp2 `0xE6` slice gave `CallOutHelper` its `PortWriteAlImm8`
+        // arm (five since the in-imm8 design's `PortReadAlImm8`, four since S2's `InterpretOne`).
+        // The count moved once before when this file's `--all-features` build was repaired: the
+        // attribution matched three arms against a four-arm enum and had not compiled since, so
+        // the pin had been asserting a shape no build could reach.
+        assert_eq!(snapshot.helpers.len(), 6);
         assert_eq!(callout_helper_counts(&snapshot, "in_al_dx"), expected);
         assert_eq!(callout_helper_counts(&snapshot, "pushad").attempts, 0);
         assert_eq!(callout_helper_counts(&snapshot, "popad").attempts, 0);
@@ -2962,6 +2962,10 @@ fn call_out_helper_match_exhaustiveness_is_a_compile_time_property() {
         ("PushAllDword", jit::direct::CallOutHelper::PushAllDword),
         ("PopAllDword", jit::direct::CallOutHelper::PopAllDword),
         (
+            "PortWriteAlImm8",
+            jit::direct::CallOutHelper::PortWriteAlImm8 { port: 0x43 },
+        ),
+        (
             "InterpretOne",
             jit::direct::CallOutHelper::InterpretOne {
                 row: jit::direct::InterpretOneRow::PopRm,
@@ -2993,7 +2997,668 @@ fn call_out_helper_match_exhaustiveness_is_a_compile_time_property() {
         jit::direct::helper_offset_for_test(jit::direct::CallOutHelper::InterpretOne {
             row: jit::direct::InterpretOneRow::Sti,
         }),
-        offsets[4].1,
+        offsets[5].1,
         "every InterpretOneRow must share InterpretOne's one CallOutTable field"
     );
+}
+
+// =================================================================================================
+// `0xE6` OUT imm8,AL -- `PortWriteAlImm8`, the WRITE twin of `PortReadAlImm8` above, behind
+// `IZARRAVM_OUT_IMM8_ROWS` (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+//
+// Placement follows the `0xE4` slice: the HELPER's contract lives here beside its read siblings;
+// the KNOB and the `classify` arm are covered in `cpu_jit_out_imm8_callout_test.rs`.
+//
+// THE ONE FACT THESE FIXTURES EXIST FOR. A port WRITE can make an interrupt newly deliverable from
+// inside `write_io` -- `MachineBus`'s PIT arm calls `pic.request(0)` when a channel-0 control word
+// raises OUT -- which is the premise the whole call-out family's pendency proof denied ("no
+// InterpretOne row writes a port; the call-outs that touch a port at all are both READS"). The
+// resolution is a step break reported UNCONDITIONALLY, not `bus.requires_step_break()`: on a
+// ring-0 protected-mode guest (gp2, DOS/4GW) `MachineBus::write_io` takes its `skip_io_touched`
+// exemption and never sets `io_touched` at all, so the bus's own answer is false for exactly the
+// guest class this row was measured on. `out_imm8_forces_the_step_break_even_when_the_bus_does_not`
+// is that claim, and `TestBus::lazy_io_writes` is the shape that lets it go red.
+// =================================================================================================
+
+/// The PIT control port -- gp2's own `0xE6` site, and the port whose write reaches
+/// `pic.request(0)`. Distinct from `PORT` and `IMM8_PORT` so a fixture sharing state with the read
+/// suites would be visible.
+const OUT_IMM8_PORT: u16 = 0x43;
+
+/// Resets `IZARRAVM_OUT_IMM8_ROWS`'s thread-local override on every exit path, unwind included.
+#[must_use]
+struct OutImm8RowsGuard;
+
+impl Drop for OutImm8RowsGuard {
+    fn drop(&mut self) {
+        jit::direct::set_out_imm8_rows_for_test(None);
+    }
+}
+
+fn select_out_imm8_rows(enabled: bool) -> OutImm8RowsGuard {
+    jit::direct::set_out_imm8_rows_for_test(Some(enabled));
+    assert_eq!(jit::direct::out_imm8_rows_armed(), enabled);
+    OutImm8RowsGuard
+}
+
+/// Build the three-slot block `mov esi,esi` / `out PORT,al` / `mov edi,edi`, call-out MID-BLOCK,
+/// exactly as `slot_block_imm8` does for `0xE4`. Requires the knob ON, which the guard supplies
+/// for the length of the `compile` call and no longer.
+fn slot_block_out_imm8(port: u8, configure: impl Fn(&mut TestBus)) -> (Fixture, CpuGsw, TestBus) {
+    let _guard = select_out_imm8_rows(true);
+    let mut code = vec![0x89, 0xf6];
+    let body_at = ENTRY + code.len() as u32;
+    code.push(0xe6);
+    code.push(port);
+    let tail_at = ENTRY + code.len() as u32;
+    code.extend_from_slice(&[0x89, 0xff, 0xf4]);
+
+    let mut memory = vec![0u8; 0x5000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = flat_cpu();
+    let mut interpreter = flat_cpu();
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interpreter_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        configure(bus);
+    }
+    for (cpu, bus) in [
+        (&mut native, &mut native_bus),
+        (&mut interpreter, &mut interpreter_bus),
+    ] {
+        cpu.registers.set_esp(STACK_TOP);
+        for &linear in &[ENTRY, body_at, tail_at] {
+            cpu.set_eip(linear);
+            cpu.fetch_decoded(bus, linear).unwrap();
+        }
+    }
+
+    // The probe is what moves the entry to `Seen`, which `install` requires; it also states that
+    // the fixture starts from an uncompiled site rather than inheriting one.
+    let key = jit::direct::key_for(&native, ENTRY, true).expect("entry key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = match jit::direct::compile(&mut native, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("structurally rejected: OUT imm8,AL was not admitted -- is the knob armed?")
+        }
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
+    };
+    assert_eq!(
+        compilation.span.instructions, 2,
+        "the walk must STOP at the OUT: its step break is unconditional, so any slot after \
+         it would be emitted dead. `DirectKind::is_terminal` is what stops it"
+    );
+    assert_eq!(compilation.callout_slots, 1);
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("block installs");
+    let block = native.jit_direct.block(id).expect("live block");
+
+    for cpu in [&mut native, &mut interpreter] {
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(STACK_TOP);
+        cpu.registers.set_eax(0xdead_be5a);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.set_eip(ENTRY);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    (
+        Fixture {
+            cpu: native,
+            bus: native_bus,
+            block,
+        },
+        interpreter,
+        interpreter_bus,
+    )
+}
+
+#[test]
+fn out_imm8_the_helper_charges_exactly_what_the_interpreter_charges() {
+    let mut cpu = flat_cpu();
+    cpu.registers.set_eax(0xdead_be5a);
+    let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+
+    let status = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, OUT_IMM8_PORT);
+    assert!(status >= 0, "a served port write is not abnormal");
+    assert_eq!(
+        status & 0xffff_ffff,
+        i64::from(OUT_PORT_CORE_CLOCKS),
+        "the helper must charge the SAME constant the interpreter's 0xE6 arm charges -- 10, not \
+         IN_PORT_CORE_CLOCKS' 12"
+    );
+    assert_eq!(
+        bus.io_writes,
+        vec![(OUT_IMM8_PORT, 0x5a, 0)],
+        "AL, and only AL, must reach the device -- port, value and `now` all pinned"
+    );
+    assert_eq!(
+        cpu.registers.eax(),
+        0xdead_be5a,
+        "OUT writes no register and no flag"
+    );
+    assert_eq!(cpu.elapsed_clocks, 0, "helper charged clocks itself");
+    assert_eq!(cpu.perf_counters().instructions, 0);
+}
+
+/// **THE UNCONDITIONAL BREAK.** With `lazy_io_writes` the bus models `MachineBus`'s
+/// `skip_io_touched` exemption -- the ring-0 protected-mode arm gp2 runs in, where a port write
+/// sets NOTHING and `requires_step_break()` stays false. The helper must report the step break
+/// anyway.
+///
+/// MUTATION that turns this red: write the status word as
+/// `i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT`, i.e. the shape both IN helpers
+/// use. The `lazy = true` leg then reads 0 and the block would run on past a write that may have
+/// just raised IRQ0 inside `pic.request(0)`.
+#[test]
+fn out_imm8_forces_the_step_break_even_when_the_bus_does_not() {
+    for lazy in [false, true] {
+        let mut cpu = flat_cpu();
+        cpu.registers.set_eax(0xdead_be5a);
+        let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+        bus.lazy_io_writes = lazy;
+
+        let status =
+            jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, OUT_IMM8_PORT);
+        assert!(status >= 0, "lazy={lazy}");
+        assert_eq!(
+            status >> jit::direct::STATUS_STEP_BREAK_BIT,
+            1,
+            "lazy={lazy}: the step break is UNCONDITIONAL, not the bus's answer"
+        );
+        assert_eq!(
+            bus.requires_step_break(),
+            !lazy,
+            "lazy={lazy}: the fixture is vacuous unless the bus really does disagree on one leg"
+        );
+    }
+}
+
+#[test]
+fn out_imm8_a_denied_port_is_abnormal_with_zero_partial_effects() {
+    let mut cpu = flat_cpu();
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x0b, 0xfb));
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x13, 0xf3));
+    cpu.registers.set_eax(0xdead_be5a);
+    cpu.registers.eflags = 0x202;
+    cpu.cpl = 3;
+    assert_eq!(cpu.current_privilege_level(), 3, "fixture must be at CPL 3");
+
+    let before = cpu.registers.clone();
+    let before_eflags = cpu.eflags();
+    let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+
+    let status = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, OUT_IMM8_PORT);
+    assert!(status < 0, "a denied port must be abnormal");
+    assert_eq!(before, cpu.registers, "abnormal path wrote a register");
+    assert_eq!(before_eflags, cpu.eflags(), "abnormal path wrote EFLAGS");
+    assert_eq!(cpu.elapsed_clocks, 0, "abnormal path charged clocks");
+    assert!(
+        bus.io_writes.is_empty(),
+        "the permission check must run BEFORE the device is written -- a refusal after the write \
+         would be a guest-visible side effect the interpreter never produced"
+    );
+}
+
+#[test]
+fn out_imm8_an_unsupported_port_is_abnormal_with_zero_partial_effects() {
+    let mut cpu = flat_cpu();
+    cpu.registers.set_eax(0xdead_be5a);
+    let before = cpu.registers.clone();
+    let mut bus = TestBus::with_memory(vec![0u8; 0x5000]);
+    bus.io_write_fails = true;
+
+    let status = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, OUT_IMM8_PORT);
+    assert!(status < 0);
+    assert_eq!(before, cpu.registers);
+    assert_eq!(cpu.elapsed_clocks, 0);
+    assert_eq!(
+        cpu.direct_stall_snapshot().callout_port_out_imm8_served,
+        0,
+        "an abnormal execution must not bump the engagement counter"
+    );
+}
+
+#[test]
+fn out_imm8_v86_call_out_on_a_cold_tlb_is_refused_before_the_tss_probe() {
+    // The TLB-miss refusal lane, isolated exactly as the two IN helpers' equivalents isolate it:
+    // IOPL 3 makes the `CPL > IOPL` half false, so only `is_v86_mode()` can send the helper down
+    // the TSS-bitmap arm, and a cold TLB refuses it there rather than page-walking from inside a
+    // block. The gate is the READ helper's, verbatim -- a write that took a wider gate than 0xE4's
+    // would admit a state the interpreter faults in.
+    let (mut cpu, mut bus) = paged_ring3_io_cpu(false);
+    cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+    assert_eq!(cpu.current_privilege_level(), 3);
+    assert_eq!(cpu.iopl(), 3);
+    let before = cpu.registers.clone();
+
+    let status = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT);
+
+    assert!(status < 0, "a V86 task on a cold TLB must be refused");
+    assert_eq!(before, cpu.registers);
+    assert!(page_walk_writes(&bus).is_empty());
+    assert!(bus.io_writes.is_empty());
+}
+
+#[test]
+fn out_imm8_a_permission_checked_port_is_refused_before_the_tss_probe_can_touch_memory() {
+    for deny in [false, true] {
+        let (mut cpu, mut bus) = paged_ring3_io_cpu(deny);
+        let before = cpu.registers.clone();
+        let before_cr2 = cpu.control.cr2;
+
+        let status = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT);
+
+        assert!(
+            status < 0,
+            "deny={deny}: the privileged state must be refused"
+        );
+        assert_eq!(before, cpu.registers, "deny={deny}: registers");
+        assert_eq!(before_cr2, cpu.control.cr2, "deny={deny}: CR2");
+        assert_eq!(cpu.written_count, 0, "deny={deny}: written_pages");
+        assert!(!cpu.written_pages_overflow, "deny={deny}");
+        assert_eq!(cpu.elapsed_clocks, 0, "deny={deny}: clocks");
+        assert!(
+            page_walk_writes(&bus).is_empty(),
+            "deny={deny}: the refused path set a page-table accessed bit"
+        );
+        assert!(
+            bus.io_writes.is_empty(),
+            "deny={deny}: the refused path reached the device"
+        );
+    }
+}
+
+#[test]
+fn out_imm8_a_v86_port_is_served_natively_once_the_tss_pages_are_tlb_resident() {
+    // The positive counterpart of the cold-TLB refusal, AND the engagement counter's gate:
+    // `callout_port_out_imm8_served` is the dedicated always-on numerator for THIS helper, so a
+    // census can say whether the arm served anything without reading it out of the shared
+    // `callout_executed`, which sums every helper class.
+    let (mut cpu, mut bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+    cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+    cpu.registers.set_eax(0xdead_be5a);
+    assert!(cpu.is_v86_mode());
+    assert_eq!(cpu.iopl(), 3);
+    let before = cpu.direct_stall_snapshot();
+
+    let status = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT);
+
+    assert!(status >= 0, "a permitted V86 port must be served");
+    assert_eq!(
+        bus.io_writes.first().map(|write| (write.0, write.1)),
+        Some((PORT, 0x5a)),
+        "AL must reach the device"
+    );
+    assert!(
+        page_walk_writes(&bus).is_empty(),
+        "the served path page-walked -- the whole hazard the design refuses"
+    );
+    let after = cpu.direct_stall_snapshot();
+    assert_eq!(
+        after.callout_port_out_imm8_served - before.callout_port_out_imm8_served,
+        1,
+        "the OUT engagement counter must fire on a served execution"
+    );
+    assert_eq!(
+        after.callout_port_imm8_served - before.callout_port_imm8_served,
+        0,
+        "the OUT arm must NOT bump the 0xE4 read arm's counter -- a guest that runs both would be \
+         unreadable"
+    );
+    assert_eq!(
+        after.callout_port_v86_served - before.callout_port_v86_served,
+        0,
+        "nor the 0xEC bitmap-serve counter"
+    );
+    assert_eq!(
+        after.callout_executed - before.callout_executed,
+        1,
+        "the shared denominator must count this call-out too"
+    );
+}
+
+#[test]
+fn out_imm8_call_out_matches_the_interpreter_mid_block() {
+    // The emitted-slot differential: the same guest bytes through the compiled block and through
+    // the block-free interpreter, from identical state. The block runs TWO slots -- the prefix and
+    // the call-out -- because the forced step break ends the native run at the boundary AFTER the
+    // OUT, so the interpreter twin is stepped twice to the same place.
+    let (mut fixture, mut interpreter, mut interpreter_bus) =
+        slot_block_out_imm8(OUT_IMM8_PORT as u8, |bus| {
+            bus.lazy_io_writes = true;
+        });
+
+    let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap(),
+        "block did not run natively"
+    );
+    for _ in 0..2 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+
+    assert_eq!(
+        fixture.cpu.perf_counters().jit_direct_insns - retired,
+        2,
+        "the prefix and the call-out retire natively; the tail does not, because the OUT's step \
+         break is unconditional and this bus does not ask for one"
+    );
+    assert_eq!(
+        fixture.cpu.registers.eip, interpreter.registers.eip,
+        "EIP must advance past the OUT by exactly its own length"
+    );
+    assert_eq!(
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter),
+        "registers"
+    );
+    assert_eq!(fixture.cpu.eflags(), interpreter.eflags(), "EFLAGS");
+    assert_eq!(
+        fixture.cpu.elapsed_clocks, interpreter.elapsed_clocks,
+        "core clocks"
+    );
+    assert_eq!(
+        fixture.bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks(),
+        "bus clocks"
+    );
+    assert_eq!(
+        fixture.bus.io_writes, interpreter_bus.io_writes,
+        "the device must see the same write, with the same value at the same guest time"
+    );
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.side_exit_callout_step_break, 1);
+    assert_eq!(stalls.side_exit_callout_abnormal, 0);
+}
+
+/// **THE BLOCK-SCOPED CLAIM.** A device that raises an IRQ from inside `write_io` is exactly
+/// `MachineBus`'s PIT arm (`pic.request(0)` on a channel-0 control word that raises OUT, the
+/// Tyrian 2000 fix). This fixture pairs it with `lazy_io_writes`, so nothing about the bus asks
+/// for a break, and asserts what the step-break bit actually buys: the native run leaves the
+/// BLOCK at the boundary after the OUT, so no later slot in it executes against the pendency
+/// answer the write just changed.
+///
+/// It does NOT assert that the interrupt is delivered any sooner, because it is not:
+/// `run_budgeted_inner`'s run break reads `bus.requires_step_break()`, which the `skip_io_touched`
+/// regime leaves false, and `can_take_interrupt` never consults the bus. Delivery parity with the
+/// interpreted path is the NEXT fixture's claim, measured on a real batch.
+#[test]
+fn out_imm8_an_irq_raised_inside_the_write_cannot_reach_a_later_slot_in_the_block() {
+    let (mut fixture, mut interpreter, mut interpreter_bus) =
+        slot_block_out_imm8(OUT_IMM8_PORT as u8, |bus| {
+            bus.lazy_io_writes = true;
+            bus.io_write_arms_pending_irq = true;
+        });
+
+    let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    for _ in 0..2 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+
+    assert!(
+        fixture.bus.interrupt_pending(),
+        "the fixture is vacuous unless the write really did raise the line"
+    );
+    assert!(
+        !fixture.bus.requires_step_break(),
+        "the fixture is vacuous unless the BUS declines to end the run -- that is the ring-0 \
+         protected-mode exemption this row was measured under"
+    );
+    assert_eq!(
+        fixture.cpu.perf_counters().jit_direct_insns - retired,
+        2,
+        "the OUT must be the LAST slot the block executes: the prefix and the call-out retire \
+         natively and nothing after them does"
+    );
+    assert_eq!(fixture.cpu.registers.eip, interpreter.registers.eip);
+    assert_eq!(
+        fixture.bus.interrupt_pending(),
+        interpreter_bus.interrupt_pending(),
+        "both paths must reach the boundary with the same pendency answer"
+    );
+    assert_eq!(
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter)
+    );
+}
+
+/// **THE DELIVERY-PARITY PROBE, on a real batch, driven identically on both roles.**
+///
+/// The first draft of this slice claimed the forced step break made the IRQ deliverable earlier.
+/// It does not, and a fixture that only ever ran the native side could not have told: the honest
+/// question is whether the two roles deliver the vector at the SAME guest instruction, and the
+/// only way to ask it is to run the same guest through both and look.
+///
+/// Both roles run `mov esi,esi` / `out 43h,al` / `inc edi` / `hlt` under `run_budgeted` -- the
+/// production driver, which is what owns the per-instruction interrupt check -- against a device
+/// that raises IRQ0 from inside the write and does NOT set `io_touched`. Real mode with CS.D = 1
+/// (so the instruction decodes at Dword and is admitted) puts a usable IVT at zero: vector 0's
+/// entry is four zero bytes, address zero holds a `HLT`, so a delivered interrupt is visible as
+/// EIP 0 and a halt.
+///
+/// `EDI` IS THE INSTRUMENT. It is the one piece of guest state that separates "the vector was
+/// taken at the boundary after the OUT" from "one more instruction ran first". Nothing here
+/// presumes which answer is right: the assertion compares the two ROLES, and would go red for a
+/// native path that delivered EARLY exactly as loudly as for one that delivered late.
+///
+/// WHAT IT MEASURED, recorded because it is the fact that corrected this slice's first draft:
+/// **neither role delivers before the tail.** EDI is 1 and `brk_interrupt` is 0 on both, because
+/// `run_budgeted_inner`'s run break reads `bus.requires_step_break()` -- false in the
+/// `skip_io_touched` regime this bus models -- and `can_take_interrupt` never consults the bus. So
+/// the guest runs `inc edi` with IRQ0 already raised, on the native path and on the interpreted
+/// path alike. That is the parity the design actually has, and the two explicit assertions at the
+/// end pin it so a future change on either side has to move both or fail.
+///
+/// Note what this fixture does NOT single out: with `DirectKind::is_terminal` stopping the walk
+/// at the OUT, the block-scoped property has two independent guards, and removing either one
+/// alone leaves this green. That is the design having belt and braces, not the fixture being
+/// weak -- the claim under test is parity, and parity is what is asserted.
+#[test]
+fn out_imm8_delivers_the_irq_at_the_same_guest_instruction_as_the_block_free_role() {
+    /// Everything about a role's run that is guest-visible or device-visible.
+    #[derive(Debug, PartialEq, Eq)]
+    struct RoleOutcome {
+        eip: u32,
+        edi: u32,
+        eflags: u32,
+        halted: bool,
+        io_writes: Vec<(u16, u32, u64)>,
+        interrupt_pending: bool,
+        brk_interrupt: u64,
+    }
+
+    fn run_role(admit_natively: bool) -> (RoleOutcome, u64) {
+        let _guard = select_out_imm8_rows(true);
+        // `inc edi` (0x47) rather than another `mov`: the tail has to be OBSERVABLE, or the
+        // instrument cannot see an instruction that ran when it should not have.
+        let code = [0x89, 0xf6, 0xe6, OUT_IMM8_PORT as u8, 0x47, 0xf4];
+        let mut memory = vec![0u8; 0x5000];
+        // The IVT's vector-0 entry is the four zero bytes already there (offset 0, segment 0), and
+        // address zero holds the HLT a delivered interrupt lands on.
+        memory[0] = 0xf4;
+        // A leading NOP, and BOTH roles start on it. A native block is entered through the
+        // CONTINUATION path -- the second and later instructions of a run -- so a block sitting at
+        // the run's first instruction would never be entered and the native role would silently
+        // interpret. The NOP is what makes the block at `ENTRY` a continuation.
+        memory[(ENTRY - 1) as usize] = 0x90;
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let pristine = memory.clone();
+
+        let mut cpu = flat_cpu();
+
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+
+        let arm = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+            bus.memory.copy_from_slice(&pristine);
+            bus.trace.clear();
+            bus.pending_irq = None;
+            bus.io_touched = false;
+            bus.io_writes.clear();
+            bus.lazy_io_writes = true;
+            bus.io_write_arms_pending_irq = true;
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(STACK_TOP);
+            cpu.registers.set_eax(0x0000_005a);
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(ENTRY - 1);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+        };
+        let run_to_halt = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+            for _ in 0..64 {
+                if cpu
+                    .run_budgeted(bus, u64::MAX)
+                    .expect("the guest must not fault")
+                    .halted
+                {
+                    return;
+                }
+            }
+            panic!("the guest did not halt");
+        };
+
+        // PRIMING. The block is compiled and installed EXPLICITLY rather than left to auto-admit
+        // heat: this guest runs its entry once per run and would need a heat schedule to earn a
+        // compile, which would make the fixture a test of the admission governor instead of a
+        // test of delivery parity. The block-free role installs nothing and so can only
+        // interpret; both roles keep auto-admit off, so nothing ELSE compiles under either.
+        cpu.set_jit_auto_admit(false);
+        if admit_natively {
+            for &linear in &[ENTRY - 1, ENTRY, ENTRY + 2, ENTRY + 4] {
+                cpu.set_eip(linear);
+                cpu.fetch_decoded(&mut bus, linear).unwrap();
+            }
+            let key = jit::direct::key_for(&cpu, ENTRY, true).expect("entry key");
+            assert!(matches!(
+                cpu.jit_direct.probe(key),
+                jit::direct::BlockProbe::Interpret
+            ));
+            let compilation = match jit::direct::compile(&mut cpu, ENTRY, true) {
+                jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+                _ => panic!("the block must compile with the knob armed"),
+            };
+            cpu.jit_direct
+                .install(&compilation)
+                .expect("block installs");
+            // Entering an installed block is gated the same way admitting one is, so the native
+            // role turns the dial back on AFTER the install: what it compiles from here is
+            // nothing (this guest's entry runs once per run and earns no heat), what it ENTERS is
+            // the block installed above.
+            cpu.set_jit_auto_admit(true);
+        }
+
+        let before = cpu.perf_counters().jit_direct_insns;
+        arm(&mut cpu, &mut bus);
+        run_to_halt(&mut cpu, &mut bus);
+        let perf = cpu.perf_counters();
+        (
+            RoleOutcome {
+                eip: cpu.registers.eip,
+                edi: cpu.registers.edi(),
+                eflags: cpu.eflags(),
+                halted: cpu.halted,
+                io_writes: bus.io_writes.clone(),
+                interrupt_pending: bus.interrupt_pending(),
+                brk_interrupt: perf.brk_interrupt,
+            },
+            perf.jit_direct_insns - before,
+        )
+    }
+
+    let (block_free, block_free_native) = run_role(false);
+    let (native, native_insns) = run_role(true);
+
+    // ANTI-VACUITY, both directions: one role must really have run the OUT natively and the other
+    // must really not have, or this is two interpreters agreeing with each other.
+    assert_eq!(
+        block_free_native, 0,
+        "the block-free role must retire nothing natively"
+    );
+    assert!(
+        native_insns > 0,
+        "the native role never entered a block -- the comparison would be vacuous: {native:#?}"
+    );
+    assert_eq!(
+        native.io_writes.len(),
+        1,
+        "the fixture is vacuous unless the OUT actually reached the device"
+    );
+    assert_eq!(
+        native, block_free,
+        "the two roles must reach the same guest state by the same device-visible route: EDI is \
+         the instrument that separates `the vector was taken at the boundary after the OUT` from \
+         `one more instruction ran first`"
+    );
+    // The measured answer, stated rather than left implicit in the equality above: BOTH roles run
+    // the tail with the IRQ already raised. If a future change makes either path deliver at the
+    // boundary instead, these two go red and the doc above has to be rewritten with them -- which
+    // is the point, because the first draft of this slice claimed the delivery point moved and
+    // nothing in the fixtures could contradict it.
+    assert_eq!(
+        native.edi, 1,
+        "the step-break bit does not preempt the next instruction, on either path"
+    );
+    assert_eq!(
+        native.brk_interrupt, 0,
+        "no run on either path ended on an interrupt transition"
+    );
+}
+
+#[test]
+fn out_imm8_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_effects() {
+    let (mut fixture, mut interpreter, mut interpreter_bus) =
+        slot_block_out_imm8(OUT_IMM8_PORT as u8, |bus| {
+            bus.io_write_fails = true;
+        });
+
+    let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    assert!(
+        fixture
+            .cpu
+            .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+            .unwrap()
+    );
+    interpreter.cycle(&mut interpreter_bus).unwrap();
+
+    assert_eq!(fixture.cpu.perf_counters().jit_direct_insns - retired, 1);
+    assert_eq!(
+        crate::tests::settled_registers(&fixture.cpu),
+        crate::tests::settled_registers(&interpreter)
+    );
+    let stalls = fixture.cpu.direct_stall_snapshot();
+    assert_eq!(stalls.side_exit_callout_abnormal, 1);
+    assert_eq!(stalls.side_exit_callout_step_break, 0);
 }

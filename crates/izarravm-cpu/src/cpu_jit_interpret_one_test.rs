@@ -5837,9 +5837,9 @@ fn interpret_one_closes_the_callout_attribution_ledger() {
 
         // THE CLOSURE THE BUG BROKE, spelled out here rather than left to the snapshot's own
         // assertion, so a future edit that relaxes that assertion still has to face this one.
-        // FIVE rows since the gp2 in-imm8 callout design added `CallOutHelper::PortReadAlImm8`
-        // (was four since S2's `InterpretOne` arm).
-        assert_eq!(snapshot.helpers.len(), 5, "{name}");
+        // SIX rows since the gp2 `0xE6` slice added `CallOutHelper::PortWriteAlImm8` (five since
+        // the in-imm8 design's `PortReadAlImm8`, four since S2's `InterpretOne` arm).
+        assert_eq!(snapshot.helpers.len(), 6, "{name}");
         let summed: u64 = snapshot.helpers.iter().map(|row| row.counts.attempts).sum();
         assert_eq!(summed, stalls.callout_executed, "{name}");
         assert_eq!(snapshot.totals.attempts, stalls.callout_executed, "{name}");

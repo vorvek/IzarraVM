@@ -1953,7 +1953,13 @@ fn pending_flags_offset() {
     // moving this pin 4560 -> 4576 -- measured off a failing-test readout, not derived. They
     // belong in PerfCounters, not at the CpuGsw tail, for the same reason the other brk_* fields
     // do: the bench and phase-mark JSON emit them alongside their siblings.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4576);
+    // The gp2 `0xE6` OUT slice adds `CallOutTable::port_write_al_imm8` (8 bytes), moving this pin
+    // 4576 -> 4584 -- measured off a failing-test readout, not derived. Same shape as the
+    // `port_read_al_imm8` growth above: one host-side function-pointer slot in the call-out
+    // window, not guest state. (The slice's OTHER new field, the
+    // `callout_port_out_imm8_served` counter, lives in the stall tally behind `jit_direct` and
+    // does not move this offset.)
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4584);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
@@ -2814,6 +2820,26 @@ struct TestBus {
     // (gp2 in-imm8 callout design mutant table, "pendency / mid-block visibility"). Default false,
     // so every existing fixture's device stays a pure peek unless it opts in.
     io_read_arms_pending_irq: bool,
+    // When true, `write_io` does NOT set `io_touched`, modeling `MachineBus::write_io`'s
+    // `skip_io_touched` exemption: on a ring-0 protected-mode guest with `lazy_port_reads` every
+    // port outside 0x60/0x64/0x92/0xE7 and the PCI config window sets nothing at all. That is the
+    // regime gp2 runs in (`brk_step` 17,677 against 59,968,424 OUTs), and it is what lets the
+    // `0xE6` call-out's UNCONDITIONAL step break be told apart from one inherited from the bus.
+    // Default false, so every existing fixture keeps the strict behaviour it was written against.
+    lazy_io_writes: bool,
+    // When true, `write_io` fails with `UnsupportedPort` -- the machine bus's only `write_io` error
+    // producer, and the `0xE6` call-out helper's abnormal set.
+    io_write_fails: bool,
+    // When true, `write_io` arms `pending_irq` as a side effect of the WRITE. This is not a
+    // hypothetical device: `MachineBus`'s PIT arm calls `pic.request(0)` from inside the write when
+    // a channel-0 control word raises OUT (the Tyrian 2000 fix), which is the counterexample the
+    // call-out family's pendency premise has to survive. Default false.
+    io_write_arms_pending_irq: bool,
+    // Every `write_io` in order, as `(port, value, core_clocks_so_far)`. The write-side counterpart
+    // of `io_reads`: `last_write_io_core_clocks_so_far` keeps only the most recent timestamp and
+    // carries neither the value nor the port, so it cannot see a call-out that wrote the wrong
+    // byte to the right port.
+    io_writes: Vec<(u16, u32, u64)>,
     // A SEQUENCE of port-read values, one consumed per `read_io`, falling back to `io_read_value`
     // once exhausted. `io_read_value` is a CONSTANT, which cannot separate "the device was read
     // again" from "the first value was cached"; a native block that re-executes must observe the
@@ -2904,6 +2930,10 @@ impl TestBus {
             io_read_value: None,
             io_read_fails: false,
             io_read_arms_pending_irq: false,
+            lazy_io_writes: false,
+            io_write_fails: false,
+            io_write_arms_pending_irq: false,
+            io_writes: Vec::new(),
             io_read_sequence: Vec::new(),
             io_read_cursor: 0,
             io_reads: Vec::new(),
@@ -3503,11 +3533,20 @@ impl CpuBus for TestBus {
         &mut self,
         port: u16,
         width: BusWidth,
-        _value: u32,
+        value: u32,
         core_clocks_so_far: u64,
         _cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError> {
-        self.io_touched = true;
+        if self.io_write_fails {
+            return Err(BusError::UnsupportedPort { port });
+        }
+        if !self.lazy_io_writes {
+            self.io_touched = true;
+        }
+        if self.io_write_arms_pending_irq {
+            self.pending_irq = Some(0);
+        }
+        self.io_writes.push((port, value, core_clocks_so_far));
         self.last_write_io_core_clocks_so_far = Some(core_clocks_so_far);
         self.trace.push(BusCycle::new(
             BusAccessKind::IoWrite,
@@ -4117,6 +4156,14 @@ mod jit_callout;
 ))]
 #[path = "cpu_jit_in_imm8_callout_test.rs"]
 mod jit_in_imm8_callout;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_out_imm8_callout_test.rs"]
+mod jit_out_imm8_callout;
 
 #[cfg(all(
     feature = "jit",
