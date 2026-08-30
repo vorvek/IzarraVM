@@ -431,7 +431,7 @@
     "colors_max": 256,
     "nonblack_min": 79.1,
     "nonblack_max": 100.0,
-    "instructions": 6637644760,
+    "instructions": 6637053770,
     "census": {
       "distira": [],
       "distira_scanout": {
