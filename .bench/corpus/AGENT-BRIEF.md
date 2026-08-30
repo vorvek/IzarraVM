@@ -72,6 +72,13 @@ View a screen: `magick <file>.ppm <file>.png`, then Read the PNG.
 
 ## What to report (the evidence block)
 
+Print it with the helper, then add the two prose items (phase covered,
+log anomalies):
+
+```
+python D:\dev\IzarraVM\.bench\corpus\scripts\summarize-run.py <result_dir>
+```
+
 From the deep run's `profile.json`, top level unless noted:
 
 * `real_time_factor`, `direct_native_coverage`, `guest_seconds`,
