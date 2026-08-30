@@ -960,8 +960,15 @@ duke3d-586 before any merge decision.**
   --cd-image .bench/tombraid_cd/tombeng.cue --cycles 28000000000
   --result-ppm <path>`. No input schedule: the title menu starts a demo level
   by itself after idling. Do NOT run it at 486 - the game needs a Pentium+FPU.
-- CONFIG.SYS loads `TOKAEMM.SYS RAM /T` and `TOKACD.SYS`; AUTOEXEC runs
-  `IZCDEX /I /D:TOKACD01 /L:D /T`, sets BLASTER, and loops `TOMB.EXE`.
+- CONFIG.SYS loads `TOKAEMM.SYS RAM /T` and nothing else; AUTOEXEC sets
+  BLASTER and loops `TOMB.EXE`. There is NO CD driver line and NO `IZCDEX`
+  line: PRs #755/#756 moved CD service into the BIOS, which claims drive D:
+  at boot, and neither `TOKACD.SYS` nor `IZCDEX.COM` has shipped in `C:\DOS`
+  since. A fixture that still names them boots with a three-line CONFIG.SYS
+  error and a `Bad command or filename - "IZCDEX".`, costs nothing visible
+  because the BIOS serves D: anyway, and is a trap for the next fixture that
+  needs a real driver loaded high. Removed from all four Tomb Raider and
+  Descent II trees on 2026-08-30.
   `TOMBPATH.TXT` in `C:\` (17 bytes, no trailing newline) names
   `C:\GAMES\TOMBRAID`. Sound: SB16 220/7/1 via `HMISET.CFG`, no MIDI.
 - Timeline and the 28e9 budget rationale: see `HARNESS.md` (mid-demo end
@@ -1011,7 +1018,8 @@ FPU, exactly like the software `tombraid-586` row.
 - The tree is `.bench/tombraid_c` with its game directory swapped for the
   packagers' `TOMB3D`, Windows `.dll` files removed. `TOMBPATH.TXT` in `C:\`
   holds `C:\GAMES\TOMB3D` with NO trailing newline; CONFIG.SYS and AUTOEXEC.BAT
-  are the software row's, with LF line endings.
+  are the software row's, with LF line endings, and carry NO CD driver or
+  `IZCDEX` line -- see that row's entry for why.
 - Measured timeline: boot 0-4 guest seconds, Glide splash 5-9, a BLACK WAIT
   9-24, title 35-50, attract DEMO 50-85, title 85-100, DEMO 100-130, and so on
   in that rhythm. The 19e9 budget is 114.5 guest seconds and lands 14 seconds

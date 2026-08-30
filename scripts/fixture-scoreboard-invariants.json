@@ -1,11 +1,11 @@
 {
   "descent2-3dfx-586": {
     "anchor_frame_sha256": [
-      "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
+      "075cc2bb62c055d6be98a3cc6a7c9076de07d197386622d11cde487ac36b0901"
     ],
     "final_distinct_colors_max": 20000,
     "final_distinct_colors_min": 120,
-    "final_instructions": 8579000326,
+    "final_instructions": 8578222429,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
     "final_nonblack_percent_min": 60.0
@@ -52,22 +52,22 @@
   },
   "tombraid-586": {
     "anchor_frame_sha256": [
-      "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
+      "075cc2bb62c055d6be98a3cc6a7c9076de07d197386622d11cde487ac36b0901"
     ],
     "final_distinct_colors_max": 256,
     "final_distinct_colors_min": 79,
-    "final_instructions": 18136220051,
+    "final_instructions": 17990425766,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
     "final_nonblack_percent_min": 89.0
   },
   "tombraid3d-586": {
     "anchor_frame_sha256": [
-      "e446305c30949f54a3089e24bc5db274158f7290203c8ad54b62c42897ed32f7"
+      "075cc2bb62c055d6be98a3cc6a7c9076de07d197386622d11cde487ac36b0901"
     ],
     "final_distinct_colors_max": 3000,
     "final_distinct_colors_min": 80,
-    "final_instructions": 19864778122,
+    "final_instructions": 19864703204,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
     "final_nonblack_percent_min": 95.0
