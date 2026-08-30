@@ -2139,12 +2139,12 @@ impl CpuGsw {
         // which is the sum of the baked per-kind constants -- does not contain it and the bound
         // would not cover it.
         //
-        // Priced BY CLASS rather than at the worst helper, and that is not an optimisation, it is
-        // exactness. Every port slot charges exactly `IN_PORT_CORE_CLOCKS` -- `PortReadAlDx` and
-        // `PortReadAlImm8` alike (gp2 in-imm8 callout design), the whole reason the constant
-        // dropped its `_DX_` -- and every memory slot exactly `PUSH_ALL_CORE_CLOCKS` (=
-        // `POP_ALL_CORE_CLOCKS`); both are the ONLY case for their class, not a worst case, so the
-        // sum is exact. Pricing both classes at the maximum
+        // Priced BY CLASS rather than at the worst helper. The port class was an EXACT sum until
+        // `0xE6` joined it: the reads charge `IN_PORT_CORE_CLOCKS`, `PortWriteAlImm8` charges
+        // `OUT_PORT_CORE_CLOCKS` (10 against 12), so it is now a STATED two-member maximum rather
+        // than the IN constant left standing. A memory slot still charges `PUSH_ALL_CORE_CLOCKS` (=
+        // `POP_ALL_CORE_CLOCKS`); both are the ONLY case for that class, so its sum stays exact.
+        // Pricing both classes at the maximum
         // of the two would inflate every port-only block -- which is what doom's 20 M call-outs
         // are -- by six core clocks a slot for traffic it cannot generate, and a budget bound
         // decides admission at the margin.
@@ -2158,7 +2158,7 @@ impl CpuGsw {
         // own charge. Widening the allowlist means widening the constant, which is why the
         // constant is derived beside the per-opcode ones rather than written here.
         let callout_core_upper = u64::from(block.callout_port_slots())
-            .saturating_mul(u64::from(IN_PORT_CORE_CLOCKS))
+            .saturating_mul(u64::from(IN_PORT_CORE_CLOCKS.max(OUT_PORT_CORE_CLOCKS)))
             .saturating_add(
                 u64::from(block.callout_memory_slots())
                     .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),

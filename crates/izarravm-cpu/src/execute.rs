@@ -1364,7 +1364,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(10))
+                Ok(clocks(OUT_PORT_CORE_CLOCKS))
             }
             0xe7 => {
                 // OUT imm8, AX/EAX: word/dword port output from the accumulator.
@@ -1377,7 +1377,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(10))
+                Ok(clocks(OUT_PORT_CORE_CLOCKS))
             }
             0xec => {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
@@ -1416,7 +1416,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(10))
+                Ok(clocks(OUT_PORT_CORE_CLOCKS))
             }
             0xef => {
                 // OUT DX, AX/EAX: word/dword port output addressed by DX.
@@ -1429,7 +1429,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(10))
+                Ok(clocks(OUT_PORT_CORE_CLOCKS))
             }
             opcode => unreachable!("port-I/O opcode {opcode:#x}"),
         }

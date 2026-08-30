@@ -3495,6 +3495,12 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_callout_executed": snapshot.callout_executed,
         "jit_direct_callout_port_v86_served": snapshot.callout_port_v86_served,
         "jit_direct_callout_port_imm8_served": snapshot.callout_port_imm8_served,
+        // The `0xE6` row's RECONCILIATION NUMERATOR, and the only always-on one it has: the
+        // per-port `direct_callout_attribution` table is behind a feature and is keyed by port
+        // rather than by helper, so it cannot answer "did the OUT arm serve anything" on a plain
+        // census build -- which is the acceptance question for a default-OFF row whose ON arm is
+        // supposed to make a barrier census row disappear.
+        "jit_direct_callout_port_out_imm8_served": snapshot.callout_port_out_imm8_served,
         "jit_direct_callout_interpret_one_executed": snapshot.callout_interpret_one_executed,
         "jit_direct_callout_interpret_one_resync": snapshot.callout_interpret_one_resync,
         // The price of the PREFIX half of the segment mask: resyncs the suffix-only rule would
@@ -3667,6 +3673,7 @@ fn direct_barrier_census_row_json(row: &izarravm_cpu::DirectBarrierCensusRow) ->
         "native_suffix_instructions": row.native_suffix_instructions,
         "max_native_prefix": row.max_native_prefix,
         "max_native_suffix": row.max_native_suffix,
+        "port": row.port,
     })
 }
 
