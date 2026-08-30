@@ -2697,6 +2697,31 @@ fn direct_barrier_census_json(
         );
         report
     };
+    // The `RetryCause::AdmissionMatrix` per-reason split (design note
+    // `dev_docs/descent2-l1-stack-width-design-2026-08-30.md` §2(H)): the two `stack_width_kind`
+    // producers of that cause, told apart. `NEW BLOCK`, not folded into `admission_declines`
+    // above -- that array means something else (dispatcher-entry declines) and the corpus already
+    // carries legs on disk that read it.
+    #[cfg(feature = "direct-admission-census")]
+    let report = {
+        let mut report = report;
+        report["stack_width_declines"] = json!({
+            "reasons": snapshot
+                .stack_width_declines
+                .iter()
+                .map(|(label, count)| json!({ "kind": label, "count": count }))
+                .collect::<Vec<_>>(),
+            "distinct_sites": snapshot.stack_width_decline_distinct_sites,
+            // Hex, matching `dormant_heat_sites` / `rejected_sites`: the reader's next move is a
+            // disassembly or map-file cross-reference, both hex.
+            "sites": snapshot.stack_width_decline_sites.iter().map(|site| json!({
+                "linear": format!("0x{:08X}", site.linear),
+                "reason": site.reason,
+                "count": site.count,
+            })).collect::<Vec<_>>(),
+        });
+        report
+    };
     report
 }
 

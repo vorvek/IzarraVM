@@ -1811,6 +1811,35 @@ pub struct DirectBarrierCensusSnapshot {
     /// Partial attribution of Direct admission declines as (label, count). It intentionally does
     /// not include every route that can return to the interpreter.
     pub admission_declines: Vec<(&'static str, u64)>,
+    /// Per-reason split of `RetryCause::AdmissionMatrix`, as (label, count). The cause has TWO
+    /// producers -- `stack_width_kind`'s 2x2 admission matrix, and the `control_target`/
+    /// `segment_access` check that runs after it in the compile walk -- and this is the
+    /// instrument that tells them apart. See
+    /// `dev_docs/descent2-l1-stack-width-design-2026-08-30.md` §0(c), §2(H). Recorded only on the
+    /// full-length compile pass, the same gate the word-control counters use, so binary-search
+    /// re-walks do not multiply the total.
+    #[cfg(feature = "direct-admission-census")]
+    pub stack_width_declines: Vec<(&'static str, u64)>,
+    /// Bounded, descending-by-count list of `stack_width_declines` sites (block entry linear,
+    /// last reason seen, hit count), head-capped at `STACK_WIDTH_DECLINE_SITES`. Turns "267 keys"
+    /// into addresses: whether the population is one hot loop or many cold ones.
+    #[cfg(feature = "direct-admission-census")]
+    pub stack_width_decline_sites: Vec<StackWidthDeclineSite>,
+    /// How many distinct block-entry linears produced an `AdmissionMatrix` decline, before the
+    /// head cap above truncates the list.
+    #[cfg(feature = "direct-admission-census")]
+    pub stack_width_decline_distinct_sites: u64,
+}
+
+/// One `stack_width_declines` site: a block entry linear, the last decline reason recorded
+/// there, and how many full-length compile passes produced it. See
+/// `DirectBarrierCensusSnapshot::stack_width_decline_sites`.
+#[cfg(feature = "direct-admission-census")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackWidthDeclineSite {
+    pub linear: u32,
+    pub reason: &'static str,
+    pub count: u64,
 }
 
 /// One emitted static successor cell in the opt-in Direct link refusal census.

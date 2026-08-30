@@ -6453,11 +6453,97 @@ fn pushf_mask(persona: CpuPersona) -> u32 {
     0xffff | high
 }
 
+/// Why `stack_width_kind` refused to admit a stack-touching kind.
+///
+/// One variant per REFUSING arm inside `stack_width_kind`, named for the cell that arm would
+/// have to build to admit it (`PushDwordSs16` etc.), plus `Other` for the `_ => ...` residue --
+/// spelled out rather than folded into a named cell so a non-zero reading there is visible on
+/// its own, per the design note's standing rule (`dev_docs/descent2-l1-stack-width-design-2026-08-30.md`
+/// §2(H)).
+///
+/// `ControlTargetLimit` and `SegmentAccess` are NOT produced by this function -- they name the
+/// second `RetryCause::AdmissionMatrix` producer, the `!control_target_ok ||
+/// !kind_segment_access_supported` check that runs after this one in the compile walk. They live
+/// on this enum because both producers feed the same census block (`stack_width_declines`) and
+/// the whole point of the instrument is telling the two apart.
+///
+/// Compiled unconditionally, not behind `direct-admission-census`: computing WHICH reason a
+/// refusal was is a compile-walk-only classification with no allocation and no side table, so it
+/// costs nothing worth gating. What the feature gates is RECORDING the reason -- the per-reason
+/// tally and the per-site map on `DirectBarrierCensus` -- which is where the cost of this
+/// instrument actually lives. Plain builds ignore the payload (`stack_width_kind(..).ok()` at the
+/// suffix scan; the compile walk's `Err(reason)` arm records only under the feature) and the
+/// optimizer drops the dead tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "direct-admission-census"), allow(dead_code))]
+pub(crate) enum StackWidthDecline {
+    PushDwordSs16,
+    PopDwordSs16,
+    RetDwordSs16,
+    CallDwordSs16,
+    LeaveDwordSs16,
+    PushWordSs32,
+    PopWordSs32,
+    RetWordSs32,
+    CallWordSs32,
+    EnterNonWord,
+    RetFarNonWord,
+    PopSegRealPmode,
+    PopSegRealWidth,
+    Other,
+    ControlTargetLimit,
+    SegmentAccess,
+}
+
+#[cfg_attr(not(feature = "direct-admission-census"), allow(dead_code))]
+impl StackWidthDecline {
+    pub(crate) const ALL: [Self; 16] = [
+        Self::PushDwordSs16,
+        Self::PopDwordSs16,
+        Self::RetDwordSs16,
+        Self::CallDwordSs16,
+        Self::LeaveDwordSs16,
+        Self::PushWordSs32,
+        Self::PopWordSs32,
+        Self::RetWordSs32,
+        Self::CallWordSs32,
+        Self::EnterNonWord,
+        Self::RetFarNonWord,
+        Self::PopSegRealPmode,
+        Self::PopSegRealWidth,
+        Self::Other,
+        Self::ControlTargetLimit,
+        Self::SegmentAccess,
+    ];
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::PushDwordSs16 => "push_dword_ss16",
+            Self::PopDwordSs16 => "pop_dword_ss16",
+            Self::RetDwordSs16 => "ret_dword_ss16",
+            Self::CallDwordSs16 => "call_dword_ss16",
+            Self::LeaveDwordSs16 => "leave_dword_ss16",
+            Self::PushWordSs32 => "push_word_ss32",
+            Self::PopWordSs32 => "pop_word_ss32",
+            Self::RetWordSs32 => "ret_word_ss32",
+            Self::CallWordSs32 => "call_word_ss32",
+            Self::EnterNonWord => "enter_non_word",
+            Self::RetFarNonWord => "ret_far_non_word",
+            Self::PopSegRealPmode => "pop_seg_real_pmode",
+            Self::PopSegRealWidth => "pop_seg_real_width",
+            Self::Other => "other",
+            Self::ControlTargetLimit => "control_target_limit",
+            Self::SegmentAccess => "segment_access",
+        }
+    }
+}
+
 fn stack_width_kind(
     cpu: &CpuGsw,
     kind: DirectKind,
     operand_size: OperandSize,
-) -> Option<DirectKind> {
+) -> Result<DirectKind, StackWidthDecline> {
     // PUSHFD checks IOPL in V86 and can raise #GP there (`check_v86_iopl`, execute.rs 0x9C).
     // The emitted form has no fault path, so refuse it outright when compiling in V86. That is
     // sound rather than merely cautious: V86 is bit 2 of `jit_mode_key`, so a block compiled
@@ -6469,7 +6555,7 @@ fn stack_width_kind(
             source: StoreSource::Flags { .. },
         } => {
             if cpu.is_v86_mode() {
-                return None;
+                return Err(StackWidthDecline::Other);
             }
             DirectKind::Push {
                 source: StoreSource::Flags {
@@ -6523,34 +6609,34 @@ fn stack_width_kind(
             }
         }
         DirectKind::PopSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
-            return None;
+            return Err(StackWidthDecline::PopSegRealPmode);
         }
         other => other,
     };
     match (kind, cpu.stack_is_32bit(), operand_size) {
-        (kind, _, _) if !kind.uses_stack() => Some(kind),
+        (kind, _, _) if !kind.uses_stack() => Ok(kind),
         // `PopSegReal` is matched BEFORE the blanket 32-bit-stack arm below, because it is the one
         // stack kind with no 32-bit shape at all: `classify` refuses it at Dword, so the arm below
         // could never wave it through, but a future edit that admitted the Dword form would
         // otherwise reach an emitter that only knows the 16-bit one. Refusing here says so.
         (DirectKind::PopSegReal { segment }, false, OperandSize::Word) => {
-            Some(DirectKind::PopSegReal { segment })
+            Ok(DirectKind::PopSegReal { segment })
         }
-        (DirectKind::PopSegReal { .. }, _, _) => None,
+        (DirectKind::PopSegReal { .. }, _, _) => Err(StackWidthDecline::PopSegRealWidth),
         // ENTER, matched BEFORE the blanket 32-bit-stack arm below for the reason `PopSegReal` is:
         // `classify` refuses the Dword operand form, so nothing could reach that arm today, but a
         // future admission of the Dword form would otherwise be waved through to an emitter that
         // only knows the Word one. Both stack widths are built, and each carries its own pointer
         // arithmetic in the emitter.
         (DirectKind::Enter16 { alloc, .. }, stack32, OperandSize::Word) => {
-            Some(DirectKind::Enter16 { alloc, stack32 })
+            Ok(DirectKind::Enter16 { alloc, stack32 })
         }
-        (DirectKind::Enter16 { .. }, _, _) => None,
+        (DirectKind::Enter16 { .. }, _, _) => Err(StackWidthDecline::EnterNonWord),
         // RETF, real mode and V86 only (`retf_admitted_here` already decided that). ONE cell has
         // an emitter: a 16-bit stack at Word operand size, which is two word pops and a 16-bit
         // `SP += 4 + release`.
         (DirectKind::RetFar { release }, false, OperandSize::Word) => {
-            Some(DirectKind::RetFar16 { release })
+            Ok(DirectKind::RetFar16 { release })
         }
         // Spelled out ABOVE the blanket 32-bit-stack arm below, for the reason `PopSegReal` and
         // `Enter16` state: nothing can reach that arm today, because `retf_admitted_here` refuses
@@ -6558,22 +6644,22 @@ fn stack_width_kind(
         // never becomes a slot. But a future admission of the Dword form would otherwise be waved
         // through to an emitter that only knows the 16-bit shape -- four bytes popped with a
         // 16-bit pointer, and a 32-bit offset written into a segment whose limit is 0xFFFF.
-        (DirectKind::RetFar { .. }, _, _) => None,
+        (DirectKind::RetFar { .. }, _, _) => Err(StackWidthDecline::RetFarNonWord),
         // LEAVE's Word cells, both stack widths. The Dword cell on a 32-bit stack is the blanket
         // arm below.
-        (DirectKind::Leave, stack32, OperandSize::Word) => Some(DirectKind::Leave16 { stack32 }),
+        (DirectKind::Leave, stack32, OperandSize::Word) => Ok(DirectKind::Leave16 { stack32 }),
         // The fourth cell, spelled out rather than left to `_ => None`: a Dword LEAVE on a 16-bit
         // stack would read four bytes and advance four with a 16-bit pointer, and no emitter
         // builds that. A silent fallthrough is the same answer for as long as no arm below
         // happens to match `Leave`, which is a property of the arm order rather than a decision.
-        (DirectKind::Leave, false, OperandSize::Dword) => None,
-        (kind, true, OperandSize::Dword) => Some(kind),
+        (DirectKind::Leave, false, OperandSize::Dword) => Err(StackWidthDecline::LeaveDwordSs16),
+        (kind, true, OperandSize::Dword) => Ok(kind),
         (DirectKind::Push { source }, false, OperandSize::Word) => {
-            Some(DirectKind::Push16 { source })
+            Ok(DirectKind::Push16 { source })
         }
-        (DirectKind::Pop { dst }, false, OperandSize::Word) => Some(DirectKind::Pop16 { dst }),
+        (DirectKind::Pop { dst }, false, OperandSize::Word) => Ok(DirectKind::Pop16 { dst }),
         (DirectKind::Ret { release }, false, OperandSize::Word) => {
-            Some(DirectKind::Ret16 { release })
+            Ok(DirectKind::Ret16 { release })
         }
         (
             DirectKind::Call {
@@ -6582,11 +6668,32 @@ fn stack_width_kind(
             },
             false,
             OperandSize::Word,
-        ) => Some(DirectKind::Call16 {
+        ) => Ok(DirectKind::Call16 {
             return_delta,
             target_delta,
         }),
-        _ => None,
+        // The residue: every stack-touching kind not named above, at the (SS.B, operand size)
+        // cross the explicit arms did not cover. Four of these ARE the missing cells the design
+        // note's §2(H) instrument exists to attribute (a Dword push/pop/ret/call on a 16-bit
+        // stack, a Word push/pop/ret/call on a 32-bit stack); everything else -- `PushMem`,
+        // `CallReg`, `CallMem`, or a combination none of the arms above name -- falls to `Other`,
+        // spelled out rather than silently folded into a named cell so a non-zero reading there
+        // is visible on its own.
+        (kind, stack32, size) => Err(match (kind, stack32, size) {
+            (DirectKind::Push { .. }, false, OperandSize::Dword) => {
+                StackWidthDecline::PushDwordSs16
+            }
+            (DirectKind::Pop { .. }, false, OperandSize::Dword) => StackWidthDecline::PopDwordSs16,
+            (DirectKind::Ret { .. }, false, OperandSize::Dword) => StackWidthDecline::RetDwordSs16,
+            (DirectKind::Call { .. }, false, OperandSize::Dword) => {
+                StackWidthDecline::CallDwordSs16
+            }
+            (DirectKind::Push { .. }, true, OperandSize::Word) => StackWidthDecline::PushWordSs32,
+            (DirectKind::Pop { .. }, true, OperandSize::Word) => StackWidthDecline::PopWordSs32,
+            (DirectKind::Ret { .. }, true, OperandSize::Word) => StackWidthDecline::RetWordSs32,
+            (DirectKind::Call { .. }, true, OperandSize::Word) => StackWidthDecline::CallWordSs32,
+            _ => StackWidthDecline::Other,
+        }),
     }
 }
 
@@ -7479,9 +7586,29 @@ fn compile_with_budget(
         // `classify` cannot make this decision: it has no `cpu`, and SS.B is CPU state. Deciding
         // it here is safe against block reuse because `jit_mode_key` already carries SS.B, so a
         // block compiled for one stack width can never be entered with the other.
-        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
-            stop = CompileStop::Retry(RetryCause::AdmissionMatrix);
-            break;
+        let kind = match stack_width_kind(cpu, kind, insn.operand_size) {
+            Ok(kind) => kind,
+            Err(reason) => {
+                // Counted only on the full-length pass, for the same reason the word-control
+                // counters just above are: `compile_with_page_len` re-enters this walk once per
+                // step of a binary search whenever the emitted block overflows a host page, and a
+                // shorter prefix reaches this same instruction again, so counting every pass would
+                // both multiply the total and could flip admitted/refused for one block between
+                // passes.
+                #[cfg(feature = "direct-admission-census")]
+                if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                    && cpu.jit_direct.barrier_census_enabled()
+                {
+                    cpu.jit_direct
+                        .note_stack_width_decline(reason, key.linear());
+                }
+                // Plain builds compute the reason (it is free, see `StackWidthDecline`'s own
+                // doc) but never record it; without this the binding is unused there.
+                #[cfg(not(feature = "direct-admission-census"))]
+                let _ = reason;
+                stop = CompileStop::Retry(RetryCause::AdmissionMatrix);
+                break;
+            }
         };
         // The governor's answer, applied at compile time instead of at every execution. A slot it
         // demoted has exactly one behaviour left -- test the byte, take the abnormal exit, hand
@@ -7578,6 +7705,20 @@ fn compile_with_budget(
             }
         }
         if !control_target_ok || !kind_segment_access_supported(cpu, kind) {
+            // Second producer of `RetryCause::AdmissionMatrix` (design note §0(c)). Same
+            // full-length-pass gate as the first producer above, for the same reason.
+            #[cfg(feature = "direct-admission-census")]
+            if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+                && cpu.jit_direct.barrier_census_enabled()
+            {
+                let reason = if !control_target_ok {
+                    StackWidthDecline::ControlTargetLimit
+                } else {
+                    StackWidthDecline::SegmentAccess
+                };
+                cpu.jit_direct
+                    .note_stack_width_decline(reason, key.linear());
+            }
             stop = CompileStop::Retry(RetryCause::AdmissionMatrix);
             break;
         }
@@ -30263,7 +30404,7 @@ fn census_native_suffix(
         {
             break;
         }
-        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size) else {
+        let Some(kind) = stack_width_kind(cpu, kind, insn.operand_size).ok() else {
             break;
         };
         // The demoted-site stop, mirrored from the compile walk. A slot the governor demoted is a
@@ -31965,6 +32106,37 @@ pub(crate) struct DirectBarrierCensus {
     #[cfg(feature = "direct-admission-census")]
     /// Partial attribution of dispatcher declines. Other routes remain outside this array.
     admission_declines: [u64; AdmissionDecline::COUNT],
+    /// Per-reason tally of `RetryCause::AdmissionMatrix`, split between the two producers
+    /// `stack_width_kind` and the `control_target`/`segment_access` check that runs after it in
+    /// the compile walk (design note `dev_docs/descent2-l1-stack-width-design-2026-08-30.md`
+    /// §0(c), §2(H)).
+    ///
+    /// Recorded ONLY on the full-length compile pass (`instruction_limit >=
+    /// MAX_BLOCK_INSTRUCTIONS`), the same gate the word-control counters use, and for the same
+    /// reason: `compile_with_page_len` re-enters the walk once per binary-search step, and a
+    /// shorter prefix that reaches the same refusing instruction would otherwise be tallied again.
+    #[cfg(feature = "direct-admission-census")]
+    stack_width_declines: [u64; StackWidthDecline::COUNT],
+    /// Bounded per-site attribution: block entry linear (`key.linear()`) -> the LAST reason and
+    /// how many times this site produced it. Answers "267 keys" turned into "267 addresses", and
+    /// whether the 123.9M hits are one hot loop or many cold ones.
+    ///
+    /// Keyed on linear alone, the same caveat `rejected_sites` and `dormant_heat_sites` carry:
+    /// two spans sharing a linear across mode/physical merge into one row, and the reason
+    /// recorded is whichever one was seen LAST for that key, not a per-reason breakdown at the
+    /// site. That is sufficient for the question this instrument answers (is the population one
+    /// loop or many, and which cell) without a nested map.
+    #[cfg(feature = "direct-admission-census")]
+    stack_width_decline_sites: HashMap<u32, StackWidthDeclineSite>,
+}
+
+/// One `stack_width_declines` site: the last decline reason seen at this block entry, and how
+/// many compile-walk full-length passes produced it.
+#[cfg(feature = "direct-admission-census")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StackWidthDeclineSite {
+    reason: StackWidthDecline,
+    count: u64,
 }
 
 /// The two exit columns of one `dormant_heat` site. Mirrors `BarrierStats`'s static/dynamic split.
@@ -32003,11 +32175,33 @@ pub(crate) mod lane_probe {
 #[cfg(feature = "barrier-census-closure")]
 pub(crate) const DORMANT_HEAT_SITES: usize = 64;
 
+/// How many `stack_width_declines` sites the snapshot publishes, same cap and same reasoning as
+/// `DORMANT_HEAT_SITES`: the tail is dropped rather than summed here because the per-reason
+/// tally (`stack_width_declines`) already carries the exact class total independent of head size
+/// -- unlike `dormant_heat_sites`, this list has no closure identity to preserve.
+#[cfg(feature = "direct-admission-census")]
+pub(crate) const STACK_WIDTH_DECLINE_SITES: usize = 64;
+
 impl DirectBarrierCensus {
     #[cfg(feature = "direct-admission-census")]
     fn note_admission_decline(&mut self, kind: AdmissionDecline) {
         self.admission_declines[kind as usize] =
             self.admission_declines[kind as usize].saturating_add(1);
+    }
+
+    /// One `RetryCause::AdmissionMatrix` refusal, at either producer. `linear` is `key.linear()`
+    /// -- the compiling block's entry, not the refusing instruction's own address, matching the
+    /// `dormant_heat_sites` / `rejected_sites` keying convention.
+    #[cfg(feature = "direct-admission-census")]
+    fn note_stack_width_decline(&mut self, reason: StackWidthDecline, linear: u32) {
+        self.stack_width_declines[reason as usize] =
+            self.stack_width_declines[reason as usize].saturating_add(1);
+        let site = self
+            .stack_width_decline_sites
+            .entry(linear)
+            .or_insert(StackWidthDeclineSite { reason, count: 0 });
+        site.reason = reason;
+        site.count = site.count.saturating_add(1);
     }
 
     fn note_unbound(&mut self, kind: UnboundTarget) {
@@ -32291,7 +32485,43 @@ impl DirectBarrierCensus {
                 .iter()
                 .map(|kind| (kind.label(), self.admission_declines[*kind as usize]))
                 .collect(),
+            #[cfg(feature = "direct-admission-census")]
+            stack_width_declines: StackWidthDecline::ALL
+                .iter()
+                .map(|kind| (kind.label(), self.stack_width_declines[*kind as usize]))
+                .collect(),
+            #[cfg(feature = "direct-admission-census")]
+            stack_width_decline_sites: self.stack_width_decline_site_snapshot(),
+            #[cfg(feature = "direct-admission-census")]
+            stack_width_decline_distinct_sites: self.stack_width_decline_sites.len() as u64,
         }
+    }
+
+    /// Top-`DORMANT_HEAT_SITES` `stack_width_declines` sites, descending by count. Same head-cap
+    /// convention as `dormant_heat_sites` / `rejected_sites`, so "267 keys" becomes a bounded,
+    /// deterministically ordered list of addresses instead of an unread 267-entry dump.
+    #[cfg(feature = "direct-admission-census")]
+    fn stack_width_decline_site_snapshot(&self) -> Vec<crate::StackWidthDeclineSite> {
+        let mut sites: Vec<_> = self
+            .stack_width_decline_sites
+            .iter()
+            .map(|(&linear, &site)| (linear, site))
+            .collect();
+        sites.sort_by(|(left_linear, left), (right_linear, right)| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left_linear.cmp(right_linear))
+        });
+        sites.truncate(STACK_WIDTH_DECLINE_SITES);
+        sites
+            .into_iter()
+            .map(|(linear, site)| crate::StackWidthDeclineSite {
+                linear,
+                reason: site.reason.label(),
+                count: site.count,
+            })
+            .collect()
     }
 }
 
@@ -32366,6 +32596,13 @@ impl crate::jit::JitState {
     pub(crate) fn note_admission_decline(&mut self, kind: AdmissionDecline) {
         if let Some(census) = self.direct_barrier_census.as_mut() {
             census.note_admission_decline(kind);
+        }
+    }
+
+    #[cfg(feature = "direct-admission-census")]
+    pub(crate) fn note_stack_width_decline(&mut self, reason: StackWidthDecline, linear: u32) {
+        if let Some(census) = self.direct_barrier_census.as_mut() {
+            census.note_stack_width_decline(reason, linear);
         }
     }
 

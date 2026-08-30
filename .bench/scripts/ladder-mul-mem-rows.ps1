@@ -188,6 +188,14 @@ $fixtures = @{
         injection = @("--inject-keys", "3000000000:{esc};4000000000:{esc}")
         cdImage   = "descent2_cd\DESCENT_II.cue"
     }
+    # duke LONG: the guest exits itself through EXITVM (~140-165 s wall); the
+    # cycle figure is the scoreboard's guard budget, not the run length.
+    "duke3d-586"        = @{
+        folder    = "duke3d_c"
+        arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+        cycles    = "79680000000"
+        injection = @()
+    }
     "wolf3d-586"        = @{
         folder    = "wolf3d_c"
         arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
