@@ -22,7 +22,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 3 | +K Cheiw | k-cheiw | 486 | PROFILED | 4.92 | 0.967 | Spanish VGA platformer; at target; census total_unbound only 60K; game-port probe on open bus 0x216-0x21e |
 | 4 | 007 - License to Kill | 007-license-to-kill | 486 | BLOCKED | 0.61 | 0.073 | FiRM cracktro only; BOND.COM has no path into the game. An agent-reported JIT-vs-interpreter divergence did NOT reproduce: a controlled 3-arm A/B (arm on / arm off / --interpreter, equal key schedule) produced bit-identical end frames, sha ad1bd224 |
 | 5 | 1 Ton | 1-ton | 486 | PROFILED | 17.91 | 0.787 | Mouse-only arcade; needs TOKAMOUS (-Mouse); real weight-drag interaction in window; mostly idle (~1M insns/guest-s) |
-| 6 | 1000 Miglia | 1000-miglia | 486 | FLAGGED | 0.60 | 0.382 | Simulmondo racer; live driving 213-350s behind code-wheel; PIT latch-poll STORM 1.28M writes/guest-s + IRET domination, see F2 |
+| 6 | 1000 Miglia | 1000-miglia | 486 | FLAGGED | 1.80* | 0.583* | Simulmondo racer; live driving 213-350s behind code-wheel; PIT storm repriced by #776 (was rt 0.60/cov 0.38); remaining deficit is F1 reflection, see F2 |
 | 7 | 10Rogue | 10rogue | 486 | FLAGGED | 1.41 | 0.787 | Text-mode roguelike; dungeon gameplay; F1 class: dword IRET 16.0M of 19.4M census total, single site; no PIT storm |
 | 8 | 10th Frame | 10th-frame | 486 | FLAGGED | 3.71 | 0.960 | CGA bowling; frames 1-2 played; F1 class: dword IRET 10.4M, near-total; coverage healthy, so F1 is the whole story |
 | 9 | 123-TALK (Shareware) | 123-talk-shareware | 486 | FLAGGED | 2.59 | 0.852 | Counting edutainment, EGA 640x350; two rounds played with speech; below target with a SMALL census (IRET 340K) - the load is the 2 kHz IRQ0 speech clock (240,709 edges/120s) plus OUT DX,AL sample writes; pit 32K/s, no storm |
@@ -121,6 +121,21 @@ row's budget, so the wait-state flip rewrites every 1000 Miglia number.
 The other flagged games (pyramid 17K pit writes, 21 and 10rogue near
 zero) are predicted INERT to the flip - more than 1% instruction movement
 on their post-flip re-runs refutes the prediction.
+
+**Post-flip re-runs (era 0885da4c, exe 4f3381cf0b7d, label
+`census-post776`): the prediction held on both sides.**
+
+- 1000-miglia: rewritten as predicted. instructions -45.6%, pit_writes
+  448.7M -> 46.9M, rt 0.598 -> 1.802, coverage 0.383 -> 0.583. irq0_edges
+  IDENTICAL (179,747), so guest timing held. Still below the 5.0 target,
+  and the census total is unchanged (~8.6M, IRET-dominated): what remains
+  after the wait-state repricing is the F1 reflection population.
+- 100-000-pyramid: instructions -0.03% - inert, as predicted.
+- 21-for-1-to-4: instructions -0.00% - inert, as predicted.
+
+The flagged-row rt/coverage columns in the table above are pre-flip
+numbers for rows 1-10; the F1 population and coverage columns carry over
+unchanged on the two inert games.
 
 ## Write-backs from the performance campaign
 
