@@ -1,0 +1,10 @@
+{
+  "game": "''21'' For 1 to 4",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "214124.EXE",
+  "inject_keys": "330000000:n\\r;990000000:1\\r;1320000000:c\\r",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "No game.bat; 214124.exe is the QuickBASIC 3.0 (brun30.exe) blackjack game itself. Title/copyright screen asks 'Instructions? (y/n)' -> 'n\\r' declines. Next screen asks 'NUMBER OF PLAYERS >' -> '1\\r'. Then '(P)lay or (C)omputer play mode >' -> 'c\\r' selects Computer play mode, which deals and auto-plays hit/stand/split/double-down decisions for all four seats (P1-P4) continuously without further input, dealing hand after hand for the rest of the run. Profile window covers: title screen dismissal -> setup prompts -> continuous unattended multi-hand blackjack gameplay (deal, hit, stand, split, double-down, payout) holding through end of the 120s window. Video is CGA graphics (320x200x4), text/card UI, no CGA-only-audio or Tandy dependency."
+}

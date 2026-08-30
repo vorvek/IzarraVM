@@ -1,0 +1,10 @@
+{
+  "game": "+K Cheiw",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "MASKA.EXE",
+  "inject_keys": "528000000:\\r",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "No game.bat; MASKA.EXE is the game itself, a Spanish +K Cheiw chewing-gum promotional platformer (Antonio Artigas / Luis Crespo / Luis Ubeda, mid-1990s). Boots straight to a hand-drawn Margo splash menu (OPCIONES.../JUGAR/INSTRUCCIONES/SALIR) by guest 5s; a single Enter at 8s (528000000 cycles) selects JUGAR by default and the game switches from the Margo splash to VGA mode13h (320x200x8, legacy_video_mode Mode13h) gameplay: a side-view street level with the Cheiw mascot, a HUD (PUNTOS score, lives, ENERGIA bar) and an animated purple alien enemy. No movement keys were injected (tested holding {+right}; the on-screen state at t+60s was identical to the unmoved run, so the visible screen is a single non-scrolling combat encounter rather than a scrolling level, and movement did not change the observed phase). With the player idle the enemy drains ENERGIA and the run ends in a GAME OVER screen at the very end of the 120s window (visible in end-frame.ppm) -- the profile window covers title/menu dismissal -> live platformer gameplay (HUD ticking, enemy AI, score/lives updates) for the bulk of the run, ending in the game's own game-over screen, not a hang or crash. LEEME.DOC (README) says the game wants HIMEM.SYS+EMM386 and >=3MB free XMS, and defaults to Sound Blaster if detected (SB 220/7/1 matches the harness default); none of that required extra CONFIG.SYS lines here. Only 486 was tried (real-mode-era VGA platformer, no 3D/protected-mode need)."
+}

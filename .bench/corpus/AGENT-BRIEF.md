@@ -49,7 +49,7 @@ View a screen: `magick <file>.ppm <file>.png`, then Read the PNG.
    plays at 486, that is a finding; record it.
 5. Deep profile: one run of 120 guest seconds or more, schedule in place, NO
    screen dumps, `-Label deep`. Add `-BarrierCensus` when the probe showed
-   rt below 1.0. Confirm gameplay actually held: check `end-frame.ppm`.
+   rt below the persona target: below 5.0 at 486, below 2.0 at 586. Confirm gameplay actually held: check `end-frame.ppm`.
 6. Write the recipe to `D:\dev\IzarraVM\.bench\corpus\games\<slug>.json`:
 
 ```json
@@ -85,6 +85,10 @@ From the deep run's `profile.json`, top level unless noted:
 rt numbers are INFORMATIONAL triage, not gated measurements; other sessions
 may load the host. Do not tune schedules by rt. Deterministic counters are
 trustworthy regardless of load.
+
+The performance targets: 486 should reach rt 5.0 or more, 586 should reach
+rt 2.0. A deep run below its target is a FINDING. Report it as such, and
+include the barrier-census evidence.
 
 ## Traps
 

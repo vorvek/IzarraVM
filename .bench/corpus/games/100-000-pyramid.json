@@ -1,0 +1,10 @@
+{
+  "game": "$100,000 Pyramid",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "CALL GAME.BAT",
+  "inject_keys": "330000000:\\r;660000000:\\r;990000000:1;1320000000:B;1650000000:JON\\r;1980000000:1;2310000000:R;2640000000:DANDELION\\r;2970000000:\\r;3300000000:\\r",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "bo_title.exe intro (dismissed with two Enters) hands off to pyramid.exe: 'Press any key to Play' auto-advances to the main menu, '1' picks 1 Player Contest, 'B' picks Beginner difficulty, 'JON\\r' enters the player name, then '1' selects the first category on the pyramid board ('Come On Up'). 'R' starts the round's clue-giving screen (timer bar visible), and a dummy clue 'DANDELION\\r' is submitted so the computer partner guesses and the round scores, returning to the category board with one category marked complete. The trailing two no-op Enters are harmless leftovers from schedule iteration. Profile window covers: intro -> menu navigation -> name entry -> one full quiz round (clue entry, computer guess, scoring) -> idle at the category board for the remainder of the 120s window."
+}
