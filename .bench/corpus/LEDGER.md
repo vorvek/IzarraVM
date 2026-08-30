@@ -26,6 +26,7 @@ reach rt 2.0. A row below target is FLAGGED with census evidence below.
 | 7 | 10Rogue | 10rogue | 486 | FLAGGED | 1.41 | 0.787 | Text-mode roguelike; dungeon gameplay; F1 class: dword IRET 16.0M of 19.4M census total, single site; no PIT storm |
 | 8 | 10th Frame | 10th-frame | 486 | FLAGGED | 3.71 | 0.960 | CGA bowling; frames 1-2 played; F1 class: dword IRET 10.4M, near-total; coverage healthy, so F1 is the whole story |
 | 9 | 123-TALK (Shareware) | 123-talk-shareware | 486 | FLAGGED | 2.59 | 0.852 | Counting edutainment, EGA 640x350; two rounds played with speech; below target with a SMALL census (IRET 340K) - the load is the 2 kHz IRQ0 speech clock (240,709 edges/120s) plus OUT DX,AL sample writes; pit 32K/s, no storm |
+| 10 | 15 Move Hole Puzzle | 15-move-hole-puzzle | 486 | FLAGGED | 1.10 | 0.686 | Mode-13h sliding puzzle; 5 moves played then idle board; F1 class: IRET 23.5M of 24.6M; far-CALL word row 1.08M second |
 
 ## Findings for the performance campaign
 
@@ -68,7 +69,8 @@ orders of magnitude lower - which corroborates the diagnosis.
 Members so far (games whose census the dword-IRET site dominates):
 100-000-pyramid (26.4M), 21-for-1-to-4 (23.3M), 1000-miglia (8.25M, see
 F2), 10rogue (16.0M), 10th-frame (10.4M at coverage 0.96 - the clean
-demonstration that F1 alone can hold a game under target). The population grows with nearly every below-target
+demonstration that F1 alone can hold a game under target),
+15-move-hole-puzzle (23.5M). The population grows with nearly every below-target
 real-mode game; new members get a ledger-row note instead of a new finding.
 
 **Attribution (2026-08-30, control run):** the dword IRET is the TOKAEMM
