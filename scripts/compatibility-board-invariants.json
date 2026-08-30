@@ -1,1 +1,549 @@
-{}
+{
+  "pinball-fantasies-486": {
+    "colors_min": 56,
+    "colors_max": 256,
+    "nonblack_min": 65.0,
+    "nonblack_max": 97.0,
+    "instructions": 3264793270,
+    "census": {
+      "distira": [],
+      "distira_scanout": {
+        "aux_base": 1228800,
+        "back_base": 614400,
+        "buffer_stride": 614400,
+        "color_pixels_stored": 0,
+        "display_enabled": false,
+        "fbz_mode": 0,
+        "frame_store_bytes": 2097152,
+        "front_base": 0,
+        "height": 480,
+        "lfb_mode": 0,
+        "painted_by_buffer": [
+          0,
+          0,
+          614400
+        ],
+        "painted_bytes": 614400,
+        "pending_swaps": 0,
+        "pitch": 1280,
+        "retrace_count": 6000,
+        "scanout_base": 0,
+        "swaps_issued": 0,
+        "triangles_drawn": 0,
+        "width": 640
+      },
+      "schema": "izarravm-mode-census-v1",
+      "vga": [
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 3,
+          "hdisp_end": 720,
+          "line_compare_active": false,
+          "mode": "Text",
+          "source_lines": 400,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 5,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "Mode13h",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 11,
+          "hdisp_end": 640,
+          "line_compare_active": false,
+          "mode": "Planar",
+          "source_lines": 480,
+          "vdisp_end": 480,
+          "vtotal": 525
+        },
+        {
+          "bpp": 4,
+          "double_scan": true,
+          "entries": 2,
+          "hdisp_end": 640,
+          "line_compare_active": false,
+          "mode": "Planar",
+          "source_lines": 240,
+          "vdisp_end": 480,
+          "vtotal": 525
+        },
+        {
+          "bpp": 4,
+          "double_scan": true,
+          "entries": 396,
+          "hdisp_end": 640,
+          "line_compare_active": false,
+          "mode": "Planar",
+          "source_lines": 240,
+          "vdisp_end": 480,
+          "vtotal": 527
+        },
+        {
+          "bpp": 8,
+          "double_scan": false,
+          "entries": 4,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 350,
+          "vdisp_end": 350,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": false,
+          "entries": 1,
+          "hdisp_end": 320,
+          "line_compare_active": true,
+          "mode": "ModeX",
+          "source_lines": 350,
+          "vdisp_end": 350,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 2,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 271
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 7,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 8,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 527
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 6,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 240,
+          "vdisp_end": 480,
+          "vtotal": 527
+        },
+        {
+          "bpp": 8,
+          "double_scan": false,
+          "entries": 3,
+          "hdisp_end": 360,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 350,
+          "vdisp_end": 350,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": false,
+          "entries": 2,
+          "hdisp_end": 360,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 400,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 3,
+          "hdisp_end": 360,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        }
+      ]
+    }
+  },
+  "keen4-486": {
+    "colors_min": 8,
+    "colors_max": 256,
+    "nonblack_min": 74.2,
+    "nonblack_max": 100.0,
+    "instructions": 3903459255,
+    "census": {
+      "distira": [],
+      "distira_scanout": {
+        "aux_base": 1228800,
+        "back_base": 614400,
+        "buffer_stride": 614400,
+        "color_pixels_stored": 0,
+        "display_enabled": false,
+        "fbz_mode": 0,
+        "frame_store_bytes": 2097152,
+        "front_base": 0,
+        "height": 480,
+        "lfb_mode": 0,
+        "painted_by_buffer": [
+          0,
+          0,
+          614400
+        ],
+        "painted_bytes": 614400,
+        "pending_swaps": 0,
+        "pitch": 1280,
+        "retrace_count": 9090,
+        "scanout_base": 0,
+        "swaps_issued": 0,
+        "triangles_drawn": 0,
+        "width": 640
+      },
+      "schema": "izarravm-mode-census-v1",
+      "vga": [
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 5,
+          "hdisp_end": 720,
+          "line_compare_active": false,
+          "mode": "Text",
+          "source_lines": 400,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 4,
+          "double_scan": true,
+          "entries": 1,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "Planar",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        }
+      ]
+    }
+  },
+  "jazz-486": {
+    "colors_min": 54,
+    "colors_max": 256,
+    "nonblack_min": 64.4,
+    "nonblack_max": 96.4,
+    "instructions": 1502848553,
+    "census": {
+      "distira": [],
+      "distira_scanout": {
+        "aux_base": 1228800,
+        "back_base": 614400,
+        "buffer_stride": 614400,
+        "color_pixels_stored": 0,
+        "display_enabled": false,
+        "fbz_mode": 0,
+        "frame_store_bytes": 2097152,
+        "front_base": 0,
+        "height": 480,
+        "lfb_mode": 0,
+        "painted_by_buffer": [
+          0,
+          0,
+          614400
+        ],
+        "painted_bytes": 614400,
+        "pending_swaps": 0,
+        "pitch": 1280,
+        "retrace_count": 7272,
+        "scanout_base": 0,
+        "swaps_issued": 0,
+        "triangles_drawn": 0,
+        "width": 640
+      },
+      "schema": "izarravm-mode-census-v1",
+      "vga": [
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 3,
+          "hdisp_end": 720,
+          "line_compare_active": false,
+          "mode": "Text",
+          "source_lines": 400,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 10,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "Mode13h",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 8,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 199,
+          "vdisp_end": 398,
+          "vtotal": 527
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 2,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 271
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 4,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 8,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "ModeX",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 527
+        }
+      ]
+    }
+  },
+  "koreatetris-486": {
+    "colors_min": 2,
+    "colors_max": 256,
+    "nonblack_min": 32.7,
+    "nonblack_max": 64.7,
+    "instructions": 4011764578,
+    "census": {
+      "distira": [],
+      "distira_scanout": {
+        "aux_base": 1228800,
+        "back_base": 614400,
+        "buffer_stride": 614400,
+        "color_pixels_stored": 0,
+        "display_enabled": false,
+        "fbz_mode": 0,
+        "frame_store_bytes": 2097152,
+        "front_base": 0,
+        "height": 480,
+        "lfb_mode": 0,
+        "painted_by_buffer": [
+          0,
+          0,
+          614400
+        ],
+        "painted_bytes": 614400,
+        "pending_swaps": 0,
+        "pitch": 1280,
+        "retrace_count": 7272,
+        "scanout_base": 0,
+        "swaps_issued": 0,
+        "triangles_drawn": 0,
+        "width": 640
+      },
+      "schema": "izarravm-mode-census-v1",
+      "vga": [
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 1,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "Text",
+          "source_lines": 200,
+          "vdisp_end": 200,
+          "vtotal": 262
+        },
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 3,
+          "hdisp_end": 720,
+          "line_compare_active": false,
+          "mode": "Text",
+          "source_lines": 400,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 2,
+          "double_scan": false,
+          "entries": 1,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "Cga",
+          "source_lines": 200,
+          "vdisp_end": 200,
+          "vtotal": 262
+        }
+      ]
+    }
+  },
+  "zone66-486": {
+    "colors_min": 6,
+    "colors_max": 256,
+    "nonblack_min": 79.1,
+    "nonblack_max": 100.0,
+    "instructions": 6637644760,
+    "census": {
+      "distira": [],
+      "distira_scanout": {
+        "aux_base": 1228800,
+        "back_base": 614400,
+        "buffer_stride": 614400,
+        "color_pixels_stored": 0,
+        "display_enabled": false,
+        "fbz_mode": 0,
+        "frame_store_bytes": 2097152,
+        "front_base": 0,
+        "height": 480,
+        "lfb_mode": 0,
+        "painted_by_buffer": [
+          0,
+          0,
+          614400
+        ],
+        "painted_bytes": 614400,
+        "pending_swaps": 0,
+        "pitch": 1280,
+        "retrace_count": 10909,
+        "scanout_base": 0,
+        "swaps_issued": 0,
+        "triangles_drawn": 0,
+        "width": 640
+      },
+      "schema": "izarravm-mode-census-v1",
+      "vga": [
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 3,
+          "hdisp_end": 720,
+          "line_compare_active": false,
+          "mode": "Text",
+          "source_lines": 400,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 8,
+          "double_scan": true,
+          "entries": 2,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "Mode13h",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        }
+      ]
+    }
+  },
+  "cabal-486": {
+    "colors_min": 8,
+    "colors_max": 256,
+    "nonblack_min": 76.1,
+    "nonblack_max": 100.0,
+    "instructions": 2829510474,
+    "census": {
+      "distira": [],
+      "distira_scanout": {
+        "aux_base": 1228800,
+        "back_base": 614400,
+        "buffer_stride": 614400,
+        "color_pixels_stored": 0,
+        "display_enabled": false,
+        "fbz_mode": 0,
+        "frame_store_bytes": 2097152,
+        "front_base": 0,
+        "height": 480,
+        "lfb_mode": 0,
+        "painted_by_buffer": [
+          0,
+          0,
+          614400
+        ],
+        "painted_bytes": 614400,
+        "pending_swaps": 0,
+        "pitch": 1280,
+        "retrace_count": 7272,
+        "scanout_base": 0,
+        "swaps_issued": 0,
+        "triangles_drawn": 0,
+        "width": 640
+      },
+      "schema": "izarravm-mode-census-v1",
+      "vga": [
+        {
+          "bpp": 4,
+          "double_scan": false,
+          "entries": 3,
+          "hdisp_end": 720,
+          "line_compare_active": false,
+          "mode": "Text",
+          "source_lines": 400,
+          "vdisp_end": 400,
+          "vtotal": 449
+        },
+        {
+          "bpp": 4,
+          "double_scan": true,
+          "entries": 1,
+          "hdisp_end": 320,
+          "line_compare_active": false,
+          "mode": "Planar",
+          "source_lines": 200,
+          "vdisp_end": 400,
+          "vtotal": 449
+        }
+      ]
+    }
+  }
+}
