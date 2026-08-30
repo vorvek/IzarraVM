@@ -1,0 +1,10 @@
+{
+  "game": "007 - License to Kill",
+  "cpu": "486",
+  "guest_seconds": 120,
+  "entry": "BOND.COM",
+  "inject_keys": "",
+  "inject_mouse": "",
+  "config_extra": [],
+  "notes": "No game.bat; BOND.COM is the only executable, a FiRM-crack copy of the 1989 Quixel/Domark game. BOND.COM never draws its own screen: it opens straight into a static EGA/VGA planar splash from 'The Software Surgeon' / THE FiRM cracktro ('Honour is the only CODE we won't break!'), cycling the credit-box border color, and holds there indefinitely with no schedule -- confirmed for a bare 200 guest-second run with zero int13 disk activity throughout, so it is not a slow load. Any single keypress (space, enter, digits, y/n, k/j, esc -- all tried) makes the screen jump to VGA text mode and go solid black except for a blinking hardware cursor; further keystrokes (including typed 'dir\\r') have zero visible effect for the rest of the run, at both 486 and 586. A manual --interpreter A/B run (bypassing this recipe) resolves what that black screen actually is: BOND.COM's crack stub prints 'Thanks for supporting THE FiRM!' and drops straight back to a normal 'C:\\GAME>' DOS prompt -- there is no jump into actual 007 game code, and no level ever loads from any LEVxx.EGA file. Under the native/JIT path the same DOS-return moment instead renders as a blank text page with the CPU busy (huge non-halted instruction counts, no int13 traffic) rather than idle at a prompt, and it never re-shows the AUTOEXEC loop's cracktro on subsequent iterations within a 200s window -- a native-path divergence from the interpreter worth flagging, distinct from this recipe's chosen fallback. Because BOND.COM itself has no code path into gameplay, the schedule here is intentionally empty: the deep profile just holds the color-cycling cracktro (the best -- and only -- reachable screen, an attract-demo per the brief's fallback rule) rather than chasing a keypress that leads to a dead end. Profile window covers 120s of the static cracktro loop only; no gameplay, no level, no menu was ever reached for this title."
+}

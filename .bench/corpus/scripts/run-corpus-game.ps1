@@ -33,6 +33,7 @@ param(
     [string[]]$ConfigExtra = @(),
     [switch]$NoLoop,
     [switch]$NoEmm,
+    [string[]]$EmuExtra = @(),
     [switch]$KeepScratch
 )
 
@@ -113,6 +114,7 @@ $emuArgs = @(
 if ($InjectKeys) { $emuArgs += @('--inject-keys', $InjectKeys) }
 if ($InjectMouse) { $emuArgs += @('--inject-mouse', $InjectMouse) }
 if ($CdImage) { $emuArgs += @('--cd-image', $CdImage) }
+if ($EmuExtra.Count -gt 0) { $emuArgs += $EmuExtra }
 if ($ScreenDumpMs -gt 0) {
     # Slices the run. A diagnostic for steering key schedules, never a benchmark.
     $dumpDir = Join-Path $resultDir 'screens'
