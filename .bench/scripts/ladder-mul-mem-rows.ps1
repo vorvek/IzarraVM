@@ -348,7 +348,11 @@ function Set-BaseEnvironment {
     $env:IZARRAVM_MUL_MEM_ROWS = "0"
     $env:IZARRAVM_LOOP_ROWS = "1"
     $env:IZARRAVM_RETRY_LIFT = "0"
-    $env:IZARRAVM_OUT_IMM8_ROWS = "0"
+    # Flipped ON with the same-night default flip (the 2026-08-30 gp2 ladder); pinned to the
+    # shipped arm. The RETRY_LIFT ladders earlier that night ran with this pin at "0" -- both
+    # their arms shared it, and duke3d-586-short carries no 0xE6 population, so those results
+    # stand.
+    $env:IZARRAVM_OUT_IMM8_ROWS = "1"
     foreach ($observer in @(
             "IZARRAVM_CPU_PROFILE", "IZARRAVM_CPU_PROFILE_ADDRS",
             "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_RIP_PROFILE",
