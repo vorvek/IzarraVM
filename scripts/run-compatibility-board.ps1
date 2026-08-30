@@ -225,26 +225,18 @@ function Get-RowTable {
             # music in game" and calls pause. The schedule has to answer it.
             targetMode = "Planar"; targetNote = ""
         }
-        [pscustomobject]@{
-            name = "tombraid3d-586"; folder = "tombraid3d_c"
-            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
-            # Glide, dynamic link. TOMB3D ships its own glide2x.ovl and a local
-            # OVL takes priority over the global one, so this row needs no file
-            # the repository cannot supply.
-            targetMode = "Distira"; targetNote = ""
-            cdImage = "tombraid3d_cd\tombeng.cue"
-        }
-        [pscustomobject]@{
-            name = "descent2-3dfx-586"; folder = "descent2_c"
-            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            cycles = $null; injectKeys = $null; injectMouse = $null
-            # Glide. run.bat is a two-level menu: choice /C:1234567 for the sound
-            # device, then choice /C:123 for the renderer, so 3DFX is the key
-            # pair `2` then `2`. Both link models are in the tree.
-            targetMode = "Distira"; targetNote = ""
-            cdImage = "descent2_cd\DESCENT_II.cue"
-        }
+        # The two Glide rows LEFT this board on 2026-08-30, when the Distira
+        # rasteriser started rendering and they became measurable. They are now
+        # `tombraid3d-586` and `descent2-3dfx-586` in
+        # scripts/run-fixture-scoreboard.ps1, where they carry a budget, an
+        # input schedule and a frame contract.
+        #
+        # They are not duplicated here on purpose. Each takes two to three
+        # minutes of wall time, and their frame contract already asserts
+        # `active_display = Distira` at the budget -- which is the only thing a
+        # row on THIS board would have proven. A board whose job is "did the
+        # guest reach this graphics mode" has nothing to add to a row that
+        # reaches the mode and then measures it for two more minutes.
     )
 }
 
@@ -803,7 +795,7 @@ if ($SelfTest) {
     $table = Get-RowTable
     $known = @($table | ForEach-Object { $_.name })
 
-    Assert-BoardEqual $known.Count 8 "row count"
+    Assert-BoardEqual $known.Count 6 "row count"
 
     $duplicates = $known | Group-Object | Where-Object { $_.Count -gt 1 }
     if ($duplicates) { throw "self-test: duplicate row name $($duplicates[0].Name)" }
@@ -811,7 +803,7 @@ if ($SelfTest) {
     $folders = $table | ForEach-Object { $_.folder } | Group-Object | Where-Object { $_.Count -gt 1 }
     if ($folders) { throw "self-test: two rows share the folder $($folders[0].Name)" }
 
-    Assert-BoardEqual (Resolve-RowSelection -Selection $null -KnownNames $known).Count 8 `
+    Assert-BoardEqual (Resolve-RowSelection -Selection $null -KnownNames $known).Count 6 `
         "an empty selection means every row"
     Assert-BoardEqual (Resolve-RowSelection -Selection @("jazz-486,keen4-486") -KnownNames $known).Count 2 `
         "the comma string splits"
@@ -827,8 +819,13 @@ if ($SelfTest) {
     if ($null -ne (Get-RowField -Row $table[0] -Name "cdImage")) {
         throw "self-test: pinball-fantasies-486 has no CD and must probe as null"
     }
-    if ($null -eq (Get-RowField -Row $table[6] -Name "cdImage")) {
-        throw "self-test: tombraid3d-586 must carry a cdImage"
+    # The PRESENT arm is proved on a synthetic row, not a table one. Every row
+    # on this board is CD-less since the two Glide rows moved to the fixture
+    # scoreboard, and a probe that can only ever return null is a probe whose
+    # other half is untested. Keep both arms.
+    $withCd = [pscustomobject]@{ name = "synthetic"; cdImage = "some_cd\disc.cue" }
+    if ((Get-RowField -Row $withCd -Name "cdImage") -ne "some_cd\disc.cue") {
+        throw "self-test: Get-RowField must return a cdImage that is present"
     }
 
     # ---- Grading, proved on synthetic values so no board run is needed. ----

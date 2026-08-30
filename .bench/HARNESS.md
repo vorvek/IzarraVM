@@ -32,6 +32,8 @@ the exception and runs DUKEMARK exactly once, then ends the VM itself with
 | `tyrian_setup_c` | 486 | Tyrian 2000 SETUP.EXE, settings menu + jukebox | the guest 70 Hz audio clock (PIT rewrite per frame + MPU-401 MIDI + DSP 0x14 chain); see PROTOCOL.md |
 | `tyrian_c` | 486, 586 | Tyrian 2000 gameplay, scripted to level 1 with fire held | same audio clock under play; the 586 row is the perf row |
 | `psycho_c` | **486** | Psycho Pinball, DOS/4GW, a table in play | the only row that replays its CRTC register table EVERY FRAME; grades the PUBLISHED frame, not a re-render |
+| `tombraid3d_c` | **586** | Tomb Raider Gold, 3dfx build, CD REQUIRED | the same game as `tombraid_c` with every pixel through GLIDE, so the two rows split a regression between engine and rasteriser |
+| `descent2_c` | **586** | Descent II, 3dfx patch, recorded demo, CD REQUIRED | the HEAVIER Glide row: rt 0.32 against Tomb Raider's 0.87, and it ships the byte-identical `glide2x.ovl` |
 
 `duke3d_short_c` is generated, not authored: `scripts/make-duke-short-fixture.ps1`
 writes it from `duke3d_c` by lowering the record count in BENCH2.DMO's header and
@@ -82,6 +84,28 @@ The game's sound config (`HMISET.CFG`) selects Sound Blaster 16 at 220/7/1
 with no MIDI device. `TOMBPATH.TXT` sits in `C:\` (17 bytes, NO trailing
 newline - the copy is byte-exact from the owner's install) and points the game
 at `C:\GAMES\TOMBRAID`.
+
+### The two Glide rows (added 2026-08-30)
+
+`tombraid3d_c` and `descent2_c` are the first fixtures that render through
+Distira. Full account in `PROTOCOL.md`; three things belong here.
+
+**The discs.** `tombraid3d_c` mounts `.bench/tombraid_cd/tombeng.cue`, the SAME
+image `tombraid_c` uses -- same game, same pressing, so a second 643 MB copy
+would buy nothing. `descent2_c` needs its own, `.bench/descent2_cd/`, 691 MB.
+
+**`descent2_c` deliberately omits the movies.** The three `.MVL` files are
+220 MB of the source tree's 266 MB, the row runs with `-nomovies`, and the
+scoreboard robocopies the whole fixture per run. Adding them back would cost
+more per run than the rest of the fixture put together.
+
+**Both rows carry an input schedule, and it is minimal on purpose.** Each 3dfx
+build waits for a keypress on a screen that shows nothing useful -- Tomb
+Raider's is BLACK -- and a run without the schedule reads exactly like a hung
+emulator, with every device counter frozen and the CPU still busy. But ONE key
+too many and Tomb Raider opens its ring menu and never starts the attract demo
+at all, so the row would pin a still picture and pass. The measured windows are
+in `PROTOCOL.md`.
 
 ### Psycho Pinball grades the PUBLISHED frame (added 2026-08-29)
 
