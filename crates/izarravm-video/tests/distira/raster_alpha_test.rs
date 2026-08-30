@@ -1797,3 +1797,43 @@ fn triangle_cmd_applies_fog_after_texture_color() {
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff31);
 }
+
+/// Tomb Raider's 3dfx build, and Glide itself, snap a screen coordinate to the
+/// 4-bit subpixel grid by ADDING a magic constant of 2^19 and writing the whole
+/// biased float to the vertex register. 2^19 gives the sum an ulp of 1/16, so
+/// the low 16 bits of the mantissa hold the 12.4 fixed-point coordinate.
+///
+/// The SST-1 latches only those 16 bits: it converts the float to 28.4 and
+/// TRUNCATES. A model that saturates instead turns every such vertex into
+/// 32767, which collapses the triangle to a point and rejects it for zero area.
+/// MEASURED before this test existed: 213,323 of Tomb Raider's 213,584
+/// triangles died that way.
+#[test]
+fn fvertex_truncates_a_magic_snapped_coordinate_instead_of_saturating() {
+    // 311.4375 + 524288.0. The low 16 bits are 0x1377 = 4983 = 311.4375 in 12.4.
+    let snapped = |x: f32| (x + 524288.0).to_bits();
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut distira, SST_FVERTEX_AX, snapped(0.0));
+    write_reg(&mut distira, SST_FVERTEX_AY, snapped(0.0));
+    write_reg(&mut distira, SST_FVERTEX_BX, snapped(4.0));
+    write_reg(&mut distira, SST_FVERTEX_BY, snapped(0.0));
+    write_reg(&mut distira, SST_FVERTEX_CX, snapped(0.0));
+    write_reg(&mut distira, SST_FVERTEX_CY, snapped(4.0));
+    write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
+
+    write_reg(&mut distira, SST_FTRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x00ff_0000, "the snapped triangle must rasterise");
+    assert_eq!(frame[1], 0x00ff_0000);
+    assert_eq!(frame[4], 0x00ff_0000);
+    assert_eq!(frame[3], 0x0000_0000, "and must stay inside its own edges");
+}

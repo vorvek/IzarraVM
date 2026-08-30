@@ -1414,6 +1414,93 @@ function Get-FixtureTable {
             cdImage = "tombraid_cd\tombeng.cue"
         }
         [pscustomobject]@{
+            name = "tombraid3d-586"; folder = "tombraid3d_c"
+            # The 3dfx build of the same game, next to the software row on
+            # purpose: same engine, same disc, same sound configuration, and the
+            # ONLY difference is that every pixel comes through Glide and the
+            # Distira rasteriser instead of the CPU. A regression that moves one
+            # of the two rows and not the other says which half it is in.
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            # 19e9 = 114.5 guest seconds. Measured timeline with this schedule:
+            # boot 0-4, Glide splash 5-9, a black wait 9-24, title 35-50, attract
+            # DEMO 50-85, title 85-100, DEMO 100-130, and so on. The budget lands
+            # 14 seconds into the SECOND demo, so the run holds one COMPLETE demo
+            # plus half of another and the end frame sits 16 seconds clear of the
+            # nearest transition. Real-time factor 0.87, 132 s wall.
+            cycles = [uint64]19000000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            qconsole = $false; resultPpm = $true; dukemark = $null
+            # ONE Escape. The 3dfx build sits on a black screen after the splash
+            # and waits for a key; the software build does not, which is why THAT
+            # row carries no schedule. MEASURED: the game ignores input until
+            # between 3.5e9 and 4e9 cycles, and any key from 4e9 to at least 6e9
+            # works, so 5e9 keeps about a quarter of the window in hand on the
+            # early side and has no bound on the late side. Keep it to ONE key:
+            # a second lands on the title, opens the ring menu, and the attract
+            # demo then never starts. That was measured too, not assumed.
+            injection = @("--inject-keys", "5000000000:{esc}")
+            # A Glide row MUST grade the PUBLISHED frame. Distira's scanout is
+            # the only path that shows it, and a re-render reports what video
+            # memory holds -- which on a double-buffered Voodoo is the buffer
+            # nobody is looking at.
+            gradePresentedFrame = $true
+            # No end-of-budget hash, for the reason tombraid-586 lost its own:
+            # the end frame is mid-demo, where any cadence-adjacent change moves
+            # it legitimately. Two repeat runs from a fresh copy are
+            # bit-identical (99.57% non-black, 365 colours, 19,864,778,122
+            # instructions), so the determinism is real; it is robustness to CODE
+            # change that a hash would lack. The anchor is the Toka-DOS boot text
+            # at 0.5e9, whose only moving part is the two-state cursor -- the
+            # same anchor and the same two phases as the software row, because
+            # both trees boot the same DOS and their first four guest seconds are
+            # byte-identical to each other.
+            frameContract = (New-FrameContract -AnchorCycles ([uint64]500000000) `
+                    -AnchorDisplay "VgaRaster" -AnchorPhases 2 `
+                    -Display "Distira" -Width 640 -Height 480 -Bpp 16 -Mode "Text")
+            # The SAME disc the software row mounts: same game, same pressing, so
+            # a second 643 MB copy would buy nothing.
+            cdImage = "tombraid_cd\tombeng.cue"
+        }
+        [pscustomobject]@{
+            name = "descent2-3dfx-586"; folder = "descent2_c"
+            # The second Glide row, and not a duplicate of the first: it ships
+            # the BYTE-IDENTICAL glide2x.ovl (md5 341b8f5d82daa46fd1ce2363...)
+            # and drives it far harder. Where Tomb Raider runs at rt 0.87, this
+            # runs at 0.32 -- six-degree-of-freedom geometry, per-pixel lighting
+            # and a rear-view viewport, all through the same rasteriser. It is
+            # the heavier of the two and the one a Distira regression should
+            # reach first.
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            # 9e9 = 54.2 guest seconds. Boot 0-4, Glide splash 5-10, a release
+            # notice at 23-24, and the recorded demo from 29 onward, still
+            # running past 170. The budget lands 25 seconds into the demo, at
+            # "PLAYBACK (33% DONE)", deep inside the phase and far from either
+            # end of it. 170 s wall.
+            cycles = [uint64]9000000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            qconsole = $false; resultPpm = $true; dukemark = $null
+            # The AUTOEXEC passes `-nomovies -autodemo`. `-nomovies` skips the
+            # Interplay MVE intro, which is why the fixture tree does not carry
+            # the three .MVL files at all: they are 220 MB of the source tree's
+            # 266 MB and this row never opens them. `-autodemo` starts
+            # DEMOS\DESCENT2.DEM from the title with no further input.
+            #
+            # The two Escapes clear the release-notice screen. A THIRD key would
+            # land after the demo starts and raise "ABORT AUTODEMO?" -- measured,
+            # not guessed.
+            injection = @("--inject-keys", "3000000000:{esc};4000000000:{esc}")
+            gradePresentedFrame = $true
+            # Same argument as the row above. Two repeat runs from a fresh copy
+            # are bit-identical (83.09% non-black, 834 colours, 8,579,000,326
+            # instructions).
+            frameContract = (New-FrameContract -AnchorCycles ([uint64]500000000) `
+                    -AnchorDisplay "VgaRaster" -AnchorPhases 2 `
+                    -Display "Distira" -Width 640 -Height 480 -Bpp 16 -Mode "Text")
+            # REQUIRED: the game reads Redbook audio and its own CD check from
+            # the disc. 691 MB, mounted read-only, never copied per run.
+            cdImage = "descent2_cd\DESCENT_II.cue"
+        }
+        [pscustomobject]@{
             name = "psycho-486"; folder = "psycho_c"
             # 486 / 64 MiB / Vega, the machine the fault was reported on. A 1995
             # game does not need 166 MHz, and at 66 MHz the same guest time costs
@@ -2793,6 +2880,10 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
                 $failures += ("the final video mode is '$($profile.legacy_video_mode)', " +
                     "expected '$($Fixture.expected_video_mode)'")
             }
+            # See the frame-contract block below for why `stop.requested` is the
+            # wrong field for a row with an INPUT SCHEDULE. No row grading this
+            # way carries one today; give this the same treatment before adding
+            # the first that does.
             if ($profile.stop.kind -ne "cycle_limit" -or
                 [uint64]$profile.stop.requested -ne $Fixture.cycles) {
                 $failures += ("the run stopped as '$($profile.stop.kind)' at " +
@@ -2884,12 +2975,28 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         # the guest quit to DOS and poked the exit port, i.e. the game died;
         # anything else means it never reached the budget at all.
         $result.stop_kind = $profile.stop.kind
+        #
+        # NOT `stop.requested`. An input schedule SLICES the run: the emulator
+        # runs to the first key, then to the second, and `stop.requested` holds
+        # the LAST SLICE's budget, not the total. MEASURED 2026-08-30 on
+        # tombraid3d-586, whose one key at 5e9 made a complete 19e9 run report
+        # `requested: 13999336000` and fail a check it had every right to pass.
+        # The two Glide rows are the first frame-contract rows to carry a
+        # schedule, which is why this sat here unhit.
+        #
+        # `cycle_budget` is the total the run was GIVEN and `elapsed_budget_clocks`
+        # is what it actually spent, so the pair is strictly stronger than the
+        # single field it replaces: it catches a wrong budget AND a run that
+        # ended early, where `stop.requested` only ever spoke to the first.
         if ($profile.stop.kind -ne "cycle_limit") {
             $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
                 "'cycle_limit' -- the guest did not run the whole budget")
-        } elseif ([uint64]$profile.stop.requested -ne $Fixture.cycles) {
-            $failures += ("the run stopped at $($profile.stop.requested) cycles, " +
-                "expected the fixture's $($Fixture.cycles)")
+        } elseif ([uint64]$profile.cycle_budget -ne $Fixture.cycles) {
+            $failures += ("the run was given a budget of $($profile.cycle_budget) " +
+                "cycles, expected the fixture's $($Fixture.cycles)")
+        } elseif ([uint64]$profile.elapsed_budget_clocks -lt [uint64]$profile.cycle_budget) {
+            $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
+                "$($profile.cycle_budget) cycle budget -- it ended early")
         }
 
         $anchor = Invoke-AnchorRun $Fixture $ExecutablePath $ScratchRoot

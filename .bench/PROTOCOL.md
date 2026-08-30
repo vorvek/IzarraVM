@@ -984,6 +984,114 @@ duke3d-586 before any merge decision.**
   `scripts/fixture-scoreboard-invariants.json`; derivations in
   `New-FrameContract` in `scripts/run-fixture-scoreboard.ps1`.
 
+### The two Glide rows (Distira, 586 ONLY, added 2026-08-30)
+
+`tombraid3d-586` and `descent2-3dfx-586` are the first fixtures that render
+through Distira, the Voodoo-Graphics-class part, instead of through the CPU or
+Margo. They exist because nothing else on either board exercises a single
+triangle of hardware 3D: before them, Distira had register-level unit tests and
+no game had ever driven it.
+
+They ship the BYTE-IDENTICAL `glide2x.ovl`, md5 `341b8f5d82daa46fd1ce2363...`.
+That is the point of running both. Whatever the library asks of the device it
+asks identically in each, so a defect that moves one row and not the other is
+in the GAME's use of Glide, and one that moves both is in the device.
+
+**586 only.** Both are DOS/4GW protected-mode titles that need a Pentium and an
+FPU, exactly like the software `tombraid-586` row.
+
+#### Tomb Raider Gold, 3dfx build
+
+- Location: `.bench/tombraid3d_c`. Disc: `.bench/tombraid_cd/tombeng.cue` --
+  the SAME image `tombraid-586` mounts, because it is the same game and the
+  same pressing. Mounted read-only, never copied per run.
+- Invocation: `--cpu 586 --memory-mib 64 --video vega --hdd-folder <fresh copy>
+  --cd-image .bench/tombraid_cd/tombeng.cue --cycles 19000000000
+  --inject-keys 5000000000:{esc} --presented-ppm <path>`.
+- The tree is `.bench/tombraid_c` with its game directory swapped for the
+  packagers' `TOMB3D`, Windows `.dll` files removed. `TOMBPATH.TXT` in `C:\`
+  holds `C:\GAMES\TOMB3D` with NO trailing newline; CONFIG.SYS and AUTOEXEC.BAT
+  are the software row's, with LF line endings.
+- Measured timeline: boot 0-4 guest seconds, Glide splash 5-9, a BLACK WAIT
+  9-24, title 35-50, attract DEMO 50-85, title 85-100, DEMO 100-130, and so on
+  in that rhythm. The 19e9 budget is 114.5 guest seconds and lands 14 seconds
+  into the second demo. rt 0.87, 132 s wall.
+
+#### Descent II, 3dfx patch
+
+- Location: `.bench/descent2_c`. Disc: `.bench/descent2_cd/DESCENT_II.cue`
+  (691 MB), REQUIRED for Redbook audio and the game's own CD check.
+- Invocation: `--cpu 586 --memory-mib 64 --video vega --hdd-folder <fresh copy>
+  --cd-image .bench/descent2_cd/DESCENT_II.cue --cycles 9000000000
+  --inject-keys "3000000000:{esc};4000000000:{esc}" --presented-ppm <path>`.
+- AUTOEXEC runs `D2_3DFX.EXE -nomovies -autodemo`. `-autodemo` plays the
+  shipped `DEMOS\DESCENT2.DEM`, so the row needs no gameplay input schedule --
+  only the two keys that clear the release-notice screen.
+- The tree does NOT carry the three `.MVL` movie files. They are 220 MB of the
+  source tree's 266 MB, `-nomovies` never opens them, and the scoreboard
+  robocopies the whole fixture per run.
+- Measured timeline: boot 0-4, splash 5-10, release notice 23-24, demo from 29
+  onward and still running past 170. The 9e9 budget is 54.2 guest seconds and
+  lands 25 seconds into the demo. rt 0.32, 170 s wall.
+
+#### THE TRAP THAT COST MOST OF A SESSION
+
+**Both 3dfx builds wait for a keypress on a screen that shows nothing useful,
+and a run without an input schedule reads exactly like a hung emulator.**
+
+Tomb Raider's wait screen is BLACK: zero non-black pixels, zero Distira
+register traffic, zero CD access, and the CPU retiring 500 million instructions
+per guest second across 81,236 distinct addresses. Every device counter freezes
+and stays frozen from 1.5e9 cycles to 20e9. Descent II's is a page of green
+text that stops mid-word.
+
+That signature was chased through a JIT hypothesis (refuted: `--interpreter`
+reproduces it with the SAME published frame hash), a texture-aperture
+hypothesis (refuted: 86Box's `voodoo_tex_writel` refuses the identical writes),
+the memory FIFO, and Glide's own init trace (which completes cleanly and prints
+nothing after). The answer was one Escape key.
+
+Before diagnosing a DOS 3D title as hung, spend one run on `--inject-keys`.
+
+#### The input schedules are minimal ON PURPOSE
+
+Tomb Raider gets ONE Escape and Descent II gets TWO, and both numbers were
+measured rather than chosen.
+
+- Tomb Raider ignores input until somewhere between 3.5e9 and 4e9 cycles, and
+  any key from 4e9 to at least 6e9 works. 5e9 keeps roughly a quarter of the
+  window in hand on the early side. A SECOND key lands on the title screen,
+  opens the ring menu, and the attract demo then never starts at all -- the row
+  would pin a still picture and look perfectly healthy doing it.
+- Descent II needs two Escapes to clear its notice screen. A THIRD lands after
+  the demo has started and raises "ABORT AUTODEMO?", which the demo survives
+  but which puts a dialogue box in the middle of the graded frame.
+
+#### Grading
+
+Both rows grade the PUBLISHED frame (`gradePresentedFrame = $true`), not a
+re-render. On a double-buffered Voodoo a re-render reports the buffer nobody is
+looking at; `--presented-ppm` reports what a user sees. See the psycho-486
+block for the general argument and the measurement behind it.
+
+Both use a FRAME CONTRACT rather than an end-of-budget hash, for the reason
+`tombraid-586` lost its own: the end frame is mid-demo, where a cadence change
+moves it legitimately. The anchor is the Toka-DOS boot text at 0.5e9, two
+phases for the cursor blink -- the same anchor as the software row, because the
+two trees boot the same DOS and their first four guest seconds are
+byte-identical to each other.
+
+The class check is `active_display = Distira` with `legacy_video_mode = Text`.
+Together those two say "the Voodoo is driving the screen and the VGA card is
+sitting in text mode behind it", which is the Glide state and nothing else.
+
+Determinism: two repeat runs from a fresh copy are bit-identical on both rows.
+
+| row | non-black | colours | retired instructions |
+|---|---|---|---|
+| `tombraid3d-586` | 305,875 / 307,200 (99.57%) | 365 | 19,864,778,122 |
+| `descent2-3dfx-586` | 255,267 / 307,200 (83.09%) | 834 | 8,579,000,326 |
+
 ### Tyrian 2000 (Loudness audio clock + DPMI16, 486 and 586)
 
 Two fixtures, three rows, added 2026-08-29. They exist because Tyrian's

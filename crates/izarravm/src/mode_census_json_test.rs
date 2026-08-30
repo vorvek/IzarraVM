@@ -23,7 +23,15 @@ fn an_empty_census_renders_two_empty_lists_rather_than_nothing() {
     // A missing section reads as "not measured". An empty list reads as
     // "measured, and the guest never went there". They are different facts and
     // the board grades on the difference, so the shape must not collapse.
-    let json = mode_census_json(&ModeCensus::default(), &DistiraCensus::default(), None);
+    let json = mode_census_json(
+        &ModeCensus::default(),
+        &DistiraCensus::default(),
+        None,
+        &[],
+        &[],
+        Default::default(),
+        0,
+    );
     assert_eq!(json["schema"], "izarravm-mode-census-v1");
     assert_eq!(json["vga"].as_array().expect("vga is a list").len(), 0);
     assert_eq!(
@@ -38,7 +46,15 @@ fn a_vga_row_carries_every_key_field_and_its_count() {
     vga.record(mode_x_256());
     vga.record(mode_x_256());
 
-    let json = mode_census_json(&vga, &DistiraCensus::default(), None);
+    let json = mode_census_json(
+        &vga,
+        &DistiraCensus::default(),
+        None,
+        &[],
+        &[],
+        Default::default(),
+        0,
+    );
     let row = &json["vga"][0];
     assert_eq!(row["mode"], "ModeX");
     assert_eq!(row["hdisp_end"], 256);
@@ -70,7 +86,15 @@ fn two_line_counts_at_one_pixel_height_render_as_two_rows() {
     vga.record(standard);
     vga.record(jazz);
 
-    let json = mode_census_json(&vga, &DistiraCensus::default(), None);
+    let json = mode_census_json(
+        &vga,
+        &DistiraCensus::default(),
+        None,
+        &[],
+        &[],
+        Default::default(),
+        0,
+    );
     let rows = json["vga"].as_array().expect("vga is a list");
     assert_eq!(rows.len(), 2);
     // MEASURED on Psycho Pinball 2026-08-29: standard mode 13h reports
@@ -108,7 +132,15 @@ fn source_lines_halves_a_double_scanned_mode() {
     standard.double_scan = true;
     vga.record(standard);
 
-    let json = mode_census_json(&vga, &DistiraCensus::default(), None);
+    let json = mode_census_json(
+        &vga,
+        &DistiraCensus::default(),
+        None,
+        &[],
+        &[],
+        Default::default(),
+        0,
+    );
     assert_eq!(json["vga"][0]["vdisp_end"], 400);
     assert_eq!(json["vga"][0]["source_lines"], 200);
 }
@@ -121,7 +153,15 @@ fn a_distira_row_carries_its_size_and_count() {
         height: 480,
     });
 
-    let json = mode_census_json(&ModeCensus::default(), &distira, None);
+    let json = mode_census_json(
+        &ModeCensus::default(),
+        &distira,
+        None,
+        &[],
+        &[],
+        Default::default(),
+        0,
+    );
     let row = &json["distira"][0];
     assert_eq!(row["width"], 640);
     assert_eq!(row["height"], 480);
