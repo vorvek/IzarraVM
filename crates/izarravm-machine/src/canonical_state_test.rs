@@ -3097,6 +3097,32 @@ fn uncommitted_batch_timing_is_rejected() {
 }
 
 #[test]
+fn construction_seed_writes_never_accrue_isa_bus_time() {
+    // Adversarial-review finding on the `IZARRAVM_ISA_IO_WAIT` slice. `new_raw_program`
+    // seeds PIT counter 0 with three `write_io` calls (dos.rs) and programs the 8259 pair,
+    // modelling POST work that happened before the guest existed. With the charge armed
+    // those writes accrued three ISA periods into `isa_io_batch_clocks` -- an accrual with no
+    // batch to belong to, which whichever batch ran first would have paid, and which made
+    // the machine uncapturable in the meantime. They go through `make_construction_bus`,
+    // which disarms the charge; a freshly constructed machine must therefore hold zero and
+    // capture cleanly with the knob ARMED.
+    crate::bus::set_isa_io_wait_for_test(Some(true));
+    let mut profile = MachineProfile::gsw_386(4, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let machine = Machine::new_raw_program(profile, &[0xf4]).unwrap();
+    crate::bus::set_isa_io_wait_for_test(None);
+
+    assert_eq!(
+        machine.isa_io_batch_clocks, 0,
+        "construction must not charge the guest for POST-time device programming"
+    );
+    assert!(
+        machine.canonical_state_capture().is_ok(),
+        "a freshly constructed machine must be capturable with the ISA charge armed"
+    );
+}
+
+#[test]
 fn uncommitted_console_publication_is_rejected() {
     let mut pending = test_machine();
     pending.program_output.extend_from_slice(b"pending");

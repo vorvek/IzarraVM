@@ -193,10 +193,52 @@ fn poll_bus_certificate_rejects_instruction_fetches_from_a_device_window() {
         cpu.poll_skip_backedge_housekeeping();
         let poll = cpu.poll_loop().expect("device-backed shape is structural");
         assert!(
-            bus.poll_bus_certificate(poll).is_none(),
+            bus.poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
+                .is_none(),
             "device-backed instruction fetches cannot be aggregated"
         );
     });
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_bus_certificate_refuses_a_port_the_isa_wait_charge_covers() {
+    // THE BLOCKER from dev_docs/isa-io-waitstate-research-2026-08-30.md section 5.2. This
+    // certificate is denominated in RAW BUS CLOCKS and is scaled by `scale_bus` on the way
+    // out; the `IZARRAVM_ISA_IO_WAIT` charge is unscaled CPU clocks accrued outside that
+    // scaler, so it cannot be expressed as a term here. A certificate that ignored it would
+    // let the skip machinery fast-forward a span each of whose iterations the guest would
+    // have paid ~1 us for -- under-pricing exactly the loops the charge exists to slow.
+    //
+    // So a charged port must REFUSE. Today 0x3DA is not a charged port (86Box parity), so
+    // the production path is unaffected in both arms; this test drives the certification
+    // entry point with a charged port directly, which is what makes the guard provable
+    // rather than merely present. Remove the guard and the 0x40 case below certifies.
+    let mut machine =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
+    prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
+    // The arm has to be set BEFORE `with_cpu_and_bus`: the bus caches the resolved knob at
+    // construction (one bool test per access instead of a lazy-static touch), which is also
+    // the production shape -- the environment is read once per process.
+    for armed in [false, true] {
+        crate::bus::set_isa_io_wait_for_test(Some(armed));
+        with_cpu_and_bus(&mut machine, |cpu, bus| {
+            let poll = cpu.poll_loop().expect("warm poll descriptor");
+            assert_eq!(
+                bus.poll_bus_certificate(poll, 0x0040).is_some(),
+                !armed,
+                "armed={armed}: a charged port must disable poll skip rather than certify a \
+                 per-iteration cost that omits the ISA charge"
+            );
+            assert!(
+                bus.poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
+                    .is_some(),
+                "armed={armed}: 0x3DA is NOT charged (86Box parity), so the production shape \
+                 must still certify in BOTH arms -- the refusal must not be a blanket one"
+            );
+        });
+    }
+    crate::bus::set_isa_io_wait_for_test(None);
 }
 
 #[cfg(feature = "jit")]
@@ -337,7 +379,7 @@ fn projected_poll_total(machine: &mut Machine, iterations: u64, batch_core: u32)
     with_cpu_and_bus(machine, |cpu, bus| {
         let poll = cpu.poll_loop().expect("warm poll descriptor");
         let certificate = bus
-            .poll_bus_certificate(poll)
+            .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("RAM poll bus certificate");
         let core = cpu
             .project_poll_skip_core(poll, iterations)
@@ -354,7 +396,7 @@ fn projected_poll_dots(machine: &mut Machine, iterations: u64, batch_core: u32) 
     with_cpu_and_bus(machine, |cpu, bus| {
         let poll = cpu.poll_loop().expect("warm poll descriptor");
         let certificate = bus
-            .poll_bus_certificate(poll)
+            .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("RAM poll bus certificate");
         let core = cpu
             .project_poll_skip_core(poll, iterations)
@@ -591,7 +633,7 @@ fn poll_skip_edge_is_strict_and_the_reserved_final_iteration_runs_real() {
         let poll = run::classify_poll_skip_boundary(cpu, &mut diagnostics)
             .expect("warm poll before bulk commit");
         let certificate = bus
-            .poll_bus_certificate(poll)
+            .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("RAM poll certificate before bulk commit");
         let charged = run::try_poll_skip(cpu, bus, &mut diagnostics, poll, 0, cap)
             .expect("edge one dot after the bulk boundary admits K");

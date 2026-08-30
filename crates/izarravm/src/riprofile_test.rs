@@ -450,13 +450,13 @@ fn find_run_until_tick(process: windows_sys::Win32::Foundation::HANDLE) -> Optio
 }
 
 #[test]
-fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1710() {
+fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1715() {
     if std::env::var_os("IZARRAVM_RIPROFILE_INLINE_CHILD").is_some() {
         inline_chain_check_in_this_process();
         return;
     }
     let output = spawn_riprofile_child(
-        "riprofile::tests::inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1710",
+        "riprofile::tests::inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapsed_to_line_1715",
         "IZARRAVM_RIPROFILE_INLINE_CHILD",
     );
     assert!(
@@ -570,13 +570,24 @@ fn inline_chain_check_in_this_process() {
 
     // Scan the function's own recorded extent for an address where the OLD
     // resolver collapses to exactly `run_until_tick` @
-    // `machine/src/run.rs:1710` (the call `cpu.run_budgeted(&mut bus,
-    // run_budget)`, the specific defect example this instrument exists to
+    // `machine/src/run.rs:1715` (the `cpu.run_budgeted(&mut bus, run_budget)`
+    // call site, as the compiler attributes it -- see the +5 note below --
+    // the specific defect example this instrument exists to
     // fix — 1677 -> 1683 as the IzarraCD doorbell and claim fields joined run.rs
     // above it, then 1683 -> 1693 as the 16-bit poll slice's I-D1b assertion
     // joined `try_poll_skip`, then 1693 -> 1694 as the extended-RAM screen's
     // bool joined the `MachineBus` literal, then 1694 -> 1710 as the fault
-    // trace grew an IDTR/GDTR line while a Zone 66 crash was diagnosed. THIS PIN DRIFTS WITH
+    // trace grew an IDTR/GDTR line while a Zone 66 crash was diagnosed, then
+    // 1710 -> 1715 as the ISA I/O wait-state slice added the `isa_io_wait`
+    // bool to the `MachineBus` literal and a five-line note to the poll-skip
+    // certification site. That last re-pin is +5, not the +6 the source moved:
+    // the address the OLD resolver collapses at is attributed to the
+    // `let run_budget = remaining;` statement immediately above the call, not
+    // to the `match` line itself, and the two drifted apart by one. The pin is
+    // whatever the resolver ACTUALLY reports -- it was measured, by scanning the
+    // extent and printing every machine-side line that reproduced the defect
+    // shape, not derived by adding the diff's line count. Do that again rather
+    // than arithmetic: the compiler chooses the attributed line. THIS PIN DRIFTS WITH
     // `machine/src/run.rs`'s line
     // count, by construction: it names a call site by line, so any edit ABOVE
     // that call moves it and this test is what says so. Re-pin it, do not skip
@@ -593,7 +604,10 @@ fn inline_chain_check_in_this_process() {
     // resolve correctly and reproducibly (three distinct lines: 623, 627,
     // 635, matching `cpu/src/run.rs`'s `run_budgeted` wrapper body exactly),
     // which is real, verified proof the resolver defeats the collapse this
-    // change targets. See the implementation notes for the full evidence,
+    // change targets. (Re-measured on the ISA I/O wait-state re-pin: the same
+    // scan now reports `run_budgeted` at cpu/src/run.rs 623, 629, 634 and 642 --
+    // still the wrapper body, still four-for-four inside it, the exact lines
+    // having moved with that file.) See the implementation notes for the full evidence,
     // including a separately confirmed 8-level chain elsewhere in this same
     // function (`next_timer_wake` down to `div_ceil`) that establishes
     // dbghelp's context order is INNERMOST-first, not outermost-first as the
@@ -607,7 +621,7 @@ fn inline_chain_check_in_this_process() {
         let Some(old_line) = super::resolve_line(process, addr) else {
             continue;
         };
-        if !old_line.contains("run.rs:1710") {
+        if !old_line.contains("run.rs:1715") {
             continue;
         }
         let chain = resolve_inline_chain(process, addr);
@@ -617,7 +631,7 @@ fn inline_chain_check_in_this_process() {
         if !innermost.name.contains("run_until_tick")
             && innermost.site.contains("izarravm-cpu")
             && innermost.site.contains("run.rs")
-            && !innermost.site.contains(":1710")
+            && !innermost.site.contains(":1715")
         {
             best = Some((addr, innermost.clone(), old_line));
             break;
@@ -631,7 +645,7 @@ fn inline_chain_check_in_this_process() {
     let (addr, innermost, old_line) = best.unwrap_or_else(|| {
         panic!(
             "no address in run_until_tick's {size:#x}-byte extent reproduced the \
-             defect example: OLD resolver collapsing to machine/src/run.rs:1710 while \
+             defect example: OLD resolver collapsing to machine/src/run.rs:1715 while \
              NEW resolver names a different izarravm-cpu run.rs line. Either the OLD \
              resolver no longer collapses there (recheck the claim in the module doc) \
              or the NEW resolver regressed."
@@ -639,7 +653,7 @@ fn inline_chain_check_in_this_process() {
     });
 
     assert_eq!(
-        old_line, "crates\\izarravm-machine\\src\\run.rs:1710",
+        old_line, "crates\\izarravm-machine\\src\\run.rs:1715",
         "the defect's OLD side must be exactly the documented collapse"
     );
     // The physical symbol itself is NEVER a member of the inline chain (a

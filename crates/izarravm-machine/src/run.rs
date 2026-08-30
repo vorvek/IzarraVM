@@ -514,7 +514,7 @@ pub(super) fn try_poll_skip(
     if !poll.at_head() {
         return None;
     }
-    if poll.resolved_port(cpu) != 0x03da {
+    if poll.resolved_port(cpu) != crate::bus::POLL_SKIP_IO_PORT {
         diagnostics.source_port_mismatch();
         return None;
     }
@@ -522,7 +522,12 @@ pub(super) fn try_poll_skip(
         diagnostics.vga_bus_certificate_rejection();
         return None;
     }
-    let Some(certificate) = bus.poll_bus_certificate(poll) else {
+    // The certificate is told which port it is pricing, because it refuses outright on a
+    // port the ISA wait-state charge covers (see `poll_bus_certificate_from`). Passing the
+    // constant is sound here and not an assumption: the check ten lines up has already
+    // rejected every shape whose `resolved_port` is not `POLL_SKIP_IO_PORT`, so the constant
+    // and the live polled port are the same value by then.
+    let Some(certificate) = bus.poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT) else {
         diagnostics.vga_bus_certificate_rejection();
         return None;
     };
@@ -1536,6 +1541,7 @@ impl Machine {
                     flat_data_cost: active_mode.uses_approximate_timing(),
                     extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
                     lazy_port_reads: active_mode.uses_approximate_timing(),
+                    isa_io_wait: crate::bus::isa_io_wait_armed(),
                     lazy_ports_386: crate::bus::lazy_ports_386_for(*active_mode),
                     io_touched,
                     exempt_io_touched,

@@ -417,6 +417,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         flat_data_cost: machine.active_mode.uses_approximate_timing(),
         extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
+        isa_io_wait: crate::bus::isa_io_wait_armed(),
         lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),
         io_touched: &mut machine.io_touched,
         exempt_io_touched: &mut machine.exempt_io_touched,
