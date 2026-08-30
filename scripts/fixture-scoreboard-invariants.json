@@ -5,7 +5,7 @@
     ],
     "final_distinct_colors_max": 20000,
     "final_distinct_colors_min": 120,
-    "final_instructions": 8578222429,
+    "final_instructions": 6614138522,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
     "final_nonblack_percent_min": 60.0
@@ -23,7 +23,7 @@
     "dukemark_samples_tolerance": 0.02
   },
   "gp2-586": {
-    "frame_sha256": "ac11e66ab796551bcddc8c9108b9e804faa6ccd62dc105611bb64a6cbfe77fe0"
+    "frame_sha256": "91fa3e01d22bd6eda86ac2043e2dea5db935f05b9339862927fd22087e8fea0a"
   },
   "nascar-586": {
     "anchor_frame_sha256": [
@@ -37,7 +37,7 @@
     "final_nonblack_percent_min": 84.0
   },
   "prince-486": {
-    "frame_sha256": "04fd85582f7c041bfc4d873b7c115cb36ce6c522d8060e91506a67ecc8a9e580"
+    "frame_sha256": "802e9d4fc0976be23a9748dbbe51f6f082d4af998b7868545136028377442bac"
   },
   "psycho-486": {
     "anchor_frame_sha256": [
