@@ -4708,3 +4708,325 @@ fn may_own_memory_agrees_with_the_extended_floor() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// IZARRAVM_ISA_IO_WAIT -- bus-realistic ISA time for legacy X-bus port access.
+// Design basis: dev_docs/isa-io-waitstate-research-2026-08-30.md section 5.2,
+// Shape C.
+// ---------------------------------------------------------------------------
+
+/// Run `body` with the `IZARRAVM_ISA_IO_WAIT` arm forced on this thread, then restore the
+/// ambient reading. The shipped knob is a process-wide `OnceLock`, so both arms can only be
+/// exercised in one process through the per-thread override.
+fn with_isa_io_wait<R>(armed: bool, body: impl FnOnce() -> R) -> R {
+    crate::bus::set_isa_io_wait_for_test(Some(armed));
+    let result = body();
+    crate::bus::set_isa_io_wait_for_test(None);
+    result
+}
+
+#[test]
+fn isa_io_wait_knob_names_exactly_two_arms_and_refuses_to_guess() {
+    use crate::bus::parse_isa_io_wait_arm_for_test as parse;
+    // Unset and empty name the SAME arm -- the shipped default, ON since the 2026-08-30 flip
+    // (gp2 1.7818 / descent2 1.1019 / wolf3d 0.9991 null control; the flip commit carries the
+    // evidence). A default moved back without a ladder of that grade would ship silently.
+    assert!(parse(Err(std::env::VarError::NotPresent)));
+    assert!(parse(Ok(String::new())));
+    assert!(parse(Ok("   ".to_string())));
+    for off in ["0", "off", "OFF", " Off "] {
+        assert!(
+            !parse(Ok(off.to_string())),
+            "{off:?} must name the base arm"
+        );
+    }
+    for on in ["1", "on", "ON", " On "] {
+        assert!(parse(Ok(on.to_string())), "{on:?} must name the charge");
+    }
+    for garbage in ["true", "yes", "2", "isa", "-1"] {
+        assert!(
+            std::panic::catch_unwind(|| parse(Ok(garbage.to_string()))).is_err(),
+            "{garbage:?} names no arm and must panic rather than silently run the default"
+        );
+    }
+    assert!(
+        std::panic::catch_unwind(|| parse(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("x")
+        ))))
+        .is_err(),
+        "a non-UTF-8 setting must panic rather than fall back to the default"
+    );
+}
+
+#[test]
+fn isa_io_wait_off_leaves_a_pit_access_charging_exactly_as_it_does_today() {
+    // The OFF arm is the pre-slice tree, and "byte-identical" is the claim: no ISA accrual at
+    // all, and the recorded bus cycle untouched. The recorded-cycle half is asserted against
+    // the ON arm below rather than against a literal, so it stays true if `wait_states.io`
+    // ever moves.
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (off_bus_clocks, off_isa) = with_isa_io_wait(false, || {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            machine.isa_io_batch_clocks = 0;
+            let before = machine.trace.elapsed_clocks();
+            with_bus(&mut machine, |bus| {
+                let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+                bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
+            });
+            (
+                machine.trace.elapsed_clocks() - before,
+                machine.isa_io_batch_clocks,
+            )
+        });
+        assert_eq!(
+            off_isa, 0,
+            "{mode:?}: knob OFF must accrue no ISA time on the PIT"
+        );
+        assert!(
+            off_bus_clocks > 0,
+            "{mode:?}: sanity -- the two accesses must still record bus cycles"
+        );
+
+        let on_bus_clocks = with_isa_io_wait(true, || {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            machine.isa_io_batch_clocks = 0;
+            let before = machine.trace.elapsed_clocks();
+            with_bus(&mut machine, |bus| {
+                let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+                bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
+            });
+            machine.trace.elapsed_clocks() - before
+        });
+        assert_eq!(
+            on_bus_clocks, off_bus_clocks,
+            "{mode:?}: the charge is ADDITIVE -- it must not move the recorded bus cycle, \
+             which is what would put it through scale_bus"
+        );
+    }
+}
+
+#[test]
+fn isa_io_wait_charges_a_pit_read_and_a_pit_write_one_isa_period_each() {
+    // 86Box charges ISA_CYCLES(8) = 160 CPU cycles on the PIT in BOTH directions
+    // (pit_fast.c:423 write, :563 read), and a Pentium machine always selects that PIT.
+    // `OUT` is not cheaper than `IN`: Pentium I/O writes are not posted (Vol 1 :3332,
+    // :3403-3416). Both personas charge the same MICROSECOND, which is what a
+    // fixed-frequency bus means -- the clock count follows the mode's clock.
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let expected = (mode.clock_hz() / 1_000_000).max(1);
+        for (port, write) in [(0x40u16, None), (0x43u16, Some(0x34u32))] {
+            let charged = with_isa_io_wait(true, || {
+                let mut machine = test_machine();
+                machine.set_mode(mode);
+                machine.isa_io_batch_clocks = 0;
+                with_bus(&mut machine, |bus| match write {
+                    None => {
+                        let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+                    }
+                    Some(value) => bus.write_io(port, BusWidth::Byte, value, false).unwrap(),
+                });
+                machine.isa_io_batch_clocks
+            });
+            assert_eq!(
+                charged, expected,
+                "{mode:?}: one 8-bit access to {port:#04x} (write={write:?}) must charge one \
+                 ISA bus period"
+            );
+        }
+    }
+
+    // A word access decomposes into two byte cycles and pays for exactly two.
+    let word = with_isa_io_wait(true, || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        with_bus(&mut machine, |bus| {
+            *bus.isa_io_clocks = 0;
+            let _ = bus.read_io(0x40, BusWidth::Word, 0, false);
+            *bus.isa_io_clocks
+        })
+    });
+    assert_eq!(
+        word,
+        2 * (GswMode::Gsw586.clock_hz() / 1_000_000).max(1),
+        "a word access decomposes into two byte cycles and pays for exactly two"
+    );
+}
+
+#[test]
+fn isa_io_wait_charges_exactly_the_ports_86box_charges_and_no_others() {
+    // THE PARITY PIN. Under owner-ruling-86box-accuracy-parity the charged set is 86Box's
+    // set, port for port: the PIT (pit_fast.c:423/:563), the PPI port B and its 0x63 mirror
+    // (port_6x.c:58/:91/:105, is486-gated and so live on 486/586), and the RTC/CMOS pair
+    // (nvr_at.c:670/:722). 86Box charges NOTHING on the PIC, the keyboard controller, either
+    // DMA controller, the page registers or the x87 latch strobes -- the research note's
+    // Shape C proposed those, and they were cut, because charging where 86Box is accurate is
+    // inventing rather than matching, and the biggest term would land on the V86 monitor's
+    // PIC OCW3 probes. Re-adding any of the UNCHARGED rows below must fail here.
+    let period = (GswMode::Gsw586.clock_hz() / 1_000_000).max(1);
+    let charged: &[u16] = &[0x40, 0x41, 0x42, 0x43, 0x61, 0x63, 0x70, 0x71];
+    let uncharged: &[u16] = &[
+        0x00, 0x0f, // DMA 1
+        0x20, 0x21, // PIC 1 -- the V86 monitor's OCW3 probe lives here
+        0x60, 0x64, // keyboard controller
+        0x62, 0x6f, // PPI neighbours: only 0x61 and its 0x63 mirror are charged
+        0x72, 0x80, 0x84, 0x8f, // extended CMOS index, DMA page + POST
+        0xa0, 0xa1, // PIC 2
+        0xc0, 0xdf, // DMA 2
+        0xf0, 0xf1, // x87 latch strobes
+    ];
+    let seen = with_isa_io_wait(true, || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        let mut seen = Vec::new();
+        with_bus(&mut machine, |bus| {
+            for port in charged.iter().chain(uncharged).copied() {
+                *bus.isa_io_clocks = 0;
+                let _ = bus.read_io(port, BusWidth::Byte, 0, false);
+                let read = *bus.isa_io_clocks;
+                *bus.isa_io_clocks = 0;
+                let _ = bus.write_io(port, BusWidth::Byte, 0, false);
+                seen.push((port, read, *bus.isa_io_clocks));
+            }
+            seen
+        })
+    });
+    for (port, read, write) in seen {
+        let expected = if charged.contains(&port) { period } else { 0 };
+        assert_eq!(
+            read, expected,
+            "read {port:#04x}: the charged set is 86Box's set, port for port"
+        );
+        assert_eq!(
+            write, expected,
+            "write {port:#04x}: the charged set is 86Box's set, port for port"
+        );
+    }
+}
+
+#[test]
+fn isa_io_wait_does_not_double_charge_the_already_charged_opl_and_dsp_reads() {
+    // The OPL ports and the SB16 DSP read ports already take `isa_io_clocks` on the read
+    // side, default-on in the Approximate class. Listing them in the X-bus set would charge
+    // those reads TWICE; they are excluded, so arming the knob must not move them at all.
+    let period = (GswMode::Gsw586.clock_hz() / 1_000_000).max(1);
+    for port in [0x0388u16, 0x0389, 0x0220, 0x22E, 0x226] {
+        for armed in [false, true] {
+            let charged = with_isa_io_wait(armed, || {
+                let mut machine = test_machine();
+                machine.set_mode(GswMode::Gsw586);
+                machine.isa_io_batch_clocks = 0;
+                with_bus(&mut machine, |bus| {
+                    let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+                });
+                machine.isa_io_batch_clocks
+            });
+            assert_eq!(
+                charged, period,
+                "{port:#06x} read: armed={armed} must charge exactly ONE period, not two"
+            );
+        }
+    }
+}
+
+#[test]
+fn isa_io_wait_leaves_the_vga_status_ports_uncharged_by_86box_parity() {
+    // 86Box charges 0x3DA nothing: its per-card timing feeds `svga_read_common` (the video
+    // MEMORY path, vid_svga.c:2039), while `svga_in`'s `case 0x3da:` (:622-634) adds no
+    // cycles. Under owner-ruling-86box-accuracy-parity, being inaccurate the same way 86Box
+    // is inaccurate can merge -- so the whole 0x3B0-0x3DF range stays cheap here, which also
+    // keeps the largest counts on the board (gp2's 2.003 G reads of 0x3DA) out of this slice.
+    // 0x00E7 rides along as the Lotura chipset's own port: a host-native device, never ISA.
+    let uncharged = with_isa_io_wait(true, || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        let mut seen = Vec::new();
+        with_bus(&mut machine, |bus| {
+            for port in [0x03dau16, 0x03ba, 0x03c2, 0x03c4, 0x03ce, 0x03d4, 0x00e7] {
+                *bus.isa_io_clocks = 0;
+                let _ = bus.read_io(port, BusWidth::Byte, 0, false);
+                let read = *bus.isa_io_clocks;
+                *bus.isa_io_clocks = 0;
+                let _ = bus.write_io(port, BusWidth::Byte, 0, false);
+                seen.push((port, read, *bus.isa_io_clocks));
+            }
+            seen
+        })
+    });
+    for (port, read, write) in uncharged {
+        assert_eq!(read, 0, "{port:#06x} read must stay uncharged");
+        assert_eq!(write, 0, "{port:#06x} write must stay uncharged");
+    }
+}
+
+#[test]
+fn isa_io_wait_leaves_the_accurate_386_class_byte_identical() {
+    // Composed with `lazy_port_reads` at the charge site, like both existing `isa_io_clocks`
+    // sites: the Accurate class advances devices per instruction and is the class whose clock
+    // bit-identity is still a merge bar, so it keeps today's cadence whatever the knob says.
+    for armed in [false, true] {
+        let charged = with_isa_io_wait(armed, || {
+            let mut machine = test_machine();
+            machine.set_mode(GswMode::Gsw386);
+            machine.isa_io_batch_clocks = 0;
+            with_bus(&mut machine, |bus| {
+                let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+                bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
+            });
+            machine.isa_io_batch_clocks
+        });
+        assert_eq!(
+            charged, 0,
+            "386, armed={armed}: no ISA charge in this class"
+        );
+    }
+}
+
+#[test]
+fn isa_io_wait_charges_a_rep_outsb_run_per_element() {
+    // The charge lands on the BUS, so every CPU path inherits it -- including REP OUTS, which
+    // calls `write_io` once per element. This is the end-to-end statement of that: the same
+    // guest, the same guest-clock budget, sixteen `OUT`s per REP to a charged port (0x61, the
+    // PPI port B -- 86Box charges it via `cycles_sub` in `port_6x.c`, and writing speaker-gate
+    // bits has no effect this test depends on). With the charge on, each REP costs ~16 us instead of ~16
+    // instruction-times, so far fewer REPs fit in the budget. If the charge reached only the
+    // discrete IN/OUT paths the two arms would be indistinguishable.
+    let code = [
+        0x31, 0xC0, // 0: xor ax, ax
+        0x8E, 0xD8, // 2: mov ds, ax
+        0xC7, 0x06, 0x00, 0x70, 0x00, 0x00, // 4: mov word [0x7000], 0
+        // loop (10):
+        0xBE, 0x00, 0x80, // 10: mov si, 0x8000
+        0xB9, 0x10, 0x00, // 13: mov cx, 16
+        0xBA, 0x61, 0x00, // 16: mov dx, 0x0061
+        0xF3, 0x6E, // 19: rep outsb
+        0xFF, 0x06, 0x00, 0x70, // 21: inc word [0x7000]
+        0xEB, 0xEF, // 25: jmp loop (-17 from 27)
+    ];
+    let mut counts = Vec::new();
+    for armed in [false, true] {
+        counts.push(with_isa_io_wait(armed, || {
+            let mut machine = Machine::new(
+                MachineProfile::gsw_386(4, VideoCard::Vega),
+                rom_with_code(&code),
+            )
+            .unwrap();
+            machine.set_mode(GswMode::Gsw586);
+            let budget = machine.active_mode().clock_hz() / 200;
+            machine.run_cycles(budget).unwrap();
+            machine.memory.read_u16(0x7000).unwrap()
+        }));
+    }
+    let (off, on) = (counts[0], counts[1]);
+    assert!(
+        off > 100,
+        "sanity: the uncharged arm must retire many REP OUTSB runs, saw {off}"
+    );
+    assert!(on > 0, "the charged arm must still make progress, saw {on}");
+    assert!(
+        u32::from(on) * 10 < u32::from(off),
+        "REP OUTSB must pay the ISA charge per ELEMENT: charged {on} runs against \
+         uncharged {off} in the same guest-clock budget"
+    );
+}

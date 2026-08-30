@@ -1141,6 +1141,15 @@ function Get-FixtureTable {
             cycles = [uint64]4000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; dukemark = $null
+            # 2026-08-30 re-pin, 04fd8558 -> 802e9d4f. The ISA I/O wait-state
+            # flip: prince issues only 43 PIT writes all run, so the charge
+            # moves it by ppm and the 4e9 budget lands one torch-flame frame
+            # off -- the SAME class as this row's two previous re-pins below.
+            # The frame was READ before pinning: level-1 dungeon, torches lit,
+            # the injected run in progress. (A first capture WITHOUT the key
+            # schedule showed the intro and briefly read as an input bug; the
+            # schedule is load-bearing -- see the injection comment below.)
+            #
             # 2026-08-29 re-pin, e312f8f3 -> 04fd8558. PR #760 (Tier B B3)
             # rebuilt KERNEL.SYS inside tokados-hdd.img (73071 -> 73487 bytes),
             # which shifts the boot phase; the 4e9 budget lands one torch-flame

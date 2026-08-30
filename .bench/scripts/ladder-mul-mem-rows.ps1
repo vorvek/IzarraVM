@@ -111,7 +111,7 @@ param(
     # OFF when measured here and flipped ON on 2026-08-30; the recorded arms did not change
     # meaning.
     [ValidateSet("IZARRAVM_MUL_MEM_ROWS", "IZARRAVM_LOOP_ROWS", "IZARRAVM_RETRY_LIFT",
-        "IZARRAVM_OUT_IMM8_ROWS")]
+        "IZARRAVM_OUT_IMM8_ROWS", "IZARRAVM_ISA_IO_WAIT")]
     [string]$Knob = "IZARRAVM_MUL_MEM_ROWS",
     # Resolve -Rows, print the selection, exit 0. Exists so the self-test's
     # green control can prove a well-formed invocation binds without running a
@@ -177,6 +177,22 @@ $fixtures = @{
         arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
         cycles    = "33200000000"
         injection = @()
+    }
+    # Verbatim from scripts/run-fixture-scoreboard.ps1's rows, minus the frame
+    # grading the ladder never does. The two Escapes clear Descent II's release
+    # notice; a third key would raise "ABORT AUTODEMO?" mid-demo.
+    "descent2-3dfx-586" = @{
+        folder    = "descent2_c"
+        arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+        cycles    = "9000000000"
+        injection = @("--inject-keys", "3000000000:{esc};4000000000:{esc}")
+        cdImage   = "descent2_cd\DESCENT_II.cue"
+    }
+    "wolf3d-586"        = @{
+        folder    = "wolf3d_c"
+        arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+        cycles    = "12000000000"
+        injection = @("--inject-keys", "2000000000:{enter}")
     }
 }
 
@@ -353,6 +369,10 @@ function Set-BaseEnvironment {
     # their arms shared it, and duke3d-586-short carries no 0xE6 population, so those results
     # stand.
     $env:IZARRAVM_OUT_IMM8_ROWS = "1"
+    # Flipped ON 2026-08-30 (owner-directed, the isa-io-wait ladder slate); pinned to the
+    # shipped arm. The ladders that MEASURED the flip ran with this pin at "0" -- correct then:
+    # arm 0 was the pre-flip shipped base.
+    $env:IZARRAVM_ISA_IO_WAIT = "1"
     foreach ($observer in @(
             "IZARRAVM_CPU_PROFILE", "IZARRAVM_CPU_PROFILE_ADDRS",
             "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_RIP_PROFILE",
@@ -434,6 +454,11 @@ function Invoke-Leg([string]$Row, [string]$Arm, [int]$Round) {
     $arguments += @("--hdd-folder", $copy)
     $arguments += @("--cycles", $fixture.cycles)
     $arguments += @("--profile-json", $profilePath)
+    # CD rows mount the shared image read-only; it is never copied per run
+    # (same rule as the scoreboard's cdImage handling).
+    if ($fixture.ContainsKey("cdImage")) {
+        $arguments += @("--cd-image", (Join-Path $benchRoot $fixture.cdImage))
+    }
     $arguments += $fixture.injection
 
     # LAUNCHED THROUGH ProcessStartInfo RATHER THAN `& $Executable`, and the reason is the

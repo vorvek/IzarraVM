@@ -844,13 +844,45 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
                     abnormal: 1,
                 },
             },
+            // Rows five and six, the two port-imm8 helpers. They carry nonzero counts for the
+            // same reason the fourth does -- and because they are PORT-CLASS, so their counts
+            // have to appear in the ports table below or `assert_closed` rejects the snapshot.
+            HelperRow {
+                helper: "in_al_imm8",
+                counts: Counts {
+                    attempts: 2,
+                    continued: 2,
+                    step_break: 0,
+                    abnormal: 0,
+                },
+            },
+            HelperRow {
+                helper: "out_al_imm8",
+                counts: Counts {
+                    attempts: 1,
+                    continued: 0,
+                    step_break: 1,
+                    abnormal: 0,
+                },
+            },
         ],
+        // The ports table must equal the sum of the PORT-CLASS helper rows (in_al_dx 3/1/1/1,
+        // in_al_imm8 2/2/0/0, out_al_imm8 1/0/1/0) = 6/3/2/1, spread over three ports.
         ports: vec![
+            PortRow {
+                port: 0x0043,
+                counts: Counts {
+                    attempts: 1,
+                    continued: 0,
+                    step_break: 1,
+                    abnormal: 0,
+                },
+            },
             PortRow {
                 port: 0x0201,
                 counts: Counts {
-                    attempts: 1,
-                    continued: 1,
+                    attempts: 3,
+                    continued: 3,
                     step_break: 0,
                     abnormal: 0,
                 },
@@ -866,9 +898,9 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
             },
         ],
         totals: Counts {
-            attempts: 10,
-            continued: 6,
-            step_break: 1,
+            attempts: 13,
+            continued: 8,
+            step_break: 2,
             abnormal: 3,
         },
     };
@@ -882,19 +914,25 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
                 { "helper": "pushad", "attempts": 2, "continued": 2, "step_break": 0, "abnormal": 0 },
                 { "helper": "popad", "attempts": 1, "continued": 0, "step_break": 0, "abnormal": 1 },
                 { "helper": "interpret_one", "attempts": 4, "continued": 3, "step_break": 0, "abnormal": 1 },
+                { "helper": "in_al_imm8", "attempts": 2, "continued": 2, "step_break": 0, "abnormal": 0 },
+                { "helper": "out_al_imm8", "attempts": 1, "continued": 0, "step_break": 1, "abnormal": 0 },
             ],
             "ports": [
-                { "port": 0x0201, "attempts": 1, "continued": 1, "step_break": 0, "abnormal": 0 },
+                { "port": 0x0043, "attempts": 1, "continued": 0, "step_break": 1, "abnormal": 0 },
+                { "port": 0x0201, "attempts": 3, "continued": 3, "step_break": 0, "abnormal": 0 },
                 { "port": 0x03da, "attempts": 2, "continued": 0, "step_break": 1, "abnormal": 1 },
             ],
-            "totals": { "attempts": 10, "continued": 6, "step_break": 1, "abnormal": 3 },
+            "totals": { "attempts": 13, "continued": 8, "step_break": 2, "abnormal": 3 },
         })
     );
 }
 
 #[cfg(feature = "direct-callout-attribution")]
 #[test]
-#[should_panic]
+// The REASON is pinned, not just the panic: this case has already spent time passing on the
+// wrong assertion (a four-name helper list tripping the row-count pin), and a bare
+// `should_panic` cannot tell the two apart.
+#[should_panic(expected = "Direct call-out row did not close")]
 fn direct_callout_attribution_json_rejects_an_open_row() {
     use izarravm_cpu::{
         DirectCallOutAttributionHelperRow as HelperRow,
@@ -905,9 +943,11 @@ fn direct_callout_attribution_json_rejects_an_open_row() {
         ..Counts::default()
     };
     let _ = direct_callout_attribution_json(Some(Snapshot {
-        // All FOUR rows, so this case panics on the OPEN ROW it is named for rather than on the
-        // helper-count pin -- a `should_panic` that trips on the wrong assertion tests nothing.
-        helpers: ["in_al_dx", "pushad", "popad", "interpret_one"]
+        // ALL SIX rows, from the exported label list, so this case panics on the OPEN ROW it is
+        // named for rather than on the row-count or label pin -- a `should_panic` that trips on
+        // the wrong assertion tests nothing. It last did exactly that: the list here sat at four
+        // while the writer expected six, so the case passed for the wrong reason.
+        helpers: izarravm_cpu::DIRECT_CALLOUT_HELPER_LABELS
             .into_iter()
             .map(|helper| HelperRow {
                 helper,
@@ -916,10 +956,56 @@ fn direct_callout_attribution_json_rejects_an_open_row() {
             .collect(),
         ports: Vec::new(),
         totals: Counts {
-            attempts: 4,
+            attempts: 6,
             ..Counts::default()
         },
     }));
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[test]
+fn direct_callout_attribution_json_accepts_real_producer_output() {
+    // THE MISSING SHAPE. Every other test of this writer feeds it a hand-built snapshot, so
+    // the writer's expectations have only ever been checked against another fixture's idea of
+    // the producer. That is how the label list went stale twice and how the ports identity
+    // shipped with the OUT-imm8 helper missing from it: both bugs are invisible to a fixture
+    // that was edited in the same commit as the writer, and both aborted a real armed run.
+    //
+    // `direct_callout_attribution_every_helper_snapshot` notes one call to EVERY
+    // `CallOutHelper` variant -- three of them port-class, on distinct ports -- and returns
+    // the producer's own snapshot. Feeding that through the writer is the only place the two
+    // sides meet.
+    let snapshot = izarravm_cpu::direct_callout_attribution_every_helper_snapshot();
+    let json = direct_callout_attribution_json(Some(snapshot));
+
+    let helpers = json["helpers"].as_array().unwrap();
+    assert_eq!(
+        helpers.len(),
+        izarravm_cpu::DIRECT_CALLOUT_HELPER_LABELS.len(),
+        "the writer must emit one row per helper"
+    );
+    for (row, expected) in helpers
+        .iter()
+        .zip(izarravm_cpu::DIRECT_CALLOUT_HELPER_LABELS)
+    {
+        assert_eq!(row["helper"], expected);
+        assert_eq!(row["attempts"], 1, "one call per helper, by construction");
+        assert_eq!(row["continued"], 1);
+    }
+    // Three port-class helpers, three distinct ports, one attempt each -- and the writer's
+    // ports table closes over exactly those three helper rows.
+    let ports = json["ports"].as_array().unwrap();
+    assert_eq!(ports.len(), 3, "one row per port-class helper");
+    assert_eq!(
+        ports
+            .iter()
+            .map(|row| row["port"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0x0043, 0x0061, 0x03da],
+        "ports are emitted in ascending order"
+    );
+    assert_eq!(json["totals"]["attempts"], 6);
+    assert_eq!(json["totals"]["continued"], 6);
 }
 
 /// The Katea JSON must expose every counter, in a pinned order.

@@ -3057,35 +3057,25 @@ fn direct_callout_attribution_json(
     let Some(snapshot) = snapshot else {
         return serde_json::Value::Null;
     };
-    // FOUR since the generic call-out landed. This list was the second half of the same bug the
-    // CPU-side module header records: the attribution's `match` arms were repaired when
-    // `--all-features` went red, but this pin -- which the JSON writer asserts against -- was left
-    // at three, so an armed run that survived the CPU closure would have aborted here instead.
-    let expected_helpers = ["in_al_dx", "pushad", "popad", "interpret_one"];
-    assert_eq!(snapshot.helpers.len(), expected_helpers.len());
-    for (row, expected) in snapshot.helpers.iter().zip(expected_helpers) {
+    // EVERY structural check this writer used to restate -- row count, row order and labels,
+    // per-row closure, totals, port ordering, and the ports-table identity over the port-class
+    // helpers -- now lives once, on the producer's own type
+    // (`DirectCallOutAttributionSnapshot::assert_closed` in izarravm-cpu). The duplicated
+    // versions are exactly what went stale: a four-name label list survived two helpers landing,
+    // and the ports identity was written as a literal `{0, 4}` index sum in both crates and
+    // updated in neither, so the first armed descent2 run aborted at teardown rather than in CI.
+    // Nothing here re-derives those identities; this function's remaining job is the JSON shape.
+    snapshot.assert_closed();
+    // The writer's own contract, which the producer cannot state: the emitted `helper` strings
+    // are the exported label list, in its order. If a helper lands and this crate is not
+    // rebuilt against the new list, the schema pin below and this assertion disagree.
+    for (row, expected) in snapshot
+        .helpers
+        .iter()
+        .zip(izarravm_cpu::DIRECT_CALLOUT_HELPER_LABELS)
+    {
         assert_eq!(row.helper, expected);
-        assert_callout_counts_closed(row.counts);
     }
-    let helper_totals = snapshot.helpers.iter().fold(
-        izarravm_cpu::DirectCallOutOutcomeCounts::default(),
-        |sum, row| add_callout_counts(sum, row.counts),
-    );
-    assert_eq!(snapshot.totals, helper_totals);
-    assert_callout_counts_closed(snapshot.totals);
-
-    let mut last_port = None;
-    let mut port_totals = izarravm_cpu::DirectCallOutOutcomeCounts::default();
-    for row in &snapshot.ports {
-        assert!(row.counts.attempts != 0);
-        if let Some(last) = last_port {
-            assert!(last < row.port, "Direct call-out ports are not ordered");
-        }
-        last_port = Some(row.port);
-        assert_callout_counts_closed(row.counts);
-        port_totals = add_callout_counts(port_totals, row.counts);
-    }
-    assert_eq!(port_totals, snapshot.helpers[0].counts);
 
     json!({
         "schema": "izarravm-direct-callout-attribution-v1",
@@ -3110,31 +3100,6 @@ fn direct_callout_attribution_json(
             "abnormal": snapshot.totals.abnormal,
         },
     })
-}
-
-#[cfg(feature = "direct-callout-attribution")]
-fn add_callout_counts(
-    left: izarravm_cpu::DirectCallOutOutcomeCounts,
-    right: izarravm_cpu::DirectCallOutOutcomeCounts,
-) -> izarravm_cpu::DirectCallOutOutcomeCounts {
-    izarravm_cpu::DirectCallOutOutcomeCounts {
-        attempts: left.attempts.checked_add(right.attempts).unwrap(),
-        continued: left.continued.checked_add(right.continued).unwrap(),
-        step_break: left.step_break.checked_add(right.step_break).unwrap(),
-        abnormal: left.abnormal.checked_add(right.abnormal).unwrap(),
-    }
-}
-
-#[cfg(feature = "direct-callout-attribution")]
-fn assert_callout_counts_closed(counts: izarravm_cpu::DirectCallOutOutcomeCounts) {
-    assert_eq!(
-        counts.attempts,
-        counts
-            .continued
-            .checked_add(counts.step_break)
-            .and_then(|sum| sum.checked_add(counts.abnormal))
-            .unwrap()
-    );
 }
 
 /// The whole-run BIOS fixed-disk census. All zero unless `IZARRAVM_INT13_PROFILE=1`.

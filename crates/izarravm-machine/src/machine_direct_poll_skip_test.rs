@@ -767,7 +767,7 @@ fn the_pod_certificate_matches_the_poll_loop_certificate() {
     with_cpu_and_bus(&mut machine, |cpu, bus| {
         let poll = warm_3slot_poll_loop(cpu, bus);
         let via_poll_loop = bus
-            .poll_bus_certificate(poll)
+            .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("PollLoop-typed certificate");
         let request = request_for(cpu, poll, u64::MAX);
         // The seam's own certification path, isolated: call it the same way
@@ -991,7 +991,7 @@ fn bus_growth_not_batch_absolute_bus_bounds_the_cap_test() {
     with_cpu_and_bus(&mut machine, |cpu, bus| {
         let poll = warm_3slot_poll_loop(cpu, bus);
         let certificate = bus
-            .poll_bus_certificate(poll)
+            .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("the warmed 3-slot shape must certify a bus cost");
         // Inflate the batch's bus trace by a known raw amount, so the batch-absolute scaled bus
         // reading is large and easy to reason about.

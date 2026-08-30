@@ -3713,6 +3713,15 @@ struct MachineBus<'a> {
     /// per-port landing plus a bool test, never a per-access classification --
     /// not a single reader.
     lazy_port_reads: bool,
+    /// Whether a legacy X-bus port access is charged its real ISA bus time in
+    /// BOTH directions. `IZARRAVM_ISA_IO_WAIT`, DEFAULT OFF; resolved once per
+    /// process and cached here at bus construction so the per-access cost when
+    /// it is off is a single bool test on an already-hot cache line.
+    ///
+    /// Composed with `lazy_port_reads` at the charge site, not here, and that is
+    /// deliberate: see `MachineBus::charge_isa_io_wait` for why the Accurate 386
+    /// class stays out of it.
+    isa_io_wait: bool,
     /// The Accurate-class (386) extension of the lazy time-derived port reads:
     /// 3DA/3BA/3C2 (VGA status), 0x61 (PIT channel 1/2 OUT), and 0x200-0x207
     /// (the gameport RC one-shots) answer WITHOUT ending the CPU batch.

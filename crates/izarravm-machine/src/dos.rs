@@ -56,9 +56,12 @@ impl Machine {
         raw_program::place_environment(&mut machine.memory, DOS_LOAD_SEGMENT, prog_top, &entries)?;
 
         // Seed PIT counter 0 the way the BIOS POST leaves it, so a program that
-        // polls the timer for a delay doesn't spin forever.
+        // polls the timer for a delay doesn't spin forever. Through the
+        // CONSTRUCTION bus: this models POST work already done before the guest
+        // exists, so it must not accrue ISA bus time against the guest's first
+        // batch. See `make_construction_bus`.
         {
-            let mut bus = machine.make_bus();
+            let mut bus = machine.make_construction_bus();
             let _ = bus.write_io(0x43, BusWidth::Byte, 0x34, false);
             let _ = bus.write_io(0x40, BusWidth::Byte, 0x00, false);
             let _ = bus.write_io(0x40, BusWidth::Byte, 0x00, false);
@@ -123,9 +126,13 @@ impl Machine {
         self.memory.write_u16(0x41c, 0x1e)?;
         self.memory.write_u8(0x417, 0)?;
         // Program the 8259 pair (master IRQ0..7 -> INT 08h..0Fh), then mask all
-        // but IRQ1 on the master so an unhandled timer INT cannot fire.
+        // but IRQ1 on the master so an unhandled timer INT cannot fire. Through
+        // the CONSTRUCTION bus, for the reason the PIT seed above uses it: POST
+        // work, not guest time. (The PIC ports are outside the charged set today,
+        // so this is future-proofing rather than a live fix -- but a seed write is
+        // a seed write whatever the set holds.)
         {
-            let mut bus = self.make_bus();
+            let mut bus = self.make_construction_bus();
             for (port, value) in [
                 (0x20u16, 0x11u16),
                 (0x21, 0x08),

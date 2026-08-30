@@ -33634,17 +33634,53 @@ impl CallOutHelper {
         }
     }
 
-    fn attribution_label(self) -> &'static str {
+    /// Whether this helper's calls are ALSO keyed into the shared per-port table. Derived
+    /// from the same exhaustive match shape as `attribution_index`, immediately beside it,
+    /// so a seventh helper cannot be added without answering the port question here -- the
+    /// closure identity over the ports table is built from this predicate, and used to be a
+    /// hand-written `{0, 4, 5}` index sum restated in two crates (it went stale in both).
+    const fn attribution_is_port_class(self) -> bool {
         match self {
-            Self::PortReadAlDx => "in_al_dx",
-            Self::PushAllDword => "pushad",
-            Self::PopAllDword => "popad",
-            Self::InterpretOne { .. } => "interpret_one",
-            Self::PortReadAlImm8 { .. } => "in_al_imm8",
-            Self::PortWriteAlImm8 { .. } => "out_al_imm8",
+            Self::PortReadAlDx | Self::PortReadAlImm8 { .. } | Self::PortWriteAlImm8 { .. } => true,
+            Self::PushAllDword | Self::PopAllDword | Self::InterpretOne { .. } => false,
         }
     }
 }
+
+/// One representative of each helper family, in `attribution_index` order. The row and port
+/// values carried here are arbitrary and unread: `attribution_index` and
+/// `attribution_is_port_class` both match `{ .. }` without looking at them.
+///
+/// Its length is `HELPER_COUNT`, which is what makes a seventh helper a compile error rather
+/// than a silently short array: the count, this array and `DIRECT_CALLOUT_HELPER_LABELS` all
+/// have to move together.
+#[cfg(feature = "direct-callout-attribution")]
+const HELPER_KINDS: [CallOutHelper; HELPER_COUNT] = [
+    CallOutHelper::PortReadAlDx,
+    CallOutHelper::PushAllDword,
+    CallOutHelper::PopAllDword,
+    CallOutHelper::InterpretOne {
+        row: InterpretOneRow::PopRm,
+    },
+    CallOutHelper::PortReadAlImm8 { port: 0 },
+    CallOutHelper::PortWriteAlImm8 { port: 0 },
+];
+
+/// Bit `i` is set when helper index `i` keys the shared per-port table. Derived from
+/// `HELPER_KINDS` through `attribution_is_port_class`, so the ports-table closure identity is
+/// computed from the enum rather than restated as a literal index set.
+#[cfg(feature = "direct-callout-attribution")]
+const PORT_CLASS_HELPER_MASK: u32 = {
+    let mut mask = 0u32;
+    let mut index = 0;
+    while index < HELPER_COUNT {
+        if HELPER_KINDS[index].attribution_is_port_class() {
+            mask |= 1 << index;
+        }
+        index += 1;
+    }
+    mask
+};
 
 #[cfg(feature = "direct-callout-attribution")]
 impl DirectCallOutOutcomeCounts {
@@ -33683,15 +33719,6 @@ impl DirectCallOutOutcomeCounts {
                 .expect("Direct call-out abnormal sum overflowed"),
         }
     }
-
-    fn assert_closed(self) {
-        let outcomes = self
-            .continued
-            .checked_add(self.step_break)
-            .and_then(|sum| sum.checked_add(self.abnormal))
-            .expect("Direct call-out outcome closure overflowed");
-        assert_eq!(self.attempts, outcomes, "Direct call-out row did not close");
-    }
 }
 
 #[cfg(feature = "direct-callout-attribution")]
@@ -33715,11 +33742,12 @@ impl CallOutAttribution {
     fn note(&mut self, helper: CallOutHelper, port: Option<u16>, outcome: CallOutOutcome) {
         self.helpers[helper.attribution_index()].note(outcome);
         match helper {
-            // BOTH port-reading helpers share this table: `0xEC` and `0xE4` (gp2 in-imm8 callout
-            // design) read disjoint port SPACES on no fixture this campaign has measured, but
-            // nothing in the type enforces that, so the shared table is keyed by the live port
-            // value regardless of which opcode produced it. `port_totals` below sums both rows,
-            // not `helpers[0]` alone, for the same reason.
+            // ALL THREE port-class helpers share this table: `0xEC`, `0xE4` (gp2 in-imm8 callout
+            // design) and `0xE6` (the gp2 OUT-imm8 slice). They touch disjoint port SPACES on no
+            // fixture this campaign has measured, but nothing in the type enforces that, so the
+            // shared table is keyed by the live port value regardless of which opcode produced
+            // it -- and the closure identity over it sums every row this arm covers, derived
+            // from `attribution_is_port_class` rather than restated as an index set.
             CallOutHelper::PortReadAlDx
             | CallOutHelper::PortReadAlImm8 { .. }
             | CallOutHelper::PortWriteAlImm8 { .. } => {
@@ -33739,34 +33767,13 @@ impl CallOutAttribution {
     #[cold]
     #[inline(never)]
     fn snapshot(&self) -> DirectCallOutAttributionSnapshot {
-        let helper_kinds = [
-            CallOutHelper::PortReadAlDx,
-            CallOutHelper::PushAllDword,
-            CallOutHelper::PopAllDword,
-            // The row carried here is arbitrary and unused: `attribution_index` and
-            // `attribution_label` both match `InterpretOne { .. }` without reading it, because
-            // this axis is the helper and not the row. `PopRm` is the family's first member.
-            CallOutHelper::InterpretOne {
-                row: InterpretOneRow::PopRm,
-            },
-            // Same arbitrariness as the `InterpretOne` row above: the port carried here is unused,
-            // because `attribution_index` and `attribution_label` both match `PortReadAlImm8 { .. }`
-            // without reading it. Index 4, matching `attribution_index`'s assignment.
-            CallOutHelper::PortReadAlImm8 { port: 0 },
-            // Index 5, matching `attribution_index`. The port carried here is unused for the same
-            // reason the row above's is.
-            CallOutHelper::PortWriteAlImm8 { port: 0 },
-        ];
-        let helpers = helper_kinds
+        // Rows come from `DIRECT_CALLOUT_HELPER_LABELS`, the exported single source, zipped
+        // against the dense counter array in `attribution_index` order. There is no local
+        // label list left to go stale.
+        let helpers = crate::DIRECT_CALLOUT_HELPER_LABELS
             .into_iter()
             .zip(self.helpers.iter().copied())
-            .map(|(helper, counts)| {
-                counts.assert_closed();
-                DirectCallOutAttributionHelperRow {
-                    helper: helper.attribution_label(),
-                    counts,
-                }
-            })
+            .map(|(helper, counts)| DirectCallOutAttributionHelperRow { helper, counts })
             .collect::<Vec<_>>();
         let totals = self
             .helpers
@@ -33775,38 +33782,147 @@ impl CallOutAttribution {
             .fold(DirectCallOutOutcomeCounts::default(), |sum, row| {
                 sum.checked_add(row)
             });
-        totals.assert_closed();
-
-        let mut port_totals = DirectCallOutOutcomeCounts::default();
         let ports = self
             .ports
             .iter()
             .copied()
             .enumerate()
-            .filter_map(|(port, counts)| {
-                counts.assert_closed();
-                port_totals = port_totals.checked_add(counts);
-                (counts.attempts != 0).then(|| DirectCallOutAttributionPortRow {
-                    port: u16::try_from(port).expect("dense port index must fit u16"),
-                    counts,
-                })
+            .filter(|(_, counts)| counts.attempts != 0)
+            .map(|(port, counts)| DirectCallOutAttributionPortRow {
+                port: u16::try_from(port).expect("dense port index must fit u16"),
+                counts,
             })
             .collect::<Vec<_>>();
-        // BOTH port-reading helpers' rows, not `helpers[0]` alone: `0xEC` is index 0 and `0xE4`
-        // (gp2 in-imm8 callout design) is index 4, and `CallOutAttribution::note` folds both into
-        // the same shared `ports` table (see that function's comment for why one table is safe).
-        assert_eq!(
-            port_totals,
-            self.helpers[0].checked_add(self.helpers[4]),
-            "port call-out ports did not close"
-        );
 
-        DirectCallOutAttributionSnapshot {
+        let snapshot = DirectCallOutAttributionSnapshot {
             helpers,
             ports,
             totals,
-        }
+        };
+        // EVERY closure identity, in one place, shared with the `izarravm` JSON writer -- see
+        // `DirectCallOutAttributionSnapshot::assert_closed` for what it checks and for the two
+        // stale copies of the ports identity it replaced.
+        snapshot.assert_closed();
+        snapshot
     }
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+impl DirectCallOutOutcomeCounts {
+    /// One row's outcomes must sum to its attempts. The only caller is
+    /// `DirectCallOutAttributionSnapshot::assert_closed`, which is where every closure clause
+    /// lives now -- including for the `izarravm` JSON writer, which calls the same method.
+    fn row_is_closed(self) -> bool {
+        self.continued
+            .checked_add(self.step_break)
+            .and_then(|sum| sum.checked_add(self.abnormal))
+            .expect("Direct call-out outcome closure overflowed")
+            == self.attempts
+    }
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+impl DirectCallOutAttributionSnapshot {
+    /// Assert every closure identity a Direct call-out attribution snapshot must satisfy:
+    /// the helper rows are the exported label list in order, each row's outcomes sum to its
+    /// attempts, the totals are the helper rows' sum, the ports table is ordered and free of
+    /// empty rows, and its total equals the sum of exactly the PORT-CLASS helper rows.
+    ///
+    /// ONE COPY, DELIBERATELY. Every clause here previously existed twice -- once in
+    /// `CallOutAttribution::snapshot` and once in `izarravm`'s `direct_callout_attribution_json`
+    /// -- and the ports clause was written as a literal `{0, 4}` index sum in both. When the
+    /// `0xE6` OUT-imm8 helper landed at index 5, neither copy was updated, and the first armed
+    /// descent2 run aborted at teardown with 101,836,675 port attempts against 54,191,998. The
+    /// port-class set is now derived from `CallOutHelper::attribution_is_port_class` through
+    /// `PORT_CLASS_HELPER_MASK`, so a seventh helper cannot repeat it: the enum match, the
+    /// label array and `HELPER_COUNT` all have to move together or the crate does not compile.
+    ///
+    /// Panics rather than returning an error, because it is a consistency assertion over an
+    /// instrument's own output: a snapshot that fails it is not a diagnosable measurement.
+    pub fn assert_closed(&self) {
+        assert_eq!(
+            self.helpers.len(),
+            crate::DIRECT_CALLOUT_HELPER_LABELS.len(),
+            "Direct call-out helper rows must cover every helper"
+        );
+        let mut helper_totals = DirectCallOutOutcomeCounts::default();
+        let mut port_class_totals = DirectCallOutOutcomeCounts::default();
+        for (index, row) in self.helpers.iter().enumerate() {
+            assert_eq!(
+                row.helper,
+                crate::DIRECT_CALLOUT_HELPER_LABELS[index],
+                "Direct call-out helper rows are out of order at index {index}"
+            );
+            assert!(
+                row.counts.row_is_closed(),
+                "Direct call-out row did not close: {} {:?}",
+                row.helper,
+                row.counts
+            );
+            helper_totals = helper_totals.checked_add(row.counts);
+            if PORT_CLASS_HELPER_MASK & (1 << index) != 0 {
+                port_class_totals = port_class_totals.checked_add(row.counts);
+            }
+        }
+        assert_eq!(
+            self.totals, helper_totals,
+            "Direct call-out totals are not the helper rows' sum"
+        );
+        assert!(
+            self.totals.row_is_closed(),
+            "Direct call-out totals row did not close"
+        );
+
+        let mut port_totals = DirectCallOutOutcomeCounts::default();
+        let mut last_port = None;
+        for row in &self.ports {
+            assert!(
+                row.counts.attempts != 0,
+                "Direct call-out port {:#06x} row is empty",
+                row.port
+            );
+            if let Some(last) = last_port {
+                assert!(last < row.port, "Direct call-out ports are not ordered");
+            }
+            last_port = Some(row.port);
+            assert!(
+                row.counts.row_is_closed(),
+                "Direct call-out port {:#06x} row did not close",
+                row.port
+            );
+            port_totals = port_totals.checked_add(row.counts);
+        }
+        assert_eq!(
+            port_totals, port_class_totals,
+            "port call-out ports did not close"
+        );
+    }
+}
+
+/// One call to every helper variant, three of them port-class on distinct ports, snapshotted.
+///
+/// EXISTS FOR THE CROSS-CRATE TEST. The `izarravm` JSON writer's expectations (row count, row
+/// order, labels, the closure identities) had never met real CPU-side output in a test: the
+/// only thing that drove the writer was a hand-built snapshot in `main_test`, which is exactly
+/// how the writer's copy of the label list went stale twice without CI noticing. This builds a
+/// genuine snapshot through `CallOutAttribution::note` so the writer can be tested against the
+/// producer instead of against a fixture's idea of it.
+#[cfg(feature = "direct-callout-attribution")]
+pub fn direct_callout_attribution_every_helper_snapshot() -> DirectCallOutAttributionSnapshot {
+    let mut attribution = CallOutAttribution::default();
+    // Distinct ports for the three port-class helpers, so the ports table has one row each and
+    // the port-class closure identity is non-trivial.
+    let ports = [0x03dau16, 0x0061, 0x0043];
+    let mut next_port = ports.into_iter();
+    for helper in HELPER_KINDS {
+        let port = helper.attribution_is_port_class().then(|| {
+            next_port
+                .next()
+                .expect("one distinct port per port-class helper")
+        });
+        attribution.note(helper, port, CallOutOutcome::Continued);
+    }
+    attribution.snapshot()
 }
 
 #[cfg(feature = "direct-callout-attribution")]

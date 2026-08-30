@@ -1575,6 +1575,74 @@ fn callout_attribution_orders_ports_and_survives_unrelated_resets() {
 
 #[cfg(feature = "direct-callout-attribution")]
 #[test]
+fn callout_attribution_closes_the_port_table_over_the_write_helper_too() {
+    // THE REGRESSION. `CallOutAttribution::note` routes all THREE port helpers -- `0xEC`,
+    // `0xE4` and (since the gp2 `0xE6` slice) `0xE6` -- into the one shared per-port table,
+    // but `snapshot`'s closure assertion summed only the two READ helper rows on the right
+    // hand side. Any run that fired an `OUT imm8, AL` call-out with the instrument armed
+    // therefore panicked at teardown with "port call-out ports did not close", the port
+    // total exceeding the read rows by exactly the OUT traffic. The instrument was doing its
+    // job; the identity it checked was the wrong one.
+    //
+    // Plain and census builds were never affected: the whole table, the note and the
+    // assertion are `direct-callout-attribution`-gated and inert without it.
+    let (mut cpu, mut bus) = resident_stack_cpu();
+    bus.lazy_io_reads = true;
+    bus.io_read_value = Some(0x5a);
+    cpu.enable_direct_callout_attribution_for_test();
+
+    // One of each port helper, on three distinct ports so the table rows stay separable.
+    cpu.registers.set_edx(0x03da);
+    assert!(jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0) >= 0);
+    assert!(jit::direct::port_read_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, 0x0061) >= 0);
+    assert!(jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, 0x0043) >= 0);
+    // `OUT` is an unconditional step break, and the direct helper seam bypasses the emitted
+    // side-exit stub that would note it, so mirror that one outer note the way
+    // `callout_attribution_counts_each_memory_helper_refusal` mirrors the abnormal one.
+    cpu.jit_direct.note_side_exit_callout_step_break();
+
+    // The snapshot itself asserts the closure; reaching this line at all is the regression
+    // test. The explicit identity below states what has to hold rather than leaving it to a
+    // panic message.
+    let snapshot = cpu.direct_callout_attribution_snapshot().unwrap();
+    let port_total =
+        snapshot
+            .ports
+            .iter()
+            .fold(DirectCallOutOutcomeCounts::default(), |sum, row| {
+                DirectCallOutOutcomeCounts {
+                    attempts: sum.attempts + row.counts.attempts,
+                    continued: sum.continued + row.counts.continued,
+                    step_break: sum.step_break + row.counts.step_break,
+                    abnormal: sum.abnormal + row.counts.abnormal,
+                }
+            });
+    assert_eq!(port_total.attempts, 3, "one attempt per port helper call");
+    assert_eq!(
+        port_total.attempts,
+        callout_helper_counts(&snapshot, "in_al_dx").attempts
+            + callout_helper_counts(&snapshot, "in_al_imm8").attempts
+            + callout_helper_counts(&snapshot, "out_al_imm8").attempts,
+        "the per-port table must close over ALL THREE port helpers"
+    );
+    assert_eq!(
+        callout_helper_counts(&snapshot, "out_al_imm8").attempts,
+        1,
+        "the write helper's own row must count its call"
+    );
+    assert_eq!(
+        snapshot
+            .ports
+            .iter()
+            .find(|row| row.port == 0x0043)
+            .map(|row| row.counts.attempts),
+        Some(1),
+        "the write call-out's port must appear in the per-port table"
+    );
+}
+
+#[cfg(feature = "direct-callout-attribution")]
+#[test]
 fn callout_attribution_counts_each_memory_helper_refusal() {
     let mut push_cpu = flat_cpu();
     push_cpu.enable_direct_callout_attribution_for_test();

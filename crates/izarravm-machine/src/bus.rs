@@ -70,6 +70,192 @@ pub(super) fn extended_ram_screen_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether a guest port access to a legacy X-bus device is charged its real ISA
+/// bus time (`isa_io_clocks`, ~1.00 us), in BOTH directions.
+/// `IZARRAVM_ISA_IO_WAIT`.
+///
+/// **DEFAULT OFF**, and the OFF arm is byte-identical to the pre-slice tree by
+/// construction: this predicate gates the single call to `charge_isa_io_wait` on
+/// each of `read_io`/`write_io`, and the refusal term it adds to
+/// `poll_bus_certificate_from`.
+///
+/// WHAT THE ON ARM BUYS, and why it is not a nicety. On the I586 persona one
+/// 8-bit `IN` costs the guest 1.610 clocks today (`IN_PORT_CORE_CLOCKS` 12
+/// scaled by `level_timing(I586) = (1,12)`, plus `clocks_for(Byte,
+/// wait_states.io = 2)` = 4 raw bus clocks scaled by `bus_timing(I586) =
+/// (16,105)`), and one `OUT` 1.443. 86Box charges `ISA_CYCLES(8)` = 160 CPU
+/// cycles = 0.96 us on the PIT, on BOTH directions
+/// (`.bench/86Box-source/src/pit_fast.c:423` write, `:563` read; a Pentium
+/// machine always selects `PIT_8254_FAST`, `src/machine/machine.c:199-211`).
+/// The IBM PC AT Technical Reference specifies 6 BCLK = 720-750 ns for an 8-bit
+/// bus operation to an 8-bit device
+/// (`dev_docs/reference/ibm-bios/6183355_PC_AT_Technical_Reference_Mar86.txt:477-484`),
+/// and Abrash measured 780-813 ns for `OUT DX,AL` on a good 486/33 ISA board
+/// (Black Book Table 45.1). We are two orders of magnitude under all three.
+/// Full derivation and prior art: `dev_docs/isa-io-waitstate-research-2026-08-30.md`.
+///
+/// THE CONVENTION (mirroring `out_imm8_rows_armed` in `izarravm-cpu`): unset and
+/// `""` name the SAME (default) arm, `0`/`off` state it, `1`/`on` name the
+/// charge, and anything else panics rather than silently running the base -- a
+/// mistyped ladder leg that quietly ran the default would be read as the arm it
+/// did not run.
+///
+/// Read once per process; the bus stores the resolved bool at construction, so
+/// the per-access hot path is one bool test, never an environment or lazy-static
+/// touch.
+pub(super) fn isa_io_wait_armed() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ISA_IO_WAIT_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| parse_isa_io_wait_arm(std::env::var("IZARRAVM_ISA_IO_WAIT")))
+}
+
+/// The `IZARRAVM_ISA_IO_WAIT` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `isa_io_wait_armed`.
+fn parse_isa_io_wait_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        // Unset is the default. The default flipped ON on 2026-08-30, owner-directed, on the
+        // three-row ladder slate (.bench/results/isa-io-wait-ladder-20260830): gp2-586 min-wall
+        // 1.7818 with every round's effect ~30x its own within-arm null (armed legs rt
+        // 2.11-2.17), descent2-3dfx-586 1.0840 min-wall / 1.1019 mean at 4/4 valid rounds under
+        // a pre-declared 4% bar, wolf3d-586 0.9991 as the uncharged-row null control. The flip
+        // is an ERA BOUNDARY for instruction-count and rt series; the four final_instructions
+        // pins moved with it (dev_docs/isa-io-wait-results-2026-08-30.md).
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_ISA_IO_WAIT is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset (the shipped default since the 2026-08-30 flip: ON), `1` \
+                 or `on` (the same arm, stated), and `0` or `off` (the pre-slice charging)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // Empty names the SAME arm as unset -- the default.
+        "" => true,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_ISA_IO_WAIT={other:?} names no arm; accepted spellings are unset (the \
+             shipped default since the 2026-08-30 flip: ON -- charge every legacy X-bus port \
+             access, both directions, one ISA bus period), `1` or `on` (the same arm, stated) \
+             and `0` or `off` (the pre-slice charging). Refusing to guess: a mistyped ladder \
+             leg that silently ran the default would be read as the arm it did not run"
+        ),
+    }
+}
+
+// Per-THREAD, because the shipped knob is a process-wide `OnceLock` and the tests have to run
+// both arms in one process. Mirrors `OUT_IMM8_ROWS_OVERRIDE` in `izarravm-cpu`.
+#[cfg(test)]
+thread_local! {
+    static ISA_IO_WAIT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the `IZARRAVM_ISA_IO_WAIT` arm on this thread for the length of a test; `None` restores
+/// the ambient reading.
+#[cfg(test)]
+pub(super) fn set_isa_io_wait_for_test(forced: Option<bool>) {
+    ISA_IO_WAIT_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the tests; `isa_io_wait_armed` caches its env reading in a
+/// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process.
+#[cfg(test)]
+pub(super) fn parse_isa_io_wait_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_isa_io_wait_arm(value)
+}
+
+/// Whether `port` decodes to a device 86Box charges ISA bus time for -- and
+/// therefore, under `owner-ruling-86box-accuracy-parity`, the exact set this
+/// charge may cover in either direction.
+///
+/// THE SET IS 86BOX'S, PORT FOR PORT. The research note's Shape C proposed the
+/// whole legacy X-bus (PIC, keyboard, DMA, page registers, the x87 latches); an
+/// adversarial read of every `ISA_CYCLES`/`cycles_sub` site in `.bench/86Box-source`
+/// narrowed it to the three device families 86Box actually charges. Charging
+/// beyond 86Box is charging where 86Box is accurate and we would be inventing --
+/// outside the parity ruling, not sheltered by it -- and its largest term would
+/// land on the V86 monitor's PIC OCW3 probes (prince/duke under TOKAEMM), which
+/// no evidence asks for.
+///
+/// | ports | device | 86Box site | charged? |
+/// |---|---|---|---|
+/// | `0x40-0x43` | PIT (8254) | `src/pit_fast.c:423` write, `:563` read | **YES**, `ISA_CYCLES(8)` |
+/// | `0x61`, `0x63` | PPI port B + its mirror | `src/device/port_6x.c:58`, `:91`, `:105` via `cycles_sub` | **YES**, `is486`-gated |
+/// | `0x70-0x71` | RTC/CMOS (NMI mask shares 0x70) | `src/device/nvr_at.c:670`, `:722` | **YES** |
+/// | `0x20-0x21`, `0xA0-0xA1` | PIC 1/2 | `src/device/pic.c` | NO -- no cycle charge anywhere |
+/// | `0x60`, `0x64` | keyboard controller | `src/device/kbc_at.c` | NO |
+/// | `0x00-0x0F`, `0xC0-0xDF` | DMA 1/2 | `src/dma.c` | NO |
+/// | `0x80-0x8F` | DMA page + POST | `src/dma.c` | NO (only the generic unclaimed-port `io_delay`) |
+/// | `0xF0-0xF1` | x87 latch strobes | — | NO |
+///
+/// A Pentium always selects the charging PIT (`PIT_8254_FAST`,
+/// `src/machine/machine.c:199-211`), and `is486` is implied by `is586`, so both
+/// gated charges are live on the persona this slice targets.
+///
+/// **WIDENING THIS SET NEEDS ITS OWN EVIDENCE AND ITS OWN LADDER.** The physical
+/// argument (every one of those devices really does sit on the 8 MHz bus) is
+/// sound and is NOT what was rejected; what was rejected is landing it here, on
+/// the parity ruling's coat-tails, with no measurement of the rows it moves.
+///
+/// THE 4% DELTA, deliberately kept. 86Box charges `ISA_CYCLES(8)` = 8 BCLK = 160
+/// CPU cycles = 0.960 us at 166 MHz; `isa_io_clocks` charges 1.000 us. Both sit
+/// inside the 120-180 clock band the hardware documents support (research note
+/// section 3), and sharing the constant with the OPL and SB16 DSP charges is
+/// worth more than four percent of agreement with one of the two references --
+/// a second, nearly equal constant would be a drift hazard, not a fidelity gain.
+///
+/// WHAT IS DELIBERATELY EXCLUDED, beyond the parity table above, and why each
+/// exclusion is a decision rather than an oversight:
+///
+/// * **The VGA registers, including 0x3DA and the whole 0x3B0-0x3DF range.**
+///   86Box charges these NOTHING: its per-card `vid_timing_*` costs feed
+///   `svga_read_common` (the video MEMORY path,
+///   `.bench/86Box-source/src/video/vid_svga.c:2039`), while `svga_in`'s
+///   `case 0x3da:` (`:622-634`) adds no cycles at all. Under the
+///   `owner-ruling-86box-accuracy-parity` ruling, being inaccurate the same way
+///   86Box is inaccurate can merge -- so 0x3DA stays cheap here even though real
+///   hardware and DOSBox-X both charge it. This is also where the largest counts
+///   on the board live (gp2-586 reads 0x3DA 2.003 billion times in an 80 s run),
+///   so repricing it is a separate slice with a separate risk budget, not a
+///   side effect of this one.
+/// * **The OPL ports and the SB16 DSP read ports.** They ALREADY take
+///   `isa_io_clocks` on the read side (`read_io`'s OPL and DSP arms), default-on
+///   in the Approximate class. Listing them here would charge those reads twice.
+///   Their WRITE side stays uncharged: the research note's Shape C does not list
+///   them, 86Box's charging of OPL writes is not established in the note, and
+///   adding a write charge to a landed default-on mechanism is a different
+///   change from arming a default-off one.
+/// * **The Lotura chipset ports 0xE0-0xE7.** A host-native device of this
+///   machine, not an ISA peripheral; nothing on the metal answers there.
+/// * **IDE/ATA (0x1F0-0x1F7, 0x170-0x177) and PCI configuration (0xCF8-0xCFF).**
+///   Explicitly left alone by the research note's Shape C. The ATA poll-skip
+///   machinery prices its own iterations, and 0xCF8 is a PCI cycle, not an ISA
+///   one.
+/// * **Unclaimed ports.** 86Box charges a smaller `io_delay` (56 cycles at
+///   166 MHz) when no handler answers (`src/io.c:384` and peers), and a real ISA
+///   cycle does happen whether or not a device drives the data lines. That is a
+///   real gap, but it is a different charge with a different magnitude, and
+///   modelling it would move fixtures that touch no modelled device at all.
+///   Left for a follow-up with its own ladder.
+const fn port_is_legacy_isa_io(port: u16) -> bool {
+    matches!(port, 0x0040..=0x0043 | 0x0061 | 0x0063 | 0x0070..=0x0071)
+}
+
+/// The one port the io-family poll skip can ever certify. Both entry points into
+/// `poll_bus_certificate_from` reach it only after establishing the polled port
+/// is the active colour status-1 register: the interpreter checks
+/// `poll.resolved_port(cpu) != 0x03da` outright (`run.rs`), and the call-out seam
+/// checks `vega.poll_skip_status1_port_active()`, which is `port_enabled(0x3da)`
+/// plus the colour-personality tests. Named so the certificate's ISA-charge
+/// refusal has a port to ask about without threading one through the seam's POD.
+#[cfg(feature = "jit")]
+pub(super) const POLL_SKIP_IO_PORT: u16 = 0x03da;
+
 /// The whole composition rule for `MachineBus::lazy_ports_386`, split out from
 /// the environment read so it is testable without touching process state.
 ///
@@ -156,6 +342,7 @@ impl Machine {
             flat_data_cost: self.active_mode.uses_approximate_timing(),
             extended_ram_screen: extended_ram_screen_enabled(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
+            isa_io_wait: isa_io_wait_armed(),
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
@@ -184,6 +371,32 @@ impl Machine {
             bus_num_at_batch_start,
             bus_den_at_batch_start,
         }
+    }
+
+    /// A bus for CONSTRUCTION-TIME device programming -- the seed writes a machine
+    /// performs before any guest instruction runs (`new_raw_program`'s PIT seed and
+    /// 8259 pair setup in `dos.rs`). Identical to `make_bus` except that the ISA
+    /// wait-state charge is disarmed.
+    ///
+    /// WHY IT HAS TO BE DISARMED, and why clearing the accrual afterwards would be
+    /// the weaker fix. `isa_io_batch_clocks` is an accrual belonging to a live CPU
+    /// batch: the run loop folds it into that batch's guest-clock step and zeroes it
+    /// (`run_until_tick`), and `canonical_state_capture` refuses a machine holding a
+    /// non-zero one precisely because an uncommitted accrual has no batch to belong
+    /// to (`MachineCanonicalCaptureError::UncommittedBatchTiming`). A construction
+    /// write happens outside every batch, so a charge taken there is not "pending",
+    /// it is SPURIOUS -- it would be paid by whichever batch happened to run first,
+    /// and until then the machine cannot be captured at all. The seed writes model
+    /// what the BIOS POST already did before the guest was loaded; that time is not
+    /// the guest's to pay.
+    ///
+    /// Found by adversarial review of the `IZARRAVM_ISA_IO_WAIT` slice: armed, a
+    /// freshly constructed `new_raw_program` machine held three PIT periods of
+    /// accrual and refused canonical capture before executing an instruction.
+    pub(super) fn make_construction_bus(&mut self) -> MachineBus<'_> {
+        let mut bus = self.make_bus();
+        bus.isa_io_wait = false;
+        bus
     }
 
     pub fn read_physical_u8(&mut self, address: u32) -> u8 {
@@ -657,8 +870,37 @@ impl MachineBus<'_> {
     /// `poll_fetch_certificate_raw_from` with the interpreter's `poll_bus_certificate`
     /// below so the two can never certify the same shape differently.
     #[cfg(feature = "jit")]
-    fn poll_bus_certificate_from(&self, fetches: &[(u32, u32, u8)]) -> Option<PollBusCertificate> {
+    fn poll_bus_certificate_from(
+        &self,
+        fetches: &[(u32, u32, u8)],
+        port: u16,
+    ) -> Option<PollBusCertificate> {
         if self.trace.tracing_mode() != TracingMode::Off || !self.lazy_port_reads {
+            return None;
+        }
+        // THE ISA-CHARGE REFUSAL (`IZARRAVM_ISA_IO_WAIT`). This certificate is
+        // denominated in RAW BUS CLOCKS: `poll_project_scaled_bus_clocks` puts
+        // the whole per-iteration figure through `scale_bus`, and `poll_commit_bus`
+        // commits it into the bus trace. The ISA charge is deliberately NOT in that
+        // unit -- it is unscaled CPU clocks accrued into `isa_io_batch_clocks`
+        // and folded into the batch step outside `scale_bus` (see
+        // `charge_isa_io_wait`) -- so it CANNOT be added to `raw` without being
+        // divided by the persona's bus scaler, which is the whole thing the
+        // charge exists to escape. A certificate that simply omitted it would
+        // under-price every skipped iteration by ~1 us and let the skip machinery
+        // fast-forward a span the guest could not have run, which is the one
+        // correctness interaction the research note names as a blocker.
+        //
+        // So: on a charged port, REFUSE. Poll skip declines and the loop runs its
+        // iterations for real, each paying the charge through `read_io`. This is
+        // conservative rather than free, and today it is also inert: the io-family
+        // poll skip only ever certifies `POLL_SKIP_IO_PORT` (0x3DA), which is
+        // deliberately NOT in the charged set (86Box parity -- see
+        // `port_is_legacy_isa_io`). The guard is here so that a future slice which
+        // widens the charged set -- the DOSBox-X-style flat model over every port,
+        // Shape A in the note -- disables the skip instead of silently
+        // under-pricing it.
+        if self.isa_io_wait && self.lazy_port_reads && port_is_legacy_isa_io(port) {
             return None;
         }
         let mut raw = self.poll_fetch_certificate_raw_from(fetches)?;
@@ -677,13 +919,17 @@ impl MachineBus<'_> {
     /// dispatches on `family()` before certification), so its own logic and
     /// order are unchanged. Delegates to `poll_bus_certificate_from` (BLOCKER B).
     #[cfg(feature = "jit")]
-    pub(super) fn poll_bus_certificate(&self, poll: PollLoop) -> Option<PollBusCertificate> {
+    pub(super) fn poll_bus_certificate(
+        &self,
+        poll: PollLoop,
+        port: u16,
+    ) -> Option<PollBusCertificate> {
         let mut fetches = [(0u32, 0u32, 0u8); 6];
         for (slot, entry) in fetches.iter_mut().zip(0..poll.fetch_count()) {
             *slot = poll.fetch(entry)?;
         }
         // M1: see `poll_fetch_certificate_raw`'s matching comment.
-        self.poll_bus_certificate_from(&fetches[..poll.fetch_count().min(6)])
+        self.poll_bus_certificate_from(&fetches[..poll.fetch_count().min(6)], port)
     }
 
     /// Certify exact warm-RAM fetch and data-read costs for the classified
@@ -788,6 +1034,46 @@ impl MachineBus<'_> {
             .checked_add(additional)
             .expect("projected poll bus clock addition must succeed");
         self.trace.add_elapsed_clocks(additional);
+    }
+
+    /// Charge one 8-bit ISA bus cycle for a legacy X-bus port access, in either
+    /// direction. `IZARRAVM_ISA_IO_WAIT`, DEFAULT OFF (`isa_io_wait_armed`).
+    ///
+    /// WHY THE CHARGE IS THE SAME IN BOTH DIRECTIONS, which is the one thing a
+    /// reader is most likely to expect to differ. On the Pentium an I/O write is
+    /// NOT posted: "only memory writes are buffered and I/O writes are not"
+    /// (Pentium Family Developer's Manual Vol 1,
+    /// `dev_docs/reference/Pentium-K6/241428-004_..._Jul95.txt:3332`), and `OUT`
+    /// does not begin the next instruction "before ... the I/O write has
+    /// completed" (`:3403-3416`). 86Box charges the PIT identically on both
+    /// directions (`pit_fast.c:423` write, `:563` read). DOSBox-X's 3/4 discount
+    /// on writes is the outlier and has no Pentium justification, so it is not
+    /// copied.
+    ///
+    /// THE CHARGE IS ADDITIVE, replacing nothing. The CPU-side `IN`/`OUT` core
+    /// clocks and the recorded bus cycle both stay exactly as they are; this is
+    /// the device-side ISA cycle on top, matching 86Box's structure (a flat
+    /// per-instruction cost plus a per-device `ISA_CYCLES` charge).
+    ///
+    /// THE UNIT. `isa_io_clocks` is CPU clocks at the LIVE mode's clock rate --
+    /// 166 at 166 MHz, 100 at 100 MHz -- so what is invariant across personas is
+    /// the microsecond, not the clock count, which is what a fixed-frequency bus
+    /// means. It accrues into `isa_io_batch_clocks`, which `run_until_tick` folds
+    /// into the batch's guest-clock step OUTSIDE `scale_bus` (see the comment
+    /// above that site): expressing this as bus wait states instead would put it
+    /// through the 586's 16/105 bus scaler and shrink a microsecond to 0.15 of
+    /// one, which is exactly the shape the charge exists to escape.
+    ///
+    /// GATED ON `lazy_port_reads` (the Approximate 486/586 class), like both
+    /// existing `isa_io_clocks` sites. The Accurate 386 class advances devices
+    /// per instruction and is the class whose clock bit-identity is still a merge
+    /// bar, so it keeps today's cadence whatever this knob says. A conservative
+    /// fork: the physical argument for the charge applies to a 386 too, and
+    /// arming it there is a separate decision with its own re-pin.
+    fn charge_isa_io_wait(&mut self, port: u16) {
+        if self.isa_io_wait && self.lazy_port_reads && port_is_legacy_isa_io(port) {
+            *self.isa_io_clocks += isa_io_clocks(self.active_mode);
+        }
     }
 
     fn record_pending_device_memory_write(&mut self, physical: u32, width: u32) {
@@ -2123,6 +2409,20 @@ impl CpuBus for MachineBus<'_> {
             return Ok(value);
         }
 
+        // The ISA bus charge, BELOW the width split so a word access pays for the
+        // two byte cycles it actually decomposes into rather than three (one for
+        // the wide access plus one per byte), and above every DEVICE arm, because
+        // the cycle happens on the bus before any device answers -- a charge
+        // tucked inside one device's arm is how the OPL and DSP charges came to be
+        // the only two in the tree.
+        //
+        // The two arms it sits below are `pci.read_io` (0xCF8-0xCFF, a PCI cycle
+        // and not an ISA one) and the bus-master IDE block, neither of which
+        // overlaps the charged set as configured; a guest that relocated BAR4 into
+        // the X-bus range would skip the charge on those sixteen ports, which is
+        // strictly the conservative direction.
+        self.charge_isa_io_wait(port);
+
         // THE 0x3DA FAST PATH. GP2 reads this one port 2.003 billion times in a run, and in
         // decode order it walks `port_disabled` plus four UART/LPT range checks first, every
         // time. Answer it here instead. `Uart16450::read_port` and `Lpt::read_port` alone are
@@ -2646,6 +2946,11 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
 
+        // See `read_io`'s matching site: below the width split (one charge per
+        // byte cycle), above every device arm, and above `port_disabled` -- an
+        // ISA cycle to a listed port happens whether or not the decode answers.
+        self.charge_isa_io_wait(port);
+
         if self.vega.port_disabled(port) {
             return Ok(());
         }
@@ -3030,7 +3335,11 @@ impl CpuBus for MachineBus<'_> {
         // compile-time bound, so a caller bug that set it above 6 must refuse here rather than
         // index-panic on `req.fetches` (a fixed `[(u32, u32, u8); 6]`).
         let fetches = &req.fetches[..usize::from(req.fetch_count).min(6)];
-        let Some(certificate) = self.poll_bus_certificate_from(fetches) else {
+        // `POLL_SKIP_IO_PORT`: the `poll_skip_status1_port_active` check just above is
+        // `port_enabled(0x3da)` plus the colour-personality tests, so this seam's polled
+        // port is that constant and the certificate can ask the ISA-charge question about
+        // it without the request POD carrying a port.
+        let Some(certificate) = self.poll_bus_certificate_from(fetches, POLL_SKIP_IO_PORT) else {
             return Err(CalloutPollDecline::BusCertificate);
         };
         let beam = self.predicted_beam();
