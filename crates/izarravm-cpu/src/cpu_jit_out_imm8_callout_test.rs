@@ -73,11 +73,12 @@ fn select_out_imm8_rows(enabled: bool) -> OutImm8RowsGuard {
 // The knob
 // ---------------------------------------------------------------------------------------------
 
-/// THE DEFAULT PIN. This row ships default OFF: no wall ladder has been run on it, and the OFF arm
-/// is the A/B base every leg is read against. A default that moved without that evidence would
-/// change every shipped binary's admission silently.
+/// THE DEFAULT PIN. This row ships default ON since the 2026-08-30 flip: the gp2-586 ladder read
+/// min-wall ratio 1.2127 with 4/4 rounds valid, and the two-arm census reconciliation removed the
+/// whole 59,968,424-exit row with zero relocation. A default that moved back without equivalent
+/// evidence would change every shipped binary's admission silently.
 #[test]
-fn out_imm8_rows_ship_off_by_default() {
+fn out_imm8_rows_ship_on_since_the_20260830_ladder() {
     jit::direct::set_out_imm8_rows_for_test(None);
     let ambient = std::env::var("IZARRAVM_OUT_IMM8_ROWS");
     let expected = jit::direct::parse_out_imm8_rows_arm_for_test(ambient.clone());
@@ -89,15 +90,16 @@ fn out_imm8_rows_ship_off_by_default() {
     );
     if ambient.is_err() {
         assert!(
-            !expected,
-            "IZARRAVM_OUT_IMM8_ROWS must default OFF: this row has no ladder yet, and the OFF arm \
-             is the base the two-arm census reconciliation is read against"
+            expected,
+            "IZARRAVM_OUT_IMM8_ROWS must default ON: the 2026-08-30 gp2-586 ladder (1.2127, 4/4 \
+             rounds) is the flip's evidence, recorded on the parse arm and in the flip commit"
         );
     }
 }
 
-/// The spelling table: unset and `""` must BOTH parse `false` (the default, OFF), `0`/`off` must
-/// name the same arm stated, `1`/`on` the admission, and anything else must PANIC.
+/// The spelling table: unset and `""` must BOTH parse `true` (the default, ON since 2026-08-30),
+/// `1`/`on` must name the same arm stated, `0`/`off` the pre-slice base, and anything else must
+/// PANIC.
 ///
 /// Catches: a `_ => false` fallthrough replacing the panic -- a mistyped ladder leg would silently
 /// run the base and be read as "the slice under test changed nothing".
@@ -107,8 +109,8 @@ fn out_imm8_rows_spelling_table_names_both_arms() {
     let unset = jit::direct::parse_out_imm8_rows_arm_for_test(Err(VarError::NotPresent));
     let empty = jit::direct::parse_out_imm8_rows_arm_for_test(Ok(String::new()));
     assert!(
-        !unset,
-        "unset must name the OFF arm: this row ships default OFF"
+        unset,
+        "unset must name the ON arm: the default flipped ON with the 2026-08-30 ladder"
     );
     assert_eq!(
         unset, empty,

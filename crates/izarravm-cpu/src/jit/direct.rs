@@ -12028,29 +12028,33 @@ pub(crate) fn out_imm8_rows_armed() -> bool {
 /// unit-tested without a process-global env write. See `out_imm8_rows_armed`.
 fn parse_out_imm8_rows_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
-        // Unset is the default, and the default is OFF until a ladder says otherwise.
-        Err(std::env::VarError::NotPresent) => return false,
+        // Unset is the default. The default flipped ON on 2026-08-30: the gp2-586 ladder read
+        // min-wall ratio 1.2127 with 4/4 rounds valid, every round's effect 20x its own
+        // within-arm null, foreign_s 0.0 on all rounds past the first, and the two-arm census
+        // reconciliation removed the whole 59,968,424-exit row with ZERO relocation
+        // (.bench/results/out-imm8-ladder-20260830, gp2-out-census-20260830).
+        Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
                 "IZARRAVM_OUT_IMM8_ROWS is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset (the shipped default: OFF), `0` or `off` (the same OFF arm, \
-                 stated -- `0xE6` stays a barrier), and `1` or `on` (the `PortWriteAlImm8` \
-                 admission)"
+                 spellings are unset (the shipped default since the 2026-08-30 ladder: ON), `1` \
+                 or `on` (the same arm, stated), and `0` or `off` (the pre-slice base -- `0xE6` \
+                 stays a barrier)"
             )
         }
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
-        "" => false,
+        "" => true,
         "0" | "off" => false,
         "1" | "on" => true,
         other => panic!(
             "IZARRAVM_OUT_IMM8_ROWS={other:?} names no arm; accepted spellings are unset (the \
-             shipped default, OFF), `0` or `off` (the same arm, stated) and `1` or `on` (the \
-             `0xE6` OUT imm8,AL call-out admission, any immediate port). Refusing to guess: a \
-             mistyped ladder leg that silently ran the default would be read as the arm it did \
-             not run"
+             shipped default since the 2026-08-30 ladder: ON), `1` or `on` (the same arm, \
+             stated -- the `0xE6` OUT imm8,AL call-out admission, any immediate port) and `0` \
+             or `off` (the pre-slice base). Refusing to guess: a mistyped ladder leg that \
+             silently ran the default would be read as the arm it did not run"
         ),
     }
 }
