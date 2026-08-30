@@ -59,3 +59,8 @@ subdirectories.
   they enter the ledger (game 4 precedent).
 * Spawn one Sonnet agent per game with AGENT-BRIEF.md; tell it to run
   emulator calls FOREGROUND and never park on background notifications.
+* Every new recipe JSON needs a LICENSE_MANIFEST.tsv row (class
+  `test-fixture`, origin `IzarraVM project`, GPL-3.0-only, sha256),
+  and the manifest is PATH-SORTED. CI's file policy fails without it.
+  One-liner before each push:
+  `for f in .bench/corpus/games/*.json; do ...` (see day-1 close, CI fix).
