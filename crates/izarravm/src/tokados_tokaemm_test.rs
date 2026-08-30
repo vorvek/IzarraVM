@@ -1555,17 +1555,17 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("599K"),
+        Some("598K"),
         "all three RAM-scaled tables -- the arena bitmap, the VCPI ownership \
          bitmap and the EMS chain table -- moved out of the resident core into \
          the system window at SYS_LIN_BASE, which took conventional free from \
          582 KiB to 598 KiB (past the 593 KiB the machine had before it grew to \
          64 MB). In the core they cost ~18 KiB AND grew at ~288 bytes per \
-         megabyte of arena; in extended memory they cost neither. The last \
-         KiB, 598 -> 599, came from the IOPL-3 rewrite: deleting the \
-         sensitive-op emulation, the vif/vip hold machinery, maybe_deliver \
-         and the VCPI boundary EOI release shrank the driver by 800 \
-         bytes.\n{text}"
+         megabyte of arena; in extended memory they cost neither. The IOPL-3 \
+         rewrite's 800-byte shrink bought 598 -> 599; the LIM 4.0 handle-name \
+         function 53h (ems_names, 8 bytes per handle) plus hardware-info 59h \
+         (both required by 1830's EMS detection and streaming pool) grew the \
+         core back across the boundary, 599 -> 598.\n{text}"
     );
     assert_extended_category(&screen, "23,552K", "23,141K");
 
@@ -1774,9 +1774,11 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(599K)"),
-        "MEM /CLASSIFY should report about 599 KiB conventional free (598 KiB \
-         before the IOPL-3 rewrite shrank the resident core by 800 bytes).\n{}",
+        Some("(598K)"),
+        "MEM /CLASSIFY should report about 598 KiB conventional free (599 KiB \
+         after the IOPL-3 rewrite's 800-byte shrink; EMS functions 53h and \
+         59h, both required by 1830, grew the core back across the KiB \
+         boundary).\n{}",
         screen.text
     );
 }

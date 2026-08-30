@@ -354,6 +354,40 @@ nm_zero2:
     or ah, ah
     jnz f_name5
 
+    ; 11j. hardware info (59h, LIM 4.0 OS/E). Subfn 01: unallocated/total RAW
+    ;      pages -- raw pages ARE 16 KB pages here, so both counts must equal
+    ;      42h's. 1830's streaming module sizes its EMS pool from 5901h's BX
+    ;      WITHOUT checking AH; an 84h answer left BX stale and the pool came
+    ;      out 50 pages instead of ~1900. Subfn 00: the 5-word hardware array
+    ;      (word 0 = raw page size in paragraphs = 0x400). Subfn 2 -> 8Fh.
+    mov ah, 0x42
+    int 0x67
+    or ah, ah
+    jnz f_raw
+    mov si, bx                    ; SI = free per 42h
+    mov di, dx                    ; DI = total per 42h
+    mov ax, 0x5901
+    int 0x67
+    or ah, ah
+    jnz f_raw
+    cmp bx, si
+    jne f_raw
+    cmp dx, di
+    jne f_raw
+    push ds
+    pop es
+    mov di, hw_buf
+    mov ax, 0x5900
+    int 0x67
+    or ah, ah
+    jnz f_raw
+    cmp word [hw_buf], 0x0400
+    jne f_raw
+    mov ax, 0x5902
+    int 0x67
+    cmp ah, 0x8F
+    jne f_raw
+
     ; 12. counts reflect the allocation (42h): free dropped by exactly the 4
     ; pages this program holds, from the baseline step 3 recorded.
     mov ah, 0x42
@@ -443,6 +477,8 @@ f_name3:  mov al, 0xC3
 f_name4:  mov al, 0xC4
           jmp sig
 f_name5:  mov al, 0xC5
+          jmp sig
+f_raw:    mov al, 0xC6
 
 sig:
     mov ah, al
@@ -460,6 +496,7 @@ ems_free0: dw 0
 name_a:   db '1830RAIL'
 name_b:   db 'ZUGZWANG'
 name_buf: times 8 db 0xAA         ; prefilled: 11e proves 5300h wrote zeros
+hw_buf:   times 10 db 0xAA        ; 5900h's 5-word hardware array (11j)
 ; 50h arrays: (logical, physical) word pairs
 map50:     dw 0, 2, 1, 3
 unmap50:   dw 0xFFFF, 2, 0xFFFF, 3
