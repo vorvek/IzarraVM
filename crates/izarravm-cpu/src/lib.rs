@@ -31,6 +31,10 @@ pub use ipe_entry_tally::IpeEntryTargets;
 mod entry_attribution_macros;
 #[cfg(feature = "jit")]
 mod jit;
+/// A genuine one-call-per-helper attribution snapshot, so the `izarravm` JSON writer can be
+/// tested against real producer output instead of a hand-built fixture. See the function.
+#[cfg(feature = "direct-callout-attribution")]
+pub use jit::direct::direct_callout_attribution_every_helper_snapshot;
 /// The entry-attribution observer's snapshot and the tables that name its buckets. Present only
 /// in the observer build (`direct-entry-attribution`); the plain build has no such symbol, which
 /// is half of why its profile-JSON key set is unchanged.
@@ -1867,6 +1871,27 @@ pub struct DirectCallOutAttributionSnapshot {
     pub ports: Vec<DirectCallOutAttributionPortRow>,
     pub totals: DirectCallOutOutcomeCounts,
 }
+
+/// Every Direct call-out helper's attribution label, in `CallOutHelper::attribution_index`
+/// order -- which is the order `DirectCallOutAttributionSnapshot::helpers` is built in and the
+/// order the `izarravm` JSON writer emits.
+///
+/// THE SINGLE SOURCE. This list used to exist three times: as a literal inside `snapshot`, as
+/// a second exhaustive match (`attribution_label`, now deleted), and again as
+/// `expected_helpers` in `izarravm`'s writer. It went stale twice -- once when the fourth
+/// helper landed, once across both port-imm8 helpers -- and each staleness aborted an armed
+/// fixture run rather than a test, because nothing drove the writer with live output. The
+/// array's length is `HELPER_COUNT`, so a seventh helper is a COMPILE error here, not a
+/// runtime one on a two-hundred-second fixture.
+#[cfg(feature = "direct-callout-attribution")]
+pub const DIRECT_CALLOUT_HELPER_LABELS: [&str; 6] = [
+    "in_al_dx",
+    "pushad",
+    "popad",
+    "interpret_one",
+    "in_al_imm8",
+    "out_al_imm8",
+];
 
 /// Stage A of the SMC census. See `jit::direct::smc_census` for the measurement rules, and
 /// `dev_docs/smc-census-design.md` §3/§4/§8 for what each rule decides.
