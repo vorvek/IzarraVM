@@ -686,10 +686,18 @@ fn every_string_opcode_is_admitted_by_the_gate_and_by_nothing_else() {
 ///   `block_straight_line` names neither, and `block_continuable`'s `Misc` arm admits only
 ///   `0xa8`/`0xa9`. So the walk refuses both one test EARLIER than `classify`, in the same
 ///   condition as the prefix refusal and with prefix winning the tie.
-/// * **`hard_boundary`** -- `0x9D` POPF (`DecodeGroup::Stack`) and `0xE2` LOOP
+/// * **`hard_boundary`** -- `0x9D` POPFD (`DecodeGroup::Stack`) and `0xE2` LOOP
 ///   (`DecodeGroup::Branch`). Both groups ARE straight-line, so both are continuable, both reach
 ///   `classify`, and both are ordinary opcode-coverage refusals -- the same arm the ten admitted
 ///   opcodes leave when the gate is off.
+///
+///   This fixture compiles at `d = true` (`Position::MidBlock.program` below), so `0x9D` decodes
+///   at `OperandSize::Dword` here -- POPFD, not POPF. POPFD still has no `classify` arm at any
+///   width and stays a barrier, unmeasured and out of scope (N2). The WORD form left this deny
+///   set on N2: it is now an `InterpretOne` call-out (`InterpretOneRow::Popf`,
+///   `cpu_jit_interpret_one_test.rs`), and this generic-callout gate has no opinion on it one way
+///   or the other -- the row's admission lives in `classify`'s Word allowlist, upstream of the
+///   knob this fixture is about.
 ///
 /// The first run of this fixture had LES/LDS pinned at `hard_boundary` and went red on exactly
 /// that row. The expectation was corrected against `route_group`, not against the failure message.
@@ -717,8 +725,10 @@ fn the_denied_neighbours_stay_barriers_in_their_own_census_arm() {
         // The far-pointer segment loads. `mod=00, reg=0, rm=1` is `les eax,[ecx]`.
         ("les eax,[ecx]", &[0xc4, 0x01], 0xc4, "non_continuable"),
         ("lds eax,[ecx]", &[0xc5, 0x01], 0xc5, "non_continuable"),
-        // POPF: one stack read, no transfer, not privileged -- and it writes IOPL.
-        ("popfd", &[0x9d], 0x9d, "hard_boundary"),
+        // POPFD (Dword; the Word form is an InterpretOne call-out since N2, tested in
+        // cpu_jit_interpret_one_test.rs, not here): one stack read, no transfer, not privileged
+        // -- and it writes IOPL.
+        ("popfd (dword only)", &[0x9d], 0x9d, "hard_boundary"),
         // A control transfer. R1 refuses resume for every one of them, forever -- so LOOP can
         // never be a CALL-OUT, which is this fixture's claim. It stopped being a BARRIER on
         // 2026-08-30: `IZARRAVM_LOOP_ROWS` (default ON) lowers it as a native TERMINAL through
@@ -1111,12 +1121,16 @@ fn interpret_one_fold_is_unmoved_by_the_string_rows() {
 /// self-adjusts from 12 to 16 -- VERIFIED rather than assumed, which is what this row is for: it
 /// names the new count explicitly, so a variant added without an `ALL` entry fails here as well as
 /// there.
+///
+/// 18 rather than 16 as of N2: `Pushf` and `Popf` joined afterwards, and this count is a floor
+/// for THIS slice's four rows, not a ceiling on the enum -- it moves again the next time a row is
+/// added, and this comment moves with it.
 #[test]
 fn the_four_string_rows_are_on_the_allowlist() {
     assert_eq!(
         jit::direct::InterpretOneRow::COUNT,
-        16,
-        "twelve rows before this slice plus the four string families"
+        18,
+        "twelve rows before this slice plus the four string families plus N2's two"
     );
     for (label, row) in ROWS {
         assert_eq!(row.label(), label);

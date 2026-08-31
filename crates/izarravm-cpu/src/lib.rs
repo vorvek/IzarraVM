@@ -5119,6 +5119,16 @@ pub(crate) const POP_SS_CORE_CLOCKS: u32 = 7;
 /// be main. See `interpret_one_fold_is_unmoved_by_the_string_rows` for the fixture that pins it.
 pub(crate) const STRING_CORE_CLOCKS: u32 = 4;
 
+/// What PUSHF charges at Word (execute.rs `0x9c`, the `OperandSize::Word` arm of the shared
+/// PUSHF/PUSHFD match). N2's row. The Dword arm (PUSHFD) is a native `Push` lowering and never
+/// reaches an `InterpretOne` slot, so only the Word charge belongs in this fold.
+pub(crate) const PUSHF_CORE_CLOCKS: u32 = 3;
+
+/// What POPF charges at Word (execute.rs `0x9d`). N2's other row. POPFD has no `classify` arm at
+/// any width and never reaches a slot, so only the Word charge belongs in this fold, the same
+/// argument `PUSHF_CORE_CLOCKS` makes.
+pub(crate) const POPF_CORE_CLOCKS: u32 = 4;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -5153,6 +5163,8 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0xA6/0xA7 CMPS, 0xAE/0xAF SCAS | execute.rs `execute_string_decoded` | `STRING_CORE_CLOCKS` |
 /// | 0xAA/0xAB STOS | execute.rs `execute_string_decoded` | `STRING_CORE_CLOCKS` |
 /// | 0xAC/0xAD LODS | execute.rs `execute_string_decoded` | `STRING_CORE_CLOCKS` |
+/// | 0x9C PUSHF, Word | execute.rs `0x9c` | `PUSHF_CORE_CLOCKS` |
+/// | 0x9D POPF, Word | execute.rs `0x9d` | `POPF_CORE_CLOCKS` |
 ///
 /// The four string rows share ONE term because they share ONE interpreter arm. That is the shape
 /// this fold was always meant to have -- one term per ARM, not one per opcode -- and it is worth
@@ -5161,6 +5173,10 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// Their four terms fold to 4, which is below the seven `MOV_SREG_CORE_CLOCKS` and
 /// `POP_SS_CORE_CLOCKS` already contribute, so this constant's VALUE does not move when they are
 /// admitted and the chain quota is identical with the knob off and on.
+///
+/// `PUSHF_CORE_CLOCKS` (3) and `POPF_CORE_CLOCKS` (4), N2, are folded in for the identical reason:
+/// both are below 7, so this constant's VALUE does not move and the two rows ship with no ladder
+/// consequence for any block that does not carry one.
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
@@ -5176,10 +5192,16 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
                 larger(PUSH_RM_CORE_CLOCKS, CLI_CORE_CLOCKS),
                 larger(
                     larger(MOV_SREG_CORE_CLOCKS, STI_CORE_CLOCKS),
-                    // One term for the four string rows, because they are one interpreter arm with
-                    // one exit. Folded in rather than left out on the argument that 4 < 7 today:
-                    // the point of a fold is that the argument does not have to be re-made.
-                    larger(POP_SS_CORE_CLOCKS, STRING_CORE_CLOCKS),
+                    larger(
+                        // One term for the four string rows, because they are one interpreter arm
+                        // with one exit. Folded in rather than left out on the argument that 4 < 7
+                        // today: the point of a fold is that the argument does not have to be
+                        // re-made.
+                        larger(POP_SS_CORE_CLOCKS, STRING_CORE_CLOCKS),
+                        // N2's two rows, same reasoning: 3 and 4 are both under 7 today, and both
+                        // are folded in rather than left out.
+                        larger(PUSHF_CORE_CLOCKS, POPF_CORE_CLOCKS),
+                    ),
                 ),
             ),
         ),
@@ -5211,11 +5233,16 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
 /// | 0xAA/0xAB STOS | one store = 1 |
 /// | 0xAC/0xAD LODS | one read = 1 |
 /// | 0xAE/0xAF SCAS | one read = 1 |
+/// | 0x9C PUSHF, Word | one stack write = 1 |
+/// | 0x9D POPF, Word | one stack read = 1 |
 ///
 /// The string rows are `rep_memory_accesses` (strings.rs) read off the same table the REP model
 /// prices its chunks with: `Movs | Cmps => 2`, everything else `=> 1`. Both are at or below the
 /// two the ordinary memory rows already present, so this bound does not move when they are
 /// admitted -- the protected-mode segment rows are still the only reason it is four.
+///
+/// PUSHF and POPF, N2, are one stack access each -- push and pop, respectively, of the flag
+/// image -- at or below the same two, so they do not move this bound either.
 ///
 /// The protected-mode segment rows are why this is FOUR rather than two, and the first of them is
 /// the one the S3 policy widening moved: a protected-mode segment load reads eight bytes of
