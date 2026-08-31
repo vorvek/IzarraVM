@@ -798,6 +798,78 @@ fn ring0_monitor_wide_port_access_stays_lazy_across_byte_decomposition() {
 }
 
 #[test]
+fn lazy_pit_counter_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
+    // L5 (corpus-lever campaign, 2026-08-31): mirrors
+    // `lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate` exactly,
+    // for the PIT counter ports. Before the L5 fix, EVERY 0x40-0x42 read fell through to the
+    // "all remaining reads are exact" catch-all and set io_touched for a guest access in BOTH
+    // timing classes -- the counter's own peek arm ran too late to matter. `cpu_is_ring0_pm` is
+    // `false` throughout, the ordinary V86/real-mode guest case every corpus game runs under:
+    // this is the read-side gap the plan's brk_step evidence points at, and the fix is the same
+    // class-based shape 0x3DA/0x61 already use, not a widening of `skip_io_touched`.
+    for port in [0x40u16, 0x41, 0x42] {
+        // Accurate class: unchanged behavior, io_touched set.
+        let mut accurate = test_machine(); // Gsw386 by construction
+        with_bus(&mut accurate, |bus| {
+            let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+            assert!(
+                *bus.io_touched,
+                "port {port:#06X}: the Accurate class must still set io_touched \
+                     on a PIT counter read"
+            );
+        });
+
+        // Approximate class: the new lazy behavior, io_touched stays false.
+        let mut approximate = test_machine();
+        approximate.set_mode(GswMode::Gsw486);
+        with_bus(&mut approximate, |bus| {
+            let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "port {port:#06X}: the Approximate class must NOT set io_touched \
+                     on a PIT counter read (the lazy path)"
+            );
+        });
+    }
+}
+
+#[test]
+fn v86_status_and_pit_polls_leave_a_pending_interrupt_visible_at_the_same_boundary() {
+    // L5's composite ask: a V86 fixture that reads 0x3DA and 0x40 with a PIC request already
+    // pending must still see that interrupt exactly where it was before -- these two ports'
+    // read-side exemption from `io_touched` must not hide or delay delivery. `io_touched`
+    // only decides when a BATCH ends; `interrupt_pending()` is driven purely by `self.pic`
+    // and is untouched by either read, so this is true by construction, but it is the
+    // guest-visible contract the corpus-lever plan asks to pin rather than infer.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586); // Approximate class, the corpus's own persona.
+    machine.pic.request(5); // an arbitrary line with no relation to 3DA/PIT.
+    with_bus(&mut machine, |bus| {
+        assert!(
+            bus.interrupt_pending(),
+            "sanity: the requested line must already be pending before either poll"
+        );
+
+        let _ = bus.read_io(0x3DA, BusWidth::Byte, 0, false).unwrap();
+        assert!(!*bus.io_touched, "the lazy 3DA read must not end the batch");
+        assert!(
+            bus.interrupt_pending(),
+            "a 3DA poll must not clear or delay the pending interrupt"
+        );
+
+        let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+        assert!(
+            !*bus.io_touched,
+            "the PIT counter read must not end the batch either"
+        );
+        assert!(
+            bus.interrupt_pending(),
+            "a PIT counter poll must not clear or delay the pending interrupt"
+        );
+    });
+}
+
+#[test]
 fn lazy_3da_read_still_resets_the_attribute_flip_flop_and_calls_catch_up() {
     // A lazy 0x3DA read must perform the exact same guest-visible side effects
     // as the non-lazy read (catch_up + the Attribute Controller address/data

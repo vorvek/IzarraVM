@@ -2580,6 +2580,47 @@ impl CpuBus for MachineBus<'_> {
                 | (u8::from(self.pit.channel_out(2)) << 5);
             return Ok(u32::from(value));
         }
+        // A counter read is time-derived: devices only advance at batch END, so the
+        // CE must be peeked at THIS instant or the guest reads the value the counter
+        // had at batch start (`Counter::count_after`). The port test guards the
+        // conversion so no other port pays for it; the peek itself runs in BOTH
+        // timing classes, exactly like the 0x61/3DA peeks above -- it changes only
+        // the VALUE read, never whether the batch ends on its own.
+        //
+        // L5 (corpus-lever campaign, 2026-08-31): hoisted from below the "all
+        // remaining reads are exact" catch-all to ABOVE it, and given the exact
+        // io_touched shape the 0x61/3DA arms already use (`lazy_port_reads ||
+        // lazy_ports_386`), not the ring-0-only `skip_io_touched` gate. Before this
+        // move, every 0x40-0x42 read fell through to the catch-all and so set
+        // io_touched for any guest (V86 or real-mode) access in EITHER timing
+        // class -- the counter's own peek logic below never got a chance to decide
+        // the flag, only the reported VALUE. The catch-all's comment ("The ring-0
+        // monitor's PIC OCW3 probe still honors the same skip_io_touched gate")
+        // was correct for ports that stop there; this port never needed to.
+        //
+        // Safe on the SAME grounds the `0xE4` call-out's per-port safety table
+        // already certifies for this exact port class (`jit/direct.rs`,
+        // `classify`'s `0xe4` arm): `read_port_at` is a pure peek against
+        // `elapsed_pit_clocks`. It does not advance the counter's own
+        // reload/decrement schedule and it does not touch the PIC, so a guest
+        // that polls 0x40-0x42 and expects an IRQ cannot observe a stale pendency
+        // answer -- nothing about `interrupt_pending()` moves because this byte
+        // was read. That is a stronger, port-specific proof than "ring-0 monitor
+        // bookkeeping is not guest-visible activity" (the `skip_io_touched`
+        // rationale), so it composes with a guest access the ring-0 exemption was
+        // never meant to cover, and does not touch `skip_io_touched` or
+        // `exempt_io_touched` at all -- exactly the 3DA/0x61 shape, not the
+        // ring-0-monitor shape.
+        if matches!(port, 0x40..=0x42) {
+            let elapsed_pit_clocks = self.elapsed_pit_clocks();
+            if let Some(value) = self.pit.read_port_at(port, elapsed_pit_clocks) {
+                self.note_pit_observer();
+                if !(self.lazy_port_reads || self.lazy_ports_386) && !skip_io_touched {
+                    *self.io_touched = true;
+                }
+                return Ok(u32::from(value));
+            }
+        }
         // OPL status reads are intentionally exact. AdLib detection is a timer
         // probe, and letting the poll continue inside an approximate CPU batch
         // can starve the emulated timer progression enough to fail on fast CPU
@@ -2756,19 +2797,6 @@ impl CpuBus for MachineBus<'_> {
             }
             if let Some(value) = self.sb16.read_port(port) {
                 self.opl_probe.record_sb(port, false, value);
-                return Ok(u32::from(value));
-            }
-        }
-        // A counter read is time-derived: devices only advance at batch END, so the
-        // CE must be peeked at THIS instant or the guest reads the value the counter
-        // had at batch start (`Counter::count_after`). The port test guards the
-        // conversion so no other port pays for it, and unlike the 0x61 / 3DA peeks
-        // this one is NOT gated on `lazy_port_reads` -- it changes only the VALUE
-        // read, never whether the batch ends, so both timing classes want it.
-        if matches!(port, 0x40..=0x42) {
-            let elapsed_pit_clocks = self.elapsed_pit_clocks();
-            if let Some(value) = self.pit.read_port_at(port, elapsed_pit_clocks) {
-                self.note_pit_observer();
                 return Ok(u32::from(value));
             }
         }
