@@ -147,11 +147,18 @@ fn filler() -> Vec<u8> {
     FILL.concat()
 }
 
-/// `call far selector:offset` (`0x9A imm16 imm16`), or the 0x66-prefixed Dword form.
+/// `call far selector:offset` (`0x9A imm16 imm16`), or the 0x66-prefixed Dword form
+/// (`0x9A imm32 imm16` -- a 4-byte offset followed by a 2-byte selector, six operand bytes in
+/// all, NOT four: a `0x66`-prefixed `CALL FAR` widens the offset half only, and the selector
+/// stays a 16-bit far pointer's word regardless of operand size).
 fn call_far(selector: u16, offset: u16, dword: bool) -> Vec<u8> {
     let mut bytes = if dword { vec![0x66] } else { vec![] };
     bytes.push(0x9a);
-    bytes.extend_from_slice(&offset.to_le_bytes());
+    if dword {
+        bytes.extend_from_slice(&(offset as u32).to_le_bytes());
+    } else {
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
     bytes.extend_from_slice(&selector.to_le_bytes());
     bytes
 }

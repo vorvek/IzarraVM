@@ -9916,6 +9916,12 @@ const EXIT_ARG: Reg = Reg::RCX;
 // `STACK_FAR_CALL_NATIVE` at 160 and 8 bytes of padding at 168 to keep the
 // frame's 16-byte alignment invariant (see `STACK_FAR_CALL_NATIVE`'s own doc),
 // filling 176 bytes.
+//
+// This +16 (160 -> 176) is paid by EVERY compiled block, not just one that uses CallFar16 --
+// the prologue's xor+store into `STACK_FAR_CALL_NATIVE` and `emit_return`'s load+store both run
+// unconditionally, including on the `IZARRAVM_DIRECT_RETF_V86` knob's `0` escape arm, which was
+// built to be byte-identical to main. frame growth accepted unpriced 2026-08-31; the escape arm
+// is no longer byte-identical to main; re-price before using =0 as an A/B base.
 const BASE_STACK_LEN: u32 = 176;
 // One frame shape for every block, x87-bearing or not. A chained native
 // transfer jumps straight into a target block's body, skipping its
@@ -10989,7 +10995,9 @@ pub(crate) fn parse_disp_load_widen_arm_for_test(
 }
 
 /// The three arms of `IZARRAVM_DIRECT_RETF_V86`: which CPU modes may serve `0xCA`/`0xCB` RETF
-/// natively.
+/// natively. **Since L8, this same knob and the same three arms also gate `0x9A` CALL FAR
+/// ptr16:16** (`call_far_admitted_here`); everything below is written in RETF's terms because RETF
+/// is what priced the flip, but every arm's admission rule applies identically to both opcodes.
 ///
 /// **`V86` IS THE SHIPPED DEFAULT SINCE THE 2026-08-24 LADDER.** It shipped `Off` for exactly the
 /// commits that built it, and the ladder that priced it flipped it in the next -- the same
@@ -11026,7 +11034,8 @@ pub(crate) enum RetfArm {
 }
 
 impl RetfArm {
-    /// Whether this arm admits a native RETF in the CPU's CURRENT mode.
+    /// Whether this arm admits a native RETF -- or, since L8, a native CALL FAR ptr16:16 -- in the
+    /// CPU's CURRENT mode.
     ///
     /// The caller tests `self != Off` FIRST and only then calls this, so the OFF arm reads no CPU
     /// state per walked instruction. That ordering is the whole of what makes the ESCAPE arm's
@@ -11042,7 +11051,9 @@ impl RetfArm {
     }
 }
 
-/// Which modes serve RETF natively (`IZARRAVM_DIRECT_RETF_V86`). See `RetfArm`.
+/// Which modes serve RETF -- and, since L8, CALL FAR ptr16:16 -- natively
+/// (`IZARRAVM_DIRECT_RETF_V86`). See `RetfArm`. `call_far_admitted_here` calls this same function
+/// and applies the same arm; there is no separate CALL-FAR knob.
 ///
 /// **DEFAULT `v86` SINCE THE 2026-08-24 LADDER.**
 ///
@@ -11077,7 +11088,9 @@ impl RetfArm {
 ///
 /// # THE SPELLING TABLE
 ///
-/// Trimmed and case-folded on the way in:
+/// Trimmed and case-folded on the way in. Governs both `0xCA`/`0xCB` RETF and, since L8, `0x9A`
+/// CALL FAR ptr16:16 -- one arm, read once, applied identically to both opcodes' admission
+/// predicates:
 ///
 /// * **unset** or `v86` -> V86 only, the shipped default since the 2026-08-24 flip. Every
 ///   "defaults" leg recorded BEFORE that date is the escape arm and is not comparable with one
@@ -11116,7 +11129,7 @@ fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfA
         Err(std::env::VarError::NotPresent) => return RetfArm::V86,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
-                "IZARRAVM_DIRECT_RETF_V86 is set to a value that is not valid UTF-8; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder: native RETF in V86), `0` or `off` (the escape and the A/B base, under which the RETF stops the block and the interpreter serves it) and `1` or `on` (native RETF in V86 and plain real mode, opt-in and unpriced)"
+                "IZARRAVM_DIRECT_RETF_V86 is set to a value that is not valid UTF-8; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder: native RETF and, since L8, native CALL FAR ptr16:16 in V86), `0` or `off` (the escape and the A/B base, under which the RETF/CALL FAR stops the block and the interpreter serves it) and `1` or `on` (native RETF and CALL FAR in V86 and plain real mode, opt-in and unpriced)"
             )
         }
         Ok(raw) => raw,
@@ -11126,7 +11139,7 @@ fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfA
         "v86" => RetfArm::V86,
         "1" | "on" => RetfArm::On,
         other => panic!(
-            "IZARRAVM_DIRECT_RETF_V86={other:?} names no arm; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder), `0` or `off` (the escape and the A/B base) and `1` or `on` (V86 and plain real mode, opt-in). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm it named doing nothing"
+            "IZARRAVM_DIRECT_RETF_V86={other:?} names no arm; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder; governs both RETF and, since L8, CALL FAR ptr16:16), `0` or `off` (the escape and the A/B base) and `1` or `on` (V86 and plain real mode, opt-in). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm it named doing nothing"
         ),
     }
 }
@@ -11138,8 +11151,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Force the RETF arm on this thread for the length of a fixture; `None` restores the ambient
-/// `IZARRAVM_DIRECT_RETF_V86` reading.
+/// Force the RETF/CALL-FAR arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_DIRECT_RETF_V86` reading. Governs both `retf_admitted_here` and
+/// `call_far_admitted_here`, which read the same knob.
 #[cfg(test)]
 pub(crate) fn set_direct_retf_v86_for_test(forced: Option<RetfArm>) {
     DIRECT_RETF_V86_OVERRIDE.with(|cell| cell.set(forced));

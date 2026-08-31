@@ -42,6 +42,15 @@ const RETF: [u8; 1] = [0xcb];
 /// `a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled` below for the current
 /// behaviour.
 const CALL_FAR: [u8; 5] = [0x9a, 0x00, 0x04, 0x20, 0x00];
+/// `JMP FAR 0020:0400`: non-continuable, and (unlike `0x9a`/`0xcb` above) has NO `classify` arm
+/// anywhere in `jit/direct.rs` and is absent from `non_continuable_walk_candidate`'s `matches!`
+/// set -- confirmed by grep, not assumed. This is the negative control the walk-admission gate
+/// needs: an opcode the walk genuinely cannot carry, so a break-site probe at this address must
+/// stay `rejected`/`absent` rather than being wrongly admitted. `0x9a` served this role before L8
+/// gave it a `classify` arm (see `a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled`'s
+/// doc comment above); `0xea` is its replacement, chosen because JMP FAR ptr16:16 native lowering
+/// has never landed in this codebase.
+const JMP_FAR: [u8; 5] = [0xea, 0x00, 0x04, 0x20, 0x00];
 
 /// Where the far return goes: selector 0x0020 (base 0x200) at offset 0x0400, linear 0x600.
 const TARGET_SELECTOR: u16 = 0x0020;
@@ -322,6 +331,53 @@ fn a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled() {
     assert!(
         cpu.perf_counters().jit_direct_linked_transfers > linked_before,
         "the bound link must be taken on every later visit"
+    );
+}
+
+/// The GATE'S NEGATIVE CONTROL, rebased onto `0xea` (`JMP FAR ptr16:16`).
+///
+/// `walk_admits_non_continuable_entry` (`non_continuable_walk_candidate(insn.opcode) && ...` for
+/// each admitted family) must still say NO to an opcode that is genuinely inadmissible: one with
+/// no `classify` arm and absent from `non_continuable_walk_candidate`'s set. Without this test the
+/// gate mechanism has no proof it can ever refuse -- a future bug that made the predicate
+/// always-true, or a future non-continuable opcode added to the walk-candidate set without ever
+/// getting a `classify` arm, would go undetected by every other fixture in this file, because they
+/// all exercise opcodes the gate is SUPPOSED to admit.
+///
+/// This is the same shape the CALL FAR fixture above used to be, before L8 gave `0x9a` a
+/// `classify` arm and turned it into a positive control (see that test's doc comment). `0xea` is
+/// its replacement: still a far transfer, still non-continuable, still with no native lowering
+/// anywhere in this codebase.
+#[test]
+fn a_genuinely_inadmissible_non_continuable_entry_stays_absent() {
+    let (mut cpu, mut bus) = staged_with(true, &JMP_FAR);
+    for _ in 0..VISITS {
+        visit(&mut cpu, &mut bus);
+    }
+
+    assert_eq!(
+        cpu.jit_direct.len(),
+        1,
+        "only the predecessor may compile; the JMP FAR entry has no classify arm and must never \
+         become a block, got {} blocks",
+        cpu.jit_direct.len()
+    );
+    assert!(
+        class(&cpu, "absent") > 0,
+        "the JMP FAR entry must classify absent, not admitted into a compile attempt: {:?}",
+        cpu.direct_barrier_census_snapshot()
+            .unwrap()
+            .unbound_targets
+    );
+    assert_eq!(
+        class(&cpu, "rejected"),
+        0,
+        "an opcode the walk cannot carry at all must never reach a structural reject -- that \
+         would mean the break-site probe admitted it into a compile attempt, which is exactly the \
+         regression this control exists to catch: {:?}",
+        cpu.direct_barrier_census_snapshot()
+            .unwrap()
+            .unbound_targets
     );
 }
 
