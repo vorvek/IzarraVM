@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use izarravm_bus::{BusWidth, Memory};
-use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, MASTER_CLOCK_HZ};
 use izarravm_video::{
     CGA_FB_SIZE, DAC_ENTRIES, Distira, DistiraApertureTraffic, DistiraCensus, DistiraScanoutState,
     HGC_FB_SIZE, MARGO_FRAME_HZ, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, Margo, MargoDisplay,
@@ -248,7 +248,6 @@ impl Vega {
         &mut self.vga
     }
 
-    #[cfg(test)]
     pub(crate) fn margo(&self) -> &Margo {
         &self.margo
     }
@@ -256,6 +255,10 @@ impl Vega {
     #[cfg(test)]
     pub(crate) fn margo_mut(&mut self) -> &mut Margo {
         &mut self.margo
+    }
+
+    pub(crate) fn distira(&self) -> &Distira {
+        &self.distira
     }
 
     #[cfg(test)]
@@ -268,7 +271,12 @@ impl Vega {
         self.distira.disable_display();
     }
 
+    #[cfg(test)]
     pub(crate) fn set_vbe_mode(&mut self, request: u16) -> bool {
+        self.set_vbe_mode_at(request, None)
+    }
+
+    pub(crate) fn set_vbe_mode_at(&mut self, request: u16, master_ticks: Option<u64>) -> bool {
         let mode = request & 0x01ff;
         if !self.margo.set_mode(mode) {
             return false;
@@ -283,6 +291,10 @@ impl Vega {
         self.margo_active = true;
         self.margo_linear = request & 0x4000 != 0;
         self.margo_bank = 0;
+        // Same yield as INT 10h AH=00 (`select_legacy`) and the test helper
+        // `set_margo_mode_640x480x8`. Guest 4F02 must not leave Distira latched
+        // over a live Margo session.
+        self.distira.disable_display();
         if self.margo_linear {
             self.vbe_mode_sets_linear = self.vbe_mode_sets_linear.saturating_add(1);
         } else {
@@ -292,15 +304,12 @@ impl Vega {
             request,
             self.vbe_mode_sets_linear,
             self.vbe_mode_sets_banked,
+            master_ticks,
         );
         true
     }
 
-    /// Accepted 4F02 mode sets so far, as (linear, banked). Recon instrument;
-    /// see the field comments. Test-only: a fixture run reads the same numbers
-    /// off `IZARRAVM_VBE_TRACE`, which is the form that answers the question
-    /// without a build that carries a reporting path nobody else calls.
-    #[cfg(test)]
+    /// Accepted 4F02 mode sets so far, as (linear, banked).
     pub(crate) fn vbe_mode_set_window_counts(&self) -> (u32, u32) {
         (self.vbe_mode_sets_linear, self.vbe_mode_sets_banked)
     }
@@ -1973,7 +1982,12 @@ fn changed_frame_rows(old: &[u32], new: &[u32], width: usize, height: usize) -> 
 /// happens a handful of times in a whole run (GP2 sets one mode; NASCAR sets
 /// one), so this is not a hot path and the `OnceLock` read is already more
 /// machinery than the site needs. The env var is read once per process.
-fn trace_vbe_mode_set(request: u16, linear_total: u32, banked_total: u32) {
+fn trace_vbe_mode_set(
+    request: u16,
+    linear_total: u32,
+    banked_total: u32,
+    master_ticks: Option<u64>,
+) {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_VBE_TRACE").is_some()) {
@@ -1984,9 +1998,16 @@ fn trace_vbe_mode_set(request: u16, linear_total: u32, banked_total: u32) {
     } else {
         "banked"
     };
+    let when = match master_ticks {
+        Some(ticks) => {
+            let guest_ms = ticks / (MASTER_CLOCK_HZ / 1000);
+            format!(" guest_ms={guest_ms} master_ticks={ticks}")
+        }
+        None => String::new(),
+    };
     eprintln!(
         "[VBE] 4F02 request={request:#06x} mode={:#05x} window={window} dont_clear={} \
-         totals: linear={linear_total} banked={banked_total}",
+         totals: linear={linear_total} banked={banked_total}{when}",
         request & 0x01ff,
         request & 0x8000 != 0,
     );

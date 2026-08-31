@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use izarravm_video::{DISTIRA_REG_FB_WIDTH, SST_SWAPBUFFER_CMD};
+use izarravm_video::{
+    DISTIRA_REG_FB_WIDTH, FBIINIT1_VIDEO_RESET, INIT_ENABLE_WRITE, SST_FBI_INIT1,
+    SST_SWAPBUFFER_CMD,
+};
 
 #[test]
 fn machine_advances_the_vga_beam_with_cpu_clocks() {
@@ -116,12 +119,87 @@ fn graphics_mode_reporting_follows_the_active_vega_engine() {
     for byte in 0..4 {
         machine.write_physical_u8(DISTIRA_MMIO_BASE + SST_SWAPBUFFER_CMD as u32 + byte, 0);
     }
-    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+    assert_eq!(
+        machine.active_display(),
+        ActiveDisplay::MargoLfb,
+        "SWAPBUFFER must not steal scanout from a live VBE session"
+    );
     assert!(machine.is_graphics_mode());
 
     assert!(machine.set_vga_mode(0x13));
     machine.video_mut().set_text_mode();
     assert!(!machine.is_graphics_mode());
+}
+
+#[test]
+fn margo_store_dump_ignores_the_active_mux() {
+    let mut machine = test_machine();
+    machine.load_margo_test_pattern();
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    let (before, width, height) = machine
+        .margo_store_frame_argb()
+        .expect("Margo session is live");
+    assert_eq!((width, height), (640, 480));
+    assert!(
+        before.iter().any(|&pixel| pixel != 0),
+        "test pattern must be visible in the Margo dump"
+    );
+
+    enable_distira_via_video_reset(&mut machine);
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+
+    let (after, width, height) = machine
+        .margo_store_frame_argb()
+        .expect("Margo stays latched behind Distira");
+    assert_eq!((width, height), (640, 480));
+    assert_eq!(
+        after, before,
+        "the Margo dump must not follow Distira scanout"
+    );
+    let pal8 = machine
+        .margo_store_pal8_argb(640, 480)
+        .expect("pal8 reread of a live store");
+    assert_eq!(pal8.len(), 640 * 480);
+}
+
+#[test]
+fn vbe_4f02_yields_distira_and_publishes_margo() {
+    let mut machine = test_machine();
+    enable_distira_via_video_reset(&mut machine);
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    assert!(!machine.vega.distira_mut().display_enabled());
+}
+
+#[test]
+fn swapbuffer_does_not_steal_mux_from_vbe() {
+    let mut machine = test_machine();
+    enable_distira_via_video_reset(&mut machine);
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+
+    for byte in 0..4 {
+        machine.write_physical_u8(DISTIRA_MMIO_BASE + SST_SWAPBUFFER_CMD as u32 + byte, 0);
+    }
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    assert!(!machine.vega.distira_mut().display_enabled());
+}
+
+fn write_distira_u32(machine: &mut Machine, offset: usize, value: u32) {
+    for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+        machine.write_physical_u8(DISTIRA_MMIO_BASE + offset as u32 + index as u32, byte);
+    }
+}
+
+fn enable_distira_via_video_reset(machine: &mut Machine) {
+    machine
+        .vega
+        .distira_mut()
+        .set_init_enable(INIT_ENABLE_WRITE);
+    write_distira_u32(machine, SST_FBI_INIT1, FBIINIT1_VIDEO_RESET);
+    write_distira_u32(machine, SST_FBI_INIT1, 0);
 }
 
 #[test]
