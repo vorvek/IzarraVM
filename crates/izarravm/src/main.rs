@@ -3435,6 +3435,10 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "jit_direct_reject_data_segment": mark.perf.jit_direct_reject_data_segment,
                 "jit_direct_reject_data_segment_strict": mark.perf.jit_direct_reject_data_segment_strict,
                 "jit_direct_reject_data_segment_masked": mark.perf.jit_direct_reject_data_segment_masked,
+                "jit_direct_reject_data_segment_real": mark.perf.jit_direct_reject_data_segment_real,
+                "jit_direct_reject_data_segment_v86": mark.perf.jit_direct_reject_data_segment_v86,
+                "jit_direct_reject_data_segment_pm16": mark.perf.jit_direct_reject_data_segment_pm16,
+                "jit_direct_reject_data_segment_pm32": mark.perf.jit_direct_reject_data_segment_pm32,
                 "jit_direct_cache_resets": mark.perf.jit_direct_cache_resets,
                 "jit_direct_arena_compactions": mark.perf.jit_direct_arena_compactions,
                 // The wall the compaction rebuild actually cost, measured rather than
@@ -3685,6 +3689,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "data_segment_retires_suppressed": snapshot.data_segment_retires_suppressed,
         "data_segment_sticky_crossings": snapshot.data_segment_sticky_crossings,
         "data_segment_link_declines": snapshot.data_segment_link_declines,
+        "data_segment_live_promotions": snapshot.data_segment_live_promotions,
         "data_segment_distinct_layouts": snapshot.data_segment_distinct_layouts.to_vec(),
         // Sticky-decline memo, always on. `decline_memo_hits / admission_declines[dormant_probe]`
         // is the acceptance instrument; a census-gated counter would leave the wall build unable

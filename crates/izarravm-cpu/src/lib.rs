@@ -861,6 +861,15 @@ pub struct PerfCounters {
     /// and the OFF leg is where it first reads.
     pub jit_direct_reject_data_segment_strict: u64,
     pub jit_direct_reject_data_segment_masked: u64,
+    /// `jit_direct_reject_data_segment`, split by the rejecting key's `mode_key`.
+    ///
+    /// `real` is PE clear; `v86` is EFLAGS.VM set; `pm16` is PE set, V86 clear, CS.D clear;
+    /// `pm32` is PE set, V86 clear, CS.D set. The four sum to `jit_direct_reject_data_segment`.
+    /// Counted at the same reject as the strict/masked split so they ride `phase_marks`.
+    pub jit_direct_reject_data_segment_real: u64,
+    pub jit_direct_reject_data_segment_v86: u64,
+    pub jit_direct_reject_data_segment_pm16: u64,
+    pub jit_direct_reject_data_segment_pm32: u64,
     pub jit_direct_reject_alignment: u64,
     pub jit_direct_reject_fetch_limit: u64,
     pub jit_direct_reject_zero_budget: u64,
@@ -2339,6 +2348,8 @@ pub struct DirectStallSnapshot {
     pub data_segment_retires_suppressed: u64,
     pub data_segment_sticky_crossings: u64,
     pub data_segment_link_declines: u64,
+    /// First cap hit that rewrites the key as live-data. Zero on the OFF arm.
+    pub data_segment_live_promotions: u64,
     /// Slice (a)'s missing census: how many DISTINCT live descriptor tuples -- masked by the
     /// rejecting arm's own mask -- each key in the cap map has been rejected against. Index is
     /// the distinct count; the last cell counts keys whose census SATURATED and must be read as

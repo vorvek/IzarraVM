@@ -897,8 +897,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The `0xEE` OUT DX,AL slice adds `CallOutTable::port_write_al_dx` (8 bytes), moving the pin
     // 4584 -> 4592 -- measured, not derived. Same shape again: a host-side function-pointer slot,
     // not architectural state; see cpu_test.rs's twin comment.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4592);
+    // The Tyrian live-data slice adds four PerfCounters fields
+    // (jit_direct_reject_data_segment_real / _v86 / _pm16 / _pm32; 32 bytes), moving the pin
+    // 4592 -> 4624 -- measured, not derived. Reject counts are host bookkeeping, so both
+    // canonical payloads are unchanged by it; see cpu_test.rs's twin comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4624);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4592);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4624);
 }
