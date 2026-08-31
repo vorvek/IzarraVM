@@ -3,6 +3,38 @@
 
 use super::*;
 
+/// The SECOND word of a far-pointer memory operand -- LES/LDS/LSS/LFS/LGS's selector, which sits
+/// `operand_size_bytes` past the offset word this instruction family reads first.
+///
+/// WRAPS MOD 64K at `AddressSize::Word`, rather than adding into a flat `u32` offset. 86Box's
+/// `opLDS_w_a16` (`src/cpu/x86_ops_mov_seg.h`) is the citation: `cpu_state.eaa16[0]` is a
+/// `uint16_t`, so `cpu_state.eaa16[0] += 2` wraps in C's unsigned 16-bit arithmetic, and the
+/// following `CHECK_READ` bounds it with `& 0xffff` too. A 16-bit EA of `0xFFFE` therefore reads
+/// its selector back at `0x0000`, not at the linear `0x10000` a bare `u32` add would reach --
+/// `resolve_memory_addr_mode`'s own Word arm masks the FIRST word's EA the same way
+/// (`(sum as u16) as u32`), so the second word has to be masked too or the two halves of one
+/// instruction disagree about how their segment wraps. `AddressSize::Dword`'s 32-bit forms
+/// (`opLDS_w_a32` et al.) add without any such mask, because their EA register (`eaaddr`) is a
+/// `u32` and the whole segment is flat -- which is why this only special-cases `Word`.
+///
+/// The far CALL/JMP-through-memory arm (`0xFF /3`, `/5`) already got this right, independently,
+/// against a SingleStepTests 80386 conformance vector (FF.3 "call far [ds:bx+di]" with
+/// `bx=di=0xffff`; `far_call_via_memory_wraps_selector_offset_at_64k` pins it). This function
+/// dedupes what was a second hand-written copy of that same arithmetic and gives LES/LDS/LSS/
+/// LFS/LGS the fix that arm already had.
+fn far_pointer_second_word_offset(
+    address_size: AddressSize,
+    first_word_offset: u32,
+    operand_size_bytes: u32,
+) -> u32 {
+    match address_size {
+        AddressSize::Word => {
+            u32::from((first_word_offset as u16).wrapping_add(operand_size_bytes as u16))
+        }
+        AddressSize::Dword => first_word_offset.wrapping_add(operand_size_bytes),
+    }
+}
+
 fn bit_op(op: u8, value: u32, bit: u32) -> (bool, u32) {
     // op: 0=BT, 1=BTS, 2=BTR, 3=BTC. `bit` is already reduced to 0..bits-1 (the caller
     // masks to the operand width, so 0..15 for a word and 0..31 for a dword).
@@ -746,7 +778,11 @@ impl CpuGsw {
                     operand_size,
                     BusAccessKind::DataRead,
                 )?;
-                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector_offset = far_pointer_second_word_offset(
+                    insn.address_size,
+                    mem.offset,
+                    operand_size.bytes(),
+                );
                 let selector = self.read_memory_sized(
                     bus,
                     mem.segment,
@@ -791,7 +827,11 @@ impl CpuGsw {
                     operand_size,
                     BusAccessKind::DataRead,
                 )?;
-                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector_offset = far_pointer_second_word_offset(
+                    insn.address_size,
+                    mem.offset,
+                    operand_size.bytes(),
+                );
                 let selector = self.read_memory_sized(
                     bus,
                     mem.segment,
@@ -982,13 +1022,15 @@ impl CpuGsw {
                         // The selector follows the offset in memory. Its address is computed in the
                         // address-size space, so on a 16-bit real-mode segment it wraps at 0xffff
                         // (offset 0xfffe puts the selector at 0x0000, not past the limit), matching
-                        // the 80386.
-                        let selector_offset = match address_size {
-                            AddressSize::Word => u32::from(
-                                (memory.offset as u16).wrapping_add(operand_size.bytes() as u16),
-                            ),
-                            AddressSize::Dword => memory.offset.wrapping_add(operand_size.bytes()),
-                        };
+                        // the 80386 (SingleStepTests FF.3 "call far [ds:bx+di]" with bx=di=0xffff;
+                        // `far_call_via_memory_wraps_selector_offset_at_64k` pins it). LES/LDS/LSS/
+                        // LFS/LGS share the exact same shape and the same wrap, through
+                        // `far_pointer_second_word_offset`.
+                        let selector_offset = far_pointer_second_word_offset(
+                            address_size,
+                            memory.offset,
+                            operand_size.bytes(),
+                        );
                         let selector = self.read_memory_sized(
                             bus,
                             memory.segment,

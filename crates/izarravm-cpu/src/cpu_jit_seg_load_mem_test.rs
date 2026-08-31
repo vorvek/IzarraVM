@@ -27,8 +27,12 @@ const CS_BASE: u32 = 0x0000;
 const DS_BASE: u32 = 0x0400;
 const ES_BASE: u32 = 0x0300;
 
+/// Sized past `DS_BASE + 0xFFFF` (0x103FE), not just 64K: the wrap-boundary rows place their far
+/// pointer at a guest OFFSET near 0xFFFF, and DS_BASE is a real-mode segment base (paragraph
+/// aligned, not itself wrapped), so the LINEAR byte a wrapped offset near the top of the segment
+/// lands at is past the first 64K of this buffer.
 fn memory_fill() -> Vec<u8> {
-    let mut memory = vec![0u8; 0x1_0000];
+    let mut memory = vec![0u8; 0x1_1000];
     for (i, byte) in memory.iter_mut().enumerate() {
         *byte = (i.wrapping_mul(37).wrapping_add(11) & 0xff) as u8;
     }
@@ -185,7 +189,7 @@ fn compile_leading_block_on(builder: fn() -> CpuGsw, d: bool, body: &[u8]) -> Op
         cpu.begin_instruction();
         cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
     }
-    for page in (0..0x1_0000u32).step_by(0x1000) {
+    for page in (0..0x11_000u32).step_by(0x1000) {
         map_direct_page(&mut cpu, &mut bus, page);
     }
     cpu.set_eip(ENTRY);
@@ -210,7 +214,13 @@ fn mov_sreg_mem(reg_field: u8) -> Vec<u8> {
 
 /// `LES`/`LDS reg, [OPERAND]` -- direct addressing, `mod = 00`, `rm = 110`.
 fn les_lds_mem(opcode: u8, dst: u8) -> Vec<u8> {
-    [vec![opcode, dst << 3 | 0x06], w(OPERAND)].concat()
+    les_lds_mem_at(opcode, dst, OPERAND)
+}
+
+/// `les_lds_mem` with an explicit disp16, for the wrap-boundary rows that need an offset other
+/// than `OPERAND` (0xFFFE, 0xFFFF).
+fn les_lds_mem_at(opcode: u8, dst: u8, offset: u16) -> Vec<u8> {
+    [vec![opcode, dst << 3 | 0x06], w(offset)].concat()
 }
 
 // -------------------------------------------------------------------------------------------
@@ -220,10 +230,21 @@ fn les_lds_mem(opcode: u8, dst: u8) -> Vec<u8> {
 #[derive(Clone, Copy)]
 struct Seed {
     gpr: [u32; 8],
-    /// The word at `DS_BASE + OPERAND` (the far pointer's offset half read by every row here).
+    /// The GUEST OFFSET the far pointer's first word sits at, matching whatever disp16 the
+    /// instruction under test was encoded with (`OPERAND` by default). Not `OPERAND` itself:
+    /// the wrap-boundary rows need 0xFFFE/0xFFFF here.
+    read_offset: u16,
+    /// The word at LINEAR `DS_BASE + read_offset`, placed there UNWRAPPED (the far pointer's
+    /// offset half every row here reads first). A disp16 is already a plain 16-bit value, so
+    /// this is where `AddressWrap::Word`'s mask leaves it -- and neither engine re-wraps an
+    /// individual word access that straddles the top of the segment (86Box's `readmemw` is a
+    /// flat fetch), so `read_offset = 0xFFFF` places this word's second byte one PAST the
+    /// segment rather than wrapping it back to offset 0. See `build`.
     offset_word: u16,
-    /// The word at `DS_BASE + OPERAND + 2` (the selector half `LesLds` reads; unused by
-    /// `LoadSegRealMem`).
+    /// The word at LINEAR `DS_BASE + ((read_offset + 2) & 0xffff)` -- the far pointer's selector
+    /// half, whose START wraps mod 0x10000 (`far_pointer_second_word_offset`'s whole point) but
+    /// whose own two bytes are then placed linearly from there, for the same reason
+    /// `offset_word` is. Unused by `LoadSegRealMem`, which performs only the one read.
     selector_word: u16,
     /// Give ES and DS an already-real-mode-incompatible descriptor (unreal-mode limit, code
     /// access byte, `default_size_32` true) before the run, so a dropped access store or a spare
@@ -234,6 +255,7 @@ struct Seed {
 impl Seed {
     fn new() -> Self {
         Self {
+            read_offset: OPERAND,
             gpr: std::array::from_fn(|i| 0xdead_0000 | (0xa0 + i as u32)),
             offset_word: 0x1234,
             selector_word: 0x9000,
@@ -243,6 +265,11 @@ impl Seed {
 
     fn stale_segments(mut self) -> Self {
         self.stale_segments = true;
+        self
+    }
+
+    fn read_offset(mut self, offset: u16) -> Self {
+        self.read_offset = offset;
         self
     }
 }
@@ -266,9 +293,21 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
     let mut memory = memory_fill();
     memory[(ENTRY - 1) as usize] = 0x90;
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
-    let at = (DS_BASE + u32::from(OPERAND)) as usize;
-    memory[at..at + 2].copy_from_slice(&seed.offset_word.to_le_bytes());
-    memory[at + 2..at + 4].copy_from_slice(&seed.selector_word.to_le_bytes());
+    // The offset word sits at `read_offset` unwrapped -- a disp16 is already a plain 16-bit
+    // value, so a linear two-byte placement there is exactly what a wrapping AddressWrap::Word
+    // mask leaves it as (a no-op below 0x10000). It is placed LINEARLY from there, not wrapped
+    // byte by byte: neither engine re-wraps an individual word access that straddles the top of
+    // the segment (86Box's `readmemw` is a flat `easeg + a` fetch; matching that is what makes
+    // `read_offset = 0xFFFF` exercise something real rather than a fixture invention).
+    //
+    // The selector word's START wraps mod 0x10000 -- `far_pointer_second_word_offset`'s whole
+    // point -- and is placed linearly from THAT wrapped start. For `read_offset = 0xFFFE` this
+    // is offset 0x0000; for `0xFFFF` it is 0x0001 (`0xFFFF + 2 = 0x10001`, masked).
+    let offset_at = (DS_BASE + u32::from(seed.read_offset)) as usize;
+    memory[offset_at..offset_at + 2].copy_from_slice(&seed.offset_word.to_le_bytes());
+    let selector_offset = (u32::from(seed.read_offset) + 2) & 0xffff;
+    let selector_at = (DS_BASE + selector_offset) as usize;
+    memory[selector_at..selector_at + 2].copy_from_slice(&seed.selector_word.to_le_bytes());
 
     let mut native = builder();
     let mut interp = builder();
@@ -305,7 +344,7 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
             cpu.begin_instruction();
             cpu.fetch_decoded(bus, linear).expect("fixture decode");
         }
-        for page in (0..0x1_0000u32).step_by(0x1000) {
+        for page in (0..0x11_000u32).step_by(0x1000) {
             map_direct_page(cpu, bus, page);
         }
     }
@@ -353,7 +392,17 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
     }
 }
 
-fn compare_state(roles: &Roles, context: &str) {
+/// What a natively-served MISALIGNED word access costs OVER the interpreted role, at `TestBus`'s
+/// dials -- a `TestBus` modelling artifact, not a divergence, per
+/// `cpu_jit_misaligned_memory_test.rs`'s module header (which this is a narrow copy of: native
+/// charges one WIDE cycle where the interpreted role charges two BYTE cycles for the same split
+/// access, and `TestBus`'s direct-page wait states are width-dependent where a real `MachineBus`'s
+/// are not, so the residual is a fixture artifact rather than a real cost). `LesLds` can trigger
+/// it TWICE in one instruction -- once per word read -- where every other kind in that file
+/// triggers it at most once, which is why this lives here rather than being imported.
+const MISALIGNED_WORD_BUS_CLOCK_DELTA: u64 = 1; // TestBus: 3 (word) - 2 (byte)
+
+fn compare_state_with_bus_slack(roles: &Roles, bus_clock_slack: u64, context: &str) {
     assert_eq!(
         crate::tests::settled_registers(&roles.native),
         crate::tests::settled_registers(&roles.interp),
@@ -374,7 +423,7 @@ fn compare_state(roles: &Roles, context: &str) {
     );
     assert_eq!(
         roles.native_bus.trace.elapsed_clocks(),
-        roles.interp_bus.trace.elapsed_clocks(),
+        roles.interp_bus.trace.elapsed_clocks() + bus_clock_slack,
         "{context}: bus clocks"
     );
     assert_eq!(
@@ -384,6 +433,21 @@ fn compare_state(roles: &Roles, context: &str) {
 }
 
 fn lowered_on(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed, context: &str) {
+    lowered_on_with_bus_slack(builder, d, body, seed, 0, context);
+}
+
+/// `lowered_on` with a caller-supplied `MISALIGNED_WORD_BUS_CLOCK_DELTA`-scaled bus-clock slack,
+/// for the rows that deliberately read at an odd address (the wrap-boundary rows). See
+/// `MISALIGNED_WORD_BUS_CLOCK_DELTA`'s own doc for why the slack is legitimate rather than a
+/// loosened assertion.
+fn lowered_on_with_bus_slack(
+    builder: fn() -> CpuGsw,
+    d: bool,
+    body: &[u8],
+    seed: Seed,
+    bus_clock_slack: u64,
+    context: &str,
+) {
     let mut roles = build(builder, d, body, seed);
     let before = roles.native.perf_counters().jit_direct_insns;
     assert!(
@@ -401,7 +465,7 @@ fn lowered_on(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed, context
     for _ in 0..3 {
         roles.interp.cycle(&mut roles.interp_bus).unwrap();
     }
-    compare_state(&roles, context);
+    compare_state_with_bus_slack(&roles, bus_clock_slack, context);
 }
 
 fn lowered16(body: &[u8], seed: Seed, context: &str) {
@@ -410,6 +474,60 @@ fn lowered16(body: &[u8], seed: Seed, context: &str) {
 
 fn lowered_v86(body: &[u8], seed: Seed, context: &str) {
     lowered_on(v86_cpu, false, body, seed, context);
+}
+
+/// The fault-parity shape: `body` is expected to FAULT (a legitimate segment-limit violation,
+/// not a wrap bug), and what this proves is that NEITHER engine silently succeeds where the
+/// other does not.
+///
+/// Native: the side exit must fire AT `body`, so only `FILL_A` retires (`jit_direct_insns`
+/// advances by exactly 1) -- the same "leaves the instruction un-started" proof the ordinary
+/// fault-ordering tests use, here read the other way around: a native lowering that silently
+/// wrapped the limit check right along with the address would complete all three slots instead.
+///
+/// Interpreter: EIP after stepping past `body` must NOT be `tail_at` (where completing `body`
+/// normally would leave it) -- it faulted and got redirected somewhere else, whatever this
+/// fixture's IVT (the same pseudo-random `memory_fill` bytes both engines share) sends it to.
+/// This does not chase the fault to a specific vector or delivery site; it only has to disagree
+/// with "the instruction ran to completion," which is the property a real-address-past-the-mask
+/// bug would break silently.
+fn fault_parity_on(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed, context: &str) {
+    let tail_at = ENTRY + FILL_A.len() as u32 + body.len() as u32;
+    let mut roles = build(builder, d, body, seed);
+    let before = roles.native.perf_counters().jit_direct_insns;
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "{context}: block did not run natively at all"
+    );
+    assert_eq!(
+        roles.native.perf_counters().jit_direct_insns - before,
+        1,
+        "{context}: only FILL_A may retire natively; a faulting row must side-exit instead of \
+         silently completing"
+    );
+    roles.interp.cycle(&mut roles.interp_bus).unwrap(); // FILL_A
+    // `body`: expected to fault. This fixture's IVT is the same pseudo-random `memory_fill`
+    // bytes every other row here shares, not a real handler, so delivering the #GP can itself
+    // escalate into a double or triple fault (`CpuError`) rather than a clean redirect -- either
+    // outcome is equally good proof the row did NOT complete normally, which is the only claim
+    // this helper makes.
+    if roles.interp.cycle(&mut roles.interp_bus).is_ok() {
+        assert_ne!(
+            roles.interp.registers.eip, tail_at,
+            "{context}: the interpreter completed the row normally instead of faulting"
+        );
+    }
+}
+
+fn fault_parity_on16(body: &[u8], seed: Seed, context: &str) {
+    fault_parity_on(sixteen_bit_cpu, false, body, seed, context);
+}
+
+fn fault_parity_on_v86(body: &[u8], seed: Seed, context: &str) {
+    fault_parity_on(v86_cpu, false, body, seed, context);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -510,6 +628,89 @@ fn les_lds_match_the_interpreter_in_real_mode_and_v86() {
                 &format!("{name} r{dst}, [m] (v86)"),
             );
         }
+    }
+}
+
+/// The selector address at the top of a 16-bit segment WRAPS mod 0x10000, matching 86Box's
+/// `opLDS_w_a16` (`src/cpu/x86_ops_mov_seg.h`, `dev_docs/reference/86box`) and this codebase's
+/// own `far_call_via_memory_wraps_selector_offset_at_64k` (`cpu_strings_segments_test.rs`), which
+/// already pinned the identical shape for `CALL FAR [m]` against a SingleStepTests 80386
+/// conformance vector.
+///
+/// Two EAs, both real mode (V86 where it is meaningful), both the default limit-0xFFFF fixture
+/// and the stale/stretched-limit fixture `Seed::stale_segments` builds:
+///
+/// * `0xFFFE`: the offset word sits entirely inside the segment (bytes 0xFFFE, 0xFFFF); the
+///   selector word wraps to 0x0000, 0x0001. Neither engine has a legitimate reason to fault here
+///   in EITHER fixture -- this is the case a `u32` `wrapping_add(2)` with no re-mask would get
+///   wrong SILENTLY (reading the selector from a linear byte one past the segment instead of the
+///   wrapped one), which is exactly why it needs a full differential rather than a fault-shape
+///   assertion. Both fixtures run it through `lowered16`/`lowered_v86` and must complete.
+/// * `0xFFFF`: the OFFSET word itself straddles the segment top (bytes 0xFFFF, then one past the
+///   limit). Under the DEFAULT limit-0xFFFF fixture this is a LEGITIMATE segment-limit
+///   violation, not a wrap question at all -- 86Box's flat `readmemw(easeg, a)` fetch does not
+///   re-wrap an individual straddling word access, and neither does this codebase's own
+///   `MemorySideExits` limit compare, so a correct engine on either side must FAULT here rather
+///   than complete. `fault_parity_on` is what proves neither engine silently disagrees and
+///   completes where the other faults. Under the STALE/STRETCHED-limit fixture there is no limit
+///   to violate, so it runs the ordinary full differential instead, and is the row that would
+///   catch a wrap bug in the FIRST word's own address (as opposed to the selector's, which
+///   `0xFFFE` already covers) if `MemorySideExits`' limit-guard-omitted path miscomputed it.
+///
+/// The stale/stretched-limit fixture is the reviewer's "silent wrong address" case named
+/// separately from the default fixture's "fault parity" one: with DS's limit stretched to
+/// `u32::MAX`, `MemorySideExits::new` omits the segment-limit guard entirely (a structurally
+/// different emitted path from the default fixture's), so a wrap bug hiding behind THAT guard's
+/// absence would not show up in the limit-0xFFFF fixture's `0xFFFE` row.
+#[test]
+fn les_lds_second_word_wraps_at_the_sixty_four_k_boundary() {
+    for (name, opcode) in [("les", 0xc4u8), ("lds", 0xc5u8)] {
+        let body_at = |offset: u16| les_lds_mem_at(opcode, 3, offset);
+
+        // 0xFFFE: no legitimate fault in either fixture; a full differential in both.
+        for stale in [false, true] {
+            let seed = Seed::new().read_offset(0xfffe);
+            let seed = if stale { seed.stale_segments() } else { seed };
+            lowered16(
+                &body_at(0xfffe),
+                seed,
+                &format!("{name} [0xfffe] (real, stale_segments={stale})"),
+            );
+        }
+        lowered_v86(
+            &body_at(0xfffe),
+            Seed::new().read_offset(0xfffe),
+            &format!("{name} [0xfffe] (v86)"),
+        );
+
+        // 0xFFFF, limit 0xFFFF: a legitimate segment-limit violation on the FIRST read. Fault
+        // parity, both real mode and V86 (V86 canonicalizes every segment's limit to 0xFFFF too,
+        // per `LoadSegReal`'s own doc, so the same violation applies there).
+        fault_parity_on16(
+            &body_at(0xffff),
+            Seed::new().read_offset(0xffff),
+            &format!("{name} [0xffff] (real, limit 0xffff)"),
+        );
+        fault_parity_on_v86(
+            &body_at(0xffff),
+            Seed::new().read_offset(0xffff),
+            &format!("{name} [0xffff] (v86, limit 0xffff)"),
+        );
+
+        // 0xFFFF, stretched limit: nothing to violate, so this is a full differential again --
+        // the row that would catch a wrap bug in the FIRST word's own straddling address.
+        //
+        // BOTH word reads land at an odd address here (the offset word at 0xFFFF itself, and the
+        // wrapped selector word at 0x0001), so this is `MISALIGNED_WORD_BUS_CLOCK_DELTA` TWICE
+        // over -- the one row in this file that needs the slack at all.
+        lowered_on_with_bus_slack(
+            sixteen_bit_cpu,
+            false,
+            &body_at(0xffff),
+            Seed::new().read_offset(0xffff).stale_segments(),
+            2 * MISALIGNED_WORD_BUS_CLOCK_DELTA,
+            &format!("{name} [0xffff] (real, stale_segments=true)"),
+        );
     }
 }
 

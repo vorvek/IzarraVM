@@ -6227,6 +6227,14 @@ impl DirectKind {
     pub(super) fn emitted_bytes_estimate(self) -> u32 {
         let body = if self.is_call_out() {
             EMITTED_CALL_OUT_SLOT_BYTES
+        } else if matches!(self, Self::LesLds { .. }) {
+            // TWO guarded word reads, not one: the offset and the selector, each its own
+            // `emit_ram_read_pointer` call behind its own cross-page/permission/segment-limit
+            // guard set (see the emit arm). A single `EMITTED_MEMORY_SLOT_BYTES` prices this at
+            // half its actual emitted size, which only under-estimates a page budget the
+            // recovery search would otherwise catch -- but LES/LDS is exactly the shape (two
+            // reads in one slot) that makes the gap large enough to name rather than absorb.
+            2 * EMITTED_MEMORY_SLOT_BYTES
         } else if self.is_x87()
             || matches!(
                 self,
@@ -17651,6 +17659,29 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
                 e.store_r64_disp32(Reg::RSP, STACK_LES_LDS_OFFSET, Reg::RDX);
                 // (b) the selector, at addr + 2.
+                //
+                // ACCURACY DECISION: the selector address WRAPS MOD 64K at a 16-bit address size,
+                // rather than reading a linear byte past the wrapped offset word. 86Box's
+                // `opLDS_w_a16` (src/cpu/x86_ops_mov_seg.h) is the citation -- `cpu_state.eaa16[0]`
+                // is a `uint16_t`, so `cpu_state.eaa16[0] += 2` wraps in C's unsigned 16-bit
+                // arithmetic and the following `CHECK_READ` bounds it with `& 0xffff` too, so an
+                // EA of 0xFFFE reads its selector back at 0x0000, not at the linear 0x10000.
+                // `execute_extended.rs`'s interpreter arm was the wrong side of this until this
+                // slice's differential caught it (`far_pointer_second_word_offset`, which the far
+                // CALL/JMP-through-memory arm already had right against a SingleStepTests
+                // conformance vector); the interpreter is what moved to match.
+                //
+                // This emitter needed NO change. `disp.wrapping_add(2)` folds the +2 into the
+                // COMPILE-TIME displacement, ADDED BEFORE `emit_ram_read_pointer`'s runtime
+                // `& 0xFFFF` (`memory.address_wrap` is `AddressWrap::Word` in every real-mode/V86
+                // block, which is the only mode this kind reaches). `(x + 2) mod M == ((x mod M) +
+                // 2) mod M` for any base+index+disp sum `x` and `M = 0x10000`, so masking once
+                // after folding in the +2 is exactly the same value as the interpreter's mask,
+                // add-2, mask-again -- the two engines were never going to disagree on the FORM of
+                // this address, only (before the interpreter fix) on whether the SECOND mask ran
+                // at all. `les_lds_second_word_wraps_at_the_sixty_four_k_boundary`
+                // (cpu_jit_seg_load_mem_test.rs) is the differential that pins both sides of
+                // 0xFFFE/0xFFFF against each other now that both are correct.
                 let selector_addr = DirectAddr {
                     disp: addr.disp.wrapping_add(2),
                     ..addr
