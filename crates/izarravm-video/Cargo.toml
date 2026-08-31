@@ -12,4 +12,5 @@ authors.workspace = true
 
 [dependencies]
 izarravm-bus = { path = "../izarravm-bus" }
+rayon.workspace = true
 thiserror.workspace = true

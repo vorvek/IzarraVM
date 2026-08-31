@@ -1125,6 +1125,105 @@ fn w_buffer_depth_codes_are_encoded_per_pixel_not_interpolated() {
 }
 
 #[test]
+fn raster_lane_policy_uses_four_lanes_only_with_six_or_more_cores() {
+    // Two raster threads by default. Four only when the host has six or
+    // more cores, so the rasteriser does not compete with the main
+    // emulation thread.
+    assert_eq!(Distira::raster_lanes_for_cores(1), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(2), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(4), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(5), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(6), 4);
+    assert_eq!(Distira::raster_lanes_for_cores(8), 4);
+    assert_eq!(Distira::raster_lanes_for_cores(16), 4);
+}
+
+#[test]
+fn parallel_raster_output_is_identical_to_single_threaded_output() {
+    // The rasteriser splits a large triangle across worker lanes by row.
+    // Rows partition the frame store, and every per-pixel test is a pure
+    // function of the pixel, so the parallel result must equal the serial
+    // result byte for byte: colour, depth, and every counter.
+    let draw_scene = |lanes: usize| -> (Vec<u32>, Vec<u16>, u64, u64) {
+        let mut distira = Distira::new();
+        distira.set_raster_lanes(lanes);
+        distira.set_frame_size(256, 128);
+        distira.set_dither_enabled(true);
+
+        // A far textured-free Gouraud triangle, W-buffered.
+        write_reg(
+            &mut distira,
+            SST_FBZ_MODE,
+            FBZ_RGB_WMASK
+                | FBZ_DRAW_BACK
+                | FBZ_DEPTH_ENABLE
+                | FBZ_DEPTH_WMASK
+                | FBZ_W_BUFFER
+                | FBZ_DITHER
+                | (DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT),
+        );
+        write_reg(&mut distira, SST_VERTEX_AX, 0);
+        write_reg(&mut distira, SST_VERTEX_AY, 0);
+        write_reg(&mut distira, SST_VERTEX_BX, 256 << 4);
+        write_reg(&mut distira, SST_VERTEX_BY, 0);
+        write_reg(&mut distira, SST_VERTEX_CX, 0);
+        write_reg(&mut distira, SST_VERTEX_CY, 128 << 4);
+        write_reg(&mut distira, SST_START_R, 0x40 << 12);
+        write_reg(&mut distira, SST_START_G, 0x80 << 12);
+        write_reg(&mut distira, SST_START_B, 0xc0 << 12);
+        write_reg(&mut distira, SST_DR_DX, 1 << 10);
+        write_reg(&mut distira, SST_DR_DY, 1 << 9);
+        write_reg(&mut distira, SST_START_W, 10_737_418);
+        write_reg(&mut distira, SST_DW_DX, 3_942_646);
+        write_reg(&mut distira, SST_DW_DY, 0);
+        write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+
+        // A nearer overlapping triangle with alpha blending, so the pixel
+        // pipeline reads the destination colour back.
+        write_reg(
+            &mut distira,
+            SST_ALPHA_MODE,
+            (1 << 4) | (0x1 << 8) | (0x5 << 12) | (0x80 << 24),
+        );
+        write_reg(&mut distira, SST_VERTEX_AX, 32 << 4);
+        write_reg(&mut distira, SST_VERTEX_AY, 16 << 4);
+        write_reg(&mut distira, SST_VERTEX_BX, 224 << 4);
+        write_reg(&mut distira, SST_VERTEX_BY, 24 << 4);
+        write_reg(&mut distira, SST_VERTEX_CX, 64 << 4);
+        write_reg(&mut distira, SST_VERTEX_CY, 120 << 4);
+        write_reg(&mut distira, SST_START_R, 0xff << 12);
+        write_reg(&mut distira, SST_START_G, 0x20 << 12);
+        write_reg(&mut distira, SST_START_B, 0x10 << 12);
+        write_reg(&mut distira, SST_START_W, 536_870_912);
+        write_reg(&mut distira, SST_DW_DX, 0);
+        write_reg(&mut distira, SST_DW_DY, 1 << 20);
+        write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+        write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+        write_reg(&mut distira, SST_LFB_MODE, LFB_READ_AUX);
+        let depth: Vec<u16> = (0..128usize)
+            .flat_map(|y| (0..256usize).map(move |x| (y, x)))
+            .map(|(y, x)| distira.read_lfb_u16(y * 2048 + x * 2))
+            .collect();
+        let state = distira.scanout_state();
+        (
+            distira.scanout_argb(),
+            depth,
+            state.triangles.pixels_in,
+            state.triangles.color_written,
+        )
+    };
+
+    let serial = draw_scene(1);
+    let parallel = draw_scene(4);
+    assert_eq!(serial.0, parallel.0, "colour output must match");
+    assert_eq!(serial.1, parallel.1, "depth output must match");
+    assert_eq!(serial.2, parallel.2, "pixels_in must match");
+    assert_eq!(serial.3, parallel.3, "color_written must match");
+    assert!(serial.3 > 0, "the scene must actually paint");
+}
+
+#[test]
 fn z_buffer_mode_is_unaffected_by_the_w_buffer_wiring() {
     // Regression guard: adding W-buffer support must not change Z-buffer
     // behavior when FBZ_W_BUFFER is clear. Same shape as the existing
