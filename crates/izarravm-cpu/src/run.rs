@@ -3523,6 +3523,22 @@ impl CpuGsw {
             u64::from(block.is_segment_write_block()),
             instructions,
         );
+        // L9 stage 0, THROWAWAY, compiled out of every normal build. Read AFTER the block ran, so
+        // the selector is the one the write installed rather than the one it replaced.
+        #[cfg(feature = "seg-head-diagnostic")]
+        {
+            let mask = self.jit_direct.written_segments_of(block.id());
+            // The lowest set bit, so a two-segment head is read on its first written segment and
+            // is separately visible in `seg_head_dirty_multi`.
+            if mask != 0
+                && let Some(segment) =
+                    crate::jit::direct::segment_of_bit(1u8 << mask.trailing_zeros())
+            {
+                let selector = self.registers.segment(segment).selector;
+                self.jit_direct
+                    .note_seg_head_diagnostic(block.id(), block.span(), mask, selector);
+            }
+        }
         // v2 IPE-trace observer, DISARMED in every normal build. A disarmed entry pays one null
         // test and nothing else; the field is EXPECTED to share a cache line with the other
         // `Option<Box<..>>` diagnostics `JitState` already carries and that the line above

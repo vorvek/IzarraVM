@@ -2229,6 +2229,25 @@ fn write_hdd_profile_json(
     // Stage 0 of the far-return slice (design §5.0a). A SIBLING top-level object for the same
     // reason the entry-attribution block below is one: `perf_counters_json`'s ordered key list
     // must stay identical between the plain and the instrumented build.
+    // L9 stage 0, THROWAWAY. A SIBLING top-level object for the same reason the two blocks around
+    // it are siblings: `perf_counters_json`'s ordered key list must read the same in a plain build
+    // and an instrumented one.
+    #[cfg(feature = "seg-head-diagnostic")]
+    {
+        let stalls = machine.cpu().direct_stall_snapshot();
+        report["seg_head_diagnostic"] = serde_json::json!({
+            "entries": stalls.seg_head_diagnostic_entries,
+            "successor_pins_written": stalls.seg_head_successor_pins_written,
+            "successor_absent": stalls.seg_head_successor_absent,
+            "selector_repeat": stalls.seg_head_selector_repeat,
+            "dirty_multi": stalls.seg_head_dirty_multi,
+            "eligible": stalls.seg_head_eligible,
+            "eligible_successor_pins_written": stalls.seg_head_eligible_successor_pins_written,
+            "eligible_successor_absent": stalls.seg_head_eligible_successor_absent,
+            "eligible_selector_repeat": stalls.seg_head_eligible_selector_repeat,
+            "segment_write_block_head_entries": stalls.segment_write_block_head_entries,
+        });
+    }
     #[cfg(feature = "retf-arity-census")]
     if let Some((histogram, sites)) = machine.cpu().retf_arity_snapshot() {
         report["retf_arity_census"] = serde_json::json!({

@@ -35,6 +35,9 @@ direct-callout-attribution = ["jit", "izarravm-cpu/direct-callout-attribution"]
 smc-census = ["jit", "izarravm-cpu/smc-census"]
 # Passthrough for the THROWAWAY stage-0 RETF arity census; see izarravm-cpu. Does not ship.
 retf-arity-census = ["jit", "izarravm-cpu/retf-arity-census"]
+# Passthrough for the THROWAWAY L9 stage-0 segment-write head tally; see izarravm-cpu. Does not
+# ship.
+seg-head-diagnostic = ["jit", "izarravm-cpu/seg-head-diagnostic"]
 # Passthrough for the store watchpoint; see izarravm-cpu.
 watch-write = ["izarravm-cpu/watch-write"]
 # Passthrough for the guest INT n tracer; see izarravm-cpu.
