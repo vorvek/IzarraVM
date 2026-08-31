@@ -367,6 +367,9 @@ pub struct Distira {
     aux_base: u32,
     buffer_stride: u32,
     display_enabled: bool,
+    /// False after a 2D yield (`disable_display`). SWAPBUFFER must not restick
+    /// Distira over a live VBE session. VIDEO_RESET falling edge sets it again.
+    swap_may_enable: bool,
     /// VIDEO_RESET falling edges in `write_fbi_init1`. Splash is one. A count
     /// that keeps climbing after a VBE yield is a Distira restick that SWAPBUFFER
     /// did not cause.
@@ -538,6 +541,7 @@ impl Distira {
             aux_base: buffer_stride * 2,
             buffer_stride,
             display_enabled: false,
+            swap_may_enable: true,
             video_reset_falling_edges: 0,
             fbi_init0_byte0_enables: 0,
             dither_enabled: false,
@@ -728,6 +732,7 @@ impl Distira {
         if old & FBIINIT1_VIDEO_RESET != 0 && self.fbi_init[1] & FBIINIT1_VIDEO_RESET == 0 {
             self.frame_phase_line = 0;
             self.reset_swap_state();
+            self.swap_may_enable = true;
             self.display_enabled = self.fbi_init[0] & FBIINIT0_VGA_PASS == 0;
             self.video_reset_falling_edges = self.video_reset_falling_edges.saturating_add(1);
         } else if self.fbi_init[1] & FBIINIT1_VIDEO_RESET != 0 {
@@ -854,7 +859,9 @@ impl Distira {
 
     fn present_swap(&mut self, target_base: u32) {
         self.scanout_base = target_base;
-        self.display_enabled = true;
+        if self.swap_may_enable {
+            self.display_enabled = true;
+        }
     }
 
     fn issue_swapbuffer_command(&mut self, value: u32) {
@@ -1014,6 +1021,7 @@ impl Distira {
 
     pub fn disable_display(&mut self) {
         self.display_enabled = false;
+        self.swap_may_enable = false;
     }
 
     pub fn set_frame_size(&mut self, width: u32, height: u32) {
