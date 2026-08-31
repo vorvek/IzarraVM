@@ -53,8 +53,12 @@
 // |---|---|---|
 // | `0xa1` width back to `MemoryWidth::Dword`, i.e. the pre-slice emitter | `the_moffs_pair_*`, `the_cs_override_*`, `the_tombraid_loop_body_*` | registers: EAX `0x1af9_1234` against the interpreter's `0xdead_1234` |
 // | the CERTAIN-EXIT rule disabled | `a_statically_misaligned_*`, `the_loop_compiles_into_the_units_*` | span length: `Some(3)` where `None` is required |
-// | `CarryFlag` drops `emit_set_cf_only` and writes only the flag shadow | `clc_and_stc_*`, `the_carry_*_adc` | raw lazy-flags descriptor, then registers on the ADC read-back |
-// | the ADC/SBB guard narrowed back to `matches!(form, 1 \| 3)` | `the_gate_does_not_sweep_in_*` | `0x15` ADC AX,imm16 compiles where it must be a barrier |
+// | `CarryFlag` drops `emit_set_cf_only` and writes only the flag shadow | `clc_and_stc_*`, `the_carry_*_rcl` | raw lazy-flags descriptor, then registers on the RCL read-back |
+// | (L1, 2026-08-31) `emit_carry_alu_preloaded`'s Word arm: `emit_load_host_flags` hoisted above the RAX/RCX masks | `word_alu_register_forms_match_the_interpreter_for_every_admitted_op` (`cpu_jit_sweep_lowering_test.rs`), the `(0x8d7, false)` row | registers: ECX `0xdead0002` against the interpreter's `0xdead0000`, at `0x11 /2 adc cx,ax` |
+//   (Replaces the STALE row this file used to carry here for the ADC/SBB guard narrowed back to
+//   `matches!(form, 1 \| 3)`: the L1 width lift deleted that guard outright, so it can no longer be
+//   re-applied as a mutation. `0x15`/`0x1d` now flip WITH `IZARRAVM_V86_LOOP_ROWS` instead of
+//   staying a barrier, which `the_gate_does_not_sweep_in_*` asserts directly.)
 // | `PopSegReal`'s `alu_r16_imm16(0, home(4), 2)` widened to `add_r32_imm32` | `pop_segment_preserves_the_high_half_of_esp_across_the_sixteen_bit_wrap` | registers: ESP `0xdeae_0000` against `0xdead_0000` |
 // | `PopSegReal` drops the access / `default_size_32` store | `pop_segment_matches_*`, the stale-descriptor row | registers: the segment's access byte |
 // | `PopSegReal`'s `shift_r32_imm8(4, RAX, 4)` -> shift by 3 | three POP fixtures | registers: the segment base |
@@ -422,13 +426,17 @@ fn every_v86_loop_row_flips_with_the_gate() {
 
 /// The neighbours this slice must NOT have swept in. Each is one bit away from an admitted row.
 ///
-/// * `0x15` ADC AX,imm16 and `0x1d` SBB AX,imm16 -- ALU form 5's carry members. They share the arm
-///   `0x3d` reaches, and `emit_alu_preloaded`'s Word lane masks both operands with `and`, which
-///   CLEARS host CF, then tags the descriptor as the SUB class. An admitted `15 iw` would compute
-///   without the carry in and then evaluate its lazy CF as `a < b`. The forms-1|3|5 guard is what
-///   refuses them.
 /// * `0xf5` CMC -- CLC/STC's neighbour. It needs the INCOMING carry rather than a constant.
 /// * `0xc7 /0` REGISTER form at Word -- refused inside its own arm since before this slice.
+///
+/// `0x15` ADC AX,imm16 and `0x1d` SBB AX,imm16 were on this list too, as ALU form 5's carry members
+/// held out by a separate refusal: `emit_alu_preloaded`'s Word lane used to mask both operands with
+/// `and`, which CLEARS host CF, so an admitted `15 iw` would have computed without the carry in.
+/// The L1 width lift gave `emit_carry_alu_preloaded` a Word lane, which removed that refusal, so
+/// the two rows now behave like every other member of the gated accumulator-immediate list: they
+/// flip WITH `IZARRAVM_V86_LOOP_ROWS` instead of staying a barrier on both arms. They moved to the
+/// loop below the neighbours-list one, which asserts that flip directly rather than a constant
+/// refusal.
 ///
 /// `0xfc` CLD was on this list, as "an existing kind whose opcode is deliberately still off the
 /// Word allowlist". The S1 width lift put it ON the UNGATED list, which is what keeps the two
@@ -458,8 +466,6 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings() {
 
 fn the_gate_does_not_sweep_in_the_neighbouring_encodings_on(arm: bool) {
     for (name, code) in [
-        ("0x15 ADC AX,imm16", [vec![0x15], w(0x1234)].concat()),
-        ("0x1D SBB AX,imm16", [vec![0x1d], w(0x1234)].concat()),
         ("0xF5 CMC", vec![0xf5]),
         (
             "0xC7 /0 MOV AX,imm16",
@@ -470,6 +476,30 @@ fn the_gate_does_not_sweep_in_the_neighbouring_encodings_on(arm: bool) {
             compile16(&code),
             None,
             "{name} is not part of this slice and must stay a barrier (v86 loop rows = {arm})"
+        );
+    }
+    // `0x15` ADC AX,imm16 and `0x1d` SBB AX,imm16 USED to be in the list above: they share ALU
+    // form 5's arm with `0x3d`, which this gate already admits, and the separate carry-in refusal
+    // (`emit_alu_preloaded`'s Word lane had no lane for ADC/SBB) was the only thing holding them
+    // out regardless of the gate. The L1 width lift gave that lane to `emit_carry_alu_preloaded`,
+    // so the two rows now follow the SAME gate their five siblings always did: refused with
+    // `IZARRAVM_V86_LOOP_ROWS` off, admitted with it on. They stay in this file rather than moving
+    // to `loop_a_rows` because their differential coverage lives with the rest of the L1 lift's ALU
+    // rows (`cpu_jit_sweep_lowering_test.rs`, `cpu_jit_word_memory_test.rs`); this fixture only
+    // needs to say which arm they compile on.
+    for (name, code) in [
+        ("0x15 ADC AX,imm16", [vec![0x15], w(0x1234)].concat()),
+        ("0x1D SBB AX,imm16", [vec![0x1d], w(0x1234)].concat()),
+    ] {
+        assert_eq!(
+            compile16(&code),
+            if arm { Some(3) } else { None },
+            "{name} is on the gated accumulator-immediate list and must {} (v86 loop rows = {arm})",
+            if arm {
+                "join the block"
+            } else {
+                "stay a barrier"
+            }
         );
     }
     // ...and the rows admitted independently of this gate, which must hold on BOTH arms.
@@ -1063,27 +1093,33 @@ fn clc_and_stc_match_the_interpreter_in_every_descriptor_state() {
 ///
 /// The fixture above compares the descriptor as a raw struct, which already catches a CF written to
 /// EFLAGS while a live descriptor kept its own answer. This one closes the loop the way the guest
-/// does: `adc ax, cx` consumes CF as an OPERAND, so a descriptor that disagrees with the published
-/// EFLAGS produces a different AX, whichever of the two the reader happens to consult.
+/// does: `rcl cx, 1` consumes CF as an OPERAND (the bit rotated in), so a descriptor that disagrees
+/// with the published EFLAGS produces a different CX, whichever of the two the reader happens to
+/// consult.
 ///
-/// `adc` is refused as a lowering by the forms-1|3|5 guard, which is exactly what makes it a useful
-/// tail: the block ends at CLC/STC and the SAME interpreter runs the consumer on both roles.
+/// `adc` was this file's original tail and is no longer a fit: the L1 width lift gave
+/// `emit_carry_alu_preloaded` a Word lane, so `adc ax,cx` now lowers into the SAME block instead of
+/// staying an interpreted consumer, which would test the native ADC lowering rather than this
+/// fixture's own claim about CLC/STC. `rcl` is register-word-refused for an unrelated reason (no
+/// rotate-through-carry lane exists at any width; see the `0xc1 | 0xd1` arm's `/4,/5,/7`-only
+/// admission), so it keeps the "block ends at CLC/STC and the SAME interpreter runs the consumer on
+/// both roles" property this fixture needs.
 #[test]
-fn the_carry_clc_and_stc_write_is_read_back_by_a_later_adc() {
+fn the_carry_clc_and_stc_write_is_read_back_by_a_later_rcl() {
     select_v86_loop_rows(true);
     for (name, opcode) in [("clc", 0xf8u8), ("stc", 0xf9)] {
         for incoming in [0u32, FLAG_CF] {
             for live_pending in [false, true] {
                 let context =
-                    format!("{name} incoming_cf={incoming:#x} pending={live_pending} then adc");
-                // `mov si,si` / CLC-or-STC / `mov di,di` / `adc ax,cx` / hlt. The block covers
+                    format!("{name} incoming_cf={incoming:#x} pending={live_pending} then rcl");
+                // `mov si,si` / CLC-or-STC / `mov di,di` / `rcl cx,1` / hlt. The block covers
                 // the first three; the compile walk refuses a block shorter than three slots, so
                 // the trailing filler is what makes the two-instruction shape expressible at all.
                 let code = [
                     FILL_A.to_vec(),
                     vec![opcode],
                     FILL_B.to_vec(),
-                    vec![0x11, 0xc8, 0xf4],
+                    vec![0xd1, 0xd1, 0xf4],
                 ]
                 .concat();
                 let mut memory = memory_fill();
@@ -1128,7 +1164,7 @@ fn the_carry_clc_and_stc_write_is_read_back_by_a_later_adc() {
                 };
                 assert_eq!(
                     compilation.span.instructions, 3,
-                    "{context}: the block must stop AT the adc, or the consumer ran natively too"
+                    "{context}: the block must stop AT the rcl, or the consumer ran natively too"
                 );
                 let key = jit::direct::key_for(&native, ENTRY, false).expect("entry key");
                 assert!(matches!(

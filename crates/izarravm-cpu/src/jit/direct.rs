@@ -14190,17 +14190,26 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // in production since its own slice, with a mutation record behind it. The census asked: a
     // 16-bit workload ranks these ten rows near 19% of block-stopping hits.
     //
-    // Two exclusions hold the boundary, and each is enforced in the ARM rather than by this
-    // list, because a list is the wrong place for a rule the next reader has to re-derive:
-    // ADC and SBB at Word (no carry-in lane), and form 1's MEMORY shape at Word (see the arms).
-    // Form 3's memory shape used to be the third: it is admitted as of the B2 slice, because it
-    // only READS and so lowers through the relaxed lean read site. See that arm.
+    // `0x11`/`0x19` and `0x13`/`0x1b`, ADC and SBB in the same two forms, joined on the L1 width
+    // lift (`dev_docs/2026-08-31-corpus-lever-plan.md`). They used to be the exclusion this
+    // paragraph named: `emit_alu_preloaded`'s Word branch masked both operands with `and`, which
+    // CLEARS host CF, so an admitted carry op would have computed without its carry in.
+    // `emit_carry_alu_preloaded` now carries a Word arm that loads host CF from the RBP shadow
+    // BEFORE the masked `alu_r16_r16`, the same ordering its Dword arm has always used, so the two
+    // opcodes reach the SAME arm as their five siblings and need no allowlist entry of their own.
+    // Form 1's MEMORY shape stays refused at Word regardless of op (see that arm) -- that boundary
+    // is untouched by this slice, it is the read-modify-write economics guard 3 left standing.
+    // Form 3's memory shape is admitted for every op including ADC/SBB, because `emit_alu_mem_
+    // source`'s Word arm stages RAX/RCX exactly as the register callers do before reaching
+    // `emit_alu_preloaded` -- see that arm and `cpu_jit_word_memory_test.rs`.
     //
-    // `0x83` WAS on that list and is now admitted, which is the second half of this slice. Its
-    // register form produces `AluImm`, which carries a `width` field as of this commit, and its
-    // memory form is refused inside the arm (see there). The census ranks `0x83 /5` word at
-    // 9,776,289 doom exits, forty-seven apart from `0x60` PUSHAD -- one function prologue, so the
-    // two must land together or neither's exits go anywhere.
+    // `0x83` WAS on the exclusion list and is now admitted, which is this slice's other half. Its
+    // register form produces `AluImm`, which carries a `width` field, and its memory form lowers
+    // through `AluMemDest` -- both including ADC/SBB as of the L1 lift; see that arm. The census
+    // ranks `0x83 /5` word at 9,776,289 doom exits, forty-seven apart from `0x60` PUSHAD -- one
+    // function prologue, so the two must land together or neither's exits go anywhere. Pyramid-586
+    // ranks `0x83 word mem /2` (ADC) at 18,902,081 runtime hits, the largest non-monitor row in the
+    // corpus's slowest game -- that is the ADC/SBB memory admission's own census line.
     //
     // `0x81` joined on 2026-08-08 (the wolf3d demo-workload census ranked its `/7` word register
     // form at 634M block-stopping hits, the single largest row). The immediate-path check the
@@ -14208,8 +14217,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // lane: `emit_alu` stages ANY immediate through `mov_r32_imm32(RCX, ..)` and the word lane
     // masks BOTH operands with `and .., 0xffff` before the 66-prefixed `alu_r16_r16`, so a raw
     // `fetch_u16` immediate (0..0xFFFF) computes exactly as `0x83`'s sign-extended imm8 already
-    // did. The arm below is shared with `0x83` and was width-complete before this admission:
-    // ADC/SBB word-refused, memory word form certified by `cpu_jit_word_memory_test.rs`.
+    // did. The arm below is shared with `0x83` and is now width-complete for every sub-op,
+    // including ADC/SBB, at both register and memory forms.
     //
     // THE SIXTEEN-BIT MEMORY ROWS (rejected-row campaign, slice 3) add `0xc7` and the four
     // MOVZX/MOVSX opcodes. The domain question this list exists to answer is not "which opcode",
@@ -14276,8 +14285,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             insn.opcode,
             0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38
                 | 0x02 | 0x0a | 0x12 | 0x1a | 0x22 | 0x2a | 0x32 | 0x3a
-                | 0x01 | 0x09 | 0x21 | 0x29 | 0x31
-                | 0x03 | 0x0b | 0x23 | 0x2b | 0x33
+                | 0x01 | 0x09 | 0x11 | 0x19 | 0x21 | 0x29 | 0x31
+                | 0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33
                 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x39 | 0x3b | 0x3c
                 | 0x06 | 0x0e | 0x16 | 0x1e
                 // POP SS, the S4 part-2 row. It is on this list rather than folded in with the
@@ -14422,8 +14431,11 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // been in production on `0x81`/`0x83` since then. `decode` fetches this immediate with
         // `fetch_immediate(operand_size)`, which at Word is a zero-extended `fetch_u16`, so the
         // emitter's `imm & 0xffff` is exact rather than a truncation. ADC (`0x15`) and SBB
-        // (`0x1d`) are refused at Word by the forms-1|3|5 guard below, for the reason forms 1 and
-        // 3 already refuse them: no carry-in lane.
+        // (`0x1d`) are ADMITTED here as of the L1 width lift, the same way forms 1 and 3 are: they
+        // reach this gate already, and the classifier arm below no longer refuses `op 2|3` for any
+        // of the three forms now that `emit_carry_alu_preloaded` carries a Word lane. This entry
+        // predates that lift and was never the thing refusing them -- the arm was -- so nothing
+        // here needed to change beyond this comment.
         //
         // `0xa1` / `0xa3` are the moffs word forms, and they are the pair the long note above
         // names as the COUNTEREXAMPLE that must not be swept in by proximity. That note was right
@@ -14753,37 +14765,26 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         if opcode < 0x40 {
             let op = (opcode >> 3) & 7;
             let form = opcode & 7;
-            // ADC and SBB have no Word lane, so refuse them here rather than leaving the
-            // allowlist as the only thing between them and a miscompile. They take the incoming
-            // CF as an OPERAND; `emit_alu_preloaded`'s Word lane masks both operands with `and`,
-            // which CLEARS host CF, then tags the descriptor as the SUB class. An admitted
-            // `66 11 /r` would compute `adc ax, bx` without the carry in and then evaluate its
-            // lazy CF as `a < b`.
+            // ADC and SBB WORD LANE, forms 1, 3 and 5 (the L1 width lift). They take the incoming
+            // CF as an OPERAND, which used to be exactly what this arm could not do at Word: the
+            // old Word branch of `emit_alu_preloaded` masked both operands with `and`, which
+            // CLEARS host CF as a side effect, so an admitted `66 11 /r` would have computed `adc`
+            // without its carry in. `emit_carry_alu_preloaded` (see its doc) now carries a Word
+            // arm that loads host CF from the RBP shadow immediately before the masked
+            // `alu_r16_r16`, so forms 1, 3 and 5 reach ONE arm for all eight ALU ops at Word,
+            // exactly as they already did at Dword. There is nothing left here to gate: the three
+            // forms' classifier arms below (and `AluImm`'s form-5 arm) never special-cased `op`,
+            // only the Word emitter did, so removing this guard is the whole admission.
             //
-            // The reason this guard exists at all is that the rule stated above says the byte set
-            // is closed over its shared classifier arms, and this slice admits five of eight
-            // members of two shared arms. Without a guard here the next reader applying that rule
-            // lands the bug above in one line. `0x81 | 0x83` states the same refusal the same way.
+            // Byte forms are unaffected and always were: `0x10`/`0x18`/`0x12`/`0x1a` produce
+            // `AluRegByte` and `0x14`/`0x1c` produce `AluByteImm`, neither of which carries a
+            // `MemoryWidth` to be Word or Dword about.
             //
-            // Forms 1, 3 and 5 ONLY. The other forms in this group are byte-width by encoding and
-            // reach lanes that carry no `operand_width` at all, so their ADC and SBB members are
-            // correct at Word and are admitted: `0x10`/`0x18`/`0x12`/`0x1a` produce `AluRegByte`
-            // and `0x14`/`0x1c` produce `AluByteImm`. Widening this guard to the whole group
-            // refuses those six as collateral, which is a regression rather than a fix.
-            //
-            // Form 5 (the accumulator with a full-width immediate) joined the guard with the
-            // V86 loop-A slice, which is what first lets a form-5 opcode reach here at Word. It
-            // produces `AluImm { width: operand_width }` and routes through the same
-            // `emit_alu_preloaded` Word lane forms 1 and 3 do, so `0x15` ADC AX,imm16 and `0x1d`
-            // SBB AX,imm16 have exactly the failure this guard already describes. The guard is
-            // UNGATED on purpose: it can only fire on a form the gate admits, and stating the
-            // refusal unconditionally is what stops the next reader re-deriving it.
-            if insn.operand_size == OperandSize::Word
-                && matches!(form, 1 | 3 | 5)
-                && matches!(op, 2 | 3)
-            {
-                return None;
-            }
+            // Form 1's MEMORY shape is a separate, unrelated refusal (`op != 7` inside that arm,
+            // below) that still holds for ADC/SBB along with every other writing op: it is the
+            // read-modify-write economics guard 3 left standing, not a carry-in hazard. Form 3's
+            // memory shape and the `0x81`/`0x83` immediate group's guard are handled in their own
+            // arms; see those.
             match form {
                 // Byte r/m destination, byte register source. BOTH operand forms as of the
                 // rejected-row campaign's Slice 7: the register form is `AluRegByte`, the byte
@@ -14907,12 +14908,17 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         // write-back lane (`emit_alu_preloaded`'s `mov_r16_r16`) were certified
                         // separately and the pair was not. It is now, by
                         // `the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op`
-                        // in `cpu_jit_word_memory_test.rs`, which runs all five writing ops plus
+                        // in `cpu_jit_word_memory_test.rs`, which runs all seven writing ops plus
                         // `0x3b` CMP as the non-writing control against a block-free interpreter
                         // with `0xdead` in every destination's high half.
                         //
-                        // ADC and SBB are still refused, by the forms-1|3 guard above and by a
-                        // release assert in `emit_alu_preloaded`; nothing here reaches them.
+                        // ADC and SBB reach here too as of the L1 width lift: this arm never
+                        // special-cased `op`, so once the forms-1|3|5 guard above stopped refusing
+                        // them, `0x13`/`0x1b` memory admitted with the rest. What makes it correct
+                        // is that this Word arm already stages RAX = home(dst) and RCX = the loaded
+                        // operand before calling `emit_alu_preloaded`, exactly the convention its
+                        // new Word-carry branch (`emit_carry_alu_preloaded`) expects from every
+                        // caller.
                         //
                         // The census asked for this one. `IZARRAVM_DIRECT_BARRIER_CENSUS=1` on
                         // peachdrm-586 ranks `0x2B` SUB r16,r/m16 word memory at 655,103,963 of
@@ -14969,7 +14975,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // is Word here whenever `IZARRAVM_V86_LOOP_ROWS` is on and the segment is 16-bit,
                 // and Dword otherwise. It has always been passed rather than hard-coded, which is
                 // what let the admission be an allowlist entry rather than an emitter change; the
-                // carry members are refused at Word by the forms-1|3|5 guard above.
+                // carry members (`0x15`/`0x1d`) reach this SAME arm and are admitted at Word too,
+                // as of the L1 width lift -- `emit_alu` stages RCX exactly as the register forms
+                // do, so `emit_carry_alu_preloaded`'s new Word lane serves them with no arm change.
                 5 => {
                     return Some(DirectKind::AluImm {
                         op,
@@ -15573,21 +15581,27 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             }
             0x81 | 0x83 => {
                 let m = insn.modrm?;
-                // ADC (/2) and SBB (/3) are refused at Word size and only there. They consume the
-                // incoming CF as an operand, which the Dword path handles with a branch on the
-                // EFLAGS shadow (`emit_carry_alu_preloaded`) that has no sixteen-bit twin. Refusing
-                // is a missed lowering, and it is now a MEASURED one: an older version of this
-                // comment said "the census measures zero Word `0x83 /2` and `/3`", which was true
-                // of the census it was written against and is false of tyrian-586 at main
-                // 0333d956, where `/3` is 3,223,263 runtime hits -- 14.5% of the static-unbound
-                // rejected class and its second-largest row. Lowering it is a slice rather than a
-                // guard relaxation: `emit_carry_alu_preloaded` is Dword throughout (`alu_r32_r32`
-                // on both arms) and its pending tags 0x8000_0200 / 0x8000_0201 encode op and width
-                // TOGETHER, so a Word carry-ALU needs a new descriptor class, not a width
-                // parameter. `0x81 /2,/3` and the `0x15`/`0x1d` accumulator forms come with it.
-                if insn.operand_size == OperandSize::Word && matches!(m.reg, 2 | 3) {
-                    return None;
-                }
+                // ADC (/2) and SBB (/3) are admitted at Word size as of the L1 width lift
+                // (`dev_docs/2026-08-31-corpus-lever-plan.md`), for the REGISTER and the MEMORY
+                // form alike, and the two forms got there by two different routes.
+                //
+                // The MEMORY form needed no emitter change at all: `emit_alu_candidate` /
+                // `emit_commit_alu_candidate` (below) were already width-parameterised through
+                // `width_tag` and already branched on the incoming CF for ANY op at ANY width --
+                // the carry-in test happens once, per instruction, independent of `width`. This
+                // arm's old refusal was purely a classifier decision with no emitter behind it, so
+                // removing it is the whole admission. Pyramid-586 ranks `0x83 word mem /2` at
+                // 18,902,081 runtime hits, the largest non-monitor row in the corpus's slowest
+                // game, and tyrian-586 carries `/3` at 3,223,263 -- both this shape exactly.
+                //
+                // The REGISTER form needed `emit_carry_alu_preloaded` to grow a Word arm, since it
+                // used to be Dword-only (`alu_r32_r32` on both branches) with pending tags
+                // 0x8000_0200 / 0x8000_0201 that assumed Dword. Its Word arm now exists and tags
+                // 0x8000_0100 / 0x8000_0101 on the no-carry branch -- the SAME class the non-carry
+                // Word lane already used for ADD/SUB -- because a clear incoming CF makes ADC/SBB
+                // compute exactly as ADD/SUB do; see that function's doc. `0x15`/`0x1d` (the
+                // accumulator immediate form) and `0x11`/`0x13`/`0x19`/`0x1b` (the plain register
+                // forms) share this same arm, so all three admissions are one emitter change.
                 return match insn.operand? {
                     // `lane: None` here is deliberate and not a stub: `classify` has no `&CpuGsw`
                     // and no physical address, and a lane needs both. The compile loop attaches
@@ -15615,10 +15629,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     // `emit_commit_alu_candidate` tags the descriptor 0x100 for Word where it tags
                     // 0x200 for Dword. Nothing in that path had to be built; it had no caller.
                     //
-                    // ADC (/2) and SBB (/3) are already refused at Word above, so the one op class
-                    // with no word lane cannot reach here. This is quake's largest surviving row:
-                    // `0x83 /7` memory word at 162,440 exits, with doom carrying /5, /0 and /7
-                    // together at 12,192.
+                    // ADC (/2) and SBB (/3) reach here too as of the L1 width lift; see this arm's
+                    // doc above. Quake's largest surviving row here is `0x83 /7` memory word at
+                    // 162,440 exits, with doom carrying /5, /0 and /7 together at 12,192.
                     DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
                         op: m.reg,
                         source: StoreSource::Imm(insn.imm),
@@ -21740,14 +21753,15 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, src_
     // RDX holds the result, zero-extended because RAX was masked before the copy, which is what the
     // lazy evaluator wants for a Word descriptor.
     if matches!(width, MemoryWidth::Word) {
-        // Must fail in release too, since the emitter runs in the release JIT, and the failure
-        // this guards is silent: the `and` masks below clear host CF, so an ADC that reached here
-        // would compute without its carry in and then tag the descriptor as the SUB class.
-        assert!(
-            !matches!(op, 2 | 3),
-            "ADC/SBB take the incoming CF as an operand and have no word lane; classify refuses \
-             them at Word size"
-        );
+        // ADC/SBB (the L1 width lift) take the incoming CF as an OPERAND, which is exactly what
+        // the masked path below cannot give them: `and` clears host CF as a side effect, so
+        // computing them through the non-carry lane would silently drop the carry in. They branch
+        // off to their own Word arm in `emit_carry_alu_preloaded` instead, which loads host CF from
+        // the RBP shadow before masking, in the order that matters; see that function's doc.
+        if matches!(op, 2 | 3) {
+            emit_carry_alu_preloaded(e, op, MemoryWidth::Word, home(dst), src_host);
+            return;
+        }
         debug_assert_eq!(
             src_host,
             Reg::RCX,
@@ -21793,7 +21807,7 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, src_
     }
     debug_assert!(matches!(width, MemoryWidth::Dword));
     if matches!(op, 2 | 3) {
-        emit_carry_alu_preloaded(e, op, home(dst), src_host);
+        emit_carry_alu_preloaded(e, op, MemoryWidth::Dword, home(dst), src_host);
         return;
     }
     let writes = op != 7;
@@ -21829,7 +21843,50 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, src_
     }
 }
 
-fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg, src_host: Reg) {
+/// ADC/SBB, both widths, register-preloaded operands.
+///
+/// Both arms branch on the guest's own CF (in the RBP shadow) rather than materializing the whole
+/// EFLAGS word and letting the host `adc`/`sbb` read it: that would need `push`/`popfq` on every
+/// carry op, where this needs it only on the branch that actually carries.
+///
+/// # THE WORD ARM (the L1 width lift)
+///
+/// It is not `alu_r32_r32` masked down: it stages the operands through RAX/RCX/RDX exactly as the
+/// non-carry Word lane in `emit_alu_preloaded` does, for the same reason -- `alu_r16_r16` only
+/// defines the destination's low sixteen bits, so the merge back into `target` has to be an
+/// explicit `mov_r16_r16` rather than the Dword arm's direct in-place `alu_r32_r32`. The masks
+/// exist for the lazy descriptor's `a`/`b`, not for the arithmetic: a real 16-bit host op already
+/// ignores garbage above bit 15 on both read and write, so `home(dst)`'s poisoned high half would
+/// compute correctly unmasked, but the pending record `a`/`b` fields have to be exact 16-bit values
+/// for `materialized_eflags` to recompute SF/ZF/PF/AF from them at Word width later.
+///
+/// Every caller of the Word arm stages RAX = home(dst) and RCX = the source before calling, the
+/// same convention `emit_alu`'s doc states for OFF/Word/CMP: `emit_alu`'s Word path always takes it
+/// (`eager_dword_non_cmp` requires Dword), so both the register and the accumulator-immediate
+/// callers already satisfy it, and `emit_alu_mem_source`'s Word arm stages it explicitly for the
+/// memory-source form.
+///
+/// # ORDERING, THE PART THAT IS SILENT IF WRONG
+///
+/// `and_r32_imm32` clears host CF as a side effect on real hardware, and this function leans on
+/// that twice rather than fighting it:
+///
+/// * On the NO-CARRY path, the `and RDI, FLAG_CF` that decided guest CF was clear already left
+///   host CF at 0, and the two operand masks that follow (`and RAX/RCX, 0xffff`) leave it at 0
+///   too, so the real `op` (ADC=2 or SBB=3) computes as ADD/SUB with no separate host-flags load.
+///   The Dword arm below relies on the identical fact for its own no-carry `alu_r32_r32`.
+/// * On the CARRY path the Word arm masks RAX/RCX and copies RAX into RDX BEFORE calling
+///   `emit_load_host_flags`, never after: that call clobbers RAX (it stages the RBP-derived word
+///   through it) and, on real hardware, `push`/`popfq` is what actually plants host CF -- an `and`
+///   emitted after it would erase the very bit the branch exists to set. RDX and RCX survive the
+///   call untouched, which is what makes staging into them first correct.
+fn emit_carry_alu_preloaded(
+    e: &mut Encoder,
+    op: u8,
+    width: MemoryWidth,
+    target: Reg,
+    src_host: Reg,
+) {
     debug_assert!(matches!(op, 2 | 3));
     let carry = e.label();
     let done = e.label();
@@ -21837,29 +21894,72 @@ fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg, src_host: Reg)
     e.and_r32_imm32(Reg::RDI, crate::FLAG_CF);
     e.jnz(carry);
 
-    e.alu_r32_r32(op, target, src_host);
+    match width {
+        MemoryWidth::Word => {
+            debug_assert_eq!(
+                src_host,
+                Reg::RCX,
+                "the Word carry lane masks RCX then ALUs against it; callers that skip the RCX \
+                 stage are Dword-only"
+            );
+            e.and_r32_imm32(Reg::RAX, 0xffff);
+            e.and_r32_imm32(Reg::RCX, 0xffff);
+            e.mov_r32_r32(Reg::RDX, Reg::RAX);
+            e.alu_r16_r16(op, Reg::RDX, Reg::RCX);
+        }
+        MemoryWidth::Dword => e.alu_r32_r32(op, target, src_host),
+        MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("carry ALU register operands are never byte, qword or tbyte")
+        }
+    }
     emit_capture_flags(e, ARITH_FLAGS);
+    if matches!(width, MemoryWidth::Word) {
+        e.mov_r16_r16(target, Reg::RDX);
+    }
     if eager_flags_enabled() {
         emit_eager_publish(e, EAGER_CLASS_ARITH);
     } else {
-        emit_pending(
-            e,
-            if op == 2 { 0x8000_0200 } else { 0x8000_0201 },
-            Some(Reg::RAX),
-            Some(Reg::RCX),
-            target,
-        );
+        // Word tag is 0x100 where Dword's is 0x200, the same split the non-carry Word lane uses --
+        // a clear incoming CF makes ADC/SBB compute exactly as ADD/SUB, so this is the SAME
+        // descriptor class those ops already tag with, not a new one.
+        let (tag, result) = match width {
+            MemoryWidth::Word => (if op == 2 { 0x8000_0100 } else { 0x8000_0101 }, Reg::RDX),
+            MemoryWidth::Dword => (if op == 2 { 0x8000_0200 } else { 0x8000_0201 }, target),
+            MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => unreachable!(),
+        };
+        emit_pending(e, tag, Some(Reg::RAX), Some(Reg::RCX), result);
     }
     e.jmp(done);
 
     e.place(carry);
+    match width {
+        MemoryWidth::Word => {
+            e.and_r32_imm32(Reg::RAX, 0xffff);
+            e.and_r32_imm32(Reg::RCX, 0xffff);
+            e.mov_r32_r32(Reg::RDX, Reg::RAX);
+        }
+        MemoryWidth::Dword => {}
+        MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => unreachable!(),
+    }
     // `emit_load_host_flags` MUST SURVIVE on both arms: it feeds the host adder's CARRY-IN, which
     // is an OPERAND of ADC/SBB and not a flag record. Only the descriptor asymmetry between the
     // two arms collapses -- the carry arm already published and cleared, so on the eager arm the
     // two arms end identically and the branch remains only because the two ARITHMETICS differ.
+    //
+    // On the Word arm this MUST run after the masks above, not before: it clobbers RAX to plant
+    // host CF, and the masked operand this branch computes with already moved into RDX/RCX.
+    // `word_alu_register_forms_match_the_interpreter_for_every_admitted_op`'s `(0x8d7, false)` row
+    // is the fixture that catches a hoist -- see its mutation ledger entry.
     emit_load_host_flags(e);
-    e.alu_r32_r32(op, target, src_host);
+    match width {
+        MemoryWidth::Word => e.alu_r16_r16(op, Reg::RDX, Reg::RCX),
+        MemoryWidth::Dword => e.alu_r32_r32(op, target, src_host),
+        MemoryWidth::Byte | MemoryWidth::Qword | MemoryWidth::Tbyte => unreachable!(),
+    }
     emit_capture_flags(e, ARITH_FLAGS);
+    if matches!(width, MemoryWidth::Word) {
+        e.mov_r16_r16(target, Reg::RDX);
+    }
     if eager_flags_enabled() {
         emit_eager_publish(e, EAGER_CLASS_ARITH);
     } else {

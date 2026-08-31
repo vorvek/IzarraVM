@@ -330,6 +330,12 @@ fn build(body: &[u8], seed: Seed) -> Roles {
         if seed.live_pending {
             // A descriptor produced BEFORE the tested instruction. MOVZX and MOV must leave it
             // alone; the `0x83` ALU forms must replace it with a WORD one.
+            //
+            // NOTE for carry-in rows (ADC/SBB): `flag(FLAG_CF)` routes CF through this descriptor
+            // whenever one is live, so a carry-in reader sees the priming ADD's own CF here (always
+            // 0), not `seed.eflags`'s CF bit. A row that needs a genuine CF=1 delivered has to pair
+            // `live_pending: false` (via `Seed::new()`, no `.pending()`) with a CF-set `.flags(..)`,
+            // which reads straight from `registers.eflags` with no descriptor in the way.
             let _ = cpu.alu(0, 0x7fff_ffff, 1, BusWidth::Dword);
         }
         cpu.set_eip(ENTRY);
@@ -583,11 +589,23 @@ fn the_word_immediate_store_writes_exactly_two_bytes() {
 /// `0xffff + 1` carries out of sixteen bits and not out of thirty-two; `0x8000 - 1` and
 /// `0x7fff + 1` are the signed overflow boundary at sixteen bits and nowhere near it at
 /// thirty-two.
+///
+/// ADC (`/2`) and SBB (`/3`) joined this loop on the L1 width lift, and they are why there are
+/// THREE `(eflags, pending)` pairs below rather than two. `flag(FLAG_CF)` (`core.rs`) routes CF
+/// through the live pending descriptor whenever one exists, so a `pending: true` row delivers
+/// whatever CF the PRIMING op left (always clear; see `build`'s comment on the `cpu.alu` call), not
+/// `seed.eflags`'s CF bit -- `(0x8d5, true)` alone would silently never exercise a real carry-in.
+/// `(0x8d7, false)` is what actually delivers CF=1: no descriptor is in the way, so it comes
+/// straight out of `registers.eflags`. All three pairs still matter for the non-carry six: `(0x202,
+/// false)` and `(0x8d5, true)` are the pending-descriptor-replacement coverage every op needs, and
+/// `(0x8d7, false)` costs those ops nothing since they never read CF.
 #[test]
 fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
     for (op, name) in [
         (0u8, "add"),
         (1, "or"),
+        (2, "adc"),
+        (3, "sbb"),
         (4, "and"),
         (5, "sub"),
         (6, "xor"),
@@ -596,7 +614,7 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
         for operand in [0x1234u16, 0xffff, 0x8000, 0x7fff, 0x0000] {
             // Both signs of the sign-extended imm8, including the boundary values.
             for imm in [0x01u8, 0x7f, 0x80, 0xff] {
-                for (eflags, pending) in [(0x202u32, false), (0x8d5, true)] {
+                for (eflags, pending) in [(0x202u32, false), (0x8d5, true), (0x8d7, false)] {
                     let mut body = vec![0x66u8];
                     body.extend_from_slice(&disp32(&[0x83], op, OPERAND));
                     body.push(imm);
@@ -630,6 +648,12 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
 /// together until this row. `0x3b` CMP is in the loop and writes nothing, which is the control
 /// that says a register failure on the other five is the write-back and not the read.
 ///
+/// `0x13` ADC and `0x1b` SBB joined this loop on the L1 width lift: their register-form guard was
+/// classify's only reason to refuse them, so lifting it opens the memory-source shape too, through
+/// the SAME `emit_alu_preloaded` word-carry lane the register rows use -- `emit_alu_mem_source`'s
+/// Word arm already stages RAX/RCX exactly as the register callers do before dispatching there.
+/// 123-talk-shareware ranks a `0x13 word` row at 13.72 M runtime hits, this shape exactly.
+///
 /// The seed poisons every high half with 0xdead, so a write-back that widens to 32 bits is a
 /// distinguishable register failure, not a coincidence.
 ///
@@ -644,6 +668,8 @@ fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
     for (opcode, name) in [
         (0x03u8, "add"),
         (0x0b, "or"),
+        (0x13, "adc"),
+        (0x1b, "sbb"),
         (0x23, "and"),
         (0x2b, "sub"),
         (0x33, "xor"),
@@ -668,22 +694,49 @@ fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
                 // `es:` override on the plain [disp32] form. ES is flat here too.
                 let mut es_override = vec![0x26u8, 0x66];
                 es_override.extend_from_slice(&disp32(&[opcode], dst, OPERAND));
-                for (body, shape) in [
-                    (base_disp, "[ebp+0x10] (SS default)"),
-                    (es_override, "es:[disp32]"),
-                ] {
-                    let seed = Seed::new()
-                        .gpr(usize::from(dst), 0xdead_8000)
-                        .gpr(5, OPERAND - 0x10)
-                        .operand(operand);
-                    lowered(
-                        &body,
-                        seed,
-                        &format!("{name} r16 dst={dst}, word {shape} operand={operand:#06x}"),
-                    );
+                // CF=0 (the default `Seed::new()` carries) is the only case for the six non-carry
+                // ops, since they never read CF. `0x13` ADC and `0x1b` SBB additionally run CF=1,
+                // NO PENDING here: without it, this loop's two addressing shapes would only ever
+                // exercise `emit_alu_mem_source`'s Word arm through the carry lane's NO-CARRY
+                // branch, and the `reg_low` loop below runs only the plain `[disp32]` form, never
+                // these two. `pending: false` is load-bearing, not incidental -- `flag(FLAG_CF)`
+                // (`core.rs`) routes CF through a live pending descriptor when one exists, so a
+                // `pending: true` row would deliver the priming op's own CF (always clear) rather
+                // than this seed's, and never actually reach the carry branch.
+                let addressing_eflags: &[(u32, bool)] = if matches!(opcode, 0x13 | 0x1b) {
+                    &[(0x202, false), (0x8d7, false)]
+                } else {
+                    &[(0x202, false)]
+                };
+                for &(eflags, pending) in addressing_eflags {
+                    for (body, shape) in [
+                        (base_disp.clone(), "[ebp+0x10] (SS default)"),
+                        (es_override.clone(), "es:[disp32]"),
+                    ] {
+                        let mut seed = Seed::new()
+                            .gpr(usize::from(dst), 0xdead_8000)
+                            .gpr(5, OPERAND - 0x10)
+                            .operand(operand)
+                            .flags(eflags);
+                        if pending {
+                            seed = seed.pending();
+                        }
+                        lowered(
+                            &body,
+                            seed,
+                            &format!(
+                                "{name} r16 dst={dst}, word {shape} operand={operand:#06x} \
+                                 eflags={eflags:#x} pending={pending}"
+                            ),
+                        );
+                    }
                 }
                 for reg_low in [0x0001u16, 0x7fff, 0x8000, 0xffff] {
-                    for (eflags, pending) in [(0x202u32, false), (0x8d5, true)] {
+                    // The third pair, `(0x8d7, false)`, is what actually delivers CF=1 to a carry
+                    // reader for `0x13`/`0x1b`: `(0x8d5, true)` alone would route CF through the
+                    // live pending descriptor instead, which always reads back clear (see the
+                    // addressing-shape loop above). Harmless extra coverage for the other six ops.
+                    for (eflags, pending) in [(0x202u32, false), (0x8d5, true), (0x8d7, false)] {
                         let mut body = vec![0x66u8];
                         body.extend_from_slice(&disp32(&[opcode], dst, OPERAND));
                         let mut seed = Seed::new()
