@@ -1461,9 +1461,9 @@ impl CpuGsw {
     /// `linear_blocks` and resolves a predecessor's parked cell, which is the whole point of
     /// admitting at a break site. It publishes, it does not execute.
     ///
-    /// Both callers run the identical chain. There is no break-site variant of any arm: the
-    /// break site's cost is managed by refusing to CALL this at all for an opcode no walk can
-    /// carry, never by taking a shortcut once inside.
+    /// `via_break_probe` marks the break-site caller. It changes exactly one thing, on the
+    /// `Rejected` arm, and only by asking the cache which half of that answer this key is: see
+    /// there. Every other arm is shared, byte for byte, by both callers.
     #[cfg(feature = "jit")]
     fn try_admit_direct_block<B: CpuBus>(
         &mut self,
@@ -1471,6 +1471,7 @@ impl CpuGsw {
         screen: DecodeScreenView,
         lin: u32,
         d: bool,
+        via_break_probe: bool,
     ) -> Result<Option<jit::direct::CompiledBlock>, CpuError> {
         // With the 16-bit level at 0 a 16-bit code segment can never produce a block (`key_for`
         // then refuses on `!d`), so this function would return Interpret for every such boundary
@@ -1584,25 +1585,37 @@ impl CpuGsw {
                 return Ok(None);
             }
             jit::direct::BlockProbe::Rejected => {
-                // NO break-site short circuit here, and that is load-bearing. `probe` collapses
-                // `Dormant` and `Rejected` into this one answer, and `Dormant` is TRANSIENT: a
-                // heat demote or a clearable compile retry parks a key here expecting the recovery
-                // below to lift it back to `Seen` on a later visit. Break-site probes are the ONLY
-                // probes a non-continuable entry ever gets, so a short circuit that treated this
-                // arm as terminal would strand such a key parked forever -- the very defect this
-                // whole change exists to remove, reintroduced for the subset of entries that lose
-                // a first-touch race.
-                //
-                // An earlier revision did short circuit here, to keep the ten `CALL FAR` sites off
-                // this path. That cost is now refused a step earlier and more cheaply, by the
-                // walk-admission gate at the break site itself: an opcode no walk can carry never
-                // reaches this function at all. So the two callers can share one arm, which is
-                // also the only way the recovery stays honest.
                 #[cfg(feature = "direct-admission-census")]
                 if self.jit_direct.barrier_census_active()
                     && let Some(kind) = self.jit_direct.classify_rejected_probe(key)
                 {
                     self.jit_direct.note_admission_decline(kind);
+                }
+                // `probe` folds `Dormant` and `Rejected` into this one answer, and only the
+                // `Dormant` half has a recovery below. ASK WHICH before spending it.
+                //
+                // Not the old shortcut. An earlier revision returned here for every `Rejected`
+                // probe from the break site, which stranded a `Dormant` key forever: break-site
+                // probes are the ONLY probes a non-continuable entry ever gets, so a key parked by
+                // a heat demote or a clearable compile retry never got the later look that would
+                // have lifted it. That is the defect this whole change removes, reintroduced for
+                // the entries that lose a first-touch race. This test reads the authoritative
+                // state instead of assuming it, and a settled `Rejected` provably has nothing to
+                // recover: `lift_cold_smc_dormant` reports `NotDormant` for one and
+                // `lift_clearable_retry_dormant` never matches one, so the only thing skipped is
+                // an `sync_smc_heat` and two lookups that cannot change any later answer.
+                //
+                // Break site only, so the dispatcher's chain is untouched. It is worth a
+                // conditional because the populations differ by orders of magnitude: `0x69`/`0x6b`
+                // IMUL is non-continuable for the interpreter and common in real code, so a break
+                // site meets settled-`Rejected` entries far more often than the dispatcher does.
+                // Measured on 15-move-hole-puzzle, sharing the whole arm cost 4.6% of the wall
+                // against an otherwise identical build.
+                if via_break_probe && !self.jit_direct.direct.rejected_probe_is_dormant(key) {
+                    ea_mark!(Phase::Refused);
+                    ea_refusal!(site::PROBE_REJECTED);
+                    ea_end!(Population::Refused);
+                    return Ok(None);
                 }
                 // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out lifts
                 // back to Seen here, so the next encounter re-admits through the normal path.
@@ -1924,7 +1937,7 @@ impl CpuGsw {
         d: bool,
         budget: ContinuationBudget,
     ) -> Result<DirectContinuation, CpuError> {
-        let Some(block) = self.try_admit_direct_block(bus, screen, lin, d)? else {
+        let Some(block) = self.try_admit_direct_block(bus, screen, lin, d, false)? else {
             return Ok(DirectContinuation::Interpret);
         };
         // A hidden short block must pass the canonical decode scan above before it becomes a link
@@ -1999,7 +2012,10 @@ impl CpuGsw {
         ea_begin!(d, self.is_v86_mode());
         // `Refused`, not `Entered`: the admission succeeded but no native window was opened, and
         // `Population::Entered` is the denominator for windows actually run.
-        if self.try_admit_direct_block(bus, screen, lin, d)?.is_some() {
+        if self
+            .try_admit_direct_block(bus, screen, lin, d, true)?
+            .is_some()
+        {
             ea_end!(Population::Refused);
         }
         Ok(())

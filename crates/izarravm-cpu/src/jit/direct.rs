@@ -3260,6 +3260,22 @@ impl BlockCache {
         }
     }
 
+    /// Which half of `BlockProbe::Rejected` this key actually is: `Dormant` (transient, and the
+    /// only half with a recovery) or `Rejected` (settled).
+    ///
+    /// `probe` folds the two states into one answer, which is fine for the dispatcher -- both mean
+    /// "interpret" -- but not for a caller deciding whether the recovery is worth running. Both
+    /// lifts require `Dormant`: `lift_cold_smc_dormant` reports `NotDormant` for a `Rejected`
+    /// entry and `lift_clearable_retry_dormant` never matches one. So on `false` there is provably
+    /// nothing for the recovery to do, and skipping it cannot change any later probe's answer.
+    ///
+    /// A disabled cache synthesizes `Rejected` for every key regardless of entry state; `false` is
+    /// the right answer there for the same reason `classify_rejected_probe` reports no label and
+    /// the decline memo refuses to record one.
+    pub(crate) fn rejected_probe_is_dormant(&self, key: BlockKey) -> bool {
+        !self.disabled && matches!(self.entries.get(&key), Some(BlockState::Dormant(..)))
+    }
+
     #[cfg(feature = "direct-admission-census")]
     /// Classify the authoritative state behind a `BlockProbe::Rejected` result for the opt-in
     /// admission census. A disabled cache synthesizes that probe result regardless of entry state,
@@ -35529,33 +35545,36 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("skip_native_continuations_inactive", 1347),
     ("skip_backend_or_skip_once", 1355),
     ("skip_approximate_timing", 1361),
-    ("jit16_level_zero", 1502),
-    ("approximate_timing", 1508),
-    ("auto_admit", 1519),
-    ("direct_hot_at", 1533),
-    ("decline_memo_hit", 1559),
-    ("key_for_phys_none", 1571),
-    ("probe_interpret", 1584),
-    ("probe_rejected", 1655),
-    ("link_line_not_live", 1898),
-    ("revalidate_none", 1904),
-    ("dispatch_deferred_short", 1942),
-    ("observer_or_diff_trace", 2605),
-    ("interrupt_shadow", 2612),
-    ("aggregate_accounting", 2619),
-    ("native_fetch_trace", 2633),
-    ("mode_key", 2641),
-    ("x87_top", 2655),
-    ("segment_layout_none", 2670),
-    ("cs_layout", 2678),
-    ("cpl", 2686),
-    ("callout_privileged", 2767),
-    ("data_segment", 2885),
-    ("alignment", 2894),
-    ("fetch_limit", 2909),
-    ("entry_deferred_short", 2923),
-    ("zero_budget", 3031),
-    ("block_regenerated_none", 3067),
+    ("jit16_level_zero", 1503),
+    ("approximate_timing", 1509),
+    ("auto_admit", 1520),
+    ("direct_hot_at", 1534),
+    ("decline_memo_hit", 1560),
+    ("key_for_phys_none", 1572),
+    ("probe_interpret", 1585),
+    // Two returns carry this site since the break-site caller learned to tell a settled
+    // `Rejected` from a `Dormant`; the first is cited, which is the one nearly every refusal
+    // takes. Both satisfy the fixture below: each has the macro immediately above it.
+    ("probe_rejected", 1618),
+    ("link_line_not_live", 1911),
+    ("revalidate_none", 1917),
+    ("dispatch_deferred_short", 1955),
+    ("observer_or_diff_trace", 2621),
+    ("interrupt_shadow", 2628),
+    ("aggregate_accounting", 2635),
+    ("native_fetch_trace", 2649),
+    ("mode_key", 2657),
+    ("x87_top", 2671),
+    ("segment_layout_none", 2686),
+    ("cs_layout", 2694),
+    ("cpl", 2702),
+    ("callout_privileged", 2783),
+    ("data_segment", 2901),
+    ("alignment", 2910),
+    ("fetch_limit", 2925),
+    ("entry_deferred_short", 2939),
+    ("zero_budget", 3047),
+    ("block_regenerated_none", 3083),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -35596,7 +35615,7 @@ pub(crate) mod site {
 #[cfg(feature = "direct-entry-attribution")]
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1561;
+pub const P0_MARK_LINE: u32 = 1562;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
@@ -35623,13 +35642,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1701),
-    ("structural_reject", 1720),
-    ("compile_retry", 1731),
-    ("page_cover_failed", 1755),
-    ("lane_install_demote", 1791),
-    ("install_failed", 1801),
-    ("installed_fall_through", 1883),
+    ("heat_demote", 1714),
+    ("structural_reject", 1733),
+    ("compile_retry", 1744),
+    ("page_cover_failed", 1768),
+    ("lane_install_demote", 1804),
+    ("install_failed", 1814),
+    ("installed_fall_through", 1896),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {
