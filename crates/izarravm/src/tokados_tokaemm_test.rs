@@ -1555,7 +1555,7 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("598K"),
+        Some("599K"),
         "all three RAM-scaled tables -- the arena bitmap, the VCPI ownership \
          bitmap and the EMS chain table -- moved out of the resident core into \
          the system window at SYS_LIN_BASE, which took conventional free from \
@@ -1563,9 +1563,10 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
          64 MB). In the core they cost ~18 KiB AND grew at ~288 bytes per \
          megabyte of arena; in extended memory they cost neither. The IOPL-3 \
          rewrite's 800-byte shrink bought 598 -> 599; the LIM 4.0 handle-name \
-         function 53h (ems_names, 8 bytes per handle) plus hardware-info 59h \
-         (both required by 1830's EMS detection and streaming pool) grew the \
-         core back across the boundary, 599 -> 598.\n{text}"
+         function 53h plus hardware-info 59h (both required by 1830) crossed \
+         back to 598; rewriting ef_map_multi as one sequential pass (the \
+         EMM386 partial-application semantics 1830's decoder needs) dropped \
+         the two-pass rewind and recrossed to 599.\n{text}"
     );
     assert_extended_category(&screen, "23,552K", "23,141K");
 
@@ -1774,11 +1775,10 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(598K)"),
-        "MEM /CLASSIFY should report about 598 KiB conventional free (599 KiB \
-         after the IOPL-3 rewrite's 800-byte shrink; EMS functions 53h and \
-         59h, both required by 1830, grew the core back across the KiB \
-         boundary).\n{}",
+        Some("(599K)"),
+        "MEM /CLASSIFY should report about 599 KiB conventional free (EMS \
+         functions 53h and 59h grew the core across the KiB boundary to 598; \
+         the sequential ef_map_multi rewrite shrank it back).\n{}",
         screen.text
     );
 }

@@ -1244,34 +1244,33 @@ ef_map_multi:
     push bx
     push di
     push bp
-    mov bp, cx                    ; entry count for the apply pass
+    mov bp, cx                    ; pair count (CX becomes scratch below)
     mov di, si                    ; array cursor (caller's DS)
     call ems_slot_of              ; DX -> SI = slot offset, or CF + AH=83h
     jc .out
-    mov dx, di                    ; remember the array start (DX is free now)
-    jcxz .done                    ; zero entries: a successful no-op
-.validate:
+    test bp, bp
+    jz .done                      ; zero entries: a successful no-op
+    ; One pass: validate THIS pair, apply it, then look at the next one.
+    ; EMM386 and DOSBox map sequentially and stop at the first bad pair,
+    ; LEAVING THE EARLIER PAIRS APPLIED. This is load-bearing, not a
+    ; shortcut: 1830's streaming decoder maps 4-page batches whose tail
+    ; overshoots the asset's last page, ignores the 8Ah, and decodes from
+    ; the pages that did land -- an atomic validate-then-apply reject left
+    ; the frame stale and livelocked its bidding-screen decode.
+.pair:
     mov bx, [di+2]
     call .phys_to_slot
     jc .badphys
     mov bx, [di]
     cmp bx, 0xFFFF
-    je .v_next
+    je .p_unmap
     cmp bx, [cs:si+2]             ; logical >= npages?
     jae .badlog
-.v_next:
-    add di, 4
-    loop .validate
-    mov di, dx                    ; rewind for the apply pass
-.apply:
-    mov bx, [di]
-    cmp bx, 0xFFFF
-    je .a_unmap
     call ems_backing_of           ; logical BX, slot SI -> CX = backing page
-    jmp .a_slot
-.a_unmap:
+    jmp .p_slot
+.p_unmap:
     mov cx, 0xFFFF
-.a_slot:
+.p_slot:
     mov bx, [di+2]
     call .phys_to_slot            ; -> BL = frame slot (validated above)
     push si
@@ -1285,7 +1284,7 @@ ef_map_multi:
     pop ax
     add di, 4
     dec bp
-    jnz .apply
+    jnz .pair
 .done:
     xor ah, ah
 .out:

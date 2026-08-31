@@ -236,6 +236,33 @@ start:
     cmp ah, 0x8B
     jne f_merr
 
+    ; 11k. partial application: 50h applies pairs IN ORDER and stops at the
+    ;      first bad one, leaving the earlier pairs mapped -- EMM386/DOSBox
+    ;      semantics, and 1830's streaming decoder depends on it: it maps
+    ;      4-page batches whose tail overshoots the asset's last page,
+    ;      ignores the 8Ah, and decodes from the pages that DID map. An
+    ;      atomic reject leaves the window stale and the decode livelocks.
+    ;      Array: (logical 0 -> slot 2) valid, (logical 7 -> slot 3) out of
+    ;      range. Expect 8Ah AND pattern A visible through slot 2.
+    mov ax, 0x5000
+    mov cx, 2
+    mov dx, [handle]
+    mov si, partial50
+    int 0x67
+    cmp ah, 0x8A
+    jne f_mpartial
+    mov ax, 0xE800
+    mov es, ax
+    cmp dword [es:0], PAT_A
+    jne f_mpartial
+    mov ax, 0x5000                ; clean up: unmap slot 2 again
+    mov cx, 1
+    mov dx, [handle]
+    mov si, unmap52
+    int 0x67
+    or ah, ah
+    jnz f_mpartial
+
     ; 11e. handle name, get (5300h): a fresh handle's name is 8 zero bytes.
     ;      1830.EXE opens EMMXXXX0, allocates one page, then REQUIRES 5301h
     ;      to succeed; an 84h answer makes it print "You must have at least
@@ -479,6 +506,8 @@ f_name4:  mov al, 0xC4
 f_name5:  mov al, 0xC5
           jmp sig
 f_raw:    mov al, 0xC6
+          jmp sig
+f_mpartial: mov al, 0xC7
 
 sig:
     mov ah, al
@@ -505,3 +534,5 @@ unmap51:   dw 0xFFFF, 0xE800
 badphys50: dw 0, 4
 badlog50:  dw 7, 2
 badseg51:  dw 0, 0xE123
+partial50: dw 0, 2, 7, 3
+unmap52:   dw 0xFFFF, 2
