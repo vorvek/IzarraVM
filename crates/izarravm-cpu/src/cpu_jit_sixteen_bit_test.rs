@@ -946,16 +946,24 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
     jit::direct::set_count_lanes_for_test(None);
 }
 
-/// The rotate sibling of the fixture above, for the identical hazard on `RotateReg`.
+/// The rotate sibling of the fixture above, for the analogous hazard on `RotateReg`.
 ///
 /// `vorvek/direct-word-rot1` gave `RotateReg` a `width` field and admitted `0xC1`/`0xD1 /0,/1` at
 /// Word, which puts the SAME shape past `count_lane_for` that the shift fixture above catches: an
 /// unprefixed `c1 c0 03` (`rol ax, 3`) in a CS.D=0 segment decodes at `OperandSize::Word` with
 /// default prefixes, `disp_len 0`, `imm_len 1`, `len 3` -- every bar the lane matcher tests bar
-/// its own kind's width. `count_lane_for`'s kind guard now reads `RotateReg { width:
-/// MemoryWidth::Dword, .. }` rather than a bare `lane: None`, for exactly this reason: without it
-/// the lane would attach and `emit_rotate_reg_lane` -- which has no Word arm -- would be reached
-/// with a Word rotate and panic the compiler the same way the shift arm once did.
+/// its own kind's width. `count_lane_for`'s kind guard reads `RotateReg { width:
+/// MemoryWidth::Dword, .. }` rather than a bare `lane: None`, for exactly this reason.
+///
+/// Unlike the shift sibling, this is a PREVENTIVE fixture rather than a repeat of a documented
+/// crash: the width field and the kind guard's width bar were added in the same slice, so there was
+/// no moment in this tree's history where a Word rotate actually reached the lane matcher unbarred.
+/// What it protects against is real anyway. `emit_rotate_reg_lane` has no Word arm at all -- every
+/// host instruction inside it is hardcoded to `shift_r32_imm8`/`shift_r32_cl` -- so a hypothetical
+/// future relaxation of the kind guard would not panic the compiler the way the shift sibling's
+/// `unreachable!()` does; it would either trip `emit_rotate_reg_lane`'s own `debug_assert` (a debug
+/// build) or silently emit a 32-bit rotate where the guest asked for 16 (a release build). This
+/// fixture is what keeps the kind guard itself in place, so neither outcome is ever reached.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",

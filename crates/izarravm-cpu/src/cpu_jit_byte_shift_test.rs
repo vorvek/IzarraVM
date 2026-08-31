@@ -286,9 +286,12 @@ const CONTROL: [u8; 2] = [0x89, 0xc8];
 /// hides a member and `/6` is the alias whose normalisation is stated at classify.
 const SUB_OPS: [(&str, u8); 4] = [("/4 shl", 4), ("/5 shr", 5), ("/6 sal", 6), ("/7 sar", 7)];
 
-/// The four sub-opcodes this slice refuses at both byte opcodes: ROL, ROR, RCL, RCR.
-const REFUSED_SUB_OPS: [(&str, u8); 4] =
-    [("/0 rol", 0), ("/1 ror", 1), ("/2 rcl", 2), ("/3 rcr", 3)];
+/// The two sub-opcodes this slice refuses at both byte opcodes: RCL and RCR. ROL and ROR moved OUT
+/// as of `vorvek/direct-word-rot1`; see `byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds`.
+const REFUSED_SUB_OPS: [(&str, u8); 2] = [("/2 rcl", 2), ("/3 rcr", 3)];
+
+/// The two sub-opcodes `vorvek/direct-word-rot1` admits: ROL and ROR.
+const ROL_ROR_SUB_OPS: [(&str, u8); 2] = [("/0 rol", 0), ("/1 ror", 1)];
 
 // ---------------------------------------------------------------------------------------------
 // Arm selection
@@ -840,32 +843,31 @@ fn byte_shift_into_a_high_byte_register_matches_the_interpreter() {
 }
 
 // =============================================================================================
-// R5: the byte rotates stay out
+// R5: RCL/RCR stay out; ROL/ROR are admitted, in BOTH segment kinds
 // =============================================================================================
 
-/// `0xD0 /0..=/3` and `0xC0 /0..=/3` stay hard boundaries WITH the knob on, in both segment kinds.
+/// `0xD0 /2,/3` and `0xC0 /2,/3` (RCL, RCR) stay hard boundaries WITH the knob on, in both segment
+/// kinds.
 ///
 /// GREEN on `main`, and it is here for the implementation mistake it catches rather than for a
-/// census row: widening `0xc1 | 0xd1` to include `0xd0`, or widening the new arm's sub-opcode match
-/// to `0 | 1 | 4..=7` "to mirror the sibling arm". `DirectKind::RotateReg` carries no `width` field
-/// at all and `emit_rotate_reg` is a 32-bit host rotate over the guest home, so a byte rotate
-/// routed through it rotates 32 bits, takes CF from bit 31 instead of bit 7, and for indices 4..7
-/// reaches an ESP/EBP/ESI/EDI home instead of AH/CH/DH/BH.
+/// census row: widening the new arms' sub-opcode match to admit `2 | 3` "to mirror the sibling
+/// sub-opcodes". RCL and RCR are refused for the standing structural reason `RotateReg`'s doc gives
+/// -- both take the incoming CF as a rotate INPUT -- which no emitter here reproduces.
 #[test]
-fn byte_rotates_stay_a_hard_boundary_at_both_opcodes_and_both_segment_kinds() {
+fn byte_rcl_rcr_stay_a_hard_boundary_at_both_opcodes_and_both_segment_kinds() {
     let _arm = force_byte_shift_rows(true);
     for seg in SEGMENTS {
         for (label, op) in REFUSED_SUB_OPS {
             assert_eq!(
                 compile_span(seg, &d0_reg(op, 0)),
                 REFUSED,
-                "{} 0xd0 {label} must stay a barrier: RotateReg has no width field",
+                "{} 0xd0 {label} must stay a barrier: no emitter takes the incoming CF",
                 seg.label()
             );
             assert_eq!(
                 compile_span(seg, &c0_reg(op, 0, 3)),
                 REFUSED,
-                "{} 0xc0 {label} must stay a barrier: RotateReg has no width field",
+                "{} 0xc0 {label} must stay a barrier: no emitter takes the incoming CF",
                 seg.label()
             );
         }
@@ -875,6 +877,354 @@ fn byte_rotates_stay_a_hard_boundary_at_both_opcodes_and_both_segment_kinds() {
             "{}: the control row must compile, or this fixture cannot fail",
             seg.label()
         );
+    }
+}
+
+/// `0xD0 /0,/1` and `0xC0 /0,/1` (ROL, ROR) are ADMITTED with the knob on, in BOTH segment kinds --
+/// the positive half of the guard above, and the ONLY fixture that can detect the reachability gate
+/// (`classify`'s top-of-function `OperandSize::Word` allowlist) being unreachable for these two
+/// sub-opcodes.
+///
+/// **The 16-bit-segment case is the one that matters, and it is not decoration.** `123-talk-
+/// shareware`'s `0xD0 register /1` and `/0` rows (24.86M and 0.45M runtime hits, its #1 and #3
+/// census rows) and `21-for-1-to-4`'s `0xD0 register /1` (13.50M) are UNPREFIXED `0xD0` in a
+/// `CS.D = 0` segment, which decodes at `OperandSize::Word` with no `0x66` byte anywhere in sight.
+/// `classify`'s reachability gate for `0xc0`/`0xd0` used to admit ONLY `matches!(m.reg, 4..=7)`
+/// past that check; a version of this arm that widened the classify MATCH inside the `0xc0`/`0xd0`
+/// arms without ALSO widening the gate's own `matches!` would refuse every corpus row this slice
+/// claims while a 32-bit-segment (or `0x66`-prefixed) positive test passed regardless, because
+/// Dword-default code never reaches that gate at all. `compile_span(Seg::ThirtyTwo, ..)` alone
+/// would NOT have caught that mistake; `compile_span(Seg::Sixteen, ..)` is what does.
+#[test]
+fn byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds() {
+    let _arm = force_byte_shift_rows(true);
+    for seg in SEGMENTS {
+        for (label, op) in ROL_ROR_SUB_OPS {
+            assert_eq!(
+                compile_span(seg, &d0_reg(op, 0)),
+                ADMITTED,
+                "{} 0xd0 {label} must admit and carry the whole three-slot block",
+                seg.label()
+            );
+            assert_eq!(
+                compile_span(seg, &c0_reg(op, 0, 3)),
+                ADMITTED,
+                "{} 0xc0 {label} must admit and carry the whole three-slot block",
+                seg.label()
+            );
+            // Byte indices 4..=7 name AH/CH/DH/BH, the lane `emit_rotate_reg8` addresses through
+            // `emit_read_store_value`/`emit_write_gpr8` rather than through `home()`. Admitted here
+            // too, so a lowering that only handled the low four registers would still fail this
+            // test rather than passing on `dst=0` alone.
+            assert_eq!(
+                compile_span(seg, &d0_reg(op, 4)),
+                ADMITTED,
+                "{} 0xd0 {label} ah-class dst=4 must admit",
+                seg.label()
+            );
+        }
+        // The memory forms are UNCHANGED by this admission -- `RotateRegByte` binds
+        // `DecodedOperand::Reg` exactly as `Shift` does, so a memory destination is refused before
+        // either kind is ever constructed.
+        for (label, op) in ROL_ROR_SUB_OPS {
+            assert_eq!(
+                compile_span(seg, &d0_mem(op)),
+                REFUSED,
+                "{} 0xd0 {label} memory form must stay refused",
+                seg.label()
+            );
+            assert_eq!(
+                compile_span(seg, &c0_mem(op, 3)),
+                REFUSED,
+                "{} 0xc0 {label} memory form must stay refused",
+                seg.label()
+            );
+        }
+    }
+}
+
+/// Byte ROL/ROR ride `rotate_rows_enabled` -- the SAME knob the Dword ROL/ROR rows have always
+/// used -- rather than `IZARRAVM_BYTE_SHIFT_ROWS`. `force_byte_shift_rows` cannot show that on its
+/// own: it always forces `rotate_rows_arm` to `On` alongside whichever `byte_shift_rows` value the
+/// caller asks for, so a fixture built only on that helper could not tell "gated on
+/// `rotate_rows_enabled`" apart from "gated on `byte_shift_rows_enabled`, and `force_byte_shift_rows`
+/// happens to always turn the other knob on too". This sets `rotate_rows_arm` directly, OFF, with
+/// `byte_shift_rows` forced ON, which isolates the claim: if ROL/ROR followed
+/// `byte_shift_rows_enabled` instead, this fixture would see them admitted and fail to catch it.
+#[test]
+fn byte_rotates_follow_the_rotate_rows_knob_not_the_byte_shift_rows_knob() {
+    jit::direct::set_byte_shift_rows_for_test(Some(true));
+    jit::direct::set_rotate_rows_arm_for_test(Some(jit::direct::RotateRowsArm::Off));
+    assert!(
+        jit::direct::byte_shift_rows_enabled(),
+        "byte_shift_rows must be on for this fixture to isolate the other knob"
+    );
+    assert!(
+        !jit::direct::rotate_rows_enabled(),
+        "rotate_rows must be off for this fixture to isolate the other knob"
+    );
+    for seg in SEGMENTS {
+        for (label, op) in ROL_ROR_SUB_OPS {
+            assert_eq!(
+                compile_span(seg, &d0_reg(op, 0)),
+                REFUSED,
+                "{} 0xd0 {label} must refuse with rotate_rows off, even though byte_shift_rows is on",
+                seg.label()
+            );
+            assert_eq!(
+                compile_span(seg, &c0_reg(op, 0, 3)),
+                REFUSED,
+                "{} 0xc0 {label} must refuse with rotate_rows off, even though byte_shift_rows is on",
+                seg.label()
+            );
+        }
+        // `/4..=7` are UNAFFECTED: `/4` needs rotate_rows too (the conjunction row) but `/5,/6,/7`
+        // ride byte_shift_rows alone and must still admit.
+        assert_eq!(
+            compile_span(seg, &d0_reg(5, 0)),
+            ADMITTED,
+            "{}: 0xd0 /5 shr must still admit on byte_shift_rows alone",
+            seg.label()
+        );
+    }
+    jit::direct::set_byte_shift_rows_for_test(None);
+    jit::direct::set_rotate_rows_arm_for_test(None);
+}
+
+// =============================================================================================
+// R5b: the byte rotate differential
+// =============================================================================================
+
+/// Operand seeds for the rotate differential. `OPERANDS` covers the shift file's own boundary set;
+/// `0x55`/`0xaa` (alternating bit patterns) are added so every rotate amount up to 7 crosses the
+/// boundary both ways, mirroring `cpu_jit_word_rotate_test.rs`'s `BOUNDARY_OPERANDS`.
+const ROTATE_OPERANDS: [u8; 8] = [0x00, 0x01, 0x7f, 0x80, 0xf0, 0xff, 0x55, 0xaa];
+
+/// A domain-real prior EFLAGS state with SF, ZF, PF and AF all SET, and bit 1 forced -- the byte
+/// file's `0x8d7` seed used verbatim, established as reachable by
+/// `cpu_jit_word_shift_test.rs::an_eflags_image_with_bit_one_clear_is_not_reachable`. Used
+/// everywhere below that asserts PRESERVATION.
+const ROTATE_SEEDED_EFLAGS: u32 = 0x8d7;
+
+/// `0xC0 /0,/1` and `0xD0 /0,/1` against the interpreter in a SIXTEEN-BIT segment, with the flag
+/// consumers reading CF/OF/SF/ZF/PF back through emitted code.
+///
+/// This is the census row's own shape: unprefixed, `operand_size: word`, `prefix_mask: 0`. Like
+/// `byte_shift_differential`, the width must come from the OPCODE regardless of the decoded
+/// segment default.
+#[test]
+fn byte_rotate_register_forms_match_the_interpreter_in_a_sixteen_bit_segment() {
+    let _arm = force_byte_shift_rows(true);
+    byte_rotate_differential(Seg::Sixteen);
+}
+
+/// The same matrix at CS.D = 1, which is the arm's own admission rather than the allowlist's.
+#[test]
+fn byte_rotate_register_forms_match_the_interpreter_in_a_thirty_two_bit_segment() {
+    let _arm = force_byte_shift_rows(true);
+    byte_rotate_differential(Seg::ThirtyTwo);
+}
+
+fn byte_rotate_differential(seg: Seg) {
+    // DL, which no consumer writes and which is the value register the byte lane stages through.
+    let dst = 2u8;
+    for (label, op) in ROL_ROR_SUB_OPS {
+        for operand in ROTATE_OPERANDS {
+            // `0xD0`: the count is the literal 1 baked into the opcode.
+            let seed = Seed::new().byte(dst, operand).flags(ROTATE_SEEDED_EFLAGS);
+            let context = format!("{} 0xd0 {label} dl={operand:#04x}", seg.label());
+            lowered(
+                seg,
+                &with_consumers(seg, &d0_reg(op, dst)),
+                CONSUMED_SLOTS,
+                seed,
+                &context,
+            );
+
+            for count in COUNTS {
+                for pending in [false, true] {
+                    for eflags in [0x202u32, ROTATE_SEEDED_EFLAGS] {
+                        let mut seed = Seed::new().byte(dst, operand).flags(eflags);
+                        if pending {
+                            seed = seed.pending();
+                        }
+                        let context = format!(
+                            "{} 0xc0 {label} dl={operand:#04x} count={count} pending={pending} \
+                             eflags={eflags:#x}",
+                            seg.label()
+                        );
+                        lowered(
+                            seg,
+                            &with_consumers(seg, &c0_reg(op, dst, count)),
+                            CONSUMED_SLOTS,
+                            seed,
+                            &context,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// EVERY raw count byte from 0 to 255, unmasked, at both sub-opcodes and both segment kinds, run
+/// through the NATIVE lane. `lowered` (via `run_and_compare`) asserts `jit_direct_insns` advances
+/// by every slot in the block, so a count that silently fell back to the interpreter would fail
+/// here rather than being missed.
+///
+/// The full range matters for the same reason `emit_rotate_reg8`'s doc names for
+/// `emit_rotate_reg`'s Dword sibling: the five-bit mask is applied to the RAW decoded immediate,
+/// not to a pre-masked value, so `rol al, 0x20` (masks to 0, the no-op shape) and `rol al, 0x21`
+/// (masks to 1, the only OF-defining shape) sit one apart in the RAW byte and any distance apart in
+/// the masked one. A mask applied at the wrong point, or applied to the wrong operand, shows up
+/// somewhere in this sweep even when the ten hand-picked `COUNTS` values above miss it.
+#[test]
+fn byte_rotates_match_the_interpreter_across_every_raw_count() {
+    let _arm = force_byte_shift_rows(true);
+    for seg in SEGMENTS {
+        for (label, op) in ROL_ROR_SUB_OPS {
+            for operand in [0x00u8, 0x55, 0xff] {
+                for raw_count in 0u16..=0xff {
+                    let raw_count = raw_count as u8;
+                    let seed = Seed::new().byte(2, operand).flags(ROTATE_SEEDED_EFLAGS);
+                    let context = format!(
+                        "{} 0xc0 {label} dl={operand:#04x} raw_count={raw_count:#04x}",
+                        seg.label()
+                    );
+                    lowered(seg, &c0_reg(op, 2, raw_count), 3, seed, &context);
+                }
+            }
+        }
+    }
+}
+
+/// Destinations AH, CH, DH and BH -- byte-register indices 4..7 -- at both rotate opcodes and in
+/// BOTH segment kinds, mirroring `byte_shift_into_a_high_byte_register_matches_the_interpreter`.
+///
+/// `home(index)` is `GUEST_HOMES[index & 7]`, so index 4 is the guest ESP home and the set is
+/// ESP/EBP/ESI/EDI. A rotate lane that reached for `home(dst)` at this width would rotate the wrong
+/// register by 32 bits, which is exactly the hazard `RotateRegByte`'s own doc names. No consumers
+/// on this row: a `SETcc` writes a byte register and would overwrite the half of the result the row
+/// exists to compare. The seeds carry a poison in every other lane instead.
+#[test]
+fn byte_rotate_into_a_high_byte_register_matches_the_interpreter() {
+    let _arm = force_byte_shift_rows(true);
+    for seg in SEGMENTS {
+        for (label, op) in ROL_ROR_SUB_OPS {
+            for dst in 4..8u8 {
+                for operand in ROTATE_OPERANDS {
+                    let seed = Seed::new().byte(dst, operand);
+                    let context = format!(
+                        "{} 0xd0 {label} byte-reg {dst} = {operand:#04x}",
+                        seg.label()
+                    );
+                    lowered(seg, &d0_reg(op, dst), 3, seed, &context);
+                    for count in [1u8, 3, 8, 31] {
+                        let seed = Seed::new().byte(dst, operand);
+                        let context = format!(
+                            "{} 0xc0 {label} byte-reg {dst} = {operand:#04x} count={count}",
+                            seg.label()
+                        );
+                        lowered(seg, &c0_reg(op, dst, count), 3, seed, &context);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A masked count of zero must leave EVERY flag and a live lazy descriptor exactly as they are, at
+/// both rotate opcodes and both segment kinds -- the byte sibling of
+/// `a_zero_count_rotate_leaves_every_flag_and_a_live_descriptor_alone` in
+/// `cpu_jit_word_rotate_test.rs`.
+///
+/// `shift_rotate` returns before touching the value or a flag, so a zero-count rotate neither
+/// creates a descriptor nor destroys one. With a DWORD descriptor live from `0x7fff_ffff + 1`, the
+/// five `SETcc` bytes must read that descriptor's flags, not the rotate's.
+#[test]
+fn a_zero_count_byte_rotate_leaves_every_flag_and_a_live_descriptor_alone() {
+    let _arm = force_byte_shift_rows(true);
+    for seg in SEGMENTS {
+        for (label, op) in ROL_ROR_SUB_OPS {
+            for operand in ROTATE_OPERANDS {
+                for pending in [false, true] {
+                    for eflags in [0x202u32, ROTATE_SEEDED_EFLAGS] {
+                        let mut seed = Seed::new().byte(2, operand).flags(eflags);
+                        if pending {
+                            seed = seed.pending();
+                        }
+                        let context = format!(
+                            "{} 0xc0 {label} count=0 dl={operand:#04x} pending={pending} \
+                             eflags={eflags:#x}",
+                            seg.label()
+                        );
+                        lowered(
+                            seg,
+                            &with_consumers(seg, &c0_reg(op, 2, 0)),
+                            CONSUMED_SLOTS,
+                            seed,
+                            &context,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The preservation claim, stated as its own assertion rather than left implicit in the
+/// differential above: from `ROTATE_SEEDED_EFLAGS` (SF, ZF, PF and AF all set), every count from 1
+/// to 31 leaves those four bits set in the resulting eflags, and every byte of the destination
+/// register OUTSIDE the rotated lane -- including the full upper 24 bits for a low register and the
+/// low 8 plus upper 16 for a high one -- survives from the seed untouched.
+///
+/// This is the row a fold into `Shift`'s byte arm (`emit_shift_reg8`, via `emit_commit_shift_flags`)
+/// would fail immediately: that path publishes the whole RBP shadow to `eflags` at every non-zero
+/// count, overwriting SF/ZF/PF with whatever the rotate's OWN 8-bit result derives them to.
+#[test]
+fn byte_rotates_preserve_flags_above_the_lane_and_bits_outside_it() {
+    const PRESERVED: u32 = crate::FLAG_SF | crate::FLAG_ZF | crate::FLAG_PF | crate::FLAG_AF;
+    let _arm = force_byte_shift_rows(true);
+    for seg in SEGMENTS {
+        for (label, op) in ROL_ROR_SUB_OPS {
+            for dst in [0u8, 1, 4, 5] {
+                for count in [1u8, 2, 3, 7, 31] {
+                    for operand in ROTATE_OPERANDS {
+                        let seed = Seed::new().byte(dst, operand).flags(ROTATE_SEEDED_EFLAGS);
+                        let lane_mask: u32 = if dst < 4 { 0xff } else { 0xff00 };
+                        let home = usize::from(dst & 3);
+                        let before = seed.gpr[home];
+                        let mut roles = build(seg, &c0_reg(op, dst, count), 3, seed);
+                        assert!(
+                            roles
+                                .native
+                                .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+                                .unwrap(),
+                            "{} {label} dst={dst} count={count} operand={operand:#04x}: block \
+                             did not run natively",
+                            seg.label()
+                        );
+                        let after_eflags = roles.native.eflags();
+                        assert_eq!(
+                            after_eflags & PRESERVED,
+                            ROTATE_SEEDED_EFLAGS & PRESERVED,
+                            "{} {label} dst={dst} count={count} operand={operand:#04x}: \
+                             SF/ZF/PF/AF must survive from the seed",
+                            seg.label()
+                        );
+                        let after = roles.native.registers.gpr[home];
+                        assert_eq!(
+                            after & !lane_mask,
+                            before & !lane_mask,
+                            "{} {label} dst={dst} count={count} operand={operand:#04x}: every \
+                             bit outside the rotated lane, including the register's high half, \
+                             must survive untouched",
+                            seg.label()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

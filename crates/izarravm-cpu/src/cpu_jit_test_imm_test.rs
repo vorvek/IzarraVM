@@ -2124,19 +2124,15 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
         vec![0xc1, 0xdb, 0x05], // /3 RCR: same
         vec![0xd1, 0xd3],       // /2 RCL by 1
         vec![0xd1, 0xdb],       // /3 RCR by 1
-        // The BYTE group's rotates, at BOTH byte opcodes. `0xC0` has admitted `/4..=7` since the
-        // byte-shift slice and `0xD0` has an arm of its own now, so these eight rows are what says
-        // both arms' `matches!(m.reg, 4..=7)` is doing the work rather than either having been
-        // widened to `0 | 1 | 4..=7` "to mirror the sibling arm". They can never be a list entry:
-        // `DirectKind::RotateReg` carries no width field at all and `emit_rotate_reg` is a 32-bit
-        // host rotate over the guest home, so a byte rotate through it rotates 32 bits and takes
-        // CF from bit 31 instead of bit 7. RCL/RCR are out at every width for the standing reason.
-        vec![0xc0, 0xc3, 0x05], // /0 ROL r8, imm8
-        vec![0xc0, 0xcb, 0x05], // /1 ROR r8, imm8
+        // The BYTE group's RCL/RCR, at BOTH byte opcodes. `0xC0`/`0xD0 /0,/1` (ROL/ROR) moved OUT
+        // of this list as of `vorvek/direct-word-rot1`: `DirectKind::RotateRegByte` and
+        // `emit_rotate_reg8` admit them, gated on `rotate_rows_enabled` exactly as the Dword rows
+        // are; their positive coverage is `cpu_jit_byte_shift_test.rs`'s
+        // `byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds` and its differential
+        // sweep. RCL/RCR stay here because they are out at every width for the standing reason: no
+        // emitter takes the incoming CF as a rotate input.
         vec![0xc0, 0xd3, 0x05], // /2 RCL r8, imm8
         vec![0xc0, 0xdb, 0x05], // /3 RCR r8, imm8
-        vec![0xd0, 0xc3],       // /0 ROL r8, 1
-        vec![0xd0, 0xcb],       // /1 ROR r8, 1
         vec![0xd0, 0xd3],       // /2 RCL r8, 1
         vec![0xd0, 0xdb],       // /3 RCR r8, 1
         // The byte group BY CL, every sub-opcode. `0xD2` has no arm at any width and no census row

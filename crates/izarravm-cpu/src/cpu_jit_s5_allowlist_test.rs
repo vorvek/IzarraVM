@@ -1216,20 +1216,16 @@ fn word_size_shift_forms_are_lowered() {
 /// anything else. Pinning both sizes is what says the Word entry did not widen it by accident.
 #[test]
 fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
-    // The group-2 admission knob is FORCED ON for this table, for the RCL/RCR rows: they sit behind
-    // the same `rotate_rows_enabled` reachability the ROL row on this file's Dword sibling table
-    // needs, and forcing keeps this table a statement about the Word guard rather than about
-    // whichever arm the knob ships with. ROL and ROR moved OUT of this table as of
-    // `vorvek/direct-word-rot1`: `RotateReg` now carries a `width` field and both are admitted at
-    // Word, so their positive coverage lives in `cpu_jit_word_rotate_test.rs` and
-    // `group2_word_rotate_register_form_is_lowered` instead. RCL and RCR are UNAFFECTED by that
-    // slice -- they stay refused at every width for the standing structural reason (both take the
-    // incoming CF as a rotate input), which is exactly what this table still certifies for them.
-    jit::direct::set_rotate_rows_for_test(Some(true));
-    assert!(
-        jit::direct::rotate_rows_enabled(),
-        "the RCL/RCR rows below share `rotate_rows_enabled`'s reachability with the ROL row"
-    );
+    // NO KNOB FORCE, and that absence is deliberate rather than an oversight. Every row left in
+    // this table refuses UNCONDITIONALLY, on both arms of `IZARRAVM_ROTATE_ROWS`: RCL/RCR have
+    // never had a classify arm at any width, `0xD3` has no arm at all (`emit_shift_cl` is
+    // Dword-only), and the memory forms are refused by the shared register-only `let-else` before
+    // any knob is consulted. A force here would be a gate that cannot fail -- it would pass
+    // identically with the knob on or off, certifying nothing about the knob and hiding that fact
+    // from a reader. (The one row that DID depend on the knob, `0xC1`/`0xD1 /0` ROL, moved OUT of
+    // this table as of `vorvek/direct-word-rot1`: `RotateReg` now carries a `width` field and is
+    // admitted at Word, so its positive coverage -- knob on and off -- lives in
+    // `cpu_jit_word_rotate_test.rs` and `group2_word_rotate_register_form_is_lowered` instead.)
     let cases: &[(&str, &[u8])] = &[
         ("0xc1 /2 rcl cx,imm8", &[0x66, 0xc1, 0xd1, 0x03]),
         ("0xc1 /3 rcr cx,imm8", &[0x66, 0xc1, 0xd9, 0x03]),
