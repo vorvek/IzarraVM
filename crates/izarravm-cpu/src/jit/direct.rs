@@ -4945,12 +4945,20 @@ pub(crate) enum DirectKind {
     /// backwards is the most likely silent error in this slice -- `completed_raw` sums the same
     /// accessor, so the end-of-emit assertion agrees with itself whatever it returns.
     ///
-    /// TWO WIDTHS IN ONE INSTRUCTION, and both are refused rather than widened. The COUNTER is
-    /// CX or ECX by ADDRESS size; the branch target wraps by OPERAND size
-    /// (`relative_jump(rel, operand_size)` masks EIP to 16 bits at Word). `classify` admits only
-    /// `AddressSize::Dword` with `OperandSize::Dword`: a Word counter would need a 16-bit
-    /// decrement preserving the high half of ECX, which `alu_r32_imm32` does not do, and a Word
-    /// target would wrap at 64K where `taken_delta` does not.
+    /// TWO WIDTHS IN ONE INSTRUCTION. The COUNTER is CX or ECX by ADDRESS size; the branch
+    /// target wraps by OPERAND size (`relative_jump(rel, operand_size)` masks EIP to 16 bits at
+    /// Word). `classify` admits the two MATCHED cells -- `AddressSize::Dword` with
+    /// `OperandSize::Dword`, and `AddressSize::Word` with `OperandSize::Word` -- and refuses the
+    /// two mixed cells explicitly: a Word counter paired with a Dword target, or a Dword counter
+    /// paired with a Word target. `counter_word` records which matched cell this instance is, so
+    /// the emitter can pick the decrement width; the Word target's wrap is handled upstream by
+    /// `control_target_limit`, which clamps the static-target check to `0xFFFF` at Word and needs
+    /// no help from this kind.
+    ///
+    /// The Word cell's decrement uses `Encoder::alu_r16_imm16`, which writes only the low 16 bits
+    /// and PRESERVES bits 31..16 of the guest register -- the opposite of `alu_r32_imm32`, which
+    /// would clear ECX's high half on every Word LOOP. Getting this backwards is silent: the
+    /// block still compiles, still runs, and only the guest's ECX comes out wrong.
     ///
     /// `0xE0` LOOPNE and `0xE1` LOOPE are deliberately NOT folded in. They read ZF, which is a
     /// different flag contract and a different emitter, and the gp2 census's head is `0xE2`
@@ -4959,6 +4967,8 @@ pub(crate) enum DirectKind {
     /// rather than merely in the opcode.
     Loop {
         taken_delta: u32,
+        /// `true` for the Word/Word cell (CX counter), `false` for Dword/Dword (ECX counter).
+        counter_word: bool,
     },
     /// `0xE0` LOOPNE / `0xE1` LOOPE: `ECX -= 1`, branch while the result is non-zero AND the
     /// guest ZF matches `wanted_zf` (`true` for LOOPE). Behind `IZARRAVM_LOOPCC_ROWS`.
@@ -7669,9 +7679,9 @@ fn compile_with_budget(
         // the existing check express exactly that condition, since `x <= a && x <= 0xFFFF` is
         // `x <= min(a, 0xFFFF)`.
         //
-        // Nothing reaches this at Word today, because the allowlist in `classify` admits no
-        // control transfer at Word size. It is a precondition for that allowlist opening, and it
-        // is separated so the two are attributable independently.
+        // Reached at Word by `Call16` and by the Word/Word cell of `DirectKind::Loop`, both
+        // admitted in `classify`. Separated from the admission check itself so the two stay
+        // independently attributable.
         //
         // In real mode `cs.limit` is already 0xFFFF, so the clamp is a no-op there and the mask
         // was never observable. The case it exists for is a 66-prefixed branch in 32-bit code,
@@ -8284,7 +8294,7 @@ fn compile_with_budget(
             slots.last().map(|slot| slot.kind),
             Some(
                 DirectKind::Jcc { taken_delta: 0, .. }
-                    | DirectKind::Loop { taken_delta: 0 }
+                    | DirectKind::Loop { taken_delta: 0, .. }
                     | DirectKind::LoopCc { taken_delta: 0, .. }
             )
         );
@@ -8500,7 +8510,7 @@ fn compile_with_budget(
     let terminal_links = match slots.last().map(|slot| slot.kind) {
         Some(
             DirectKind::Jcc { taken_delta, .. }
-            | DirectKind::Loop { taken_delta }
+            | DirectKind::Loop { taken_delta, .. }
             | DirectKind::LoopCc { taken_delta, .. },
         ) => TerminalLinks {
             targets: [
@@ -8570,7 +8580,7 @@ fn compile_with_budget(
         _ if segment_write_block => [None, None],
         Some(
             DirectKind::Jcc { taken_delta, .. }
-            | DirectKind::Loop { taken_delta }
+            | DirectKind::Loop { taken_delta, .. }
             | DirectKind::LoopCc { taken_delta, .. },
         ) => [
             Some(fallthrough),
@@ -8739,9 +8749,10 @@ pub(crate) fn compile_outcome_with_instruction_limit_for_test(
 /// in 32-bit code, where the limit is typically `u32::MAX` and the interpreter would wrap while
 /// the emitted form would not.
 ///
-/// Nothing reaches this at Word size today: `classify`'s Word allowlist admits no control
-/// transfer. It is a precondition for that allowlist opening, split out so the two are
-/// separately attributable, and it is a free function so it can be tested at all.
+/// Reached at Word size by `Call16` and by the Word/Word cell of `DirectKind::Loop`: both are
+/// control transfers admitted at Word operand size, and both rely on this clamp for the same
+/// reason. Split out so the clamp and its callers are separately attributable, and so it is a
+/// free function that can be tested on its own.
 fn control_target_limit(operand_size: OperandSize, cs_limit: u32) -> u32 {
     match operand_size {
         OperandSize::Word => cs_limit.min(0xFFFF),
@@ -8761,7 +8772,7 @@ fn static_control_target(kind: DirectKind) -> Option<u32> {
         | DirectKind::Call16 { target_delta, .. }
         | DirectKind::Jmp { target_delta } => Some(target_delta),
         DirectKind::Jcc { taken_delta, .. }
-        | DirectKind::Loop { taken_delta }
+        | DirectKind::Loop { taken_delta, .. }
         | DirectKind::LoopCc { taken_delta, .. } => Some(taken_delta),
         _ => None,
     }
@@ -11182,9 +11193,10 @@ pub(crate) fn parse_mul_mem_rows_arm_for_test(value: Result<String, std::env::Va
 /// 2.05x larger and should read 3.4-4.5%. If it ALSO reads inside the null, the campaign's
 /// entry-cost model is wrong and that is the more valuable finding.
 ///
-/// Spelling table identical to `IZARRAVM_MUL_MEM_ROWS`: unset / `` / `0` / `off` -> OFF (the
-/// shipped default and the A/B base), `1` / `on` -> ON, anything else PANICS so a mistyped
-/// ladder leg cannot run the default and be read as the arm it named doing nothing.
+/// Spelling table, same shape as `IZARRAVM_MUL_MEM_ROWS` but NOT the same default: unset ->
+/// ON (the shipped default since the 2026-08-30 flip), `` / `0` / `off` -> OFF (the escape and
+/// the A/B base), `1` / `on` -> ON, anything else PANICS so a mistyped ladder leg cannot run the
+/// default and be read as the arm it named doing nothing.
 pub(crate) fn loop_rows_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = LOOP_ROWS_OVERRIDE.with(std::cell::Cell::get) {
@@ -14486,6 +14498,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // Operand-size-invariant for the same reason `0xec` is (the classifier arm's own comment):
         // the interpreter's `0xe4` arm always reads and writes a byte regardless of `operand_size`.
         && !(direct_in_imm8_callout_armed() && insn.opcode == 0xe4)
+        // `0xe2` LOOP's Word/Word cell (the L0 lever), its OWN knob-gated term for the same
+        // reason `0xe4` above is: the gate-off arm stays byte-identical to the pre-slice tree by
+        // inspection. This term only lets a Word-operand `0xe2` reach the classifier arm at all;
+        // that arm is what tells the matched Word/Word cell apart from the two mixed cells and
+        // refuses those explicitly (see the `DirectKind::Loop` doc comment).
+        && !(loop_rows_enabled() && insn.opcode == 0xe2)
         // THE BYTE-SHIFT ROWS (`IZARRAVM_BYTE_SHIFT_ROWS`, default ON since the 2026-08-29
         // re-ladder) are a FIFTH allowlist term, written as its own term for the reason the V86 and TEST terms
         // above are: the gate-off arm stays byte-identical to the pre-slice tree by inspection
@@ -16758,15 +16776,18 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // must agree, and a shared helper would let one of them acquire a wrap or a mask the
             // other did not.
             //
-            // THREE REFUSALS, each a boundary rather than an omission:
+            // TWO MATCHED CELLS ADMITTED, TWO MIXED CELLS REFUSED EXPLICITLY, plus `0xE0`/`0xE1`:
             //
-            // * `address_size != Dword`. The counter would be CX, a 16-bit decrement that has to
-            //   preserve the high half of ECX. `alu_r32_imm32` writes all 32 bits, so a Word
-            //   form routed here would clear the top half of the guest's ECX. The census row is
-            //   `address_size: dword` and no fixture measures a Word one.
-            // * `operand_size != Dword`. `relative_jump(rel, operand_size)` masks EIP to 16 bits
-            //   at Word, so the taken target wraps at 64K. `taken_delta` carries no such wrap and
-            //   would send the block outside the segment.
+            // * `(Dword, Dword)`. The counter is ECX, decremented with `alu_r32_imm32`; the
+            //   target does not wrap.
+            // * `(Word, Word)`. The counter is CX, decremented with `alu_r16_imm16`, which
+            //   preserves ECX's high half; the target wraps at 64K, which `control_target_limit`
+            //   already clamps for. `counter_word` on the returned kind records this cell.
+            // * `(Word, Dword)` and `(Dword, Word)` are refused BY NAME below, not by falling
+            //   through a catch-all: a Word counter decremented as if it were Dword would clear
+            //   ECX's high half, and a Dword counter paired with a Word target would need the
+            //   emitted `taken_delta` to carry a wrap it does not model. Neither corpus shape
+            //   nor a fixture backs either mixed cell, so both stay interpreter.
             // * `0xE0`/`0xE1`. They read ZF; see the `DirectKind::Loop` comment for why the flag
             //   contract is what splits the family rather than the opcode.
             // `0xE0` LOOPNE / `0xE1` LOOPE. `taken_delta` is computed by the same three
@@ -16790,17 +16811,24 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 });
             }
             0xe2 if insn.group == DecodeGroup::Branch => {
-                if insn.address_size != AddressSize::Dword
-                    || insn.operand_size != OperandSize::Dword
-                    || !loop_rows_enabled()
-                {
+                if !loop_rows_enabled() {
                     return None;
                 }
+                let counter_word = match (insn.address_size, insn.operand_size) {
+                    (AddressSize::Dword, OperandSize::Dword) => false,
+                    (AddressSize::Word, OperandSize::Word) => true,
+                    // The two mixed cells, refused by name rather than by falling through: see
+                    // the `DirectKind::Loop` doc comment for why neither is a straightforward
+                    // widening of the matched cells above.
+                    (AddressSize::Word, OperandSize::Dword)
+                    | (AddressSize::Dword, OperandSize::Word) => return None,
+                };
                 let end_delta = lin
                     .wrapping_add(u32::from(insn.len))
                     .wrapping_sub(entry_lin);
                 return Some(DirectKind::Loop {
                     taken_delta: end_delta.wrapping_add(insn.imm),
+                    counter_word,
                 });
             }
             0xe8 if insn.group == DecodeGroup::Branch => {
@@ -18888,10 +18916,22 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 terminal = true;
                 break;
             }
-            DirectKind::Loop { taken_delta } => {
+            DirectKind::Loop {
+                taken_delta,
+                counter_word,
+            } => {
                 completed.retire(slot);
                 let taken = e.label();
-                e.alu_r32_imm32(5, home(1), 1);
+                // The width swap the `counter_word` field exists for. `alu_r16_imm16` writes
+                // only CX and preserves ECX's bits 31..16, exactly as `alu_r32_imm32` writes all
+                // of ECX for the Dword cell; either way the subtract lands in the SAME host
+                // register (`home(1)`, the guest ECX home), sets host ZF from its own width, and
+                // the branch immediately below reads that ZF with nothing inserted between them.
+                if counter_word {
+                    e.alu_r16_imm16(5, home(1), 1);
+                } else {
+                    e.alu_r32_imm32(5, home(1), 1);
+                }
                 // JNZ. Condition 5 is the guest's own `0x75` encoding, passed straight through
                 // exactly as the Jcc arm passes its `condition`.
                 e.jcc(5, taken);

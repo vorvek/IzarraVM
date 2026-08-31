@@ -2753,6 +2753,26 @@ fn word_size_control_targets_are_refused_above_the_sixteen_bit_wrap() {
         0x100,
         word
     ));
+    // The Word/Word `Loop` cell rides the same predicate as `Call16`: `counter_word` decides the
+    // decrement width in the emitter, but the TARGET is still `taken_delta`, checked against the
+    // identical clamp. Without this row the wrap guard could regress for LOOP alone and every
+    // assertion above would keep passing.
+    assert!(!static_control_target_within_limit(
+        DirectKind::Loop {
+            taken_delta: 0x40,
+            counter_word: true,
+        },
+        0x1_0100,
+        word
+    ));
+    assert!(static_control_target_within_limit(
+        DirectKind::Loop {
+            taken_delta: 0x40,
+            counter_word: true,
+        },
+        0x100,
+        word
+    ));
 
     // A kind with no control target is unaffected in either width.
     assert!(static_control_target_within_limit(
