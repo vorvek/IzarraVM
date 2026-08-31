@@ -1053,6 +1053,78 @@ fn w_buffer_mode_orders_depth_by_nearer_reciprocal_w() {
 }
 
 #[test]
+fn w_buffer_depth_codes_are_encoded_per_pixel_not_interpolated() {
+    // The SST-1 W-buffer code is a floating-point-style encode (exponent
+    // from a leading-zero count plus an inverted 12-bit mantissa). 86Box's
+    // vid_voodoo_render.c iterates 1/w linearly PER PIXEL and encodes each
+    // pixel's value. Encoding only the three vertices and interpolating the
+    // CODE linearly is wrong: the encode is not linear, so interior pixels
+    // of a large triangle get a depth that is off by thousands of codes.
+    // That inverts occlusion between big polygons (Tomb Raider's room
+    // geometry flickers). This test draws one wide triangle with a 1/w
+    // gradient and checks the depth stored at an interior pixel against
+    // the per-pixel encode.
+    let mut distira = Distira::new();
+    distira.set_frame_size(256, 8);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | FBZ_W_BUFFER
+            | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 256 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 8 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_B, 0);
+    // 1/w rises from 0.01 at x=0 to 0.95 at x=256 (signed 2.30 fixed point).
+    let start_w = 10_737_418u32; // 0.01 * 2^30
+    let dw_dx = 3_942_646u32; // (0.95 - 0.01) / 256 * 2^30
+    write_reg(&mut distira, SST_START_W, start_w);
+    write_reg(&mut distira, SST_DW_DX, dw_dx);
+    write_reg(&mut distira, SST_DW_DY, 0);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+
+    // 86Box's per-pixel wfloat encode, over a .32 fixed-point 1/w.
+    let wfloat_code = |w: f64| -> u16 {
+        let fixed = (w * 4294967296.0) as u64;
+        if fixed & 0xffff_0000_0000 != 0 {
+            return 0;
+        }
+        if fixed & 0xffff_0000 == 0 {
+            return 0xf001;
+        }
+        let exp = ((fixed >> 16) as u16).leading_zeros();
+        let mant = ((!fixed as u32) >> (19 - exp)) & 0xfff;
+        ((exp << 12) + mant + 1).min(0xffff) as u16
+    };
+
+    write_reg(&mut distira, SST_LFB_MODE, LFB_READ_AUX);
+    for x in [32u32, 64, 128, 192] {
+        let stored = distira.read_lfb_u16((x as usize) * 2);
+        // The rasteriser samples at the pixel centre (x + 0.5, y = 0.5).
+        let w = f64::from(start_w) / 1_073_741_824.0
+            + f64::from(dw_dx) / 1_073_741_824.0 * (f64::from(x) + 0.5);
+        let expected = wfloat_code(w);
+        let error = (i32::from(stored) - i32::from(expected)).abs();
+        assert!(
+            error <= 2,
+            "x={x}: stored depth code {stored} but the per-pixel encode of \
+             1/w={w:.5} is {expected} (error {error} codes)"
+        );
+    }
+}
+
+#[test]
 fn z_buffer_mode_is_unaffected_by_the_w_buffer_wiring() {
     // Regression guard: adding W-buffer support must not change Z-buffer
     // behavior when FBZ_W_BUFFER is clear. Same shape as the existing

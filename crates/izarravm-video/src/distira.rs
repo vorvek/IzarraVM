@@ -241,6 +241,30 @@ enum DistiraFifoEntry {
     TextureU32 { offset: usize, value: u32 },
 }
 
+/// Per-vertex depth terms for the triangle rasteriser. The Z variant is
+/// linear in screen space, so the interpolated value IS the depth. The W
+/// variant carries raw 1/w: the wfloat encode is not linear, so each pixel
+/// must interpolate 1/w first and encode second, the way 86Box's
+/// `vid_voodoo_render.c` iterates `state->w` per pixel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TriangleDepth {
+    Z([f32; 3]),
+    W([f32; 3]),
+}
+
+impl TriangleDepth {
+    /// The depth at one pixel, in the raw "4096 units per depth code" scale
+    /// `depth_to_u16` divides back out.
+    fn at(self, l0: f32, l1: f32, l2: f32) -> f32 {
+        match self {
+            Self::Z([za, zb, zc]) => lerp_f32(za, zb, zc, l0, l1, l2),
+            Self::W([wa, wb, wc]) => {
+                f32::from(wfloat_depth(lerp_f32(wa, wb, wc, l0, l1, l2))) * 4096.0
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingSwap {
     target_base: u32,
@@ -885,7 +909,7 @@ impl Distira {
     fn draw_triangle_with_depth(
         &mut self,
         vertices: [DistiraVertex; 3],
-        depths: [f32; 3],
+        depths: TriangleDepth,
         texture: TextureRaster,
         coverage: SstTriangleCoverage,
     ) -> u64 {
@@ -895,7 +919,7 @@ impl Distira {
     fn draw_triangle_inner(
         &mut self,
         vertices: [DistiraVertex; 3],
-        depths: Option<[f32; 3]>,
+        depths: Option<TriangleDepth>,
         texture: Option<TextureRaster>,
         coverage: Option<SstTriangleCoverage>,
     ) -> u64 {
@@ -997,7 +1021,7 @@ impl Distira {
                 let l0 = w0 * inv_area;
                 let l1 = w1 * inv_area;
                 let l2 = w2 * inv_area;
-                let depth_raw = depths.map(|[za, zb, zc]| lerp_f32(za, zb, zc, l0, l1, l2));
+                let depth_raw = depths.map(|depths| depths.at(l0, l1, l2));
                 let depth = depth_raw.map(|raw| self.biased_triangle_depth(raw));
                 if let Some(depth) = depth
                     && !self.depth_test_passes(x, draw_y, depth)
@@ -2484,15 +2508,15 @@ impl Distira {
             (origin_x, origin_y),
         );
         let depths = if self.fbz_mode & FBZ_W_BUFFER != 0 {
-            coords.map(|(x, y)| {
-                let w = self.texture_iterators.fbi_w_at(x, y, origin_x, origin_y);
-                // wfloat_depth already returns the same "raw, pre depth_to_u16
-                // divide-by-4096" units fixed_depth_at produces for Z, so both
-                // paths feed the shared depth_to_u16 conversion unchanged.
-                f32::from(wfloat_depth(w)) * 4096.0
-            })
+            // Raw per-vertex 1/w. The rasteriser interpolates 1/w per pixel
+            // and runs the wfloat encode there; the encode is not linear, so
+            // encoding here and interpolating the code would misplace every
+            // interior pixel of a large triangle.
+            TriangleDepth::W(coords.map(|(x, y)| {
+                self.texture_iterators.fbi_w_at(x, y, origin_x, origin_y)
+            }))
         } else {
-            coords.map(|(x, y)| {
+            TriangleDepth::Z(coords.map(|(x, y)| {
                 fixed_depth_at(
                     self.triangle_depth,
                     self.triangle_depth_dx,
@@ -2502,7 +2526,7 @@ impl Distira {
                     origin_x,
                     origin_y,
                 )
-            })
+            }))
         };
         let vertices = coords.map(|(x, y)| DistiraVertex {
             x,
