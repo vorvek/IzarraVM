@@ -850,6 +850,8 @@ ems_int67:
     je ef_map_multi
     cmp ah, 0x53                  ; 53h too: get/set handle name
     je ef_name
+    cmp ah, 0x59                  ; 59h too: hardware info / raw page counts
+    je ef_hwinfo
     cmp ah, 0x40
     jb ef_undef
     cmp ah, 0x4D
@@ -919,6 +921,42 @@ ef_counts:
 ef_version:                       ; 46h get version -> AL = BCD 4.0
     mov al, 0x40
     xor ah, ah
+    iret
+
+; 59h expanded-memory hardware information (LIM 4.0 OS/E). AL=01 gets the
+; unallocated/total RAW page counts in BX/DX; a raw page IS a 16 KB page on
+; this hardware (no alternate page sizes), so the answer is 42h's. This is
+; not optional polish either: 1830's streaming module sizes its EMS pool
+; from 5901h's BX WITHOUT checking AH, so the old 84h answer left a stale
+; register value in BX and the pool came out 50 pages instead of ~1900.
+; AL=00 fills the 5-word hardware array at ES:DI: raw page size 0x400
+; paragraphs; no alternate register sets; no context save area (function
+; 4Eh is not implemented, so there is no map context an OS could save); no
+; DMA register sets; no DMA channel operation.
+ef_hwinfo:
+    cmp al, 1
+    je ef_counts                  ; 5901h == 42h on 16 KB raw pages (BX/DX
+                                  ; outputs match; ef_counts preserves AL)
+    cmp al, 0
+    jne .badsub
+    push ax
+    push cx
+    push di
+    mov ax, 0x0400                ; word 0: raw page size in paragraphs
+    mov [es:di], ax
+    xor ax, ax                    ; words 1-4: see the header comment
+    mov cx, 4
+.zw:
+    add di, 2
+    mov [es:di], ax
+    loop .zw
+    pop di
+    pop cx
+    pop ax
+    xor ah, ah
+    iret
+.badsub:
+    mov ah, 0x8F                  ; undefined subfunction
     iret
 
 ; 53h handle names (LIM 4.0). AL=0 get: DX = handle -> the 8-byte name at
@@ -1206,34 +1244,33 @@ ef_map_multi:
     push bx
     push di
     push bp
-    mov bp, cx                    ; entry count for the apply pass
+    mov bp, cx                    ; pair count (CX becomes scratch below)
     mov di, si                    ; array cursor (caller's DS)
     call ems_slot_of              ; DX -> SI = slot offset, or CF + AH=83h
     jc .out
-    mov dx, di                    ; remember the array start (DX is free now)
-    jcxz .done                    ; zero entries: a successful no-op
-.validate:
+    test bp, bp
+    jz .done                      ; zero entries: a successful no-op
+    ; One pass: validate THIS pair, apply it, then look at the next one.
+    ; EMM386 and DOSBox map sequentially and stop at the first bad pair,
+    ; LEAVING THE EARLIER PAIRS APPLIED. This is load-bearing, not a
+    ; shortcut: 1830's streaming decoder maps 4-page batches whose tail
+    ; overshoots the asset's last page, ignores the 8Ah, and decodes from
+    ; the pages that did land -- an atomic validate-then-apply reject left
+    ; the frame stale and livelocked its bidding-screen decode.
+.pair:
     mov bx, [di+2]
     call .phys_to_slot
     jc .badphys
     mov bx, [di]
     cmp bx, 0xFFFF
-    je .v_next
+    je .p_unmap
     cmp bx, [cs:si+2]             ; logical >= npages?
     jae .badlog
-.v_next:
-    add di, 4
-    loop .validate
-    mov di, dx                    ; rewind for the apply pass
-.apply:
-    mov bx, [di]
-    cmp bx, 0xFFFF
-    je .a_unmap
     call ems_backing_of           ; logical BX, slot SI -> CX = backing page
-    jmp .a_slot
-.a_unmap:
+    jmp .p_slot
+.p_unmap:
     mov cx, 0xFFFF
-.a_slot:
+.p_slot:
     mov bx, [di+2]
     call .phys_to_slot            ; -> BL = frame slot (validated above)
     push si
@@ -1247,7 +1284,7 @@ ef_map_multi:
     pop ax
     add di, 4
     dec bp
-    jnz .apply
+    jnz .pair
 .done:
     xor ah, ah
 .out:
