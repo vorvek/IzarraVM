@@ -252,6 +252,12 @@ mod word_shift;
 #[path = "cpu_jit_byte_shift_test.rs"]
 mod byte_shift;
 
+/// `vorvek/direct-word-rot1`: the sixteen-bit REGISTER rotate lane, `0xC1`/`0xD1 /0,/1`. Nested
+/// here for the reason the modules above are: it wants this module's differential fixture
+/// (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than another copy of it.
+#[path = "cpu_jit_word_rotate_test.rs"]
+mod word_rotate;
+
 /// The sixteen-bit INC/DEC lazy-flag descriptor, the survivor `word_memory`'s header recorded and
 /// left for its own change. Nested here for the reason the four modules above are: it wants this
 /// module's differential fixture (`ENTRY`, `STACK_TOP`, `flat_cpu`) rather than a sixth copy.

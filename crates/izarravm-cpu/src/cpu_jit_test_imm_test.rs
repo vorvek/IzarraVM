@@ -2101,12 +2101,17 @@ fn byte_shl_register_form_matches_the_interpreter_in_486_mode() {
 #[test]
 fn group2_non_lowered_rotates_remain_interpreter_only() {
     // FORCED ON, and this is the subtle one. Every row here is refused by a GUARD -- the `m.reg`
-    // tests, the register-only `let-else`, the Word check inside the rotate branch. On the OFF arm
-    // the knob refuses `0xC1 /0` and the whole of `0xC0` before any of those guards runs, so the
-    // rows would still pass while certifying nothing about the guards, and a widening of
-    // `m.reg != 4` to `4..=7` would survive. That the default arm happens to be ON since
-    // 2026-08-19 does not make the force redundant: it is what keeps this test meaningful if the
-    // default moves again. The knob itself is pinned by
+    // tests and the register-only `let-else` (the Word `/0`,`/1` rows and the byte `/0`,`/1`
+    // register rows all moved out of this file once `vorvek/direct-word-rot1` admitted them; see
+    // `group2_word_rotate_register_form_is_lowered` and, in `cpu_jit_byte_shift_test.rs`,
+    // `byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds`). What is LEFT that
+    // still needs the force is the two MEMORY-form rows below that pass through a sub-opcode the
+    // knob also gates: `0xC1 /0` ROL memory (`vec![0xc1, 0x05, ..]`) and `0xC0 /4` SHL memory
+    // (`vec![0xc0, 0x25, ..]`). On the OFF arm the knob refuses both BEFORE the register-only
+    // `let-else` ever runs, so those two rows would still pass while certifying nothing about the
+    // `let-else`, and a widening of it to a defaulting match would survive undetected. That the
+    // default arm happens to be ON since 2026-08-19 does not make the force redundant: it is what
+    // keeps this test meaningful if the default moves again. The knob itself is pinned by
     // `the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admissions`; the
     // guards are pinned here, and the two must not be allowed to stand in for each other.
     select_rotate_rows(true);
@@ -2122,19 +2127,15 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
         vec![0xc1, 0xdb, 0x05], // /3 RCR: same
         vec![0xd1, 0xd3],       // /2 RCL by 1
         vec![0xd1, 0xdb],       // /3 RCR by 1
-        // The BYTE group's rotates, at BOTH byte opcodes. `0xC0` has admitted `/4..=7` since the
-        // byte-shift slice and `0xD0` has an arm of its own now, so these eight rows are what says
-        // both arms' `matches!(m.reg, 4..=7)` is doing the work rather than either having been
-        // widened to `0 | 1 | 4..=7` "to mirror the sibling arm". They can never be a list entry:
-        // `DirectKind::RotateReg` carries no width field at all and `emit_rotate_reg` is a 32-bit
-        // host rotate over the guest home, so a byte rotate through it rotates 32 bits and takes
-        // CF from bit 31 instead of bit 7. RCL/RCR are out at every width for the standing reason.
-        vec![0xc0, 0xc3, 0x05], // /0 ROL r8, imm8
-        vec![0xc0, 0xcb, 0x05], // /1 ROR r8, imm8
+        // The BYTE group's RCL/RCR, at BOTH byte opcodes. `0xC0`/`0xD0 /0,/1` (ROL/ROR) moved OUT
+        // of this list as of `vorvek/direct-word-rot1`: `DirectKind::RotateRegByte` and
+        // `emit_rotate_reg8` admit them, gated on `rotate_rows_enabled` exactly as the Dword rows
+        // are; their positive coverage is `cpu_jit_byte_shift_test.rs`'s
+        // `byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds` and its differential
+        // sweep. RCL/RCR stay here because they are out at every width for the standing reason: no
+        // emitter takes the incoming CF as a rotate input.
         vec![0xc0, 0xd3, 0x05], // /2 RCL r8, imm8
         vec![0xc0, 0xdb, 0x05], // /3 RCR r8, imm8
-        vec![0xd0, 0xc3],       // /0 ROL r8, 1
-        vec![0xd0, 0xcb],       // /1 ROR r8, 1
         vec![0xd0, 0xd3],       // /2 RCL r8, 1
         vec![0xd0, 0xdb],       // /3 RCR r8, 1
         // The byte group BY CL, every sub-opcode. `0xD2` has no arm at any width and no census row
@@ -2160,11 +2161,11 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
         // register battery above.
         vec![0xc0, 0x2d, 0x00, 0x50, 0x00, 0x00, 0x05],
         vec![0xd0, 0x2d, 0x00, 0x50, 0x00, 0x00],
-        // 66-prefixed ROR and ROL r/m16. The OperandSize::Word guard inside the classify arm is
-        // the only thing stopping these from being lowered as 32-bit rotates, which would smear
-        // the high half into the low one.
-        vec![0x66, 0xc1, 0xcb, 0x05],
-        vec![0x66, 0xc1, 0xc3, 0x05],
+        // 66-prefixed ROR and ROL r/m16 used to stay here, refused by `classify`'s
+        // `insn.operand_size == OperandSize::Word` guard inside the rotate branch. That guard is
+        // gone as of `vorvek/direct-word-rot1`: `RotateReg` now carries a `width` field and
+        // dispatches to `shift_r16_imm8`, so these two rows are admitted and lowered. See
+        // `group2_word_rotate_register_form_is_lowered` for their positive coverage.
     ] {
         assert!(
             compile_leading_block(&code).is_none(),
@@ -2204,6 +2205,36 @@ fn group2_dword_rotate_register_form_is_lowered() {
             compile_leading_block(&code),
             Some(3),
             "rotate {code:02x?} must admit and carry the whole three-slot block"
+        );
+    }
+}
+
+#[test]
+fn group2_word_rotate_register_form_is_lowered() {
+    // The Word sibling of `group2_dword_rotate_register_form_is_lowered`, and the ONLY test that
+    // can detect the classify arm's `insn.operand_size == OperandSize::Word` refusal being
+    // deleted from underneath a passing dword battery -- that refusal used to sit between the
+    // `m.reg` guard and the `Some(DirectKind::RotateReg { .. })` return, so a dword-only positive
+    // test cannot see it. `123-talk-shareware`'s `0xD1 word register /1` (29.70M runtime hits, its
+    // #1 census row) and `21-for-1-to-4`'s `0xD0 word register /1` (13.50M) are both this arm at
+    // `operand_size: Word`, reached with a 0x66 prefix in a 32-bit segment (below) and with no
+    // prefix at all in a 16-bit one (`the_word_size_group_two_shapes_...` fixtures cover the
+    // segment-default path).
+    select_rotate_rows(true);
+    for code in [
+        vec![0x66u8, 0xc1, 0xcb, 0x10], // ror bx, 16
+        vec![0x66, 0xc1, 0xcb, 0x01],   // ror bx, 1
+        vec![0x66, 0xc1, 0xcb, 0x00],   // ror bx, 0, the no-op shape still has to ADMIT
+        vec![0x66, 0xd1, 0xcb],         // ror bx, 1 via the 0xD1 encoding
+        vec![0x66, 0xc1, 0xc3, 0x10],   // rol bx, 16
+        vec![0x66, 0xc1, 0xc3, 0x01],   // rol bx, 1
+        vec![0x66, 0xc1, 0xc3, 0x00],   // rol bx, 0, the no-op shape
+        vec![0x66, 0xd1, 0xc3],         // rol bx, 1 via the 0xD1 encoding
+    ] {
+        assert_eq!(
+            compile_leading_block(&code),
+            Some(3),
+            "word rotate {code:02x?} must admit and carry the whole three-slot block"
         );
     }
 }

@@ -1202,50 +1202,43 @@ fn word_size_shift_forms_are_lowered() {
 
 /// The group-2 shapes that stay refused at Word size, and the boundary that keeps them out.
 ///
-/// Three separate refusals share this table, and they are refused in three different places:
+/// Two separate refusals share this table now (a third, the ROL/ROR Word guard, was RETIRED by
+/// `vorvek/direct-word-rot1` -- see below):
 ///
-/// * **The four ROTATES of `0xC1` itself.** `/2` RCL and `/3` RCR have never had a classify arm
-///   at any width. `/0` ROL and `/1` ROR both do -- ROR since slice 3b, ROL since the 2026-08-09
-///   duke3d-586 re-census slice -- and BOTH are refused at Word by one guard: `RotateReg` carries
-///   no width and emits `shift_r32_imm8(op, ..)`, so a 66-prefixed rotate routed through it would
-///   rotate 32 bits and take CF from bit 31 instead of bit 15. That guard is the only thing
-///   standing between the allowlist entry and a miscompile, which is why both have a row here and
-///   a mutation in the differential file. ROL's row was a "no arm anywhere" refusal when it was
-///   written and is a genuine Word-guard refusal now; nothing about the assertion changed, which
-///   is the point of pinning the shape rather than the reason.
-/// * **The four ROTATES of `0xD1`.** Same split as `0xC1`'s, and they matter more now that the
-///   opcode is on the allowlist: `/0` and `/1` reach the Word guard through `0xD1` far more often
-///   than through `0xC1`, and `/2` RCL is the largest single row in the 16-bit census at 10.91%,
-///   so it is the shape most likely to be admitted by a hurried edit.
+/// * **RCL (`/2`) and RCR (`/3`) of both `0xC1` and `0xD1`.** Neither has ever had a classify arm
+///   at any width -- the standing structural reason is that both take the incoming CF as a rotate
+///   INPUT, which needs the guest flags loaded before the rotate rather than only captured after
+///   it. `/2` RCL is the largest single row in the 16-bit census at 10.91%, so it is the shape most
+///   likely to be admitted by a hurried edit, which is why it still has a row here even though the
+///   refusal predates this file.
 /// * **`0xD3`, the shift-by-CL group.** A different arm, still Dword-only: `emit_shift_cl` has no
 ///   sixteen-bit lane and would be a second emitter primitive.
+///
+/// **ROL (`/0`) and ROR (`/1`) of `0xC1` and `0xD1` moved OUT of this table.**
+/// `vorvek/direct-word-rot1` gave `RotateReg` a `width` field and `emit_rotate_reg` a
+/// `shift_r16_imm8` arm, so a 66-prefixed rotate now narrows to the guest's own 16 bits instead of
+/// rotating 32 -- the guard this table used to pin is gone by design, not by accident. Their
+/// positive coverage is `group2_word_rotate_register_form_is_lowered` in
+/// `cpu_jit_test_imm_test.rs` and the differential sweep in `cpu_jit_word_rotate_test.rs`.
 ///
 /// The MEMORY form of `0xC1` is here too, at BOTH operand sizes, because its refusal is neither
 /// the allowlist's nor new -- the classify arm binds `DecodedOperand::Reg` and returns None for
 /// anything else. Pinning both sizes is what says the Word entry did not widen it by accident.
 #[test]
 fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
-    // The group-2 admission knob is FORCED ON for this table, and it is the ROL rows that need it.
-    // On the OFF arm the knob refuses them BEFORE the Word guard runs -- they would still pass
-    // while certifying nothing about the guard this test exists to pin, and a Word admission
-    // slipped into the rotate branch would survive. The shipped default has been ON since the
-    // 2026-08-19/20 re-measurement (`jit::direct::rotate_rows_enabled` carries both A/Bs), so the
-    // force is now insurance against the default moving rather than the thing that makes these rows
-    // reachable. The knob's own arms are pinned in
-    // `the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admissions`; the
-    // Word guard is pinned here, and neither may stand in for the other.
-    jit::direct::set_rotate_rows_for_test(Some(true));
-    assert!(
-        jit::direct::rotate_rows_enabled(),
-        "the ROL rows below pin the Word guard, which the off arm never reaches"
-    );
+    // NO KNOB FORCE, and that absence is deliberate rather than an oversight. Every row left in
+    // this table refuses UNCONDITIONALLY, on both arms of `IZARRAVM_ROTATE_ROWS`: RCL/RCR have
+    // never had a classify arm at any width, `0xD3` has no arm at all (`emit_shift_cl` is
+    // Dword-only), and the memory forms are refused by the shared register-only `let-else` before
+    // any knob is consulted. A force here would be a gate that cannot fail -- it would pass
+    // identically with the knob on or off, certifying nothing about the knob and hiding that fact
+    // from a reader. (The one row that DID depend on the knob, `0xC1`/`0xD1 /0` ROL, moved OUT of
+    // this table as of `vorvek/direct-word-rot1`: `RotateReg` now carries a `width` field and is
+    // admitted at Word, so its positive coverage -- knob on and off -- lives in
+    // `cpu_jit_word_rotate_test.rs` and `group2_word_rotate_register_form_is_lowered` instead.)
     let cases: &[(&str, &[u8])] = &[
-        ("0xc1 /0 rol cx,imm8", &[0x66, 0xc1, 0xc1, 0x03]),
-        ("0xc1 /1 ror cx,imm8", &[0x66, 0xc1, 0xc9, 0x03]),
         ("0xc1 /2 rcl cx,imm8", &[0x66, 0xc1, 0xd1, 0x03]),
         ("0xc1 /3 rcr cx,imm8", &[0x66, 0xc1, 0xd9, 0x03]),
-        ("0xd1 /0 rol cx,1", &[0x66, 0xd1, 0xc1]),
-        ("0xd1 /1 ror cx,1", &[0x66, 0xd1, 0xc9]),
         ("0xd1 /2 rcl cx,1", &[0x66, 0xd1, 0xd1]),
         ("0xd1 /3 rcr cx,1", &[0x66, 0xd1, 0xd9]),
         ("0xd3 /4 shl cx,cl", &[0x66, 0xd3, 0xe1]),
