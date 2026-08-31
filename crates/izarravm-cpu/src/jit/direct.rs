@@ -17387,10 +17387,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // 586-mode `66 F7 /4` out, and a 16-bit MUL writes DX and AX as halves of the
                 // existing EDX and EAX rather than replacing them.
                 //
-                // `opcode == 0xf7` is load-bearing on the MEMORY form for the reason it is
-                // load-bearing on the /5 arm below: `0xF6 /4` is the BYTE MUL, which multiplies AL
-                // and writes only AX. Without the test it would be read as a dword and lowered as
-                // the dword multiply, writing EAX and EDX whole.
+                // `opcode == 0xf7` is still load-bearing on the MEMORY form if the FIRST arm above
+                // ever loses F6: `0xF6 /4` is the BYTE MUL, which multiplies AL and writes only AX.
+                // Without the test it would be read as a dword and lowered as the dword multiply,
+                // writing EAX and EDX whole. FIRST currently intercepts F6 `/2../7` as InterpretOne
+                // before this arm; `byte_mul_imul_memory_forms_join_as_call_outs_with_the_gate_on`
+                // pins that F6 /4 still joins as a call-out with MUL_MEM_ROWS on.
                 //
                 // The MEMORY form is the 2026-08-29 gp2-586 census's `0xF7 /4 memory dword` row at
                 // 13.1 M interpreted hits, the second head of that fixture's rejected class, and it
@@ -17432,12 +17434,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // (It formerly cited a `mul_memory_form_stays_interpreter_only` that has never
                 // existed in this tree; the citation is repaired here rather than left dangling.)
                 //
-                // `opcode == 0xf7` is equally load-bearing: this arm sits inside the shared
-                // `0xf6 | 0xf7` group arm, and 0xF6 /5 is the BYTE IMUL, which multiplies AL and
-                // writes only AX. Without the test it would be read as a dword and lowered as the
-                // dword multiply. `grp3_imul_neighbouring_forms_remain_interpreter_only`'s byte
-                // case is what catches that. (It formerly cited an
-                // `imul_byte_form_stays_interpreter_only` that has never existed in this tree.)
+                // `opcode == 0xf7` is equally load-bearing if FIRST ever loses F6: this arm sits
+                // inside the shared `0xf6 | 0xf7` group arm, and 0xF6 /5 is the BYTE IMUL, which
+                // multiplies AL and writes only AX. Without the test it would be read as a dword
+                // and lowered as the dword multiply.
+                // `byte_mul_imul_memory_forms_join_as_call_outs_with_the_gate_on` pins that F6 /5
+                // still joins as a call-out rather than as `ImulMemAcc`.
                 //
                 // No width field and no raw_clocks field. The OperandSize::Word gate above keeps a
                 // 66-prefixed form out, and the whole group-3 arm returns clocks(2), which is
