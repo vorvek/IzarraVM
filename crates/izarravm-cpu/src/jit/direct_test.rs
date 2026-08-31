@@ -76,6 +76,9 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         x87_exit_top: 0,
         dynamic_successor: false,
         successors: [None, None],
+        written_segments: 0,
+        #[cfg(feature = "seg-head-diagnostic")]
+        seg_head_guard_eligible: false,
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets: [None, None],
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],

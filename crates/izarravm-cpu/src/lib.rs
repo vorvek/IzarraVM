@@ -2225,6 +2225,25 @@ pub struct DirectStallSnapshot {
     /// the reasons on `DirectStallTally`.
     pub segment_write_block_head_entries: u64,
     pub segment_write_block_head_insns: u64,
+    /// L9 stage 0, THROWAWAY. See `DirectStallTally` for what each of the five counts.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_diagnostic_entries: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_successor_pins_written: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_successor_absent: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_selector_repeat: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_dirty_multi: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible_successor_pins_written: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible_successor_absent: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible_selector_repeat: u64,
     /// G1 lane trials granted and the subset that installed a lane-carrying block under a hot
     /// span. See `DirectStallTally`.
     pub lane_trials: u64,

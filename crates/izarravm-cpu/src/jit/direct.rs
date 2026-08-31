@@ -925,6 +925,19 @@ pub(crate) struct BlockCache {
     /// reads this array, an over-strict ENTRY; a stale-too-NARROW one is a wrong-base miscompile,
     /// which is why the narrowing keys on `outbound` emptiness and never on link VISIBILITY.
     chain_layouts: Vec<SegmentLayout>,
+    /// Parallel to `blocks`, same `BlockId::index()`: `Compilation::written_segments`, the segments
+    /// this block's own lowerings overwrite. A side lane rather than a `CompiledBlock` field
+    /// because that struct is pinned at 120 bytes and no reader of this mask is on the per-entry
+    /// copy path; every one of them already holds an index.
+    written_segments: Vec<u8>,
+    /// L9 stage 0, THROWAWAY. Parallel to `blocks`: `Compilation::seg_head_guard_eligible`.
+    #[cfg(feature = "seg-head-diagnostic")]
+    seg_head_guard_eligible: Vec<bool>,
+    /// L9 stage 0, THROWAWAY: the selector each segment-write head wrote on its PREVIOUS entry,
+    /// keyed by the head's linear rather than by `BlockId` so a recompile at the same address
+    /// keeps the history the question is about. Only ever read by `note_seg_head_diagnostic`.
+    #[cfg(feature = "seg-head-diagnostic")]
+    seg_head_last_selector: HashMap<u32, u16, U32BuildHasher>,
     /// `IZARRAVM_CHAIN_ENTRY_CHECK`, read ONCE here rather than on the entry path. See
     /// `chain_entry_check_armed` for the arm table and the nulling semantics,
     /// and `BlockCache::entry_layout` for what it selects.
@@ -1341,6 +1354,11 @@ impl BlockCache {
             blocks: Vec::new(),
             segment_layouts: Vec::new(),
             chain_layouts: Vec::new(),
+            written_segments: Vec::new(),
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_guard_eligible: Vec::new(),
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_last_selector: HashMap::default(),
             chain_entry_check_armed: chain_entry_check_armed(),
             #[cfg(test)]
             entry_layout_fetches: std::sync::atomic::AtomicU32::new(0),
@@ -1619,6 +1637,10 @@ impl BlockCache {
             self.blocks.push(block);
             self.segment_layouts.push(compilation.segment_layout);
             self.chain_layouts.push(compilation.segment_layout);
+            self.written_segments.push(compilation.written_segments);
+            #[cfg(feature = "seg-head-diagnostic")]
+            self.seg_head_guard_eligible
+                .push(compilation.seg_head_guard_eligible);
             self.block_imm_lanes.push(compilation.imm_lanes);
             self.block_imm_lane_widths.push(compilation.imm_lane_widths);
             if index == self.block_portals.len() {
@@ -1651,6 +1673,11 @@ impl BlockCache {
             // A recycled slot must never inherit the retired occupant's WIDENED chain
             // requirement: the new block reaches a different successor set entirely.
             self.chain_layouts[index] = compilation.segment_layout;
+            self.written_segments[index] = compilation.written_segments;
+            #[cfg(feature = "seg-head-diagnostic")]
+            {
+                self.seg_head_guard_eligible[index] = compilation.seg_head_guard_eligible;
+            }
             self.block_imm_lanes[index] = compilation.imm_lanes;
             self.block_imm_lane_widths[index] = compilation.imm_lane_widths;
             self.link_cells[index] = compilation.link_cells.clone();
@@ -3692,6 +3719,9 @@ impl BlockCache {
         self.blocks.clear();
         self.segment_layouts.clear();
         self.chain_layouts.clear();
+        self.written_segments.clear();
+        #[cfg(feature = "seg-head-diagnostic")]
+        self.seg_head_guard_eligible.clear();
         self.block_imm_lanes.clear();
         self.block_imm_lane_widths.clear();
         self.lane_trial_epochs.clear();
@@ -3935,6 +3965,22 @@ pub(crate) struct Compilation {
     /// from the successor match falls to the fall-through arm, which is a wrong edge rather than
     /// a missing one, and nothing observable in guest state or in the block's shape shows it.
     pub(crate) successors: [Option<LinkTarget>; 2],
+    /// The segments this block's own LOWERINGS overwrite, one bit per `segment_bit`. This is
+    /// `dirty_segments`, so it names the four real-mode kinds and nothing else: the `InterpretOne`
+    /// call-out producer of `segment_write_block` writes a segment the compiler cannot name and
+    /// deliberately leaves this mask clear.
+    ///
+    /// Rides `Compilation` and `BlockCache::written_segments` rather than `CompiledBlock`, which is
+    /// pinned at 120 bytes with a full budget. Every reader holds an index or a `Compilation`
+    /// already, so the side lane costs nothing the packed byte would have saved.
+    pub(crate) written_segments: u8,
+    /// L9 stage 0, THROWAWAY: whether this block has the exact shape the guarded edge would admit.
+    /// One real-mode lowering write, that segment neither CS nor SS, no call-out that could write a
+    /// segment the compiler cannot name, and a plain fallthrough terminal. Without it the tally
+    /// probes a fallthrough linear that a RET- or jump-terminated head never executes, and reads
+    /// the resulting miss as "no successor compiled".
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub(crate) seg_head_guard_eligible: bool,
     #[cfg(feature = "direct-link-refusal-census")]
     pub(crate) emitted_static_targets: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
@@ -8906,6 +8952,32 @@ fn compile_with_budget(
     // successor is not a later slot in this block, and nothing in the mask says anything about
     // what it bakes.
     let segment_write_block = segment_writes != 0 || callout_segment_writes != 0;
+    // L9 stage 0, THROWAWAY. The shape the guarded edge would admit, decided here where every term
+    // is in scope. The terminal test is the complement of the kinds the `successors` match names
+    // explicitly, so it is true for exactly the plain fallthrough catch-all.
+    #[cfg(feature = "seg-head-diagnostic")]
+    let seg_head_guard_eligible = dirty_segments.count_ones() == 1
+        && dirty_segments & (segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)) == 0
+        && callout_segment_writes == 0
+        && !matches!(
+            slots.last().map(|slot| slot.kind),
+            Some(
+                DirectKind::Jcc { .. }
+                    | DirectKind::Loop { .. }
+                    | DirectKind::LoopCc { .. }
+                    | DirectKind::Call { .. }
+                    | DirectKind::Call16 { .. }
+                    | DirectKind::Jmp { .. }
+                    | DirectKind::Ret { .. }
+                    | DirectKind::Ret16 { .. }
+                    | DirectKind::RetFar16 { .. }
+                    | DirectKind::CallFar16 { .. }
+                    | DirectKind::JmpMem { .. }
+                    | DirectKind::JmpReg { .. }
+                    | DirectKind::CallReg { .. }
+                    | DirectKind::CallMem { .. }
+            )
+        );
     // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
     // segment-write block -- it writes CS, which is the whole point -- so the `!segment_write_block`
     // term above would make the far cell unreachable and the slice inert.
@@ -9136,6 +9208,9 @@ fn compile_with_budget(
         dynamic_successor,
         far_dynamic,
         successors,
+        written_segments: dirty_segments,
+        #[cfg(feature = "seg-head-diagnostic")]
+        seg_head_guard_eligible,
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets,
         link_cells,
@@ -9847,6 +9922,22 @@ const fn segment_bit(segment: SegmentIndex) -> u8 {
         SegmentIndex::Ds => 1 << 3,
         SegmentIndex::Fs => 1 << 4,
         SegmentIndex::Gs => 1 << 5,
+    }
+}
+
+/// The inverse of `segment_bit` for a mask holding exactly one bit, `None` for anything else.
+/// L9 stage 0 only, which is why it is gated: nothing on the default path turns a mask back into a
+/// segment.
+#[cfg(feature = "seg-head-diagnostic")]
+pub(crate) const fn segment_of_bit(bit: u8) -> Option<SegmentIndex> {
+    match bit {
+        1 => Some(SegmentIndex::Es),
+        2 => Some(SegmentIndex::Cs),
+        4 => Some(SegmentIndex::Ss),
+        8 => Some(SegmentIndex::Ds),
+        16 => Some(SegmentIndex::Fs),
+        32 => Some(SegmentIndex::Gs),
+        _ => None,
     }
 }
 
@@ -32642,6 +32733,41 @@ pub(crate) struct DirectStallTally {
     /// global figure says directly whether these blocks are short because they cannot chain.
     pub segment_write_block_head_entries: u64,
     pub segment_write_block_head_insns: u64,
+    /// L9 stage 0, THROWAWAY (dev_docs/2026-08-31-l9-segment-chain-design.md, section 6). All five
+    /// are counted at the same site as the pair above and share its denominator caveat, with one
+    /// narrowing: they count only heads whose LOWERINGS wrote a segment, so the `InterpretOne`
+    /// call-out producer is excluded. `seg_head_diagnostic_entries` is that narrowed denominator.
+    ///
+    /// * `seg_head_successor_pins_written` -- a block exists at this head's fallthrough linear and
+    ///   its chain requirement claims the segment the head just wrote. High here means a refusal
+    ///   design would refuse the measured case.
+    /// * `seg_head_successor_absent` -- nothing is compiled at the fallthrough linear yet, so no
+    ///   edge design buys anything at this entry.
+    /// * `seg_head_selector_repeat` -- the selector this entry wrote equals the one the previous
+    ///   entry at this same head wrote. This is the conversion rate of a selector-guarded edge.
+    /// * `seg_head_dirty_multi` -- heads writing more than one segment.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_diagnostic_entries: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_successor_pins_written: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_successor_absent: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_selector_repeat: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_dirty_multi: u64,
+    /// The same question asked of the population a guarded edge could actually serve: one
+    /// non-CS, non-SS lowering write, no call-out segment write, and a plain fallthrough terminal.
+    /// The four counters above probe a fallthrough linear even on a head that returns or jumps and
+    /// therefore never reaches it, which reads as a missing successor and is not one.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible_successor_pins_written: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible_successor_absent: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub seg_head_eligible_selector_repeat: u64,
     /// The x87 TOP-mismatch retire cap (`retire_key_for_top_mismatch`). `suppressed` counts every
     /// retire the cap refused -- one per mismatch on an already-capped key, so on a churning guest
     /// it approaches `jit_direct_reject_x87_top`. The identity
@@ -34420,6 +34546,26 @@ impl crate::jit::JitState {
             callout_governor_io_touching: self.stalls.callout_governor_io_touching,
             segment_write_block_head_entries: self.stalls.segment_write_block_head_entries,
             segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_diagnostic_entries: self.stalls.seg_head_diagnostic_entries,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_successor_pins_written: self.stalls.seg_head_successor_pins_written,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_successor_absent: self.stalls.seg_head_successor_absent,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_selector_repeat: self.stalls.seg_head_selector_repeat,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_dirty_multi: self.stalls.seg_head_dirty_multi,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_eligible: self.stalls.seg_head_eligible,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_eligible_successor_pins_written: self
+                .stalls
+                .seg_head_eligible_successor_pins_written,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_eligible_successor_absent: self.stalls.seg_head_eligible_successor_absent,
+            #[cfg(feature = "seg-head-diagnostic")]
+            seg_head_eligible_selector_repeat: self.stalls.seg_head_eligible_selector_repeat,
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
             lane_trial_first_grants: self.stalls.lane_trial_first_grants,
@@ -34735,6 +34881,67 @@ impl crate::jit::JitState {
     pub(crate) fn note_segment_write_block_entry(&mut self, is_segment_write: u64, insns: u64) {
         self.stalls.segment_write_block_head_entries += is_segment_write;
         self.stalls.segment_write_block_head_insns += is_segment_write * insns;
+    }
+
+    /// The written mask of an installed block, `0` for a stale id and for the call-out producer.
+    /// Gated for now because the stage-0 tally is its only reader; the guarded-edge slice this
+    /// diagnostic decides is what makes it default-path code.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub(crate) fn written_segments_of(&self, id: BlockId) -> u8 {
+        self.active_index(id)
+            .map_or(0, |index| self.written_segments[index])
+    }
+
+    /// L9 stage 0, THROWAWAY. Called once per dispatcher entry whose head wrote a segment through
+    /// one of the four real-mode lowerings, AFTER the block ran, so `selector` is the value the
+    /// write installed and is exactly what a selector-guarded edge would compare.
+    ///
+    /// `#[inline(never)]` because the whole point of the feature gate is that the default build
+    /// carries none of this; an armed build is a diagnostic build and pays for the call.
+    #[cfg(feature = "seg-head-diagnostic")]
+    #[inline(never)]
+    pub(crate) fn note_seg_head_diagnostic(
+        &mut self,
+        id: BlockId,
+        span: BlockSpan,
+        mask: u8,
+        selector: u16,
+    ) {
+        if mask == 0 {
+            return;
+        }
+        let eligible = self
+            .active_index(id)
+            .is_some_and(|index| self.seg_head_guard_eligible[index]);
+        self.stalls.seg_head_diagnostic_entries += 1;
+        self.stalls.seg_head_eligible += u64::from(eligible);
+        self.stalls.seg_head_dirty_multi += u64::from(mask.count_ones() > 1);
+        let fallthrough = LinkTarget {
+            linear: span.key.linear.wrapping_add(u32::from(span.guest_len)),
+            mode_key: span.key.mode_key,
+        };
+        match self
+            .linear_blocks
+            .get(&fallthrough)
+            .copied()
+            .and_then(|id| self.active_index(id))
+        {
+            Some(index) => {
+                let pins = u64::from(self.chain_layouts[index].used & mask != 0);
+                self.stalls.seg_head_successor_pins_written += pins;
+                self.stalls.seg_head_eligible_successor_pins_written += pins * u64::from(eligible);
+            }
+            None => {
+                self.stalls.seg_head_successor_absent += 1;
+                self.stalls.seg_head_eligible_successor_absent += u64::from(eligible);
+            }
+        }
+        let previous = self
+            .seg_head_last_selector
+            .insert(span.key.linear, selector);
+        let repeat = u64::from(previous == Some(selector));
+        self.stalls.seg_head_selector_repeat += repeat;
+        self.stalls.seg_head_eligible_selector_repeat += repeat * u64::from(eligible);
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {

@@ -57,6 +57,13 @@ retf-arity-census = ["jit"]
 # boundary while the Direct backend owns execution and the real classifier is gated off.
 # Compiled out unless selected.
 poll-head-probe = ["jit"]
+# L9 stage 0: the segment-write head tally
+# (dev_docs/2026-08-31-l9-segment-chain-design.md, section 6). THROWAWAY. It answers whether a
+# segment-write head's fallthrough successor pins the segment the head just wrote and whether the
+# written selector repeats from one entry at that head to the next, which is what picks between the
+# refusal design and the guarded-edge design. Compiled out unless selected, so the default entry
+# path pays nothing.
+seg-head-diagnostic = ["jit"]
 # Diagnostic guest-store watchpoint (IZARRAVM_WATCH_WRITE). OFF by default: the check sits
 # on the store hot path, and leaving it compiled in measured ~10% on a 586 16-bit workload
 # even while disarmed. Build with `--features watch-write` when hunting a corruption.
