@@ -2945,25 +2945,19 @@ fn mul_register_form_matches_the_interpreter_in_486_mode() {
 #[test]
 fn group3_non_test_subops_remain_interpreter_only() {
     // Everything in group 3 except TEST (/0), the lowered dword NEG (/3), MUL (/4), IMUL (/5) and
-    // the lowered dword DIV (/6) and IDIV (/7) REGISTER forms. The byte group 0xf6 stays entirely
-    // interpreter-only, including its own /3 and /4.
+    // the lowered dword DIV (/6) and IDIV (/7) REGISTER forms, and the byte `0xF6 /2../7` call-outs
+    // (tyrian-486 intro). F6 `/1` stays #UD.
     //
     // The 66-prefixed WORD forms of /3, /4, /6 and /7 used to be on this list, each pinning the
     // `OperandSize::Word` allowlist as the only thing keeping a 16-bit operand away from a 32-bit
     // lowering. The S3 policy widening admits them as `InterpretOne` call-outs, so the claim moved
     // rather than lapsed: `group3_word_subops_join_as_call_outs_not_lowerings` below asserts they
     // join the block AND that they join as call-outs, which is the same protection stated
-    // positively.
+    // positively. F6 `/2../7` moved the same way in `group3_byte_non_test_subops_join_as_call_outs`.
     for code in [
         vec![0xf7, 0xcb], // /1 TEST alias, undocumented
         vec![0xf7, 0xd3], // /2 NOT r/m32
-        vec![0xf6, 0xcb], // /1 byte
-        vec![0xf6, 0xd3], // /2 NOT r/m8
-        vec![0xf6, 0xdb], // /3 NEG r/m8, the byte form is NOT lowered
-        vec![0xf6, 0xe3], // /4 MUL r/m8
-        vec![0xf6, 0xeb], // /5 IMUL r/m8
-        vec![0xf6, 0xf3], // /6 DIV r/m8
-        vec![0xf6, 0xfb], // /7 IDIV r/m8
+        vec![0xf6, 0xcb], // /1 byte, #UD
         // NEG dword [disp32]: the MEMORY form of the very sub-opcode this slice lowers. Without
         // this case, replacing the register-only `let-else` in classify with a defaulting match
         // would lower it as `NEG EAX` and survive the whole battery, including the differential
@@ -3019,6 +3013,37 @@ fn group3_word_subops_join_as_call_outs_not_lowerings() {
     }
 }
 
+/// Byte group-3 `/2../7` joins as a call-out, not as `NegReg`/`MulReg`/`DivReg`.
+///
+/// Instruction count alone cannot say that: a mutant that dropped `opcode == 0xf7` on `NegReg`
+/// still returns `Some(3)`. The slot class is the claim. F6 `/1` stays on the negative list
+/// above. Do not Word-gate this admission to keep that list green.
+#[test]
+fn group3_byte_non_test_subops_join_as_call_outs() {
+    for code in [
+        vec![0xf6u8, 0xd3],                       // /2 NOT r8
+        vec![0xf6, 0xdb],                         // /3 NEG r8
+        vec![0xf6, 0xe3],                         // /4 MUL r8
+        vec![0xf6, 0xeb],                         // /5 IMUL r8
+        vec![0xf6, 0xf3],                         // /6 DIV r8
+        vec![0xf6, 0xfb],                         // /7 IDIV r8
+        vec![0xf6, 0x1d, 0x00, 0x50, 0x00, 0x00], // /3 NEG byte [disp32]
+        vec![0xf6, 0x25, 0x00, 0x50, 0x00, 0x00], // /4 MUL byte [disp32]
+        vec![0x66, 0xf6, 0xdb],                   // 66-prefixed F6 /3
+    ] {
+        let compilation = compile_leading_block_outcome(&code)
+            .unwrap_or_else(|| panic!("byte group 3 {code:02x?} must join the block"));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "byte group 3 {code:02x?} must carry the whole three-slot block"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, 1,
+            "byte group 3 {code:02x?} must join as a call-out, not through a dword lowering"
+        );
+    }
+}
+
 /// `/1` is not a group-3 operation at any width and stays refused on both sides of the prefix.
 #[test]
 fn group3_undefined_extension_stays_refused_at_both_widths() {
@@ -3035,16 +3060,21 @@ fn group3_dword_neg_register_form_is_lowered() {
     // The positive half of the guard above. Without it the negative list cannot distinguish
     // "rejected because this sub-opcode stayed out" from "rejected for an unrelated reason",
     // and a fixture that stopped compiling anything at all would still pass.
-    assert_eq!(
-        compile_leading_block(&[0xf7, 0xe3]),
-        Some(3),
-        "MUL EBX must admit and carry the whole three-slot block"
-    );
-    assert_eq!(
-        compile_leading_block(&[0xf7, 0xdb]),
-        Some(3),
-        "NEG EBX must admit and carry the whole three-slot block"
-    );
+    //
+    // Slot class is the other half: a mutant that stole Dword NEG into Group3 still returns
+    // Some(3). Native NegReg/MulReg/DivReg have zero InterpretOne slots.
+    for (code, name) in [(&[0xf7u8, 0xe3][..], "MUL EBX"), (&[0xf7, 0xdb], "NEG EBX")] {
+        let compilation =
+            compile_leading_block_outcome(code).unwrap_or_else(|| panic!("{name} must admit"));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{name} must admit and carry the whole three-slot block"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, 0,
+            "{name} must stay a native lowering, not a Group3 call-out"
+        );
+    }
     // The F7 slice's three. Their differential cover is `cpu_jit_f7_group_test.rs`; what this
     // pins is ADMISSION, which is what the negative list above would otherwise be silent about.
     //
@@ -3053,14 +3083,19 @@ fn group3_dword_neg_register_form_is_lowered() {
     // can be slot 0 in production. A guard exit there retires zero instructions with EIP unmoved;
     // `emit_div_reg`'s "guard exit at the block's ENTRY slot" note carries the liveness argument.
     for (code, name) in [
-        ([0xf7u8, 0xebu8], "IMUL EBX"),
-        ([0xf7, 0xf3], "DIV EBX"),
-        ([0xf7, 0xfb], "IDIV EBX"),
+        (&[0xf7u8, 0xeb][..], "IMUL EBX"),
+        (&[0xf7, 0xf3], "DIV EBX"),
+        (&[0xf7, 0xfb], "IDIV EBX"),
     ] {
+        let compilation =
+            compile_leading_block_outcome(code).unwrap_or_else(|| panic!("{name} must admit"));
         assert_eq!(
-            compile_leading_block(&code),
-            Some(3),
+            compilation.span.instructions, 3,
             "{name} must admit and carry the whole three-slot block"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, 0,
+            "{name} must stay a native lowering, not a Group3 call-out"
         );
     }
 }

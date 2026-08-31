@@ -2332,6 +2332,18 @@ fn interpret_one_group3_word_forms_resume() {
         &[0xF7, 0x3F],
         // F7 /0 with mod 00 r/m 111: test word [bx], 0x1234.
         &[0xF7, 0x07, 0x34, 0x12],
+        // F6 /2../5 register through BH: EBX is 0x1800 so BH is 0x18. DIV/IDIV r8 of
+        // AX=0x1111 overflow AL (unsigned 182 for DIV BH, signed overflow for IDIV) so they
+        // stay on the fault fixture. A 32-bit NEG of EAX or EBX cannot match a byte NEG of BH.
+        &[0xF6, 0xD7],
+        &[0xF6, 0xDF],
+        &[0xF6, 0xE7],
+        &[0xF6, 0xEF],
+        // F6 /2../5 memory: byte at [bx], seeded to 3. DIV/IDIV of AX=0x1111 by 3 overflow AL.
+        &[0xF6, 0x17],
+        &[0xF6, 0x1F],
+        &[0xF6, 0x27],
+        &[0xF6, 0x2F],
     ] {
         assert_row_resumes(row, seed_divisor);
     }
@@ -2352,6 +2364,10 @@ fn group3_test_word_splits_native_register_from_call_out_memory() {
     // F7 /0 with mod 11 r/m 011: test bx, 0x1234.
     assert_row_is_native(&[0xF7, 0xC3, 0x34, 0x12]);
     assert_row_is_a_call_out(&[0xF7, 0x07, 0x34, 0x12]);
+    // F6 /0 TEST r8,imm8 stays native. A FIRST arm of `/0../7` would steal this into Group3
+    // and still compile; slot class is the claim. Unprefixed and 66-prefixed.
+    assert_row_is_native(&[0xF6, 0xC3, 0x12]);
+    assert_row_is_native(&[0x66, 0xF6, 0xC3, 0x12]);
 }
 
 /// `/1` is not a group-3 operation and stays refused.
@@ -2374,6 +2390,67 @@ fn group3_word_refuses_the_undefined_extension() {
         "0xF7 /1 must still end the block"
     );
     assert_eq!(block.callout_interpret_one_slots(), 0);
+}
+
+fn seed_string_indices(cpu: &mut CpuGsw, _bus: &mut TestBus) {
+    // SI/DI, not ESI/EDI as 32-bit pointers. Stay on DATA_PAGE so STOS is not a code-watch write.
+    cpu.registers.set_esi(POP_TARGET);
+    cpu.registers.set_edi(POP_TARGET + 0x20);
+}
+
+/// Unprefixed 16-bit LODSB/STOSB/STOSW/MOVSW join as a call-out. `0xAB` and unprefixed `0xA5`
+/// are the Word-sized encodings 32-bit LODSB coverage never touched.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_sixteen_bit_string_rows_resume() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            jit::direct::set_generic_callout_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    jit::direct::set_generic_callout_for_test(Some(true));
+    for row in [&[0xACu8][..], &[0xAA], &[0xAB], &[0xA5], &[0xA4]] {
+        assert_row_resumes(row, seed_string_indices);
+    }
+}
+
+/// Knob-off, or a REP prefix: the 16-bit string stays a hard boundary and the suffix is not
+/// in the same block. A mutant that puts the opcodes on the Word list but leaves the classify
+/// arm behind `generic_callout_enabled` false fails here.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn sixteen_bit_string_rows_stay_barriers_with_the_gate_off() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            jit::direct::set_generic_callout_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    jit::direct::set_generic_callout_for_test(Some(false));
+    for row in [&[0xACu8][..], &[0xAA], &[0xAB], &[0xA5], &[0xF3, 0xAA]] {
+        let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
+        code.extend_from_slice(row);
+        code.extend_from_slice(&[0x40, 0xF4]);
+        let starts = vec![0, 3, 4, 5, 5 + row.len() as u32];
+        let (_, _, block) = build_native(&code, &starts);
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "row {row:02x?} must still end the block with the string gate off"
+        );
+        assert_eq!(block.callout_interpret_one_slots(), 0);
+    }
 }
 
 /// The RESYNC-after-fault path on a row that faults on ORDINARY DATA.
@@ -2432,6 +2509,11 @@ fn group3_core_clocks_is_what_the_interpreter_charges() {
         &[0xF7, 0xE3],
         &[0xF7, 0x17],
         &[0xF7, 0x07, 0x34, 0x12],
+        // F6 execute charges a literal clocks(2), not the named constant. If those drift,
+        // Group3's fold term lies about the byte form.
+        &[0xF6, 0xDF],
+        &[0xF6, 0xE7],
+        &[0xF6, 0x1F],
     ] {
         assert_row_charges(row, crate::GROUP3_CORE_CLOCKS, |cpu, _| {
             cpu.registers.set_edx(0);
