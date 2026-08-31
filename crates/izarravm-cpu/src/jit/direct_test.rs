@@ -3641,10 +3641,10 @@ fn link_clear_causes_close_on_the_aggregate() {
         1
     );
 
-    // DataSegmentDecline: stage 2 of the data-segment reject governor cuts a source's outbound
-    // edges once its retire cap is spent on a strict-arm reject. Re-installed and re-linked
-    // between turns because the first `DATA_SEGMENT_RETIRE_CAP` of them still retire, and a
-    // retired key has nothing left to decline.
+    // DataSegmentDecline: the promoting Strict On reject cuts the still-live outbound cell
+    // before it retires. Re-installed and re-linked between turns because the first
+    // `DATA_SEGMENT_RETIRE_CAP` of them still retire, and a retired key has nothing left to
+    // decline. The extra turn is the promote; leaf-ness afterwards rides live_data.
     let declined_source = key(0x1900);
     let declined_target = key(0x1a00);
     let declined_target_id = install_trivial(&mut cache, declined_target, 1);

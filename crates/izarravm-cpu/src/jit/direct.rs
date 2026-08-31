@@ -31500,9 +31500,13 @@ pub(crate) enum SegmentRetireGovernor {
     /// the cap the entry still REFUSES (interprets), and the block stays installed and specialized
     /// for whatever layout it froze on.
     Cap,
-    /// Stage 1 + stage 2: a suppressed reject that took the STRICT arm also cuts the key's
-    /// outbound edges and marks the key link-declined, so the block drops to the check it would
-    /// have had if it had never linked.
+    /// Stage 1 + stage 2. A Strict On reject with `own_mask_matches` asserts
+    /// `decline_links_for_data_segment`. On the promoting entry that call runs before
+    /// `retire_key_for_recompile`, so the still-live cell is labelled `DataSegmentDecline`
+    /// rather than `Retired`; retire then forgets declined-set membership and the next
+    /// compile live-loads DS/ES. Leaf-ness rides `live_data`. A later suppressed Strict
+    /// reject re-asserts the decline on already-empty cells. It does not keep the baked
+    /// body compiled and unlinked.
     ///
     /// OPT-IN, and it stays that way. It beats `Cap` on the loader (+28.8% against +27.1%) and
     /// LOSES to it on duke (+3.5% against +4.3%) -- which is exactly the shape §5's refutation
@@ -31753,9 +31757,19 @@ impl BlockCache {
             };
             if promote {
                 // The promoting entry still returns NotRun; the body has not been rewritten yet.
-                // Decline on this path is optional: retire_key_for_recompile forgets it at the
-                // existing hook, and leaf-ness rides live_data instead.
+                // Leaf-ness rides live_data; retire_key_for_recompile forgets declined-set
+                // membership at the existing hook. The decline call is load-bearing for
+                // LinkClearCause::DataSegmentDecline: this is the only production path that
+                // can pass that cause into unlink_outbound against a still-live cell, and
+                // link_clear_causes_close_on_the_aggregate pins it. Order is load-bearing:
+                // after retire the id is inactive and unlink_outbound no-ops.
                 self.stalls.data_segment_live_promotions += 1;
+                if matches!(governor, SegmentRetireGovernor::On)
+                    && matches!(arm, DataSegmentRejectArm::Strict)
+                    && own_mask_matches
+                {
+                    self.decline_links_for_data_segment(key, id);
+                }
                 return self.retire_key_for_recompile(watch, key);
             }
             self.stalls.data_segment_retires_suppressed += 1;
@@ -31811,8 +31825,8 @@ impl BlockCache {
         // retried by every later install at that `LinkTarget` and refused every time.
         self.remove_waiting_sources(id);
         self.data_segment_link_declined.insert(key);
-        // TRIPS, not crossings. `data_segment_sticky_crossings` is the one-shot counter; this one
-        // says how often the decline actually had to be re-asserted.
+        // Assertions, not live set membership. A Strict On promote bumps this once, then
+        // retire_key_for_recompile forgets the set row. Empty-cell re-asserts still count.
         self.stalls.data_segment_link_declines += 1;
     }
 
@@ -33004,9 +33018,10 @@ pub(crate) struct DirectStallTally {
     /// `suppressed` counts every retire the cap refused -- one per data-segment reject on an
     /// already-capped key, so on a churning guest it approaches `jit_direct_reject_data_segment`.
     /// `sticky_crossings` counts CAP CROSSINGS, not live keys. `link_declines` counts stage 2
-    /// TRIPS and not crossings: the decline is re-asserted on every suppressed strict-arm reject,
-    /// idempotently, because the crossing entry may have been a masked-arm reject and a key whose
-    /// crossing landed there would otherwise never decline at all.
+    /// assertions, not a live declined-set membership. Decline always bumps it, including on
+    /// empty cells. A Strict On promote increments it once, then `retire_key_for_recompile`
+    /// forgets the set row; leaf-ness is `live_data`. The suppressed Strict arm re-asserts
+    /// it because the crossing entry may have been a masked-arm reject.
     ///
     /// All three read ZERO on the OFF arm, which is the cheapest check that a ladder leg named
     /// the arm it meant to.
@@ -33725,11 +33740,12 @@ pub(crate) enum LinkClearCause {
     /// the same conflict. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
     ChainWiden,
     /// Stage 2 of the data-segment reject governor cut this source's outbound edges after its
-    /// retire cap was spent on a strict-arm reject. Both blocks stay compiled and the cell
-    /// reverts to the zero portal, so the source's exits report `StaticUnbound` and its next
-    /// entry takes the check it would have had unlinked. Like `ChainWiden`, the edge is NOT
-    /// re-parked in `waiting`: the decline is a standing judgement and a retry could only
-    /// re-derive the same refusal. Reads ZERO on every arm but
+    /// retire cap was spent on a strict-arm reject. The only production path that still
+    /// increments this lane is a Strict On promote: `decline_links_for_data_segment` runs
+    /// before `retire_key_for_recompile`, so the still-live cell is labelled here rather than
+    /// `Retired`. The source is then retired in the same call; the next body is a new live-data
+    /// compile, not the same block taking the masked check. Like `ChainWiden`, the edge is NOT
+    /// re-parked in `waiting`. Reads ZERO on every arm but
     /// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=on`.
     DataSegmentDecline,
 }
