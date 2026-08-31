@@ -6504,30 +6504,79 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 /// untouched. (`0x69`/`0x6B` need no such term: they are on `classify`'s Word allowlist and are
 /// admitted at both sizes, so admitting them here relocates nothing.)
 fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
-    matches!(insn.opcode, 0x69 | 0x6b | 0xee)
-        || (insn.opcode == 0xe6 && out_imm8_rows_armed())
-        // LES/LDS (0xc4/0xc5), the L4 slice, WORD form only -- the inverse shape from `0xe6`
-        // above: real-mode DOS code is unprefixed 16-bit code, so the Word form is the census
-        // row and the Dword form (a 32-bit offset behind a 66 prefix) is neither measured nor
-        // built. Refusing it HERE rather than in `classify` keeps the Dword form's barrier
-        // census bucket exactly what it always was (`BarrierStop::NonContinuable`) instead of
-        // relocating it to `classify`'s `None` arm.
-        || (matches!(insn.opcode, 0xc4 | 0xc5) && insn.operand_size == OperandSize::Word)
+    // The candidate test is redundant here -- every arm below is already inside the set -- and it
+    // is written anyway, because that redundancy is what makes the superset property STRUCTURAL
+    // instead of asserted. Add an opcode to this function without adding it to the set and the
+    // function stops admitting it, which the lowering fixtures catch, rather than the decode pack
+    // quietly under-reporting it. The arms are a subset of the `matches!`, so it folds away.
+    non_continuable_walk_candidate(insn.opcode)
+        && (matches!(insn.opcode, 0x69 | 0x6b | 0xee)
+            || (insn.opcode == 0xe6 && out_imm8_rows_armed())
+            // LES/LDS (0xc4/0xc5), the L4 slice, WORD form only -- the inverse shape from `0xe6`
+            // above: real-mode DOS code is unprefixed 16-bit code, so the Word form is the census
+            // row and the Dword form (a 32-bit offset behind a 66 prefix) is neither measured nor
+            // built. Refusing it HERE rather than in `classify` keeps the Dword form's barrier
+            // census bucket exactly what it always was (`BarrierStop::NonContinuable`) instead of
+            // relocating it to `classify`'s `None` arm.
+            || (matches!(insn.opcode, 0xc4 | 0xc5) && insn.operand_size == OperandSize::Word))
+}
+
+/// Every opcode any non-continuable walk admission can name, as a function of
+/// `DecodedInsn::opcode` alone. The conservative half of `walk_admits_non_continuable_entry`.
+///
+/// This is the single definition of that set. `jit_admits_non_continuable` and
+/// `retf_admitted_here` both open with it, so neither can admit an opcode this function does not
+/// carry, and `DecodePack`'s `PACK_FLAG_NONCONT_WALK_CANDIDATE` is written from it. There is no
+/// second list to drift.
+///
+/// Deliberately a superset: it reads no CPU state, no operand size, no prefixes and no knob, so a
+/// `true` answer means "ask the full predicate", never "the walk will carry this". The run loop
+/// wants exactly that shape, because the cheap half can be answered out of a decode-pack bit while
+/// the expensive half needs the instruction and the CPU.
+///
+/// Membership is decided by that rule alone. `0xee` joins unconditionally because
+/// `jit_admits_non_continuable` names it unconditionally; `0xc4`/`0xc5` join even though only
+/// their Word form is admitted, because operand size is exactly the kind of term this function
+/// refuses to read and the superset must therefore carry both forms. The full predicate still
+/// makes the narrow refusal, one step later.
+///
+/// `0x9a` is absent on purpose: `CALL FAR imm16:16` has no `classify` arm, so a walk starting on it
+/// stops before its first instruction. Adding one is the L8 slice, and adding it here is part of
+/// that slice's edit.
+///
+/// The parameter is `DecodedInsn::opcode`'s own `u16`, which carries the escape-prefixed two-byte
+/// opcodes in its high half; every entry in the set is a one-byte opcode, so the high half simply
+/// never matches.
+pub(crate) const fn non_continuable_walk_candidate(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        0x69 | 0x6b | 0xc4 | 0xc5 | 0xca | 0xcb | 0xe6 | 0xee
+    )
 }
 
 /// Whether a compile walk that STARTED at this non-continuable instruction could carry it.
 ///
-/// Exactly the walk's own per-slot admission (`compile_with_budget`'s `continuable` term) with
-/// the `insn.continuable` half dropped, because the caller has already screened that half false.
+/// Exactly the walk's own per-slot admission (`compile_with_budget`'s `prefixes_supported` AND
+/// `continuable` terms) with the `insn.continuable` half dropped, because the caller has already
+/// screened that half false. Both terms are needed: the prefix test is a separate conjunct in the
+/// walk, and `jit_admits_non_continuable`'s two families say nothing about prefixes, so without it
+/// a `0x66`-prefixed `IMUL` entry would pass here and stop inside the walk anyway. (`RETF` needs
+/// no help from the prefix term -- `retf_admitted_here` already demands `Prefixes::default()` --
+/// but the other families do.)
+///
 /// The run loop's break-site probe asks this before spending an admission chain: an opcode the
 /// walk cannot carry produces a zero-instruction span and a structural reject, which buys the
 /// census a `rejected` label instead of an `absent` one and buys the guest nothing, while the
 /// probe itself would recur on every visit to the address. The measured shape is the ten
 /// `CALL FAR imm16:16` sites on 15-move-hole-puzzle: 116 M visits, no lowering, about 4% of the
-/// wall. When an opcode grows a `classify` arm this predicate admits it and the break-site probe
-/// starts paying for itself, with no second edit here.
-pub(crate) fn walk_admits_non_continuable_entry(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
-    jit_admits_non_continuable(insn) || retf_admitted_here(cpu, insn)
+/// wall.
+///
+/// The gate is NOT self-opening. Giving an opcode a `classify` arm does not reach it; the same
+/// edit has to add the opcode to `non_continuable_walk_candidate` and to whichever of the two
+/// predicates below should claim it, and those two edits open the pack bit and this gate together.
+pub(crate) fn walk_admits_non_continuable_entry(cpu: &CpuGsw, insn: &DecodedInsn, d: bool) -> bool {
+    prefixes_supported_for(insn.prefixes, insn.operand_size, d)
+        && (jit_admits_non_continuable(insn) || retf_admitted_here(cpu, insn))
 }
 
 pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> CompileOutcome {
@@ -10892,9 +10941,18 @@ pub(crate) fn parse_direct_retf_v86_arm_for_test(
 /// the stack width are tested HERE and not left to `stack_width_kind`: a RETF admitted into the
 /// walk and then refused a kind would end the block on a different reason and move a census row.
 pub(crate) fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
+    // OPCODE FIRST, ahead of `direct_retf_v86`'s `OnceLock` load. This predicate is asked at every
+    // walk slot and now at every non-continuable run-loop break as well, and the overwhelming
+    // majority of those asks are about some other opcode entirely; making them pay an atomic load
+    // to learn it is not a RETF is pure waste. The `non_continuable_walk_candidate` conjunct is
+    // redundant (the `matches!` is inside the set) and is written for the reason stated on
+    // `jit_admits_non_continuable`: it keeps the set a structural superset rather than an asserted
+    // one. Both fold away.
+    if !(non_continuable_walk_candidate(insn.opcode) && matches!(insn.opcode, 0xca | 0xcb)) {
+        return false;
+    }
     let arm = direct_retf_v86();
     arm != RetfArm::Off
-        && matches!(insn.opcode, 0xca | 0xcb)
         // CS.D = 0 and no 0x66. `operand_size` is `default_32 XOR override`, so Word in a 16-bit
         // segment means no prefix, and the prefix test below is what keeps a segment override or
         // an address-size override out.
@@ -35468,36 +35526,36 @@ pub const N_REFUSAL_SITES: usize = 30;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1298),
-    ("skip_backend_or_skip_once", 1306),
-    ("skip_approximate_timing", 1312),
-    ("jit16_level_zero", 1437),
-    ("approximate_timing", 1443),
-    ("auto_admit", 1454),
-    ("direct_hot_at", 1468),
-    ("decline_memo_hit", 1494),
-    ("key_for_phys_none", 1506),
-    ("probe_interpret", 1519),
-    ("probe_rejected", 1576),
-    ("link_line_not_live", 1819),
-    ("revalidate_none", 1825),
-    ("dispatch_deferred_short", 1841),
-    ("observer_or_diff_trace", 2447),
-    ("interrupt_shadow", 2454),
-    ("aggregate_accounting", 2461),
-    ("native_fetch_trace", 2475),
-    ("mode_key", 2483),
-    ("x87_top", 2497),
-    ("segment_layout_none", 2512),
-    ("cs_layout", 2520),
-    ("cpl", 2528),
-    ("callout_privileged", 2609),
-    ("data_segment", 2727),
-    ("alignment", 2736),
-    ("fetch_limit", 2751),
-    ("entry_deferred_short", 2765),
-    ("zero_budget", 2873),
-    ("block_regenerated_none", 2909),
+    ("skip_native_continuations_inactive", 1347),
+    ("skip_backend_or_skip_once", 1355),
+    ("skip_approximate_timing", 1361),
+    ("jit16_level_zero", 1502),
+    ("approximate_timing", 1508),
+    ("auto_admit", 1519),
+    ("direct_hot_at", 1533),
+    ("decline_memo_hit", 1559),
+    ("key_for_phys_none", 1571),
+    ("probe_interpret", 1584),
+    ("probe_rejected", 1655),
+    ("link_line_not_live", 1898),
+    ("revalidate_none", 1904),
+    ("dispatch_deferred_short", 1942),
+    ("observer_or_diff_trace", 2605),
+    ("interrupt_shadow", 2612),
+    ("aggregate_accounting", 2619),
+    ("native_fetch_trace", 2633),
+    ("mode_key", 2641),
+    ("x87_top", 2655),
+    ("segment_layout_none", 2670),
+    ("cs_layout", 2678),
+    ("cpl", 2686),
+    ("callout_privileged", 2767),
+    ("data_segment", 2885),
+    ("alignment", 2894),
+    ("fetch_limit", 2909),
+    ("entry_deferred_short", 2923),
+    ("zero_budget", 3031),
+    ("block_regenerated_none", 3067),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -35538,7 +35596,7 @@ pub(crate) mod site {
 #[cfg(feature = "direct-entry-attribution")]
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1496;
+pub const P0_MARK_LINE: u32 = 1561;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
@@ -35565,13 +35623,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1622),
-    ("structural_reject", 1641),
-    ("compile_retry", 1652),
-    ("page_cover_failed", 1676),
-    ("lane_install_demote", 1712),
-    ("install_failed", 1722),
-    ("installed_fall_through", 1804),
+    ("heat_demote", 1701),
+    ("structural_reject", 1720),
+    ("compile_retry", 1731),
+    ("page_cover_failed", 1755),
+    ("lane_install_demote", 1791),
+    ("install_failed", 1801),
+    ("installed_fall_through", 1883),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {

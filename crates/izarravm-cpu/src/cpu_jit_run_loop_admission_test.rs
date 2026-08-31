@@ -298,3 +298,61 @@ fn a_non_continuable_entry_the_walk_cannot_carry_is_not_probed() {
         "a probe at the CALL FAR entry would relocate the class to `rejected` for no gain"
     );
 }
+
+/// A TRANSIENT Dormant park at a non-continuable entry must still recover.
+///
+/// `BlockCache::probe` collapses `Dormant` and `Rejected` into one `BlockProbe::Rejected`, and
+/// `Dormant` is the transient half: a heat demote or a clearable compile retry parks a key there
+/// expecting a later probe to lift it back to `Seen`. Break-site probes are the ONLY probes a
+/// non-continuable entry ever gets, so a break-site short circuit on that arm would strand such a
+/// key parked for the life of the process -- the same never-revisited defect this whole file is
+/// about, narrowed to the entries that lose a first-touch race.
+///
+/// `TranslationMismatch` is one of the two causes `RetryCause::clearable_by_retry` admits, and the
+/// visit counter is pre-loaded to one short of the threshold so the FIRST break-site probe after
+/// the park is the one that lifts. That keeps the fixture about the recovery reaching the break
+/// site at all, not about how many eras the memo paces it over.
+#[test]
+fn a_transient_dormant_park_at_a_break_site_entry_still_recovers() {
+    jit::direct::set_retry_lift_for_test(Some(true));
+    let (mut cpu, mut bus) = staged(true);
+
+    // One visit is what puts the RETF key in the cache at all: the break-site probe inserts
+    // `Seen` on its first miss.
+    visit(&mut cpu, &mut bus);
+    let key = jit::direct::key_for(&cpu, FALLTHROUGH, false).expect("the RETF entry keys");
+    cpu.jit_direct.direct.park_dormant_for_test(
+        key,
+        jit::direct::DormantReason::CompileRetry,
+        Some(jit::direct::RetryCause::TranslationMismatch),
+    );
+    cpu.jit_direct
+        .direct
+        .set_dormant_visits_for_test(key, jit::direct::RETRY_LIFT_VISITS - 1);
+    assert!(
+        cpu.jit_direct.direct.is_dormant_for_test(key),
+        "the fixture must actually park the RETF entry, or the recovery below proves nothing"
+    );
+    assert!(
+        !cpu.jit_direct.direct.key_is_compiled_for_test(key),
+        "the park must undo the first visit's admission"
+    );
+
+    for _ in 0..VISITS {
+        visit(&mut cpu, &mut bus);
+    }
+
+    assert!(
+        !cpu.jit_direct.direct.is_dormant_for_test(key),
+        "the break-site probe must reach the dormant recovery and lift the key"
+    );
+    assert!(
+        cpu.jit_direct.direct.key_is_compiled_for_test(key),
+        "a lifted key must go on to compile through the same break-site probe"
+    );
+    assert!(
+        cpu.direct_stall_snapshot().retry_lifts > 0,
+        "the lift must be the retry arm, not an incidental cache wipe"
+    );
+    jit::direct::set_retry_lift_for_test(None);
+}

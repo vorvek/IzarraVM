@@ -797,32 +797,49 @@ impl CpuGsw {
                             // Admission only; nothing is entered, and the break below is
                             // unchanged. See `probe_admit_at_break`.
                             //
-                            // Gated on the walk being able to CARRY this opcode. The line fetch
-                            // is one array index and it happens on the break path only, where the
-                            // run is ending anyway; without it the probe would recur forever at
-                            // every address whose entry the walk refuses, which on
-                            // 15-move-hole-puzzle is 116 M visits to ten `CALL FAR` sites that
-                            // cannot lower and cost about 4% of the wall. The predicate admits
-                            // each opcode as it grows a `classify` arm, so this gate opens on its
-                            // own.
+                            // Gated on the walk being able to CARRY this opcode, in two steps,
+                            // cheap one first.
+                            //
+                            // Step one is the decode-pack bit, which answers out of the 16-byte
+                            // entry the screen above already read. Most non-continuable opcodes
+                            // are far transfers, `INT`s and undefined bytes no walk can carry, so
+                            // this is where the common case ends and it touches no extra memory.
+                            // Without a gate the probe would recur forever at every such address:
+                            // on 15-move-hole-puzzle that is 116 M visits to ten `CALL FAR` sites
+                            // that cannot lower, measured at about 4% of the wall.
+                            //
+                            // Step two takes the line, because the rest of the question is about
+                            // the operand size, the prefixes and the CPU's mode. On the packed arm
+                            // this is the only place that line is faulted in, and the bit is what
+                            // keeps that rare.
                             #[cfg(feature = "jit")]
-                            {
-                                let entry_view = match held_view {
-                                    Some(view) => Some(view),
-                                    None => self.decode_cache.get_view(lin, cs.default_size_32),
-                                };
-                                if let Some(view) = entry_view
-                                    && jit::direct::walk_admits_non_continuable_entry(
-                                        self, &view.insn,
-                                    )
+                            if screen.noncont_walk_candidate {
+                                match held_view
+                                    .or_else(|| self.decode_cache.get_view(lin, cs.default_size_32))
                                 {
-                                    self.probe_admit_at_break(
-                                        bus,
-                                        native_continuations_active,
-                                        screen,
-                                        lin,
-                                        cs.default_size_32,
-                                    )?;
+                                    Some(view) => {
+                                        if jit::direct::walk_admits_non_continuable_entry(
+                                            self,
+                                            &view.insn,
+                                            cs.default_size_32,
+                                        ) {
+                                            self.probe_admit_at_break(
+                                                bus,
+                                                native_continuations_active,
+                                                screen,
+                                                lin,
+                                                cs.default_size_32,
+                                            )?;
+                                        }
+                                    }
+                                    // The screen passed and the line is gone: the same
+                                    // impossible-by-construction miss the interpreted arm counts,
+                                    // counted the same way rather than swallowed. Admission only
+                                    // READS the decode cache, so nothing between the screen and
+                                    // here can retire the slot; a non-zero reading means that
+                                    // argument is wrong. Skipping the probe is the sound response
+                                    // either way, since the run is ending regardless.
+                                    None => self.jit_direct.note_decode_pack_late_view_miss(),
                                 }
                             }
                             break;
@@ -1444,8 +1461,9 @@ impl CpuGsw {
     /// `linear_blocks` and resolves a predecessor's parked cell, which is the whole point of
     /// admitting at a break site. It publishes, it does not execute.
     ///
-    /// `via_break_probe` marks the break-site caller. It only suppresses the Dormant recovery
-    /// bookkeeping on an already-`Rejected` key: see that arm.
+    /// Both callers run the identical chain. There is no break-site variant of any arm: the
+    /// break site's cost is managed by refusing to CALL this at all for an opcode no walk can
+    /// carry, never by taking a shortcut once inside.
     #[cfg(feature = "jit")]
     fn try_admit_direct_block<B: CpuBus>(
         &mut self,
@@ -1453,8 +1471,7 @@ impl CpuGsw {
         screen: DecodeScreenView,
         lin: u32,
         d: bool,
-        via_break_probe: bool,
-    ) -> Result<Option<jit::direct::BlockId>, CpuError> {
+    ) -> Result<Option<jit::direct::CompiledBlock>, CpuError> {
         // With the 16-bit level at 0 a 16-bit code segment can never produce a block (`key_for`
         // then refuses on `!d`), so this function would return Interpret for every such boundary
         // anyway -- but only after a decode-cache line lookup, a hotness mutation and the probe
@@ -1567,25 +1584,20 @@ impl CpuGsw {
                 return Ok(None);
             }
             jit::direct::BlockProbe::Rejected => {
-                // Break-site fast path. A non-continuable entry that has already settled on
-                // `Rejected` is asked again on every single visit -- 116 M times per corpus run at
-                // the ten `CALL FAR` sites on 15-move-hole-puzzle -- and none of the recovery
-                // bookkeeping below can change what a later static exit sees there: the
-                // `Rejected` state was written the first time the walk structurally refused, and
-                // that is already what the barrier census reads. Running the heat sync, the
-                // dormant lift and the memo write on every one of those visits would add a
-                // recurring cost to a path that pays nothing today, so the break-site caller
-                // stops here. The dispatch caller is unchanged.
+                // NO break-site short circuit here, and that is load-bearing. `probe` collapses
+                // `Dormant` and `Rejected` into this one answer, and `Dormant` is TRANSIENT: a
+                // heat demote or a clearable compile retry parks a key here expecting the recovery
+                // below to lift it back to `Seen` on a later visit. Break-site probes are the ONLY
+                // probes a non-continuable entry ever gets, so a short circuit that treated this
+                // arm as terminal would strand such a key parked forever -- the very defect this
+                // whole change exists to remove, reintroduced for the subset of entries that lose
+                // a first-touch race.
                 //
-                // The admission-decline census note is skipped with it, deliberately: a
-                // break-site probe is an ask the instrument never used to see, and counting it
-                // would inflate that histogram rather than measure it.
-                if via_break_probe {
-                    ea_mark!(Phase::Refused);
-                    ea_refusal!(site::PROBE_REJECTED);
-                    ea_end!(Population::Refused);
-                    return Ok(None);
-                }
+                // An earlier revision did short circuit here, to keep the ten `CALL FAR` sites off
+                // this path. That cost is now refused a step earlier and more cheaply, by the
+                // walk-admission gate at the break site itself: an opcode no walk can carry never
+                // reaches this function at all. So the two callers can share one arm, which is
+                // also the only way the recovery stays honest.
                 #[cfg(feature = "direct-admission-census")]
                 if self.jit_direct.barrier_census_active()
                     && let Some(kind) = self.jit_direct.classify_rejected_probe(key)
@@ -1893,16 +1905,16 @@ impl CpuGsw {
             };
             block
         };
-        Ok(Some(block.id()))
+        // The block itself, not its id. `CompiledBlock` is `Copy` and is what every consumer
+        // wants; handing back an id would only buy a second `active_index` lookup at the caller.
+        Ok(Some(block))
     }
 
     /// The execution half of the old `try_direct_continuation`: admit through the chain above,
     /// then decide whether to ENTER the block on this continuation.
     ///
-    /// The split is a pure extract, not a behaviour change. `BlockCache::block` returns a copy of
-    /// the same `self.blocks[index]` slot `revalidate_translation` hands back, and no `&mut self`
-    /// call runs between the admit call returning and the re-fetch below, so the re-fetch observes
-    /// exactly the block the single function used to hold.
+    /// The split is a pure extract, not a behaviour change: the admitted block travels back by
+    /// value, exactly as the single function used to hold it.
     #[cfg(feature = "jit")]
     fn try_direct_continuation<B: CpuBus>(
         &mut self,
@@ -1912,13 +1924,9 @@ impl CpuGsw {
         d: bool,
         budget: ContinuationBudget,
     ) -> Result<DirectContinuation, CpuError> {
-        let Some(id) = self.try_admit_direct_block(bus, screen, lin, d, false)? else {
+        let Some(block) = self.try_admit_direct_block(bus, screen, lin, d)? else {
             return Ok(DirectContinuation::Interpret);
         };
-        let block = self
-            .jit_direct
-            .block(id)
-            .expect("admitted direct block must remain live");
         // A hidden short block must pass the canonical decode scan above before it becomes a link
         // target again. Once current, avoid the heavier native-entry validation until one of its
         // own successor cells is live.
@@ -1989,10 +1997,9 @@ impl CpuGsw {
             return Ok(());
         }
         ea_begin!(d, self.is_v86_mode());
-        if self
-            .try_admit_direct_block(bus, screen, lin, d, true)?
-            .is_some()
-        {
+        // `Refused`, not `Entered`: the admission succeeded but no native window was opened, and
+        // `Population::Entered` is the denominator for windows actually run.
+        if self.try_admit_direct_block(bus, screen, lin, d)?.is_some() {
             ea_end!(Population::Refused);
         }
         Ok(())
