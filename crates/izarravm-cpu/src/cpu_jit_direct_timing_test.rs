@@ -2700,6 +2700,94 @@ fn loop_word_matches_the_interpreter_across_the_counter_boundary() {
     }
 }
 
+/// THE WORD FLAG FIXTURE, the twin of `loop_preserves_every_flag`. Slot 0 is now a WORD add
+/// (`01 c8` decodes as `add ax, cx` in a 16-bit code segment), so a live pending descriptor is in
+/// flight across the Word LOOP exactly as it is across the Dword one, and every arithmetic flag
+/// must still come out of the ADD rather than the LOOP's own host decrement.
+#[test]
+fn loop_word_preserves_every_flag() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    for (seed_eax, seed_ax, seed_ecx, seed_eflags) in [
+        (0x1234_0005u32, 0x0005u32, 0x1234_0002u32, 0x0202u32),
+        // Carry, overflow and sign all set by the ADD itself, at the 16-bit boundary this time.
+        (0x1234_8000, 0x8000, 0x1234_0001, 0x0202),
+        // Every arithmetic flag seeded SET on the way in, and AF seeded set too.
+        (0x1234_0001, 0x0001, 0x1234_0003, 0x0ed7),
+        // The counter wrap, with flags live.
+        (0x1234_ffff, 0xffff, 0x1234_0000, 0x0202),
+    ] {
+        // 01 c8 = add ax, cx (word form), then a filler mov and the LOOP. Two slots plus the
+        // terminal, identical shape to `loop_word_case` except for slot 0.
+        let code = vec![
+            0x01, 0xc8, // add ax, cx
+            0x89, 0xf6, // mov si, si
+            0xe2, 0x02, // loop +2
+            0xf4, 0x90, 0xf4,
+        ];
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh_real16();
+        let mut interp = fresh_real16();
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        let block = install_fixture_block_word(&mut native, ENTRY);
+
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_eax(seed_eax);
+            cpu.registers.set_ecx(seed_ecx);
+            cpu.registers.eflags = seed_eflags;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+
+        let label = format!(
+            "eax={seed_eax:#010x} ax={seed_ax:#06x} ecx={seed_ecx:#010x} fl={seed_eflags:#06x}"
+        );
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers"
+        );
+        assert_eq!(
+            native.eflags(),
+            interp.eflags(),
+            "{label}: eflags -- the WORD LOOP must publish NO host flag, and the pending \
+             descriptor from the ADD must still settle correctly across it"
+        );
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+    }
+}
+
 /// THE NAMED SILENT-FAILURE-MODE CATCHER, isolated from the counter-boundary sweep above so it
 /// reads as its own claim: ECX = 0x1234_0003 in, a Word LOOP that both takes and falls through,
 /// and bits 31..16 must read back exactly 0x1234 every time. `alu_r32_imm32(5, home(1), 1)`
@@ -2760,6 +2848,107 @@ fn loop_word_preserves_ecx_high_half() {
     }
 }
 
+/// THE BACKWARD SELF-LOOP SHAPE, which is what the corpus actually runs: a LOOP whose taken
+/// target is the block's own entry (`taken_delta == 0`) lowers through the `self_loop` arm at
+/// `direct.rs:18919-18980`, a host-native iteration loop that never returns to the dispatcher
+/// between counter decrements. No other fixture in this file reaches it for the Word cell -- every
+/// one above targets a FORWARD label two bytes ahead -- and the self-loop arm is the ONE emitter
+/// path with its own not-taken exit (`emit_advance_eip(.., span.guest_len)`) and its own taken
+/// exit through `STACK_QUOTA`, neither of which the forward-branch fixtures above ever execute.
+///
+/// `mov si,si; loop $-4`: the LOOP's end-of-instruction offset is ENTRY+4, and `-4` brings the
+/// taken target back to ENTRY exactly, so `taken_delta` is 0 and `self_loop` is true. ECX is
+/// seeded `0x1234_0003` per the review's request: three iterations (3->2 taken, 2->1 taken,
+/// 1->0 NOT taken) exit through the not-taken path with CX at 0, and the high half must still
+/// read 0x1234 -- the same silent-failure mode `loop_word_preserves_ecx_high_half` names, now
+/// exercised through the OTHER emitter branch of this arm.
+#[test]
+fn loop_word_backward_self_loop_matches_the_interpreter() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    let code = vec![
+        0x89, 0xf6, // mov si, si
+        0xe2, 0xfc, // loop $-4  -> ENTRY (taken_delta == 0, the self-loop shape)
+        0xf4, // ENTRY+4: hlt (the not-taken exit)
+    ];
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut native = fresh_real16();
+    let mut interp = fresh_real16();
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        bus.report_batch_clocks = true;
+        bus.uniform_native_fetches = true;
+    }
+    let starts = [ENTRY, ENTRY + 2];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interp, &mut interp_bus, &starts);
+    let block = install_fixture_block_word(&mut native, ENTRY);
+    assert!(
+        block.is_self_loop(),
+        "the taken target must equal ENTRY for this fixture to exercise the self-loop arm at all"
+    );
+
+    let seed_ecx = 0x1234_0003u32;
+    for cpu in [&mut native, &mut interp] {
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.set_esp(0xc000);
+        cpu.registers.set_ecx(seed_ecx);
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.registers.eip = ENTRY;
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap(),
+        "must run natively"
+    );
+    // Three iterations, two guest instructions each (mov then loop): six interpreter steps
+    // reach the same not-taken exit the native self-loop settles at.
+    for _ in 0..6 {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "registers -- a Dword decrement routed onto this cell clears ECX's high half exactly as \
+         it would on the forward-branch fixtures, just reached through the self-loop arm instead"
+    );
+    assert_eq!(native.eflags(), interp.eflags(), "eflags");
+    assert_eq!(
+        native.elapsed_clocks, interp.elapsed_clocks,
+        "core clocks -- 11 per LOOP iteration, taken or not"
+    );
+
+    assert_eq!(
+        native.registers.ecx() & 0xffff,
+        0,
+        "CX must reach exactly zero after three iterations"
+    );
+    assert_eq!(
+        native.registers.ecx() >> 16,
+        0x1234,
+        "ECX bits 31..16 must survive three native iterations of the Word self-loop unchanged"
+    );
+    assert_eq!(
+        native.registers.eip,
+        ENTRY + 4,
+        "the not-taken exit must land on the instruction after the LOOP"
+    );
+}
+
 /// The positive admission pin for the Word cell, the Word twin of `loop_is_lowered_with_the_gate_on`.
 #[test]
 fn loop_word_is_lowered_with_the_gate_on() {
@@ -2809,13 +2998,20 @@ fn loop_word_target_beyond_the_limit_is_refused() {
     let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
     decode_fixture(&mut cpu, &mut bus, &starts);
     let outcome = jit::direct::compile(&mut cpu, ENTRY, false);
-    let instructions = outcome
-        .is_some()
-        .then(|| outcome.unwrap().span.instructions);
-    assert_ne!(
-        instructions,
-        Some(3),
-        "a Word LOOP target beyond cs.limit must not lower its terminal"
+    // The specific outcome, not merely "not fully compiled": the LOOP slot is the first thing
+    // the full-length walk meets that fails `static_control_target_within_limit`, so the walk
+    // stops there with the exact cause `control_target_limit`'s clamp produces --
+    // `RetryCause::AdmissionMatrix` -- and `compile` (unlike `compile_with_instruction_limit`'s
+    // binary search) propagates that cause straight through rather than falling back to a
+    // shorter compiled prefix. `assert_ne!(.., Some(3))` alone would also pass on an unrelated
+    // Retry or a StructuralReject, which states nothing about WHY the terminal was refused.
+    assert!(
+        matches!(
+            outcome,
+            jit::direct::CompileOutcome::Retry(jit::direct::RetryCause::AdmissionMatrix)
+        ),
+        "a Word LOOP target beyond cs.limit must refuse specifically through the admission \
+         matrix (control_target_limit), not through some other cause"
     );
 }
 

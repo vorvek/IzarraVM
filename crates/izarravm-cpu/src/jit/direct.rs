@@ -11193,9 +11193,10 @@ pub(crate) fn parse_mul_mem_rows_arm_for_test(value: Result<String, std::env::Va
 /// 2.05x larger and should read 3.4-4.5%. If it ALSO reads inside the null, the campaign's
 /// entry-cost model is wrong and that is the more valuable finding.
 ///
-/// Spelling table identical to `IZARRAVM_MUL_MEM_ROWS`: unset / `` / `0` / `off` -> OFF (the
-/// shipped default and the A/B base), `1` / `on` -> ON, anything else PANICS so a mistyped
-/// ladder leg cannot run the default and be read as the arm it named doing nothing.
+/// Spelling table, same shape as `IZARRAVM_MUL_MEM_ROWS` but NOT the same default: unset ->
+/// ON (the shipped default since the 2026-08-30 flip), `` / `0` / `off` -> OFF (the escape and
+/// the A/B base), `1` / `on` -> ON, anything else PANICS so a mistyped ladder leg cannot run the
+/// default and be read as the arm it named doing nothing.
 pub(crate) fn loop_rows_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = LOOP_ROWS_OVERRIDE.with(std::cell::Cell::get) {
