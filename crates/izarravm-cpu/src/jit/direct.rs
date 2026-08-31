@@ -9350,17 +9350,22 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     //     UNCHANGED and still refuses dispatcher entries into a call-out-bearing block in that
     //     state; a CHAINED entry bypasses it by construction, which is the mechanism the slice is
     //     for. See the call-out section and the notes on `classify`'s `0xec` and `0xee` arms.
-    //   * PUSHF: its PUSHFD arm is refused by `stack_width_kind` in V86 (`StoreSource::Flags`,
-    //     IOPL check), and its Word form is off the allowlist.
-    //   * POPF, STI, INT, IRET: no `classify` arm at any size. That absence is PINNED by
+    //   * PUSHF: its Dword arm (PUSHFD) is refused by `stack_width_kind` in V86
+    //     (`StoreSource::Flags`, IOPL check) -- a compile-time barrier with no fault path. Its
+    //     WORD form is an `InterpretOne` call-out since N2, so its V86 cover is the helper's fault
+    //     arm rather than a compile-time refusal, the same argument CLI makes below.
+    //   * POPF: WORD form is an `InterpretOne` call-out since N2, same cover as PUSHF's Word form.
+    //     The Dword form (POPFD) still has no `classify` arm at any size and stays refused,
+    //     unmeasured and out of scope.
+    //   * STI, INT, IRET: no `classify` arm at any size. That absence is PINNED by
     //     `v86_sensitive_opcodes_keep_their_word_answers` (cpu_jit_compile_outcome_test.rs),
     //     because an absence defended by nothing is exactly what a coverage campaign widens by
     //     accident.
-    //   * CLI: an `InterpretOne` call-out since the S3 policy widening, so its V86 cover is the
+    //   * CLI, PUSHF (Word), POPF (Word): `InterpretOne` call-outs, so their V86 cover is the
     //     helper's fault arm rather than a compile-time refusal. `check_v86_iopl` is the first
-    //     statement of the interpreter's own `0xfa` arm, which is the arm the helper runs, so a
-    //     V86 task below IOPL 3 raises the same #GP from inside the call-out that it raised at
-    //     the barrier. The same test pins that, from the other side.
+    //     statement of each interpreter arm (`0xfa`, `0x9c`, `0x9d`), which is the arm the helper
+    //     runs, so a V86 task below IOPL 3 raises the same #GP from inside the call-out that it
+    //     raised at the barrier. The same test pins that, from the other side.
     //
     // V86 blocks stay key-separated by mode-key bit 2.
     if !d && !word_operands_admitted(cpu) {
@@ -14727,6 +14732,15 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // pendency note in `interpret_one_step`. Loader census: 486,000 block-stopping
                 // hits.
                 | 0xfa | 0xfb
+                // PUSHF (0x9c) and POPF (0x9d), N2. Both are `InterpretOne` call-outs at this
+                // width -- PUSHFD (Dword) keeps its existing `Push` lowering below and never
+                // reaches this list's question because its arm produces a kind before this gate
+                // is even consulted at Dword; POPFD (Dword) has no arm at any width and stays
+                // refused, unmeasured and out of scope. This entry only lets the Word forms reach
+                // their arms at all. 21-for-1-to-4: `0x9d` 23,476,271 unbound + 718,016 dyn at
+                // pre=8 suf=7 (its #1 rejected row), `0x9c` 5,007,641 at pre=11 suf=8. 10rogue:
+                // `0x9d` 3,404,615, `0x9c` 1,702,388.
+                | 0x9c | 0x9d
                 // CLD / STD. A POLICY lift and nothing else: `emit_direction_flag` is one `or` or
                 // `and` on the flag shadow, DF sits outside the lazy arithmetic descriptor, and
                 // neither interpreter arm consults `operand_size`, so the two widths are the same
@@ -15761,13 +15775,50 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     stack32: false,
                 });
             }
-            // PUSHFD. Fifth in the runtime-weighted reject audit at 1,194,127 dispatcher exits
-            // (9.5%). The persona mask and the V86 refusal are resolved in `stack_width_kind`,
-            // which has the CPU; `u32::MAX` is the placeholder until then and must never reach
-            // the emitter.
+            // PUSHF / PUSHFD. Fifth in the runtime-weighted reject audit at 1,194,127 dispatcher
+            // exits (9.5%). The persona mask and the V86 refusal are resolved in
+            // `stack_width_kind`, which has the CPU; `u32::MAX` is the placeholder until then and
+            // must never reach the emitter.
+            //
+            // The WORD form splits off here, N2. It is an `InterpretOne` call-out rather than a
+            // lowering: `stack_width_kind`'s V86 refusal is a compile-time barrier with no fault
+            // path, which is sound for the Dword lowering but would refuse the Word row outright
+            // rather than let a V86 IOPL<3 task fault the way the interpreter does. The call-out's
+            // fault arm covers that instead, the same argument that admitted `Cli`. The Dword form
+            // is UNTOUCHED -- it keeps the existing `Push` lowering below, which already ships and
+            // is not part of this row's measured population (every corpus guest is 16-bit).
+            0x9c if insn.operand_size == OperandSize::Word => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Pushf,
+                    },
+                });
+            }
             0x9c => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Flags { mask: u32::MAX },
+                });
+            }
+            // POPF, WORD form only, N2. No `classify` arm existed for this opcode at any width
+            // before this row -- see the pin comment on `key_for_phys` and
+            // `v86_sensitive_opcodes_keep_their_word_answers`, both updated in this commit. POPFD
+            // (Dword) is deliberately left with no arm: the corpus evidence (21-for-1-to-4's
+            // `0x9d` row, its #1 rejected row at 23,476,271 unbound exits + 718,016 dyn,
+            // pre=8 suf=7; 10rogue 3,404,615) is exclusively the Word form, every corpus guest
+            // being 16-bit real mode / V86, and this campaign does not ship an admission with no
+            // counter behind it.
+            //
+            // Its interpreter arm (`execute.rs` `0x9d`) calls `check_v86_iopl` before touching any
+            // state and then `load_flags`, which writes `eflags` directly and clears
+            // `pending_flags` in the same call -- no lazy-descriptor staleness window for
+            // `ResumeSnapshot::allows_resume` to read through. R3's existing TF and IF clauses,
+            // neither scoped to a specific row, already cover every flag this instruction can
+            // move.
+            0x9d if insn.operand_size == OperandSize::Word => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::Popf,
+                    },
                 });
             }
             // SAHF. Behind `IZARRAVM_FPU_LOOP_ROWS` (default off); the tombraid FMV census ranks
@@ -26977,13 +27028,30 @@ pub(crate) enum InterpretOneRow {
     /// `0xAC`/`0xAD` LODS, unprefixed. The nascar-586 `0xAD` LODSD row, 17,202,631 runtime hits --
     /// the largest single rejected head on that fixture.
     StringLoad,
+    /// `0x9C` PUSHF, WORD form only. N2. The Dword form (PUSHFD) stays the existing `Push`
+    /// lowering -- see the `0x9c` classify arm -- because that lowering already ships and this
+    /// row is scoped to the population the corpus measures, which is 16-bit real mode and V86.
+    ///
+    /// Its interpreter arm (`execute.rs` `0x9c`) calls `check_v86_iopl` as its first statement,
+    /// before touching any state, so a V86 task below IOPL 3 raises the same #GP from inside this
+    /// call-out that it raises at a compile-time barrier -- the same argument `Cli` already makes.
+    Pushf,
+    /// `0x9D` POPF, WORD form only. N2. The Dword form (POPFD) has no `classify` arm at any width
+    /// and stays a hard boundary, unmeasured and out of scope.
+    ///
+    /// `load_flags` (`control.rs`) writes `eflags` directly and clears `pending_flags` in the same
+    /// call, so there is no lazy-descriptor staleness window for `ResumeSnapshot::allows_resume` to
+    /// read through. R3's existing unconditional post-step TF test and its directional IF test
+    /// (neither scoped to a specific row) already cover every flag POPF can move; this row adds no
+    /// new clause to that predicate.
+    Popf,
 }
 
 impl InterpretOneRow {
     /// Every row, in discriminant order. The census array is indexed by `as usize`, so this is
     /// what keeps the two in step: a variant added without an entry here fails the length pin in
     /// `interpret_one_row_labels_cover_every_variant`.
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::PopRm,
         Self::MovRmSreg,
         Self::Xchg,
@@ -27000,6 +27068,8 @@ impl InterpretOneRow {
         Self::StringCompare,
         Self::StringStore,
         Self::StringLoad,
+        Self::Pushf,
+        Self::Popf,
     ];
 
     /// How many rows the census array holds.
@@ -27025,6 +27095,8 @@ impl InterpretOneRow {
             Self::StringCompare => "0xa6_a7_cmps",
             Self::StringStore => "0xaa_ab_stos",
             Self::StringLoad => "0xac_ad_lods",
+            Self::Pushf => "0x9c_pushf_word",
+            Self::Popf => "0x9d_popf_word",
         }
     }
 
@@ -27119,7 +27191,9 @@ impl InterpretOneRow {
             | Self::StringMove
             | Self::StringCompare
             | Self::StringStore
-            | Self::StringLoad => false,
+            | Self::StringLoad
+            | Self::Pushf
+            | Self::Popf => false,
         }
     }
 

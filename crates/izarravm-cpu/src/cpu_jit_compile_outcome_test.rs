@@ -903,21 +903,31 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
     }
 }
 
-/// The V86-sensitive opcodes stay compile barriers at `OperandSize::Word`, pinned per opcode.
+/// The V86-sensitive opcodes stay compile barriers at `OperandSize::Word`, pinned per opcode,
+/// PER WIDTH.
 ///
 /// V86 code is always CS.D = 0, so every instruction it executes decodes at Word. That makes the
-/// Word-size path the one that matters for V86 safety, and for five of these six opcodes the ONLY
+/// Word-size path the one that matters for V86 safety, and for most of these opcodes the ONLY
 /// remaining gate is "no `classify` arm exists" -- a gate this campaign's whole method is to
 /// widen. A list defended by nothing but the absence of code needs a test that names each member,
 /// or the arm that admits one of them lands without anything failing.
 ///
-/// PUSHF (0x9c) is the deliberate exception and the reason this is a table rather than a loop
-/// over interchangeable bytes: it HAS a classify arm (PUSHFD, a runtime-weighted top-five reject
-/// before it was lowered), and its V86 cover is `stack_width_kind`, which refuses
-/// `StoreSource::Flags` whenever `cpu.is_v86_mode()` because PUSHF checks IOPL in V86 and can
-/// raise #GP. Its Word arm is still refused by the allowlist, and the Dword control here proves
-/// the arm is live so this test cannot rot into "refused at every size" vacuity the way the port
-/// test once did.
+/// The table carries one outcome PER WIDTH rather than the "admitted at Dword" / "call-out at
+/// every width" pair of bools an earlier revision used, because N2 needed a shape neither bool
+/// could express: PUSHF and POPF each answer DIFFERENTLY at Dword than at Word, and the two
+/// widths are not "barrier" and "not barrier" -- one of them is a lowering and the other a
+/// call-out.
+///
+/// PUSHF (0x9c) HAS a classify arm at Dword (PUSHFD, a runtime-weighted top-five reject before it
+/// was lowered) that produces the `Push` LOWERING, unchanged by N2. Its Word form is N2's row: an
+/// `InterpretOne` call-out rather than a second lowering, because `stack_width_kind`'s V86 refusal
+/// (the Dword lowering's cover) is a compile-time barrier with no fault path, while the call-out's
+/// fault arm lets a V86 IOPL<3 task raise #GP the way the interpreter does instead of refusing the
+/// block outright.
+///
+/// POPF (0x9d) had no classify arm at any width before N2. Its Dword form (POPFD) still has none
+/// and stays a barrier, deliberately: the corpus evidence is exclusively the Word row. Its Word
+/// form is N2's other row, admitted the same way PUSHF's is.
 ///
 /// CLI (0xfa) LEFT the barrier list with the S3 policy widening and is asserted from the other
 /// side in the same table: it joins the block at both widths as an `InterpretOne` call-out. Its
@@ -926,22 +936,30 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 /// raises the same #GP from inside the call-out that it raises at a barrier, delivered by
 /// `finish_instruction` with the block reporting the prefix only.
 ///
-/// STI (0xfb) joined it on 2026-08-22 with S4d and the table says so. The prose here used to claim
-/// the opposite, as the pair that "get opposite answers"; the row was flipped and the sentence was
-/// not. What the pair pins now is that both take the CALL-OUT answer at both widths while POPF,
-/// one encoding further on, still has no arm at all.
+/// STI (0xfb) joined it on 2026-08-22 with S4d and the table says so.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SensitiveOutcome {
+    /// No `classify` arm reaches an `Ok` at this width; the block stops at three slots.
+    Barrier,
+    /// A `classify` arm produces a native, emitted lowering -- no `InterpretOne` slot.
+    Lowered,
+    /// A `classify` arm produces an `InterpretOne` call-out.
+    CallOut,
+}
+
 #[test]
 fn v86_sensitive_opcodes_keep_their_word_answers() {
-    // (bytes, admitted_at_dword, call_out_at_every_width)
-    let table: &[(&[u8], bool, bool)] = &[
-        (&[0x9c], true, false),  // PUSHF: lowered at Dword, allowlist-refused at Word
-        (&[0x9d], false, false), // POPF: no classify arm
-        (&[0xfa], false, true),  // CLI: an InterpretOne call-out since the S3 widening
-        (&[0xfb], false, true),  // STI: an InterpretOne call-out since S4d
-        (&[0xcd, 0x20], false, false), // INT imm8: no classify arm
-        (&[0xcf], false, false), // IRET: no classify arm
+    use SensitiveOutcome::{Barrier, CallOut, Lowered};
+    // (bytes, outcome_at_dword, outcome_at_word)
+    let table: &[(&[u8], SensitiveOutcome, SensitiveOutcome)] = &[
+        (&[0x9c], Lowered, CallOut), // PUSHF: Push lowering at Dword, InterpretOne at Word (N2)
+        (&[0x9d], Barrier, CallOut), // POPF: no arm at Dword, InterpretOne at Word (N2)
+        (&[0xfa], CallOut, CallOut), // CLI: an InterpretOne call-out since the S3 widening
+        (&[0xfb], CallOut, CallOut), // STI: an InterpretOne call-out since S4d
+        (&[0xcd, 0x20], Barrier, Barrier), // INT imm8: no classify arm
+        (&[0xcf], Barrier, Barrier), // IRET: no classify arm
     ];
-    for (op, admitted_at_dword, call_out_at_every_width) in table {
+    for (op, outcome_at_dword, outcome_at_word) in table {
         for prefixed in [false, true] {
             let mut code = vec![0x40, 0x41, 0x42];
             let mut offsets = vec![0u32, 1, 2, 3];
@@ -958,25 +976,38 @@ fn v86_sensitive_opcodes_keep_their_word_answers() {
             warm(&mut cpu, &mut bus, &addresses);
             let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
             let first = op[0];
-            if *call_out_at_every_width {
-                assert!(
-                    compilation.span.instructions > 3,
-                    "{first:#04x} (prefixed={prefixed}) must join the block as a call-out"
-                );
-                assert_eq!(
-                    compilation.callout_interpret_one_slots, 1,
-                    "{first:#04x} (prefixed={prefixed}) must join as a call-out, not a lowering"
-                );
-            } else if !prefixed && *admitted_at_dword {
-                assert!(
-                    compilation.span.instructions > 3,
-                    "{first:#04x} at Dword has a classify arm and must not end the block;                      if this fails the Dword control is dead and the Word assertions below                      can no longer distinguish Word-refusal from always-refusal"
-                );
+            let outcome = if prefixed {
+                *outcome_at_word
             } else {
-                assert_eq!(
-                    compilation.span.instructions, 3,
-                    "{first:#04x} (prefixed={prefixed}) must stop the block at three slots"
-                );
+                *outcome_at_dword
+            };
+            match outcome {
+                CallOut => {
+                    assert!(
+                        compilation.span.instructions > 3,
+                        "{first:#04x} (prefixed={prefixed}) must join the block as a call-out"
+                    );
+                    assert_eq!(
+                        compilation.callout_interpret_one_slots, 1,
+                        "{first:#04x} (prefixed={prefixed}) must join as a call-out, not a lowering"
+                    );
+                }
+                Lowered => {
+                    assert!(
+                        compilation.span.instructions > 3,
+                        "{first:#04x} (prefixed={prefixed}) has a classify arm and must not end the block"
+                    );
+                    assert_eq!(
+                        compilation.callout_interpret_one_slots, 0,
+                        "{first:#04x} (prefixed={prefixed}) must be a native lowering, not a call-out"
+                    );
+                }
+                Barrier => {
+                    assert_eq!(
+                        compilation.span.instructions, 3,
+                        "{first:#04x} (prefixed={prefixed}) must stop the block at three slots"
+                    );
+                }
             }
         }
     }

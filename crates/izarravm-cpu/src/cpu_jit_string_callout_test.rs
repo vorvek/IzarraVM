@@ -1111,12 +1111,16 @@ fn interpret_one_fold_is_unmoved_by_the_string_rows() {
 /// self-adjusts from 12 to 16 -- VERIFIED rather than assumed, which is what this row is for: it
 /// names the new count explicitly, so a variant added without an `ALL` entry fails here as well as
 /// there.
+///
+/// 18 rather than 16 as of N2: `Pushf` and `Popf` joined afterwards, and this count is a floor
+/// for THIS slice's four rows, not a ceiling on the enum -- it moves again the next time a row is
+/// added, and this comment moves with it.
 #[test]
 fn the_four_string_rows_are_on_the_allowlist() {
     assert_eq!(
         jit::direct::InterpretOneRow::COUNT,
-        16,
-        "twelve rows before this slice plus the four string families"
+        18,
+        "twelve rows before this slice plus the four string families plus N2's two"
     );
     for (label, row) in ROWS {
         assert_eq!(row.label(), label);

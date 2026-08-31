@@ -2649,6 +2649,335 @@ fn cli_core_clocks_is_what_the_interpreter_charges() {
     assert_row_charges(&[0xFA], crate::CLI_CORE_CLOCKS, |_, _| {});
 }
 
+// ---------------------------------------------------------------------------
+// 7a. PUSHF / POPF word form, N2.
+// ---------------------------------------------------------------------------
+
+/// The anti-vacuity gate for both rows: each compiles into a call-out slot rather than ending
+/// the block, mirroring `pop_rm16_compiles_into_an_interpret_one_slot`.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn pushf_and_popf_word_join_the_block_as_call_outs() {
+    assert_row_is_a_call_out(&[0x9C]);
+    assert_row_is_a_call_out(&[0x9D]);
+}
+
+/// Seeds the stack word `POPF` reads with a value that keeps IF set and TF clear, so the
+/// resume predicate's directional IF clause and its unconditional TF clause both agree to
+/// resume. `POPPED` (0x4321) cannot be reused here: bit 8 (TF) is set in it, which is exactly
+/// the shape R3's TF clause refuses, so a fixture built on it would prove nothing about the
+/// resuming case.
+fn seed_popf_resuming_flags(_: &mut CpuGsw, bus: &mut TestBus) {
+    bus.memory[STACK_TOP as usize..STACK_TOP as usize + 2]
+        .copy_from_slice(&0x0202u16.to_le_bytes());
+}
+
+/// PUSHF word: the block carries the call-out and resumes, matching the interpreter's register
+/// file, EFLAGS, guest RAM (the pushed word), `elapsed_clocks` and `perf.instructions` exactly.
+///
+/// `no_perturb` leaves `arm_fixture`'s eflags at 0x202 (IF=1, reserved bit 1), so this is the
+/// ordinary real-mode case: no V86, no fault, IF unchanged by the push (PUSHF only READS
+/// EFLAGS). The V86 IOPL cases below are the ones that can fault.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_pushf_resumes_and_matches_the_interpreter() {
+    assert_row_resumes(&[0x9C], no_perturb);
+}
+
+/// POPF word: the block carries the call-out and resumes, matching the interpreter exactly,
+/// with the stack seeded so IF stays set and TF stays clear (see `seed_popf_resuming_flags`).
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_popf_resumes_and_matches_the_interpreter() {
+    let legs = assert_row_resumes(&[0x9D], seed_popf_resuming_flags);
+    assert_eq!(
+        legs.native.eflags() & crate::FLAG_IF,
+        crate::FLAG_IF,
+        "the seeded stack word must have left IF set"
+    );
+}
+
+/// The block-context claim N2 is chasing: a call-out sitting in the MIDDLE of a longer block
+/// does not truncate it. Four native slots before PUSHF (the `mov` and three `inc`s), the
+/// call-out, three native slots after -- all eight retire in one native run, which is what "the
+/// row stops ending the block" means in the census columns (`pre`/`suf`).
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn pushf_mid_block_keeps_its_native_prefix_and_suffix() {
+    let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41, 0x42]; // mov ax,0x1111; inc ax x3
+    code.push(0x9C); // pushf
+    code.extend_from_slice(&[0x40, 0x41, 0x42, 0xF4]); // inc ax x3; hlt
+    let starts = vec![0, 3, 4, 5, 6, 7, 8, 9];
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        8,
+        "the four prefix slots, the call-out and the three suffix slots must all be one block"
+    );
+    assert_eq!(block.callout_interpret_one_slots(), 1);
+}
+
+/// The same claim for POPF, which is the corpus's actual #1 rejected row (21-for-1-to-4,
+/// pre=8 suf=7) -- the shape this test approximates at a size a unit fixture can afford.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn popf_mid_block_keeps_its_native_prefix_and_suffix() {
+    let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41, 0x42]; // mov ax,0x1111; inc ax x3
+    code.push(0x9D); // popf
+    code.extend_from_slice(&[0x40, 0x41, 0x42, 0xF4]); // inc ax x3; hlt
+    let starts = vec![0, 3, 4, 5, 6, 7, 8, 9];
+    let (_, _, block) = build_native(&code, &starts);
+    assert_eq!(
+        block.span().instructions,
+        8,
+        "the four prefix slots, the call-out and the three suffix slots must all be one block"
+    );
+    assert_eq!(block.callout_interpret_one_slots(), 1);
+}
+
+/// A V86 task at IOPL 3, where `check_v86_iopl` passes and PUSHF/POPF run their ordinary body
+/// through the call-out, is the positive half of N2's differential. Both opcodes in one test:
+/// `mov ax,0x1111; pushf; popf; inc ax; hlt`, so the popped word is exactly what was just
+/// pushed and the round trip is its own oracle -- AX and EFLAGS must both survive it unchanged
+/// (modulo materialising the reserved bit 1, which is architectural for both instructions).
+///
+/// This is the case `interpret_one_cli_faults_in_v86_with_the_window_open` does NOT cover: CLI
+/// cannot fault at IOPL 3 either, but it also touches no memory, so it proves nothing about a
+/// call-out whose interpreter arm pushes or pops a guest stack word inside a V86 frame.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn pushf_then_popf_round_trip_natively_in_v86_at_iopl_3() {
+    const V86_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x9C, 0x9D, 0x40, 0xF4];
+    const V86_BASE: u32 = 0xA000;
+    const MONITOR: &[u8] = &[0xF4];
+
+    let (mut cpu, mut bus) = super::super::v86_world(MONITOR, V86_CODE, &[0x00]);
+    super::super::enter_v86_direct(&mut cpu, 0, 0x1000);
+    cpu.registers.eflags |= 0x3000; // IOPL 3
+    assert_eq!(
+        cpu.registers.eflags & 0x3000,
+        0x3000,
+        "the fixture needs IOPL 3"
+    );
+
+    for offset in [0u32, 3, 4, 5, 6] {
+        let linear = V86_BASE + offset;
+        cpu.set_eip(offset);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(0);
+
+    let compilation = jit::direct::compile(&mut cpu, V86_BASE, false)
+        .expect("the V86 fixture must compile as a block");
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "mov, pushf, popf and inc must all be one block"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 2,
+        "PUSHF and POPF must both be call-out slots"
+    );
+    let key = jit::direct::key_for(&cpu, V86_BASE, false).expect("a key for the V86 block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the V86 block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    cpu.set_eip(0);
+    cpu.registers.set_eax(0);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("the block must not stop the machine"),
+        "the block must run"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        None,
+        "IOPL 3 must retire the whole block natively, no side exit"
+    );
+    assert_eq!(
+        cpu.registers.eax() & 0xffff,
+        0x1112,
+        "AX must be 0x1111 plus the trailing INC"
+    );
+    let _ = key;
+}
+
+// ---------------------------------------------------------------------------
+// 8. PUSHF / POPF in V86 below IOPL 3, where each is the one admitted row on its slot that can
+// fault on its own -- the negative half of N2's differential, mirrored directly off
+// `interpret_one_cli_faults_in_v86_with_the_window_open`.
+// ---------------------------------------------------------------------------
+
+/// PUSHF below IOPL 3 in a V86 task raises #GP from inside the helper, identically to the
+/// interpreter: `check_v86_iopl` is the FIRST statement of the interpreter's own `0x9c` arm,
+/// which is the arm the helper runs.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_pushf_faults_in_v86_below_iopl_3() {
+    const V86_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x9C, 0x40, 0xF4];
+    const V86_BASE: u32 = 0xA000;
+    const MONITOR: &[u8] = &[0xF4];
+
+    let (mut cpu, mut bus) = super::super::v86_world(MONITOR, V86_CODE, &[0x00]);
+    super::super::enter_v86_direct(&mut cpu, 0, 0x1000);
+    assert_eq!(cpu.registers.eflags & 0x3000, 0, "the fixture needs IOPL 0");
+    assert!(cpu.is_v86_mode());
+
+    for offset in [0u32, 3, 4] {
+        let linear = V86_BASE + offset;
+        cpu.set_eip(offset);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(0);
+
+    let compilation = jit::direct::compile(&mut cpu, V86_BASE, false)
+        .expect("the V86 fixture must compile as a block");
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.callout_interpret_one_slots, 1);
+    let key = jit::direct::key_for(&cpu, V86_BASE, false).expect("a key for the V86 block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the V86 block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    cpu.set_eip(0);
+    cpu.registers.set_eax(0);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("a delivered #GP must not stop the machine"),
+        "the block must run"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutResyncFault as u32),
+        "a V86 PUSHF below IOPL 3 must take the not-retired RESYNC stub"
+    );
+    assert_eq!(
+        row_counts(&cpu, "0x9c_pushf_word").resync_fault,
+        1,
+        "the fault must be attributed to the PUSHF row"
+    );
+    assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+    assert_eq!(cpu.registers.cs().selector, 0x08);
+    assert_eq!(cpu.registers.eip, 0x8000);
+    assert_eq!(
+        cpu.registers.eflags & crate::FLAG_IF,
+        0,
+        "an interrupt gate clears IF on entry, so the guest's own PUSHF never ran"
+    );
+    let _ = key;
+}
+
+/// POPF below IOPL 3 in a V86 task raises #GP from inside the helper, identically to the
+/// interpreter, exactly as PUSHF's twin above.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_popf_faults_in_v86_below_iopl_3() {
+    const V86_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x9D, 0x40, 0xF4];
+    const V86_BASE: u32 = 0xA000;
+    const MONITOR: &[u8] = &[0xF4];
+
+    let (mut cpu, mut bus) = super::super::v86_world(MONITOR, V86_CODE, &[0x00]);
+    super::super::enter_v86_direct(&mut cpu, 0, 0x1000);
+    assert_eq!(cpu.registers.eflags & 0x3000, 0, "the fixture needs IOPL 0");
+    assert!(cpu.is_v86_mode());
+
+    for offset in [0u32, 3, 4] {
+        let linear = V86_BASE + offset;
+        cpu.set_eip(offset);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(0);
+
+    let compilation = jit::direct::compile(&mut cpu, V86_BASE, false)
+        .expect("the V86 fixture must compile as a block");
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.callout_interpret_one_slots, 1);
+    let key = jit::direct::key_for(&cpu, V86_BASE, false).expect("a key for the V86 block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the V86 block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    cpu.set_eip(0);
+    cpu.registers.set_eax(0);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("a delivered #GP must not stop the machine"),
+        "the block must run"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutResyncFault as u32),
+        "a V86 POPF below IOPL 3 must take the not-retired RESYNC stub"
+    );
+    assert_eq!(
+        row_counts(&cpu, "0x9d_popf_word").resync_fault,
+        1,
+        "the fault must be attributed to the POPF row"
+    );
+    assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+    assert_eq!(cpu.registers.cs().selector, 0x08);
+    assert_eq!(cpu.registers.eip, 0x8000);
+    assert_eq!(
+        cpu.registers.eflags & crate::FLAG_IF,
+        0,
+        "an interrupt gate clears IF on entry, so the guest's own POPF never ran"
+    );
+    let _ = key;
+}
+
 /// Row 8: MOV Sreg, r/m, the form the resume predicate actually decides.
 ///
 /// R2 compares all six cached segment records, so this is the first admitted row whose answer
