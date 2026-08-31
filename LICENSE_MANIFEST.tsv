@@ -8,7 +8,7 @@ path	class	origin	license	sha256
 .bench/corpus/games/123-talk-shareware.json	test-fixture	IzarraVM project	GPL-3.0-only	cfd72584bfa3a3a0f377b3cc0f847fef338689b993318eef29160579e9b82472
 .bench/corpus/games/15-move-hole-puzzle.json	test-fixture	IzarraVM project	GPL-3.0-only	3f9cbb2d7443165ed141ce2ef6038d958d86976a940dd203e382109c512bba27
 .bench/corpus/games/15x15.json	test-fixture	IzarraVM project	GPL-3.0-only	dd249c65d0c092d68fbdd10d62c83068d21413d25251150e31c269d23beeff56
-.bench/corpus/games/1830-railroads-robber-barons.json	test-fixture	IzarraVM project	GPL-3.0-only	088acc8c2f35428c12879dfed79a50efa4250942b5d43e9ef09369bc57029f4f
+.bench/corpus/games/1830-railroads-robber-barons.json	test-fixture	IzarraVM project	GPL-3.0-only	2184fda0c6d159702afccff6588a369e8bd1177708df0f410db1852592b704cb
 .bench/corpus/games/21-for-1-to-4.json	test-fixture	IzarraVM project	GPL-3.0-only	3a976e95b3be8c1ca605bdac7f893594dd3458d0b1c3d6d67f972922798eb0b6
 .bench/corpus/games/k-cheiw.json	test-fixture	IzarraVM project	GPL-3.0-only	52e64204119120c1bd292660b65b74461efdee515597872ff741a48c7c64ac06
 Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	6d35e4c0c317936bcbaf4656b02b2532d5a3afac1b9e4b954fd0ab76fa803bd2
