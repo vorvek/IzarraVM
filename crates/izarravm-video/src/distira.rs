@@ -1175,26 +1175,35 @@ impl Distira {
         if defer && self.raster_queue_enabled && triangle_defers(&triangle) {
             if !self.raster_queue.push(triangle) {
                 // Full. Draw what is waiting, then this one joins an empty
-                // queue, so a triangle is never dropped.
+                // queue, so a triangle is never dropped. The second push
+                // cannot refuse: the drain above leaves the queue at zero and
+                // the capacity is not zero.
                 self.drain_raster_queue();
-                self.raster_queue.push(triangle);
+                // Not inside the assertion: a release build compiles the
+                // assertion's expression away, and the push has to happen.
+                let queued = self.raster_queue.push(triangle);
+                debug_assert!(queued, "a drained queue accepts");
             }
             return 0;
         }
 
         // The immediate path. Draining first leaves this triangle alone in
-        // the batch, so the pixel count belongs to it and to nothing else.
+        // the batch, so the pixel count belongs to it and to nothing else,
+        // and the push cannot refuse for the same reason.
         self.drain_raster_queue();
-        self.raster_queue.push(triangle);
+        let queued = self.raster_queue.push(triangle);
+        debug_assert!(queued, "a drained queue accepts");
         self.drain_raster_queue()
     }
 
     /// Draw every triangle waiting on the queue and return how many pixels
     /// they stored.
     ///
-    /// One fork and one join for the whole batch. Lane `i` owns the absolute
-    /// rows where `y % lanes == i` and walks the batch in submission order,
-    /// so overlapping triangles land in the order the guest sent them.
+    /// One fork and one join for the whole batch. Lane `i` owns the
+    /// FRAMEBUFFER rows where `draw_y(y) % lanes == i` and walks the batch in
+    /// submission order, so overlapping triangles land in the order the guest
+    /// sent them. `distira/raster_queue.rs` has why the framebuffer row is the
+    /// one that has to partition and not the triangle's own row.
     fn drain_raster_queue(&mut self) -> u64 {
         if self.raster_queue.is_empty() {
             return 0;
@@ -1241,18 +1250,30 @@ impl Distira {
 
     /// How many lanes a batch is worth. Below the threshold the wake-up cost
     /// of the pool beats the win and the calling thread draws the batch.
+    ///
+    /// The two measures answer different questions. Pixels are the work, so
+    /// they sum over the batch. Rows are the parallelism, and lanes divide
+    /// DISTINCT rows, so they take the union span rather than the sum: a stack
+    /// of small triangles sitting on top of each other has one triangle's
+    /// worth of rows to share out however many triangles it holds.
     fn batch_lanes(&self, jobs: &[QueuedTriangle]) -> usize {
         if self.raster_lanes < 2 {
             return 1;
         }
-        let mut rows = 0usize;
+        let mut lowest = u32::MAX;
+        let mut highest = 0;
         let mut pixels = 0usize;
         for job in jobs {
             let job_rows = job.context.max_y.saturating_sub(job.context.min_y) as usize;
             let columns = job.context.max_x.saturating_sub(job.context.min_x) as usize;
-            rows += job_rows;
+            if job_rows == 0 {
+                continue;
+            }
+            lowest = lowest.min(job.context.min_y);
+            highest = highest.max(job.context.max_y);
             pixels += job_rows.saturating_mul(columns);
         }
+        let rows = highest.saturating_sub(lowest) as usize;
         if rows >= self.raster_lanes * 2 && pixels >= PARALLEL_PIXEL_THRESHOLD {
             self.raster_lanes
         } else {
@@ -2868,9 +2889,26 @@ fn raster_snapshot_covers_register(register: usize) -> bool {
 /// queue would change. Only the SST-1 statistics registers do; `stipple` is
 /// listed because the rotating stipple writes back through it.
 ///
-/// Everything else -- `status`, the retrace counters, the FIFO registers, the
-/// mode registers read back -- is answered from state the rasteriser never
-/// writes, so those reads cost nothing.
+/// Everything else is answered from state the rasteriser never writes, so
+/// those reads cost nothing. `SST_STATUS` is the one worth arguing, because
+/// it is deliberately NOT here and it therefore reports the FIFO idle while
+/// the queue still holds triangles.
+///
+/// That is safe, and it is safe for a reason rather than by luck: the status
+/// bits are a promise about what a guest will SEE, and everything that can
+/// see a queued triangle's pixels draws the queue first. Those paths are the
+/// whole list -- an LFB read or write, a texture-aperture write, the
+/// statistics registers above, `scanout_argb` and `scanout_state`, and every
+/// register write the snapshot does not cover, which is where `fastfillCMD`,
+/// `swapbufferCMD` and the framebuffer layout live. A guest that polls status
+/// until idle and then looks will find the work done by the act of looking.
+///
+/// Reporting busy instead would be worse in both directions. The drain is
+/// synchronous, so nothing clears a busy bit while the guest spins on it: a
+/// guest waiting for idle before it submits more work would wait forever.
+/// And draining on a status poll would put the drain back on the per-triangle
+/// path that this queue exists to get off, since polling status between
+/// triangles is exactly what a Glide driver does.
 fn register_read_needs_raster(register: usize) -> bool {
     matches!(
         register,

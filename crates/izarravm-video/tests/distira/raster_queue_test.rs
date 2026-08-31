@@ -62,6 +62,32 @@ fn submit_triangle(
     write_reg(distira, SST_TRIANGLE_CMD, 1);
 }
 
+/// A triangle with FLAT depth and no colour gradient, so its depth at every
+/// pixel is exactly `start_w` and two of them can be ordered by depth alone.
+fn submit_flat_triangle(
+    distira: &mut Distira,
+    vertices: [(u32, u32); 3],
+    color: (u32, u32, u32),
+    start_w: u32,
+) {
+    write_reg(distira, SST_VERTEX_AX, vertices[0].0 << 4);
+    write_reg(distira, SST_VERTEX_AY, vertices[0].1 << 4);
+    write_reg(distira, SST_VERTEX_BX, vertices[1].0 << 4);
+    write_reg(distira, SST_VERTEX_BY, vertices[1].1 << 4);
+    write_reg(distira, SST_VERTEX_CX, vertices[2].0 << 4);
+    write_reg(distira, SST_VERTEX_CY, vertices[2].1 << 4);
+    write_reg(distira, SST_START_R, color.0 << 12);
+    write_reg(distira, SST_START_G, color.1 << 12);
+    write_reg(distira, SST_START_B, color.2 << 12);
+    write_reg(distira, SST_START_A, 0xc0 << 12);
+    write_reg(distira, SST_DR_DX, 0);
+    write_reg(distira, SST_DR_DY, 0);
+    write_reg(distira, SST_START_W, start_w);
+    write_reg(distira, SST_DW_DX, 0);
+    write_reg(distira, SST_DW_DY, 0);
+    write_reg(distira, SST_TRIANGLE_CMD, 1);
+}
+
 fn read_counters(
     distira: &mut Distira,
     label: &'static str,
@@ -340,6 +366,105 @@ fn queued_triangles_answer_interleaved_reads_like_synchronous_ones() {
         queued.frame.iter().any(|&pixel| pixel != 0),
         "the scanned-out frame must not be blank"
     );
+}
+
+/// One batch, two triangles, opposite Y origins, overlapping framebuffer
+/// rows.
+///
+/// `fbzMode` is a register the snapshot covers, so the guest can flip the Y
+/// origin between two triangles without the queue being drawn in between and
+/// both land in the same batch. Lanes own FRAMEBUFFER rows, and the flip
+/// means the two triangles reach a given framebuffer row from opposite
+/// triangle rows. Split the batch on the triangle's row instead and at two
+/// lanes the flip always swaps parity, so two lanes meet on one framebuffer
+/// row and race each other's read-modify-write in the depth test and the
+/// blend.
+fn mixed_y_origin_scene(queue_enabled: bool, lanes: usize) -> (Vec<u32>, Vec<u16>, u64) {
+    let mut distira = Distira::new();
+    distira.set_raster_queue_enabled(queue_enabled);
+    distira.set_raster_lanes(lanes);
+    distira.set_frame_size(SCENE_WIDTH as u32, SCENE_HEIGHT as u32);
+
+    let depth_mode = FBZ_RGB_WMASK
+        | FBZ_DRAW_BACK
+        | FBZ_DEPTH_ENABLE
+        | FBZ_DEPTH_WMASK
+        | FBZ_W_BUFFER
+        | (DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT);
+    // Blending makes every pixel a read of the destination followed by a
+    // write of it, which is what a row shared by two lanes corrupts.
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        (1 << 4) | (0x1 << 8) | (0x5 << 12) | (0x80 << 24),
+    );
+    write_reg(&mut distira, SST_COLOR1, 0x0010_2030);
+    write_reg(&mut distira, SST_ZA_COLOR, 0xffff);
+    write_reg(&mut distira, SST_FBZ_MODE, depth_mode);
+    write_reg(&mut distira, SST_FASTFILL_CMD, 1);
+
+    // Both triangles run off the edges of the frame, so each one covers
+    // nearly all of it and they overlap nearly everywhere. The second is
+    // nearer at every pixel and its depth is flat, so the depth test decides
+    // the result purely by ORDER: drawn second it blends over the first and
+    // takes the depth, drawn first it is overwritten and the first is
+    // rejected. A row two lanes share comes out differently every run.
+    write_reg(&mut distira, SST_FBZ_MODE, depth_mode);
+    submit_flat_triangle(
+        &mut distira,
+        [(0, 0), (512, 0), (0, 256)],
+        (0xc0, 0x30, 0x30),
+        20_000_000,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, depth_mode | FBZ_Y_ORIGIN);
+    submit_flat_triangle(
+        &mut distira,
+        [(0, 0), (512, 0), (0, 256)],
+        (0x20, 0xb0, 0x40),
+        500_000_000,
+    );
+    assert_eq!(
+        distira.raster_queue_depth(),
+        usize::from(queue_enabled) * 2,
+        "the two triangles must share one batch for this to test anything"
+    );
+
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+    let frame = distira.scanout_argb();
+    write_reg(&mut distira, SST_LFB_MODE, LFB_READ_AUX);
+    let depth: Vec<u16> = (0..SCENE_HEIGHT)
+        .flat_map(|y| (0..SCENE_WIDTH).map(move |x| (y, x)))
+        .map(|(y, x)| distira.read_lfb_u16(y * 2048 + x * 2))
+        .collect();
+    let written = distira.scanout_state().triangles.color_written;
+    (frame, depth, written)
+}
+
+#[test]
+fn a_batch_may_mix_y_origins_without_two_lanes_meeting_on_one_row() {
+    let serial = mixed_y_origin_scene(false, 1);
+    assert!(
+        serial.2 > 20_000,
+        "the scene must actually paint: {}",
+        serial.2
+    );
+
+    // Two lanes is the sharp case: flipping always swaps row parity there.
+    for lanes in [1, 2, 4] {
+        let queued = mixed_y_origin_scene(true, lanes);
+        assert_eq!(
+            serial.0, queued.0,
+            "colour must match the unqueued render at {lanes} lanes"
+        );
+        assert_eq!(
+            serial.1, queued.1,
+            "depth must match the unqueued render at {lanes} lanes"
+        );
+        assert_eq!(
+            serial.2, queued.2,
+            "color_written must match the unqueued render at {lanes} lanes"
+        );
+    }
 }
 
 #[test]

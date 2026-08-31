@@ -13,12 +13,26 @@
 //! `Distira::drain_raster_queue` and its callers).
 //!
 //! The whole batch takes ONE fork and ONE join. Lanes split the batch by
-//! ABSOLUTE screen row: lane `i` owns the rows where `y % lanes == i`, for
-//! every triangle in the batch. Rows partition the frame store and every
-//! per-pixel test is a pure function of the pixel, so a lane can walk the
-//! whole queue in submission order and the result is the serial result, byte
-//! for byte. Splitting per triangle instead would need a barrier between
-//! triangles, which is the cost this exists to remove.
+//! FRAMEBUFFER row: lane `i` owns the rows where `draw_y(y) % lanes == i`,
+//! for every triangle in the batch.
+//!
+//! The framebuffer row is the one that matters, and it is not the triangle's
+//! row. `fbzMode`'s Y-origin bit flips a triangle vertically, so a lane's
+//! rows are `y % lanes == i` for an unflipped triangle and
+//! `(height - 1 - y) % lanes == i` for a flipped one. Every store in
+//! `RasterView::raster_row` goes through `draw_y`, so deriving the lane from
+//! it is what makes the rows a true partition of the frame store. Splitting
+//! on the triangle's own row instead would look right and would be wrong the
+//! moment one batch held triangles with different Y-origin bits: at two lanes
+//! the flip always swaps parity, so two lanes would land on one framebuffer
+//! row and race each other's read-modify-write in the depth test and the
+//! blend.
+//!
+//! Given that partition, every per-pixel test is a pure function of the
+//! pixel, so a lane can walk the whole queue in submission order and the
+//! result is the serial result, byte for byte. Splitting per triangle instead
+//! would need a barrier between triangles, which is the cost this exists to
+//! remove.
 
 use super::*;
 
@@ -81,6 +95,15 @@ impl RasterQueue {
 /// will paint are decided already, they have simply not been stored yet. Two
 /// devices therefore compare on how much work is outstanding, not on the
 /// geometry of it. Same reasoning as [`FrameStore`]'s hand-written impls.
+///
+/// The blind spot is real and worth naming: two devices holding the SAME
+/// number of pending triangles compare equal however different that geometry
+/// is. Nothing can currently observe it, because the geometry is only ever
+/// observed as pixels and every path to a pixel draws the queue first, so a
+/// comparison that ran after either device was read would be comparing two
+/// empty queues. Comparing properly is not an option anyway: `TriangleContext`
+/// carries `f32` and `f64` planes, so it has no `Eq`, and `Distira` derives
+/// one.
 impl PartialEq for RasterQueue {
     fn eq(&self, other: &Self) -> bool {
         self.pending.len() == other.pending.len()
@@ -105,11 +128,15 @@ impl std::fmt::Debug for RasterQueue {
 
 /// Rasterise one lane's rows of a whole batch, in submission order.
 ///
-/// `lane` owns the absolute rows where `y % lanes == lane`. The stipple
-/// pattern is re-seeded per triangle from that triangle's snapshot; a
-/// triangle that uses the ROTATING stipple never reaches a batch with a
-/// neighbour, because rotating stipple chains from one triangle to the next
-/// and that chain cannot be split across lanes.
+/// `lane` owns the FRAMEBUFFER rows where `draw_y(y) % lanes == lane`, which
+/// is the triangle's own row only while the Y-origin bit is clear. See this
+/// module's header for why the framebuffer row is the one that has to
+/// partition.
+///
+/// The stipple pattern is re-seeded per triangle from that triangle's
+/// snapshot; a triangle that uses the ROTATING stipple never reaches a batch
+/// with a neighbour, because rotating stipple chains from one triangle to the
+/// next and that chain cannot be split across lanes.
 pub(super) fn render_band(
     jobs: &[QueuedTriangle],
     view_memory: ViewMemory<'_>,
@@ -122,8 +149,18 @@ pub(super) fn render_band(
         local.stipple = job.params.stipple;
         let view = view_memory.view(job.params);
         let TriangleContext { min_y, max_y, .. } = job.context;
-        let mut y = min_y + (lanes + lane - min_y % lanes) % lanes;
+        // The triangle row this lane wants. `draw_y` is `y` or
+        // `height - 1 - y`, and the bounding box is clamped to the display
+        // height when the triangle is set up, so over `min_y..max_y` it is a
+        // bijection and inverting it on the residue is exact.
+        let residue = if job.params.fbz_mode & FBZ_Y_ORIGIN == 0 {
+            lane
+        } else {
+            (job.params.display.height.saturating_sub(1) % lanes + lanes - lane) % lanes
+        };
+        let mut y = min_y + (lanes + residue - min_y % lanes) % lanes;
         while y < max_y {
+            debug_assert_eq!(view.draw_y(y) % lanes, lane, "lanes must partition rows");
             view.raster_row(&job.context, y, &mut local);
             y = y.saturating_add(lanes);
         }
