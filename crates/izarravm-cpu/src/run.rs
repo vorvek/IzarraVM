@@ -3573,10 +3573,9 @@ impl CpuGsw {
         // shipped binary since the 2026-08-24 flip -- 273.4 M on the wolf3d-586 ladder row; zero
         // only on the `0` escape.
         self.jit_direct.note_far_returns(far_returns);
-        // L8's sibling ledger: `exit.far_call_native` is a WHOLE dedicated `NativeExit` field,
-        // not a shared high half, so it needs no mask and no shift before this deposit -- see
-        // `STACK_FAR_CALL_NATIVE`'s own doc for why.
-        self.jit_direct.note_far_calls(exit.far_call_native);
+        // L8's sibling ledger takes no per-exit fold at all since the 2026-09-01 reprice: it is
+        // a `CpuGsw` cell the `CallFar16` lowering increments through R15, read by
+        // `direct_stall_snapshot`. See `jit::direct::far_call_ledger_offset`.
         match exit.unresolved_reason {
             jit::direct::UnresolvedReason::None => {}
             jit::direct::UnresolvedReason::StaticUnbound => {

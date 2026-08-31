@@ -585,7 +585,7 @@ fn the_far_call_ledger_reaches_rust_and_inflates_neither_writes_nor_clocks() {
     select_arm(jit::direct::RetfArm::V86);
     let far = call_far(TARGET_SELECTOR, TARGET_OFFSET, false);
     let mut roles = build(v86_cpu, &far, STACK_ESP);
-    let ledger_before = roles.native.jit_direct.far_call_native_for_test();
+    let ledger_before = roles.native.direct_stall_snapshot().far_call_native;
     assert!(
         roles
             .native
@@ -593,7 +593,7 @@ fn the_far_call_ledger_reaches_rust_and_inflates_neither_writes_nor_clocks() {
             .unwrap()
     );
     assert_eq!(
-        roles.native.jit_direct.far_call_native_for_test() - ledger_before,
+        roles.native.direct_stall_snapshot().far_call_native - ledger_before,
         1,
         "one far call must reach Rust through the STACK_FAR_CALL_NATIVE lane"
     );

@@ -2630,6 +2630,31 @@ impl PartialEq for FaultSite {
 
 impl Eq for FaultSite {}
 
+/// L8's far-CALL ledger, moved OUT of the JIT stack frame (2026-09-01 reprice).
+///
+/// Emitted `CallFar16` code increments this cell through R15 -- the same pointer it already
+/// writes CS and the guest GPRs through -- so the ledger costs one load/add/store per RETIRED
+/// far call and NOTHING per block entry. The frame slot it replaces (`STACK_FAR_CALL_NATIVE`)
+/// cost a prologue zero on every entry and an `emit_return` copy on every exit, and grew
+/// `BASE_STACK_LEN` from 160 to 176; duke3d-586 makes ~384 M entries and ~a few thousand far
+/// calls, so the per-entry price was three memory ops for a counter that ticks about
+/// 0.001% as often.
+///
+/// Always-equal `PartialEq` for the reason `FaultSite` and `CallOutTable` have one: `CpuGsw`
+/// equality is load-bearing in differential tests and this is a diagnostic, not guest state.
+/// Monotonic for the life of the CPU; `direct_stall_snapshot` reads it, nothing drains it, so
+/// no per-exit Rust-side work is added either.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FarCallLedger(pub u64);
+
+impl PartialEq for FarCallLedger {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for FarCallLedger {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuGsw {
     pub registers: Registers,
@@ -2806,6 +2831,9 @@ pub struct CpuGsw {
     poll_skip_memory: PollSkipMemoryCounters,
     /// See `ApertureCodeFlag`; at the tail so `pending_flags` keeps its pinned offset.
     pub(crate) has_aperture_code: ApertureCodeFlag,
+    /// L8's far-CALL ledger. At the tail for the layout reason every field around it is: it
+    /// must not move `pending_flags` off its pinned offset. See `FarCallLedger`.
+    pub(crate) far_call_ledger: FarCallLedger,
     /// Poll-head probe tally, feature-gated and at the tail for exactly the reason the field
     /// above is: this must not move `pending_flags` off its pinned offset. See
     /// `PollHeadProbeCounters`.
@@ -2961,6 +2989,7 @@ impl Default for CpuGsw {
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
             has_aperture_code: ApertureCodeFlag(false),
+            far_call_ledger: FarCallLedger::default(),
             #[cfg(feature = "poll-head-probe")]
             poll_head_probe: PollHeadProbeCounters::default(),
             #[cfg(all(

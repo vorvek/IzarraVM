@@ -98,16 +98,16 @@ fn flags_copy_bytes() -> Vec<u8> {
 #[cfg(target_os = "windows")]
 fn rsi_save_bytes() -> Vec<u8> {
     let mut e = Encoder::new();
-    // `STACK_SAVED_RSI` == `BASE_STACK_LEN`, 176 since L8's `STACK_FAR_CALL_NATIVE` slot (160)
-    // plus its alignment padding grew the frame from 160.
-    e.store_r64_disp32(Reg::RSP, 176, Reg::RSI);
+    // `STACK_SAVED_RSI` == `BASE_STACK_LEN`, back to 160 since the 2026-09-01 reprice moved
+    // L8's far-CALL ledger out of the frame and into `CpuGsw`.
+    e.store_r64_disp32(Reg::RSP, 160, Reg::RSI);
     e.finish()
 }
 
 #[cfg(target_os = "windows")]
 fn rsi_restore_bytes() -> Vec<u8> {
     let mut e = Encoder::new();
-    e.load_r64_disp32(Reg::RSI, Reg::RSP, 176);
+    e.load_r64_disp32(Reg::RSI, Reg::RSP, 160);
     e.finish()
 }
 
