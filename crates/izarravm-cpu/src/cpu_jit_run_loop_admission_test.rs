@@ -29,10 +29,16 @@ const RUN_ENTRY: u32 = 0x100;
 /// The predecessor block: `OR AL,AL` then `JNZ`. `Jcc` is a terminal, so the walk installs these
 /// two slots and stops, and its fallthrough static successor is the `RETF`.
 const PRED: u32 = 0x101;
-/// The address the whole fixture is about: a bare `RETF`, the not-taken fallthrough.
-const RETF_AT: u32 = 0x105;
-/// The taken arm. Never reached, since AL is zero on every visit.
-const TAKEN: u32 = 0x109;
+/// The address the whole fixture is about: the not-taken fallthrough, and always a
+/// non-continuable entry.
+const FALLTHROUGH: u32 = 0x105;
+
+/// A bare `RETF`: non-continuable AND lowerable, so the break-site probe can carry it all the way
+/// to a compiled block.
+const RETF: [u8; 1] = [0xcb];
+/// `CALL FAR 0020:0400`: non-continuable and NOT lowerable. `0x9a` has no `classify` arm anywhere
+/// in `jit/direct.rs`, so a walk starting here stops before its first instruction.
+const CALL_FAR: [u8; 5] = [0x9a, 0x00, 0x04, 0x20, 0x00];
 
 /// Where the far return goes: selector 0x0020 (base 0x200) at offset 0x0400, linear 0x600.
 const TARGET_SELECTOR: u16 = 0x0020;
@@ -54,20 +60,25 @@ const MEMORY_LEN: usize = 0x1_0000;
 /// absent class" assertion non-vacuous.
 const VISITS: usize = 10;
 
-fn program() -> Vec<u8> {
+fn program(fallthrough: &[u8]) -> Vec<u8> {
     let mut memory = vec![0u8; MEMORY_LEN];
     memory[RUN_ENTRY as usize] = 0x90; // nop
+    let taken = FALLTHROUGH as usize + fallthrough.len();
     memory[PRED as usize..PRED as usize + 4].copy_from_slice(&[
-        0x08, 0xc0, // or al,al
-        0x75, 0x04, // jnz TAKEN
+        0x08,
+        0xc0, // or al,al
+        0x75,
+        fallthrough.len() as u8, // jnz over the fallthrough
     ]);
-    memory[RETF_AT as usize] = 0xcb; // retf
+    memory[FALLTHROUGH as usize..FALLTHROUGH as usize + fallthrough.len()]
+        .copy_from_slice(fallthrough);
     // Self-loops, not `HLT`: this fixture is V86 at CPL 3, where `HLT` is a #GP and the run
-    // would never reach the far return at all. Neither self-loop is ever RETIRED -- the driver
+    // would never reach the far transfer at all. Neither self-loop is ever RETIRED -- the driver
     // stops the moment EIP arrives.
-    memory[TAKEN as usize..TAKEN as usize + 2].copy_from_slice(&[0xeb, 0xfe]);
+    memory[taken..taken + 2].copy_from_slice(&[0xeb, 0xfe]);
     memory[TARGET_LINEAR as usize..TARGET_LINEAR as usize + 2].copy_from_slice(&[0xeb, 0xfe]);
     // The far return frame, exactly as a `push cs; push ip` pair leaves it: offset then selector.
+    // Ignored by the `CALL FAR` arm, which carries its target in the instruction.
     let sp = STACK_SP as usize;
     memory[sp..sp + 2].copy_from_slice(&TARGET_OFFSET.to_le_bytes());
     memory[sp + 2..sp + 4].copy_from_slice(&TARGET_SELECTOR.to_le_bytes());
@@ -97,6 +108,10 @@ fn v86_cpu() -> CpuGsw {
 /// The machine every arm starts from. `jit` decides whether the Direct backend admits at all, so
 /// the same helper builds the native arm and the interpreted control.
 fn staged(jit: bool) -> (CpuGsw, TestBus) {
+    staged_with(jit, &RETF)
+}
+
+fn staged_with(jit: bool, fallthrough: &[u8]) -> (CpuGsw, TestBus) {
     // The arm is stated, in both directions, rather than read off the ambient
     // IZARRAVM_DIRECT_RETF_V86: the suite runs on both legs and a fixture that leaned on the
     // default would be testing the refusal on one of them.
@@ -110,15 +125,15 @@ fn staged(jit: bool) -> (CpuGsw, TestBus) {
     // `MIN_STANDALONE_INSTRUCTIONS`, so leaving it on would refuse every native entry.
     cpu.jit_direct.set_defer_short_for_test(false);
     cpu.jit_direct.enable_barrier_census_for_test();
-    let mut bus = TestBus::with_memory(program());
+    let mut bus = TestBus::with_memory(program(fallthrough));
     bus.direct_pages_enabled = true;
     bus.direct_page_clocks = true;
     arm(&mut cpu);
     (cpu, bus)
 }
 
-/// Seed one visit: back at the `NOP`, AL clear so the `Jcc` falls through to the `RETF`, and the
-/// far return frame back under SP.
+/// Seed one visit: back at the `NOP`, AL clear so the `Jcc` falls through, and the far return
+/// frame back under SP.
 fn arm(cpu: &mut CpuGsw) {
     cpu.halted = false;
     cpu.interrupt_shadow = false;
@@ -128,7 +143,7 @@ fn arm(cpu: &mut CpuGsw) {
     cpu.set_eip(RUN_ENTRY);
 }
 
-/// Walk the fixture once, from the `NOP` to the far return's landing site.
+/// Walk the fixture once, from the `NOP` to the far transfer's landing site.
 fn visit(cpu: &mut CpuGsw, bus: &mut TestBus) {
     arm(cpu);
     for _ in 0..32 {
@@ -138,7 +153,7 @@ fn visit(cpu: &mut CpuGsw, bus: &mut TestBus) {
         cpu.run_straight_line(bus, u64::MAX).unwrap();
     }
     panic!(
-        "the guest never reached the far return target, stuck at {:#x}",
+        "the guest never reached the far transfer target, stuck at {:#x}",
         cpu.linear_eip()
     );
 }
@@ -250,5 +265,36 @@ fn break_site_admission_does_not_change_the_guest_visible_outcome() {
     assert_eq!(
         native_bus.memory, interp_bus.memory,
         "guest RAM must be untouched by where the run ended"
+    );
+}
+
+/// The gate on the break-site probe: an entry the compile walk cannot CARRY is not probed at all.
+///
+/// `0x9a` has no `classify` arm, so a walk starting on it stops before its first instruction and
+/// structurally rejects. Probing there would move the census label from `absent` to `rejected` and
+/// buy the guest nothing, while the probe itself recurred on every visit -- on
+/// 15-move-hole-puzzle that is 116 M visits to ten such sites and about 4% of the wall. The gate
+/// is what keeps that cost off the table until `0x9a` grows an arm, at which point the same
+/// predicate admits it with no edit here.
+#[test]
+fn a_non_continuable_entry_the_walk_cannot_carry_is_not_probed() {
+    let (mut cpu, mut bus) = staged_with(true, &CALL_FAR);
+    for _ in 0..VISITS {
+        visit(&mut cpu, &mut bus);
+    }
+
+    assert_eq!(
+        cpu.jit_direct.len(),
+        1,
+        "only the predecessor may compile; the CALL FAR entry must never be walked"
+    );
+    assert!(
+        class(&cpu, "absent") > 0,
+        "the CALL FAR entry stays absent, which is the zero-cost answer for an entry that          cannot lower"
+    );
+    assert_eq!(
+        class(&cpu, "rejected"),
+        0,
+        "a probe at the CALL FAR entry would relocate the class to `rejected` for no gain"
     );
 }

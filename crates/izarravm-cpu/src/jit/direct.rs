@@ -6515,6 +6515,21 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
         || (matches!(insn.opcode, 0xc4 | 0xc5) && insn.operand_size == OperandSize::Word)
 }
 
+/// Whether a compile walk that STARTED at this non-continuable instruction could carry it.
+///
+/// Exactly the walk's own per-slot admission (`compile_with_budget`'s `continuable` term) with
+/// the `insn.continuable` half dropped, because the caller has already screened that half false.
+/// The run loop's break-site probe asks this before spending an admission chain: an opcode the
+/// walk cannot carry produces a zero-instruction span and a structural reject, which buys the
+/// census a `rejected` label instead of an `absent` one and buys the guest nothing, while the
+/// probe itself would recur on every visit to the address. The measured shape is the ten
+/// `CALL FAR imm16:16` sites on 15-move-hole-puzzle: 116 M visits, no lowering, about 4% of the
+/// wall. When an opcode grows a `classify` arm this predicate admits it and the break-site probe
+/// starts paying for itself, with no second edit here.
+pub(crate) fn walk_admits_non_continuable_entry(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
+    jit_admits_non_continuable(insn) || retf_admitted_here(cpu, insn)
+}
+
 pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> CompileOutcome {
     compile_with_page_len(cpu, entry_lin, d, super::exec_mem::host_page_len())
 }

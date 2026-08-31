@@ -796,14 +796,35 @@ impl CpuGsw {
                             // Let the Direct dispatcher SEE this address before the run ends.
                             // Admission only; nothing is entered, and the break below is
                             // unchanged. See `probe_admit_at_break`.
+                            //
+                            // Gated on the walk being able to CARRY this opcode. The line fetch
+                            // is one array index and it happens on the break path only, where the
+                            // run is ending anyway; without it the probe would recur forever at
+                            // every address whose entry the walk refuses, which on
+                            // 15-move-hole-puzzle is 116 M visits to ten `CALL FAR` sites that
+                            // cannot lower and cost about 4% of the wall. The predicate admits
+                            // each opcode as it grows a `classify` arm, so this gate opens on its
+                            // own.
                             #[cfg(feature = "jit")]
-                            self.probe_admit_at_break(
-                                bus,
-                                native_continuations_active,
-                                screen,
-                                lin,
-                                cs.default_size_32,
-                            )?;
+                            {
+                                let entry_view = match held_view {
+                                    Some(view) => Some(view),
+                                    None => self.decode_cache.get_view(lin, cs.default_size_32),
+                                };
+                                if let Some(view) = entry_view
+                                    && jit::direct::walk_admits_non_continuable_entry(
+                                        self, &view.insn,
+                                    )
+                                {
+                                    self.probe_admit_at_break(
+                                        bus,
+                                        native_continuations_active,
+                                        screen,
+                                        lin,
+                                        cs.default_size_32,
+                                    )?;
+                                }
+                            }
                             break;
                         }
                         if (lin & 0xfff) + u32::from(screen.len) > 0x1000 {
