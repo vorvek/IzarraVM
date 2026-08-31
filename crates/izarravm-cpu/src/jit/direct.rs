@@ -12686,13 +12686,13 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 /// yielding machinery; `run_string`'s `prefixes.rep == None` arm is exactly one `string_step` with
 /// no yield, which is what makes the unprefixed form a single-step object at all.
 ///
-/// # NOT on the `OperandSize::Word` allowlist, deliberately
+/// # On the `OperandSize::Word` allowlist since the tyrian-486 intro census
 ///
-/// The census rows are 32-bit (LODSD, STOSD) and no fixture measures a 16-bit string row, so the
-/// Word gate above keeps these arms unreachable in a CS.D = 0 segment. That is the campaign's
-/// standing refusal on unmeasured admissions rather than a width hazard: the helper runs the
-/// decode line through the interpreter, so there is no width field to get wrong and the Word entry
-/// would be one line away the day a census asks for it.
+/// The original census rows were 32-bit (LODSD, STOSD). The helper runs the decode line through
+/// the interpreter, so there is no width field to get wrong. tyrian-486 at t=2.5 now ranks
+/// unprefixed `0xAC` LODSB and `0xAA` STOSB as hard boundaries in a CS.D = 0 segment (92291 and
+/// 39678 runtime hits on a 6 guest-second intro budget). The Word entries are what let those
+/// arms run there. `IZARRAVM_GENERIC_CALLOUT=off` still falls through to `None`.
 ///
 /// # WHAT PRICED THE FLIP
 ///
@@ -15108,6 +15108,11 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 | 0x99
                 | 0xa0
                 | 0xa2
+                // The four unprefixed string families, the tyrian-486 intro census. Without these
+                // entries the `generic_callout_enabled` arms below never run in a CS.D = 0
+                // segment. Knob-off still falls through to None. INS/OUTS 0x6C-0x6F are not here.
+                | 0xa4..=0xa7
+                | 0xaa..=0xaf
                 | 0xa8
                 | 0xb0..=0xb7
                 | 0xb8..=0xbf
@@ -16960,9 +16965,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // NO WIDTH to get wrong and none carried: the helper runs the decode line, so the
             // element width is `execute_string_decoded`'s own choice from the opcode's low bit and
-            // `insn.operand_size`. These opcodes are deliberately NOT on the `OperandSize::Word`
-            // allowlist above, so a 16-bit code segment never reaches this arm at all; the measured
-            // rows are 32-bit and an unmeasured Word admission is the campaign's standing refusal.
+            // `insn.operand_size`. These opcodes are on the Word allowlist (tyrian-486 intro:
+            // LODSB/STOSB). A 16-bit code segment reaches this arm; knob-off still returns None.
             0xa4 | 0xa5 if generic_callout_enabled() => {
                 return Some(DirectKind::CallOut {
                     helper: CallOutHelper::InterpretOne {
@@ -17317,8 +17321,11 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             }
             0xf6 | 0xf7 => {
                 let m = insn.modrm?;
-                // GROUP 3 AT WORD, `/2../7`, as `InterpretOne` call-outs. The S3 policy widening's
-                // fourth row: NOT, NEG, MUL, IMUL, DIV and IDIV, both operand forms.
+                // GROUP 3, `/2../7`, as `InterpretOne` call-outs. S3 admitted `0xF7` at Word.
+                // tyrian-486 intro ranks byte `0xF6 /3` NEG and `/4` MUL as the two largest
+                // unbound hard boundaries (77602 and 45651 on a 6 guest-second budget). `0xF6`
+                // is already on the Word allowlist; without this clause it falls through to
+                // `m.reg != 0 { return None }`.
                 //
                 // FIRST in the arm, and that placement is the whole safety argument. Every
                 // lowering below carries NO width field and says so in its own comment: `NegReg`
@@ -17326,8 +17333,13 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // merging DX and AX, `DivReg`/`DivMem` read four bytes. Each names the
                 // `OperandSize::Word` gate as the only thing keeping a 66-prefixed form away from
                 // it. That gate now admits `0xf7 /2../7`, so the guard has to move HERE, in front
-                // of them, or every one of those comments becomes a miscompile. The Dword forms
-                // fall past this and reach their emitters unchanged.
+                // of them, or every one of those comments becomes a miscompile. The Dword F7
+                // forms fall past this and reach their emitters unchanged. F6 is the byte form
+                // at every operand_size (unprefixed F6 in a 32-bit segment included); do not
+                // Word-gate the F6 half.
+                //
+                // `/0` TEST stays below, native. `/1` stays the refuse. Do not write `/0../7`
+                // or `/1../7`.
                 //
                 // `/2` NOT has no lowering at any width and is a call-out at Word only, which is
                 // where the census measures it. Widening it to Dword would be an unmeasured
@@ -17340,9 +17352,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // reports the prefix only. It is the first admitted row whose fault arm fires on
                 // ORDINARY DATA rather than on a bad address, which is why it has a fixture of its
                 // own.
-                if opcode == 0xf7
-                    && insn.operand_size == OperandSize::Word
-                    && matches!(m.reg, 2..=7)
+                if matches!(m.reg, 2..=7)
+                    && (opcode == 0xf6
+                        || (opcode == 0xf7 && insn.operand_size == OperandSize::Word))
                 {
                     return Some(DirectKind::CallOut {
                         helper: CallOutHelper::InterpretOne {
@@ -17375,10 +17387,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // 586-mode `66 F7 /4` out, and a 16-bit MUL writes DX and AX as halves of the
                 // existing EDX and EAX rather than replacing them.
                 //
-                // `opcode == 0xf7` is load-bearing on the MEMORY form for the reason it is
-                // load-bearing on the /5 arm below: `0xF6 /4` is the BYTE MUL, which multiplies AL
-                // and writes only AX. Without the test it would be read as a dword and lowered as
-                // the dword multiply, writing EAX and EDX whole.
+                // `opcode == 0xf7` is still load-bearing on the MEMORY form if the FIRST arm above
+                // ever loses F6: `0xF6 /4` is the BYTE MUL, which multiplies AL and writes only AX.
+                // Without the test it would be read as a dword and lowered as the dword multiply,
+                // writing EAX and EDX whole. FIRST currently intercepts F6 `/2../7` as InterpretOne
+                // before this arm; `byte_mul_imul_memory_forms_join_as_call_outs_with_the_gate_on`
+                // pins that F6 /4 still joins as a call-out with MUL_MEM_ROWS on.
                 //
                 // The MEMORY form is the 2026-08-29 gp2-586 census's `0xF7 /4 memory dword` row at
                 // 13.1 M interpreted hits, the second head of that fixture's rejected class, and it
@@ -17420,12 +17434,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // (It formerly cited a `mul_memory_form_stays_interpreter_only` that has never
                 // existed in this tree; the citation is repaired here rather than left dangling.)
                 //
-                // `opcode == 0xf7` is equally load-bearing: this arm sits inside the shared
-                // `0xf6 | 0xf7` group arm, and 0xF6 /5 is the BYTE IMUL, which multiplies AL and
-                // writes only AX. Without the test it would be read as a dword and lowered as the
-                // dword multiply. `grp3_imul_neighbouring_forms_remain_interpreter_only`'s byte
-                // case is what catches that. (It formerly cited an
-                // `imul_byte_form_stays_interpreter_only` that has never existed in this tree.)
+                // `opcode == 0xf7` is equally load-bearing if FIRST ever loses F6: this arm sits
+                // inside the shared `0xf6 | 0xf7` group arm, and 0xF6 /5 is the BYTE IMUL, which
+                // multiplies AL and writes only AX. Without the test it would be read as a dword
+                // and lowered as the dword multiply.
+                // `byte_mul_imul_memory_forms_join_as_call_outs_with_the_gate_on` pins that F6 /5
+                // still joins as a call-out rather than as `ImulMemAcc`.
                 //
                 // No width field and no raw_clocks field. The OperandSize::Word gate above keeps a
                 // 66-prefixed form out, and the whole group-3 arm returns clocks(2), which is
@@ -27679,7 +27693,9 @@ pub(crate) enum InterpretOneRow {
     Xchg,
     /// `0x0FA3`, `0x0FAB`, `0x0FB3`, `0x0FBB` and `0x0FBA`.
     BitString,
-    /// `0xF7` group 3 at Word: `/2../7` both forms, and `/0` through memory.
+    /// Group 3 as a call-out: `0xF7 /2../7` at Word (S3), `0xF6 /2../7` at any
+    /// operand size (tyrian-486 intro), and `0xF7 /0` through memory at Word.
+    /// The JSON census label stays `0xf7_group3_word`.
     Group3,
     /// `0xFE` `/0` and `/1`, memory form.
     IncDecRm8,

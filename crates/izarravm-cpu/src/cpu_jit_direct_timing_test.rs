@@ -1592,80 +1592,73 @@ fn grp3_imul_memory_form_materializes_a_live_descriptor_first() {
     }
 }
 
-/// The negative list. Each case is PAIRED with `grp3_imul_memory_form_is_lowered` below; on its own
-/// any of these passes whenever the harness stops compiling for a reason unrelated to the opcode.
-/// Every fixture maps the target page, because not mapping it is exactly how the previous IMUL
-/// guard rail in this repository passed vacuously for two slices.
+/// The negative neighbour of `grp3_imul_memory_form_is_lowered`. On its own this assertion
+/// passes whenever the harness stops compiling for a reason unrelated to the opcode. The fixture
+/// maps the target page, because not mapping it is exactly how the previous IMUL guard rail in
+/// this repository passed vacuously for two slices.
+///
+/// The F7 /5 REGISTER form used to be a case here. The rejected-row campaign's Slice 2 lowered
+/// it (`DirectKind::ImulRegAcc`), so its admission is now pinned positively in
+/// `group3_dword_neg_register_form_is_lowered` and its behaviour in `cpu_jit_f7_group_test.rs`.
+///
+/// The 66-prefixed WORD memory IMUL used to be another. The S3 policy widening routes every
+/// Word group-3 form to an `InterpretOne` call-out BEFORE the /5 arm is reached, so it no
+/// longer stays out of the block -- but it still never reaches that arm, which is what this
+/// list is about. The claim moved to `group3_word_subops_join_as_call_outs_not_lowerings`
+/// (cpu_jit_test_imm_test.rs), which asserts the slot class directly rather than inferring it
+/// from the block ending.
+///
+/// F6 /5 byte IMUL used to be the last neighbour with no call-out. tyrian-486 intro admits
+/// `0xF6 /2../7` as InterpretOne in the Group3 FIRST arm, so that encoding now joins the
+/// block. The claim that it still never reaches `ImulMemAcc` moved to
+/// `byte_mul_imul_memory_forms_join_as_call_outs_with_the_gate_on`, which pins slot class.
+///
+/// The case left is F7 /4 memory with the MUL-memory gate OFF: it must NOT reach the /5 arm
+/// and has no call-out to take instead.
+///
+/// **The arm is FORCED, not inherited.** `IZARRAVM_MUL_MEM_ROWS` gates the MUL /4 memory case
+/// below (2026-08-29, `DirectKind::MulMemAcc`), and this fixture is about the /5 arm rather
+/// than about the gate: the claim it makes -- that a /4 never reaches /5 -- has to hold in the
+/// world where /4 memory has no lowering at all. Reading the ambient knob would also make this
+/// test order-dependent, because the positive MUL fixtures in this file force the arm ON on
+/// whatever libtest thread they land on.
 #[test]
 fn grp3_imul_neighbouring_forms_remain_interpreter_only() {
     const ENTRY: u32 = 0x101;
     const TARGET: u32 = 0x0003_0000;
-    let mut mul_mem = vec![0xf7u8, 0xa6]; // F7 /4 mod=10 rm=110: MUL dword [esi+disp32], UNSIGNED
-    mul_mem.extend_from_slice(&TARGET.to_le_bytes());
-    let mut byte_imul = vec![0xf6u8, 0xae]; // F6 /5 mod=10 rm=110: IMUL byte [esi+disp32]
-    byte_imul.extend_from_slice(&TARGET.to_le_bytes());
-    // The F7 /5 REGISTER form used to be a fourth case here. The rejected-row campaign's Slice 2
-    // lowered it (`DirectKind::ImulRegAcc`), so its admission is now pinned positively in
-    // `group3_dword_neg_register_form_is_lowered` and its behaviour in `cpu_jit_f7_group_test.rs`.
-    //
-    // The 66-prefixed WORD memory IMUL used to be a fifth. The S3 policy widening routes every
-    // Word group-3 form to an `InterpretOne` call-out BEFORE the /5 arm is reached, so it no
-    // longer stays out of the block -- but it still never reaches that arm, which is what this
-    // list is about. The claim moved to `group3_word_subops_join_as_call_outs_not_lowerings`
-    // (cpu_jit_test_imm_test.rs), which asserts the slot class directly rather than inferring it
-    // from the block ending.
-    //
-    // The two cases left are the ones that must NOT reach either /5 arm and have no call-out to
-    // take instead.
-    //
-    // **The arm is FORCED, not inherited.** `IZARRAVM_MUL_MEM_ROWS` gates the MUL /4 memory case
-    // below (2026-08-29, `DirectKind::MulMemAcc`), and this fixture is about the /5 arm rather
-    // than about the gate: the claim it makes -- that a /4 never reaches /5 -- has to hold in the
-    // world where /4 memory has no lowering at all. Reading the ambient knob would also make this
-    // test order-dependent, because the positive MUL fixtures in this file force the arm ON on
-    // whatever libtest thread they land on.
+    let mut code = vec![0xf7u8, 0xa6]; // F7 /4 mod=10 rm=110: MUL dword [esi+disp32], UNSIGNED
+    code.extend_from_slice(&TARGET.to_le_bytes());
     select_mul_mem_rows(false);
-    for (code, why) in [
-        (
-            mul_mem,
-            "MUL /4 memory: reaching the /5 arm would emit a SIGNED multiply",
-        ),
-        (
-            byte_imul,
-            "F6 /5 byte IMUL: reaching the /5 arm would read a dword and write EAX and EDX",
-        ),
-    ] {
-        let mut memory = vec![0; 0x0004_0000];
-        let mut block = code.clone();
-        block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
-        memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
-        let mut cpu = fresh();
-        make_data_segments_flat(&mut cpu);
-        cpu.registers.eip = ENTRY;
-        let mut bus = TestBus::with_memory(memory);
-        bus.direct_pages_enabled = true;
-        // Three warmed starts. Warming only the entry makes slot 1 miss, the walk stops at Retry,
-        // and the fewer-than-three-slots gate returns the same None a real reject would.
-        let starts = [
-            ENTRY,
-            ENTRY + code.len() as u32,
-            ENTRY + code.len() as u32 + 2,
-        ];
-        decode_fixture(&mut cpu, &mut bus, &starts);
-        map_direct_page(
-            &mut cpu,
-            &mut bus,
-            TARGET,
-            TARGET,
-            jit::fast_map::PagePermissions::UNPAGED,
-            true,
-            false,
-        );
-        assert!(
-            jit::direct::compile(&mut cpu, ENTRY, true).is_none(),
-            "{code:02x?} must stay interpreter-only: {why}"
-        );
-    }
+    let mut memory = vec![0; 0x0004_0000];
+    let mut block = code.clone();
+    block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+    memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
+    let mut cpu = fresh();
+    make_data_segments_flat(&mut cpu);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    // Three warmed starts. Warming only the entry makes slot 1 miss, the walk stops at Retry,
+    // and the fewer-than-three-slots gate returns the same None a real reject would.
+    let starts = [
+        ENTRY,
+        ENTRY + code.len() as u32,
+        ENTRY + code.len() as u32 + 2,
+    ];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    map_direct_page(
+        &mut cpu,
+        &mut bus,
+        TARGET,
+        TARGET,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    assert!(
+        jit::direct::compile(&mut cpu, ENTRY, true).is_none(),
+        "{code:02x?} must stay interpreter-only: MUL /4 memory: reaching the /5 arm would emit a SIGNED multiply"
+    );
 }
 
 #[test]
@@ -2148,48 +2141,62 @@ fn grp3_mul_memory_form_is_lowered_with_the_gate_on() {
     );
 }
 
-/// THE BYTE NEIGHBOUR, and it must stay refused with the gate ON. `0xF6 /4` is the BYTE MUL: it
-/// multiplies AL and writes only AX. Reaching the dword arm would read four bytes and replace EAX
-/// and EDX whole. `opcode == 0xf7` in the classify arm is the only thing stopping it, and this is
-/// the fixture that holds that test in place -- the gate is forced ON precisely so that the
-/// refusal cannot be the gate's doing.
+/// THE BYTE NEIGHBOURS of the dword MUL/IMUL memory arms. `0xF6 /4` multiplies AL and writes
+/// only AX; `0xF6 /5` is the signed sibling. Reaching `MulMemAcc` / `ImulMemAcc` would read four
+/// bytes and replace EAX and EDX whole.
+///
+/// The Group3 FIRST arm now admits F6 `/2../7` as InterpretOne, so these encodings join the
+/// block. Slot class is the claim: instruction count alone cannot say a mutant that lost F6
+/// from FIRST and dropped `opcode == 0xf7` on the dword memory arm did not lower them as
+/// dwords. The MUL-memory gate is forced ON and the target page is mapped so that steal can
+/// compile native (`slots == 0`); a CallOut admission does not need the map, but the native
+/// steal does.
 #[test]
-fn byte_mul_memory_form_stays_interpreter_only_with_the_gate_on() {
+fn byte_mul_imul_memory_forms_join_as_call_outs_with_the_gate_on() {
     const ENTRY: u32 = 0x101;
     const TARGET: u32 = 0x0003_0000;
     select_mul_mem_rows(true);
-    let mut code = vec![0xf6u8, 0xa6]; // F6 /4 mod=10 rm=110: MUL byte [esi+disp32]
-    code.extend_from_slice(&TARGET.to_le_bytes());
-    let mut memory = vec![0; 0x0004_0000];
-    let mut block = code.clone();
-    block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
-    memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
-    let mut cpu = fresh();
-    make_data_segments_flat(&mut cpu);
-    cpu.registers.eip = ENTRY;
-    let mut bus = TestBus::with_memory(memory);
-    bus.direct_pages_enabled = true;
-    let starts = [
-        ENTRY,
-        ENTRY + code.len() as u32,
-        ENTRY + code.len() as u32 + 2,
-    ];
-    decode_fixture(&mut cpu, &mut bus, &starts);
-    // Mapped on purpose. Not mapping the target page is exactly how an earlier IMUL guard rail in
-    // this repository passed vacuously for two slices.
-    map_direct_page(
-        &mut cpu,
-        &mut bus,
-        TARGET,
-        TARGET,
-        jit::fast_map::PagePermissions::UNPAGED,
-        true,
-        false,
-    );
-    assert!(
-        jit::direct::compile(&mut cpu, ENTRY, true).is_none(),
-        "F6 /4 byte MUL: reaching the dword arm would read a dword and write EAX and EDX"
-    );
+    for (modrm, why) in [
+        (0xa6u8, "F6 /4 byte MUL"), // mod=10 rm=110: MUL byte [esi+disp32]
+        (0xae, "F6 /5 byte IMUL"),  // mod=10 rm=110: IMUL byte [esi+disp32]
+    ] {
+        let mut code = vec![0xf6, modrm];
+        code.extend_from_slice(&TARGET.to_le_bytes());
+        let mut memory = vec![0; 0x0004_0000];
+        let mut block = code.clone();
+        block.extend_from_slice(&[0x89, 0xf6, 0x89, 0xff, 0xf4]);
+        memory[ENTRY as usize..ENTRY as usize + block.len()].copy_from_slice(&block);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let starts = [
+            ENTRY,
+            ENTRY + code.len() as u32,
+            ENTRY + code.len() as u32 + 2,
+        ];
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        map_direct_page(
+            &mut cpu,
+            &mut bus,
+            TARGET,
+            TARGET,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            false,
+        );
+        let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+            .unwrap_or_else(|| panic!("{why} must join the block as a call-out"));
+        assert_eq!(
+            compilation.span.instructions, 3,
+            "{why} must carry the whole three-slot block"
+        );
+        assert_eq!(
+            compilation.callout_interpret_one_slots, 1,
+            "{why}: reaching the dword arm would read a dword and write EAX and EDX"
+        );
+    }
 }
 
 /// The shipped default, read AMBIENT on purpose -- no override -- so it also fails if
