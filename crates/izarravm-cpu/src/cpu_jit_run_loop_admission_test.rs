@@ -487,10 +487,17 @@ fn a_walk_admissible_non_probe_opcode_is_never_probed_at_a_break_site() {
             .unbound_targets
     );
     assert_eq!(
-        class(&cpu, "rejected") + class(&cpu, "seen") + class(&cpu, "compiled"),
+        class(&cpu, "no_key")
+            + class(&cpu, "seen")
+            + class(&cpu, "dormant_heat")
+            + class(&cpu, "dormant_other")
+            + class(&cpu, "rejected")
+            + class(&cpu, "compiled")
+            + class(&cpu, "compiled_retired"),
         0,
-        "a break-site probe at the IMUL would show up as one of these classes; none may move: \
-         {:?}",
+        "a break-site probe at the IMUL would show up as one of these classes -- every class but \
+         `absent` -- so a future heat-gate change that parks the IMUL entry dormant instead of \
+         rejecting it cannot slip past this fixture unnoticed; none may move: {:?}",
         cpu.direct_barrier_census_snapshot()
             .unwrap()
             .unbound_targets
