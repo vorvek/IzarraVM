@@ -2601,21 +2601,41 @@ impl CpuBus for MachineBus<'_> {
         // Safe on the SAME grounds the `0xE4` call-out's per-port safety table
         // already certifies for this exact port class (`jit/direct.rs`,
         // `classify`'s `0xe4` arm): `read_port_at` is a pure peek against
-        // `elapsed_pit_clocks`. It does not advance the counter's own
-        // reload/decrement schedule and it does not touch the PIC, so a guest
-        // that polls 0x40-0x42 and expects an IRQ cannot observe a stale pendency
-        // answer -- nothing about `interrupt_pending()` moves because this byte
-        // was read. That is a stronger, port-specific proof than "ring-0 monitor
-        // bookkeeping is not guest-visible activity" (the `skip_io_touched`
-        // rationale), so it composes with a guest access the ring-0 exemption was
-        // never meant to cover, and does not touch `skip_io_touched` or
-        // `exempt_io_touched` at all -- exactly the 3DA/0x61 shape, not the
-        // ring-0-monitor shape.
+        // `elapsed_pit_clocks` WHEN the counter is binary-programmed. It does not
+        // advance the counter's own reload/decrement schedule and it does not
+        // touch the PIC, so a guest that polls 0x40-0x42 and expects an IRQ
+        // cannot observe a stale pendency answer -- nothing about
+        // `interrupt_pending()` moves because this byte was read. That is a
+        // stronger, port-specific proof than "ring-0 monitor bookkeeping is not
+        // guest-visible activity" (the `skip_io_touched` rationale), so it
+        // composes with a guest access the ring-0 exemption was never meant to
+        // cover, and does not touch `skip_io_touched` or `exempt_io_touched` at
+        // all -- exactly the 3DA/0x61 shape, not the ring-0-monitor shape.
+        //
+        // THE BCD LEG (mirrors the 0x61 arm's own BCD fallback exactly). For a
+        // BCD-programmed counter `count_after` declines and `Counter::read` falls
+        // back to `masked_count()` -- the frozen batch-start CE, not a live one --
+        // so the peek's "changes only the VALUE, never whether the batch ends"
+        // premise above does NOT hold for this leg: the value itself is already
+        // stale for the whole batch. In the Approximate class nothing else
+        // refreshes it (`fine_batch_grain_required` is never consulted here), so
+        // exempting a BCD read from io_touched would let a guest spin an entire
+        // coarse batch on one frozen byte. `counter_is_bcd` is checked BEFORE the
+        // exemption decision -- not folded into `read_port_at`'s `Option`, which
+        // already means "not a PIT port" and mutates latch/read-order state on
+        // every call -- so a BCD read always takes the exact non-lazy path
+        // (io_touched set, unless the unrelated ring-0-monitor exemption applies),
+        // in every timing class, exactly like 0x61's BCD fallback.
         if matches!(port, 0x40..=0x42) {
             let elapsed_pit_clocks = self.elapsed_pit_clocks();
             if let Some(value) = self.pit.read_port_at(port, elapsed_pit_clocks) {
                 self.note_pit_observer();
-                if !(self.lazy_port_reads || self.lazy_ports_386) && !skip_io_touched {
+                let bcd = self.pit.counter_is_bcd(port);
+                if bcd {
+                    if !skip_io_touched {
+                        *self.io_touched = true;
+                    }
+                } else if !(self.lazy_port_reads || self.lazy_ports_386) && !skip_io_touched {
                     *self.io_touched = true;
                 }
                 return Ok(u32::from(value));
