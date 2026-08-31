@@ -793,6 +793,17 @@ impl CpuGsw {
                         if !screen.continuable {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_not_continuable += 1;
+                            // Let the Direct dispatcher SEE this address before the run ends.
+                            // Admission only; nothing is entered, and the break below is
+                            // unchanged. See `probe_admit_at_break`.
+                            #[cfg(feature = "jit")]
+                            self.probe_admit_at_break(
+                                bus,
+                                native_continuations_active,
+                                screen,
+                                lin,
+                                cs.default_size_32,
+                            )?;
                             break;
                         }
                         if (lin & 0xfff) + u32::from(screen.len) > 0x1000 {
@@ -1398,15 +1409,31 @@ impl CpuGsw {
             | u8::from(self.stack_is_32bit())
     }
 
+    /// The admission half of the Direct dispatcher: everything from the cheap refusals through
+    /// probe, compile, install and link publication, stopping short of entering the block.
+    ///
+    /// Split out of `try_direct_continuation` so the run loop can run the same chain at a
+    /// NON-CONTINUABLE block entry, where the loop breaks before any dispatch and the address
+    /// would otherwise never be keyed at all (see `probe_admit_at_break`). Returns the admitted
+    /// block's id, which the caller re-fetches; `None` is every refusal the single function used
+    /// to answer with `DirectContinuation::Interpret` in this span.
+    ///
+    /// The published-link step is INSIDE this function on purpose. `install` alone leaves a block
+    /// invisible to links; `revalidate_translation` is what inserts the portal into
+    /// `linear_blocks` and resolves a predecessor's parked cell, which is the whole point of
+    /// admitting at a break site. It publishes, it does not execute.
+    ///
+    /// `via_break_probe` marks the break-site caller. It only suppresses the Dormant recovery
+    /// bookkeeping on an already-`Rejected` key: see that arm.
     #[cfg(feature = "jit")]
-    fn try_direct_continuation<B: CpuBus>(
+    fn try_admit_direct_block<B: CpuBus>(
         &mut self,
         bus: &mut B,
         screen: DecodeScreenView,
         lin: u32,
         d: bool,
-        budget: ContinuationBudget,
-    ) -> Result<DirectContinuation, CpuError> {
+        via_break_probe: bool,
+    ) -> Result<Option<jit::direct::BlockId>, CpuError> {
         // With the 16-bit level at 0 a 16-bit code segment can never produce a block (`key_for`
         // then refuses on `!d`), so this function would return Interpret for every such boundary
         // anyway -- but only after a decode-cache line lookup, a hotness mutation and the probe
@@ -1434,13 +1461,13 @@ impl CpuGsw {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::JIT16_LEVEL_ZERO);
             ea_end!(Population::Refused);
-            return Ok(DirectContinuation::Interpret);
+            return Ok(None);
         }
         if !self.mode().uses_approximate_timing() {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::APPROXIMATE_TIMING);
             ea_end!(Population::Refused);
-            return Ok(DirectContinuation::Interpret);
+            return Ok(None);
         }
         // Emission-shape synchronisation, BEFORE the probe so a compile below emits what this
         // bus needs. `JitState::native_fetch_trace` carries the whole argument; the cost here
@@ -1451,7 +1478,7 @@ impl CpuGsw {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::AUTO_ADMIT);
             ea_end!(Population::Refused);
-            return Ok(DirectContinuation::Interpret);
+            return Ok(None);
         }
         if !self
             .decode_cache
@@ -1465,7 +1492,7 @@ impl CpuGsw {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::DIRECT_HOT_AT);
             ea_end!(Population::Refused);
-            return Ok(DirectContinuation::Interpret);
+            return Ok(None);
         }
         // Sticky-decline memo (`dev_docs/sticky-decline-memo-design.md`). Exactly where §1.3 puts
         // it: AFTER `direct_hot_at`, so the pack load is shared and the hotness byte still
@@ -1491,7 +1518,7 @@ impl CpuGsw {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::DECLINE_MEMO_HIT);
             ea_end!(Population::Refused);
-            return Ok(DirectContinuation::Interpret);
+            return Ok(None);
         }
         ea_mark!(Phase::DispatchGates);
         let Some(key) = jit::direct::key_for_phys(self, lin, d, screen.phys_start) else {
@@ -1503,7 +1530,7 @@ impl CpuGsw {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::KEY_FOR_PHYS_NONE);
             ea_end!(Population::Refused);
-            return Ok(DirectContinuation::Interpret);
+            return Ok(None);
         };
         ea_mark!(Phase::Key);
         let probe = self.jit_direct.probe(key);
@@ -1516,9 +1543,28 @@ impl CpuGsw {
                 ea_mark!(Phase::Refused);
                 ea_refusal!(site::PROBE_INTERPRET);
                 ea_end!(Population::Refused);
-                return Ok(DirectContinuation::Interpret);
+                return Ok(None);
             }
             jit::direct::BlockProbe::Rejected => {
+                // Break-site fast path. A non-continuable entry that has already settled on
+                // `Rejected` is asked again on every single visit -- 116 M times per corpus run at
+                // the ten `CALL FAR` sites on 15-move-hole-puzzle -- and none of the recovery
+                // bookkeeping below can change what a later static exit sees there: the
+                // `Rejected` state was written the first time the walk structurally refused, and
+                // that is already what the barrier census reads. Running the heat sync, the
+                // dormant lift and the memo write on every one of those visits would add a
+                // recurring cost to a path that pays nothing today, so the break-site caller
+                // stops here. The dispatch caller is unchanged.
+                //
+                // The admission-decline census note is skipped with it, deliberately: a
+                // break-site probe is an ask the instrument never used to see, and counting it
+                // would inflate that histogram rather than measure it.
+                if via_break_probe {
+                    ea_mark!(Phase::Refused);
+                    ea_refusal!(site::PROBE_REJECTED);
+                    ea_end!(Population::Refused);
+                    return Ok(None);
+                }
                 #[cfg(feature = "direct-admission-census")]
                 if self.jit_direct.barrier_census_active()
                     && let Some(kind) = self.jit_direct.classify_rejected_probe(key)
@@ -1573,7 +1619,7 @@ impl CpuGsw {
                 ea_mark!(Phase::Refused);
                 ea_refusal!(site::PROBE_REJECTED);
                 ea_end!(Population::Refused);
-                return Ok(DirectContinuation::Interpret);
+                return Ok(None);
             }
             jit::direct::BlockProbe::Ready(id) => self
                 .jit_direct
@@ -1619,7 +1665,7 @@ impl CpuGsw {
                         ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::HEAT_DEMOTE);
                         ea_end!(Population::Compile);
-                        return Ok(DirectContinuation::Interpret);
+                        return Ok(None);
                     }
                 }
                 let compile_start = std::time::Instant::now();
@@ -1638,7 +1684,7 @@ impl CpuGsw {
                         ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::STRUCTURAL_REJECT);
                         ea_end!(Population::Compile);
-                        return Ok(DirectContinuation::Interpret);
+                        return Ok(None);
                     }
                     jit::direct::CompileOutcome::Retry(cause) => {
                         self.jit_direct.dormant(
@@ -1649,7 +1695,7 @@ impl CpuGsw {
                         ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::COMPILE_RETRY);
                         ea_end!(Population::Compile);
-                        return Ok(DirectContinuation::Interpret);
+                        return Ok(None);
                     }
                 };
                 // G4 guarantee (dev_docs/specs/2026-07-15-smc-hardening-design.md): a block only
@@ -1673,7 +1719,7 @@ impl CpuGsw {
                     ea_mark_coarse!(Phase::Compile);
                     ea_compile_site!(compile_site::PAGE_COVER_FAILED);
                     ea_end!(Population::Compile);
-                    return Ok(DirectContinuation::Interpret);
+                    return Ok(None);
                 }
                 // G1 pre-install gate (full span): the compiled block may cover chunks past its
                 // entry that are churning even when the entry chunk is cold. Refuse installation
@@ -1709,7 +1755,7 @@ impl CpuGsw {
                         ea_mark_coarse!(Phase::Compile);
                         ea_compile_site!(compile_site::LANE_INSTALL_DEMOTE);
                         ea_end!(Population::Compile);
-                        return Ok(DirectContinuation::Interpret);
+                        return Ok(None);
                     }
                     lane_trial = true;
                 }
@@ -1719,7 +1765,7 @@ impl CpuGsw {
                     ea_mark_coarse!(Phase::Compile);
                     ea_compile_site!(compile_site::INSTALL_FAILED);
                     ea_end!(Population::Compile);
-                    return Ok(DirectContinuation::Interpret);
+                    return Ok(None);
                 };
                 // E2 sweep before this or any block runs (watched-page-bit design D4): the
                 // install just acquired the span's watch, and every fast-map entry filled
@@ -1816,16 +1862,42 @@ impl CpuGsw {
                 ea_mark!(Phase::Refused);
                 ea_refusal!(site::LINK_LINE_NOT_LIVE);
                 ea_end!(Population::Refused);
-                return Ok(DirectContinuation::Interpret);
+                return Ok(None);
             }
             let Some(block) = self.jit_direct.revalidate_translation(block.span().key) else {
                 ea_mark!(Phase::Refused);
                 ea_refusal!(site::REVALIDATE_NONE);
                 ea_end!(Population::Refused);
-                return Ok(DirectContinuation::Interpret);
+                return Ok(None);
             };
             block
         };
+        Ok(Some(block.id()))
+    }
+
+    /// The execution half of the old `try_direct_continuation`: admit through the chain above,
+    /// then decide whether to ENTER the block on this continuation.
+    ///
+    /// The split is a pure extract, not a behaviour change. `BlockCache::block` returns a copy of
+    /// the same `self.blocks[index]` slot `revalidate_translation` hands back, and no `&mut self`
+    /// call runs between the admit call returning and the re-fetch below, so the re-fetch observes
+    /// exactly the block the single function used to hold.
+    #[cfg(feature = "jit")]
+    fn try_direct_continuation<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        screen: DecodeScreenView,
+        lin: u32,
+        d: bool,
+        budget: ContinuationBudget,
+    ) -> Result<DirectContinuation, CpuError> {
+        let Some(id) = self.try_admit_direct_block(bus, screen, lin, d, false)? else {
+            return Ok(DirectContinuation::Interpret);
+        };
+        let block = self
+            .jit_direct
+            .block(id)
+            .expect("admitted direct block must remain live");
         // A hidden short block must pass the canonical decode scan above before it becomes a link
         // target again. Once current, avoid the heavier native-entry validation until one of its
         // own successor cells is live.
@@ -1845,6 +1917,64 @@ impl CpuGsw {
             DirectBlockOutcome::Prefix(outcome) => Ok(DirectContinuation::Prefix(outcome)),
             DirectBlockOutcome::NotRun => Ok(DirectContinuation::Interpret),
         }
+    }
+
+    /// Run the Direct admission chain at a block entry the run loop is about to break on because
+    /// its first instruction is non-continuable, and enter nothing.
+    ///
+    /// The defect this closes: `run_straight_line` screens the continuation, sees
+    /// `continuable == false` (a far transfer, an `INT`, a `HLT`, an undefined opcode) and breaks
+    /// BEFORE `dispatch_continuation`. The dispatcher is therefore never consulted at such an
+    /// address, `BlockCache::probe` never runs there, the key never becomes `Seen`, no compile
+    /// walk ever starts, and every static exit that targets it classifies `absent` for the life of
+    /// the process. On `15-move-hole-puzzle` that was 186.7 M of 186.7 M absent exits over twelve
+    /// addresses. Probing here lets the address acquire a state and, for the kinds that lower
+    /// (`RETF` is one), a compiled block a predecessor's parked link cell can bind to, so the
+    /// predecessor chains into it in native code instead of ending a run every iteration.
+    ///
+    /// Nothing is EXECUTED. The chain stops at link publication; the caller still breaks and the
+    /// interpreter still retires the instruction on the next run's first cycle, exactly as today.
+    ///
+    /// The three gates below are `dispatch_continuation`'s own run-invariant prefix, repeated
+    /// because that function is not on this path. `skip_direct_once` is taken here as it is
+    /// there: the latch is per-continuation and a run that breaks is about to end anyway.
+    ///
+    /// Entry attribution: this opens its own `ea_begin!` span and closes it on the admitted arm.
+    /// Every refusal inside `try_admit_direct_block` already closes its own span, so only the
+    /// success arm owes an `ea_end!`, and `Population::Refused` is the honest population for it:
+    /// no block was entered. This is a break-time probe, not a dispatcher traversal, so the
+    /// instrument now sees a small population of spans the run loop's own `ea_begin!` at the
+    /// continuation seam does not account for. `direct-entry-attribution` is opt-in profiling and
+    /// is not in the default test suite or in the census grading build, so that is acceptable
+    /// here, but a reader comparing traversal counts against `straight_line_runs` should know it.
+    #[cfg(feature = "jit")]
+    fn probe_admit_at_break<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        native_continuations_active: bool,
+        screen: DecodeScreenView,
+        lin: u32,
+        d: bool,
+    ) -> Result<(), CpuError> {
+        if !native_continuations_active {
+            return Ok(());
+        }
+        if !self.jit_direct.backend_enabled()
+            || std::mem::take(&mut self.direct_runtime.skip_direct_once)
+        {
+            return Ok(());
+        }
+        if !self.mode().uses_approximate_timing() {
+            return Ok(());
+        }
+        ea_begin!(d, self.is_v86_mode());
+        if self
+            .try_admit_direct_block(bus, screen, lin, d, true)?
+            .is_some()
+        {
+            ea_end!(Population::Refused);
+        }
+        Ok(())
     }
 
     #[cfg(all(
