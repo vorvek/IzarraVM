@@ -4178,6 +4178,14 @@ mod jit_poll_skip;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_seg_load_mem_test.rs"]
+mod jit_seg_load_mem;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_decode_pack_test.rs"]
 mod decode_pack;
 

@@ -4153,6 +4153,47 @@ pub(crate) enum DirectKind {
         segment: SegmentIndex,
         src: u8,
     },
+    /// `MOV Sreg, m16` (0x8E, MEMORY source) -- ES or DS only, real mode or V86. `LoadSegReal`'s
+    /// write with a word memory read standing in for the register read: one guarded word load,
+    /// then the same three stores (`access`/`default_size_32` and `base = selector << 4`, no
+    /// limit) `LoadSegReal`'s own arm argues for at length.
+    ///
+    /// `stack_width_kind` rewrites this into the `InterpretOne` call-out the register form
+    /// already takes in protected mode (`InterpretOneRow::MovSreg`, the SAME row the memory form
+    /// used unconditionally before this kind existed), so a protected-mode compile sees no change
+    /// at all -- only real mode and V86 gain a lowering.
+    ///
+    /// Pyramid's `0x8E` non_continuable rows are the census this admits: 1,401,930 (#1) and
+    /// 134,070 (#3), both memory-source, real mode.
+    LoadSegRealMem {
+        segment: SegmentIndex,
+        addr: DirectAddr,
+    },
+    /// `LES`/`LDS` (0xC4 ES, 0xC5 DS), WORD operand size only -- two guarded word memory reads
+    /// (the offset, then the selector at `addr + 2`), a GPR write and a `LoadSegReal`-shaped
+    /// segment write, in the interpreter's own order: `execute_system_seg_decoded`'s 0xc4/0xc5 arm
+    /// reads both words first, then calls `load_segment`, and only then writes the GPR. The
+    /// offset is parked at `STACK_LES_LDS_OFFSET` across the selector read and the segment write
+    /// so the final GPR write reads it back rather than racing the scratch registers those two
+    /// clobber.
+    ///
+    /// Real mode or V86 only. There is no `InterpretOne` row for this opcode to fall back to --
+    /// unlike `LoadSegRealMem` above, `jit_admits_non_continuable` only admits the WORD form to
+    /// `classify` at all, so `stack_width_kind` refuses a protected-mode instance outright
+    /// (`StackWidthDecline::LesLdsPmode`) rather than rewriting it into a call-out, and the block
+    /// stops one instruction short exactly as it always has there.
+    ///
+    /// The DWORD form (a 32-bit offset plus a 16-bit selector) is out of scope and stays
+    /// unclassified: `jit_admits_non_continuable` withholds it, so it never reaches this file at
+    /// all and keeps the `BarrierStop::NonContinuable` census bucket it has always had.
+    ///
+    /// No limit store, for `LoadSegReal`'s reason: a real-mode segment load leaves the cached
+    /// limit alone.
+    LesLds {
+        dst: u8,
+        segment: SegmentIndex,
+        addr: DirectAddr,
+    },
     /// `POP Sreg` (0x07 ES, 0x1F DS) on a SIXTEEN-BIT stack at Word operand size, in REAL MODE or
     /// V86 -- the tombraid loop-A census's largest row, behind `IZARRAVM_V86_LOOP_ROWS`.
     ///
@@ -5559,8 +5600,15 @@ impl DirectKind {
             // ACCUMULATES across slot counts separates a wrong arm from a right one.
             // `PopSegReal` joins it at the same 7: the interpreter's 0x07 / 0x1f arms return
             // clocks(7) too, and the stack read is charged separately through `word_reads` the
-            // way `Pop16`'s is.
-            Self::LoadSegReal { .. } | Self::PopSegReal { .. } => 7,
+            // way `Pop16`'s is. `LoadSegRealMem` joins it for the reason `LoadSegReal` is here:
+            // it is the SAME 0x8E arm, memory-sourced. `LesLds` joins it because
+            // `execute_system_seg_decoded`'s 0xc4/0xc5 arm returns the same `clocks(7)`; its two
+            // memory reads are charged separately through `word_reads`, exactly like `PopSegReal`'s
+            // stack read.
+            Self::LoadSegReal { .. }
+            | Self::LoadSegRealMem { .. }
+            | Self::PopSegReal { .. }
+            | Self::LesLds { .. } => 7,
             // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
             // arm below returns 2, which would under-charge this instruction by 7. Both operand
             // forms share the arm because the interpreter charges them from one `Ok(clocks(9))`.
@@ -5636,8 +5684,10 @@ impl DirectKind {
                         width: MemoryWidth::Word,
                         ..
                     }
+                    // ONE word read, the memory-sourced `0x8E`'s selector.
+                    | Self::LoadSegRealMem { .. }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Word),
-        ) + 2 * u8::from(matches!(self, Self::RetFar16 { .. }))
+        ) + 2 * u8::from(matches!(self, Self::RetFar16 { .. } | Self::LesLds { .. }))
     }
 
     pub(crate) fn dword_reads(self) -> u8 {
@@ -5852,7 +5902,12 @@ impl DirectKind {
             | Self::RmwIncDec { addr, .. }
             | Self::PushMem { addr, .. }
             | Self::JmpMem { addr, .. }
-            | Self::CallMem { addr, .. } => Some(addr.segment),
+            | Self::CallMem { addr, .. }
+            // The memory SOURCE segment -- DS by default, overridable -- not the ES/DS the
+            // instruction WRITES. `written_segment` reports that half; the two are independent
+            // and can differ (`les bx, es:[si]` reads through ES and writes ES right back).
+            | Self::LoadSegRealMem { addr, .. }
+            | Self::LesLds { addr, .. } => Some(addr.segment),
             Self::X87 {
                 insn,
                 addr: Some(addr),
@@ -5986,7 +6041,10 @@ impl DirectKind {
     /// Consumed only by the compile walk's dirty-segment rule.
     fn written_segment(self) -> Option<SegmentIndex> {
         match self {
-            Self::LoadSegReal { segment, .. } | Self::PopSegReal { segment } => Some(segment),
+            Self::LoadSegReal { segment, .. }
+            | Self::LoadSegRealMem { segment, .. }
+            | Self::PopSegReal { segment }
+            | Self::LesLds { segment, .. } => Some(segment),
             // LOAD-BEARING, and the temptation to drop it is real: relaxing
             // `dynamic_successor`'s `!segment_write_block` term (the one structural change this
             // slice makes) invites an implementer to stop reporting the write instead. Do not.
@@ -6408,6 +6466,13 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
             // Dword only, and refused HERE rather than in `classify`: see the note above.
             && insn.operand_size != OperandSize::Word
             && out_imm8_rows_armed())
+        // LES/LDS (0xc4/0xc5), the L4 slice, WORD form only -- the inverse shape from `0xe6`
+        // above: real-mode DOS code is unprefixed 16-bit code, so the Word form is the census
+        // row and the Dword form (a 32-bit offset behind a 66 prefix) is neither measured nor
+        // built. Refusing it HERE rather than in `classify` keeps the Dword form's barrier
+        // census bucket exactly what it always was (`BarrierStop::NonContinuable`) instead of
+        // relocating it to `classify`'s `None` arm.
+        || (matches!(insn.opcode, 0xc4 | 0xc5) && insn.operand_size == OperandSize::Word)
 }
 
 pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> CompileOutcome {
@@ -6557,11 +6622,12 @@ pub(crate) enum StackWidthDecline {
     Other,
     ControlTargetLimit,
     SegmentAccess,
+    LesLdsPmode,
 }
 
 #[cfg_attr(not(feature = "direct-admission-census"), allow(dead_code))]
 impl StackWidthDecline {
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 17] = [
         Self::PushDwordSs16,
         Self::PopDwordSs16,
         Self::RetDwordSs16,
@@ -6578,6 +6644,7 @@ impl StackWidthDecline {
         Self::Other,
         Self::ControlTargetLimit,
         Self::SegmentAccess,
+        Self::LesLdsPmode,
     ];
     pub(crate) const COUNT: usize = Self::ALL.len();
 
@@ -6599,6 +6666,7 @@ impl StackWidthDecline {
             Self::Other => "other",
             Self::ControlTargetLimit => "control_target_limit",
             Self::SegmentAccess => "segment_access",
+            Self::LesLdsPmode => "les_lds_pmode",
         }
     }
 }
@@ -6672,8 +6740,27 @@ fn stack_width_kind(
                 },
             }
         }
+        // `LoadSegRealMem` rides the exact argument above: it is `0x8E`'s memory-sourced twin, on
+        // the SAME `InterpretOne` allowlist row, so its protected-mode instance rewrites into the
+        // identical call-out rather than being refused. This is what makes the memory-form
+        // admission a no-op for a protected-mode compile -- see the kind's own doc comment.
+        DirectKind::LoadSegRealMem { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
+            DirectKind::CallOut {
+                helper: CallOutHelper::InterpretOne {
+                    row: InterpretOneRow::MovSreg,
+                },
+            }
+        }
         DirectKind::PopSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
             return Err(StackWidthDecline::PopSegRealPmode);
+        }
+        // `LesLds` has no `InterpretOne` row to rewrite into -- `jit_admits_non_continuable` is
+        // what let a Word-operand `0xc4`/`0xc5` reach `classify` at all, and it carries no CPU
+        // state, so protected mode reaches this arm exactly as real mode does and the mode
+        // question has to be answered HERE. Refusing rather than rewriting is `PopSegReal`'s own
+        // shape: the block stops one instruction short, same as it always has for this opcode.
+        DirectKind::LesLds { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
+            return Err(StackWidthDecline::LesLdsPmode);
         }
         other => other,
     };
@@ -9608,6 +9695,16 @@ const STACK_PUSH_MEM_VALUE: i32 = STACK_ALU_OLD_RESULT;
 /// 136 is outside `STACK_ZERO_FILL_LEN` = 128, so the prologue does not clear it. Irrelevant: the
 /// write precedes the read inside one slot, and no path reads it without having written it.
 const STACK_RET_FAR_OFFSET: i32 = STACK_ALU_OLD_RESULT;
+/// Where `LesLds` parks the offset it read first, across the SECOND memory read's address, guard
+/// and pointer path (which clobbers RAX, RCX, RDX and RDI) and across the segment write between
+/// the two reads and the final GPR write, both of which stage through the same registers.
+///
+/// Aliased onto the ALU slot by `STACK_PUSH_MEM_VALUE`'s argument, restated for this third alias:
+/// `LesLds` is not an ALU kind, not `PushMem`, not `RetFar16`, and none of the four ever appear in
+/// one slot's emission together. The write precedes every read inside a single slot's emission,
+/// exactly as `STACK_RET_FAR_OFFSET` argues, so there is nothing here for the prologue's zero-fill
+/// to race.
+const STACK_LES_LDS_OFFSET: i32 = STACK_ALU_OLD_RESULT;
 const STACK_ALU_FLAGS: i32 = 144;
 /// Where a shared stub (store OR read pad, designs D4 of each) parks its CALL's return
 /// address: the stub's `pop qword [rsp+..]` prologue moves the return address here and
@@ -14390,6 +14487,13 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // block-stopping hits.
                 | 0x8d
                 | 0x8e
+                // LES/LDS, WORD form only -- the L4 slice. `jit_admits_non_continuable` is the
+                // gate that lets a Word-operand `0xc4`/`0xc5` reach `classify` at all (see that
+                // function); this entry is what keeps the Word gate here from refusing it a
+                // second time once it does. The Dword form stays off `jit_admits_non_continuable`
+                // and never reaches this list's question.
+                | 0xc4
+                | 0xc5
                 // XCHG, the whole family, admitted to the S3 `InterpretOne` allowlist. Every one
                 // of them decodes at `OperandSize::Word` in a 16-bit segment whatever its actual
                 // operand width -- `0x86` is a byte exchange and takes its size from the encoding
@@ -15973,14 +16077,45 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     }
                     _ => return None,
                 };
-                let DecodedOperand::Reg(src) = insn.operand? else {
-                    return Some(DirectKind::CallOut {
-                        helper: CallOutHelper::InterpretOne {
-                            row: InterpretOneRow::MovSreg,
-                        },
-                    });
+                // The MEMORY form used to be an unconditional `InterpretOne` call-out here, mode
+                // and all -- `classify` has no `&CpuGsw`, so it could not tell real mode from
+                // protected. It returns the same lowering the register arm below does now,
+                // unconditionally, and `stack_width_kind` is what rewrites a protected-mode
+                // instance back into the identical call-out (`InterpretOneRow::MovSreg`), so a
+                // protected-mode compile sees no change at all.
+                return match insn.operand? {
+                    DecodedOperand::Reg(src) => Some(DirectKind::LoadSegReal { segment, src }),
+                    DecodedOperand::Mem(addr) => Some(DirectKind::LoadSegRealMem {
+                        segment,
+                        addr: direct_addr(addr)?,
+                    }),
                 };
-                return Some(DirectKind::LoadSegReal { segment, src });
+            }
+            // LES (0xc4) / LDS (0xc5), WORD form only. The register form does not exist --
+            // `mod == 3` raises #UD (`execute_system_seg_decoded`'s own comment) -- so
+            // `insn.operand` is Mem for every legal encoding, and the `else` arm below covers the
+            // illegal one the same way an unreached memory form does elsewhere in this file: it
+            // returns `None`, the instruction stays a barrier, and the interpreter delivers the
+            // #UD it always has.
+            //
+            // Reached only at Word: `jit_admits_non_continuable` withholds the Dword form from
+            // `classify` entirely (see that function and the Word allowlist entry above), so
+            // there is no operand-size branch to write here. `LesLds` carries no width field for
+            // the same reason `PopSegReal` doesn't -- one width exists.
+            0xc4 | 0xc5 => {
+                let DecodedOperand::Mem(addr) = insn.operand? else {
+                    return None;
+                };
+                let m = insn.modrm?;
+                return Some(DirectKind::LesLds {
+                    dst: m.reg,
+                    segment: if opcode == 0xc4 {
+                        SegmentIndex::Es
+                    } else {
+                        SegmentIndex::Ds
+                    },
+                    addr: direct_addr(addr)?,
+                });
             }
             0x8d => {
                 let m = insn.modrm?;
@@ -17449,6 +17584,108 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.store_r16_disp32(Reg::R15, base + access_offset(), Reg::RDX);
                 e.shift_r32_imm8(4, Reg::RAX, 4);
                 e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
+            }
+            // `MOV Sreg, m16`, real mode or V86. `LoadSegReal`'s write, sourced from a guarded
+            // word memory read instead of `home(src)`: the read's guards all jump to `side`, so a
+            // memory exit leaves the segment register untouched, exactly as every other lowered
+            // read does.
+            DirectKind::LoadSegRealMem { segment, addr } => {
+                const REAL: SegmentRegister = SegmentRegister::real(0);
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    addr,
+                    memory,
+                    reasons,
+                    memory.address_wrap,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                let base = segment_field_base(segment);
+                e.mov_r32_r32(Reg::RAX, Reg::RDX);
+                // The selector is stored BEFORE the shift turns RAX into the base.
+                e.store_r16_disp32(Reg::R15, base + selector_offset(), Reg::RAX);
+                e.mov_r32_imm32(
+                    Reg::RDX,
+                    u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
+                );
+                e.store_r16_disp32(Reg::R15, base + access_offset(), Reg::RDX);
+                e.shift_r32_imm8(4, Reg::RAX, 4);
+                e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    MemoryWidth::Word.needs_alignment_guard(),
+                    memory.cpl3,
+                    false,
+                );
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+            }
+            // LES (0xC4) / LDS (0xC5), WORD form, real mode or V86. Two guarded word reads --
+            // the offset, then the selector at `addr + 2` -- both against the SAME `reasons`,
+            // exactly as `RetFar16`'s two stack reads share one `MemorySideExits`: both go
+            // through the same segment, so one segment-limit label serves both.
+            //
+            // The ORDER is the interpreter's (`execute_system_seg_decoded`'s 0xc4/0xc5 arm): both
+            // reads complete, THEN the segment loads, THEN the GPR is written. Every guest write
+            // sits after both reads' guards, so a memory exit on either leaves the instruction
+            // entirely un-started -- neither the GPR nor the segment record has moved.
+            //
+            // The offset is parked at `STACK_LES_LDS_OFFSET` across the selector read and the
+            // segment write, both of which clobber RAX/RDX exactly as `RetFar16`'s CS write does
+            // between its own two pops.
+            DirectKind::LesLds { dst, segment, addr } => {
+                const REAL: SegmentRegister = SegmentRegister::real(0);
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                // (a) the offset.
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    addr,
+                    memory,
+                    reasons,
+                    memory.address_wrap,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                e.store_r64_disp32(Reg::RSP, STACK_LES_LDS_OFFSET, Reg::RDX);
+                // (b) the selector, at addr + 2.
+                let selector_addr = DirectAddr {
+                    disp: addr.disp.wrapping_add(2),
+                    ..addr
+                };
+                emit_ram_read_pointer(
+                    &mut e,
+                    MemoryWidth::Word,
+                    selector_addr,
+                    memory,
+                    reasons,
+                    memory.address_wrap,
+                );
+                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                // (c) the segment record -- `LoadSegReal`'s three stores, unchanged.
+                let base = segment_field_base(segment);
+                e.mov_r32_r32(Reg::RAX, Reg::RDX);
+                e.store_r16_disp32(Reg::R15, base + selector_offset(), Reg::RAX);
+                e.mov_r32_imm32(
+                    Reg::RDX,
+                    u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
+                );
+                e.store_r16_disp32(Reg::R15, base + access_offset(), Reg::RDX);
+                e.shift_r32_imm8(4, Reg::RAX, 4);
+                e.store_r32_disp32(Reg::R15, base + base_offset(), Reg::RAX);
+                // (d) the GPR, reloaded from the parked slot.
+                e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_LES_LDS_OFFSET);
+                emit_write_gpr16(&mut e, dst, Reg::RDX);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    MemoryWidth::Word.needs_alignment_guard(),
+                    memory.cpl3,
+                    false,
+                );
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::MovSegToReg { dst, segment } => {
                 let selector = memory.segments.selector(segment);
