@@ -11,7 +11,7 @@ path	class	origin	license	sha256
 .bench/corpus/games/1830-railroads-robber-barons.json	test-fixture	IzarraVM project	GPL-3.0-only	2184fda0c6d159702afccff6588a369e8bd1177708df0f410db1852592b704cb
 .bench/corpus/games/21-for-1-to-4.json	test-fixture	IzarraVM project	GPL-3.0-only	3a976e95b3be8c1ca605bdac7f893594dd3458d0b1c3d6d67f972922798eb0b6
 .bench/corpus/games/k-cheiw.json	test-fixture	IzarraVM project	GPL-3.0-only	52e64204119120c1bd292660b65b74461efdee515597872ff741a48c7c64ac06
-Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	6d35e4c0c317936bcbaf4656b02b2532d5a3afac1b9e4b954fd0ab76fa803bd2
+Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	5112aee73e7ddc68e1bea883c278ea381597efca7b24298f4381c496a844f93f
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	bbae07fb98e8140d0330645ffeccdb637b4a62ff8300e4fdfbc539e08e25a1b7
 crates/izarravm-cdaudio/tests/fixtures/tone-22k-mono.wav	generated-test-fixture	IzarraVM project source	GPL-3.0-only	98b43874f2cdcac75465cf3df534f8654b635f24612f49f0158affb87a9d6234

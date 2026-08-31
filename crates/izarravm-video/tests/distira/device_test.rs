@@ -1053,6 +1053,177 @@ fn w_buffer_mode_orders_depth_by_nearer_reciprocal_w() {
 }
 
 #[test]
+fn w_buffer_depth_codes_are_encoded_per_pixel_not_interpolated() {
+    // The SST-1 W-buffer code is a floating-point-style encode (exponent
+    // from a leading-zero count plus an inverted 12-bit mantissa). 86Box's
+    // vid_voodoo_render.c iterates 1/w linearly PER PIXEL and encodes each
+    // pixel's value. Encoding only the three vertices and interpolating the
+    // CODE linearly is wrong: the encode is not linear, so interior pixels
+    // of a large triangle get a depth that is off by thousands of codes.
+    // That inverts occlusion between big polygons (Tomb Raider's room
+    // geometry flickers). This test draws one wide triangle with a 1/w
+    // gradient and checks the depth stored at an interior pixel against
+    // the per-pixel encode.
+    let mut distira = Distira::new();
+    distira.set_frame_size(256, 8);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | FBZ_W_BUFFER
+            | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 256 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 8 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_B, 0);
+    // 1/w rises from 0.01 at x=0 to 0.95 at x=256 (signed 2.30 fixed point).
+    let start_w = 10_737_418u32; // 0.01 * 2^30
+    let dw_dx = 3_942_646u32; // (0.95 - 0.01) / 256 * 2^30
+    write_reg(&mut distira, SST_START_W, start_w);
+    write_reg(&mut distira, SST_DW_DX, dw_dx);
+    write_reg(&mut distira, SST_DW_DY, 0);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+
+    // 86Box's per-pixel wfloat encode, over a .32 fixed-point 1/w.
+    let wfloat_code = |w: f64| -> u16 {
+        let fixed = (w * 4294967296.0) as u64;
+        if fixed & 0xffff_0000_0000 != 0 {
+            return 0;
+        }
+        if fixed & 0xffff_0000 == 0 {
+            return 0xf001;
+        }
+        let exp = ((fixed >> 16) as u16).leading_zeros();
+        let mant = ((!fixed as u32) >> (19 - exp)) & 0xfff;
+        ((exp << 12) + mant + 1).min(0xffff) as u16
+    };
+
+    write_reg(&mut distira, SST_LFB_MODE, LFB_READ_AUX);
+    for x in [32u32, 64, 128, 192] {
+        let stored = distira.read_lfb_u16((x as usize) * 2);
+        // The rasteriser samples at the pixel centre (x + 0.5, y = 0.5).
+        let w = f64::from(start_w) / 1_073_741_824.0
+            + f64::from(dw_dx) / 1_073_741_824.0 * (f64::from(x) + 0.5);
+        let expected = wfloat_code(w);
+        let error = (i32::from(stored) - i32::from(expected)).abs();
+        assert!(
+            error <= 2,
+            "x={x}: stored depth code {stored} but the per-pixel encode of \
+             1/w={w:.5} is {expected} (error {error} codes)"
+        );
+    }
+}
+
+#[test]
+fn raster_lane_policy_uses_four_lanes_only_with_six_or_more_cores() {
+    // Two raster threads by default. Four only when the host has six or
+    // more cores, so the rasteriser does not compete with the main
+    // emulation thread.
+    assert_eq!(Distira::raster_lanes_for_cores(1), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(2), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(4), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(5), 2);
+    assert_eq!(Distira::raster_lanes_for_cores(6), 4);
+    assert_eq!(Distira::raster_lanes_for_cores(8), 4);
+    assert_eq!(Distira::raster_lanes_for_cores(16), 4);
+}
+
+#[test]
+fn parallel_raster_output_is_identical_to_single_threaded_output() {
+    // The rasteriser splits a large triangle across worker lanes by row.
+    // Rows partition the frame store, and every per-pixel test is a pure
+    // function of the pixel, so the parallel result must equal the serial
+    // result byte for byte: colour, depth, and every counter.
+    let draw_scene = |lanes: usize| -> (Vec<u32>, Vec<u16>, u64, u64) {
+        let mut distira = Distira::new();
+        distira.set_raster_lanes(lanes);
+        distira.set_frame_size(256, 128);
+        distira.set_dither_enabled(true);
+
+        // A far textured-free Gouraud triangle, W-buffered.
+        write_reg(
+            &mut distira,
+            SST_FBZ_MODE,
+            FBZ_RGB_WMASK
+                | FBZ_DRAW_BACK
+                | FBZ_DEPTH_ENABLE
+                | FBZ_DEPTH_WMASK
+                | FBZ_W_BUFFER
+                | FBZ_DITHER
+                | (DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT),
+        );
+        write_reg(&mut distira, SST_VERTEX_AX, 0);
+        write_reg(&mut distira, SST_VERTEX_AY, 0);
+        write_reg(&mut distira, SST_VERTEX_BX, 256 << 4);
+        write_reg(&mut distira, SST_VERTEX_BY, 0);
+        write_reg(&mut distira, SST_VERTEX_CX, 0);
+        write_reg(&mut distira, SST_VERTEX_CY, 128 << 4);
+        write_reg(&mut distira, SST_START_R, 0x40 << 12);
+        write_reg(&mut distira, SST_START_G, 0x80 << 12);
+        write_reg(&mut distira, SST_START_B, 0xc0 << 12);
+        write_reg(&mut distira, SST_DR_DX, 1 << 10);
+        write_reg(&mut distira, SST_DR_DY, 1 << 9);
+        write_reg(&mut distira, SST_START_W, 10_737_418);
+        write_reg(&mut distira, SST_DW_DX, 3_942_646);
+        write_reg(&mut distira, SST_DW_DY, 0);
+        write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+
+        // A nearer overlapping triangle with alpha blending, so the pixel
+        // pipeline reads the destination colour back.
+        write_reg(
+            &mut distira,
+            SST_ALPHA_MODE,
+            (1 << 4) | (0x1 << 8) | (0x5 << 12) | (0x80 << 24),
+        );
+        write_reg(&mut distira, SST_VERTEX_AX, 32 << 4);
+        write_reg(&mut distira, SST_VERTEX_AY, 16 << 4);
+        write_reg(&mut distira, SST_VERTEX_BX, 224 << 4);
+        write_reg(&mut distira, SST_VERTEX_BY, 24 << 4);
+        write_reg(&mut distira, SST_VERTEX_CX, 64 << 4);
+        write_reg(&mut distira, SST_VERTEX_CY, 120 << 4);
+        write_reg(&mut distira, SST_START_R, 0xff << 12);
+        write_reg(&mut distira, SST_START_G, 0x20 << 12);
+        write_reg(&mut distira, SST_START_B, 0x10 << 12);
+        write_reg(&mut distira, SST_START_W, 536_870_912);
+        write_reg(&mut distira, SST_DW_DX, 0);
+        write_reg(&mut distira, SST_DW_DY, 1 << 20);
+        write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+        write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+        write_reg(&mut distira, SST_LFB_MODE, LFB_READ_AUX);
+        let depth: Vec<u16> = (0..128usize)
+            .flat_map(|y| (0..256usize).map(move |x| (y, x)))
+            .map(|(y, x)| distira.read_lfb_u16(y * 2048 + x * 2))
+            .collect();
+        let state = distira.scanout_state();
+        (
+            distira.scanout_argb(),
+            depth,
+            state.triangles.pixels_in,
+            state.triangles.color_written,
+        )
+    };
+
+    let serial = draw_scene(1);
+    let parallel = draw_scene(4);
+    assert_eq!(serial.0, parallel.0, "colour output must match");
+    assert_eq!(serial.1, parallel.1, "depth output must match");
+    assert_eq!(serial.2, parallel.2, "pixels_in must match");
+    assert_eq!(serial.3, parallel.3, "color_written must match");
+    assert!(serial.3 > 0, "the scene must actually paint");
+}
+
+#[test]
 fn z_buffer_mode_is_unaffected_by_the_w_buffer_wiring() {
     // Regression guard: adding W-buffer support must not change Z-buffer
     // behavior when FBZ_W_BUFFER is clear. Same shape as the existing

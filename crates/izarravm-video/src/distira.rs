@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 mod ncc;
 mod raster_math;
+mod raster_pool;
 mod registers;
 mod texture_combine;
 mod texture_raster;
@@ -16,6 +17,7 @@ mod texture_raster;
 use crate::{DistiraCensus, DistiraCensusKey};
 use ncc::NccState;
 use raster_math::*;
+use raster_pool::{DiagCounter, FrameStore, raster_pool};
 pub use registers::*;
 use texture_raster::{
     TextureIteratorState, TextureRaster, TextureSample, texture_base_slot, texture_dimensions,
@@ -28,6 +30,79 @@ const SWAPBUFFER_SYNC_TO_RETRACE: u32 = 1;
 const SWAPBUFFER_INTERVAL_MASK: u32 = 0xff;
 const DISTIRA_TMU_CONFIG: u8 = 1 | (1 << 6) | (1 << 7);
 const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+/// Bounding-box pixel count above which a triangle forks across the
+/// raster lanes. Below it, the wake-up cost of the pool beats the win.
+const PARALLEL_PIXEL_THRESHOLD: usize = 2048;
+
+/// The triangle-constant inputs of `raster_row`, so a lane needs only
+/// this, the device, and the frame-store view.
+#[derive(Clone, Copy)]
+struct TriangleContext {
+    vertices: [DistiraVertex; 3],
+    area: f32,
+    depths: Option<TriangleDepth>,
+    texture: Option<TextureRaster>,
+    coverage: Option<SstTriangleCoverage>,
+    count_fbi_pixels: bool,
+    affine_lods: [u32; 2],
+    min_x: u32,
+    max_x: u32,
+}
+
+/// One lane's per-pixel counters, merged into the device after the join.
+struct PixelStats {
+    written: u64,
+    fbi_pixels_in: u32,
+    fbi_zfunc_fail: u32,
+    fbi_chroma_fail: u32,
+    fbi_afunc_fail: u32,
+    fbi_pixels_out: u32,
+    pixels_in: u64,
+    reject_stipple: u64,
+    reject_depth: u64,
+    reject_alpha_mask: u64,
+    reject_chroma: u64,
+    reject_alpha_test: u64,
+    pixels_out: u64,
+    color_written: u64,
+    color_written_nonblack: u64,
+    reject_rgb_wmask: u64,
+    reject_offscreen: u64,
+    depth_written: u64,
+    color_offset_min: u32,
+    color_offset_max: u32,
+    /// The lane's rotating-stipple state, seeded from the register.
+    stipple: u32,
+}
+
+impl PixelStats {
+    fn new(stipple: u32) -> Self {
+        Self {
+            written: 0,
+            fbi_pixels_in: 0,
+            fbi_zfunc_fail: 0,
+            fbi_chroma_fail: 0,
+            fbi_afunc_fail: 0,
+            fbi_pixels_out: 0,
+            pixels_in: 0,
+            reject_stipple: 0,
+            reject_depth: 0,
+            reject_alpha_mask: 0,
+            reject_chroma: 0,
+            reject_alpha_test: 0,
+            pixels_out: 0,
+            color_written: 0,
+            color_written_nonblack: 0,
+            reject_rgb_wmask: 0,
+            reject_offscreen: 0,
+            depth_written: 0,
+            color_offset_min: u32::MAX,
+            color_offset_max: 0,
+            stipple,
+        }
+    }
+}
+
 
 /// Why the triangle rasteriser did not store a colour pixel. One counter per
 /// exit, so a run that submits geometry and paints nothing names the predicate
@@ -241,6 +316,30 @@ enum DistiraFifoEntry {
     TextureU32 { offset: usize, value: u32 },
 }
 
+/// Per-vertex depth terms for the triangle rasteriser. The Z variant is
+/// linear in screen space, so the interpolated value IS the depth. The W
+/// variant carries raw 1/w: the wfloat encode is not linear, so each pixel
+/// must interpolate 1/w first and encode second, the way 86Box's
+/// `vid_voodoo_render.c` iterates `state->w` per pixel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TriangleDepth {
+    Z([f32; 3]),
+    W([f32; 3]),
+}
+
+impl TriangleDepth {
+    /// The depth at one pixel, in the raw "4096 units per depth code" scale
+    /// `depth_to_u16` divides back out.
+    fn at(self, l0: f32, l1: f32, l2: f32) -> f32 {
+        match self {
+            Self::Z([za, zb, zc]) => lerp_f32(za, zb, zc, l0, l1, l2),
+            Self::W([wa, wb, wc]) => {
+                f32::from(wfloat_depth(lerp_f32(wa, wb, wc, l0, l1, l2))) * 4096.0
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingSwap {
     target_base: u32,
@@ -254,7 +353,7 @@ pub struct Distira {
     /// ever driven it, so this is the first instrument that says whether a
     /// real title reached the 3D unit at all.
     census: DistiraCensus,
-    fb: Vec<u8>,
+    fb: FrameStore,
     texture: [Vec<u8>; 2],
     fifo: VecDeque<DistiraFifoEntry>,
     command_fifo: VecDeque<u32>,
@@ -264,6 +363,10 @@ pub struct Distira {
     buffer_stride: u32,
     display_enabled: bool,
     dither_enabled: bool,
+    /// How many threads rasterise a large triangle, caller included.
+    /// Chosen from the host core count at construction; see
+    /// [`Distira::raster_lanes_for_cores`].
+    raster_lanes: usize,
     clear_color: u32,
     command: u32,
     intr_ctrl: u32,
@@ -371,13 +474,13 @@ pub struct Distira {
     /// Reads are taken through `&self`, so the counters need a `Cell`. A guest
     /// that stops rendering and never writes again may still be POLLING, and
     /// only the read side shows it.
-    register_reads: Box<[std::cell::Cell<u64>; 256]>,
+    register_reads: Box<[DiagCounter; 256]>,
     offset_bits_or: usize,
     /// The three apertures a guest reaches that are NOT register writes. The
     /// register histogram misses all of them, so a guest that looks idle there
     /// can still be hammering texture memory or the LFB.
     aperture_traffic: DistiraApertureTraffic,
-    lfb_reads: std::cell::Cell<u64>,
+    lfb_reads: DiagCounter,
     pending_swap: Option<PendingSwap>,
     swap_commands: VecDeque<u32>,
     texture_mode: u32,
@@ -408,7 +511,7 @@ impl Distira {
         let buffer_stride = display.pitch * display.height;
         let mut distira = Self {
             census: DistiraCensus::default(),
-            fb: vec![0; DISTIRA_FB_SIZE],
+            fb: FrameStore::new(DISTIRA_FB_SIZE),
             texture: std::array::from_fn(|_| vec![0; DISTIRA_TEX_SIZE]),
             fifo: VecDeque::new(),
             command_fifo: VecDeque::new(),
@@ -418,6 +521,7 @@ impl Distira {
             buffer_stride,
             display_enabled: false,
             dither_enabled: false,
+            raster_lanes: raster_pool::host_lanes(),
             clear_color: 0,
             command: 0,
             intr_ctrl: 0,
@@ -500,10 +604,10 @@ impl Distira {
             },
             fastfill_pixels: 0,
             register_writes: Box::new([0; 256]),
-            register_reads: Box::new(std::array::from_fn(|_| std::cell::Cell::new(0))),
+            register_reads: Box::new(std::array::from_fn(|_| DiagCounter::default())),
             offset_bits_or: 0,
             aperture_traffic: DistiraApertureTraffic::default(),
-            lfb_reads: std::cell::Cell::new(0),
+            lfb_reads: DiagCounter::default(),
             pending_swap: None,
             swap_commands: VecDeque::new(),
             texture_mode: 0,
@@ -807,7 +911,7 @@ impl Distira {
             triangles: self.triangle_census,
             fastfill_pixels: self.fastfill_pixels,
             retrace_count: self.retrace_count,
-            painted_bytes: self.fb.iter().filter(|&&byte| byte != 0).count(),
+            painted_bytes: self.fb.count_nonzero(0, self.fb.len()),
             // Per BUFFER, so a black picture says WHICH buffer holds the paint.
             // A swap alternates the scanout between buffer 0 and buffer 1, so
             // paint in only one of them plus an unchanging picture is the
@@ -822,7 +926,7 @@ impl Distira {
                     let start = index * stride;
                     let end = (start + stride).min(self.fb.len());
                     if start < end {
-                        *slot = self.fb[start..end].iter().filter(|&&b| b != 0).count();
+                        *slot = self.fb.count_nonzero(start, end);
                     }
                 }
                 counts
@@ -833,6 +937,19 @@ impl Distira {
 
     pub fn set_dither_enabled(&mut self, enabled: bool) {
         self.dither_enabled = enabled;
+    }
+
+    /// The raster thread count for a host with `cores` logical CPUs: two,
+    /// or four when six or more cores leave room for the main emulation
+    /// thread.
+    pub fn raster_lanes_for_cores(cores: usize) -> usize {
+        raster_pool::lanes_for_cores(cores)
+    }
+
+    /// Override the raster thread count (clamped to 1..=4). One lane
+    /// disables the worker pool entirely.
+    pub fn set_raster_lanes(&mut self, lanes: usize) {
+        self.raster_lanes = lanes.clamp(1, 4);
     }
 
     pub fn disable_display(&mut self) {
@@ -864,12 +981,12 @@ impl Distira {
     }
 
     pub fn clear_back_rgb(&mut self, r: u8, g: u8, b: u8) {
-        let pixel = pack_rgb565(r, g, b).to_le_bytes();
+        let pixel = pack_rgb565(r, g, b);
         let start = self.display.back_base as usize;
         let len = (self.display.pitch as usize).saturating_mul(self.display.height as usize);
         let end = start.saturating_add(len).min(self.fb.len());
-        for chunk in self.fb[start..end].as_chunks_mut::<2>().0 {
-            *chunk = pixel;
+        for offset in (start..end.saturating_sub(1)).step_by(2) {
+            self.fb.write_u16_le(offset, pixel);
         }
     }
 
@@ -885,7 +1002,7 @@ impl Distira {
     fn draw_triangle_with_depth(
         &mut self,
         vertices: [DistiraVertex; 3],
-        depths: [f32; 3],
+        depths: TriangleDepth,
         texture: TextureRaster,
         coverage: SstTriangleCoverage,
     ) -> u64 {
@@ -895,7 +1012,7 @@ impl Distira {
     fn draw_triangle_inner(
         &mut self,
         vertices: [DistiraVertex; 3],
-        depths: Option<[f32; 3]>,
+        depths: Option<TriangleDepth>,
         texture: Option<TextureRaster>,
         coverage: Option<SstTriangleCoverage>,
     ) -> u64 {
@@ -952,12 +1069,89 @@ impl Distira {
             self.triangle_census.reject_empty_box += 1;
         }
 
-        let affine_lods = [self.texture_lod, self.texture_lod_tmu1];
-        let mut written = 0;
-        for y in min_y..max_y {
+        let context = TriangleContext {
+            vertices: [a, b, c],
+            area,
+            depths,
+            texture,
+            coverage,
+            count_fbi_pixels,
+            affine_lods: [self.texture_lod, self.texture_lod_tmu1],
+            min_x,
+            max_x,
+        };
+        let rows = max_y.saturating_sub(min_y) as usize;
+        let columns = max_x.saturating_sub(min_x) as usize;
+        // Fork only when the pixel work dwarfs the wake-up cost of the
+        // pool. Small triangles stay on the calling thread.
+        let lanes = if self.raster_lanes >= 2
+            && rows >= self.raster_lanes * 2
+            && rows.saturating_mul(columns) >= PARALLEL_PIXEL_THRESHOLD
+        {
+            self.raster_lanes
+        } else {
+            1
+        };
+
+        let mut lane_stats: Vec<PixelStats> =
+            (0..lanes).map(|_| PixelStats::new(self.stipple)).collect();
+        if lanes == 1 {
+            let stats = &mut lane_stats[0];
+            for y in min_y..max_y {
+                self.raster_row(&context, y, stats);
+            }
+        } else {
+            let this: &Distira = self;
+            let context = &context;
+            // A lane accumulates into a stack-local `PixelStats` and
+            // stores it once at the end: the `lane_stats` elements share
+            // cache lines, and a per-pixel counter write there makes the
+            // lanes false-share their way back to serial speed.
+            let raster_lane = move |lane: usize, stats: &mut PixelStats| {
+                let mut local = PixelStats::new(stats.stipple);
+                let mut y = min_y + lane as u32;
+                while y < max_y {
+                    this.raster_row(context, y, &mut local);
+                    y = y.saturating_add(lanes as u32);
+                }
+                *stats = local;
+            };
+            // `install` moves the whole fork onto the pool: the scope
+            // then spawns into a worker-local queue, which the other
+            // workers steal far faster than an external injection wakes
+            // them. The installed worker rasterises the last lane.
+            let (worker_stats, install_stats) = lane_stats.split_at_mut(lanes - 1);
+            raster_pool().install(|| {
+                rayon::scope(|scope| {
+                    for (lane, stats) in worker_stats.iter_mut().enumerate() {
+                        scope.spawn(move |_| raster_lane(lane, stats));
+                    }
+                    raster_lane(lanes - 1, &mut install_stats[0]);
+                });
+            });
+        }
+        self.merge_pixel_stats(&lane_stats, count_fbi_pixels, min_y, max_y)
+    }
+
+    /// Rasterise one row of a triangle. Every frame-store access goes
+    /// through the atomic store and every counter goes into the lane's
+    /// stats, so any number of lanes can run disjoint rows at once.
+    fn raster_row(&self, context: &TriangleContext, y: u32, stats: &mut PixelStats) {
+        let TriangleContext {
+            vertices: [a, b, c],
+            area,
+            depths,
+            texture,
+            coverage,
+            count_fbi_pixels,
+            affine_lods,
+            min_x,
+            max_x,
+        } = *context;
+        {
             let (row_min_x, row_max_x) = if let Some(coverage) = coverage {
                 let Some((span_min, span_max)) = coverage.scanline_span(y) else {
-                    continue;
+                    return;
                 };
                 let span_min = span_min.max(0) as u32;
                 let span_max = span_max.max(-1).saturating_add(1) as u32;
@@ -982,13 +1176,13 @@ impl Distira {
                     continue;
                 }
                 if count_fbi_pixels {
-                    self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(1);
-                    self.triangle_census.pixels_in += 1;
+                    stats.fbi_pixels_in += 1;
+                    stats.pixels_in += 1;
                 }
                 let draw_y = self.draw_y(y);
-                if !self.stipple_test_passes(x, draw_y) {
+                if !self.stipple_test(&mut stats.stipple, x, draw_y) {
                     if count_fbi_pixels {
-                        self.triangle_census.reject_stipple += 1;
+                        stats.reject_stipple += 1;
                     }
                     continue;
                 }
@@ -997,14 +1191,14 @@ impl Distira {
                 let l0 = w0 * inv_area;
                 let l1 = w1 * inv_area;
                 let l2 = w2 * inv_area;
-                let depth_raw = depths.map(|[za, zb, zc]| lerp_f32(za, zb, zc, l0, l1, l2));
+                let depth_raw = depths.map(|depths| depths.at(l0, l1, l2));
                 let depth = depth_raw.map(|raw| self.biased_triangle_depth(raw));
                 if let Some(depth) = depth
                     && !self.depth_test_passes(x, draw_y, depth)
                 {
-                    self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(1);
+                    stats.fbi_zfunc_fail += 1;
                     if count_fbi_pixels {
-                        self.triangle_census.reject_depth += 1;
+                        stats.reject_depth += 1;
                     }
                     continue;
                 }
@@ -1030,16 +1224,16 @@ impl Distira {
                 let aother = self.texture_alpha_or_source(alpha, texture.alpha);
                 if self.fbz_mode & FBZ_ALPHA_MASK != 0 && aother & 1 == 0 {
                     if count_fbi_pixels {
-                        self.triangle_census.reject_alpha_mask += 1;
+                        stats.reject_alpha_mask += 1;
                     }
                     continue;
                 }
 
                 let selected = self.selected_color_or_source((x, draw_y), (r, g, blue), texture);
                 if !self.chroma_key_passes(selected.0, selected.1, selected.2) {
-                    self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
+                    stats.fbi_chroma_fail += 1;
                     if count_fbi_pixels {
-                        self.triangle_census.reject_chroma += 1;
+                        stats.reject_chroma += 1;
                     }
                     continue;
                 }
@@ -1047,15 +1241,15 @@ impl Distira {
                     self.texture_color_or_source(selected, (r, g, blue), alocal, aother, texture);
                 let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
                 if !self.alpha_test_passes(alpha) {
-                    self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
+                    stats.fbi_afunc_fail += 1;
                     if count_fbi_pixels {
-                        self.triangle_census.reject_alpha_test += 1;
+                        stats.reject_alpha_test += 1;
                     }
                     continue;
                 }
                 if count_fbi_pixels {
-                    self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(1);
-                    self.triangle_census.pixels_out += 1;
+                    stats.fbi_pixels_out += 1;
+                    stats.pixels_out += 1;
                 }
                 let (r, g, blue) = self.apply_fog_color(r, g, blue);
                 let (r, g, blue) = self.alpha_blend_color(x, draw_y, r, g, blue, alpha);
@@ -1064,20 +1258,20 @@ impl Distira {
                     self.write_pixel_at_base(self.display.back_base, x, draw_y, pixel)
                 } else if self.fbz_mode & FBZ_RGB_WMASK == 0 {
                     if count_fbi_pixels {
-                        self.triangle_census.reject_rgb_wmask += 1;
+                        stats.reject_rgb_wmask += 1;
                     }
                     false
                 } else {
                     let stored = self.write_draw_pixel(x, draw_y, pixel);
                     if count_fbi_pixels && !stored {
-                        self.triangle_census.reject_offscreen += 1;
+                        stats.reject_offscreen += 1;
                     }
                     stored
                 };
                 if count_fbi_pixels && wrote_color {
-                    self.triangle_census.color_written += 1;
+                    stats.color_written += 1;
                     if pixel != 0 {
-                        self.triangle_census.color_written_nonblack += 1;
+                        stats.color_written_nonblack += 1;
                     }
                     let base = match self.fbz_mode & FBZ_DRAW_MASK {
                         FBZ_DRAW_FRONT => self.display.front_base,
@@ -1085,20 +1279,65 @@ impl Distira {
                     };
                     if let Some(offset) = self.framebuffer_pixel_offset(base, x, draw_y) {
                         let offset = offset as u32;
-                        let range = &mut self.triangle_census;
-                        range.color_offset_min = range.color_offset_min.min(offset);
-                        range.color_offset_max = range.color_offset_max.max(offset);
+                        stats.color_offset_min = stats.color_offset_min.min(offset);
+                        stats.color_offset_max = stats.color_offset_max.max(offset);
                     }
                 }
                 let wrote_depth =
                     depth.is_some_and(|depth| self.write_depth_pixel(x, draw_y, depth));
                 if count_fbi_pixels && wrote_depth {
-                    self.triangle_census.depth_written += 1;
+                    stats.depth_written += 1;
                 }
                 if wrote_color || wrote_depth {
-                    written += 1;
+                    stats.written += 1;
                 }
             }
+        }
+    }
+
+    fn merge_pixel_stats(
+        &mut self,
+        lane_stats: &[PixelStats],
+        count_fbi_pixels: bool,
+        min_y: u32,
+        max_y: u32,
+    ) -> u64 {
+        let mut written = 0;
+        for stats in lane_stats {
+            written += stats.written;
+            self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(stats.fbi_pixels_in);
+            self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(stats.fbi_zfunc_fail);
+            self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(stats.fbi_chroma_fail);
+            self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(stats.fbi_afunc_fail);
+            self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(stats.fbi_pixels_out);
+            if count_fbi_pixels {
+                let census = &mut self.triangle_census;
+                census.pixels_in += stats.pixels_in;
+                census.reject_stipple += stats.reject_stipple;
+                census.reject_depth += stats.reject_depth;
+                census.reject_alpha_mask += stats.reject_alpha_mask;
+                census.reject_chroma += stats.reject_chroma;
+                census.reject_alpha_test += stats.reject_alpha_test;
+                census.pixels_out += stats.pixels_out;
+                census.color_written += stats.color_written;
+                census.color_written_nonblack += stats.color_written_nonblack;
+                census.reject_rgb_wmask += stats.reject_rgb_wmask;
+                census.reject_offscreen += stats.reject_offscreen;
+                census.depth_written += stats.depth_written;
+                census.color_offset_min = census.color_offset_min.min(stats.color_offset_min);
+                if stats.color_offset_max != 0 || stats.color_written != 0 {
+                    census.color_offset_max = census.color_offset_max.max(stats.color_offset_max);
+                }
+            }
+        }
+        // The rotating stipple register keeps the value of the lane that
+        // rasterised the LAST row. With one lane that is the exact serial
+        // behavior; with more lanes it is the same approximation 86Box
+        // makes with per-render-thread stipple state.
+        if max_y > min_y
+            && let Some(stats) = lane_stats.get((max_y - 1 - min_y) as usize % lane_stats.len())
+        {
+            self.stipple = stats.stipple;
         }
         written
     }
@@ -1116,7 +1355,7 @@ impl Distira {
                     .saturating_add(y.saturating_mul(pitch))
                     .saturating_add(x.saturating_mul(2));
                 let raw = if off + 1 < len {
-                    u16::from_le_bytes([self.fb[off as usize], self.fb[off as usize + 1]])
+                    self.fb.read_u16_le(off as usize).unwrap_or(0)
                 } else {
                     0
                 };
@@ -1168,10 +1407,9 @@ impl Distira {
     }
 
     pub fn read_lfb_u8(&self, offset: usize) -> u8 {
-        let slot = &self.lfb_reads;
-        slot.set(slot.get() + 1);
+        self.lfb_reads.increment();
         self.lfb_byte_offset(self.lfb_read_base(), offset)
-            .and_then(|offset| self.fb.get(offset).copied())
+            .and_then(|offset| self.fb.get(offset))
             .unwrap_or(0xff)
     }
 
@@ -1198,11 +1436,8 @@ impl Distira {
         } else {
             self.lfb_write_base()
         };
-        if let Some(slot) = self
-            .lfb_byte_offset(base, offset)
-            .and_then(|offset| self.fb.get_mut(offset))
-        {
-            *slot = value;
+        if let Some(offset) = self.lfb_byte_offset(base, offset) {
+            self.fb.set(offset, value);
         }
     }
 
@@ -1482,8 +1717,7 @@ impl Distira {
     }
 
     pub fn read_mmio_u8(&self, offset: usize) -> u8 {
-        let slot = &self.register_reads[(offset >> 2) & 0xff];
-        slot.set(slot.get() + 1);
+        self.register_reads[(offset >> 2) & 0xff].increment();
         let reg = offset & !0x3;
         let voodoo_reg = offset & 0x3fc;
         let byte = offset & 0x3;
@@ -2250,8 +2484,10 @@ impl Distira {
         let Some(end) = start.checked_add(N) else {
             return bytes;
         };
-        if let Some(source) = self.fb.get(start..end) {
-            bytes.copy_from_slice(source);
+        if end <= self.fb.len() {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = self.fb.get(start + index).unwrap_or(0xff);
+            }
         }
         bytes
     }
@@ -2381,15 +2617,23 @@ impl Distira {
     }
 
     fn stipple_test_passes(&mut self, x: u32, y: u32) -> bool {
+        let mut stipple = self.stipple;
+        let passes = self.stipple_test(&mut stipple, x, y);
+        self.stipple = stipple;
+        passes
+    }
+
+    /// The stipple test against a caller-owned rotating state, so each
+    /// raster lane rotates its own copy.
+    fn stipple_test(&self, stipple: &mut u32, x: u32, y: u32) -> bool {
         if self.fbz_mode & FBZ_STIPPLE == 0 {
             return true;
         }
         if self.fbz_mode & FBZ_STIPPLE_PATT != 0 {
-            let index = ((y & 3) << 3) | ((!x) & 7);
-            self.stipple & (1 << index) != 0
+            *stipple & (1 << (((y & 3) << 3) | ((!x) & 7))) != 0
         } else {
-            self.stipple = self.stipple.rotate_left(1);
-            self.stipple & 0x8000_0000 != 0
+            *stipple = stipple.rotate_left(1);
+            *stipple & 0x8000_0000 != 0
         }
     }
 
@@ -2415,7 +2659,7 @@ impl Distira {
         else {
             return;
         };
-        self.fb[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        self.fb.write_u16_le(offset, value);
     }
 
     fn write_color_pixel(&mut self, base: u32, position: (u32, u32), value: u16) {
@@ -2423,7 +2667,7 @@ impl Distira {
         let Some(offset) = self.framebuffer_pixel_offset(base, position.0, position.1) else {
             return;
         };
-        self.fb[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        self.fb.write_u16_le(offset, value);
     }
 
     fn run_fastfill(&mut self) {
@@ -2437,9 +2681,8 @@ impl Distira {
             (self.color1 >> 16) as u8,
             (self.color1 >> 8) as u8,
             self.color1 as u8,
-        )
-        .to_le_bytes();
-        let depth = (self.za_color as u16).to_le_bytes();
+        );
+        let depth = self.za_color as u16;
         let color_start = match self.fbz_mode & FBZ_DRAW_MASK {
             FBZ_DRAW_FRONT => self.display.front_base,
             _ => self.display.back_base,
@@ -2459,14 +2702,12 @@ impl Distira {
                     .saturating_add(x.saturating_mul(2));
                 let color_offset = u64::from(color_start).saturating_add(pixel_offset);
                 if write_color && color_offset + 1 < len {
-                    self.fb[color_offset as usize] = color[0];
-                    self.fb[color_offset as usize + 1] = color[1];
+                    self.fb.write_u16_le(color_offset as usize, color);
                     self.fastfill_pixels += 1;
                 }
                 let depth_offset = u64::from(self.aux_base).saturating_add(pixel_offset);
                 if write_depth && depth_offset + 1 < len {
-                    self.fb[depth_offset as usize] = depth[0];
-                    self.fb[depth_offset as usize + 1] = depth[1];
+                    self.fb.write_u16_le(depth_offset as usize, depth);
                 }
             }
         }
@@ -2484,15 +2725,15 @@ impl Distira {
             (origin_x, origin_y),
         );
         let depths = if self.fbz_mode & FBZ_W_BUFFER != 0 {
-            coords.map(|(x, y)| {
-                let w = self.texture_iterators.fbi_w_at(x, y, origin_x, origin_y);
-                // wfloat_depth already returns the same "raw, pre depth_to_u16
-                // divide-by-4096" units fixed_depth_at produces for Z, so both
-                // paths feed the shared depth_to_u16 conversion unchanged.
-                f32::from(wfloat_depth(w)) * 4096.0
-            })
+            // Raw per-vertex 1/w. The rasteriser interpolates 1/w per pixel
+            // and runs the wfloat encode there; the encode is not linear, so
+            // encoding here and interpolating the code would misplace every
+            // interior pixel of a large triangle.
+            TriangleDepth::W(coords.map(|(x, y)| {
+                self.texture_iterators.fbi_w_at(x, y, origin_x, origin_y)
+            }))
         } else {
-            coords.map(|(x, y)| {
+            TriangleDepth::Z(coords.map(|(x, y)| {
                 fixed_depth_at(
                     self.triangle_depth,
                     self.triangle_depth_dx,
@@ -2502,7 +2743,7 @@ impl Distira {
                     origin_x,
                     origin_y,
                 )
-            })
+            }))
         };
         let vertices = coords.map(|(x, y)| DistiraVertex {
             x,
@@ -2567,15 +2808,14 @@ impl Distira {
         self.command = 0;
     }
 
-    fn write_pixel_at_base(&mut self, base: u32, x: u32, y: u32, pixel: u16) -> bool {
+    fn write_pixel_at_base(&self, base: u32, x: u32, y: u32, pixel: u16) -> bool {
         let Some(offset) = self.framebuffer_pixel_offset(base, x, y) else {
             return false;
         };
-        self.fb[offset..offset + 2].copy_from_slice(&pixel.to_le_bytes());
-        true
+        self.fb.write_u16_le(offset, pixel)
     }
 
-    fn write_draw_pixel(&mut self, x: u32, y: u32, pixel: u16) -> bool {
+    fn write_draw_pixel(&self, x: u32, y: u32, pixel: u16) -> bool {
         let base = match self.fbz_mode & FBZ_DRAW_MASK {
             FBZ_DRAW_FRONT => self.display.front_base,
             _ => self.display.back_base,
@@ -3170,7 +3410,7 @@ impl Distira {
     fn read_pixel_rgb_at_base(&self, base: u32, x: u32, y: u32) -> (u8, u8, u8) {
         let raw = self
             .framebuffer_pixel_offset(base, x, y)
-            .map(|offset| u16::from_le_bytes([self.fb[offset], self.fb[offset + 1]]))
+            .and_then(|offset| self.fb.read_u16_le(offset))
             .unwrap_or(0);
         (
             expand5(raw >> 11) as u8,
@@ -3181,10 +3421,10 @@ impl Distira {
 
     fn read_depth_pixel(&self, x: u32, y: u32) -> Option<u16> {
         self.framebuffer_pixel_offset(self.aux_base, x, y)
-            .map(|offset| u16::from_le_bytes([self.fb[offset], self.fb[offset + 1]]))
+            .and_then(|offset| self.fb.read_u16_le(offset))
     }
 
-    fn write_depth_pixel(&mut self, x: u32, y: u32, depth: u16) -> bool {
+    fn write_depth_pixel(&self, x: u32, y: u32, depth: u16) -> bool {
         if self.fbz_mode & (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
             != (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
         {
@@ -3193,8 +3433,7 @@ impl Distira {
         let Some(offset) = self.framebuffer_pixel_offset(self.aux_base, x, y) else {
             return false;
         };
-        self.fb[offset..offset + 2].copy_from_slice(&depth.to_le_bytes());
-        true
+        self.fb.write_u16_le(offset, depth)
     }
 
     fn framebuffer_pixel_offset(&self, base: u32, x: u32, y: u32) -> Option<usize> {
@@ -3202,7 +3441,9 @@ impl Distira {
             .checked_add(u64::from(y).checked_mul(u64::from(self.display.pitch))?)?
             .checked_add(u64::from(x).checked_mul(2)?)?;
         let offset = usize::try_from(offset).ok()?;
-        (offset.checked_add(2)? <= self.fb.len()).then_some(offset)
+        // The frame store never changes size, so the constant keeps this
+        // valid while the raster path holds the store outside `self`.
+        (offset.checked_add(2)? <= DISTIRA_FB_SIZE).then_some(offset)
     }
 
     fn clear_aux_depth(&mut self) {
@@ -3211,9 +3452,7 @@ impl Distira {
         };
         let len = (self.display.pitch as usize).saturating_mul(self.display.height as usize);
         let end = start.saturating_add(len).min(self.fb.len());
-        if let Some(bytes) = self.fb.get_mut(start..end) {
-            bytes.fill(0xff);
-        }
+        self.fb.fill(start, end, 0xff);
     }
 }
 
