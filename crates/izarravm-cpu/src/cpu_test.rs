@@ -4094,6 +4094,14 @@ mod jit_retf_v86;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_call_far_imm_test.rs"]
+mod jit_call_far_imm;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_run_loop_admission_test.rs"]
 mod jit_run_loop_admission;
 

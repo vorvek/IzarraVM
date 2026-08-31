@@ -5023,6 +5023,91 @@ pub(crate) enum DirectKind {
     RetFar16 {
         release: u16,
     },
+    /// CALL FAR ptr16:16 (`0x9A`) on a 16-bit stack at Word operand size, in REAL MODE or V86
+    /// only. L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`), gated on L7 Part 1's run-loop
+    /// reachability fix landing first: without it this kind converts the block ENTRY sites
+    /// `rejected -> compiled`, but the run loop never reaches `try_direct_continuation` at a
+    /// non-continuable entry, so nothing native ever runs there. With it, the ten `0x9A` sites
+    /// that carried 116.3 M of the corpus's 186.7 M `absent` class on 15-move-hole-puzzle become
+    /// reachable, compiled and (once a predecessor's link binds) chained.
+    ///
+    /// `selector` and `offset` are the instruction's own bytes -- a ptr16:16 IMMEDIATE, already
+    /// fully decoded by `decode.rs`'s `0x9a` arm into `insn.imm` (offset) and `insn.imm2`
+    /// (selector) -- not a value read off the stack. This is the whole reason the kind is
+    /// EASIER than `RetFar16` despite writing the same CS record: nothing about the target is
+    /// runtime-unknown, so there is no POP, no stack READ guard for the target and no register
+    /// materialization needed to name it.
+    ///
+    /// **THE COMPLETION-PATH DECISION, verified rather than assumed (owed by the design doc).**
+    /// `emit_completed_path`'s only lever is `emit_advance_eip`, which ADDS a compile-time delta
+    /// to the CPU's IN-MEMORY `eip` field. For a SAME-segment control transfer (`Call16`, `Jmp`,
+    /// `Jcc`) that delta is a LINEAR-space difference computed by `classify` from `entry_lin`
+    /// alone, which is exactly the EIP-space difference because CS's base does not change across
+    /// the edge. A far call's target lives in a DIFFERENT segment with a DIFFERENT, compile-time
+    /// KNOWN base (`selector << 4`), so the arithmetic identity `entry_eip + (offset -
+    /// entry_eip) == offset` still holds bit-for-bit -- modular subtraction and re-addition of
+    /// the same value always cancels, whatever that value denotes -- but `classify` (`insn: &_,
+    /// lin: u32, entry_lin: u32`) is never handed the block's entry EIP or CS base needed to
+    /// compute that delta, only linear addresses. Recovering `entry_eip` would mean threading
+    /// `memory.segments.cs.base` from the EMITTER back through `classify`'s signature, which
+    /// every other kind in this file keeps free of `&CpuGsw`/`MemoryEmitContext` on purpose (see
+    /// `stack_width_kind`'s own "classify has no CPU" refrain, repeated at `RetFar16`,
+    /// `LoadSegReal` and `PopSegReal`). Rather than break that invariant for one kind, this
+    /// lowering takes the FALLBACK the design explicitly allows: it mirrors `RetFar16`'s dynamic
+    /// completion route exactly, materializing the compile-time-known `offset` into a register
+    /// with `mov_r32_imm32` where `RetFar16` would have loaded the popped word off the stack,
+    /// then handing it to the same `emit_completed_dynamic_path`/far-PIC/`far_merge` machinery.
+    /// This is sound rather than merely convenient, and cheap rather than merely simple:
+    /// `written_segment() == Some(SegmentIndex::Cs)` already forces `segment_write_block = true`
+    /// through the existing catch-all, which ALREADY forces `successors = [None, None]`
+    /// regardless of which completion path is chosen -- so the "simpler" static path would have
+    /// bought no chaining a link cell could use anyway, only saved a `mov_r32_imm32` and a
+    /// register move that this path already pays once, on a terminal that fires far less often
+    /// than the instructions inside the blocks it replaces. `far_dynamic` is therefore SET for
+    /// this kind (a fourth arm on the `matches!` `is_segment_write_block`'s own doc proof
+    /// enumerates as "a third arm" for `RetFar16` alone -- read that comment; the argument is
+    /// identical here: this kind reaches `[None, None]` through the segment-write arm while
+    /// `dynamic_successor` is independently true through the `far_dynamic` disjunct, which is
+    /// exactly the non-exclusivity `RetFar16` already introduced and this kind now shares).
+    ///
+    /// The two pushes mirror `Call16`'s single push widened to two, in the exact order
+    /// `far_call` (`control.rs`) uses: CS first (the higher stack address, at `(SP+2) & 0xFFFF`
+    /// after both pushes), then the return IP (at `SP & 0xFFFF`) -- the mirror image of
+    /// `RetFar16`'s two pops, which is what lets one instruction's CALL be undone by the other's
+    /// RETF. Both pushes share one `MemorySideExits` guard set (`AddressWrap::Word`), and SP does
+    /// not move until AFTER both stores, so a fault on EITHER push leaves CS, EIP and SP
+    /// completely unchanged from the guest's perspective -- matching, rather than merely
+    /// tolerating, the interpreter's own `far_call`, whose comment states the identical fact: a
+    /// second-push fault "restores (E)SP past the committed first one", so the CS word may
+    /// already be physically in memory at that point and it does not matter, because nothing
+    /// architectural ever reads a word at an address SP no longer names.
+    ///
+    /// **The far-transfer ledger.** `STACK_RAM_DWORD_WRITES`'s high half is `RetFar16`'s
+    /// `far_ret_native` counter and is DOCUMENTED TAKEN; there is no second free high half
+    /// anywhere in the frame (`STACK_BYTE_READS`'s carries `split_extra_bytes`,
+    /// `STACK_RAM_BYTE_WRITES`'s carries the static word-store total). Conflating a far CALL into
+    /// `far_ret_native` would silently break its pre-registered identity
+    /// (`decode_inval_cs_load(armed) + far_ret_native(armed) == decode_inval_cs_load(base)`),
+    /// since a CALL and a RETF are two different `decode_inval_cs_load` gaps that must stay
+    /// separately attributable. So this kind deposits into a NEW, DEDICATED lane instead --
+    /// `STACK_FAR_CALL_NATIVE`, a whole extra 8-byte stack slot (with 8 bytes of padding beside
+    /// it to keep the frame's 16-byte alignment invariant intact) rather than a shared half --
+    /// unpacked in `run.rs` into `direct_stalls.far_call_native` and exposed as
+    /// `far_call_native_for_test`/the `far_call_native` JSON field, with its own identity
+    /// extension: `decode_inval_cs_load(armed) + far_ret_native(armed) + far_call_native(armed)
+    /// == decode_inval_cs_load(base)`.
+    CallFar16 {
+        selector: u16,
+        offset: u16,
+        /// The block-entry-relative delta of the return address (the byte immediately after this
+        /// 5-byte instruction), exactly `Call16`'s own `return_delta`: computed by `classify` from
+        /// `lin` and `entry_lin`, which is the LINEAR-space difference and, because CS's base does
+        /// not change before this push executes, is also the EIP-space difference
+        /// `StoreSource::EipDelta` needs -- "the LIVE eip plus the delta". Carried as a field
+        /// because `classify` is the only place `lin` is in hand; the emitter has only `span` and
+        /// `slot`, not the instruction's own address.
+        return_delta: u32,
+    },
     Jcc {
         condition: u8,
         taken_delta: u32,
@@ -5560,7 +5645,11 @@ impl DirectKind {
             // undercharge by 7 and riding the `_ => 2` default by 15; this is a PIN against the
             // interpreter, not an approximation, because `elapsed_clocks` and `raw_bus_clocks`
             // feed the cycle budget the fixtures stop on.
-            Self::RetFar { .. } | Self::RetFar16 { .. } => 17,
+            // CALL FAR (`0x9a`) charges clocks(17) regardless of operand size
+            // (`execute_extended.rs`, the 0x9a arm), exactly like the RETF forms above -- a PIN
+            // against the interpreter, not an approximation, for the identical reason: it feeds
+            // `elapsed_clocks`/`raw_bus_clocks`, the cycle budget the fixtures stop on.
+            Self::RetFar { .. } | Self::RetFar16 { .. } | Self::CallFar16 { .. } => 17,
             Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
             // PUSHFD is clocks(3) where PUSH r32 is clocks(2), so it cannot ride the `_ => 2`
             // default the other push forms use.
@@ -5803,7 +5892,7 @@ impl DirectKind {
                 // dword pair against an emitted completion that also bumps the word lane is the
                 // static-versus-dynamic disagreement that underflows `ram_word_writes`.
                 || x87_memory_access_is(self, NativeX87MemoryDirection::Write, MemoryWidth::Tbyte),
-        )
+        ) + 2 * u8::from(matches!(self, Self::CallFar16 { .. }))
     }
 
     pub(crate) fn dword_stores(self) -> u8 {
@@ -5950,7 +6039,13 @@ impl DirectKind {
             // `SegmentLayout::descriptor`'s `debug_assert_ne!` on the first emitted far block.
             // The segment WRITTEN is CS and is reported by `written_segment`, which is a
             // different question and must not be folded in here.
-            | Self::RetFar16 { .. } => Some(SegmentIndex::Ss),
+            //
+            // `CallFar16` joins it for the identical reason, one push wider: two words are
+            // written THROUGH SS (`write_segment` reports that), but SS's own descriptor must
+            // still be pinned in `used` or `MemorySideExits::new`'s `descriptor(Ss)` call trips
+            // its `debug_assert_ne!` on the first emitted far call.
+            | Self::RetFar16 { .. }
+            | Self::CallFar16 { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -6015,6 +6110,13 @@ impl DirectKind {
                 segment: SegmentIndex::Cs,
                 ..
             }
+                // `CallFar16` pushes the OLD (pre-transfer) CS selector as a compile-time
+                // immediate baked from this block's entry CS -- exactly the same shape `PUSH CS`
+                // and `MOV r16, CS` bake, just inside a far-call's own emitter arm rather than a
+                // dedicated PUSH/MOV kind. It is NOT applicable to `RetFar16`, which is the sibling
+                // this predicate might be mistaken for: `RetFar16` writes a NEW CS record it just
+                // POPPED, baking nothing about the OLD one.
+                | Self::CallFar16 { .. }
         )
     }
 
@@ -6067,7 +6169,14 @@ impl DirectKind {
             // This report is what sets `segment_writes` and therefore `segment_write_block`,
             // which is what masks the `successors` catch-alls -- and a far block that published a
             // static fallthrough would put a LINEAR-keyed cell on a static edge.
-            Self::RetFar16 { .. } => Some(SegmentIndex::Cs),
+            // `CallFar16` writes CS from an IMMEDIATE selector already in the instruction bytes,
+            // not from a value popped off the stack -- a different source but the identical
+            // question this accessor asks (which segment REGISTER does this slot overwrite), and
+            // the identical reason it must answer it: this report is what sets `segment_writes`
+            // and therefore `segment_write_block`, which masks the `successors` catch-alls. See
+            // the `CallFar16` variant doc for why a far CALL needs this exactly as much as a far
+            // RETURN does.
+            Self::RetFar16 { .. } | Self::CallFar16 { .. } => Some(SegmentIndex::Cs),
             _ => None,
         }
     }
@@ -6098,7 +6207,10 @@ impl DirectKind {
             | Self::Call16 { .. }
             | Self::CallReg { .. }
             | Self::PushMem { .. }
-            | Self::CallMem { .. } => Some(SegmentIndex::Ss),
+            | Self::CallMem { .. }
+            // The two pushed words (CS then the return IP) both go through SS, exactly like
+            // `Call16`'s one push -- widened by one word, not by a different segment.
+            | Self::CallFar16 { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
     }
@@ -6153,6 +6265,10 @@ impl DirectKind {
                 // with an emitter.
                 | Self::RetFar { .. }
                 | Self::RetFar16 { .. }
+                // `CallFar16` is here for the same load-bearing reason: the stack-width matrix
+                // is only consulted for kinds this predicate accepts, and it is what refuses
+                // every (SS.B, operand size) cell but the one with an emitter (Word, SS.B = 0).
+                | Self::CallFar16 { .. }
                 | Self::PushMem { .. }
                 | Self::CallReg { .. }
                 | Self::CallMem { .. }
@@ -6188,6 +6304,7 @@ impl DirectKind {
                 | Self::Ret16 { .. }
                 | Self::RetFar { .. }
                 | Self::RetFar16 { .. }
+                | Self::CallFar16 { .. }
                 | Self::Jcc { .. }
                 | Self::Loop { .. }
                 | Self::LoopCc { .. }
@@ -6540,9 +6657,9 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
 /// Every opcode any non-continuable walk admission can name, as a function of
 /// `DecodedInsn::opcode` alone. The conservative half of `walk_admits_non_continuable_entry`.
 ///
-/// This is the single definition of that set. `jit_admits_non_continuable` and
-/// `retf_admitted_here` both open with it, so neither can admit an opcode this function does not
-/// carry, and `DecodePack`'s `PACK_FLAG_NONCONT_WALK_CANDIDATE` is written from it. There is no
+/// This is the single definition of that set. `jit_admits_non_continuable`, `retf_admitted_here`
+/// and `call_far_admitted_here` all open with it, so none can admit an opcode this function does
+/// not carry, and `DecodePack`'s `PACK_FLAG_NONCONT_WALK_CANDIDATE` is written from it. There is no
 /// second list to drift.
 ///
 /// Deliberately a superset: it reads no CPU state, no operand size, no prefixes and no knob, so a
@@ -6556,9 +6673,12 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
 /// refuses to read and the superset must therefore carry both forms. The full predicate still
 /// makes the narrow refusal, one step later.
 ///
-/// `0x9a` is absent on purpose: `CALL FAR imm16:16` has no `classify` arm, so a walk starting on it
-/// stops before its first instruction. Adding one is the L8 slice, and adding it here is part of
-/// that slice's edit.
+/// `0x9a` (`CALL FAR imm16:16`) is IN the set as of the L8 slice, which gave it a `classify` arm
+/// and `call_far_admitted_here` as its admission predicate. Before that slice it was absent on
+/// purpose -- a walk starting on it stopped before its first instruction because no `classify` arm
+/// existed to reach -- and this comment is the reason the earlier revision gave; it is recorded
+/// here rather than deleted because the same reasoning applies to every opcode NOT in the set
+/// today (`0x9a`'s own history is the worked example).
 ///
 /// The parameter is `DecodedInsn::opcode`'s own `u16`, which carries the escape-prefixed two-byte
 /// opcodes in its high half; every entry in the set is a one-byte opcode, so the high half simply
@@ -6566,7 +6686,7 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
 pub(crate) const fn non_continuable_walk_candidate(opcode: u16) -> bool {
     matches!(
         opcode,
-        0x69 | 0x6b | 0xc4 | 0xc5 | 0xca | 0xcb | 0xe6 | 0xee
+        0x69 | 0x6b | 0x9a | 0xc4 | 0xc5 | 0xca | 0xcb | 0xe6 | 0xee
     )
 }
 
@@ -6590,9 +6710,17 @@ pub(crate) const fn non_continuable_walk_candidate(opcode: u16) -> bool {
 /// The gate is NOT self-opening. Giving an opcode a `classify` arm does not reach it; the same
 /// edit has to add the opcode to `non_continuable_walk_candidate` and to whichever of the two
 /// predicates below should claim it, and those two edits open the pack bit and this gate together.
+///
+/// **L8's `call_far_admitted_here` folds into this SAME disjunction** rather than requiring the
+/// run loop to consult a second, independent list -- see that predicate's own doc for why this is
+/// the site the L7 design named and why it is not a gate-design defect that a brand-new predicate
+/// needs to be named here explicitly (an opcode reusing an ALREADY-disjoined predicate needs no
+/// edit; a genuinely new predicate is, definitionally, one `||` term away from being reachable).
 pub(crate) fn walk_admits_non_continuable_entry(cpu: &CpuGsw, insn: &DecodedInsn, d: bool) -> bool {
     prefixes_supported_for(insn.prefixes, insn.operand_size, d)
-        && (jit_admits_non_continuable(insn) || retf_admitted_here(cpu, insn))
+        && (jit_admits_non_continuable(insn)
+            || retf_admitted_here(cpu, insn)
+            || call_far_admitted_here(cpu, insn))
 }
 
 pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> CompileOutcome {
@@ -6737,6 +6865,11 @@ pub(crate) enum StackWidthDecline {
     CallWordSs32,
     EnterNonWord,
     RetFarNonWord,
+    /// `CallFar16`'s sibling of `RetFarNonWord`: `call_far_admitted_here` already restricts a
+    /// walked `0x9A` to (Word, SS.B = 0) before it can reach `classify` at all, so every other
+    /// cell this arm names is defence in depth rather than a live path -- exactly the status
+    /// `RetFarNonWord` has, and for the identical reason.
+    CallFarNonWord,
     PopSegRealPmode,
     PopSegRealWidth,
     Other,
@@ -6747,7 +6880,7 @@ pub(crate) enum StackWidthDecline {
 
 #[cfg_attr(not(feature = "direct-admission-census"), allow(dead_code))]
 impl StackWidthDecline {
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::PushDwordSs16,
         Self::PopDwordSs16,
         Self::RetDwordSs16,
@@ -6759,6 +6892,7 @@ impl StackWidthDecline {
         Self::CallWordSs32,
         Self::EnterNonWord,
         Self::RetFarNonWord,
+        Self::CallFarNonWord,
         Self::PopSegRealPmode,
         Self::PopSegRealWidth,
         Self::Other,
@@ -6781,6 +6915,7 @@ impl StackWidthDecline {
             Self::CallWordSs32 => "call_word_ss32",
             Self::EnterNonWord => "enter_non_word",
             Self::RetFarNonWord => "ret_far_non_word",
+            Self::CallFarNonWord => "call_far_non_word",
             Self::PopSegRealPmode => "pop_seg_real_pmode",
             Self::PopSegRealWidth => "pop_seg_real_width",
             Self::Other => "other",
@@ -6916,6 +7051,29 @@ fn stack_width_kind(
         // through to an emitter that only knows the 16-bit shape -- four bytes popped with a
         // 16-bit pointer, and a 32-bit offset written into a segment whose limit is 0xFFFF.
         (DirectKind::RetFar { .. }, _, _) => Err(StackWidthDecline::RetFarNonWord),
+        // CALL FAR, real mode and V86 only (`call_far_admitted_here` already decided that,
+        // mirroring `retf_admitted_here`). ONE cell has an emitter: a 16-bit stack at Word
+        // operand size, which is two word pushes (CS then the return IP) and a 16-bit
+        // `SP -= 4`.
+        (
+            DirectKind::CallFar16 {
+                selector,
+                offset,
+                return_delta,
+            },
+            false,
+            OperandSize::Word,
+        ) => Ok(DirectKind::CallFar16 {
+            selector,
+            offset,
+            return_delta,
+        }),
+        // Spelled out ABOVE the blanket 32-bit-stack arm below, for the reason `RetFar` states
+        // just above: `call_far_admitted_here` refuses every operand size but Word and every
+        // stack width but 16-bit, so an unadmitted far call never becomes a slot -- but a future
+        // admission of the Dword form would otherwise be waved through to an emitter that only
+        // knows the 16-bit shape.
+        (DirectKind::CallFar16 { .. }, _, _) => Err(StackWidthDecline::CallFarNonWord),
         // LEAVE's Word cells, both stack widths. The Dword cell on a 32-bit stack is the blanket
         // arm below.
         (DirectKind::Leave, stack32, OperandSize::Word) => Ok(DirectKind::Leave16 { stack32 }),
@@ -7631,8 +7789,10 @@ fn compile_with_budget(
         // what the classifier could lower. That is why this has to be fixed before any of the
         // 16-bit admission work can produce a single native instruction.
         let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
-        let continuable =
-            insn.continuable || jit_admits_non_continuable(&insn) || retf_admitted_here(cpu, &insn);
+        let continuable = insn.continuable
+            || jit_admits_non_continuable(&insn)
+            || retf_admitted_here(cpu, &insn)
+            || call_far_admitted_here(cpu, &insn);
         if !prefixes_supported || !continuable {
             // Attributed since the completeness slice. The two conditions are split rather than
             // folded, because they are different work: a prefix refusal names a prefix the
@@ -8758,9 +8918,14 @@ fn compile_with_budget(
     // popped selector in real mode and V86, and INV-FAR-CS refuses any far edge whose target's
     // chain requirement claims CS's descriptor or CS's selector. `far_merge` is the edge predicate
     // and `widen_chain_requirement`'s cut arm is what keeps it true as requirements grow.
+    // `CallFar16` is a FOURTH arm sharing this flag, for the reason its own doc comment gives in
+    // full: its target is a compile-time immediate rather than a popped word, so nothing about it
+    // is dynamic in the ordinary sense, but it still writes CS (forcing `segment_write_block`)
+    // and still needs the far PIC's linear-keyed cell and `far_merge`'s INV-FAR-CS treatment
+    // rather than an ordinary static link, so it rides the identical machinery `RetFar16` built.
     let far_dynamic = matches!(
         slots.last().map(|slot| slot.kind),
-        Some(DirectKind::RetFar16 { .. })
+        Some(DirectKind::RetFar16 { .. } | DirectKind::CallFar16 { .. })
     );
     let dynamic_successor = far_dynamic
         || (!segment_write_block
@@ -8817,11 +8982,15 @@ fn compile_with_budget(
         // in this match that is load-bearing on its own. `emitted_static_targets` is built from
         // `emitted_mask` and is NOT masked by `segment_write_block`, so a far block riding the
         // catch-all would register a phantom static-fallthrough refusal-census row on SLOT 0 --
-        // the far cell -- and the campaign ranks and closes on censuses.
+        // the far cell -- and the campaign ranks and closes on censuses. `CallFar16` joins it for
+        // the identical reason: it is ALSO a far terminal whose successor cell is the linear-keyed
+        // far PIC, not an ordinary static fallthrough, and letting it ride the catch-all below
+        // would register the same phantom census row this arm exists to prevent.
         Some(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
             | DirectKind::RetFar16 { .. }
+            | DirectKind::CallFar16 { .. }
             | DirectKind::JmpMem { .. }
             | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
@@ -8877,11 +9046,13 @@ fn compile_with_budget(
         ],
         // Explicit, not inherited. Today `segment_write_block` is true for every far block and
         // the guard arm above already answers, but that is a COINCIDENCE of two independent
-        // decisions; the explicit arm makes `[None, None]` a decision about the kind.
+        // decisions; the explicit arm makes `[None, None]` a decision about the kind. `CallFar16`
+        // joins `RetFar16` here for the same reason it joins it in `terminal_links` above.
         Some(
             DirectKind::Ret { .. }
             | DirectKind::Ret16 { .. }
             | DirectKind::RetFar16 { .. }
+            | DirectKind::CallFar16 { .. }
             | DirectKind::JmpMem { .. }
             | DirectKind::JmpReg { .. }
             | DirectKind::CallReg { .. }
@@ -9249,6 +9420,15 @@ pub(crate) struct NativeExit {
     pub(crate) mode13_dword_writes: u64,
     pub(crate) mode13_dirty_pages: u64,
     pub(crate) side_exit: u64,
+    /// `CallFar16`'s ledger deposit: one per native far call that retired, mirroring
+    /// `ram_dword_writes`'s high half (`far_ret_native`) but in a WHOLE dedicated lane rather than
+    /// a shared half -- see the `STACK_FAR_CALL_NATIVE` doc for why no shared half was available
+    /// and `run.rs`'s reader for the identity this closes. Placed here, beside the other `u64`
+    /// fields, rather than after the trailing `u32`s below: an 8-byte field dropped between two
+    /// 4-byte ones would force alignment padding neither of them needs, growing the struct by 16
+    /// bytes instead of 8 and moving `direct_exit_and_link_cell_layouts_are_pinned`'s pin further
+    /// than this field's own size accounts for.
+    pub(crate) far_call_native: u64,
     pub(crate) side_exit_reason: u32,
     pub(crate) trace_len: u32,
     pub(crate) linked_transfers: u32,
@@ -9732,8 +9912,17 @@ const EXIT_ARG: Reg = Reg::R9;
 const EXIT_ARG: Reg = Reg::RCX;
 
 // Base frame: 20 accounting and scratch slots at 8 bytes each, offsets 0 to
-// 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes.
-const BASE_STACK_LEN: u32 = 160;
+// 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes, plus
+// `STACK_FAR_CALL_NATIVE` at 160 and 8 bytes of padding at 168 to keep the
+// frame's 16-byte alignment invariant (see `STACK_FAR_CALL_NATIVE`'s own doc),
+// filling 176 bytes.
+//
+// This +16 (160 -> 176) is paid by EVERY compiled block, not just one that uses CallFar16 --
+// the prologue's xor+store into `STACK_FAR_CALL_NATIVE` and `emit_return`'s load+store both run
+// unconditionally, including on the `IZARRAVM_DIRECT_RETF_V86` knob's `0` escape arm, which was
+// built to be byte-identical to main. frame growth accepted unpriced 2026-08-31; the escape arm
+// is no longer byte-identical to main; re-price before using =0 as an A/B base.
+const BASE_STACK_LEN: u32 = 176;
 // One frame shape for every block, x87-bearing or not. A chained native
 // transfer jumps straight into a target block's body, skipping its
 // prologue, so the target's own epilogue always runs against whatever
@@ -9842,6 +10031,40 @@ const STACK_ALU_FLAGS: i32 = 144;
 /// must not adopt the stub-call shape without moving this slot.
 const STACK_STUB_RETURN: i32 = STACK_ALU_FLAGS;
 const STACK_SHIFT_COUNT: i32 = 152;
+/// `CallFar16`'s far-CALL ledger: one deposit per native far call that retired, mirroring
+/// `RetFar16`'s `far_ret_native` counter (`STACK_RAM_DWORD_WRITES`'s high half) but NOT sharing
+/// that half or any other lane's. Both existing "free high half" lanes in this frame are
+/// documented TAKEN before this slice (`STACK_BYTE_READS`/`dword_reads` carries
+/// `split_extra_bytes`; `STACK_RAM_DWORD_WRITES`/`ram_dword_writes` carries `far_ret_native`
+/// itself), and `STACK_RAM_BYTE_WRITES`'s high half is already spoken for by the STATIC
+/// total-word-store count `word_stores()` feeds. Conflating a far CALL into `far_ret_native`
+/// would silently break its pre-registered identity (`decode_inval_cs_load(armed) +
+/// far_ret_native(armed) == decode_inval_cs_load(base)`), since a CALL and a RETF are two
+/// different `decode_inval_cs_load` gaps that must stay separately attributable -- a CALL never
+/// calls `invalidate_code_caches_for_cs_load` any more than a RETF does, but the two are different
+/// instructions with different census rows and, on the corpus, wildly different execution counts.
+///
+/// So this is a WHOLE dedicated 8-byte lane rather than a shared half, which is why the frame grew
+/// (`BASE_STACK_LEN` 160 -> 176: this slot at 160, then 8 bytes of padding at 168 to preserve the
+/// 16-byte alignment `native_stack_len_keeps_the_call_16_byte_aligned`-style asserts pin) instead
+/// of being threaded through the existing dynamic-counter machinery. Two consequences of that
+/// follow directly and are NOT bugs:
+///
+/// - 160 is outside `i8`'s range and outside `STACK_ZERO_FILL_LEN` (128), so this slot uses the
+///   disp32 load/store forms throughout (`dynamic_counter_fields`'s `(i8, usize)` pairs cannot
+///   name it) and is zeroed with its own explicit store in the prologue, exactly the pattern
+///   `STACK_EXIT`/`STACK_QUOTA` already use for the same reason: cheaper than widening the
+///   vector-fill window over the ALU scratch cluster (128..160), which is deliberately NOT zeroed
+///   (see `STACK_ZERO_FILL_LEN`'s own doc) and must stay that way.
+/// - The deposit itself cannot reuse `emit_dynamic_word_increment` (which always adds `1 << 32`,
+///   i.e. increments a shared HIGH half): a fresh full-width, low-half counter needs a plain
+///   64-bit `+= 1`, done here as an explicit disp32 load/add/store rather than the single
+///   `add_r64_to_mem_disp8` instruction the shared-half deposit uses, because that instruction has
+///   no disp32 form and this slot is out of disp8 range.
+///
+/// `run.rs` reads this field directly with no mask and no shift -- unlike `far_ret_native`, it
+/// shares no bits with anything, so there is nothing to unpack.
+const STACK_FAR_CALL_NATIVE: i32 = 160;
 // Beyond the base frame: the saved host RSI slot, then the x87 XMM6-11
 // save area right after it. Both Windows only, see NATIVE_STACK_LEN above.
 #[cfg(target_os = "windows")]
@@ -10772,7 +10995,9 @@ pub(crate) fn parse_disp_load_widen_arm_for_test(
 }
 
 /// The three arms of `IZARRAVM_DIRECT_RETF_V86`: which CPU modes may serve `0xCA`/`0xCB` RETF
-/// natively.
+/// natively. **Since L8, this same knob and the same three arms also gate `0x9A` CALL FAR
+/// ptr16:16** (`call_far_admitted_here`); everything below is written in RETF's terms because RETF
+/// is what priced the flip, but every arm's admission rule applies identically to both opcodes.
 ///
 /// **`V86` IS THE SHIPPED DEFAULT SINCE THE 2026-08-24 LADDER.** It shipped `Off` for exactly the
 /// commits that built it, and the ladder that priced it flipped it in the next -- the same
@@ -10809,7 +11034,8 @@ pub(crate) enum RetfArm {
 }
 
 impl RetfArm {
-    /// Whether this arm admits a native RETF in the CPU's CURRENT mode.
+    /// Whether this arm admits a native RETF -- or, since L8, a native CALL FAR ptr16:16 -- in the
+    /// CPU's CURRENT mode.
     ///
     /// The caller tests `self != Off` FIRST and only then calls this, so the OFF arm reads no CPU
     /// state per walked instruction. That ordering is the whole of what makes the ESCAPE arm's
@@ -10825,7 +11051,9 @@ impl RetfArm {
     }
 }
 
-/// Which modes serve RETF natively (`IZARRAVM_DIRECT_RETF_V86`). See `RetfArm`.
+/// Which modes serve RETF -- and, since L8, CALL FAR ptr16:16 -- natively
+/// (`IZARRAVM_DIRECT_RETF_V86`). See `RetfArm`. `call_far_admitted_here` calls this same function
+/// and applies the same arm; there is no separate CALL-FAR knob.
 ///
 /// **DEFAULT `v86` SINCE THE 2026-08-24 LADDER.**
 ///
@@ -10860,7 +11088,9 @@ impl RetfArm {
 ///
 /// # THE SPELLING TABLE
 ///
-/// Trimmed and case-folded on the way in:
+/// Trimmed and case-folded on the way in. Governs both `0xCA`/`0xCB` RETF and, since L8, `0x9A`
+/// CALL FAR ptr16:16 -- one arm, read once, applied identically to both opcodes' admission
+/// predicates:
 ///
 /// * **unset** or `v86` -> V86 only, the shipped default since the 2026-08-24 flip. Every
 ///   "defaults" leg recorded BEFORE that date is the escape arm and is not comparable with one
@@ -10899,7 +11129,7 @@ fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfA
         Err(std::env::VarError::NotPresent) => return RetfArm::V86,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
-                "IZARRAVM_DIRECT_RETF_V86 is set to a value that is not valid UTF-8; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder: native RETF in V86), `0` or `off` (the escape and the A/B base, under which the RETF stops the block and the interpreter serves it) and `1` or `on` (native RETF in V86 and plain real mode, opt-in and unpriced)"
+                "IZARRAVM_DIRECT_RETF_V86 is set to a value that is not valid UTF-8; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder: native RETF and, since L8, native CALL FAR ptr16:16 in V86), `0` or `off` (the escape and the A/B base, under which the RETF/CALL FAR stops the block and the interpreter serves it) and `1` or `on` (native RETF and CALL FAR in V86 and plain real mode, opt-in and unpriced)"
             )
         }
         Ok(raw) => raw,
@@ -10909,7 +11139,7 @@ fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfA
         "v86" => RetfArm::V86,
         "1" | "on" => RetfArm::On,
         other => panic!(
-            "IZARRAVM_DIRECT_RETF_V86={other:?} names no arm; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder), `0` or `off` (the escape and the A/B base) and `1` or `on` (V86 and plain real mode, opt-in). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm it named doing nothing"
+            "IZARRAVM_DIRECT_RETF_V86={other:?} names no arm; accepted spellings are unset or `v86` (the shipped default since the 2026-08-24 ladder; governs both RETF and, since L8, CALL FAR ptr16:16), `0` or `off` (the escape and the A/B base) and `1` or `on` (V86 and plain real mode, opt-in). Refusing to guess: a mistyped ladder leg would silently run the DEFAULT and be read as the arm it named doing nothing"
         ),
     }
 }
@@ -10921,8 +11151,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Force the RETF arm on this thread for the length of a fixture; `None` restores the ambient
-/// `IZARRAVM_DIRECT_RETF_V86` reading.
+/// Force the RETF/CALL-FAR arm on this thread for the length of a fixture; `None` restores the
+/// ambient `IZARRAVM_DIRECT_RETF_V86` reading. Governs both `retf_admitted_here` and
+/// `call_far_admitted_here`, which read the same knob.
 #[cfg(test)]
 pub(crate) fn set_direct_retf_v86_for_test(forced: Option<RetfArm>) {
     DIRECT_RETF_V86_OVERRIDE.with(|cell| cell.set(forced));
@@ -10975,6 +11206,52 @@ pub(crate) fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
         && insn.operand_size == OperandSize::Word
         && insn.prefixes == Prefixes::default()
         // SS.B = 0. The emitted pointer arithmetic is 16-bit throughout.
+        && !cpu.stack_is_32bit()
+        // LAST: the two CR0/EFLAGS reads.
+        && arm.admits(cpu)
+}
+
+/// Whether the compile walk may carry on THROUGH this `0x9A` CALL FAR ptr16:16 and lower it
+/// natively. `CallFar16`'s sibling of `retf_admitted_here`, and deliberately structured to match
+/// it term for term: same lemma (the CS record a real-mode or V86 far transfer writes is a pure
+/// function of the selector -- here an IMMEDIATE rather than a popped word, which changes nothing
+/// about the lemma itself), same mode restriction, same operand-size and stack-width restriction.
+///
+/// **REUSES `IZARRAVM_DIRECT_RETF_V86` rather than inventing a second knob**, a deliberate design
+/// decision rather than an oversight: `RetfArm`'s three arms (`Off`/`V86`/`On`) already name
+/// exactly the mode question this predicate needs to ask, the two kinds share one lemma and one
+/// blast-radius argument (V86 is the measured population; plain real mode is the unpriced one),
+/// and a corpus fixture that ladders one far-transfer arm should ladder both together rather than
+/// needing two knobs kept in sync by hand. If a future ladder measures CALL FAR and RETF diverging
+/// under the SAME arm, that is the trigger to split them -- not a reason to split them in advance
+/// of any evidence that they differ.
+///
+/// **THIS IS THE ONE EDIT THAT MAKES THE L7 RUN-LOOP GATE SELF-OPEN FOR L8.**
+/// `walk_admits_non_continuable_entry` is `jit_admits_non_continuable(insn) ||
+/// retf_admitted_here(cpu, insn)` and is consulted, verbatim, at THREE sites: the run loop's
+/// `!screen.continuable` break-site probe (this predicate's whole reason to exist), the compile
+/// walk's own per-slot admission (`compile_with_budget`'s `continuable` term, for a `0x9A` that is
+/// not the block's first slot), and the barrier-census suffix scan that mirrors the compile walk
+/// for counterfactual accounting. All three already OR in `retf_admitted_here`; this predicate is
+/// added to all three of the SAME three disjunctions -- not a fourth, independent list -- which is
+/// exactly the multi-site pattern `retf_admitted_here` itself already established (the suffix
+/// scan's own comment names this explicitly: "THE THIRD DISJUNCT MIRRORS THE COMPILE WALK, and it
+/// has to"). No gate outside these three sites needed a second edit.
+pub(crate) fn call_far_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
+    // OPCODE FIRST, ahead of `direct_retf_v86`'s `OnceLock` load -- same ordering and the same
+    // reason `retf_admitted_here` gives: the overwhelming majority of asks are about some other
+    // opcode, and the `non_continuable_walk_candidate` conjunct is redundant (the `matches!` is
+    // inside the set) and folds away.
+    if !(non_continuable_walk_candidate(insn.opcode) && insn.opcode == 0x9a) {
+        return false;
+    }
+    let arm = direct_retf_v86();
+    arm != RetfArm::Off
+        // CS.D = 0 and no 0x66, for the identical reason `retf_admitted_here` gives: `operand_size`
+        // is `default_32 XOR override`, so Word in a 16-bit segment means no prefix.
+        && insn.operand_size == OperandSize::Word
+        && insn.prefixes == Prefixes::default()
+        // SS.B = 0. The emitted pointer arithmetic (two word pushes) is 16-bit throughout.
         && !cpu.stack_is_32bit()
         // LAST: the two CR0/EFLAGS reads.
         && arm.admits(cpu)
@@ -14664,6 +14941,17 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // (SS.B = 0, Word) cell that has an emitter and refuses the rest.
                 | 0xca
                 | 0xcb
+                // CALL FAR ptr16:16, L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`). L7 Part 1
+                // made the ten `0x9A` block-ENTRY sites on 15-move-hole-puzzle (116.3 M of the
+                // corpus's 186.7 M `absent` class) reachable by the Direct dispatcher; without
+                // this entry they would still never reach the classifier arm at Word, and Part 1
+                // would only convert them `absent -> rejected` -- a zero-slot span, no win.
+                // Admission is decided by `call_far_admitted_here` in the compile walk (mirroring
+                // `retf_admitted_here`'s own placement note immediately above), which is where
+                // the CPU mode is in hand; this entry only lets the Word form reach the classifier
+                // arm at all, and the stack-width matrix then builds the one (SS.B = 0, Word) cell
+                // that has an emitter and refuses the rest.
+                | 0x9a
                 | 0xc6
                 | 0xc7
                 // The BIT-STRING family, admitted to the S3 `InterpretOne` allowlist. In a 16-bit
@@ -17016,6 +17304,25 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     release: if opcode == 0xca { insn.imm as u16 } else { 0 },
                 });
             }
+            // CALL FAR ptr16:16. Mode-independent here, exactly like `0xca`/`0xcb` above: the
+            // compile walk's `call_far_admitted_here` has already decided that this instruction
+            // may join a block at all -- it is non-continuable, so an unadmitted one never
+            // reaches `classify` -- and the stack-width matrix admits the one cell with an
+            // emitter. `classify` has no CPU, so the mode question cannot be asked here.
+            //
+            // `decode.rs`'s `0x9a` arm already parses the far pointer in full: the offset into
+            // `insn.imm` and the selector into `insn.imm2` (`decode.rs:744-753`). Nothing here
+            // decodes anything the decoder had not already produced.
+            0x9a => {
+                let return_delta = lin
+                    .wrapping_add(u32::from(insn.len))
+                    .wrapping_sub(entry_lin);
+                return Some(DirectKind::CallFar16 {
+                    selector: insn.imm2 as u16,
+                    offset: insn.imm as u16,
+                    return_delta,
+                });
+            }
             0xc2 | 0xc3 => {
                 // No width gate here. `OperandSize` has exactly two variants, so the only widths
                 // that reach this arm are Word and Dword, and both are wanted: the Word-size
@@ -17624,6 +17931,12 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     e.store_r64_disp8(Reg::RSP, STACK_EXIT, Reg::RAX);
     e.mov_r32_r32(Reg::RAX, QUOTA_ARG);
     e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
+    // `STACK_FAR_CALL_NATIVE` sits outside `STACK_ZERO_FILL_LEN` (128) on purpose (see its own
+    // doc), so it needs its own explicit zero, the same pattern `STACK_EXIT`/`STACK_QUOTA` use
+    // for the identical reason -- cheaper than widening the vector-fill window over the ALU
+    // scratch cluster, which must stay unzeroed.
+    e.xor_r64_self(Reg::RAX);
+    e.store_r64_disp32(Reg::RSP, STACK_FAR_CALL_NATIVE, Reg::RAX);
     for (index, home) in GUEST_HOMES.into_iter().enumerate() {
         e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
     }
@@ -18791,6 +19104,116 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // rewrites it into `RetFar16`, and refuses every other cell explicitly.
             DirectKind::RetFar { .. } => {
                 unreachable!("RetFar is rewritten into RetFar16 by the stack-width matrix")
+            }
+            // CALL FAR ptr16:16, real mode/V86, Word operand, 16-bit stack. See the `CallFar16`
+            // variant's own doc for the completion-path decision (mirrors `RetFar16`'s dynamic
+            // route rather than `Call16`'s static one) and the ledger decision (a whole new lane,
+            // not a share of `far_ret_native`'s).
+            DirectKind::CallFar16 {
+                selector,
+                offset,
+                return_delta,
+            } => {
+                // `far_call` (`control.rs`) pushes CS FIRST (the higher stack address, at
+                // `(SP - 2) & 0xFFFF`) and the return IP SECOND (at `(SP - 4) & 0xFFFF`) -- the
+                // mirror image of `RetFar16`'s two pops, offset then selector, which is what lets
+                // one instruction's CALL be undone by the other's RETF. SP itself does not move
+                // until step (c), AFTER both stores, so a fault on EITHER leaves CS, EIP and SP
+                // completely unchanged from the guest's perspective even though the CS word may
+                // already be physically in memory when the SECOND store faults -- exactly the
+                // interpreter's own `far_call`, whose comment states the identical fact ("A fault
+                // on the SECOND push restores (E)SP past the committed first one"): nothing
+                // architectural ever reads a word at an address SP no longer names.
+                let cs_addr = stack_addr(0u32.wrapping_sub(2));
+                let ip_addr = stack_addr(0u32.wrapping_sub(4));
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(cs_addr));
+                // (a) the OLD, CURRENT CS selector -- NOT `selector`, the far call's TARGET,
+                // which does not go on the stack at all. `far_call` (`control.rs`) pushes
+                // `self.registers.cs().selector` -- the pre-transfer value -- exactly as a plain
+                // `push cs` does. This block's entry CS is a compile-time constant (the block is
+                // keyed on CS through `mode_key`/`segment_layout`), read the same way
+                // `MovSegToReg { segment: Cs, .. }` reads it: `memory.segments.selector(Cs)`.
+                // Baking it is why this kind must report `bakes_cs_selector()` (see that
+                // predicate's arm for `CallFar16`): a chained entry into this block from a
+                // predecessor whose own CS the chain requirement does not already pin would push
+                // a STALE old-CS value otherwise.
+                let old_cs = memory.segments.selector(SegmentIndex::Cs);
+                emit_store(
+                    &mut e,
+                    StoreSource::Imm(u32::from(old_cs)),
+                    MemoryWidth::Word,
+                    cs_addr,
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                // (b) the return IP, computed from the LIVE eip (still the block's entry EIP: no
+                // guest-visible state has moved yet) plus the static `return_delta`, exactly the
+                // value `Call16`'s single push writes.
+                emit_store(
+                    &mut e,
+                    StoreSource::EipDelta(return_delta),
+                    MemoryWidth::Word,
+                    ip_addr,
+                    memory,
+                    reasons,
+                    AddressWrap::Word,
+                );
+                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+                // (c) SP -= 4, 16-bit and wrapping -- both pushes' worth in one SUB (op 5), the
+                // same operation `Call16`'s single push uses for its own SP -= 2, folded here to
+                // cover both pushes' worth of movement in one instruction.
+                e.alu_r16_imm16(5, home(4), 4);
+                // (d) the CS record: EXACTLY `SegmentRegister::real(selector)`, the same three
+                // stores `RetFar16` makes from its POPPED selector, made here from the IMMEDIATE
+                // one instead. Nothing else about the record differs: it is a pure function of the
+                // selector in both admitted modes, which is the shared lemma `retf_admitted_here`
+                // and `call_far_admitted_here` both rest on.
+                const REAL: SegmentRegister = SegmentRegister::real(0);
+                let cs = segment_field_base(SegmentIndex::Cs);
+                e.mov_r32_imm32(Reg::RAX, u32::from(selector));
+                e.store_r16_disp32(Reg::R15, cs + selector_offset(), Reg::RAX);
+                e.mov_r32_imm32(
+                    Reg::RDX,
+                    u32::from(REAL.access) | (u32::from(REAL.default_size_32) << 8),
+                );
+                e.store_r16_disp32(Reg::R15, cs + access_offset(), Reg::RDX);
+                e.mov_r32_imm32(Reg::RDX, REAL.limit);
+                e.store_r32_disp32(Reg::R15, cs + limit_offset(), Reg::RDX);
+                e.shift_r32_imm8(4, Reg::RAX, 4);
+                e.store_r32_disp32(Reg::R15, cs + base_offset(), Reg::RAX);
+                // (e) the far-CALL ledger. See `STACK_FAR_CALL_NATIVE`'s doc for why this is a
+                // whole dedicated lane (a plain `+= 1`) rather than a share of `far_ret_native`'s
+                // high half, and for why it cannot reuse `emit_dynamic_word_increment` (that
+                // helper always adds `1 << 32`, staged for a shared HIGH half; this lane is a
+                // fresh full-width counter, out of `i8` disp8 range, so both the load and the
+                // store below use the disp32 forms).
+                e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_FAR_CALL_NATIVE);
+                e.add_r64_imm32(Reg::RDX, 1);
+                e.store_r64_disp32(Reg::RSP, STACK_FAR_CALL_NATIVE, Reg::RDX);
+                // (f) EIP <- the immediate offset, then the far PIC. Materialized into a register
+                // here rather than baked as an `emit_completed_path` delta: see the `CallFar16`
+                // variant's own doc for why `classify` cannot compute an EIP-space delta to the
+                // target (it has no CS base for the TARGET segment) and why the dynamic route
+                // costs nothing extra anyway, since `segment_write_block` already forces
+                // `successors = [None, None]` regardless of which completion path is chosen.
+                e.mov_r32_imm32(Reg::RDX, u32::from(offset));
+                completed.retire(slot);
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                    x87_entry_top.is_some(),
+                    fetch_trace,
+                    true,
+                );
+                terminal = true;
+                break;
             }
             DirectKind::Leave => {
                 // ESP <- EBP, then POP EBP. The guard runs first, against SS:EBP, which is the
@@ -24225,6 +24648,15 @@ fn emit_return(e: &mut Encoder) {
         e.load_r64_disp8(Reg::RAX, Reg::RSP, stack_offset);
         e.store_r64_disp32(Reg::RDI, output_offset as i32, Reg::RAX);
     }
+    // `STACK_FAR_CALL_NATIVE` is copied out separately from `dynamic_counter_fields`'s loop:
+    // it is at offset 160, outside `i8`'s disp8 range that loop's `(i8, usize)` pairs require,
+    // so both the read and the write use the disp32 forms.
+    e.load_r64_disp32(Reg::RAX, Reg::RSP, STACK_FAR_CALL_NATIVE);
+    e.store_r64_disp32(
+        Reg::RDI,
+        core::mem::offset_of!(NativeExit, far_call_native) as i32,
+        Reg::RAX,
+    );
     e.add_r64_imm32(Reg::RSP, NATIVE_STACK_LEN);
     for reg in SAVED_HOST_REGS.into_iter().rev() {
         e.pop(reg);
@@ -31449,7 +31881,8 @@ fn census_native_suffix(
             // `retf_admitted_here` returns after one `OnceLock` load.
             || !(insn.continuable
                 || jit_admits_non_continuable(&insn)
-                || retf_admitted_here(cpu, &insn))
+                || retf_admitted_here(cpu, &insn)
+                || call_far_admitted_here(cpu, &insn))
             || (insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu))
         {
             break;
@@ -32037,6 +32470,19 @@ pub(crate) struct DirectStallTally {
     /// `canonical_state_test.rs`) say what that costs -- a cache-line reshuffle of the hot region
     /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
     pub far_ret_native: u64,
+    /// L8's sibling of `far_ret_native`: CALL FARs served natively by `DirectKind::CallFar16`,
+    /// read out of the DEDICATED `STACK_FAR_CALL_NATIVE` frame lane (not a shared high half --
+    /// see that constant's own doc for why no shared half was available).
+    ///
+    /// A LEDGER rather than a rate, for the identical reason `far_ret_native` is one: a native
+    /// far CALL does not call `invalidate_code_caches_for_cs_load` either, so `decode_inval_cs_load`
+    /// falls by exactly this count too, and the two counters extend rather than replace
+    /// `far_ret_native`'s own pre-registered identity: `decode_inval_cs_load(armed) +
+    /// far_ret_native(armed) + far_call_native(armed) == decode_inval_cs_load(base)`. Kept
+    /// SEPARATE from `far_ret_native` rather than folded into it, because a CALL and a RETF are
+    /// different `decode_inval_cs_load` gaps on different census rows with different execution
+    /// counts on the corpus, and conflating them would make neither count individually checkable.
+    pub far_call_native: u64,
     /// Stage 0 §5.0c: installed blocks whose OWN snapshot claims CS in either way -- the
     /// descriptor (`segment_bit(Cs)`, a CS-override memory operand) or the selector
     /// (`BAKES_CS_BIT`, `PUSH CS` / `MOV r16, CS`).
@@ -33777,6 +34223,16 @@ impl crate::jit::JitState {
         self.stalls.far_ret_native += far_returns;
     }
 
+    /// L8's sibling of `note_far_returns`. See `DirectStallTally::far_call_native`.
+    pub(crate) fn note_far_calls(&mut self, far_calls: u64) {
+        self.stalls.far_call_native += far_calls;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn far_call_native_for_test(&self) -> u64 {
+        self.stalls.far_call_native
+    }
+
     #[cfg(test)]
     pub(crate) fn far_ret_native_for_test(&self) -> u64 {
         self.stalls.far_ret_native
@@ -33917,6 +34373,7 @@ impl crate::jit::JitState {
             disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             far_ret_native: self.stalls.far_ret_native,
+            far_call_native: self.stalls.far_call_native,
             blocks_installed_baking_cs: self.stalls.blocks_installed_baking_cs,
             far_link_refused_cs: self.stalls.far_link_refused_cs,
             far_link_refused_limit: self.stalls.far_link_refused_limit,
