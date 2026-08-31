@@ -1792,6 +1792,17 @@ pub struct DirectBarrierCensusSnapshot {
     pub rejected_truncated_dynamic: u64,
     #[cfg(feature = "barrier-census-closure")]
     pub rejected_distinct_sites: u64,
+    /// L7 DIAGNOSTIC (2026-08-31). The `Absent` twin of the four fields above, same columns and
+    /// same closure identity: `sum(absent_sites.static_exits) + absent_truncated_static` equals
+    /// the `absent` entry of `unbound_targets` exactly, at any head size.
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_sites: Vec<DirectDormantHeatSite>,
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_truncated_static: u64,
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_truncated_dynamic: u64,
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_distinct_sites: u64,
     /// How many distinct block entries a compile walk started from ANYWHERE IN THE RUN, which is
     /// the set the per-site `compile_walked` column is looked up in.
     ///
@@ -3782,6 +3793,31 @@ const PACK_FLAG_D: u8 = 1 << 0;
 /// `DecodePack::flags` bit 1: `DecodedInsn::continuable`, the first screen the loop applies.
 #[cfg(feature = "jit")]
 const PACK_FLAG_CONTINUABLE: u8 = 1 << 1;
+/// `DecodePack::flags` bit 2: `jit::direct::non_continuable_walk_candidate` of the opcode.
+///
+/// What it buys. When bit 1 is CLEAR the run loop ends its run, and before it does it asks whether
+/// the Direct dispatcher should be given a look at the address (`probe_admit_at_break`). Answering
+/// that needs the opcode, and the opcode lives on the 56-byte line this array exists to keep cold.
+/// Most non-continuable opcodes are far transfers, `INT`s and undefined bytes that no walk can
+/// carry, so the common answer is "no" and this bit lets the loop reach it without faulting the
+/// line in at all. Only when the bit is SET does the loop take the line and ask the full
+/// predicate, which needs the operand size, the prefixes and the CPU's mode.
+///
+/// Why the bit can be conservative. `non_continuable_walk_candidate` reads the opcode byte and
+/// nothing else, so it is a strict superset of what `walk_admits_non_continuable_entry` admits.
+/// A set bit means "ask", never "yes". A clear bit is the only load-bearing direction, and the
+/// superset property is what makes it sound.
+///
+/// STALENESS: there is none to handle, for the same reason `PACK_FLAG_CONTINUABLE` has none.
+/// `publish_line` is the ONLY writer of a pack, and it re-derives every flag from the freshly
+/// decoded `line.insn` it is publishing; `kill_line_at` and `clear_lines` retire slots rather than
+/// editing them. So a pack can never describe an instruction other than the one in its line, and
+/// `assert_packs_consistent` pins that for this bit alongside the other two. The set itself is a
+/// `const fn` of the opcode alone -- no knob, no CPU state, no feature flag -- so it cannot change
+/// at run time either, and growing it (the L8 `0x9a` slice) is a source edit that recompiles both
+/// sides from the one definition.
+#[cfg(feature = "jit")]
+const PACK_FLAG_NONCONT_WALK_CANDIDATE: u8 = 1 << 2;
 
 /// What a first touch yields: the screen fields plus the two facts native admission needs. The
 /// interpreted path asks for the full `DecodeLineView` separately, because only it needs the
@@ -3798,6 +3834,11 @@ pub(crate) struct DecodeScreenView {
     /// its key, so a consumer can address it without re-testing the tag.
     #[cfg(feature = "jit")]
     pub(crate) slot: u32,
+    /// `PACK_FLAG_NONCONT_WALK_CANDIDATE`: may a compile walk that STARTS here carry this opcode?
+    /// Only meaningful when `continuable` is false, which is the one place the run loop asks it.
+    /// Conservative: true means "take the line and ask the full predicate".
+    #[cfg(feature = "jit")]
+    pub(crate) noncont_walk_candidate: bool,
 }
 
 /// One decode-line fetch, materialised once and threaded through a whole continuation iteration.
@@ -3835,6 +3876,11 @@ impl DecodeLineView {
             phys_start: self.phys_start,
             #[cfg(feature = "jit")]
             slot: self.slot,
+            // The unpacked arm holds the instruction already, so it answers from the same
+            // definition the pack writer uses rather than from a stored bit. Both arms therefore
+            // reach the run loop's gate with the same value.
+            #[cfg(feature = "jit")]
+            noncont_walk_candidate: jit::direct::non_continuable_walk_candidate(self.insn.opcode),
         }
     }
 }
@@ -4328,6 +4374,7 @@ impl DecodeCache {
                 phys_start: pack.phys_start,
                 #[cfg(feature = "jit")]
                 slot,
+                noncont_walk_candidate: pack.flags & PACK_FLAG_NONCONT_WALK_CANDIDATE != 0,
             })
         } else {
             None
@@ -4348,6 +4395,12 @@ impl DecodeCache {
             }
             if line.insn.is_some_and(|insn| insn.continuable) {
                 flags |= PACK_FLAG_CONTINUABLE;
+            }
+            if line
+                .insn
+                .is_some_and(|insn| jit::direct::non_continuable_walk_candidate(insn.opcode))
+            {
+                flags |= PACK_FLAG_NONCONT_WALK_CANDIDATE;
             }
             self.packs[index] = DecodePack {
                 tag: line.tag,
@@ -4410,6 +4463,11 @@ impl DecodeCache {
                 pack.flags & PACK_FLAG_CONTINUABLE != 0,
                 insn.continuable,
                 "slot {index}: continuable"
+            );
+            assert_eq!(
+                pack.flags & PACK_FLAG_NONCONT_WALK_CANDIDATE != 0,
+                jit::direct::non_continuable_walk_candidate(insn.opcode),
+                "slot {index}: non-continuable walk candidate"
             );
         }
     }
