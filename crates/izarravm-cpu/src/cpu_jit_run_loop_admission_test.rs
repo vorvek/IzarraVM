@@ -51,6 +51,12 @@ const CALL_FAR: [u8; 5] = [0x9a, 0x00, 0x04, 0x20, 0x00];
 /// doc comment above); `0xea` is its replacement, chosen because JMP FAR ptr16:16 native lowering
 /// has never landed in this codebase.
 const JMP_FAR: [u8; 5] = [0xea, 0x00, 0x04, 0x20, 0x00];
+/// `IMUL BX, [0x0600], 0x0010`, the word form. Non-continuable for the interpreter, IN
+/// `non_continuable_walk_candidate`, and admitted by `jit_admits_non_continuable`, so a compile
+/// walk carries it -- but it is NOT in `non_continuable_break_probe_candidate`, so the run loop
+/// must not probe it at a break site. It also does not transfer control, which is why the fixture
+/// below drives to the self-loop rather than to `TARGET_LINEAR`.
+const IMUL_WORD: [u8; 6] = [0x69, 0x1e, 0x00, 0x06, 0x10, 0x00];
 
 /// Where the far return goes: selector 0x0020 (base 0x200) at offset 0x0400, linear 0x600.
 const TARGET_SELECTOR: u16 = 0x0020;
@@ -157,15 +163,21 @@ fn arm(cpu: &mut CpuGsw) {
 
 /// Walk the fixture once, from the `NOP` to the far transfer's landing site.
 fn visit(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    visit_until(cpu, bus, TARGET_LINEAR);
+}
+
+/// The same walk with the stopping point named. A fallthrough that does not transfer control (the
+/// `IMUL` arm) settles on the fixture's own self-loop instead of on the far target.
+fn visit_until(cpu: &mut CpuGsw, bus: &mut TestBus, stop_at: u32) {
     arm(cpu);
     for _ in 0..32 {
-        if cpu.linear_eip() == TARGET_LINEAR {
+        if cpu.linear_eip() == stop_at {
             return;
         }
         cpu.run_straight_line(bus, u64::MAX).unwrap();
     }
     panic!(
-        "the guest never reached the far transfer target, stuck at {:#x}",
+        "the guest never reached {stop_at:#x}, stuck at {:#x}",
         cpu.linear_eip()
     );
 }
@@ -437,4 +449,87 @@ fn a_transient_dormant_park_at_a_break_site_entry_still_recovers() {
         "the lift must be the retry arm, not an incidental cache wipe"
     );
     jit::direct::set_retry_lift_for_test(None);
+}
+
+/// THE POLICY GATE, and the reason it exists: an opcode a compile WALK can carry is not
+/// automatically an opcode the run loop probes at a break site.
+///
+/// `walk_admits_non_continuable_entry` is a capability test and it says yes to word `IMUL`, word
+/// `LES`/`LDS` and `OUT` -- all three have `classify` arms and all three are in
+/// `jit_admits_non_continuable`. Reaching the break-site probe through that test alone priced
+/// duke3d-586 at -5.7%: 2.79 M probes across those three families bought 92 blocks, and the block
+/// keys and rejected watch spans they minted moved `jit_direct_blocks_installed` 200,711 ->
+/// 235,235 and `smc_scan_keys` 657.5 M -> 669.2 M. `non_continuable_break_probe_candidate` is the
+/// narrower door, and this fixture is what holds it shut.
+///
+/// RED WITHOUT THE GATE: the `IMUL` entry compiles a second block, its census class leaves
+/// `absent`, and `jit_direct.len()` reads 2.
+#[test]
+fn a_walk_admissible_non_probe_opcode_is_never_probed_at_a_break_site() {
+    let stop_at = FALLTHROUGH + IMUL_WORD.len() as u32;
+    let (mut cpu, mut bus) = staged_with(true, &IMUL_WORD);
+    for _ in 0..VISITS {
+        visit_until(&mut cpu, &mut bus, stop_at);
+    }
+
+    assert_eq!(
+        cpu.jit_direct.len(),
+        1,
+        "only the predecessor may compile; the IMUL entry is outside the break-probe set and must \
+         never be keyed by the run loop, got {} blocks",
+        cpu.jit_direct.len()
+    );
+    assert!(
+        class(&cpu, "absent") > 0,
+        "the IMUL entry must stay absent, which is what costs nothing: {:?}",
+        cpu.direct_barrier_census_snapshot()
+            .unwrap()
+            .unbound_targets
+    );
+    assert_eq!(
+        class(&cpu, "rejected") + class(&cpu, "seen") + class(&cpu, "compiled"),
+        0,
+        "a break-site probe at the IMUL would show up as one of these classes; none may move: \
+         {:?}",
+        cpu.direct_barrier_census_snapshot()
+            .unwrap()
+            .unbound_targets
+    );
+}
+
+/// The two predicates answer different questions, pinned on the four families the narrowing
+/// removed and on the three it kept. Without this, a future edit that re-pointed the decode-pack
+/// bit at `non_continuable_walk_candidate` would put the duke3d regression back with every other
+/// fixture in this file still green.
+#[test]
+fn the_break_probe_set_is_a_strict_subset_of_the_walk_candidate_set() {
+    for opcode in [0x69u16, 0x6b, 0xc4, 0xc5, 0xe6, 0xee] {
+        assert!(
+            jit::direct::non_continuable_walk_candidate(opcode),
+            "{opcode:#04x} must stay admissible to a compile walk"
+        );
+        assert!(
+            !jit::direct::non_continuable_break_probe_candidate(opcode),
+            "{opcode:#04x} must not be probed at a break site"
+        );
+    }
+    for opcode in [0x9au16, 0xca, 0xcb] {
+        assert!(
+            jit::direct::non_continuable_break_probe_candidate(opcode),
+            "the far-transfer family carries L7's and L8's whole measured win; {opcode:#04x} must \
+             stay in the probe set"
+        );
+        assert!(
+            jit::direct::non_continuable_walk_candidate(opcode),
+            "the probe set must be a subset of the walk-candidate set, {opcode:#04x} is not"
+        );
+    }
+    // The subset property in full, over every opcode a `DecodedInsn` can carry.
+    for opcode in 0u16..=u16::MAX {
+        assert!(
+            !jit::direct::non_continuable_break_probe_candidate(opcode)
+                || jit::direct::non_continuable_walk_candidate(opcode),
+            "{opcode:#06x} is probed at a break site but is not a walk candidate"
+        );
+    }
 }
