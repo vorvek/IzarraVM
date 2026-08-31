@@ -2581,11 +2581,13 @@ fn direct_entry_attribution_json(
         "outlier_marks": snapshot.outlier_marks,
         "lane_pin_mismatches": snapshot.lane_pin_mismatches,
         // A3's `marks(P0) == decode_probes` identity needs every traversal that counted a probe
-        // and never reached the P0 mark. Four decode-screen breaks sit ABOVE `begin()`
-        // (run.rs:791-812) and are the three `brk_cont_*` keys; a FIFTH `brk_cont_decode_miss`
-        // site sits BELOW it (run.rs:857-862, the late view miss) and must be subtracted back
-        // out, or the identity over-counts by exactly this many. Emitted here so the report does
-        // not have to reach into another object for it.
+        // and never reached the P0 mark. In the continuation loop's `screened` match, the
+        // not-continuable, page-cross and decode-miss breaks all sit ABOVE the `ea_begin!` call
+        // and are the three `brk_cont_*` keys; a FIFTH site, the late decode-cache view miss in
+        // the interpreted fallback below `dispatch_continuation`, reuses `brk_cont_decode_miss`
+        // but sits BELOW `ea_begin!` and must be subtracted back out, or the identity over-counts
+        // by exactly this many. Emitted here so the report does not have to reach into another
+        // object for it.
         "decode_pack_late_view_miss": decode_pack_late_view_miss,
         // The `run.rs` line the P0 mark sits on -- the line `above_p0_mark` partitions the
         // refusal sites by, published so the reader is not left inferring it.

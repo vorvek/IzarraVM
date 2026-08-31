@@ -57,6 +57,13 @@ const JMP_FAR: [u8; 5] = [0xea, 0x00, 0x04, 0x20, 0x00];
 /// must not probe it at a break site. It also does not transfer control, which is why the fixture
 /// below drives to the self-loop rather than to `TARGET_LINEAR`.
 const IMUL_WORD: [u8; 6] = [0x69, 0x1e, 0x00, 0x06, 0x10, 0x00];
+/// A `0x66`-prefixed `RETF`: opcode `0xcb`, so `PACK_FLAG_NONCONT_BREAK_PROBE` is set from the
+/// opcode alone (step one) exactly as the bare `RETF` above sets it, but the operand-size override
+/// makes `retf_admitted_here`'s `insn.prefixes == Prefixes::default()` conjunct false (step two).
+/// Pins that the pack bit passing is not sufficient: the run loop must still refuse to key this
+/// entry at all, the same `absent`-forever outcome the `IMUL_WORD` fixture pins for a different
+/// reason (an opcode the probe policy never admits in the first place).
+const RETF_OPSIZE_OVERRIDE: [u8; 2] = [0x66, 0xcb];
 
 /// Where the far return goes: selector 0x0020 (base 0x200) at offset 0x0400, linear 0x600.
 const TARGET_SELECTOR: u16 = 0x0020;
@@ -498,6 +505,59 @@ fn a_walk_admissible_non_probe_opcode_is_never_probed_at_a_break_site() {
         "a break-site probe at the IMUL would show up as one of these classes -- every class but \
          `absent` -- so a future heat-gate change that parks the IMUL entry dormant instead of \
          rejecting it cannot slip past this fixture unnoticed; none may move: {:?}",
+        cpu.direct_barrier_census_snapshot()
+            .unwrap()
+            .unbound_targets
+    );
+}
+
+/// STEP TWO of the break-probe gate, pinned separately from step one (the previous fixture).
+/// `PACK_FLAG_NONCONT_BREAK_PROBE` is written from `non_continuable_break_probe_candidate`, which
+/// reads the opcode alone -- so a `0x66`-prefixed `RETF` sets the same pack bit a bare `RETF` does.
+/// The run loop still must not key this entry: `walk_admits_non_continuable_entry` also runs
+/// `retf_admitted_here`, which demands `insn.prefixes == Prefixes::default()`, and the operand-size
+/// override fails that. Without step two the entry would compile a second block exactly as the
+/// bare `RETF` fixture above does, just with the wrong operand width baked into the emitted code.
+#[test]
+fn a_0x66_prefixed_retf_still_refuses_the_break_probe() {
+    let (mut cpu, mut bus) = staged_with(true, &RETF_OPSIZE_OVERRIDE);
+    // `program()` lays down a far-return frame sized for a 16-bit RETF: a word offset then a word
+    // selector. This opcode pops a 32-bit offset then a 16-bit selector, so the frame is widened
+    // to match -- `TARGET_OFFSET` fits in 16 bits, so its top half is zero and the selector moves
+    // out two bytes to make room for it.
+    let sp = STACK_SP as usize;
+    bus.memory[sp..sp + 4].copy_from_slice(&u32::from(TARGET_OFFSET).to_le_bytes());
+    bus.memory[sp + 4..sp + 6].copy_from_slice(&TARGET_SELECTOR.to_le_bytes());
+
+    for _ in 0..VISITS {
+        visit(&mut cpu, &mut bus);
+    }
+
+    assert_eq!(
+        cpu.jit_direct.len(),
+        1,
+        "only the predecessor may compile; the 0x66-prefixed RETF must never be keyed by the run \
+         loop even though its opcode alone sets the break-probe pack bit, got {} blocks",
+        cpu.jit_direct.len()
+    );
+    assert!(
+        class(&cpu, "absent") > 0,
+        "the prefixed RETF entry must stay absent, which is what costs nothing: {:?}",
+        cpu.direct_barrier_census_snapshot()
+            .unwrap()
+            .unbound_targets
+    );
+    assert_eq!(
+        class(&cpu, "no_key")
+            + class(&cpu, "seen")
+            + class(&cpu, "dormant_heat")
+            + class(&cpu, "dormant_other")
+            + class(&cpu, "rejected")
+            + class(&cpu, "compiled")
+            + class(&cpu, "compiled_retired"),
+        0,
+        "step two (`retf_admitted_here`'s prefix conjunct) must refuse this entry even though \
+         step one (the opcode-only pack bit) passed; none of these classes may move: {:?}",
         cpu.direct_barrier_census_snapshot()
             .unwrap()
             .unbound_targets
