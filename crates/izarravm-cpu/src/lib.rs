@@ -3815,20 +3815,23 @@ const PACK_FLAG_D: u8 = 1 << 0;
 /// `DecodePack::flags` bit 1: `DecodedInsn::continuable`, the first screen the loop applies.
 #[cfg(feature = "jit")]
 const PACK_FLAG_CONTINUABLE: u8 = 1 << 1;
-/// `DecodePack::flags` bit 2: `jit::direct::non_continuable_walk_candidate` of the opcode.
+/// `DecodePack::flags` bit 2: `jit::direct::non_continuable_break_probe_candidate` of the opcode.
 ///
 /// What it buys. When bit 1 is CLEAR the run loop ends its run, and before it does it asks whether
 /// the Direct dispatcher should be given a look at the address (`probe_admit_at_break`). Answering
 /// that needs the opcode, and the opcode lives on the 56-byte line this array exists to keep cold.
-/// Most non-continuable opcodes are far transfers, `INT`s and undefined bytes that no walk can
-/// carry, so the common answer is "no" and this bit lets the loop reach it without faulting the
-/// line in at all. Only when the bit is SET does the loop take the line and ask the full
-/// predicate, which needs the operand size, the prefixes and the CPU's mode.
+/// Almost every non-continuable opcode is outside the probe set, so the common answer is "no" and
+/// this bit lets the loop reach it without faulting the line in at all. Only when the bit is SET
+/// does the loop take the line and ask the full predicate, which needs the operand size, the
+/// prefixes and the CPU's mode.
 ///
-/// Why the bit can be conservative. `non_continuable_walk_candidate` reads the opcode byte and
-/// nothing else, so it is a strict superset of what `walk_admits_non_continuable_entry` admits.
-/// A set bit means "ask", never "yes". A clear bit is the only load-bearing direction, and the
-/// superset property is what makes it sound.
+/// What a CLEAR bit means, exactly. It is a POLICY answer, not a capability answer: "this opcode is
+/// not one the run loop probes at a break site". It does NOT mean a compile walk could not carry
+/// the instruction, and it must not be reused as if it did -- `walk_admits_non_continuable_entry`
+/// is still the capability test, it still admits IMUL, word LES/LDS and OUT in the middle of a
+/// block, and this bit is clear for all three. The policy set and the reason it is drawn where it
+/// is live on `non_continuable_break_probe_candidate`; read that before widening this bit.
+/// A set bit still means "ask", never "yes": the run loop asks the full predicate either way.
 ///
 /// STALENESS: there is none to handle, for the same reason `PACK_FLAG_CONTINUABLE` has none.
 /// `publish_line` is the ONLY writer of a pack, and it re-derives every flag from the freshly
@@ -3836,10 +3839,10 @@ const PACK_FLAG_CONTINUABLE: u8 = 1 << 1;
 /// editing them. So a pack can never describe an instruction other than the one in its line, and
 /// `assert_packs_consistent` pins that for this bit alongside the other two. The set itself is a
 /// `const fn` of the opcode alone -- no knob, no CPU state, no feature flag -- so it cannot change
-/// at run time either, and growing it (the L8 `0x9a` slice) is a source edit that recompiles both
-/// sides from the one definition.
+/// at run time either, and growing it is a source edit that recompiles both sides from the one
+/// definition.
 #[cfg(feature = "jit")]
-const PACK_FLAG_NONCONT_WALK_CANDIDATE: u8 = 1 << 2;
+const PACK_FLAG_NONCONT_BREAK_PROBE: u8 = 1 << 2;
 
 /// What a first touch yields: the screen fields plus the two facts native admission needs. The
 /// interpreted path asks for the full `DecodeLineView` separately, because only it needs the
@@ -3856,11 +3859,12 @@ pub(crate) struct DecodeScreenView {
     /// its key, so a consumer can address it without re-testing the tag.
     #[cfg(feature = "jit")]
     pub(crate) slot: u32,
-    /// `PACK_FLAG_NONCONT_WALK_CANDIDATE`: may a compile walk that STARTS here carry this opcode?
-    /// Only meaningful when `continuable` is false, which is the one place the run loop asks it.
-    /// Conservative: true means "take the line and ask the full predicate".
+    /// `PACK_FLAG_NONCONT_BREAK_PROBE`: does the run loop probe THIS opcode for admission at a
+    /// break site? A policy answer, not a capability one; see the flag's own documentation. Only
+    /// meaningful when `continuable` is false, which is the one place the run loop asks it. True
+    /// means "take the line and ask the full predicate".
     #[cfg(feature = "jit")]
-    pub(crate) noncont_walk_candidate: bool,
+    pub(crate) noncont_break_probe: bool,
 }
 
 /// One decode-line fetch, materialised once and threaded through a whole continuation iteration.
@@ -3902,7 +3906,9 @@ impl DecodeLineView {
             // definition the pack writer uses rather than from a stored bit. Both arms therefore
             // reach the run loop's gate with the same value.
             #[cfg(feature = "jit")]
-            noncont_walk_candidate: jit::direct::non_continuable_walk_candidate(self.insn.opcode),
+            noncont_break_probe: jit::direct::non_continuable_break_probe_candidate(
+                self.insn.opcode,
+            ),
         }
     }
 }
@@ -4396,7 +4402,7 @@ impl DecodeCache {
                 phys_start: pack.phys_start,
                 #[cfg(feature = "jit")]
                 slot,
-                noncont_walk_candidate: pack.flags & PACK_FLAG_NONCONT_WALK_CANDIDATE != 0,
+                noncont_break_probe: pack.flags & PACK_FLAG_NONCONT_BREAK_PROBE != 0,
             })
         } else {
             None
@@ -4420,9 +4426,9 @@ impl DecodeCache {
             }
             if line
                 .insn
-                .is_some_and(|insn| jit::direct::non_continuable_walk_candidate(insn.opcode))
+                .is_some_and(|insn| jit::direct::non_continuable_break_probe_candidate(insn.opcode))
             {
-                flags |= PACK_FLAG_NONCONT_WALK_CANDIDATE;
+                flags |= PACK_FLAG_NONCONT_BREAK_PROBE;
             }
             self.packs[index] = DecodePack {
                 tag: line.tag,
@@ -4487,9 +4493,9 @@ impl DecodeCache {
                 "slot {index}: continuable"
             );
             assert_eq!(
-                pack.flags & PACK_FLAG_NONCONT_WALK_CANDIDATE != 0,
-                jit::direct::non_continuable_walk_candidate(insn.opcode),
-                "slot {index}: non-continuable walk candidate"
+                pack.flags & PACK_FLAG_NONCONT_BREAK_PROBE != 0,
+                jit::direct::non_continuable_break_probe_candidate(insn.opcode),
+                "slot {index}: non-continuable break-probe candidate"
             );
         }
     }

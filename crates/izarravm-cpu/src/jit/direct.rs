@@ -6705,8 +6705,7 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
 ///
 /// This is the single definition of that set. `jit_admits_non_continuable`, `retf_admitted_here`
 /// and `call_far_admitted_here` all open with it, so none can admit an opcode this function does
-/// not carry, and `DecodePack`'s `PACK_FLAG_NONCONT_WALK_CANDIDATE` is written from it. There is no
-/// second list to drift.
+/// not carry. There is no second list to drift.
 ///
 /// Deliberately a superset: it reads no CPU state, no operand size, no prefixes and no knob, so a
 /// `true` answer means "ask the full predicate", never "the walk will carry this". The run loop
@@ -6736,6 +6735,47 @@ pub(crate) const fn non_continuable_walk_candidate(opcode: u16) -> bool {
     )
 }
 
+/// Which non-continuable opcodes the RUN LOOP probes for admission at a break site, as a function
+/// of `DecodedInsn::opcode` alone. `DecodePack`'s `PACK_FLAG_NONCONT_BREAK_PROBE` is written from
+/// this and from nothing else, and `run_straight_line`'s break arm is its only consumer.
+///
+/// It is a strict subset of `non_continuable_walk_candidate` above, and the two answer DIFFERENT
+/// questions. That function asks what a compile walk can carry, which is a capability. This one
+/// asks which addresses are worth minting a block key for before the run ends, which is a
+/// POPULATION decision, and the two must not be conflated: the walk keeps admitting `0x69`/`0x6b`
+/// IMUL, word `0xc4`/`0xc5` LES/LDS and `0xe6`/`0xee` OUT in the middle of a block exactly as
+/// before. Only the break-site probe stops asking about them.
+///
+/// WHY A PROBE COSTS SOMETHING PERMANENT, which is the rule membership is decided by. A probe that
+/// reaches `BlockCache::probe` INSERTS a key, and a walk that then rejects structurally acquires
+/// watch ranges over the span it examined. Both outlive the probe. `invalidate_physical_range`
+/// walks the keys on every guest code write, so the residue is a standing tax on SMC scanning
+/// proportional to the number of DISTINCT break sites the family has, plus the arena churn the
+/// extra installs bring. Membership is therefore a measured decision about site counts, never a
+/// "can this lower" decision: an opcode with a million break sites and no lowering reproduces the
+/// duke3d regression below however admissible it is in a walk.
+///
+/// WHAT IS IN, AND WHY ONLY THIS. The L7 and L8 slices that built the break-site probe measured
+/// their whole win on the far-transfer family: on 15-move-hole-puzzle twelve sites carry 99.98% of
+/// 186.7 M absent static exits, 70.4 M of them `0xcb` RETF and 116.3 M `0x9a` CALL FAR, and L8 took
+/// that census row to 7,926. `0xca` joins `0xcb` because `retf_admitted_here` treats them as one
+/// row. The other four families never appeared in an L7 or L8 measurement; they reached the break
+/// gate only because `walk_admits_non_continuable_entry` reuses the pre-existing
+/// `jit_admits_non_continuable` disjunct, which is a capability test.
+///
+/// MEASURED, duke3d-586-short, plain release builds, break-site probes and the blocks they install:
+/// IMUL 1,253,841 probes for 71 installs, word LES/LDS 1,516,630 for 20, OUT 23,176 for 1, and the
+/// far family 7,304 for 1. The residue those 2.79 M useless probes leave moved
+/// `jit_direct_blocks_installed` 200,711 -> 235,235, `jit_direct_entries` 158.86 M -> 161.41 M and
+/// `smc_scan_keys` 657.5 M -> 669.2 M, which is the whole of the -5.7% duke3d-586 regression
+/// attributed to the L7 merge. Narrowing to the far family restores every one of those counters.
+pub(crate) const fn non_continuable_break_probe_candidate(opcode: u16) -> bool {
+    // Written as a conjunction with the walk set rather than as a bare list, for the reason
+    // `jit_admits_non_continuable` gives: the subset property is then STRUCTURAL. An opcode that
+    // leaves the walk set can never keep probing at a break, and the arms fold away.
+    non_continuable_walk_candidate(opcode) && matches!(opcode, 0x9a | 0xca | 0xcb)
+}
+
 /// Whether a compile walk that STARTED at this non-continuable instruction could carry it.
 ///
 /// Exactly the walk's own per-slot admission (`compile_with_budget`'s `prefixes_supported` AND
@@ -6758,10 +6798,18 @@ pub(crate) const fn non_continuable_walk_candidate(opcode: u16) -> bool {
 /// predicates below should claim it, and those two edits open the pack bit and this gate together.
 ///
 /// **L8's `call_far_admitted_here` folds into this SAME disjunction** rather than requiring the
-/// run loop to consult a second, independent list -- see that predicate's own doc for why this is
+/// walk to consult a second, independent list -- see that predicate's own doc for why this is
 /// the site the L7 design named and why it is not a gate-design defect that a brand-new predicate
 /// needs to be named here explicitly (an opcode reusing an ALREADY-disjoined predicate needs no
 /// edit; a genuinely new predicate is, definitionally, one `||` term away from being reachable).
+///
+/// The RUN LOOP now reaches this function through a narrower door. Being admissible here is
+/// necessary but no longer sufficient for a break-site probe: `non_continuable_break_probe_candidate`
+/// screens the opcode first, and it carries only the far-transfer family. That is deliberately a
+/// second list, because the two ask different questions -- this one is a capability test, that one
+/// is a population decision about which addresses are worth a permanent block key. Adding an
+/// opcode here still opens it to the WALK with no further edit, which is the self-opening property
+/// L8 wanted; opening it to the break-site probe as well is now an explicit, measured choice.
 pub(crate) fn walk_admits_non_continuable_entry(cpu: &CpuGsw, insn: &DecodedInsn, d: bool) -> bool {
     prefixes_supported_for(insn.prefixes, insn.operand_size, d)
         && (jit_admits_non_continuable(insn)
@@ -11325,7 +11373,9 @@ pub(crate) fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// **THIS IS THE ONE EDIT THAT MAKES THE L7 RUN-LOOP GATE SELF-OPEN FOR L8.**
 /// `walk_admits_non_continuable_entry` is `jit_admits_non_continuable(insn) ||
 /// retf_admitted_here(cpu, insn)` and is consulted, verbatim, at THREE sites: the run loop's
-/// `!screen.continuable` break-site probe (this predicate's whole reason to exist), the compile
+/// `!screen.continuable` break-site probe (this predicate's whole reason to exist, and since the
+/// duke3d re-pricing it is reached only for opcodes
+/// `non_continuable_break_probe_candidate` also names, which `0x9A` is), the compile
 /// walk's own per-slot admission (`compile_with_budget`'s `continuable` term, for a `0x9A` that is
 /// not the block's first slot), and the barrier-census suffix scan that mirrors the compile walk
 /// for counterfactual accounting. All three already OR in `retf_admitted_here`; this predicate is
@@ -36289,39 +36339,39 @@ pub const N_REFUSAL_SITES: usize = 30;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1347),
-    ("skip_backend_or_skip_once", 1355),
-    ("skip_approximate_timing", 1361),
-    ("jit16_level_zero", 1503),
-    ("approximate_timing", 1509),
-    ("auto_admit", 1520),
-    ("direct_hot_at", 1534),
-    ("decline_memo_hit", 1560),
-    ("key_for_phys_none", 1572),
-    ("probe_interpret", 1585),
+    ("skip_native_continuations_inactive", 1350),
+    ("skip_backend_or_skip_once", 1358),
+    ("skip_approximate_timing", 1364),
+    ("jit16_level_zero", 1506),
+    ("approximate_timing", 1512),
+    ("auto_admit", 1523),
+    ("direct_hot_at", 1537),
+    ("decline_memo_hit", 1563),
+    ("key_for_phys_none", 1575),
+    ("probe_interpret", 1588),
     // Two returns carry this site since the break-site caller learned to tell a settled
     // `Rejected` from a `Dormant`; the first is cited, which is the one nearly every refusal
     // takes. Both satisfy the fixture below: each has the macro immediately above it.
-    ("probe_rejected", 1618),
-    ("link_line_not_live", 1911),
-    ("revalidate_none", 1917),
-    ("dispatch_deferred_short", 1955),
-    ("observer_or_diff_trace", 2621),
-    ("interrupt_shadow", 2628),
-    ("aggregate_accounting", 2635),
-    ("native_fetch_trace", 2649),
-    ("mode_key", 2657),
-    ("x87_top", 2671),
-    ("segment_layout_none", 2686),
-    ("cs_layout", 2694),
-    ("cpl", 2702),
-    ("callout_privileged", 2783),
-    ("data_segment", 2901),
-    ("alignment", 2910),
-    ("fetch_limit", 2925),
-    ("entry_deferred_short", 2939),
-    ("zero_budget", 3047),
-    ("block_regenerated_none", 3083),
+    ("probe_rejected", 1621),
+    ("link_line_not_live", 1914),
+    ("revalidate_none", 1920),
+    ("dispatch_deferred_short", 1958),
+    ("observer_or_diff_trace", 2624),
+    ("interrupt_shadow", 2631),
+    ("aggregate_accounting", 2638),
+    ("native_fetch_trace", 2652),
+    ("mode_key", 2660),
+    ("x87_top", 2674),
+    ("segment_layout_none", 2689),
+    ("cs_layout", 2697),
+    ("cpl", 2705),
+    ("callout_privileged", 2786),
+    ("data_segment", 2904),
+    ("alignment", 2913),
+    ("fetch_limit", 2928),
+    ("entry_deferred_short", 2942),
+    ("zero_budget", 3050),
+    ("block_regenerated_none", 3086),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -36362,7 +36412,7 @@ pub(crate) mod site {
 #[cfg(feature = "direct-entry-attribution")]
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1562;
+pub const P0_MARK_LINE: u32 = 1565;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
@@ -36389,13 +36439,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1714),
-    ("structural_reject", 1733),
-    ("compile_retry", 1744),
-    ("page_cover_failed", 1768),
-    ("lane_install_demote", 1804),
-    ("install_failed", 1814),
-    ("installed_fall_through", 1896),
+    ("heat_demote", 1717),
+    ("structural_reject", 1736),
+    ("compile_retry", 1747),
+    ("page_cover_failed", 1771),
+    ("lane_install_demote", 1807),
+    ("install_failed", 1817),
+    ("installed_fall_through", 1899),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {

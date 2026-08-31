@@ -797,23 +797,26 @@ impl CpuGsw {
                             // Admission only; nothing is entered, and the break below is
                             // unchanged. See `probe_admit_at_break`.
                             //
-                            // Gated on the walk being able to CARRY this opcode, in two steps,
-                            // cheap one first.
+                            // Gated in two steps, cheap one first.
                             //
                             // Step one is the decode-pack bit, which answers out of the 16-byte
-                            // entry the screen above already read. Most non-continuable opcodes
-                            // are far transfers, `INT`s and undefined bytes no walk can carry, so
-                            // this is where the common case ends and it touches no extra memory.
-                            // Without a gate the probe would recur forever at every such address:
-                            // on 15-move-hole-puzzle that is 116 M visits to ten `CALL FAR` sites
-                            // that cannot lower, measured at about 4% of the wall.
+                            // entry the screen above already read. It carries the PROBE POLICY set
+                            // (`non_continuable_break_probe_candidate`), not the walk's capability
+                            // set: the far-transfer family and nothing else. That is where the
+                            // common case ends and it touches no extra memory. Without a gate the
+                            // probe would recur forever at every non-continuable address: on
+                            // 15-move-hole-puzzle that is 116 M visits to ten `CALL FAR` sites that
+                            // cannot lower, measured at about 4% of the wall, and on duke3d-586
+                            // 2.79 M visits to IMUL, LES/LDS and OUT sites that bought 92 blocks
+                            // and cost 5.7% of the row. The policy set's own documentation carries
+                            // both measurements and the residue argument behind them.
                             //
                             // Step two takes the line, because the rest of the question is about
                             // the operand size, the prefixes and the CPU's mode. On the packed arm
                             // this is the only place that line is faulted in, and the bit is what
                             // keeps that rare.
                             #[cfg(feature = "jit")]
-                            if screen.noncont_walk_candidate {
+                            if screen.noncont_break_probe {
                                 match held_view
                                     .or_else(|| self.decode_cache.get_view(lin, cs.default_size_32))
                                 {
