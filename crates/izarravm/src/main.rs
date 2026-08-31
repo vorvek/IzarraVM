@@ -2687,6 +2687,36 @@ fn direct_barrier_census_json(
                 "disp_lane_matched": site.disp_lane_matched,
             })).collect::<Vec<_>>(),
         });
+        // L7 DIAGNOSTIC (2026-08-31). The `Absent` twin.
+        let absent_head_static: u64 = snapshot
+            .absent_sites
+            .iter()
+            .map(|site| site.static_exits)
+            .sum();
+        let absent_head_dynamic: u64 = snapshot
+            .absent_sites
+            .iter()
+            .map(|site| site.dynamic_exits)
+            .sum();
+        report["absent_sites"] = json!({
+            "class_static": class_of(&snapshot.unbound_targets, "absent"),
+            "class_dynamic": class_of(&snapshot.dynamic_miss_targets, "absent"),
+            "head_static": absent_head_static,
+            "head_dynamic": absent_head_dynamic,
+            "truncated_static": snapshot.absent_truncated_static,
+            "truncated_dynamic": snapshot.absent_truncated_dynamic,
+            "unattributed_static": class_of(&snapshot.unbound_targets, "absent")
+                .saturating_sub(absent_head_static + snapshot.absent_truncated_static),
+            "unattributed_dynamic": class_of(&snapshot.dynamic_miss_targets, "absent")
+                .saturating_sub(absent_head_dynamic + snapshot.absent_truncated_dynamic),
+            "distinct_sites": snapshot.absent_distinct_sites,
+            "sites": snapshot.absent_sites.iter().map(|site| json!({
+                "linear": format!("0x{:08X}", site.linear),
+                "static_exits": site.static_exits,
+                "dynamic_exits": site.dynamic_exits,
+                "compile_walked": site.compile_walked,
+            })).collect::<Vec<_>>(),
+        });
         report
     };
     #[cfg(feature = "direct-admission-census")]

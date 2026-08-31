@@ -33057,6 +33057,12 @@ pub(crate) struct DirectBarrierCensus {
     /// linear across mode or physical merge into one row.
     #[cfg(feature = "barrier-census-closure")]
     rejected_sites: HashMap<u32, DormantHeatStats>,
+    /// L7 DIAGNOSTIC (2026-08-31). The `Absent` twin of `rejected_sites`: 15-move-hole-puzzle
+    /// spends 79% of its static-unbound exits on targets the block cache has NO entry for at all,
+    /// and no instrument on the tree says how many distinct addresses that is. Same key, same two
+    /// columns, same merge caveat.
+    #[cfg(feature = "barrier-census-closure")]
+    absent_sites: HashMap<u32, DormantHeatStats>,
     /// B.3's lane-match export: block entry linear -> `LaneProbe` bits, recorded by the compile
     /// walk itself.
     ///
@@ -33225,6 +33231,12 @@ impl DirectBarrierCensus {
         Self::note_site(&mut self.rejected_sites, linear, dynamic);
     }
 
+    /// The `Absent` twin. L7 diagnostic; see `absent_sites`.
+    #[cfg(feature = "barrier-census-closure")]
+    fn note_absent_site_at(&mut self, linear: u32, dynamic: bool) {
+        Self::note_site(&mut self.absent_sites, linear, dynamic);
+    }
+
     #[cfg(feature = "barrier-census-closure")]
     fn note_site(sites: &mut HashMap<u32, DormantHeatStats>, linear: u32, dynamic: bool) {
         let site = sites.entry(linear).or_default();
@@ -33348,6 +33360,12 @@ impl DirectBarrierCensus {
         self.site_snapshot(&self.rejected_sites)
     }
 
+    /// The `Absent` twin. L7 diagnostic.
+    #[cfg(feature = "barrier-census-closure")]
+    fn absent_site_snapshot(&self) -> (Vec<crate::DirectDormantHeatSite>, u64, u64, u64) {
+        self.site_snapshot(&self.absent_sites)
+    }
+
     #[cfg(feature = "barrier-census-closure")]
     fn site_snapshot(
         &self,
@@ -33400,6 +33418,13 @@ impl DirectBarrierCensus {
             rejected_truncated_dynamic,
             rejected_distinct_sites,
         ) = self.rejected_site_snapshot();
+        #[cfg(feature = "barrier-census-closure")]
+        let (
+            absent_sites,
+            absent_truncated_static,
+            absent_truncated_dynamic,
+            absent_distinct_sites,
+        ) = self.absent_site_snapshot();
         let mut keyed_rows: Vec<_> = self
             .rows
             .iter()
@@ -33460,6 +33485,14 @@ impl DirectBarrierCensus {
             rejected_truncated_dynamic,
             #[cfg(feature = "barrier-census-closure")]
             rejected_distinct_sites,
+            #[cfg(feature = "barrier-census-closure")]
+            absent_sites,
+            #[cfg(feature = "barrier-census-closure")]
+            absent_truncated_static,
+            #[cfg(feature = "barrier-census-closure")]
+            absent_truncated_dynamic,
+            #[cfg(feature = "barrier-census-closure")]
+            absent_distinct_sites,
             #[cfg(feature = "barrier-census-closure")]
             walked_entries_run_wide: self.lane_probes.len() as u64,
             #[cfg(feature = "direct-admission-census")]
@@ -33623,6 +33656,11 @@ impl crate::jit::JitState {
             #[cfg(feature = "barrier-census-closure")]
             if kind == UnboundTarget::DormantHeat {
                 census.note_dormant_heat_at(linear, false);
+            }
+            // L7 diagnostic.
+            #[cfg(feature = "barrier-census-closure")]
+            if kind == UnboundTarget::Absent {
+                census.note_absent_site_at(linear, false);
             }
         }
     }
@@ -33839,6 +33877,11 @@ impl crate::jit::JitState {
             #[cfg(feature = "barrier-census-closure")]
             if kind == UnboundTarget::DormantHeat {
                 census.note_dormant_heat_at(linear, true);
+            }
+            // L7 diagnostic.
+            #[cfg(feature = "barrier-census-closure")]
+            if kind == UnboundTarget::Absent {
+                census.note_absent_site_at(linear, true);
             }
         }
     }

@@ -1792,6 +1792,17 @@ pub struct DirectBarrierCensusSnapshot {
     pub rejected_truncated_dynamic: u64,
     #[cfg(feature = "barrier-census-closure")]
     pub rejected_distinct_sites: u64,
+    /// L7 DIAGNOSTIC (2026-08-31). The `Absent` twin of the four fields above, same columns and
+    /// same closure identity: `sum(absent_sites.static_exits) + absent_truncated_static` equals
+    /// the `absent` entry of `unbound_targets` exactly, at any head size.
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_sites: Vec<DirectDormantHeatSite>,
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_truncated_static: u64,
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_truncated_dynamic: u64,
+    #[cfg(feature = "barrier-census-closure")]
+    pub absent_distinct_sites: u64,
     /// How many distinct block entries a compile walk started from ANYWHERE IN THE RUN, which is
     /// the set the per-site `compile_walked` column is looked up in.
     ///
