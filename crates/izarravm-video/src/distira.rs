@@ -103,7 +103,6 @@ impl PixelStats {
     }
 }
 
-
 /// Why the triangle rasteriser did not store a colour pixel. One counter per
 /// exit, so a run that submits geometry and paints nothing names the predicate
 /// that ate it instead of leaving a choice of five.
@@ -2729,9 +2728,9 @@ impl Distira {
             // and runs the wfloat encode there; the encode is not linear, so
             // encoding here and interpolating the code would misplace every
             // interior pixel of a large triangle.
-            TriangleDepth::W(coords.map(|(x, y)| {
-                self.texture_iterators.fbi_w_at(x, y, origin_x, origin_y)
-            }))
+            TriangleDepth::W(
+                coords.map(|(x, y)| self.texture_iterators.fbi_w_at(x, y, origin_x, origin_y)),
+            )
         } else {
             TriangleDepth::Z(coords.map(|(x, y)| {
                 fixed_depth_at(
