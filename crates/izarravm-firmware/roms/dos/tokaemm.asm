@@ -846,7 +846,7 @@ init:
 ; implemented set return 84h like a real manager that lacks them.
 ; ============================================================================
 ems_int67:
-    cmp ah, 0x50                  ; 50h sits past the 40h-4Dh table
+    cmp ah, 0x50                  ; 50h sits past the 40h-4Eh table
     je ef_map_multi
     cmp ah, 0x53                  ; 53h too: get/set handle name
     je ef_name
@@ -854,7 +854,7 @@ ems_int67:
     je ef_hwinfo
     cmp ah, 0x40
     jb ef_undef
-    cmp ah, 0x4D
+    cmp ah, 0x4E
     ja ef_undef
     push bx
     mov bl, ah                    ; zero-extend AH through the 16-bit ABI
@@ -869,7 +869,7 @@ ems_jt:
     dw ef_status, ef_frame, ef_counts, ef_alloc     ; 40h-43h
     dw ef_map, ef_free, ef_version, ef_save         ; 44h-47h
     dw ef_restore, ef_undef, ef_undef, ef_count     ; 48h-4Bh (49/4A reserved)
-    dw ef_pages, ef_all_pages                       ; 4Ch-4Dh
+    dw ef_pages, ef_all_pages, ef_pagemap           ; 4Ch-4Eh
 
 ef_undef:
     mov ah, 0x84                  ; undefined function
@@ -930,9 +930,9 @@ ef_version:                       ; 46h get version -> AL = BCD 4.0
 ; from 5901h's BX WITHOUT checking AH, so the old 84h answer left a stale
 ; register value in BX and the pool came out 50 pages instead of ~1900.
 ; AL=00 fills the 5-word hardware array at ES:DI: raw page size 0x400
-; paragraphs; no alternate register sets; no context save area (function
-; 4Eh is not implemented, so there is no map context an OS could save); no
-; DMA register sets; no DMA channel operation.
+; paragraphs; no alternate register sets; context save area 8 bytes
+; (function 4Eh, four frame-map words); no DMA register sets; no DMA
+; channel operation.
 ef_hwinfo:
     cmp al, 1
     je ef_counts                  ; 5901h == 42h on 16 KB raw pages (BX/DX
@@ -940,18 +940,13 @@ ef_hwinfo:
     cmp al, 0
     jne .badsub
     push ax
-    push cx
     push di
-    mov ax, 0x0400                ; word 0: raw page size in paragraphs
-    mov [es:di], ax
-    xor ax, ax                    ; words 1-4: see the header comment
-    mov cx, 4
-.zw:
-    add di, 2
-    mov [es:di], ax
-    loop .zw
+    mov word [es:di], 0x0400      ; word 0: raw page size in paragraphs
+    mov word [es:di+2], 0         ; word 1: alternate register sets
+    mov word [es:di+4], 8         ; word 2: 4Eh context size
+    mov word [es:di+6], 0         ; word 3: DMA register sets
+    mov word [es:di+8], 0         ; word 4: DMA channel operation
     pop di
-    pop cx
     pop ax
     xor ah, ah
     iret
@@ -1570,6 +1565,132 @@ ef_all_pages:
     pop ax
     xor ah, ah
     iret
+
+; 4Eh get/set page map (LIM 4.0). The context is ems_frame_map: four words,
+; one backing page per physical slot, 0xFFFF unmapped. Size 8. SOUND.EXE
+; (RAC Rally) aborts via INT 0 if 4E00/4E01/4E02/4E03 return AH != 0.
+; Copies are byte-at-a-time so a set DF cannot smash the caller's buffer
+; (same reason 53h does not use movsb). Set range-checks each word against
+; ems_pages and answers A3h on garbage; 0xFFFF unmaps. 4Eh blobs live in
+; guest RAM, so ef_free cannot scrub them the way it scrubs 47h saved_map.
+; SOUND.EXE's ISR Get/Set does not free between the pair.
+EMS_MAP_BYTES equ 8
+ef_pagemap:
+    cmp al, 3
+    ja .badsub
+    cmp al, 3
+    je .size
+    cmp al, 0
+    je .get
+    cmp al, 1
+    je .set
+    ; AL=2: Get then Set (LIM 4.0 function 15 subfn 2)
+    push si
+    call .copy_out
+    pop si
+    jmp .set
+.size:
+    mov al, EMS_MAP_BYTES
+    xor ah, ah
+    iret
+.get:
+    call .copy_out
+    xor ah, ah
+    iret
+.set:
+    call .copy_in
+    jc .badsrc
+    call .apply
+    xor ah, ah
+    iret
+.badsub:
+    mov ah, 0x8F
+    iret
+.badsrc:
+    mov ah, 0xA3                  ; source array invalid
+    iret
+; ES:DI <- ems_frame_map. Preserves AX/BX/CX/DX/SI/DI.
+.copy_out:
+    push ax
+    push cx
+    push si
+    push di
+    mov si, ems_frame_map
+    mov cx, EMS_MAP_BYTES
+.co:
+    mov al, [cs:si]
+    mov [es:di], al
+    inc si
+    inc di
+    loop .co
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+; ems_frame_map <- DS:SI, CF set if a word is neither 0xFFFF nor < ems_pages.
+; Validate the whole blob first so a bad tail does not leave a half-applied
+; map. Does not remap; .apply does that after the copy is accepted.
+.copy_in:
+    push ax
+    push bx
+    push cx
+    push si
+    push di
+    mov bx, si
+    mov cx, 4
+.chk:
+    mov ax, [bx]
+    cmp ax, 0xFFFF
+    je .ok
+    cmp ax, [cs:ems_pages]
+    jae .bad
+.ok:
+    add bx, 2
+    loop .chk
+    mov di, ems_frame_map
+    mov cx, 4
+.ci:
+    mov ax, [si]
+    mov [cs:di], ax
+    add si, 2
+    add di, 2
+    loop .ci
+    pop di
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    clc
+    ret
+.bad:
+    pop di
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    stc
+    ret
+.apply:
+    push ax
+    push bx
+    push cx
+    push si
+    xor bx, bx
+.ap:
+    mov si, bx
+    add si, si
+    mov cx, [cs:ems_frame_map + si]
+    mov al, bl
+    call ems_remap_slot
+    inc bx
+    cmp bx, 4
+    jb .ap
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    ret
 
 ; --- EMS helpers --------------------------------------------------------------
 

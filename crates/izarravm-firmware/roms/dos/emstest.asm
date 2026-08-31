@@ -8,13 +8,14 @@
 ; pages through the frame slots, writing distinct patterns and reading them
 ; back through OTHER slots (the runtime-remap proof: the same backing page is
 ; visible wherever it is mapped) -> save context -> unmap -> restore context
-; (the mapping comes back) -> map/unmap multiple pages in one call (50h, both
-; the page-number and the segment form, plus its error answers) -> get/set
+; (the mapping comes back) -> get/set page map (4Eh, while the handle is
+; still live) -> map/unmap multiple pages in one call (50h, both the
+; page-number and the segment form, plus its error answers) -> get/set
 ; handle names (53h: fresh name is zeros, set/get round-trip, duplicate ->
 ; A1h, bad handle/subfunction, the name dies with the handle) -> free and
 ; watch the counts recover -> then signal 0xA5 (success) via the unit-tester
 ; exit port. Any other code names the step that broke (0xEn, 0xDn for the 50h
-; steps, 0xCn for the 53h steps).
+; steps, 0xCn for the 53h steps, 0xBn for the 4Eh steps).
 ;
 ; Build: nasm -f bin emstest.asm -o emstest.com
 cpu 386
@@ -143,6 +144,110 @@ start:
     jnz f_restore
     cmp dword [es:0], PAT_B
     jne f_restore
+
+    ; 4Eh while the 4-page handle is still allocated, after 47h/48h (frame
+    ; is in a known mapped state) and before 45h. After free, a 4E01 of a
+    ; pre-free Get would remap leftover arena RAM and read as a green lie.
+    ; 4E03: size is 8 (four frame-map words).
+    mov ax, 0x4E03
+    int 0x67
+    or ah, ah
+    jnz f_4e03
+    cmp al, 8
+    jne f_4e03
+
+    ; 4E00 into a 16-byte buffer. First word is a mapped backing page, not
+    ; 0xFFFF. Bytes 8-15 stay the 0xA5 canary: Get wrote 8, not 16.
+    push ds
+    pop es
+    mov di, map4e
+    mov ax, 0x4E00
+    int 0x67
+    or ah, ah
+    jnz f_4e00
+    cmp word [map4e], 0xFFFF
+    je f_4e00
+    cmp dword [map4e+8], 0xA5A5A5A5
+    jne f_4e00
+    cmp dword [map4e+12], 0xA5A5A5A5
+    jne f_4e00
+
+    ; Unmap slot 1, then 4E01 from the saved blob. Pattern B returns at E400.
+    ; This is SOUND.EXE's ISR path (4E00 / work / 4E01) with the handle live.
+    mov ah, 0x44
+    mov al, 1
+    mov bx, 0xFFFF
+    mov dx, [handle]
+    int 0x67
+    or ah, ah
+    jnz f_4e01
+    mov ax, 0xE400
+    mov es, ax
+    cmp dword [es:0], PAT_B
+    je f_4e01
+    mov si, map4e
+    mov ax, 0x4E01
+    int 0x67
+    or ah, ah
+    jnz f_4e01
+    mov ax, 0xE400
+    mov es, ax
+    cmp dword [es:0], PAT_B
+    jne f_4e01
+
+    ; 4E02 Get-then-Set: buf_src is the restored map (A). Unmap slot 1 so the
+    ; live map is B. 4E02 dest=buf_got source=buf_src. Frame must show A
+    ; (pattern B back) AND buf_got slot-1 word must be 0xFFFF (the B map).
+    push ds
+    pop es
+    mov di, map4e_src
+    mov ax, 0x4E00
+    int 0x67
+    or ah, ah
+    jnz f_4e02
+    mov ah, 0x44
+    mov al, 1
+    mov bx, 0xFFFF
+    mov dx, [handle]
+    int 0x67
+    or ah, ah
+    jnz f_4e02
+    push ds
+    pop es
+    mov di, map4e_got
+    mov si, map4e_src
+    mov ax, 0x4E02
+    int 0x67
+    or ah, ah
+    jnz f_4e02
+    mov ax, 0xE400
+    mov es, ax
+    cmp dword [es:0], PAT_B
+    jne f_4e02
+    cmp word [map4e_got+2], 0xFFFF
+    jne f_4e02
+
+    ; 4E04 undefined subfunction -> 8Fh. 5900h word 2 is the 4Eh size.
+    mov ax, 0x4E04
+    int 0x67
+    cmp ah, 0x8F
+    jne f_4e04
+    push ds
+    pop es
+    mov di, hw_buf
+    mov ax, 0x5900
+    int 0x67
+    or ah, ah
+    jnz f_4e59
+    cmp word [hw_buf+4], 8
+    jne f_4e59
+
+    ; Put the frame back to the post-step-11 map so 50h sees the same start.
+    mov si, map4e
+    mov ax, 0x4E01
+    int 0x67
+    or ah, ah
+    jnz f_4e01
 
     ; 11a. map/unmap multiple (50h subfn 0, physical page NUMBERS): one call
     ;      maps logical 0 -> slot 2 and logical 1 -> slot 3. UW.EXE maps its
@@ -508,6 +613,18 @@ f_name5:  mov al, 0xC5
 f_raw:    mov al, 0xC6
           jmp sig
 f_mpartial: mov al, 0xC7
+          jmp sig
+f_4e03:   mov al, 0xB1
+          jmp sig
+f_4e00:   mov al, 0xB2
+          jmp sig
+f_4e01:   mov al, 0xB3
+          jmp sig
+f_4e02:   mov al, 0xB4
+          jmp sig
+f_4e04:   mov al, 0xB5
+          jmp sig
+f_4e59:   mov al, 0xB6
 
 sig:
     mov ah, al
@@ -526,6 +643,9 @@ name_a:   db '1830RAIL'
 name_b:   db 'ZUGZWANG'
 name_buf: times 8 db 0xAA         ; prefilled: 11e proves 5300h wrote zeros
 hw_buf:   times 10 db 0xAA        ; 5900h's 5-word hardware array (11j)
+map4e:     times 16 db 0xA5       ; 4E00 dest; bytes 8-15 are the write-length canary
+map4e_src: times 16 db 0
+map4e_got: times 16 db 0
 ; 50h arrays: (logical, physical) word pairs
 map50:     dw 0, 2, 1, 3
 unmap50:   dw 0xFFFF, 2, 0xFFFF, 3

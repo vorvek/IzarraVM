@@ -150,7 +150,8 @@ Specification 4.0. This gives a 64 KB page frame at segment `E000`, in 16 KB
 pages from the shared pool. TOKAEMM maps a page when a program requests it.
 Software that looks for the `EMMXXXX0` device name finds the manager in the
 standard way. `INT 67h` answers the LIM 4.0 function set: status, frame
-address, page counts, allocate, map, free, save, restore, and version.
+address, page counts, allocate, map, free, save, restore, version, and get
+or set the page map (`AH=4Eh`, eight bytes for the four frame slots).
 
 The Toka-DOS `CONFIG.SYS` writes `RAM` directly. A `DEVICE=` line with no
 argument has the same effect. Replace `RAM` with `NOEMS` to disable EMS and to
