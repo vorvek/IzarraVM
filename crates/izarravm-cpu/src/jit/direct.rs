@@ -6435,7 +6435,8 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 /// refused on the original policy grounds: the reason is written
 /// down so the next slice re-opens it on the device-write proof rather than on the census rank.
 ///
-/// ## The re-opening, for `0xE6` (`IZARRAVM_OUT_IMM8_ROWS`, default OFF)
+/// ## The re-opening, for `0xE6` (`IZARRAVM_OUT_IMM8_ROWS`, default ON since the 2026-08-30
+/// gp2-586 ladder -- see `parse_out_imm8_rows_arm`)
 ///
 /// The audit above is discharged on its own terms rather than overruled. Its two live objections
 /// were the `CpuBus::write_io` device-write proof and the `io_touched` bound, and the second is
@@ -6480,7 +6481,8 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 /// the measurement the standing refusal was waiting for -- `0xEE` word is 1000-miglia's largest
 /// `non_continuable` row, `unbound_exits` 46,927,173, exactly its post-#776 `timer.pit_writes`: this
 /// row IS the PIT write storm. 123-talk carries it too (94,170 unbound plus 130,766 dynamic-unbound,
-/// `max_native_prefix = 22`).
+/// `max_native_prefix = 22`). Post-admission: `port_write_al_dx`'s doc has the served numbers --
+/// the row does not merely compile, it serves the corpus's measured guest class.
 ///
 /// It carries NO `slot_delta` and no poll-skip scan -- the GP2 poll-skip design's own scan requires
 /// a `len == 1` fetch to seed from and a write has nothing to poll for, so folding the scan in was
@@ -28093,11 +28095,25 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
         None
     };
 
-    // The SMC assertion, verbatim from the read helpers: `write_io` reaches a DEVICE, never guest
-    // memory, so the call-out contract's "no watched guest memory write while a block is live"
-    // clause is discharged by construction here and this assertion is what says so out loud.
-    #[cfg(debug_assertions)]
-    let written_before = (cpu.written_count, cpu.written_pages_overflow);
+    // NO SMC ASSERTION HERE. An earlier revision of this comment claimed `write_io` reaches a
+    // DEVICE and never guest memory, discharging the call-out contract's "no watched guest memory
+    // write while a block is live" clause by construction; that claim is false. `MachineBus`'s
+    // port 0x09 (the 8237 mem-to-mem DMA trigger, `bus.rs`'s `dma.mem_to_mem`) and port 0xE7 (the
+    // Lotura codepage-font bank copy, up to 4096 bytes into `CODEPAGE_FONT_WINDOW`) both write
+    // guest RAM synchronously from inside `write_io`, and either port immediate can select one.
+    // A `written_count` / `written_pages_overflow` check would not have caught it: those two
+    // counters are the CPU's OWN write path (`note_code_write` from a CPU-driven store), and a
+    // device writing RAM through the bus never touches them.
+    //
+    // See `port_write_al_dx`'s doc for the real invariant and why it holds without a per-call
+    // check here -- the argument is the same for both helpers and is stated once there: `write_io`
+    // callers set a machine-side flag the run loop drains at the NEXT batch boundary
+    // (`consume_pending_device_memory_write_range` / `device_wrote_memory`, `run.rs` in
+    // `izarravm-machine`), `lotura_font_bank_invalidates_executed_window_bytes`
+    // (`machine_code_write_coherence_test.rs`) pins that the write itself does not retire the
+    // code, and the UNCONDITIONAL STEP BREAK below is what guarantees the drain always runs
+    // before any later slot -- in this block or a chained one -- executes against the changed
+    // memory.
 
     let fp =
         crate::jit::native_x87::scale_weighted_fp_clocks(prefix_weighted_fp_clocks, cpu.fp_rem);
@@ -28187,15 +28203,8 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
     // The dedicated always-on engagement numerator, bumped last on the success-only path for the
     // reason `callout_port_imm8_served` is: `callout_executed` sums every helper class, so on a
     // guest that runs both `0xE4` and `0xE6` call-outs it cannot say whether THIS arm served
-    // anything -- which is the acceptance question for a default-OFF row.
+    // anything -- which is the acceptance question this row's shipped ON default is graded on.
     cpu.jit_direct.note_callout_port_out_imm8_served();
-
-    #[cfg(debug_assertions)]
-    debug_assert_eq!(
-        written_before,
-        (cpu.written_count, cpu.written_pages_overflow),
-        "a call-out slot must never write guest memory"
-    );
 
     // THE UNCONDITIONAL STEP BREAK. `bus.requires_step_break()` is deliberately not consulted:
     // see this function's doc for why its answer is false on exactly the guest class that carries
@@ -28226,6 +28235,17 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
 /// classify and seed a backward walk from, and an OUT has nothing to poll for. That is also why
 /// this helper carries no fourth argument at all (`CallOutHelper::PortWriteAlDx::carries_a_cell()`
 /// is `false`) -- there is neither a `slot_delta` nor a port immediate to ride the channel.
+///
+/// **THE V86 ADMISSION SERVES, MEASURED.** The unconditional step break forces
+/// `CallOutAdmission::IoTouching` on a block's first dispatcher trial, which was an open question
+/// on landing -- an admission that never got past that trial would never serve a single V86 port
+/// no matter how correct the helper is. A corpus census on 1000-miglia and 123-talk-shareware
+/// answered it: `jit_direct_callout_port_out_dx_served` reads 46,654,405 on 1000-miglia (against
+/// the removed `0xEE` barrier row's 46,654,278 unbound exits -- the same population, not a
+/// coincidence) and 391,593 on 123-talk-shareware (whose `0xE6` row, `PortWriteAlImm8`, serves
+/// 1,385,922 the same run). Neither row relocated to a different `stop_reason`; 1000-miglia's
+/// `direct_native_coverage` rose 0.790 -> 0.832. The trial-admission gate is not a wall for this
+/// row on the corpus's measured guest class.
 ///
 /// # Safety
 ///
@@ -28277,11 +28297,37 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
         None
     };
 
-    // The SMC assertion, verbatim from the other port helpers: `write_io` reaches a DEVICE, never
-    // guest memory, so the call-out contract's "no watched guest memory write while a block is
-    // live" clause is discharged by construction here.
-    #[cfg(debug_assertions)]
-    let written_before = (cpu.written_count, cpu.written_pages_overflow);
+    // NO SMC ASSERTION HERE, and the reason is worth stating rather than leaving a gap where a
+    // narrower one used to sit. `write_io` is NOT guaranteed to reach a device and nothing else --
+    // `MachineBus`'s port 0x09 (the 8237 mem-to-mem DMA trigger, `bus.rs`'s `dma.mem_to_mem`) and
+    // port 0xE7 (the Lotura codepage-font bank copy, up to 4096 bytes into
+    // `CODEPAGE_FONT_WINDOW`) both write guest RAM synchronously from inside this call, and `0xEE`
+    // takes its port from DX live, so either is reachable from this helper. A `written_count` /
+    // `written_pages_overflow` check would not catch it even if one were written: those two
+    // counters are the CPU's OWN write path (`note_code_write` from a CPU-driven store), and a
+    // device writing RAM through the bus never touches them -- the same gap a prior revision of
+    // this comment on `port_write_al_imm8` did not disclose.
+    //
+    // The real invariant, and why it holds without a per-call check here. `MachineBus` holds no
+    // CPU reference, so it cannot invalidate a decoded line or a compiled block synchronously from
+    // inside `write_io`; both writers instead set a machine-side flag
+    // (`device_wrote_memory` / `pending_device_memory_write_range`, `bus.rs:3066` and `:3135`)
+    // that the run loop drains at the NEXT batch boundary, before dispatching another instruction
+    // (`consume_pending_device_memory_write_range` and the `device_wrote_memory` take, `run.rs`
+    // in `izarravm-machine`, at both the top of `run_until_tick` and after every inner
+    // `run_budgeted` call). `lotura_font_bank_invalidates_executed_window_bytes`
+    // (`machine_code_write_coherence_test.rs`) pins exactly this ordering for port `0xE7`: the
+    // write itself leaves `device_write_code_hits` at 0, and only the NEXT `run_cycles` call
+    // drains the flag and retires the overlapping code.
+    //
+    // What makes THIS call-out safe under that ordering is the unconditional step break below,
+    // for a reason beyond the IRQ-pendency one already stated on this function's doc: it is what
+    // guarantees the drain always gets to run before anything else does. Without it, a block that
+    // kept going past the OUT could execute later slots -- already decoded, already compiled --
+    // against memory the device just changed, because nothing inside a live native run re-checks
+    // the flag. `is_terminal()` stops the COMPILE walk at the OUT for the same reason; the two
+    // together are what keep "the write happened, the flag is set, and the very next thing the
+    // run loop does is drain it" true on every execution, not just this call-out's own.
 
     let fp =
         crate::jit::native_x87::scale_weighted_fp_clocks(prefix_weighted_fp_clocks, cpu.fp_rem);
@@ -28371,13 +28417,6 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
     // reasoning one opcode over: `callout_executed` sums every helper class, so on a guest that
     // runs both the DX and imm8 OUT call-outs it cannot say whether THIS arm served anything.
     cpu.jit_direct.note_callout_port_out_dx_served();
-
-    #[cfg(debug_assertions)]
-    debug_assert_eq!(
-        written_before,
-        (cpu.written_count, cpu.written_pages_overflow),
-        "a call-out slot must never write guest memory"
-    );
 
     // THE UNCONDITIONAL STEP BREAK, verbatim from `port_write_al_imm8`: `bus.requires_step_break()`
     // is deliberately not consulted, for the same reason stated on that function's doc.
@@ -29221,7 +29260,7 @@ fn interpret_one_step<B: CpuBus>(
     // regardless, so no LATER instruction in the block can observe a stale answer.
     //
     // ONE helper WRITES a port, and the sentence above is false for it: `PortWriteAlImm8`
-    // (`0xE6`, `IZARRAVM_OUT_IMM8_ROWS`, default OFF). `MachineBus::write_io`'s PIT arm calls
+    // (`0xE6`, `IZARRAVM_OUT_IMM8_ROWS`, default ON since the 2026-08-30 ladder). `MachineBus::write_io`'s PIT arm calls
     // `pic.request(0)` from inside the write when a channel-0 control word raises OUT, so that one
     // helper CAN make an interrupt newly deliverable mid-block, and on a ring-0 protected-mode
     // guest `io_touched` is not even set, so the `requires_step_break()` half of the argument
@@ -31609,7 +31648,8 @@ pub(crate) struct DirectStallTally {
     /// mirroring `callout_port_imm8_served`'s reasoning one opcode over: a guest that runs both the
     /// `0xE4` read and the `0xE6` write call-outs cannot be read out of `callout_executed`, which
     /// sums every helper class. Reads zero whichever way the knob is set until the arm serves a
-    /// port -- which is the acceptance question for a row that ships default OFF.
+    /// port -- which is the acceptance question the knob's ON default (since the 2026-08-30
+    /// ladder) is graded on.
     pub callout_port_out_imm8_served: u64,
     /// The dedicated always-on numerator for `PortWriteAlDx` (`0xEE`, unconditional, no knob),
     /// mirroring `callout_port_out_imm8_served`'s reasoning one opcode over: `callout_executed`

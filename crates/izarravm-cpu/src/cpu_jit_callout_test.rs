@@ -4120,6 +4120,116 @@ fn slot_block_out_dx(port: u16, configure: impl Fn(&mut TestBus)) -> (Fixture, C
     )
 }
 
+/// Build a two-slot block whose FIRST slot writes DX (or DL alone) and whose SECOND is
+/// `out dx,al`, then run it natively and return the port the device actually saw.
+///
+/// NIT-1: `port_write_al_dx` reads `cpu.read_gpr16(2)` at call time, after `emit_call_out`'s
+/// unconditional `emit_store_homes` has flushed every guest register (including DX) from its host
+/// home back to `cpu.registers`. This is the fixture that exercises that flush for DX specifically
+/// -- every other `out_dx_*` fixture seeds DX before the block ever runs, which cannot tell "the
+/// call-out reads the live register" apart from "the call-out reads whatever `set_edx` last wrote
+/// before compilation", because both would be the same value. Here the block's OWN first slot is
+/// what sets DX, so a call-out that baked the port at compile time (or read a stale host copy)
+/// would serve the WRONG port.
+fn port_seen_after_dx_write_slot(dx_write: &[u8], initial_edx: u32) -> u16 {
+    let mut code = dx_write.to_vec();
+    let out_at = ENTRY + code.len() as u32;
+    code.push(0xee);
+    let tail_at = ENTRY + code.len() as u32;
+    code.extend_from_slice(&[0x89, 0xff, 0xf4]);
+
+    let mut memory = vec![0u8; 0x5000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    bus.lazy_io_writes = true;
+    cpu.registers.set_esp(STACK_TOP);
+    for &linear in &[ENTRY, out_at, tail_at] {
+        cpu.set_eip(linear);
+        cpu.fetch_decoded(&mut bus, linear).unwrap();
+    }
+
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("entry key");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = match jit::direct::compile(&mut cpu, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("structurally rejected: the DX-writing prefix must compile alongside the OUT")
+        }
+        jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
+    };
+    assert_eq!(
+        compilation.span.instructions, 2,
+        "the DX write and the OUT must be the whole block"
+    );
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("block installs");
+    let block = cpu.jit_direct.block(id).expect("live block");
+
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.set_edx(initial_edx);
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.registers.set_eax(0xdead_be5a);
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    bus.trace = BusTrace::default();
+    bus.io_writes.clear();
+
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+        "block did not run natively"
+    );
+    let (port, value, _) = *bus
+        .io_writes
+        .first()
+        .expect("the OUT must have reached the device");
+    assert_eq!(value, 0x5a, "AL must still be the value the OUT sends");
+    port
+}
+
+#[test]
+fn out_dx_uses_a_full_dx_write_from_the_same_block_not_a_stale_or_baked_value() {
+    // `mov edx, imm32` (0xBA + 4-byte LE immediate): NEW_PORT (0x0060) must reach the device.
+    // `initial_edx` seeds a DIFFERENT port (0x03DA) so a call-out reading a stale pre-block value
+    // would be caught red-handed rather than accidentally agreeing.
+    const NEW_PORT: u32 = 0x0060;
+    let mut dx_write = vec![0xba];
+    dx_write.extend_from_slice(&NEW_PORT.to_le_bytes());
+    let port = port_seen_after_dx_write_slot(&dx_write, u32::from(PORT));
+    assert_eq!(
+        port, NEW_PORT as u16,
+        "the call-out must serve the port the block's own DX write set, not the pre-block value"
+    );
+}
+
+#[test]
+fn out_dx_uses_a_dl_only_write_from_the_same_block_combined_with_the_live_dh() {
+    // `mov dl, imm8` (0xB2 ib) touches only the low byte. `initial_edx` seeds DH = 0x12 (and a
+    // DL the write must overwrite); the served port must be 0x1240 -- DH untouched by the write,
+    // DL the write's new value -- which is what a byte-partial home reload has to get right.
+    let dx_write = vec![0xb2, 0x40];
+    let port = port_seen_after_dx_write_slot(&dx_write, 0x0000_1299);
+    assert_eq!(
+        port, 0x1240,
+        "DL must come from the block's own write and DH must survive it unchanged"
+    );
+}
+
 #[test]
 fn out_dx_call_out_matches_the_interpreter_mid_block() {
     // The emitted-slot differential: same guest bytes, native block against the block-free

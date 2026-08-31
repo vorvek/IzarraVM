@@ -11,9 +11,11 @@
 //! fixtures, per the placement the `0xE4` slice established.
 //!
 //! **Every fixture here states its arm through `set_out_imm8_rows_for_test`, in both
-//! directions.** The knob ships default OFF, so a positive fixture that read the ambient arm would
-//! be asserting nothing at all; a refusal fixture that inherited it would go vacuous the moment the
-//! default flips.
+//! directions.** The knob has shipped default ON since the 2026-08-30 gp2-586 ladder
+//! (`parse_out_imm8_rows_arm`); stating the arm explicitly rather than reading the ambient one is
+//! what keeps a refusal fixture from going vacuous now that the default is the arm it used to test
+//! against, and what keeps a positive fixture from silently asserting the shipped behavior instead
+//! of the one it names.
 
 use super::*;
 
