@@ -2101,14 +2101,17 @@ fn byte_shl_register_form_matches_the_interpreter_in_486_mode() {
 #[test]
 fn group2_non_lowered_rotates_remain_interpreter_only() {
     // FORCED ON, and this is the subtle one. Every row here is refused by a GUARD -- the `m.reg`
-    // tests and the register-only `let-else` (the Word `/0`,`/1` rows moved out of this file
-    // entirely once `vorvek/direct-word-rot1` admitted them; see
-    // `group2_word_rotate_register_form_is_lowered`). On the OFF arm
-    // the knob refuses `0xC1 /0` and the whole of `0xC0` before any of those guards runs, so the
-    // rows would still pass while certifying nothing about the guards, and a widening of
-    // `m.reg != 4` to `4..=7` would survive. That the default arm happens to be ON since
-    // 2026-08-19 does not make the force redundant: it is what keeps this test meaningful if the
-    // default moves again. The knob itself is pinned by
+    // tests and the register-only `let-else` (the Word `/0`,`/1` rows and the byte `/0`,`/1`
+    // register rows all moved out of this file once `vorvek/direct-word-rot1` admitted them; see
+    // `group2_word_rotate_register_form_is_lowered` and, in `cpu_jit_byte_shift_test.rs`,
+    // `byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds`). What is LEFT that
+    // still needs the force is the two MEMORY-form rows below that pass through a sub-opcode the
+    // knob also gates: `0xC1 /0` ROL memory (`vec![0xc1, 0x05, ..]`) and `0xC0 /4` SHL memory
+    // (`vec![0xc0, 0x25, ..]`). On the OFF arm the knob refuses both BEFORE the register-only
+    // `let-else` ever runs, so those two rows would still pass while certifying nothing about the
+    // `let-else`, and a widening of it to a defaulting match would survive undetected. That the
+    // default arm happens to be ON since 2026-08-19 does not make the force redundant: it is what
+    // keeps this test meaningful if the default moves again. The knob itself is pinned by
     // `the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admissions`; the
     // guards are pinned here, and the two must not be allowed to stand in for each other.
     select_rotate_rows(true);

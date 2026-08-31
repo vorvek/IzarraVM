@@ -14581,6 +14581,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // row the moment either flips, which is the exact hazard `rotate_rows_enabled`'s own header
         // names for the ROR case.
         //
+        // `0xC0 /4` IS a conjunction row and stays one: it is gated on `byte_shift_rows_enabled()`
+        // at THIS gate (it falls under the `/4..=7` branch here) and on `rotate_rows_enabled()`
+        // INSIDE the `0xc0` arm (it predates the byte-shift-rows slice and stays on that older
+        // knob there), so it needs BOTH knobs on to reach the emitter. That split is unchanged by
+        // this slice; only the reachability term's SHAPE (two branches instead of one) is new.
+        //
         // Why the Word entry is sound, in one line each. The guest semantics do not depend on the
         // decoded operand size: `execute.rs` selects `BusWidth::Byte` from the OPCODE and
         // `shift_rotate` derives mask, msb and bits from that argument alone, so `c0 e8 03` in a
