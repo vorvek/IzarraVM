@@ -1026,26 +1026,27 @@ fn the_census_suffix_scan_applies_the_x87_block_cap() {
     );
 }
 
-/// The port opcodes at `OperandSize::Word`: `0xED`/`0xEE`/`0xEF` are never admitted, `0xEC` now
-/// is. Load-bearing rather than defensive, in both directions.
+/// The port opcodes at `OperandSize::Word`: `0xED`/`0xEF` are never admitted, `0xEC` and `0xEE`
+/// now are. Load-bearing rather than defensive, in both directions.
 ///
 /// `key_for_phys`'s V86 safety argument used to rest on three gates, "any ONE sufficient". One of
 /// them (`try_direct_continuation` refusing every 16-bit boundary) is already conditional on
 /// `IZARRAVM_JIT16`, so the argument really rests on two, and the Word allowlist was one of the
-/// two: an `IN` in a V86 16-bit segment stayed a barrier, because operand size follows CS.D
+/// two: an `IN`/`OUT` in a V86 16-bit segment stayed a barrier, because operand size follows CS.D
 /// opcode-independently and V86 code is always CS.D = 0.
 ///
-/// `0xEC` LEFT that argument on purpose, and its safety is now the helper's rather than the
-/// list's: `port_read_al_dx` proves the TSS I/O-permission answer purely before it commits
-/// anything, and refuses whatever it cannot prove. The Word admission and that helper arm are ONE
-/// change and must revert together -- the admission alone is measured negative
-/// (`classify.rs`, the 2026-08-11 note). This row pins the admission so a revert of one half
-/// cannot pass silently.
+/// `0xEC` and `0xEE` LEFT that argument on purpose, and their safety is now the helpers' rather
+/// than the list's: `port_read_al_dx` and `port_write_al_dx` prove the TSS I/O-permission answer
+/// purely before they commit anything, and refuse whatever they cannot prove. The Word admission
+/// and the helper arm are ONE change and must revert together for each opcode -- the admission
+/// alone is measured negative (`classify.rs`, the 2026-08-11 note, for `0xEC`; the corpus campaign
+/// L2 slice, for `0xEE`). This row pins both admissions so a revert of one half cannot pass
+/// silently.
 ///
-/// The other three keep the original claim. That gate is a LIST under active change by this very
+/// The other two keep the original claim. That gate is a LIST under active change by this very
 /// campaign, and a list defended by a git-ignored findings doc nobody reads is not defended.
 #[test]
-fn only_the_call_out_port_opcode_is_admitted_at_word() {
+fn only_the_call_out_port_opcodes_are_admitted_at_word() {
     for opcode in [0xecu8, 0xed, 0xee, 0xef] {
         // The un-prefixed CONTROL, and it is asserted, not just built. An earlier revision
         // constructed, configured and warmed this pair and then dropped it, so the test could not
@@ -1053,9 +1054,13 @@ fn only_the_call_out_port_opcode_is_admitted_at_word() {
         // read like a positive control while asserting nothing.
         //
         // The control's meaning differs by opcode, and pretending otherwise is how the vacuity
-        // crept in. `0xEC` has a call-out helper (`CallOutHelper::PortReadAlDx`), so at Dword it
-        // is ADMITTED mid-block and the whole seven-slot program compiles as one span; its Word
-        // arm below therefore isolates the Word gate exactly. `0xED`/`0xEE`/`0xEF` have no
+        // crept in. `0xEC` has a call-out helper (`CallOutHelper::PortReadAlDx`) that does not
+        // terminate the block, so at Dword it is ADMITTED mid-block and the whole seven-slot
+        // program compiles as one span; its Word arm below therefore isolates the Word gate
+        // exactly. `0xEE` has a call-out helper too (`CallOutHelper::PortWriteAlDx`), but its
+        // unconditional step break makes `DirectKind::is_terminal` true, so the walk stops AT the
+        // call-out and the four-slot prefix (three plain instructions plus the OUT slot itself)
+        // is the whole span -- the same shape `0xE6`'s admission produces. `0xED`/`0xEF` have no
         // `classify` arm at any size, so their un-prefixed arm stops at the same three slots and
         // proves the stronger fact that carries their V86 safety: refused everywhere, with the
         // Word gate as redundant cover rather than the only gate.
@@ -1067,6 +1072,12 @@ fn only_the_call_out_port_opcode_is_admitted_at_word() {
             assert_eq!(
                 dword.span.instructions, 7,
                 "IN AL,DX at Dword is a call-out slot and must not end the block"
+            );
+        } else if opcode == 0xee {
+            assert_eq!(
+                dword.span.instructions, 4,
+                "OUT DX,AL at Dword is a call-out slot but its unconditional step break makes it \
+                 terminal, so the walk must stop right after it"
             );
         } else {
             assert_eq!(
@@ -1090,6 +1101,16 @@ fn only_the_call_out_port_opcode_is_admitted_at_word() {
             assert_eq!(
                 compilation.span.instructions, 7,
                 "IN AL,DX at Word is the V86 port call-out slice and must join the block"
+            );
+            assert_eq!(
+                compilation.callout_slots, 1,
+                "the Word form must produce a call-out slot, not a silent lowering"
+            );
+        } else if opcode == 0xee {
+            assert_eq!(
+                compilation.span.instructions, 4,
+                "OUT DX,AL at Word is the V86 port call-out slice too, but its unconditional \
+                 step break stops the walk right after it"
             );
             assert_eq!(
                 compilation.callout_slots, 1,

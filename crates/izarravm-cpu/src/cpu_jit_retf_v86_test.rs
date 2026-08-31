@@ -1813,12 +1813,16 @@ fn a_near_bind_past_the_segment_limit_still_refuses_through_try_link_inner() {
 /// Catches: M26, the `retf_admitted_here` disjunct deleted from the scan.
 #[test]
 fn the_barrier_census_suffix_scan_walks_through_an_admitted_retf() {
-    // `0xEE` OUT DX,AL is the barrier: non-continuable, unlowered, and a census row of its own.
-    // After it: one filler, the RETF, then two more fillers. The scan's answer is how many of
-    // those four it would have admitted.
+    // `0xCF` IRETD is the barrier: non-continuable, unlowered, and a census row of its own. (Was
+    // `0xEE` OUT DX,AL before the corpus L2 slice gave it a `classify` arm and an unconditional
+    // admission -- it stopped being a barrier at all, so it stopped being usable as this
+    // fixture's filler opcode. IRETD is untouched by that slice and keeps the same role: it loads
+    // CS, so a block cannot run past it, and `classify` refuses it independently of this
+    // predicate.) After it: one filler, the RETF, then two more fillers. The scan's answer is how
+    // many of those four it would have admitted.
     let code = [
         filler(),
-        vec![0xee],
+        vec![0xcf],
         FILL[0].to_vec(),
         retf(None),
         FILL[1].to_vec(),
@@ -1856,8 +1860,8 @@ fn the_barrier_census_suffix_scan_walks_through_an_admitted_retf() {
         let row = snapshot
             .rows
             .iter()
-            .find(|row| row.opcode == 0xee)
-            .expect("the OUT barrier must have recorded a census row");
+            .find(|row| row.opcode == 0xcf)
+            .expect("the IRETD barrier must have recorded a census row");
         assert_eq!(row.hits, 1, "exactly one barrier hit");
         row.native_suffix_instructions
     };

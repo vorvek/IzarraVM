@@ -1913,13 +1913,14 @@ pub struct DirectCallOutAttributionSnapshot {
 /// array's length is `HELPER_COUNT`, so a seventh helper is a COMPILE error here, not a
 /// runtime one on a two-hundred-second fixture.
 #[cfg(feature = "direct-callout-attribution")]
-pub const DIRECT_CALLOUT_HELPER_LABELS: [&str; 6] = [
+pub const DIRECT_CALLOUT_HELPER_LABELS: [&str; 7] = [
     "in_al_dx",
     "pushad",
     "popad",
     "interpret_one",
     "in_al_imm8",
     "out_al_imm8",
+    "out_al_dx",
 ];
 
 /// Stage A of the SMC census. See `jit::direct::smc_census` for the measurement rules, and
@@ -2168,6 +2169,8 @@ pub struct DirectStallSnapshot {
     pub callout_port_imm8_served: u64,
     /// The `PortWriteAlImm8` (`0xE6`) engagement numerator. See `BlockCacheStats`.
     pub callout_port_out_imm8_served: u64,
+    /// The `PortWriteAlDx` (`0xEE`) engagement numerator. See `BlockCacheStats`.
+    pub callout_port_out_dx_served: u64,
     /// The `InterpretOne` call-out family; see `DirectStallTally` for what each one denominates.
     pub callout_interpret_one_executed: u64,
     pub callout_interpret_one_resync: u64,

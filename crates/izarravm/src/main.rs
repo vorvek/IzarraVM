@@ -3498,6 +3498,10 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         // census build -- which is the acceptance question for a default-OFF row whose ON arm is
         // supposed to make a barrier census row disappear.
         "jit_direct_callout_port_out_imm8_served": snapshot.callout_port_out_imm8_served,
+        // `0xEE`'s reconciliation numerator, the DX-port twin of the row above. Unlike `0xE6` this
+        // row ships unconditionally, so a nonzero read here says the corpus's miglia/123-talk
+        // rows are being served rather than that a knob is off.
+        "jit_direct_callout_port_out_dx_served": snapshot.callout_port_out_dx_served,
         "jit_direct_callout_interpret_one_executed": snapshot.callout_interpret_one_executed,
         "jit_direct_callout_interpret_one_resync": snapshot.callout_interpret_one_resync,
         // The price of the PREFIX half of the segment mask: resyncs the suffix-only rule would
