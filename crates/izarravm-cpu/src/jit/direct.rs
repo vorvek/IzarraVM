@@ -12192,10 +12192,19 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 ///   `registers.eflags`, and DF is outside the lazy descriptor's ARITH mask, so it is never
 ///   deferred and `materialize_flags` passes it through untouched. The invariant that makes the
 ///   memory copy current at any point inside a block is **RBP.DF == memory.DF**: RBP is loaded at
-///   entry from the materialized eflags, and the only writer of either copy is
-///   `emit_direction_flag`, which writes BOTH. `a_string_slot_reads_the_direction_flag_*` pins it
-///   from both ends, including the production shape where the block contains no `DirectionFlag`
-///   slot at all and a wholesale RBP publish runs ahead of the string slot.
+///   entry from the materialized eflags, and it was true until N2 that the only writer of either
+///   copy was `emit_direction_flag`, which writes BOTH. `a_string_slot_reads_the_direction_flag_*`
+///   pins it from both ends, including the production shape where the block contains no
+///   `DirectionFlag` slot at all and a wholesale RBP publish runs ahead of the string slot.
+///
+///   N2 added a SECOND writer of both copies: `InterpretOneRow::Popf`'s resume path.
+///   `CallOutHelper::republishes_flags()` is true for every `InterpretOne` row, unconditionally,
+///   so `emit_call_out` reloads RBP from the memory copy after ANY of them -- but only `Popf` can
+///   actually move DF, because `load_flags` writes the full popped image and DF sits inside it.
+///   The invariant survives because the reload is unconditional on the resume path, not because
+///   `emit_direction_flag` stays the sole writer: a POPF slot ahead of a string slot in the same
+///   block leaves RBP.DF and memory.DF equal to whatever the guest just popped, exactly as a
+///   `DirectionFlag` slot would have left them equal to what it set.
 ///
 /// **`0x6C`-`0x6F` INS/OUTS are NOT admitted, and the exclusion is enforced three independent
 /// ways.** They are members of the same `StringOp` family and would be swept in by any rule
