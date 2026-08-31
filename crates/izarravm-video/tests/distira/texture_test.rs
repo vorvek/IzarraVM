@@ -791,7 +791,7 @@ fn triangle_cmd_applies_texture_detail_blend_factor() {
         DETAIL_MAX_128 | DETAIL_BIAS_32 | DETAIL_SCALE_2,
     );
     assert_eq!(
-        read_reg(&distira, SST_TEXTURE_MODE),
+        read_reg(&mut distira, SST_TEXTURE_MODE),
         (TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL)
             | TC_ZERO_OTHER
             | TC_SUB_CLOCAL
@@ -799,7 +799,7 @@ fn triangle_cmd_applies_texture_detail_blend_factor() {
             | TC_ADD_CLOCAL,
     );
     assert_eq!(
-        read_reg(&distira, SST_TDETAIL),
+        read_reg(&mut distira, SST_TDETAIL),
         DETAIL_MAX_128 | DETAIL_BIAS_32 | DETAIL_SCALE_2,
     );
     write_reg(&mut distira, TREX0 | SST_TEX_BASE_ADDR, 0);

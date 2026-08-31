@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 mod ncc;
 mod raster_math;
 mod raster_pool;
+mod raster_queue;
+mod raster_view;
 mod registers;
 mod texture_combine;
 mod texture_raster;
@@ -18,6 +20,8 @@ use crate::{DistiraCensus, DistiraCensusKey};
 use ncc::NccState;
 use raster_math::*;
 use raster_pool::{DiagCounter, FrameStore, raster_pool};
+use raster_queue::{QueuedTriangle, RasterQueue, ViewMemory, render_band};
+use raster_view::{RasterParams, RasterView};
 pub use registers::*;
 use texture_raster::{
     TextureIteratorState, TextureRaster, TextureSample, texture_base_slot, texture_dimensions,
@@ -35,8 +39,8 @@ const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], 
 const PARALLEL_PIXEL_THRESHOLD: usize = 2048;
 
 /// The triangle-constant inputs of `raster_row`, so a lane needs only
-/// this, the device, and the frame-store view.
-#[derive(Clone, Copy)]
+/// this, the snapshot, and the frame-store view.
+#[derive(Debug, Clone, Copy)]
 struct TriangleContext {
     vertices: [DistiraVertex; 3],
     area: f32,
@@ -47,6 +51,8 @@ struct TriangleContext {
     affine_lods: [u32; 2],
     min_x: u32,
     max_x: u32,
+    min_y: u32,
+    max_y: u32,
 }
 
 /// One lane's per-pixel counters, merged into the device after the join.
@@ -362,10 +368,16 @@ pub struct Distira {
     buffer_stride: u32,
     display_enabled: bool,
     dither_enabled: bool,
-    /// How many threads rasterise a large triangle, caller included.
+    /// How many threads rasterise a batch of triangles, caller included.
     /// Chosen from the host core count at construction; see
     /// [`Distira::raster_lanes_for_cores`].
     raster_lanes: usize,
+    /// Triangles submitted but not yet drawn. See `distira/raster_queue.rs`.
+    raster_queue: RasterQueue,
+    /// Whether a guest triangle may wait on the queue at all. Off draws
+    /// every triangle at submission, which is what the queue is graded
+    /// against.
+    raster_queue_enabled: bool,
     clear_color: u32,
     command: u32,
     intr_ctrl: u32,
@@ -521,6 +533,8 @@ impl Distira {
             display_enabled: false,
             dither_enabled: false,
             raster_lanes: raster_pool::host_lanes(),
+            raster_queue: RasterQueue::default(),
+            raster_queue_enabled: true,
             clear_color: 0,
             command: 0,
             intr_ctrl: 0,
@@ -893,7 +907,8 @@ impl Distira {
         self.offset_bits_or
     }
 
-    pub fn scanout_state(&self) -> DistiraScanoutState {
+    pub fn scanout_state(&mut self) -> DistiraScanoutState {
+        self.drain_raster_queue();
         DistiraScanoutState {
             width: self.display.width,
             height: self.display.height,
@@ -935,6 +950,7 @@ impl Distira {
     }
 
     pub fn set_dither_enabled(&mut self, enabled: bool) {
+        self.drain_raster_queue();
         self.dither_enabled = enabled;
     }
 
@@ -945,9 +961,23 @@ impl Distira {
         raster_pool::lanes_for_cores(cores)
     }
 
+    /// Whether a guest triangle may wait on the queue. Off draws every
+    /// triangle at submission, which is the behavior the queue is graded
+    /// against.
+    pub fn set_raster_queue_enabled(&mut self, enabled: bool) {
+        self.drain_raster_queue();
+        self.raster_queue_enabled = enabled;
+    }
+
+    /// How many triangles are submitted but not yet drawn.
+    pub fn raster_queue_depth(&self) -> usize {
+        self.raster_queue.len()
+    }
+
     /// Override the raster thread count (clamped to 1..=4). One lane
     /// disables the worker pool entirely.
     pub fn set_raster_lanes(&mut self, lanes: usize) {
+        self.drain_raster_queue();
         self.raster_lanes = lanes.clamp(1, 4);
     }
 
@@ -956,6 +986,7 @@ impl Distira {
     }
 
     pub fn set_frame_size(&mut self, width: u32, height: u32) {
+        self.drain_raster_queue();
         let width = width.clamp(1, DISTIRA_MAX_WIDTH);
         let height = height.clamp(1, DISTIRA_MAX_HEIGHT);
         // Recorded AFTER the clamp: the census reports the geometry the device
@@ -980,6 +1011,7 @@ impl Distira {
     }
 
     pub fn clear_back_rgb(&mut self, r: u8, g: u8, b: u8) {
+        self.drain_raster_queue();
         let pixel = pack_rgb565(r, g, b);
         let start = self.display.back_base as usize;
         let len = (self.display.pitch as usize).saturating_mul(self.display.height as usize);
@@ -990,12 +1022,13 @@ impl Distira {
     }
 
     pub fn swap_buffers(&mut self) {
+        self.drain_raster_queue();
         self.rotate_buffers();
         self.present_swap(self.display.front_base);
     }
 
     pub fn draw_triangle(&mut self, vertices: [DistiraVertex; 3]) -> u64 {
-        self.draw_triangle_inner(vertices, None, None, None)
+        self.draw_triangle_inner(vertices, None, None, None, false)
     }
 
     fn draw_triangle_with_depth(
@@ -1005,15 +1038,69 @@ impl Distira {
         texture: TextureRaster,
         coverage: SstTriangleCoverage,
     ) -> u64 {
-        self.draw_triangle_inner(vertices, Some(depths), Some(texture), Some(coverage))
+        self.draw_triangle_inner(vertices, Some(depths), Some(texture), Some(coverage), true)
     }
 
+    /// Copy the register state the pixel pipeline reads. Taken once when a
+    /// triangle is submitted, so a later register write cannot reach a
+    /// triangle that has not been rasterised yet.
+    fn raster_params(&self) -> RasterParams {
+        RasterParams {
+            display: self.display,
+            aux_base: self.aux_base,
+            dither_enabled: self.dither_enabled,
+            fbz_mode: self.fbz_mode,
+            fbz_color_path: self.fbz_color_path,
+            alpha_mode: self.alpha_mode,
+            fog_mode: self.fog_mode,
+            fog_color: self.fog_color,
+            za_color: self.za_color,
+            chroma_key: self.chroma_key,
+            color0: self.color0,
+            color1: self.color1,
+            stipple: self.stipple,
+            texture_mode: self.texture_mode,
+            texture_mode_tmu1: self.texture_mode_tmu1,
+            texture_lod: self.texture_lod,
+            texture_lod_tmu1: self.texture_lod_tmu1,
+            texture_detail: self.texture_detail,
+            texture_detail_tmu1: self.texture_detail_tmu1,
+            tex_base_addr: self.tex_base_addr,
+            tex_base_addr_tmu1: self.tex_base_addr_tmu1,
+            tex_base_addr1: self.tex_base_addr1,
+            tex_base_addr2: self.tex_base_addr2,
+            tex_base_addr38: self.tex_base_addr38,
+            trex_init1: self.trex_init1,
+        }
+    }
+
+    /// The pipeline's view of the device THIS INSTANT. The LFB write path and
+    /// the texture-aperture decode use it; a triangle uses the params it was
+    /// submitted with instead.
+    fn raster_view(&self) -> RasterView<'_> {
+        self.view_memory().view(self.raster_params())
+    }
+
+    fn view_memory(&self) -> ViewMemory<'_> {
+        ViewMemory {
+            fb: &self.fb,
+            texture: &self.texture,
+            ncc: &self.ncc,
+        }
+    }
+
+    /// Set a triangle up and either queue it or draw it.
+    ///
+    /// `defer` is what separates the guest's path from the direct one: a
+    /// guest triangle may wait on the queue, but `draw_triangle` returns the
+    /// pixel count for THIS triangle and so has to draw it now.
     fn draw_triangle_inner(
         &mut self,
         vertices: [DistiraVertex; 3],
         depths: Option<TriangleDepth>,
         texture: Option<TextureRaster>,
         coverage: Option<SstTriangleCoverage>,
+        defer: bool,
     ) -> u64 {
         let count_fbi_pixels = coverage.is_some();
         if count_fbi_pixels {
@@ -1078,228 +1165,132 @@ impl Distira {
             affine_lods: [self.texture_lod, self.texture_lod_tmu1],
             min_x,
             max_x,
+            min_y,
+            max_y,
         };
-        let rows = max_y.saturating_sub(min_y) as usize;
-        let columns = max_x.saturating_sub(min_x) as usize;
-        // Fork only when the pixel work dwarfs the wake-up cost of the
-        // pool. Small triangles stay on the calling thread.
-        let lanes = if self.raster_lanes >= 2
-            && rows >= self.raster_lanes * 2
-            && rows.saturating_mul(columns) >= PARALLEL_PIXEL_THRESHOLD
-        {
-            self.raster_lanes
-        } else {
-            1
+        let triangle = QueuedTriangle {
+            params: self.raster_params(),
+            context,
         };
-
-        let mut lane_stats: Vec<PixelStats> =
-            (0..lanes).map(|_| PixelStats::new(self.stipple)).collect();
-        if lanes == 1 {
-            let stats = &mut lane_stats[0];
-            for y in min_y..max_y {
-                self.raster_row(&context, y, stats);
+        if defer && self.raster_queue_enabled && triangle_defers(&triangle) {
+            if !self.raster_queue.push(triangle) {
+                // Full. Draw what is waiting, then this one joins an empty
+                // queue, so a triangle is never dropped. The second push
+                // cannot refuse: the drain above leaves the queue at zero and
+                // the capacity is not zero.
+                self.drain_raster_queue();
+                // Not inside the assertion: a release build compiles the
+                // assertion's expression away, and the push has to happen.
+                let queued = self.raster_queue.push(triangle);
+                debug_assert!(queued, "a drained queue accepts");
             }
+            return 0;
+        }
+
+        // The immediate path. Draining first leaves this triangle alone in
+        // the batch, so the pixel count belongs to it and to nothing else,
+        // and the push cannot refuse for the same reason.
+        self.drain_raster_queue();
+        let queued = self.raster_queue.push(triangle);
+        debug_assert!(queued, "a drained queue accepts");
+        self.drain_raster_queue()
+    }
+
+    /// Draw every triangle waiting on the queue and return how many pixels
+    /// they stored.
+    ///
+    /// One fork and one join for the whole batch. Lane `i` owns the
+    /// FRAMEBUFFER rows where `draw_y(y) % lanes == i` and walks the batch in
+    /// submission order, so overlapping triangles land in the order the guest
+    /// sent them. `distira/raster_queue.rs` has why the framebuffer row is the
+    /// one that has to partition and not the triangle's own row.
+    fn drain_raster_queue(&mut self) -> u64 {
+        if self.raster_queue.is_empty() {
+            return 0;
+        }
+        let jobs = self.raster_queue.take();
+        let lanes = self.batch_lanes(&jobs);
+        let mut lane_stats: Vec<PixelStats> = (0..lanes).map(|_| PixelStats::new(0)).collect();
+        if lanes == 1 {
+            render_band(&jobs, self.view_memory(), 0, 1, &mut lane_stats[0]);
         } else {
-            let this: &Distira = self;
-            let context = &context;
-            // A lane accumulates into a stack-local `PixelStats` and
-            // stores it once at the end: the `lane_stats` elements share
-            // cache lines, and a per-pixel counter write there makes the
-            // lanes false-share their way back to serial speed.
-            let raster_lane = move |lane: usize, stats: &mut PixelStats| {
-                let mut local = PixelStats::new(stats.stipple);
-                let mut y = min_y + lane as u32;
-                while y < max_y {
-                    this.raster_row(context, y, &mut local);
-                    y = y.saturating_add(lanes as u32);
-                }
-                *stats = local;
-            };
-            // `install` moves the whole fork onto the pool: the scope
-            // then spawns into a worker-local queue, which the other
-            // workers steal far faster than an external injection wakes
-            // them. The installed worker rasterises the last lane.
+            let jobs = &jobs;
+            let memory = self.view_memory();
+            let lane_count = lanes as u32;
+            // A lane accumulates into a stack-local `PixelStats` and stores
+            // it once at the end: the `lane_stats` elements share cache
+            // lines, and a per-pixel counter write there makes the lanes
+            // false-share their way back to serial speed.
             let (worker_stats, install_stats) = lane_stats.split_at_mut(lanes - 1);
+            // `install` moves the whole fork onto the pool: the scope then
+            // spawns into a worker-local queue, which the other workers
+            // steal far faster than an external injection wakes them. The
+            // installed worker rasterises the last lane.
             raster_pool().install(|| {
                 rayon::scope(|scope| {
                     for (lane, stats) in worker_stats.iter_mut().enumerate() {
-                        scope.spawn(move |_| raster_lane(lane, stats));
+                        scope.spawn(move |_| {
+                            render_band(jobs, memory, lane as u32, lane_count, stats);
+                        });
                     }
-                    raster_lane(lanes - 1, &mut install_stats[0]);
+                    render_band(
+                        jobs,
+                        memory,
+                        lane_count - 1,
+                        lane_count,
+                        &mut install_stats[0],
+                    );
                 });
             });
         }
-        self.merge_pixel_stats(&lane_stats, count_fbi_pixels, min_y, max_y)
+        let written = self.merge_pixel_stats(&lane_stats, &jobs, lanes);
+        self.raster_queue.recycle(jobs);
+        written
     }
 
-    /// Rasterise one row of a triangle. Every frame-store access goes
-    /// through the atomic store and every counter goes into the lane's
-    /// stats, so any number of lanes can run disjoint rows at once.
-    fn raster_row(&self, context: &TriangleContext, y: u32, stats: &mut PixelStats) {
-        let TriangleContext {
-            vertices: [a, b, c],
-            area,
-            depths,
-            texture,
-            coverage,
-            count_fbi_pixels,
-            affine_lods,
-            min_x,
-            max_x,
-        } = *context;
-        {
-            let (row_min_x, row_max_x) = if let Some(coverage) = coverage {
-                let Some((span_min, span_max)) = coverage.scanline_span(y) else {
-                    return;
-                };
-                let span_min = span_min.max(0) as u32;
-                let span_max = span_max.max(-1).saturating_add(1) as u32;
-                (min_x.max(span_min), max_x.min(span_max))
-            } else {
-                (min_x, max_x)
-            };
-            for x in row_min_x..row_max_x {
-                let px = x as f32 + 0.5;
-                let py = y as f32 + 0.5;
-                let w0 = edge(b.x, b.y, c.x, c.y, px, py);
-                let w1 = edge(c.x, c.y, a.x, a.y, px, py);
-                let w2 = edge(a.x, a.y, b.x, b.y, px, py);
-                let inside = if coverage.is_some() {
-                    true
-                } else if area < 0.0 {
-                    w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
-                } else {
-                    w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0
-                };
-                if !inside {
-                    continue;
-                }
-                if count_fbi_pixels {
-                    stats.fbi_pixels_in += 1;
-                    stats.pixels_in += 1;
-                }
-                let draw_y = self.draw_y(y);
-                if !self.stipple_test(&mut stats.stipple, x, draw_y) {
-                    if count_fbi_pixels {
-                        stats.reject_stipple += 1;
-                    }
-                    continue;
-                }
-
-                let inv_area = 1.0 / area;
-                let l0 = w0 * inv_area;
-                let l1 = w1 * inv_area;
-                let l2 = w2 * inv_area;
-                let depth_raw = depths.map(|depths| depths.at(l0, l1, l2));
-                let depth = depth_raw.map(|raw| self.biased_triangle_depth(raw));
-                if let Some(depth) = depth
-                    && !self.depth_test_passes(x, draw_y, depth)
-                {
-                    stats.fbi_zfunc_fail += 1;
-                    if count_fbi_pixels {
-                        stats.reject_depth += 1;
-                    }
-                    continue;
-                }
-
-                let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);
-                let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
-                let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
-                let texture_samples = if let Some(texture) = texture {
-                    texture.samples(px, py)
-                } else {
-                    let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
-                    let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
-                    std::array::from_fn(|tmu| TextureSample::affine(s, t, affine_lods[tmu]))
-                };
-                let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
-                let alocal = self.alpha_local_source(alpha, depth_raw);
-                let texture = if self.fbz_color_path & FBZCP_TEXTURE_ENABLED != 0 {
-                    self.combined_texture(texture_samples)
-                } else {
-                    TextureRgba::TRANSPARENT_BLACK
-                };
-                let texture_alpha = self.texture_alpha_factor(texture.alpha);
-                let aother = self.texture_alpha_or_source(alpha, texture.alpha);
-                if self.fbz_mode & FBZ_ALPHA_MASK != 0 && aother & 1 == 0 {
-                    if count_fbi_pixels {
-                        stats.reject_alpha_mask += 1;
-                    }
-                    continue;
-                }
-
-                let selected = self.selected_color_or_source((x, draw_y), (r, g, blue), texture);
-                if !self.chroma_key_passes(selected.0, selected.1, selected.2) {
-                    stats.fbi_chroma_fail += 1;
-                    if count_fbi_pixels {
-                        stats.reject_chroma += 1;
-                    }
-                    continue;
-                }
-                let (r, g, blue) =
-                    self.texture_color_or_source(selected, (r, g, blue), alocal, aother, texture);
-                let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
-                if !self.alpha_test_passes(alpha) {
-                    stats.fbi_afunc_fail += 1;
-                    if count_fbi_pixels {
-                        stats.reject_alpha_test += 1;
-                    }
-                    continue;
-                }
-                if count_fbi_pixels {
-                    stats.fbi_pixels_out += 1;
-                    stats.pixels_out += 1;
-                }
-                let (r, g, blue) = self.apply_fog_color(r, g, blue);
-                let (r, g, blue) = self.alpha_blend_color(x, draw_y, r, g, blue, alpha);
-                let pixel = pack_rgb565_for_pixel(r, g, blue, x, draw_y, self.dither_enabled);
-                let wrote_color = if depths.is_none() {
-                    self.write_pixel_at_base(self.display.back_base, x, draw_y, pixel)
-                } else if self.fbz_mode & FBZ_RGB_WMASK == 0 {
-                    if count_fbi_pixels {
-                        stats.reject_rgb_wmask += 1;
-                    }
-                    false
-                } else {
-                    let stored = self.write_draw_pixel(x, draw_y, pixel);
-                    if count_fbi_pixels && !stored {
-                        stats.reject_offscreen += 1;
-                    }
-                    stored
-                };
-                if count_fbi_pixels && wrote_color {
-                    stats.color_written += 1;
-                    if pixel != 0 {
-                        stats.color_written_nonblack += 1;
-                    }
-                    let base = match self.fbz_mode & FBZ_DRAW_MASK {
-                        FBZ_DRAW_FRONT => self.display.front_base,
-                        _ => self.display.back_base,
-                    };
-                    if let Some(offset) = self.framebuffer_pixel_offset(base, x, draw_y) {
-                        let offset = offset as u32;
-                        stats.color_offset_min = stats.color_offset_min.min(offset);
-                        stats.color_offset_max = stats.color_offset_max.max(offset);
-                    }
-                }
-                let wrote_depth =
-                    depth.is_some_and(|depth| self.write_depth_pixel(x, draw_y, depth));
-                if count_fbi_pixels && wrote_depth {
-                    stats.depth_written += 1;
-                }
-                if wrote_color || wrote_depth {
-                    stats.written += 1;
-                }
+    /// How many lanes a batch is worth. Below the threshold the wake-up cost
+    /// of the pool beats the win and the calling thread draws the batch.
+    ///
+    /// The two measures answer different questions. Pixels are the work, so
+    /// they sum over the batch. Rows are the parallelism, and lanes divide
+    /// DISTINCT rows, so they take the union span rather than the sum: a stack
+    /// of small triangles sitting on top of each other has one triangle's
+    /// worth of rows to share out however many triangles it holds.
+    fn batch_lanes(&self, jobs: &[QueuedTriangle]) -> usize {
+        if self.raster_lanes < 2 {
+            return 1;
+        }
+        let mut lowest = u32::MAX;
+        let mut highest = 0;
+        let mut pixels = 0usize;
+        for job in jobs {
+            let job_rows = job.context.max_y.saturating_sub(job.context.min_y) as usize;
+            let columns = job.context.max_x.saturating_sub(job.context.min_x) as usize;
+            if job_rows == 0 {
+                continue;
             }
+            lowest = lowest.min(job.context.min_y);
+            highest = highest.max(job.context.max_y);
+            pixels += job_rows.saturating_mul(columns);
+        }
+        let rows = highest.saturating_sub(lowest) as usize;
+        if rows >= self.raster_lanes * 2 && pixels >= PARALLEL_PIXEL_THRESHOLD {
+            self.raster_lanes
+        } else {
+            1
         }
     }
 
+    /// Fold a batch's lane counters into the device.
+    ///
+    /// The census fields are added unconditionally: `raster_row` only ever
+    /// bumps them for a triangle whose context asked for them, so a lane's
+    /// counters are already zero for the triangles that did not.
     fn merge_pixel_stats(
         &mut self,
         lane_stats: &[PixelStats],
-        count_fbi_pixels: bool,
-        min_y: u32,
-        max_y: u32,
+        jobs: &[QueuedTriangle],
+        lanes: usize,
     ) -> u64 {
         let mut written = 0;
         for stats in lane_stats {
@@ -1309,7 +1300,7 @@ impl Distira {
             self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(stats.fbi_chroma_fail);
             self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(stats.fbi_afunc_fail);
             self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(stats.fbi_pixels_out);
-            if count_fbi_pixels {
+            {
                 let census = &mut self.triangle_census;
                 census.pixels_in += stats.pixels_in;
                 census.reject_stipple += stats.reject_stipple;
@@ -1330,18 +1321,29 @@ impl Distira {
             }
         }
         // The rotating stipple register keeps the value of the lane that
-        // rasterised the LAST row. With one lane that is the exact serial
-        // behavior; with more lanes it is the same approximation 86Box
-        // makes with per-render-thread stipple state.
-        if max_y > min_y
-            && let Some(stats) = lane_stats.get((max_y - 1 - min_y) as usize % lane_stats.len())
+        // rasterised the LAST row of the last triangle. With one lane that is
+        // the exact serial behavior; with more lanes it is the same
+        // approximation 86Box makes with per-render-thread stipple state.
+        //
+        // Only the ROTATING stipple writes back. A patterned one is a pure
+        // function of the pixel, so a lane's copy never moved, and storing it
+        // would undo a stipple the guest wrote while the batch was waiting.
+        // A rotating triangle is never batched with another (see
+        // `triangle_defers`), so the batch that reaches this is one triangle
+        // long whenever the value matters.
+        if let Some(job) = jobs.last()
+            && job.params.fbz_mode & FBZ_STIPPLE != 0
+            && job.params.fbz_mode & FBZ_STIPPLE_PATT == 0
+            && job.context.max_y > job.context.min_y
+            && let Some(stats) = lane_stats.get((job.context.max_y - 1) as usize % lanes)
         {
             self.stipple = stats.stipple;
         }
         written
     }
 
-    pub fn scanout_argb(&self) -> Vec<u32> {
+    pub fn scanout_argb(&mut self) -> Vec<u32> {
+        self.drain_raster_queue();
         let width = self.display.width as usize;
         let height = self.display.height as usize;
         let pitch = self.display.pitch as u64;
@@ -1405,18 +1407,21 @@ impl Distira {
         }
     }
 
-    pub fn read_lfb_u8(&self, offset: usize) -> u8 {
+    pub fn read_lfb_u8(&mut self, offset: usize) -> u8 {
+        self.drain_raster_queue();
         self.lfb_reads.increment();
         self.lfb_byte_offset(self.lfb_read_base(), offset)
             .and_then(|offset| self.fb.get(offset))
             .unwrap_or(0xff)
     }
 
-    pub fn read_lfb_u16(&self, offset: usize) -> u16 {
+    pub fn read_lfb_u16(&mut self, offset: usize) -> u16 {
+        self.drain_raster_queue();
         u16::from_le_bytes(self.read_lfb_bytes::<2>(offset & !1))
     }
 
-    pub fn read_lfb_u32(&self, offset: usize) -> u32 {
+    pub fn read_lfb_u32(&mut self, offset: usize) -> u32 {
+        self.drain_raster_queue();
         u32::from_le_bytes(self.read_lfb_bytes::<4>(offset & !1))
     }
 
@@ -1429,6 +1434,7 @@ impl Distira {
     }
 
     pub fn write_lfb_u8(&mut self, offset: usize, value: u8) {
+        self.drain_raster_queue();
         self.aperture_traffic.lfb_writes += 1;
         let base = if self.lfb_mode & LFB_FORMAT_MASK == LFB_FORMAT_DEPTH {
             self.aux_base
@@ -1441,6 +1447,7 @@ impl Distira {
     }
 
     pub fn write_lfb_u16(&mut self, offset: usize, value: u16) {
+        self.drain_raster_queue();
         self.aperture_traffic.lfb_writes += 1;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
@@ -1492,6 +1499,7 @@ impl Distira {
     }
 
     pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
+        self.drain_raster_queue();
         self.aperture_traffic.lfb_writes += 1;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
@@ -1704,6 +1712,8 @@ impl Distira {
 
     pub fn drain_fifo(&mut self) {
         self.drain_command_fifo();
+        // The entries below replay through the register, LFB and texture
+        // paths, each of which draws the raster queue where it must.
         while let Some(entry) = self.fifo.pop_front() {
             match entry {
                 DistiraFifoEntry::Register { offset, value } => self.write_mmio_u32(offset, value),
@@ -1715,10 +1725,17 @@ impl Distira {
         }
     }
 
-    pub fn read_mmio_u8(&self, offset: usize) -> u8 {
+    pub fn read_mmio_u8(&mut self, offset: usize) -> u8 {
         self.register_reads[(offset >> 2) & 0xff].increment();
         let reg = offset & !0x3;
         let voodoo_reg = offset & 0x3fc;
+        if register_read_needs_raster(if reg < DISTIRA_REG_ID {
+            voodoo_reg
+        } else {
+            reg
+        }) {
+            self.drain_raster_queue();
+        }
         let byte = offset & 0x3;
         let chip = tmu_chip_mask(offset);
         let value = match voodoo_reg {
@@ -1738,6 +1755,14 @@ impl Distira {
         self.offset_bits_or |= offset;
         let voodoo_reg = offset & 0x3fc;
         let register = canonical_write_register(offset, self.fbi_init[3]);
+        // Classified BEFORE the NCC and texture-iterator arms below, which
+        // return early: an NCC or palette write never reaches the `match`,
+        // and it is one of the writes the queue has to be drawn for.
+        if !raster_snapshot_covers_register(register)
+            || !raster_snapshot_covers_register(voodoo_reg)
+        {
+            self.drain_raster_queue();
+        }
         let byte = offset & 0x3;
         let chip = tmu_chip_mask(offset);
         if self.ncc.write_register(chip, register, byte, value) {
@@ -2125,6 +2150,10 @@ impl Distira {
     }
 
     pub fn write_texture_u32(&mut self, aperture_offset: usize, value: u32) {
+        // Texture memory is NOT part of the snapshot: it is megabytes, and a
+        // game uploads it at level load rather than between triangles. So the
+        // queue is drawn before an upload lands instead of copied.
+        self.drain_raster_queue();
         self.aperture_traffic.texture_writes += 1;
         let Some((tmu, offset)) = self.texture_write_offset(aperture_offset) else {
             let traffic = &mut self.aperture_traffic;
@@ -2154,7 +2183,8 @@ impl Distira {
             return None;
         }
 
-        let mode = self.texture_mode_for_tmu(tmu);
+        let params = self.raster_params();
+        let mode = params.texture_mode_for_tmu(tmu);
         let bytes_per_texel = if ((mode >> 8) & 0xf) & 8 != 0 { 2 } else { 1 };
         let s = if bytes_per_texel == 2 {
             (aperture_offset >> 1) & 0xfe
@@ -2164,13 +2194,13 @@ impl Distira {
             (aperture_offset >> 1) & 0xfc
         };
         let t = (aperture_offset >> 9) & 0xff;
-        let lod_reg = self.texture_lod_for_tmu(tmu);
+        let lod_reg = params.texture_lod_for_tmu(tmu);
         let (width, _) = texture_dimensions(lod_reg, lod);
         let row_offset = t
             .saturating_mul(width)
             .saturating_add(s)
             .saturating_mul(bytes_per_texel);
-        let offset = (self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
+        let offset = (params.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
             .saturating_add(texture_mip_offset(lod_reg, lod, bytes_per_texel))
             .saturating_add(row_offset);
         Some((tmu, offset & (DISTIRA_TEX_SIZE - 1)))
@@ -2530,7 +2560,7 @@ impl Distira {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
             return true;
         }
-        let Some(old_depth) = self.read_depth_pixel(position.0, position.1) else {
+        let Some(old_depth) = self.raster_view().read_depth_pixel(position.0, position.1) else {
             return false;
         };
         depth_compare_passes(self.fbz_mode, old_depth, depth)
@@ -2538,7 +2568,9 @@ impl Distira {
 
     fn lfb_pipeline_color_passes(&mut self, color: (u8, u8, u8)) -> bool {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0
-            || self.chroma_key_passes(color.0, color.1, color.2)
+            || self
+                .raster_params()
+                .chroma_key_passes(color.0, color.1, color.2)
         {
             return true;
         }
@@ -2547,7 +2579,9 @@ impl Distira {
     }
 
     fn lfb_pipeline_alpha_passes(&mut self, alpha: u8) -> bool {
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.alpha_test_passes(alpha) {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0
+            || self.raster_params().alpha_test_passes(alpha)
+        {
             return true;
         }
         self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
@@ -2608,7 +2642,8 @@ impl Distira {
 
     fn lfb_pipeline_stipple_position(&mut self, position: (u32, u32)) -> Option<(u32, u32)> {
         let (x, y) = position;
-        self.framebuffer_pixel_offset(self.lfb_write_base(), x, y)?;
+        self.raster_params()
+            .framebuffer_pixel_offset(self.lfb_write_base(), x, y)?;
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.stipple_test_passes(x, y) {
             return Some((x, y));
         }
@@ -2617,23 +2652,9 @@ impl Distira {
 
     fn stipple_test_passes(&mut self, x: u32, y: u32) -> bool {
         let mut stipple = self.stipple;
-        let passes = self.stipple_test(&mut stipple, x, y);
+        let passes = self.raster_params().stipple_test(&mut stipple, x, y);
         self.stipple = stipple;
         passes
-    }
-
-    /// The stipple test against a caller-owned rotating state, so each
-    /// raster lane rotates its own copy.
-    fn stipple_test(&self, stipple: &mut u32, x: u32, y: u32) -> bool {
-        if self.fbz_mode & FBZ_STIPPLE == 0 {
-            return true;
-        }
-        if self.fbz_mode & FBZ_STIPPLE_PATT != 0 {
-            *stipple & (1 << (((y & 3) << 3) | ((!x) & 7))) != 0
-        } else {
-            *stipple = stipple.rotate_left(1);
-            *stipple & 0x8000_0000 != 0
-        }
     }
 
     fn lfb_pipeline_shade_color_at(
@@ -2648,13 +2669,16 @@ impl Distira {
             return None;
         }
         let (x, y) = position;
-        let (r, g, b) = self.apply_fog_color(color.0, color.1, color.2);
-        let (r, g, b) = self.alpha_blend_color_at_base(base, (x, y), (r, g, b), alpha);
+        let view = self.raster_view();
+        let (r, g, b) = view.apply_fog_color(color.0, color.1, color.2);
+        let (r, g, b) = view.alpha_blend_color_at_base(base, (x, y), (r, g, b), alpha);
         Some(pack_rgb565_for_pixel(r, g, b, x, y, self.dither_enabled))
     }
 
     fn write_depth_pixel_at(&mut self, position: (u32, u32), value: u16) {
-        let Some(offset) = self.framebuffer_pixel_offset(self.aux_base, position.0, position.1)
+        let Some(offset) =
+            self.raster_params()
+                .framebuffer_pixel_offset(self.aux_base, position.0, position.1)
         else {
             return;
         };
@@ -2663,7 +2687,10 @@ impl Distira {
 
     fn write_color_pixel(&mut self, base: u32, position: (u32, u32), value: u16) {
         self.color_pixels_stored = self.color_pixels_stored.saturating_add(1);
-        let Some(offset) = self.framebuffer_pixel_offset(base, position.0, position.1) else {
+        let Some(offset) = self
+            .raster_params()
+            .framebuffer_pixel_offset(base, position.0, position.1)
+        else {
             return;
         };
         self.fb.write_u16_le(offset, value);
@@ -2692,9 +2719,10 @@ impl Distira {
         let high_y = self.clip_high_y.min(self.display.height) as u64;
         let pitch = u64::from(self.display.pitch);
         let len = self.fb.len() as u64;
+        let params = self.raster_params();
 
         for y in low_y..high_y {
-            let draw_y = u64::from(self.draw_y(y as u32));
+            let draw_y = u64::from(params.draw_y(y as u32));
             for x in left..right {
                 let pixel_offset = draw_y
                     .saturating_mul(pitch)
@@ -2807,644 +2835,6 @@ impl Distira {
         self.command = 0;
     }
 
-    fn write_pixel_at_base(&self, base: u32, x: u32, y: u32, pixel: u16) -> bool {
-        let Some(offset) = self.framebuffer_pixel_offset(base, x, y) else {
-            return false;
-        };
-        self.fb.write_u16_le(offset, pixel)
-    }
-
-    fn write_draw_pixel(&self, x: u32, y: u32, pixel: u16) -> bool {
-        let base = match self.fbz_mode & FBZ_DRAW_MASK {
-            FBZ_DRAW_FRONT => self.display.front_base,
-            _ => self.display.back_base,
-        };
-        self.write_pixel_at_base(base, x, y, pixel)
-    }
-
-    fn depth_test_passes(&self, x: u32, y: u32, depth: u16) -> bool {
-        if self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
-            return true;
-        }
-        let Some(old_depth) = self.read_depth_pixel(x, y) else {
-            return false;
-        };
-        let test_depth = if self.fbz_mode & FBZ_DEPTH_SOURCE != 0 {
-            self.za_color as u16
-        } else {
-            depth
-        };
-        depth_compare_passes(self.fbz_mode, old_depth, test_depth)
-    }
-
-    fn biased_triangle_depth(&self, raw: f32) -> u16 {
-        let depth = i32::from(depth_to_u16(raw));
-        if self.fbz_mode & FBZ_DEPTH_BIAS == 0 {
-            return depth as u16;
-        }
-        let bias = i32::from(self.za_color as u16 as i16);
-        (depth + bias).clamp(0, i32::from(u16::MAX)) as u16
-    }
-
-    fn draw_y(&self, logical_y: u32) -> u32 {
-        if self.fbz_mode & FBZ_Y_ORIGIN == 0 {
-            logical_y
-        } else {
-            self.display
-                .height
-                .saturating_sub(1)
-                .saturating_sub(logical_y)
-        }
-    }
-
-    fn alpha_test_passes(&self, alpha: u8) -> bool {
-        if self.alpha_mode & ALPHA_TEST_ENABLE == 0 {
-            return true;
-        }
-        let reference = (self.alpha_mode >> ALPHA_REF_SHIFT) as u8;
-        match (self.alpha_mode >> ALPHA_FUNC_SHIFT) & 7 {
-            AFUNC_NEVER => false,
-            AFUNC_LESSTHAN => alpha < reference,
-            AFUNC_EQUAL => alpha == reference,
-            AFUNC_LESSTHANEQUAL => alpha <= reference,
-            AFUNC_GREATERTHAN => alpha > reference,
-            AFUNC_NOTEQUAL => alpha != reference,
-            AFUNC_GREATERTHANEQUAL => alpha >= reference,
-            AFUNC_ALWAYS => true,
-            _ => true,
-        }
-    }
-
-    fn chroma_key_passes(&self, r: u8, g: u8, b: u8) -> bool {
-        self.fbz_mode & FBZ_CHROMAKEY == 0
-            || r != (self.chroma_key >> 16) as u8
-            || g != (self.chroma_key >> 8) as u8
-            || b != self.chroma_key as u8
-    }
-
-    fn apply_color_path_local_combine(
-        &self,
-        color: (u8, u8, u8),
-        source: (u8, u8, u8),
-        alocal: u8,
-        aother: u8,
-        texture_alpha: u8,
-        texture_rgb: (u8, u8, u8),
-    ) -> (u8, u8, u8) {
-        let mselect = (self.fbz_color_path >> FBZCP_CC_MSELECT_SHIFT) & FBZCP_CC_MSELECT_MASK;
-        if self.fbz_color_path
-            & (FBZCP_CC_ZERO_OTHER
-                | FBZCP_CC_SUB_CLOCAL
-                | FBZCP_CC_LOCALSELECT_COLOR0
-                | FBZCP_CC_LOCALSELECT_OVERRIDE
-                | FBZCP_CC_INVERT_OUTPUT)
-            == 0
-            && ((self.fbz_color_path >> FBZCP_CC_ADD_SHIFT) & 0x3) == 0
-            && mselect != CC_MSELECT_CLOCAL
-            && mselect != CC_MSELECT_AOTHER
-            && mselect != CC_MSELECT_ALOCAL
-            && mselect != CC_MSELECT_TEX_ALPHA
-            && mselect != CC_MSELECT_TEX_RGB
-        {
-            return color;
-        }
-        let mut color = if self.fbz_color_path & FBZCP_CC_ZERO_OTHER != 0 {
-            (0_i32, 0_i32, 0_i32)
-        } else {
-            (i32::from(color.0), i32::from(color.1), i32::from(color.2))
-        };
-        let local_select_color0 = if self.fbz_color_path & FBZCP_CC_LOCALSELECT_OVERRIDE != 0 {
-            texture_alpha & 0x80 != 0
-        } else {
-            self.fbz_color_path & FBZCP_CC_LOCALSELECT_COLOR0 != 0
-        };
-        let local = if local_select_color0 {
-            (
-                i32::from((self.color0 >> 16) as u8),
-                i32::from((self.color0 >> 8) as u8),
-                i32::from(self.color0 as u8),
-            )
-        } else {
-            (
-                i32::from(source.0),
-                i32::from(source.1),
-                i32::from(source.2),
-            )
-        };
-        if self.fbz_color_path & FBZCP_CC_SUB_CLOCAL != 0 {
-            color.0 -= local.0;
-            color.1 -= local.1;
-            color.2 -= local.2;
-        }
-
-        color = if mselect == CC_MSELECT_CLOCAL {
-            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
-            (
-                color_path_blend_component(color.0, local.0 as u8, reverse),
-                color_path_blend_component(color.1, local.1 as u8, reverse),
-                color_path_blend_component(color.2, local.2 as u8, reverse),
-            )
-        } else if mselect == CC_MSELECT_AOTHER {
-            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
-            (
-                color_path_blend_component(color.0, aother, reverse),
-                color_path_blend_component(color.1, aother, reverse),
-                color_path_blend_component(color.2, aother, reverse),
-            )
-        } else if mselect == CC_MSELECT_ALOCAL {
-            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
-            (
-                color_path_blend_component(color.0, alocal, reverse),
-                color_path_blend_component(color.1, alocal, reverse),
-                color_path_blend_component(color.2, alocal, reverse),
-            )
-        } else if mselect == CC_MSELECT_TEX_ALPHA {
-            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
-            (
-                color_path_blend_component(color.0, texture_alpha, reverse),
-                color_path_blend_component(color.1, texture_alpha, reverse),
-                color_path_blend_component(color.2, texture_alpha, reverse),
-            )
-        } else if mselect == CC_MSELECT_TEX_RGB {
-            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
-            (
-                color_path_blend_component(color.0, texture_rgb.0, reverse),
-                color_path_blend_component(color.1, texture_rgb.1, reverse),
-                color_path_blend_component(color.2, texture_rgb.2, reverse),
-            )
-        } else {
-            color
-        };
-
-        match (self.fbz_color_path >> FBZCP_CC_ADD_SHIFT) & 0x3 {
-            1 => {
-                color.0 += local.0;
-                color.1 += local.1;
-                color.2 += local.2;
-            }
-            2 => {
-                let alocal = i32::from(alocal);
-                color.0 += alocal;
-                color.1 += alocal;
-                color.2 += alocal;
-            }
-            _ => {}
-        }
-
-        (
-            color.0.clamp(0, 255) as u8,
-            color.1.clamp(0, 255) as u8,
-            color.2.clamp(0, 255) as u8,
-        )
-    }
-
-    fn texture_detail_factor(&self, tmu: usize, lod: u32) -> u8 {
-        let detail = self.texture_detail_for_tmu(tmu);
-        let max = (detail & 0xff).min(0xff) as i32;
-        let bias = ((detail >> 8) & 0x3f) as i32;
-        let scale = (detail >> 14) & 0x7;
-        ((bias - lod as i32) << scale).clamp(0, max).min(255) as u8
-    }
-
-    fn texture_alpha_or_source(&self, alpha: u8, texture_alpha: u8) -> u8 {
-        match (self.fbz_color_path >> FBZCP_A_SELECT_SHIFT) & FBZCP_A_SELECT_MASK {
-            A_SELECT_TEX => texture_alpha,
-            A_SELECT_COLOR1 => (self.color1 >> 24) as u8,
-            _ => alpha,
-        }
-    }
-
-    fn alpha_local_source(&self, alpha: u8, depth_raw: Option<f32>) -> u8 {
-        match (self.fbz_color_path >> FBZCP_CCA_LOCALSELECT_SHIFT) & FBZCP_CCA_LOCALSELECT_MASK {
-            CCA_LOCALSELECT_COLOR0 => (self.color0 >> 24) as u8,
-            CCA_LOCALSELECT_ITER_Z => depth_raw.map_or(0, fixed_depth_to_local_alpha),
-            _ => alpha,
-        }
-    }
-
-    fn texture_alpha_factor(&self, texture_alpha: u8) -> u8 {
-        texture_alpha
-    }
-
-    fn apply_alpha_path(&self, alocal: u8, aother: u8, texture_alpha: u8) -> u8 {
-        let mut alpha = if self.fbz_color_path & FBZCP_CCA_ZERO_OTHER != 0 {
-            0
-        } else {
-            i32::from(aother)
-        };
-        if self.fbz_color_path & FBZCP_CCA_SUB_CLOCAL != 0 {
-            alpha -= i32::from(alocal);
-        }
-        let mselect = (self.fbz_color_path >> FBZCP_CCA_MSELECT_SHIFT) & FBZCP_CCA_MSELECT_MASK;
-        if mselect == CCA_MSELECT_ALOCAL
-            || mselect == CCA_MSELECT_AOTHER
-            || mselect == CCA_MSELECT_ALOCAL2
-            || mselect == CCA_MSELECT_TEX_ALPHA
-        {
-            let factor = if mselect == CCA_MSELECT_AOTHER {
-                aother
-            } else if mselect == CCA_MSELECT_TEX_ALPHA {
-                texture_alpha
-            } else {
-                alocal
-            };
-            let reverse = self.fbz_color_path & FBZCP_CCA_REVERSE_BLEND != 0;
-            alpha = color_path_blend_component(alpha, factor, reverse);
-        }
-        if ((self.fbz_color_path >> FBZCP_CCA_ADD_SHIFT) & FBZCP_CCA_ADD_MASK) != 0 {
-            alpha += i32::from(alocal);
-        }
-        let mut alpha = alpha.clamp(0, 255) as u8;
-        if self.fbz_color_path & FBZCP_CCA_INVERT_OUTPUT != 0 {
-            alpha ^= 0xff;
-        }
-        alpha
-    }
-
-    fn sample_tmu_alpha(&self, tmu: usize, sample: TextureSample) -> u8 {
-        match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
-            TEX_A8 => self.sample_tmu_u8(tmu, sample),
-            TEX_AI8 => expand4(self.sample_tmu_u8(tmu, sample) >> 4),
-            TEX_APAL8 => {
-                let index = usize::from(self.sample_tmu_u8(tmu, sample));
-                let red = (self.ncc.palette(tmu, index) >> 16) as u8;
-                (red & 0xfc) | ((red & 0xc0) >> 6)
-            }
-            TEX_ARGB8332 | TEX_A8Y4I2Q2 | TEX_A8I8 | TEX_APAL88 => {
-                (self.sample_tmu_u16(tmu, sample) >> 8) as u8
-            }
-            TEX_ARGB1555 => {
-                if self.sample_tmu_u16(tmu, sample) & 0x8000 != 0 {
-                    0xff
-                } else {
-                    0
-                }
-            }
-            TEX_ARGB4444 => expand4((self.sample_tmu_u16(tmu, sample) >> 12) as u8),
-            _ => 0xff,
-        }
-    }
-
-    fn sample_tmu_texture(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
-            TEX_RGB332 => self.sample_tmu_rgb332(tmu, sample),
-            TEX_Y4I2Q2 => self.sample_tmu_yiq_ncc(tmu, sample),
-            TEX_A8 => self.sample_tmu_a8(tmu, sample),
-            TEX_I8 => self.sample_tmu_i8(tmu, sample),
-            TEX_AI8 => self.sample_tmu_ai44(tmu, sample),
-            TEX_PAL8 => self.sample_tmu_pal8(tmu, sample),
-            TEX_APAL8 => self.sample_tmu_apal8(tmu, sample),
-            TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, sample),
-            TEX_A8Y4I2Q2 => self.sample_tmu_a8_yiq_ncc(tmu, sample),
-            TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, sample),
-            TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, sample),
-            TEX_ARGB4444 => self.sample_tmu_argb4444(tmu, sample),
-            TEX_A8I8 => self.sample_tmu_ai88(tmu, sample),
-            TEX_APAL88 => self.sample_tmu_apal88(tmu, sample),
-            _ => (0, 0, 0),
-        }
-    }
-
-    fn sample_tmu_rgb332(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let TextureSample { s, t, lod, .. } = sample;
-        let mode = self.texture_mode_for_tmu(tmu);
-        let lod_reg = self.texture_lod_for_tmu(tmu);
-        let scale = (1_u32 << lod).max(1) as f32;
-        let (width, height) = texture_dimensions(lod_reg, lod);
-        let s = texture_coord_index(
-            s / scale,
-            width,
-            mode & TEXTUREMODE_TCLAMPS != 0,
-            lod_reg & LOD_TMIRROR_S != 0,
-        );
-        let t = texture_coord_index(
-            t / scale,
-            height,
-            mode & TEXTUREMODE_TCLAMPT != 0,
-            lod_reg & LOD_TMIRROR_T != 0,
-        );
-        let texel = t * width + s;
-        let offset = ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
-            .saturating_add(texture_mip_offset(lod_reg, lod, 1))
-            .saturating_add(texel))
-            & (DISTIRA_TEX_SIZE - 1);
-        let Some(&raw) = self.texture[tmu].get(offset) else {
-            return (0, 0, 0);
-        };
-        expand_rgb332(raw)
-    }
-
-    fn sample_tmu_yiq_ncc(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u8(tmu, sample);
-        self.ncc_color(tmu, raw)
-    }
-
-    fn sample_tmu_a8_yiq_ncc(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u16(tmu, sample) as u8;
-        self.ncc_color(tmu, raw)
-    }
-
-    fn ncc_color(&self, tmu: usize, raw: u8) -> (u8, u8, u8) {
-        let table = usize::from(self.texture_mode_for_tmu(tmu) & TEXTUREMODE_TNCCSELECT != 0);
-        self.ncc.color(tmu, table, raw)
-    }
-
-    fn sample_tmu_a8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u8(tmu, sample);
-        (raw, raw, raw)
-    }
-
-    fn sample_tmu_ai44(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let intensity = expand4(self.sample_tmu_u8(tmu, sample));
-        (intensity, intensity, intensity)
-    }
-
-    fn sample_tmu_ai88(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let intensity = self.sample_tmu_u16(tmu, sample) as u8;
-        (intensity, intensity, intensity)
-    }
-
-    fn sample_tmu_pal8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let raw = self
-            .ncc
-            .palette(tmu, usize::from(self.sample_tmu_u8(tmu, sample)));
-        ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
-    }
-
-    fn sample_tmu_apal8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        expand_apal8(
-            self.ncc
-                .palette(tmu, usize::from(self.sample_tmu_u8(tmu, sample))),
-        )
-    }
-
-    fn sample_tmu_apal88(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let index = (self.sample_tmu_u16(tmu, sample) & 0xff) as usize;
-        let raw = self.ncc.palette(tmu, index);
-        ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
-    }
-
-    fn sample_tmu_argb8332(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        expand_rgb332(self.sample_tmu_u16(tmu, sample) as u8)
-    }
-
-    fn sample_tmu_argb1555(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        expand_rgb555(self.sample_tmu_u16(tmu, sample))
-    }
-
-    fn sample_tmu_argb4444(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        expand_rgb444(self.sample_tmu_u16(tmu, sample))
-    }
-
-    fn sample_tmu_i8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u8(tmu, sample);
-        (raw, raw, raw)
-    }
-
-    fn sample_tmu_u8(&self, tmu: usize, sample: TextureSample) -> u8 {
-        self.texture[tmu][self.tmu_u8_offset(tmu, sample)]
-    }
-
-    fn tmu_u8_offset(&self, tmu: usize, sample: TextureSample) -> usize {
-        let TextureSample { s, t, lod, .. } = sample;
-        let mode = self.texture_mode_for_tmu(tmu);
-        let lod_reg = self.texture_lod_for_tmu(tmu);
-        let scale = (1_u32 << lod).max(1) as f32;
-        let (width, height) = texture_dimensions(lod_reg, lod);
-        let s = texture_coord_index(
-            s / scale,
-            width,
-            mode & TEXTUREMODE_TCLAMPS != 0,
-            lod_reg & LOD_TMIRROR_S != 0,
-        );
-        let t = texture_coord_index(
-            t / scale,
-            height,
-            mode & TEXTUREMODE_TCLAMPT != 0,
-            lod_reg & LOD_TMIRROR_T != 0,
-        );
-        let texel = t * width + s;
-        ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
-            .saturating_add(texture_mip_offset(lod_reg, lod, 1))
-            .saturating_add(texel))
-            & (DISTIRA_TEX_SIZE - 1)
-    }
-
-    fn sample_tmu_u16(&self, tmu: usize, sample: TextureSample) -> u16 {
-        let TextureSample { s, t, lod, .. } = sample;
-        let mode = self.texture_mode_for_tmu(tmu);
-        let lod_reg = self.texture_lod_for_tmu(tmu);
-        let scale = (1_u32 << lod).max(1) as f32;
-        let (width, height) = texture_dimensions(lod_reg, lod);
-        let s = texture_coord_index(
-            s / scale,
-            width,
-            mode & TEXTUREMODE_TCLAMPS != 0,
-            lod_reg & LOD_TMIRROR_S != 0,
-        );
-        let t = texture_coord_index(
-            t / scale,
-            height,
-            mode & TEXTUREMODE_TCLAMPT != 0,
-            lod_reg & LOD_TMIRROR_T != 0,
-        );
-        let texel = (t * width + s).saturating_mul(2);
-        let offset = ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
-            .saturating_add(texture_mip_offset(lod_reg, lod, 2))
-            .saturating_add(texel))
-            & (DISTIRA_TEX_SIZE - 1);
-        u16::from_le_bytes([
-            self.texture[tmu][offset],
-            self.texture[tmu][(offset + 1) & (DISTIRA_TEX_SIZE - 1)],
-        ])
-    }
-
-    fn sample_tmu_rgb565(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let TextureSample { s, t, lod, .. } = sample;
-        let mode = self.texture_mode_for_tmu(tmu);
-        let lod_reg = self.texture_lod_for_tmu(tmu);
-        let scale = (1_u32 << lod).max(1) as f32;
-        let s = s / scale;
-        let t = t / scale;
-        let base_addr = self.tex_base_addr_for_tmu_lod(tmu, lod);
-        let mip_offset = texture_mip_offset(lod_reg, lod, 2);
-        let (width, height) = texture_dimensions(lod_reg, lod);
-        let texture_sample = TmuTextureSample {
-            tmu,
-            width,
-            height,
-            base_addr,
-            mip_offset,
-            mode,
-            lod_reg,
-        };
-        let s = texture_coord_index(
-            s,
-            width,
-            mode & TEXTUREMODE_TCLAMPS != 0,
-            lod_reg & LOD_TMIRROR_S != 0,
-        ) as i32;
-        let t = texture_coord_index(
-            t,
-            height,
-            mode & TEXTUREMODE_TCLAMPT != 0,
-            lod_reg & LOD_TMIRROR_T != 0,
-        ) as i32;
-        self.sample_rgb565_texel(s, t, texture_sample)
-    }
-
-    fn texture_mode_for_tmu(&self, tmu: usize) -> u32 {
-        if tmu == 0 {
-            self.texture_mode
-        } else {
-            self.texture_mode_tmu1
-        }
-    }
-
-    fn texture_lod_for_tmu(&self, tmu: usize) -> u32 {
-        if tmu == 0 {
-            self.texture_lod
-        } else {
-            self.texture_lod_tmu1
-        }
-    }
-
-    fn texture_detail_for_tmu(&self, tmu: usize) -> u32 {
-        if tmu == 0 {
-            self.texture_detail
-        } else {
-            self.texture_detail_tmu1
-        }
-    }
-
-    fn tex_base_addr_for_tmu(&self, tmu: usize) -> u32 {
-        let value = if tmu == 0 {
-            self.tex_base_addr
-        } else {
-            self.tex_base_addr_tmu1
-        };
-        (value & 0x0007_ffff) << 3
-    }
-
-    fn tex_base_addr_for_tmu_lod(&self, tmu: usize, lod: u32) -> u32 {
-        let lod_reg = self.texture_lod_for_tmu(tmu);
-        match texture_base_slot(lod_reg, lod) {
-            0 => self.tex_base_addr_for_tmu(tmu),
-            1 => (self.tex_base_addr1[tmu] & 0x0007_ffff) << 3,
-            2 => (self.tex_base_addr2[tmu] & 0x0007_ffff) << 3,
-            _ => (self.tex_base_addr38[tmu] & 0x0007_ffff) << 3,
-        }
-    }
-
-    fn sample_rgb565_texel(&self, s: i32, t: i32, sample: TmuTextureSample) -> (u8, u8, u8) {
-        let s = texture_coord_index_i32(
-            s,
-            sample.width,
-            sample.mode & TEXTUREMODE_TCLAMPS != 0,
-            sample.lod_reg & LOD_TMIRROR_S != 0,
-        );
-        let t = texture_coord_index_i32(
-            t,
-            sample.height,
-            sample.mode & TEXTUREMODE_TCLAMPT != 0,
-            sample.lod_reg & LOD_TMIRROR_T != 0,
-        );
-        let texel = (t * sample.width + s).saturating_mul(2);
-        let offset = ((sample.base_addr as usize)
-            .saturating_add(sample.mip_offset)
-            .saturating_add(texel))
-            & (DISTIRA_TEX_SIZE - 1);
-        let raw = u16::from_le_bytes([
-            self.texture[sample.tmu][offset],
-            self.texture[sample.tmu][(offset + 1) & (DISTIRA_TEX_SIZE - 1)],
-        ]);
-        (
-            expand5(raw >> 11) as u8,
-            expand6(raw >> 5) as u8,
-            expand5(raw) as u8,
-        )
-    }
-
-    fn apply_fog_color(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-        if self.fog_mode & (FOG_ENABLE | FOG_CONSTANT) != (FOG_ENABLE | FOG_CONSTANT) {
-            return (r, g, b);
-        }
-        (
-            r.saturating_add((self.fog_color >> 16) as u8),
-            g.saturating_add((self.fog_color >> 8) as u8),
-            b.saturating_add(self.fog_color as u8),
-        )
-    }
-
-    fn alpha_blend_color(&self, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: u8) -> (u8, u8, u8) {
-        self.alpha_blend_color_at_base(self.display.back_base, (x, y), (r, g, b), alpha)
-    }
-
-    fn alpha_blend_color_at_base(
-        &self,
-        base: u32,
-        position: (u32, u32),
-        color: (u8, u8, u8),
-        alpha: u8,
-    ) -> (u8, u8, u8) {
-        let (r, g, b) = color;
-        if self.alpha_mode & ALPHA_BLEND_ENABLE == 0 {
-            return (r, g, b);
-        }
-        let (x, y) = position;
-        let (dest_r, dest_g, dest_b) = self.read_pixel_rgb_at_base(base, x, y);
-        let source_func = (self.alpha_mode >> ALPHA_SRC_FUNC_SHIFT) & 0xf;
-        let dest_func = (self.alpha_mode >> ALPHA_DST_FUNC_SHIFT) & 0xf;
-        (
-            alpha_blend_component(source_func, dest_func, r, dest_r, alpha),
-            alpha_blend_component(source_func, dest_func, g, dest_g, alpha),
-            alpha_blend_component(source_func, dest_func, b, dest_b, alpha),
-        )
-    }
-
-    fn read_back_pixel_rgb(&self, x: u32, y: u32) -> (u8, u8, u8) {
-        self.read_pixel_rgb_at_base(self.display.back_base, x, y)
-    }
-
-    fn read_pixel_rgb_at_base(&self, base: u32, x: u32, y: u32) -> (u8, u8, u8) {
-        let raw = self
-            .framebuffer_pixel_offset(base, x, y)
-            .and_then(|offset| self.fb.read_u16_le(offset))
-            .unwrap_or(0);
-        (
-            expand5(raw >> 11) as u8,
-            expand6(raw >> 5) as u8,
-            expand5(raw) as u8,
-        )
-    }
-
-    fn read_depth_pixel(&self, x: u32, y: u32) -> Option<u16> {
-        self.framebuffer_pixel_offset(self.aux_base, x, y)
-            .and_then(|offset| self.fb.read_u16_le(offset))
-    }
-
-    fn write_depth_pixel(&self, x: u32, y: u32, depth: u16) -> bool {
-        if self.fbz_mode & (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
-            != (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
-        {
-            return false;
-        }
-        let Some(offset) = self.framebuffer_pixel_offset(self.aux_base, x, y) else {
-            return false;
-        };
-        self.fb.write_u16_le(offset, depth)
-    }
-
-    fn framebuffer_pixel_offset(&self, base: u32, x: u32, y: u32) -> Option<usize> {
-        let offset = u64::from(base)
-            .checked_add(u64::from(y).checked_mul(u64::from(self.display.pitch))?)?
-            .checked_add(u64::from(x).checked_mul(2)?)?;
-        let offset = usize::try_from(offset).ok()?;
-        // The frame store never changes size, so the constant keeps this
-        // valid while the raster path holds the store outside `self`.
-        (offset.checked_add(2)? <= DISTIRA_FB_SIZE).then_some(offset)
-    }
-
     fn clear_aux_depth(&mut self) {
         let Some(start) = usize::try_from(self.aux_base).ok() else {
             return;
@@ -3453,6 +2843,82 @@ impl Distira {
         let end = start.saturating_add(len).min(self.fb.len());
         self.fb.fill(start, end, 0xff);
     }
+}
+
+/// Whether a triangle may wait on the queue.
+///
+/// The ROTATING stipple is the one piece of per-pixel state that chains from
+/// one triangle to the next, and the chain cannot be split across lanes. Such
+/// a triangle is drawn at submission, exactly as it was before the queue
+/// existed. The patterned stipple is a pure function of the pixel and queues
+/// like anything else.
+fn triangle_defers(triangle: &QueuedTriangle) -> bool {
+    let mode = triangle.params.fbz_mode;
+    mode & FBZ_STIPPLE == 0 || mode & FBZ_STIPPLE_PATT != 0
+}
+
+/// Whether [`RasterParams`] carries everything a write to this register
+/// changes, so a triangle already on the queue does not have to be drawn
+/// before the write lands.
+///
+/// The covered set is the triangle setup block (both the fixed and the float
+/// protocol, the texture iterators, and the two triangle commands), the clip
+/// window, and the mode, colour and TMU registers the snapshot copies.
+/// Everything else draws the queue first: the framebuffer layout, the DAC and
+/// the CLUT, the command registers, `lfbMode`, and the NCC tables and palette,
+/// which the snapshot deliberately does not carry.
+fn raster_snapshot_covers_register(register: usize) -> bool {
+    matches!(
+        register,
+        // Vertices, colour, depth, alpha and texture iterators, fixed and
+        // float, plus triangleCMD and ftriangleCMD themselves.
+        SST_VERTEX_AX..=SST_FTRIANGLE_CMD
+        // fbzColorPath, fogMode, alphaMode, fbzMode.
+        | SST_FBZ_COLOR_PATH..=SST_FBZ_MODE
+        // The clip window, consumed when the triangle is set up.
+        | SST_CLIP_LEFT_RIGHT
+        | SST_CLIP_LOW_Y_HIGH_Y
+        | SST_FOG_COLOR..=SST_CHROMA_KEY
+        | SST_STIPPLE..=SST_COLOR1
+        | SST_TEXTURE_MODE..=SST_TEX_BASE_ADDR38
+        | SST_TREX_INIT1
+    )
+}
+
+/// Whether a READ of this register reports something a triangle still on the
+/// queue would change. Only the SST-1 statistics registers do; `stipple` is
+/// listed because the rotating stipple writes back through it.
+///
+/// Everything else is answered from state the rasteriser never writes, so
+/// those reads cost nothing. `SST_STATUS` is the one worth arguing, because
+/// it is deliberately NOT here and it therefore reports the FIFO idle while
+/// the queue still holds triangles.
+///
+/// That is safe, and it is safe for a reason rather than by luck: the status
+/// bits are a promise about what a guest will SEE, and everything that can
+/// see a queued triangle's pixels draws the queue first. Those paths are the
+/// whole list -- an LFB read or write, a texture-aperture write, the
+/// statistics registers above, `scanout_argb` and `scanout_state`, and every
+/// register write the snapshot does not cover, which is where `fastfillCMD`,
+/// `swapbufferCMD` and the framebuffer layout live. A guest that polls status
+/// until idle and then looks will find the work done by the act of looking.
+///
+/// Reporting busy instead would be worse in both directions. The drain is
+/// synchronous, so nothing clears a busy bit while the guest spins on it: a
+/// guest waiting for idle before it submits more work would wait forever.
+/// And draining on a status poll would put the drain back on the per-triangle
+/// path that this queue exists to get off, since polling status between
+/// triangles is exactly what a Glide driver does.
+fn register_read_needs_raster(register: usize) -> bool {
+    matches!(
+        register,
+        SST_FBI_PIXELS_IN
+            | SST_FBI_CHROMA_FAIL
+            | SST_FBI_ZFUNC_FAIL
+            | SST_FBI_AFUNC_FAIL
+            | SST_FBI_PIXELS_OUT
+            | SST_STIPPLE
+    )
 }
 
 fn lfb_position(aperture_offset: usize, packed_32_bit: bool) -> (u32, u32) {

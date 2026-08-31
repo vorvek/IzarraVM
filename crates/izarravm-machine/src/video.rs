@@ -2428,7 +2428,7 @@ impl Machine {
     }
 
     /// A Distira scanout snapshot. See `Distira::scanout_state`.
-    pub fn distira_scanout_state(&self) -> DistiraScanoutState {
+    pub fn distira_scanout_state(&mut self) -> DistiraScanoutState {
         self.vega.distira_scanout_state()
     }
 
@@ -2481,7 +2481,7 @@ impl Machine {
     /// The active display as native-resolution `0x00RRGGBB` words plus
     /// `(width, height)`. Legacy VGA keeps the complete beam raster here for
     /// unit-tester CRC compatibility, including rows outside the visible image.
-    pub fn frame_argb(&self) -> (Vec<u32>, usize, usize) {
+    pub fn frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
         let start = self.host_profile.start();
         let frame = self.vega.frame_argb();
         self.host_profile
@@ -2497,7 +2497,7 @@ impl Machine {
     /// period after every mode set. Pair it with
     /// [`Self::presented_frame_generation`], which has always returned `None` in
     /// the same situations.
-    pub fn presented_frame_argb(&self) -> Option<(Vec<u32>, usize, usize)> {
+    pub fn presented_frame_argb(&mut self) -> Option<(Vec<u32>, usize, usize)> {
         let start = self.host_profile.start();
         let frame = self.vega.presented_frame_argb();
         self.host_profile
@@ -2505,7 +2505,7 @@ impl Machine {
         frame
     }
 
-    pub fn presented_frame_update(&self) -> Option<crate::PresentedFrameUpdate> {
+    pub fn presented_frame_update(&mut self) -> Option<crate::PresentedFrameUpdate> {
         let start = self.host_profile.start();
         let frame = self.vega.presented_frame_update();
         self.host_profile

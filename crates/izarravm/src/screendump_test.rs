@@ -67,9 +67,9 @@ fn the_index_line_carries_every_field_the_sweep_reads() {
     let scratch = Scratch::new("shape");
     let mut machine = dump_test_machine();
     let mut dumper = ScreenDumper::new(scratch.path(), 5_000_000).unwrap();
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     poke_text(&mut machine, 0, b'A');
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     dumper.finish();
 
     let lines = index_lines(scratch.path());
@@ -108,11 +108,11 @@ fn a_ppm_is_written_only_when_the_hash_moves() {
     let mut machine = dump_test_machine();
     let mut dumper = ScreenDumper::new(scratch.path(), 5_000_000).unwrap();
     // Three samples of one unchanged picture, then one changed.
-    dumper.after_slice(&machine);
-    dumper.after_slice(&machine);
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
+    dumper.after_slice(&mut machine);
+    dumper.after_slice(&mut machine);
     poke_text(&mut machine, 0, b'Z');
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     dumper.finish();
 
     let lines = index_lines(scratch.path());
@@ -179,9 +179,9 @@ fn unpresented_machine() -> Machine {
 #[test]
 fn a_sample_before_the_first_frame_writes_no_ppm() {
     let scratch = Scratch::new("noframe");
-    let machine = unpresented_machine();
+    let mut machine = unpresented_machine();
     let mut dumper = ScreenDumper::new(scratch.path(), 5_000_000).unwrap();
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     dumper.finish();
 
     let written: Vec<String> = std::fs::read_dir(scratch.path())
@@ -202,9 +202,9 @@ fn a_sample_before_the_first_frame_writes_no_ppm() {
 #[test]
 fn a_sample_before_the_first_frame_still_writes_an_index_line() {
     let scratch = Scratch::new("noframe-index");
-    let machine = unpresented_machine();
+    let mut machine = unpresented_machine();
     let mut dumper = ScreenDumper::new(scratch.path(), 5_000_000).unwrap();
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     dumper.finish();
 
     let lines = index_lines(scratch.path());
@@ -229,15 +229,15 @@ fn a_sample_between_a_mode_set_and_its_first_frame_writes_no_ppm() {
     let scratch = Scratch::new("modeset");
     let mut machine = dump_test_machine();
     let mut dumper = ScreenDumper::new(scratch.path(), 5_000_000).unwrap();
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
 
     // The mode set drops the text frame; no frame exists in mode 13h yet.
     assert!(machine.set_vga_mode(0x13));
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
 
     // One frame later there is a picture again.
     machine.advance_devices_ticks(MASTER_CLOCK_HZ / 20);
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     dumper.finish();
 
     let lines = index_lines(scratch.path());
@@ -277,7 +277,7 @@ fn a_missing_frame_is_not_a_picture_the_next_sample_can_match() {
     // A mode 13h picture, sampled once.
     assert!(machine.set_vga_mode(0x13));
     machine.advance_devices_ticks(MASTER_CLOCK_HZ / 20);
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     let first = index_lines(scratch.path())[0]["hash"]
         .as_str()
         .unwrap()
@@ -286,10 +286,10 @@ fn a_missing_frame_is_not_a_picture_the_next_sample_can_match() {
     // Re-setting the same mode drops the frame without touching video memory,
     // so the picture that comes back is the one that left.
     assert!(machine.set_vga_mode(0x13));
-    dumper.after_slice(&machine);
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
+    dumper.after_slice(&mut machine);
     machine.advance_devices_ticks(MASTER_CLOCK_HZ / 20);
-    dumper.after_slice(&machine);
+    dumper.after_slice(&mut machine);
     dumper.finish();
 
     let lines = index_lines(scratch.path());

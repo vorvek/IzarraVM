@@ -3,7 +3,7 @@
 
 use izarravm_video::*;
 
-fn read_reg(distira: &Distira, reg: usize) -> u32 {
+fn read_reg(distira: &mut Distira, reg: usize) -> u32 {
     (0..4)
         .map(|i| u32::from(distira.read_mmio_u8(reg + i)) << (i * 8))
         .fold(0, |a, b| a | b)
@@ -60,7 +60,7 @@ fn draw_textured_alpha_probe(
 
     (
         distira.scanout_argb(),
-        read_reg(&distira, SST_FBI_AFUNC_FAIL),
+        read_reg(&mut distira, SST_FBI_AFUNC_FAIL),
     )
 }
 
@@ -764,7 +764,7 @@ fn voodoo_lfb_pipeline_chroma_key_rejects_matching_color() {
     distira.write_lfb_u32(0, 0x07e0_f800);
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x0000_ff00]);
-    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 1);
+    assert_eq!(read_reg(&mut distira, SST_FBI_CHROMA_FAIL), 1);
 }
 
 #[test]
@@ -786,11 +786,11 @@ fn voodoo_lfb_pipeline_alpha_test_rejects_low_argb8888_alpha() {
 
     distira.write_lfb_u32(0, 0x40ff_0000);
     assert_eq!(distira.scanout_argb(), vec![0x0000_0000]);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 1);
 
     distira.write_lfb_u32(0, 0xff00_ff00);
     assert_eq!(distira.scanout_argb(), vec![0x0000_ff00]);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 1);
 }
 
 #[test]
@@ -882,11 +882,11 @@ fn voodoo_lfb_pipeline_alpha_tests_argb1555_source_alpha() {
 
     distira.write_lfb_u32(0, 0x0000_03e0);
     assert_eq!(distira.scanout_argb(), vec![0x0000_0000]);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 2);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 2);
 
     distira.write_lfb_u32(0, 0x0000_fc00);
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 3);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 3);
 }
 
 #[test]
@@ -934,13 +934,13 @@ fn voodoo_lfb_pipeline_depth_only_alpha_test_uses_zacolor_alpha() {
     distira.write_lfb_u32(0, 0x1111_1111);
     assert_eq!(distira.read_lfb_u8(0), 0xff);
     assert_eq!(distira.read_lfb_u8(1), 0xff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 2);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 2);
 
     write_reg(&mut distira, SST_ZA_COLOR, 0xff00_0000);
     distira.write_lfb_u32(0, 0x2222_2222);
     assert_eq!(distira.read_lfb_u8(0), 0x22);
     assert_eq!(distira.read_lfb_u8(1), 0x22);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 2);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 2);
 }
 
 #[test]
@@ -990,13 +990,13 @@ fn voodoo_lfb_word_depth_uses_pixel_pipeline_zacolor_alpha() {
     distira.write_lfb_u16(0, 0x1111);
     assert_eq!(distira.read_lfb_u8(0), 0xff);
     assert_eq!(distira.read_lfb_u8(1), 0xff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 1);
 
     write_reg(&mut distira, SST_ZA_COLOR, 0xff00_0000);
     distira.write_lfb_u16(0, 0x2222);
     assert_eq!(distira.read_lfb_u8(0), 0x22);
     assert_eq!(distira.read_lfb_u8(1), 0x22);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 1);
 }
 
 #[test]

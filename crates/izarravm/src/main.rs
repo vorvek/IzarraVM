@@ -1969,17 +1969,20 @@ fn run_boot_hdd_folder(
         println!("screenshot: {}", path.display());
     }
     if let Some(path) = presented_ppm {
-        if write_presented_ppm(&machine, path)? {
+        if write_presented_ppm(&mut machine, path)? {
             println!("presented: {}", path.display());
         } else {
             println!("presented: none (no completed raster)");
         }
     }
     if let Some(path) = mode_census {
+        // The scanout state is taken first: reading it drains Distira's
+        // triangle queue, so it needs the machine on its own.
+        let scanout_state = machine.distira_scanout_state();
         let census = mode_census_json(
             machine.mode_census(),
             machine.distira_census(),
-            Some(machine.distira_scanout_state()),
+            Some(scanout_state),
             &machine.distira_register_writes(),
             &machine.distira_register_reads(),
             machine.distira_aperture_traffic(),
@@ -4078,7 +4081,7 @@ fn print_dump_result(machine: &mut Machine, stop_reason: &StopReason) {
 /// been published yet, in which case nothing is written: see the
 /// `presented_ppm` flag comment for why an absent frame is reported rather than
 /// substituted.
-fn write_presented_ppm(machine: &Machine, path: &Path) -> Result<bool, Box<dyn Error>> {
+fn write_presented_ppm(machine: &mut Machine, path: &Path) -> Result<bool, Box<dyn Error>> {
     use std::io::Write;
 
     let Some((pixels, width, height)) = machine.presented_frame_argb() else {

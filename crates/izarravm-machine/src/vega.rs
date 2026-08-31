@@ -520,7 +520,7 @@ impl Vega {
         self.distira.census()
     }
 
-    pub(crate) fn distira_scanout_state(&self) -> DistiraScanoutState {
+    pub(crate) fn distira_scanout_state(&mut self) -> DistiraScanoutState {
         self.distira.scanout_state()
     }
 
@@ -936,7 +936,7 @@ impl Vega {
     /// looking, so the stand-in is unreachable rather than merely unlikely. Do
     /// not route an observer through here — use `presented_frame_argb`, which
     /// says `None` when there is no frame.
-    pub(crate) fn frame_argb(&self) -> (Vec<u32>, usize, usize) {
+    pub(crate) fn frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
         match self.active_display() {
             ActiveDisplay::VgaRaster => {
                 if let Some((words, width, height, _)) = self.vga.cached_mode13h_presented_argb() {
@@ -986,7 +986,7 @@ impl Vega {
     /// vacuously one solid colour, which is the blank-screen signature. A
     /// substitute frame is worse than no frame, because it looks like a
     /// measurement.
-    pub(crate) fn presented_frame_argb(&self) -> Option<(Vec<u32>, usize, usize)> {
+    pub(crate) fn presented_frame_argb(&mut self) -> Option<(Vec<u32>, usize, usize)> {
         if self.active_display() != ActiveDisplay::VgaRaster {
             return Some(self.frame_argb());
         }
@@ -1038,7 +1038,7 @@ impl Vega {
     /// raster by truncating where a row-diff would have to reject it. Both of
     /// those go to the generic branch, which is `presented_frame_argb` verbatim
     /// with a row diff on top -- one presentation, two ways of costing it.
-    pub(crate) fn presented_frame_update(&self) -> Option<PresentedFrameUpdate> {
+    pub(crate) fn presented_frame_update(&mut self) -> Option<PresentedFrameUpdate> {
         let owner = self.active_display();
         if owner == ActiveDisplay::MargoLfb {
             return self.margo_frame_update();
