@@ -85,18 +85,18 @@ fn word_size_byte_forms_are_lowered() {
 /// `0x01` and `0x31` were here and have gone, with the rest of the ALU register forms 1 and 3.
 /// The reason they stayed was that nothing had measured them, not that they would miscompile; a
 /// 16-bit workload now ranks the ten rows near 19% of block-stopping hits. What replaced them is
-/// `word_size_alu_register_forms_are_lowered` plus two tests that carry the arm's own boundary,
-/// because this slice moved that boundary INTO the classifier arm:
-/// `word_size_alu_carry_forms_stay_refused` and `word_size_alu_memory_shapes_split_by_site`. The
-/// carry test is purely negative and would keep passing if the allowlist entries were reverted, so
-/// it cannot live in this table; the memory test is mixed since the B2 slice — its form-1 row is
-/// negative for the same reason, and its lowered rows belong with the other positive fixtures
-/// rather than in a list of opcodes held OUT.
+/// `word_size_alu_register_forms_are_lowered` plus `word_size_alu_memory_shapes_split_by_site`,
+/// which carries form 1's memory-vs-register boundary.
+///
+/// `0x11`/`0x13`/`0x19`/`0x1b`, ADC and SBB in forms 1 and 3, joined the same way on the L1 width
+/// lift: `word_size_alu_carry_forms_are_lowered` is their positive fixture now that
+/// `emit_carry_alu_preloaded` carries a Word lane, so they no longer belong in this held-out table
+/// either.
 ///
 /// Two opcodes have moved OUT of this list as the rejected-row campaign measured them, and each
 /// left a differently-shaped remainder behind:
-/// * `0x83` -> `word_size_0x83_register_forms_are_lowered` and
-///   `word_size_memory_immediate_forms_are_lowered`. Only its two CARRY sub-ops stay refused.
+/// * `0x83` -> `word_size_0x83_register_forms_are_lowered`, `word_size_0x83_carry_forms_are_lowered`
+///   and `word_size_memory_immediate_forms_are_lowered`. No sub-op stays refused any more.
 /// * `0xc7` -> `word_size_memory_immediate_forms_are_lowered` for the memory form. Its REGISTER
 ///   form is still refused, but by an arm inside the classifier rather than by this list, so it
 ///   has its own test (`the_word_size_0xc7_register_form_stays_refused`) and must NOT be asserted
@@ -328,8 +328,8 @@ fn word_size_0x83_register_forms_are_lowered() {
 /// `0x81` at Word size: the six non-carry sub-ops of the REGISTER form are lowered, exactly the
 /// `0x83` slice above with a two-byte immediate. The wolf3d demo-workload census asked for it:
 /// `0x81 /7` word register (CMP CX, imm16) is 634M block-stopping hits, the largest single row.
-/// ADC (/2) and SBB (/3) stay refused by the shared arm; the emitter's word lane masks both
-/// operands before a 66-prefixed `alu_r16_r16`, so the raw imm16 needs no admission-side care.
+/// ADC (/2) and SBB (/3) join them as of the L1 width lift; see
+/// `word_size_0x81_carry_forms_are_lowered` just below.
 #[test]
 fn word_size_0x81_register_forms_are_lowered() {
     let cases: &[(&str, u8)] = &[
@@ -364,10 +364,10 @@ fn word_size_0x81_register_forms_are_lowered() {
     }
 }
 
-/// `0x81` ADC and SBB keep their Word refusal after the opcode's admission: the shared arm's
-/// carry-in refusal, not the allowlist, is what holds them now, so this pins the arm.
+/// `0x81` ADC and SBB REGISTER forms are lowered at Word size, the same L1 lift `0x83` gets: the
+/// two opcodes share the classifier arm and `0x81`'s immediate is just wider.
 #[test]
-fn word_size_0x81_carry_forms_stay_refused() {
+fn word_size_0x81_carry_forms_are_lowered() {
     for (label, op) in [("/2 adc", 2u8), ("/3 sbb", 3)] {
         let form = [0x66u8, 0x81, 0xc0 | (op << 3) | 1, 0x34, 0x12];
         let mut code = vec![0x40, 0x41, 0x42];
@@ -381,8 +381,8 @@ fn word_size_0x81_carry_forms_stay_refused() {
 
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
         assert_eq!(
-            compilation.span.instructions, 3,
-            "{label}: the carry forms have no word lane and must end the block"
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
         );
     }
 }
@@ -840,17 +840,23 @@ fn word_size_alu_register_forms_are_lowered() {
     }
 }
 
-/// ADC and SBB in forms 1 and 3 stay refused at Word size, and the guard is inside the classifier
-/// arm rather than in the allowlist.
+/// ADC and SBB in forms 1 and 3 are LOWERED at Word size, the L1 width lift: the register forms
+/// gained a Word carry lane in `emit_carry_alu_preloaded`, so the guard that used to hold them out
+/// is gone from the classifier arm.
 ///
-/// This is the boundary that matters most in the whole slice. The allowlist alone would not hold
-/// it: the file's stated rule is that the byte set is closed over its shared classifier arms, and
-/// the slice admits five of eight members of two shared arms, so the next reader closing the
-/// family lands a silent miscompile in one line. `emit_alu_preloaded`'s Word lane masks both
-/// operands with `and`, which CLEARS host CF, then tags the descriptor as the SUB class: an
-/// admitted `66 11 /r` computes `adc` without its carry in and evaluates its lazy CF as `a < b`.
+/// This is the boundary that mattered most before the lift, so it is worth restating why the
+/// allowlist alone could not have held it and why the arm can now let go: the file's stated rule
+/// is that the byte set is closed over its shared classifier arms, and the slice that opened
+/// forms 1 and 3 admitted five of eight members of two shared arms, so a silent miscompile was one
+/// line away for as long as the sixth and seventh members reached the OLD `emit_alu_preloaded`
+/// Word lane -- it masked both operands with `and`, which CLEARS host CF, then tagged the
+/// descriptor as the SUB class, so an admitted `66 11 /r` would have computed `adc` without its
+/// carry in. `emit_carry_alu_preloaded`'s Word arm loads the host CF from the guest shadow before
+/// the masked `alu_r16_r16`, which is the lane that closes the gap; the differential coverage lives
+/// in `cpu_jit_word_memory_test.rs` and `cpu_jit_sweep_lowering_test.rs`, and this fixture only
+/// pins that the classifier arm actually emits a slot instead of ending the block.
 #[test]
-fn word_size_alu_carry_forms_stay_refused() {
+fn word_size_alu_carry_forms_are_lowered() {
     let cases: &[(&str, &[u8])] = &[
         ("0x11 adc r/m16,r16", &[0x66, 0x11, 0xc1]),
         ("0x19 sbb r/m16,r16", &[0x66, 0x19, 0xc1]),
@@ -870,9 +876,13 @@ fn word_size_alu_carry_forms_stay_refused() {
 
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
         assert_eq!(
-            compilation.span.instructions, 3,
-            "{label}: must stay refused at Word size, so the block is the three fillers"
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
         );
+        assert_eq!(compilation.word_reads, 0, "{label}: word reads");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_reads, 0, "{label}: dword reads");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
     }
 }
 
@@ -962,17 +972,17 @@ fn word_size_alu_memory_shapes_split_by_site() {
     }
 }
 
-/// The two `0x83` shapes that stay refused at Word size, and the boundary that keeps them out.
+/// The two `0x83` carry shapes, register AND memory, are LOWERED at Word size -- the L1 width
+/// lift's headline row.
 ///
-/// ADC (/2) and SBB (/3) consume the incoming CF as an OPERAND, which the Dword lane handles by
-/// branching on the EFLAGS shadow (`emit_carry_alu_preloaded`) and which has no sixteen-bit twin.
-/// That is a missed lowering; admitting either without a sixteen-bit carry lane would be the
-/// miscompile. Both fixtures measure zero Word `0x83 /2` and `/3` exits.
-///
-/// The MEMORY forms were here too and have MOVED to the test below: the rejected-row campaign's
-/// Slice 3 admitted them, and quake's `0x83 /7` memory word at 162,440 exits is what asked.
+/// ADC (/2) and SBB (/3) consume the incoming CF as an OPERAND. The REGISTER form used to have no
+/// sixteen-bit lane for that at all; `emit_carry_alu_preloaded` grew one. The MEMORY form's
+/// emitter (`emit_alu_candidate` / `emit_commit_alu_candidate`) was already width-parameterised and
+/// already branched on the incoming CF for ANY width, so admitting it here was a pure classifier
+/// change -- pyramid-586's `0x83 word mem /2` row is 18,902,081 runtime hits, the largest
+/// non-monitor row in the corpus's slowest game, and it is this memory case exactly.
 #[test]
-fn word_size_0x83_carry_forms_stay_refused() {
+fn word_size_0x83_carry_forms_are_lowered() {
     let cases: &[(&str, &[u8])] = &[
         ("/2 adc r/m16,imm8", &[0x66, 0x83, 0xd1, 0x03]),
         ("/3 sbb r/m16,imm8", &[0x66, 0x83, 0xd9, 0x03]),
@@ -999,8 +1009,8 @@ fn word_size_0x83_carry_forms_stay_refused() {
 
         let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
         assert_eq!(
-            compilation.span.instructions, 3,
-            "{label}: must stay refused at Word size, so the block is the three fillers"
+            compilation.span.instructions, 4,
+            "{label}: the word form must join the block rather than end it"
         );
     }
 }

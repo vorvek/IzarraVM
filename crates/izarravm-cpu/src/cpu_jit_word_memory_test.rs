@@ -583,11 +583,21 @@ fn the_word_immediate_store_writes_exactly_two_bytes() {
 /// `0xffff + 1` carries out of sixteen bits and not out of thirty-two; `0x8000 - 1` and
 /// `0x7fff + 1` are the signed overflow boundary at sixteen bits and nowhere near it at
 /// thirty-two.
+///
+/// ADC (`/2`) and SBB (`/3`) joined this loop on the L1 width lift, and they are why the
+/// `(eflags, pending)` pairs below are exactly `(0x202, false)` (CF clear) and `(0x8d5, true)`
+/// (CF set): every non-carry op in the loop runs both pairs for the pending-descriptor coverage,
+/// and ADC/SBB additionally get both incoming-CF polarities out of the SAME pairs for free. A
+/// carry-in read from the wrong place -- the masked-CF host `and` the register lane used to rely
+/// on, or a materialized EFLAGS read that missed a live descriptor -- shows up as a wrong sum or
+/// difference only on the CF-set row, so both rows have to pass for either op.
 #[test]
 fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
     for (op, name) in [
         (0u8, "add"),
         (1, "or"),
+        (2, "adc"),
+        (3, "sbb"),
         (4, "and"),
         (5, "sub"),
         (6, "xor"),
@@ -630,6 +640,12 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
 /// together until this row. `0x3b` CMP is in the loop and writes nothing, which is the control
 /// that says a register failure on the other five is the write-back and not the read.
 ///
+/// `0x13` ADC and `0x1b` SBB joined this loop on the L1 width lift: their register-form guard was
+/// classify's only reason to refuse them, so lifting it opens the memory-source shape too, through
+/// the SAME `emit_alu_preloaded` word-carry lane the register rows use -- `emit_alu_mem_source`'s
+/// Word arm already stages RAX/RCX exactly as the register callers do before dispatching there.
+/// 123-talk-shareware ranks a `0x13 word` row at 13.72 M runtime hits, this shape exactly.
+///
 /// The seed poisons every high half with 0xdead, so a write-back that widens to 32 bits is a
 /// distinguishable register failure, not a coincidence.
 ///
@@ -644,6 +660,8 @@ fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
     for (opcode, name) in [
         (0x03u8, "add"),
         (0x0b, "or"),
+        (0x13, "adc"),
+        (0x1b, "sbb"),
         (0x23, "and"),
         (0x2b, "sub"),
         (0x33, "xor"),

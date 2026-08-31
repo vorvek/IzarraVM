@@ -457,12 +457,16 @@ fn cdq_matches_the_interpreter_across_both_sign_boundaries_and_widths() {
 ///   before the operation and not after.
 #[test]
 fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
-    // (sub-op, name). ADC (/2) and SBB (/3) are deliberately absent: `classify` refuses them at
-    // Word size because they consume the incoming CF as an operand, and
-    // `word_size_0x83_carry_forms_stay_refused` is what pins that.
-    let ops: [(u8, &str); 6] = [
+    // (sub-op, name). ADC (/2) and SBB (/3) joined on the L1 width lift: `emit_carry_alu_preloaded`
+    // grew a Word lane, so `classify` no longer refuses them here. The `(eflags, live_pending)`
+    // pairs below are `(0x202, false)` (CF clear) and `(0x8d5, true)` (CF set), which both
+    // non-carry ops already ran for the pending-descriptor coverage; for ADC/SBB the same two rows
+    // also cover both incoming-CF polarities, so no extra axis is needed for the carry-in.
+    let ops: [(u8, &str); 8] = [
         (0, "add"),
         (1, "or"),
+        (2, "adc"),
+        (3, "sbb"),
         (4, "and"),
         (5, "sub"),
         (6, "xor"),
@@ -533,14 +537,18 @@ fn word_mov_immediate_matches_the_interpreter_for_every_destination() {
 /// The three properties `0x83`'s sweep names apply unchanged, and the seeds carry recognisable
 /// high halves and sixteen-bit corner low halves for the same reasons. CMP is included as the
 /// control: it writes nothing, so a failure on the other five is the write-back and not the
-/// operation. ADC (/2) and SBB (/3) are absent because `classify` refuses them at Word size in the
-/// arm itself; `word_size_alu_carry_forms_stay_refused` pins that.
+/// operation. ADC (/2) and SBB (/3) joined on the L1 width lift, the same `emit_carry_alu_preloaded`
+/// Word lane that admitted `0x83`'s carry sub-ops; the `(eflags, live_pending)` pairs below already
+/// run both CF polarities for the pending-descriptor coverage, so they double as the carry-in sweep
+/// for these two ops with no extra axis.
 #[test]
 fn word_alu_register_forms_match_the_interpreter_for_every_admitted_op() {
     // (sub-op, form-1 opcode, form-3 opcode, name).
-    let ops: [(u8, u8, u8, &str); 6] = [
+    let ops: [(u8, u8, u8, &str); 8] = [
         (0, 0x01, 0x03, "add"),
         (1, 0x09, 0x0b, "or"),
+        (2, 0x11, 0x13, "adc"),
+        (3, 0x19, 0x1b, "sbb"),
         (4, 0x21, 0x23, "and"),
         (5, 0x29, 0x2b, "sub"),
         (6, 0x31, 0x33, "xor"),
