@@ -1963,6 +1963,7 @@ fn run_boot_hdd_folder(
     print_video_summary(&mut machine);
     if dump_result {
         print_dump_result(&mut machine, &stop_reason);
+        write_margo_store_ppms(&mut machine, result_ppm)?;
     }
     if let Some(path) = result_ppm {
         write_framebuffer_ppm(&mut machine, path)?;
@@ -1979,7 +1980,7 @@ fn run_boot_hdd_folder(
         // The scanout state is taken first: reading it drains Distira's
         // triangle queue, so it needs the machine on its own.
         let scanout_state = machine.distira_scanout_state();
-        let census = mode_census_json(
+        let mut census = mode_census_json(
             machine.mode_census(),
             machine.distira_census(),
             Some(scanout_state),
@@ -1988,6 +1989,26 @@ fn run_boot_hdd_folder(
             machine.distira_aperture_traffic(),
             machine.distira_offset_bits_or(),
         );
+        let (vbe_linear, vbe_banked) = machine.vbe_mode_set_window_counts();
+        census["margo"] = json!({
+            "active": machine.margo_active(),
+            "display": machine.margo_display().map(|display| json!({
+                "mode": format!("0x{:04x}", display.mode),
+                "width": display.width,
+                "height": display.height,
+                "bpp": display.bpp,
+                "pitch": display.pitch,
+                "start": display.start,
+            })),
+            "vbe_mode_sets_linear": vbe_linear,
+            "vbe_mode_sets_banked": vbe_banked,
+            "vga_pass": machine.distira_vga_pass(),
+            "video_reset": machine.distira_video_reset(),
+            "init_enable": machine.distira_init_enable(),
+            "fbi_init0": machine.distira_fbi_init0(),
+            "video_reset_falling_edges": machine.distira_video_reset_falling_edges(),
+            "fbi_init0_byte0_enables": machine.distira_fbi_init0_byte0_enables(),
+        });
         std::fs::write(
             path,
             serde_json::to_string_pretty(&census)?
@@ -4157,12 +4178,78 @@ fn write_presented_ppm(machine: &mut Machine, path: &Path) -> Result<bool, Box<d
 }
 
 fn write_framebuffer_ppm(machine: &mut Machine, path: &Path) -> Result<(), Box<dyn Error>> {
+    let (pixels, width, height) = machine.capture_frame_argb();
+    write_argb_ppm(path, &pixels, width, height)
+}
+
+/// Decode Margo even when Distira owns the mux, plus pal8 rereads of the same
+/// bytes. Sidecar files go next to `--result-ppm` when that flag is set.
+fn write_margo_store_ppms(
+    machine: &mut Machine,
+    result_ppm: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let Some((pixels, width, height)) = machine.margo_store_frame_argb() else {
+        println!("margo store: none (no VBE session)");
+        return Ok(());
+    };
+    let nonzero = pixels.iter().filter(|&&pixel| pixel != 0).count();
+    println!(
+        "margo store: {width}x{height} non-zero={nonzero}/{} ({:.1}%)",
+        pixels.len(),
+        if pixels.is_empty() {
+            0.0
+        } else {
+            100.0 * nonzero as f64 / pixels.len() as f64
+        }
+    );
+    if let Some(base) = result_ppm {
+        let native = sidecar_ppm(base, "margo");
+        write_argb_ppm(&native, &pixels, width as usize, height as usize)?;
+        println!("margo store ppm: {}", native.display());
+    }
+
+    for (label, w, h) in [("pal8-640x480", 640u32, 480u32), ("pal8-320x120", 320, 120)] {
+        let Some(pal8) = machine.margo_store_pal8_argb(w, h) else {
+            continue;
+        };
+        let pal_nonzero = pal8.iter().filter(|&&pixel| pixel != 0).count();
+        println!(
+            "margo {label}: non-zero={pal_nonzero}/{} ({:.1}%)",
+            pal8.len(),
+            if pal8.is_empty() {
+                0.0
+            } else {
+                100.0 * pal_nonzero as f64 / pal8.len() as f64
+            }
+        );
+        if let Some(base) = result_ppm {
+            let path = sidecar_ppm(base, &format!("margo-{label}"));
+            write_argb_ppm(&path, &pal8, w as usize, h as usize)?;
+            println!("margo {label} ppm: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn sidecar_ppm(result_ppm: &Path, suffix: &str) -> PathBuf {
+    let stem = result_ppm
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("result");
+    result_ppm.with_file_name(format!("{stem}-{suffix}.ppm"))
+}
+
+fn write_argb_ppm(
+    path: &Path,
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+) -> Result<(), Box<dyn Error>> {
     use std::io::Write;
 
-    let (pixels, width, height) = machine.capture_frame_argb();
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     write!(out, "P6\n{width} {height}\n255\n")?;
-    for color in pixels {
+    for &color in pixels {
         out.write_all(&[(color >> 16) as u8, (color >> 8) as u8, color as u8])?;
     }
     Ok(())
@@ -4216,6 +4303,25 @@ fn print_video_summary(machine: &mut Machine) {
             100.0 * nonzero as f64 / total as f64
         }
     );
+    if let Some(display) = machine.margo_display() {
+        let (linear, banked) = machine.vbe_mode_set_window_counts();
+        println!(
+            "margo: mode={:#06x} {}x{}x{} pitch={} start={} linear_sets={} banked_sets={} \
+             vga_pass={} video_reset={} video_reset_falling_edges={} fbi_init0_enables={}",
+            display.mode,
+            display.width,
+            display.height,
+            display.bpp,
+            display.pitch,
+            display.start,
+            linear,
+            banked,
+            machine.distira_vga_pass(),
+            machine.distira_video_reset(),
+            machine.distira_video_reset_falling_edges(),
+            machine.distira_fbi_init0_byte0_enables(),
+        );
+    }
     let mut histogram = std::collections::HashMap::new();
     for &color in &pixels {
         *histogram.entry(color).or_insert(0u32) += 1;

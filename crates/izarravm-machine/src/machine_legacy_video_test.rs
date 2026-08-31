@@ -125,6 +125,46 @@ fn graphics_mode_reporting_follows_the_active_vega_engine() {
 }
 
 #[test]
+fn margo_store_dump_ignores_the_active_mux() {
+    let mut machine = test_machine();
+    machine.load_margo_test_pattern();
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    let (before, width, height) = machine
+        .margo_store_frame_argb()
+        .expect("Margo session is live");
+    assert_eq!((width, height), (640, 480));
+    assert!(
+        before.iter().any(|&pixel| pixel != 0),
+        "test pattern must be visible in the Margo dump"
+    );
+
+    let fb_width = 2_u32.to_le_bytes();
+    for (byte, value) in fb_width.into_iter().enumerate() {
+        machine.write_physical_u8(
+            DISTIRA_MMIO_BASE + DISTIRA_REG_FB_WIDTH as u32 + byte as u32,
+            value,
+        );
+    }
+    for byte in 0..4 {
+        machine.write_physical_u8(DISTIRA_MMIO_BASE + SST_SWAPBUFFER_CMD as u32 + byte, 0);
+    }
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+
+    let (after, width, height) = machine
+        .margo_store_frame_argb()
+        .expect("Margo stays latched behind Distira");
+    assert_eq!((width, height), (640, 480));
+    assert_eq!(
+        after, before,
+        "the Margo dump must not follow Distira scanout"
+    );
+    let pal8 = machine
+        .margo_store_pal8_argb(640, 480)
+        .expect("pal8 reread of a live store");
+    assert_eq!(pal8.len(), 640 * 480);
+}
+
+#[test]
 fn planar_mode_presents_a_vga_raster() {
     let mut machine = test_machine();
     machine.set_vga_mode_0dh();

@@ -367,6 +367,13 @@ pub struct Distira {
     aux_base: u32,
     buffer_stride: u32,
     display_enabled: bool,
+    /// VIDEO_RESET falling edges in `write_fbi_init1`. Splash is one. A count
+    /// that keeps climbing after a VBE yield is a Distira restick that SWAPBUFFER
+    /// did not cause.
+    video_reset_falling_edges: u64,
+    /// FBIINIT0 byte-0 writes that set `display_enabled` because VGA_PASS was
+    /// clear and VIDEO_RESET was already clear. Level-triggered, not an edge.
+    fbi_init0_byte0_enables: u64,
     dither_enabled: bool,
     /// How many threads rasterise a batch of triangles, caller included.
     /// Chosen from the host core count at construction; see
@@ -531,6 +538,8 @@ impl Distira {
             aux_base: buffer_stride * 2,
             buffer_stride,
             display_enabled: false,
+            video_reset_falling_edges: 0,
+            fbi_init0_byte0_enables: 0,
             dither_enabled: false,
             raster_lanes: raster_pool::host_lanes(),
             raster_queue: RasterQueue::default(),
@@ -662,6 +671,26 @@ impl Distira {
         self.init_enable
     }
 
+    pub fn fbi_init0(&self) -> u32 {
+        self.fbi_init[0]
+    }
+
+    pub fn vga_pass(&self) -> bool {
+        self.fbi_init[0] & FBIINIT0_VGA_PASS != 0
+    }
+
+    pub fn video_reset(&self) -> bool {
+        self.fbi_init[1] & FBIINIT1_VIDEO_RESET != 0
+    }
+
+    pub fn video_reset_falling_edges(&self) -> u64 {
+        self.video_reset_falling_edges
+    }
+
+    pub fn fbi_init0_byte0_enables(&self) -> u64 {
+        self.fbi_init0_byte0_enables
+    }
+
     fn init_writes_enabled(&self) -> bool {
         self.init_enable & INIT_ENABLE_WRITE != 0
     }
@@ -678,6 +707,7 @@ impl Distira {
             self.display_enabled = false;
         } else if self.fbi_init[1] & FBIINIT1_VIDEO_RESET == 0 {
             self.display_enabled = true;
+            self.fbi_init0_byte0_enables = self.fbi_init0_byte0_enables.saturating_add(1);
         }
         if self.fbi_init[0] & FBIINIT0_GRAPHICS_RESET != 0 {
             self.display.front_base = 0;
@@ -699,6 +729,7 @@ impl Distira {
             self.frame_phase_line = 0;
             self.reset_swap_state();
             self.display_enabled = self.fbi_init[0] & FBIINIT0_VGA_PASS == 0;
+            self.video_reset_falling_edges = self.video_reset_falling_edges.saturating_add(1);
         } else if self.fbi_init[1] & FBIINIT1_VIDEO_RESET != 0 {
             self.display_enabled = false;
             self.reset_swap_state();

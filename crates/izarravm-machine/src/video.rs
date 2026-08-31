@@ -2191,7 +2191,10 @@ impl Machine {
 
     fn vbe_set_mode(&mut self) {
         let request = self.cpu.registers.ebx() as u16;
-        if self.vega.set_vbe_mode(request) {
+        if self
+            .vega
+            .set_vbe_mode_at(request, Some(self.master_ticks()))
+        {
             self.vega.legacy_mut().set_dac_component_bits(6);
             self.set_vbe_status(0x004f);
         } else {
@@ -2450,6 +2453,61 @@ impl Machine {
 
     pub fn margo_display(&self) -> Option<crate::MargoDisplay> {
         self.vega.margo_active().then(|| self.vega.margo_display())
+    }
+
+    pub fn vbe_mode_set_window_counts(&self) -> (u32, u32) {
+        self.vega.vbe_mode_set_window_counts()
+    }
+
+    /// Margo's visible store decoded with the latched mode, even when Distira
+    /// owns scanout. None if no VBE session is live.
+    pub fn margo_store_frame_argb(&self) -> Option<(Vec<u32>, u32, u32)> {
+        let display = self.margo_display()?;
+        let palette = self.vega.palette_argb();
+        let pixels = self.vega.margo().scanout_argb(&palette);
+        Some((pixels, display.width, display.height))
+    }
+
+    /// The same Margo VRAM bytes read as packed pal8 of `width` by `height`,
+    /// ignoring the latched bpp and pitch. For telling a 15-bit misread from a
+    /// pal8 movie sitting in the store.
+    pub fn margo_store_pal8_argb(&self, width: u32, height: u32) -> Option<Vec<u32>> {
+        if !self.vega.margo_active() {
+            return None;
+        }
+        let palette = self.vega.palette_argb();
+        let vram = self.vega.margo().vram();
+        let len = (width as usize).saturating_mul(height as usize);
+        let mut out = Vec::with_capacity(len);
+        for index in 0..len {
+            let color = vram.get(index).copied().unwrap_or(0);
+            out.push(palette[usize::from(color)]);
+        }
+        Some(out)
+    }
+
+    pub fn distira_vga_pass(&self) -> bool {
+        self.vega.distira().vga_pass()
+    }
+
+    pub fn distira_video_reset(&self) -> bool {
+        self.vega.distira().video_reset()
+    }
+
+    pub fn distira_init_enable(&self) -> u32 {
+        self.vega.distira().init_enable()
+    }
+
+    pub fn distira_fbi_init0(&self) -> u32 {
+        self.vega.distira().fbi_init0()
+    }
+
+    pub fn distira_video_reset_falling_edges(&self) -> u64 {
+        self.vega.distira().video_reset_falling_edges()
+    }
+
+    pub fn distira_fbi_init0_byte0_enables(&self) -> u64 {
+        self.vega.distira().fbi_init0_byte0_enables()
     }
 
     /// Monotonic legacy timing sequence used by the host renderer to pace frame
