@@ -14419,8 +14419,11 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // been in production on `0x81`/`0x83` since then. `decode` fetches this immediate with
         // `fetch_immediate(operand_size)`, which at Word is a zero-extended `fetch_u16`, so the
         // emitter's `imm & 0xffff` is exact rather than a truncation. ADC (`0x15`) and SBB
-        // (`0x1d`) are refused at Word by the forms-1|3|5 guard below, for the reason forms 1 and
-        // 3 already refuse them: no carry-in lane.
+        // (`0x1d`) are ADMITTED here as of the L1 width lift, the same way forms 1 and 3 are: they
+        // reach this gate already, and the classifier arm below no longer refuses `op 2|3` for any
+        // of the three forms now that `emit_carry_alu_preloaded` carries a Word lane. This entry
+        // predates that lift and was never the thing refusing them -- the arm was -- so nothing
+        // here needed to change beyond this comment.
         //
         // `0xa1` / `0xa3` are the moffs word forms, and they are the pair the long note above
         // names as the COUNTEREXAMPLE that must not be swept in by proximity. That note was right
@@ -14954,7 +14957,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // is Word here whenever `IZARRAVM_V86_LOOP_ROWS` is on and the segment is 16-bit,
                 // and Dword otherwise. It has always been passed rather than hard-coded, which is
                 // what let the admission be an allowlist entry rather than an emitter change; the
-                // carry members are refused at Word by the forms-1|3|5 guard above.
+                // carry members (`0x15`/`0x1d`) reach this SAME arm and are admitted at Word too,
+                // as of the L1 width lift -- `emit_alu` stages RCX exactly as the register forms
+                // do, so `emit_carry_alu_preloaded`'s new Word lane serves them with no arm change.
                 5 => {
                     return Some(DirectKind::AluImm {
                         op,
@@ -21903,6 +21908,8 @@ fn emit_carry_alu_preloaded(
     //
     // On the Word arm this MUST run after the masks above, not before: it clobbers RAX to plant
     // host CF, and the masked operand this branch computes with already moved into RDX/RCX.
+    // `word_alu_register_forms_match_the_interpreter_for_every_admitted_op`'s `(0x8d7, false)` row
+    // is the fixture that catches a hoist -- see its mutation ledger entry.
     emit_load_host_flags(e);
     match width {
         MemoryWidth::Word => e.alu_r16_r16(op, Reg::RDX, Reg::RCX),

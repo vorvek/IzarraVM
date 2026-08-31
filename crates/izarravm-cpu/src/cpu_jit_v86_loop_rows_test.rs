@@ -54,9 +54,11 @@
 // | `0xa1` width back to `MemoryWidth::Dword`, i.e. the pre-slice emitter | `the_moffs_pair_*`, `the_cs_override_*`, `the_tombraid_loop_body_*` | registers: EAX `0x1af9_1234` against the interpreter's `0xdead_1234` |
 // | the CERTAIN-EXIT rule disabled | `a_statically_misaligned_*`, `the_loop_compiles_into_the_units_*` | span length: `Some(3)` where `None` is required |
 // | `CarryFlag` drops `emit_set_cf_only` and writes only the flag shadow | `clc_and_stc_*`, `the_carry_*_rcl` | raw lazy-flags descriptor, then registers on the RCL read-back |
-// | the ADC/SBB guard narrowed back to `matches!(form, 1 \| 3)` | `the_gate_does_not_sweep_in_*` | `0x15` ADC AX,imm16 compiles where it must be a barrier |
-//   (STALE since the L1 width lift removed that guard outright; `0x15`/`0x1d` now flip WITH the
-//   gate instead of staying a barrier, and the fixture asserts the flip directly.)
+// | (L1, 2026-08-31) `emit_carry_alu_preloaded`'s Word arm: `emit_load_host_flags` hoisted above the RAX/RCX masks | `word_alu_register_forms_match_the_interpreter_for_every_admitted_op` (`cpu_jit_sweep_lowering_test.rs`), the `(0x8d7, false)` row | registers: ECX `0xdead0002` against the interpreter's `0xdead0000`, at `0x11 /2 adc cx,ax` |
+//   (Replaces the STALE row this file used to carry here for the ADC/SBB guard narrowed back to
+//   `matches!(form, 1 \| 3)`: the L1 width lift deleted that guard outright, so it can no longer be
+//   re-applied as a mutation. `0x15`/`0x1d` now flip WITH `IZARRAVM_V86_LOOP_ROWS` instead of
+//   staying a barrier, which `the_gate_does_not_sweep_in_*` asserts directly.)
 // | `PopSegReal`'s `alu_r16_imm16(0, home(4), 2)` widened to `add_r32_imm32` | `pop_segment_preserves_the_high_half_of_esp_across_the_sixteen_bit_wrap` | registers: ESP `0xdeae_0000` against `0xdead_0000` |
 // | `PopSegReal` drops the access / `default_size_32` store | `pop_segment_matches_*`, the stale-descriptor row | registers: the segment's access byte |
 // | `PopSegReal`'s `shift_r32_imm8(4, RAX, 4)` -> shift by 3 | three POP fixtures | registers: the segment base |

@@ -1575,8 +1575,9 @@ fn width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
 ///   what a Watcom local looks like, and at a Word address size the sum wraps rather than going
 ///   negative.
 ///
-/// ADC and SBB are excluded from the ALU slot's operation pool: both are refused at Word size (no
-/// carry-in lane), so drawing one would stop the block and cost a retirement.
+/// ADC and SBB are in the ALU slot's operation pool alongside the other six: the L1 width lift gave
+/// `emit_carry_alu_preloaded` a Word lane, so drawing one lowers into the block exactly as its
+/// six siblings do rather than stopping it.
 fn sixteen_bit_width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
     let seed = 0x5715_16b1_0000_0001u64
         ^ u64::from(index + mode_offset).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -1607,7 +1608,7 @@ fn sixteen_bit_width_lift_case(index: u32, mode_offset: u32) -> GeneratedCase {
     bytes.push(0xb8 + dst);
     bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
 
-    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    let op = [0u8, 1, 2, 3, 4, 5, 6, 7][((index + mode_offset) % 8) as usize];
     bytes.extend_from_slice(&[
         (op << 3) | 1,
         0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
@@ -1962,7 +1963,8 @@ fn sixteen_bit_interpret_one_case(index: u32, mode_offset: u32) -> GeneratedCase
     // 8F /0 -- POP word [BP+0]. ModRM 0x46 is mod 01 with r/m 110, the [BP+disp8] form.
     bytes.extend_from_slice(&[0x8F, 0x46, 0x00]);
 
-    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    // The full eight-op ALU pool, ADC/SBB included since the L1 width lift gave them a Word lane.
+    let op = [0u8, 1, 2, 3, 4, 5, 6, 7][((index + mode_offset) % 8) as usize];
     bytes.extend_from_slice(&[
         (op << 3) | 1,
         0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),
@@ -2428,9 +2430,9 @@ fn sixteen_bit_policy_case_with(index: u32, mode_offset: u32, row: PolicyRow) ->
     bytes.push(0xb8 + dst);
     bytes.extend_from_slice(&(rng.u32() as u16).to_le_bytes());
     bytes.extend_from_slice(&row(&mut gpr));
-    // ADC and SBB have no Word lane and are refused by the classifier, so the op set is the other
-    // six; the same choice `sixteen_bit_interpret_one_case` makes.
-    let op = [0u8, 1, 4, 5, 6, 7][((index + mode_offset) % 6) as usize];
+    // The full eight-op ALU pool, ADC/SBB included since the L1 width lift gave them a Word lane;
+    // the same pool `sixteen_bit_interpret_one_case` and `sixteen_bit_width_lift_case` draw from.
+    let op = [0u8, 1, 2, 3, 4, 5, 6, 7][((index + mode_offset) % 8) as usize];
     bytes.extend_from_slice(&[
         (op << 3) | 1,
         0xc0 | (non_stack_reg(&mut rng) << 3) | non_stack_reg(&mut rng),

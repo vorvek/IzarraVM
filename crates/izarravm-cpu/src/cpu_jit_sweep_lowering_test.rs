@@ -166,6 +166,13 @@ fn differential_full(
         cpu.registers.eflags = seed_eflags;
         cpu.pending_flags = PendingFlags::default();
         if live_pending {
+            // NOTE for carry-in callers: `flag(FLAG_CF)` routes CF through this pending
+            // descriptor whenever one is live (`core.rs`'s ARITH-flag short circuit), so the
+            // priming ADD's own CF (always 0: `0x7fff_ffff + 1` does not carry out of thirty-two
+            // bits) is what a carry-in reader sees here, NOT `seed_eflags`'s CF bit. A row that
+            // needs a genuine CF=1 delivered has to pair `live_pending: false` with a CF-set
+            // `seed_eflags`, which reads straight from `registers.eflags` with no descriptor in
+            // the way.
             let _ = cpu.alu(0, 0x7fff_ffff, 1, BusWidth::Dword);
         }
         cpu.set_eip(ENTRY);
@@ -458,10 +465,13 @@ fn cdq_matches_the_interpreter_across_both_sign_boundaries_and_widths() {
 #[test]
 fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
     // (sub-op, name). ADC (/2) and SBB (/3) joined on the L1 width lift: `emit_carry_alu_preloaded`
-    // grew a Word lane, so `classify` no longer refuses them here. The `(eflags, live_pending)`
-    // pairs below are `(0x202, false)` (CF clear) and `(0x8d5, true)` (CF set), which both
-    // non-carry ops already ran for the pending-descriptor coverage; for ADC/SBB the same two rows
-    // also cover both incoming-CF polarities, so no extra axis is needed for the carry-in.
+    // grew a Word lane, so `classify` no longer refuses them here. THREE `(eflags, live_pending)`
+    // pairs run below, not two: `differential_full`'s `cpu.alu` priming call leaves CF clear, and
+    // `flag(FLAG_CF)` (`core.rs`) routes CF through that live descriptor rather than through
+    // `seed_eflags` whenever one exists, so `(0x8d5, true)` alone would never deliver a real CF=1
+    // to a carry reader. `(0x8d7, false)` is what does -- no descriptor in the way, CF comes
+    // straight out of `registers.eflags`. `(0x202, false)` and `(0x8d5, true)` are still both run
+    // for the pending-descriptor-replacement coverage every op needs, carry or not.
     let ops: [(u8, &str); 8] = [
         (0, "add"),
         (1, "or"),
@@ -487,7 +497,7 @@ fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
     for (op, name) in ops {
         for seed in seeds {
             for imm in imms {
-                for (eflags, live_pending) in [(0x202u32, false), (0x8d5, true)] {
+                for (eflags, live_pending) in [(0x202u32, false), (0x8d5, true), (0x8d7, false)] {
                     let body = [0x66u8, 0x83, 0xc0 | (op << 3) | 1, imm];
                     let context = format!(
                         "0x83 /{op} {name} cx,{imm:#04x} seed={seed:#010x} \
@@ -538,9 +548,10 @@ fn word_mov_immediate_matches_the_interpreter_for_every_destination() {
 /// high halves and sixteen-bit corner low halves for the same reasons. CMP is included as the
 /// control: it writes nothing, so a failure on the other five is the write-back and not the
 /// operation. ADC (/2) and SBB (/3) joined on the L1 width lift, the same `emit_carry_alu_preloaded`
-/// Word lane that admitted `0x83`'s carry sub-ops; the `(eflags, live_pending)` pairs below already
-/// run both CF polarities for the pending-descriptor coverage, so they double as the carry-in sweep
-/// for these two ops with no extra axis.
+/// Word lane that admitted `0x83`'s carry sub-ops; see `word_alu_immediate_forms_match_the_
+/// interpreter_for_every_admitted_sub_op`'s doc for why the `(eflags, live_pending)` loop below runs
+/// THREE pairs rather than two -- `(0x8d7, false)` is the one that actually delivers a live CF=1 to
+/// a carry reader, since a live pending descriptor routes CF through itself instead.
 #[test]
 fn word_alu_register_forms_match_the_interpreter_for_every_admitted_op() {
     // (sub-op, form-1 opcode, form-3 opcode, name).
@@ -568,7 +579,7 @@ fn word_alu_register_forms_match_the_interpreter_for_every_admitted_op() {
 
     for (op, form1, form3, name) in ops {
         for (ecx, eax) in seeds {
-            for (eflags, live_pending) in [(0x202u32, false), (0x8d5, true)] {
+            for (eflags, live_pending) in [(0x202u32, false), (0x8d5, true), (0x8d7, false)] {
                 // Form 1 is `op r/m16, r16`: ModRM r/m = CX is the destination, reg = AX.
                 let body = [0x66u8, form1, 0xc1];
                 let context = format!(
