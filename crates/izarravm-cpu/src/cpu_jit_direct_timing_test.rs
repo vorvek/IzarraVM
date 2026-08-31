@@ -2492,9 +2492,13 @@ fn loop_is_lowered_with_the_gate_on() {
 
 /// THE REFUSALS, every one forced knob-ON so the refusal cannot be the knob's doing.
 ///
-/// `0x67` makes the COUNTER 16-bit: a decrement through `alu_r32_imm32` would clear the high half
-/// of ECX. `0x66` makes the TARGET wrap at 64K in `relative_jump`, which `taken_delta` does not
-/// model. `0xE0`/`0xE1` read ZF and belong to a different flag contract.
+/// `0x67` on a Dword-default (`fresh()`) block gives the MIXED cell (Word address / Dword
+/// operand): a Word counter decremented as if it were Dword would clear the high half of ECX.
+/// `0x66` gives the other MIXED cell (Dword address / Word operand): a Dword counter paired with
+/// a Word target that `taken_delta` does not model wrapping for. `classify` refuses both cells by
+/// name -- see the `DirectKind::Loop` doc comment -- even though the Word/Word cell (both
+/// prefixes together, `loop_word_*` below) is admitted. `0xE0`/`0xE1` read ZF and belong to a
+/// different flag contract.
 #[test]
 fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
     const ENTRY: u32 = 0x101;
@@ -2508,11 +2512,11 @@ fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
     for (code, why) in [
         (
             vec![0x89u8, 0xf6, 0x89, 0xff, 0x67, 0xe2, 0x02, 0xf4],
-            "67 E2: a 16-bit COUNTER, and a 32-bit decrement would clear the high half of ECX",
+            "67 E2: the (Word, Dword) mixed cell, refused by name",
         ),
         (
             vec![0x89u8, 0xf6, 0x89, 0xff, 0x66, 0xe2, 0x02, 0xf4],
-            "66 E2: a 16-bit TARGET, which relative_jump wraps at 64K and taken_delta does not",
+            "66 E2: the (Dword, Word) mixed cell, refused by name",
         ),
         (
             vec![0x89u8, 0xf6, 0x89, 0xff, 0xe1, 0x02, 0xf4],
@@ -2544,6 +2548,275 @@ fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
             "{code:02x?} must not lower its terminal: {why}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Word/Word `0xE2` cell (`DirectKind::Loop { counter_word: true, .. }`). Every corpus guest
+// is 16-bit, so the Dword lane above never fires on it: the L0 lever
+// (dev_docs/2026-08-31-corpus-lever-plan.md) widens `classify` to the matched Word cell while the
+// mixed cells stay refused (`loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on`
+// above already covers those, unchanged).
+//
+// WHAT THESE CATCH THAT THE DWORD FIXTURES CANNOT:
+//  * `alu_r16_imm16` vs `alu_r32_imm32` at the emission site. Routing a Word cell through the
+//    Dword decrement clears ECX's bits 31..16, a silent failure invisible to any assertion that
+//    only reads CX. `loop_word_preserves_ecx_high_half` seeds a non-zero high half specifically
+//    to catch it, and the differential below would also catch it on any seed with a non-zero
+//    high half.
+//  * the Word wrap `control_target_limit` guards. `loop_word_target_beyond_the_limit_is_refused`
+//    shrinks `cs.limit` below the taken target and checks the terminal does not lower.
+// ---------------------------------------------------------------------------
+
+/// `mov si,si; mov di,di; loop +2`, identical bytes to `loop_case()` -- in a 16-bit code segment
+/// the same encoding decodes as the Word forms with no prefix needed. Target ENTRY+8, fallthrough
+/// ENTRY+6, so a lowering that took the wrong path fails on EIP rather than needing its own check.
+fn loop_word_case() -> Vec<u8> {
+    vec![
+        0x89, 0xf6, // mov si, si
+        0x89, 0xff, // mov di, di
+        0xe2, 0x02, // loop +2  -> ENTRY+8
+        0xf4, 0x90, // ENTRY+6: hlt (not taken), pad
+        0xf4, // ENTRY+8: hlt (taken)
+    ]
+}
+
+/// `install_fixture_block`'s `d = false` twin: the Word/Word cell only classifies in a 16-bit
+/// code segment, so every fixture below compiles and installs through this instead.
+fn install_fixture_block_word(cpu: &mut CpuGsw, linear: u32) -> jit::direct::CompiledBlock {
+    let key = jit::direct::key_for(cpu, linear, false).unwrap();
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let outcome = jit::direct::compile(cpu, linear, false);
+    match &outcome {
+        jit::direct::CompileOutcome::Retry(cause) => {
+            panic!("word direct compilation retried at {linear:#x}: {cause:?}");
+        }
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("word direct compilation structurally rejected at {linear:#x}");
+        }
+        jit::direct::CompileOutcome::Compiled(_) => {}
+    }
+    let compilation =
+        outcome.unwrap_or_else(|| panic!("word direct compilation failed at {linear:#x}"));
+    let id = cpu.jit_direct.install(&compilation).unwrap_or_else(|| {
+        panic!(
+            "word direct install failed at {linear:#x}, code_len={}",
+            compilation.code.len()
+        )
+    });
+    cpu.jit_direct.block(id).unwrap()
+}
+
+/// THE DIFFERENTIAL, the Word twin of `loop_matches_the_interpreter_across_the_counter_boundary`.
+/// Every seed carries a non-zero high half in ECX (`0x1234_xxxx`), so a decrement that mistakenly
+/// used the Dword width -- clearing that high half -- fails on the register comparison even
+/// though CX itself would still read correctly.
+#[test]
+fn loop_word_matches_the_interpreter_across_the_counter_boundary() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    // 1 -> 0, NOT taken. 2 -> 1, taken. 3 -> 2, taken.
+    // 0 -> 0xFFFF, TAKEN -- the 16-bit wrap, CX's own boundary and not ECX's.
+    for seed_cx in [1u32, 2, 3, 0, 0xffff] {
+        let seed_ecx = 0x1234_0000 | seed_cx;
+        let code = loop_word_case();
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh_real16();
+        let mut interp = fresh_real16();
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+        }
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        decode_fixture(&mut interp, &mut interp_bus, &starts);
+        let block = install_fixture_block_word(&mut native, ENTRY);
+
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr.fill(0);
+            cpu.registers.set_esp(0xc000);
+            cpu.registers.set_ecx(seed_ecx);
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.registers.eip = ENTRY;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+
+        let label = format!("ecx={seed_ecx:#010x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers -- this is where a Dword decrement routed onto a Word cell shows \
+             up, as a cleared ECX high half"
+        );
+        assert_eq!(native.eflags(), interp.eflags(), "{label}: eflags");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks -- 11 per LOOP, taken or not"
+        );
+
+        // Pin the concrete answers the same way the Dword fixture does.
+        assert_eq!(
+            native.registers.ecx() & 0xffff,
+            seed_cx.wrapping_sub(1) & 0xffff,
+            "{label}: CX must be decremented exactly once"
+        );
+        assert_eq!(
+            native.registers.ecx() >> 16,
+            0x1234,
+            "{label}: ECX bits 31..16 must survive a Word LOOP unchanged"
+        );
+        let expected_eip = if (seed_cx.wrapping_sub(1) & 0xffff) != 0 {
+            ENTRY + 8
+        } else {
+            ENTRY + 6
+        };
+        assert_eq!(
+            native.registers.eip, expected_eip,
+            "{label}: the branch is taken when the DECREMENTED counter is non-zero"
+        );
+    }
+}
+
+/// THE NAMED SILENT-FAILURE-MODE CATCHER, isolated from the counter-boundary sweep above so it
+/// reads as its own claim: ECX = 0x1234_0003 in, a Word LOOP that both takes and falls through,
+/// and bits 31..16 must read back exactly 0x1234 every time. `alu_r32_imm32(5, home(1), 1)`
+/// copy-pasted onto this cell passes every OTHER assertion in this file -- CX still decrements,
+/// the branch still goes the right way -- and only this one goes red.
+#[test]
+fn loop_word_preserves_ecx_high_half() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    // Two counters: 3 takes the branch twice then falls through on the third pass is not
+    // reachable in one native execution (the block is a single LOOP, not a host loop), so the
+    // two rows below are simply "still non-zero after the decrement" and "reaches zero".
+    for (seed_cx, taken) in [(0x0003u32, true), (0x0001u32, false)] {
+        let seed_ecx = 0x1234_0000 | seed_cx;
+        let code = loop_word_case();
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+        let mut native = fresh_real16();
+        let mut native_bus = TestBus::with_memory(memory);
+        native_bus.direct_pages_enabled = true;
+        native_bus.direct_page_clocks = true;
+        native_bus.report_batch_clocks = true;
+        native_bus.uniform_native_fetches = true;
+        let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+        decode_fixture(&mut native, &mut native_bus, &starts);
+        let block = install_fixture_block_word(&mut native, ENTRY);
+
+        native.halted = false;
+        native.interrupt_shadow = false;
+        native.registers.gpr.fill(0);
+        native.registers.set_esp(0xc000);
+        native.registers.set_ecx(seed_ecx);
+        native.registers.eflags = 0x202;
+        native.pending_flags = PendingFlags::default();
+        native.registers.eip = ENTRY;
+        native.elapsed_clocks = 0;
+        native.timing_rem = 0;
+        native.core_clocks_so_far = 0;
+
+        let label = format!("ecx={seed_ecx:#010x}");
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: must run natively"
+        );
+        assert_eq!(
+            native.registers.ecx() >> 16,
+            0x1234,
+            "{label}: ECX bits 31..16 unchanged by the Word LOOP decrement"
+        );
+        assert_eq!(
+            native.registers.eip,
+            if taken { ENTRY + 8 } else { ENTRY + 6 },
+            "{label}: branch outcome"
+        );
+    }
+}
+
+/// The positive admission pin for the Word cell, the Word twin of `loop_is_lowered_with_the_gate_on`.
+#[test]
+fn loop_word_is_lowered_with_the_gate_on() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    let code = loop_word_case();
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh_real16();
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, false);
+    let instructions = outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions);
+    assert_eq!(
+        instructions,
+        Some(3),
+        "the Word/Word LOOP cell must terminate and carry the whole three-slot block with the \
+         gate on"
+    );
+}
+
+/// The Word twin of `word_size_control_targets_are_refused_above_the_sixteen_bit_wrap`'s claim,
+/// exercised end to end: with `cs.limit` shrunk below the taken target, the terminal must not
+/// lower even though the Word/Word cell is otherwise admitted.
+#[test]
+fn loop_word_target_beyond_the_limit_is_refused() {
+    const ENTRY: u32 = 0x101;
+    select_loop_rows(true);
+    let code = loop_word_case();
+    let mut memory = vec![0; 0x0004_0000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = fresh_real16();
+    // The taken target is ENTRY+8. Shrinking CS's limit to ENTRY+7 puts it one byte past the
+    // segment, which `control_target_limit`'s Word clamp (a no-op only when the limit is already
+    // 0xFFFF) must catch.
+    let mut cs = cpu.registers.cs();
+    cs.limit = ENTRY + 7;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    cpu.registers.eip = ENTRY;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let starts = [ENTRY, ENTRY + 2, ENTRY + 4];
+    decode_fixture(&mut cpu, &mut bus, &starts);
+    let outcome = jit::direct::compile(&mut cpu, ENTRY, false);
+    let instructions = outcome
+        .is_some()
+        .then(|| outcome.unwrap().span.instructions);
+    assert_ne!(
+        instructions,
+        Some(3),
+        "a Word LOOP target beyond cs.limit must not lower its terminal"
+    );
 }
 
 /// The shipped default, read AMBIENT on purpose so it also fails if `IZARRAVM_LOOP_ROWS=0` is
