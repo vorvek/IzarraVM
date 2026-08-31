@@ -1507,6 +1507,24 @@ impl Pit {
         }
     }
 
+    /// Whether the counter this port addresses is currently BCD-programmed. `Counter::read`
+    /// (via `count_after`) silently declines to a live peek and falls back to `masked_count`
+    /// (the batch-start CE) for a BCD counter, the same decline `out_after` reports for the
+    /// 0x61 arm -- but unlike `out_after`, `read_port_at` above has no `Option` left to carry
+    /// that decline back to the caller (it already returns `Option` for "not a PIT port" and
+    /// mutates read/latch state on every call, so calling it twice to probe is not free).
+    /// `MachineBus::read_io`'s 0x40-0x42 arm calls this BEFORE deciding whether to exempt the
+    /// read from `io_touched`, mirroring the 0x61 arm's own BCD fallback: a BCD counter's
+    /// `read_port_at` answer is a stale (batch-start) byte, so a guest polling it needs the
+    /// batch to end on every read, not just the first, or it spins on a frozen value for the
+    /// rest of the batch.
+    pub(crate) fn counter_is_bcd(&self, port: u16) -> bool {
+        match port {
+            0x40..=0x42 => self.counters[(port - 0x40) as usize].bcd,
+            _ => false,
+        }
+    }
+
     /// Zero-offset convenience for tests (see `write_port`).
     #[cfg(test)]
     pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {

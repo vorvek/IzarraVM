@@ -798,6 +798,146 @@ fn ring0_monitor_wide_port_access_stays_lazy_across_byte_decomposition() {
 }
 
 #[test]
+fn lazy_pit_counter_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
+    // L5 (corpus-lever campaign, 2026-08-31): mirrors
+    // `lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate` exactly,
+    // for the PIT counter ports. Before the L5 fix, EVERY 0x40-0x42 read fell through to the
+    // "all remaining reads are exact" catch-all and set io_touched for a guest access in BOTH
+    // timing classes -- the counter's own peek arm ran too late to matter. `cpu_is_ring0_pm` is
+    // `false` throughout, the ordinary V86/real-mode guest case every corpus game runs under:
+    // this is the read-side gap the plan's brk_step evidence points at, and the fix is the same
+    // class-based shape 0x3DA/0x61 already use, not a widening of `skip_io_touched`.
+    for port in [0x40u16, 0x41, 0x42] {
+        // Accurate class: unchanged behavior, io_touched set.
+        let mut accurate = test_machine(); // Gsw386 by construction
+        with_bus(&mut accurate, |bus| {
+            let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+            assert!(
+                *bus.io_touched,
+                "port {port:#06X}: the Accurate class must still set io_touched \
+                     on a PIT counter read"
+            );
+        });
+
+        // Approximate class: the new lazy behavior, io_touched stays false.
+        let mut approximate = test_machine();
+        approximate.set_mode(GswMode::Gsw486);
+        with_bus(&mut approximate, |bus| {
+            let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "port {port:#06X}: the Approximate class must NOT set io_touched \
+                     on a PIT counter read (the lazy path)"
+            );
+        });
+    }
+}
+
+#[test]
+fn v86_pit_counter_read_falls_back_to_the_non_lazy_path_for_a_bcd_channel() {
+    // The BCD leg the reviewer's fold caught: `count_after` declines for a
+    // BCD-programmed counter and `Counter::read` (via `read_port_at`) silently
+    // falls back to `masked_count()` -- the frozen batch-start CE, not a live
+    // one. The lazy exemption above is only sound because the peek is live
+    // across the batch (see
+    // `a_mid_batch_unlatched_pit_read_moves_with_the_in_batch_offset_in_the_approximate_class`);
+    // for a BCD counter that premise is false, so the read must take the exact
+    // non-lazy path -- io_touched set -- exactly like
+    // `lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter`'s own BCD
+    // fallback, in EITHER timing class (`counter_is_bcd` is checked unconditionally,
+    // not gated on `lazy_port_reads`, matching 0x61's `!skip_io_touched` alone).
+    //
+    // Value correctness is checked differentially against the Accurate class,
+    // which this fix never touches and which is trusted correct: the Approximate
+    // class's BCD fallback byte must equal the Accurate class's byte for the
+    // identical program-then-read sequence, proving the fallback is not just
+    // "sets io_touched" but "returns exactly what the untouched path returns".
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        let mut accurate = test_machine(); // Gsw386 by construction
+        let (touched, value) = with_bus(&mut machine, |bus| {
+            // Channel 0 as BCD, mode 2, LSB-then-MSB: SC=00, RW=11, mode=010, BCD=1.
+            bus.write_io(0x43, BusWidth::Byte, 0x35, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x01, false).unwrap();
+            *bus.io_touched = false; // clear the setup writes' own effect
+            let value = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+            (*bus.io_touched, value)
+        });
+        let expected = with_bus(&mut accurate, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x35, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x01, false).unwrap();
+            bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap()
+        });
+        assert!(
+            touched,
+            "{mode:?}: a BCD-programmed counter must fall back to the non-lazy \
+                 path, which sets io_touched, even in the Approximate class"
+        );
+        assert_eq!(
+            value, expected,
+            "{mode:?}: the BCD fallback must return exactly the Accurate class's \
+                 (untouched, trusted) live read"
+        );
+
+        // Channel 2, left binary (never programmed BCD), must stay on the lazy
+        // path: the BCD check is per-counter, not a whole-chip refusal.
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0xb4, false).unwrap(); // ch2, lo/hi, mode 2, binary
+            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x01, false).unwrap();
+            *bus.io_touched = false;
+            let _ = bus.read_io(0x42, BusWidth::Byte, 0, false).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "{mode:?}: a binary-programmed counter must stay on the lazy \
+                     path even after a sibling channel was set BCD"
+            );
+        });
+    }
+}
+
+#[test]
+fn v86_status_and_pit_polls_leave_a_pending_interrupt_visible_at_the_same_boundary() {
+    // L5's composite ask: a V86 fixture that reads 0x3DA and 0x40 with a PIC request already
+    // pending must still see that interrupt exactly where it was before -- these two ports'
+    // read-side exemption from `io_touched` must not hide or delay delivery. `io_touched`
+    // only decides when a BATCH ends; `interrupt_pending()` is driven purely by `self.pic`
+    // and is untouched by either read, so this is true by construction, but it is the
+    // guest-visible contract the corpus-lever plan asks to pin rather than infer.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586); // Approximate class, the corpus's own persona.
+    machine.pic.request(5); // an arbitrary line with no relation to 3DA/PIT.
+    with_bus(&mut machine, |bus| {
+        assert!(
+            bus.interrupt_pending(),
+            "sanity: the requested line must already be pending before either poll"
+        );
+
+        let _ = bus.read_io(0x3DA, BusWidth::Byte, 0, false).unwrap();
+        assert!(!*bus.io_touched, "the lazy 3DA read must not end the batch");
+        assert!(
+            bus.interrupt_pending(),
+            "a 3DA poll must not clear or delay the pending interrupt"
+        );
+
+        let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
+        assert!(
+            !*bus.io_touched,
+            "the PIT counter read must not end the batch either"
+        );
+        assert!(
+            bus.interrupt_pending(),
+            "a PIT counter poll must not clear or delay the pending interrupt"
+        );
+    });
+}
+
+#[test]
 fn lazy_3da_read_still_resets_the_attribute_flip_flop_and_calls_catch_up() {
     // A lazy 0x3DA read must perform the exact same guest-visible side effects
     // as the non-lazy read (catch_up + the Attribute Controller address/data
@@ -1288,6 +1428,51 @@ fn a_mid_batch_counter_latch_moves_with_the_in_batch_offset() {
     assert_ne!(
         at_batch_start, mid_batch,
         "a latch 450k clocks into the batch must not report the batch-start count"
+    );
+}
+
+/// Read channel 0's LSB byte with no preceding latch command, at a given
+/// prior/in-batch offset -- the plain unlatched path `Counter::read` takes
+/// (`self.latch` is `None`, so `live = count_after(clocks)`), which is exactly
+/// what `MachineBus::read_io`'s 0x40-0x42 arm exempts from `io_touched` in the
+/// Approximate class. Deliberately NOT `latch_and_read_channel0`: that helper
+/// issues a counter-latch command first, exercising `latch_count` instead.
+fn read_channel0_lsb_unlatched(machine: &mut Machine, prior: u64, core: u64) -> u8 {
+    with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = prior;
+        bus.core_clocks_so_far = core;
+        bus.read_io(0x40, BusWidth::Byte, core, false).unwrap() as u8
+    })
+}
+
+#[test]
+fn a_mid_batch_unlatched_pit_read_moves_with_the_in_batch_offset_in_the_approximate_class() {
+    // L5 (corpus-lever campaign, 2026-08-31): the property that makes it safe to
+    // exempt an Approximate-class 0x40-0x42 read from io_touched is that the
+    // unlatched read is a LIVE peek across an unbroken batch, not a frozen
+    // batch-start value -- otherwise a guest polling the counter after the
+    // exemption would spin on the same stale byte for a whole coarse batch. That
+    // property previously lived only in a comment (`read_port_at`'s doc, and the
+    // io_touched arm's own). This is its pin, the unlatched-read counterpart of
+    // `a_mid_batch_counter_latch_moves_with_the_in_batch_offset`. 450_000 clocks
+    // is far more than one coarse batch; a mode-2 counter's LSB byte must have
+    // visibly walked in that span.
+    let mut early = test_machine();
+    early.set_mode(GswMode::Gsw486);
+    program_channel0_mode2(&mut early, 0x4000);
+    early.run_cycles(5_000).unwrap();
+
+    let mut late = test_machine();
+    late.set_mode(GswMode::Gsw486);
+    program_channel0_mode2(&mut late, 0x4000);
+    late.run_cycles(5_000).unwrap();
+
+    let at_batch_start = read_channel0_lsb_unlatched(&mut early, 0, 0);
+    let mid_batch = read_channel0_lsb_unlatched(&mut late, 0, 450_000);
+    assert_ne!(
+        at_batch_start, mid_batch,
+        "an unlatched Approximate-class 0x40 read 450k clocks into the batch must \
+             not report the batch-start count"
     );
 }
 
