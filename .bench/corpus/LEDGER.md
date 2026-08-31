@@ -144,4 +144,33 @@ This file is shared through the `.bench` junction. Performance sessions:
 append your rows here directly (what you changed, which corpus rows you
 re-ran, PR number). The corpus session commits this file on its branch.
 
-(none yet)
+**2026-08-31 overnight campaign (PRs #781-#791, eleven merges, main
+`b6fe9b39`).** Dynarec levers landed: word/word LOOP (#782), word
+ADC/SBB (#783), word+byte ROL/ROR register forms (#784), memory-source
+segment loads MOV Sreg,m16 + LES/LDS (#786), OUT DX,AL call-out + word
+OUT imm8 (#787), run-loop admission at non-continuable breaks (#788),
+native CALL FAR ptr16:16 (#790), PUSHF/POPF InterpretOne call-outs
+(#791), V86 PIT-read io_touched exemption (#789). Also the Distira
+deferred triangle queue (#785) and the DOSBox-X oracle harness (#781).
+
+Single-leg rt spot re-runs on main `375dbced` (results in
+`results/<slug>/*-campaign-rt-spot/`; L8/#790, N2/#791 and L5/#789
+landed AFTER these legs, so current main should read higher still):
+
+| slug | rt was | rt spot | coverage |
+|---|---|---|---|
+| 1000-miglia | 1.80* | 4.264 | 0.833 |
+| 123-talk-shareware | 2.59 | 4.793 | 0.936 |
+| 15-move-hole-puzzle | 1.10 | 1.456 | 0.688 |
+| 100-000-pyramid | 1.18 | 1.726 | 0.712 |
+| 10rogue | 1.41 | 1.651 | 0.821 |
+| 21-for-1-to-4 | 1.50 | 1.636 | 0.805 |
+| k-cheiw | 4.92 | 4.832 | 0.969 |
+
+k-cheiw's -1.8% is one leg on a near-target game; re-leg before
+treating it as a regression. The four still-flagged games are capped
+at rt ~2.2-2.5 by monitor-resident clocks (26-43% of guest clocks) -
+the F1 shape, closed as a perf lever; the remaining 2x is CR4.VME
+(fidelity ledger #29) or a lower bar for V86-monitor-heavy titles.
+Full arc: `dev_docs/2026-08-31-overnight-campaign-log.md` and the
+2026-09-01 handoff (local to the main checkout).
