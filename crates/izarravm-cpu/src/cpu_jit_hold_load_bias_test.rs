@@ -98,21 +98,24 @@ fn flags_copy_bytes() -> Vec<u8> {
 #[cfg(target_os = "windows")]
 fn rsi_save_bytes() -> Vec<u8> {
     let mut e = Encoder::new();
-    e.store_r64_disp32(Reg::RSP, 160, Reg::RSI);
+    // `STACK_SAVED_RSI` == `BASE_STACK_LEN`, 176 since L8's `STACK_FAR_CALL_NATIVE` slot (160)
+    // plus its alignment padding grew the frame from 160.
+    e.store_r64_disp32(Reg::RSP, 176, Reg::RSI);
     e.finish()
 }
 
 #[cfg(target_os = "windows")]
 fn rsi_restore_bytes() -> Vec<u8> {
     let mut e = Encoder::new();
-    e.load_r64_disp32(Reg::RSI, Reg::RSP, 160);
+    e.load_r64_disp32(Reg::RSI, Reg::RSP, 176);
     e.finish()
 }
 
 #[cfg(target_os = "windows")]
 fn xmm6_restore_bytes() -> Vec<u8> {
     let mut e = Encoder::new();
-    e.vmovupd_xmm_disp32(Xmm::XMM6, Reg::RSP, 168);
+    // `STACK_X87_XMM_BASE` == `STACK_SAVED_RSI` + 8, 184 since the frame grew.
+    e.vmovupd_xmm_disp32(Xmm::XMM6, Reg::RSP, 184);
     e.finish()
 }
 

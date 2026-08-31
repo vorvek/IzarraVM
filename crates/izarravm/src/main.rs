@@ -3631,6 +3631,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         // counter present on one leg and absent on the other confounds the arm with a
         // counter-surface change.
         "far_ret_native": snapshot.far_ret_native,
+        "far_call_native": snapshot.far_call_native,
         "blocks_installed_baking_cs": snapshot.blocks_installed_baking_cs,
         "far_link_refused_cs": snapshot.far_link_refused_cs,
         "far_link_refused_limit": snapshot.far_link_refused_limit,

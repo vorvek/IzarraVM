@@ -36,8 +36,11 @@ const FALLTHROUGH: u32 = 0x105;
 /// A bare `RETF`: non-continuable AND lowerable, so the break-site probe can carry it all the way
 /// to a compiled block.
 const RETF: [u8; 1] = [0xcb];
-/// `CALL FAR 0020:0400`: non-continuable and NOT lowerable. `0x9a` has no `classify` arm anywhere
-/// in `jit/direct.rs`, so a walk starting here stops before its first instruction.
+/// `CALL FAR 0020:0400`: non-continuable, and now (L8) LOWERABLE via `DirectKind::CallFar16`.
+/// Before L8, `0x9a` had no `classify` arm anywhere in `jit/direct.rs`, so a walk starting here
+/// stopped before its first instruction; see
+/// `a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled` below for the current
+/// behaviour.
 const CALL_FAR: [u8; 5] = [0x9a, 0x00, 0x04, 0x20, 0x00];
 
 /// Where the far return goes: selector 0x0020 (base 0x200) at offset 0x0400, linear 0x600.
@@ -268,34 +271,57 @@ fn break_site_admission_does_not_change_the_guest_visible_outcome() {
     );
 }
 
-/// The gate on the break-site probe: an entry the compile walk cannot CARRY is not probed at all.
+/// **UPDATED FOR L8.** This fixture used to be the CONTROL for the RETF fixture above: `0x9a` had
+/// no `classify` arm anywhere in `jit/direct.rs`, so the break-site probe (admitted by
+/// `walk_admits_non_continuable_entry`) would still walk into a structural reject, and the
+/// original assertions here pinned that zero-gain outcome -- `jit_direct.len() == 1`, the class
+/// staying `absent` rather than moving to `rejected`.
 ///
-/// `0x9a` has no `classify` arm, so a walk starting on it stops before its first instruction and
-/// structurally rejects. Probing there would move the census label from `absent` to `rejected` and
-/// buy the guest nothing, while the probe itself recurred on every visit -- on
-/// 15-move-hole-puzzle that is 116 M visits to ten such sites and about 4% of the wall. The gate
-/// is what keeps that cost off the table until `0x9a` grows an arm, at which point the same
-/// predicate admits it with no edit here.
+/// **L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`) gives `0x9a` a `classify` arm** --
+/// `DirectKind::CallFar16`, admitted by `call_far_admitted_here` and folded into
+/// `walk_admits_non_continuable_entry`'s disjunction with NO edit to this predicate itself, which
+/// is exactly the self-opening behaviour the OLD doc comment on this fixture predicted ("at which
+/// point the same predicate admits it with no edit here"). The CALL FAR entry now compiles the
+/// same way the RETF entry above does, so this fixture is rewritten to assert THAT instead of the
+/// old refusal -- it is now the CALL FAR mirror of
+/// `a_non_continuable_block_entry_is_admitted_at_the_run_loop_break`, not its control.
 #[test]
-fn a_non_continuable_entry_the_walk_cannot_carry_is_not_probed() {
+fn a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled() {
     let (mut cpu, mut bus) = staged_with(true, &CALL_FAR);
     for _ in 0..VISITS {
         visit(&mut cpu, &mut bus);
     }
 
-    assert_eq!(
-        cpu.jit_direct.len(),
-        1,
-        "only the predecessor may compile; the CALL FAR entry must never be walked"
+    assert!(
+        cpu.jit_direct.len() >= 2,
+        "the predecessor AND the CALL FAR entry must both compile, got {} blocks",
+        cpu.jit_direct.len()
     );
     assert!(
-        class(&cpu, "absent") > 0,
-        "the CALL FAR entry stays absent, which is the zero-cost answer for an entry that          cannot lower"
+        class(&cpu, "seen") + class(&cpu, "compiled") > 0,
+        "the CALL FAR entry must leave the absent class: {:?}",
+        cpu.direct_barrier_census_snapshot()
+            .unwrap()
+            .unbound_targets
     );
+    assert!(
+        cpu.perf_counters().jit_direct_linked_transfers > 0,
+        "the predecessor's fallthrough cell must bind to the CALL FAR block and be taken natively"
+    );
+
+    let absent_before = class(&cpu, "absent");
+    let linked_before = cpu.perf_counters().jit_direct_linked_transfers;
+    for _ in 0..VISITS {
+        visit(&mut cpu, &mut bus);
+    }
     assert_eq!(
-        class(&cpu, "rejected"),
-        0,
-        "a probe at the CALL FAR entry would relocate the class to `rejected` for no gain"
+        class(&cpu, "absent"),
+        absent_before,
+        "the CALL FAR entry is compiled, so no later exit may classify absent"
+    );
+    assert!(
+        cpu.perf_counters().jit_direct_linked_transfers > linked_before,
+        "the bound link must be taken on every later visit"
     );
 }
 

@@ -2303,6 +2303,9 @@ pub struct DirectStallSnapshot {
     /// what each one counts, which of the three sites bumps it, and why the ledger is here rather
     /// than in `PerfCounters`.
     pub far_ret_native: u64,
+    /// L8's sibling of `far_ret_native`: the far-CALL ledger. See
+    /// `DirectStallTally::far_call_native`.
+    pub far_call_native: u64,
     /// Stage 0 §5.0c. See `DirectStallTally::blocks_installed_baking_cs`.
     pub blocks_installed_baking_cs: u64,
     pub far_link_refused_cs: u64,
