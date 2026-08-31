@@ -227,62 +227,41 @@ fn masked_turn(cpu: &mut CpuGsw, bus: &mut TestBus, baked_base: u32) -> bool {
         .expect("a refused entry is not a machine stop")
 }
 
-/// FIXTURE 1. After the cap the block is no longer retired -- and the REFUSAL is untouched.
+/// FIXTURE 1. Other callers of `retire_key_for_recompile` still demote a capped key.
 ///
-/// Kills the miscompile "cap the refusal too": a governor that let the entry through once the
-/// budget was spent would run the body under a record its snapshot does not match, which is the
-/// one thing no arm of this design may ever do. Also kills CALLER DRIFT, by proving that the cap
-/// lives in the data-segment caller and not inside `retire_key_for_recompile`, whose four other
-/// callers must keep retiring a capped key.
+/// The "still refuses after the cap" half is now the (A) live-data rows: a capped DS-pinning
+/// key is promoted and then runs natively on both layouts. This half stays, because the cap
+/// lives in the data-segment caller and not inside `retire_key_for_recompile`.
 #[test]
 fn data_segment_reject_still_refuses_after_the_retire_cap() {
     let _guard = force_arm(SegmentRetireGovernor::Cap);
     let (mut cpu, mut bus) = masked_fixture();
     let key = key_at(&cpu, ENTRY);
-    let turns = u32::from(DATA_SEGMENT_RETIRE_CAP) + 3;
 
-    for turn in 0..turns {
+    for turn in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) {
         assert!(
             !masked_turn(&mut cpu, &mut bus, 0),
-            "turn {turn}: the entry must be REFUSED on every arm, capped or not"
+            "turn {turn}: every reject below the cap retires"
         );
-        assert_eq!(
-            cpu.registers.edx(),
-            0,
-            "turn {turn}: nothing may have run under a mismatched descriptor"
-        );
+        assert_eq!(cpu.registers.edx(), 0, "turn {turn}: edx must not move");
         assert_eq!(cpu.registers.eip, ENTRY, "turn {turn}: eip must not move");
     }
-
+    set_base(&mut cpu, SegmentIndex::Ds, 0);
+    ensure_compiled(&mut cpu, ENTRY);
     let stalls = cpu.jit_direct.stall_snapshot();
-    assert_eq!(
-        stalls.data_segment_retires_suppressed,
-        u64::from(turns - u32::from(DATA_SEGMENT_RETIRE_CAP)),
-        "every reject past the cap suppresses exactly one retire"
-    );
     assert_eq!(
         stalls.data_segment_sticky_crossings, 1,
         "one key, one crossing"
     );
     assert_eq!(
-        cpu.perf_counters().jit_direct_reject_data_segment,
-        u64::from(turns),
-        "the refusal itself is ungoverned"
+        stalls.data_segment_live_promotions, 0,
+        "the promoting entry has not fired yet"
     );
-    assert_eq!(
-        cpu.perf_counters().jit_direct_reject_data_segment_masked,
-        u64::from(turns),
-        "this shape pins DS itself, so every reject is on the masked arm"
-    );
-    assert_eq!(cpu.perf_counters().jit_direct_reject_data_segment_strict, 0);
     assert!(
         cpu.jit_direct.direct.key_is_compiled_for_test(key),
-        "a capped key keeps its block: that is what stops the recompile"
+        "a just-capped key can still be compiled"
     );
 
-    // The unchanged-callers control. `retire_key_for_recompile` is the shared implementation of
-    // the CS-layout retire (`run.rs`, above the data-segment check), the CPL retire, the call-out
-    // demotion latch and the x87 cap, and NONE of them may inherit this cap.
     assert!(
         cpu.jit_direct.retire_key_for_recompile(key),
         "a capped key is still retirable by every other caller"
@@ -350,6 +329,7 @@ fn the_off_arm_touches_no_governor_state() {
     assert_eq!(stalls.data_segment_retires_suppressed, 0);
     assert_eq!(stalls.data_segment_sticky_crossings, 0);
     assert_eq!(stalls.data_segment_link_declines, 0);
+    assert_eq!(stalls.data_segment_live_promotions, 0);
     assert_eq!(
         stalls.data_segment_distinct_layouts,
         [0; jit::direct::DATA_SEGMENT_LAYOUT_CENSUS_CAP + 2],
@@ -376,10 +356,9 @@ fn the_off_arm_touches_no_governor_state() {
     );
 }
 
-/// FIXTURE 2. The capped block is not a dead block: it runs natively on the layout it froze on.
+/// FIXTURE 2. After promotion the live variant runs natively on both layouts.
 ///
-/// Kills "a cap that also kills the block" -- a governor that stopped the recompile by leaving the
-/// key permanently interpreted would move every counter this slice grades on while buying nothing.
+/// Mutant: restoring the baked immediate on the sticky emit path, or leaving `used` unstripped.
 #[test]
 fn capped_key_still_runs_natively_on_the_layout_it_froze_on() {
     let _guard = force_arm(SegmentRetireGovernor::Cap);
@@ -388,58 +367,51 @@ fn capped_key_still_runs_natively_on_the_layout_it_froze_on() {
     for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
         assert!(!masked_turn(&mut cpu, &mut bus, 0));
     }
-    // The block is frozen on the base the last turn compiled it under.
-    let frozen_id = match cpu.jit_direct.probe(key_at(&cpu, ENTRY)) {
-        jit::direct::BlockProbe::Ready(id) => id,
-        other => panic!("the capped key must still be compiled, got {other:?}"),
-    };
-    let frozen = cpu
-        .jit_direct
-        .segment_layout(frozen_id)
-        .expect("a capped block keeps its layout")
-        .data_segment_base_for_test(SegmentIndex::Ds);
+    assert_eq!(
+        cpu.jit_direct.stall_snapshot().data_segment_live_promotions,
+        1
+    );
+    let key = key_at(&cpu, ENTRY);
+    assert!(
+        cpu.jit_direct
+            .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data()),
+        "the promoting entry sets live_data before it retires"
+    );
 
-    let installs_before = cpu.jit_direct.direct.len();
     let block = ensure_compiled(&mut cpu, ENTRY);
+    let layout = cpu
+        .jit_direct
+        .segment_layout(block.id())
+        .expect("the live compile is installed");
+    assert_eq!(
+        layout.used_for_test() & jit::direct::LIVE_DATA_BITS,
+        0,
+        "the installed snapshot must drop DS/ES so the entry compare matches both layouts"
+    );
+    let _ = layout.data_segment_base_for_test(SegmentIndex::Ds);
+    let installs_after_live = cpu.jit_direct.direct.len();
+
+    for (base, expected) in [(0, BAKED_VALUE), (SHIFT, SHIFTED_VALUE)] {
+        set_base(&mut cpu, SegmentIndex::Ds, base);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_edx(0);
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block)
+                .expect("a live entry runs"),
+            "base {base:#x}: both layouts retire native"
+        );
+        assert_eq!(
+            cpu.registers.edx(),
+            expected,
+            "base {base:#x}: the read must follow the LIVE base"
+        );
+    }
     assert_eq!(
         cpu.jit_direct.direct.len(),
-        installs_before,
-        "control: no recompile happened, so what follows is the FROZEN block"
-    );
-
-    set_base(&mut cpu, SegmentIndex::Ds, frozen);
-    cpu.set_eip(ENTRY);
-    cpu.registers.set_edx(0);
-    assert!(
-        cpu.try_run_direct_block_for_test(&mut bus, block)
-            .expect("a matching entry runs"),
-        "an entry carrying the frozen layout must run NATIVELY"
-    );
-    let expected = if frozen == 0 {
-        BAKED_VALUE
-    } else {
-        SHIFTED_VALUE
-    };
-    assert_eq!(
-        cpu.registers.edx(),
-        expected,
-        "and it must read through the base it actually holds"
-    );
-
-    // The other value still interprets, and still pays no compile.
-    let attempts_before = cpu.jit_direct.direct.len();
-    set_base(&mut cpu, SegmentIndex::Ds, frozen ^ SHIFT);
-    cpu.set_eip(ENTRY);
-    cpu.registers.set_edx(0);
-    assert!(
-        !cpu.try_run_direct_block_for_test(&mut bus, block)
-            .expect("a refused entry is not a machine stop")
-    );
-    assert_eq!(cpu.registers.edx(), 0);
-    assert_eq!(
-        cpu.jit_direct.direct.len(),
-        attempts_before,
-        "and the refusal costs no re-specialization"
+        installs_after_live,
+        "compile_attempts stay flat after the one live compile"
     );
 }
 
@@ -484,19 +456,32 @@ fn alternating_es_with_a_successor_that_bakes_es_is_state_identical_on_both_arms
             .jit_direct
             .direct
             .data_segment_link_declined_for_test(key);
-        assert_eq!(
-            declined,
-            matches!(arm, SegmentRetireGovernor::On),
-            "{arm:?}: the head is declined on the `on` arm and on no other"
+        assert!(
+            !declined,
+            "{arm:?}: promote retires and forgets any decline; leaf-ness rides live_data"
         );
-        if declined {
-            let head_id = match native.jit_direct.probe(key) {
-                jit::direct::BlockProbe::Ready(id) => id,
-                other => panic!("a declined key stays compiled, got {other:?}"),
-            };
+        if !matches!(arm, SegmentRetireGovernor::Off) {
             assert!(
-                !native.jit_direct.has_linked_successor(head_id),
-                "a declined head must be on the MASKED arm: no live outbound edge"
+                native
+                    .jit_direct
+                    .direct
+                    .data_segment_retire_record_for_test(key)
+                    .is_some_and(|record| record.live_data()),
+                "{arm:?}: the promoting entry sets live_data"
+            );
+            let head = ensure_compiled(&mut native, ENTRY);
+            assert!(
+                native.jit_direct.direct.link_source_declined(head.id()),
+                "{arm:?}: a live key is a leaf"
+            );
+            assert!(
+                !native.jit_direct.has_linked_successor(head.id()),
+                "{arm:?}: no live outbound edge"
+            );
+            assert_eq!(
+                native.jit_direct.outbound_targets_for_test(head.id()),
+                [None, None],
+                "{arm:?}: both LinkCells stay empty"
             );
         }
 
@@ -573,9 +558,9 @@ fn alternating_es_with_a_successor_that_bakes_es_is_state_identical_on_both_arms
                 native
                     .jit_direct
                     .stall_snapshot()
-                    .data_segment_retires_suppressed
+                    .data_segment_live_promotions
                     > 0,
-                "{arm:?}: the cap must be doing work"
+                "{arm:?}: the cap must promote the key"
             );
         }
     }
@@ -619,27 +604,34 @@ fn link_declined_block_is_never_relinked_and_is_never_re_parked() {
         "non-vacuity for the strict arm: and it must be linked on the other slot"
     );
 
-    // The turn that crosses into suppression, and therefore declines.
+    // The turn that crosses into promotion. live_data is the leaf-ness, not a decline.
     assert!(!strict_turn(&mut cpu, &mut bus, 0));
     assert!(
         cpu.jit_direct
             .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data()),
+        "non-vacuity: the promoting entry sets live_data"
+    );
+    assert!(
+        !cpu.jit_direct
+            .direct
             .data_segment_link_declined_for_test(key),
-        "non-vacuity: the decline must have fired"
+        "promote retires and forgets any decline"
     );
-    assert_eq!(
-        clears_by_cause(&cpu, "data_segment_decline"),
-        1,
-        "one edge cut, under its own cause"
+    let head = ensure_compiled(&mut cpu, ENTRY);
+    let head_id = head.id();
+    assert!(
+        cpu.jit_direct.direct.link_source_declined(head_id),
+        "a live key is a leaf"
     );
-    let head_id = match cpu.jit_direct.probe(key) {
-        jit::direct::BlockProbe::Ready(id) => id,
-        other => panic!("a declined key stays compiled, got {other:?}"),
-    };
     assert!(
         !cpu.jit_direct.direct.waiting_holds_source_for_test(head_id),
-        "the decline must also UNPARK the source: its second successor slot never resolves, \
-         so without this every later install at that LinkTarget re-tries and re-refuses it"
+        "resolve_successors must not park a live source"
+    );
+    assert!(
+        !cpu.jit_direct.has_linked_successor(head_id),
+        "nothing may have bound the cell"
     );
 
     let refused_before = refusal_count(&cpu, "declined");
@@ -683,33 +675,24 @@ fn link_decline_leaves_inbound_edges_alone() {
     for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
         assert!(!strict_turn(&mut cpu, &mut bus, 0));
     }
+    let entry_key = key_at(&cpu, ENTRY);
     assert!(
         cpu.jit_direct
             .direct
-            .data_segment_link_declined_for_test(key_at(&cpu, ENTRY)),
-        "non-vacuity: the decline must have fired"
+            .data_segment_retire_record_for_test(entry_key)
+            .is_some_and(|record| record.live_data()),
+        "non-vacuity: ENTRY promotes"
     );
+    ensure_compiled(&mut cpu, ENTRY);
+    // live_data bars ENTRY as a SOURCE, not as a TARGET: the predecessor may re-link into it.
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    cpu.jit_direct
+        .direct
+        .resolve_successors_for_test(predecessor.id());
     assert!(
         cpu.jit_direct.has_linked_successor(predecessor.id()),
-        "the predecessor's OUTBOUND edge is not the declined block's to cut"
+        "the predecessor's OUTBOUND edge is not the live key's to bar"
     );
-
-    // Still on the strict arm: with ES moved, entering the predecessor must be refused, because
-    // its chain requirement still carries the ES its cone baked.
-    set_base(&mut cpu, SegmentIndex::Es, SHIFT);
-    cpu.set_eip(HEAD_PRED);
-    cpu.registers.set_edx(0);
-    let before = cpu.perf_counters().jit_direct_reject_data_segment_strict;
-    assert!(
-        !cpu.try_run_direct_block_for_test(&mut bus, predecessor)
-            .expect("a refused entry is not a machine stop"),
-        "the predecessor must still take the STRICT arm and refuse"
-    );
-    assert_eq!(
-        cpu.perf_counters().jit_direct_reject_data_segment_strict - before,
-        1
-    );
-    assert_eq!(cpu.registers.edx(), 0, "and nothing may have run");
 }
 
 /// FIXTURE 6. A masked-arm reject reaches the cap and does NOT decline the link.
@@ -722,24 +705,32 @@ fn link_decline_leaves_inbound_edges_alone() {
 fn masked_arm_reject_does_not_decline_the_link() {
     let _guard = force_arm(SegmentRetireGovernor::On);
     let (mut cpu, mut bus) = masked_fixture();
-    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 3 {
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
         assert!(!masked_turn(&mut cpu, &mut bus, 0));
     }
     let stalls = cpu.jit_direct.stall_snapshot();
-    assert!(
-        stalls.data_segment_retires_suppressed > 0,
-        "non-vacuity: the cap must have been reached"
+    assert_eq!(
+        stalls.data_segment_live_promotions, 1,
+        "non-vacuity: the cap must have promoted"
     );
     assert_eq!(
         stalls.data_segment_link_declines, 0,
         "the masked arm never declines"
     );
+    let key = key_at(&cpu, ENTRY);
     assert!(
         !cpu.jit_direct
             .direct
-            .data_segment_link_declined_for_test(key_at(&cpu, ENTRY))
+            .data_segment_link_declined_for_test(key)
     );
     assert_eq!(clears_by_cause(&cpu, "data_segment_decline"), 0);
+    ensure_compiled(&mut cpu, ENTRY);
+    assert!(
+        cpu.jit_direct
+            .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data())
+    );
 }
 
 /// FIXTURE 7. Both governor structures die with their key.
@@ -757,16 +748,13 @@ fn data_segment_state_dies_with_its_key() {
         assert!(!strict_turn(&mut cpu, &mut bus, 0));
     }
     let key = key_at(&cpu, ENTRY);
+    ensure_compiled(&mut cpu, ENTRY);
     assert!(
         cpu.jit_direct
             .direct
             .data_segment_retire_record_for_test(key)
-            .is_some()
-            && cpu
-                .jit_direct
-                .direct
-                .data_segment_link_declined_for_test(key),
-        "non-vacuity: both structures must hold this key before the write"
+            .is_some_and(|record| record.live_data()),
+        "non-vacuity: the budget (and live_data) must hold this key before the write"
     );
 
     assert!(
@@ -806,15 +794,22 @@ fn invalidate_translation_forgets_a_decline_and_the_edge_re_forms() {
     set_base(&mut cpu, SegmentIndex::Es, 0);
     ensure_compiled(&mut cpu, ENTRY);
     ensure_compiled(&mut cpu, SECOND);
-    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
-        assert!(!strict_turn(&mut cpu, &mut bus, 0));
-    }
     let key = key_at(&cpu, ENTRY);
+    cpu.jit_direct
+        .direct
+        .decline_links_for_data_segment_for_test(key);
     assert!(
         cpu.jit_direct
             .direct
             .data_segment_link_declined_for_test(key),
         "non-vacuity: the decline must have fired"
+    );
+    assert!(
+        !cpu.jit_direct
+            .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data()),
+        "this row is the non-live decline; live_data must not be the bar"
     );
 
     cpu.jit_direct.invalidate_translation();
@@ -824,17 +819,7 @@ fn invalidate_translation_forgets_a_decline_and_the_edge_re_forms() {
             .data_segment_link_declined_for_test(key),
         "the flush erased what the decline was earned against, so the decline goes with it"
     );
-    assert!(
-        cpu.jit_direct
-            .direct
-            .data_segment_retire_record_for_test(key)
-            .is_some(),
-        "the BUDGET survives: it is a statement about the guest's records at this address"
-    );
 
-    // Republish both ends -- `revalidate_translation` is the door root dispatch uses once it has
-    // revalidated a block's canonical key, and it is what calls `make_link_visible` -- and the
-    // edge must bind again.
     set_base(&mut cpu, SegmentIndex::Es, 0);
     let second_key = key_at(&cpu, SECOND);
     cpu.jit_direct
@@ -848,6 +833,7 @@ fn invalidate_translation_forgets_a_decline_and_the_edge_re_forms() {
         cpu.jit_direct.has_linked_successor(head.id()),
         "a block whose decline was forgotten must be able to chain again"
     );
+    let _ = &mut bus;
 }
 
 /// FIXTURE 7b. Another caller's retire clears the decline, so the recompile is not BORN declined.
@@ -867,10 +853,10 @@ fn a_cs_layout_retire_clears_the_decline_so_the_recompile_is_not_born_declined()
     set_base(&mut cpu, SegmentIndex::Es, 0);
     ensure_compiled(&mut cpu, ENTRY);
     ensure_compiled(&mut cpu, SECOND);
-    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
-        assert!(!strict_turn(&mut cpu, &mut bus, 0));
-    }
     let key = key_at(&cpu, ENTRY);
+    cpu.jit_direct
+        .direct
+        .decline_links_for_data_segment_for_test(key);
     assert!(
         cpu.jit_direct
             .direct
@@ -880,20 +866,13 @@ fn a_cs_layout_retire_clears_the_decline_so_the_recompile_is_not_born_declined()
 
     assert!(
         cpu.jit_direct.retire_key_for_recompile(key),
-        "the other callers still retire a capped, declined key"
+        "the other callers still retire a declined key"
     );
     assert!(
         !cpu.jit_direct
             .direct
             .data_segment_link_declined_for_test(key),
         "and that retire takes the decline with it"
-    );
-    assert!(
-        cpu.jit_direct
-            .direct
-            .data_segment_retire_record_for_test(key)
-            .is_some(),
-        "the budget is still spent: records, not edges"
     );
 
     set_base(&mut cpu, SegmentIndex::Es, 0);
@@ -1164,6 +1143,14 @@ fn governor_on_is_state_identical_to_the_interpreter_over_a_segment_moving_sweep
             perf.jit_direct_reject_data_segment,
             "round {round}: the arm split must partition the reject counter"
         );
+        assert_eq!(
+            perf.jit_direct_reject_data_segment_real
+                + perf.jit_direct_reject_data_segment_v86
+                + perf.jit_direct_reject_data_segment_pm16
+                + perf.jit_direct_reject_data_segment_pm32,
+            perf.jit_direct_reject_data_segment,
+            "round {round}: the mode-key buckets must partition the reject counter"
+        );
     }
     let perf = native.perf_counters().clone();
     assert!(
@@ -1182,9 +1169,9 @@ fn governor_on_is_state_identical_to_the_interpreter_over_a_segment_moving_sweep
         native
             .jit_direct
             .stall_snapshot()
-            .data_segment_link_declines
+            .data_segment_live_promotions
             > 0,
-        "non-vacuity: the sweep must actually have exercised stage 2"
+        "non-vacuity: the sweep must actually have promoted a sticky key"
     );
 }
 
@@ -1253,32 +1240,25 @@ fn governor_own_mask_input_is_the_blocks_own_mask() {
         "non-vacuity: the head pins NOTHING itself, so a non-empty requirement can only be the          ES its successor pins"
     );
 
-    // The turn that crosses into suppression, and therefore declines.
+    // The turn that crosses into promotion. own_pass still counts on that reject.
     assert!(!strict_turn(&mut cpu, &mut bus, 0));
+    assert!(
+        cpu.jit_direct.stall_snapshot().entry_chain_reject_own_pass > 0,
+        "the own_pass - chain_pass residual counter must have seen the promoting reject"
+    );
     assert!(
         cpu.jit_direct
             .direct
-            .data_segment_link_declined_for_test(key),
-        "the decline must fire: the head's OWN mask is empty, so it passes, so the reject is the \
-         `linked` kind stage 2 exists for"
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data()),
+        "the promoting entry sets live_data"
     );
-    assert_eq!(clears_by_cause(&cpu, "data_segment_decline"), 1);
-    assert!(
-        cpu.jit_direct.stall_snapshot().entry_chain_reject_own_pass > 0,
-        "and the own_pass - chain_pass residual counter must have seen the same event"
-    );
-
-    // REPAIR 1. The decline cut both cells, so the narrowing reset the requirement, so the next
-    // entry is the one the block would have had unlinked -- which for a block that pins nothing
-    // is unconditional. A stale-wide requirement here would reject again.
-    let head_id = match cpu.jit_direct.probe(key) {
-        jit::direct::BlockProbe::Ready(id) => id,
-        other => panic!("a declined key stays compiled, got {other:?}"),
-    };
+    let head = ensure_compiled(&mut cpu, ENTRY);
+    let head_id = head.id();
     assert_eq!(
         cpu.jit_direct.outbound_targets_for_test(head_id),
         [None, None],
-        "the decline cuts BOTH cells; that is what makes the block a leaf"
+        "live_data bars both cells; that is what makes the block a leaf"
     );
     assert_eq!(
         cpu.jit_direct.chain_requirement_used_for_test(head_id),
@@ -1291,8 +1271,7 @@ fn governor_own_mask_input_is_the_blocks_own_mask() {
     let before = cpu.perf_counters().clone();
     assert!(
         cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
-        "the declined block must now RUN under the moved ES; if it rejects again the decline \
-         bought nothing and the governor's whole keep argument collapses"
+        "the live leaf must RUN under the moved ES"
     );
     assert_eq!(
         cpu.perf_counters().jit_direct_reject_data_segment - before.jit_direct_reject_data_segment,
@@ -1367,4 +1346,517 @@ fn the_masked_arm_census_mask_follows_the_entry_check() {
         "the two entries moved ES, and ES is in the mask the reject was taken under; a census \
          taken under the block's own (empty) mask folds both to one fingerprint"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sticky live DS/ES (problem (A)).
+// ---------------------------------------------------------------------------------------------
+
+#[must_use]
+fn force_entry_check(armed: bool) -> EntryCheckGuard {
+    jit::direct::set_chain_entry_check_for_test(Some(armed));
+    EntryCheckGuard
+}
+
+fn jmp16(from: u32, to: u32) -> [u8; 3] {
+    let next = from + 3;
+    let rel = (to as i32 - next as i32) as i16;
+    let bytes = rel.to_le_bytes();
+    [0xe9, bytes[0], bytes[1]]
+}
+
+fn compile_sixteen(cpu: &mut CpuGsw, linear: u32) -> jit::direct::CompiledBlock {
+    let key = jit::direct::key_for(cpu, linear, false).expect("a 16-bit key");
+    match cpu.jit_direct.probe(key) {
+        jit::direct::BlockProbe::Ready(id) => {
+            return cpu.jit_direct.block(id).expect("a live 16-bit block");
+        }
+        jit::direct::BlockProbe::Interpret | jit::direct::BlockProbe::Compile => {}
+        other => panic!("unexpected 16-bit probe {other:?}"),
+    }
+    let compilation = match jit::direct::compile(cpu, linear, false) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("the 16-bit block became a structural rejection")
+        }
+        jit::direct::CompileOutcome::Retry(cause) => {
+            panic!("the 16-bit block requested a retry: {cause:?}")
+        }
+    };
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the 16-bit block");
+    cpu.jit_direct
+        .block(id)
+        .expect("the 16-bit block must be live")
+}
+
+fn sixteen_load_memory(with_successor: bool) -> Vec<u8> {
+    let mut memory = vec![0; 0x5000];
+    let load = [0x8b, 0x16, 0x00, 0x30];
+    memory[ENTRY as usize..ENTRY as usize + 4].copy_from_slice(&load);
+    let jmp_target = if with_successor { SECOND } else { DONE };
+    memory[ENTRY as usize + 4..ENTRY as usize + 7].copy_from_slice(&jmp16(ENTRY + 4, jmp_target));
+    if with_successor {
+        memory[SECOND as usize..SECOND as usize + 4].copy_from_slice(&[0x8b, 0x0e, 0x00, 0x30]);
+        memory[SECOND as usize + 4..SECOND as usize + 7].copy_from_slice(&jmp16(SECOND + 4, DONE));
+    }
+    memory[DONE as usize] = 0xf4;
+    memory[DATA as usize..DATA as usize + 2].copy_from_slice(&0xbeefu16.to_le_bytes());
+    memory[(DATA + SHIFT) as usize..(DATA + SHIFT) as usize + 2]
+        .copy_from_slice(&0xcafeu16.to_le_bytes());
+    memory
+}
+
+fn sixteen_load_cpu(with_successor: bool) -> (CpuGsw, TestBus) {
+    let memory = sixteen_load_memory(with_successor);
+    let mut bus = super::sixteen_bit::sixteen_bit_bus(memory);
+    let mut cpu = super::sixteen_bit::sixteen_bit_code_cpu(ENTRY);
+    super::sixteen_bit::arm_native_sixteen_bit(&mut cpu, &mut bus, &[0, DATA]);
+    let mut starts = vec![ENTRY, ENTRY + 4];
+    if with_successor {
+        starts.extend_from_slice(&[SECOND, SECOND + 4]);
+    }
+    super::sixteen_bit::warm_sixteen_bit(&mut cpu, &mut bus, &starts);
+    (cpu, bus)
+}
+
+fn sixteen_key(cpu: &CpuGsw, linear: u32) -> jit::direct::BlockKey {
+    jit::direct::key_for(cpu, linear, false).expect("a 16-bit key")
+}
+
+fn promote_sixteen_masked(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
+        set_base(cpu, SegmentIndex::Ds, 0);
+        let block = compile_sixteen(cpu, ENTRY);
+        set_base(cpu, SegmentIndex::Ds, SHIFT);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_edx(0);
+        assert!(
+            !cpu.try_run_direct_block_for_test(bus, block)
+                .expect("a refused 16-bit entry is not a machine stop"),
+            "every reject through the promoting entry is NotRun"
+        );
+        assert_eq!(cpu.registers.edx(), 0);
+        assert_eq!(cpu.registers.eip, ENTRY);
+    }
+}
+
+/// MASKED (A). A 16-bit real-mode DS-relative load block, no MOV DS, no successor.
+///
+/// Mutant: restoring the baked immediate on the sticky emit path, or leaving `used` unstripped.
+#[test]
+fn live_data_masked_sixteen_bit_load_runs_both_layouts() {
+    for armed in [true, false] {
+        let _check = force_entry_check(armed);
+        let _guard = force_arm(SegmentRetireGovernor::Cap);
+        let (mut cpu, mut bus) = sixteen_load_cpu(false);
+        promote_sixteen_masked(&mut cpu, &mut bus);
+        let key = sixteen_key(&cpu, ENTRY);
+        assert_eq!(
+            cpu.jit_direct.stall_snapshot().data_segment_live_promotions,
+            1
+        );
+        assert!(
+            cpu.jit_direct
+                .direct
+                .data_segment_retire_record_for_test(key)
+                .is_some_and(|record| record.live_data())
+        );
+        let installs_before_live = cpu.jit_direct.direct.len();
+        let block = compile_sixteen(&mut cpu, ENTRY);
+        assert_eq!(
+            cpu.jit_direct.direct.len(),
+            installs_before_live + 1,
+            "CHAIN_ENTRY_CHECK={armed}: one live compile"
+        );
+        let layout = cpu
+            .jit_direct
+            .segment_layout(block.id())
+            .expect("live layout");
+        assert_eq!(
+            layout.used_for_test() & jit::direct::LIVE_DATA_BITS,
+            0,
+            "CHAIN_ENTRY_CHECK={armed}: installed used must drop DS/ES"
+        );
+        for (base, expected) in [(0, 0xbeefu32), (SHIFT, 0xcafeu32)] {
+            set_base(&mut cpu, SegmentIndex::Ds, base);
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_edx(0);
+            assert!(
+                cpu.try_run_direct_block_for_test(&mut bus, block)
+                    .expect("live 16-bit entry"),
+                "CHAIN_ENTRY_CHECK={armed} base {base:#x}: both layouts retire native"
+            );
+            assert_eq!(
+                cpu.registers.edx(),
+                expected,
+                "CHAIN_ENTRY_CHECK={armed} base {base:#x}"
+            );
+        }
+        assert_eq!(
+            cpu.jit_direct.direct.len(),
+            installs_before_live + 1,
+            "CHAIN_ENTRY_CHECK={armed}: compile_attempts stay flat"
+        );
+        let _ = armed;
+    }
+}
+
+/// STRICT (A). A 16-bit load root with a live linked successor that also pins DS.
+///
+/// Mutant: live_data read missing from link_source_declined, so the edge re-forms.
+#[test]
+fn live_data_strict_sixteen_bit_load_is_a_leaf() {
+    for armed in [true, false] {
+        let _check = force_entry_check(armed);
+        let _guard = force_arm(SegmentRetireGovernor::Cap);
+        let (mut cpu, mut bus) = sixteen_load_cpu(true);
+        set_base(&mut cpu, SegmentIndex::Ds, 0);
+        compile_sixteen(&mut cpu, SECOND);
+        let root = compile_sixteen(&mut cpu, ENTRY);
+        assert!(
+            cpu.jit_direct.has_linked_successor(root.id()),
+            "CHAIN_ENTRY_CHECK={armed}: the chain must form before promotion"
+        );
+        for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
+            set_base(&mut cpu, SegmentIndex::Ds, 0);
+            compile_sixteen(&mut cpu, SECOND);
+            let block = compile_sixteen(&mut cpu, ENTRY);
+            set_base(&mut cpu, SegmentIndex::Ds, SHIFT);
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_edx(0);
+            assert!(
+                !cpu.try_run_direct_block_for_test(&mut bus, block)
+                    .expect("a refused 16-bit entry is not a machine stop")
+            );
+        }
+        assert_eq!(
+            cpu.jit_direct.stall_snapshot().data_segment_live_promotions,
+            1
+        );
+        let installs_before_live = cpu.jit_direct.direct.len();
+        compile_sixteen(&mut cpu, SECOND);
+        let root = compile_sixteen(&mut cpu, ENTRY);
+        assert_eq!(cpu.jit_direct.direct.len(), installs_before_live + 1);
+        let layout = cpu
+            .jit_direct
+            .segment_layout(root.id())
+            .expect("live root layout");
+        assert_eq!(layout.used_for_test() & jit::direct::LIVE_DATA_BITS, 0);
+        assert!(
+            cpu.jit_direct.direct.link_source_declined(root.id()),
+            "CHAIN_ENTRY_CHECK={armed}: live_data bars the outbound edge"
+        );
+        assert!(
+            !cpu.jit_direct.has_linked_successor(root.id()),
+            "CHAIN_ENTRY_CHECK={armed}: no live outbound edge"
+        );
+        assert_eq!(
+            cpu.jit_direct.outbound_targets_for_test(root.id()),
+            [None, None]
+        );
+        for (base, expected) in [(0, 0xbeefu32), (SHIFT, 0xcafeu32)] {
+            set_base(&mut cpu, SegmentIndex::Ds, base);
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_edx(0);
+            assert!(
+                cpu.try_run_direct_block_for_test(&mut bus, root)
+                    .expect("live 16-bit root"),
+                "CHAIN_ENTRY_CHECK={armed} base {base:#x}"
+            );
+            assert_eq!(cpu.registers.edx(), expected);
+        }
+        assert_eq!(cpu.jit_direct.direct.len(), installs_before_live + 1);
+        let _ = armed;
+    }
+}
+
+fn protected16_at(entry: u32) -> CpuGsw {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.control.cr0 |= CR0_PE;
+    let mut cs = SegmentRegister::flat(0x08, 0x9b);
+    cs.default_size_32 = false;
+    cs.base = 0;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        let mut data = SegmentRegister::flat(0x10, 0x93);
+        data.default_size_32 = false;
+        data.base = 0;
+        cpu.registers.set_segment(segment, data);
+    }
+    cpu.registers.set_esp(0x0700);
+    cpu.set_eip(entry);
+    cpu
+}
+
+fn stamp_ds(cpu: &mut CpuGsw, selector: u16, base: u32, limit: u32, access: u8) {
+    let mut descriptor = cpu.registers.segment(SegmentIndex::Ds);
+    descriptor.selector = selector;
+    descriptor.base = base;
+    descriptor.limit = limit;
+    descriptor.access = access;
+    descriptor.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Ds, descriptor);
+}
+
+/// 16-bit PM twin. Compile live under a writable selector, then enter read-only.
+///
+/// Mutant: live-base plus baked limit/access.
+#[test]
+fn live_data_pm16_store_live_loads_limit_and_access() {
+    for armed in [true, false] {
+        let _check = force_entry_check(armed);
+        let _guard = force_arm(SegmentRetireGovernor::Cap);
+        let mut memory = vec![0; 0x5000];
+        memory[ENTRY as usize..ENTRY as usize + 4].copy_from_slice(&[0x89, 0x16, 0x00, 0x30]);
+        memory[ENTRY as usize + 4..ENTRY as usize + 7].copy_from_slice(&jmp16(ENTRY + 4, DONE));
+        memory[DONE as usize] = 0xf4;
+        let mut bus = super::sixteen_bit::sixteen_bit_bus(memory);
+        let mut cpu = protected16_at(ENTRY);
+        super::sixteen_bit::arm_native_sixteen_bit(&mut cpu, &mut bus, &[0, DATA]);
+        super::sixteen_bit::warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY, ENTRY + 4]);
+
+        const WRITABLE: u8 = 0x93;
+        const READ_ONLY: u8 = 0x91;
+        stamp_ds(&mut cpu, 0x10, 0, 0x4000, WRITABLE);
+        for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
+            stamp_ds(&mut cpu, 0x10, 0, 0x4000, WRITABLE);
+            let block = compile_sixteen(&mut cpu, ENTRY);
+            stamp_ds(&mut cpu, 0x18, SHIFT, 0x5000, WRITABLE);
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_edx(0x00aa);
+            assert!(
+                !cpu.try_run_direct_block_for_test(&mut bus, block)
+                    .expect("a refused PM16 entry is not a machine stop")
+            );
+        }
+        assert_eq!(
+            cpu.jit_direct.stall_snapshot().data_segment_live_promotions,
+            1
+        );
+        stamp_ds(&mut cpu, 0x10, 0, 0x4000, WRITABLE);
+        let block = compile_sixteen(&mut cpu, ENTRY);
+        let layout = cpu
+            .jit_direct
+            .segment_layout(block.id())
+            .expect("live PM16 layout");
+        assert_eq!(layout.used_for_test() & jit::direct::LIVE_DATA_BITS, 0);
+
+        stamp_ds(&mut cpu, 0x10, 0, 0x4000, WRITABLE);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_edx(0x1111);
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(
+            &bus.memory[DATA as usize..DATA as usize + 2],
+            &0x1111u16.to_le_bytes()
+        );
+
+        stamp_ds(&mut cpu, 0x18, SHIFT, 0x5000, WRITABLE);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_edx(0x2222);
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(
+            &bus.memory[(DATA + SHIFT) as usize..(DATA + SHIFT) as usize + 2],
+            &0x2222u16.to_le_bytes()
+        );
+
+        let before_exits = cpu.perf_counters().jit_direct_exit_unavailable_or_kind;
+        let stored = bus.memory[DATA as usize..DATA as usize + 2].to_vec();
+        stamp_ds(&mut cpu, 0x20, 0, 0x4000, READ_ONLY);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_edx(0x3333);
+        let ran = cpu
+            .try_run_direct_block_for_test(&mut bus, block)
+            .expect("a side-exit is not a machine stop");
+        assert!(
+            ran,
+            "CHAIN_ENTRY_CHECK={armed}: used-strip must let the read-only entry reach the body"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_exit_unavailable_or_kind - before_exits,
+            1,
+            "CHAIN_ENTRY_CHECK={armed}: store to a read-only selector side-exits"
+        );
+        assert_eq!(
+            &bus.memory[DATA as usize..DATA as usize + 2],
+            stored.as_slice(),
+            "CHAIN_ENTRY_CHECK={armed}: the read-only entry must not store"
+        );
+
+        let before_limit = cpu.jit_direct.stall_snapshot().side_exit_segment_limit;
+        stamp_ds(&mut cpu, 0x28, 0, 0x1000, WRITABLE);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_edx(0x4444);
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(
+            cpu.jit_direct.stall_snapshot().side_exit_segment_limit - before_limit,
+            1,
+            "CHAIN_ENTRY_CHECK={armed}: a too-small live limit must side-exit"
+        );
+        let _ = armed;
+    }
+}
+
+/// 16-bit `mov bx, ds` still refuses when DS's selector moves, sticky or not.
+#[test]
+fn sixteen_bit_mov_reg_sreg_keeps_the_selector_pin() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize..ENTRY as usize + 2].copy_from_slice(&[0x8c, 0xdb]);
+    memory[ENTRY as usize + 2..ENTRY as usize + 5].copy_from_slice(&jmp16(ENTRY + 2, DONE));
+    memory[DONE as usize] = 0xf4;
+    let mut bus = super::sixteen_bit::sixteen_bit_bus(memory);
+    let mut cpu = super::sixteen_bit::sixteen_bit_code_cpu(ENTRY);
+    super::sixteen_bit::arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
+    super::sixteen_bit::warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+    let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+    ds.selector = 0x1234;
+    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    ds.selector = 0x5678;
+    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+    cpu.set_eip(ENTRY);
+    cpu.registers.set_ebx(0);
+    assert!(
+        !cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+        "mov bx, ds must refuse when the selector moves"
+    );
+    assert_eq!(cpu.registers.ebx(), 0);
+    let layout = cpu
+        .jit_direct
+        .segment_layout(block.id())
+        .expect("selector-pin layout");
+    assert_ne!(
+        layout.used_for_test() & jit::direct::LIVE_DATA_BITS,
+        0,
+        "a selector pin keeps DS in used even if the key later promotes"
+    );
+}
+
+/// `mov ds, ax` then a DS-relative load still ends the block at the load.
+#[test]
+fn dirty_segment_still_splits_mov_ds_then_load() {
+    let mut memory = vec![0; 0x5000];
+    memory[ENTRY as usize..ENTRY as usize + 6].copy_from_slice(&[
+        0x89, 0xf6, // mov si, si
+        0x89, 0xff, // mov di, di
+        0x8e, 0xd8, // mov ds, ax
+    ]);
+    let load_at = ENTRY + 6;
+    memory[load_at as usize..load_at as usize + 4].copy_from_slice(&[0x8b, 0x16, 0x00, 0x30]);
+    memory[load_at as usize + 4..load_at as usize + 7].copy_from_slice(&jmp16(load_at + 4, DONE));
+    memory[DONE as usize] = 0xf4;
+    let mut bus = super::sixteen_bit::sixteen_bit_bus(memory);
+    let mut cpu = super::sixteen_bit::sixteen_bit_code_cpu(ENTRY);
+    super::sixteen_bit::arm_native_sixteen_bit(&mut cpu, &mut bus, &[0, DATA]);
+    super::sixteen_bit::warm_sixteen_bit(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 2, ENTRY + 4, load_at, load_at + 4],
+    );
+    let write_block = compile_sixteen(&mut cpu, ENTRY);
+    assert_eq!(
+        write_block.span().instructions,
+        3,
+        "the load after MOV DS must not join the write block"
+    );
+    let load_block = compile_sixteen(&mut cpu, load_at);
+    assert_eq!(load_block.span().instructions, 2);
+    assert_ne!(write_block.id(), load_block.id());
+}
+
+/// Fixture 7 live twin: after promote, install the live compile, then flush; the edge must not
+/// re-form. Mutant: `link_source_declined` still keyed only on the declined set.
+#[test]
+fn live_promoted_key_stays_a_leaf_across_a_flush() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = strict_fixture();
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    ensure_compiled(&mut cpu, ENTRY);
+    ensure_compiled(&mut cpu, SECOND);
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
+        assert!(!strict_turn(&mut cpu, &mut bus, 0));
+    }
+    let key = key_at(&cpu, ENTRY);
+    let head = ensure_compiled(&mut cpu, ENTRY);
+    assert!(
+        cpu.jit_direct
+            .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data())
+    );
+    assert!(cpu.jit_direct.direct.link_source_declined(head.id()));
+    assert!(!cpu.jit_direct.has_linked_successor(head.id()));
+
+    cpu.jit_direct.invalidate_translation();
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    let second_key = key_at(&cpu, SECOND);
+    cpu.jit_direct
+        .revalidate_translation(second_key)
+        .expect("the successor is still compiled across a link flush");
+    let head = cpu
+        .jit_direct
+        .revalidate_translation(key)
+        .expect("the live key is Compiled, not Seen");
+    assert!(
+        cpu.jit_direct
+            .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data()),
+        "live_data survives the flush"
+    );
+    assert!(
+        cpu.jit_direct.direct.link_source_declined(head.id()),
+        "link_source_declined must read live_data with the declined set empty"
+    );
+    assert!(
+        !cpu.jit_direct.has_linked_successor(head.id()),
+        "the edge must not re-form"
+    );
+}
+
+/// Fixture 7b live half: a CS retire of a live-promoted key keeps leaf-ness via live_data.
+#[test]
+fn a_cs_layout_retire_of_a_live_key_keeps_leaf_ness() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = strict_fixture();
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    ensure_compiled(&mut cpu, ENTRY);
+    ensure_compiled(&mut cpu, SECOND);
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
+        assert!(!strict_turn(&mut cpu, &mut bus, 0));
+    }
+    let key = key_at(&cpu, ENTRY);
+    ensure_compiled(&mut cpu, ENTRY);
+    assert!(
+        cpu.jit_direct
+            .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data())
+    );
+    assert!(cpu.jit_direct.retire_key_for_recompile(key));
+    assert!(
+        cpu.jit_direct
+            .direct
+            .data_segment_retire_record_for_test(key)
+            .is_some_and(|record| record.live_data()),
+        "live_data survives retire_key_for_recompile"
+    );
+    set_base(&mut cpu, SegmentIndex::Es, 0);
+    let head = ensure_compiled(&mut cpu, ENTRY);
+    ensure_compiled(&mut cpu, SECOND);
+    assert!(
+        cpu.jit_direct.direct.link_source_declined(head.id()),
+        "the recompile is born a leaf because live_data survived"
+    );
+    assert!(!cpu.jit_direct.has_linked_successor(head.id()));
 }

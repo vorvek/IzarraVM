@@ -1963,7 +1963,11 @@ fn pending_flags_offset() {
     // 4584 -> 4592 -- measured off a failing-test readout, not derived. Same shape again: one
     // host-side function-pointer slot, not guest state. (`callout_port_out_dx_served` lives in
     // the stall tally and does not move this offset either.)
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4592);
+    // The Tyrian live-data slice adds four PerfCounters fields
+    // (jit_direct_reject_data_segment_real / _v86 / _pm16 / _pm32; 32 bytes), moving this pin
+    // 4592 -> 4624 -- measured off a failing-test readout, not derived. They belong in
+    // PerfCounters so they ride phase_marks beside the existing strict/masked split.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4624);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a

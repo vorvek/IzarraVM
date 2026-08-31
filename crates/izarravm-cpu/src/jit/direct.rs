@@ -7762,6 +7762,7 @@ fn compile_with_budget(
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
     let mut pinned_segments = 0u8;
+    let mut selector_segments = 0u8;
     // Segments this block has already overwritten, and how many such writes it carries. The mask
     // ends slots that would bake a stale value; the count bars the two block shapes that would
     // re-enter or leave the block without a segment check (see `self_loop` and `successors`).
@@ -8482,6 +8483,9 @@ fn compile_with_budget(
             "a kind with a data access must pin the segment it reaches it through"
         );
         pinned_segments |= kind.pinned_segments();
+        if let Some(segment) = kind.selector_segment() {
+            selector_segments |= segment_bit(segment);
+        }
         // AFTER the test above, never before, or the write would bar itself.
         if let Some(segment) = kind.written_segment() {
             dirty_segments |= segment_bit(segment);
@@ -8762,10 +8766,13 @@ fn compile_with_budget(
                 suffix_masks[position],
             );
         }
-        // `used` IS `pinned_segments` (SegmentLayout::capture), and the mask is a union over a
-        // SUBSET of the slots that produced it, so this is a subset by construction. Asserted
-        // because the entry check leans on it: `data_matches` compares the block-wide `used`, and
-        // a mask reaching outside it would be comparing a record the block never pinned.
+        // The mask is a union of `pinned_segments` over a subset of the slots that produced that
+        // walk accumulator, so it is a subset of `pinned_segments` by construction. On a live-data
+        // compile `used` is `pinned_segments` minus the live-drop bits, and this assert stays
+        // against `pinned_segments` rather than `used` so a live-dropped bit in a cell is still
+        // the `pinned_segments()` mutation this slice forbids. Asserted because the entry check
+        // leans on the subset: a mask reaching outside the pinned set would compare a record the
+        // block never pinned.
         debug_assert_eq!(
             interpret_one_cells
                 .iter()
@@ -8794,6 +8801,12 @@ fn compile_with_budget(
     else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
+    let live_data = if cpu.jit_direct.live_data_for_key(key) {
+        LIVE_DATA_BITS
+    } else {
+        0
+    };
+    let protected_not_v86 = cpu.is_protected_mode() && !cpu.is_v86_mode();
     // A self-loop block accounts by MULTIPLYING its whole static accounting by the iteration
     // count at exit, so nothing inside the loop body may deposit into the runtime lanes per
     // iteration. A call-out does exactly that (it adds the helper's runtime clocks at the call
@@ -9221,6 +9234,8 @@ fn compile_with_budget(
             // the table pointer (wolf3d ON-arm ACCESS_VIOLATION).
             hold_load_bias: hold_load_bias_enabled() && x87_slots == 0,
             segments: segment_layout,
+            live_data,
+            protected_not_v86,
             address_wrap: if d {
                 AddressWrap::None
             } else {
@@ -9231,6 +9246,13 @@ fn compile_with_budget(
         interpret_one_cells: &interpret_one_cell_ptrs,
         fetch_trace: cpu.jit_direct.native_fetch_trace,
     });
+    // Emit reads the full-used snapshot so descriptor() still sees DS/ES. Install gets the
+    // stripped one so the entry compare skips live DS/ES. Selector pins stay in used.
+    let segment_layout = if live_data != 0 {
+        segment_layout.without_pins(LIVE_DATA_BITS & !selector_segments)
+    } else {
+        segment_layout
+    };
     CompileOutcome::Compiled(Compilation {
         span,
         fetch_lens,
@@ -9939,6 +9961,17 @@ impl SegmentLayout {
         debug_assert_ne!(self.used & segment_bit(segment), 0);
         self.data[segment_index(segment)]
     }
+
+    /// Clear `mask` from `used`. May only clear bits; the captured descriptors stay.
+    fn without_pins(mut self, mask: u8) -> Self {
+        self.used &= !mask;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used_for_test(self) -> u8 {
+        self.used
+    }
 }
 
 fn segment_access_supported(
@@ -9972,6 +10005,9 @@ const fn segment_bit(segment: SegmentIndex) -> u8 {
         SegmentIndex::Gs => 1 << 5,
     }
 }
+
+/// DS and ES only. Sticky keys live-load these two; SS/FS/GS stay baked.
+pub(crate) const LIVE_DATA_BITS: u8 = segment_bit(SegmentIndex::Ds) | segment_bit(SegmentIndex::Es);
 
 /// The inverse of `segment_bit` for a mask holding exactly one bit, `None` for anything else.
 /// L9 stage 0 only, which is why it is gated: nothing on the default path turns a mask back into a
@@ -17969,6 +18005,11 @@ struct MemoryEmitContext {
     /// `one_lookup_load` so a classic-front integer block still saves and restores RSI.
     hold_load_bias: bool,
     segments: SegmentLayout,
+    /// DS/ES bits to live-load from R15 instead of baking. Zero on a first compile.
+    live_data: u8,
+    /// PE set and V86 clear, baked from the compile-time mode key. Do not recover this from
+    /// `address_wrap`: Word wrap is CS.D, and 16-bit PM would take the real/V86 emit.
+    protected_not_v86: bool,
     /// Whether a ModRM-derived effective address wraps at 64K.
     ///
     /// A BLOCK property, not an address one. `decode` computes
@@ -18031,7 +18072,10 @@ impl MemorySideExits {
             permission: e.label(),
             code_watch: e.label(),
             segment_limit: addr
-                .filter(|addr| memory.segments.descriptor(addr.segment).limit != u32::MAX)
+                .filter(|addr| {
+                    memory.live_data & segment_bit(addr.segment) != 0
+                        || memory.segments.descriptor(addr.segment).limit != u32::MAX
+                })
                 .map(|_| e.label()),
         }
     }
@@ -21130,7 +21174,7 @@ fn emit_x87_memory_pointer(
     // `needs_alignment_guard()` the way `emit_ram_read_pointer_inner` gates it.
     debug_assert!(width.needs_alignment_guard());
     let map = memory.map.expect("x87 memory block has fast-map bases");
-    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap);
+    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, write);
     // The width here is what the slice's performance rests on, not its byte identity:
     // `BusCycle::clocks_for` ignores width, so a Word access charged as a Dword costs the same
     // bus clocks. What a Dword guard WOULD do is refuse every 2-aligned-but-not-4-aligned
@@ -21303,7 +21347,7 @@ fn emit_ram_read_pointer_inner(
     wrap: AddressWrap,
 ) {
     let map = memory.map.expect("native read has fast-map bases");
-    emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
+    emit_segmented_linear_address(e, addr, width, memory, sides, wrap, false);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -21694,7 +21738,7 @@ fn emit_alu_mem_dest(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("writing memory ALU has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap);
+    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, true);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -21839,6 +21883,7 @@ fn emit_double_shift_mem(
         memory,
         sides,
         memory.address_wrap,
+        true,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
@@ -22101,12 +22146,17 @@ fn emit_segmented_linear_address(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
     wrap: AddressWrap,
+    write: bool,
 ) {
     // The mask lands inside `emit_effective_address`, which is BEFORE the limit compare below.
     // That ordering is load-bearing twice over: the compare sits between the effective address
     // and the segment base, so masking afterwards would compare an address the guest never forms
     // -- AND the mask is the precondition of the compare's own elision under `AddressWrap::Word`
     // below. Hoist the mask after the compare and that elision stops being sound.
+    if memory.live_data & segment_bit(addr.segment) != 0 {
+        emit_live_segmented_linear_address(e, addr, width, memory, sides, wrap, write);
+        return;
+    }
     let descriptor = memory.segments.descriptor(addr.segment);
     // Folding the segment base into the address-forming instruction's own displacement field is
     // licensed only when NOTHING has to sit between the effective address and the base add:
@@ -22174,6 +22224,70 @@ fn emit_segmented_linear_address(
     }
 }
 
+fn emit_live_segmented_linear_address(
+    e: &mut Encoder,
+    addr: DirectAddr,
+    width: MemoryWidth,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+    wrap: AddressWrap,
+    write: bool,
+) {
+    // Live DS/ES never take the compile-time fold: the live limit may be finite when the
+    // captured one was u32::MAX, and a fold would bake the captured base this path exists
+    // to stop emitting.
+    debug_assert!(
+        memory.live_data & segment_bit(addr.segment) != 0,
+        "live emit is only for sticky DS/ES"
+    );
+    emit_effective_address(e, addr, wrap, 0);
+    let field = segment_field_base(addr.segment);
+    if memory.protected_not_v86 {
+        emit_live_pm_access_check(e, field, write, sides.unavailable_or_kind);
+    }
+    let limit_exit = sides
+        .segment_limit
+        .expect("sticky DS/ES always allocate a segment_limit label");
+    e.load_r32_disp32(Reg::RDX, Reg::R15, field + limit_offset());
+    let extent = width.bytes() - 1;
+    if extent != 0 {
+        e.cmp_r32_imm32(Reg::RDX, extent);
+        e.jcc(2, limit_exit);
+        e.alu_r32_imm32(5, Reg::RDX, extent);
+    }
+    e.alu_r32_r32(7, Reg::RAX, Reg::RDX);
+    e.jcc(7, limit_exit);
+    e.load_r32_disp32(Reg::RDX, Reg::R15, field + base_offset());
+    e.add_r32_r32(Reg::RAX, Reg::RDX);
+}
+
+fn emit_live_pm_access_check(e: &mut Encoder, field: i32, write: bool, fail: Label) {
+    e.movzx_r32_byte_disp32(Reg::RDX, Reg::R15, field + access_offset());
+    e.test_r32_imm32(Reg::RDX, 0x80);
+    e.jz(fail);
+    e.test_r32_imm32(Reg::RDX, 0x10);
+    e.jz(fail);
+    let not_expand_down = e.label();
+    e.test_r32_imm32(Reg::RDX, 0x08);
+    e.jnz(not_expand_down);
+    e.test_r32_imm32(Reg::RDX, 0x04);
+    e.jnz(fail);
+    e.place(not_expand_down);
+    if write {
+        e.test_r32_imm32(Reg::RDX, 0x08);
+        e.jnz(fail);
+        e.test_r32_imm32(Reg::RDX, 0x02);
+        e.jz(fail);
+    } else {
+        let data_ok = e.label();
+        e.test_r32_imm32(Reg::RDX, 0x08);
+        e.jz(data_ok);
+        e.test_r32_imm32(Reg::RDX, 0x02);
+        e.jz(fail);
+        e.place(data_ok);
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -22204,7 +22318,7 @@ fn emit_store(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("native store has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
+    emit_segmented_linear_address(e, addr, width, memory, sides, wrap, true);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
@@ -24889,7 +25003,7 @@ fn emit_rmw_inc_dec(
     let code_watch_tables = memory
         .code_watch_tables
         .expect("native RMW has code-watch tables");
-    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap);
+    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, true);
     emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -25047,6 +25161,7 @@ fn emit_rmw_inc_dec_dword(
         memory,
         sides,
         memory.address_wrap,
+        true,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
@@ -25169,6 +25284,7 @@ fn emit_push_mem(
         memory,
         source_sides,
         memory.address_wrap,
+        false,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, source_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -25205,6 +25321,7 @@ fn emit_push_mem(
         memory,
         stack_sides,
         AddressWrap::None,
+        true,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, stack_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -25342,6 +25459,7 @@ fn emit_call_mem(
         memory,
         source_sides,
         memory.address_wrap,
+        false,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, source_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -25381,6 +25499,7 @@ fn emit_call_mem(
         memory,
         stack_sides,
         AddressWrap::None,
+        true,
     );
     emit_wide_page_guard(e, MemoryWidth::Dword, stack_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -25871,7 +25990,7 @@ fn emit_store_fast(
     let slow = e.label();
     let done = e.label();
     let fast_join = e.label();
-    emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
+    emit_segmented_linear_address(e, addr, width, memory, sides, wrap, true);
     emit_store_bias_probe(e, map);
     // The value is materialized BEFORE the tag branch so the fast arm and both stubs share it
     // (the stubs receive it in RDX; the slow stub spills it across its own front — review F1).
@@ -26579,7 +26698,7 @@ fn emit_ram_read_pointer_fast(
     // dead code) and still places both labels.
     let slow = e.label();
     let done = e.label();
-    emit_segmented_linear_address(e, addr, width, memory, sides, wrap);
+    emit_segmented_linear_address(e, addr, width, memory, sides, wrap, false);
     if width.needs_alignment_guard() {
         // Alignment only. A crossing Word/Dword is also misaligned, so it takes this test to the
         // counting-read stub; the stub RAM arm refuses before the pointer resolve. That is what
@@ -31441,6 +31560,13 @@ pub(crate) struct DataSegmentRetireRecord {
     /// Whether the census stopped recording because it filled. A saturated key reports "at least
     /// 8" and must never be read as exactly 8.
     layouts_saturated: bool,
+    /// Whether the next compile of this key live-loads DS/ES instead of baking them.
+    ///
+    /// Set on the first `spent >= DATA_SEGMENT_RETIRE_CAP` reject, before `retire_key_for_recompile`.
+    /// Survives that retire, a CS-layout retire, and `invalidate_translation`; dies with the
+    /// key on SMC (`forget_data_segment_state_for_key`). `link_source_declined` reads it so a
+    /// live key stays a leaf even after the declined set is flushed.
+    live_data: bool,
     /// Fingerprints of the distinct live descriptor tuples this key has been rejected against,
     /// MASKED BY THE REJECTING ARM'S OWN MASK.
     ///
@@ -31478,6 +31604,11 @@ impl DataSegmentRetireRecord {
 
     pub(crate) fn layouts_saturated(self) -> bool {
         self.layouts_saturated
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_data(self) -> bool {
+        self.live_data
     }
 }
 
@@ -31608,6 +31739,25 @@ impl BlockCache {
             record.spent
         };
         if spent >= DATA_SEGMENT_RETIRE_CAP {
+            let promote = {
+                let record = self
+                    .data_segment_retires
+                    .get_mut(&key)
+                    .expect("the reject that just filled this row");
+                if record.live_data {
+                    false
+                } else {
+                    record.live_data = true;
+                    true
+                }
+            };
+            if promote {
+                // The promoting entry still returns NotRun; the body has not been rewritten yet.
+                // Decline on this path is optional: retire_key_for_recompile forgets it at the
+                // existing hook, and leaf-ness rides live_data instead.
+                self.stalls.data_segment_live_promotions += 1;
+                return self.retire_key_for_recompile(watch, key);
+            }
             self.stalls.data_segment_retires_suppressed += 1;
             // Stage 2 fires on EVERY suppressed strict-arm reject, not once at the crossing: the
             // crossing entry may well have been a masked-arm reject, and a key whose crossing
@@ -31666,17 +31816,30 @@ impl BlockCache {
         self.stalls.data_segment_link_declines += 1;
     }
 
-    /// Whether `source`'s key is link-declined. The emptiness test is not an optimisation of the
-    /// hash lookup so much as a statement about the OFF and `cap` arms, where the set can never
-    /// be non-empty and `try_link_inner` must not start paying for a governor that is not armed.
+    /// Whether `source` must not grow an outbound edge.
+    ///
+    /// Two bars, and they are not the same map. `live_data` lives in `data_segment_retires`,
+    /// which survives `invalidate_translation`; the declined set is cleared there. The live-data
+    /// read is therefore not behind the declined-set emptiness test: after a flush the set is
+    /// empty and the records are not, and a live key must stay a leaf. Combined emptiness of
+    /// both maps is the OFF-arm cheap path, where neither structure is ever written.
     pub(crate) fn link_source_declined(&self, source: BlockId) -> bool {
-        if self.data_segment_link_declined.is_empty() {
+        if self.data_segment_retires.is_empty() && self.data_segment_link_declined.is_empty() {
             return false;
         }
         self.active_index(source).is_some_and(|index| {
-            self.data_segment_link_declined
-                .contains(&self.blocks[index].span.key)
+            let key = self.blocks[index].span.key;
+            self.data_segment_retires
+                .get(&key)
+                .is_some_and(|record| record.live_data)
+                || self.data_segment_link_declined.contains(&key)
         })
+    }
+
+    pub(crate) fn live_data_for_key(&self, key: BlockKey) -> bool {
+        self.data_segment_retires
+            .get(&key)
+            .is_some_and(|record| record.live_data)
     }
 
     /// Drop one key's decline. Called from `retire_key_for_recompile` (the flag is a statement
@@ -31757,6 +31920,14 @@ impl BlockCache {
     #[cfg(test)]
     pub(crate) fn data_segment_link_declined_for_test(&self, key: BlockKey) -> bool {
         self.data_segment_link_declined.contains(&key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decline_links_for_data_segment_for_test(&mut self, key: BlockKey) {
+        let Some(BlockState::Compiled(id)) = self.entries.get(&key).copied() else {
+            panic!("decline_links_for_data_segment_for_test needs a compiled key");
+        };
+        self.decline_links_for_data_segment(key, id);
     }
 
     /// The link-graph door the governor fixtures need. `resolve_successors` is the function
@@ -32842,6 +33013,10 @@ pub(crate) struct DirectStallTally {
     pub data_segment_retires_suppressed: u64,
     pub data_segment_sticky_crossings: u64,
     pub data_segment_link_declines: u64,
+    /// First `spent >= DATA_SEGMENT_RETIRE_CAP` reject on a key that was not yet live-data:
+    /// the promoting entry, which retires so the next compile emits live DS/ES. Already-live
+    /// suppressed rejects stay in `data_segment_retires_suppressed`.
+    pub data_segment_live_promotions: u64,
     /// Sticky-decline memo instruments, always on. Here for this struct's stated reason:
     /// `PerfCounters` sits ahead of `pending_flags` in `CpuGsw` at an offset emitted code bakes,
     /// and `BlockCacheStats` is drained per dispatcher exit — these have to accumulate for the
@@ -34662,6 +34837,7 @@ impl crate::jit::JitState {
             data_segment_retires_suppressed: self.stalls.data_segment_retires_suppressed,
             data_segment_sticky_crossings: self.stalls.data_segment_sticky_crossings,
             data_segment_link_declines: self.stalls.data_segment_link_declines,
+            data_segment_live_promotions: self.stalls.data_segment_live_promotions,
             data_segment_distinct_layouts: self.data_segment_layout_histogram(),
             ss_load_same_record: self.stalls.ss_load_same_record,
             ss_load_changed_record: self.stalls.ss_load_changed_record,

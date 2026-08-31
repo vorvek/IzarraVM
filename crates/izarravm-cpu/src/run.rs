@@ -2822,6 +2822,19 @@ impl CpuGsw {
         }
         if !data_descriptors_match {
             self.perf.jit_direct_reject_data_segment += 1;
+            // Mode-key bucket of the same reject. `jit_mode_key` packs CS.D at bit 0, PE at
+            // bit 1, V86 at bit 2. V86 is checked first so a V86 key is not also counted as
+            // protected. The four buckets sum to `jit_direct_reject_data_segment`.
+            let mode_key = span.key.mode_key;
+            if mode_key & (1 << 2) != 0 {
+                self.perf.jit_direct_reject_data_segment_v86 += 1;
+            } else if mode_key & (1 << 1) == 0 {
+                self.perf.jit_direct_reject_data_segment_real += 1;
+            } else if mode_key & (1 << 0) == 0 {
+                self.perf.jit_direct_reject_data_segment_pm16 += 1;
+            } else {
+                self.perf.jit_direct_reject_data_segment_pm32 += 1;
+            }
             // The ARM split, promoted from the 2026-08-23 throwaway instrument. It is the only
             // way the strict/masked share is readable on the shipped arm -- one counter served
             // both arms before this, and the design could bound the strict half at <=32% from
