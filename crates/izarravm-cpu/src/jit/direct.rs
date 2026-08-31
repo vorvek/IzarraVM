@@ -4495,13 +4495,25 @@ pub(crate) enum DirectKind {
     /// sub-opcode would need one -- /2 and /3 are RCL and RCR, which the classify arm refuses
     /// because they take the incoming CF as a rotate INPUT.
     ///
-    /// No `width` field, and refusing rather than adding one is a deliberate boundary: `classify`
-    /// returns None for both sub-opcodes at `OperandSize::Word`, because this kind's emitter is
-    /// `shift_r32_imm8` and a 66-prefixed rotate routed through it would rotate 32 bits where the
-    /// guest rotates 16 -- wrong result AND wrong CF, since the bit rotated across the boundary
-    /// comes from bit 31 instead of bit 15. Neither the duke3d-586 nor the 16-bit census measures
-    /// a Word row for either sub-opcode, so a second emitter lane would be an unmeasured
-    /// admission.
+    /// `width` selects the host rotate's operand width, Word or Dword. `classify` never constructs
+    /// this kind at `MemoryWidth::Byte`: 0xD0/0xC0's rotate sub-opcodes (`/0`, `/1`) stay refused
+    /// there for the reason `emit_rotate_reg` still gives -- a byte rotate needs
+    /// `emit_read_store_value`/`emit_write_gpr8`, not a host rotate over the whole home, and no
+    /// census row asks for it. The corpus's `123-talk-shareware` and `21-for-1-to-4` rows are what
+    /// justify Word: `0xD1 word register /1` (ROR) and `0xD0 word register /0,/1` in the census are
+    /// both spellings of the SAME `0xc1 | 0xd1` arm below with `insn.operand_size ==
+    /// OperandSize::Word` (the census's "word" and "0xD0" are the decoded-segment default width and
+    /// the by-one encoding respectively, not a 0xD0 opcode with a rotate sub-opcode -- that stays
+    /// refused, see `emit_rotate_reg`'s byte paragraph above).
+    ///
+    /// A 66-prefixed `C1`/`D1 /0,/1` narrows exactly one instruction, the host rotate itself:
+    /// `shift_r16_imm8` takes CF from the bit rotated across the 16-bit boundary and computes OF
+    /// from the 16-bit result, matching `CpuGsw::shift_rotate` at `BusWidth::Word` bit for bit. The
+    /// x86-64 16-bit rotate also writes only the destination's low 16 bits, leaving bits 16..=63 of
+    /// the underlying 64-bit host register untouched -- the same high-half preservation
+    /// `word_shifts_write_the_operand_size_and_preserve_what_is_above_it` pins for `Shift`, and for
+    /// the identical reason: nothing in the emitter has to ask for it, the host CPU does it as part
+    /// of executing a 16-bit instruction.
     ///
     /// Deliberately NOT folded into `Shift`. That variant's emitter falls through to an
     /// arithmetic shift right, so a rotate routed through it would be silently emitted as SAR.
@@ -4513,8 +4525,11 @@ pub(crate) enum DirectKind {
         op: u8,
         dst: u8,
         count: u8,
+        width: MemoryWidth,
         /// Present only for the shapes `count_lane_for` admits (the register-destination `0xC1`
-        /// form, no prefixes, `imm_len == 1`, `len == 3`). When present the emitted form IGNORES
+        /// form, no prefixes, `imm_len == 1`, `len == 3`, and `width: MemoryWidth::Dword` -- see
+        /// `count_lane_for`'s kind guard for why the Word admission does not extend to this field).
+        /// When present the emitted form IGNORES
         /// `count` and loads the count byte out of guest RAM on every execution, so a guest patch
         /// of that byte needs no recompile. `count` still carries the value decoded at compile time
         /// and is what the non-lane form bakes.
@@ -6946,10 +6961,10 @@ fn imm8_lane_for(
 ///   short, -4.94% long), with `0` / `off` the escape to the pre-slice world; both arms ship in one
 ///   executable so a later ladder can still measure them. Independent of `IZARRAVM_IMM8_LANES` on
 ///   purpose — see `count_lanes_enabled`.
-/// - `DirectKind::RotateReg { lane: None, .. }` / `DirectKind::Shift { lane: None, width: Byte |
-///   Dword, .. }`: the only two kinds whose emitters have a lane arm, at the only two widths whose
-///   emitters have one. `ShiftCl` (`0xD3`) is excluded by kind: its count is already runtime data
-///   out of guest CL and it has no immediate byte to lane.
+/// - `DirectKind::RotateReg { lane: None, width: Dword, .. }` / `DirectKind::Shift { lane: None,
+///   width: Byte | Dword, .. }`: the kinds and widths whose emitters have a lane arm. `ShiftCl`
+///   (`0xD3`) is excluded by kind: its count is already runtime data out of guest CL and it has no
+///   immediate byte to lane.
 ///
 ///   **THE WIDTH HALF OF THAT TEST IS LOAD-BEARING AND WAS ONCE ABSENT.** The first version of
 ///   this function argued Word away instead of testing it: "a Word `0xC1` needs a `0x66` prefix,
@@ -6961,7 +6976,11 @@ fn imm8_lane_for(
 ///   kind's own width is what makes the refusal a fact rather than an inference about encodings.
 ///   `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
 ///   fixture; the Word form keeps compiling with a baked count, exactly as before this slice.
-///   `RotateReg` needs no width test: classify refuses both rotates at Word outright.
+///   `RotateReg` carries the identical hazard now that Word rotates are admitted (the
+///   `vorvek/direct-word-rot1` slice), so its kind match bars `width: MemoryWidth::Word` the same
+///   way `Shift`'s does — an unprefixed `c1 e0 03` ROL in a CS.D=0 segment satisfies every other
+///   bar here too, and `emit_rotate_reg_lane` has no Word arm.
+///   `a_word_rotate_in_a_sixteen_bit_segment_takes_no_count_lane` is that regression fixture.
 /// - `insn.opcode == 0xC1 || insn.opcode == 0xC0`: `0xD1` produces the SAME two kinds but carries
 ///   no immediate at all — its count is the literal 1 baked into the opcode — so `physical + 2`
 ///   would name the next instruction's first byte. **This bar is REDUNDANT today and kept anyway,
@@ -7018,12 +7037,15 @@ fn count_lane_for(
     }
     if !matches!(
         kind,
-        DirectKind::RotateReg { lane: None, .. }
-            | DirectKind::Shift {
-                lane: None,
-                width: MemoryWidth::Byte | MemoryWidth::Dword,
-                ..
-            }
+        DirectKind::RotateReg {
+            lane: None,
+            width: MemoryWidth::Dword,
+            ..
+        } | DirectKind::Shift {
+            lane: None,
+            width: MemoryWidth::Byte | MemoryWidth::Dword,
+            ..
+        }
     ) {
         return None;
     }
@@ -7049,10 +7071,17 @@ fn count_lane_for(
         width: IMM8_LANE_WIDTH as u8,
     };
     let kind = match kind {
-        DirectKind::RotateReg { op, dst, count, .. } => DirectKind::RotateReg {
+        DirectKind::RotateReg {
             op,
             dst,
             count,
+            width,
+            ..
+        } => DirectKind::RotateReg {
+            op,
+            dst,
+            count,
+            width,
             lane: Some(lane),
         },
         DirectKind::Shift {
@@ -11708,11 +11737,13 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
 ///
 /// # What is deliberately NOT behind this knob
 ///
-/// * **`0xD0 /0,/1` and `0xC0 /0,/1` (ROL/ROR r8).** `DirectKind::RotateReg` has no `width` field
-///   and `emit_rotate_reg` is `shift_r32_imm8(op, home(dst), count)` -- a 32-bit host rotate over a
-///   32-bit guest home. A byte rotate through it rotates 32 bits where the guest rotates 8, takes
-///   CF from bit 31 instead of bit 7, and for byte indices 4..7 reaches a guest ESP/EBP/ESI/EDI
-///   home instead of AH/CH/DH/BH. Admitting them is a real slice, not a list entry.
+/// * **`0xD0 /0,/1` and `0xC0 /0,/1` (ROL/ROR r8).** `DirectKind::RotateReg` carries a `width`
+///   field as of `vorvek/direct-word-rot1`, but that field is Word or Dword only -- `emit_rotate_reg`
+///   dispatches on it to `shift_r16_imm8` or `shift_r32_imm8`, neither of which is the byte rotate
+///   this opcode pair needs. A byte rotate through either one rotates 16 or 32 bits where the guest
+///   rotates 8, takes CF from bit 15 or 31 instead of bit 7, and for byte indices 4..7 reaches a
+///   guest ESP/EBP/ESI/EDI home instead of AH/CH/DH/BH. Admitting them is a real slice, not a list
+///   entry.
 /// * **`0xD0 /2,/3` and `0xC0 /2,/3` (RCL/RCR r8)**, for the standing structural reason the
 ///   `0xc1 | 0xd1` arm gives: both take the incoming CF as a rotate INPUT.
 /// * **Memory forms of either opcode**, refused by the shared `DecodedOperand::Reg` bind.
@@ -16192,12 +16223,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // bit, so routing it there would shift 16 or 32 bits in a byte instruction.
             //
             // ROL (/0), ROR (/1), RCL (/2), RCR (/3) stay out. The first two are not a missing
-            // census row: `RotateReg` carries no `width` field at all and `emit_rotate_reg` is
-            // `shift_r32_imm8(op, home(dst), ..)`, so a byte rotate through it rotates 32 bits,
-            // takes CF from bit 31 instead of bit 7, and for byte indices 4..7 reaches a guest
-            // ESP/EBP/ESI/EDI home instead of AH/CH/DH/BH (`home` is `GUEST_HOMES[index & 7]`).
-            // RCL/RCR are out for the standing structural reason the arm below gives: both take
-            // the incoming CF as a rotate INPUT.
+            // census row: `RotateReg`'s `width` field is Word or Dword only and `emit_rotate_reg`
+            // dispatches on it to `shift_r16_imm8` or `shift_r32_imm8`, so a byte rotate through
+            // either one rotates 16 or 32 bits, takes CF from bit 15 or 31 instead of bit 7, and
+            // for byte indices 4..7 reaches a guest ESP/EBP/ESI/EDI home instead of AH/CH/DH/BH
+            // (`home` is `GUEST_HOMES[index & 7]`). RCL/RCR are out for the standing structural
+            // reason the arm below gives: both take the incoming CF as a rotate INPUT.
             //
             // NO IMMEDIATE: the count is the literal 1 baked into the opcode, so `count: 1` here is
             // the encoding rather than a decode field. `insn.imm` is not read and must not be --
@@ -16270,22 +16301,24 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // architectural five-bit mask is applied in the emitter.
                 let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 };
                 if matches!(m.reg, 0 | 1) {
-                    // BOTH rotates are REFUSED at Word, and this guard is the only thing that
-                    // stops them now that 0xc1 is on the Word allowlist. `RotateReg` carries no
-                    // width and its emitter is `shift_r32_imm8(op, ..)` plus `emit_set_cf_only`,
-                    // so a 66-prefixed rotate routed through it would rotate 32 bits where the
-                    // guest rotates 16 -- wrong result AND wrong CF, since the bit rotated across
-                    // the boundary comes from bit 31 instead of bit 15. The duke3d-586 re-census
-                    // measures the ROL row at `operand_size: dword` with `prefix_mask: 0`, and no
-                    // fixture measures a Word row for either sub-opcode, so this is a refusal with
-                    // nothing to buy rather than a missed lowering worth the second emitter lane.
-                    if insn.operand_size == OperandSize::Word {
-                        return None;
-                    }
+                    // BOTH rotates are now admitted at Word (the `vorvek/direct-word-rot1` slice),
+                    // via the same width field `Shift`'s Word arm carries: `emit_rotate_reg` picks
+                    // `shift_r16_imm8` or `shift_r32_imm8` on this field, and a 66-prefixed rotate
+                    // narrows to the guest's own 16 bits instead of rotating 32 -- CF from bit 15
+                    // instead of bit 31, OF from the 16-bit result, and the host leaves bits 16..=63
+                    // of the underlying 64-bit register untouched, which is the guest's high-half
+                    // preservation for free. `123-talk-shareware`'s `0xD1 word register /1` (ROR,
+                    // 29.70M runtime hits, its #1 census row) and `21-for-1-to-4`'s `0xD0 word
+                    // register /1` (13.50M) are both this arm at `operand_size: Word` -- the census
+                    // names for the by-one encoding and the decoded segment default width, not a
+                    // literal 0xD0 opcode, which stays a byte-only instruction and is refused above
+                    // by `emit_rotate_reg`'s reasons stated on `0xD0`'s own arm. RCL (`/2`) and RCR
+                    // (`/3`) are unaffected: they never reach this branch, `matches!(m.reg, 0 | 1)`.
                     return Some(DirectKind::RotateReg {
                         op: m.reg,
                         dst,
                         count,
+                        width: operand_width,
                         lane: None,
                     });
                 }
@@ -17693,10 +17726,14 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 op,
                 dst,
                 count,
+                width,
                 lane,
             } => match lane {
+                // The lane form is Dword-only (`count_lane_for`'s kind guard bars Word), so it
+                // still takes no width argument; the debug_assert in `emit_rotate_reg_lane` is the
+                // guard against a future admission drifting past that bar unnoticed.
                 Some(lane) => emit_rotate_reg_lane(&mut e, op, dst, lane),
-                None => emit_rotate_reg(&mut e, op, dst, count),
+                None => emit_rotate_reg(&mut e, op, dst, count, width),
             },
             DirectKind::DoubleShiftReg {
                 left,
@@ -22711,14 +22748,23 @@ fn emit_set_cf_only(e: &mut Encoder) {
     e.place(done);
 }
 
-/// ROL and ROR r32, imm8 (0xC1 and 0xD1, sub-opcodes /0 and /1), register destination.
+/// ROL and ROR r/m, imm8 (0xC1 and 0xD1, sub-opcodes /0 and /1), register destination, Word or
+/// Dword. `width` selects the host rotate exactly as it does in `emit_shift`: the two widths
+/// differ in ONE instruction, `shift_r16_imm8` versus `shift_r32_imm8`, and nothing below that
+/// line cares which one ran, because a rotate's flag contract (CF from the bit rotated out, OF
+/// only at count 1, SF/ZF/PF/AF preserved) is defined in terms of the OPERAND's own width and the
+/// host computes it that way at either size.
 ///
-/// `op` is the guest ModRM `reg` field and goes STRAIGHT into `shift_r32_imm8`'s `/op` slot: host
+/// `op` is the guest ModRM `reg` field and goes STRAIGHT into the encoder's `/op` slot: host
 /// group 2 numbers ROL 0 and ROR 1 exactly as the guest does, so there is no translation to get
 /// wrong. Everything below this line is direction-independent, which is the whole reason the two
 /// sub-opcodes share one function -- the flag contract, not the rotate, is what the code is for.
-fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
+fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidth) {
     debug_assert!(matches!(op, 0 | 1), "only ROL and ROR reach this emitter");
+    debug_assert!(
+        matches!(width, MemoryWidth::Word | MemoryWidth::Dword),
+        "0xD0/0xC0's byte rotate sub-opcodes never construct RotateReg"
+    );
     // The five-bit mask is applied HERE, on the raw decoded immediate, the same way emit_shift
     // does it. classify stores the immediate unmasked, so selecting the shape below on the raw
     // byte would misread `ror eax, 32` as a fourth case instead of the no-op it is.
@@ -22735,9 +22781,13 @@ fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
     // CF is the bit rotated across the boundary -- out of the MSB for ROL, out of bit 0 for ROR --
     // which is what the loop leaves in `cf` for either direction. At count 1 the interpreter's OF
     // arm splits by op: `0 | 2 => top ^ cf` for a left rotate and `1 | 3 => top ^ (bit 30 of the
-    // result)` for a right one. Those are the SAME two definitions x86 gives ROL and ROR, so the
-    // host computes each one for us and the split never appears in this function.
-    e.shift_r32_imm8(op, home(dst), count);
+    // result)` for a right one -- at Word width `shift_rotate` derives that same pair from bit 15
+    // and bit 14 instead. Those are the SAME definitions x86 gives ROL and ROR at either width, so
+    // the host computes each one for us and the split never appears in this function.
+    match width {
+        MemoryWidth::Word => e.shift_r16_imm8(op, home(dst), count),
+        _ => e.shift_r32_imm8(op, home(dst), count),
+    }
     if count == 1 {
         // Two set_flag calls, and their ORDER is what makes this branch-free. set_flag(FLAG_CF)
         // writes the override into the descriptor; set_flag(FLAG_OF) then sees a mask that is not
@@ -22816,6 +22866,9 @@ const SHIFT_DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | cr
 fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, lane: ImmLane) {
     debug_assert!(matches!(op, 0 | 1), "only ROL and ROR reach this emitter");
     debug_assert_eq!(u32::from(lane.width), IMM8_LANE_WIDTH);
+    // Dword-only, hardcoded, with no width parameter: `count_lane_for`'s kind guard bars
+    // `RotateReg { width: MemoryWidth::Word, .. }` from ever reaching a lane, so a Word rotate
+    // always takes the baked `emit_rotate_reg` path.
     let one = e.label();
     let done = e.label();
     e.mov_r64_imm64(Reg::RDX, lane.host as u64);

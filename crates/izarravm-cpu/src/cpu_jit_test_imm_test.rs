@@ -2101,7 +2101,9 @@ fn byte_shl_register_form_matches_the_interpreter_in_486_mode() {
 #[test]
 fn group2_non_lowered_rotates_remain_interpreter_only() {
     // FORCED ON, and this is the subtle one. Every row here is refused by a GUARD -- the `m.reg`
-    // tests, the register-only `let-else`, the Word check inside the rotate branch. On the OFF arm
+    // tests and the register-only `let-else` (the Word `/0`,`/1` rows moved out of this file
+    // entirely once `vorvek/direct-word-rot1` admitted them; see
+    // `group2_word_rotate_register_form_is_lowered`). On the OFF arm
     // the knob refuses `0xC1 /0` and the whole of `0xC0` before any of those guards runs, so the
     // rows would still pass while certifying nothing about the guards, and a widening of
     // `m.reg != 4` to `4..=7` would survive. That the default arm happens to be ON since
@@ -2160,11 +2162,11 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
         // register battery above.
         vec![0xc0, 0x2d, 0x00, 0x50, 0x00, 0x00, 0x05],
         vec![0xd0, 0x2d, 0x00, 0x50, 0x00, 0x00],
-        // 66-prefixed ROR and ROL r/m16. The OperandSize::Word guard inside the classify arm is
-        // the only thing stopping these from being lowered as 32-bit rotates, which would smear
-        // the high half into the low one.
-        vec![0x66, 0xc1, 0xcb, 0x05],
-        vec![0x66, 0xc1, 0xc3, 0x05],
+        // 66-prefixed ROR and ROL r/m16 used to stay here, refused by `classify`'s
+        // `insn.operand_size == OperandSize::Word` guard inside the rotate branch. That guard is
+        // gone as of `vorvek/direct-word-rot1`: `RotateReg` now carries a `width` field and
+        // dispatches to `shift_r16_imm8`, so these two rows are admitted and lowered. See
+        // `group2_word_rotate_register_form_is_lowered` for their positive coverage.
     ] {
         assert!(
             compile_leading_block(&code).is_none(),
@@ -2204,6 +2206,36 @@ fn group2_dword_rotate_register_form_is_lowered() {
             compile_leading_block(&code),
             Some(3),
             "rotate {code:02x?} must admit and carry the whole three-slot block"
+        );
+    }
+}
+
+#[test]
+fn group2_word_rotate_register_form_is_lowered() {
+    // The Word sibling of `group2_dword_rotate_register_form_is_lowered`, and the ONLY test that
+    // can detect the classify arm's `insn.operand_size == OperandSize::Word` refusal being
+    // deleted from underneath a passing dword battery -- that refusal used to sit between the
+    // `m.reg` guard and the `Some(DirectKind::RotateReg { .. })` return, so a dword-only positive
+    // test cannot see it. `123-talk-shareware`'s `0xD1 word register /1` (29.70M runtime hits, its
+    // #1 census row) and `21-for-1-to-4`'s `0xD0 word register /1` (13.50M) are both this arm at
+    // `operand_size: Word`, reached with a 0x66 prefix in a 32-bit segment (below) and with no
+    // prefix at all in a 16-bit one (`the_word_size_group_two_shapes_...` fixtures cover the
+    // segment-default path).
+    select_rotate_rows(true);
+    for code in [
+        vec![0x66u8, 0xc1, 0xcb, 0x10], // ror bx, 16
+        vec![0x66, 0xc1, 0xcb, 0x01],   // ror bx, 1
+        vec![0x66, 0xc1, 0xcb, 0x00],   // ror bx, 0, the no-op shape still has to ADMIT
+        vec![0x66, 0xd1, 0xcb],         // ror bx, 1 via the 0xD1 encoding
+        vec![0x66, 0xc1, 0xc3, 0x10],   // rol bx, 16
+        vec![0x66, 0xc1, 0xc3, 0x01],   // rol bx, 1
+        vec![0x66, 0xc1, 0xc3, 0x00],   // rol bx, 0, the no-op shape
+        vec![0x66, 0xd1, 0xc3],         // rol bx, 1 via the 0xD1 encoding
+    ] {
+        assert_eq!(
+            compile_leading_block(&code),
+            Some(3),
+            "word rotate {code:02x?} must admit and carry the whole three-slot block"
         );
     }
 }

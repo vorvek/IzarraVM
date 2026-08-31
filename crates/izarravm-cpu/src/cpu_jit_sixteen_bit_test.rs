@@ -946,6 +946,81 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
     jit::direct::set_count_lanes_for_test(None);
 }
 
+/// The rotate sibling of the fixture above, for the identical hazard on `RotateReg`.
+///
+/// `vorvek/direct-word-rot1` gave `RotateReg` a `width` field and admitted `0xC1`/`0xD1 /0,/1` at
+/// Word, which puts the SAME shape past `count_lane_for` that the shift fixture above catches: an
+/// unprefixed `c1 c0 03` (`rol ax, 3`) in a CS.D=0 segment decodes at `OperandSize::Word` with
+/// default prefixes, `disp_len 0`, `imm_len 1`, `len 3` -- every bar the lane matcher tests bar
+/// its own kind's width. `count_lane_for`'s kind guard now reads `RotateReg { width:
+/// MemoryWidth::Dword, .. }` rather than a bare `lane: None`, for exactly this reason: without it
+/// the lane would attach and `emit_rotate_reg_lane` -- which has no Word arm -- would be reached
+/// with a Word rotate and panic the compiler the same way the shift arm once did.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_word_rotate_in_a_sixteen_bit_segment_takes_no_count_lane() {
+    jit::direct::set_count_lanes_for_test(Some(true));
+    let mut memory = vec![0u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + 7].copy_from_slice(&[
+        0x40, // inc ax
+        0xc1, 0xc0, 0x03, // rol ax, 3   -- Word by CS.D, no prefix, three bytes
+        0xd1, 0xc8, // ror ax, 1   -- the by-one shape, likewise Word
+        0xf4, // hlt
+    ]);
+    let mut bus = sixteen_bit_bus(memory.clone());
+    let mut cpu = sixteen_bit_code_cpu(ENTRY);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000]);
+    warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 4]);
+
+    // The compile itself is the crash site. `install_sixteen_bit_block` panics on a reject, so
+    // reaching past it says the walk completed.
+    let compilation = match jit::direct::compile(&mut cpu, ENTRY, false) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("the Word rotate block must still compile: structural reject")
+        }
+        jit::direct::CompileOutcome::Retry(_) => {
+            panic!("the Word rotate block must still compile: retry")
+        }
+    };
+    assert_eq!(
+        compilation.count_lane_count(),
+        0,
+        "a Word rotate must take no count lane; its emitter has no CL-form Word lane"
+    );
+    assert_eq!(compilation.imm_lane_count(), 0);
+
+    let block = install_sixteen_bit_block(&mut cpu, ENTRY, 3);
+    cpu.registers.gpr = [0; 8];
+    cpu.registers.set_eax(0xdead_1234);
+    cpu.set_eip(ENTRY);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+        "the baked-count Word rotate block must still run natively"
+    );
+
+    // The oracle: the same bytes interpreted, with no block at all.
+    let mut interpreter_bus = sixteen_bit_bus(memory);
+    let mut interpreter = sixteen_bit_code_cpu(ENTRY);
+    interpreter.registers.gpr = [0; 8];
+    interpreter.registers.set_eax(0xdead_1234);
+    interpreter.set_eip(ENTRY);
+    for _ in 0..3 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+    assert_eq!(
+        crate::tests::settled_registers(&cpu),
+        crate::tests::settled_registers(&interpreter),
+        "the baked Word rotate lowering must still match the interpreter"
+    );
+    assert_eq!(cpu.eflags(), interpreter.eflags());
+    jit::direct::set_count_lanes_for_test(None);
+}
+
 // ---------------------------------------------------------------------------
 // 6. S6: under AddressWrap::Word the segment-limit compare can be DEAD CODE.
 // ---------------------------------------------------------------------------
