@@ -65,13 +65,13 @@ impl ScreenDumper {
 
     /// Sample after a completed run slice. Errors are reported and swallowed:
     /// a full disk must not take the run down.
-    pub fn after_slice(&mut self, machine: &Machine) {
+    pub fn after_slice(&mut self, machine: &mut Machine) {
         if let Err(error) = self.sample(machine) {
             eprintln!("screen-dump: {error}");
         }
     }
 
-    fn sample(&mut self, machine: &Machine) -> std::io::Result<()> {
+    fn sample(&mut self, machine: &mut Machine) -> std::io::Result<()> {
         let frame = machine.presented_frame_argb();
         let display = machine.active_display();
         let mode = (display == ActiveDisplay::VgaRaster).then(|| machine.active_video_mode());

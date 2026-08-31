@@ -1130,7 +1130,7 @@ fn presented_frame_generation_waits_for_the_matching_completed_raster() {
 
 #[test]
 fn a_machine_that_has_completed_no_frame_presents_nothing() {
-    let machine = test_machine();
+    let mut machine = test_machine();
     assert!(
         machine.presented_frame_argb().is_none(),
         "a frame that does not exist must not be substituted"

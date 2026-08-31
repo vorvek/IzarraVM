@@ -177,7 +177,7 @@ fn triangle_cmd_depth_test_rejects_farther_pixels_and_counts_failures() {
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x00ff_0000);
     assert_eq!(frame[1], 0x00ff_0000);
-    assert_ne!(read_reg(&distira, SST_FBI_ZFUNC_FAIL), 0);
+    assert_ne!(read_reg(&mut distira, SST_FBI_ZFUNC_FAIL), 0);
 }
 
 #[test]
@@ -401,7 +401,7 @@ fn triangle_cmd_alpha_test_rejects_pixels_below_reference() {
     assert_eq!(frame[0], 0x0000_0000);
     assert_eq!(frame[1], 0x00ff_0000);
     assert_eq!(frame[2], 0x00ff_0000);
-    assert_ne!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_ne!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -455,7 +455,7 @@ fn triangle_cmd_alpha_test_uses_texture_alpha_when_selected() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_0000);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -510,7 +510,7 @@ fn triangle_cmd_alpha_zero_other_rejects_texture_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -565,7 +565,7 @@ fn triangle_cmd_alpha_subtracts_local_from_texture_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -624,7 +624,7 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_local_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -683,7 +683,7 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_local_alpha_2() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -742,7 +742,7 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_other_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -797,7 +797,7 @@ fn triangle_cmd_alpha_modulates_iterated_alpha_by_texture_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -852,7 +852,7 @@ fn triangle_cmd_alpha_adds_local_alpha_to_texture_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff00);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -907,7 +907,7 @@ fn triangle_cmd_alpha_adds_local_alpha_with_saturation() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff00);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -963,7 +963,7 @@ fn triangle_cmd_alpha_subtracts_before_adding_local_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -1002,7 +1002,7 @@ fn untextured_alpha_path_selects_color_registers_and_combines_them() {
     write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x0000_ff00);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -1065,7 +1065,7 @@ fn triangle_cmd_alpha_subtracts_then_modulates_then_adds_local_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff00);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -1120,7 +1120,7 @@ fn triangle_cmd_alpha_adds_local_alpha_for_clocal_add_mode() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff00);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -1175,7 +1175,7 @@ fn triangle_cmd_alpha_inverts_texture_alpha_output() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff00);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -1230,7 +1230,7 @@ fn triangle_cmd_alpha_nonreverse_modulates_by_inverted_local_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -1285,7 +1285,7 @@ fn triangle_cmd_alpha_selects_color1_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -1348,7 +1348,7 @@ fn triangle_cmd_alpha_selects_color0_as_local_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -1410,7 +1410,7 @@ fn triangle_cmd_alpha_selects_iter_z_as_local_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -1472,7 +1472,7 @@ fn ftriangle_cmd_alpha_selects_float_iter_z_as_local_alpha() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 6);
 }
 
 #[test]
@@ -1512,7 +1512,7 @@ fn ftriangle_cmd_alpha_test_uses_float_alpha_derivatives() {
     assert_eq!(frame[0], 0x0000_0000);
     assert_eq!(frame[1], 0x00ff_0000);
     assert_eq!(frame[2], 0x00ff_0000);
-    assert_ne!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+    assert_ne!(read_reg(&mut distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
 #[test]
@@ -1633,7 +1633,7 @@ fn triangle_cmd_chroma_key_rejects_matching_source_color() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_CHROMA_FAIL), 6);
 }
 
 #[test]
@@ -1678,7 +1678,7 @@ fn triangle_cmd_chroma_key_rejects_matching_texture_color() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_CHROMA_FAIL), 6);
 }
 
 #[test]
@@ -1724,7 +1724,7 @@ fn triangle_cmd_chroma_key_checks_cother_before_color_combining() {
     write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x0000_00ff);
-    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_CHROMA_FAIL), 6);
 }
 
 #[test]

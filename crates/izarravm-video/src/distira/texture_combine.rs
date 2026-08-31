@@ -3,7 +3,7 @@
 
 use super::*;
 
-impl Distira {
+impl RasterView<'_> {
     pub(super) fn selected_color_or_source(
         &self,
         position: (u32, u32),

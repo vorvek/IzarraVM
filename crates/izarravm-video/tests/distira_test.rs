@@ -28,7 +28,7 @@ use izarravm_video::{
     SST_VERTEX_CY, SST_VIDEO_DIMENSIONS, SST_ZA_COLOR, TEX_R5G6B5, TEXTUREMODE_LOCAL,
 };
 
-fn read_reg(distira: &Distira, reg: usize) -> u32 {
+fn read_reg(distira: &mut Distira, reg: usize) -> u32 {
     (0..4)
         .map(|i| u32::from(distira.read_mmio_u8(reg + i)) << (i * 8))
         .fold(0, |a, b| a | b)
@@ -61,3 +61,6 @@ mod perspective_lod;
 
 #[path = "distira/ncc_test.rs"]
 mod ncc;
+
+#[path = "distira/raster_queue_test.rs"]
+mod raster_queue;

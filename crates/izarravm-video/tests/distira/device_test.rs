@@ -5,15 +5,15 @@ use super::*;
 
 #[test]
 fn custom_identity_and_capabilities_are_readable() {
-    let distira = Distira::new();
+    let mut distira = Distira::new();
 
-    assert_eq!(read_reg(&distira, DISTIRA_REG_ID), DISTIRA_ID_VALUE);
-    assert_eq!(read_reg(&distira, DISTIRA_REG_CAPS), DISTIRA_CAPS_VALUE);
+    assert_eq!(read_reg(&mut distira, DISTIRA_REG_ID), DISTIRA_ID_VALUE);
+    assert_eq!(read_reg(&mut distira, DISTIRA_REG_CAPS), DISTIRA_CAPS_VALUE);
 }
 
 #[test]
 fn unknown_sst_register_reads_return_open_bus() {
-    assert_eq!(read_reg(&Distira::new(), 0x1d0), u32::MAX);
+    assert_eq!(read_reg(&mut Distira::new(), 0x1d0), u32::MAX);
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn fbi_chip_alias_updates_triangle_registers() {
     write_reg(&mut distira, FBI | SST_TRIANGLE_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x00ff_0000);
-    assert_eq!(read_reg(&distira, FBI | SST_VERTEX_BX), 4 << 4);
+    assert_eq!(read_reg(&mut distira, FBI | SST_VERTEX_BX), 4 << 4);
 }
 
 #[test]
@@ -214,8 +214,8 @@ fn adjacent_sst_quads_share_their_edge_without_a_seam() {
     draw_quad(&mut distira, 16 << 4, 32 << 4, 0x0000_ff00);
 
     let frame = distira.scanout_argb();
-    assert_eq!(read_reg(&distira, SST_FBI_PIXELS_IN), 32 * 16);
-    assert_eq!(read_reg(&distira, SST_FBI_PIXELS_OUT), 32 * 16);
+    assert_eq!(read_reg(&mut distira, SST_FBI_PIXELS_IN), 32 * 16);
+    assert_eq!(read_reg(&mut distira, SST_FBI_PIXELS_OUT), 32 * 16);
     for y in 0..16 {
         assert_eq!(frame[y * 32 + 15], 0x00ff_0000, "left tile row {y}");
         assert_eq!(frame[y * 32 + 16], 0x0000_ff00, "right tile row {y}");
@@ -240,8 +240,8 @@ fn fbi_pixel_counters_do_not_depend_on_write_masks() {
     write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
 
-    assert_eq!(read_reg(&distira, SST_FBI_PIXELS_IN), 6);
-    assert_eq!(read_reg(&distira, SST_FBI_PIXELS_OUT), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_PIXELS_IN), 6);
+    assert_eq!(read_reg(&mut distira, SST_FBI_PIXELS_OUT), 6);
     assert!(distira.scanout_argb().iter().all(|&pixel| pixel == 0));
 }
 
@@ -300,7 +300,7 @@ fn nop_command_bit_zero_resets_all_fbi_pixel_counters() {
     assert!(
         counters
             .into_iter()
-            .all(|counter| read_reg(&distira, counter) != 0)
+            .all(|counter| read_reg(&mut distira, counter) != 0)
     );
 
     write_reg(&mut distira, SST_NOP_CMD, 0);
@@ -308,14 +308,14 @@ fn nop_command_bit_zero_resets_all_fbi_pixel_counters() {
     assert!(
         counters
             .into_iter()
-            .all(|counter| read_reg(&distira, counter) != 0)
+            .all(|counter| read_reg(&mut distira, counter) != 0)
     );
 
     write_reg(&mut distira, SST_NOP_CMD, 1);
     assert!(
         counters
             .into_iter()
-            .all(|counter| read_reg(&distira, counter) == 0)
+            .all(|counter| read_reg(&mut distira, counter) == 0)
     );
 }
 
@@ -350,8 +350,8 @@ fn triangle_stipple_pattern_rejects_masked_pixels() {
     );
 
     let frame = distira.scanout_argb();
-    assert_eq!(read_reg(&distira, SST_FBI_PIXELS_IN), 8 * 4);
-    assert_eq!(read_reg(&distira, SST_FBI_PIXELS_OUT), 1);
+    assert_eq!(read_reg(&mut distira, SST_FBI_PIXELS_IN), 8 * 4);
+    assert_eq!(read_reg(&mut distira, SST_FBI_PIXELS_OUT), 1);
     assert_eq!(frame[0], 0x00ff_0000);
     assert!(frame[1..].iter().all(|&pixel| pixel == 0));
 }
@@ -463,18 +463,18 @@ fn alternate_register_map_routes_glide_setup_columns() {
     distira.set_init_enable(INIT_ENABLE_WRITE);
 
     write_reg(&mut distira, ALT | 0x024, 0x0011_1111);
-    assert_eq!(read_reg(&distira, SST_START_G), 0x0011_1111);
-    assert_eq!(read_reg(&distira, SST_DR_DX), 0);
+    assert_eq!(read_reg(&mut distira, SST_START_G), 0x0011_1111);
+    assert_eq!(read_reg(&mut distira, SST_DR_DX), 0);
 
     write_reg(&mut distira, SST_FBI_INIT3, FBIINIT3_REMAP);
     write_reg(&mut distira, ALT | 0x020, 0x0022_2222);
     write_reg(&mut distira, ALT | 0x024, 0x0033_3333);
     write_reg(&mut distira, ALT | 0x028, 0x0044_4444);
     write_reg(&mut distira, ALT | 0x02c, 0x0055_5555);
-    assert_eq!(read_reg(&distira, SST_START_R), 0x0022_2222);
-    assert_eq!(read_reg(&distira, SST_DR_DX), 0x0033_3333);
-    assert_eq!(read_reg(&distira, SST_DR_DY), 0x0044_4444);
-    assert_eq!(read_reg(&distira, SST_START_G), 0x0055_5555);
+    assert_eq!(read_reg(&mut distira, SST_START_R), 0x0022_2222);
+    assert_eq!(read_reg(&mut distira, SST_DR_DX), 0x0033_3333);
+    assert_eq!(read_reg(&mut distira, SST_DR_DY), 0x0044_4444);
+    assert_eq!(read_reg(&mut distira, SST_START_G), 0x0055_5555);
 
     distira.set_frame_size(4, 4);
     assert!(distira.queue_texture_write_u32(0, 0x07e0_f800));
@@ -516,9 +516,9 @@ fn alternate_register_map_routes_glide_setup_columns() {
     ] {
         write_reg(&mut distira, ALT | register, value.to_bits());
     }
-    assert_eq!(read_reg(&distira, SST_FSTART_R), 255.0f32.to_bits());
-    assert_eq!(read_reg(&distira, SST_FDR_DX), 2.0f32.to_bits());
-    assert_eq!(read_reg(&distira, SST_FDR_DY), 3.0f32.to_bits());
+    assert_eq!(read_reg(&mut distira, SST_FSTART_R), 255.0f32.to_bits());
+    assert_eq!(read_reg(&mut distira, SST_FDR_DX), 2.0f32.to_bits());
+    assert_eq!(read_reg(&mut distira, SST_FDR_DY), 3.0f32.to_bits());
 
     write_reg(&mut distira, ALT | SST_TRIANGLE_CMD, 0);
     write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
@@ -568,22 +568,22 @@ fn voodoo_registers_store_init_and_render_state() {
     write_reg(&mut distira, SST_CLIP_LEFT_RIGHT, (2 << 16) | 7);
     write_reg(&mut distira, SST_CLIP_LOW_Y_HIGH_Y, (3 << 16) | 9);
 
-    assert_eq!(read_reg(&distira, SST_STATUS) & 0x380, 0);
-    assert_eq!(read_reg(&distira, SST_FBI_INIT0), 0x0000_0003);
-    assert_eq!(read_reg(&distira, SST_FBI_INIT1), 0x0000_0100);
-    assert_eq!(read_reg(&distira, SST_FBI_INIT2), 0x0000_0200);
-    assert_eq!(read_reg(&distira, SST_FBI_INIT3), 0x0000_0601);
-    assert_eq!(read_reg(&distira, SST_LFB_MODE), 0x0000_0005);
-    assert_eq!(read_reg(&distira, SST_FBZ_MODE), FBZ_RGB_WMASK);
-    assert_eq!(read_reg(&distira, SST_ALPHA_MODE), 0x0001_0001);
-    assert_eq!(read_reg(&distira, SST_CLIP_LEFT_RIGHT), (2 << 16) | 7);
-    assert_eq!(read_reg(&distira, SST_CLIP_LOW_Y_HIGH_Y), (3 << 16) | 9);
+    assert_eq!(read_reg(&mut distira, SST_STATUS) & 0x380, 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT0), 0x0000_0003);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT1), 0x0000_0100);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT2), 0x0000_0200);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT3), 0x0000_0601);
+    assert_eq!(read_reg(&mut distira, SST_LFB_MODE), 0x0000_0005);
+    assert_eq!(read_reg(&mut distira, SST_FBZ_MODE), FBZ_RGB_WMASK);
+    assert_eq!(read_reg(&mut distira, SST_ALPHA_MODE), 0x0001_0001);
+    assert_eq!(read_reg(&mut distira, SST_CLIP_LEFT_RIGHT), (2 << 16) | 7);
+    assert_eq!(read_reg(&mut distira, SST_CLIP_LOW_Y_HIGH_Y), (3 << 16) | 9);
 }
 
 #[test]
 fn fbi_init_register_writes_require_pci_init_enable() {
     let mut distira = Distira::new();
-    let initial_init2 = read_reg(&distira, SST_FBI_INIT2);
+    let initial_init2 = read_reg(&mut distira, SST_FBI_INIT2);
 
     write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_GRAPHICS_RESET);
     write_reg(
@@ -593,13 +593,13 @@ fn fbi_init_register_writes_require_pci_init_enable() {
     );
     write_reg(&mut distira, SST_FBI_INIT4, 0x1234_5678);
 
-    assert_eq!(read_reg(&distira, SST_FBI_INIT0), 0);
-    assert_eq!(read_reg(&distira, SST_FBI_INIT2), initial_init2);
-    assert_eq!(read_reg(&distira, SST_FBI_INIT4), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT0), 0);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT2), initial_init2);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT4), 0);
 
     distira.set_init_enable(INIT_ENABLE_WRITE);
     write_reg(&mut distira, SST_FBI_INIT4, 0x1234_5678);
-    assert_eq!(read_reg(&distira, SST_FBI_INIT4), 0x1234_5678);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT4), 0x1234_5678);
 }
 
 #[test]
@@ -643,7 +643,7 @@ fn voodoo_texture_detail_register_round_trips() {
 
     write_reg(&mut distira, SST_TDETAIL, 0x0001_c23f);
 
-    assert_eq!(read_reg(&distira, SST_TDETAIL), 0x0001_c23f);
+    assert_eq!(read_reg(&mut distira, SST_TDETAIL), 0x0001_c23f);
 }
 
 #[test]
@@ -694,17 +694,17 @@ fn swapbuffer_command_distinguishes_immediate_and_retrace_swaps() {
     immediate.clear_back_rgb(0xff, 0, 0);
     write_reg(&mut immediate, SST_SWAPBUFFER_CMD, 0);
     assert_eq!(immediate.scanout_argb(), vec![0x00ff_0000]);
-    assert_eq!(read_reg(&immediate, SST_STATUS) & STATUS_BUSY, 0);
-    assert_eq!(read_reg(&immediate, SST_STATUS) & STATUS_SWAP_COUNT, 0);
+    assert_eq!(read_reg(&mut immediate, SST_STATUS) & STATUS_BUSY, 0);
+    assert_eq!(read_reg(&mut immediate, SST_STATUS) & STATUS_SWAP_COUNT, 0);
 
     let mut queued = Distira::new();
     queued.set_frame_size(1, 1);
     queued.clear_back_rgb(0xff, 0, 0);
     write_reg(&mut queued, SST_SWAPBUFFER_CMD, 1);
     assert_eq!(queued.scanout_argb(), vec![0]);
-    assert_eq!(read_reg(&queued, SST_STATUS) & STATUS_BUSY, STATUS_BUSY);
+    assert_eq!(read_reg(&mut queued, SST_STATUS) & STATUS_BUSY, STATUS_BUSY);
     assert_eq!(
-        read_reg(&queued, SST_STATUS) & STATUS_SWAP_COUNT,
+        read_reg(&mut queued, SST_STATUS) & STATUS_SWAP_COUNT,
         0x1000_0000
     );
 
@@ -712,9 +712,9 @@ fn swapbuffer_command_distinguishes_immediate_and_retrace_swaps() {
     assert_eq!(queued.scanout_argb(), vec![0]);
     queued.advance_frame_phase(1);
     assert_eq!(queued.scanout_argb(), vec![0x00ff_0000]);
-    assert_eq!(read_reg(&queued, SST_STATUS) & STATUS_BUSY, 0);
-    assert_eq!(read_reg(&queued, SST_STATUS) & STATUS_SWAP_COUNT, 0);
-    assert_eq!(read_reg(&queued, SST_STATUS) & 0x40, 0);
+    assert_eq!(read_reg(&mut queued, SST_STATUS) & STATUS_BUSY, 0);
+    assert_eq!(read_reg(&mut queued, SST_STATUS) & STATUS_SWAP_COUNT, 0);
+    assert_eq!(read_reg(&mut queued, SST_STATUS) & 0x40, 0);
 }
 
 #[test]
@@ -726,13 +726,13 @@ fn retrace_swap_honors_the_requested_interval() {
 
     distira.advance_frame_phase(480);
     assert_eq!(distira.scanout_argb(), vec![0]);
-    assert_ne!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+    assert_ne!(read_reg(&mut distira, SST_STATUS) & 0x380, 0);
 
     distira.advance_frame_phase(524);
     assert_eq!(distira.scanout_argb(), vec![0]);
     distira.advance_frame_phase(1);
     assert_eq!(distira.scanout_argb(), vec![0x0000_ff00]);
-    assert_eq!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+    assert_eq!(read_reg(&mut distira, SST_STATUS) & 0x380, 0);
 }
 
 #[test]
@@ -745,16 +745,22 @@ fn queued_retrace_swaps_commit_in_submission_order() {
     distira.clear_back_rgb(0, 0, 0xff);
     write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
 
-    assert_eq!(read_reg(&distira, SST_STATUS) & 0x7000_0000, 0x2000_0000);
+    assert_eq!(
+        read_reg(&mut distira, SST_STATUS) & 0x7000_0000,
+        0x2000_0000
+    );
     distira.advance_frame_phase(480);
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
-    assert_eq!(read_reg(&distira, SST_STATUS) & 0x7000_0000, 0x1000_0000);
-    assert_ne!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+    assert_eq!(
+        read_reg(&mut distira, SST_STATUS) & 0x7000_0000,
+        0x1000_0000
+    );
+    assert_ne!(read_reg(&mut distira, SST_STATUS) & 0x380, 0);
 
     distira.advance_frame_phase(525);
     assert_eq!(distira.scanout_argb(), vec![0x0000_00ff]);
-    assert_eq!(read_reg(&distira, SST_STATUS) & 0x7000_0000, 0);
-    assert_eq!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+    assert_eq!(read_reg(&mut distira, SST_STATUS) & 0x7000_0000, 0);
+    assert_eq!(read_reg(&mut distira, SST_STATUS) & 0x380, 0);
 }
 
 #[test]
@@ -772,7 +778,7 @@ fn retrace_swap_is_invariant_to_split_frame_advances() {
 
     assert_eq!(split, whole);
     assert_eq!(whole.scanout_argb(), vec![0x0000_00ff]);
-    assert_eq!(read_reg(&whole, SST_STATUS) & 0x380, 0);
+    assert_eq!(read_reg(&mut whole, SST_STATUS) & 0x380, 0);
 }
 
 #[test]
@@ -823,12 +829,12 @@ fn voodoo_fifo_drains_queued_register_and_lfb_writes_in_order() {
     assert_eq!(queued.fifo_depth(), 8);
     assert!(!queued.fifo_is_empty());
     assert!(!queued.fifo_is_full());
-    assert_ne!(read_reg(&queued, SST_STATUS) & 0x380, 0);
+    assert_ne!(read_reg(&mut queued, SST_STATUS) & 0x380, 0);
 
     queued.drain_fifo();
 
     assert!(queued.fifo_is_empty());
-    assert_eq!(read_reg(&queued, SST_STATUS) & 0x380, 0);
+    assert_eq!(read_reg(&mut queued, SST_STATUS) & 0x380, 0);
     assert_eq!(queued.scanout_argb(), direct.scanout_argb());
 }
 
@@ -945,7 +951,7 @@ fn dac_data_write_side_effects_are_accepted_without_special_casing() {
         SST_DAC_DATA,
         (5 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
     );
-    assert_eq!(read_reg(&distira, SST_FBI_INIT2) & 0xff, 0xff);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT2) & 0xff, 0xff);
 }
 
 #[test]
@@ -963,7 +969,7 @@ fn dac_read_cycle_returns_the_addressed_register() {
         (2 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
     );
     assert_eq!(
-        read_reg(&distira, SST_FBI_INIT2) & 0xff,
+        read_reg(&mut distira, SST_FBI_INIT2) & 0xff,
         0x42,
         "register 2 reads back its own byte"
     );
@@ -985,7 +991,7 @@ fn fbi_init2_reads_raw_storage_when_remap_bit_is_clear() {
         (5 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
     );
 
-    assert_eq!(read_reg(&distira, SST_FBI_INIT2), 0x0000_0200);
+    assert_eq!(read_reg(&mut distira, SST_FBI_INIT2), 0x0000_0200);
 }
 
 #[test]
@@ -1272,7 +1278,7 @@ fn z_buffer_mode_is_unaffected_by_the_w_buffer_wiring() {
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x00ff_0000);
     assert_eq!(frame[1], 0x00ff_0000);
-    assert_ne!(read_reg(&distira, SST_FBI_ZFUNC_FAIL), 0);
+    assert_ne!(read_reg(&mut distira, SST_FBI_ZFUNC_FAIL), 0);
 }
 
 #[test]
@@ -1287,22 +1293,22 @@ fn v_retrace_and_status_bit_toggle_so_a_poll_loop_terminates() {
     let mut distira = Distira::new();
     distira.set_frame_size(64, 48);
 
-    let mut saw_not_retracing = (read_reg(&distira, SST_STATUS) & 0x40) != 0;
-    let mut saw_retracing = (read_reg(&distira, SST_STATUS) & 0x40) == 0;
-    let initial_v_retrace = read_reg(&distira, SST_V_RETRACE);
+    let mut saw_not_retracing = (read_reg(&mut distira, SST_STATUS) & 0x40) != 0;
+    let mut saw_retracing = (read_reg(&mut distira, SST_STATUS) & 0x40) == 0;
+    let initial_v_retrace = read_reg(&mut distira, SST_V_RETRACE);
     let mut v_retrace_changed = false;
     let mut hv_retrace_nonzero = false;
 
     for _ in 0..2000 {
         distira.advance_frame_phase(10_000);
-        let status = read_reg(&distira, SST_STATUS);
+        let status = read_reg(&mut distira, SST_STATUS);
         if status & 0x40 != 0 {
             saw_not_retracing = true;
         } else {
             saw_retracing = true;
         }
-        let v_retrace = read_reg(&distira, SST_V_RETRACE);
-        let hv_retrace = read_reg(&distira, SST_HV_RETRACE);
+        let v_retrace = read_reg(&mut distira, SST_V_RETRACE);
+        let hv_retrace = read_reg(&mut distira, SST_HV_RETRACE);
         assert_eq!(hv_retrace & 0x1fff, v_retrace);
         assert_eq!(hv_retrace >> 16, 0);
         if v_retrace != initial_v_retrace {
