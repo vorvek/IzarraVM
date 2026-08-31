@@ -23,7 +23,7 @@
     "dukemark_samples_tolerance": 0.02
   },
   "gp2-586": {
-    "frame_sha256": "91fa3e01d22bd6eda86ac2043e2dea5db935f05b9339862927fd22087e8fea0a"
+    "frame_sha256": "1945b7ca1884cf31fbf9d9ab02f7a0ae348ce6591c5c4c513b2502791ce84cf2"
   },
   "nascar-586": {
     "anchor_frame_sha256": [
@@ -37,7 +37,7 @@
     "final_nonblack_percent_min": 84.0
   },
   "prince-486": {
-    "frame_sha256": "802e9d4fc0976be23a9748dbbe51f6f082d4af998b7868545136028377442bac"
+    "frame_sha256": "e312f8f366a68442a247df6bc9bf51290ed41e4d49e89564c320c78739a42986"
   },
   "psycho-486": {
     "anchor_frame_sha256": [
