@@ -229,14 +229,17 @@ fn out_imm8_admits_any_port_unconditionally() {
     }
 }
 
-/// The Word gate: `0xE6` is NOT on `classify`'s Word-size allowlist, so a 16-bit code segment
-/// refuses it on BOTH arms of the knob. This is the campaign's standing refusal on unmeasured
-/// admissions -- gp2's site is 32-bit, and no fixture measures a 16-bit `0xE6` row worth admitting
-/// (wolf3d's whole `0xE6` population is 15,919 exits).
+/// The Word gate, RE-OPENED by the corpus campaign's L2 slice: `0xE6` is now on `classify`'s
+/// Word-size allowlist, so a 16-bit code segment refuses `0xE6` on the OFF arm (the knob's
+/// pre-slice base, `non_continuable`) and ADMITS it as a call-out slot on the ON arm, exactly as
+/// the 32-bit form already does. The standing refusal this used to pin is gone: the corpus
+/// supplied the missing measurement (123-talk-shareware 238,768 unbound exits on this exact row,
+/// its #1 `non_continuable` row; 1000-miglia 173,344; 100-000-pyramid 11,530).
 ///
-/// Catches: an allowlist term added to the Word gate by proximity to `0xE4`'s.
+/// Catches: the ON arm compiling on neither leg (the admission silently regressing) or the OFF
+/// arm compiling on either leg (a Word admission that leaked past the knob).
 #[test]
-fn out_imm8_stays_a_barrier_in_a_sixteen_bit_segment_on_both_arms() {
+fn out_imm8_is_barred_off_and_admitted_on_in_a_sixteen_bit_segment() {
     let code = [0x89, 0xf6, 0xe6, PORT, 0x89, 0xff];
     let mut memory = vec![0u8; 0x5000];
     memory[(ENTRY - 1) as usize] = 0x90;
@@ -256,46 +259,54 @@ fn out_imm8_stays_a_barrier_in_a_sixteen_bit_segment_on_both_arms() {
         cpu.fetch_decoded(&mut bus, linear).unwrap();
     }
 
-    for arm in [false, true] {
-        let _guard = select_out_imm8_rows(arm);
+    {
+        let _guard = select_out_imm8_rows(false);
         assert!(
             matches!(
                 jit::direct::compile(&mut cpu, ENTRY, false),
                 jit::direct::CompileOutcome::StructuralReject(_)
                     | jit::direct::CompileOutcome::Retry(_)
             ),
-            "arm={arm}: a 16-bit segment must refuse 0xE6 whichever way the knob is set"
+            "the OFF arm must still refuse a 16-bit `0xE6`"
         );
+    }
+    {
+        let _guard = select_out_imm8_rows(true);
+        let compilation = match jit::direct::compile(&mut cpu, ENTRY, false) {
+            jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+            _ => panic!("the ON arm must admit a 16-bit `0xE6`"),
+        };
+        assert_eq!(
+            compilation.span.instructions, 2,
+            "the walk must stop AT the call-out: its step break is unconditional"
+        );
+        assert_eq!(compilation.callout_slots, 1);
     }
 }
 
-/// **THE ROW MUST NOT RELOCATE.** The test above says a 16-bit `0xE6` compiles on neither arm,
-/// and that assertion passes whether the refusal is made in `jit_admits_non_continuable` or one
-/// step later by `classify` returning `None` -- so on its own it cannot see the defect this
-/// fixture exists for.
+/// **THE OFF ARM'S ROW MUST NOT RELOCATE, and the ON arm's row must DISAPPEAR (0 exits), not
+/// move.** The test above says the OFF arm still refuses a 16-bit `0xE6` and the ON arm now
+/// compiles it; this fixture is the barrier-census half of that claim, read with the census
+/// enabled on the OFF arm alone (the ON arm produces no barrier row at all, because it compiles).
 ///
-/// The defect: admit `0xE6` on the opcode ALONE and a 16-bit site stops with
-/// `BarrierStop::HardBoundary` on the ON arm where the OFF arm stopped it with `NonContinuable`.
-/// Neither arm compiles the block, so nothing about the guest moves -- but the barrier census row
-/// MOVES BETWEEN STOP ARMS, and the two-arm reconciliation this slice will be judged by reads
-/// "exactly one row removed, zero rows new" ([[overlapping-slices-measure-leftovers]]). A
-/// relocated row is a new row. `retf_admitted_here`'s own doc states the rule this enforces:
-/// "a RETF admitted into the walk and then refused a kind would end the block on a different
-/// reason and move a census row".
-///
-/// So this reads the recorded `stop_reason` on BOTH arms with the census enabled and requires
-/// them equal. It goes RED if the operand-size term is deleted from the predicate.
+/// Before the corpus L2 slice, the historical defect this fixture guarded against was admitting
+/// `0xE6` on the opcode ALONE and having a 16-bit site stop with `BarrierStop::HardBoundary` on
+/// the ON arm where the OFF arm stopped it with `NonContinuable` -- a relocated row rather than a
+/// vanished one, which the two-arm reconciliation
+/// ([[overlapping-slices-measure-leftovers]]) would have misread. Now that the Word admission is
+/// real and knob-gated in `classify` itself (not just in `jit_admits_non_continuable`), the ON
+/// arm's row does not relocate, it is retired: `compile` returns `Compiled`, not
+/// `StructuralReject`, so no barrier is recorded for it at all. This fixture pins the OFF arm's
+/// row identity, which is what a revert of the Word allowlist entry (leaving the
+/// `jit_admits_non_continuable` term behind) would move.
 #[test]
-fn out_imm8_does_not_relocate_the_sixteen_bit_barrier_row_between_arms() {
-    fn recorded_stop_reason(arm: bool) -> String {
-        let _guard = select_out_imm8_rows(arm);
+fn out_imm8_off_arm_keeps_its_pre_slice_barrier_row() {
+    fn fixture_cpu_and_bus() -> (CpuGsw, TestBus) {
         let code = [0x89, 0xf6, 0xe6, PORT, 0x89, 0xff];
         let mut memory = vec![0u8; 0x5000];
         memory[(ENTRY - 1) as usize] = 0x90;
         memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
 
-        // A FRESH CPU per arm: the census accumulates, and two arms sharing one would compare a
-        // row against itself.
         let mut cpu = CpuGsw::default();
         cpu.set_mode(GswMode::Gsw586);
         cpu.load_segment_real(SegmentIndex::Cs, 0);
@@ -309,13 +320,19 @@ fn out_imm8_does_not_relocate_the_sixteen_bit_barrier_row_between_arms() {
             cpu.set_eip(linear);
             cpu.fetch_decoded(&mut bus, linear).unwrap();
         }
+        (cpu, bus)
+    }
+
+    {
+        let _guard = select_out_imm8_rows(false);
+        let (mut cpu, _bus) = fixture_cpu_and_bus();
         assert!(
             matches!(
                 jit::direct::compile(&mut cpu, ENTRY, false),
                 jit::direct::CompileOutcome::StructuralReject(_)
                     | jit::direct::CompileOutcome::Retry(_)
             ),
-            "arm={arm}: the fixture is only about WHICH refusal, not whether"
+            "the OFF arm must refuse"
         );
         let snapshot = cpu
             .direct_barrier_census_snapshot()
@@ -324,20 +341,35 @@ fn out_imm8_does_not_relocate_the_sixteen_bit_barrier_row_between_arms() {
             .rows
             .iter()
             .find(|row| row.opcode == 0xe6)
-            .unwrap_or_else(|| panic!("arm={arm}: no 0xE6 barrier row was recorded at all"));
-        row.stop_reason.to_string()
+            .expect("the OFF arm must record its own 0xE6 barrier row");
+        assert_eq!(
+            row.stop_reason.to_string(),
+            "non_continuable",
+            "the OFF arm must be main's own row, or this fixture is comparing against a moved \
+             base"
+        );
     }
-
-    let off = recorded_stop_reason(false);
-    let on = recorded_stop_reason(true);
-    assert_eq!(
-        off, "non_continuable",
-        "the OFF arm must be main's own row, or this fixture is comparing against a moved base"
-    );
-    assert_eq!(
-        on, off,
-        "the 16-bit `0xE6` row must carry the SAME stop arm on both knob arms: refusing Word in \
-         `classify` instead of in `jit_admits_non_continuable` relocates it to hard_boundary and \
-         the two-arm census reconciliation would read that as a new row"
-    );
+    {
+        // The ON arm's counterpart: it must not leave a barrier row behind AT ALL, because it
+        // compiles. A stray row here would mean the Word admission is real in `classify` but the
+        // compile walk still stopped short of it on some path -- the exact relocation defect this
+        // fixture used to detect by comparing two barrier rows, now detected instead by there
+        // being only one to find.
+        let _guard = select_out_imm8_rows(true);
+        let (mut cpu, _bus) = fixture_cpu_and_bus();
+        assert!(
+            matches!(
+                jit::direct::compile(&mut cpu, ENTRY, false),
+                jit::direct::CompileOutcome::Compiled(_)
+            ),
+            "the ON arm must admit a 16-bit `0xE6`"
+        );
+        let snapshot = cpu
+            .direct_barrier_census_snapshot()
+            .expect("the census was enabled");
+        assert!(
+            snapshot.rows.iter().all(|row| row.opcode != 0xe6),
+            "the ON arm compiled the block and must not also have recorded an 0xE6 barrier row"
+        );
+    }
 }

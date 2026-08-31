@@ -894,8 +894,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The gp2 `0xE6` OUT slice adds `CallOutTable::port_write_al_imm8` (8 bytes), moving the pin
     // 4576 -> 4584 -- measured, not derived. A host-side function-pointer slot, not architectural
     // state, so both canonical payloads are unchanged by it; see cpu_test.rs's twin comment.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4584);
+    // The `0xEE` OUT DX,AL slice adds `CallOutTable::port_write_al_dx` (8 bytes), moving the pin
+    // 4584 -> 4592 -- measured, not derived. Same shape again: a host-side function-pointer slot,
+    // not architectural state; see cpu_test.rs's twin comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4592);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4584);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4592);
 }

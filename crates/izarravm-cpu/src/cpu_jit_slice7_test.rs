@@ -465,12 +465,53 @@ fn sixteen_bit_three_operand_imul_is_still_a_barrier() {
 
 #[test]
 fn the_non_continuable_admission_is_narrow() {
-    // The predicate admits 0x69/0x6B and nothing else. These three are the other shapes the
-    // Slice 5 census named at that arm, and each must stay refused for its own reason: IRET
-    // loads CS, OUT sets `io_touched`, HLT stops the machine.
+    // The predicate admits 0x69/0x6B, `0xEE` (unconditionally, since the corpus L2 slice) and
+    // `0xE6` behind its knob, and nothing else. IRET and HLT are the other shapes the Slice 5
+    // census named at that arm, and each must stay refused for its own reason: IRET loads CS,
+    // HLT stops the machine. `0xEE` left this list when its call-out helper
+    // (`CallOutHelper::PortWriteAlDx`) gained the same V86-safe TSS-bitmap probe `0xEC`'s already
+    // has -- see `jit_admits_non_continuable`'s doc for the admission and
+    // `only_the_call_out_port_opcodes_are_admitted_at_word`
+    // (`cpu_jit_compile_outcome_test.rs`) for its own coverage.
     still_a_barrier(&[0xcf], "0xCF IRETD");
-    still_a_barrier(&[0xee], "0xEE OUT DX,AL");
     still_a_barrier(&[0xf4], "0xF4 HLT");
+}
+
+#[test]
+fn out_dx_is_admitted_not_a_barrier() {
+    // The narrow admission's positive control: `0xEE` alone, mid-block, must NOT take the
+    // `StructuralReject` path `still_a_barrier` asserts -- it is a call-out slot now, and its own
+    // suite (`cpu_jit_callout_test.rs`'s `out_dx_*` tests) covers the mechanism in full. This is
+    // just the narrow-admission fixture's mirror image, built with the same `LEAD`/`TAIL` shape
+    // `still_a_barrier` uses, so a future contributor reading this file top to bottom sees both
+    // directions of the claim in one place.
+    let mut code = LEAD.to_vec();
+    let body_at = ENTRY + code.len() as u32;
+    code.push(0xee);
+    let tail_at = ENTRY + code.len() as u32;
+    code.extend_from_slice(&TAIL);
+    code.push(0xf4);
+
+    let mut memory = vec![0u8; 0x5000];
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.registers.set_esp(STACK_TOP);
+    for &linear in &[ENTRY, body_at, tail_at] {
+        cpu.set_eip(linear);
+        cpu.fetch_decoded(&mut bus, linear).unwrap();
+    }
+    assert!(
+        matches!(
+            jit::direct::compile(&mut cpu, ENTRY, true),
+            jit::direct::CompileOutcome::Compiled(_)
+        ),
+        "0xEE must be admitted as a call-out, not refused as a structural barrier"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1959,7 +1959,11 @@ fn pending_flags_offset() {
     // window, not guest state. (The slice's OTHER new field, the
     // `callout_port_out_imm8_served` counter, lives in the stall tally behind `jit_direct` and
     // does not move this offset.)
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4584);
+    // The `0xEE` OUT DX,AL slice adds `CallOutTable::port_write_al_dx` (8 bytes), moving this pin
+    // 4584 -> 4592 -- measured off a failing-test readout, not derived. Same shape again: one
+    // host-side function-pointer slot, not guest state. (`callout_port_out_dx_served` lives in
+    // the stall tally and does not move this offset either.)
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4592);
 }
 
 /// Measure fully register-allocated native code against the interpreter. Runs a
