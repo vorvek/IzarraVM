@@ -2656,16 +2656,20 @@ fn cli_core_clocks_is_what_the_interpreter_charges() {
 /// resumes; a load that changes it resyncs. Both are pinned here, because a predicate that always
 /// resumed and one that always resynced would each pass half of this test.
 ///
-/// The resuming cases load selector 0 into ES and DS, which the fixture already holds:
-/// `sixteen_bit_code_cpu` installs them through `load_segment_real`, and `load_segment_real_mode`
-/// (the ordinary real-mode `MOV Sreg` path) rebuilds the same record from the same selector while
-/// preserving the limit, so the byte comparison finds nothing moved. That is the re-establishing
-/// `mov ds, ax` a 16-bit C runtime emits at every function that could have changed it, which is
-/// the shape the census row is made of.
+/// FS/GS only, register form: the L4 slice lowers `/0` and `/3`'s MEMORY form natively
+/// (`DirectKind::LoadSegRealMem`) in real mode and V86, so `mov es,[bx]` / `mov ds,[bx]` no
+/// longer reach `InterpretOne` at all there and belong to `cpu_jit_seg_load_mem_test.rs` now, not
+/// this row's R2 coverage. The register form of `/0`/`/3` was never here either (`LoadSegReal`
+/// since before this file existed); FS/GS have no lowering in any mode, so their register form is
+/// still the row this predicate decides.
 ///
-/// MUTATION: delete the FS/GS arm and the two FS cases fail on the block shape; delete R2's
-/// segment comparison instead and the resync case reports a completed block where the interpreted
-/// leg is one instruction further along.
+/// The resuming case loads selector 0 into FS/GS via EDX, which the fixture already holds at 0
+/// from `sixteen_bit_code_cpu`'s reset state, so the real-mode load rebuilds the same record and
+/// the byte comparison finds nothing moved.
+///
+/// MUTATION: delete the FS/GS arm and both cases fail on the block shape; delete R2's segment
+/// comparison instead and the resync case (the sibling test) reports a completed block where the
+/// interpreted leg is one instruction further along.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -2673,16 +2677,12 @@ fn cli_core_clocks_is_what_the_interpreter_charges() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resumes_on_an_unchanged_record() {
-    fn zero_the_source(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    fn zero_the_source(cpu: &mut CpuGsw, _bus: &mut TestBus) {
         cpu.registers.set_edx(0);
-        bus.memory[POP_TARGET as usize..POP_TARGET as usize + 2].fill(0);
     }
     for row in [
-        // 8E /0 and /3 with mod 00 r/m 111: mov es,[bx] and mov ds,[bx], both reading zero.
-        &[0x8Eu8, 0x07][..],
-        &[0x8E, 0x1F],
         // 8E /4 and /5 with mod 11 r/m 010: mov fs,dx and mov gs,dx, both loading zero.
-        &[0x8E, 0xE2],
+        &[0x8Eu8, 0xE2][..],
         &[0x8E, 0xEA],
     ] {
         assert_row_resumes(row, zero_the_source);

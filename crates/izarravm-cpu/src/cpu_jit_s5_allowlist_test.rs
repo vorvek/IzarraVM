@@ -655,6 +655,12 @@ fn word_size_load_segment_forms_are_lowered() {
 /// widening, which admits them as `InterpretOne` CALL-OUTS. The claim moves rather than lapses:
 /// what this table said was that they must not be LOWERED as `LoadSegReal`, which emits
 /// `base = selector << 4` and nothing else, and the slot-class column is how that is said now.
+///
+/// `/3`'s memory form flipped again with the L4 slice: `flat_fixture` is REAL MODE (`fresh()`
+/// with the segment limits stretched to `u32::MAX`, not protected mode), so ES/DS memory-source
+/// `MOV Sreg, m16` now lowers through `LoadSegRealMem` exactly as the register form already did,
+/// joining the block with ZERO call-out slots. `/2`, `/4` and `/5` are unaffected -- SS keeps its
+/// own row and FS/GS have no real-mode lowering -- so they still call out.
 #[test]
 fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
     // (label, bytes, call-out slots; `None` means the shape must end the block)
@@ -666,9 +672,9 @@ fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
         ("/4 mov fs,ax calls out", &[0x66, 0x8e, 0xe0], Some(1)),
         ("/5 mov gs,ax calls out", &[0x66, 0x8e, 0xe8], Some(1)),
         (
-            "/3 memory form calls out",
+            "/3 memory form lowers natively in real mode",
             &[0x66, 0x8e, 0x1d, 0x00, 0x20, 0x00, 0x00],
-            Some(1),
+            Some(0),
         ),
     ];
 
@@ -696,7 +702,7 @@ fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
                 );
                 assert_eq!(
                     compilation.callout_interpret_one_slots, slots,
-                    "{label}: must join as a call-out, never through LoadSegReal"
+                    "{label}: call-out slot count must match its lowering class"
                 );
             }
         }
