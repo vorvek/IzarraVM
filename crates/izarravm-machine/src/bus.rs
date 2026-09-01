@@ -1238,7 +1238,12 @@ impl MachineBus<'_> {
     #[inline]
     fn charge_ram_only(&mut self, address: u32, width: BusWidth, kind: BusAccessKind) {
         if self.flat_data_cost {
-            self.shadow_probe(kind, address);
+            // Probe the POST-A20 address, matching `data_access_wait_states`: that is
+            // the address the tag array on real silicon would see. The charge itself
+            // does not apply A20 here (see the doc above -- the FastMap precondition
+            // already guarantees identity for every caller of this arm), so this is a
+            // probe-only fold with no effect on `address` used below.
+            self.shadow_probe(kind, self.apply_a20(address));
             self.trace.record(kind, address, width, self.cache.cost.l1);
             return;
         }
@@ -2244,6 +2249,13 @@ impl CpuBus for MachineBus<'_> {
         if linear.wrapping_sub(BIOS_LEGACY_IRET_LINEAR) < BIOS_STUB_WINDOW_LEN {
             self.note_stub_fetch(linear);
         }
+    }
+
+    /// A guest INVD/WBINVD flushes the shadow L1 probe. See `note_cache_flush`'s
+    /// trait doc and `shadow_cache`'s module doc ("Invalidation").
+    #[inline]
+    fn note_cache_flush(&mut self) {
+        self.shadow_l1.flush();
     }
 
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {

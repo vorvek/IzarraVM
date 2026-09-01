@@ -20,6 +20,50 @@
 //! recompute differently across a save/restore round trip. Coverage is
 //! necessarily partial -- see the module doc on `probe` for what it does and
 //! does not see.
+//!
+//! ## Persona
+//!
+//! The geometry is the 486's specifically. `flat_data_cost` is also true for
+//! the 586 persona, which has a real 8K+8K split code/data cache with 32-byte
+//! lines and 2-way associativity, not this module's unified 8K/16-byte/4-way
+//! array. Enabling the probe on a 586 run reports 486 numbers against 586
+//! traffic; S1 only asked for the 486 figure, so this is accepted for now, not
+//! silently fixed.
+//!
+//! ## No-write-allocate
+//!
+//! The i486 is write-through with no allocation on a write miss ("Cache
+//! allocations are not made on write misses", DX2 Data Book Sec 5.3): a write
+//! hit updates the line and touches LRU like any other hit, but a write miss
+//! installs nothing and touches no LRU bit, unlike a read/fetch miss, which
+//! always installs (a real fill). `ShadowTags::probe` takes `is_write` and
+//! implements exactly this asymmetry.
+//!
+//! ## Invalidation
+//!
+//! The array is flushed (every tag and every LRU byte reset) on INVD, WBINVD,
+//! and a persona change -- the same events a real i486 flushes its own cache
+//! on ("the on-chip cache to be flushed", Nov89 Sec 5.7; "all 128 sets of
+//! three LRU bits are set to 0"). INVD/WBINVD reach it through
+//! `CpuBus::note_cache_flush`, called from `izarravm_cpu`'s two-byte-opcode
+//! handler; a persona change reaches it from `Machine::set_mode`, right next
+//! to the equivalent `CacheModel::set_mode` flush. There is no separate
+//! in-place "machine reset" to hook: a reset in this codebase tears down and
+//! reconstructs the whole `Machine` (see the GUI session's generation
+//! teardown), and a fresh `Machine` already gets a cold array from
+//! `ShadowL1Probe::from_env`.
+//!
+//! Guest DMA does **not** flush or invalidate the shadow, and this is a
+//! deliberate omission, not a hole: the i486 does not autonomously snoop bus
+//! traffic. Coherency requires external logic to drive an address onto the
+//! part with EADS# (normally gated by AHOLD), and whether that happens is a
+//! system/chipset design choice the Hardware Reference Manual explicitly
+//! leaves to the board (Nov89 Sec 7.2.8). Modelling "the shadow does not see
+//! DMA" is therefore modelling a real PC whose chipset does not drive EADS#,
+//! which is the common case. The measured exposure is bounded and small: on
+//! doom-486 the SB16 DMA ring is a few KB refilled a few million bytes over a
+//! run, at most a few hundred distinct 16-byte lines out of ~90M probed
+//! accesses in that run, well under 0.01%.
 
 use izarravm_bus::BusAccessKind;
 
@@ -137,6 +181,17 @@ const fn plru_touch(bits: u8, way: usize) -> u8 {
 /// PLRU byte per set. Kept in its own type (rather than folded into
 /// `ShadowL1Probe`) so the unit tests can drive `probe` directly without the
 /// env-gated wrapper.
+///
+/// Deviation from Intel, numerically nil: on a miss, real hardware checks the
+/// four valid bits first and prefers an invalid (never-filled) way over the
+/// PLRU victim (DX2 Sec 5.5). This array always asks `plru_victim` and never
+/// looks for an `EMPTY_TAG` way. From the cold state (`plru` all zero, every
+/// tag `EMPTY_TAG`) the tree's own fill order happens to visit ways
+/// 0, 2, 1, 3 -- all four, no repeats -- before it can repeat any way, and a
+/// hit only ever re-marks an already-filled way. So no valid line is ever
+/// evicted while an empty way still exists; the shortcut is unobservable here,
+/// not because the code checks for it, but because the tree shape guarantees
+/// it for this replacement algorithm.
 #[derive(Debug)]
 struct ShadowTags {
     tags: Box<[u32]>, // [set * WAYS + way]
@@ -151,9 +206,15 @@ impl ShadowTags {
         }
     }
 
-    /// Probe physical address `phys`, installing the line on a miss via the
-    /// documented pseudo-LRU victim choice. Returns `true` on a hit.
-    fn probe(&mut self, phys: u32) -> bool {
+    /// Probe physical address `phys`. Returns `true` on a hit.
+    ///
+    /// No-write-allocate (DX2 Data Book Sec 5.3): a HIT (read or write)
+    /// touches PLRU like any real access. A READ MISS installs the line (a
+    /// real fill) and touches PLRU for the new line. A WRITE MISS installs
+    /// NOTHING and touches no PLRU bit -- the i486 never allocates a line for
+    /// a write that misses, so there is nothing on real silicon for this
+    /// probe to mark as used.
+    fn probe(&mut self, phys: u32, is_write: bool) -> bool {
         let line = phys >> LINE_SHIFT;
         let set = (line as usize) & SET_MASK;
         let base = set * WAYS;
@@ -163,10 +224,20 @@ impl ShadowTags {
                 return true;
             }
         }
+        if is_write {
+            return false;
+        }
         let victim = plru_victim(self.plru[set]);
         self.tags[base + victim] = line;
         self.plru[set] = plru_touch(self.plru[set], victim);
         false
+    }
+
+    /// Flush every tag and every PLRU byte, as INVD/WBINVD/reset do on real
+    /// silicon ("all 128 sets of three LRU bits are set to 0", Nov89 Sec 5.7).
+    fn flush(&mut self) {
+        self.tags.fill(EMPTY_TAG);
+        self.plru.fill(0);
     }
 }
 
@@ -223,19 +294,29 @@ impl ShadowL1Probe {
     }
 
     /// Probe one access of `class` at physical address `phys`. A no-op (one
-    /// bool test) when the probe is disabled.
+    /// bool test) when the probe is disabled. `class == DataWrite` takes the
+    /// no-write-allocate path in `ShadowTags::probe`.
     #[inline]
     pub(crate) fn probe(&mut self, class: ShadowAccessClass, phys: u32) {
         if !self.enabled {
             return;
         }
-        let hit = self.tags.probe(phys);
+        let is_write = class == ShadowAccessClass::DataWrite;
+        let hit = self.tags.probe(phys, is_write);
         let counts = &mut self.counts[class_index(class)];
         if hit {
             counts.hits += 1;
         } else {
             counts.misses += 1;
         }
+    }
+
+    /// Flush the tag array (INVD/WBINVD/reset/persona change). Counters are
+    /// cumulative performance data, not cache state, and are NOT reset by a
+    /// flush -- a real flush invalidates lines, it does not erase a
+    /// performance counter.
+    pub(crate) fn flush(&mut self) {
+        self.tags.flush();
     }
 
     pub(crate) fn diagnostics(&self) -> ShadowL1Diagnostics {
@@ -249,95 +330,5 @@ impl ShadowL1Probe {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn line_addr(line: u32) -> u32 {
-        line << LINE_SHIFT
-    }
-
-    /// Known-pattern proof of the 4-way pseudo-LRU replacement: fill one set,
-    /// evict its pseudo-LRU victim, and confirm the victim -- not just "a"
-    /// miss -- is exactly the one Intel's 3-bit tree algorithm predicts.
-    ///
-    /// Four lines alias into set 0 (line numbers 128 apart, since `SETS` =
-    /// 128), then a fifth forces an eviction. Every step below is hand-traced
-    /// against `plru_victim`/`plru_touch`, not just re-derived from the code
-    /// under test:
-    ///
-    /// 1. probe(L0)   MISS  bits 0b000 -> victim way0        -> bits 0b011
-    /// 2. probe(L128) MISS  bits 0b011 -> victim way2        -> bits 0b110
-    /// 3. probe(L256) MISS  bits 0b110 -> victim way1        -> bits 0b101
-    /// 4. probe(L384) MISS  bits 0b101 -> victim way3        -> bits 0b000
-    /// 5. probe(L0)   HIT   (way0)                           -> bits 0b011
-    /// 6. probe(L512) MISS  bits 0b011 -> victim way2 (L128 evicted) -> bits 0b110
-    /// 7. probe(L256) HIT   (way1, untouched by the eviction) -> bits 0b101
-    /// 8. probe(L128) MISS  (evicted at step 6, so this proves the eviction
-    ///                       target -- not merely that some slot missed)
-    #[test]
-    fn four_way_pseudo_lru_matches_hand_traced_sequence() {
-        let mut tags = ShadowTags::new();
-        let sequence = [
-            (0u32, false),
-            (128, false),
-            (256, false),
-            (384, false),
-            (0, true),
-            (512, false),
-            (256, true),
-            (128, false),
-        ];
-        for (step, (line, expect_hit)) in sequence.into_iter().enumerate() {
-            let hit = tags.probe(line_addr(line));
-            assert_eq!(
-                hit, expect_hit,
-                "step {step}: probing line {line} expected hit={expect_hit}, got {hit}"
-            );
-        }
-    }
-
-    #[test]
-    fn disabled_probe_counts_nothing() {
-        let mut probe = ShadowL1Probe {
-            tags: ShadowTags::new(),
-            counts: [ShadowClassCounts::default(); CLASS_COUNT],
-            enabled: false,
-        };
-        probe.probe(ShadowAccessClass::DataRead, 0);
-        probe.probe(ShadowAccessClass::DataRead, 0x1_0000);
-        let diag = probe.diagnostics();
-        assert_eq!(diag.data_read, ShadowClassCounts::default());
-    }
-
-    #[test]
-    fn enabled_probe_splits_by_class() {
-        let mut probe = ShadowL1Probe {
-            tags: ShadowTags::new(),
-            counts: [ShadowClassCounts::default(); CLASS_COUNT],
-            enabled: true,
-        };
-        probe.probe(ShadowAccessClass::CodeFetch, 0);
-        probe.probe(ShadowAccessClass::CodeFetch, 0); // same line: hit
-        probe.probe(ShadowAccessClass::DataRead, 0x2000);
-        probe.probe(ShadowAccessClass::DataWrite, 0x4000);
-        let diag = probe.diagnostics();
-        assert_eq!(diag.code_fetch, ShadowClassCounts { hits: 1, misses: 1 });
-        assert_eq!(diag.data_read, ShadowClassCounts { hits: 0, misses: 1 });
-        assert_eq!(diag.data_write, ShadowClassCounts { hits: 0, misses: 1 });
-    }
-
-    #[test]
-    fn shadow_class_for_maps_page_walks_into_data_classes() {
-        assert_eq!(
-            shadow_class_for(BusAccessKind::PageWalkRead),
-            Some(ShadowAccessClass::DataRead)
-        );
-        assert_eq!(
-            shadow_class_for(BusAccessKind::PageWalkWrite),
-            Some(ShadowAccessClass::DataWrite)
-        );
-        assert_eq!(shadow_class_for(BusAccessKind::IoRead), None);
-        assert_eq!(shadow_class_for(BusAccessKind::IoWrite), None);
-        assert_eq!(shadow_class_for(BusAccessKind::InterruptAcknowledge), None);
-    }
-}
+#[path = "shadow_cache_test.rs"]
+mod tests;

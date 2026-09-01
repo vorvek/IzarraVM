@@ -1151,15 +1151,19 @@ impl CpuGsw {
             // `execute_bitmanip_decoded` runs them. Not handled here.
             0x08 | 0x09 => {
                 // INVD (08) / WBINVD (09): flush the internal caches. Both are privileged and
-                // raise #UD outside CPL 0. We model no cache, so they are no-ops after the
-                // privilege check. WBINVD differs only by writing dirty lines back first, which
-                // has no observable effect here.
+                // raise #UD outside CPL 0. We model no PRICED cache on the Approximate class, so
+                // there is no guest-visible timing effect here either way; WBINVD differs from
+                // INVD only by writing dirty lines back first, which has no observable effect on
+                // a write-through part. `note_cache_flush` still fires for both: it flushes the
+                // diagnostic shadow L1 probe (`izarravm_machine::shadow_cache`), which is a real
+                // (if unpriced) tag array and must not carry state across a guest-issued flush.
                 if self.current_privilege_level() != 0 {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
                     });
                 }
+                bus.note_cache_flush();
                 Ok(clocks(4))
             }
             // CMPXCHG (0xb0/0xb1) and XADD (0xc0/0xc1) are converted to the decode/execute split

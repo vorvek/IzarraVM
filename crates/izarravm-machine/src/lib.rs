@@ -3162,6 +3162,9 @@ impl Machine {
         }
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
+        // The shadow L1 probe's array is likewise per-mode state on real silicon
+        // (a persona change is a different part); start it cold too.
+        self.shadow_l1.flush();
         // The bus scaler's fractional carry is per-mode (the ratio changes); start
         // a new mode with no carried remainder, exactly like the CPU does for its
         // instruction-clock scaler.
