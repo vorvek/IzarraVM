@@ -19181,8 +19181,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
                 emit_rotate_shift_mem(&mut e, op, count, width, addr, memory, reasons);
                 // The cross-page label is still requested at Word and Dword: this emitter serves
-                // the ALIGNMENT half of the guard but keeps the CROSSING half as a side exit, so
-                // the stub is referenced and must be placed.
+                // the ALIGNMENT half of the guard for RAM but keeps the CROSSING half as a side
+                // exit for every kind, and re-runs the alignment verdict for a misaligned Mode
+                // 13h access (N1), so the stub is referenced on both paths and must be placed.
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
@@ -25481,6 +25482,13 @@ fn emit_rmw_inc_dec_dword(
 /// Byte skips both halves: `needs_alignment_guard()` is false there, a one-byte access cannot
 /// straddle a page, and it owes no split charge.
 ///
+/// **The alignment relaxation is a RAM-only claim.** A misaligned access to the Mode 13h aperture
+/// re-runs `emit_alignment_test` and side exits, exactly as every other Mode 13h-admitting emitter
+/// does (`emit_alu_mem_dest`, `emit_rmw_inc_dec_dword`, `emit_push_mem`): `memory.rs`'s
+/// `is_mode13_aperture` and `run.rs`'s split-cost comment both assert that nothing in the RAM
+/// split-cost pool came from the aperture, and this emitter's misalignment service must not be the
+/// first place that assertion goes false.
+///
 /// # The flag tail, and why the store sits in the middle of it
 ///
 /// The capture masks are the REGISTER lanes' verbatim, because the two must define the same set
@@ -25557,6 +25565,16 @@ fn emit_rotate_shift_mem(
     e.jz(valid);
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
     e.jnz(sides.unavailable_or_kind);
+    // It is the aperture. This emitter's in-page misalignment service (below) is a RAM-only
+    // claim: `memory.rs`'s `is_mode13_aperture` and `run.rs`'s split-cost comment both assert a
+    // misaligned aperture access is refused everywhere in the tree, so a misaligned aperture row
+    // must not fall through to the RAM split-cost deposit. Re-run `emit_alignment_test` for the
+    // aperture arm alone, matching `emit_wide_page_guard`'s discipline at every other Mode
+    // 13h-admitting emitter. RCX is free here -- it is unconditionally recomputed past `valid` --
+    // so it takes the scratch, leaving RDX's raw flags byte alone for the watched-bit read below.
+    if width.needs_alignment_guard() {
+        emit_alignment_test(e, width, Reg::RCX, sides.cross_page_or_alignment);
+    }
     e.place(valid);
     if memory.watch_page_bit {
         // D3's carry shape, `emit_rmw_inc_dec`'s verbatim: RCX is dead here (the page index is

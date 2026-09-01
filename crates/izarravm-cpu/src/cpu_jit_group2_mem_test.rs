@@ -53,6 +53,19 @@
 //! two spellings the same instruction, and on the lazy arm `run.rs`'s entry clear means a native
 //! slot never meets a live descriptor. It is a blind spot the register lanes share, not a hole
 //! this kind opened.
+//!
+//! ## N1 (review finding, closed): the aperture's misaligned tail
+//!
+//! `a_misaligned_mode13_group_two_memory_form_side_exits` closes a gap the review found: before
+//! it, `emit_rotate_shift_mem` admitted a misaligned Mode 13h access at every width, dropping
+//! `emit_alignment_test` for the aperture arm and depositing the split charge unconditionally.
+//! That falsified `memory.rs`'s `is_mode13_aperture` and `run.rs`'s split-cost comment, both of
+//! which assert nothing in the RAM split-cost pool came from the aperture, and every other Mode
+//! 13h-admitting emitter (`emit_alu_mem_dest`, `emit_rmw_inc_dec_dword`, `emit_push_mem`) refuses
+//! or side exits on it. The fix re-runs `emit_alignment_test` for the Mode 13h arm alone, so a
+//! misaligned aperture access side exits exactly as it does everywhere else in the tree while the
+//! RAM in-page misalignment relaxation this module's other rows exercise is untouched. Proved red
+//! against the unguarded emitter first.
 
 use super::*;
 
@@ -440,6 +453,21 @@ struct Roles {
 /// `slots` is the EXACT instruction count the block must cover. An exact count rather than a lower
 /// bound is what says the tested opcode joined the block instead of ending it.
 fn build(seg: Seg, body: &[u8], slots: u8, seed: Seed) -> Roles {
+    build_with_pages(seg, body, slots, seed, 0x5000, &[])
+}
+
+/// `build`'s general form: a caller-chosen memory length and an extra set of physical pages to map
+/// beyond the default code/stack range `0..0x5000`. Exists for the Mode 13h aperture row, whose
+/// operand sits at `0xA0000` and needs both a bigger backing buffer and that page mapped so
+/// `populate_read`/`populate_write` classify it by physical range.
+fn build_with_pages(
+    seg: Seg,
+    body: &[u8],
+    slots: u8,
+    seed: Seed,
+    memory_len: usize,
+    extra_pages: &[u32],
+) -> Roles {
     let mut code = FILL_A.to_vec();
     let mut starts = vec![ENTRY, ENTRY + code.len() as u32];
     code.extend_from_slice(body);
@@ -447,7 +475,10 @@ fn build(seg: Seg, body: &[u8], slots: u8, seed: Seed) -> Roles {
     code.extend_from_slice(&FILL_B);
     code.push(0xf4);
 
-    let mut memory = memory_fill();
+    let mut memory = vec![0u8; memory_len];
+    for (i, byte) in memory.iter_mut().enumerate() {
+        *byte = (i.wrapping_mul(37).wrapping_add(11) & 0xff) as u8;
+    }
     memory[(ENTRY - 1) as usize] = 0x90;
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
     memory[DATA as usize..DATA as usize + 4].copy_from_slice(&seed.data.to_le_bytes());
@@ -480,6 +511,9 @@ fn build(seg: Seg, body: &[u8], slots: u8, seed: Seed) -> Roles {
             cpu.fetch_decoded(bus, linear).unwrap();
         }
         for page in (0..0x5000u32).step_by(0x1000) {
+            map_direct_page(cpu, bus, page);
+        }
+        for &page in extra_pages {
             map_direct_page(cpu, bus, page);
         }
     }
@@ -954,6 +988,74 @@ fn a_page_crossing_group_two_memory_form_side_exits_and_still_agrees() {
                 roles.native.eflags(),
                 roles.interp.eflags(),
                 "{} {label} crossing: EFLAGS",
+                seg.label()
+            );
+        }
+    }
+}
+
+/// The Mode 13h aperture's misaligned word rotate must side exit, not run natively.
+///
+/// N1 from the review: `memory.rs`'s `is_mode13_aperture` and `run.rs`'s split-cost comment both
+/// assert that a misaligned access to the aperture is refused elsewhere in the tree, so
+/// `run.rs`'s RAM split-cost pool never carries an aperture byte. This emitter's whole point is to
+/// SERVE a misaligned in-page RAM access -- see `a_misaligned_group_two_memory_form_runs_natively`
+/// -- but that service must stop at the aperture boundary: `emit_alu_mem_dest`,
+/// `emit_rmw_inc_dec_dword` and `emit_push_mem` all refuse Mode 13h outright or refuse it whenever
+/// it is misaligned, and this kind must not be the first native site that bills an aperture access
+/// through the RAM-only pool.
+///
+/// The operand sits at `MODE13_BASE + 1`, which is misaligned but stays inside the aperture's own
+/// page, so this row isolates misalignment from page-crossing (`emit_page_cross_bound` already
+/// refuses a crossing access at any kind, aperture included, and is not what this row is about).
+///
+/// 32-bit segments only. `by_one_mem_at`'s Sixteen arm encodes a disp16-only operand against a
+/// FLAT (base-zero) real-mode segment, so `MODE13_BASE + 1` truncates to `0x0001` and never
+/// reaches the aperture at all -- the emitter-level guard this row proves is segment-width
+/// independent, so the 32-bit segment alone is enough to exercise it.
+#[test]
+fn a_misaligned_mode13_group_two_memory_form_side_exits() {
+    let _arm = force_rows(true);
+    const MODE13_BASE: u32 = 0x000a_0000;
+    const MODE13_MEMORY_LEN: usize = 0x000b_0000;
+    for seg in [Seg::ThirtyTwo] {
+        for (label, op) in SUB_OPS {
+            let mut roles = build_with_pages(
+                seg,
+                &by_one_mem_at(seg, W::Word, op, MODE13_BASE + 1),
+                3,
+                Seed::new(0x0f0f_0f0f).flags(SEEDED_EFLAGS),
+                MODE13_MEMORY_LEN,
+                &[MODE13_BASE],
+            );
+            let _ = roles
+                .native
+                .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+                .unwrap();
+            assert!(
+                roles.native.registers.eip < ENTRY + 6,
+                "{} {label} misaligned mode13 word rotate ran natively to completion, so the \
+                 aperture's misaligned access was served rather than refused",
+                seg.label()
+            );
+            // Whatever the block did, finish the three slots on both roles and compare: a side
+            // exit still has to leave the architectural state right.
+            while roles.native.registers.eip < ENTRY + 6 && !roles.native.halted {
+                roles.native.cycle(&mut roles.native_bus).unwrap();
+            }
+            for _ in 0..3 {
+                roles.interp.cycle(&mut roles.interp_bus).unwrap();
+            }
+            assert_eq!(
+                roles.native_bus.memory[MODE13_BASE as usize..MODE13_BASE as usize + 3],
+                roles.interp_bus.memory[MODE13_BASE as usize..MODE13_BASE as usize + 3],
+                "{} {label} mode13 misaligned: the operand must still be right",
+                seg.label()
+            );
+            assert_eq!(
+                roles.native.eflags(),
+                roles.interp.eflags(),
+                "{} {label} mode13 misaligned: EFLAGS",
                 seg.label()
             );
         }
