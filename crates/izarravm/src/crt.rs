@@ -109,13 +109,36 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
 }
 
 // Sharp-bilinear with adjustable softness (higher `sharp` = crisper edges).
+// The shader's ONLY texture read, and the Glide gamma toggle's whole seam.
+//
+// "Compatible" neutralises the Voodoo era's authoring lift by raising the DAC
+// code to a fixed exponent. That is a SIGNAL-domain edit -- it changes the
+// code as if the guest had programmed a different gamma CLUT -- so it has to
+// happen before anything else looks at a pixel, the halation taps included:
+// adding a raw glow term to a compensated base would make bright halos
+// relatively too bright, and it would do so in the default configuration
+// (style Subtle, Glide gamma Compatible). Funnelling every read through here
+// is what keeps that from being possible.
+//
+// The caller sets the uniform to 1.0 for "Original" and for every frame that
+// did not come from Distira; the explicit inequality keeps that case
+// byte-exact, since pow(c, 1.0) is not guaranteed to be.
+// See dev_docs/2026-09-01-glide-gamma-toggle-design.md section 4.3.
+fn sample_signal(uv: vec2<f32>) -> vec3<f32> {
+  let c = textureSample(tex, samp, uv).rgb;
+  if (u.glide_gamma != 1.0) {
+    return pow(c, vec3<f32>(u.glide_gamma));
+  }
+  return c;
+}
+
 fn sample_sharp(t: vec2<f32>, sharp: f32) -> vec3<f32> {
   let px = t * u.src_size - vec2<f32>(0.5);
   let tf = floor(px);
   var f = px - tf;
   f = clamp((f - 0.5) * sharp + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
   let s = (tf + 0.5 + f) / u.src_size;
-  return textureSample(tex, samp, s).rgb;
+  return sample_signal(s);
 }
 
 // 8-tap bright-source halation, radius in source texels. Dark samples add
@@ -125,7 +148,7 @@ fn glow(t: vec2<f32>, radius: f32) -> vec3<f32> {
   let r = radius / u.src_size;
   for (var i = 0; i < 8; i = i + 1) {
     let a = f32(i) / 8.0 * 6.2832;
-    let s = textureSample(tex, samp, t + vec2<f32>(cos(a), sin(a)) * r).rgb;
+    let s = sample_signal(t + vec2<f32>(cos(a), sin(a)) * r);
     g = g + max(s - vec3<f32>(0.25), vec3<f32>(0.0));
   }
   return g / 8.0;
@@ -213,18 +236,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     t = clamp(w, vec2<f32>(0.0), vec2<f32>(1.0));
   }
 
+  // Already Glide-compensated: sample_signal applies it to every texture read,
+  // the halation taps in glow() included.
   var col = sample_sharp(t, sharp);
-  // Glide gamma, "Compatible": neutralise the Voodoo era's authoring lift.
-  // This is a SIGNAL-domain edit -- it changes the code as if the guest had
-  // programmed a different gamma CLUT -- so it runs before the display model
-  // below, and it is deliberately NOT gated on the CRT style. The caller sets
-  // it to 1.0 for "Original" and for every frame that did not come from
-  // Distira; the explicit inequality keeps that case byte-exact, since
-  // pow(c, 1.0) is not guaranteed to be.
-  // See dev_docs/2026-09-01-glide-gamma-toggle-design.md section 4.3.
-  if (u.glide_gamma != 1.0) {
-    col = pow(col, vec3<f32>(u.glide_gamma));
-  }
   if (u.style > 0.5) {
     let fy = fract(t.y * u.src_size.y) - 0.5;
     let b = exp(-(fy * fy) / (2.0 * beam * beam));

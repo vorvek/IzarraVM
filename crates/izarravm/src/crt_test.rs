@@ -86,24 +86,59 @@ fn glide_gamma_lands_at_uniform_offset_24_without_growing_the_block() {
     assert_eq!(&bytes[28..32], &[0u8; 4], "the last pad slot stays zero");
 }
 
-/// The shader's compensation exponent must be the one `display_transform.rs`
-/// defines, and it must be applied through an explicit inequality branch:
-/// `pow(c, 1.0)` is not guaranteed bit-exact, and "Original" has to be
-/// provably today's picture.
+/// The Glide compensation must sit on the shader's ONLY texture read.
+///
+/// `glow()`'s 8 halation taps used to sample the texture directly, so under
+/// `Subtle` and `Ye Olde` -- the default style -- an uncompensated halation
+/// term was added to a compensated base. Funnelling every read through
+/// `sample_signal` is what makes "the compensation happens before anything
+/// else looks at a pixel" true rather than nearly true, so this test pins the
+/// single-reader property rather than the call sites, and stays red for any
+/// future effect that reaches for the texture on its own.
 #[test]
-fn shader_applies_the_glide_compensation_before_the_style_branch() {
-    let compensation = SHADER
-        .find("u.glide_gamma != 1.0")
-        .expect("the shader must branch on the Original sentinel rather than pow(c, 1.0)");
-    let style_branch = SHADER
-        .find("if (u.style > 0.5)")
-        .expect("the CRT effect block must still be there");
+fn every_texture_read_goes_through_the_compensated_sampler() {
+    assert_eq!(
+        SHADER.matches("textureSample(").count(),
+        1,
+        "exactly one textureSample call may remain, inside sample_signal; a second          read would take uncompensated codes"
+    );
+    let sampler = SHADER
+        .find("fn sample_signal(")
+        .expect("the shared compensated sampler must exist");
+    let read = SHADER
+        .find("textureSample(")
+        .expect("the shader must read the texture somewhere");
     assert!(
-        compensation < style_branch,
-        "the compensation is a signal-domain edit and must run before the display model"
+        read > sampler,
+        "the surviving texture read must be the one inside sample_signal"
+    );
+    for caller in ["fn sample_sharp(", "fn glow("] {
+        let start = SHADER.find(caller).expect("caller must exist");
+        let body = &SHADER[start..];
+        let end = body
+            .find(
+                "
+}",
+            )
+            .expect("caller must be a complete function");
+        assert!(
+            body[..end].contains("sample_signal("),
+            "{caller} must read the texture through sample_signal"
+        );
+    }
+}
+
+/// The shader's compensation exponent must be applied through an explicit
+/// inequality branch: `pow(c, 1.0)` is not guaranteed bit-exact, and
+/// "Original" has to be provably today's picture.
+#[test]
+fn the_compensation_branches_on_the_original_sentinel() {
+    assert!(
+        SHADER.contains("u.glide_gamma != 1.0"),
+        "the shader must branch on the Original sentinel rather than pow(c, 1.0)"
     );
     assert!(
-        SHADER.contains("pow(col, vec3<f32>(u.glide_gamma))"),
+        SHADER.contains("pow(c, vec3<f32>(u.glide_gamma))"),
         "the shader must raise the sampled code to the compensation exponent"
     );
 }

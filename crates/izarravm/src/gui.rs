@@ -1305,6 +1305,7 @@ impl GuiApp {
         if !self.session_snapshot.powered {
             self.session_frame = None;
             self.screenshot_frame = None;
+            self.frame_owner = None;
             self.frame_seq = u64::MAX;
         }
         if prefs_changed {
@@ -1320,6 +1321,9 @@ impl GuiApp {
         self.frame_seq = u64::MAX;
         self.session_frame = None;
         self.screenshot_frame = None;
+        // Travels with the frame it describes: a stale owner would compensate
+        // the next machine's first frames on the strength of the last one's.
+        self.frame_owner = None;
         self.last_controller_gameport = None;
         self.controller_mapper = self.controller_config.clone().map(ControllerMapper::new);
         self.guest_keys = GuestKeyRouter::default();
