@@ -1118,10 +1118,110 @@ sitting in text mode behind it", which is the Glide state and nothing else.
 
 Determinism: two repeat runs from a fresh copy are bit-identical on both rows.
 
+**PROSE REFRESHED 2026-09-01.** The `tombraid3d-586` figures below drifted
+from 305,875 non-black / 365 colours to 305,890 / 387 somewhere across
+#810/#812/#814 (Distira Glide gamma and framebuffer-size work). The retired
+instruction count drifted too, from 19,864,778,122 to 19,787,632,889 (0.39%,
+well inside the row's 5% tolerance). The `final_nonblack_percent`,
+`final_distinct_colors` and `final_instructions_tolerance` bands in
+`scripts/fixture-scoreboard-invariants.json` are wide enough that the row
+never went red; this table's prose numbers were simply never re-measured
+after the drift. Reconfirmed on main at `e95d3c4f` before updating.
+
 | row | non-black | colours | retired instructions |
 |---|---|---|---|
-| `tombraid3d-586` | 305,875 / 307,200 (99.57%) | 365 | 19,864,778,122 |
+| `tombraid3d-586` | 305,890 / 307,200 (99.57%) | 387 | 19,787,632,889 |
 | `descent2-3dfx-586` | 255,267 / 307,200 (83.09%) | 834 | 8,579,000,326 |
+
+### MOJO (Distira board identity, 586 ONLY, added 2026-09-01)
+
+`mojo-586` is the only row in the table that grades no picture, and the only
+one that asks the board what it IS rather than watching it draw. It runs
+MOJO.EXE, 3dfx's own DOS diagnostic for the SST-1, and pins the two text
+reports the guest redirects to disk.
+
+- Location: `.bench/mojo_c`, built by `scripts/make-mojo-fixture.ps1`. No disc.
+- Invocation: `--cpu 586 --memory-mib 64 --video vega --hdd-folder <fresh copy>
+  --cycles 4000000000`. No `--result-ppm`, no `--inject-keys`, no `--cd-image`.
+- AUTOEXEC runs `MOJO.EXE > C:\MOJO.TXT`, then `MOJO.EXE -v > C:\MOJOV.TXT`,
+  then `C:\EXITVM.COM`. The budget is a GUARD: EXITVM fires at ~0.55e9 clocks.
+- **No input schedule, and that is a property of the tool.** `usage: mojo [-v]`
+  is its entire command line; it never waits for a key. This is the exception
+  to `dos-3d-title-waiting-looks-hung`, not a violation of it.
+- 0.73 s of wall, rt ~3.0. It is the cheapest row in the table by two orders of
+  magnitude and can be run on every candidate without thinking about cost.
+
+**Why a row that draws nothing earns its place.** The two Glide rows grade
+pixels, and pixels are a very indirect witness to board identity: Tomb Raider
+and Descent II render identically whether the SST-1 advertises one TMU or two,
+2 MB or 4 MB, and neither would notice if the vendor ID moved. MOJO reads
+exactly those facts and prints them. It also reaches the hardware along two
+paths nothing else in the table exercises:
+
+* **Per-TMU memory is not read from a register.** MOJO sizes texture memory by
+  writing and reading back through the texture aperture until it aliases, so
+  this row grades the APERTURE BOUNDS directly.
+* **The TMU config byte comes back as a rendered pixel.** MOJO sets
+  `trexInit1`'s sendConfig bit and reads the config byte out of the LFB, the
+  way real silicon delivers it.
+
+**The row is pinned to ONE build of the diagnostic.** MOJO.EXE sha256
+`d1cd2ce36f4eb333d3136ae8a88af027bf29a5475316b48677dc497b8cdeeeb5`, from the
+3dfx Glide 2.43 SDK; `make-mojo-fixture.ps1` hard-fails on any other. A
+different build would move the report for reasons that have nothing to do with
+Distira.
+
+**Provenance, and a FLAG.** MOJO.EXE comes from `glide_sdk-243.zip`
+(`Glide/Diags/Dos/`), already unpacked on this box at `.bench/glide243-tests`;
+the copy redistributed today as bitsundbolts' `mojo_dos.zip` is byte-identical,
+which is the cross-check the recorded hash encodes. **3dfx shipped no licence
+text with the diagnostics and the redistribution terms are unclear**, so the
+binary stays in the git-ignored fixture tree, never enters git history, and
+never ships with IzarraVM -- the same posture as `dev_docs/reference/` and as
+`.bench/glide243-tests` itself. The full account, including the oracle
+comparison and the gap list this row came out of, is in
+`dev_docs/2026-09-01-mojo-fixture.md` (local to the main checkout;
+`dev_docs/` is git-ignored) and in the header of
+`scripts/make-mojo-fixture.ps1`.
+
+**Grading is an exact sha256 per file, with ONE line masked, and the mask was
+earned rather than assumed.** Duke3D, Tomb Raider and NASCAR all lost
+end-of-budget frame hashes because those hashes sampled a demo's PHASE, and the
+first version of this row walked into the same trap: `MOJOV.TXT` prints
+`vRetrace`, which Distira synthesises from the LIVE beam position rather than
+storing, so it reports whatever scanline the raster was on when the program
+asked. Rebuilding this fixture tree with two unused binaries removed -- a change
+that cannot touch the SST-1 at all -- moved that line 0x29 -> 0x14 and moved
+nothing else in the file. `MOJO.TXT` was byte-identical across the same change.
+
+So `MOJO.TXT` is pinned raw, and `MOJOV.TXT` is pinned with `^\s*vRetrace:`
+masked to `<masked>` before hashing, which leaves the other 40 lines of the
+SST-1 register file under an exact pin. **The masked hash is not the sha256 of
+the file on disk**, which is one more reason both reports are archived beside
+the profile. MEASURED, not argued: the two-extra-binaries tree produces
+`vRetrace: 0x2c` against the pinned tree's `0x14` and the row PASSES, while
+every other byte is still graded exactly.
+
+The stop is graded the way Duke3D's is -- `test_exit` code `0x51` from
+EXITVM.COM, so a `cycle_limit` stop fails the row instead of quietly hashing a
+partial file.
+
+Determinism: three repeat runs from a fresh copy are byte-identical in both
+reports (`MOJO.TXT` 835 bytes, `MOJOV.TXT` 1352 bytes). The beam line moves
+only when something upstream changes how long boot takes.
+
+BOTH ARMS MEASURED, because a gate that cannot fail is not a gate:
+
+* pin mutated by hand -> FAIL, naming the file: `MOJO.TXT moved: expected
+  0000..., got 4600f9dc...`.
+* the PR #814 binary (`vorvek/distira-tex-4mb`, 4 MB per TMU) run against
+  main's pins -> FAIL on `MOJO.TXT`, and the diff of the two reports is exactly
+  two lines, `TMU 0 RAM` and `TMU 1 RAM`, 2 MB -> 4 MB, with `MOJOV.TXT`
+  unchanged. (Cross-tree `-Executable` against this tree's pins, which is the
+  deliberate A/B this section of the protocol permits when it is declared.)
+  That is the row doing precisely the job it was added for, and it is why the
+  reports are archived beside the profile: a moved hash always raises "moved
+  HOW", and a diff answers it in seconds.
 
 ### Tyrian 2000 (Loudness audio clock + DPMI16, 486 and 586)
 

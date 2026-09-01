@@ -1573,6 +1573,68 @@ function Get-FixtureTable {
                     -AnchorDisplay "VgaRaster" -AnchorPhases 1 `
                     -Display "VgaRaster" -Width 320 -Height 368 -Bpp 8 -Mode "ModeX")
         }
+        [pscustomobject]@{
+            name = "mojo-586"; folder = "mojo_c"
+            # THE BOARD-IDENTITY ROW, and the cheapest row in the table by an
+            # order of magnitude: 0.73 s of wall against descent2's 170.
+            #
+            # Every other Distira row grades PICTURES. A picture is a very
+            # indirect witness to what the board says it IS: Tomb Raider and
+            # Descent II would render identically whether the SST-1 reports one
+            # TMU or two, 2 MB or 4 MB, and neither would notice if the vendor
+            # ID moved. MOJO.EXE is 3dfx's own DOS diagnostic for the SST-1 --
+            # `usage: mojo [-v]`, no menus, no keypress, no graphics -- and it
+            # reads exactly those facts out of the hardware and prints them.
+            # Bare MOJO prints the board report (vendor/device ID, FBI revision
+            # and memory, FBI and TMU power-on sense, DAC colour format, SLI
+            # state, TMU revision, TMU count and per-TMU memory); `-v` prints
+            # the SST-1 register file INSTEAD of it, so the AUTOEXEC runs both
+            # and the row pins both.
+            #
+            # It also reaches the board a different way than a game does. The
+            # per-TMU memory line is not read from any register: MOJO sizes
+            # texture memory by writing and reading back through the texture
+            # aperture until it aliases, so this row grades the APERTURE BOUNDS,
+            # which nothing else in the table touches. The TMU config byte is
+            # read the way real silicon delivers it, by setting trexInit1's
+            # sendConfig bit and reading the config byte back as a rendered
+            # pixel through the LFB -- a path with no other coverage here.
+            #
+            # The fixture tree is built by scripts/make-mojo-fixture.ps1, which
+            # hard-fails on the sha256 of mojo.exe: the pins below are pins on
+            # ONE build of one diagnostic, and a different build would fail the
+            # row for a reason that has nothing to do with Distira.
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            # A GUARD, not the length of the run -- EXITVM.COM ends the VM once
+            # both reports are written, at roughly 0.55e9 clocks. 4e9 is 24 guest
+            # seconds and about seven times the headroom needed.
+            cycles = [uint64]4000000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            # No frame to grade: the run ends at the DOS prompt in text mode with
+            # both reports redirected to files, and MOJO opens no graphics mode
+            # at all. The reports ARE the invariant.
+            qconsole = $false; resultPpm = $false; injection = @(); dukemark = $null
+            # No key injection, and that is a property of the tool rather than a
+            # choice: MOJO takes its whole configuration from the command line
+            # and never waits for input. A DOS diagnostic that needs no schedule
+            # is the rare case; see dos-3d-title-waiting-looks-hung for the rule
+            # it is the exception to.
+            # MOJO.TXT is pinned raw -- every line of it is a board-identity
+            # fact and none of them may drift benignly. MOJOV.TXT needs ONE
+            # line masked, and the mask was earned rather than assumed: Distira
+            # synthesises `vRetrace` from the live beam position, so it reports
+            # whatever scanline the raster was on when the program asked.
+            # Rebuilding this very fixture tree with two unused binaries removed
+            # moved it 0x29 -> 0x14 and moved NOTHING else in the file. Left
+            # unmasked it would be a phase-sensitive hash of exactly the kind
+            # Duke3D, Tomb Raider and NASCAR each had to give up; masked, the
+            # rest of the SST-1 register file stays under an exact pin.
+            textResults = @{
+                exitCode = 0x51
+                files    = @("MOJO.TXT", "MOJOV.TXT")
+                masks    = @{ "MOJOV.TXT" = @('^\s*vRetrace:') }
+            }
+        }
     )
 }
 
@@ -1686,6 +1748,48 @@ function Copy-Fixture([string]$SourcePath, [string]$DestinationPath) {
 function Get-FileSha256([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+<#
+.SYNOPSIS
+Hash a guest-written text report for a `textResults` row, with named lines
+masked out.
+
+.DESCRIPTION
+Lines are joined with LF regardless of what the guest wrote, so a fixture whose
+AUTOEXEC gains a line does not move the pin through DOS line endings, and any
+line matching one of `$Masks` is replaced by `<masked>` before hashing.
+
+THE MASK IS NOT A CONVENIENCE. It was earned: MOJO's `-v` register dump prints
+`vRetrace`, which on Distira is a LIVE beam position rather than a stored
+register, so it reads whatever scanline the raster happened to be on when the
+program asked. Rebuilding the fixture tree with two unused binaries removed --
+a change that cannot touch the SST-1 at all -- moved that one line from 0x29 to
+0x14 and nothing else in the file. Pinned raw, `MOJOV.TXT` would be a
+phase-sensitive hash of exactly the kind Duke3D, Tomb Raider and NASCAR each
+had to give up; masked, the other 40 lines of the register file stay under an
+exact pin.
+
+The masked hash is therefore NOT the sha256 of the file on disk, and the file
+itself is archived beside the profile so the difference is inspectable.
+#>
+function Get-TextResultSha256([string]$Path, [string[]]$Masks) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $lines = @(Get-Content -LiteralPath $Path)
+    if ($null -ne $Masks -and $Masks.Count -gt 0) {
+        $lines = @($lines | ForEach-Object {
+            $line = $_
+            foreach ($mask in $Masks) {
+                if ($line -match $mask) { return "<masked>" }
+            }
+            return $line
+        })
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    $stream = [IO.MemoryStream]::new($bytes)
+    try {
+        return (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash.ToLowerInvariant()
+    } finally { $stream.Dispose() }
 }
 
 function Test-Sha256Allowed($Allowed, [string]$Actual) {
@@ -2682,6 +2786,20 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         }
     }
 
+    # ...and for a `textResults` row, which grades files the guest redirected to
+    # disk rather than a framebuffer. Identical hazard, identical repair: a stale
+    # copy in the SOURCE tree would be hashed and pass while the run produced
+    # nothing at all.
+    $textResultsProperty = $Fixture.PSObject.Properties['textResults']
+    $textResultPaths = [ordered]@{}
+    if ($null -ne $textResultsProperty -and $textResultsProperty.Value) {
+        foreach ($file in $textResultsProperty.Value.files) {
+            $path = Join-Path $workingCopy $file
+            $textResultPaths[$file] = $path
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
+    }
+
     $arguments = Get-FixtureArguments $Fixture $workingCopy $Fixture.cycles `
         $profilePath $(if ($Fixture.resultPpm) { $ppmPath } else { $null })
     $environment = Get-RowEnvironment
@@ -3103,6 +3221,65 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         }
     }
 
+    # TEXT RESULTS (2026-09-01, added for `mojo-586`). A row whose whole output
+    # is a report the guest redirected to a file, graded by sha256 of the bytes.
+    #
+    # This is the third grading shape in the table and it exists because the
+    # other two cannot see what this row is for. A framebuffer hash grades
+    # PIXELS, and MOJO draws none worth grading -- it prints text and exits. The
+    # DUKEMARK path grades a report too, but it parses ONE known report format
+    # for three named fields; here the whole file IS the invariant, because
+    # every line of it is a board-identity fact (vendor and device ID, FBI
+    # revision and memory, TMU count, revision and memory, DAC colour format,
+    # and under `-v` the SST-1 register file). There is nothing in a MOJO report
+    # that may drift benignly, which is exactly what makes an exact hash the
+    # right instrument rather than the fragile one it is on an animating demo.
+    #
+    # The stop is graded the same way Duke3D's is: the guest ends the VM itself
+    # through EXITVM.COM once the reports are written, so a `cycle_limit` stop
+    # means the run never got that far and any file found would be a partial.
+    if ($null -ne $textResultsProperty -and $textResultsProperty.Value) {
+        $pins = $textResultsProperty.Value
+        $stopKind = $profile.stop.kind
+        $result.stop_kind = $stopKind
+        if ($stopKind -ne "test_exit") {
+            $failures += ("the guest did not exit through EXITVM: stop was '$stopKind', " +
+                "expected 'test_exit' -- the reports were never finished")
+        } else {
+            $stopCode = [int]$profile.stop.code
+            $result.stop_code = $stopCode
+            if ($stopCode -ne $pins.exitCode) {
+                $failures += "EXITVM reported exit code $stopCode, expected $($pins.exitCode)"
+            }
+        }
+
+        $masksProperty = if ($pins -is [hashtable] -and $pins.ContainsKey('masks')) {
+            $pins.masks
+        } else { $null }
+
+        $hashes = [ordered]@{}
+        foreach ($entry in $textResultPaths.GetEnumerator()) {
+            $masks = if ($null -ne $masksProperty -and $masksProperty.ContainsKey($entry.Key)) {
+                @($masksProperty[$entry.Key])
+            } else { @() }
+            $hash = Get-TextResultSha256 $entry.Value $masks
+            if ($null -eq $hash) {
+                $failures += ("no $($entry.Key) was written: the redirection or the " +
+                    "host-folder flush failed")
+                continue
+            }
+            $hashes[$entry.Key] = $hash
+            # Keep the report itself beside the profile. When the hash moves,
+            # the question is always "moved HOW", and a diff of two reports
+            # answers it in seconds where a bare pair of hashes answers nothing.
+            if (-not [string]::IsNullOrWhiteSpace($KeepProfilesIn)) {
+                Copy-Item -LiteralPath $entry.Value `
+                    -Destination (Join-Path $KeepProfilesIn "$($Fixture.name).$($entry.Key)")
+            }
+        }
+        if ($hashes.Count -gt 0) { $result.text_result_sha256 = $hashes }
+    }
+
     # PROFILE BANDS. A row may pin dotted profile-JSON fields to [min, max]
     # ranges. The Tyrian rows use them for the guest's own audio-clock
     # liveness: MPU-401 MIDI byte counts and IRQ0 edge counts collapse to
@@ -3218,6 +3395,49 @@ try {
             }
         } elseif ($RecordInvariants -and $null -ne $allowedHashProperty) {
             $row.notes += "allowed frame set is hand-curated and was not re-recorded"
+        }
+
+        # TEXT RESULT hashes. Same sidecar, same -RecordInvariants / -Force
+        # machinery and the same three outcomes as the frame hash above. One
+        # file per key, so a row that grades two reports says WHICH of them
+        # moved instead of failing as a unit.
+        if ($row.Contains("text_result_sha256")) {
+            $recorded = if ($invariants.Contains($fixture.name)) {
+                $invariants[$fixture.name]
+            } else { $null }
+            $pinned = if ($null -ne $recorded -and $recorded.Contains("text_result_sha256")) {
+                $recorded.text_result_sha256
+            } else { $null }
+
+            foreach ($entry in $row.text_result_sha256.GetEnumerator()) {
+                $expectedText = if ($null -ne $pinned -and $pinned.Contains($entry.Key)) {
+                    $pinned[$entry.Key]
+                } else { $null }
+
+                if ($RecordInvariants) {
+                    if ($null -ne $expectedText -and $expectedText -ne $entry.Value -and -not $Force) {
+                        throw ("$($fixture.name) already has a recorded hash for " +
+                            "$($entry.Key) and this run disagrees with it. Re-recording " +
+                            "would erase the evidence of a real change. Pass -Force only " +
+                            "if you have established that the move is legitimate.")
+                    }
+                    if (-not $invariants.Contains($fixture.name)) {
+                        $invariants[$fixture.name] = @{}
+                    }
+                    if (-not $invariants[$fixture.name].Contains("text_result_sha256")) {
+                        $invariants[$fixture.name].text_result_sha256 = @{}
+                    }
+                    $invariants[$fixture.name].text_result_sha256[$entry.Key] = $entry.Value
+                    $row.notes += "$($entry.Key) hash recorded"
+                } elseif ($null -eq $expectedText) {
+                    $row.notes += "no recorded hash for $($entry.Key) to compare against"
+                    if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
+                } elseif ($expectedText -ne $entry.Value) {
+                    $row.invariant = "FAIL"
+                    $row.notes += ("$($entry.Key) moved: expected $expectedText, " +
+                        "got $($entry.Value)")
+                }
+            }
         }
 
         # The DUKEMARK extrapolation count, held to a band. Same sidecar, same

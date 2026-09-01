@@ -34,6 +34,7 @@ the exception and runs DUKEMARK exactly once, then ends the VM itself with
 | `psycho_c` | **486** | Psycho Pinball, DOS/4GW, a table in play | the only row that replays its CRTC register table EVERY FRAME; grades the PUBLISHED frame, not a re-render |
 | `tombraid3d_c` | **586** | Tomb Raider Gold, 3dfx build, CD REQUIRED | the same game as `tombraid_c` with every pixel through GLIDE, so the two rows split a regression between engine and rasteriser |
 | `descent2_c` | **586** | Descent II, 3dfx patch, recorded demo, CD REQUIRED | the HEAVIER Glide row: rt 0.32 against Tomb Raider's 0.87, and it ships the byte-identical `glide2x.ovl` |
+| `mojo_c` | **586** | MOJO.EXE, 3dfx's own DOS diagnostic for the SST-1 | the board-IDENTITY row: it grades no picture at all, and it is the cheapest row in the table at 0.73 s |
 
 `duke3d_short_c` is generated, not authored: `scripts/make-duke-short-fixture.ps1`
 writes it from `duke3d_c` by lowering the record count in BENCH2.DMO's header and
@@ -107,6 +108,38 @@ too many and Tomb Raider opens its ring menu and never starts the attract demo
 at all, so the row would pin a still picture and pass. The measured windows are
 in `PROTOCOL.md`.
 
+### MOJO grades a TEXT REPORT (added 2026-09-01)
+
+`mojo-586` is the third grading shape in the table, after the framebuffer hash
+and DUKEMARK's parsed report. Its whole output is two text files the guest
+redirects to disk, pinned by exact sha256 through the row's `textResults`
+field, and its whole reason for existing is that no picture answers the
+question it asks.
+
+The two Glide rows would render identically whether the SST-1 advertises one
+TMU or two, 2 MB or 4 MB, or a different vendor ID. MOJO.EXE reads those facts
+out of the hardware and prints them, and it reaches them along two paths
+nothing else here touches: per-TMU memory is SIZED by aliasing the texture
+aperture rather than read from a register, and the TMU config byte comes back
+as a rendered pixel through the LFB via `trexInit1`'s sendConfig bit.
+
+An exact hash is nearly the right instrument here for the reason it is the
+wrong one on an animating demo: a MOJO report is almost all board-identity
+facts, none of which may drift benignly. Almost. `MOJOV.TXT` prints `vRetrace`,
+a LIVE beam position, and the first version of this row walked straight into
+the phase-sensitivity trap with it -- removing two unused binaries from the
+fixture tree moved that one line and nothing else. That line is masked before
+hashing; everything else in both reports is pinned exactly. Measured all three
+ways -- a hand-mutated pin fails and names the file; the PR #814 binary (4 MB
+per TMU) fails against main's pins with a two-line diff, `TMU 0 RAM` and
+`TMU 1 RAM`; and a tree that shifts the beam line passes. Full account,
+including the fixture-tree recipe and the MOJO.EXE provenance flag, in
+`PROTOCOL.md` and `dev_docs/2026-09-01-mojo-fixture.md`.
+
+The fixture tree is git-ignored like every other; `scripts/make-mojo-fixture.ps1`
+rebuilds it and hard-fails on the sha256 of `mojo.exe`, because the pins are
+pins on one build of one diagnostic.
+
 ### Psycho Pinball grades the PUBLISHED frame (added 2026-08-29)
 
 `psycho_c` is the only row whose picture comes from `--presented-ppm` rather
@@ -171,6 +204,7 @@ playback.
 | `QCONSOLE.LOG` last line | quake | `969 frames 22.3 seconds 43.5 fps` |
 | DUKEMARK report file | Duke3D | clean EXITVM stop + Info String + sample count are INVARIANTS; fps is a MEASUREMENT |
 | framebuffer PPM SHA | PoP, Wolf3D | a CORRECTNESS invariant, see below |
+| guest-written report SHA | MOJO | board identity; one masked line, see below |
 | `real_time_factor` | Wolf3D, Duke3D | the performance metric for the two that print no score |
 | wall seconds | all | fragile; see `PROTOCOL.md` |
 
