@@ -1670,7 +1670,12 @@ impl CpuGsw {
     pub fn direct_stall_snapshot(&self) -> crate::DirectStallSnapshot {
         #[cfg(feature = "jit")]
         {
-            self.jit_direct.stall_snapshot()
+            let mut snapshot = self.jit_direct.stall_snapshot();
+            // L8's far-CALL ledger is a `CpuGsw` cell written by emitted code through R15, not a
+            // JIT-frame lane folded in per exit -- see `jit::direct::far_call_ledger_offset`. It
+            // is monotonic, so reading it here IS the ledger; nothing drains it.
+            snapshot.far_call_native = self.far_call_ledger.0;
+            snapshot
         }
         #[cfg(not(feature = "jit"))]
         {

@@ -2928,19 +2928,19 @@ fn compiled_block_stays_small_enough_to_copy_per_entry() {
 
 #[test]
 fn direct_exit_and_link_cell_layouts_are_pinned() {
-    // L8 grew `NativeExit` by one `u64` (`far_call_native`), placed beside the other `u64`
-    // fields rather than after the trailing `u32`s so the struct grows by exactly 8 bytes and
-    // not 16 -- see that field's own doc. Every offset from `side_exit_reason` onward moves by
-    // that same 8.
-    assert_eq!(core::mem::size_of::<NativeExit>(), 152);
+    // L8 grew `NativeExit` by one `u64` (`far_call_native`) and the 2026-09-01 reprice took it
+    // straight back out again: the far-CALL ledger is a `CpuGsw` cell now, not a lane this
+    // struct carries, so every offset from `side_exit_reason` onward returns to its pre-L8
+    // value and the struct is 144 bytes again.
+    assert_eq!(core::mem::size_of::<NativeExit>(), 144);
     assert_eq!(core::mem::align_of::<NativeExit>(), 8);
-    assert_eq!(core::mem::offset_of!(NativeExit, unresolved_reason), 124);
-    assert_eq!(core::mem::offset_of!(NativeExit, dynamic_target_eip), 144);
+    assert_eq!(core::mem::offset_of!(NativeExit, unresolved_reason), 116);
+    assert_eq!(core::mem::offset_of!(NativeExit, dynamic_target_eip), 136);
     #[cfg(feature = "direct-link-refusal-census")]
     {
         assert_eq!(
             core::mem::offset_of!(NativeExit, direct_link_refusal_census_id),
-            148
+            140
         );
         assert_eq!(core::mem::size_of::<LinkCell>(), 24);
         assert_eq!(core::mem::align_of::<LinkCell>(), 8);

@@ -585,7 +585,7 @@ fn the_far_call_ledger_reaches_rust_and_inflates_neither_writes_nor_clocks() {
     select_arm(jit::direct::RetfArm::V86);
     let far = call_far(TARGET_SELECTOR, TARGET_OFFSET, false);
     let mut roles = build(v86_cpu, &far, STACK_ESP);
-    let ledger_before = roles.native.jit_direct.far_call_native_for_test();
+    let ledger_before = roles.native.direct_stall_snapshot().far_call_native;
     assert!(
         roles
             .native
@@ -593,9 +593,9 @@ fn the_far_call_ledger_reaches_rust_and_inflates_neither_writes_nor_clocks() {
             .unwrap()
     );
     assert_eq!(
-        roles.native.jit_direct.far_call_native_for_test() - ledger_before,
+        roles.native.direct_stall_snapshot().far_call_native - ledger_before,
         1,
-        "one far call must reach Rust through the STACK_FAR_CALL_NATIVE lane"
+        "one far call must reach Rust through the far_call_ledger cell"
     );
     for _ in 0..=FILL.len() {
         roles.interp.cycle(&mut roles.interp_bus).unwrap();
@@ -608,6 +608,141 @@ fn the_far_call_ledger_reaches_rust_and_inflates_neither_writes_nor_clocks() {
     assert_eq!(
         roles.native.elapsed_clocks, roles.interp.elapsed_clocks,
         "elapsed clocks"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// The ledger is MONOTONIC and the deposit COMMITS with the far call itself, not with some later
+/// exit-time copy-out. `direct_stall_snapshot` just reads the live `CpuGsw` cell (see
+/// `far_call_ledger_offset`'s own doc), so nothing about reading it after the first retirement may
+/// drain or reset it -- a second retirement through the identical compiled block must ADD to the
+/// first count. The 2026-08-31 frame-lane design happened to get this right too (its own
+/// `emit_return` copy ran unconditionally on every exit), but it needed that unconditional copy to
+/// get there; this design has no copy step to get wrong in the first place.
+#[test]
+fn far_call_ledger_accumulates_across_repeated_entries_without_draining() {
+    select_arm(jit::direct::RetfArm::V86);
+    let far = call_far(TARGET_SELECTOR, TARGET_OFFSET, false);
+    let mut roles = build(v86_cpu, &far, STACK_ESP);
+    let before = roles.native.direct_stall_snapshot().far_call_native;
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "first entry must run natively"
+    );
+    let after_first = roles.native.direct_stall_snapshot().far_call_native;
+    assert_eq!(
+        after_first - before,
+        1,
+        "the first entry must retire exactly one far call"
+    );
+
+    // Put the role back at the block's entry precondition -- CS the original flat selector, ESP
+    // the pre-call value, EIP at ENTRY -- and run the SAME compiled block a second time.
+    roles.native.halted = false;
+    roles.native.interrupt_shadow = false;
+    roles.native.load_segment_real(SegmentIndex::Cs, 0);
+    roles.native.registers.set_esp(STACK_ESP);
+    roles.native.pending_flags = PendingFlags::default();
+    roles.native.set_eip(ENTRY);
+    assert!(
+        roles
+            .native
+            .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+            .unwrap(),
+        "second entry must also run natively"
+    );
+    let after_second = roles.native.direct_stall_snapshot().far_call_native;
+    assert_eq!(
+        after_second - before,
+        2,
+        "a second retirement must add to the first, not replace it: the ledger read must not \
+         drain the CpuGsw cell"
+    );
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
+
+/// A block that never lowers a `CallFar16` must never touch the ledger cell at all, and the OFF
+/// arm's escape block -- built to stop BEFORE the CALL FAR entirely -- is the same claim from the
+/// other direction. Byte-level rather than counter-level: a stray unconditional touch (the shape
+/// of the bug L8's original frame slot had, before the 2026-09-01 reprice) would still show up
+/// here even if it happened to write zero.
+#[test]
+fn a_block_without_call_far_never_references_the_ledger_cell() {
+    use jit::encoder::{Encoder, Reg};
+
+    fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
+    }
+    fn ledger_load_bytes() -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.load_r64_disp32(
+            Reg::RDX,
+            Reg::R15,
+            core::mem::offset_of!(CpuGsw, far_call_ledger) as i32,
+        );
+        e.finish()
+    }
+    fn ledger_store_bytes() -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.store_r64_disp32(
+            Reg::R15,
+            core::mem::offset_of!(CpuGsw, far_call_ledger) as i32,
+            Reg::RDX,
+        );
+        e.finish()
+    }
+
+    select_arm(jit::direct::RetfArm::V86);
+    let far = call_far(TARGET_SELECTOR, TARGET_OFFSET, false);
+    let with_call_far =
+        compile_on(v86_cpu, &far).expect("V86 admits the far call and must compile it");
+    let load = ledger_load_bytes();
+    let store = ledger_store_bytes();
+    assert_eq!(
+        occurrences(&with_call_far.code, &load),
+        1,
+        "sanity: a CallFar16 block must load the ledger cell exactly once, or this fixture \
+         cannot fail"
+    );
+    assert_eq!(
+        occurrences(&with_call_far.code, &store),
+        1,
+        "sanity: a CallFar16 block must store the ledger cell exactly once"
+    );
+
+    let filler_only = compile_on(v86_cpu, &[0x89, 0xc8])
+        .expect("a plain control-tail block with no far call must still compile");
+    assert_eq!(
+        occurrences(&filler_only.code, &load),
+        0,
+        "a block with no CallFar16 must never load the ledger cell"
+    );
+    assert_eq!(
+        occurrences(&filler_only.code, &store),
+        0,
+        "a block with no CallFar16 must never store the ledger cell"
+    );
+
+    // The OFF arm's own escape block: compiled from the SAME far-call bytes, but the barrier
+    // stops the walk before the 0x9A opcode, so this is the `IZARRAVM_DIRECT_RETF_V86=0` knob's
+    // byte-identical-to-pre-L8 claim from the far-call side.
+    select_arm(jit::direct::RetfArm::Off);
+    let escaped = compile_on(real_cpu, &far).expect("the OFF arm still compiles up to the barrier");
+    assert_eq!(
+        occurrences(&escaped.code, &load),
+        0,
+        "the escape arm must emit nothing the ledger touches"
+    );
+    assert_eq!(
+        occurrences(&escaped.code, &store),
+        0,
+        "the escape arm must emit nothing the ledger touches"
     );
     jit::direct::set_direct_retf_v86_for_test(None);
 }

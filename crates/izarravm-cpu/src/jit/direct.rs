@@ -5135,13 +5135,12 @@ pub(crate) enum DirectKind {
     /// `far_ret_native` would silently break its pre-registered identity
     /// (`decode_inval_cs_load(armed) + far_ret_native(armed) == decode_inval_cs_load(base)`),
     /// since a CALL and a RETF are two different `decode_inval_cs_load` gaps that must stay
-    /// separately attributable. So this kind deposits into a NEW, DEDICATED lane instead --
-    /// `STACK_FAR_CALL_NATIVE`, a whole extra 8-byte stack slot (with 8 bytes of padding beside
-    /// it to keep the frame's 16-byte alignment invariant intact) rather than a shared half --
-    /// unpacked in `run.rs` into `direct_stalls.far_call_native` and exposed as
-    /// `far_call_native_for_test`/the `far_call_native` JSON field, with its own identity
-    /// extension: `decode_inval_cs_load(armed) + far_ret_native(armed) + far_call_native(armed)
-    /// == decode_inval_cs_load(base)`.
+    /// separately attributable. So this kind deposits into a NEW, DEDICATED counter instead of a
+    /// shared half -- the `CpuGsw::far_call_ledger` cell (`far_call_ledger_offset`), written
+    /// through R15 by leg (e) below since the 2026-09-01 reprice moved it out of the frame -- read
+    /// by `direct_stall_snapshot` and exposed as the `far_call_native` JSON field, with its own
+    /// identity extension: `decode_inval_cs_load(armed) + far_ret_native(armed) +
+    /// far_call_native(armed) == decode_inval_cs_load(base)`.
     CallFar16 {
         selector: u16,
         offset: u16,
@@ -9565,15 +9564,6 @@ pub(crate) struct NativeExit {
     pub(crate) mode13_dword_writes: u64,
     pub(crate) mode13_dirty_pages: u64,
     pub(crate) side_exit: u64,
-    /// `CallFar16`'s ledger deposit: one per native far call that retired, mirroring
-    /// `ram_dword_writes`'s high half (`far_ret_native`) but in a WHOLE dedicated lane rather than
-    /// a shared half -- see the `STACK_FAR_CALL_NATIVE` doc for why no shared half was available
-    /// and `run.rs`'s reader for the identity this closes. Placed here, beside the other `u64`
-    /// fields, rather than after the trailing `u32`s below: an 8-byte field dropped between two
-    /// 4-byte ones would force alignment padding neither of them needs, growing the struct by 16
-    /// bytes instead of 8 and moving `direct_exit_and_link_cell_layouts_are_pinned`'s pin further
-    /// than this field's own size accounts for.
-    pub(crate) far_call_native: u64,
     pub(crate) side_exit_reason: u32,
     pub(crate) trace_len: u32,
     pub(crate) linked_transfers: u32,
@@ -10092,17 +10082,15 @@ const EXIT_ARG: Reg = Reg::R9;
 const EXIT_ARG: Reg = Reg::RCX;
 
 // Base frame: 20 accounting and scratch slots at 8 bytes each, offsets 0 to
-// 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes, plus
-// `STACK_FAR_CALL_NATIVE` at 160 and 8 bytes of padding at 168 to keep the
-// frame's 16-byte alignment invariant (see `STACK_FAR_CALL_NATIVE`'s own doc),
-// filling 176 bytes.
+// 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes.
 //
-// This +16 (160 -> 176) is paid by EVERY compiled block, not just one that uses CallFar16 --
-// the prologue's xor+store into `STACK_FAR_CALL_NATIVE` and `emit_return`'s load+store both run
-// unconditionally, including on the `IZARRAVM_DIRECT_RETF_V86` knob's `0` escape arm, which was
-// built to be byte-identical to main. frame growth accepted unpriced 2026-08-31; the escape arm
-// is no longer byte-identical to main; re-price before using =0 as an A/B base.
-const BASE_STACK_LEN: u32 = 176;
+// L8 grew this to 176 for a far-CALL ledger slot at 160 plus its alignment padding, and every
+// compiled block paid the prologue zero and the `emit_return` copy that slot needed -- three
+// memory ops per ENTRY for a counter that ticks once per far CALL. The 2026-09-01 reprice moved
+// the ledger to `CpuGsw::far_call_ledger`, written through R15 by the `CallFar16` lowering
+// itself, and the frame came back to 160. Anything added here is paid ~384 M times on
+// duke3d-586; price it before you add it.
+const BASE_STACK_LEN: u32 = 160;
 // One frame shape for every block, x87-bearing or not. A chained native
 // transfer jumps straight into a target block's body, skipping its
 // prologue, so the target's own epilogue always runs against whatever
@@ -10211,10 +10199,11 @@ const STACK_ALU_FLAGS: i32 = 144;
 /// must not adopt the stub-call shape without moving this slot.
 const STACK_STUB_RETURN: i32 = STACK_ALU_FLAGS;
 const STACK_SHIFT_COUNT: i32 = 152;
-/// `CallFar16`'s far-CALL ledger: one deposit per native far call that retired, mirroring
-/// `RetFar16`'s `far_ret_native` counter (`STACK_RAM_DWORD_WRITES`'s high half) but NOT sharing
-/// that half or any other lane's. Both existing "free high half" lanes in this frame are
-/// documented TAKEN before this slice (`STACK_BYTE_READS`/`dword_reads` carries
+/// Byte offset from the `CpuGsw` pointer in R15 to the far-CALL ledger cell: one deposit per
+/// native far call that retired, `CallFar16`'s sibling of `RetFar16`'s `far_ret_native` counter.
+///
+/// **Why a whole dedicated counter, not a shared high half.** Both existing "free high half"
+/// lanes in the JIT frame are documented TAKEN (`STACK_BYTE_READS`/`dword_reads` carries
 /// `split_extra_bytes`; `STACK_RAM_DWORD_WRITES`/`ram_dword_writes` carries `far_ret_native`
 /// itself), and `STACK_RAM_BYTE_WRITES`'s high half is already spoken for by the STATIC
 /// total-word-store count `word_stores()` feeds. Conflating a far CALL into `far_ret_native`
@@ -10224,27 +10213,24 @@ const STACK_SHIFT_COUNT: i32 = 152;
 /// calls `invalidate_code_caches_for_cs_load` any more than a RETF does, but the two are different
 /// instructions with different census rows and, on the corpus, wildly different execution counts.
 ///
-/// So this is a WHOLE dedicated 8-byte lane rather than a shared half, which is why the frame grew
-/// (`BASE_STACK_LEN` 160 -> 176: this slot at 160, then 8 bytes of padding at 168 to preserve the
-/// 16-byte alignment `native_stack_len_keeps_the_call_16_byte_aligned`-style asserts pin) instead
-/// of being threaded through the existing dynamic-counter machinery. Two consequences of that
-/// follow directly and are NOT bugs:
+/// **History.** The ledger was first a frame slot (`STACK_FAR_CALL_NATIVE` at offset 160, which
+/// grew `BASE_STACK_LEN` 160 -> 176); the 2026-09-01 reprice moved it here, to this `CpuGsw` cell,
+/// and brought `BASE_STACK_LEN` back down to 160. The frame slot charged every block ENTRY a
+/// prologue zero and every block EXIT an `emit_return` copy so a counter that ticks once per far
+/// call could be aggregated per native exit -- on duke3d-586, ~384 M entries against a far-call
+/// count four to five orders of magnitude smaller.
 ///
-/// - 160 is outside `i8`'s range and outside `STACK_ZERO_FILL_LEN` (128), so this slot uses the
-///   disp32 load/store forms throughout (`dynamic_counter_fields`'s `(i8, usize)` pairs cannot
-///   name it) and is zeroed with its own explicit store in the prologue, exactly the pattern
-///   `STACK_EXIT`/`STACK_QUOTA` already use for the same reason: cheaper than widening the
-///   vector-fill window over the ALU scratch cluster (128..160), which is deliberately NOT zeroed
-///   (see `STACK_ZERO_FILL_LEN`'s own doc) and must stay that way.
-/// - The deposit itself cannot reuse `emit_dynamic_word_increment` (which always adds `1 << 32`,
-///   i.e. increments a shared HIGH half): a fresh full-width, low-half counter needs a plain
-///   64-bit `+= 1`, done here as an explicit disp32 load/add/store rather than the single
-///   `add_r64_to_mem_disp8` instruction the shared-half deposit uses, because that instruction has
-///   no disp32 form and this slot is out of disp8 range.
-///
-/// `run.rs` reads this field directly with no mask and no shift -- unlike `far_ret_native`, it
-/// shares no bits with anything, so there is nothing to unpack.
-const STACK_FAR_CALL_NATIVE: i32 = 160;
+/// **Why the R15 cell is correct where the frame slot was the wrong shape.** It survives a
+/// CHAINED native transfer for free: a hop jumps straight into a successor's `body_offset` and
+/// skips its prologue, so a frame lane needs to be zeroed by whoever entered and copied out by
+/// whoever left, while a `CpuGsw` cell is simply always there and needs neither. It also survives
+/// a side exit or a fault on a later instruction for free, because the increment commits at the
+/// instant the far call retires rather than at the exit that would otherwise copy the frame out.
+/// And it is monotonic: `direct_stall_snapshot` reads the live cell and nothing drains it per
+/// exit, so the reprice adds no Rust-side per-entry work either.
+fn far_call_ledger_offset() -> i32 {
+    core::mem::offset_of!(CpuGsw, far_call_ledger) as i32
+}
 // Beyond the base frame: the saved host RSI slot, then the x87 XMM6-11
 // save area right after it. Both Windows only, see NATIVE_STACK_LEN above.
 #[cfg(target_os = "windows")]
@@ -10359,6 +10345,12 @@ const _: () = {
 /// Links form at runtime between any two blocks sharing a mode key, so no compile-time union
 /// bounds either set. Both failures are guest-visible bus accounting. The prologue cost was
 /// recovered instead by making the zeroing WIDER, not narrower — see `STACK_ZERO_FILL_LEN`.
+///
+/// The identical argument later killed a conditional-growth design for L8's far-CALL ledger
+/// (`far_call_ledger_offset`): a per-`CallFar16` frame mask hits the same two failures above,
+/// just for one lane instead of seven. That lane's escape hatch was to leave the frame alone
+/// and put the counter in `CpuGsw` instead, written through R15 by the one lowering that needs
+/// it — see `dev_docs/2026-09-01-duke-l8-reprice.md` for the worked example.
 fn dynamic_counter_fields() -> [(i8, usize); 7] {
     [
         (
@@ -18190,12 +18182,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     e.store_r64_disp8(Reg::RSP, STACK_EXIT, Reg::RAX);
     e.mov_r32_r32(Reg::RAX, QUOTA_ARG);
     e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
-    // `STACK_FAR_CALL_NATIVE` sits outside `STACK_ZERO_FILL_LEN` (128) on purpose (see its own
-    // doc), so it needs its own explicit zero, the same pattern `STACK_EXIT`/`STACK_QUOTA` use
-    // for the identical reason -- cheaper than widening the vector-fill window over the ALU
-    // scratch cluster, which must stay unzeroed.
-    e.xor_r64_self(Reg::RAX);
-    e.store_r64_disp32(Reg::RSP, STACK_FAR_CALL_NATIVE, Reg::RAX);
+    // No far-CALL ledger slot to zero here: the ledger lives in `CpuGsw` and the `CallFar16`
+    // lowering increments it through R15. See `far_call_ledger_offset`.
     for (index, home) in GUEST_HOMES.into_iter().enumerate() {
         e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
     }
@@ -19443,15 +19431,16 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.store_r32_disp32(Reg::R15, cs + limit_offset(), Reg::RDX);
                 e.shift_r32_imm8(4, Reg::RAX, 4);
                 e.store_r32_disp32(Reg::R15, cs + base_offset(), Reg::RAX);
-                // (e) the far-CALL ledger. See `STACK_FAR_CALL_NATIVE`'s doc for why this is a
-                // whole dedicated lane (a plain `+= 1`) rather than a share of `far_ret_native`'s
-                // high half, and for why it cannot reuse `emit_dynamic_word_increment` (that
-                // helper always adds `1 << 32`, staged for a shared HIGH half; this lane is a
-                // fresh full-width counter, out of `i8` disp8 range, so both the load and the
-                // store below use the disp32 forms).
-                e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_FAR_CALL_NATIVE);
+                // (e) the far-CALL ledger: a plain `+= 1` into the `CpuGsw` cell through R15,
+                // which this emitter has just been writing CS through. RDX is scratch here and
+                // is reloaded with the target offset two instructions below. Three memory ops
+                // per RETIRED far call, and none at all per block entry -- see
+                // `far_call_ledger_offset` for why the frame slot this replaces was the wrong
+                // shape for a counter this rare.
+                let ledger = far_call_ledger_offset();
+                e.load_r64_disp32(Reg::RDX, Reg::R15, ledger);
                 e.add_r64_imm32(Reg::RDX, 1);
-                e.store_r64_disp32(Reg::RSP, STACK_FAR_CALL_NATIVE, Reg::RDX);
+                e.store_r64_disp32(Reg::R15, ledger, Reg::RDX);
                 // (f) EIP <- the immediate offset, then the far PIC. Materialized into a register
                 // here rather than baked as an `emit_completed_path` delta: see the `CallFar16`
                 // variant's own doc for why `classify` cannot compute an EIP-space delta to the
@@ -24977,15 +24966,8 @@ fn emit_return(e: &mut Encoder) {
         e.load_r64_disp8(Reg::RAX, Reg::RSP, stack_offset);
         e.store_r64_disp32(Reg::RDI, output_offset as i32, Reg::RAX);
     }
-    // `STACK_FAR_CALL_NATIVE` is copied out separately from `dynamic_counter_fields`'s loop:
-    // it is at offset 160, outside `i8`'s disp8 range that loop's `(i8, usize)` pairs require,
-    // so both the read and the write use the disp32 forms.
-    e.load_r64_disp32(Reg::RAX, Reg::RSP, STACK_FAR_CALL_NATIVE);
-    e.store_r64_disp32(
-        Reg::RDI,
-        core::mem::offset_of!(NativeExit, far_call_native) as i32,
-        Reg::RAX,
-    );
+    // Nothing to copy out for the far-CALL ledger: it is a `CpuGsw` cell, not a frame lane.
+    // See `far_call_ledger_offset`.
     e.add_r64_imm32(Reg::RSP, NATIVE_STACK_LEN);
     for reg in SAVED_HOST_REGS.into_iter().rev() {
         e.pop(reg);
@@ -32895,19 +32877,18 @@ pub(crate) struct DirectStallTally {
     /// `canonical_state_test.rs`) say what that costs -- a cache-line reshuffle of the hot region
     /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
     pub far_ret_native: u64,
-    /// L8's sibling of `far_ret_native`: CALL FARs served natively by `DirectKind::CallFar16`,
-    /// read out of the DEDICATED `STACK_FAR_CALL_NATIVE` frame lane (not a shared high half --
-    /// see that constant's own doc for why no shared half was available).
-    ///
-    /// A LEDGER rather than a rate, for the identical reason `far_ret_native` is one: a native
-    /// far CALL does not call `invalidate_code_caches_for_cs_load` either, so `decode_inval_cs_load`
-    /// falls by exactly this count too, and the two counters extend rather than replace
-    /// `far_ret_native`'s own pre-registered identity: `decode_inval_cs_load(armed) +
-    /// far_ret_native(armed) + far_call_native(armed) == decode_inval_cs_load(base)`. Kept
-    /// SEPARATE from `far_ret_native` rather than folded into it, because a CALL and a RETF are
-    /// different `decode_inval_cs_load` gaps on different census rows with different execution
-    /// counts on the corpus, and conflating them would make neither count individually checkable.
-    pub far_call_native: u64,
+    // L8's sibling of `far_ret_native` -- CALL FARs served natively by `DirectKind::CallFar16` --
+    // does NOT live here since the 2026-09-01 reprice. It is `CpuGsw::far_call_ledger`, a cell
+    // written through R15 by the one lowering that needs it, and it is never folded into this
+    // tally: there is nothing here to fold in from, since no emitted code writes `JitState` any
+    // more for this counter. `direct_stall_snapshot` (`core.rs`) reads the live cell straight into
+    // `DirectStallSnapshot::far_call_native` and never through this struct. A `far_call_native`
+    // field here was deleted rather than kept as a silent zero: a snapshot field that LOOKS live
+    // but is always 0 is a trap for the next reader of `stall_snapshot()`, and there is now
+    // exactly one caller (`core.rs`) so nothing depends on this struct carrying the value. See
+    // `far_call_ledger_offset`'s own doc for the identity this counter extends
+    // (`decode_inval_cs_load(armed) + far_ret_native(armed) + far_call_native(armed) ==
+    // decode_inval_cs_load(base)`) and why it cannot share `far_ret_native`'s high half.
     /// Stage 0 §5.0c: installed blocks whose OWN snapshot claims CS in either way -- the
     /// descriptor (`segment_bit(Cs)`, a CS-override memory operand) or the selector
     /// (`BAKES_CS_BIT`, `PUSH CS` / `MOV r16, CS`).
@@ -34689,15 +34670,10 @@ impl crate::jit::JitState {
         self.stalls.far_ret_native += far_returns;
     }
 
-    /// L8's sibling of `note_far_returns`. See `DirectStallTally::far_call_native`.
-    pub(crate) fn note_far_calls(&mut self, far_calls: u64) {
-        self.stalls.far_call_native += far_calls;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn far_call_native_for_test(&self) -> u64 {
-        self.stalls.far_call_native
-    }
+    // L8's `note_far_calls` is gone with the frame lane it drained and with
+    // `DirectStallTally::far_call_native`, the field it used to fold into: the ledger is a
+    // `CpuGsw` cell now, and `core.rs`'s `direct_stall_snapshot` override reads it straight into
+    // the snapshot's `far_call_native` after `stall_snapshot` below builds everything else.
 
     #[cfg(test)]
     pub(crate) fn far_ret_native_for_test(&self) -> u64 {
@@ -34859,7 +34835,12 @@ impl crate::jit::JitState {
             disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             far_ret_native: self.stalls.far_ret_native,
-            far_call_native: self.stalls.far_call_native,
+            // Placeholder: this struct carries no far-CALL ledger any more (see
+            // `DirectStallTally::far_ret_native`'s neighbouring comment). `core.rs`'s
+            // `direct_stall_snapshot` override always overwrites this with the live
+            // `CpuGsw::far_call_ledger` value before the snapshot reaches a caller, and it is
+            // that function's only caller, so 0 is never observed outside this one function.
+            far_call_native: 0,
             blocks_installed_baking_cs: self.stalls.blocks_installed_baking_cs,
             far_link_refused_cs: self.stalls.far_link_refused_cs,
             far_link_refused_limit: self.stalls.far_link_refused_limit,
