@@ -2600,6 +2600,21 @@ impl Distira {
         }
     }
 
+    // `lfb_byte_offset` deliberately does NOT wrap. It backs the LFB
+    // *read* aperture (`read_lfb_u8`, `read_lfb_bytes`) and the guest's own
+    // `write_lfb_u8` (dead today -- `vega.rs::write_wide_memory` drops
+    // `BusWidth::Byte` before it reaches Distira). Reads past the FBI
+    // aperture return OPEN BUS on both references that model an SST-1:
+    // 86Box's `voodoo_fb_readw`/`readl` guard with
+    // `if (read_addr > fb_mask) return 0xffff` / `0xffffffff`
+    // (`vid_voodoo_fb.c:91-95,132-136`) -- note the `& fb_mask` that follows
+    // the guard is therefore redundant for memory safety, so the guard is a
+    // deliberate behavioural choice, not a bounds check standing in for one
+    // -- and DOSBox-X's `lfb_r` returns `0xffffffff` the same way
+    // (`voodoo_emu.cpp:2860-2862`). Only the FBI *write* decode wraps
+    // (`RasterView::framebuffer_pixel_offset`'s doc comment carries that
+    // citation); this function stays unbounded and lets its callers apply
+    // whichever contract is theirs.
     fn lfb_byte_offset(&self, base: u32, aperture_offset: usize) -> Option<usize> {
         let x = (aperture_offset & 0x7fe) | (aperture_offset & 1);
         let y = (aperture_offset >> 11) & 0x3ff;
@@ -2619,6 +2634,8 @@ impl Distira {
         let Some(end) = start.checked_add(N) else {
             return bytes;
         };
+        // Open bus past the aperture, not a wrap: see `lfb_byte_offset`'s
+        // doc comment for the read-vs-write citation.
         if end <= self.fb.len() {
             for (index, byte) in bytes.iter_mut().enumerate() {
                 *byte = self.fb.get(start + index).unwrap_or(0xff);
@@ -2824,7 +2841,15 @@ impl Distira {
         let low_y = self.clip_low_y.min(self.display.height) as u64;
         let high_y = self.clip_high_y.min(self.display.height) as u64;
         let pitch = u64::from(self.display.pitch);
-        let len = self.fb.len() as u64;
+        // Wraps modulo FBI RAM size, the same write-side rule
+        // `RasterView::framebuffer_pixel_offset` uses -- see that
+        // function's doc comment for the hardware citation. Every
+        // `color_offset`/`depth_offset` below stays even (both bases are
+        // multiples of 8192 and `pixel_offset` is `draw_y * pitch + x * 2`
+        // with `pitch` a multiple of 128), so a masked offset can never
+        // land on `DISTIRA_FB_SIZE - 1` and hit the one-byte hole noted on
+        // `FrameStore::write_u16_le`.
+        let mask = (DISTIRA_FB_SIZE - 1) as u64;
         let params = self.raster_params();
 
         for y in low_y..high_y {
@@ -2833,13 +2858,13 @@ impl Distira {
                 let pixel_offset = draw_y
                     .saturating_mul(pitch)
                     .saturating_add(x.saturating_mul(2));
-                let color_offset = u64::from(color_start).saturating_add(pixel_offset);
-                if write_color && color_offset + 1 < len {
+                let color_offset = (u64::from(color_start).saturating_add(pixel_offset)) & mask;
+                if write_color {
                     self.fb.write_u16_le(color_offset as usize, color);
                     self.fastfill_pixels += 1;
                 }
-                let depth_offset = u64::from(self.aux_base).saturating_add(pixel_offset);
-                if write_depth && depth_offset + 1 < len {
+                let depth_offset = (u64::from(self.aux_base).saturating_add(pixel_offset)) & mask;
+                if write_depth {
                     self.fb.write_u16_le(depth_offset as usize, depth);
                 }
             }

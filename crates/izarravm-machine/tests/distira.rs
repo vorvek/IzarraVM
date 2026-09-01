@@ -52,7 +52,7 @@ fn write_reg(machine: &mut Machine, reg: usize, value: u32) {
 /// it purely from that bit, bit 0 SET routing the Voodoo onto the cable).
 /// initEnable is reachable only through port I/O, so this runs a tiny
 /// real-mode program (mirrors
-/// `glide_destructive_framebuffer_probe_reports_two_megabytes`) before
+/// `glide_destructive_framebuffer_probe_reports_four_megabytes`) before
 /// handing the machine back for the rest of a test's direct MMIO pokes.
 fn distira_display_enabled_machine(profile: MachineProfile) -> Machine {
     let mut code = Vec::new();
@@ -445,8 +445,15 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
     assert_eq!(frame, vec![0x0000_00ff]);
 }
 
+/// Pins the guest-visible half of the FBI board-identity decision
+/// (`dev_docs/2026-09-01-mojo-fixture.md` section 5.1: MOJO reported a 2 MB
+/// FBI on a dual-TMU board, a config that never shipped). Renamed from
+/// `glide_destructive_framebuffer_probe_reports_two_megabytes`, which
+/// pinned the OLD 2 MB size and went red the moment `DISTIRA_FB_SIZE` grew
+/// -- this is the guest-facing half of that decision, not incidental
+/// breakage, the same shape as PR #814's texture-memory probe rename.
 #[test]
-fn glide_destructive_framebuffer_probe_reports_two_megabytes() {
+fn glide_destructive_framebuffer_probe_reports_four_megabytes() {
     let mut code = Vec::new();
     push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8040);
     push_real_out_dx_eax(&mut code, 0x0cfc, INIT_ENABLE_WRITE);
@@ -458,7 +465,7 @@ fn glide_destructive_framebuffer_probe_reports_two_megabytes() {
         machine.run_until_halt_or_cycles(100_000).unwrap(),
         StopReason::DosExit { code: 0 }
     );
-    assert_eq!(run_glide_fbi_memory_probe(&mut machine), 2);
+    assert_eq!(run_glide_fbi_memory_probe(&mut machine), 4);
 }
 
 #[test]
