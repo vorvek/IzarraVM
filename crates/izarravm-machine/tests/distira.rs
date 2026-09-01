@@ -891,6 +891,15 @@ fn distira_retrace_start_ticks() -> u64 {
 /// formula that assumed a cold start. Every mode iteration below still runs
 /// the identical setup, so this preserves the "identical in every mode"
 /// contract the test exists to check.
+///
+/// CAVEAT: the predicate this bisects (`SST_STATUS` bit 0x40, the vertical
+/// retrace flag) is PERIODIC -- it reasserts every frame -- so bisection is
+/// only guaranteed to land on the first edge because `hi` starts at (and
+/// then only doubles past) `distira_retrace_start_ticks()`, which is close
+/// to the true edge. A search that drifted onto a later period would still
+/// return a self-consistent low/high split and this function would not
+/// notice on its own; the caller checks the result against the formula for
+/// exactly that reason.
 fn calibrate_retrace_edge_tick() -> u64 {
     let mut hi = distira_retrace_start_ticks().max(1);
     loop {
@@ -918,6 +927,19 @@ fn calibrate_retrace_edge_tick() -> u64 {
 #[test]
 fn distira_retrace_swap_deadline_is_identical_in_every_cpu_mode() {
     let deadline = calibrate_retrace_edge_tick();
+    // Independent oracle: the calibrated edge must still sit close to the
+    // textbook formula, not just be self-consistent across modes. This is
+    // what catches the calibration silently locking onto a later period (or
+    // the device's retrace timing model moving) -- either would blow well
+    // past this bound, while the small, fixed nudge the initEnable-unlock
+    // program leaves in the master-tick position stays comfortably inside
+    // it (measured: tens of thousands of ticks against an ~83-million-tick
+    // deadline).
+    let formula = distira_retrace_start_ticks();
+    assert!(
+        deadline.abs_diff(formula) < 100_000,
+        "calibrated retrace edge {deadline} drifted too far from the textbook formula {formula}"
+    );
     let mut expected = None;
 
     for mode in [

@@ -1435,15 +1435,21 @@ fn ascii_to_set1_maps_a_letter_to_make_and_break() {
     assert!(ascii_to_set1('\u{00f1}').is_empty());
 }
 
-#[test]
-fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
-    // The mux is FBIINIT0 bit 0 alone (86Box vid_voodoo.c:744-761, DOSBox-X
-    // voodoo_emu.cpp:1764-1775), and that register is write-protected by
-    // initEnable (PCI config offset 0x40) until a guest unlocks it -- both
-    // reachable only through port I/O, so a tiny real-mode program runs
-    // first (mirrors distira_display_enabled_machine in
-    // crates/izarravm-machine/tests/distira.rs) before the rest of this
-    // test's direct MMIO pokes.
+/// A machine with Distira's PCI initEnable unlocked and FBIINIT0 bit 0 set,
+/// so `active_display()` reads Distira the way it would once a real Glide
+/// driver's startup handshake finished. The mux is FBIINIT0 bit 0 alone
+/// (86Box `vid_voodoo.c:744-761`, DOSBox-X `voodoo_emu.cpp:1764-1775`), and
+/// that register is write-protected by initEnable (PCI config offset 0x40)
+/// until a guest unlocks it -- both reachable only through port I/O, so a
+/// tiny real-mode program runs first (mirrors
+/// `distira_display_enabled_machine` in
+/// `crates/izarravm-machine/tests/distira.rs`) before the caller's own
+/// direct MMIO pokes. Note for whoever reaches for the Distira-*native*
+/// register block (`DISTIRA_REG_COMMAND` et al, IzarraVM's own invention,
+/// not SST-1) instead of this preamble: that block has no way to reach the
+/// screen on its own. One mux, one owner -- SST FBIINIT0, initEnable
+/// unlocked -- by design.
+fn distira_display_enabled_bios_machine() -> Machine {
     let mut unlock = Vec::new();
     let out_dx_eax = |code: &mut Vec<u8>, port: u16, value: u32| {
         code.push(0xba);
@@ -1478,6 +1484,12 @@ fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
         izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::SST_FBI_INIT0 as u32,
         izarravm_video::FBIINIT0_VGA_PASS,
     );
+    machine
+}
+
+#[test]
+fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
+    let mut machine = distira_display_enabled_bios_machine();
     machine.write_physical_u32(
         izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_CLEAR_COLOR as u32,
         0x0010_2030,
@@ -1534,11 +1546,7 @@ fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
 /// pass.
 #[test]
 fn presented_ppm_is_unaffected_by_monitor_gamma() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::izarra_bios(),
-    )
-    .expect("build machine");
+    let mut machine = distira_display_enabled_bios_machine();
     machine.write_physical_u32(
         izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_CLEAR_COLOR as u32,
         0x0010_2030,
