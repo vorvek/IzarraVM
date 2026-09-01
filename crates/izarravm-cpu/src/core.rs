@@ -199,25 +199,36 @@ impl CpuGsw {
         self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
     }
 
-    /// The half every control-register flush runs: the TLB, the physical data-page caches and the
-    /// FastMap. Deliberately NOT gated by `cr0_write_moves_code_translation` -- the FastMap is
-    /// linear-keyed and privilege-tagged and a PE toggle changes CPL, which is a separate argument
-    /// with a separate blast radius. Keeping it ungated also keeps the `memory.rs` WP invariant
-    /// ("WP changes flush, so `wp` is consistent within a generation") true unconditionally.
+    /// The half every UNGATED control-register flush runs: the TLB, the physical data-page caches
+    /// and the FastMap. Used as-is by `flush_tlb_and_code_caches`, whose callers always have a
+    /// linear->physical map that moved (or a WP change under paging), so there is nothing to gate.
     ///
-    /// `wipes_tlb_flush` is counted HERE, above the gate, so it keeps counting flush EVENTS on the
-    /// gated arm: it is the divergence check that says the guest took the same path the same
-    /// number of times.
+    /// `wipes_tlb_flush` is counted HERE, above the wipe, so it keeps counting flush EVENTS: it is
+    /// the divergence check that says the guest took the same path the same number of times. The
+    /// PE-only caller (`flush_tlb_keep_code_caches`) does NOT route through here -- see that
+    /// function for why the data-side wipe itself is conditional there while the count is not.
     fn flush_tlb_and_direct_pages(&mut self) {
+        self.bump_wipes_tlb_flush_counter();
+        self.wipe_tlb_and_direct_pages();
+    }
+
+    #[cfg(feature = "jit")]
+    fn bump_wipes_tlb_flush_counter(&mut self) {
+        self.jit_direct.fast_map_audit.wipes_tlb_flush += 1;
+    }
+
+    #[cfg(not(feature = "jit"))]
+    fn bump_wipes_tlb_flush_counter(&mut self) {}
+
+    /// The TLB, the physical data-page caches and the FastMap, unconditionally. Split out of
+    /// `flush_tlb_and_direct_pages` so `flush_tlb_keep_code_caches` can skip this half alone while
+    /// still paying `bump_wipes_tlb_flush_counter` every time (see that function).
+    fn wipe_tlb_and_direct_pages(&mut self) {
         self.tlb.flush();
         // Clear the physical caches with the linear FastMap so alias-verification tags and
         // mappings are rebuilt from the current translation and permissions.
         self.data_read_pages.invalidate();
         self.data_write_pages.invalidate();
-        #[cfg(feature = "jit")]
-        {
-            self.jit_direct.fast_map_audit.wipes_tlb_flush += 1;
-        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -232,7 +243,9 @@ impl CpuGsw {
     }
 
     /// `flush_tlb_and_code_caches` without the code-translation teardown: the decode lines, their
-    /// SMC marks, the aperture flag and the Direct link graph all stay.
+    /// SMC marks, the aperture flag and the Direct link graph all stay. `new_cr0` is the value CR0
+    /// holds AFTER the write that reached here; see `flush_tlb_for_cr0_write` for why the DATA-side
+    /// wipe below only needs the new value, not the old one.
     ///
     /// What this gives up, and why each one is safe to retain (design section 4.1):
     ///
@@ -250,8 +263,42 @@ impl CpuGsw {
     /// data-segment decline clear that ride inside `invalidate_translation`). Losing an amnesty can
     /// only make link ADMISSION stricter, never admit an edge that should be refused, so it is not
     /// a soundness question -- but it is why the ladder measures `link_refusals` alongside the win.
-    fn flush_tlb_keep_code_caches(&mut self) {
-        self.flush_tlb_and_direct_pages();
+    ///
+    /// The DATA half (TLB, `data_read_pages`/`data_write_pages`, FastMap) is now ALSO gated, on a
+    /// narrower condition than the code half above: it wipes only when `new_cr0 & CR0_PG != 0`.
+    /// This branch is reached only when `cr0_write_moves_code_translation` is false, which forces
+    /// `old_cr0 & CR0_PG == new_cr0 & CR0_PG` (the predicate's first disjunct is exactly
+    /// `delta & CR0_PG != 0`) -- so PG is unchanged here, and checking `new_cr0` alone tells us
+    /// whether it was already 0 or already 1 on both sides. Two cases:
+    ///
+    /// - PG stays 1 (paging was already on, e.g. only TS/MP/EM/NE/AM/CD/NW moved): still wipe.
+    ///   `data_read_pages`/`data_write_pages` and the FastMap ARE privilege-tagged once paging is
+    ///   live (`memory.rs::fast_map_permissions` reads the live TLB entry's `user`/`writable`
+    ///   bits), and the `memory.rs` WP invariant ("WP changes flush, so `wp` is consistent within a
+    ///   generation") stays exactly as conservative as before for this case -- unconditional.
+    /// - PG stays 0 (paging was already off -- the ONLY way a bare PE toggle reaches this branch,
+    ///   since PG=1 with PE=0 is `#GP(0)` at the MOV CR0 site): skip the wipe. With paging off,
+    ///   `translate_linear_checked`'s early return makes the TLB dead weight (never populated,
+    ///   never consulted); `data_read_pages`/`data_write_pages` are keyed by PHYSICAL address alone
+    ///   with no permission bits in the entry (`memory.rs::read_direct_page_cached`); and
+    ///   `memory.rs::fast_map_permissions` returns the fixed, fully-permissive
+    ///   `PagePermissions::UNPAGED` for every population made while paging is off, so no FastMap
+    ///   entry populated under this condition carries a CPL-dependent tag to begin with. A PE
+    ///   toggle "changes CPL", but there is no privilege-tagged data here for a changed CPL to
+    ///   stale. `tlb.flush()` is skipped along with the rest rather than kept alone: it is free
+    ///   either way (nothing is in it), so keeping it unconditional would buy nothing.
+    ///
+    /// `wipes_tlb_flush` still counts the EVENT on the skipped arm (`bump_wipes_tlb_flush_counter`
+    /// runs unconditionally, same as the ungated function above) -- only `wipe_pages_cleared` and
+    /// the rest of the wipe's cost collapse. See `dev_docs/2026-09-01-tyrian-transition-diag.md`
+    /// section 7 S2 for the measured motivation (34,112 whole-map wipes per guest second on a
+    /// workload that never enables paging) and `cpu_cr0_flush_test.rs`'s `data_caches` module for
+    /// the red/anti-regression/correctness rows this rests on.
+    fn flush_tlb_keep_code_caches(&mut self, new_cr0: u32) {
+        self.bump_wipes_tlb_flush_counter();
+        if new_cr0 & CR0_PG != 0 {
+            self.wipe_tlb_and_direct_pages();
+        }
         self.invalidate_fetch_frontend();
     }
 
@@ -269,11 +316,17 @@ impl CpuGsw {
     ///
     /// WP IS NOT HERE FOR CODE TRANSLATION. Code fetch is a read; WP is supervisor *write*
     /// permission, so it cannot stale a decode line or a link. It is in this predicate for the
-    /// DATA-SIDE successor slice, whose invariant is stated in `memory.rs`: the protection check is
-    /// redone from the cached page bits against the current accessor (CPL can change without a
-    /// flush); WP changes flush, so `wp` is consistent within a generation. That invariant holds
-    /// TODAY regardless of this term, because `flush_tlb_and_direct_pages` is ungated. Keeping the
-    /// term costs nothing and pre-pays the follow-on. Do not "simplify" it away.
+    /// DATA-SIDE slice (`flush_tlb_keep_code_caches`'s `new_cr0 & CR0_PG` gate), whose invariant is
+    /// stated in `memory.rs`: the protection check is redone from the cached page bits against the
+    /// current accessor (CPL can change without a flush); WP changes flush, so `wp` is consistent
+    /// within a generation. That invariant still holds with the data-side gate in place: a write
+    /// where `new & CR0_PG != 0 && delta & CR0_WP != 0` makes this predicate TRUE, so it takes the
+    /// `flush_tlb_and_code_caches` arm and its ungated `flush_tlb_and_direct_pages` -- not the gated
+    /// `flush_tlb_keep_code_caches` at all. A WP change can only reach the gated function when
+    /// `new & CR0_PG == 0`, at which point the WP bit governs nothing (WP is a paging-only
+    /// protection check) and the DATA-side gate's own `new_cr0 & CR0_PG != 0` test is already false,
+    /// so it wipes only for the unrelated "PG stays 1" case, never skips it. Keeping the term costs
+    /// nothing and pre-pays the follow-on. Do not "simplify" it away.
     fn cr0_write_moves_code_translation(old: u32, new: u32) -> bool {
         let delta = old ^ new;
         delta & CR0_PG != 0 || (new & CR0_PG != 0 && delta & CR0_WP != 0)
@@ -293,7 +346,7 @@ impl CpuGsw {
         if Self::cr0_write_moves_code_translation(old_cr0, new_cr0) {
             self.flush_tlb_and_code_caches();
         } else {
-            self.flush_tlb_keep_code_caches();
+            self.flush_tlb_keep_code_caches(new_cr0);
         }
     }
 
