@@ -42,6 +42,16 @@ jobs:
       - name: Policy self-checks
         shell: pwsh
         run: |
+          # Every line below is a cargo invocation that must gate the build on its own exit
+          # code. Without these two settings, pwsh only propagates the LAST command's
+          # $LASTEXITCODE to the step (a failing native command does not stop a pwsh script
+          # by default), so a red cargo check or test partway down this block would pass
+          # silently and only the final clippy call would actually gate CI. That happened:
+          # PR #787 and PR #796 both landed with stale fixtures this block runs, and the
+          # step stayed green through both because nothing upstream of the last line could
+          # fail it.
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo check -p izarravm --no-default-features
           # int-trace is off by default, so the workspace clippy/test steps below
           # compile neither the tracer nor its tests. The check proves the feature
@@ -78,6 +88,12 @@ jobs:
           # stops the refusal/compile line-number tables going stale behind a green CI.
           cargo check -p izarravm --no-default-features --features direct-entry-attribution
           cargo test -p izarravm-cpu --no-default-features --features direct-entry-attribution entry_attribution
+          # The line-table rot fixture lives in `jit::direct::armed_tests`, not under
+          # `tests::entry_attribution::` -- the module is nested under `jit::direct` while the
+          # file lives in `entry_attribution/`, so the filter above is a substring match that
+          # never selects it. This is the second, independent filter for that module; it must
+          # stay separate because the test harness takes one filter string per invocation.
+          cargo test -p izarravm-cpu --no-default-features --features direct-entry-attribution armed_tests
           cargo test -p izarravm --no-default-features --features direct-entry-attribution hdd_profile_json_reports_fixed_time_and_native_metrics
           cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features direct-entry-attribution -- -D warnings
           cargo check -p izarravm --no-default-features --features smc-census
