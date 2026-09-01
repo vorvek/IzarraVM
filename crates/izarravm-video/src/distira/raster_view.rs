@@ -738,7 +738,9 @@ impl RasterView<'_> {
     }
 
     pub(super) fn sample_tmu_u8(&self, tmu: usize, sample: TextureSample) -> u8 {
-        self.texture[tmu][self.tmu_u8_offset(tmu, sample)]
+        let offset = self.tmu_u8_offset(tmu, sample);
+        super::lod_diag::note_read(tmu, offset);
+        self.texture[tmu][offset]
     }
 
     pub(super) fn tmu_u8_offset(&self, tmu: usize, sample: TextureSample) -> usize {

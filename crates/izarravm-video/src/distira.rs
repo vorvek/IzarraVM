@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 
+mod lod_diag;
 mod ncc;
 mod raster_math;
 mod raster_pool;
@@ -22,6 +23,7 @@ use raster_math::*;
 use raster_pool::{DiagCounter, FrameStore, raster_pool};
 use raster_queue::{QueuedTriangle, RasterQueue, ViewMemory, render_band};
 use raster_view::{RasterParams, RasterView};
+pub use lod_diag::dump as lod_diag_dump;
 pub use registers::*;
 use texture_combine::TextureCombineTarget;
 use texture_raster::{
@@ -2265,6 +2267,7 @@ impl Distira {
             return;
         };
         let mask = DISTIRA_TEX_SIZE - 1;
+        lod_diag::note_upload_bytes(tmu, offset, 4, self.texture_write_offset_unmasked(aperture_offset));
         for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
             self.texture[tmu][(offset + index) & mask] = byte;
         }
@@ -2280,6 +2283,7 @@ impl Distira {
         if lod > 8 {
             return None;
         }
+        lod_diag::note_upload_lod(tmu, lod);
 
         let params = self.raster_params();
         let mode = params.texture_mode_for_tmu(tmu);
@@ -2302,6 +2306,34 @@ impl Distira {
             .saturating_add(texture_mip_offset(lod_reg, lod, bytes_per_texel))
             .saturating_add(row_offset);
         Some((tmu, offset & (DISTIRA_TEX_SIZE - 1)))
+    }
+
+    /// DIAGNOSTIC: the same address `texture_write_offset` computes, before
+    /// the 2 MB wrap, so the diag can see an upload that ran past the TMU.
+    fn texture_write_offset_unmasked(&self, aperture_offset: usize) -> usize {
+        let aperture_offset = aperture_offset & !3;
+        let tmu = usize::from(aperture_offset & (1 << 21) != 0);
+        let lod = ((aperture_offset >> 17) & 0xf) as u32;
+        let params = self.raster_params();
+        let mode = params.texture_mode_for_tmu(tmu);
+        let bytes_per_texel = if ((mode >> 8) & 0xf) & 8 != 0 { 2 } else { 1 };
+        let s = if bytes_per_texel == 2 {
+            (aperture_offset >> 1) & 0xfe
+        } else if mode & TEXTUREMODE_SEQ_8_DOWNLD != 0 {
+            aperture_offset & 0xfc
+        } else {
+            (aperture_offset >> 1) & 0xfc
+        };
+        let t = (aperture_offset >> 9) & 0xff;
+        let lod_reg = params.texture_lod_for_tmu(tmu);
+        let (width, _) = texture_dimensions(lod_reg, lod);
+        let row_offset = t
+            .saturating_mul(width)
+            .saturating_add(s)
+            .saturating_mul(bytes_per_texel);
+        (params.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
+            .saturating_add(texture_mip_offset(lod_reg, lod, bytes_per_texel))
+            .saturating_add(row_offset)
     }
 
     fn drain_command_fifo(&mut self) {

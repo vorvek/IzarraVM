@@ -115,7 +115,14 @@ impl TextureIteratorState {
     ) -> TextureRaster {
         TextureRaster {
             tmu: std::array::from_fn(|tmu| {
-                TmuRaster::new(self.tmu[tmu], texture_modes[tmu], texture_lods[tmu], origin)
+                super::lod_diag::note_triangle(tmu, texture_modes[tmu], texture_lods[tmu]);
+                TmuRaster::new(
+                    tmu,
+                    self.tmu[tmu],
+                    texture_modes[tmu],
+                    texture_lods[tmu],
+                    origin,
+                )
             }),
         }
     }
@@ -235,6 +242,7 @@ impl TextureRaster {
 
 #[derive(Debug, Clone, Copy)]
 struct TmuRaster {
+    tmu: usize,
     s_over_w: RasterPlane,
     t_over_w: RasterPlane,
     reciprocal_w: RasterPlane,
@@ -252,6 +260,7 @@ struct TmuRaster {
 
 impl TmuRaster {
     fn new(
+        tmu: usize,
         iterators: TmuIterators,
         texture_mode: u32,
         texture_lod: u32,
@@ -263,6 +272,7 @@ impl TmuRaster {
         let rho_y = s_over_w.dy.hypot(t_over_w.dy);
         let rho = rho_x.max(rho_y);
         Self {
+            tmu,
             s_over_w,
             t_over_w,
             reciprocal_w: iterators.components[W].as_f64(),
@@ -307,6 +317,7 @@ impl TmuRaster {
             self.lod_max,
             self.lod_bias,
         );
+        super::lod_diag::note_sample_lod(self.tmu, lod.physical);
         TextureSample {
             s: s as f32,
             t: t as f32,

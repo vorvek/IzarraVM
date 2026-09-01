@@ -1966,6 +1966,7 @@ fn run_boot_hdd_folder(
         print_dump_result(&mut machine, &stop_reason);
         write_margo_store_ppms(&mut machine, result_ppm)?;
     }
+    izarravm_video::lod_diag_dump();
     if let Some(path) = result_ppm {
         write_framebuffer_ppm(&mut machine, path)?;
         println!("screenshot: {}", path.display());
