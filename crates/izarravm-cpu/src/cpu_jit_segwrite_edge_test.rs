@@ -22,6 +22,25 @@
 //! 3. `a_mismatched_selector_takes_the_guarded_exit_to_the_dispatcher` -- a live selector that
 //!    disagrees with the target's frozen requirement exits through `SegmentSelectorMismatch`, not
 //!    `StaticUnbound`, and does not spend a linked transfer.
+//!
+//! Plus three fixtures added in response to adversarial review (PR #809,
+//! `dev_docs/2026-09-01-segwrite-edge-review.md`), closing coverage holes the review's own
+//! mutation sweep found (N1, N2) and red-proving what dropping `seg_write_merge`'s `| dirty` term
+//! changes (N3):
+//!
+//! 4. `a_two_segment_write_block_still_publishes_no_successor` -- N2. Relaxing
+//!    `dirty_segments.count_ones() == 1` to `>= 1` left every existing test green; a multi-write
+//!    head (14.3% of 10rogue's, per L9 §9.1) must still get `[None, None]`.
+//! 5. `a_chain_widen_folds_through_a_dirty_predecessor_instead_of_cutting_it` -- N1, design §7.1
+//!    item 5, cloned from `cpu_jit_retf_v86_test.rs`'s "a requirement GROWS" shape. Reverting the
+//!    `widen_chain_requirement` arm to plain `merge_chain` left every existing test green; this
+//!    proves the B2 fold survives a widen instead of cutting the edge.
+//! 6. `a_write_only_segment_never_gates_reentry_into_its_own_source_block` -- N3. `seg_write_merge`
+//!    no longer OR's the written segment into the merged `used` mask (an earlier revision did);
+//!    this proves why not: with the bit present, re-entering the SOURCE block with a live value of
+//!    the segment it is about to overwrite -- unrelated to anything the guard checks -- would
+//!    refuse the entry through the chain entry check and route it down the data-segment decline
+//!    treadmill this design exists to convert out of.
 
 use super::*;
 
@@ -393,5 +412,244 @@ fn a_mismatched_selector_takes_the_guarded_exit_to_the_dispatcher() {
         cpu.registers.eip, b_linear,
         "EIP must sit at the block's normal end (B's start), exactly as an ordinary unbound exit \
          would leave it"
+    );
+}
+
+// =================================================================================================
+// N2: the multi-write bar. Relaxing dirty_segments.count_ones() == 1 to >= 1 is invisible to the
+// rest of the suite; this is the fixture that catches it.
+// =================================================================================================
+
+/// `mov es, bx` -- `0x8E /0`, register form. Writes a SECOND segment after `MOV_DS_AX` without
+/// tripping the compile walk's dirty-segment rule: `LoadSegReal` bakes nothing (`written_segment`
+/// is deliberately excluded from `pinned_segments`), so this instruction's own `pinned_segments()`
+/// does not intersect `dirty_segments` after the DS write, and the walk keeps going.
+const MOV_ES_BX: [u8; 2] = [0x8e, 0xc3];
+
+#[test]
+fn a_two_segment_write_block_still_publishes_no_successor() {
+    // filler(2) + mov ds,ax + mov es,bx + filler(2): six slots, two segment writes, ending on the
+    // ordinary catch-all boundary (decode simply runs out after the tail filler) -- every OTHER
+    // `seg_write_edge_eligible` term holds (V86, no CS/SS, no call-out write, plain-fallthrough
+    // terminal) except `dirty_segments.count_ones() == 1`.
+    let mut code = filler();
+    code.extend_from_slice(&MOV_DS_AX);
+    code.extend_from_slice(&MOV_ES_BX);
+    code.extend(FILL_TAIL.concat());
+
+    let mut memory = memory_fill();
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut cpu = v86_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.set_fast_map_enabled_for_test(true);
+
+    let starts: Vec<u32> = (0..(code.len() / 2) as u32)
+        .map(|i| ENTRY + 2 * i)
+        .collect();
+    for &linear in &starts {
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
+        map_direct_page(&mut cpu, &mut bus, page);
+    }
+    cpu.set_eip(ENTRY);
+
+    let block = install_at(&mut cpu, ENTRY);
+    assert_eq!(
+        block.span().instructions,
+        6,
+        "the walk must actually carry both writes into one block, or this fixture proves nothing"
+    );
+    assert!(
+        block.is_segment_write_block(),
+        "a two-segment write must keep the [None, None] bar even though every OTHER eligibility \
+         term (V86, plain-fallthrough terminal, no CS/SS, no call-out write) holds"
+    );
+    assert_eq!(
+        block.successors_for_test(),
+        [None, None],
+        "count_ones() == 1 is a hard bar, not a preference: a source can never owe two guards at \
+         one exit"
+    );
+}
+
+// =================================================================================================
+// N1 (design §7.1 item 5): the B2 widen fixture. Reverting `widen_chain_requirement`'s dirty arm
+// to plain `merge_chain` is invisible to the rest of the suite; this proves the fold, not the cut.
+// =================================================================================================
+
+/// `mov ax, fs` -- `0x8C /4`, register form. Pins FS's SELECTOR (`selector_segment`, part of
+/// `pinned_segments`) without addressing memory through it, so it is exactly two bytes like every
+/// other slot here and needs no segment-override prefix.
+const MOV_AX_FS: [u8; 2] = [0x8c, 0xe0];
+
+#[test]
+fn a_chain_widen_folds_through_a_dirty_predecessor_instead_of_cutting_it() {
+    // A (writes DS) -> B (reads DS) -> C (pins FS), each compiled and installed in its own pass so
+    // the walk cannot fuse two of them into one block. Installing C widens B's OWN chain
+    // requirement to include FS -- a segment B's compile-time snapshot never claimed -- and that
+    // widen must propagate backward across the A -> B edge through `seg_write_merge`, not the
+    // ordinary `merge_chain` L9's own design pass reached for and got wrong (B2).
+    let mut code = filler();
+    code.extend_from_slice(&MOV_DS_AX);
+    let b_linear = ENTRY + code.len() as u32;
+    code.extend_from_slice(&block_b_body());
+    let c_linear = ENTRY + code.len() as u32;
+    code.extend_from_slice(&MOV_AX_FS);
+    code.extend(FILL_TAIL.concat());
+    code.push(0xf4);
+
+    let mut memory = memory_fill();
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[0x0400] = 0xa5;
+
+    let mut cpu = v86_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.set_fast_map_enabled_for_test(true);
+    cpu.registers.set_ebx(0);
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
+        map_direct_page(&mut cpu, &mut bus, page);
+    }
+
+    // A: three slots (two filler, the write).
+    for &linear in &[ENTRY, ENTRY + 2, ENTRY + 4] {
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("decode A");
+    }
+    cpu.set_eip(ENTRY);
+    let block_a = install_at(&mut cpu, ENTRY);
+    assert!(!block_a.is_segment_write_block());
+
+    // B: three slots, compiled with DS = TARGET_SELECTOR live so it claims exactly that selector
+    // -- installing it binds A -> B (unrelated to the widen this fixture is about).
+    for i in 0..3u32 {
+        let linear = b_linear + 2 * i;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("decode B");
+    }
+    cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+    cpu.set_eip(b_linear);
+    install_at(&mut cpu, b_linear);
+
+    let narrowed_before = cpu.direct_stall_snapshot().chain_requirement_narrowed
+        [jit::direct::LinkClearCause::ChainWiden as usize]
+        .1;
+
+    // C: three slots. Installing it binds B -> C through the ORDINARY (non-dirty) merge, and
+    // because C pins FS -- which B's own compile-time snapshot never touched -- that admission
+    // WIDENS B's chain requirement to include FS. `widen_chain_requirement` then walks B's
+    // inbound edges, finds A (a dirty, non-far predecessor), and must re-fold A's requirement
+    // through `seg_write_merge`, not cut the edge.
+    for i in 0..3u32 {
+        let linear = c_linear + 2 * i;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("decode C");
+    }
+    cpu.set_eip(c_linear);
+    install_at(&mut cpu, c_linear);
+
+    let narrowed_after = cpu.direct_stall_snapshot().chain_requirement_narrowed
+        [jit::direct::LinkClearCause::ChainWiden as usize]
+        .1;
+    assert_eq!(
+        narrowed_after, narrowed_before,
+        "the widen must FOLD through the dirty predecessor A via seg_write_merge, not cut the \
+         A -> B edge (LinkClearCause::ChainWiden) -- that is the exact shape of L9's own mistake"
+    );
+
+    // The A -> B edge must still be LIVE, not merely uncut in the counter: entering A must still
+    // chain straight into B in one dispatcher entry.
+    cpu.registers.set_eax(u32::from(TARGET_SELECTOR));
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+    let entries_before = cpu.perf_counters().jit_direct_entries;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_entries - entries_before,
+        1,
+        "the A -> B edge must have survived the widen and still chain in one entry"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        TARGET_SELECTOR,
+        "A's write must still have taken"
+    );
+}
+
+// =================================================================================================
+// N3: dropping seg_write_merge's `| dirty` term. Proves what the term changed rather than merely
+// asserting the drop is safe.
+// =================================================================================================
+
+#[test]
+fn a_write_only_segment_never_gates_reentry_into_its_own_source_block() {
+    // The same A -> B edge as fixture 1, bound identically.
+    let (mut cpu, mut bus, b_linear) = stage(v86_cpu, &block_b_body());
+    let block_a = install_at(&mut cpu, ENTRY);
+    cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+    install_at(&mut cpu, b_linear);
+
+    // Re-enter A STANDALONE (not chained into, just a plain top-level dispatcher entry) with a
+    // live DS that agrees with NEITHER A's original compile-time DS (0, from `stage`) NOR B's
+    // frozen requirement (`TARGET_SELECTOR`). A never READS DS -- it only overwrites it -- so
+    // this must have no bearing on whether A can be entered at all.
+    //
+    // If `seg_write_merge` OR'd the written segment into `used` (the reverted shape N3 removes),
+    // `chain_layouts[A].used` would claim DS with A's ORIGINAL entry-time descriptor, the armed
+    // entry check (`chain_entry_check_armed`, on by default) would compare that against this
+    // DIFFERENT live DS, and the entry would be REFUSED
+    // (`jit_direct_reject_data_segment`/`_v86`) even though nothing A does depends on DS's value
+    // before the write. That refusal is exactly the data-segment decline treadmill this design
+    // exists to convert traffic OUT of, aimed at its own population.
+    const UNRELATED_DS: u16 = 0x0099;
+    assert_ne!(UNRELATED_DS, TARGET_SELECTOR);
+    cpu.load_segment_real(SegmentIndex::Ds, UNRELATED_DS);
+    cpu.registers.set_eax(u32::from(TARGET_SELECTOR));
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+
+    let entries_before = cpu.perf_counters().jit_direct_entries;
+    let reject_before = cpu.perf_counters().jit_direct_reject_data_segment;
+
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap(),
+        "A must still be enterable with an unrelated live DS -- it does not read DS before \
+         overwriting it, and the written segment must not be part of A's own entry requirement"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_entries - entries_before,
+        1,
+        "the entry must actually run natively, not fall back to the interpreter"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment,
+        reject_before,
+        "the written-but-unread segment must not gate A's own entry"
+    );
+    // And the chain into B still works off the write A performs during this very run, exactly as
+    // fixture 1 already covers -- confirmed here as a sanity check that this run actually took
+    // the native path rather than silently falling through to the interpreter for some other
+    // reason.
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        TARGET_SELECTOR,
+        "A's write must have taken, overwriting the unrelated entry-time DS"
     );
 }

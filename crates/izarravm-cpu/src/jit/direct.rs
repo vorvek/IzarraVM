@@ -9211,6 +9211,21 @@ fn compile_with_budget(
     // block carrying a native segment-write lowering can never BE a self loop, and this predicate
     // requires `segment_writes != 0`. The two are mutually exclusive by construction, not by an
     // extra check here.
+    //
+    // `callout_segment_writes == 0` IS VACUOUS ON THE SHIPPED DEFAULT (review finding N6), and
+    // this is recorded rather than left to be rediscovered. `callout_segment_writes` is fed by
+    // `segment_resume && row.may_write_segment()`, and `segment_resume` reads
+    // `IZARRAVM_CALLOUT_SEGMENT_RESUME`, default OFF since 2026-08-22. So on every shipped build
+    // `callout_segment_writes` is always 0 and this term never refuses anything. What actually
+    // keeps an `InterpretOne` row that writes a segment out of this population, on the shipped
+    // arm, is a DIFFERENT invariant: with the knob off, R2 resyncs against all six segment
+    // records for these rows, so a call-out slot that really moves one leaves the block via a
+    // side exit (a resync) at that slot and never reaches this catch-all at all -- there is no
+    // eligible block for the term to have refused. The term stays here as a real bar rather than
+    // a redundant one for exactly one reason: it is the only thing that keeps this population
+    // disjoint from lever 1's the day `IZARRAVM_CALLOUT_SEGMENT_RESUME` is ever flipped on, at
+    // which point R2's resync stops running and this term becomes load-bearing for the first
+    // time.
     let seg_write_edge_eligible = segment_writes != 0
         && dirty_segments.count_ones() == 1
         && dirty_segments & (segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)) == 0
@@ -9218,11 +9233,24 @@ fn compile_with_budget(
         && key.mode_key & JIT_MODE_KEY_V86_BIT != 0
         && is_plain_fallthrough_terminal(slots.last().map(|slot| slot.kind));
     // The one segment this edge would guard. `None` whenever `seg_write_edge_eligible` is false,
-    // in which case nothing reads it; `count_ones() == 1` in that predicate is what makes
-    // `segment_of_bit` total here.
-    let segment_write_guard = seg_write_edge_eligible
-        .then(|| segment_of_bit(dirty_segments))
-        .flatten();
+    // in which case nothing reads it.
+    //
+    // `expect`, NOT `.flatten()` (review finding N2). `count_ones() == 1` in
+    // `seg_write_edge_eligible` is what makes `segment_of_bit` total here, and that is an
+    // invariant of THIS predicate, not a fact `segment_of_bit` can defend on its own. A `.flatten()`
+    // here would fail OPEN: if `seg_write_edge_eligible` were ever relaxed to admit a multi-bit
+    // mask (a mutation that leaves the whole test suite green -- see
+    // `a_two_segment_write_block_still_publishes_no_successor`), `segment_of_bit` would return
+    // `None`, `.flatten()` would swallow it silently, and the catch-all `successors` arm below
+    // would publish an UNGUARDED edge for a block this design's §4.1 explicitly bars
+    // (`dirty_segments.count_ones() == 1` in slice 1; two-write heads are 14.3% of 10rogue's
+    // heads, L9 §9.1). The link-time twin at `try_link_inner`'s `expected_selector` bind already
+    // treats this as an `expect`-worthy impossibility; this site must agree rather than quietly
+    // disarming the guard while that one panics.
+    let segment_write_guard =
+        seg_write_edge_eligible.then(|| segment_of_bit(dirty_segments).expect(
+            "seg_write_edge_eligible's count_ones() == 1 term admits only a single-bit written mask",
+        ));
     // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
     // segment-write block -- it writes CS, which is the whole point -- so the `!segment_write_block`
     // term above would make the far cell unreachable and the slice inert.
@@ -10163,16 +10191,30 @@ impl SegmentLayout {
     ///    rarely claim the write pays this refusal, unchanged from before the slice, on that
     ///    share.
     ///
-    /// `used` still carries `dirty`, sourced from `self` (the union's other half is masked so
-    /// nothing about the written segment comes from `target`): a later widen at `target` that
-    /// tries to fold this edge back through the ordinary `merge_chain` must see the segment as
-    /// part of `self`'s own requirement, or the widen's own re-derivation (`widen_chain_requirement`
-    /// selecting THIS method again for a dirty predecessor) would silently stop applying to it.
+    /// `used` does NOT carry `dirty` (review finding N3). An earlier revision OR'd it in on the
+    /// theory that a later widen re-deriving this edge needs to see the segment as part of
+    /// `self`'s own requirement -- that theory is wrong: `widen_chain_requirement` selects THIS
+    /// method for a predecessor by testing `written_segments[predecessor]` directly
+    /// (`BlockCache`'s own parallel lane), never by testing `chain_layouts[predecessor].used`, so
+    /// nothing downstream needs the bit to survive in `used` for the re-derivation to keep firing.
+    ///
+    /// Carrying it anyway was actively harmful: the dispatcher entry check compares the ENTERED
+    /// block's own `chain_layouts` snapshot against live state
+    /// (`chain_entry_check_armed`/`entry_layout`, on by default), so a dirty bit surviving into
+    /// `used` makes every entry into `self` compare the LIVE pre-write descriptor of a segment
+    /// `self` never reads against a frozen snapshot -- a spurious requirement on a segment the
+    /// source block only overwrites. On a hot site whose caller leaves that segment varying
+    /// (`0x18803: MOV ES,AX`, design §2.1, ES is whatever the caller left), that refuses every
+    /// entry, and `own_mask_matches` reading `segment_layouts[self]` (which never carried the bit)
+    /// as `true` sends the refusal down the data-segment decline path: unlink, re-bind, re-reject
+    /// -- the treadmill this whole design exists to convert *out of*. Dropping the bit removes the
+    /// requirement entirely: the ONLY thing that ever discharges the written segment is the
+    /// runtime guard, exactly as clause 3 above already requires.
     pub(crate) fn seg_write_merge(self, target: Self, dirty: u8) -> Option<Self> {
         if target.used & dirty == 0 {
             return None;
         }
-        let used = self.used | (target.used & !dirty) | dirty;
+        let used = self.used | (target.used & !dirty);
         for segment in SEGMENT_ORDER {
             let bit = segment_bit(segment);
             if bit & dirty != 0 {
@@ -32479,6 +32521,16 @@ impl BlockCache {
         // `SEGWRITE-V86-EDGE`: same selection `try_link_inner` made for this edge's admission.
         // `written_segments[source_index]` cannot have changed between admission and this call
         // (nothing in between recompiles `source`), so this reproduces the identical merge.
+        //
+        // ASYMMETRY WITH `try_link_inner`, noted rather than silently carried (review finding
+        // N7): the dirty branch there guards this exact call with
+        // `source_layout.cs == target_layout.cs` before trying `seg_write_merge`, because
+        // `seg_write_merge` -- unlike `link_merge` -- does not check `cs` itself. This call omits
+        // that guard. It is harmless: `cs` is immutable for a block's whole life, and the edge's
+        // ORIGINAL admission at `try_link_inner` already proved the two ends agree on it, so
+        // re-deriving the identical merge here cannot newly disagree. But the two "the same
+        // merge, recomputed" call sites are not literally symmetric, and a future refactor that
+        // makes `seg_write_merge` cs-sensitive must update both.
         let dirty = self.written_segments[source_index];
         let merged = if far {
             source_layout.far_merge(target_layout)
@@ -32570,8 +32622,18 @@ impl BlockCache {
                 // must be re-folded through `seg_write_merge`, not plain `merge_chain`. The naive
                 // merge compares the predecessor's PRE-write descriptor against `requirement`'s
                 // POST-write one for the written segment and refuses on every widen -- L9's own
-                // finding, reproduced here as the exact failure this arm exists to prevent. A far
-                // predecessor never reaches this line with the far-dynamic cut above intact.
+                // finding, reproduced here as the exact failure this arm exists to prevent.
+                //
+                // A far predecessor DOES still reach this line (review finding N7): the cut above
+                // only `continue`s when `requirement` itself carries a CS bit, so a far
+                // predecessor whose downstream widen never touches CS falls through to here like
+                // any other. The `far_dynamic() -> 0` guard immediately below is therefore
+                // LOAD-BEARING, not redundant belt-and-braces -- it is what stops a far
+                // predecessor's `written_segments` entry (always the CS bit; `RetFar16`/
+                // `CallFar16` report `written_segment() == Some(Cs)`) from selecting
+                // `seg_write_merge` here, which would compare against `BAKES_CS_BIT` machinery
+                // `seg_write_merge` knows nothing about. Do not delete this guard on the theory
+                // that the cut above already excludes far predecessors -- it does not.
                 let predecessor_dirty = if self.blocks[predecessor_index].far_dynamic() {
                     0
                 } else {
@@ -36250,6 +36312,18 @@ impl crate::jit::JitState {
     /// the backend, next to the sixteen-bit split that is written the same way for the same
     /// reason. The caller passes the predicate already widened, so both lanes are an unconditional
     /// add and neither can mispredict.
+    ///
+    /// **`SEGWRITE-V86-EDGE`'s counter-run expectation is a LARGE drop here, not a modest one**
+    /// (review finding, PR #809 §6/§7 item 13 -- corrects the segwrite continue design's own
+    /// pre-registration, which predates this predicate's change). The `is_segment_write` predicate
+    /// this counts is `CompiledBlock::is_segment_write_block()`, and that predicate now reads
+    /// FALSE for the entire population this slice makes eligible (see its doc comment): an
+    /// eligible V86 block publishes a successor at compile time regardless of whether the edge
+    /// ever binds, so it stops being a "segment write block" by this predicate's definition the
+    /// moment the slice ships, not only once traffic actually chains through it. A drop by
+    /// roughly the eligible share (pyramid's, 21-for's, 10rogue's guard-eligible fraction per the
+    /// measurement backlog) is the EXPECTED reading; a merely MODEST move means eligibility is
+    /// not firing at the rate the S0 diagnostic measured, and that is the actual falsifier here.
     pub(crate) fn note_segment_write_block_entry(&mut self, is_segment_write: u64, insns: u64) {
         self.stalls.segment_write_block_head_entries += is_segment_write;
         self.stalls.segment_write_block_head_insns += is_segment_write * insns;
