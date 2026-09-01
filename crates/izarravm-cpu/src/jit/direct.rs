@@ -10199,10 +10199,11 @@ const STACK_ALU_FLAGS: i32 = 144;
 /// must not adopt the stub-call shape without moving this slot.
 const STACK_STUB_RETURN: i32 = STACK_ALU_FLAGS;
 const STACK_SHIFT_COUNT: i32 = 152;
-/// `CallFar16`'s far-CALL ledger: one deposit per native far call that retired, mirroring
-/// `RetFar16`'s `far_ret_native` counter (`STACK_RAM_DWORD_WRITES`'s high half) but NOT sharing
-/// that half or any other lane's. Both existing "free high half" lanes in this frame are
-/// documented TAKEN before this slice (`STACK_BYTE_READS`/`dword_reads` carries
+/// Byte offset from the `CpuGsw` pointer in R15 to the far-CALL ledger cell: one deposit per
+/// native far call that retired, `CallFar16`'s sibling of `RetFar16`'s `far_ret_native` counter.
+///
+/// **Why a whole dedicated counter, not a shared high half.** Both existing "free high half"
+/// lanes in the JIT frame are documented TAKEN (`STACK_BYTE_READS`/`dword_reads` carries
 /// `split_extra_bytes`; `STACK_RAM_DWORD_WRITES`/`ram_dword_writes` carries `far_ret_native`
 /// itself), and `STACK_RAM_BYTE_WRITES`'s high half is already spoken for by the STATIC
 /// total-word-store count `word_stores()` feeds. Conflating a far CALL into `far_ret_native`
@@ -10212,30 +10213,21 @@ const STACK_SHIFT_COUNT: i32 = 152;
 /// calls `invalidate_code_caches_for_cs_load` any more than a RETF does, but the two are different
 /// instructions with different census rows and, on the corpus, wildly different execution counts.
 ///
-/// So this needs a WHOLE dedicated counter rather than a shared half, not threaded through the
-/// existing dynamic-counter machinery. It was first built as a frame slot (`STACK_FAR_CALL_NATIVE`
-/// at offset 160, which grew `BASE_STACK_LEN` 160 -> 176), and the 2026-09-01 reprice moved it to
-/// the `CpuGsw` cell below -- see this function's own doc for why the frame slot was the wrong
-/// shape for a counter this rare.
+/// **History.** The ledger was first a frame slot (`STACK_FAR_CALL_NATIVE` at offset 160, which
+/// grew `BASE_STACK_LEN` 160 -> 176); the 2026-09-01 reprice moved it here, to this `CpuGsw` cell,
+/// and brought `BASE_STACK_LEN` back down to 160. The frame slot charged every block ENTRY a
+/// prologue zero and every block EXIT an `emit_return` copy so a counter that ticks once per far
+/// call could be aggregated per native exit -- on duke3d-586, ~384 M entries against a far-call
+/// count four to five orders of magnitude smaller.
 ///
-/// Byte offset from the `CpuGsw` pointer in R15 to the far-CALL ledger cell.
-///
-/// The ledger is NOT a stack slot. It was one (`STACK_FAR_CALL_NATIVE` at frame offset 160,
-/// which is what grew `BASE_STACK_LEN` from 160 to 176), and that shape charged every block
-/// entry a prologue zero and every block exit an `emit_return` copy so that a counter which
-/// ticks once per far CALL could be aggregated per native exit. On duke3d-586 that is ~384 M
-/// entries against a far-call count four to five orders of magnitude smaller.
-///
-/// Two properties make the R15 cell correct where a frame slot was needed for the other
-/// lanes. It survives a CHAINED native transfer for free (a hop jumps to a successor's
-/// `body_offset` and skips its prologue; a frame lane therefore has to be zeroed by whoever
-/// entered and copied out by whoever left, while a `CpuGsw` cell is simply always there), and
-/// it survives a side exit and a fault for free as well, because the increment is committed at
-/// the same instant the far call retires rather than at the exit that eventually copies the
-/// frame out.
-///
-/// It is monotonic: `direct_stall_snapshot` reads it, and nothing drains it per exit, so the
-/// reprice adds no Rust-side per-entry work either.
+/// **Why the R15 cell is correct where the frame slot was the wrong shape.** It survives a
+/// CHAINED native transfer for free: a hop jumps straight into a successor's `body_offset` and
+/// skips its prologue, so a frame lane needs to be zeroed by whoever entered and copied out by
+/// whoever left, while a `CpuGsw` cell is simply always there and needs neither. It also survives
+/// a side exit or a fault on a later instruction for free, because the increment commits at the
+/// instant the far call retires rather than at the exit that would otherwise copy the frame out.
+/// And it is monotonic: `direct_stall_snapshot` reads the live cell and nothing drains it per
+/// exit, so the reprice adds no Rust-side per-entry work either.
 fn far_call_ledger_offset() -> i32 {
     core::mem::offset_of!(CpuGsw, far_call_ledger) as i32
 }
@@ -32885,20 +32877,18 @@ pub(crate) struct DirectStallTally {
     /// `canonical_state_test.rs`) say what that costs -- a cache-line reshuffle of the hot region
     /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
     pub far_ret_native: u64,
-    /// L8's sibling of `far_ret_native`: CALL FARs served natively by `DirectKind::CallFar16`,
-    /// read out of the DEDICATED `CpuGsw::far_call_ledger` cell (not a shared high half -- see
-    /// `far_call_ledger_offset`'s own doc for why no shared half was available and why the cell
-    /// lives in `CpuGsw` rather than the frame since the 2026-09-01 reprice).
-    ///
-    /// A LEDGER rather than a rate, for the identical reason `far_ret_native` is one: a native
-    /// far CALL does not call `invalidate_code_caches_for_cs_load` either, so `decode_inval_cs_load`
-    /// falls by exactly this count too, and the two counters extend rather than replace
-    /// `far_ret_native`'s own pre-registered identity: `decode_inval_cs_load(armed) +
-    /// far_ret_native(armed) + far_call_native(armed) == decode_inval_cs_load(base)`. Kept
-    /// SEPARATE from `far_ret_native` rather than folded into it, because a CALL and a RETF are
-    /// different `decode_inval_cs_load` gaps on different census rows with different execution
-    /// counts on the corpus, and conflating them would make neither count individually checkable.
-    pub far_call_native: u64,
+    // L8's sibling of `far_ret_native` -- CALL FARs served natively by `DirectKind::CallFar16` --
+    // does NOT live here since the 2026-09-01 reprice. It is `CpuGsw::far_call_ledger`, a cell
+    // written through R15 by the one lowering that needs it, and it is never folded into this
+    // tally: there is nothing here to fold in from, since no emitted code writes `JitState` any
+    // more for this counter. `direct_stall_snapshot` (`core.rs`) reads the live cell straight into
+    // `DirectStallSnapshot::far_call_native` and never through this struct. A `far_call_native`
+    // field here was deleted rather than kept as a silent zero: a snapshot field that LOOKS live
+    // but is always 0 is a trap for the next reader of `stall_snapshot()`, and there is now
+    // exactly one caller (`core.rs`) so nothing depends on this struct carrying the value. See
+    // `far_call_ledger_offset`'s own doc for the identity this counter extends
+    // (`decode_inval_cs_load(armed) + far_ret_native(armed) + far_call_native(armed) ==
+    // decode_inval_cs_load(base)`) and why it cannot share `far_ret_native`'s high half.
     /// Stage 0 §5.0c: installed blocks whose OWN snapshot claims CS in either way -- the
     /// descriptor (`segment_bit(Cs)`, a CS-override memory operand) or the selector
     /// (`BAKES_CS_BIT`, `PUSH CS` / `MOV r16, CS`).
@@ -34680,10 +34670,10 @@ impl crate::jit::JitState {
         self.stalls.far_ret_native += far_returns;
     }
 
-    // L8's `note_far_calls` is gone with the frame lane it drained: the ledger is a `CpuGsw`
-    // cell now and `Cpu::direct_stall_snapshot` reads it straight into the snapshot's
-    // `far_call_native`. `DirectStallTally::far_call_native` stays as the snapshot's default
-    // source so this file's shape is unchanged, and is simply never written.
+    // L8's `note_far_calls` is gone with the frame lane it drained and with
+    // `DirectStallTally::far_call_native`, the field it used to fold into: the ledger is a
+    // `CpuGsw` cell now, and `core.rs`'s `direct_stall_snapshot` override reads it straight into
+    // the snapshot's `far_call_native` after `stall_snapshot` below builds everything else.
 
     #[cfg(test)]
     pub(crate) fn far_ret_native_for_test(&self) -> u64 {
@@ -34845,7 +34835,12 @@ impl crate::jit::JitState {
             disp_load_widen_lane_cap_refusals: self.stalls.disp_load_widen_lane_cap_refusals,
             decode_pack_late_view_miss: self.stalls.decode_pack_late_view_miss,
             far_ret_native: self.stalls.far_ret_native,
-            far_call_native: self.stalls.far_call_native,
+            // Placeholder: this struct carries no far-CALL ledger any more (see
+            // `DirectStallTally::far_ret_native`'s neighbouring comment). `core.rs`'s
+            // `direct_stall_snapshot` override always overwrites this with the live
+            // `CpuGsw::far_call_ledger` value before the snapshot reaches a caller, and it is
+            // that function's only caller, so 0 is never observed outside this one function.
+            far_call_native: 0,
             blocks_installed_baking_cs: self.stalls.blocks_installed_baking_cs,
             far_link_refused_cs: self.stalls.far_link_refused_cs,
             far_link_refused_limit: self.stalls.far_link_refused_limit,

@@ -2331,8 +2331,10 @@ pub struct DirectStallSnapshot {
     /// what each one counts, which of the three sites bumps it, and why the ledger is here rather
     /// than in `PerfCounters`.
     pub far_ret_native: u64,
-    /// L8's sibling of `far_ret_native`: the far-CALL ledger. See
-    /// `DirectStallTally::far_call_native`.
+    /// L8's sibling of `far_ret_native`: the far-CALL ledger. Served from the live
+    /// `CpuGsw::far_call_ledger` cell by `CpuGsw::direct_stall_snapshot` (`core.rs`), not from
+    /// `DirectStallTally` -- see `far_call_ledger_offset`'s own doc for why the counter moved
+    /// out of the JIT frame and out of this tally in the 2026-09-01 reprice.
     pub far_call_native: u64,
     /// Stage 0 §5.0c. See `DirectStallTally::blocks_installed_baking_cs`.
     pub blocks_installed_baking_cs: u64,

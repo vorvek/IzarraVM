@@ -1987,6 +1987,13 @@ fn far_call_ledger_partial_eq_is_always_equal() {
         native, interp,
         "two fresh CpuGsw values must be equal before this test says anything about the ledger"
     );
+    let mut unrelated = CpuGsw::default();
+    unrelated.set_eip(0x1234);
+    assert_ne!(
+        native, unrelated,
+        "an unrelated field must still fail equality, or this test cannot tell the ledger's \
+         always-equal PartialEq from CpuGsw's whole equality being degenerate"
+    );
     native.far_call_ledger = FarCallLedger(1);
     assert_eq!(
         native, interp,
