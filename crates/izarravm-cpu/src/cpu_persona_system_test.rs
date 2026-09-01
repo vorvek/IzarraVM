@@ -1443,7 +1443,7 @@ fn a_fetch_page_made_not_present_re_faults_after_invalidation() {
 
     // Clear the PTE present bit and flush so the cache invalidates.
     bus.memory[0x7004..0x7008].copy_from_slice(&0x0000_5006u32.to_le_bytes());
-    cpu.flush_tlb_and_code_caches();
+    cpu.flush_tlb_and_code_caches(TranslationFlushReason::Cr3);
     assert!(
         cpu.decode_cache.get(0x1000, true).is_none(),
         "the flush invalidated the cache"

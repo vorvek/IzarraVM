@@ -1001,6 +1001,9 @@ pub(super) fn perf_counters_json(
         "decode_inval_cs_load": perf.decode_inval_cs_load,
         "decode_inval_smc": perf.decode_inval_smc,
         "decode_inval_other": perf.decode_inval_other,
+        "decode_inval_cr3": perf.decode_inval_cr3,
+        "decode_inval_cr0": perf.decode_inval_cr0,
+        "decode_inval_task_switch": perf.decode_inval_task_switch,
         "poll_skip_spans": perf.poll_skip_spans,
         "poll_skip_iterations": perf.poll_skip_iterations,
         "poll_neg_cache_hits": perf.poll_neg_cache_hits,
@@ -1172,7 +1175,7 @@ pub(super) fn print_perf_counter_row(
     println!(
         "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
          brk[branch/step/int/cap/halt/rep/fatal]={}/{}/{}/{}/{}/{}/{}  \
-         inval[cs/smc/other/all]={}/{}/{}/{} narrow={}  \
+         inval[cs/smc/other/all]={}/{}/{}/{} inval_ctl[cr3/cr0/task]={}/{}/{} narrow={}  \
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  fastmap[hit/miss]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
@@ -1199,6 +1202,9 @@ pub(super) fn print_perf_counter_row(
         perf.decode_inval_smc,
         perf.decode_inval_other,
         perf.code_invalidations,
+        perf.decode_inval_cr3,
+        perf.decode_inval_cr0,
+        perf.decode_inval_task_switch,
         perf.smc_narrow_kills,
         perf.data_direct_reads,
         perf.data_slow_reads,

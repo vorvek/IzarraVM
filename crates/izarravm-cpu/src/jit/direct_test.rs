@@ -1295,7 +1295,7 @@ fn translation_flush_preserves_blocks_but_coarse_map_flushes_drop_them() {
     install_trivial(&mut cpu.jit_direct, block_key, 1);
     let entry = cpu.jit_direct.blocks[0].entry_ptr();
 
-    cpu.flush_tlb_and_code_caches();
+    cpu.flush_tlb_and_code_caches(crate::TranslationFlushReason::Cr3);
 
     assert_eq!(cpu.jit_direct.len(), 1);
     assert_eq!(cpu.jit_direct.blocks[0].entry_ptr(), entry);

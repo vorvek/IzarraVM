@@ -617,7 +617,7 @@ impl CpuGsw {
                             CpuPersona::I486 | CpuPersona::I586 => 0xffff_f018,
                         };
                         self.control.cr3 = value & mask;
-                        self.flush_tlb_and_code_caches();
+                        self.flush_tlb_and_code_caches(TranslationFlushReason::Cr3);
                     }
                     4 => {
                         // CR4 is present only on the P55C persona. TSD has a modeled effect;

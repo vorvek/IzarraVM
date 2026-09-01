@@ -4,6 +4,18 @@
 use super::*;
 use crate::paging::{VGA_APERTURE_END, VGA_APERTURE_START};
 
+/// Which control-register write drove a `flush_tlb_and_code_caches`. Diagnostic only: the arms
+/// select a counter and nothing else. See `CpuGsw::flush_tlb_and_code_caches`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranslationFlushReason {
+    /// `MOV CR3, r32` -- the page-directory base was reloaded.
+    Cr3,
+    /// `MOV CR0, r32` or `LMSW`, on the arm where `cr0_write_moves_code_translation` is true.
+    Cr0,
+    /// `load_task_state` reloading CR3 out of the incoming TSS while PG is set.
+    TaskSwitch,
+}
+
 impl CpuGsw {
     pub fn reset(&mut self) {
         #[cfg(feature = "jit")]
@@ -237,7 +249,27 @@ impl CpuGsw {
         self.record_fast_map_wipe_extent();
     }
 
-    pub(super) fn flush_tlb_and_code_caches(&mut self) {
+    /// The whole-cache code-translation teardown, with the CAUSE named so the teardown that
+    /// `decode_inval_other` aggregates can be attributed to the control-register write that
+    /// caused it.
+    ///
+    /// The three named reasons are the three production callers: `MOV CR3`
+    /// (`execute_extended.rs`), `MOV CR0` when `cr0_write_moves_code_translation` says the map
+    /// moved (`flush_tlb_for_cr0_write` below), and `load_task_state` under paging
+    /// (`control.rs`). `Unattributed` is for test harnesses and any future caller that has not
+    /// been given a reason yet; it counts in `decode_inval_other` like every other reason and in
+    /// no split counter, so the split can only ever UNDER-count, never over-count.
+    ///
+    /// The split is diagnostic, not behavioural: every arm does exactly the same work. Nothing
+    /// here gates anything. `dev_docs/2026-09-02-tyrian-586-specs-diag.md` section 4.1 reached
+    /// "it is CR3" by eliminating the other two from unrelated counters; this makes the same
+    /// claim measurable, which is the precondition the diagnosis set for writing any gate.
+    pub(super) fn flush_tlb_and_code_caches(&mut self, reason: TranslationFlushReason) {
+        match reason {
+            TranslationFlushReason::Cr3 => self.perf.decode_inval_cr3 += 1,
+            TranslationFlushReason::Cr0 => self.perf.decode_inval_cr0 += 1,
+            TranslationFlushReason::TaskSwitch => self.perf.decode_inval_task_switch += 1,
+        }
         self.flush_tlb_and_direct_pages();
         self.invalidate_translation_code_caches();
     }
@@ -344,7 +376,7 @@ impl CpuGsw {
     /// at the foot of `cpu_cr0_flush_test.rs` records this as a non-gate rather than as coverage.
     pub(super) fn flush_tlb_for_cr0_write(&mut self, old_cr0: u32, new_cr0: u32) {
         if Self::cr0_write_moves_code_translation(old_cr0, new_cr0) {
-            self.flush_tlb_and_code_caches();
+            self.flush_tlb_and_code_caches(TranslationFlushReason::Cr0);
         } else {
             self.flush_tlb_keep_code_caches(new_cr0);
         }

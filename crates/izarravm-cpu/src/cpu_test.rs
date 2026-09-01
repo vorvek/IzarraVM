@@ -213,7 +213,7 @@ fn interpreter_direct_pages_skip_fast_map_when_native_admission_is_disabled() {
     );
     assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
 
-    cpu.flush_tlb_and_code_caches();
+    cpu.flush_tlb_and_code_caches(TranslationFlushReason::Cr3);
     assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
     assert_eq!(
         cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x3456, BusAccessKind::DataRead,)
@@ -1681,7 +1681,7 @@ fn fast_map_wipe_causes_split_out_the_sites_direct_map_invalidations_misses() {
     cpu.note_direct_data_map_changed();
     cpu.note_direct_data_map_changed();
     cpu.note_a20_changed();
-    cpu.flush_tlb_and_code_caches();
+    cpu.flush_tlb_and_code_caches(TranslationFlushReason::Cr3);
 
     let audit = cpu.fast_map_audit_counters();
     assert_eq!(audit.wipes_direct_map, 1);
@@ -1971,7 +1971,11 @@ fn pending_flags_offset() {
     // 8 bytes), moving this pin 4624 -> 4632 -- measured off a failing-test readout, not derived.
     // Same shape as every other counter above: host-side bookkeeping the guard's true conversion
     // rate rides, not guest state.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4632);
+    // The CR3/CR0/task-switch flush attribution split adds three PerfCounters fields
+    // (decode_inval_cr3 / _cr0 / _task_switch; 24 bytes), moving this pin 4632 -> 4656 --
+    // measured off a failing-test readout, not derived. They are an attribution of
+    // `decode_inval_other`, host-side diagnostics, not guest state.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4656);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and

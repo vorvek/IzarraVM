@@ -12,6 +12,7 @@ pub use canonical_state::{CanonicalCpuExecution, CpuCanonicalCaptureError};
 mod control;
 #[path = "core.rs"]
 mod cpu_core;
+pub(crate) use cpu_core::TranslationFlushReason;
 mod decode;
 mod execute;
 mod execute_extended;
@@ -719,6 +720,20 @@ pub struct PerfCounters {
     pub decode_inval_cs_load: u64,
     pub decode_inval_smc: u64,
     pub decode_inval_other: u64,
+    /// Attribution SPLIT of the `flush_tlb_and_code_caches` share of `decode_inval_other`. Every
+    /// event counted here also bumps `decode_inval_other`, so the three are a partition of that
+    /// counter's control-register half and never a second total: `decode_inval_cr3 +
+    /// decode_inval_cr0 + decode_inval_task_switch <= decode_inval_other`, with the remainder
+    /// being A20, direct-map, device-DMA and `INVLPG` invalidations.
+    ///
+    /// They exist because `decode_inval_other` alone cannot say WHICH control-register write
+    /// tore the code caches down, and the Tyrian 586 diagnosis
+    /// (`dev_docs/2026-09-02-tyrian-586-specs-diag.md` section 4.1) had to reach `MOV CR3` by
+    /// elimination rather than by measurement. A gate on any one of these three paths must be
+    /// designed against the counter that names it.
+    pub decode_inval_cr3: u64,
+    pub decode_inval_cr0: u64,
+    pub decode_inval_task_switch: u64,
     /// Code-cache invalidation events, including narrow self-modifying-code kills. This is the
     /// aggregate rate; the `decode_inval_*` and `smc_narrow_kills` counters retain the cause and
     /// affected-line detail.
