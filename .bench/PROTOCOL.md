@@ -1118,9 +1118,19 @@ sitting in text mode behind it", which is the Glide state and nothing else.
 
 Determinism: two repeat runs from a fresh copy are bit-identical on both rows.
 
+**PROSE REFRESHED 2026-09-01.** The `tombraid3d-586` figures below drifted
+from 305,875 non-black / 365 colours to 305,890 / 387 somewhere across
+#810/#812/#814 (Distira Glide gamma and framebuffer-size work). The retired
+instruction count drifted too, from 19,864,778,122 to 19,787,632,889 (0.39%,
+well inside the row's 5% tolerance). The `final_nonblack_percent`,
+`final_distinct_colors` and `final_instructions_tolerance` bands in
+`scripts/fixture-scoreboard-invariants.json` are wide enough that the row
+never went red; this table's prose numbers were simply never re-measured
+after the drift. Reconfirmed on main at `e95d3c4f` before updating.
+
 | row | non-black | colours | retired instructions |
 |---|---|---|---|
-| `tombraid3d-586` | 305,875 / 307,200 (99.57%) | 365 | 19,864,778,122 |
+| `tombraid3d-586` | 305,890 / 307,200 (99.57%) | 387 | 19,787,632,889 |
 | `descent2-3dfx-586` | 255,267 / 307,200 (83.09%) | 834 | 8,579,000,326 |
 
 ### MOJO (Distira board identity, 586 ONLY, added 2026-09-01)
