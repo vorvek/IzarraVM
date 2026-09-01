@@ -1311,6 +1311,15 @@ pub trait CpuBus {
     #[inline]
     fn note_code_fetch_linear(&mut self, _linear: u32) {}
 
+    /// Observe a guest INVD/WBINVD or a machine/persona reset that flushes the
+    /// real cache. Purely an observation seam: no bus time, no required
+    /// guest-visible side effect. The machine uses this to flush its shadow
+    /// L1 tag probe (`izarravm_machine::shadow_cache`) so the array does not
+    /// carry state across an event the real 486 clears its own cache on.
+    /// Default: no-op.
+    #[inline]
+    fn note_cache_flush(&mut self) {}
+
     /// Charge a warm instruction-fetch run in one address domain.
     fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
         for i in 0..count {

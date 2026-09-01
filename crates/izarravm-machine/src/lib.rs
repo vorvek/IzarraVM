@@ -53,6 +53,7 @@ pub(crate) use pci::PciConfig;
 mod cache_config;
 mod ram_lookup;
 mod sb16_path;
+mod shadow_cache;
 mod timeline;
 mod timing;
 mod vega;
@@ -90,6 +91,9 @@ pub(crate) use cache_config::{
     CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_TIER_DISABLED_MASK, CacheLevelConfig, TierCost,
     cache_level_config, code_fetch_ws, tier_cost,
 };
+
+pub use shadow_cache::{ShadowAccessClass, ShadowClassCounts, ShadowL1Diagnostics};
+pub(crate) use shadow_cache::{ShadowL1Probe, shadow_class_for};
 
 #[allow(unused_imports)]
 pub(crate) use video_params::{
@@ -1582,6 +1586,10 @@ pub struct Machine {
     // Never read by an emulation decision and never part of canonical state, so
     // unlike `isa_io_batch_clocks` above it does not gate a canonical capture.
     opl_probe: OplProbe,
+    // S1 shadow-tag probe (`dev_docs/2026-09-01-bus-clock-diag.md`): diagnostic
+    // ONLY, exactly like `opl_probe` above -- never read by an emulation
+    // decision, never part of canonical state. See `shadow_cache` module doc.
+    shadow_l1: ShadowL1Probe,
     // Set only when a bus-side DMA block copy writes guest RAM without exposing
     // its destination range. Range-aware HLE and device paths notify the CPU directly.
     device_wrote_memory: bool,
@@ -2074,6 +2082,7 @@ impl Machine {
             device_edge_batches: 0,
             device_edge_scans: 0,
             opl_probe: OplProbe::from_env(),
+            shadow_l1: ShadowL1Probe::from_env(),
             device_wrote_memory: false,
             pending_device_memory_write_range: None,
             direct_map_changed: false,
@@ -3153,6 +3162,9 @@ impl Machine {
         }
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
+        // The shadow L1 probe's array is likewise per-mode state on real silicon
+        // (a persona change is a different part); start it cold too.
+        self.shadow_l1.flush();
         // The bus scaler's fractional carry is per-mode (the ratio changes); start
         // a new mode with no carried remainder, exactly like the CPU does for its
         // instruction-clock scaler.
@@ -3263,6 +3275,12 @@ impl Machine {
 
     pub fn cache_tier_lookups(&self) -> u64 {
         self.cache_model.lookups()
+    }
+
+    /// S1 shadow-tag probe counters (`dev_docs/2026-09-01-bus-clock-diag.md`).
+    /// Diagnostic only; see `shadow_cache` module doc for scope and coverage.
+    pub fn shadow_l1_diagnostics(&self) -> ShadowL1Diagnostics {
+        self.shadow_l1.diagnostics()
     }
 
     /// Measure pure memory read timing for a block by driving the bus directly.
@@ -3794,6 +3812,9 @@ struct MachineBus<'a> {
     // Diagnostic-only OPL counters and trace. Points at `Machine::opl_probe`.
     // Never read by any emulation decision; see `OplProbe`.
     opl_probe: &'a mut OplProbe,
+    // S1 shadow-tag probe. Points at `Machine::shadow_l1`. Diagnostic only,
+    // charges nothing; see `shadow_cache` module doc.
+    shadow_l1: &'a mut ShadowL1Probe,
     device_wrote_memory: &'a mut bool,
     pending_device_memory_write_range: &'a mut Option<(u32, u32)>,
     direct_map_changed: &'a mut bool,
