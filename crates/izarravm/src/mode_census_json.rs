@@ -113,6 +113,12 @@ pub fn mode_census_json(
                 "reject_rgb_wmask": state.triangles.reject_rgb_wmask,
                 "reject_offscreen": state.triangles.reject_offscreen,
                 "depth_written": state.triangles.depth_written,
+                // The async-queue win metric: how many times
+                // drain_raster_queue actually rasterised a batch, and how
+                // many of those batches were large enough to reach the
+                // parallel lanes. See DistiraTriangleCensus::queue_drains.
+                "queue_drains": state.triangles.queue_drains,
+                "queue_drains_parallel": state.triangles.queue_drains_parallel,
             },
             "retrace_count": state.retrace_count,
             "painted_bytes": state.painted_bytes,

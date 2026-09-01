@@ -172,6 +172,18 @@ pub struct DistiraTriangleCensus {
     pub zero_area_float_samples: [[(u32, u32); 3]; 4],
     /// The first few ACCEPTED triangles, for comparison.
     pub drawn_samples: [[(i16, i16); 3]; 4],
+
+    /// How many times `drain_raster_queue` actually rasterised a non-empty
+    /// batch. This is the async-queue win metric: a guest that fences with
+    /// `nopCMD` between triangles used to force one drain per fence (see
+    /// `nop_cmd_needs_drain`), so this number tracked the fence count rather
+    /// than a real synchronisation need. It should now track only the real
+    /// consumers: LFB reads and writes, texture-aperture writes, statistics
+    /// reads, `swapbufferCMD`, `fastfillCMD`, and the queue filling up.
+    pub queue_drains: u64,
+    /// Of those drains, how many batch was large enough to reach the
+    /// parallel lanes (see `Distira::batch_lanes`).
+    pub queue_drains_parallel: u64,
 }
 
 /// Traffic through the three non-register apertures. A guest can look idle in
@@ -1249,6 +1261,10 @@ impl Distira {
         }
         let jobs = self.raster_queue.take();
         let lanes = self.batch_lanes(&jobs);
+        self.triangle_census.queue_drains += 1;
+        if lanes > 1 {
+            self.triangle_census.queue_drains_parallel += 1;
+        }
         let mut lane_stats: Vec<PixelStats> = (0..lanes).map(|_| PixelStats::new(0)).collect();
         if lanes == 1 {
             render_band(&jobs, self.view_memory(), 0, 1, &mut lane_stats[0]);
@@ -1794,15 +1810,34 @@ impl Distira {
         self.offset_bits_or |= offset;
         let voodoo_reg = offset & 0x3fc;
         let register = canonical_write_register(offset, self.fbi_init[3]);
+        let byte = offset & 0x3;
         // Classified BEFORE the NCC and texture-iterator arms below, which
         // return early: an NCC or palette write never reaches the `match`,
         // and it is one of the writes the queue has to be drawn for.
-        if !raster_snapshot_covers_register(register)
+        //
+        // `nopCMD` is carved out from the generic rule. On real Glide it is
+        // Voodoo's fence: it travels the FIFO in order behind whatever
+        // triangles precede it, so it needs ORDERING against the queue, not
+        // a synchronous join. `nop_cmd_needs_drain` proves the common case
+        // (byte != 0, or byte 0 with the reset bit clear) touches no device
+        // state at all -- not even order matters, because nothing is read or
+        // written. Only the reset-statistics case
+        // (byte == 0 && value & 1 != 0) still drains: it zeroes
+        // `fbi_pixels_in` and friends directly, and those counters are only
+        // correct if every triangle submitted before the reset has already
+        // folded its pixels in (see `merge_pixel_stats`). A reset that ran
+        // ahead of still-queued triangles would let their pixels land in the
+        // wrong epoch, so that path is not provably ordering-only and it
+        // keeps the pre-existing drain.
+        if voodoo_reg == SST_NOP_CMD {
+            if nop_cmd_needs_drain(byte, value) {
+                self.drain_raster_queue();
+            }
+        } else if !raster_snapshot_covers_register(register)
             || !raster_snapshot_covers_register(voodoo_reg)
         {
             self.drain_raster_queue();
         }
-        let byte = offset & 0x3;
         let chip = tmu_chip_mask(offset);
         if self.ncc.write_register(chip, register, byte, value) {
             return;
@@ -1979,7 +2014,7 @@ impl Distira {
                 self.clip_high_y = clip & 0xffff;
                 self.clip_low_y = (clip >> 16) & 0xffff;
             }
-            SST_NOP_CMD if byte == 0 && value & 1 != 0 => {
+            SST_NOP_CMD if nop_cmd_needs_drain(byte, value) => {
                 self.fbi_pixels_in = 0;
                 self.fbi_chroma_fail = 0;
                 self.fbi_zfunc_fail = 0;
@@ -2906,6 +2941,16 @@ fn triangle_defers(triangle: &QueuedTriangle) -> bool {
 /// Everything else draws the queue first: the framebuffer layout, the DAC and
 /// the CLUT, the command registers, `lfbMode`, and the NCC tables and palette,
 /// which the snapshot deliberately does not carry.
+/// Whether a `nopCMD` write actually mutates device state that a queued
+/// triangle's later drain could still affect. See the call site in
+/// `write_mmio_u8` for the ordering argument. Only byte 0 carries the reset
+/// bit (bit 0); every other byte, and byte 0 with the bit clear, is a
+/// complete no-op that this device does nothing with -- not even ordering
+/// applies, because there is nothing to order against.
+fn nop_cmd_needs_drain(byte: usize, value: u8) -> bool {
+    byte == 0 && value & 1 != 0
+}
+
 fn raster_snapshot_covers_register(register: usize) -> bool {
     matches!(
         register,

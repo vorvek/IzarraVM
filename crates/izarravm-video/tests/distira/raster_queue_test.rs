@@ -467,6 +467,129 @@ fn a_batch_may_mix_y_origins_without_two_lanes_meeting_on_one_row() {
     }
 }
 
+/// `nopCMD` with the reset bit clear is Glide's fence: real hardware queues
+/// it in FIFO order behind pending triangles and moves on. It carries no
+/// state this device reads or writes, so it must not force a drain. Before
+/// the L1 fix every `nopCMD` write drained synchronously regardless of the
+/// value, which is exactly the per-fence drain the 2026-09-01 diagnosis
+/// measured (248 drains for 960 triangles, 3.9 triangles per drain). This
+/// test fails on that old behavior: it would see the queue empty right after
+/// the fence instead of still holding both triangles.
+#[test]
+fn a_plain_nop_cmd_fence_does_not_drain_pending_triangles() {
+    let mut distira = Distira::new();
+    distira.set_raster_queue_enabled(true);
+    distira.set_frame_size(SCENE_WIDTH as u32, SCENE_HEIGHT as u32);
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+
+    submit_flat_triangle(
+        &mut distira,
+        [(0, 0), (256, 0), (0, 128)],
+        (0x40, 0x80, 0xc0),
+        10_737_418,
+    );
+    submit_flat_triangle(
+        &mut distira,
+        [(32, 16), (224, 24), (64, 120)],
+        (0xff, 0x20, 0x10),
+        20_000_000,
+    );
+    assert_eq!(distira.raster_queue_depth(), 2, "both triangles must batch");
+
+    // Glide's ordinary fence: no bits set. Real Glide code sends this between
+    // essentially every triangle to mark FIFO order, which is why it dominates
+    // the drain-trigger census by two orders of magnitude.
+    write_reg(&mut distira, SST_NOP_CMD, 0);
+
+    assert_eq!(
+        distira.raster_queue_depth(),
+        2,
+        "an ordering-only nopCMD must not join the queue: it touches no state \
+         a queued triangle could still change"
+    );
+}
+
+/// Many triangles fenced by plain `nopCMD` writes, the shape the diagnosis's
+/// demo-frame trace actually saw. Before the fix each fence forced its own
+/// drain (one triangle per drain, in this scene); after it the whole run is
+/// one batch, because nothing between the triangles needs the framebuffer.
+#[test]
+fn nop_cmd_fences_between_triangles_batch_into_one_drain() {
+    let mut distira = Distira::new();
+    distira.set_raster_queue_enabled(true);
+    distira.set_frame_size(SCENE_WIDTH as u32, SCENE_HEIGHT as u32);
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_FRONT | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+
+    const TRIANGLES: u32 = 20;
+    for index in 0..TRIANGLES {
+        let offset = (index % 4) * 8;
+        submit_flat_triangle(
+            &mut distira,
+            [(offset, 0), (256, offset), (0, 128)],
+            (0x10 + index, 0x20, 0x30),
+            10_000_000 + index * 1000,
+        );
+        write_reg(&mut distira, SST_NOP_CMD, 0);
+    }
+    assert_eq!(
+        distira.raster_queue_depth(),
+        TRIANGLES as usize,
+        "the fences must not have drawn anything yet"
+    );
+
+    // A real consumer: scanning out drains whatever is left.
+    let frame = distira.scanout_argb();
+    assert!(
+        frame.iter().any(|&pixel| pixel != 0),
+        "the batched triangles must actually have painted"
+    );
+    assert_eq!(
+        distira.scanout_state().triangles.queue_drains,
+        1,
+        "twenty triangles fenced only by ordering-only nopCMD writes must \
+         collapse into a single drain, not twenty"
+    );
+}
+
+/// The correctness half of the same story: a framebuffer read that comes
+/// right after an ordering-only barrier must still see every triangle
+/// submitted before that barrier. This is what pins the consumer path --
+/// `scanout_argb` is a true consumer and must drain, even though the
+/// `nopCMD` immediately before it must not.
+#[test]
+fn framebuffer_read_after_a_barrier_sees_every_prior_triangle() {
+    let mut distira = Distira::new();
+    distira.set_raster_queue_enabled(true);
+    distira.set_frame_size(64, 64);
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_FRONT | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    submit_flat_triangle(
+        &mut distira,
+        [(0, 0), (64, 0), (0, 64)],
+        (0xff, 0x00, 0x00),
+        10_000_000,
+    );
+    // A pure ordering barrier: no reset bit, nothing to drain for.
+    write_reg(&mut distira, SST_NOP_CMD, 0);
+
+    let frame = distira.scanout_argb();
+    assert!(
+        frame.iter().any(|&pixel| red_channel(pixel) > 0),
+        "scanout after a barrier must still show the triangle submitted before it"
+    );
+}
+
 #[test]
 fn a_pending_triangle_is_drained_before_the_frame_is_scanned_out() {
     // The narrow version of the stress test: submit and scan out with no
