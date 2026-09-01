@@ -384,6 +384,12 @@ impl RasterView<'_> {
     /// Rasterise one row of a triangle. Every frame-store access goes
     /// through the atomic store and every counter goes into the lane's
     /// stats, so any number of lanes can run disjoint rows at once.
+    /// The unspecialized row rasteriser `raster_row_specialized` was copied
+    /// from. Production dispatch (`render_band`) now always goes through a
+    /// kernel from `select_kernel`, so this function's only remaining
+    /// caller is `raster_kernel_test.rs`'s differential test, which checks
+    /// every kernel against it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn raster_row(&self, context: &TriangleContext, y: u32, stats: &mut PixelStats) {
         let TriangleContext {
             vertices: [a, b, c],
@@ -545,6 +551,261 @@ impl RasterView<'_> {
                 if wrote_color || wrote_depth {
                     stats.written += 1;
                 }
+            }
+        }
+    }
+
+    /// Rasterise one row through a kernel monomorphized for the caller's
+    /// mode key (`raster_kernel.rs`). Every `if DEPTH` / `if TEXTURED` /
+    /// `if BLEND` below replaces a condition `raster_row` re-tests at every
+    /// pixel with one `select_kernel` already resolved for the whole
+    /// triangle, and `if WBUF`/`!WBUF` replaces `TriangleDepth`'s own enum
+    /// match the same way. Every one of those conditions was already
+    /// constant for the triangle before this function existed — this
+    /// changes how the compiler generates the loop, never what it computes.
+    ///
+    /// The `debug_assert!`s are the safety net: `select_kernel` is the only
+    /// caller and derives DEPTH/WBUF/TEXTURED/BLEND from exactly the fields
+    /// checked here, so a failure means the dispatch table drifted from the
+    /// pixel pipeline, not that some caller mis-selected a kernel.
+    pub(super) fn raster_row_specialized<
+        const DEPTH: bool,
+        const WBUF: bool,
+        const TEXTURED: bool,
+        const BLEND: bool,
+    >(
+        &self,
+        context: &TriangleContext,
+        y: u32,
+        stats: &mut PixelStats,
+    ) {
+        debug_assert_eq!(
+            context.depths.is_some(),
+            DEPTH,
+            "raster kernel: DEPTH mismatch"
+        );
+        debug_assert_eq!(
+            matches!(context.depths, Some(TriangleDepth::W(_))),
+            DEPTH && WBUF,
+            "raster kernel: WBUF mismatch"
+        );
+        debug_assert_eq!(
+            self.fbz_color_path & FBZCP_TEXTURE_ENABLED != 0,
+            TEXTURED,
+            "raster kernel: TEXTURED mismatch"
+        );
+        debug_assert_eq!(
+            self.alpha_mode & ALPHA_BLEND_ENABLE != 0,
+            BLEND,
+            "raster kernel: BLEND mismatch"
+        );
+        let TriangleContext {
+            vertices: [a, b, c],
+            area,
+            depths,
+            texture,
+            coverage,
+            count_fbi_pixels,
+            affine_lods,
+            min_x,
+            max_x,
+            min_y: _,
+            max_y: _,
+        } = *context;
+        let (row_min_x, row_max_x) = if let Some(coverage) = coverage {
+            let Some((span_min, span_max)) = coverage.scanline_span(y) else {
+                return;
+            };
+            let span_min = span_min.max(0) as u32;
+            let span_max = span_max.max(-1).saturating_add(1) as u32;
+            (min_x.max(span_min), max_x.min(span_max))
+        } else {
+            (min_x, max_x)
+        };
+        let inv_area = 1.0 / area;
+        let tmu_need = if TEXTURED {
+            self.tmu_need()
+        } else {
+            [false, false]
+        };
+        for x in row_min_x..row_max_x {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let w0 = edge(b.x, b.y, c.x, c.y, px, py);
+            let w1 = edge(c.x, c.y, a.x, a.y, px, py);
+            let w2 = edge(a.x, a.y, b.x, b.y, px, py);
+            let inside = if coverage.is_some() {
+                true
+            } else if area < 0.0 {
+                w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
+            } else {
+                w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0
+            };
+            if !inside {
+                continue;
+            }
+            if count_fbi_pixels {
+                stats.fbi_pixels_in += 1;
+                stats.pixels_in += 1;
+            }
+            let draw_y = self.draw_y(y);
+            if !self.stipple_test(&mut stats.stipple, x, draw_y) {
+                if count_fbi_pixels {
+                    stats.reject_stipple += 1;
+                }
+                continue;
+            }
+
+            let l0 = w0 * inv_area;
+            let l1 = w1 * inv_area;
+            let l2 = w2 * inv_area;
+            let depth_raw: Option<f32> = if DEPTH {
+                // `select_kernel` derives WBUF from this same
+                // `context.depths`, so the guarded arms below are the only
+                // ones a correct caller ever reaches. A future second
+                // caller that mis-selects lands in one of the two
+                // unguarded arms instead of `unreachable!()`: this runs in
+                // a rayon lane, where a panic takes down a worker thread
+                // rather than failing loudly and safely, so a mis-selection
+                // degrades to computing the depth from whichever variant
+                // `depths` actually holds (still correct — WBUF only
+                // exists to skip the enum match, not to change the
+                // formula) instead of crashing the lane. The
+                // `debug_assert!` still makes the drift loud in any
+                // debug/test build.
+                let raw = match depths {
+                    Some(TriangleDepth::Z([za, zb, zc])) if !WBUF => {
+                        lerp_f32(za, zb, zc, l0, l1, l2)
+                    }
+                    Some(TriangleDepth::W([wa, wb, wc])) if WBUF => {
+                        f32::from(wfloat_depth(lerp_f32(wa, wb, wc, l0, l1, l2))) * 4096.0
+                    }
+                    Some(TriangleDepth::Z([za, zb, zc])) => {
+                        debug_assert!(false, "raster kernel: WBUF mismatch (Z depth, WBUF=true)");
+                        lerp_f32(za, zb, zc, l0, l1, l2)
+                    }
+                    Some(TriangleDepth::W([wa, wb, wc])) => {
+                        debug_assert!(false, "raster kernel: WBUF mismatch (W depth, WBUF=false)");
+                        f32::from(wfloat_depth(lerp_f32(wa, wb, wc, l0, l1, l2))) * 4096.0
+                    }
+                    None => {
+                        debug_assert!(
+                            false,
+                            "raster kernel: DEPTH mismatch (no depths, DEPTH=true)"
+                        );
+                        0.0
+                    }
+                };
+                Some(raw)
+            } else {
+                None
+            };
+            let depth = if DEPTH {
+                Some(self.biased_triangle_depth(depth_raw.expect("DEPTH kernel implies Some")))
+            } else {
+                None
+            };
+            if DEPTH {
+                let depth = depth.expect("DEPTH kernel implies Some");
+                if !self.depth_test_passes(x, draw_y, depth) {
+                    stats.fbi_zfunc_fail += 1;
+                    if count_fbi_pixels {
+                        stats.reject_depth += 1;
+                    }
+                    continue;
+                }
+            }
+
+            let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);
+            let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
+            let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
+            let texture_samples = if let Some(texture) = texture {
+                texture.samples_masked(px, py, tmu_need)
+            } else {
+                let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
+                let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
+                std::array::from_fn(|tmu| TextureSample::affine(s, t, affine_lods[tmu]))
+            };
+            let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
+            let alocal = self.alpha_local_source(alpha, depth_raw);
+            let texture = if TEXTURED {
+                self.combined_texture(texture_samples)
+            } else {
+                TextureRgba::TRANSPARENT_BLACK
+            };
+            let texture_alpha = self.texture_alpha_factor(texture.alpha);
+            let aother = self.texture_alpha_or_source(alpha, texture.alpha);
+            if self.fbz_mode & FBZ_ALPHA_MASK != 0 && aother & 1 == 0 {
+                if count_fbi_pixels {
+                    stats.reject_alpha_mask += 1;
+                }
+                continue;
+            }
+
+            let selected = self.selected_color_or_source((x, draw_y), (r, g, blue), texture);
+            if !self.chroma_key_passes(selected.0, selected.1, selected.2) {
+                stats.fbi_chroma_fail += 1;
+                if count_fbi_pixels {
+                    stats.reject_chroma += 1;
+                }
+                continue;
+            }
+            let (r, g, blue) =
+                self.texture_color_or_source(selected, (r, g, blue), alocal, aother, texture);
+            let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
+            if !self.alpha_test_passes(alpha) {
+                stats.fbi_afunc_fail += 1;
+                if count_fbi_pixels {
+                    stats.reject_alpha_test += 1;
+                }
+                continue;
+            }
+            if count_fbi_pixels {
+                stats.fbi_pixels_out += 1;
+                stats.pixels_out += 1;
+            }
+            let (r, g, blue) = self.apply_fog_color(r, g, blue);
+            let (r, g, blue) = if BLEND {
+                self.alpha_blend_color(x, draw_y, r, g, blue, alpha)
+            } else {
+                (r, g, blue)
+            };
+            let pixel = pack_rgb565_for_pixel(r, g, blue, x, draw_y, self.dither_enabled);
+            let wrote_color = if !DEPTH {
+                self.write_pixel_at_base(self.display.back_base, x, draw_y, pixel)
+            } else if self.fbz_mode & FBZ_RGB_WMASK == 0 {
+                if count_fbi_pixels {
+                    stats.reject_rgb_wmask += 1;
+                }
+                false
+            } else {
+                let stored = self.write_draw_pixel(x, draw_y, pixel);
+                if count_fbi_pixels && !stored {
+                    stats.reject_offscreen += 1;
+                }
+                stored
+            };
+            if count_fbi_pixels && wrote_color {
+                stats.color_written += 1;
+                if pixel != 0 {
+                    stats.color_written_nonblack += 1;
+                }
+                let base = match self.fbz_mode & FBZ_DRAW_MASK {
+                    FBZ_DRAW_FRONT => self.display.front_base,
+                    _ => self.display.back_base,
+                };
+                if let Some(offset) = self.framebuffer_pixel_offset(base, x, draw_y) {
+                    let offset = offset as u32;
+                    stats.color_offset_min = stats.color_offset_min.min(offset);
+                    stats.color_offset_max = stats.color_offset_max.max(offset);
+                }
+            }
+            let wrote_depth = depth.is_some_and(|depth| self.write_depth_pixel(x, draw_y, depth));
+            if count_fbi_pixels && wrote_depth {
+                stats.depth_written += 1;
+            }
+            if wrote_color || wrote_depth {
+                stats.written += 1;
             }
         }
     }

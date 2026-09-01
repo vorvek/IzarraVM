@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 
 mod ncc;
+mod raster_kernel;
 mod raster_math;
 mod raster_pool;
 mod raster_queue;
@@ -57,6 +58,7 @@ struct TriangleContext {
 }
 
 /// One lane's per-pixel counters, merged into the device after the join.
+#[derive(Debug, Clone, PartialEq)]
 struct PixelStats {
     written: u64,
     fbi_pixels_in: u32,
@@ -348,6 +350,12 @@ enum TriangleDepth {
 impl TriangleDepth {
     /// The depth at one pixel, in the raw "4096 units per depth code" scale
     /// `depth_to_u16` divides back out.
+    ///
+    /// Only `RasterView::raster_row` calls this now; `raster_row_specialized`
+    /// extracts the Z/W terms itself so the WBUF flag can skip the enum
+    /// match. Kept, and only `allow(dead_code)` outside tests, because
+    /// `raster_row` is the differential oracle in `raster_kernel_test.rs`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn at(self, l0: f32, l1: f32, l2: f32) -> f32 {
         match self {
             Self::Z([za, zb, zc]) => lerp_f32(za, zb, zc, l0, l1, l2),

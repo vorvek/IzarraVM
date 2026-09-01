@@ -34,6 +34,7 @@
 //! would need a barrier between triangles, which is the cost this exists to
 //! remove.
 
+use super::raster_kernel::{ModeKey, select_kernel};
 use super::*;
 
 /// How many triangles wait before the queue rasterises itself. A batch that
@@ -148,6 +149,11 @@ pub(super) fn render_band(
     for job in jobs {
         local.stipple = job.params.stipple;
         let view = view_memory.view(job.params);
+        // Picked once per triangle, never per row or per pixel: the mode
+        // key is triangle-constant, so re-deriving it inside the row loop
+        // below would just reintroduce the branch the kernel exists to
+        // remove.
+        let kernel = select_kernel(ModeKey::for_triangle(&job.params, &job.context));
         let TriangleContext { min_y, max_y, .. } = job.context;
         // The triangle row this lane wants. `draw_y` is `y` or
         // `height - 1 - y`, and the bounding box is clamped to the display
@@ -161,7 +167,7 @@ pub(super) fn render_band(
         let mut y = min_y + (lanes + residue - min_y % lanes) % lanes;
         while y < max_y {
             debug_assert_eq!(view.draw_y(y) % lanes, lane, "lanes must partition rows");
-            view.raster_row(&job.context, y, &mut local);
+            kernel(&view, &job.context, y, &mut local);
             y = y.saturating_add(lanes);
         }
     }
