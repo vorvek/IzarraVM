@@ -886,6 +886,13 @@ pub struct PerfCounters {
     /// is a surprise to explain, and a large one is a net loss, because a bail costs a quota
     /// decrement, a linked-transfer increment, an indirect jump and the guard before returning.
     pub jit_direct_x87_pad_bails: u64,
+    /// `SEGWRITE-V86-EDGE`: completed-path exits whose emitted guard found the live post-write
+    /// selector did not equal the target's frozen requirement (`UnresolvedReason::
+    /// SegmentSelectorMismatch`). This IS the guard's true conversion rate, measured for real
+    /// rather than estimated: `jit_direct_linked_transfers` for this edge shape divided by
+    /// (that plus this) is the discount the design's §6.2 could only bound before this counter
+    /// existed.
+    pub jit_direct_seg_guard_mismatch_exits: u64,
     pub jit_direct_cache_resets: u64,
     pub jit_direct_arena_compactions: u64,
     pub jit_direct_arena_compaction_live_blocks: u64,

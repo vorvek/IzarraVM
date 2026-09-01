@@ -3652,6 +3652,10 @@ impl CpuGsw {
                 self.perf.jit_direct_unresolved_exits += 1;
                 self.perf.jit_direct_x87_pad_bails += 1;
             }
+            jit::direct::UnresolvedReason::SegmentSelectorMismatch => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_seg_guard_mismatch_exits += 1;
+            }
         }
         self.perf.jit_native_load_hits += reads;
         self.perf.data_direct_reads += reads;

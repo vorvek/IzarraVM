@@ -498,8 +498,8 @@ impl CompiledBlock {
         self.span
     }
 
-    /// Whether this block was barred from publishing successors because it overwrites a segment
-    /// register.
+    /// Whether this block was barred from publishing ANY successor because it overwrites a
+    /// segment register.
     ///
     /// DERIVED, not stored, and that is a size decision rather than a stylistic one.
     /// `compiled_block_stays_small_enough_to_copy_per_entry` pins `CompiledBlock` at 120 bytes
@@ -507,23 +507,37 @@ impl CompiledBlock {
     /// eight bytes on every per-entry memcpy. `CallOutSlotCounts` is bit-packed for the same
     /// reason.
     ///
-    /// The equivalence is exact rather than approximate. Only TWO arms of `compile`'s `successors`
-    /// match produce `[None, None]`: the segment-write arm, which is reached only when
-    /// `dynamic_successor` was already forced false by its own `!segment_write_block` term; and
-    /// the Ret/JmpMem/CallReg/CallMem arm, which is reached only when `segment_write_block` is
-    /// false and therefore sets `dynamic_successor` TRUE from the identical kind list. So the
-    /// second conjunct is what separates them, and nothing else in the function can produce the
-    /// pair.
+    /// **No longer an exact equivalence with "this block contains a segment write" as of
+    /// `SEGWRITE-V86-EDGE`.** Before that slice, EVERY `segment_write_block` reached
+    /// `successors == [None, None]` (the far-return caveat below aside), so this predicate and
+    /// `segment_write_block` agreed on every block. Now an ELIGIBLE V86 segment-write block
+    /// (`seg_write_edge_eligible`: one write, not CS/SS, no call-out write, the plain-fallthrough
+    /// terminal shape, V86) publishes `successors = [Some(fallthrough), None]` at COMPILE TIME
+    /// regardless of whether the edge ever actually binds at link time -- so this predicate reads
+    /// **false** for that population, exactly as it would for any other block with a published
+    /// successor. What it still answers exactly is "the compile walk refused this block a
+    /// successor for a segment-write reason": CS/SS writes, a multi-write head, an `InterpretOne`
+    /// call-out write, plain real mode (B1's population, still barred), or a non-fallthrough
+    /// terminal all still land here. Only the eligible carve-out moved.
+    ///
+    /// The equivalence for that (now narrower) population is still exact for the same reason it
+    /// always was. Of `compile`'s `successors` match, the segment-write arm produces
+    /// `[None, None]` only when `!seg_write_edge_eligible` (see the guard on that arm), and is
+    /// reached only when `dynamic_successor` was already forced false by its own
+    /// `!segment_write_block` term; the Ret/JmpMem/CallReg/CallMem arm is reached only when
+    /// `segment_write_block` is false and therefore sets `dynamic_successor` TRUE from the
+    /// identical kind list. So the second conjunct below is still what separates the two, and
+    /// nothing else in the function can produce the pair.
     ///
     /// **THE FAR RETURN IS A THIRD ARM AND IT BREAKS THAT EXCLUSIVITY**, which is why the
     /// derivation carries a `|| far_dynamic()` disjunct. A `RetFar16` block reaches `[None, None]`
-    /// through the SEGMENT-WRITE arm -- it writes CS, so `segment_write_block` is true -- while
-    /// `dynamic_successor` is ALSO true, because the relaxation this slice makes is exactly to let
-    /// a segment-write block own a dynamic successor. Without the disjunct this predicate would
-    /// answer "no" for every far block and silently under-count the segment-write population by
-    /// 274 M on wolf3d. Nothing correctness-load-bearing reads it -- a `DirectStallTally`
-    /// diagnostic and the refusal census -- but a quietly-false counter is the exact failure this
-    /// campaign has been burned by.
+    /// through the SEGMENT-WRITE arm -- it writes CS, so `segment_write_block` is true, and CS is
+    /// barred from `seg_write_edge_eligible` unconditionally -- while `dynamic_successor` is ALSO
+    /// true, because the far-return slice's relaxation is exactly to let a segment-write block own
+    /// a dynamic successor. Without the disjunct this predicate would answer "no" for every far
+    /// block and silently under-count the segment-write population by 274 M on wolf3d. Nothing
+    /// correctness-load-bearing reads it -- a `DirectStallTally` diagnostic and the refusal census
+    /// -- but a quietly-false counter is the exact failure this campaign has been burned by.
     ///
     /// `segment_write_block` itself has TWO PRODUCERS since S4f and the proof above is unchanged
     /// by that: it is a proof about the two `successors` arms, not about what sets the flag. The
@@ -531,12 +545,21 @@ impl CompiledBlock {
     /// `may_write_segment` says yes, and they reach the flag through separate accumulators so that
     /// only the first also marks `dirty_segments`.
     ///
-    /// What this costs the block is not one extra boundary. `run_direct_block` computes
-    /// `chain_eligible` from `has_linked_successor`, so a block with no successors can never
-    /// chain and its quota is clamped to 1: every entry runs this block alone and returns through
-    /// the full prologue and epilogue.
+    /// What this costs the block, when it reads true, is not one extra boundary.
+    /// `run_direct_block` computes `chain_eligible` from `has_linked_successor`, so a block with
+    /// no successors can never chain and its quota is clamped to 1: every entry runs this block
+    /// alone and returns through the full prologue and epilogue.
     pub(crate) fn is_segment_write_block(&self) -> bool {
         self.successors == [None, None] && (!self.dynamic_successor() || self.far_dynamic())
+    }
+
+    /// The raw `successors` array, for fixtures that need to distinguish "no successor at all"
+    /// from "a successor was published but `try_link_inner` refused to bind it" -- a distinction
+    /// `is_segment_write_block` cannot make, since it answers a compile-time question and this
+    /// answers a slightly different one for the same population.
+    #[cfg(test)]
+    pub(crate) fn successors_for_test(&self) -> [Option<LinkTarget>; 2] {
+        self.successors
     }
 
     pub(crate) fn entry_ptr(&self) -> *const u8 {
@@ -9173,25 +9196,61 @@ fn compile_with_budget(
     let seg_head_guard_eligible = dirty_segments.count_ones() == 1
         && dirty_segments & (segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)) == 0
         && callout_segment_writes == 0
-        && !matches!(
-            slots.last().map(|slot| slot.kind),
-            Some(
-                DirectKind::Jcc { .. }
-                    | DirectKind::Loop { .. }
-                    | DirectKind::LoopCc { .. }
-                    | DirectKind::Call { .. }
-                    | DirectKind::Call16 { .. }
-                    | DirectKind::Jmp { .. }
-                    | DirectKind::Ret { .. }
-                    | DirectKind::Ret16 { .. }
-                    | DirectKind::RetFar16 { .. }
-                    | DirectKind::CallFar16 { .. }
-                    | DirectKind::JmpMem { .. }
-                    | DirectKind::JmpReg { .. }
-                    | DirectKind::CallReg { .. }
-                    | DirectKind::CallMem { .. }
-            )
-        );
+        && is_plain_fallthrough_terminal(slots.last().map(|slot| slot.kind));
+    // `SEGWRITE-V86-EDGE` (dev_docs/2026-09-01-segwrite-continue-design.md §4.1). The bars a
+    // segment-write block must clear to publish its plain static fallthrough anyway, on the
+    // default path -- not gated behind a diagnostic feature, because this is what decides
+    // `successors` below. Scoped identically to `seg_head_guard_eligible` above (one write, not
+    // CS/SS, no call-out write, the plain-fallthrough terminal shape) plus the ONE new term that
+    // diagnostic never needed: V86, the one mode where INV-V86-CANON holds
+    // (`load_segment_checked`'s V86 arm rebuilds the whole segment record from the selector, so a
+    // selector-equality guard suffices for a whole descriptor; `load_segment_real_mode` does not,
+    // which is what unreal mode IS and why L9's B1 killed a selector-only guard there).
+    //
+    // No separate self-loop term: `self_loop` above already requires `segment_writes == 0`, so a
+    // block carrying a native segment-write lowering can never BE a self loop, and this predicate
+    // requires `segment_writes != 0`. The two are mutually exclusive by construction, not by an
+    // extra check here.
+    //
+    // `callout_segment_writes == 0` IS VACUOUS ON THE SHIPPED DEFAULT (review finding N6), and
+    // this is recorded rather than left to be rediscovered. `callout_segment_writes` is fed by
+    // `segment_resume && row.may_write_segment()`, and `segment_resume` reads
+    // `IZARRAVM_CALLOUT_SEGMENT_RESUME`, default OFF since 2026-08-22. So on every shipped build
+    // `callout_segment_writes` is always 0 and this term never refuses anything. What actually
+    // keeps an `InterpretOne` row that writes a segment out of this population, on the shipped
+    // arm, is a DIFFERENT invariant: with the knob off, R2 resyncs against all six segment
+    // records for these rows, so a call-out slot that really moves one leaves the block via a
+    // side exit (a resync) at that slot and never reaches this catch-all at all -- there is no
+    // eligible block for the term to have refused. The term stays here as a real bar rather than
+    // a redundant one for exactly one reason: it is the only thing that keeps this population
+    // disjoint from lever 1's the day `IZARRAVM_CALLOUT_SEGMENT_RESUME` is ever flipped on, at
+    // which point R2's resync stops running and this term becomes load-bearing for the first
+    // time.
+    let seg_write_edge_eligible = segment_writes != 0
+        && dirty_segments.count_ones() == 1
+        && dirty_segments & (segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)) == 0
+        && callout_segment_writes == 0
+        && key.mode_key & JIT_MODE_KEY_V86_BIT != 0
+        && is_plain_fallthrough_terminal(slots.last().map(|slot| slot.kind));
+    // The one segment this edge would guard. `None` whenever `seg_write_edge_eligible` is false,
+    // in which case nothing reads it.
+    //
+    // `expect`, NOT `.flatten()` (review finding N2). `count_ones() == 1` in
+    // `seg_write_edge_eligible` is what makes `segment_of_bit` total here, and that is an
+    // invariant of THIS predicate, not a fact `segment_of_bit` can defend on its own. A `.flatten()`
+    // here would fail OPEN: if `seg_write_edge_eligible` were ever relaxed to admit a multi-bit
+    // mask (a mutation that leaves the whole test suite green -- see
+    // `a_two_segment_write_block_still_publishes_no_successor`), `segment_of_bit` would return
+    // `None`, `.flatten()` would swallow it silently, and the catch-all `successors` arm below
+    // would publish an UNGUARDED edge for a block this design's §4.1 explicitly bars
+    // (`dirty_segments.count_ones() == 1` in slice 1; two-write heads are 14.3% of 10rogue's
+    // heads, L9 §9.1). The link-time twin at `try_link_inner`'s `expected_selector` bind already
+    // treats this as an `expect`-worthy impossibility; this site must agree rather than quietly
+    // disarming the guard while that one panics.
+    let segment_write_guard =
+        seg_write_edge_eligible.then(|| segment_of_bit(dirty_segments).expect(
+            "seg_write_edge_eligible's count_ones() == 1 term admits only a single-bit written mask",
+        ));
     // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
     // segment-write block -- it writes CS, which is the whole point -- so the `!segment_write_block`
     // term above would make the far cell unreachable and the slice inert.
@@ -9293,7 +9352,7 @@ fn compile_with_budget(
         },
     };
     #[cfg(feature = "direct-link-refusal-census")]
-    let successors = if segment_write_block {
+    let successors = if segment_write_block && !seg_write_edge_eligible {
         [None, None]
     } else {
         [
@@ -9307,7 +9366,14 @@ fn compile_with_budget(
     };
     #[cfg(not(feature = "direct-link-refusal-census"))]
     let successors = match slots.last().map(|slot| slot.kind) {
-        _ if segment_write_block => [None, None],
+        // `SEGWRITE-V86-EDGE`: an eligible segment-write block falls through to the ordinary
+        // catch-all arm below instead of taking this bar. `seg_write_edge_eligible` already
+        // requires the plain-fallthrough terminal shape (`is_plain_fallthrough_terminal`), so
+        // when it holds this guard is never reached for any OTHER named kind below -- the arm
+        // order still matters for the non-eligible population, which is every other reason
+        // `segment_write_block` can be true (CS/SS writes, multi-write heads, call-out writes,
+        // plain real mode, a non-fallthrough terminal).
+        _ if segment_write_block && !seg_write_edge_eligible => [None, None],
         Some(
             DirectKind::Jcc { taken_delta, .. }
             | DirectKind::Loop { taken_delta, .. }
@@ -9398,6 +9464,7 @@ fn compile_with_budget(
         link_cell_ptrs: link_cells.each_ref().map(|cell| cell.address()),
         interpret_one_cells: &interpret_one_cell_ptrs,
         fetch_trace: cpu.jit_direct.native_fetch_trace,
+        segment_write_guard,
     });
     // Emit reads the full-used snapshot so descriptor() still sees DS/ES. Install gets the
     // stripped one so the entry compare skips live DS/ES. Selector pins stay in used.
@@ -9681,6 +9748,12 @@ pub(crate) enum UnresolvedReason {
     /// The shared x87 re-entry pad refused the crossing: the target float block's baked entry TOP
     /// does not match the CPU's live TOP, so its register cache cannot be entered for it.
     X87TopMismatch,
+    /// `SEGWRITE-V86-EDGE`: the edge WAS linked, but the live selector the source block just
+    /// wrote did not equal the target's frozen requirement (`LinkCell::expected_selector`). A
+    /// distinct variant on purpose -- not folded into `StaticUnbound`, which would hide the
+    /// guard's true conversion rate behind a counter that also holds every ordinary unlinked
+    /// edge.
+    SegmentSelectorMismatch,
 }
 
 /// Fetch replay retained for buses that observe individual code addresses. Production RAM timing
@@ -9741,6 +9814,16 @@ pub(crate) struct BlockKey {
     pub physical: u32,
     pub mode_key: u32,
 }
+
+/// Bit 2 of `jit_mode_key` (`core.rs`'s `jit_mode_key`): EFLAGS.VM was set when the key was
+/// captured. `SEGWRITE-V86-EDGE` keys its edge relaxation on this bit and only this bit: in V86,
+/// `load_segment_checked` routes to `load_segment_real`, which rebuilds the whole segment record
+/// from the selector alone (`SegmentRegister::real`), so a selector-equality guard is sufficient
+/// for a whole descriptor. That is false in plain real mode -- `load_segment_real_mode` preserves
+/// the cached limit, which is what unreal mode IS -- so a block compiled outside V86 must never
+/// take the relaxed path, and `BlockKey`/the entry check already refuse to enter a block admitted
+/// under one mode key from another.
+pub(crate) const JIT_MODE_KEY_V86_BIT: u32 = 1 << 2;
 
 impl BlockKey {
     pub(crate) const fn new(linear: u32, physical: u32, mode_key: u32) -> Self {
@@ -10085,6 +10168,70 @@ impl SegmentLayout {
         })
     }
 
+    /// `merge_chain` for a `SEGWRITE-V86-EDGE` source: `self` writes the segment(s) named by
+    /// `dirty` (`Compilation::written_segments`/`BlockCache::written_segments`, always exactly
+    /// one bit for an edge `try_link_inner` will admit -- `seg_write_edge_eligible` is what
+    /// guarantees that) before it exits, so `self.data`'s entry for that segment is the PRE-write
+    /// value and comparing it against anything would be comparing a dead value no downstream body
+    /// ever observes.
+    ///
+    /// Two departures from `merge_chain`, both load-bearing (design §4.2 clause 2/3, §4.4 item 3):
+    ///
+    /// 1. **`dirty` is excluded from the comparison loop entirely.** Neither side's descriptor for
+    ///    that segment is examined; equality there would be requiring an accident (design §3's
+    ///    table, L9 B2's finding that a NAIVE merge here refuses the edge on every rebind).
+    /// 2. **The target must already CLAIM the written segment** (`target.used & dirty != 0`), or
+    ///    this returns `None`. Not a courtesy check: `SegmentLayout::selector` debug-asserts its
+    ///    `used` bit before reading, and the emitted guard's `expected_selector` comes from
+    ///    `chain_layouts[target].selector(written_segment)` -- so a target that never pins the
+    ///    segment has nothing for the guard to compare against, and the edge must fall back to
+    ///    today's dispatcher-mediated bar rather than manufacture a value. This is exactly the
+    ///    Stage-0 "does the successor's `chain_layouts[..].used` claim the write" measurement
+    ///    (`dev_docs/2026-09-01-measurement-backlog-results.md` §4); a game whose successors
+    ///    rarely claim the write pays this refusal, unchanged from before the slice, on that
+    ///    share.
+    ///
+    /// `used` does NOT carry `dirty` (review finding N3). An earlier revision OR'd it in on the
+    /// theory that a later widen re-deriving this edge needs to see the segment as part of
+    /// `self`'s own requirement -- that theory is wrong: `widen_chain_requirement` selects THIS
+    /// method for a predecessor by testing `written_segments[predecessor]` directly
+    /// (`BlockCache`'s own parallel lane), never by testing `chain_layouts[predecessor].used`, so
+    /// nothing downstream needs the bit to survive in `used` for the re-derivation to keep firing.
+    ///
+    /// Carrying it anyway was actively harmful: the dispatcher entry check compares the ENTERED
+    /// block's own `chain_layouts` snapshot against live state
+    /// (`chain_entry_check_armed`/`entry_layout`, on by default), so a dirty bit surviving into
+    /// `used` makes every entry into `self` compare the LIVE pre-write descriptor of a segment
+    /// `self` never reads against a frozen snapshot -- a spurious requirement on a segment the
+    /// source block only overwrites. On a hot site whose caller leaves that segment varying
+    /// (`0x18803: MOV ES,AX`, design §2.1, ES is whatever the caller left), that refuses every
+    /// entry, and `own_mask_matches` reading `segment_layouts[self]` (which never carried the bit)
+    /// as `true` sends the refusal down the data-segment decline path: unlink, re-bind, re-reject
+    /// -- the treadmill this whole design exists to convert *out of*. Dropping the bit removes the
+    /// requirement entirely: the ONLY thing that ever discharges the written segment is the
+    /// runtime guard, exactly as clause 3 above already requires.
+    pub(crate) fn seg_write_merge(self, target: Self, dirty: u8) -> Option<Self> {
+        if target.used & dirty == 0 {
+            return None;
+        }
+        let used = self.used | (target.used & !dirty);
+        for segment in SEGMENT_ORDER {
+            let bit = segment_bit(segment);
+            if bit & dirty != 0 {
+                continue;
+            }
+            let index = segment_index(segment);
+            if used & bit != 0 && self.data[index] != target.data[index] {
+                return None;
+            }
+        }
+        Some(Self {
+            cs: self.cs,
+            data: self.data,
+            used,
+        })
+    }
+
     /// The pinned selector for `segment`, from whichever of the two snapshots holds it. CS lives
     /// in its own field and is pinned for every block; the other five must be in `used`, which
     /// `DirectKind::selector_segment` is what guarantees for a `MovSegToReg` slot.
@@ -10140,6 +10287,34 @@ fn segment_access_supported(
     !write || (!code && access & 0x02 != 0)
 }
 
+/// True for exactly the plain-fallthrough catch-all terminal shape: the complement of every kind
+/// the `successors` match (and `terminal_links` under `direct-link-refusal-census`) names
+/// explicitly. Shared by the L9 stage-0 diagnostic's `seg_head_guard_eligible` and
+/// `SEGWRITE-V86-EDGE`'s `seg_write_edge_eligible`, which both need "this block's last slot ends
+/// on the ordinary fallthrough boundary, not a branch/call/return" and must agree on what that
+/// means.
+fn is_plain_fallthrough_terminal(kind: Option<DirectKind>) -> bool {
+    !matches!(
+        kind,
+        Some(
+            DirectKind::Jcc { .. }
+                | DirectKind::Loop { .. }
+                | DirectKind::LoopCc { .. }
+                | DirectKind::Call { .. }
+                | DirectKind::Call16 { .. }
+                | DirectKind::Jmp { .. }
+                | DirectKind::Ret { .. }
+                | DirectKind::Ret16 { .. }
+                | DirectKind::RetFar16 { .. }
+                | DirectKind::CallFar16 { .. }
+                | DirectKind::JmpMem { .. }
+                | DirectKind::JmpReg { .. }
+                | DirectKind::CallReg { .. }
+                | DirectKind::CallMem { .. }
+        )
+    )
+}
+
 const fn segment_bit(segment: SegmentIndex) -> u8 {
     match segment {
         SegmentIndex::Es => 1 << 0,
@@ -10155,9 +10330,9 @@ const fn segment_bit(segment: SegmentIndex) -> u8 {
 pub(crate) const LIVE_DATA_BITS: u8 = segment_bit(SegmentIndex::Ds) | segment_bit(SegmentIndex::Es);
 
 /// The inverse of `segment_bit` for a mask holding exactly one bit, `None` for anything else.
-/// L9 stage 0 only, which is why it is gated: nothing on the default path turns a mask back into a
-/// segment.
-#[cfg(feature = "seg-head-diagnostic")]
+/// Used on the default path since `SEGWRITE-V86-EDGE`: the compile walk turns a single-bit
+/// `dirty_segments` mask back into the segment it names to select the guarded edge's written
+/// segment. `seg-head-diagnostic` also reads it (unchanged use).
 pub(crate) const fn segment_of_bit(bit: u8) -> Option<SegmentIndex> {
     match bit {
         1 => Some(SegmentIndex::Es),
@@ -18332,6 +18507,14 @@ struct EmitInput<'a> {
     /// backstop before entering native code. A change clears the block cache, so a resident
     /// block's emission shape always matches the bus that will enter it.
     fetch_trace: bool,
+    /// `SEGWRITE-V86-EDGE`: `Some(segment)` when this block is an eligible V86 segment-write
+    /// block (`seg_write_edge_eligible`) publishing a guarded static fallthrough, naming the ONE
+    /// segment `dirty_segments` set. Consumed by exactly one `emit_completed_path` call --
+    /// the catch-all after the slot loop, the only site a plain-fallthrough terminal reaches --
+    /// which emits the three-instruction selector guard ahead of the ordinary chain hop. Every
+    /// other `emit_completed_path` call in this function passes `None`: the source's own body is
+    /// unchanged by this slice (§4.4's byte-identity claim), only this one exit gains anything.
+    segment_write_guard: Option<SegmentIndex>,
 }
 
 struct EmittedCode {
@@ -18528,6 +18711,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         link_cell_ptrs,
         interpret_one_cells,
         fetch_trace,
+        segment_write_guard,
     } = input;
     let full_accounting = StaticAccounting {
         instructions: span.instructions,
@@ -20195,6 +20379,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    None,
                 );
                 terminal = true;
                 break;
@@ -20241,6 +20426,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    None,
                 );
                 terminal = true;
                 break;
@@ -20257,6 +20443,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     full_accounting,
                     x87_entry_top.is_some(),
                     fetch_trace,
+                    None,
                 );
                 terminal = true;
                 break;
@@ -20569,6 +20756,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         full_accounting,
                         x87_entry_top.is_some(),
                         fetch_trace,
+                        None,
                     );
                 }
                 e.place(taken);
@@ -20592,6 +20780,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         full_accounting,
                         x87_entry_top.is_some(),
                         fetch_trace,
+                        None,
                     );
                 }
                 terminal = true;
@@ -20631,6 +20820,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         full_accounting,
                         x87_entry_top.is_some(),
                         fetch_trace,
+                        None,
                     );
                 }
                 e.place(taken);
@@ -20654,6 +20844,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         full_accounting,
                         x87_entry_top.is_some(),
                         fetch_trace,
+                        None,
                     );
                 }
                 terminal = true;
@@ -20689,6 +20880,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         full_accounting,
                         x87_entry_top.is_some(),
                         fetch_trace,
+                        None,
                     );
                 }
                 e.place(taken);
@@ -20712,6 +20904,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         full_accounting,
                         x87_entry_top.is_some(),
                         fetch_trace,
+                        None,
                     );
                 }
                 terminal = true;
@@ -20731,6 +20924,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             full_accounting,
             x87_entry_top.is_some(),
             fetch_trace,
+            segment_write_guard,
         );
     }
     if let Some(self_loop_return) = self_loop_return {
@@ -21064,6 +21258,12 @@ fn emit_completed_path(
     accounting: StaticAccounting,
     x87_source: bool,
     fetch_trace: bool,
+    // `SEGWRITE-V86-EDGE`: `Some(segment)` on the ONE call site that can carry a guarded
+    // segment-write edge (the plain-fallthrough catch-all); `None` everywhere else, which is a
+    // straight pass-through and costs the pure-integer/pure-static chain nothing. See
+    // `EmitInput::segment_write_guard`'s doc comment for why only that one site ever passes
+    // `Some`.
+    segment_guard: Option<SegmentIndex>,
 ) {
     emit_accounting(
         e,
@@ -21110,6 +21310,31 @@ fn emit_completed_path(
         );
         e.cmp_r64_imm32(Reg::RDX, 0);
         e.jz(unresolved);
+        // `SEGWRITE-V86-EDGE`'s guard (design §4.3): three instructions, RAX only, ABOVE the
+        // quota decrement and the `linked_transfers` increment so a mismatch counts as neither --
+        // it is a completed-path exit through the dispatcher, not a chain hop. RCX still holds
+        // the `LinkCell` address here (the doc comment above states that invariant for the whole
+        // branch) and RDX still holds the resolved target, untouched by the compare.
+        //
+        // INV-V86-CANON is what makes a plain 16-bit selector compare sufficient for a whole
+        // segment record: in V86, `load_segment_real` rebuilds EVERY field from the selector
+        // alone, so selector equality implies descriptor equality, and `seg_write_edge_eligible`
+        // never admits this arm outside V86.
+        let segment_mismatch = segment_guard.map(|segment| {
+            let mismatch = e.label();
+            e.movzx_r32_word_disp32(
+                Reg::RAX,
+                Reg::R15,
+                segment_field_base(segment) + selector_offset(),
+            );
+            e.cmp_r16_disp8(
+                Reg::RAX,
+                Reg::RCX,
+                core::mem::offset_of!(LinkCell, expected_selector) as i8,
+            );
+            e.jnz(mismatch);
+            mismatch
+        });
         e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_QUOTA);
         e.sub_r64_imm32(Reg::RAX, 1);
         e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
@@ -21148,6 +21373,18 @@ fn emit_completed_path(
         )))]
         debug_assert!(!x87_source);
         e.jmp_r64(Reg::RDX);
+        // The mismatch tail, out of the linked-chain fast path entirely: reached only via the
+        // `jnz` above, and it ends by jumping to `returning` rather than falling through, so it
+        // can sit anywhere after the unconditional `jmp_r64` without being on the hot path.
+        // `SegmentSelectorMismatch` is its OWN `UnresolvedReason` (design §4.3/§7.2) precisely so
+        // this is not folded into `StaticUnbound`: the edge WAS resolved, the guard is what
+        // refused it, and the campaign has lost a mechanism's visibility to exactly that fold
+        // before (`run.rs:3666-3671`, the L8 far-ledger note this file already carries).
+        if let Some(mismatch) = segment_mismatch {
+            e.place(mismatch);
+            emit_store_unresolved_reason(e, UnresolvedReason::SegmentSelectorMismatch);
+            e.jmp(returning);
+        }
         e.place(unresolved);
         let hidden = e.label();
         e.load_r64_disp8(
@@ -31572,12 +31809,23 @@ impl BlockCache {
         // every far edge. `far_merge` replaces that compare with INV-FAR-CS, which is a refusal on
         // the TARGET's side and is what makes the linear-keyed cell sound.
         let far = source_block.far_dynamic();
+        // `SEGWRITE-V86-EDGE`: a non-far source whose written mask is non-zero merges through
+        // `seg_write_merge` instead of `link_merge`. `written_segments` is `BlockCache`'s own
+        // parallel lane (L9's reusable residue, `direct.rs:928-932`), so this needs no new
+        // storage. `seg_write_edge_eligible` at compile time guarantees `dirty` is a single bit
+        // whenever `successors` published this edge at all, so there is exactly one segment to
+        // guard.
+        let dirty = self.written_segments[source_index];
         let chain_merge = (!stale_epoch)
             .then(|| {
                 let source_layout = self.chain_layouts[source_index];
                 let target_layout = self.chain_layouts[target_index];
                 if far {
                     source_layout.far_merge(target_layout)
+                } else if dirty != 0 {
+                    (source_layout.cs == target_layout.cs)
+                        .then(|| source_layout.seg_write_merge(target_layout, dirty))
+                        .flatten()
                 } else {
                     source_layout.link_merge(target_layout)
                 }
@@ -31679,6 +31927,25 @@ impl BlockCache {
         } else {
             self.link_cells[source_index][slot_index]
                 .set(self.block_portals[target_index].as_ref());
+        }
+        // `SEGWRITE-V86-EDGE`: bind the guard's comparand. `!far` is load-bearing, not a style
+        // choice: a far block's `written_segments` entry is the CS bit (`RetFar16`/`CallFar16`
+        // report `written_segment() == Some(Cs)`), which is also nonzero, and CS's selector lives
+        // in a DIFFERENT bit (`BAKES_CS_BIT`) that `chain_merge`'s far branch never requires --
+        // calling `.selector(Cs)` on that layout trips `SegmentLayout::selector`'s own
+        // `debug_assert_ne!(self.used & BAKES_CS_BIT, 0)` and corrupts the far edge's own chain
+        // bookkeeping. `dirty != 0` alone would silently misroute every far bind onto this arm.
+        //
+        // For a genuine (non-far) dirty edge, `target_eip` is always `None` here -- a
+        // segment-write block's terminal is the plain fallthrough, never the dynamic RET PIC --
+        // and `chain_merge` being admitted above already proved
+        // `self.chain_layouts[target_index].used` claims `dirty`
+        // (`SegmentLayout::seg_write_merge`'s own refusal bar), so `selector` cannot debug-assert.
+        if !far && dirty != 0 {
+            let segment = segment_of_bit(dirty)
+                .expect("seg_write_edge_eligible admits only a single-bit written mask");
+            self.link_cells[source_index][slot_index]
+                .set_expected_selector(self.chain_layouts[target_index].selector(segment));
         }
         self.outbound[source_index][slot_index] = Some(target);
         self.inbound.entry(target).or_default().push(LinkSource {
@@ -32251,8 +32518,24 @@ impl BlockCache {
         };
         let source_layout = self.chain_layouts[source_index];
         let target_layout = self.chain_layouts[target_index];
+        // `SEGWRITE-V86-EDGE`: same selection `try_link_inner` made for this edge's admission.
+        // `written_segments[source_index]` cannot have changed between admission and this call
+        // (nothing in between recompiles `source`), so this reproduces the identical merge.
+        //
+        // ASYMMETRY WITH `try_link_inner`, noted rather than silently carried (review finding
+        // N7): the dirty branch there guards this exact call with
+        // `source_layout.cs == target_layout.cs` before trying `seg_write_merge`, because
+        // `seg_write_merge` -- unlike `link_merge` -- does not check `cs` itself. This call omits
+        // that guard. It is harmless: `cs` is immutable for a block's whole life, and the edge's
+        // ORIGINAL admission at `try_link_inner` already proved the two ends agree on it, so
+        // re-deriving the identical merge here cannot newly disagree. But the two "the same
+        // merge, recomputed" call sites are not literally symmetric, and a future refactor that
+        // makes `seg_write_merge` cs-sensitive must update both.
+        let dirty = self.written_segments[source_index];
         let merged = if far {
             source_layout.far_merge(target_layout)
+        } else if dirty != 0 {
+            source_layout.seg_write_merge(target_layout, dirty)
         } else {
             source_layout.link_merge(target_layout)
         };
@@ -32335,7 +32618,34 @@ impl BlockCache {
                     self.unlink_outbound(link.block, link.slot, LinkClearCause::ChainWiden);
                     continue;
                 }
-                match self.chain_layouts[predecessor_index].merge_chain(requirement) {
+                // `SEGWRITE-V86-EDGE`, B2 (design §3/§4.4 item 5): a dirty, non-far predecessor
+                // must be re-folded through `seg_write_merge`, not plain `merge_chain`. The naive
+                // merge compares the predecessor's PRE-write descriptor against `requirement`'s
+                // POST-write one for the written segment and refuses on every widen -- L9's own
+                // finding, reproduced here as the exact failure this arm exists to prevent.
+                //
+                // A far predecessor DOES still reach this line (review finding N7): the cut above
+                // only `continue`s when `requirement` itself carries a CS bit, so a far
+                // predecessor whose downstream widen never touches CS falls through to here like
+                // any other. The `far_dynamic() -> 0` guard immediately below is therefore
+                // LOAD-BEARING, not redundant belt-and-braces -- it is what stops a far
+                // predecessor's `written_segments` entry (always the CS bit; `RetFar16`/
+                // `CallFar16` report `written_segment() == Some(Cs)`) from selecting
+                // `seg_write_merge` here, which would compare against `BAKES_CS_BIT` machinery
+                // `seg_write_merge` knows nothing about. Do not delete this guard on the theory
+                // that the cut above already excludes far predecessors -- it does not.
+                let predecessor_dirty = if self.blocks[predecessor_index].far_dynamic() {
+                    0
+                } else {
+                    self.written_segments[predecessor_index]
+                };
+                let predecessor_merge = if predecessor_dirty != 0 {
+                    self.chain_layouts[predecessor_index]
+                        .seg_write_merge(requirement, predecessor_dirty)
+                } else {
+                    self.chain_layouts[predecessor_index].merge_chain(requirement)
+                };
+                match predecessor_merge {
                     Some(predecessor_merged) => {
                         if predecessor_merged.used != self.chain_layouts[predecessor_index].used {
                             self.chain_layouts[predecessor_index] = predecessor_merged;
@@ -36002,6 +36312,18 @@ impl crate::jit::JitState {
     /// the backend, next to the sixteen-bit split that is written the same way for the same
     /// reason. The caller passes the predicate already widened, so both lanes are an unconditional
     /// add and neither can mispredict.
+    ///
+    /// **`SEGWRITE-V86-EDGE`'s counter-run expectation is a LARGE drop here, not a modest one**
+    /// (review finding, PR #809 §6/§7 item 13 -- corrects the segwrite continue design's own
+    /// pre-registration, which predates this predicate's change). The `is_segment_write` predicate
+    /// this counts is `CompiledBlock::is_segment_write_block()`, and that predicate now reads
+    /// FALSE for the entire population this slice makes eligible (see its doc comment): an
+    /// eligible V86 block publishes a successor at compile time regardless of whether the edge
+    /// ever binds, so it stops being a "segment write block" by this predicate's definition the
+    /// moment the slice ships, not only once traffic actually chains through it. A drop by
+    /// roughly the eligible share (pyramid's, 21-for's, 10rogue's guard-eligible fraction per the
+    /// measurement backlog) is the EXPECTED reading; a merely MODEST move means eligibility is
+    /// not firing at the rate the S0 diagnostic measured, and that is the actual falsifier here.
     pub(crate) fn note_segment_write_block_entry(&mut self, is_segment_write: u64, insns: u64) {
         self.stalls.segment_write_block_head_entries += is_segment_write;
         self.stalls.segment_write_block_head_insns += is_segment_write * insns;
