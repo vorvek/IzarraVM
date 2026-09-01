@@ -474,6 +474,42 @@ fn a_batch_may_mix_y_origins_without_two_lanes_meeting_on_one_row() {
 /// value, which is exactly the per-fence drain the 2026-09-01 diagnosis
 /// measured (248 drains for 960 triangles, 3.9 triangles per drain). This
 /// test fails on that old behavior: it would see the queue empty right after
+/// The other half of the nopCMD story: the reset-statistics case (byte 0,
+/// bit 0 set) must still drain before it zeroes the FBI pixel counters. A
+/// queued triangle's pixels belong to the epoch BEFORE the reset, so they
+/// have to be folded in first. Deleting that drain (making `nopCMD` never
+/// drain at all) passes every other test in this suite -- the pre-existing
+/// `nop_command_bit_zero_resets_all_fbi_pixel_counters` test never enables
+/// the queue, so it never exercises this ordering. This is the test that
+/// does.
+#[test]
+fn a_reset_statistics_nop_cmd_drains_the_queue_first() {
+    let mut distira = Distira::new();
+    distira.set_raster_queue_enabled(true);
+    distira.set_frame_size(SCENE_WIDTH as u32, SCENE_HEIGHT as u32);
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_FRONT | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    submit_flat_triangle(
+        &mut distira,
+        [(0, 0), (256, 0), (0, 128)],
+        (0xff, 0x00, 0x00),
+        10_000_000,
+    );
+    assert_eq!(distira.raster_queue_depth(), 1, "triangle must be queued");
+    // Reset statistics. The queued triangle's pixels belong to the epoch
+    // BEFORE the reset, so they must be folded in and then zeroed.
+    write_reg(&mut distira, SST_NOP_CMD, 1);
+    assert_eq!(
+        read_reg(&mut distira, SST_FBI_PIXELS_IN),
+        0,
+        "a reset-statistics nopCMD must drain first: pixels from triangles \
+         submitted before the reset must not survive into the new epoch"
+    );
+}
+
 /// the fence instead of still holding both triangles.
 #[test]
 fn a_plain_nop_cmd_fence_does_not_drain_pending_triangles() {

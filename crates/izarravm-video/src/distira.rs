@@ -1829,6 +1829,16 @@ impl Distira {
         // ahead of still-queued triangles would let their pixels land in the
         // wrong epoch, so that path is not provably ordering-only and it
         // keeps the pre-existing drain.
+        //
+        // Gating on `voodoo_reg` here (the `match` below keys on `register`
+        // instead) is safe only because the two never disagree about
+        // `SST_NOP_CMD`: `0x120 >= 0x100`, so `canonical_write_register`'s
+        // remap table never touches it, and no remap TARGET is `0x120`
+        // either (they are all parameter and triangle registers). So
+        // `voodoo_reg == SST_NOP_CMD` iff `register == SST_NOP_CMD`, and
+        // gating on one is equivalent to gating on the other. Extending the
+        // remap table has to preserve that, or this carve-out silently stops
+        // firing.
         if voodoo_reg == SST_NOP_CMD {
             if nop_cmd_needs_drain(byte, value) {
                 self.drain_raster_queue();
@@ -2941,16 +2951,6 @@ fn triangle_defers(triangle: &QueuedTriangle) -> bool {
 /// Everything else draws the queue first: the framebuffer layout, the DAC and
 /// the CLUT, the command registers, `lfbMode`, and the NCC tables and palette,
 /// which the snapshot deliberately does not carry.
-/// Whether a `nopCMD` write actually mutates device state that a queued
-/// triangle's later drain could still affect. See the call site in
-/// `write_mmio_u8` for the ordering argument. Only byte 0 carries the reset
-/// bit (bit 0); every other byte, and byte 0 with the bit clear, is a
-/// complete no-op that this device does nothing with -- not even ordering
-/// applies, because there is nothing to order against.
-fn nop_cmd_needs_drain(byte: usize, value: u8) -> bool {
-    byte == 0 && value & 1 != 0
-}
-
 fn raster_snapshot_covers_register(register: usize) -> bool {
     matches!(
         register,
@@ -2967,6 +2967,23 @@ fn raster_snapshot_covers_register(register: usize) -> bool {
         | SST_TEXTURE_MODE..=SST_TEX_BASE_ADDR38
         | SST_TREX_INIT1
     )
+}
+
+/// Whether a `nopCMD` write actually mutates device state that a queued
+/// triangle's later drain could still affect. See the call site in
+/// `write_mmio_u8` for the ordering argument.
+///
+/// Real Voodoo hardware also gates a SECOND effect on bit 1: it resets
+/// `fbiTrianglesOut` (DOSBox-X/MAME `voodoo_emu.cpp`, the `nopCMD` case).
+/// This predicate ignores it, and that is correct ONLY because Distira does
+/// not implement `fbiTrianglesOut` today -- there is no such register or
+/// counter anywhere in this device. The day that counter is added, this
+/// predicate must widen to `value & 3 != 0`, or a bit-1-only `nopCMD` will
+/// reset it without draining first, which is exactly the epoch bug the
+/// bit-0 case exists to avoid. Nothing enforces that widening happens; it is
+/// a trap for whoever adds the counter, not a currently-live gap.
+fn nop_cmd_needs_drain(byte: usize, value: u8) -> bool {
+    byte == 0 && value & 1 != 0
 }
 
 /// Whether a READ of this register reports something a triangle still on the
