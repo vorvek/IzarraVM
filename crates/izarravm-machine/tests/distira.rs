@@ -226,6 +226,35 @@ fn write_texture_texel(machine: &mut Machine, tmu: usize, byte_address: u32, tex
     machine.write_physical_u32(aperture, u32::from(texel) | (u32::from(texel) << 16));
 }
 
+/// The largest byte address `SST_TEX_BASE_ADDR` can name on its own: the
+/// register's field is 19 bits (`(val & 0x0007_ffff) << 3`,
+/// `raster_view.rs::tex_base_addr_for_tmu`), matching 86Box's non-Banshee
+/// `SST_texBaseAddr` handler. One qword short of 4 MB.
+/// (`dev_docs/2026-09-01-tex4mb-review.md` section 1.)
+const TEX_BASE_ADDR_MAX: u32 = 0x7_ffff << 3;
+
+/// Writes one R5G6B5 texel at an absolute byte `address` that may sit at or
+/// beyond `TEX_BASE_ADDR_MAX`, which `write_texture_texel` cannot reach
+/// (the base register alone would silently truncate it). Parks the base
+/// register at the largest representable address at or below `address` and
+/// crosses the remaining distance through the aperture's own row offset --
+/// the same `base + mip_offset + row_offset` sum `texture_write_offset`
+/// computes for a real triangle's upload. Only exact for a target `address`
+/// that is a multiple of 2 bytes and within one texel row of
+/// `TEX_BASE_ADDR_MAX` (this file only ever calls it at the 4 MB boundary).
+fn write_texture_texel_at(machine: &mut Machine, tmu: usize, address: u32, texel: u16) {
+    let chip = if tmu == 0 { TREX0 } else { TREX1 };
+    let aperture =
+        DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET + if tmu == 0 { 0 } else { TMU1_APERTURE };
+    let base = (address & !0x7).min(TEX_BASE_ADDR_MAX);
+    let remainder = address - base;
+    write_reg(machine, chip | SST_TEX_BASE_ADDR, base >> 3);
+    machine.write_physical_u32(
+        aperture + remainder,
+        u32::from(texel) | (u32::from(texel) << 16),
+    );
+}
+
 fn push_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -564,8 +593,21 @@ fn distira_texture_aperture_keeps_tmu_stores_independent() {
     assert_eq!(draw_texture_sample(&mut machine, 1), 0x00ff_00ff);
 }
 
+/// Pins the wrap boundary at the NEW 4 MB-per-TMU budget
+/// (`dev_docs/2026-09-01-tex4mb-review.md` section 7), covering both TMUs.
+/// Renamed from `distira_glide_probe_detects_two_megabytes_on_each_tmu`
+/// (landed in #509), which asserted the OLD 2 MB wrap and went red the
+/// moment `DISTIRA_TEX_SIZE` grew -- this is the guest-facing half of that
+/// board-identity decision, not incidental breakage.
+///
+/// Each pass proves both directions of the boundary by write ORDER, not by
+/// reading at the candidate address directly: `SST_TEX_BASE_ADDR` cannot
+/// itself name 0x40_0000 (see `TEX_BASE_ADDR_MAX`), so "does a write here
+/// alias offset 0" is read back by writing a victim to offset 0 first, then
+/// the candidate, then sampling offset 0 -- if the candidate aliases, its
+/// value wins.
 #[test]
-fn distira_glide_probe_detects_two_megabytes_on_each_tmu() {
+fn distira_glide_probe_detects_four_megabytes_on_each_tmu() {
     let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
 
     for tmu in 0..2 {
@@ -575,25 +617,36 @@ fn distira_glide_probe_detects_two_megabytes_on_each_tmu() {
         write_reg(&mut machine, chip | SST_TREX_INIT0, 0x5000);
         assert_eq!(read_reg(&mut machine, chip | SST_TREX_INIT0), 0x5000);
 
-        write_texture_texel(&mut machine, tmu, 0x0020_0000, 0xf800);
-        write_texture_texel(&mut machine, tmu, 0x0010_0000, 0x07e0);
-        write_texture_texel(&mut machine, tmu, 0, 0x001f);
-        write_reg(&mut machine, chip | SST_TEX_BASE_ADDR, 0x0020_0000 >> 3);
+        // A write at 4 MB -- the new advertised per-TMU budget -- must still
+        // wrap and clobber offset 0.
+        write_texture_texel(&mut machine, tmu, 0, 0x001f); // blue, victim at offset 0
+        write_texture_texel_at(&mut machine, tmu, 0x0040_0000, 0xf800); // red, the wrapping write
+        write_reg(&mut machine, chip | SST_TEX_BASE_ADDR, 0);
         if tmu == 1 {
             write_texture_texel(&mut machine, 0, 0, 0);
         }
-        assert_eq!(draw_texture_sample(&mut machine, tmu), 0x0000_00ff);
+        assert_eq!(
+            draw_texture_sample(&mut machine, tmu),
+            0x00ff_0000,
+            "a write at 0x40_0000 must alias offset 0 at the new 4 MB budget"
+        );
 
         write_reg(&mut machine, chip | SST_TREX_INIT0, 0x2000);
         assert_eq!(read_reg(&mut machine, chip | SST_TREX_INIT0), 0x2000);
-        write_texture_texel(&mut machine, tmu, 0x0020_0000, 0xf800);
-        write_texture_texel(&mut machine, tmu, 0x0010_0000, 0x07e0);
-        write_texture_texel(&mut machine, tmu, 0, 0x001f);
-        write_reg(&mut machine, chip | SST_TEX_BASE_ADDR, 0x0010_0000 >> 3);
+
+        // A write at 2 MB -- the OLD budget's full width -- must NOT alias
+        // offset 0 any more: that is exactly the wrap this PR removed.
+        write_texture_texel(&mut machine, tmu, 0, 0x07e0); // green, victim at offset 0
+        write_texture_texel(&mut machine, tmu, 0x0020_0000, 0xf800); // red, must land elsewhere
+        write_reg(&mut machine, chip | SST_TEX_BASE_ADDR, 0);
         if tmu == 1 {
             write_texture_texel(&mut machine, 0, 0, 0);
         }
-        assert_eq!(draw_texture_sample(&mut machine, tmu), 0x0000_ff00);
+        assert_eq!(
+            draw_texture_sample(&mut machine, tmu),
+            0x0000_ff00,
+            "a write at 0x20_0000 must not alias offset 0 at the new 4 MB budget"
+        );
     }
 }
 
