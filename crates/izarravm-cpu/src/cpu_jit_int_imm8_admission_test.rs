@@ -736,3 +736,556 @@ fn only_the_int_row_claims_the_never_resumes_property() {
         );
     }
 }
+
+// ------------------------------------------------------------------------------------------
+// The `always_resyncs` gate, on the one guest shape that needs it
+// ------------------------------------------------------------------------------------------
+
+/// The IVT slot for vector `0x21`, in a program image.
+fn seed_ivt(program: &mut [u8], vector: u8, segment: u16, offset: u16) {
+    let at = usize::from(vector) * 4;
+    program[at..at + 2].copy_from_slice(&offset.to_le_bytes());
+    program[at + 2..at + 4].copy_from_slice(&segment.to_le_bytes());
+}
+
+/// The fall-through address: the byte right after the `INT` in `INT_CODE`.
+const INT_FALL_THROUGH: u32 = INT_ENTRY + INT_CODE.len() as u32;
+
+/// The same program, but with vector `0x21` pointing at `CS:INT_FALL_THROUGH` -- the very address
+/// the block would have carried on to. A `HLT` lives there so both legs still halt.
+fn fall_through_handler_program() -> Vec<u8> {
+    let mut program = int_program();
+    program[INT_FALL_THROUGH as usize] = 0xf4;
+    seed_ivt(&mut program, 0x21, 0, INT_FALL_THROUGH as u16);
+    program
+}
+
+/// **THE SHAPE `always_resyncs` EXISTS FOR, EXECUTED.** A guest whose interrupt vector lands on the
+/// address right after the `INT`, in the same code segment.
+///
+/// This is the one guest for which `ResumeSnapshot::allows_resume` answers TRUE after an `INT`, and
+/// every clause is satisfied for an ordinary reason rather than a contrived one:
+///
+/// * R1 compares `cpu.registers.eip` against `end_eip` and `cpu.registers.cs()` against the
+///   snapshot. The handler IS `end_eip` and the handler's segment IS the snapshot's, so both halves
+///   pass -- which is the whole point: R1 is a reading of the guest's IVT, not a fact about the
+///   mechanism.
+/// * R2 compares CS and SS (the row answers `may_write_segment`), and a same-CS delivery with no
+///   privilege change moves neither.
+/// * R3's TF clause passes because `INT` CLEARS TF, and its IF clause is DIRECTIONAL -- it refuses a
+///   0-to-1 edge, and `INT` clears IF, which is the arm that resumes.
+///
+/// So without the structural gate the resume tail would restore the block's ENTRY EIP and carry on
+/// through the block's remaining slots, keeping the pushed frame and the cleared IF while undoing
+/// the control transfer. With the gate the slot resyncs and the guest lands on its handler.
+///
+/// A `debug_assert` used to stand at the gate claiming `allows_resume` would answer FALSE here.
+/// Review N1 caught it: it asserted the negation of its own doc comment, and this fixture is the
+/// guest that would have tripped it. It is gone, and this test is what owns the claim now.
+///
+/// RED-FIRST, measured: change `InterpretOneRow::always_resyncs` to name any other row and this
+/// fixture goes red at the resync assertion below with `left: 0` -- the slot RESUMED, the block
+/// carried on from its entry EIP, and the control transfer was undone. The real-mode differential
+/// above stays GREEN under that same mutation, because its zeroed IVT sends the handler to
+/// `0000:0000` and R1 refuses on its own. That contrast is the fixture's whole reason to exist.
+#[test]
+fn a_handler_at_the_fall_through_address_still_resyncs() {
+    let _guard = select_int_imm8_rows(true);
+
+    let mut interp_bus = sixteen_bit_bus(fall_through_handler_program());
+    let mut interp = sixteen_bit_code_cpu(INT_ENTRY);
+    arm_int_fixture(&mut interp, &mut interp_bus);
+    drive_to_halt(&mut interp, &mut interp_bus);
+
+    let mut native_bus = sixteen_bit_bus(fall_through_handler_program());
+    let mut native = sixteen_bit_code_cpu(INT_ENTRY);
+    arm_native_sixteen_bit(&mut native, &mut native_bus, &[0x0000, INT_DATA_PAGE]);
+    let linears: Vec<u32> = INT_STARTS.iter().map(|offset| INT_ENTRY + offset).collect();
+    warm_sixteen_bit(&mut native, &mut native_bus, &linears);
+    let compilation = match jit::direct::compile(&mut native, INT_ENTRY, false) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("the fall-through fixture became a structural rejection")
+        }
+        jit::direct::CompileOutcome::Retry(_) => {
+            panic!("the fall-through fixture asked for a retry")
+        }
+    };
+    assert_eq!(compilation.callout_int_imm8_slots, 1);
+    let key = jit::direct::key_for(&native, INT_ENTRY, false).expect("a 16-bit key");
+    assert!(matches!(
+        native.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = native
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fall-through block");
+    let block = native.jit_direct.block(id).expect("the block must be live");
+
+    arm_int_fixture(&mut native, &mut native_bus);
+    let cs_before = native.registers.cs();
+    let before = native.perf_counters().jit_direct_insns;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the installed block must actually run natively"
+    );
+    let native_insns = native.perf_counters().jit_direct_insns - before;
+
+    // R1's two halves, read off the machine rather than argued. This is the assertion that makes
+    // the fixture NON-VACUOUS: a delivery landing anywhere else would fail R1 and the gate would
+    // never have been the thing that refused.
+    assert_eq!(
+        native.registers.eip, INT_FALL_THROUGH,
+        "the handler must be at the fall-through address, or R1 refuses and the gate is untested"
+    );
+    assert_eq!(
+        native.registers.cs(),
+        cs_before,
+        "the handler must be in the SAME code segment, or R1's second half refuses"
+    );
+
+    // The gate did the refusing. `resync` counts the slot leaving through the RESYNC stub; a
+    // resumed slot would have counted nothing here and would have run the rest of the block.
+    let stalls = native.direct_stall_snapshot();
+    assert_eq!(
+        stalls.callout_interpret_one_resync, 1,
+        "the slot must resync; a resumed slot would restore the block's entry EIP"
+    );
+    assert_eq!(
+        native_insns, 2,
+        "the MOV and the INT retire natively and the block ends at the INT"
+    );
+
+    // The control transfer survived: a resumed slot would have kept this frame AND rewound EIP.
+    assert_eq!(
+        native.registers.esp() & 0xffff,
+        (INT_STACK_TOP - 6) & 0xffff,
+        "the three-word real-mode frame must still be on the stack"
+    );
+
+    drive_to_halt(&mut native, &mut native_bus);
+    native.materialize_flags();
+    interp.materialize_flags();
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interp),
+        "registers or EIP differ from the interpreted leg on the fall-through-handler guest"
+    );
+    assert_eq!(native.eflags(), interp.eflags(), "EFLAGS");
+    assert_eq!(
+        native_bus.memory, interp_bus.memory,
+        "guest RAM differs, and the pushed frame lives in here"
+    );
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks, "guest clocks");
+    assert_eq!(
+        native.perf_counters().instructions,
+        interp.perf_counters().instructions,
+        "retirement counts differ"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// Protected mode, and the fault mid-delivery
+// ------------------------------------------------------------------------------------------
+//
+// The differentials above run in a 16-bit real-mode segment against a zeroed IVT. That is the
+// population the row is measured on, and it exercises the SHORTEST delivery the interpreter has:
+// four words read, three pushed, no descriptor walked.
+//
+// Review N3 asked for the other two. Protected mode walks an IDT gate AND a GDT descriptor, writes
+// an Accessed bit back into the table, and pushes dwords -- and it is what
+// `INT_IMM8_MAX_DATA_ACCESSES`' derivation is about, which until now was arithmetic on paper with
+// nothing executing it. And a delivery that FAILS is the one path where the call-out has bespoke
+// code of its own rather than the interpreter's arm: `interpret_one_step`'s fault tail names the
+// SLOT's `start_eip` and `start_cs` to `finish_instruction`, charges the fetch by hand, reports
+// zero clocks and leaves through a different stub. Every one of those is a place to get a call-out
+// wrong in a way the interpreter cannot be wrong, so both are differentials rather than
+// self-checks.
+
+const PM_ENTRY: u32 = 0x100;
+const PM_DATA_PAGE: u32 = 0x1000;
+const PM_GDT_BASE: u32 = 0x1200;
+const PM_IDT_BASE: u32 = 0x1400;
+/// On the code page, far below `PM_ENTRY`, so a delivery does not disturb the block's own bytes.
+const PM_HANDLER: u32 = 0x800;
+const PM_STACK_TOP: u32 = 0x1700;
+/// Index 1: flat 32-bit code. The Accessed bit is CLEAR (`0x9A`, not `0x9B`), so the gate's CS load
+/// writes the descriptor back and the RAM comparison covers that write too.
+const PM_SEL_CODE: u16 = 0x08;
+/// Index 2: flat 32-bit data.
+const PM_SEL_DATA: u16 = 0x10;
+/// Two usable entries.
+const PM_GDT_LIMIT: u16 = 0x17;
+/// Big enough for vector `0x21`, whose descriptor occupies `0x108..=0x10F`.
+const PM_IDT_LIMIT_OK: u16 = 0x1ff;
+/// TOO SMALL for vector `0x21` and big enough for vector 13, which is the whole fault fixture:
+/// the delivery raises `#GP(0x21 * 8 + 2)` and that #GP has a gate to be delivered through.
+const PM_IDT_LIMIT_SHORT: u16 = 0xff;
+/// `#GP`'s vector, whose gate has to stay inside even the short limit.
+const PM_VECTOR_GP: u32 = 13;
+/// The vector the fixture's `INT` names.
+const PM_VECTOR: u32 = 0x21;
+
+/// `mov eax,0x11111111` then `int 0x21`, at 32-bit operand size. The INT is at slot 1 for the same
+/// reason `INT_CODE` puts it there: the block must carry a real native prefix into the call-out.
+const PM_CODE: &[u8] = &[0xb8, 0x11, 0x11, 0x11, 0x11, 0xcd, 0x21];
+const PM_STARTS: &[u32] = &[0, 5];
+/// Where the faulting `INT` itself begins. The #GP frame must name THIS address, not the block's
+/// entry, and that is the assertion the fault fixture is built around.
+const PM_INT_AT: u32 = PM_ENTRY + 5;
+
+fn pm_descriptor(low: u32, high: u32) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&low.to_le_bytes());
+    bytes[4..].copy_from_slice(&high.to_le_bytes());
+    bytes
+}
+
+/// A 32-bit interrupt gate: present, DPL 0, through `PM_SEL_CODE`.
+fn pm_interrupt_gate(offset: u32) -> [u8; 8] {
+    pm_descriptor(
+        (u32::from(PM_SEL_CODE) << 16) | (offset & 0xffff),
+        (offset & 0xffff_0000) | (0x8e << 8),
+    )
+}
+
+fn pm_program() -> Vec<u8> {
+    let mut program = vec![0u8; 0x2000];
+    program[PM_ENTRY as usize..PM_ENTRY as usize + PM_CODE.len()].copy_from_slice(PM_CODE);
+    program[PM_HANDLER as usize] = 0xf4;
+    let mut put = |at: u32, bytes: [u8; 8]| {
+        let at = at as usize;
+        program[at..at + 8].copy_from_slice(&bytes);
+    };
+    put(
+        PM_GDT_BASE + u32::from(PM_SEL_CODE),
+        pm_descriptor(0x0000_ffff, 0x00cf_9a00),
+    );
+    put(
+        PM_GDT_BASE + u32::from(PM_SEL_DATA),
+        pm_descriptor(0x0000_ffff, 0x00cf_9300),
+    );
+    put(PM_IDT_BASE + PM_VECTOR * 8, pm_interrupt_gate(PM_HANDLER));
+    put(
+        PM_IDT_BASE + PM_VECTOR_GP * 8,
+        pm_interrupt_gate(PM_HANDLER),
+    );
+    program
+}
+
+fn pm_cpu(idt_limit: u16) -> CpuGsw {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.control.cr0 |= CR0_PE;
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(PM_SEL_CODE, 0x9b));
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        cpu.registers
+            .set_segment(segment, SegmentRegister::flat(PM_SEL_DATA, 0x93));
+    }
+    cpu.gdtr = DescriptorTable {
+        base: PM_GDT_BASE,
+        limit: PM_GDT_LIMIT,
+    };
+    cpu.idtr = DescriptorTable {
+        base: PM_IDT_BASE,
+        limit: idt_limit,
+    };
+    cpu.set_eip(PM_ENTRY);
+    cpu
+}
+
+fn arm_pm_fixture(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.set_esp(PM_STACK_TOP);
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(PM_ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    bus.trace = BusTrace::default();
+}
+
+/// Compile and install the protected-mode INT block. `d = true`: `PM_CODE` is 32-bit.
+fn pm_native_leg(idt_limit: u16) -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
+    let mut bus = sixteen_bit_bus(pm_program());
+    let mut cpu = pm_cpu(idt_limit);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, PM_DATA_PAGE]);
+    for &offset in PM_STARTS {
+        let linear = PM_ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(PM_ENTRY);
+    let compilation = match jit::direct::compile(&mut cpu, PM_ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("the protected-mode INT block became a structural rejection")
+        }
+        jit::direct::CompileOutcome::Retry(_) => {
+            panic!("the protected-mode INT block requested a retry")
+        }
+    };
+    assert_eq!(
+        compilation.span.instructions, 2,
+        "the block must be the MOV plus the INT, and stop there"
+    );
+    assert_eq!(
+        compilation.callout_int_imm8_slots, 1,
+        "the INT must be counted in its own slot class"
+    );
+    let key = jit::direct::key_for(&cpu, PM_ENTRY, true).expect("a protected-mode key");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the protected-mode INT block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+    (cpu, bus, block)
+}
+
+/// The two legs, plus the two quantities that only exist BEFORE the guest is driven on to its
+/// `HLT`: the EIP the block exit left behind, and the ESP under the frame it pushed.
+struct PmLegs {
+    native: CpuGsw,
+    native_bus: TestBus,
+    interp: CpuGsw,
+    interp_bus: TestBus,
+    /// Where the block exit put EIP. Read here rather than after the drive, because the handler's
+    /// `HLT` retires and moves it.
+    native_eip_after_block: u32,
+    native_esp_after_block: u32,
+}
+
+/// Run both legs of the protected-mode fixture and hand back the two settled machines.
+///
+/// `native_insns` is a PARAMETER and not a constant, because the two fixtures differ in it and the
+/// difference is the point: a successful delivery retires the `INT`, and a delivery that faults
+/// does not. `interpret_one_step`'s fault arm reports the PREFIX ONLY -- `finish_instruction` has
+/// already counted the faulting instruction in `perf.instructions`, so the block must not count it
+/// again. A fault leg reporting 2 here would be that double count.
+fn pm_both_legs(idt_limit: u16, native_insns: u64) -> PmLegs {
+    let mut interp_bus = sixteen_bit_bus(pm_program());
+    let mut interp = pm_cpu(idt_limit);
+    arm_pm_fixture(&mut interp, &mut interp_bus);
+    drive_to_halt(&mut interp, &mut interp_bus);
+
+    let (mut native, mut native_bus, block) = pm_native_leg(idt_limit);
+    arm_pm_fixture(&mut native, &mut native_bus);
+    let before = native.perf_counters().jit_direct_insns;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the installed block must actually run natively"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_insns - before,
+        native_insns,
+        "the block reported the wrong number of natively retired instructions"
+    );
+    let native_eip_after_block = native.registers.eip;
+    let native_esp_after_block = native.registers.esp();
+    drive_to_halt(&mut native, &mut native_bus);
+    PmLegs {
+        native,
+        native_bus,
+        interp,
+        interp_bus,
+        native_eip_after_block,
+        native_esp_after_block,
+    }
+}
+
+fn pm_assert_legs_agree(
+    native: &mut CpuGsw,
+    native_bus: &TestBus,
+    interp: &mut CpuGsw,
+    interp_bus: &TestBus,
+) {
+    native.materialize_flags();
+    interp.materialize_flags();
+    assert_eq!(
+        crate::tests::settled_registers(native),
+        crate::tests::settled_registers(interp),
+        "registers or EIP differ between the native and interpreted legs"
+    );
+    assert_eq!(native.eflags(), interp.eflags(), "EFLAGS");
+    assert_eq!(
+        native.registers.cs(),
+        interp.registers.cs(),
+        "CS selector differs, and the delivery is what loads it"
+    );
+    assert_eq!(
+        native_bus.memory, interp_bus.memory,
+        "guest RAM differs: the pushed frame AND the descriptor write-backs live in here"
+    );
+    assert_eq!(
+        native.elapsed_clocks, interp.elapsed_clocks,
+        "guest clocks differ"
+    );
+    assert_eq!(
+        native.perf_counters().instructions,
+        interp.perf_counters().instructions,
+        "retirement counts differ, so some instruction was counted twice or not at all"
+    );
+}
+
+fn pm_dword(bus: &TestBus, at: u32) -> u32 {
+    let at = at as usize;
+    u32::from_le_bytes([
+        bus.memory[at],
+        bus.memory[at + 1],
+        bus.memory[at + 2],
+        bus.memory[at + 3],
+    ])
+}
+
+/// **THE PROTECTED-MODE DIFFERENTIAL.** A real IDT gate, a real GDT descriptor, dword pushes, and
+/// the Accessed-bit write-back the gate's CS load performs -- against the interpreter running the
+/// identical guest.
+///
+/// The RAM comparison is the load-bearing one here rather than the register comparison: the
+/// descriptor write-back is a guest-memory side effect that no register carries, and it happens
+/// inside the `deferred_code_writes` window the helper opens around the step.
+#[test]
+fn the_int_call_out_matches_the_interpreter_in_protected_mode() {
+    let _guard = select_int_imm8_rows(true);
+    let legs = pm_both_legs(PM_IDT_LIMIT_OK, 2);
+    let native_bus = &legs.native_bus;
+
+    // Non-vacuity: the delivery really happened and really went through the gate.
+    assert_eq!(
+        legs.native_eip_after_block, PM_HANDLER,
+        "the gate must have transferred control to the handler, and the block exit must advance \
+         EIP by ZERO or the handler address would not survive"
+    );
+    let sp = PM_STACK_TOP - 12;
+    assert_eq!(
+        legs.native_esp_after_block, sp,
+        "a same-privilege 32-bit gate pushes exactly three dwords"
+    );
+    assert_eq!(
+        pm_dword(native_bus, sp),
+        PM_INT_AT + 2,
+        "the pushed EIP is the address AFTER the INT"
+    );
+    assert_eq!(
+        pm_dword(native_bus, sp + 4),
+        u32::from(PM_SEL_CODE),
+        "the pushed CS is the running code selector"
+    );
+    assert_eq!(
+        legs.native.registers.eflags & FLAG_IF,
+        0,
+        "an interrupt gate clears IF"
+    );
+    assert_eq!(
+        native_bus.memory[(PM_GDT_BASE + u32::from(PM_SEL_CODE) + 5) as usize] & 0x01,
+        0x01,
+        "the gate's CS load must have written the Accessed bit back into the GDT"
+    );
+
+    let PmLegs {
+        mut native,
+        native_bus,
+        mut interp,
+        interp_bus,
+        ..
+    } = legs;
+    pm_assert_legs_agree(&mut native, &native_bus, &mut interp, &interp_bus);
+}
+
+/// **THE FAULT PATH.** The IDT limit refuses vector `0x21`, so the delivery itself raises
+/// `#GP(0x21 * 8 + 2)` instead of transferring control -- and the call-out's fault tail has to
+/// produce exactly the frame the interpreter's own tail produces.
+///
+/// This is the one shape where the call-out is NOT simply the interpreter's arm.
+/// `interpret_one_step` advances EIP past the `INT` before stepping, so its fault tail has to hand
+/// `finish_instruction` the SLOT's own `start_eip` and `start_cs` for the rewind; the block's entry
+/// EIP is a plausible wrong answer that only a fixture like this can see, because it differs from
+/// the right one by the prefix's five bytes. The hand-rolled fetch charge, the zero-clock return
+/// and the separate stub are the other three pieces of bespoke tail code, and the clock and
+/// retirement comparisons below cover them.
+///
+/// RED-FIRST, and the mutation is named so the next reader can re-run it: pass `entry_eip` in place
+/// of `start_eip` at `direct.rs`'s
+/// `cpu.finish_instruction(bus, result, start_eip, start_cs, 0, None, None)`. Measured, not
+/// assumed: with that one-word edit the pushed EIP becomes `PM_ENTRY` (256) instead of `PM_INT_AT`
+/// (261) and this fixture goes red on the frame read below.
+///
+/// WHAT THE MUTATION ALSO SHOWED, and it is worth stating rather than hiding: seven existing
+/// `interpret_one` fault fixtures go red on it too. The fault tail is SHARED by every
+/// `InterpretOne` row, so there is no INT-specific fault code to mutate -- which is exactly review
+/// N3's structural point and the reason this is a nit rather than a hole. Mutating the delivery
+/// itself (skipping the IDT-limit check in `execute_extended.rs`) would move BOTH legs identically
+/// and prove nothing, which is why this fixture does not rest on the differential alone: the frame
+/// reads above it are absolute values, not a comparison, and they are what stays red when both legs
+/// move together. What the fixture adds over the existing seven is the `IntImm8` row driving that
+/// tail at all, in protected mode, through a delivery that fails with an ERROR CODE -- the shape
+/// the row's own `INT_IMM8_MAX_DATA_ACCESSES` bound is derived against.
+#[test]
+fn a_failed_int_delivery_faults_exactly_as_the_interpreter_does() {
+    let _guard = select_int_imm8_rows(true);
+    let legs = pm_both_legs(PM_IDT_LIMIT_SHORT, 1);
+    let native_bus = &legs.native_bus;
+
+    // Non-vacuity: this really is the fault path and not a successful delivery.
+    let stalls = legs.native.direct_stall_snapshot();
+    assert_eq!(
+        stalls.callout_interpret_one_resync_fault, 1,
+        "the slot must have left through the resync-FAULT stub, or the delivery succeeded"
+    );
+    assert_eq!(
+        legs.native_eip_after_block, PM_HANDLER,
+        "#GP is delivered through vector 13's gate, which is inside even the short limit"
+    );
+
+    // The #GP frame: the error code, then EIP, CS and EFLAGS above it.
+    let sp = PM_STACK_TOP - 16;
+    assert_eq!(
+        legs.native_esp_after_block, sp,
+        "a #GP with an error code pushes four dwords"
+    );
+    assert_eq!(
+        pm_dword(native_bus, sp),
+        PM_VECTOR * 8 + 2,
+        "the error code names the IDT entry that was out of limit, with the IDT bit set"
+    );
+    assert_eq!(
+        pm_dword(native_bus, sp + 4),
+        PM_INT_AT,
+        "the fault frame must name the INT ITSELF, not the block's entry: a fault rewinds onto \
+         the faulting instruction, and the call-out's tail is what supplies that address"
+    );
+    assert_eq!(
+        pm_dword(native_bus, sp + 8),
+        u32::from(PM_SEL_CODE),
+        "the pushed CS is the faulting code selector"
+    );
+
+    let PmLegs {
+        mut native,
+        native_bus,
+        mut interp,
+        interp_bus,
+        ..
+    } = legs;
+    pm_assert_legs_agree(&mut native, &native_bus, &mut interp, &interp_bus);
+}

@@ -28144,9 +28144,12 @@ impl InterpretOneRow {
     /// class rather than by row.
     pub(crate) fn may_write_segment(self) -> bool {
         match self {
-            // `IntImm8` answers TRUE and the answer is never READ by R2, because `always_resyncs`
-            // refuses resume before the predicate runs. It is stated anyway, and it is the honest
-            // answer rather than a defensive one: `software_interrupt` loads CS through the IDT
+            // `IntImm8` answers TRUE, and never because R2's answer decides anything for it:
+            // `always_resyncs` refuses resume before the predicate is consulted on the deciding
+            // path. R2 still READS it -- `interpret_one_step`'s resync tail re-runs
+            // `allows_resume` with the suffix-only mask for the prefix-use census, and that call
+            // reaches this arm -- so the answer has to be the true one rather than a convenient
+            // one. It is: `software_interrupt` loads CS through the IDT
             // gate, and a V86 reflection into the monitor additionally reloads DS, ES, FS and GS.
             // The OTHER consumer is the one that still reads it -- the accumulator that bars a
             // block from publishing a static successor -- and a block ending in a control transfer
@@ -30501,13 +30504,27 @@ fn interpret_one_step<B: CpuBus>(
     // DIRECTIONAL, and `INT` CLEARS IF, which is the arm that resumes. The tail below would then
     // restore the block's entry EIP and carry on, undoing the control transfer while keeping the
     // pushed frame and the cleared IF and TF. So the refusal is made here, before the predicate is
-    // consulted at all, and the `debug_assert` says what the predicate would have answered so a
-    // future edit that re-narrows one of the two cannot pass silently.
+    // consulted at all.
+    //
+    // AND THERE IS NOTHING TO ASSERT ALONGSIDE IT. A `debug_assert` stood here claiming
+    // `allows_resume` would have answered false for this row; it was the NEGATION of the paragraph
+    // above and review N1 caught it. The predicate's answer for an `IntImm8` slot is not an
+    // invariant in either direction -- it is a reading of the guest's IDT. A vector pointing at the
+    // fall-through address in the same code segment makes R1 pass, R2 pass (CS and SS both
+    // unchanged with no privilege change), R3 pass (`INT` clears TF and the IF clause is
+    // directional), and the epoch and deferred-write clauses are satisfied by any ordinary step. So
+    // `allows_resume` returns TRUE on that guest, and the assert would have fired in debug builds
+    // on legitimate, correctly-compiled guest behaviour -- on exactly the shape this gate exists
+    // for. The gate's whole point is that it does not care what the predicate says, so there is no
+    // second derivation here to cross-check, and an assert that re-derives the same
+    // `always_resyncs` call is one that cannot fail.
+    //
+    // What owns the claim instead is a fixture that BUILDS that guest and drives it:
+    // `cpu_jit_int_imm8_admission_test.rs`'s
+    // `a_handler_at_the_fall_through_address_still_resyncs`, which pins that the predicate really
+    // does say resume, that the gate refuses anyway, and that the guest-visible outcome matches the
+    // interpreter. Delete the gate and that fixture goes red.
     let always_resyncs = cell.row().always_resyncs();
-    debug_assert!(
-        !always_resyncs || !snapshot.allows_resume(cpu, end_eip, cell.row(), cell.used_by_others()),
-        "a row that can never resume was about to be allowed to"
-    );
     let resume = !always_resyncs
         && snapshot.allows_resume(cpu, end_eip, cell.row(), cell.used_by_others())
         && !(cell.row().arms_interrupt_shadow()
