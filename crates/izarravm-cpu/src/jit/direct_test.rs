@@ -72,6 +72,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         callout_port_slots: 0,
         callout_memory_slots: 0,
         callout_interpret_one_slots: 0,
+        callout_int_imm8_slots: 0,
         x87_entry_top: 0,
         x87_exit_top: 0,
         dynamic_successor: false,

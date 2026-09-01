@@ -1059,13 +1059,32 @@ fn a_string_slot_reads_a_direction_flag_set_outside_the_block() {
 /// The OFF leg is MAIN, and this is the fixture that says so.
 ///
 /// `INTERPRET_ONE_MAX_CORE_CLOCKS` and `MAX_CALL_OUT_CORE_CLOCKS` are `const` and no knob can gate
-/// them. They feed `compute_iteration_upper`, whose result is the chain quota's DIVISOR, so a row
-/// whose charge raised either fold would change how much native work fits in EVERY block on EVERY
-/// fixture -- with the knob OFF. The string arm charges 4 against an existing 7, so neither moves.
+/// them. The string arm charges 4 against an existing 7, so neither moves for it.
 ///
 /// The property pinned is "the OFF leg is main", NOT "7 is the correct charge". The assertion
 /// message says so, because a future row that legitimately raises the fold must read this failure
 /// as "re-ladder" rather than as a stale constant to update.
+///
+/// # The two constants are NOT the same claim, which the `0xCD` slice is what established
+///
+/// This doc used to say both of them "feed `compute_iteration_upper`, whose result is the chain
+/// quota's DIVISOR". That is true of `INTERPRET_ONE_MAX_CORE_CLOCKS` and FALSE of
+/// `MAX_CALL_OUT_CORE_CLOCKS`, and `run.rs` already says so in a comment that was itself a review
+/// correction: the latter's only reader is `compute_global_block_upper`, whose result is read at
+/// exactly two places -- a memo store and the `debug_assert!(per_hop_estimate <= global_block_upper)`
+/// beside it. The chain quota's divisor is `per_hop_estimate`, i.e. `iteration_upper`, and has been
+/// since the per-hop re-pricing. So in a release build "inflating this eight times over would
+/// change no guest-visible behaviour at all; it would only make the debug assertion weaker".
+///
+/// **`MAX_CALL_OUT_CORE_CLOCKS` moved 18 -> 37 with the `0xCD` INT imm8 row and the two
+/// `INTERPRET_ONE_*` constants deliberately did not.** That asymmetry IS the slice's design: INT
+/// charges 37 core clocks against the allowlist's 7 and presents more data accesses than its 4, so
+/// it takes its OWN slot class (`CompiledBlock::callout_int_imm8_slots`) and its own budget terms.
+/// The per-class constants therefore stay exactly where they were -- no CLI, STI, segment or string
+/// block's bound moves, and no block's ADMISSION changes -- while the global ceiling rises because
+/// a ceiling that failed to dominate an admitted helper would stop catching what it exists to
+/// catch. Raising the ceiling costs slack in a debug assertion; raising the per-class terms would
+/// have cost guest-visible admission, and that is the trade this fixture is here to keep visible.
 #[test]
 fn interpret_one_fold_is_unmoved_by_the_string_rows() {
     assert_eq!(
@@ -1078,10 +1097,12 @@ fn interpret_one_fold_is_unmoved_by_the_string_rows() {
     );
     assert_eq!(
         crate::MAX_CALL_OUT_CORE_CLOCKS,
-        18,
-        "the OFF leg is no longer main; re-ladder. MAX_CALL_OUT_CORE_CLOCKS is what prices a \
-         call-out slot when the budget cannot tell the helpers apart, and it is not behind any \
-         knob. Do not update this number: measure the OFF leg against main first"
+        37,
+        "MAX_CALL_OUT_CORE_CLOCKS is the GLOBAL ceiling, not a per-class term: its only reader is \
+         compute_global_block_upper, which throttles nothing (see this fixture's doc and run.rs). \
+         It reads 37 since the 0xCD INT imm8 row, whose 37-clock charge a dominating ceiling must \
+         cover. If this fails at some OTHER value, check which constant moved: the two \
+         INTERPRET_ONE_* pins below are the ones that would change block admission"
     );
     assert_eq!(
         crate::INTERPRET_ONE_MAX_DATA_ACCESSES,
@@ -1122,15 +1143,16 @@ fn interpret_one_fold_is_unmoved_by_the_string_rows() {
 /// names the new count explicitly, so a variant added without an `ALL` entry fails here as well as
 /// there.
 ///
-/// 18 rather than 16 as of N2: `Pushf` and `Popf` joined afterwards, and this count is a floor
-/// for THIS slice's four rows, not a ceiling on the enum -- it moves again the next time a row is
-/// added, and this comment moves with it.
+/// 19 rather than 16 as of N2 and the `0xCD` slice: `Pushf` and `Popf` joined after the string
+/// families, and `IntImm8` after them. The count is a floor for THIS slice's four rows, not a
+/// ceiling on the enum -- it moves again the next time a row is added, and this comment moves with
+/// it.
 #[test]
 fn the_four_string_rows_are_on_the_allowlist() {
     assert_eq!(
         jit::direct::InterpretOneRow::COUNT,
-        18,
-        "twelve rows before this slice plus the four string families plus N2's two"
+        19,
+        "twelve rows, the four string families, N2's two, and the 0xCD INT imm8 row"
     );
     for (label, row) in ROWS {
         assert_eq!(row.label(), label);
