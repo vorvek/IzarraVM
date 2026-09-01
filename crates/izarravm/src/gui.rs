@@ -1352,7 +1352,7 @@ impl GuiApp {
             warn!("could not save screenshot because no guest frame is available");
             return;
         };
-        match frame.save(&self.screenshots_dir) {
+        match frame.save(&self.screenshots_dir, self.monitor_gamma) {
             Ok(path) => info!(path = %path.display(), "saved guest screenshot"),
             Err(err) => {
                 warn!(%err, path = %self.screenshots_dir.display(), "could not save screenshot")

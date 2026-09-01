@@ -50,10 +50,10 @@ fn srgb_oetf(l: f32) -> f32 {
 /// existed. This makes "Raw" a first-class mode rather than a special case
 /// threaded through by hand at every call site.
 ///
-/// Not yet called from anywhere in this slice; the pref and shader plumbing
-/// that call it land in later slices of the same design. `allow(dead_code)`
-/// comes off once a caller exists.
-#[allow(dead_code)]
+/// Called from `screenshot.rs` so a saved PNG matches the window. Every
+/// headless `--*-ppm` writer and `screendump.rs` deliberately never call
+/// this (design section 4.4); `presented_ppm_is_unaffected_by_monitor_gamma`
+/// in `main_test.rs` guards that.
 pub fn display_transform(code: u8, gamma: Option<f32>) -> u8 {
     let Some(gamma) = gamma else {
         return code;

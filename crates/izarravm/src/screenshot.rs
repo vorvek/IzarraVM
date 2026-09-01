@@ -27,8 +27,17 @@ impl ScreenshotFrame {
         }
     }
 
-    pub(super) fn save(&self, directory: &Path) -> Result<PathBuf, ScreenshotError> {
-        save_png_at(self, directory, local_now())
+    /// `gamma` is the live `monitor_gamma` preference: the saved PNG must show
+    /// the same picture the window did, so a screenshot goes through
+    /// `display_transform` exactly like the CRT shader's `CrtStyle::Off`
+    /// path. `screendump.rs` and every headless `--*-ppm` writer stay raw on
+    /// purpose (design section 4.4) and must never call this.
+    pub(super) fn save(
+        &self,
+        directory: &Path,
+        gamma: Option<f32>,
+    ) -> Result<PathBuf, ScreenshotError> {
+        save_png_at(self, directory, local_now(), gamma)
     }
 }
 
@@ -109,14 +118,16 @@ fn save_png_at(
     frame: &ScreenshotFrame,
     directory: &Path,
     now: OffsetDateTime,
+    gamma: Option<f32>,
 ) -> Result<PathBuf, ScreenshotError> {
-    save_png_with_stem(frame, directory, &filename_stem(now))
+    save_png_with_stem(frame, directory, &filename_stem(now), gamma)
 }
 
 fn save_png_with_stem(
     frame: &ScreenshotFrame,
     directory: &Path,
     stem: &str,
+    gamma: Option<f32>,
 ) -> Result<PathBuf, ScreenshotError> {
     let expected = frame.width.checked_mul(frame.height);
     let width = u32::try_from(frame.width).ok();
@@ -137,6 +148,16 @@ fn save_png_with_stem(
 
     let mut rgba = Vec::with_capacity(frame.words.len() * 4);
     crate::crt::pack_argb_rows(&frame.words, frame.width, 0..frame.height, &mut rgba);
+    // Apply the same present-time correction the window shows, per channel.
+    // pack_argb_rows itself stays untouched: it is also the GPU-upload path
+    // in crt.rs, and touching its signature would widen this change's blast
+    // radius for no reason. Alpha (the 4th byte of each pixel) is always
+    // 0xff and is left alone.
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        for channel in &mut pixel[..3] {
+            *channel = crate::display_transform::display_transform(*channel, gamma);
+        }
+    }
 
     std::fs::create_dir_all(directory)?;
     let (path, file) = reserve_destination(directory, stem)?;
