@@ -13,6 +13,13 @@
 /// inconsistency as a mismatched board identity
 /// (`dev_docs/2026-09-01-mojo-fixture.md` section 5.1) -- no SST-1 was ever
 /// built that way.
+///
+/// 4 MB is also the first size at which `SST_FBI_INIT2`'s buffer-offset
+/// field cannot name an address outside its own RAM: the field is 9 bits
+/// of 8 KB pages (`distira.rs::recalculate_fbi_layout`, `n << 13`), so its
+/// maximum is `511 << 13` = 4,186,112, inside a 4 MB store but past a 2 MB
+/// one -- the same argument #814's review made for `SST_TEX_BASE_ADDR` at
+/// 4 MB (`dev_docs/2026-09-01-tex4mb-review.md` section 1).
 pub const DISTIRA_FB_SIZE: usize = 4 * 1024 * 1024;
 pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
 /// Bytes of texture RAM per TMU. `DISTIRA_TMU_CONFIG` (`distira.rs`)

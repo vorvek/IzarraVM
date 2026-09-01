@@ -1480,6 +1480,57 @@ fn lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode() {
     );
 }
 
+/// The counterpart to `lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode`,
+/// and the read-side contract `lfb_physical_addresses_past_two_megabytes_are_open_bus`
+/// used to pin before its rename discarded it
+/// (`dev_docs/2026-09-01-fb4mb-review.md` section 1): the FBI *write*
+/// decode wraps, but neither reference wraps the *read* decode. 86Box's
+/// `voodoo_fb_readw`/`readl` return `0xffff`/`0xffffffff` for any
+/// `read_addr > fb_mask`, checked BEFORE the mask is applied at all
+/// (`vid_voodoo_fb.c:91-95,132-136` -- the trailing `& fb_mask` there is
+/// therefore redundant for memory safety, so the guard is a deliberate
+/// behavioural choice, not a bounds check standing in for one), and
+/// DOSBox-X's `lfb_r` returns `0xffffffff` the same way
+/// (`voodoo_emu.cpp:2860-2862`). Two independent references, same answer,
+/// and the opposite of the write-side rule.
+///
+/// Same register configuration and the same two raw offsets as the write
+/// test above: a sentinel is written at raw offset 1408 (`buffer_offset=0`,
+/// so the aux buffer's origin is 0), then the register fields are pushed to
+/// their maximum width so an aperture READ reaches raw offset 4,195,712 --
+/// one whole `DISTIRA_FB_SIZE` above the sentinel. If the read decode
+/// wrapped like the write decode, this would return the sentinel; it must
+/// instead return `0xffff`, open bus.
+#[test]
+fn lfb_reads_past_four_megabytes_are_open_bus() {
+    let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_WRITE);
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH | LFB_WRITE_FRONT | LFB_READ_AUX,
+    );
+
+    write_reg(&mut distira, SST_FBI_INIT2, 0);
+    let low_aperture_offset = 704 << 1;
+    distira.write_lfb_u16(low_aperture_offset, 0xdead);
+
+    write_reg(&mut distira, SST_FBI_INIT1, 15 << FBIINIT1_TILES_IN_X_SHIFT);
+    write_reg(
+        &mut distira,
+        SST_FBI_INIT2,
+        511 << FBIINIT2_BUFFER_OFFSET_SHIFT,
+    );
+    let high_aperture_offset = 5 << 11;
+
+    assert_eq!(
+        distira.read_lfb_u16(high_aperture_offset),
+        0xffff,
+        "a read DISTIRA_FB_SIZE bytes past a live sentinel must return open bus, not the \
+         sentinel a wrapped read would alias onto"
+    );
+}
+
 #[test]
 fn the_census_counts_every_frame_size_distira_is_given() {
     // Distira had register-level unit tests only until 2026-08-29 and no game

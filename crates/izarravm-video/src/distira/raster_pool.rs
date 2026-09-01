@@ -85,6 +85,17 @@ impl FrameStore {
         Some(u16::from_le_bytes([low, high]))
     }
 
+    /// A masked offset of exactly `len - 1` still drops the whole write
+    /// instead of wrapping its high byte to offset 0 -- a residual
+    /// one-byte hole in the FBI write path's otherwise unconditional
+    /// "wrap, never drop" contract (`dev_docs/2026-09-01-fb4mb-review.md`
+    /// section 4). Every caller in this codebase computes an even offset
+    /// (`color_start`/`aux_base` are multiples of 8192, `pitch` a multiple
+    /// of 128, and the column term is always `x * 2`), and `len` (aliased
+    /// to `DISTIRA_FB_SIZE`) is a power of two and therefore even, so
+    /// `len - 1` is odd and this arm is unreachable today. Not fixed here:
+    /// 86Box has the mirror-image bug, a one-byte overread at
+    /// `addr == fb_mask`, so there is no reference to copy either way.
     pub(super) fn write_u16_le(&self, offset: usize, value: u16) -> bool {
         if offset + 1 >= self.bytes.len() {
             return false;
