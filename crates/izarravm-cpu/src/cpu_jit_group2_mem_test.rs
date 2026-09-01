@@ -101,10 +101,10 @@ impl Seg {
         }
     }
 
-    fn disp_bytes(self) -> Vec<u8> {
+    fn disp_bytes(self, at: u32) -> Vec<u8> {
         match self {
-            Seg::Sixteen => (DATA as u16).to_le_bytes().to_vec(),
-            Seg::ThirtyTwo => DATA.to_le_bytes().to_vec(),
+            Seg::Sixteen => (at as u16).to_le_bytes().to_vec(),
+            Seg::ThirtyTwo => at.to_le_bytes().to_vec(),
         }
     }
 
@@ -198,29 +198,37 @@ impl W {
     }
 }
 
-/// `[C0|C1] /op disp ib` against the absolute-displacement memory operand.
-fn imm8_mem(seg: Seg, width: W, op: u8, count: u8) -> Vec<u8> {
+/// `[C0|C1] /op disp ib` against the absolute-displacement memory operand at `at`.
+fn imm8_mem_at(seg: Seg, width: W, op: u8, count: u8, at: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     if width.needs_prefix(seg) {
         bytes.push(0x66);
     }
     bytes.push(width.imm8_opcode());
     bytes.push((op << 3) | seg.mem_rm());
-    bytes.extend_from_slice(&seg.disp_bytes());
+    bytes.extend_from_slice(&seg.disp_bytes(at));
     bytes.push(count);
     bytes
 }
 
+fn imm8_mem(seg: Seg, width: W, op: u8, count: u8) -> Vec<u8> {
+    imm8_mem_at(seg, width, op, count, DATA)
+}
+
 /// `[D0|D1] /op disp`. NO immediate: the count is the literal 1 baked into the opcode.
-fn by_one_mem(seg: Seg, width: W, op: u8) -> Vec<u8> {
+fn by_one_mem_at(seg: Seg, width: W, op: u8, at: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     if width.needs_prefix(seg) {
         bytes.push(0x66);
     }
     bytes.push(width.by_one_opcode());
     bytes.push((op << 3) | seg.mem_rm());
-    bytes.extend_from_slice(&seg.disp_bytes());
+    bytes.extend_from_slice(&seg.disp_bytes(at));
     bytes
+}
+
+fn by_one_mem(seg: Seg, width: W, op: u8) -> Vec<u8> {
+    by_one_mem_at(seg, width, op, DATA)
 }
 
 /// `mov eax,ecx` / `mov ax,cx`: the control row, which must compile in BOTH segment kinds. Without
@@ -511,7 +519,42 @@ fn build(seg: Seg, body: &[u8], slots: u8, seed: Seed) -> Roles {
     }
 }
 
-fn compare_state(roles: &Roles, context: &str) {
+/// `TestBus`'s width-DEPENDENT direct dial, in clocks for one `bytes`-wide cycle: 0, 1 and 3 wait
+/// states for Byte, Word and Dword. Copied from `cpu_jit_misaligned_memory_test.rs`, which
+/// derives the same quantity for the same reason.
+fn direct_cycle_clocks(bytes: u32) -> u64 {
+    match bytes {
+        1 => 2,
+        2 => 3,
+        4 => 5,
+        other => unreachable!("no TestBus dial for a {other}-byte access"),
+    }
+}
+
+/// What a natively served MISALIGNED read-modify-write costs over the interpreted role, at
+/// `TestBus`'s dials.
+///
+/// Per access the native role charges one WIDE cycle -- the one the block's static count carries
+/// -- plus `bytes - 1` byte cycles from the split deposit, where the interpreted role charges
+/// `bytes` byte cycles through `charge_direct_ram_split`. The `bytes - 1` cancel and what remains
+/// is `wide_cycle(bytes) - byte_cycle`, which is a pure `TestBus` artifact: on a real `MachineBus`
+/// `BusCycle::clocks_for` ignores width and the quantity is exactly zero.
+///
+/// **TWICE, and that factor is the assertion.** A read-modify-write splits on BOTH accesses where
+/// a plain load or store splits on one, so `emit_rotate_shift_mem` deposits twice. An emitter that
+/// deposited once, or three times, moves this number immediately.
+fn expected_split_delta(width: W) -> u64 {
+    let bytes = match width {
+        W::Byte => return 0,
+        W::Word => 2,
+        W::Dword => 4,
+    };
+    2 * (direct_cycle_clocks(bytes) - direct_cycle_clocks(1))
+}
+
+/// `split_delta` is the bus-clock excess the native role is EXPECTED to carry, which is zero for
+/// every aligned row and `expected_split_delta` for a misaligned one.
+fn compare_state_with_split(roles: &Roles, split_delta: u64, context: &str) {
     assert_eq!(
         crate::tests::settled_registers(&roles.native),
         crate::tests::settled_registers(&roles.interp),
@@ -532,8 +575,8 @@ fn compare_state(roles: &Roles, context: &str) {
     );
     assert_eq!(
         roles.native_bus.trace.elapsed_clocks(),
-        roles.interp_bus.trace.elapsed_clocks(),
-        "{context}: bus clocks"
+        roles.interp_bus.trace.elapsed_clocks() + split_delta,
+        "{context}: bus clocks (expected split delta {split_delta})"
     );
     // The WHOLE array, not a window over `DATA`. A window would hide a store of the wrong width
     // one byte past the operand, which is the exact way a Byte lane running as a Word one fails.
@@ -546,6 +589,17 @@ fn compare_state(roles: &Roles, context: &str) {
 /// A row that completes NATIVELY: every slot retires in the block and the whole architectural
 /// state matches the same number of interpreted steps.
 fn lowered(seg: Seg, body: &[u8], slots: u8, seed: Seed, context: &str) {
+    lowered_with_split(seg, body, slots, seed, 0, context);
+}
+
+fn lowered_with_split(
+    seg: Seg,
+    body: &[u8],
+    slots: u8,
+    seed: Seed,
+    split_delta: u64,
+    context: &str,
+) {
     let mut roles = build(seg, body, slots, seed);
     let retired = roles.native.perf_counters().jit_direct_insns;
     assert!(
@@ -563,7 +617,7 @@ fn lowered(seg: Seg, body: &[u8], slots: u8, seed: Seed, context: &str) {
     for _ in 0..roles.slots {
         roles.interp.cycle(&mut roles.interp_bus).unwrap();
     }
-    compare_state(&roles, context);
+    compare_state_with_split(&roles, split_delta, context);
 }
 
 /// The form under test plus the five flag consumers, as one block body.
@@ -715,17 +769,36 @@ fn a_count_that_masks_to_zero_stays_a_barrier() {
     }
 }
 
-/// With both row knobs OFF, every cell goes back to the barrier it was before this slice.
+/// The memory form rides EXACTLY the row axis its register sibling does, which is not a uniform
+/// axis and this row is the pin on that.
+///
+/// With both row knobs off:
+///
+/// * `0xC0`/`0xD0` (the Byte opcodes) refuse EVERY sub-opcode. `/0` and `/1` are on
+///   `IZARRAVM_ROTATE_ROWS` and `/4..=7` on `IZARRAVM_BYTE_SHIFT_ROWS`, and the arm reads both
+///   above the operand bind, so the memory form goes with the register form.
+/// * `0xC1`/`0xD1` refuse `/0` ALONE. `/1` ROR was lowered before the rotate-rows slice and stays
+///   ungated by design -- the off arm has to restore the PRE-SLICE world, not a no-rotates world,
+///   or an A/B prices two slices as one -- and `/4..=7` are older still.
+///
+/// A uniform expectation here would be the easier assertion and the wrong one: it would force a
+/// knob read into the `0xc1 | 0xd1` arm that the register lane does not have, and the off arm
+/// would then stop reproducing the shipped tree.
 #[test]
 fn the_row_knobs_off_restore_the_pre_slice_barrier() {
     let _arm = force_rows(false);
     for seg in SEGMENTS {
         for width in WIDTHS {
             for (label, op) in SUB_OPS {
+                let expected = if width == W::Byte || op == 0 {
+                    REFUSED
+                } else {
+                    ADMITTED
+                };
                 assert_eq!(
                     compile_span(seg, &by_one_mem(seg, width, op)),
-                    REFUSED,
-                    "{} {label} {} must be refused with the row knobs off",
+                    expected,
+                    "{} {label} {} with the row knobs off",
                     seg.label(),
                     width.label()
                 );
@@ -737,6 +810,136 @@ fn the_row_knobs_off_restore_the_pre_slice_barrier() {
             "control: the harness compiles a register move in {}",
             seg.label()
         );
+    }
+}
+
+// =============================================================================================
+// The alignment verdict: misaligned is SERVED, page-crossing is REFUSED
+// =============================================================================================
+
+/// A MISALIGNED but page-local operand runs natively, with the split bus charge deposited
+/// dynamically.
+///
+/// This is the property that makes the Word row admissible at all. `emit_wide_page_guard` sends
+/// every misaligned Word or Dword access to a side exit, and 16-bit DOS code has no alignment
+/// discipline: under that guard an odd operand would sit inside the block and exit at that slot on
+/// EVERY execution, which is worse than the barrier it replaced. `emit_rotate_shift_mem` keeps the
+/// crossing half of the guard and serves the alignment half instead.
+///
+/// The bus-clock column in `compare_state` is what proves the deposit, and it proves the DOUBLE
+/// deposit specifically: a read-modify-write splits twice where a plain store splits once, so an
+/// emitter that deposited a single extra charge would read low against the interpreter here and
+/// nowhere else.
+#[test]
+fn a_misaligned_group_two_memory_form_runs_natively() {
+    let _arm = force_rows(true);
+    for seg in SEGMENTS {
+        for (width, at) in [
+            (W::Word, DATA + 1),
+            (W::Dword, DATA + 1),
+            (W::Dword, DATA + 2),
+            (W::Dword, DATA + 3),
+        ] {
+            for (label, op) in SUB_OPS {
+                for count in [1u8, 3] {
+                    let context = format!(
+                        "{} {label} {} misaligned at {at:#x} count={count}",
+                        seg.label(),
+                        width.label()
+                    );
+                    lowered_with_split(
+                        seg,
+                        &with_consumers(seg, &imm8_mem_at(seg, width, op, count, at)),
+                        CONSUMED_SLOTS,
+                        Seed::new(0xaaaa_aaaa).flags(SEEDED_EFLAGS),
+                        expected_split_delta(width),
+                        &context,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The one shape `certainly_exits_on_alignment` can decide statically stays ADMITTED.
+///
+/// That rule refuses a slot whose operand address is decidable at compile time and fails the
+/// alignment guard the emitter will produce, because such a slot would exit on every execution.
+/// It reads `DirectKind::unrelaxed_wide_guard_access`, and `RotateShiftMem` is deliberately absent
+/// from that list: this emitter SERVES a misaligned access instead of exiting on it, so the rule
+/// must not fire for it. A `2E`-prefixed, displacement-only operand at an odd address is the exact
+/// shape the rule decides, so this row goes red the moment the kind is added to that accessor.
+#[test]
+fn a_statically_odd_cs_override_word_rotate_is_still_admitted() {
+    let _arm = force_rows(true);
+    // REAL MODE ONLY, and the restriction is the fixture's rather than the rule's. `flat_cpu`'s CS
+    // is an executable segment (access byte 0x9B), so a WRITE through it is refused by
+    // `segment_access_supported` long before any alignment question, and a 32-bit row here would
+    // assert nothing about this rule. Real mode is also the shape the rule was written for: a
+    // real-mode segment base is a multiple of 16, so the operand's parity is the displacement's.
+    {
+        let seg = Seg::Sixteen;
+        for (label, op) in SUB_OPS {
+            // `2E` CS override in front of the by-one form. A CS-override, displacement-only
+            // operand is the ONE shape `certainly_exits_on_alignment` can decide statically, and
+            // at an odd displacement it decides MISALIGNED. Every other unrelaxed memory kind is
+            // refused there; this one must not be, because its emitter serves the access.
+            let mut form = vec![0x2eu8];
+            form.extend_from_slice(&by_one_mem_at(seg, W::Word, op, DATA + 1));
+            assert_eq!(
+                compile_span(seg, &form),
+                ADMITTED,
+                "{} {label} cs:[odd] word must still join the block: the alignment half of the \
+                 guard is served, not refused",
+                seg.label()
+            );
+        }
+    }
+}
+
+/// A PAGE-CROSSING operand still side exits, and the block still forms around it.
+///
+/// The two-byte access at `0x2FFF` spans two FastMap entries where the slot resolved one bias, so
+/// this is the half of the guard the emitter keeps. The block compiles, the slot exits, and the
+/// interpreter runs the instruction. The row asserts the architectural result is still right,
+/// which is what a side exit has to guarantee.
+#[test]
+fn a_page_crossing_group_two_memory_form_side_exits_and_still_agrees() {
+    let _arm = force_rows(true);
+    const CROSSING: u32 = 0x2fff;
+    for seg in SEGMENTS {
+        for (label, op) in SUB_OPS {
+            let mut roles = build(
+                seg,
+                &by_one_mem_at(seg, W::Word, op, CROSSING),
+                3,
+                Seed::new(0x0f0f_0f0f).flags(SEEDED_EFLAGS),
+            );
+            let _ = roles
+                .native
+                .try_run_direct_block_for_test(&mut roles.native_bus, roles.block)
+                .unwrap();
+            // Whatever the block did, finish the three slots on both roles and compare. The
+            // native role may have exited part-way, so it is stepped to the same place.
+            while roles.native.registers.eip < ENTRY + 6 && !roles.native.halted {
+                roles.native.cycle(&mut roles.native_bus).unwrap();
+            }
+            for _ in 0..3 {
+                roles.interp.cycle(&mut roles.interp_bus).unwrap();
+            }
+            assert_eq!(
+                roles.native_bus.memory[CROSSING as usize..CROSSING as usize + 2],
+                roles.interp_bus.memory[CROSSING as usize..CROSSING as usize + 2],
+                "{} {label} crossing: the operand must still be right",
+                seg.label()
+            );
+            assert_eq!(
+                roles.native.eflags(),
+                roles.interp.eflags(),
+                "{} {label} crossing: EFLAGS",
+                seg.label()
+            );
+        }
     }
 }
 
@@ -845,12 +1048,7 @@ fn memory_rotates_preserve_sf_zf_pf_and_af() {
             for op in [0u8, 1] {
                 for count in [1u8, 2, 7, 31] {
                     let seed = Seed::new(0x0000_0001).flags(SEEDED_EFLAGS);
-                    let mut roles = build(
-                        seg,
-                        &imm8_mem(seg, width, op, count),
-                        3,
-                        seed,
-                    );
+                    let mut roles = build(seg, &imm8_mem(seg, width, op, count), 3, seed);
                     assert!(
                         roles
                             .native
@@ -859,7 +1057,8 @@ fn memory_rotates_preserve_sf_zf_pf_and_af() {
                         "block did not run natively"
                     );
                     let flags = roles.native.eflags();
-                    let preserved = crate::FLAG_SF | crate::FLAG_ZF | crate::FLAG_PF | crate::FLAG_AF;
+                    let preserved =
+                        crate::FLAG_SF | crate::FLAG_ZF | crate::FLAG_PF | crate::FLAG_AF;
                     assert_eq!(
                         flags & preserved,
                         SEEDED_EFLAGS & preserved,

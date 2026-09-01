@@ -1227,16 +1227,18 @@ fn word_size_shift_forms_are_lowered() {
 /// positive coverage is `group2_word_rotate_register_form_is_lowered` in
 /// `cpu_jit_test_imm_test.rs` and the differential sweep in `cpu_jit_word_rotate_test.rs`.
 ///
-/// The MEMORY form of `0xC1` is here too, at BOTH operand sizes, because its refusal is neither
-/// the allowlist's nor new -- the classify arm binds `DecodedOperand::Reg` and returns None for
-/// anything else. Pinning both sizes is what says the Word entry did not widen it by accident.
+/// **The MEMORY form of `0xC1 /4` moved OUT of this table too**, for the same class of reason and
+/// on `vorvek/direct-rot-mem-lane`: the `else` branch of that register-only bind now produces
+/// `DirectKind::RotateShiftMem`, so the refusal this table used to pin at both operand sizes is
+/// gone by design. What replaced it here is a positive row on the RCL memory form, which is the
+/// assertion the table actually needs now: the memory admission must not have swept `/2` and `/3`
+/// in with the rest. The lane's own coverage is `cpu_jit_group2_mem_test.rs`.
 #[test]
 fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
     // NO KNOB FORCE, and that absence is deliberate rather than an oversight. Every row left in
     // this table refuses UNCONDITIONALLY, on both arms of `IZARRAVM_ROTATE_ROWS`: RCL/RCR have
-    // never had a classify arm at any width, `0xD3` has no arm at all (`emit_shift_cl` is
-    // Dword-only), and the memory forms are refused by the shared register-only `let-else` before
-    // any knob is consulted. A force here would be a gate that cannot fail -- it would pass
+    // never had a classify arm at any width at EITHER operand form, and `0xD3` has no arm at all
+    // (`emit_shift_cl` is Dword-only). A force here would be a gate that cannot fail -- it would pass
     // identically with the knob on or off, certifying nothing about the knob and hiding that fact
     // from a reader. (The one row that DID depend on the knob, `0xC1`/`0xD1 /0` ROL, moved OUT of
     // this table as of `vorvek/direct-word-rot1`: `RotateReg` now carries a `width` field and is
@@ -1249,13 +1251,17 @@ fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
         ("0xd1 /3 rcr cx,1", &[0x66, 0xd1, 0xd9]),
         ("0xd3 /4 shl cx,cl", &[0x66, 0xd3, 0xe1]),
         ("0xd3 /7 sar cx,cl", &[0x66, 0xd3, 0xf9]),
+        // The MEMORY forms of RCL and RCR, at both operand sizes. These replace the two `/4`
+        // memory rows the group-2 memory lane admitted: what has to be pinned now is that the
+        // lane's `matches!(reg, 0 | 1 | 4..=7)` whitelist did not sweep `/2` and `/3` in with the
+        // rest of the family.
         (
-            "0xc1 /4 shl word [m],imm8",
-            &[0x66, 0xc1, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03],
+            "0xc1 /2 rcl word [m],imm8",
+            &[0x66, 0xc1, 0x15, 0x00, 0x20, 0x00, 0x00, 0x03],
         ),
         (
-            "0xc1 /4 shl dword [m],imm8",
-            &[0xc1, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03],
+            "0xc1 /3 rcr dword [m],imm8",
+            &[0xc1, 0x1d, 0x00, 0x20, 0x00, 0x00, 0x03],
         ),
     ];
 
