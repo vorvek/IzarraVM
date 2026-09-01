@@ -84,3 +84,52 @@ fn high_texture_upload_does_not_alias_a_low_texel_within_tmu_budget() {
          upload that wrapped onto this texel's storage"
     );
 }
+
+/// THE WRAP-VS-DROP DIVERGENCE
+/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8): before this fix, the
+/// FBI pixel-offset path (`RasterView::framebuffer_pixel_offset`) dropped
+/// any pixel whose computed address landed at or past `DISTIRA_FB_SIZE`
+/// instead of wrapping, unlike the texture-memory path (which has always
+/// masked with `& (DISTIRA_TEX_SIZE - 1)`) and unlike 86Box's own FBI write
+/// path, which indexes every store as `fb_mem[write_addr & fb_mask]` with
+/// no bounds check first (`vid_voodoo_fb.c`, `voodoo_fb_writew`/`writel`).
+/// The FBI address decode has no more address lines than it has RAM to
+/// back them, so a bit above that boundary is simply not routed -- a
+/// modulo-2^n wrap, not an aborted write.
+///
+/// This test writes one pixel through the real LFB write path
+/// (`write_lfb_u16`, the same call a guest's pixel-pipeline write goes
+/// through) at raw byte offset 0, then a second, different pixel exactly
+/// `DISTIRA_FB_SIZE` bytes above it -- a real row address the FBI's own
+/// row/tile math can reach at a large enough configured pitch (the
+/// machine-level `glide_destructive_framebuffer_probe_reports_four_megabytes`
+/// fixture reaches an address in this shape through `SST_FBI_INIT2`'s
+/// buffer-offset field). RED against the pre-fix drop behaviour: the high
+/// write would fall outside `DISTIRA_FB_SIZE` and vanish, leaving the low
+/// pixel unclobbered. GREEN under wrap: the high write lands back on
+/// offset 0 and clobbers it, exactly as address-line truncation would on
+/// real hardware.
+#[test]
+fn lfb_write_above_the_fbi_limit_wraps_instead_of_dropping() {
+    let mut distira = Distira::new();
+    distira.display.front_base = 0;
+    // A pitch equal to the whole FBI size makes one aperture row exactly
+    // `DISTIRA_FB_SIZE` bytes, so aperture y=1 is the write under test.
+    distira.display.pitch = DISTIRA_FB_SIZE as u32;
+
+    // aperture_offset 0 decodes to position (x=0, y=0): raw byte offset 0.
+    distira.write_lfb_u16(0, 0x1111);
+    assert_eq!(distira.read_lfb_u16(0), 0x1111);
+
+    // aperture_offset with bit 11 set decodes to position (x=0, y=1): raw
+    // byte offset `front_base + 1 * pitch` = `DISTIRA_FB_SIZE` exactly --
+    // one whole framebuffer above the low write.
+    distira.write_lfb_u16(1 << 11, 0x2222);
+
+    assert_eq!(
+        distira.read_lfb_u16(0),
+        0x2222,
+        "a write DISTIRA_FB_SIZE bytes above offset 0 must wrap and land on offset 0, \
+         not vanish"
+    );
+}

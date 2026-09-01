@@ -1407,30 +1407,76 @@ fn lfb_aperture_wraps_its_unused_high_address_bit() {
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
 }
 
+/// Renamed from `lfb_physical_addresses_past_two_megabytes_are_open_bus`
+/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8's rename shape,
+/// applied to the FBI probe growing FB_SIZE now surfaces): the SAME 800x600
+/// register configuration this test always used put the auxiliary buffer's
+/// origin at raw byte offset 4,186,112 -- past the OLD 2 MB FBI budget, so
+/// the write there used to vanish (open bus, `0xffff`). Under the NEW 4 MB
+/// budget that same origin is a real, in-bounds address (`DISTIRA_FB_SIZE`
+/// is 4,194,304; 4,186,112 < that), so it now round-trips -- see the first
+/// assertion below.
+///
+/// THE WRAP-VS-DROP DIVERGENCE
+/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8): the FBI address
+/// decode wraps modulo its RAM size, the same rule the texture path uses
+/// and the rule 86Box's own FBI write path uses unconditionally
+/// (`vid_voodoo_fb.c`, see `RasterView::framebuffer_pixel_offset`'s doc
+/// comment for the full citation). This test still proves that at the NEW
+/// 4 MB boundary, using the SAME real register fields a guest programs
+/// (`SST_FBI_INIT1`'s tiles-in-x, `SST_FBI_INIT2`'s buffer-offset, both
+/// pushed to their maximum field width): a write at raw byte offset 1,408
+/// (reached with `buffer_offset=0`, so the aux buffer starts at 0) is
+/// aliased by a second write at aux-buffer offset `9,600` under
+/// `buffer_offset=511, tiles=15` -- an address whose aux-buffer origin
+/// alone (4,186,112) plus that offset (9,600) totals 4,195,712, exactly
+/// `DISTIRA_FB_SIZE` (4,194,304) + 1,408. The high write must land on top
+/// of the low one, not vanish.
 #[test]
-fn lfb_physical_addresses_past_two_megabytes_are_open_bus() {
+fn lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode() {
     let mut distira = Distira::new();
     distira.set_init_enable(INIT_ENABLE_WRITE);
-    write_reg(&mut distira, SST_FBI_INIT1, 13 << FBIINIT1_TILES_IN_X_SHIFT);
-    write_reg(
-        &mut distira,
-        SST_FBI_INIT2,
-        247 << FBIINIT2_BUFFER_OFFSET_SHIFT,
-    );
-    write_reg(&mut distira, SST_VIDEO_DIMENSIONS, (600 << 16) | 799);
     write_reg(
         &mut distira,
         SST_LFB_MODE,
         LFB_FORMAT_DEPTH | LFB_WRITE_FRONT | LFB_READ_AUX,
     );
 
-    let aperture_offset = (100 << 11) | (128 << 1);
-    distira.write_lfb_u16(aperture_offset, 0xdead);
-
+    // buffer_offset=0 puts the aux buffer's origin at raw offset 0, so
+    // aperture (x=704, y=0) -- aperture_offset 1408 -- writes raw offset
+    // 1408 directly.
+    write_reg(&mut distira, SST_FBI_INIT2, 0);
+    let low_aperture_offset = 704 << 1;
+    distira.write_lfb_u16(low_aperture_offset, 0xdead);
     assert_eq!(
-        distira.read_lfb_u16(aperture_offset),
-        0xffff,
-        "the 800x600 auxiliary buffer starts near the end of installed memory"
+        distira.read_lfb_u16(low_aperture_offset),
+        0xdead,
+        "an aux-buffer write at offset 1408 with buffer_offset=0 must round-trip"
+    );
+
+    // Push both register fields to their maximum width: tiles=15 (pitch
+    // 1920) and buffer_offset=511 (aux-buffer origin 4,186,112 -- inside
+    // the new 4 MB budget by only 8,192 bytes, and the old test's own
+    // "near the end of installed memory" address, now valid instead of
+    // dropped). Aperture (x=0, y=5) then reaches raw offset
+    // 4,186,112 + 5*1920 = 4,195,712, one full DISTIRA_FB_SIZE above the
+    // low write's offset 1408.
+    write_reg(&mut distira, SST_FBI_INIT1, 15 << FBIINIT1_TILES_IN_X_SHIFT);
+    write_reg(
+        &mut distira,
+        SST_FBI_INIT2,
+        511 << FBIINIT2_BUFFER_OFFSET_SHIFT,
+    );
+    let high_aperture_offset = 5 << 11;
+    distira.write_lfb_u16(high_aperture_offset, 0xbeef);
+
+    // Back to buffer_offset=0 to read raw offset 1408 again.
+    write_reg(&mut distira, SST_FBI_INIT2, 0);
+    assert_eq!(
+        distira.read_lfb_u16(low_aperture_offset),
+        0xbeef,
+        "a write DISTIRA_FB_SIZE bytes above offset 1408 must wrap and land on top of it, \
+         not vanish"
     );
 }
 

@@ -1,7 +1,19 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-pub const DISTIRA_FB_SIZE: usize = 2 * 1024 * 1024;
+/// Bytes of framebuffer (FBI) RAM. `DISTIRA_TMU_CONFIG` (`distira.rs`)
+/// advertises a dual-TMU board (both TMU-count bits set, matching DOSBox-X's
+/// `VOODOO_1_DTMU`), and every real dual-TMU Voodoo 1 board carried a 4 MB
+/// frame buffer, not the 2 MB of a plain single-TMU board. DOSBox-X pairs
+/// `VOODOO_1_DTMU` with `fbmemsize = 4` (`voodoo_emu.cpp:3005-3012`); 86Box
+/// treats FBI size and TMU size as independent config knobs (`fb_size`,
+/// `texture_size`, `vid_voodoo.c:1165-1166`), so it does not force this
+/// pairing, but both agree a real dual-TMU card ships 4 MB of FBI RAM. MOJO,
+/// 3dfx's own DOS diagnostic, reported this exact 2 MB-FBI/dual-TMU
+/// inconsistency as a mismatched board identity
+/// (`dev_docs/2026-09-01-mojo-fixture.md` section 5.1) -- no SST-1 was ever
+/// built that way.
+pub const DISTIRA_FB_SIZE: usize = 4 * 1024 * 1024;
 pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
 /// Bytes of texture RAM per TMU. `DISTIRA_TMU_CONFIG` (`distira.rs`)
 /// advertises a dual-TMU board (both TMU-count bits set, matching DOSBox-X's

@@ -374,9 +374,18 @@ impl RasterParams {
             .checked_add(u64::from(y).checked_mul(u64::from(self.display.pitch))?)?
             .checked_add(u64::from(x).checked_mul(2)?)?;
         let offset = usize::try_from(offset).ok()?;
-        // The frame store never changes size, so the constant keeps this
-        // valid while the raster path holds the store outside `self`.
-        (offset.checked_add(2)? <= DISTIRA_FB_SIZE).then_some(offset)
+        // The FBI decode wraps modulo its RAM size, the same rule the
+        // texture path uses (`& (DISTIRA_TEX_SIZE - 1)`, `distira.rs`'s
+        // `write_texture_u32`/`texture_write_offset`) and the rule 86Box's
+        // own FBI write path uses unconditionally
+        // (`vid_voodoo_fb.c`: every store indexes
+        // `fb_mem[write_addr & fb_mask]`, no bounds check first). A
+        // triangle or an LFB write that lands past the end of FBI RAM does
+        // not vanish on real hardware -- the address lines that would
+        // select a higher byte are simply not routed, so the write lands
+        // on a lower byte instead. `DISTIRA_FB_SIZE` is a power of two, so
+        // masking is exact modulo arithmetic, not an approximation.
+        Some(offset & (DISTIRA_FB_SIZE - 1))
     }
 }
 

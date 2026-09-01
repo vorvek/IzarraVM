@@ -12,7 +12,7 @@ VEGA has two graphics engines, each with its own memory:
 - **Margo**, the 2D engine. It drives the desktop and all of the 2D display
   modes. It has a 4 MB frame store, and a blit engine for accelerated fills,
   copies, text, and lines.
-- **Distira**, the 3D engine. It has a 2 MB frame buffer and two independent
+- **Distira**, the 3D engine. It has a 4 MB frame buffer and two independent
   2 MB texture stores.
 
 VEGA shows the scanout of the active engine. Margo and Distira do not share
@@ -579,7 +579,7 @@ Graphics board does not sell its 3D chip and its TMU chip separately.
 | PCI device ID | `0x0001` |
 | BAR0 size | 16 MB (MMIO and LFB windows in it) |
 | MMIO window | 64 KB, register-mapped |
-| Framebuffer | 2 MB, dedicated (not shared with the 4 MB frame store of Margo) |
+| Framebuffer | 4 MB, dedicated (not shared with the 4 MB frame store of Margo) |
 | Texture memory | 2 MB for each TMU |
 | TMU count | 2 |
 | Native ID register | `0x44540100` ("DT", version 1.00) |

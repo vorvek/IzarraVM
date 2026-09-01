@@ -2595,12 +2595,16 @@ impl Distira {
     fn lfb_byte_offset(&self, base: u32, aperture_offset: usize) -> Option<usize> {
         let x = (aperture_offset & 0x7fe) | (aperture_offset & 1);
         let y = (aperture_offset >> 11) & 0x3ff;
-        usize::try_from(
+        let offset = usize::try_from(
             u64::from(base)
                 .checked_add((y as u64).checked_mul(u64::from(self.display.pitch))?)?
                 .checked_add(x as u64)?,
         )
-        .ok()
+        .ok()?;
+        // Wraps modulo FBI RAM size, like `RasterView::framebuffer_pixel_offset`
+        // and the texture-aperture path -- the same address-decode rule, not a
+        // bounds check. See that function's comment for the hardware citation.
+        Some(offset & (DISTIRA_FB_SIZE - 1))
     }
 
     fn read_lfb_bytes<const N: usize>(&self, aperture_offset: usize) -> [u8; N] {
@@ -2608,13 +2612,14 @@ impl Distira {
         let Some(start) = self.lfb_byte_offset(self.lfb_read_base(), aperture_offset) else {
             return bytes;
         };
-        let Some(end) = start.checked_add(N) else {
-            return bytes;
-        };
-        if end <= self.fb.len() {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                *byte = self.fb.get(start + index).unwrap_or(0xff);
-            }
+        // `start` is already wrapped into `0..DISTIRA_FB_SIZE`, but an N-byte
+        // read starting near the top must itself wrap byte by byte rather
+        // than fail as a whole -- the same reason the texture-fetch path
+        // masks each of a texel's two bytes independently
+        // (`raster_view.rs::sample_tmu_u16`).
+        let mask = DISTIRA_FB_SIZE - 1;
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = self.fb.get((start + index) & mask).unwrap_or(0xff);
         }
         bytes
     }
@@ -2816,7 +2821,9 @@ impl Distira {
         let low_y = self.clip_low_y.min(self.display.height) as u64;
         let high_y = self.clip_high_y.min(self.display.height) as u64;
         let pitch = u64::from(self.display.pitch);
-        let len = self.fb.len() as u64;
+        // Wraps modulo FBI RAM size like every other framebuffer address in
+        // this file -- see `lfb_byte_offset`'s comment for the citation.
+        let mask = (DISTIRA_FB_SIZE - 1) as u64;
         let params = self.raster_params();
 
         for y in low_y..high_y {
@@ -2825,13 +2832,13 @@ impl Distira {
                 let pixel_offset = draw_y
                     .saturating_mul(pitch)
                     .saturating_add(x.saturating_mul(2));
-                let color_offset = u64::from(color_start).saturating_add(pixel_offset);
-                if write_color && color_offset + 1 < len {
+                let color_offset = (u64::from(color_start).saturating_add(pixel_offset)) & mask;
+                if write_color {
                     self.fb.write_u16_le(color_offset as usize, color);
                     self.fastfill_pixels += 1;
                 }
-                let depth_offset = u64::from(self.aux_base).saturating_add(pixel_offset);
-                if write_depth && depth_offset + 1 < len {
+                let depth_offset = (u64::from(self.aux_base).saturating_add(pixel_offset)) & mask;
+                if write_depth {
                     self.fb.write_u16_le(depth_offset as usize, depth);
                 }
             }
