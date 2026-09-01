@@ -287,8 +287,7 @@ impl TmuRaster {
         let s_over_w = self.s_over_w.at(x, y, self.origin.0, self.origin.1);
         let t_over_w = self.t_over_w.at(x, y, self.origin.0, self.origin.1);
         let reciprocal_w = self.reciprocal_w.at(x, y, self.origin.0, self.origin.1);
-        let perspective = self.texture_mode & TEXTUREMODE_TPERSP_ST != 0;
-        let (s, t) = if perspective {
+        let (s, t) = if self.lod_perspective {
             if reciprocal_w == 0.0
                 || self.texture_mode & TEXTUREMODE_TCLAMPW != 0 && reciprocal_w < 0.0
             {

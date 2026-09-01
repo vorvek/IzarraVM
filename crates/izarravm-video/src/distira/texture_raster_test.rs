@@ -95,10 +95,44 @@ fn samples_masked_matches_the_unmasked_sample_on_the_needed_slot() {
     // The needed slot must read exactly what the pre-hoist `samples()`
     // (recreated here as need = [true, true]) read; the unneeded slot
     // must be the placeholder, never a real sample.
-    let state = TextureIteratorState::default();
+    //
+    // TMU0 and TMU1 get distinct, non-zero S/T planes on purpose. A
+    // `TextureIteratorState::default()` oracle makes every plane zero,
+    // which makes every sample equal `TextureSample::UNUSED` -- the
+    // assertions below would then compare the placeholder to itself and
+    // pass no matter what `samples_masked` actually indexed. The
+    // `assert_ne!` guards make that failure mode impossible to reintroduce
+    // silently: if a future edit collapses `full` back to the placeholder,
+    // those guards fail before the rest of the test gets a chance to be
+    // vacuous again.
+    fn write_start(state: &mut TextureIteratorState, chip: usize, register: usize, value: u32) {
+        for (byte, b) in value.to_le_bytes().into_iter().enumerate() {
+            state.write_register(chip, register, byte, b);
+        }
+    }
+
+    let mut state = TextureIteratorState::default();
+    write_start(&mut state, CHIP_TREX0, SST_START_S, 1);
+    write_start(&mut state, CHIP_TREX0, SST_START_T, 2);
+    write_start(&mut state, CHIP_TREX1, SST_START_S, 3);
+    write_start(&mut state, CHIP_TREX1, SST_START_T, 4);
     let raster = state.raster([0, 0], [0, 0], (0.0, 0.0));
 
     let full = raster.samples_masked(4.5, 4.5, [true, true]);
+    assert_ne!(
+        full[0],
+        TextureSample::UNUSED,
+        "TMU0's real sample must not coincide with the placeholder, or this test cannot fail"
+    );
+    assert_ne!(
+        full[1],
+        TextureSample::UNUSED,
+        "TMU1's real sample must not coincide with the placeholder, or this test cannot fail"
+    );
+    assert_ne!(
+        full[0], full[1],
+        "TMU0 and TMU1 must sample differently, or a swapped index would be invisible"
+    );
 
     let tmu0_only = raster.samples_masked(4.5, 4.5, [true, false]);
     assert_eq!(tmu0_only[0], full[0], "needed TMU0 slot must match");
