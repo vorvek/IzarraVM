@@ -101,6 +101,25 @@ fn out_of_range_mouse_sensitivity_is_clamped_on_load() {
     assert_eq!(high.mouse_sensitivity, MAX_MOUSE_SENSITIVITY);
 }
 
+/// A hand-edited `monitor_gamma` outside [`MIN_MONITOR_GAMMA`,
+/// `MAX_MONITOR_GAMMA`] is clamped on load, the same as `mouse_sensitivity`.
+/// The Raw sentinel (0.0, and anything non-positive) is exempt: it must stay
+/// `None`, not get clamped up into the band.
+#[test]
+fn out_of_range_monitor_gamma_is_clamped_on_load() {
+    let low: GuiPrefs = toml::from_str("monitor_gamma = 0.5").expect("deserialize");
+    assert_eq!(low.monitor_gamma, Some(MIN_MONITOR_GAMMA));
+    let high: GuiPrefs = toml::from_str("monitor_gamma = 9000").expect("deserialize");
+    assert_eq!(high.monitor_gamma, Some(MAX_MONITOR_GAMMA));
+    let raw: GuiPrefs = toml::from_str("monitor_gamma = 0.0").expect("deserialize");
+    assert_eq!(
+        raw.monitor_gamma, None,
+        "Raw must not be clamped into the band"
+    );
+    let negative: GuiPrefs = toml::from_str("monitor_gamma = -3.0").expect("deserialize");
+    assert_eq!(negative.monitor_gamma, None);
+}
+
 #[test]
 fn legacy_joystick_binding_migrates_and_is_not_written_back() {
     let text = r#"

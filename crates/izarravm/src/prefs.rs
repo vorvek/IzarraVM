@@ -363,7 +363,10 @@ impl<'de> Deserialize<'de> for GuiPrefs {
         Ok(Self {
             master_volume: wire.master_volume,
             crt_style: wire.crt_style,
-            monitor_gamma: (wire.monitor_gamma > 0.0).then_some(wire.monitor_gamma),
+            monitor_gamma: (wire.monitor_gamma > 0.0).then_some(
+                wire.monitor_gamma
+                    .clamp(MIN_MONITOR_GAMMA, MAX_MONITOR_GAMMA),
+            ),
             start_fullscreen: wire.start_fullscreen,
             mouse_sensitivity: wire
                 .mouse_sensitivity

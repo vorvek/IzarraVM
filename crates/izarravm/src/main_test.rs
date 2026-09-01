@@ -1557,10 +1557,32 @@ fn presented_ppm_is_unaffected_by_monitor_gamma() {
         .expect("PPM header must have a maxval line")
         + 4;
     let body = &bytes[header_end..];
+    // A plain assert_eq! here dumps two full-frame Vec<u8>s into the panic
+    // message on failure -- megabytes of noise for a fixture this size.
+    // Compare lengths and the first differing byte instead: enough to
+    // diagnose a regression, small enough to read.
     assert_eq!(
-        body, expected_raw,
-        "--presented-ppm must write the raw DAC bytes untouched, regardless of monitor_gamma"
+        body.len(),
+        expected_raw.len(),
+        "--presented-ppm body length must match the raw frame's"
     );
+    if let Some((offset, (&got, &want))) = body
+        .iter()
+        .zip(expected_raw.iter())
+        .enumerate()
+        .find(|(_, (got, want))| got != want)
+    {
+        panic!(
+            "--presented-ppm must write the raw DAC bytes untouched, regardless of \
+             monitor_gamma: byte {offset} was {got}, expected {want} \
+             ({} of {} bytes differ)",
+            body.iter()
+                .zip(expected_raw.iter())
+                .filter(|(got, want)| got != want)
+                .count(),
+            body.len()
+        );
+    }
 }
 
 #[test]

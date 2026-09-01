@@ -21,8 +21,17 @@ fn shader_compiles_under_naga() {
 }
 
 /// The WGSL `srgb_oetf` helper (the display-gamma correction's re-encode
-/// half) must use the exact same constants as `display_transform.rs`'s
-/// `srgb_oetf`, not independently re-typed literals that could drift.
+/// half) must use `display_transform.rs`'s exact constants IN THE OPERAND
+/// POSITIONS its own `srgb_oetf` uses them, not merely contain the same five
+/// numbers somewhere in the function body.
+///
+/// A bare "does this text contain the number 2.4" check cannot catch the
+/// single most damaging drift this test exists to prevent: swapping the
+/// OETF's reciprocal exponent `pow(l, 1.0 / gamma)` for the EOTF's bare
+/// `pow(l, gamma)`, which silently turns the re-encode step into a second
+/// decode. `2.4` remains present in the text either way; the reciprocal
+/// `1.0 / 2.4` does not survive that mutation, so this test pins that exact
+/// substring rather than the number alone.
 #[test]
 fn shader_srgb_oetf_constants_mirror_display_transform() {
     use crate::display_transform::{
@@ -38,16 +47,18 @@ fn shader_srgb_oetf_constants_mirror_display_transform() {
         .unwrap_or(SHADER.len());
     let body = &SHADER[start..end];
 
-    for literal in [
-        SRGB_LOW_THRESHOLD.to_string(),
-        SRGB_LOW_SLOPE.to_string(),
-        SRGB_A.to_string(),
-        SRGB_B.to_string(),
-        SRGB_GAMMA.to_string(),
-    ] {
+    let checks = [
+        format!("l * {SRGB_LOW_SLOPE}"),
+        format!("1.0 / {SRGB_GAMMA}"),
+        format!("{SRGB_A} * pow"),
+        format!("vec3<f32>({SRGB_B})"),
+        format!("vec3<f32>({SRGB_LOW_THRESHOLD})"),
+    ];
+    for expected in checks {
         assert!(
-            body.contains(&literal),
-            "shader's srgb_oetf must use the constant {literal}, matching display_transform.rs; got:\n{body}"
+            body.contains(&expected),
+            "srgb_oetf must contain `{expected}`, matching display_transform.rs's operand \
+             positions exactly; got:\n{body}"
         );
     }
 }

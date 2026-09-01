@@ -479,11 +479,16 @@ impl GuiApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            let is_raw = dialog.monitor_gamma.is_none();
                                             let mut custom = dialog
                                                 .monitor_gamma
                                                 .unwrap_or(crate::prefs::DEFAULT_MONITOR_GAMMA);
+                                            // Greyed out and inert while Raw is selected: a
+                                            // number here would otherwise claim an active
+                                            // gamma that Raw does not apply.
                                             if ui
-                                                .add(
+                                                .add_enabled(
+                                                    !is_raw,
                                                     egui::DragValue::new(&mut custom)
                                                         .range(
                                                             crate::prefs::MIN_MONITOR_GAMMA

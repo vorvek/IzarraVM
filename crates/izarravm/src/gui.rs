@@ -1352,7 +1352,8 @@ impl GuiApp {
             warn!("could not save screenshot because no guest frame is available");
             return;
         };
-        match frame.save(&self.screenshots_dir, self.monitor_gamma) {
+        let gamma = screenshot_gamma(self.crt_style, self.monitor_gamma);
+        match frame.save(&self.screenshots_dir, gamma) {
             Ok(path) => info!(path = %path.display(), "saved guest screenshot"),
             Err(err) => {
                 warn!(%err, path = %self.screenshots_dir.display(), "could not save screenshot")
@@ -1411,6 +1412,19 @@ fn merge_row_runs(
         }
     }
     merged
+}
+
+/// The gamma to bake into a saved screenshot. The shader applies the display
+/// gamma correction only on the `CrtStyle::Off` path (`crt.rs`'s
+/// `u.style < 0.5 && u.monitor_gamma > 0.0` branch) -- every other style
+/// keeps the pre-existing `to_linear` cancellation and shows the guest bytes
+/// uncorrected. A saved screenshot must match what the window actually
+/// shows, not what the preference says in the abstract, so any style other
+/// than Off saves raw bytes regardless of `monitor_gamma`.
+fn screenshot_gamma(crt_style: CrtStyle, monitor_gamma: Option<f32>) -> Option<f32> {
+    (crt_style == CrtStyle::Off)
+        .then_some(monitor_gamma)
+        .flatten()
 }
 
 /// The largest 4:3 rectangle that fits `area`, centred.
