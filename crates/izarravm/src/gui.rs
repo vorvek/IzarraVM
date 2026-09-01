@@ -708,6 +708,9 @@ pub struct GuiApp {
     // CRT presentation style (off / subtle / Ye Olde). Persisted; read by
     // monitor_ui each frame and mapped to the shader's style uniform.
     crt_style: CrtStyle,
+    // Assumed monitor gamma (None = Raw). Persisted; read by monitor_ui each
+    // frame and mapped to the shader's monitor_gamma uniform.
+    monitor_gamma: Option<f32>,
     // Live host hotkeys. The
     // event loop matches physical keys against these; the config dialog edits
     // staged copies and writes them back on Accept.
@@ -755,6 +758,7 @@ struct ConfigDialog {
     fullscreen: KeyBinding,
     screenshot: KeyBinding,
     crt_style: CrtStyle,
+    monitor_gamma: Option<f32>,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
     soundfont: Option<PathBuf>,
@@ -1142,6 +1146,7 @@ impl GuiApp {
         let mut initial_prefs_changed =
             remember_initial_media(&mut prefs, &initial_update.snapshot);
         let crt_style = prefs.crt_style;
+        let monitor_gamma = prefs.monitor_gamma;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
         let screenshot_key = prefs.screenshot.clone();
@@ -1210,6 +1215,7 @@ impl GuiApp {
             volume,
             gain,
             crt_style,
+            monitor_gamma,
             input_release,
             fullscreen_key,
             screenshot_key,
@@ -1446,12 +1452,21 @@ impl GuiApp {
         // Olde grain animates, so keep repainting while it is active.
         let style = self.crt_style.as_u32();
         let time = ui.input(|i| i.time) as f32;
+        // 0.0 is the shader's "Raw" sentinel: display_transform's own None
+        // spelling, mirrored so the WGSL side has an explicit branch rather
+        // than relying on pow(c, 0.0), which is not the identity.
+        let monitor_gamma = self.monitor_gamma.unwrap_or(0.0);
         if self.crt_style == CrtStyle::YeOlde {
             ui.ctx().request_repaint();
         }
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
-            crate::crt::CrtCallback { frame, style, time },
+            crate::crt::CrtCallback {
+                frame,
+                style,
+                time,
+                monitor_gamma,
+            },
         ));
         // Clicking the screen requests input capture (handled later by the event
         // loop, which owns the winit Window).

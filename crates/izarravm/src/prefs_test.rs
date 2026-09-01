@@ -11,6 +11,7 @@ fn round_trips_through_toml() {
     let prefs = GuiPrefs {
         master_volume: 0.65,
         crt_style: CrtStyle::YeOlde,
+        monitor_gamma: Some(2.2),
         start_fullscreen: true,
         mouse_sensitivity: 150,
         input_release: KeyBinding::new(true, true, false, true, "F4"),
@@ -51,6 +52,11 @@ fn missing_keys_fall_back_to_defaults() {
         "CRT defaults to the subtle look for older files"
     );
     assert_eq!(
+        parsed.monitor_gamma,
+        Some(DEFAULT_MONITOR_GAMMA),
+        "an older file with the key absent must load the default gamma, not Raw"
+    );
+    assert_eq!(
         parsed.input_release,
         KeyBinding::new(false, false, false, true, "F2")
     );
@@ -71,6 +77,20 @@ fn missing_keys_fall_back_to_defaults() {
     );
     assert!(parsed.panel_open, "panel defaults to open for older files");
     assert_eq!(parsed.midi, MidiConfig::default());
+}
+
+/// `monitor_gamma = None` ("Raw") must round-trip as itself, not fall back to
+/// the default the way an absent key does -- an explicit choice to go raw
+/// must stick across a save/load cycle.
+#[test]
+fn raw_monitor_gamma_round_trips_as_none() {
+    let prefs = GuiPrefs {
+        monitor_gamma: None,
+        ..GuiPrefs::default()
+    };
+    let text = toml::to_string_pretty(&prefs).expect("serialize");
+    let parsed: GuiPrefs = toml::from_str(&text).expect("deserialize");
+    assert_eq!(parsed.monitor_gamma, None);
 }
 
 #[test]

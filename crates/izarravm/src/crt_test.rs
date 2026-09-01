@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use super::{SHADER, pack_argb_rows, upload_is_full};
+use super::{SHADER, pack_argb_rows, uniform_bytes, upload_is_full};
 
 /// Parse and validate the WGSL through naga so a shader error fails the test
 /// suite instead of panicking at pipeline creation when the GUI launches.
@@ -18,6 +18,17 @@ fn shader_compiles_under_naga() {
     validator
         .validate(&module)
         .unwrap_or_else(|e| panic!("WGSL validation error: {e}"));
+}
+
+/// The uniform block must stay 32 bytes (std140-safe as 8 f32s) with
+/// `monitor_gamma` at the offset the WGSL struct `U` gives it: after
+/// `src_size.xy, style, srgb, time` (16 bytes), so byte offset 20.
+#[test]
+fn uniform_block_is_32_bytes_with_monitor_gamma_at_offset_20() {
+    let bytes = uniform_bytes(320.0, 200.0, 1.0, true, 2.5, 2.4);
+    assert_eq!(bytes.len(), 32);
+    let gamma_bytes: [u8; 4] = bytes[20..24].try_into().unwrap();
+    assert_eq!(f32::from_le_bytes(gamma_bytes), 2.4);
 }
 
 /// Packing one run produces exactly that run's bytes, in upload order: the

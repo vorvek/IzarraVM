@@ -83,7 +83,7 @@ struct U {
   style: f32, // 0 off, 1 subtle, 2 Ye Olde
   srgb: f32,
   time: f32,
-  pad0: f32,
+  monitor_gamma: f32, // 0 = Raw (identity); otherwise the assumed CRT EOTF exponent
   pad1: f32,
   pad2: f32,
 };
@@ -246,11 +246,14 @@ pub(crate) fn upload_is_full(frame_update_from: u64, last_update: u64, recreated
 }
 
 /// Per-paint callback: the optional new frame, the CRT style selector (0 off,
-/// 1 subtle, 2 Ye Olde), and a monotonic time in seconds for the Ye Olde grain.
+/// 1 subtle, 2 Ye Olde), a monotonic time in seconds for the Ye Olde grain, and
+/// the assumed monitor gamma (0.0 is the "Raw" sentinel: identity, matching
+/// `display_transform`'s `None`).
 pub struct CrtCallback {
     pub frame: Option<CrtFrame>,
     pub style: u32,
     pub time: f32,
+    pub monitor_gamma: f32,
 }
 
 /// Persistent GPU resources, stored in the renderer's `callback_resources`.
@@ -280,6 +283,36 @@ pub(crate) fn pack_argb_rows(words: &[u32], width: usize, rows: Range<usize>, ou
             0xff,
         ]);
     }
+}
+
+/// Pack the shader's uniform block: 8 floats (32 bytes, std140-safe) --
+/// `src_size.xy, style, srgb, time, monitor_gamma, pad1, pad2` -- little-endian,
+/// matching WGSL struct `U` in `SHADER`. Pulled out of `prepare` so the byte
+/// layout (buffer size, and which offset `monitor_gamma` lands at) is a plain
+/// unit-testable function.
+pub(crate) fn uniform_bytes(
+    width: f32,
+    height: f32,
+    style: f32,
+    srgb: bool,
+    time: f32,
+    monitor_gamma: f32,
+) -> [u8; 32] {
+    let data: [f32; 8] = [
+        width,
+        height,
+        style,
+        if srgb { 1.0 } else { 0.0 },
+        time,
+        monitor_gamma,
+        0.0,
+        0.0,
+    ];
+    let mut bytes = [0u8; 32];
+    for (i, v) in data.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    bytes
 }
 
 fn source_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
@@ -542,21 +575,14 @@ impl CallbackTrait for CrtCallback {
             }
         }
         let (w, h) = res.dims;
-        // 8 floats = 32 bytes (std140-safe): src_size.xy, style, srgb, time, pad×3.
-        let data: [f32; 8] = [
+        let bytes = uniform_bytes(
             w as f32,
             h as f32,
             self.style as f32,
-            if res.srgb { 1.0 } else { 0.0 },
+            res.srgb,
             self.time,
-            0.0,
-            0.0,
-            0.0,
-        ];
-        let mut bytes = [0u8; 32];
-        for (i, v) in data.iter().enumerate() {
-            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-        }
+            self.monitor_gamma,
+        );
         queue.write_buffer(&res.uniform, 0, &bytes);
         Vec::new()
     }
