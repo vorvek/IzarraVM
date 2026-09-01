@@ -409,6 +409,11 @@ impl RasterView<'_> {
             } else {
                 (min_x, max_x)
             };
+            // Triangle-constant; it was a reciprocal per PIXEL.
+            let inv_area = 1.0 / area;
+            // Which TMUs the texture combine will read this triangle.
+            // Constant per triangle; sampling the other one is thrown away.
+            let tmu_need = self.tmu_need();
             for x in row_min_x..row_max_x {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
@@ -437,7 +442,6 @@ impl RasterView<'_> {
                     continue;
                 }
 
-                let inv_area = 1.0 / area;
                 let l0 = w0 * inv_area;
                 let l1 = w1 * inv_area;
                 let l2 = w2 * inv_area;
@@ -457,7 +461,7 @@ impl RasterView<'_> {
                 let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
                 let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
                 let texture_samples = if let Some(texture) = texture {
-                    texture.samples(px, py)
+                    texture.samples_masked(px, py, tmu_need)
                 } else {
                     let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
                     let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
@@ -542,6 +546,24 @@ impl RasterView<'_> {
                     stats.written += 1;
                 }
             }
+        }
+    }
+
+    /// Which of the two TMUs `combined_texture` reads under the current
+    /// texture mode, folding in whether texturing is enabled at all.
+    /// Delegates the mode decode to `texture_combine_target`, the same
+    /// function `combined_texture` matches on, so the two decisions cannot
+    /// drift out of sync as the combine unit's mode space grows: any mode
+    /// `combined_texture` would read from a given TMU is, by construction,
+    /// a mode this returns `true` for.
+    pub(super) fn tmu_need(&self) -> [bool; 2] {
+        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
+            return [false, false];
+        }
+        match self.texture_combine_target() {
+            TextureCombineTarget::Tmu0Only => [true, false],
+            TextureCombineTarget::Tmu1Only => [false, true],
+            TextureCombineTarget::Both => [true, true],
         }
     }
 

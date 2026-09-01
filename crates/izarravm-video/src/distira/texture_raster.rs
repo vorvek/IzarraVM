@@ -173,6 +173,18 @@ pub(super) struct TextureSample {
 }
 
 impl TextureSample {
+    /// The placeholder for a TMU the texture combine never reads. Its
+    /// `lod` fields do not feed any visible output; only its presence in
+    /// the `[TextureSample; 2]` pair matters, and `combined_texture` never
+    /// indexes the slot `tmu_need` marked unused.
+    pub(super) const UNUSED: Self = Self {
+        s: 0.0,
+        t: 0.0,
+        lod: 0,
+        lod_floor: 0,
+        lod_fraction: 0,
+    };
+
     pub(super) fn affine(s: f32, t: f32, texture_lod: u32) -> Self {
         let lod = select_lod(f64::NEG_INFINITY, 1.0, 0, texture_lod);
         Self {
@@ -198,8 +210,26 @@ pub(super) struct TextureRaster {
 }
 
 impl TextureRaster {
-    pub(super) fn samples(self, x: f32, y: f32) -> [TextureSample; 2] {
-        self.tmu.map(|tmu| tmu.sample(x, y))
+    /// Sample only the TMUs the texture combine will actually read.
+    /// `need` comes from `RasterView::tmu_need`, which mirrors
+    /// `combined_texture`'s own branching, so the unread slot is a
+    /// placeholder that `combined_texture` never looks at. `need = [true,
+    /// true]` samples both unconditionally, which is what every triangle
+    /// did before this hoist and is what the equivalence tests in
+    /// `texture_raster_test.rs` use as the oracle.
+    pub(super) fn samples_masked(self, x: f32, y: f32, need: [bool; 2]) -> [TextureSample; 2] {
+        [
+            if need[0] {
+                self.tmu[0].sample(x, y)
+            } else {
+                TextureSample::UNUSED
+            },
+            if need[1] {
+                self.tmu[1].sample(x, y)
+            } else {
+                TextureSample::UNUSED
+            },
+        ]
     }
 }
 
@@ -212,6 +242,12 @@ struct TmuRaster {
     texture_mode: u32,
     texture_lod: u32,
     base_lod: f64,
+    /// Triangle-constant halves of `select_lod`, derived once from
+    /// `texture_lod` here instead of at every pixel.
+    lod_min: f64,
+    lod_max: f64,
+    lod_bias: f64,
+    lod_perspective: bool,
 }
 
 impl TmuRaster {
@@ -238,6 +274,10 @@ impl TmuRaster {
             } else {
                 f64::NEG_INFINITY
             },
+            lod_min: lod_min(texture_lod),
+            lod_max: lod_max(texture_lod),
+            lod_bias: lod_bias(texture_lod),
+            lod_perspective: texture_mode & TEXTUREMODE_TPERSP_ST != 0,
         }
     }
 
@@ -259,11 +299,14 @@ impl TmuRaster {
         } else {
             (s_over_w, t_over_w)
         };
-        let lod = select_lod(
+        let lod = select_lod_hoisted(
             self.base_lod,
             reciprocal_w,
-            self.texture_mode,
+            self.lod_perspective,
             self.texture_lod,
+            self.lod_min,
+            self.lod_max,
+            self.lod_bias,
         );
         TextureSample {
             s: s as f32,
@@ -321,17 +364,51 @@ pub(super) fn texture_mip_offset(texture_lod: u32, lod: u32, bytes_per_texel: us
         .sum()
 }
 
-fn select_lod(base_lod: f64, reciprocal_w: f64, texture_mode: u32, texture_lod: u32) -> TextureLod {
-    let min = f64::from(texture_lod & 0x3f) / 4.0;
-    let max = (f64::from((texture_lod >> 6) & 0x3f) / 4.0).min(8.0);
-    let min = min.min(8.0);
+fn lod_min(texture_lod: u32) -> f64 {
+    (f64::from(texture_lod & 0x3f) / 4.0).min(8.0)
+}
+
+fn lod_max(texture_lod: u32) -> f64 {
+    (f64::from((texture_lod >> 6) & 0x3f) / 4.0).min(8.0)
+}
+
+fn lod_bias(texture_lod: u32) -> f64 {
     let bias_raw = ((texture_lod >> 12) & 0x3f) as i32;
-    let bias = f64::from(if bias_raw & 0x20 != 0 {
+    f64::from(if bias_raw & 0x20 != 0 {
         bias_raw | !0x3f
     } else {
         bias_raw
-    }) / 4.0;
-    let perspective_adjust = if texture_mode & TEXTUREMODE_TPERSP_ST != 0 && reciprocal_w > 0.0 {
+    }) / 4.0
+}
+
+/// Selects a mip level for one sample. `texture_mode` and `texture_lod`
+/// only ever contribute the four triangle-constant values computed below
+/// (perspective flag, min, max, bias); `select_lod_hoisted` takes them
+/// pre-derived so a triangle's raster loop computes them once instead of
+/// per pixel.
+fn select_lod(base_lod: f64, reciprocal_w: f64, texture_mode: u32, texture_lod: u32) -> TextureLod {
+    select_lod_hoisted(
+        base_lod,
+        reciprocal_w,
+        texture_mode & TEXTUREMODE_TPERSP_ST != 0,
+        texture_lod,
+        lod_min(texture_lod),
+        lod_max(texture_lod),
+        lod_bias(texture_lod),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_lod_hoisted(
+    base_lod: f64,
+    reciprocal_w: f64,
+    perspective: bool,
+    texture_lod: u32,
+    min: f64,
+    max: f64,
+    bias: f64,
+) -> TextureLod {
+    let perspective_adjust = if perspective && reciprocal_w > 0.0 {
         reciprocal_w.log2()
     } else {
         0.0
