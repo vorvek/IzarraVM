@@ -64,6 +64,46 @@ pub fn display_transform(code: u8, gamma: Option<f32>) -> u8 {
     out.round().clamp(0.0, 255.0) as u8
 }
 
+/// The exponent the "Compatible" Glide gamma setting applies to Distira's
+/// presented output.
+///
+/// The Voodoo era's Glide runtimes lifted the picture with a gamma CLUT --
+/// about 1.7 on a Voodoo 1, about 1.3 on a Voodoo 2 -- because the period CRTs
+/// they were authored on were darker than the artists wanted. 1.5 is the
+/// geometric mean of that band, so it is the constant that minimises the
+/// worst-case residual lift in the log domain (bounded by 1.5/1.7 = 0.88 on one
+/// side and 1.5/1.3 = 1.15 on the other). It was also measured, against the
+/// `SST_GAMMA=1.0` reference frames, to reproduce that guest-side setting to
+/// 0.062 codes mean absolute error --
+/// `dev_docs/2026-09-01-glide-gamma-toggle-design.md` section 2.2.
+pub const GLIDE_COMPAT_EXPONENT: f32 = 1.5;
+
+/// Signal-domain compensation for the Voodoo-era gamma lift:
+/// `p_out = 255 * (p_in / 255) ^ exponent`.
+///
+/// This is a fixed exponent, deliberately: composed with the guest's own gamma
+/// CLUT it leaves the net exponent at `exponent / g_programmed`, so every
+/// relative change the guest makes to its CLUT -- including the gamma ramps
+/// games fade the screen with -- survives, merely scaled. Cancelling the
+/// *current* CLUT instead would pin the picture and destroy those fades, which
+/// is the `SST_GAMMA` behaviour recorded in
+/// `dev_docs/2026-09-01-sst-gamma-verification.md`. The design doc measures
+/// both arms on a real fade.
+///
+/// `exponent == None` ("Original") is the identity, byte for byte: the
+/// hardware-faithful setting is exactly what IzarraVM did before this existed.
+///
+/// This never touches `clutData`. The guest can read that register back, so it
+/// stays the table the guest wrote.
+pub fn glide_compensate(code: u8, exponent: Option<f32>) -> u8 {
+    let Some(exponent) = exponent else {
+        return code;
+    };
+    let p = f32::from(code) / 255.0;
+    let out = 255.0 * p.powf(exponent);
+    out.round().clamp(0.0, 255.0) as u8
+}
+
 #[cfg(test)]
 #[path = "display_transform_test.rs"]
 mod tests;

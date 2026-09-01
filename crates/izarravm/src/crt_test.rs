@@ -68,10 +68,79 @@ fn shader_srgb_oetf_constants_mirror_display_transform() {
 /// `src_size.xy, style, srgb, time` (16 bytes), so byte offset 20.
 #[test]
 fn uniform_block_is_32_bytes_with_monitor_gamma_at_offset_20() {
-    let bytes = uniform_bytes(320.0, 200.0, 1.0, true, 2.5, 2.4);
+    let bytes = uniform_bytes(320.0, 200.0, 1.0, true, 2.5, 2.4, 1.5);
     assert_eq!(bytes.len(), 32);
     let gamma_bytes: [u8; 4] = bytes[20..24].try_into().unwrap();
     assert_eq!(f32::from_le_bytes(gamma_bytes), 2.4);
+}
+
+/// The Glide compensation takes the block's first pad slot, so the uniform
+/// stays 32 bytes: after `src_size.xy, style, srgb, time, monitor_gamma`
+/// (24 bytes), so byte offset 24.
+#[test]
+fn glide_gamma_lands_at_uniform_offset_24_without_growing_the_block() {
+    let bytes = uniform_bytes(320.0, 200.0, 0.0, false, 0.0, 2.4, 1.5);
+    assert_eq!(bytes.len(), 32);
+    let glide_bytes: [u8; 4] = bytes[24..28].try_into().unwrap();
+    assert_eq!(f32::from_le_bytes(glide_bytes), 1.5);
+    assert_eq!(&bytes[28..32], &[0u8; 4], "the last pad slot stays zero");
+}
+
+/// The Glide compensation must sit on the shader's ONLY texture read.
+///
+/// `glow()`'s 8 halation taps used to sample the texture directly, so under
+/// `Subtle` and `Ye Olde` -- the default style -- an uncompensated halation
+/// term was added to a compensated base. Funnelling every read through
+/// `sample_signal` is what makes "the compensation happens before anything
+/// else looks at a pixel" true rather than nearly true, so this test pins the
+/// single-reader property rather than the call sites, and stays red for any
+/// future effect that reaches for the texture on its own.
+#[test]
+fn every_texture_read_goes_through_the_compensated_sampler() {
+    assert_eq!(
+        SHADER.matches("textureSample(").count(),
+        1,
+        "exactly one textureSample call may remain, inside sample_signal; a second          read would take uncompensated codes"
+    );
+    let sampler = SHADER
+        .find("fn sample_signal(")
+        .expect("the shared compensated sampler must exist");
+    let read = SHADER
+        .find("textureSample(")
+        .expect("the shader must read the texture somewhere");
+    assert!(
+        read > sampler,
+        "the surviving texture read must be the one inside sample_signal"
+    );
+    for caller in ["fn sample_sharp(", "fn glow("] {
+        let start = SHADER.find(caller).expect("caller must exist");
+        let body = &SHADER[start..];
+        let end = body
+            .find(
+                "
+}",
+            )
+            .expect("caller must be a complete function");
+        assert!(
+            body[..end].contains("sample_signal("),
+            "{caller} must read the texture through sample_signal"
+        );
+    }
+}
+
+/// The shader's compensation exponent must be applied through an explicit
+/// inequality branch: `pow(c, 1.0)` is not guaranteed bit-exact, and
+/// "Original" has to be provably today's picture.
+#[test]
+fn the_compensation_branches_on_the_original_sentinel() {
+    assert!(
+        SHADER.contains("u.glide_gamma != 1.0"),
+        "the shader must branch on the Original sentinel rather than pow(c, 1.0)"
+    );
+    assert!(
+        SHADER.contains("pow(c, vec3<f32>(u.glide_gamma))"),
+        "the shader must raise the sampled code to the compensation exponent"
+    );
 }
 
 /// Packing one run produces exactly that run's bytes, in upload order: the

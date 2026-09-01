@@ -12,6 +12,7 @@ fn round_trips_through_toml() {
         master_volume: 0.65,
         crt_style: CrtStyle::YeOlde,
         monitor_gamma: Some(2.2),
+        glide_gamma: GlideGamma::Original,
         start_fullscreen: true,
         mouse_sensitivity: 150,
         input_release: KeyBinding::new(true, true, false, true, "F4"),
@@ -449,4 +450,40 @@ fn prefs_path_sits_beside_c_root() {
     let c_root = PathBuf::from("/home/user/.izarravm/c_drive");
     let path = prefs_path(&c_root);
     assert_eq!(path, PathBuf::from("/home/user/.izarravm/izarravm.conf"));
+}
+
+/// The Glide gamma toggle must round-trip both settings, and a preferences
+/// file written before the key existed must load as `Compatible` -- the
+/// owner-specified default -- rather than as the hardware-faithful setting.
+#[test]
+fn glide_gamma_round_trips_and_defaults_to_compatible() {
+    assert_eq!(GuiPrefs::default().glide_gamma, GlideGamma::Compatible);
+
+    let absent: GuiPrefs = toml::from_str("master_volume = 1.0").expect("deserialize");
+    assert_eq!(
+        absent.glide_gamma,
+        GlideGamma::Compatible,
+        "an older preferences file without the key must default to Compatible"
+    );
+
+    for setting in [GlideGamma::Compatible, GlideGamma::Original] {
+        let prefs = GuiPrefs {
+            glide_gamma: setting,
+            ..GuiPrefs::default()
+        };
+        let text = toml::to_string(&prefs).expect("serialize");
+        let parsed: GuiPrefs = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed.glide_gamma, setting);
+    }
+}
+
+/// `Original` must select no compensation at all, so the hardware-faithful
+/// setting is provably today's behaviour rather than a near-identity power.
+#[test]
+fn glide_gamma_original_is_no_compensation() {
+    assert_eq!(GlideGamma::Original.exponent(), None);
+    assert_eq!(
+        GlideGamma::Compatible.exponent(),
+        Some(crate::display_transform::GLIDE_COMPAT_EXPONENT)
+    );
 }

@@ -4,8 +4,8 @@
 use izarravm_audio::{AudioDebugSnapshot, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiConfig, MidiStatus};
 use izarravm_machine::{
-    CdAudioState, CdImage, CueSource, GamePortUpdate, Machine, MachineProfile, StopReason,
-    VideoHostMetricsSnapshot,
+    ActiveDisplay, CdAudioState, CdImage, CueSource, GamePortUpdate, Machine, MachineProfile,
+    StopReason, VideoHostMetricsSnapshot,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -312,6 +312,11 @@ pub(super) struct SessionFrame {
     pub(super) update_from: u64,
     pub(super) update_to: u64,
     pub(super) generation: u64,
+    /// The engine that produced these words. Presentation settings that apply
+    /// to one engine only -- the Glide gamma toggle -- read this rather than
+    /// asking the machine at paint time, which would describe a later instant
+    /// than the pixels do.
+    pub(super) owner: ActiveDisplay,
 }
 
 #[derive(Debug, Clone)]
@@ -1496,6 +1501,7 @@ fn run_worker(
                     update_from: published_update,
                     update_to: published_update,
                     generation: generation.id,
+                    owner: frame.owner,
                 });
                 last_frame_gen = frame_gen;
                 published_seq = seq;

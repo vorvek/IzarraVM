@@ -308,6 +308,7 @@ impl GuiApp {
             screenshot: self.screenshot_key.clone(),
             crt_style: self.crt_style,
             monitor_gamma: self.monitor_gamma,
+            glide_gamma: self.glide_gamma,
             midi_backend: midi_config.backend,
             external_midi_port: midi_config.external_port,
             soundfont: midi_config.soundfont,
@@ -520,6 +521,31 @@ impl GuiApp {
                                                 &mut dialog.monitor_gamma,
                                                 None,
                                                 "Raw",
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Glide gamma");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            // Applies to Distira's output only.
+                                            // Compatible neutralises the Voodoo
+                                            // era's gamma lift, which was meant
+                                            // for the darker CRTs of the period;
+                                            // Original presents it as the card
+                                            // did. Neither setting alters the
+                                            // guest's gamma register.
+                                            ui.selectable_value(
+                                                &mut dialog.glide_gamma,
+                                                crate::prefs::GlideGamma::Original,
+                                                "Original",
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.glide_gamma,
+                                                crate::prefs::GlideGamma::Compatible,
+                                                "Compatible",
                                             );
                                         },
                                     );
@@ -759,6 +785,7 @@ impl GuiApp {
         self.screenshot_key = dialog.screenshot.clone();
         self.crt_style = dialog.crt_style;
         self.monitor_gamma = dialog.monitor_gamma;
+        self.glide_gamma = dialog.glide_gamma;
         self.prefs.start_fullscreen = dialog.start_fullscreen;
         self.prefs.mouse_sensitivity = dialog.mouse_sensitivity;
         self.mouse_scale = crate::host_input::mouse_sensitivity_scale(dialog.mouse_sensitivity);
@@ -767,6 +794,7 @@ impl GuiApp {
         self.prefs.screenshot = dialog.screenshot.clone();
         self.prefs.crt_style = dialog.crt_style;
         self.prefs.monitor_gamma = dialog.monitor_gamma;
+        self.prefs.glide_gamma = dialog.glide_gamma;
         let midi_config = MidiConfig {
             backend: dialog.midi_backend,
             external_port: dialog.external_midi_port.clone(),

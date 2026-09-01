@@ -352,6 +352,13 @@ pub struct PresentedFrameUpdate {
     pub changed_rows: Vec<std::ops::Range<usize>>,
     pub width: usize,
     pub height: usize,
+    /// The engine whose scanout these words came from.
+    ///
+    /// The GUI publishes frames from a worker thread and paints them later, so
+    /// a separate `Machine::active_display()` call at paint time can describe a
+    /// different instant than the pixels do. Presentation settings that apply
+    /// to one engine only -- the Glide gamma toggle -- read this instead.
+    pub owner: ActiveDisplay,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
