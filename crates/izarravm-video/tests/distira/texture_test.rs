@@ -1578,3 +1578,46 @@ fn tmu_add_alocal_uses_the_current_local_texel_alpha() {
         [0, 0x00ff_ffff]
     );
 }
+
+/// Every SST_TRIANGLE_CMD triangle builds a `TextureRaster` regardless of
+/// `FBZCP_TEXTURE_ENABLED`, so a Gouraud-only triangle still carries a
+/// texture sample the raster loop could accidentally read. It must not:
+/// `combined_texture` is only called when the enable bit is set, and
+/// `tmu_need` folds the same bit in before deciding what to sample. This
+/// is the "5 of 17 modes are untextured" case from the open-area
+/// diagnosis: both TMUs are skipped, not evaluated and discarded.
+fn render_untextured_triangle(garbage0: u32, garbage1: u32) -> u32 {
+    const TMU1_APERTURE: usize = 1 << 21;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.write_texture_u32(0, garbage0);
+    distira.write_texture_u32(TMU1_APERTURE, garbage1);
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut distira, SST_FBZ_COLOR_PATH, 0);
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
+    write_reg(&mut distira, SST_START_R, 0x40 << 12);
+    write_reg(&mut distira, SST_START_G, 0x80 << 12);
+    write_reg(&mut distira, SST_START_B, 0xc0 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+    distira.scanout_argb()[0]
+}
+
+#[test]
+fn untextured_triangle_ignores_both_tmus_texture_memory() {
+    let baseline = render_untextured_triangle(0, 0);
+    let with_garbage = render_untextured_triangle(0xffff_ffff, 0x1234_5678);
+
+    assert_eq!(
+        baseline, with_garbage,
+        "an FBZCP_TEXTURE_ENABLED-clear triangle must not read either TMU"
+    );
+    assert_ne!(baseline, 0, "the scene must actually paint a vertex color");
+}

@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// Which TMU(s) the texture combine unit reads, per `texture_mode`. See
+/// `RasterView::texture_combine_target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TextureCombineTarget {
+    Tmu0Only,
+    Tmu1Only,
+    Both,
+}
+
 impl RasterView<'_> {
     pub(super) fn selected_color_or_source(
         &self,
@@ -70,18 +79,34 @@ impl RasterView<'_> {
     }
 
     pub(super) fn combined_texture(&self, samples: [TextureSample; 2]) -> TextureRgba {
+        match self.texture_combine_target() {
+            TextureCombineTarget::Tmu0Only => self.sample_tmu_rgba(0, samples[0]),
+            TextureCombineTarget::Tmu1Only => self.sample_tmu_rgba(1, samples[1]),
+            TextureCombineTarget::Both => {
+                let local1 = self.sample_tmu_rgba(1, samples[1]);
+                let downstream = self.combine_terminal_texture(local1, samples[1]);
+                let local0 = self.sample_tmu_rgba(0, samples[0]);
+                self.combine_texture_rgba(0, downstream, local0, samples[0])
+            }
+        }
+    }
+
+    /// Which TMU sample(s) `combined_texture` reads for the current
+    /// `texture_mode`, independent of whether texturing is enabled at all
+    /// (`RasterView::tmu_need` folds `FBZCP_TEXTURE_ENABLED` in on top of
+    /// this). Single source of truth for the two decisions: this function
+    /// decides what `combined_texture` reads, and the raster loop calls it
+    /// through `tmu_need` to decide what to sample in the first place, so
+    /// the two can never drift apart.
+    pub(super) fn texture_combine_target(&self) -> TextureCombineTarget {
         let mode = self.texture_mode;
         if mode & TEXTUREMODE_LOCAL_MASK == TEXTUREMODE_LOCAL {
-            return self.sample_tmu_rgba(0, samples[0]);
+            return TextureCombineTarget::Tmu0Only;
         }
         if mode & TEXTUREMODE_COMBINE_MASK == TEXTUREMODE_PASSTHROUGH {
-            return self.sample_tmu_rgba(1, samples[1]);
+            return TextureCombineTarget::Tmu1Only;
         }
-
-        let local1 = self.sample_tmu_rgba(1, samples[1]);
-        let downstream = self.combine_terminal_texture(local1, samples[1]);
-        let local0 = self.sample_tmu_rgba(0, samples[0]);
-        self.combine_texture_rgba(0, downstream, local0, samples[0])
+        TextureCombineTarget::Both
     }
 
     fn sample_tmu_rgba(&self, tmu: usize, sample: TextureSample) -> TextureRgba {

@@ -23,6 +23,7 @@ use raster_pool::{DiagCounter, FrameStore, raster_pool};
 use raster_queue::{QueuedTriangle, RasterQueue, ViewMemory, render_band};
 use raster_view::{RasterParams, RasterView};
 pub use registers::*;
+use texture_combine::TextureCombineTarget;
 use texture_raster::{
     TextureIteratorState, TextureRaster, TextureSample, texture_base_slot, texture_dimensions,
     texture_mip_offset,
