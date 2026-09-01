@@ -36269,7 +36269,7 @@ impl DirectCallOutAttributionSnapshot {
     }
 }
 
-/// One call to every helper variant, three of them port-class on distinct ports, snapshotted.
+/// One call to every helper variant, four of them port-class on distinct ports, snapshotted.
 ///
 /// EXISTS FOR THE CROSS-CRATE TEST. The `izarravm` JSON writer's expectations (row count, row
 /// order, labels, the closure identities) had never met real CPU-side output in a test: the
@@ -36280,9 +36280,9 @@ impl DirectCallOutAttributionSnapshot {
 #[cfg(feature = "direct-callout-attribution")]
 pub fn direct_callout_attribution_every_helper_snapshot() -> DirectCallOutAttributionSnapshot {
     let mut attribution = CallOutAttribution::default();
-    // Distinct ports for the three port-class helpers, so the ports table has one row each and
+    // Distinct ports for the four port-class helpers, so the ports table has one row each and
     // the port-class closure identity is non-trivial.
-    let ports = [0x03dau16, 0x0061, 0x0043];
+    let ports = [0x03dau16, 0x0061, 0x0043, 0x0201];
     let mut next_port = ports.into_iter();
     for helper in HELPER_KINDS {
         let port = helper.attribution_is_port_class().then(|| {
@@ -36574,12 +36574,12 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("cs_layout", 2697),
     ("cpl", 2705),
     ("callout_privileged", 2786),
-    ("data_segment", 2904),
-    ("alignment", 2913),
-    ("fetch_limit", 2928),
-    ("entry_deferred_short", 2942),
-    ("zero_budget", 3050),
-    ("block_regenerated_none", 3086),
+    ("data_segment", 2917),
+    ("alignment", 2926),
+    ("fetch_limit", 2941),
+    ("entry_deferred_short", 2955),
+    ("zero_budget", 3063),
+    ("block_regenerated_none", 3099),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]

@@ -873,15 +873,36 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
                     abnormal: 0,
                 },
             },
+            // The seventh row, the OUT DX,AL port-class helper (#787). It carries a nonzero
+            // count and its own port below, for the same reason rows five and six do.
+            HelperRow {
+                helper: "out_al_dx",
+                counts: Counts {
+                    attempts: 2,
+                    continued: 1,
+                    step_break: 1,
+                    abnormal: 0,
+                },
+            },
         ],
         // The ports table must equal the sum of the PORT-CLASS helper rows (in_al_dx 3/1/1/1,
-        // in_al_imm8 2/2/0/0, out_al_imm8 1/0/1/0) = 6/3/2/1, spread over three ports.
+        // in_al_imm8 2/2/0/0, out_al_imm8 1/0/1/0, out_al_dx 2/1/1/0) = 8/4/3/1, spread over
+        // four ports.
         ports: vec![
             PortRow {
                 port: 0x0043,
                 counts: Counts {
                     attempts: 1,
                     continued: 0,
+                    step_break: 1,
+                    abnormal: 0,
+                },
+            },
+            PortRow {
+                port: 0x0061,
+                counts: Counts {
+                    attempts: 2,
+                    continued: 1,
                     step_break: 1,
                     abnormal: 0,
                 },
@@ -906,9 +927,9 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
             },
         ],
         totals: Counts {
-            attempts: 13,
-            continued: 8,
-            step_break: 2,
+            attempts: 15,
+            continued: 9,
+            step_break: 3,
             abnormal: 3,
         },
     };
@@ -924,13 +945,15 @@ fn direct_callout_attribution_json_has_the_exact_ordered_schema() {
                 { "helper": "interpret_one", "attempts": 4, "continued": 3, "step_break": 0, "abnormal": 1 },
                 { "helper": "in_al_imm8", "attempts": 2, "continued": 2, "step_break": 0, "abnormal": 0 },
                 { "helper": "out_al_imm8", "attempts": 1, "continued": 0, "step_break": 1, "abnormal": 0 },
+                { "helper": "out_al_dx", "attempts": 2, "continued": 1, "step_break": 1, "abnormal": 0 },
             ],
             "ports": [
                 { "port": 0x0043, "attempts": 1, "continued": 0, "step_break": 1, "abnormal": 0 },
+                { "port": 0x0061, "attempts": 2, "continued": 1, "step_break": 1, "abnormal": 0 },
                 { "port": 0x0201, "attempts": 3, "continued": 3, "step_break": 0, "abnormal": 0 },
                 { "port": 0x03da, "attempts": 2, "continued": 0, "step_break": 1, "abnormal": 1 },
             ],
-            "totals": { "attempts": 13, "continued": 8, "step_break": 2, "abnormal": 3 },
+            "totals": { "attempts": 15, "continued": 9, "step_break": 3, "abnormal": 3 },
         })
     );
 }
@@ -964,7 +987,7 @@ fn direct_callout_attribution_json_rejects_an_open_row() {
             .collect(),
         ports: Vec::new(),
         totals: Counts {
-            attempts: 6,
+            attempts: 7,
             ..Counts::default()
         },
     }));
@@ -1000,20 +1023,20 @@ fn direct_callout_attribution_json_accepts_real_producer_output() {
         assert_eq!(row["attempts"], 1, "one call per helper, by construction");
         assert_eq!(row["continued"], 1);
     }
-    // Three port-class helpers, three distinct ports, one attempt each -- and the writer's
-    // ports table closes over exactly those three helper rows.
+    // Four port-class helpers, four distinct ports, one attempt each -- and the writer's
+    // ports table closes over exactly those four helper rows.
     let ports = json["ports"].as_array().unwrap();
-    assert_eq!(ports.len(), 3, "one row per port-class helper");
+    assert_eq!(ports.len(), 4, "one row per port-class helper");
     assert_eq!(
         ports
             .iter()
             .map(|row| row["port"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        vec![0x0043, 0x0061, 0x03da],
+        vec![0x0043, 0x0061, 0x0201, 0x03da],
         "ports are emitted in ascending order"
     );
-    assert_eq!(json["totals"]["attempts"], 6);
-    assert_eq!(json["totals"]["continued"], 6);
+    assert_eq!(json["totals"]["attempts"], 7);
+    assert_eq!(json["totals"]["continued"], 7);
 }
 
 /// The Katea JSON must expose every counter, in a pinned order.
