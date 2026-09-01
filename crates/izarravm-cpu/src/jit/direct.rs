@@ -599,6 +599,24 @@ impl CompiledBlock {
         self.callout_slots.interpret_one()
     }
 
+    /// Call-out slots carrying the `0xCD` INT imm8 row, i.e. the INT class. Priced at
+    /// `INT_IMM8_CORE_CLOCKS` plus `INT_IMM8_MAX_DATA_ACCESSES` worst-width data accesses each in
+    /// `compute_iteration_upper`.
+    ///
+    /// A FOURTH class rather than a term folded into `callout_interpret_one_slots`, and the reason
+    /// is an admission change rather than tidiness. `INT` charges 37 core clocks against that
+    /// class's 7 and presents more data accesses than its 4, so folding it in would raise
+    /// `INTERPRET_ONE_MAX_CORE_CLOCKS` 7 -> 37 and `INTERPRET_ONE_MAX_DATA_ACCESSES` 4 -> 10 for
+    /// EVERY block carrying any of the eighteen other rows -- CLI, STI, the segment loads, the
+    /// four string rows, PUSHF, POPF. `compute_iteration_upper` multiplies those constants by the
+    /// block's slot count and the quotient decides `budget_quota`, so an over-priced bound changes
+    /// WHICH blocks are admitted, and that is guest-visible. Under-pricing is the other way round
+    /// and is only a timing overshoot, but `InterpretOneRow::may_write_segment`'s deny invariant
+    /// already refuses that trade in writing for exactly this reason.
+    pub(crate) fn callout_int_imm8_slots(&self) -> u32 {
+        self.callout_slots.int_imm8()
+    }
+
     pub(crate) fn weighted_fp_clocks(&self) -> u32 {
         self.weighted_fp_clocks
     }
@@ -1581,20 +1599,25 @@ impl BlockCache {
             self.disabled = true;
             return None;
         };
-        // The one place the call-out TOTAL is dropped in favour of the two class counts, so the
-        // one place that can notice a slot belonging to neither class -- the shape a fourth
-        // `CallOutHelper` takes if it is added without choosing one. `CompiledBlock` then derives
-        // the total from the split, and `compute_iteration_upper` prices the split, so a classless
-        // slot would be invisible to both.
+        // The one place the call-out TOTAL is dropped in favour of the class counts, so the one
+        // place that can notice a slot belonging to no class -- the shape a fifth `CallOutHelper`
+        // takes if it is added without choosing one. `CompiledBlock` then derives the total from
+        // the split, and `compute_iteration_upper` prices the split, so a classless slot would be
+        // invisible to both.
         debug_assert_eq!(
             compilation.callout_port_slots
                 + compilation.callout_memory_slots
-                + compilation.callout_interpret_one_slots,
+                + compilation.callout_interpret_one_slots
+                + compilation.callout_int_imm8_slots,
             compilation.callout_slots,
-            "a call-out slot belongs to none of the three helper classes"
+            "a call-out slot belongs to none of the four helper classes"
         );
+        // The INT class shares the generic helper, so it owns a cell too and both counts feed the
+        // cell tally. It does NOT share the budget term, which is the whole reason the counts are
+        // separate; see `CompiledBlock::callout_int_imm8_slots`.
         debug_assert_eq!(
-            usize::from(compilation.callout_interpret_one_slots),
+            usize::from(compilation.callout_interpret_one_slots)
+                + usize::from(compilation.callout_int_imm8_slots),
             compilation.interpret_one_cells.len(),
             "every InterpretOne slot owns exactly one governor cell"
         );
@@ -1621,6 +1644,7 @@ impl BlockCache {
                 compilation.callout_port_slots,
                 compilation.callout_memory_slots,
                 compilation.callout_interpret_one_slots,
+                compilation.callout_int_imm8_slots,
             ),
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
@@ -3947,9 +3971,13 @@ pub(crate) struct Compilation {
     /// The memory-class subset (`0x60`, `0x61`), each of which moves
     /// `CALL_OUT_STACK_FRAME_DWORDS` dwords of guest stack.
     pub callout_memory_slots: u8,
-    /// Slots whose helper runs one interpreter instruction; see `CallOutHelper::interprets_one`.
-    /// The length of `interpret_one_cells`, asserted at install.
+    /// Slots whose helper runs one interpreter instruction, EXCLUDING the INT row; see
+    /// `CallOutHelper::interprets_one`. Together with `callout_int_imm8_slots` this is the length
+    /// of `interpret_one_cells`, asserted at install.
     pub callout_interpret_one_slots: u8,
+    /// The INT-class subset (`0xCD`), priced separately from the interpret-one class; see
+    /// `CompiledBlock::callout_int_imm8_slots`. Bounded at ONE by `DirectKind::is_terminal`.
+    pub callout_int_imm8_slots: u8,
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
     /// Readable outside this module for the same reason as `successors` below: a terminal that
@@ -6340,7 +6368,17 @@ impl DirectKind {
         matches!(
             self,
             Self::CallOut {
-                helper: CallOutHelper::PortWriteAlImm8 { .. } | CallOutHelper::PortWriteAlDx
+                helper: CallOutHelper::PortWriteAlImm8 { .. }
+                    | CallOutHelper::PortWriteAlDx
+                    // The `0xCD` INT row, and the FIRST member here that is terminal for the
+                    // ordinary reason rather than for the OUT helpers' step-break one: `INT` loads
+                    // CS:EIP through the IDT, so it IS a control transfer and the walk cannot
+                    // follow it statically. It reaches this predicate through the helper because
+                    // the generic call-out is what runs it; `InterpretOneRow::always_resyncs` is
+                    // the row-level statement of the same fact, and the two must agree.
+                    | CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::IntImm8
+                    }
             } | Self::Call { .. }
                 | Self::Call16 { .. }
                 | Self::Jmp { .. }
@@ -6731,7 +6769,7 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
 pub(crate) const fn non_continuable_walk_candidate(opcode: u16) -> bool {
     matches!(
         opcode,
-        0x69 | 0x6b | 0x9a | 0xc4 | 0xc5 | 0xca | 0xcb | 0xe6 | 0xee
+        0x69 | 0x6b | 0x9a | 0xc4 | 0xc5 | 0xca | 0xcb | 0xcd | 0xe6 | 0xee
     )
 }
 
@@ -6814,7 +6852,8 @@ pub(crate) fn walk_admits_non_continuable_entry(cpu: &CpuGsw, insn: &DecodedInsn
     prefixes_supported_for(insn.prefixes, insn.operand_size, d)
         && (jit_admits_non_continuable(insn)
             || retf_admitted_here(cpu, insn)
-            || call_far_admitted_here(cpu, insn))
+            || call_far_admitted_here(cpu, insn)
+            || int_imm8_admitted_here(cpu, insn))
 }
 
 pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> CompileOutcome {
@@ -7775,6 +7814,7 @@ fn compile_with_budget(
     let mut callout_port_slots = 0u8;
     let mut callout_memory_slots = 0u8;
     let mut callout_interpret_one_slots = 0u8;
+    let mut callout_int_imm8_slots = 0u8;
     // Built during the walk rather than after it, because each cell carries its slot's GUEST
     // OFFSET and length, which are in hand here and would have to be recovered from `slots` and
     // `span.key.linear` afterwards.
@@ -7887,7 +7927,8 @@ fn compile_with_budget(
         let continuable = insn.continuable
             || jit_admits_non_continuable(&insn)
             || retf_admitted_here(cpu, &insn)
-            || call_far_admitted_here(cpu, &insn);
+            || call_far_admitted_here(cpu, &insn)
+            || int_imm8_admitted_here(cpu, &insn);
         if !prefixes_supported || !continuable {
             // Attributed since the completeness slice. The two conditions are split rather than
             // folded, because they are different work: a prefix refusal names a prefix the
@@ -8418,7 +8459,12 @@ fn compile_with_budget(
         if let Some(helper) = kind.call_out_helper() {
             callout_port_slots += u8::from(helper.probes_io_permission());
             callout_memory_slots += u8::from(helper.moves_a_stack_frame());
-            callout_interpret_one_slots += u8::from(helper.interprets_one());
+            // The interpret-one count EXCLUDES the INT row, which takes its own class so its
+            // 37-clock charge cannot inflate the allowlist maximum the other eighteen rows are
+            // priced at. Both counters read the same helper, so a row can never land in neither.
+            callout_int_imm8_slots += u8::from(helper.prices_as_int_imm8());
+            callout_interpret_one_slots +=
+                u8::from(helper.interprets_one() && !helper.prices_as_int_imm8());
             if helper.interprets_one() {
                 // The slot's offset from the block's ENTRY linear, which is what the helper adds
                 // to the live `cpu.eip` to reach the instruction. `lin` is this instruction's
@@ -9273,6 +9319,7 @@ fn compile_with_budget(
         callout_port_slots,
         callout_memory_slots,
         callout_interpret_one_slots,
+        callout_int_imm8_slots,
         x87_entry_top,
         x87_exit_top,
         dynamic_successor,
@@ -11439,6 +11486,49 @@ pub(crate) fn call_far_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
         && arm.admits(cpu)
 }
 
+/// Whether the compile walk may carry this `0xCD` INT imm8 as an `InterpretOneRow::IntImm8`
+/// call-out slot.
+///
+/// A sibling of `retf_admitted_here` and `call_far_admitted_here`, and it takes `&CpuGsw` for the
+/// same kind of reason they do: the admission depends on live mode state that
+/// `jit_admits_non_continuable` has no argument to read.
+///
+/// # The V86 IOPL refusal, which is the whole reason this is not a `jit_admits_non_continuable` arm
+///
+/// The interpreter's `0xCD` arm (`execute_extended.rs`) faults on EVERY execution in V86 below
+/// IOPL 3: it notifies the bus and then `check_v86_iopl()?` raises #GP to the monitor. Admitted
+/// there, the slot would take the call-out's RESYNC-FAULT path on every single visit -- spill,
+/// call, delivery, side exit, dispatcher trip -- buying the guest nothing and costing it a frame
+/// per visit. The `InterpretOneCell` governor would eventually demote the site (three faults in
+/// its first eight executions), which bounds the loss but does not make it a win, and it charges
+/// a permanent demoted-site entry for every distinct `INT` site in an EMM386-style guest.
+///
+/// So the state is refused UP FRONT rather than cleaned up afterwards. The population this row is
+/// measured on is unaffected: the four 486 laggards run under TOKAEMM at real IOPL 3, which is the
+/// arm that admits.
+///
+/// # What is NOT restricted
+///
+/// Operand size is not, and deliberately: every corpus site decodes at `OperandSize::Word` in a
+/// 16-bit segment, so a Dword-only admission would move nothing at all. `classify`'s own Word
+/// allowlist carries `0xcd` for the same reason.
+///
+/// Prefixes are handled by `walk_admits_non_continuable_entry`'s own `prefixes_supported_for`
+/// conjunct and by the compile walk's, so they are not re-tested here.
+pub(crate) fn int_imm8_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
+    // OPCODE FIRST, ahead of the knob's `OnceLock` load, for the ordering reason
+    // `retf_admitted_here` states. The `non_continuable_walk_candidate` conjunct is redundant and
+    // is written anyway so the superset property stays structural; both fold away.
+    if !(non_continuable_walk_candidate(insn.opcode) && insn.opcode == 0xcd) {
+        return false;
+    }
+    // The V86 IOPL gate, ahead of the knob for no reason but cost: it is two field reads.
+    if cpu.is_v86_mode() && cpu.iopl() < 3 {
+        return false;
+    }
+    int_imm8_rows_armed()
+}
+
 /// Whether `imm8_lane_for` admits the one-byte `0x80 /r` immediate lane class
 /// (`IZARRAVM_IMM8_LANES`). See `imm8_lane_for` for what qualifies and why this family alone.
 ///
@@ -12988,6 +13078,77 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_out_imm8_rows_for_test(forced: Option<bool>) {
     OUT_IMM8_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// Whether `0xCD` INT imm8 is admitted as an `InterpretOneRow::IntImm8` call-out
+/// (`IZARRAVM_INT_IMM8_ROWS`).
+///
+/// **DEFAULT ON.** What is measured is the census rather than a wall ladder, and the census is
+/// unambiguous: on the 2026-09-01 grade of main `680a6579` the four 486 laggards carry about 56 M
+/// static unbound exits on this one instruction. `100-000-pyramid`'s `INT 16h` head at `0x10E3D`
+/// is 25,750,933 of them and 87.2% of that game's whole `absent` class, with the per-edge link
+/// census recording `0x00010E37 -> 0x00010E3D` as `not_attempted`; `15-move-hole-puzzle` pays
+/// 23,474,587 through the `0xCD` `non_continuable` row, `21-for-1-to-4` 4,858,277 static plus
+/// 11,869,917 dynamic, `10rogue` 1,703,556.
+///
+/// The knob is kept rather than shipped bare for one reason the `0xE6` row's history supplies: this
+/// predicate gates BOTH halves of the edit (the `classify` arm and the walk admission), so the OFF
+/// arm is byte-identical to the pre-slice tree by construction, which is what makes a two-arm
+/// census reconciliation readable and a revert one environment variable rather than a patch.
+///
+/// THE CONVENTION, as everywhere else in this file: unset and `""` name the SAME (default) arm,
+/// `1`/`on` state it, `0`/`off` name the pre-slice base, and anything else panics rather than
+/// silently running the default.
+pub(crate) fn int_imm8_rows_armed() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = INT_IMM8_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_int_imm8_rows_arm(std::env::var("IZARRAVM_INT_IMM8_ROWS")))
+}
+
+/// The `IZARRAVM_INT_IMM8_ROWS` spelling table, lifted out of the `OnceLock` closure so it can be
+/// unit-tested without a process-global env write. See `int_imm8_rows_armed`.
+fn parse_int_imm8_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_INT_IMM8_ROWS is set to a value that is not valid UTF-8; accepted                  spellings are unset (the shipped default: ON), `1` or `on` (the same arm,                  stated), and `0` or `off` (the pre-slice base -- `0xCD` stays a barrier)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_INT_IMM8_ROWS={other:?} names no arm; accepted spellings are unset (the              shipped default: ON), `1` or `on` (the same arm, stated -- the `0xCD` INT imm8              call-out admission) and `0` or `off` (the pre-slice base). Refusing to guess: a              mistyped ladder leg that silently ran the default would be read as the arm it did              not run"
+        ),
+    }
+}
+
+// Per-THREAD, for `OUT_IMM8_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
+// and the fixtures have to run both arms in one process.
+#[cfg(test)]
+thread_local! {
+    static INT_IMM8_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the `IZARRAVM_INT_IMM8_ROWS` arm on this thread for the length of a fixture; `None`
+/// restores the ambient reading.
+#[cfg(test)]
+pub(crate) fn set_int_imm8_rows_for_test(forced: Option<bool>) {
+    INT_IMM8_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures; `int_imm8_rows_armed` caches its env reading
+/// in a process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process.
+#[cfg(test)]
+pub(crate) fn parse_int_imm8_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_int_imm8_rows_arm(value)
 }
 
 /// The spelling table, reachable from the fixtures; `out_imm8_rows_armed` caches its env reading
@@ -15137,6 +15298,16 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // (SS.B = 0, Word) cell that has an emitter and refuses the rest.
                 | 0xca
                 | 0xcb
+                // INT imm8 (0xcd), and ONLY 0xcd -- 0xcc INT3, 0xce INTO and 0xcf IRET have no
+                // classify arm at any size and keep their `hard_boundary` census arm. Every site
+                // the corpus measures is 16-bit code, so this entry is not a widening of a Dword
+                // row but the ONLY form the row has: without it `classify` returns `None` before
+                // the `0xcd` arm below is ever tried, and the census row would relocate from
+                // `non_continuable` to `hard_boundary` on the ON arm -- the two-arm reconciliation
+                // error `jit_admits_non_continuable`'s doc describes. Admission is decided by
+                // `int_imm8_admitted_here` in the compile walk, which is where the V86 IOPL state
+                // is in hand.
+                | 0xcd
                 // CALL FAR ptr16:16, L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`). L7 Part 1
                 // made the ten `0x9A` block-ENTRY sites on 15-move-hole-puzzle (116.3 M of the
                 // corpus's 186.7 M `absent` class) reachable by the Direct dispatcher; without
@@ -16297,6 +16468,39 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 return Some(DirectKind::CallOut {
                     helper: CallOutHelper::InterpretOne {
                         row: InterpretOneRow::Popf,
+                    },
+                });
+            }
+            // INT imm8, at EITHER operand size. `0xCC` INT3, `0xCE` INTO and `0xCF` IRET stay
+            // without an arm: only `0xCD` carries an immediate vector, and only `0xCD` is what the
+            // corpus measured.
+            //
+            // # Why the generic call-out and not a helper of its own
+            //
+            // The instruction pushes a frame onto the guest stack and, under paging, page-walks
+            // the IDT and the GDT to read its gate. Both need the `deferred_code_writes` window
+            // that `interpret_one` opens around its step, or a push into the running block's own
+            // page would reach `invalidate_physical_range` with that block's native frame still on
+            // the host stack. And it loads CS:EIP, so the slot's exit must advance EIP by ZERO --
+            // which is exactly what the two RESYNC stubs the `InterpretOne` class already emits
+            // do, and what every other exit in `emit` deliberately does not do. A dedicated helper
+            // would have had to reproduce both mechanisms plus the fault tail; running the
+            // interpreter's own decoded arm reproduces nothing and cannot drift from it.
+            //
+            // # Why it still is not priced as one
+            //
+            // `InterpretOneRow::IntImm8` takes its own slot class. See
+            // `CompiledBlock::callout_int_imm8_slots`: a 37-clock row folded into a 7-clock
+            // allowlist maximum would raise the budget bound, and therefore change block
+            // ADMISSION, for every CLI/STI/segment/string block on the board.
+            //
+            // The walk STOPS here: `DirectKind::is_terminal` names this row, because the block can
+            // never carry on past a control transfer. `InterpretOneRow::always_resyncs` is the
+            // same fact stated where the helper reads it.
+            0xcd => {
+                return Some(DirectKind::CallOut {
+                    helper: CallOutHelper::InterpretOne {
+                        row: InterpretOneRow::IntImm8,
                     },
                 });
             }
@@ -27762,13 +27966,35 @@ pub(crate) enum InterpretOneRow {
     /// (neither scoped to a specific row) already cover every flag POPF can move; this row adds no
     /// new clause to that predicate.
     Popf,
+    /// `0xCD` INT imm8, at either operand size, and NEVER `0xCC`/`0xCE`/`0xCF`.
+    ///
+    /// The first row that can NEVER resume. Every other row on this list runs an instruction that
+    /// usually leaves the block able to carry on; this one loads CS:EIP through the IDT, so the
+    /// architectural next address is the handler's and the block is finished at the slot whatever
+    /// the resume predicate would say. `always_resyncs` is that fact, and the three places it is
+    /// read (the resume gate, the governor, `DirectKind::is_terminal`) are the three places the
+    /// difference shows.
+    ///
+    /// Admitted for the corpus population the 2026-09-01 grade measured: `100-000-pyramid`'s
+    /// `INT 16h` keyboard-poll head at `0x10E3D` carries 25,750,933 static unbound exits, 87.2% of
+    /// that game's whole `absent` class, and `15-move-hole-puzzle` (23,474,587),
+    /// `21-for-1-to-4` (4,858,277 static plus 11,869,917 dynamic) and `10rogue` (1,703,556) pay the
+    /// same instruction through the `0xCD` `non_continuable` census row instead.
+    ///
+    /// It is priced in its OWN slot class rather than through `INTERPRET_ONE_MAX_CORE_CLOCKS`. See
+    /// `CallOutSlotCounts` for why (this row's charge is 37 core clocks against the allowlist's 7,
+    /// and its worst-case data accesses are past `INTERPRET_ONE_MAX_DATA_ACCESSES`' 4, so folding
+    /// it into that maximum would raise the budget bound of every CLI/STI/segment/string block on
+    /// the board -- an admission change, which is guest-visible, for a row those blocks do not
+    /// carry).
+    IntImm8,
 }
 
 impl InterpretOneRow {
     /// Every row, in discriminant order. The census array is indexed by `as usize`, so this is
     /// what keeps the two in step: a variant added without an entry here fails the length pin in
     /// `interpret_one_row_labels_cover_every_variant`.
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 19] = [
         Self::PopRm,
         Self::MovRmSreg,
         Self::Xchg,
@@ -27787,6 +28013,7 @@ impl InterpretOneRow {
         Self::StringLoad,
         Self::Pushf,
         Self::Popf,
+        Self::IntImm8,
     ];
 
     /// How many rows the census array holds.
@@ -27814,7 +28041,29 @@ impl InterpretOneRow {
             Self::StringLoad => "0xac_ad_lods",
             Self::Pushf => "0x9c_pushf_word",
             Self::Popf => "0x9d_popf_word",
+            Self::IntImm8 => "0xcd_int_imm8",
         }
+    }
+
+    /// Whether this row can NEVER leave the block able to carry on.
+    ///
+    /// True for `IntImm8` alone. `INT` loads CS:EIP through the IDT, so the architectural next
+    /// address is the handler's entry and no continuation of the compiled span is reachable.
+    ///
+    /// A HARD GATE and not a shortcut around `ResumeSnapshot::allows_resume`. The clause that
+    /// would otherwise refuse is R1, `cpu.registers.eip != end_eip || cpu.registers.cs() != self.cs`
+    /// -- and that is a fact about the GUEST'S IDT rather than a construction. A vector whose gate
+    /// points at the very address after the `INT` satisfies both halves of R1, and R3 does not
+    /// cover the gap either: its IF clause is DIRECTIONAL and `INT` clears IF, which is the arm
+    /// that RESUMES. `allows_resume` would then return true and `interpret_one_step`'s resume tail
+    /// would restore the block's entry EIP, silently undoing the control transfer while keeping
+    /// the pushed frame and the cleared IF and TF. That is a miscompile, so the refusal is made
+    /// here, structurally, before the predicate is consulted at all.
+    ///
+    /// It is also why `DirectKind::is_terminal` names this row: a slot the block can never carry
+    /// on from must end the compile walk, or every instruction after it is emitted dead.
+    pub(crate) fn always_resyncs(self) -> bool {
+        matches!(self, Self::IntImm8)
     }
 
     /// Whether this row may leave `interrupt_shadow` ARMED after its step and still resume.
@@ -27895,7 +28144,14 @@ impl InterpretOneRow {
     /// class rather than by row.
     pub(crate) fn may_write_segment(self) -> bool {
         match self {
-            Self::MovSreg | Self::MovSsReg | Self::PopSs => true,
+            // `IntImm8` answers TRUE and the answer is never READ by R2, because `always_resyncs`
+            // refuses resume before the predicate runs. It is stated anyway, and it is the honest
+            // answer rather than a defensive one: `software_interrupt` loads CS through the IDT
+            // gate, and a V86 reflection into the monitor additionally reloads DS, ES, FS and GS.
+            // The OTHER consumer is the one that still reads it -- the accumulator that bars a
+            // block from publishing a static successor -- and a block ending in a control transfer
+            // has none to publish, so the answer costs nothing there either.
+            Self::MovSreg | Self::MovSsReg | Self::PopSs | Self::IntImm8 => true,
             Self::PopRm
             | Self::MovRmSreg
             | Self::Xchg
@@ -28034,6 +28290,26 @@ impl CallOutHelper {
         }
     }
 
+    /// Whether this slot is PRICED as the INT class rather than as the interpret-one class.
+    ///
+    /// The one place the two split. `interprets_one` stays TRUE for the INT row, because it is the
+    /// generic helper that runs it and the two things that predicate gates -- the slot's
+    /// `InterpretOneCell` and the emitter's pair of RESYNC exit stubs -- are both needed. What the
+    /// row does NOT share is the budget term: see `CompiledBlock::callout_int_imm8_slots` for why
+    /// folding a 37-clock row into a 7-clock allowlist maximum would change block admission across
+    /// the whole board.
+    ///
+    /// Written against the ROW rather than against the helper, because the split is a property of
+    /// the instruction the slot runs and not of the call-out mechanism.
+    pub(crate) fn prices_as_int_imm8(self) -> bool {
+        matches!(
+            self,
+            Self::InterpretOne {
+                row: InterpretOneRow::IntImm8
+            }
+        )
+    }
+
     /// True for every helper whose slot is allocated a `PortSlotCell` -- the governor's per-site
     /// kill switch. `InterpretOne` needs one for `republish_flags`'s reason (below) as well as the
     /// governor; `PortReadAlDx` needs one PURELY as a `slot_delta` data channel for the poll-skip
@@ -28099,8 +28375,20 @@ pub(crate) struct CallOutSlotCounts(u8);
 /// the constructor.
 const SLOT_COUNT_RADIX: u8 = 5;
 
+/// The stride the INT class rides above the base-5 field, and the whole of why a FOURTH class
+/// fits a byte the base-5 packing had already filled.
+///
+/// Three classes in base 5 occupy `0..=124`. A fourth positional digit would need `5^4 = 625` and
+/// does not fit -- but the INT class does not need a digit, because it is bounded at ONE per
+/// block rather than at `MAX_BLOCK_CALLOUT_SLOTS`. `DirectKind::is_terminal` names the row, so the
+/// compile walk STOPS at an INT slot and a second one can never be appended. So the class is a
+/// flag, encoded as `+125`, and the widest value the byte can hold is `124 + 125 = 249`.
+///
+/// That bound is asserted rather than asserted-by-comment: `new` refuses `int_imm8 > 1`.
+const INT_IMM8_SLOT_STRIDE: u8 = SLOT_COUNT_RADIX * SLOT_COUNT_RADIX * SLOT_COUNT_RADIX;
+
 impl CallOutSlotCounts {
-    fn new(port: u8, memory: u8, interpret_one: u8) -> Self {
+    fn new(port: u8, memory: u8, interpret_one: u8, int_imm8: u8) -> Self {
         debug_assert!(
             port < SLOT_COUNT_RADIX
                 && memory < SLOT_COUNT_RADIX
@@ -28108,10 +28396,18 @@ impl CallOutSlotCounts {
             "MAX_BLOCK_CALLOUT_SLOTS bounds every class below the base-5 radix"
         );
         debug_assert!(
-            port + memory + interpret_one <= MAX_BLOCK_CALLOUT_SLOTS,
+            int_imm8 <= 1,
+            "the INT class is a flag: `is_terminal` stops the walk at the slot, so a block holds              at most one"
+        );
+        debug_assert!(
+            port + memory + interpret_one + int_imm8 <= MAX_BLOCK_CALLOUT_SLOTS,
             "the classes share one per-block slot budget"
         );
-        Self(port + SLOT_COUNT_RADIX * memory + SLOT_COUNT_RADIX * SLOT_COUNT_RADIX * interpret_one)
+        Self(
+            port + SLOT_COUNT_RADIX * memory
+                + SLOT_COUNT_RADIX * SLOT_COUNT_RADIX * interpret_one
+                + INT_IMM8_SLOT_STRIDE * int_imm8,
+        )
     }
 
     /// Slots whose helper can reach `check_io_permission`; see `CallOutHelper::probes_io_permission`.
@@ -28124,9 +28420,15 @@ impl CallOutSlotCounts {
         u32::from((self.0 / SLOT_COUNT_RADIX) % SLOT_COUNT_RADIX)
     }
 
-    /// Slots that run one interpreter instruction; see `CallOutHelper::interprets_one`.
+    /// Slots that run one interpreter instruction, EXCLUDING the INT row; see
+    /// `CallOutHelper::interprets_one` and `CallOutHelper::prices_as_int_imm8`.
     fn interpret_one(self) -> u32 {
-        u32::from(self.0 / (SLOT_COUNT_RADIX * SLOT_COUNT_RADIX))
+        u32::from((self.0 % INT_IMM8_SLOT_STRIDE) / (SLOT_COUNT_RADIX * SLOT_COUNT_RADIX))
+    }
+
+    /// The INT class flag; see `CallOutHelper::prices_as_int_imm8`.
+    fn int_imm8(self) -> u32 {
+        u32::from(self.0 / INT_IMM8_SLOT_STRIDE)
     }
 
     /// The three counts summed. TEST-ONLY, and gated for the same reason
@@ -28135,7 +28437,7 @@ impl CallOutSlotCounts {
     /// triple it sums is vacuous. See that accessor's comment for where the real check lives.
     #[cfg(test)]
     fn total(self) -> u32 {
-        self.port() + self.memory() + self.interpret_one()
+        self.port() + self.memory() + self.interpret_one() + self.int_imm8()
     }
 }
 
@@ -30189,7 +30491,25 @@ fn interpret_one_step<B: CpuBus>(
     //
     // Asked AFTER the step rather than before it because the step runs on either answer -- the row
     // retires whatever this returns -- and executing it cannot change what is pending.
-    let resume = snapshot.allows_resume(cpu, end_eip, cell.row(), cell.used_by_others())
+    //
+    // THE `always_resyncs` GATE COMES FIRST, and it is structural rather than an optimisation.
+    // `InterpretOneRow::IntImm8` loads CS:EIP through the IDT, so the block is finished at the
+    // slot -- but the clause that would otherwise notice is R1, and R1 compares `cpu.registers.eip`
+    // and `cpu.registers.cs()` against the snapshot, which are facts about the GUEST'S IDT rather
+    // than about the mechanism. A gate whose handler begins at the address right after the `INT`
+    // satisfies both halves of R1, and R3 does not cover the gap either: its IF clause is
+    // DIRECTIONAL, and `INT` CLEARS IF, which is the arm that resumes. The tail below would then
+    // restore the block's entry EIP and carry on, undoing the control transfer while keeping the
+    // pushed frame and the cleared IF and TF. So the refusal is made here, before the predicate is
+    // consulted at all, and the `debug_assert` says what the predicate would have answered so a
+    // future edit that re-narrows one of the two cannot pass silently.
+    let always_resyncs = cell.row().always_resyncs();
+    debug_assert!(
+        !always_resyncs || !snapshot.allows_resume(cpu, end_eip, cell.row(), cell.used_by_others()),
+        "a row that can never resume was about to be allowed to"
+    );
+    let resume = !always_resyncs
+        && snapshot.allows_resume(cpu, end_eip, cell.row(), cell.used_by_others())
         && !(cell.row().arms_interrupt_shadow()
             && cpu.registers.eflags & FLAG_IF != 0
             && bus.interrupt_pending());
@@ -30234,7 +30554,20 @@ fn interpret_one_step<B: CpuBus>(
     // moves no counter: the interpreter does not materialise after every instruction either.
     publish_flags(cpu);
 
-    if cell.note_execution(!resume) {
+    // THE GOVERNOR, and the one row that is exempt from HALF of it.
+    //
+    // `note_execution` demotes a slot after three resyncs in its first eight executions, which is
+    // right for a row whose resume predicate keeps failing for reasons the compile walk could not
+    // see. A row that can NEVER resume is not that case: its resync is the design, and demoting it
+    // would retire the block, recompile it without the slot, and put the instruction back at a
+    // barrier -- the whole lever, undone after three visits.
+    //
+    // The exemption is narrow ON PURPOSE and covers only this path. The FAULT arm above still
+    // charges `note_execution(true)`, so a site that faults on every execution -- which is what an
+    // `INT` in a V86 task below IOPL 3 does -- still demotes after three of its first eight. That
+    // arm is the one the governor exists for, and `int_imm8_admitted_here` refuses that state up
+    // front anyway, so the two bound it independently.
+    if cell.note_execution(!resume && !always_resyncs) {
         note_demotion(cpu, cell);
     }
 

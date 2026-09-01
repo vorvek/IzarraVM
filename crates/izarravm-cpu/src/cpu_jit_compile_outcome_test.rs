@@ -945,18 +945,33 @@ enum SensitiveOutcome {
     Lowered,
     /// A `classify` arm produces an `InterpretOne` call-out.
     CallOut,
+    /// A `classify` arm produces an `InterpretOne` call-out that ENDS the block.
+    ///
+    /// `0xCD` INT imm8 alone. It shares the generic helper with the `CallOut` rows, so it is not a
+    /// lowering -- but `DirectKind::is_terminal` names its row, because `INT` loads CS:EIP through
+    /// the IDT and no continuation of the span is reachable. So the block is exactly the three
+    /// lead slots plus the INT, where a `CallOut` row leaves the walk free to carry on. It is also
+    /// counted in its OWN slot class, for the budget reason on
+    /// `CompiledBlock::callout_int_imm8_slots`, which is why the interpret-one count below stays
+    /// zero for it.
+    TerminalCallOut,
 }
 
 #[test]
 fn v86_sensitive_opcodes_keep_their_word_answers() {
-    use SensitiveOutcome::{Barrier, CallOut, Lowered};
+    use SensitiveOutcome::{Barrier, CallOut, Lowered, TerminalCallOut};
     // (bytes, outcome_at_dword, outcome_at_word)
     let table: &[(&[u8], SensitiveOutcome, SensitiveOutcome)] = &[
         (&[0x9c], Lowered, CallOut), // PUSHF: Push lowering at Dword, InterpretOne at Word (N2)
         (&[0x9d], Barrier, CallOut), // POPF: no arm at Dword, InterpretOne at Word (N2)
         (&[0xfa], CallOut, CallOut), // CLI: an InterpretOne call-out since the S3 widening
         (&[0xfb], CallOut, CallOut), // STI: an InterpretOne call-out since S4d
-        (&[0xcd, 0x20], Barrier, Barrier), // INT imm8: no classify arm
+        // INT imm8: an InterpretOne call-out at BOTH widths since the 0xCD admission slice, and
+        // terminal at both. Every corpus site is 16-bit, so the Word arm is the measured one; the
+        // Dword arm is admitted with it because `INT` is width-invariant (the vector is an imm8
+        // whatever the segment decoded at) and splitting them would have been a refusal with no
+        // measurement behind it in either direction.
+        (&[0xcd, 0x20], TerminalCallOut, TerminalCallOut),
         (&[0xcf], Barrier, Barrier), // IRET: no classify arm
     ];
     for (op, outcome_at_dword, outcome_at_word) in table {
@@ -1000,6 +1015,20 @@ fn v86_sensitive_opcodes_keep_their_word_answers() {
                     assert_eq!(
                         compilation.callout_interpret_one_slots, 0,
                         "{first:#04x} (prefixed={prefixed}) must be a native lowering, not a call-out"
+                    );
+                }
+                TerminalCallOut => {
+                    assert_eq!(
+                        compilation.span.instructions, 4,
+                        "{first:#04x} (prefixed={prefixed}) must join the block as a call-out AND                          end it: three lead slots plus the call-out itself"
+                    );
+                    assert_eq!(
+                        compilation.callout_int_imm8_slots, 1,
+                        "{first:#04x} (prefixed={prefixed}) must be counted in the INT class,                          which is what keeps its 37-clock charge out of the interpret-one budget                          term"
+                    );
+                    assert_eq!(
+                        compilation.callout_interpret_one_slots, 0,
+                        "{first:#04x} (prefixed={prefixed}) must NOT also be counted in the                          interpret-one class; the two counts feed different budget terms"
                     );
                 }
                 Barrier => {

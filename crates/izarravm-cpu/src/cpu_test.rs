@@ -4114,6 +4114,14 @@ mod jit_run_loop_admission;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_int_imm8_admission_test.rs"]
+mod jit_int_imm8_admission;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_test_word_row_test.rs"]
 mod jit_test_word_row;
 

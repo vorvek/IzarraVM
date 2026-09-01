@@ -2214,11 +2214,25 @@ impl CpuGsw {
         // `dword_data_upper` that term uses. `INTERPRET_ONE_MAX_DATA_ACCESSES` per slot, the same
         // shape and the same constant, so the two bounds cannot drift apart when the allowlist
         // grows a row with wider traffic.
+        //
+        // `INT_IMM8_MAX_DATA_ACCESSES` and not `INTERPRET_ONE_MAX_DATA_ACCESSES` is what this term
+        // must carry since the `0xCD` row joined. The two classes share the generic helper but not
+        // their budget terms, and this bound cannot see which of them a block holds, so it prices
+        // every slot at the LARGER -- 16 against 4. That is the opposite of the choice
+        // `compute_iteration_upper` makes, and deliberately so: that one is a per-class term whose
+        // over-pricing would change block admission, while this one is a ceiling whose whole job is
+        // to dominate, and a ceiling that failed to cover the INT class would trip the
+        // chain-pricing `debug_assert!(per_hop_estimate <= global_block_upper)` on a zero-dial bus.
         let callout_interpret_one_bus = if has_x87 {
             0
         } else {
+            let per_slot = if INT_IMM8_MAX_DATA_ACCESSES > INTERPRET_ONE_MAX_DATA_ACCESSES {
+                INT_IMM8_MAX_DATA_ACCESSES
+            } else {
+                INTERPRET_ONE_MAX_DATA_ACCESSES
+            };
             u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
-                .saturating_mul(INTERPRET_ONE_MAX_DATA_ACCESSES)
+                .saturating_mul(per_slot)
                 .saturating_mul(max_store)
         };
         // The MEMORY class's traffic, added ONCE for the whole block rather than folded into the
@@ -2343,6 +2357,15 @@ impl CpuGsw {
             .saturating_add(
                 u64::from(block.callout_interpret_one_slots())
                     .saturating_mul(u64::from(INTERPRET_ONE_MAX_CORE_CLOCKS)),
+            )
+            // The FOURTH class, `0xCD` INT imm8. It shares the generic helper with the class above
+            // but not its budget term: 37 against that class's 7, so folding it in would have
+            // raised every CLI/STI/segment/string block's bound by more than five times for a row
+            // none of them carries. Its own count is bounded at one per block by
+            // `DirectKind::is_terminal`.
+            .saturating_add(
+                u64::from(block.callout_int_imm8_slots())
+                    .saturating_mul(u64::from(INT_IMM8_CORE_CLOCKS)),
             );
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
@@ -2470,6 +2493,15 @@ impl CpuGsw {
             .saturating_add(
                 u64::from(block.callout_interpret_one_slots())
                     .saturating_mul(INTERPRET_ONE_MAX_DATA_ACCESSES)
+                    .saturating_mul(dword_data_upper),
+            )
+            // The INT class's own bus term, for `callout_core_upper`'s reason: an interrupt
+            // delivery reads its gate and its descriptor and pushes a frame, which is past
+            // `INTERPRET_ONE_MAX_DATA_ACCESSES`' four. See `INT_IMM8_MAX_DATA_ACCESSES` for the
+            // per-delivery derivation and for why the V86 reflection case is not the bound.
+            .saturating_add(
+                u64::from(block.callout_int_imm8_slots())
+                    .saturating_mul(INT_IMM8_MAX_DATA_ACCESSES)
                     .saturating_mul(dword_data_upper),
             );
         let raw_bus_upper = fetch_upper

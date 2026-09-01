@@ -5165,6 +5165,40 @@ pub(crate) const PUSHF_CORE_CLOCKS: u32 = 3;
 /// argument `PUSHF_CORE_CLOCKS` makes.
 pub(crate) const POPF_CORE_CLOCKS: u32 = 4;
 
+/// What `INT imm8` charges (`execute_extended.rs`, the `0xcd` arm: `Ok(clocks(37))`).
+///
+/// Deliberately NOT a term in `INTERPRET_ONE_MAX_CORE_CLOCKS`, which is the only row on that
+/// allowlist to stay out of the fold. 37 is more than five times the fold's current value of 7, and
+/// `compute_iteration_upper` multiplies that value by the block's interpret-one slot count -- so
+/// folding this in would raise the budget bound of every block carrying a CLI, an STI, a segment
+/// load, a string row, a PUSHF or a POPF, none of which can charge anything like it. A raised bound
+/// shrinks `budget_quota`, which changes WHICH blocks are admitted, which is guest-visible. The row
+/// takes its own slot class instead; see `jit::direct::CompiledBlock::callout_int_imm8_slots`.
+pub(crate) const INT_IMM8_CORE_CLOCKS: u32 = 37;
+
+/// The most DATA ACCESSES one `INT imm8` call-out slot can present, and the multiplicand
+/// `compute_iteration_upper` prices its bus traffic at.
+///
+/// Derived worst case first, the way `INTERPRET_ONE_MAX_DATA_ACCESSES` is derived:
+///
+/// | delivery | accesses |
+/// |---|---|
+/// | real mode / V86 to a real-mode vector | 2 IVT halves + 3 word pushes = 5 |
+/// | protected mode, no privilege change | 2 IDT gate dwords + 2 GDT descriptor dwords + accessed-bit write + 5 pushes = 10 |
+/// | protected mode, inter-privilege | the above + 2 TSS dwords + 2 SS descriptor dwords + its accessed bit = 15 |
+/// | V86 monitor reflection | the inter-privilege frame plus GS/FS/DS/ES pushes = 19 |
+///
+/// **16**, not 19, and the shortfall is stated rather than hidden. A V86 reflection is only
+/// reachable from a task already in V86, and `int_imm8_admitted_here` refuses admission in V86
+/// below IOPL 3 -- which is the state that reflects. At IOPL 3 the interpreter's own arm waves the
+/// task through to `software_interrupt`, which takes the real-mode vector path and its five
+/// accesses. So the reachable worst case here is the inter-privilege protected-mode one at 15, and
+/// 16 dominates it with a margin rather than sitting exactly on it.
+///
+/// PAGE WALKS are not priced, exactly as `INTERPRET_ONE_MAX_DATA_ACCESSES` does not price them:
+/// the owner's ruling of 2026-07-30 accepted that class of overshoot for the chain quota.
+pub(crate) const INT_IMM8_MAX_DATA_ACCESSES: u64 = 16;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -5294,9 +5328,9 @@ pub(crate) const INTERPRET_ONE_MAX_DATA_ACCESSES: u64 = 4;
 
 /// The largest core charge any admitted call-out helper can return, and the term
 /// `compute_iteration_upper` / `compute_global_block_upper` must price a slot at when they cannot
-/// tell the helpers apart. Derived from the three constants above rather than written down, so a
-/// fourth helper with a bigger charge raises it by construction instead of silently under-budgeting
-/// the block that carries it.
+/// tell the helpers apart. Derived from the constants above rather than written down, so a new
+/// helper with a bigger charge raises it by construction instead of silently under-budgeting the
+/// block that carries it.
 pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     // `OUT_PORT_CORE_CLOCKS` (10) cannot be the maximum today -- it is under all three of the
     // others -- and it is folded in anyway, because the property this constant claims is
@@ -5317,10 +5351,21 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     } else {
         POP_ALL_CORE_CLOCKS
     };
-    if b > INTERPRET_ONE_MAX_CORE_CLOCKS {
+    let c = if b > INTERPRET_ONE_MAX_CORE_CLOCKS {
         b
     } else {
         INTERPRET_ONE_MAX_CORE_CLOCKS
+    };
+    // The INT row, folded in HERE even though it is deliberately out of
+    // `INTERPRET_ONE_MAX_CORE_CLOCKS`. The two constants answer different questions and the
+    // difference is the whole reason the row has its own slot class. That one is a PER-CLASS term
+    // multiplied by a class count, so a row that cannot occur in a block must not raise it. This
+    // one is a GLOBAL CEILING that must dominate every helper by construction, and a ceiling that
+    // failed to cover an admitted row would trip the chain-pricing `debug_assert` it exists for.
+    if c > INT_IMM8_CORE_CLOCKS {
+        c
+    } else {
+        INT_IMM8_CORE_CLOCKS
     }
 };
 
