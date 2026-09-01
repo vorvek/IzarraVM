@@ -1440,3 +1440,75 @@ fn the_census_records_the_video_dimensions_register_a_real_driver_writes() {
     assert_eq!(rows[0].0.width, 640, "639 in the register means 640 pixels");
     assert_eq!(rows[0].0.height, 480);
 }
+
+#[test]
+fn a_zero_pixel_triangle_does_not_arm_a_yielded_display() {
+    // A degenerate (zero-area) or fully clipped-away triangle rasterises
+    // nothing. "A triangle was submitted" is not "real content landed in the
+    // framebuffer" -- a guest that submits a culled triangle during a yielded
+    // VBE session (Tomb Raider's Glide FMV window does this for out-of-frustum
+    // geometry) must not have its next SWAPBUFFER steal the mux back.
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.disable_display();
+    assert!(!distira.display_enabled());
+
+    // All three vertices coincide: area is exactly zero.
+    let written = distira.draw_triangle([
+        DistiraVertex::rgb(1.0, 1.0, 255, 0, 0),
+        DistiraVertex::rgb(1.0, 1.0, 255, 0, 0),
+        DistiraVertex::rgb(1.0, 1.0, 255, 0, 0),
+    ]);
+    assert_eq!(written, 0);
+
+    distira.swap_buffers();
+    assert!(
+        !distira.display_enabled(),
+        "a zero-pixel triangle must not arm a yielded display"
+    );
+}
+
+#[test]
+fn content_submitted_after_a_retrace_swap_is_issued_does_not_arm_that_swap() {
+    // present_swap for a SYNC_TO_RETRACE command used to read
+    // content_drawn_since_yield when the swap RETIRED, at the retrace edge,
+    // not when it was ISSUED. A triangle landing in the gap between issue and
+    // retrace then licensed a swap that was genuinely idle at the moment the
+    // guest asked for it -- content belonging to frame N+1 armed frame N's
+    // swap. The flag must be snapshotted at issue time.
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+    distira.disable_display();
+    assert!(!distira.display_enabled());
+
+    // Issue a retrace-synced swap (bit 0) with interval 0 while genuinely
+    // idle: no content since the yield.
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    // New real content lands AFTER the swap was issued but BEFORE its
+    // retrace fires.
+    let written = distira.draw_triangle([
+        DistiraVertex::rgb(0.0, 0.0, 0, 255, 0),
+        DistiraVertex::rgb(1.0, 0.0, 0, 255, 0),
+        DistiraVertex::rgb(0.0, 1.0, 0, 255, 0),
+    ]);
+    assert!(written > 0, "the probe triangle must draw real pixels");
+
+    // Retire the pending swap (480 lines to the first vertical retrace edge,
+    // per the interval-0 fixtures above).
+    distira.advance_frame_phase(480);
+
+    assert!(
+        !distira.display_enabled(),
+        "content submitted after the swap was issued must not retroactively arm it"
+    );
+
+    // The content is real and still pending a swap of its own: the NEXT
+    // SWAPBUFFER (issued now that content_drawn_since_yield is true) must
+    // retake the display.
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+    assert!(
+        distira.display_enabled(),
+        "a swap issued after real content must arm the display"
+    );
+}

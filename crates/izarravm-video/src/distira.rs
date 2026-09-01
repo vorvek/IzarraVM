@@ -349,6 +349,11 @@ impl TriangleDepth {
 struct PendingSwap {
     target_base: u32,
     interval: u8,
+    /// `content_drawn_since_yield` snapshotted at SWAPBUFFER issue, not read
+    /// again at retire. A triangle submitted after this swap command but
+    /// before its retrace must not license THIS swap to re-arm the mux --
+    /// that content belongs to the frame after.
+    may_enable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,9 +372,18 @@ pub struct Distira {
     aux_base: u32,
     buffer_stride: u32,
     display_enabled: bool,
-    /// False after a 2D yield (`disable_display`). SWAPBUFFER must not restick
-    /// Distira over a live VBE session. VIDEO_RESET falling edge sets it again.
-    swap_may_enable: bool,
+    /// False after a 2D yield (`disable_display`). SWAPBUFFER may only restick
+    /// Distira over a live VBE session once real content (a rasterised
+    /// triangle or a direct LFB pixel write) has landed since the yield — an
+    /// idle vsync-poll swap with nothing new to show must not steal the mux
+    /// back (Tomb Raider's Glide FMV window: 4F02 yields, then WVIDEO keeps
+    /// swapping an unchanged, cleared back buffer while it blits the movie
+    /// into Margo). VIDEO_RESET falling edge sets it unconditionally, same as
+    /// splash always turning Distira on. A guest that resumes real Glide
+    /// rendering after the yield (a fresh triangle, then a swap) must retake
+    /// the cable without waiting on another VIDEO_RESET pulse — see
+    /// `dev_docs/2026-09-01-distira-fidelity-diag.md`.
+    content_drawn_since_yield: bool,
     /// VIDEO_RESET falling edges in `write_fbi_init1`. Splash is one. A count
     /// that keeps climbing after a VBE yield is a Distira restick that SWAPBUFFER
     /// did not cause.
@@ -541,7 +555,7 @@ impl Distira {
             aux_base: buffer_stride * 2,
             buffer_stride,
             display_enabled: false,
-            swap_may_enable: true,
+            content_drawn_since_yield: true,
             video_reset_falling_edges: 0,
             fbi_init0_byte0_enables: 0,
             dither_enabled: false,
@@ -732,7 +746,7 @@ impl Distira {
         if old & FBIINIT1_VIDEO_RESET != 0 && self.fbi_init[1] & FBIINIT1_VIDEO_RESET == 0 {
             self.frame_phase_line = 0;
             self.reset_swap_state();
-            self.swap_may_enable = true;
+            self.content_drawn_since_yield = true;
             self.display_enabled = self.fbi_init[0] & FBIINIT0_VGA_PASS == 0;
             self.video_reset_falling_edges = self.video_reset_falling_edges.saturating_add(1);
         } else if self.fbi_init[1] & FBIINIT1_VIDEO_RESET != 0 {
@@ -835,7 +849,7 @@ impl Distira {
             edges -= until_swap;
             self.pending_swap = None;
             self.retrace_count = 0;
-            self.present_swap(pending.target_base);
+            self.present_swap(pending.target_base, pending.may_enable);
             self.start_next_swap();
         }
     }
@@ -857,9 +871,9 @@ impl Distira {
         }
     }
 
-    fn present_swap(&mut self, target_base: u32) {
+    fn present_swap(&mut self, target_base: u32, may_enable: bool) {
         self.scanout_base = target_base;
-        if self.swap_may_enable {
+        if may_enable {
             self.display_enabled = true;
         }
     }
@@ -875,14 +889,19 @@ impl Distira {
             let Some(value) = self.swap_commands.pop_front() else {
                 return;
             };
+            // Snapshot at issue time. A retrace-synced swap must not read
+            // this again when it retires: content submitted while the swap
+            // sits pending belongs to the NEXT frame, not this one.
+            let may_enable = self.content_drawn_since_yield;
             self.rotate_buffers();
             let target_base = self.display.front_base;
             if value & SWAPBUFFER_SYNC_TO_RETRACE == 0 {
-                self.present_swap(target_base);
+                self.present_swap(target_base, may_enable);
             } else {
                 self.pending_swap = Some(PendingSwap {
                     target_base,
                     interval: ((value >> 1) & SWAPBUFFER_INTERVAL_MASK) as u8,
+                    may_enable,
                 });
             }
         }
@@ -1021,7 +1040,7 @@ impl Distira {
 
     pub fn disable_display(&mut self) {
         self.display_enabled = false;
-        self.swap_may_enable = false;
+        self.content_drawn_since_yield = false;
     }
 
     pub fn set_frame_size(&mut self, width: u32, height: u32) {
@@ -1063,7 +1082,7 @@ impl Distira {
     pub fn swap_buffers(&mut self) {
         self.drain_raster_queue();
         self.rotate_buffers();
-        self.present_swap(self.display.front_base);
+        self.present_swap(self.display.front_base, self.content_drawn_since_yield);
     }
 
     pub fn draw_triangle(&mut self, vertices: [DistiraVertex; 3]) -> u64 {
@@ -1283,6 +1302,14 @@ impl Distira {
             });
         }
         let written = self.merge_pixel_stats(&lane_stats, &jobs, lanes);
+        if written > 0 {
+            // Pixels actually landed in the framebuffer: real Voodoo
+            // content, not an idle vsync heartbeat. A degenerate zero-area
+            // triangle, or one clipped away to an empty box, contributes
+            // zero here and must not arm the mux -- see
+            // `content_drawn_since_yield`.
+            self.content_drawn_since_yield = true;
+        }
         self.raster_queue.recycle(jobs);
         written
     }
@@ -1472,6 +1499,11 @@ impl Distira {
         }
     }
 
+    // No `content_drawn_since_yield` re-arm here: `vega.rs::write_wide_memory`
+    // silently drops `BusWidth::Byte` before it reaches the Distira LFB, so
+    // this method has no caller in the workspace today. That drop is a
+    // separate, pre-existing bug (a guest that wrote the LFB a byte at a time
+    // would lose every pixel) and is not this PR's to fix.
     pub fn write_lfb_u8(&mut self, offset: usize, value: u8) {
         self.drain_raster_queue();
         self.aperture_traffic.lfb_writes += 1;
@@ -1488,6 +1520,7 @@ impl Distira {
     pub fn write_lfb_u16(&mut self, offset: usize, value: u16) {
         self.drain_raster_queue();
         self.aperture_traffic.lfb_writes += 1;
+        self.content_drawn_since_yield = true;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
         let write_depth = self.lfb_pipeline_writes_depth();
@@ -1540,6 +1573,7 @@ impl Distira {
     pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
         self.drain_raster_queue();
         self.aperture_traffic.lfb_writes += 1;
+        self.content_drawn_since_yield = true;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
         let write_depth = self.lfb_pipeline_writes_depth();
