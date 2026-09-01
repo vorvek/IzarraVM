@@ -282,6 +282,12 @@ mod eager_flags;
 #[path = "cpu_jit_string_callout_test.rs"]
 mod string_callout;
 
+/// The group-2 shift/rotate MEMORY lane (`0xC0`/`0xC1`/`0xD0`/`0xD1` with a ModRM memory operand),
+/// the follow-up `#784` named. Nested here for the reason the eight modules above are: it wants
+/// this module's `ENTRY`, `STACK_TOP` and `flat_cpu` rather than a tenth copy of them.
+#[path = "cpu_jit_group2_mem_test.rs"]
+mod group2_mem;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a
