@@ -3510,6 +3510,9 @@ mod width_lift;
 #[path = "cpu_jit_interpret_one_test.rs"]
 mod interpret_one;
 
+#[path = "cpu_jit_int_imm8_admission_test.rs"]
+mod int_imm8_admission;
+
 #[path = "cpu_jit_direct_timing_test.rs"]
 mod timing;
 
