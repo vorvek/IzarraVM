@@ -58,11 +58,14 @@ const JMP_FAR: [u8; 5] = [0xea, 0x00, 0x04, 0x20, 0x00];
 /// below drives to the self-loop rather than to `TARGET_LINEAR`.
 const IMUL_WORD: [u8; 6] = [0x69, 0x1e, 0x00, 0x06, 0x10, 0x00];
 /// A `0x66`-prefixed `RETF`: opcode `0xcb`, so `PACK_FLAG_NONCONT_BREAK_PROBE` is set from the
-/// opcode alone (step one) exactly as the bare `RETF` above sets it, but the operand-size override
-/// makes `retf_admitted_here`'s `insn.prefixes == Prefixes::default()` conjunct false (step two).
-/// Pins that the pack bit passing is not sufficient: the run loop must still refuse to key this
-/// entry at all, the same `absent`-forever outcome the `IMUL_WORD` fixture pins for a different
-/// reason (an opcode the probe policy never admits in the first place).
+/// opcode alone (step one) exactly as the bare `RETF` above sets it, but `retf_admitted_here`
+/// (step two) refuses it anyway. The single `0x66` byte moves TWO of its conjuncts at once:
+/// `operand_size` is `default_32 XOR override`, so it reads `Dword` in this 16-bit segment, and
+/// `insn.prefixes.operand_size_override` is the same bit, so `insn.prefixes != Prefixes::default()`
+/// too -- this shape does not isolate the two terms, and either alone still refuses it. Pins that
+/// the pack bit passing is not sufficient: the run loop must still refuse to key this entry at all,
+/// the same `absent`-forever outcome the `IMUL_WORD` fixture pins for a different reason (an opcode
+/// the probe policy never admits in the first place).
 const RETF_OPSIZE_OVERRIDE: [u8; 2] = [0x66, 0xcb];
 
 /// Where the far return goes: selector 0x0020 (base 0x200) at offset 0x0400, linear 0x600.
@@ -197,6 +200,21 @@ fn class(cpu: &CpuGsw, label: &str) -> u64 {
         .find(|(name, _)| *name == label)
         .unwrap_or_else(|| panic!("missing unbound-target class {label}"))
         .1
+}
+
+/// Every `unbound_targets` row except `absent`, summed structurally off the snapshot's own row
+/// list rather than a hand-maintained label enumeration. `UnboundTarget::ALL` is what backs
+/// `unbound_targets`, and `unbound_target_classes_are_exhaustive` pins that every member appears
+/// there -- so a future ninth variant shows up in this sum automatically instead of needing an
+/// edit here to stay caught, which is the exact failure mode a hand-listed sum would reintroduce.
+fn every_class_but_absent(cpu: &CpuGsw) -> u64 {
+    cpu.direct_barrier_census_snapshot()
+        .expect("the census is enabled for this fixture")
+        .unbound_targets
+        .iter()
+        .filter(|(name, _)| *name != "absent")
+        .map(|(_, count)| *count)
+        .sum()
 }
 
 /// The whole defect, in one fixture: the `RETF` entry acquires a state and the predecessor's
@@ -494,13 +512,7 @@ fn a_walk_admissible_non_probe_opcode_is_never_probed_at_a_break_site() {
             .unbound_targets
     );
     assert_eq!(
-        class(&cpu, "no_key")
-            + class(&cpu, "seen")
-            + class(&cpu, "dormant_heat")
-            + class(&cpu, "dormant_other")
-            + class(&cpu, "rejected")
-            + class(&cpu, "compiled")
-            + class(&cpu, "compiled_retired"),
+        every_class_but_absent(&cpu),
         0,
         "a break-site probe at the IMUL would show up as one of these classes -- every class but \
          `absent` -- so a future heat-gate change that parks the IMUL entry dormant instead of \
@@ -515,9 +527,13 @@ fn a_walk_admissible_non_probe_opcode_is_never_probed_at_a_break_site() {
 /// `PACK_FLAG_NONCONT_BREAK_PROBE` is written from `non_continuable_break_probe_candidate`, which
 /// reads the opcode alone -- so a `0x66`-prefixed `RETF` sets the same pack bit a bare `RETF` does.
 /// The run loop still must not key this entry: `walk_admits_non_continuable_entry` also runs
-/// `retf_admitted_here`, which demands `insn.prefixes == Prefixes::default()`, and the operand-size
-/// override fails that. Without step two the entry would compile a second block exactly as the
-/// bare `RETF` fixture above does, just with the wrong operand width baked into the emitted code.
+/// `retf_admitted_here`, and the `0x66` byte moves two of its conjuncts at once (see
+/// `RETF_OPSIZE_OVERRIDE`'s doc) -- `insn.operand_size == OperandSize::Word` and
+/// `insn.prefixes == Prefixes::default()` each independently refuse this shape, so removing either
+/// one alone still leaves the fixture green; the red-proof below drops both. Without step two the
+/// entry would be KEYED and PARKED (`seen` 1, `dormant_other` 7) rather than staying absent --
+/// never compiled, since the lowering itself still refuses the Dword width one step later, but the
+/// key and its watch-span residue are the permanent cost the gate exists to avoid.
 #[test]
 fn a_0x66_prefixed_retf_still_refuses_the_break_probe() {
     let (mut cpu, mut bus) = staged_with(true, &RETF_OPSIZE_OVERRIDE);
@@ -548,16 +564,10 @@ fn a_0x66_prefixed_retf_still_refuses_the_break_probe() {
             .unbound_targets
     );
     assert_eq!(
-        class(&cpu, "no_key")
-            + class(&cpu, "seen")
-            + class(&cpu, "dormant_heat")
-            + class(&cpu, "dormant_other")
-            + class(&cpu, "rejected")
-            + class(&cpu, "compiled")
-            + class(&cpu, "compiled_retired"),
+        every_class_but_absent(&cpu),
         0,
-        "step two (`retf_admitted_here`'s prefix conjunct) must refuse this entry even though \
-         step one (the opcode-only pack bit) passed; none of these classes may move: {:?}",
+        "step two (`retf_admitted_here`'s operand-size conjunct) must refuse this entry even \
+         though step one (the opcode-only pack bit) passed; none of these classes may move: {:?}",
         cpu.direct_barrier_census_snapshot()
             .unwrap()
             .unbound_targets
