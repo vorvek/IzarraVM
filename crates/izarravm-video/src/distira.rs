@@ -349,6 +349,11 @@ impl TriangleDepth {
 struct PendingSwap {
     target_base: u32,
     interval: u8,
+    /// `content_drawn_since_yield` snapshotted at SWAPBUFFER issue, not read
+    /// again at retire. A triangle submitted after this swap command but
+    /// before its retrace must not license THIS swap to re-arm the mux --
+    /// that content belongs to the frame after.
+    may_enable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,7 +849,7 @@ impl Distira {
             edges -= until_swap;
             self.pending_swap = None;
             self.retrace_count = 0;
-            self.present_swap(pending.target_base);
+            self.present_swap(pending.target_base, pending.may_enable);
             self.start_next_swap();
         }
     }
@@ -866,9 +871,9 @@ impl Distira {
         }
     }
 
-    fn present_swap(&mut self, target_base: u32) {
+    fn present_swap(&mut self, target_base: u32, may_enable: bool) {
         self.scanout_base = target_base;
-        if self.content_drawn_since_yield {
+        if may_enable {
             self.display_enabled = true;
         }
     }
@@ -884,14 +889,19 @@ impl Distira {
             let Some(value) = self.swap_commands.pop_front() else {
                 return;
             };
+            // Snapshot at issue time. A retrace-synced swap must not read
+            // this again when it retires: content submitted while the swap
+            // sits pending belongs to the NEXT frame, not this one.
+            let may_enable = self.content_drawn_since_yield;
             self.rotate_buffers();
             let target_base = self.display.front_base;
             if value & SWAPBUFFER_SYNC_TO_RETRACE == 0 {
-                self.present_swap(target_base);
+                self.present_swap(target_base, may_enable);
             } else {
                 self.pending_swap = Some(PendingSwap {
                     target_base,
                     interval: ((value >> 1) & SWAPBUFFER_INTERVAL_MASK) as u8,
+                    may_enable,
                 });
             }
         }
@@ -1072,7 +1082,7 @@ impl Distira {
     pub fn swap_buffers(&mut self) {
         self.drain_raster_queue();
         self.rotate_buffers();
-        self.present_swap(self.display.front_base);
+        self.present_swap(self.display.front_base, self.content_drawn_since_yield);
     }
 
     pub fn draw_triangle(&mut self, vertices: [DistiraVertex; 3]) -> u64 {
@@ -1150,9 +1160,6 @@ impl Distira {
         coverage: Option<SstTriangleCoverage>,
         defer: bool,
     ) -> u64 {
-        // A rasterised triangle is real Voodoo content, not an idle vsync
-        // heartbeat. See `content_drawn_since_yield`.
-        self.content_drawn_since_yield = true;
         let count_fbi_pixels = coverage.is_some();
         if count_fbi_pixels {
             self.triangle_census.submitted += 1;
@@ -1295,6 +1302,14 @@ impl Distira {
             });
         }
         let written = self.merge_pixel_stats(&lane_stats, &jobs, lanes);
+        if written > 0 {
+            // Pixels actually landed in the framebuffer: real Voodoo
+            // content, not an idle vsync heartbeat. A degenerate zero-area
+            // triangle, or one clipped away to an empty box, contributes
+            // zero here and must not arm the mux -- see
+            // `content_drawn_since_yield`.
+            self.content_drawn_since_yield = true;
+        }
         self.raster_queue.recycle(jobs);
         written
     }
@@ -1484,10 +1499,14 @@ impl Distira {
         }
     }
 
+    // No `content_drawn_since_yield` re-arm here: `vega.rs::write_wide_memory`
+    // silently drops `BusWidth::Byte` before it reaches the Distira LFB, so
+    // this method has no caller in the workspace today. That drop is a
+    // separate, pre-existing bug (a guest that wrote the LFB a byte at a time
+    // would lose every pixel) and is not this PR's to fix.
     pub fn write_lfb_u8(&mut self, offset: usize, value: u8) {
         self.drain_raster_queue();
         self.aperture_traffic.lfb_writes += 1;
-        self.content_drawn_since_yield = true;
         let base = if self.lfb_mode & LFB_FORMAT_MASK == LFB_FORMAT_DEPTH {
             self.aux_base
         } else {
