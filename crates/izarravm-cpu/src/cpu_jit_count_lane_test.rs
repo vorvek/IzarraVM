@@ -1059,21 +1059,18 @@ fn near_miss_shapes_take_no_count_lane() {
         0,
         "0x66-prefixed 0xC1 shift"
     );
-    // The MEMORY destination form of `0xC1` never reaches the lane matcher at all: classify's
-    // group-2 arms take `DecodedOperand::Reg` only, so the walk breaks at the instruction and the
-    // whole fixture span is rejected rather than compiled with a baked count. Pinned as the
-    // OUTCOME rather than as a lane count, because a lane count would be a statement about a block
-    // that does not exist.
-    let mut cpu = flat_cpu();
-    let mut bus = test_bus(image_from(&[0xc1, 0x05, 0x00, 0x20, 0x00, 0x00, 0x03]));
-    decode_at(&mut cpu, &mut bus, &block_starts(7));
-    guest_store_dword(&mut cpu, &mut bus, 0x2000, 0);
-    assert!(
-        matches!(
-            jit::direct::compile(&mut cpu, ENTRY, true),
-            jit::direct::CompileOutcome::StructuralReject(_)
-        ),
-        "0xC1 with a memory destination must be refused before the lane matcher"
+    // The MEMORY destination form of `0xC1` takes NO lane. It used to be pinned as a compile
+    // OUTCOME, because classify's group-2 arms bound `DecodedOperand::Reg` only and the block did
+    // not exist to count lanes in. `vorvek/direct-rot-mem-lane` gives it
+    // `DirectKind::RotateShiftMem`, so the block compiles now and the claim is pinned where it
+    // belongs: `count_lane_for` matches `RotateReg` and `Shift` BY NAME and ends in a catch-all
+    // `return None`, so the new kind cannot reach a lane whatever its encoding looks like. This is
+    // the stronger assertion of the two -- the old one would have gone green again for the wrong
+    // reason the moment the memory form was admitted.
+    assert_eq!(
+        lanes_registered_for_warm(&[0xc1, 0x05, 0x00, 0x20, 0x00, 0x00, 0x03], 5, &[0x2000]),
+        0,
+        "0xC1 with a memory destination takes no count lane"
     );
     // `0x80 /r`, the other one-byte immediate family: `imm_len == 1` and `len == 3` like the
     // admitted shape, but its kind is `AluByteImm` and its lane belongs to the OTHER arm, which is

@@ -4973,6 +4973,64 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
         addr: DirectAddr,
     },
+    /// Group-2 shift/rotate with a MEMORY destination: `0xC0`/`0xC1` (imm8 count) and
+    /// `0xD0`/`0xD1` (count 1), sub-opcodes `/0` ROL, `/1` ROR, `/4` SHL, `/5` SHR and `/7` SAR.
+    ///
+    /// `123-talk-shareware`'s `0xD1 /1` word memory row is 29,698,831 runtime hits and 66.8% of
+    /// that game's whole static unbound class, the largest single row on the 2026-09-01 board.
+    /// `#784` lowered the register lanes and named this as the follow-up it could not reach:
+    /// `RotateReg`, `RotateRegByte` and `Shift` all bind `DecodedOperand::Reg`, and no kind in
+    /// this file carried a read-modify-write memory lane for the family.
+    ///
+    /// **One kind for both sub-opcode families, where the register side splits into `RotateReg`
+    /// and `Shift`, and the asymmetry is deliberate.** That split exists because the two register
+    /// emitters differ in their WHOLE body: `emit_shift`'s falls through to an arithmetic shift
+    /// right and publishes the RBP shadow wholesale, which would be wrong for a rotate twice over.
+    /// Here the body is the memory gauntlet -- one effective address, one page-kind check, one
+    /// permission check, one code-watch probe, two bias lookups and one mode-13 tail -- and it is
+    /// IDENTICAL for all five sub-opcodes. Only the flag capture differs, and it differs by one
+    /// mask and one three-line tail. Two kinds would mean two copies of the gauntlet, which is
+    /// the duplication this tree refuses rather than the separation the register side needs.
+    ///
+    /// `op` is the guest ModRM `reg` field and is passed STRAIGHT into the encoder's `/op` slot:
+    /// host group 2 numbers its sub-opcodes exactly as the guest does. `/6`, the undocumented SAL
+    /// alias, is NORMALISED to `4` at classify, so this field only ever carries a documented
+    /// sub-opcode and no part of the lowering depends on undocumented host behaviour. `/2` RCL and
+    /// `/3` RCR never appear: both take the incoming CF as a rotate INPUT (`shift_rotate` seeds
+    /// `cf` from `flag(FLAG_CF)` before its loop), which needs the guest flags loaded into the host
+    /// BEFORE the rotate rather than only captured after it. `emit_rotate_shift_mem` narrows `op`
+    /// again in RELEASE-live code rather than trusting this doc.
+    ///
+    /// `count` is the MASKED count and is guaranteed non-zero. classify applies `& 0x1f` and
+    /// refuses the zero case rather than lowering it, which is an accounting requirement and not a
+    /// semantic one: `execute.rs`'s group-2 arm reads the operand and writes it back even when
+    /// `shift_rotate` returns early, so the interpreter performs one read and one store at count
+    /// zero. An emitted form that elided both would register static read and store counts the
+    /// emitted code never produces, which is the static-versus-dynamic disagreement that
+    /// underflows the bus charge.
+    ///
+    /// `width` is `Byte` for `0xC0`/`0xD0`, whose width is the opcode's low bit, and the decoded
+    /// operand width for `0xC1`/`0xD1`. All three are reachable.
+    ///
+    /// No `raw_clocks` field and none is owed: the interpreter's whole group-2 arm returns
+    /// `Ok(clocks(2))` without consulting `operand_size`, which IS the `_ => 2` default.
+    ///
+    /// **NOT in `is_memory_alu`, and that is a decision rather than an omission.** That predicate
+    /// gates `MAX_MEMORY_ALU_SLOTS` and `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, a CODE SIZE bound on
+    /// the kilobyte-scale emitters. This kind's emitter is `emit_rmw_inc_dec`'s shape and
+    /// `RmwIncDec` is outside the predicate too, so joining it would price this row differently
+    /// from the read-modify-write it is modelled on. The cost of being wrong either way is bounded
+    /// and is only a cost: too generous and a long run of these overruns the one-host-page install
+    /// limit, at which point `compile_with_page_len`'s binary search lands on a shorter block; too
+    /// strict and the walk stops at four instructions when the page had room. Nothing here is a
+    /// correctness question. If a fixture ever shows this row driving blocks into that fallback,
+    /// adding it to `is_memory_alu` is the one-line answer.
+    RotateShiftMem {
+        op: u8,
+        count: u8,
+        width: MemoryWidth,
+        addr: DirectAddr,
+    },
     Push {
         source: StoreSource,
     },
@@ -5667,8 +5725,11 @@ pub(crate) struct DirectAddr {
     /// The lane arm forms the address through EAX alone, so it is safe whatever a caller has
     /// staged in the other scratch registers — and, for the Store admission, both store emitters
     /// were checked to stage NOTHING across it (`emit_store` and `emit_store_fast` both form the
-    /// address first). An `AluMemSource` / `RmwIncDec` / x87 admission is still unmeasured and
-    /// still owes its own review and census row.
+    /// address first). An `AluMemSource` / `RmwIncDec` / `RotateShiftMem` / x87 admission is still
+    /// unmeasured and still owes its own review and census row. `RotateShiftMem` is named here
+    /// rather than left to the general clause because it has LIVE STATE across its address form:
+    /// the flag capture reads the host flags of one instruction it emitted itself, so a lane
+    /// staged inside the address work would have to be proven not to disturb them.
     pub(crate) disp_lane: Option<ImmLane>,
 }
 
@@ -5829,6 +5890,9 @@ impl DirectKind {
             } | Self::TestImmMem {
                 width: MemoryWidth::Byte,
                 ..
+            } | Self::RotateShiftMem {
+                width: MemoryWidth::Byte,
+                ..
             }
         ))
     }
@@ -5850,6 +5914,9 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::RmwIncDec {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::RotateShiftMem {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::Pop16 { .. }
@@ -5889,6 +5956,9 @@ impl DirectKind {
                 } | Self::RmwIncDec {
                     width: MemoryWidth::Dword,
                     ..
+                } | Self::RotateShiftMem {
+                    width: MemoryWidth::Dword,
+                    ..
                 } | Self::DoubleShiftMem { .. }
                     | Self::ImulMem { .. }
                     | Self::ImulMemAcc { .. }
@@ -5925,6 +5995,10 @@ impl DirectKind {
                     width: MemoryWidth::Byte,
                     ..
                 } | Self::SetCcMem { .. }
+                    | Self::RotateShiftMem {
+                        width: MemoryWidth::Byte,
+                        ..
+                    }
             ) || matches!(
                 self,
                 Self::AluMemDest {
@@ -5944,6 +6018,9 @@ impl DirectKind {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::RmwIncDec {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::RotateShiftMem {
                     width: MemoryWidth::Word,
                     ..
                 } | Self::Push16 { .. }
@@ -5979,6 +6056,9 @@ impl DirectKind {
                     width: MemoryWidth::Dword,
                     ..
                 } | Self::RmwIncDec {
+                    width: MemoryWidth::Dword,
+                    ..
+                } | Self::RotateShiftMem {
                     width: MemoryWidth::Dword,
                     ..
                 } | Self::DoubleShiftMem { .. }
@@ -6030,6 +6110,15 @@ impl DirectKind {
     /// guard their STACK access too, but that address is ESP-relative and so is never decidable by
     /// the caller; only the source address is reported here.
     ///
+    /// **`RotateShiftMem` is DELIBERATELY absent, and the omission is the point of that kind.**
+    /// It is the one read-modify-write emitter whose alignment verdict SERVES rather than exits:
+    /// `emit_rotate_shift_mem` keeps `emit_page_cross_bound` and replaces `emit_alignment_test`
+    /// with a dynamic split deposit. Listing it here would make `certainly_exits_on_alignment`
+    /// refuse every statically odd CS-override word rotate that the emitter now runs natively,
+    /// which is a missed lowering rather than the certain exit this rule was built to catch. Its
+    /// crossing half is still a side exit and is still not decidable here, exactly as no other
+    /// kind's is.
+    ///
     /// **Stated at the shipped one-lookup defaults.** `Load`, `LoadExtend`, `AluMemSource`,
     /// `ImulMem`, `ImulMemAcc`, `TestImmMem`, `Store`, `SetCcMem` and CMP's read all dispatch to a
     /// relaxed site through `emit_ram_read_pointer` / `emit_store`, and they do so only while
@@ -6078,6 +6167,7 @@ impl DirectKind {
             | Self::TestImmMem { addr, .. }
             | Self::DivMem { addr, .. }
             | Self::RmwIncDec { addr, .. }
+            | Self::RotateShiftMem { addr, .. }
             | Self::PushMem { addr, .. }
             | Self::JmpMem { addr, .. }
             | Self::CallMem { addr, .. }
@@ -6258,6 +6348,7 @@ impl DirectKind {
         match self {
             Self::Store { addr, .. }
             | Self::RmwIncDec { addr, .. }
+            | Self::RotateShiftMem { addr, .. }
             | Self::SetCcMem { addr, .. }
             | Self::DoubleShiftMem { addr, .. } => Some(addr.segment),
             Self::AluMemDest {
@@ -7681,10 +7772,11 @@ fn count_lane_for(
 /// * `0xC0`/`0xC1` carry an `imm8` and it is the instruction's LAST byte (`physical + len - 1`).
 ///   That is the byte duke patches: the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows.
 /// * `0xD1` has no immediate at all -- its count is the literal 1 baked into the OPCODE, so the
-///   only byte that can change the count is the opcode byte itself. Register form only (classify
-///   admits nothing else), so the encoding is prefixes + opcode + modrm and the opcode sits at
-///   `physical + len - 2`. Gating a `0xD1` on its opcode byte is the faithful inversion rather
-///   than a widening: a `D1 -> C1` patch is exactly the write that would kill a block spanning it.
+///   only byte that can change the count is the opcode byte itself. REGISTER FORM ONLY, tested
+///   rather than assumed since the memory lane landed, so the encoding is prefixes + opcode +
+///   modrm and the opcode sits at `physical + len - 2`. Gating a `0xD1` on its opcode byte is the
+///   faithful inversion rather than a widening: a `D1 -> C1` patch is exactly the write that would
+///   kill a block spanning it.
 fn rotate_row_count_byte(insn: &DecodedInsn, physical: u32) -> Option<u32> {
     let reg = insn.modrm?.reg;
     match insn.opcode {
@@ -7696,6 +7788,22 @@ fn rotate_row_count_byte(insn: &DecodedInsn, physical: u32) -> Option<u32> {
             // a future widening of the admitted shape degrades to "no gate site, refuse" instead
             // of probing an unrelated byte.
             if insn.imm_len != 0 || insn.disp_len != 0 {
+                return None;
+            }
+            // THE REGISTER FORM ONLY, and this bar is load-bearing rather than a restatement of
+            // the test above. `vorvek/direct-rot-mem-lane` admits the MEMORY form of `0xD1 /0`,
+            // and a memory operand with `mod = 00, rm = 100` carries a SIB byte and no
+            // displacement -- so `imm_len` and `disp_len` are both zero, `len` is one larger than
+            // the register form's, and `physical + len - 2` lands on the ModRM byte rather than
+            // the opcode. The gate would then read an unrelated byte's heat record.
+            //
+            // Barring the memory form leaves it UNGATED (`None` here means "no site", which
+            // `rotate_row_count_byte_is_patched` reports as not patched, which admits). That is
+            // the same answer `0xD0` already gets and for the same reason: `D1 -> C1` changes the
+            // instruction LENGTH as well as the count, so it is an ordinary code write the
+            // block-kill machinery already handles, not the narrow in-place count patch this gate
+            // was built for.
+            if !matches!(insn.operand, Some(DecodedOperand::Reg(_))) {
                 return None;
             }
             return physical.checked_add(u32::from(insn.len).checked_sub(2)?);
@@ -15536,6 +15644,15 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // produce a kind whose width is a literal `Byte` fact, not a decoded one, which is exactly
         // the property the ungated list above is built on.
         //
+        // THE MEMORY FORM RIDES THIS TERM UNCHANGED, and the term needed no widening for it: it
+        // keys on `insn.opcode` and `m.reg` alone and has always been form-agnostic. What changed
+        // with `vorvek/direct-rot-mem-lane` is the sentence above rather than the test -- a memory
+        // `0xC0`/`0xD0` now produces `DirectKind::RotateShiftMem`, whose `width` field this arm
+        // sets to a literal `MemoryWidth::Byte` for exactly the reason `Shift`'s and
+        // `RotateRegByte`'s arms do. The closure rule holds for it verbatim: the width is the
+        // opcode's low bit, not the decoded operand size, so the emitted code does not read
+        // `operand_width` at all.
+        //
         // NOT the `0xa1`/`0xa3` hazard the header names: those hard-coded `MemoryWidth::Dword` and
         // would have moved four bytes where the guest moves two. `Shift` HAS a width field and
         // these arms set it to a literal `Byte`; `RotateRegByte` has no width field because it is
@@ -17329,7 +17446,10 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     _ => return None,
                 }
                 let DecodedOperand::Reg(dst) = insn.operand? else {
-                    return None;
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None;
+                    };
+                    return group_two_mem_kind(m.reg, insn.imm as u8, MemoryWidth::Byte, addr);
                 };
                 if matches!(m.reg, 0 | 1) {
                     return Some(DirectKind::RotateRegByte {
@@ -17401,7 +17521,10 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     _ => return None,
                 }
                 let DecodedOperand::Reg(dst) = insn.operand? else {
-                    return None;
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None;
+                    };
+                    return group_two_mem_kind(m.reg, 1, MemoryWidth::Byte, addr);
                 };
                 if matches!(m.reg, 0 | 1) {
                     return Some(DirectKind::RotateRegByte {
@@ -17455,12 +17578,23 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 if m.reg == 0 && !rotate_rows_enabled() {
                     return None;
                 }
-                let DecodedOperand::Reg(dst) = insn.operand? else {
-                    return None;
-                };
                 // The RAW immediate, unmasked, matching what the Shift arm has always stored. The
                 // architectural five-bit mask is applied in the emitter.
                 let count = if opcode == 0xd1 { 1 } else { insn.imm as u8 };
+                let DecodedOperand::Reg(dst) = insn.operand? else {
+                    // THE MEMORY FORM, `vorvek/direct-rot-mem-lane`, and it is the largest single
+                    // row on the 2026-09-01 board: `123-talk-shareware`'s `0xD1 /1` word memory
+                    // row is 29,698,831 runtime hits, 66.8% of that game's whole static unbound
+                    // class. It stayed refused through `#784` because every group-2 kind in this
+                    // file bound `DecodedOperand::Reg`; `DirectKind::RotateShiftMem` is the
+                    // read-modify-write lane that reaches it. RCL and RCR are unaffected -- the
+                    // `matches!(m.reg, 0 | 1 | 4..=7)` guard above has already refused them, and
+                    // `group_two_mem_kind` re-states the narrowing rather than assuming it.
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None;
+                    };
+                    return group_two_mem_kind(m.reg, count, operand_width, addr);
+                };
                 if matches!(m.reg, 0 | 1) {
                     // BOTH rotates are now admitted at Word (the `vorvek/direct-word-rot1` slice),
                     // via the same width field `Shift`'s Word arm carries: `emit_rotate_reg` picks
@@ -18074,6 +18208,60 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         });
     }
     None
+}
+
+/// The MEMORY half of the three group-2 imm8/by-one classify arms, shared by all three rather
+/// than written out per opcode.
+///
+/// One function because the three arms differ in exactly two things by the time they reach it --
+/// the width (`Byte` for `0xC0`/`0xD0`, the decoded operand width for `0xC1`/`0xD1`) and where
+/// the count came from (a decoded immediate or the opcode's literal 1) -- and both arrive as
+/// arguments. Everything else is one rule for the whole family, so a per-arm copy would be three
+/// places for the RCL/RCR bar and the zero-count bar to drift apart.
+///
+/// **Every knob was already read by the caller.** Each of the three arms tests
+/// `rotate_rows_enabled()` for `/0,/1` and `byte_shift_rows_enabled()` (or, at `0xc1 | 0xd1`, the
+/// `m.reg == 0` bar) for the shifts BEFORE binding the operand, so the memory form rides exactly
+/// the row axis its register sibling does and a knob-off arm refuses both forms identically.
+///
+/// `/2` RCL and `/3` RCR reach this function only through a bug in one of those arms, so the bar
+/// is restated here rather than assumed: both take the incoming CF as a rotate INPUT and have no
+/// emitter at any width or operand form.
+fn group_two_mem_kind(
+    reg: u8,
+    raw_count: u8,
+    width: MemoryWidth,
+    addr: crate::AddrMode,
+) -> Option<DirectKind> {
+    if !matches!(reg, 0 | 1 | 4..=7) {
+        return None;
+    }
+    // The architectural five-bit mask, applied HERE rather than in the emitter, because the zero
+    // case is refused rather than lowered and the refusal has to be decided on the masked value:
+    // `rol word [m], 32` is the no-op shape and `rol word [m], 33` is a rotate by one.
+    //
+    // THE ZERO CASE IS AN ACCOUNTING REFUSAL, not a semantic one. `execute.rs`'s group-2 arm reads
+    // the operand and writes it back even when `shift_rotate` returns before touching a value or a
+    // flag, so the interpreter performs one read and one store at count zero. `word_reads` and
+    // `word_stores` register this kind's access statically from its width alone, and an emitted
+    // form that elided both would report a static count the emitted code never produces. Lowering
+    // it as a genuine read-and-write-back would be sound too, but it would spend the whole
+    // gauntlet on an instruction no corpus row executes.
+    let count = raw_count & 0x1f;
+    if count == 0 {
+        return None;
+    }
+    Some(DirectKind::RotateShiftMem {
+        // `/6` is the undocumented SAL alias of `/4` and is NORMALISED here rather than passed
+        // through, exactly as the `0xc0` register arm normalises it: the encoder puts `op` into the
+        // ModRM `/op` slot verbatim, so without this the host would execute a real `C1 /6`.
+        // `core.rs`'s `4 | 6 => // SHL` already treats the two as one arm, so nothing observable
+        // changes. The CENSUS still bins by `insn.modrm.reg` and still reports `/6`.
+        op: if reg == 6 { 4 } else { reg },
+        count,
+        width,
+        addr: direct_addr(addr)?,
+    })
 }
 
 fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
@@ -19178,6 +19366,28 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
                 emit_rmw_inc_dec(&mut e, is_dec, width, addr, memory, reasons);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    width.needs_alignment_guard(),
+                    memory.cpl3,
+                    true,
+                );
+                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+            }
+            DirectKind::RotateShiftMem {
+                op,
+                count,
+                width,
+                addr,
+            } => {
+                let side = e.label();
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_rotate_shift_mem(&mut e, op, count, width, addr, memory, reasons);
+                // The cross-page label is still requested at Word and Dword: this emitter serves
+                // the ALIGNMENT half of the guard for RAM but keeps the CROSSING half as a side
+                // exit for every kind, and re-runs the alignment verdict for a misaligned Mode
+                // 13h access (N1), so the stub is referenced on both paths and must be placed.
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
@@ -25439,6 +25649,315 @@ fn emit_rmw_inc_dec_dword(
     e.store_r32_disp8(Reg::RDX, 0, Reg::RAX);
 }
 
+/// Group-2 shift/rotate with a MEMORY destination: `0xC0`/`0xC1`/`0xD0`/`0xD1`, sub-opcodes `/0`
+/// ROL, `/1` ROR, `/4` SHL, `/5` SHR and `/7` SAR, at Byte, Word or Dword.
+///
+/// `123-talk-shareware`'s `0xD1 /1` word memory row is 29,698,831 runtime hits and 66.8% of that
+/// game's whole static unbound class. `#784` lowered the register lanes and named this emitter as
+/// the follow-up it could not write.
+///
+/// # The memory front is `emit_rmw_inc_dec`'s, with ONE deliberate difference
+///
+/// The effective address, the page-kind classify, the write-permission check, the code-watch
+/// probe, the address/kind pack and the read-bias/write-bias pair are that function's word arm
+/// line for line, including the RCX recompute after the code-watch join that `emit_push_mem`'s
+/// comment names as the silent failure if it is skipped.
+///
+/// The difference is the ALIGNMENT verdict, and it is the whole reason this emitter can carry a
+/// Word row at all. `emit_wide_page_guard` sends every misaligned Word or Dword access to a side
+/// exit, and 16-bit DOS code has no alignment discipline: admitted under that guard, an odd
+/// operand would sit INSIDE the block and exit at that slot on EVERY execution, which is strictly
+/// worse than the barrier it replaced. That is the economics the `0x01`-family form-1 arm records
+/// when it refuses Word memory for the writing ALU ops, and the reason it names the read-and-write
+/// deposit pair as the prerequisite.
+///
+/// This emitter pays that prerequisite directly rather than borrowing a lean stub. It splits the
+/// guard's two halves:
+///
+/// * the PAGE-CROSSING half stays a side exit, because a two- or four-byte access that straddles
+///   the page boundary spans two FastMap entries and the one bias this slot resolved is right for
+///   only one of them;
+/// * the ALIGNMENT half is SERVED. A misaligned but page-local access reaches the same host bytes
+///   through the same bias, so the only thing it owes is the bus charge, and the tail deposits it
+///   dynamically -- TWICE, because a read-modify-write performs two split accesses where the lean
+///   store stub performs one. `run.rs` prices `ram_byte_writes` through the same
+///   `jit_data_cost_clocks(Byte)` as `ram_byte_reads`, which is why one pool takes both.
+///
+/// Byte skips both halves: `needs_alignment_guard()` is false there, a one-byte access cannot
+/// straddle a page, and it owes no split charge.
+///
+/// **The alignment relaxation is a RAM-only claim.** A misaligned access to the Mode 13h aperture
+/// re-runs `emit_alignment_test` and side exits, exactly as every other Mode 13h-admitting emitter
+/// does (`emit_alu_mem_dest`, `emit_rmw_inc_dec_dword`, `emit_push_mem`): `memory.rs`'s
+/// `is_mode13_aperture` and `run.rs`'s split-cost comment both assert that nothing in the RAM
+/// split-cost pool came from the aperture, and this emitter's misalignment service must not be the
+/// first place that assertion goes false.
+///
+/// # The flag tail, and why the store sits in the middle of it
+///
+/// The capture masks are the REGISTER lanes' verbatim, because the two must define the same set
+/// for the same instruction at the same count:
+///
+/// * a rotate at a masked count of 1 captures `CF|OF`, publishes the RBP shadow and clears the
+///   descriptor (`emit_rotate_reg`'s count-1 branch);
+/// * a rotate above count 1 captures CF alone and routes it through `emit_set_cf_only`, because a
+///   rotate architecturally PRESERVES SF, ZF, PF and AF and must not publish the shadow wholesale;
+/// * a shift captures `SHIFT_DEFINED` plus OF at count 1 and publishes, which is
+///   `emit_commit_shift_flags` inlined rather than called, so the store can sit between the
+///   capture and the publish.
+///
+/// **That store position is a requirement, not a preference.** `emit_capture_flags` writes only
+/// RDI and RBP, so the shifted value in RAX and the write pointer in RDX both survive it. The
+/// PUBLISH does not: `emit_set_cf_only`'s non-eager arm writes RAX and RDI. Storing after the
+/// capture and before the publish is what keeps the rotate-above-1 path from writing a flags
+/// intermediate into guest memory. Nothing may be inserted between the host group-2 instruction
+/// and the capture's `pushfq`, for the ordinary reason: the capture is reading that instruction's
+/// own flags.
+///
+/// A masked count of zero never reaches here. `classify` refuses it, for the accounting reason
+/// `group_two_mem_kind` states.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_rotate_shift_mem(
+    e: &mut Encoder,
+    op: u8,
+    count: u8,
+    width: MemoryWidth,
+    addr: DirectAddr,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
+    // A RELEASE-LIVE narrowing, not a `debug_assert`. `shift_r8_imm8` and its two siblings push
+    // `op` into the ModRM `/op` slot with no translation and no table, so a `/2` or `/3` that ever
+    // slipped past `classify` would become a real host RCL or RCR seeded with the HOST's carry --
+    // a silent miscompile in exactly the release builds the census grades on.
+    let is_rotate = match op {
+        0 | 1 => true,
+        4 | 5 | 7 => false,
+        _ => unreachable!("RCL, RCR and /6 never reach the group-2 memory emitter"),
+    };
+    debug_assert!(
+        count != 0 && count <= 0x1f,
+        "classify masks the count and refuses the zero case"
+    );
+    let map = memory.map.expect("native group-2 RMW has fast-map bases");
+    let code_watch_tables = memory
+        .code_watch_tables
+        .expect("native group-2 RMW has code-watch tables");
+    emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, true);
+    if width.needs_alignment_guard() {
+        // The crossing half ALONE. See the header: the alignment half is served, not refused.
+        emit_page_cross_bound(e, width, Reg::RDX, sides.cross_page_or_alignment);
+    }
+
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_FLAGS,
+        map.flags(),
+        Reg::RDX,
+    );
+    e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.mov_r32_r32(Reg::RDI, Reg::RDX);
+    e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
+    let valid = e.label();
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
+    e.jz(valid);
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
+    e.jnz(sides.unavailable_or_kind);
+    // It is the aperture. This emitter's in-page misalignment service (below) is a RAM-only
+    // claim: `memory.rs`'s `is_mode13_aperture` and `run.rs`'s split-cost comment both assert a
+    // misaligned aperture access is refused everywhere in the tree, so a misaligned aperture row
+    // must not fall through to the RAM split-cost deposit. Re-run `emit_alignment_test` for the
+    // aperture arm alone, matching `emit_wide_page_guard`'s discipline at every other Mode
+    // 13h-admitting emitter. RCX is free here -- it is unconditionally recomputed past `valid` --
+    // so it takes the scratch, leaving RDX's raw flags byte alone for the watched-bit read below.
+    if width.needs_alignment_guard() {
+        emit_alignment_test(e, width, Reg::RCX, sides.cross_page_or_alignment);
+    }
+    e.place(valid);
+    if memory.watch_page_bit {
+        // D3's carry shape, `emit_rmw_inc_dec`'s verbatim: RCX is dead here (the page index is
+        // recomputed after the join), so it carries the PAGE_WATCHED bit across the cpl3
+        // permission check, which destroys the flags byte in RDX.
+        e.mov_r32_r32(Reg::RCX, Reg::RDX);
+        e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_PAGE_WATCHED));
+    }
+    emit_write_permission_check(e, memory.cpl3, sides.permission);
+
+    // EXIT BEFORE ANY MUTATION, which is the ordering `emit_code_watch_branch` is placed for at
+    // every writing site. Unlike INC/DEC this instruction does NOT always change its operand -- a
+    // rotate by a multiple of the operand width is the identity -- so the exit is conservative
+    // here rather than exact. That costs a watched chunk one interpreted execution and is the same
+    // conservatism `emit_watched_store_guard` and `emit_watched_alu_result_guard` already carry:
+    // neither compares the old value against the new one either.
+    let unwatched = e.label();
+    if memory.watch_page_bit {
+        // The permission check clobbered host flags, so re-test the carried bit explicitly.
+        e.cmp_r32_imm32(Reg::RCX, 0);
+        e.jz(unwatched);
+    }
+    emit_code_watch_branch(
+        e,
+        width,
+        memory.r15_tables,
+        map,
+        code_watch_tables,
+        sides.code_watch,
+        unwatched,
+    );
+    e.place(unwatched);
+
+    // The address and the MASKED kind, packed into one slot. The mask matters for the tail's
+    // unmasked compare: the watch bit rides in RCX at this site, never in the pack, so the tail
+    // needs no second `and` the way `emit_alu_mem_dest`'s does.
+    e.shift_r64_imm8(4, Reg::RDI, 32);
+    e.or_r64_r64(Reg::RDI, Reg::RAX);
+    e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
+
+    // RCX MUST be recomputed here: `emit_code_watch_branch` leaves one of three watch-probe
+    // intermediates in it depending on which path reached the join.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_READ_BIASES,
+        map.read_biases(),
+        Reg::RDI,
+    );
+    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
+    e.jz(sides.unavailable_or_kind);
+    e.add_r64_r64(Reg::RDI, Reg::RAX);
+    emit_table_base(
+        e,
+        memory.r15_tables,
+        TABLE_SLOT_WRITE_BIASES,
+        map.write_biases(),
+        Reg::RDX,
+    );
+    e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
+    e.jz(sides.unavailable_or_kind);
+    e.add_r64_r64(Reg::RDX, Reg::RAX);
+
+    // The operand goes to RAX, which the linear address no longer needs: the pack above holds it
+    // and the tail reloads it from there.
+    //
+    // A GENUINE 8- OR 16-BIT HOST OPERATION, not a 32-bit one over a zero-extended operand. That
+    // is what makes the flags the host's rather than something this function reconstructs:
+    // `shift_rotate` at `BusWidth::Byte` takes CF from the last bit shifted out of EIGHT, SF from
+    // bit 7 and ZF/PF from the 8-bit result. At `/7` the wrong width is wrong in the VALUE too --
+    // a 32-bit arithmetic shift of a zero-extended byte shifts in zeros where the guest shifts in
+    // bit 7.
+    match width {
+        MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
+        MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
+        MemoryWidth::Dword => e.load_r32_disp8(Reg::RAX, Reg::RDI, 0),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("group-2 memory operands are never 8- or 10-byte wide")
+        }
+    }
+    match width {
+        MemoryWidth::Byte => e.shift_r8_imm8(op, Reg::RAX, count),
+        MemoryWidth::Word => e.shift_r16_imm8(op, Reg::RAX, count),
+        MemoryWidth::Dword => e.shift_r32_imm8(op, Reg::RAX, count),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("group-2 memory operands are never 8- or 10-byte wide")
+        }
+    }
+    let defined = if is_rotate {
+        if count == 1 {
+            crate::FLAG_CF | crate::FLAG_OF
+        } else {
+            crate::FLAG_CF
+        }
+    } else if count == 1 {
+        SHIFT_DEFINED | crate::FLAG_OF
+    } else {
+        SHIFT_DEFINED
+    };
+    emit_capture_flags(e, defined);
+    // Between the capture and the publish. See the header: the publish may write RAX.
+    match width {
+        MemoryWidth::Byte => e.store_r8_disp8(Reg::RDX, 0, Reg::RAX),
+        MemoryWidth::Word => e.store_r16_disp8(Reg::RDX, 0, Reg::RAX),
+        MemoryWidth::Dword => e.store_r32_disp8(Reg::RDX, 0, Reg::RAX),
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("group-2 memory operands are never 8- or 10-byte wide")
+        }
+    }
+    if is_rotate && count != 1 {
+        emit_set_cf_only(e);
+    } else {
+        e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
+        emit_clear_pending(e);
+    }
+
+    e.load_r64_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
+    e.mov_r64_r64(Reg::RCX, Reg::RAX);
+    e.shift_r64_imm8(5, Reg::RCX, 32);
+    e.mov_r32_r32(Reg::RAX, Reg::RAX);
+    if width.needs_alignment_guard() {
+        // The split charge for the alignment half this emitter SERVES. Two deposits, because the
+        // slot performed two accesses at the same address and both are split; the lean store stub
+        // deposits once because it performs one. The gate and the deposit read the same width
+        // model, so a site cannot decide "split" on one criterion and bill from another.
+        let aligned = e.label();
+        debug_assert!(width.alignment_mask() <= 0xff);
+        e.test_r8_low_imm8(Reg::RAX, width.alignment_mask() as u8);
+        e.jz(aligned);
+        emit_dynamic_split_extra(e, width.split_extra_bytes());
+        emit_dynamic_split_extra(e, width.split_extra_bytes());
+        e.place(aligned);
+    }
+    let mode13 = e.label();
+    let done = e.label();
+    e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
+    e.jz(mode13);
+    e.jmp(done);
+    e.place(mode13);
+    // ONE read and ONE store, counted in the lane each width's static accounting used. The Byte
+    // and Dword arms follow `emit_alu_mem_dest`, which is the only precedent that reaches those
+    // two: `emit_rmw_inc_dec`'s Byte arms are `unreachable!` and its Dword arms are dead, because
+    // it forwards Dword to `emit_rmw_inc_dec_dword`, which admits RAM alone and has no mode-13
+    // tail at all.
+    //
+    // Admitting mode 13 at every width where that function refuses it at Dword is safe for a
+    // reason worth stating, because the next reader will want to "restore" the RAM-only check.
+    // `emit_rmw_inc_dec_dword` and `emit_push_mem` refuse it on a COUNTER-ORDERING argument:
+    // `emit_mode13_read_completion` bumps the dynamic read count as soon as the read resolves,
+    // and a store guard that side exits afterwards would leave `run.rs`'s
+    // `dword_reads - exit.mode13_dword_reads` negative. Nothing here can do that. Every guard --
+    // page kind, permission, code watch and both biases -- precedes the read, the store is
+    // unconditional once the read has happened, and both counters are bumped together in this
+    // tail, after both accesses have completed.
+    match width {
+        MemoryWidth::Byte => {
+            emit_dynamic_increment(e, STACK_MODE13_BYTE_READS);
+            emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES);
+        }
+        MemoryWidth::Word => {
+            emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS);
+            emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES);
+        }
+        MemoryWidth::Dword => {
+            emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
+            emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
+        }
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("group-2 memory operands are never 8- or 10-byte wide")
+        }
+    }
+    emit_mode13_dirty_bit(e, memory.r15_tables, map);
+    e.place(done);
+}
+
 /// PUSH r/m32 through memory (0xFF /6).
 ///
 /// Both accesses refuse every page kind but plain RAM, exactly as `emit_rmw_inc_dec_dword` does.
@@ -25581,6 +26100,22 @@ fn emit_push_mem(
     e.load_r64_disp32(Reg::RDI, Reg::RSP, STACK_PUSH_MEM_VALUE);
     e.store_r32_disp8(Reg::RDX, 0, Reg::RDI);
 }
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_rotate_shift_mem(
+    _: &mut Encoder,
+    _: u8,
+    _: u8,
+    _: MemoryWidth,
+    _: DirectAddr,
+    _: MemoryEmitContext,
+    _: MemorySideExits,
+) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
 #[cfg(not(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")

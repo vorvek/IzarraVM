@@ -923,20 +923,22 @@ fn byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds() {
                 seg.label()
             );
         }
-        // The memory forms are UNCHANGED by this admission -- `RotateRegByte` binds
-        // `DecodedOperand::Reg` exactly as `Shift` does, so a memory destination is refused before
-        // either kind is ever constructed.
+        // The memory forms are a DIFFERENT kind and a different emitter, and they moved with
+        // `vorvek/direct-rot-mem-lane`: `RotateRegByte` still binds `DecodedOperand::Reg`, and the
+        // `else` branch of that bind now produces `DirectKind::RotateShiftMem`. They are asserted
+        // here as admitted rather than dropped, so this file keeps saying what the arm does with
+        // BOTH operand forms; their behaviour is certified in `cpu_jit_group2_mem_test.rs`.
         for (label, op) in ROL_ROR_SUB_OPS {
             assert_eq!(
                 compile_span(seg, &d0_mem(op)),
-                REFUSED,
-                "{} 0xd0 {label} memory form must stay refused",
+                ADMITTED,
+                "{} 0xd0 {label} memory form joins the block through RotateShiftMem",
                 seg.label()
             );
             assert_eq!(
                 compile_span(seg, &c0_mem(op, 3)),
-                REFUSED,
-                "{} 0xc0 {label} memory form must stay refused",
+                ADMITTED,
+                "{} 0xc0 {label} memory form joins the block through RotateShiftMem",
                 seg.label()
             );
         }
@@ -1493,18 +1495,43 @@ fn the_gate_does_not_sweep_in_its_neighbours() {
     for on in [false, true] {
         let _arm = force_byte_shift_rows(on);
         for seg in SEGMENTS {
-            // The MEMORY forms of both claimed opcodes, refused by the shared `Reg` bind.
+            // The MEMORY forms of both claimed opcodes ride the SAME knob as their register
+            // siblings, which is the property this row now pins. They used to be barriers at both
+            // arms, refused by the shared `Reg` bind; `vorvek/direct-rot-mem-lane` lowers them
+            // through `DirectKind::RotateShiftMem` and reads the knob ABOVE the operand bind, so
+            // the off arm still refuses them and the on arm admits them. A memory form that
+            // compiled on the OFF arm would mean the knob had stopped gating the whole opcode.
             for (label, op) in SUB_OPS {
+                // The SAME cell of the two-knob matrix the register row occupies, which is not
+                // uniform across the sub-opcodes: `/4` is on `IZARRAVM_ROTATE_ROWS` inside the
+                // arm (it predates the byte-shift slice) and needs the byte-shift reachability
+                // term only in a 16-bit segment, while `/5..=7` are on
+                // `IZARRAVM_BYTE_SHIFT_ROWS` in the arm itself and refuse at both segment kinds.
+                // `force_byte_shift_rows` pins the rotate knob to `On` at both arms, so `/4` in a
+                // 32-bit segment is admitted either way -- exactly what the conjunction-row
+                // assertion above says about the register form.
+                //
+                // `0xD0` does NOT share that exception: its own arm puts `/4..=7` on
+                // `byte_shift_rows_enabled()` with no rotate-knob term at all, so every one of its
+                // sub-opcodes refuses at both segment kinds on the off arm. The two opcodes really
+                // do sit in different cells here, and one shared expression for both would be
+                // wrong for one of them.
+                let c0_expected = if on || (op == 4 && seg == Seg::ThirtyTwo) {
+                    ADMITTED
+                } else {
+                    REFUSED
+                };
+                let d0_expected = if on { ADMITTED } else { REFUSED };
                 assert_eq!(
                     compile_span(seg, &c0_mem(op, 3)),
-                    REFUSED,
-                    "{} 0xc0 {label} MEMORY form must stay a barrier on the {on} arm",
+                    c0_expected,
+                    "{} 0xc0 {label} MEMORY form on the {on} arm",
                     seg.label()
                 );
                 assert_eq!(
                     compile_span(seg, &d0_mem(op)),
-                    REFUSED,
-                    "{} 0xd0 {label} MEMORY form must stay a barrier on the {on} arm",
+                    d0_expected,
+                    "{} 0xd0 {label} MEMORY form on the {on} arm",
                     seg.label()
                 );
             }
