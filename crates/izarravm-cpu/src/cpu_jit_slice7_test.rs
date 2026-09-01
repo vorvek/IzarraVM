@@ -608,23 +608,35 @@ fn byte_lane_register_alu_handles_lanes_of_the_same_home() {
     // one lane twice. Both fail if the emitter writes the destination before reading the source,
     // and the same-lane rows are the ones whose result is a constant (0 for XOR/SUB) so a
     // divergence shows up in the flags as well as the register.
+    //
+    // `op` sweeps ADC (2) and SBB (3) too, and `0x202`/`0x203` differ only in CF, an arithmetic
+    // bit `flag(FLAG_CF)` (`core.rs`) reads through a live pending descriptor whenever one exists.
+    // `pending` used to be unconditional `true`, so the CF axis was entirely inert -- every aliased
+    // pair here had zero real carry-in coverage. Sweeping `pending` adds the `(0x203, false)`
+    // no-descriptor row that actually delivers CF=1.
     for op in 0u8..8 {
         // `(6, 6)` is DH against itself, the same-home row for the destination index the matrix
         // above had to be widened to reach.
         for (dst, src) in [(0u8, 4u8), (4, 0), (1, 1), (5, 5), (3, 3), (6, 6), (2, 6)] {
             for eflags in [0x202u32, 0x203] {
-                let seed = byte_seed().flags(eflags).pending();
-                let label = format!("op={op} dst={dst} src={src} eflags={eflags:#x}");
-                differential(
-                    &alu_byte_rm_dst(op, dst, src),
-                    seed,
-                    &format!("aliased form 0 {label}"),
-                );
-                differential(
-                    &alu_byte_reg_dst(op, dst, src),
-                    seed,
-                    &format!("aliased form 2 {label}"),
-                );
+                for pending in [false, true] {
+                    let mut seed = byte_seed().flags(eflags);
+                    if pending {
+                        seed = seed.pending();
+                    }
+                    let label =
+                        format!("op={op} dst={dst} src={src} eflags={eflags:#x} pending={pending}");
+                    differential(
+                        &alu_byte_rm_dst(op, dst, src),
+                        seed,
+                        &format!("aliased form 0 {label}"),
+                    );
+                    differential(
+                        &alu_byte_reg_dst(op, dst, src),
+                        seed,
+                        &format!("aliased form 2 {label}"),
+                    );
+                }
             }
         }
     }
@@ -742,24 +754,34 @@ fn sixteen_bit_byte_alu_register_form_matches_its_unprefixed_encoding() {
     //
     // `run_and_compare` requires every slot to retire natively, so this cannot pass by quietly
     // falling back to the interpreter the way a weaker assertion would.
-    let seed = byte_seed();
+    // `op` sweeps ADC (2) and SBB (3), and `0x202`/`0x203` differ only in CF, an arithmetic bit
+    // `flag(FLAG_CF)` (`core.rs`) reads through a live pending descriptor whenever one exists.
+    // `.pending()` used to be unconditional, so the CF axis never delivered a real carry-in.
+    // Sweeping `pending` adds the `(0x203, false)` no-descriptor row that does.
+    let base_seed = byte_seed();
     for op in 0..8u8 {
         for (dst, src) in [(0u8, 4u8), (4, 0), (3, 3), (7, 7), (2, 6)] {
             for eflags in [0x202u32, 0x203] {
-                let seed = seed.flags(eflags).pending();
-                let label = format!("op={op} dst={dst} src={src} eflags={eflags:#x}");
-                let mut form0 = vec![0x66];
-                form0.extend_from_slice(&alu_byte_rm_dst(op, dst, src));
-                differential(&form0, seed, &format!("66 form 0 {label}"));
-                let mut form2 = vec![0x66];
-                form2.extend_from_slice(&alu_byte_reg_dst(op, dst, src));
-                differential(&form2, seed, &format!("66 form 2 {label}"));
-                let mut form2_mem = vec![0x66];
-                form2_mem.extend_from_slice(&alu_byte_reg_mem(op, dst, 0x3f00));
-                run_and_compare(
-                    build_mem(&form2_mem, seed, &[(0x3f00, 0x80)]),
-                    &format!("66 form 2 mem {label}"),
-                );
+                for pending in [false, true] {
+                    let mut seed = base_seed.flags(eflags);
+                    if pending {
+                        seed = seed.pending();
+                    }
+                    let label =
+                        format!("op={op} dst={dst} src={src} eflags={eflags:#x} pending={pending}");
+                    let mut form0 = vec![0x66];
+                    form0.extend_from_slice(&alu_byte_rm_dst(op, dst, src));
+                    differential(&form0, seed, &format!("66 form 0 {label}"));
+                    let mut form2 = vec![0x66];
+                    form2.extend_from_slice(&alu_byte_reg_dst(op, dst, src));
+                    differential(&form2, seed, &format!("66 form 2 {label}"));
+                    let mut form2_mem = vec![0x66];
+                    form2_mem.extend_from_slice(&alu_byte_reg_mem(op, dst, 0x3f00));
+                    run_and_compare(
+                        build_mem(&form2_mem, seed, &[(0x3f00, 0x80)]),
+                        &format!("66 form 2 mem {label}"),
+                    );
+                }
             }
         }
     }

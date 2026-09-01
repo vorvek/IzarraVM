@@ -2581,11 +2581,18 @@ fn direct_entry_attribution_json(
         "outlier_marks": snapshot.outlier_marks,
         "lane_pin_mismatches": snapshot.lane_pin_mismatches,
         // A3's `marks(P0) == decode_probes` identity needs every traversal that counted a probe
-        // and never reached the P0 mark. Four decode-screen breaks sit ABOVE `begin()`
-        // (run.rs:791-812) and are the three `brk_cont_*` keys; a FIFTH `brk_cont_decode_miss`
-        // site sits BELOW it (run.rs:857-862, the late view miss) and must be subtracted back
-        // out, or the identity over-counts by exactly this many. Emitted here so the report does
-        // not have to reach into another object for it.
+        // and never reached the P0 mark. Four break sites in the continuation loop's `screened`
+        // match sit ABOVE the `ea_begin!` call and are the three `brk_cont_*` keys (the
+        // fetch-limit break shares `brk_cont_not_continuable` with the plain not-continuable one);
+        // a FIFTH site, the late decode-cache view miss in the interpreted fallback below
+        // `dispatch_continuation`, reuses `brk_cont_decode_miss` and sits BELOW `ea_begin!`.
+        // `note_decode_pack_late_view_miss` actually has TWO feed sites: one inside the
+        // non-continuable break arm ABOVE `ea_begin!` (which does not touch `brk_cont_decode_miss`
+        // at all) and this one BELOW it. The subtraction below is sound only because the ABOVE
+        // feed is argued to be identically zero elsewhere; if it ever moves, this field stops
+        // reflecting the whole late-view-miss population. Must be subtracted back out of the
+        // identity, or it over-counts by exactly this many. Emitted here so the report does not
+        // have to reach into another object for it.
         "decode_pack_late_view_miss": decode_pack_late_view_miss,
         // The `run.rs` line the P0 mark sits on -- the line `above_p0_mark` partitions the
         // refusal sites by, published so the reader is not left inferring it.

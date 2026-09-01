@@ -357,17 +357,27 @@ fn byte_alu_memory_destination_matches_the_interpreter_for_every_op_and_lane() {
     // The disp32 lands inside the page the harness already populates in the fast map for the
     // stack slot, so the access resolves without a side exit; anywhere else returns the whole
     // block as Retry and the fixture would report the opcode as still being a barrier.
+    //
+    // `op = 2` (`0x10` ADC) and `op = 3` (`0x18` SBB) consume CF as an operand, and `flag(FLAG_CF)`
+    // (`core.rs`) routes it through a live pending descriptor whenever one exists. `pending` used
+    // to be hardcoded `true`, so `0x8d7`'s seeded CF was always replaced by the priming op's own CF
+    // (always clear) and ADC/SBB never saw a real carry-in. Sweeping `pending` here delivers it:
+    // `(0x8d7, false)` is the no-descriptor row that actually carries CF=1 into the ALU.
     const TARGET: u32 = 0x3f00;
     for op in 0u8..8 {
         for lane in [1u8, 5] {
             for ecx in [0x0000_0000u32, 0x0000_017f, 0x0000_ab01, 0xffff_ffff] {
                 for seed in [0x202u32, 0x8d7] {
-                    let modrm = (lane << 3) | 0b101;
-                    let mut body = vec![op << 3, modrm];
-                    body.extend_from_slice(&TARGET.to_le_bytes());
-                    let context =
-                        format!("alu form0 mem op={op} lane={lane} ecx={ecx:#x} seed={seed:#x}");
-                    differential_with(&body, seed, true, ecx, &context);
+                    for pending in [false, true] {
+                        let modrm = (lane << 3) | 0b101;
+                        let mut body = vec![op << 3, modrm];
+                        body.extend_from_slice(&TARGET.to_le_bytes());
+                        let context = format!(
+                            "alu form0 mem op={op} lane={lane} ecx={ecx:#x} seed={seed:#x} \
+                             pending={pending}"
+                        );
+                        differential_with(&body, seed, pending, ecx, &context);
+                    }
                 }
             }
         }
