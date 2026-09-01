@@ -234,8 +234,7 @@ impl GlideGamma {
 /// A feasibility measurement against the in-progress renderer work is still
 /// pending, and this codebase's convention is to leave a feature off the
 /// board until it exists rather than show a disabled option for it (there is
-/// no disabled-radio-button precedent anywhere in this GUI); see
-/// `dev_docs/2026-09-01-graphics-subwindow-design.md`.
+/// no disabled-radio-button precedent anywhere in this GUI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GlideTextureFilter {

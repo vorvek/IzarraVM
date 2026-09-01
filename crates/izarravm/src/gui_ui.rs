@@ -645,8 +645,8 @@ impl GuiApp {
                                 });
                             });
                             ui.small(
-                                "Graphics settings take effect the next time the machine \
-                                 powers on.",
+                                "Glide texture filtering takes effect the next time the \
+                                 machine powers on.",
                             );
                         }
                         ConfigPage::Hotkeys => {

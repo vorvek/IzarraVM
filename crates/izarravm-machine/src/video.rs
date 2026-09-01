@@ -2583,6 +2583,11 @@ impl Machine {
         self.vega.set_glide_force_point_sampling(enabled);
     }
 
+    /// See [`Self::set_glide_force_point_sampling`].
+    pub fn glide_force_point_sampling(&self) -> bool {
+        self.vega.glide_force_point_sampling()
+    }
+
     /// Render the current display state immediately for a headless capture.
     /// Legacy VGA output is cropped to its visible rows; accelerated scanouts
     /// use their current front buffers.

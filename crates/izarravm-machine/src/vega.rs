@@ -272,6 +272,11 @@ impl Vega {
         self.distira.set_force_point_sampling(enabled);
     }
 
+    /// See [`Self::set_glide_force_point_sampling`].
+    pub(crate) fn glide_force_point_sampling(&self) -> bool {
+        self.distira.force_point_sampling()
+    }
+
     pub(crate) fn select_legacy(&mut self) {
         // The display mux is FBIINIT0 bit 0 alone (real hardware: 86Box
         // `vid_voodoo.c:744-761`, DOSBox-X `voodoo_emu.cpp:1764-1775`); a

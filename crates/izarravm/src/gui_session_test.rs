@@ -305,6 +305,31 @@ fn generation_installs_initial_media_before_its_first_guest_tick() {
     generation.finalize();
 }
 
+/// The GUI's Glide texture filtering pref has three hops -- `GuiPrefs` ->
+/// `SessionSpec::glide_force_point_sampling` -> `Machine` -- and the middle
+/// two are otherwise untested: nothing exercises `MachineGeneration::build`
+/// actually applying the field it carries. Deleting the
+/// `machine.set_glide_force_point_sampling(...)` call in `build` passes
+/// every other test in this crate, so this is the one that would catch it.
+#[test]
+fn build_applies_the_spec_glide_force_point_sampling_to_the_machine() {
+    let off_scratch = TestScratch::new("glide-filter-off");
+    let off = MachineGeneration::build(test_spec(&off_scratch), 1).unwrap();
+    assert!(
+        !off.machine.glide_force_point_sampling(),
+        "the default spec must leave point sampling off"
+    );
+
+    let on_scratch = TestScratch::new("glide-filter-on");
+    let mut spec = test_spec(&on_scratch);
+    spec.glide_force_point_sampling = true;
+    let on = MachineGeneration::build(spec, 2).unwrap();
+    assert!(
+        on.machine.glide_force_point_sampling(),
+        "a spec with glide_force_point_sampling: true must reach the built machine"
+    );
+}
+
 #[test]
 fn poll_acknowledges_the_frame_slot_before_the_worker_publishes_a_newer_frame() {
     let scratch = TestScratch::new("frame-mailbox");

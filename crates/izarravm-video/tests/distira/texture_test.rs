@@ -455,6 +455,65 @@ fn force_point_sampling_overrides_the_guest_bilinear_mode() {
     );
 }
 
+/// Same override, on TMU1 via the `Tmu1Only` combine target -- proves "every
+/// TMU" (the phrase in `Distira::set_force_point_sampling`'s doc comment,
+/// `Machine::set_glide_force_point_sampling`'s, and the GUI's) is not
+/// actually "TMU0 only". `texture_combine_target` reads TMU0's own
+/// `texture_mode` register to pick the target: leaving `TEXTUREMODE_LOCAL`
+/// and every combine bit clear selects PASSTHROUGH, i.e. TMU1 alone -- see
+/// `tmu0_mode_selects_local_passthrough_and_modulated_texture_paths` above,
+/// which exercises the same selection.
+#[test]
+fn force_point_sampling_overrides_the_guest_bilinear_mode_on_tmu1() {
+    const TREX1: usize = 4 << 10;
+    const TMU1_APERTURE: usize = 1 << 21;
+    const TEXTUREMODE_BILINEAR_FILTER: u32 = 0x2;
+    const TEX_COORD_ONE: u32 = 1 << 18;
+    const BLENDED: u32 = 0x007b_7d7b;
+    const CORNER_TEXELS: [u32; 4] = [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0x00ff_ffff];
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.set_force_point_sampling(true);
+    // TMU0's own texture_mode picks the combine target: every combine bit
+    // and TEXTUREMODE_LOCAL clear is PASSTHROUGH, which selects TMU1 alone.
+    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(
+        &mut distira,
+        TREX1 | SST_TEXTURE_MODE,
+        (TEX_R5G6B5 << 8) | TEXTUREMODE_BILINEAR_FILTER,
+    );
+    assert!(distira.queue_texture_write_u32(TMU1_APERTURE, 0x07e0_f800));
+    assert!(distira.queue_texture_write_u32(TMU1_APERTURE + 256 * 2, 0xffff_001f));
+    distira.drain_fifo();
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        (1 << 27) | RGB_SELECT_TEXTURE,
+    );
+    write_reg(&mut distira, TREX1 | SST_START_S, TEX_COORD_ONE);
+    write_reg(&mut distira, TREX1 | SST_START_T, TEX_COORD_ONE);
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+    let pixel = distira.scanout_argb()[0];
+    assert_ne!(
+        pixel, BLENDED,
+        "forced point sampling must not blend TMU1's four neighbor texels either"
+    );
+    assert!(
+        CORNER_TEXELS.contains(&pixel),
+        "forced point sampling on TMU1 must select exactly one texel, got {pixel:#010x}"
+    );
+}
+
 #[test]
 fn bilinear_filter_blends_decoded_rgb_for_every_sst_texture_format() {
     for case in BILINEAR_FORMATS {

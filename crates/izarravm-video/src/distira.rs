@@ -1042,6 +1042,11 @@ impl Distira {
         self.force_point_sampling = enabled;
     }
 
+    /// See [`Self::set_force_point_sampling`].
+    pub fn force_point_sampling(&self) -> bool {
+        self.force_point_sampling
+    }
+
     /// The raster thread count for a host with `cores` logical CPUs: two,
     /// or four when six or more cores leave room for the main emulation
     /// thread.
