@@ -122,7 +122,8 @@ fn graphics_mode_reporting_follows_the_active_vega_engine() {
     assert_eq!(
         machine.active_display(),
         ActiveDisplay::MargoLfb,
-        "SWAPBUFFER must not steal scanout from a live VBE session"
+        "an idle SWAPBUFFER with no new Distira content must not steal scanout \
+         from a live VBE session"
     );
     assert!(machine.is_graphics_mode());
 
@@ -175,6 +176,11 @@ fn vbe_4f02_yields_distira_and_publishes_margo() {
 
 #[test]
 fn swapbuffer_does_not_steal_mux_from_vbe() {
+    // An idle SWAPBUFFER (no triangle, no LFB write since the yield) is the
+    // Glide vsync heartbeat WVIDEO keeps issuing while it blits an FMV frame
+    // into Margo. It must not retake the cable: see
+    // `swapbuffer_after_new_content_restores_distira_over_a_yielded_vbe_session`
+    // for the companion case where a swap DOES follow real content.
     let mut machine = test_machine();
     enable_distira_via_video_reset(&mut machine);
     assert!(machine.vega.set_vbe_mode(0x0101));
@@ -185,6 +191,38 @@ fn swapbuffer_does_not_steal_mux_from_vbe() {
     }
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
     assert!(!machine.vega.distira_mut().display_enabled());
+}
+
+#[test]
+fn swapbuffer_after_new_content_restores_distira_over_a_yielded_vbe_session() {
+    // The regression this pins: Tomb Raider Gold sets a VBE mode (yield) for
+    // each FMV, then resumes Glide gameplay with real triangles and swaps,
+    // but never pulses VIDEO_RESET again. A latch that only re-arms on
+    // VIDEO_RESET leaves the Voodoo off the cable for the rest of the run
+    // (`dev_docs/2026-09-01-distira-fidelity-diag.md`). The mux must instead
+    // track who is actually producing pixels: a swap that follows real new
+    // content (a rasterised triangle) must retake the cable even without a
+    // VIDEO_RESET pulse.
+    let mut machine = test_machine();
+    enable_distira_via_video_reset(&mut machine);
+    assert!(machine.vega.set_vbe_mode(0x0101));
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    assert!(!machine.vega.distira_mut().display_enabled());
+
+    machine.vega.distira_mut().set_frame_size(4, 4);
+    machine.vega.distira_mut().draw_triangle([
+        izarravm_video::DistiraVertex::rgb(0.0, 0.0, 255, 0, 0),
+        izarravm_video::DistiraVertex::rgb(3.0, 0.0, 255, 0, 0),
+        izarravm_video::DistiraVertex::rgb(0.0, 3.0, 255, 0, 0),
+    ]);
+    machine.vega.distira_mut().swap_buffers();
+
+    assert_eq!(
+        machine.active_display(),
+        ActiveDisplay::Distira,
+        "a swap that follows new Distira content must retake the cable from a stale VBE session"
+    );
+    assert!(machine.vega.distira_mut().display_enabled());
 }
 
 fn write_distira_u32(machine: &mut Machine, offset: usize, value: u32) {
