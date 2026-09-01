@@ -16,28 +16,41 @@ pub(super) struct ScreenshotFrame {
     words: Arc<Vec<u32>>,
     width: usize,
     height: usize,
+    /// Whether Distira produced these words. The Glide gamma setting shapes
+    /// that engine's output only, so a VGA or Margo screenshot must save the
+    /// same bytes under either setting.
+    pub(super) from_distira: bool,
 }
 
 impl ScreenshotFrame {
-    pub(super) fn new(words: Arc<Vec<u32>>, width: usize, height: usize) -> Self {
+    pub(super) fn new(
+        words: Arc<Vec<u32>>,
+        width: usize,
+        height: usize,
+        from_distira: bool,
+    ) -> Self {
         Self {
             words,
             width,
             height,
+            from_distira,
         }
     }
 
-    /// `gamma` is the live `monitor_gamma` preference: the saved PNG must show
-    /// the same picture the window did, so a screenshot goes through
-    /// `display_transform` exactly like the CRT shader's `CrtStyle::Off`
-    /// path. `screendump.rs` and every headless `--*-ppm` writer stay raw on
-    /// purpose (design section 4.4) and must never call this.
+    /// `gamma` is the live `monitor_gamma` preference and `glide` the live
+    /// Glide compensation exponent (`None` for "Original", and `None` for any
+    /// frame Distira did not produce). The saved PNG must show the same
+    /// picture the window did, so a screenshot goes through the same two
+    /// transforms in the same order the shader applies them.
+    /// `screendump.rs` and every headless `--*-ppm` writer stay raw on
+    /// purpose and must never call this.
     pub(super) fn save(
         &self,
         directory: &Path,
         gamma: Option<f32>,
+        glide: Option<f32>,
     ) -> Result<PathBuf, ScreenshotError> {
-        save_png_at(self, directory, local_now(), gamma)
+        save_png_at(self, directory, local_now(), gamma, glide)
     }
 }
 
@@ -119,8 +132,9 @@ fn save_png_at(
     directory: &Path,
     now: OffsetDateTime,
     gamma: Option<f32>,
+    glide: Option<f32>,
 ) -> Result<PathBuf, ScreenshotError> {
-    save_png_with_stem(frame, directory, &filename_stem(now), gamma)
+    save_png_with_stem(frame, directory, &filename_stem(now), gamma, glide)
 }
 
 fn save_png_with_stem(
@@ -128,6 +142,7 @@ fn save_png_with_stem(
     directory: &Path,
     stem: &str,
     gamma: Option<f32>,
+    glide: Option<f32>,
 ) -> Result<PathBuf, ScreenshotError> {
     let expected = frame.width.checked_mul(frame.height);
     let width = u32::try_from(frame.width).ok();
@@ -153,9 +168,12 @@ fn save_png_with_stem(
     // in crt.rs, and touching its signature would widen this change's blast
     // radius for no reason. Alpha (the 4th byte of each pixel) is always
     // 0xff and is left alone.
+    // Order matters and mirrors the shader: the Glide compensation is a
+    // signal-domain edit and runs first, then the display model.
     for pixel in rgba.as_chunks_mut::<4>().0 {
         for channel in &mut pixel[..3] {
-            *channel = crate::display_transform::display_transform(*channel, gamma);
+            let compensated = crate::display_transform::glide_compensate(*channel, glide);
+            *channel = crate::display_transform::display_transform(compensated, gamma);
         }
     }
 

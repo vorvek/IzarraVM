@@ -68,10 +68,44 @@ fn shader_srgb_oetf_constants_mirror_display_transform() {
 /// `src_size.xy, style, srgb, time` (16 bytes), so byte offset 20.
 #[test]
 fn uniform_block_is_32_bytes_with_monitor_gamma_at_offset_20() {
-    let bytes = uniform_bytes(320.0, 200.0, 1.0, true, 2.5, 2.4);
+    let bytes = uniform_bytes(320.0, 200.0, 1.0, true, 2.5, 2.4, 1.5);
     assert_eq!(bytes.len(), 32);
     let gamma_bytes: [u8; 4] = bytes[20..24].try_into().unwrap();
     assert_eq!(f32::from_le_bytes(gamma_bytes), 2.4);
+}
+
+/// The Glide compensation takes the block's first pad slot, so the uniform
+/// stays 32 bytes: after `src_size.xy, style, srgb, time, monitor_gamma`
+/// (24 bytes), so byte offset 24.
+#[test]
+fn glide_gamma_lands_at_uniform_offset_24_without_growing_the_block() {
+    let bytes = uniform_bytes(320.0, 200.0, 0.0, false, 0.0, 2.4, 1.5);
+    assert_eq!(bytes.len(), 32);
+    let glide_bytes: [u8; 4] = bytes[24..28].try_into().unwrap();
+    assert_eq!(f32::from_le_bytes(glide_bytes), 1.5);
+    assert_eq!(&bytes[28..32], &[0u8; 4], "the last pad slot stays zero");
+}
+
+/// The shader's compensation exponent must be the one `display_transform.rs`
+/// defines, and it must be applied through an explicit inequality branch:
+/// `pow(c, 1.0)` is not guaranteed bit-exact, and "Original" has to be
+/// provably today's picture.
+#[test]
+fn shader_applies_the_glide_compensation_before_the_style_branch() {
+    let compensation = SHADER
+        .find("u.glide_gamma != 1.0")
+        .expect("the shader must branch on the Original sentinel rather than pow(c, 1.0)");
+    let style_branch = SHADER
+        .find("if (u.style > 0.5)")
+        .expect("the CRT effect block must still be there");
+    assert!(
+        compensation < style_branch,
+        "the compensation is a signal-domain edit and must run before the display model"
+    );
+    assert!(
+        SHADER.contains("pow(col, vec3<f32>(u.glide_gamma))"),
+        "the shader must raise the sampled code to the compensation exponent"
+    );
 }
 
 /// Packing one run produces exactly that run's bytes, in upload order: the

@@ -544,6 +544,7 @@ fn every_rom_failure_says_something_different() {
 
 fn test_session_frame(update: u64, changed_rows: Vec<std::ops::Range<usize>>) -> SessionFrame {
     SessionFrame {
+        owner: izarravm_machine::ActiveDisplay::VgaRaster,
         words: std::sync::Arc::new(vec![0u32; 4 * 8]),
         changed_rows,
         width: 4,
@@ -594,4 +595,33 @@ fn frames_from_different_generations_do_not_fold() {
     );
     assert_eq!(merged.update_from, 5);
     assert!(crate::crt::upload_is_full(merged.update_from, 3, false));
+}
+
+/// The Glide gamma toggle shapes Distira's output and nothing else: a DOS VGA
+/// or Margo frame must reach the shader with the identity sentinel under
+/// either setting, so those pictures are byte-identical either way.
+#[test]
+fn glide_gamma_reaches_the_shader_for_distira_frames_only() {
+    use izarravm_machine::ActiveDisplay;
+
+    assert_eq!(
+        frame_glide_gamma(GlideGamma::Compatible, Some(ActiveDisplay::Distira)),
+        crate::display_transform::GLIDE_COMPAT_EXPONENT
+    );
+    assert_eq!(
+        frame_glide_gamma(GlideGamma::Original, Some(ActiveDisplay::Distira)),
+        1.0,
+        "Original must be the shader's identity sentinel, not a near-identity power"
+    );
+    for owner in [
+        Some(ActiveDisplay::VgaRaster),
+        Some(ActiveDisplay::MargoLfb),
+        None,
+    ] {
+        assert_eq!(
+            frame_glide_gamma(GlideGamma::Compatible, owner),
+            1.0,
+            "a non-Distira frame ({owner:?}) must not be compensated"
+        );
+    }
 }

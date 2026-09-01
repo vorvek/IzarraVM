@@ -193,6 +193,38 @@ impl CrtStyle {
     }
 }
 
+/// How the Voodoo era's gamma lift is presented.
+///
+/// The Glide runtimes of the period brightened their output through the
+/// SST-1's gamma CLUT -- about 1.7 on a Voodoo 1, about 1.3 on a Voodoo 2 --
+/// because the CRTs the content was authored on were darker than the artists
+/// wanted. On a modern panel that lift greys the blacks and washes the colour.
+///
+/// This selects only how the *presented* picture is shaped. The guest's
+/// `clutData` register is untouched under either setting, so a game that reads
+/// its gamma table back, or fades the screen by reprogramming it, behaves
+/// identically. See `dev_docs/2026-09-01-glide-gamma-toggle-design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GlideGamma {
+    /// Neutralise the era lift for a modern display. The default.
+    #[default]
+    Compatible,
+    /// Hardware-faithful: present the lift exactly as the period card did.
+    Original,
+}
+
+impl GlideGamma {
+    /// The exponent `display_transform::glide_compensate` applies, or `None`
+    /// for no compensation at all.
+    pub fn exponent(self) -> Option<f32> {
+        match self {
+            GlideGamma::Compatible => Some(crate::display_transform::GLIDE_COMPAT_EXPONENT),
+            GlideGamma::Original => None,
+        }
+    }
+}
+
 /// Default assumed CRT gamma: the midpoint of the 2.2-2.5 desktop-SVGA band,
 /// and the analytically special value at which the correction collapses to a
 /// pure black-level offset above the sRGB knee (see
@@ -251,6 +283,11 @@ pub struct GuiPrefs {
     /// `f32` for the same reason.
     #[serde(serialize_with = "serialize_monitor_gamma")]
     pub monitor_gamma: Option<f32>,
+    /// Whether the Voodoo-era gamma lift is neutralised for a modern display
+    /// (`Compatible`, the default) or presented as the period card did
+    /// (`Original`). Applies to Distira's output only; DOS VGA and Margo are
+    /// unaffected, as is the guest's `clutData` register.
+    pub glide_gamma: GlideGamma,
     /// Whether a new GUI window starts in borderless full screen.
     pub start_fullscreen: bool,
     /// Mouse sensitivity in percent, the DOSBox-X `sensitivity` scale (default
@@ -290,6 +327,7 @@ impl Default for GuiPrefs {
             master_volume: DEFAULT_VOLUME,
             crt_style: CrtStyle::Subtle,
             monitor_gamma: Some(DEFAULT_MONITOR_GAMMA),
+            glide_gamma: GlideGamma::default(),
             start_fullscreen: false,
             mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
             input_release: default_input_release(),
@@ -315,6 +353,7 @@ struct GuiPrefsWire {
     // 0.0 is the "Raw" sentinel, matching the shader's own convention
     // (crt.rs's monitor_gamma uniform, CrtCallback).
     monitor_gamma: f32,
+    glide_gamma: GlideGamma,
     start_fullscreen: bool,
     mouse_sensitivity: u16,
     input_release: KeyBinding,
@@ -337,6 +376,7 @@ impl Default for GuiPrefsWire {
             master_volume: prefs.master_volume,
             crt_style: prefs.crt_style,
             monitor_gamma: prefs.monitor_gamma.unwrap_or(0.0),
+            glide_gamma: prefs.glide_gamma,
             start_fullscreen: prefs.start_fullscreen,
             mouse_sensitivity: prefs.mouse_sensitivity,
             input_release: prefs.input_release,
@@ -367,6 +407,7 @@ impl<'de> Deserialize<'de> for GuiPrefs {
                 wire.monitor_gamma
                     .clamp(MIN_MONITOR_GAMMA, MAX_MONITOR_GAMMA),
             ),
+            glide_gamma: wire.glide_gamma,
             start_fullscreen: wire.start_fullscreen,
             mouse_sensitivity: wire
                 .mouse_sensitivity

@@ -1100,6 +1100,7 @@ impl Vega {
             changed_rows,
             width,
             height,
+            owner,
         })
     }
 
@@ -1173,6 +1174,7 @@ impl Vega {
             changed_rows,
             width,
             height,
+            owner: ActiveDisplay::VgaRaster,
         })
     }
 
@@ -1224,6 +1226,7 @@ impl Vega {
             changed_rows,
             width,
             height,
+            owner: ActiveDisplay::MargoLfb,
         })
     }
 

@@ -1532,7 +1532,7 @@ fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
 /// `dev_docs/2026-09-01-display-gamma-design.md` section 5's claim that the
 /// re-pin set for the present-time shader placement is EMPTY: `--presented-ppm`
 /// captures the DAC signal, not the picture, and must stay raw no matter what
-/// `monitor_gamma` a GUI session has selected. Headless `main.rs` never even
+/// `monitor_gamma` -- or Glide gamma --  a GUI session has selected. Headless `main.rs` never even
 /// loads `GuiPrefs`, so today this holds by construction -- this test is what
 /// would catch a future change that threads the pref in anyway.
 ///
@@ -1545,7 +1545,7 @@ fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
 /// fails this test's first assertion, and reverting that change restores the
 /// pass.
 #[test]
-fn presented_ppm_is_unaffected_by_monitor_gamma() {
+fn presented_ppm_is_unaffected_by_display_settings() {
     let mut machine = distira_display_enabled_bios_machine();
     machine.write_physical_u32(
         izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_CLEAR_COLOR as u32,
@@ -1577,6 +1577,19 @@ fn presented_ppm_is_unaffected_by_monitor_gamma() {
     assert_ne!(
         expected_raw, transformed,
         "fixture pixels must include codes display_transform actually changes, or this guard proves nothing"
+    );
+    // The same guard for the Glide gamma toggle, whose whole subject matter is
+    // Distira output -- which is exactly what this fixture presents. See
+    // `dev_docs/2026-09-01-glide-gamma-toggle-design.md` section 6.
+    let compensated: Vec<u8> = expected_raw
+        .iter()
+        .map(|&byte| {
+            display_transform::glide_compensate(byte, prefs::GlideGamma::Compatible.exponent())
+        })
+        .collect();
+    assert_ne!(
+        expected_raw, compensated,
+        "fixture pixels must include codes glide_compensate actually changes, or this guard proves nothing"
     );
 
     let dir = std::env::temp_dir().join(format!(

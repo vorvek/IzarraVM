@@ -19,6 +19,7 @@ fn sample_frame() -> ScreenshotFrame {
         Arc::new(vec![0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0x00ff_ffff]),
         2,
         2,
+        false,
     )
 }
 
@@ -34,7 +35,8 @@ fn screenshots_directory_is_inside_the_state_directory() {
 #[test]
 fn png_is_created_with_the_guest_pixels() {
     let directory = test_dir("pixels").join("screenshots");
-    let path = save_png_with_stem(&sample_frame(), &directory, "IzarraVM_test", None).unwrap();
+    let path =
+        save_png_with_stem(&sample_frame(), &directory, "IzarraVM_test", None, None).unwrap();
     assert_eq!(path, directory.join("IzarraVM_test.png"));
 
     let decoder = png::Decoder::new(File::open(&path).unwrap());
@@ -58,8 +60,8 @@ fn png_is_created_with_the_guest_pixels() {
 #[test]
 fn a_screenshot_applies_the_monitor_gamma_pref() {
     let directory = test_dir("gamma").join("screenshots");
-    let frame = ScreenshotFrame::new(Arc::new(vec![0x0020_2020]), 1, 1);
-    let path = save_png_with_stem(&frame, &directory, "IzarraVM_gamma", Some(2.4)).unwrap();
+    let frame = ScreenshotFrame::new(Arc::new(vec![0x0020_2020]), 1, 1, false);
+    let path = save_png_with_stem(&frame, &directory, "IzarraVM_gamma", Some(2.4), None).unwrap();
 
     let decoder = png::Decoder::new(File::open(&path).unwrap());
     let mut reader = decoder.read_info().unwrap();
@@ -74,8 +76,10 @@ fn a_screenshot_applies_the_monitor_gamma_pref() {
 #[test]
 fn a_same_timestamp_uses_a_collision_suffix() {
     let directory = test_dir("collision");
-    let first = save_png_with_stem(&sample_frame(), &directory, "IzarraVM_same", None).unwrap();
-    let second = save_png_with_stem(&sample_frame(), &directory, "IzarraVM_same", None).unwrap();
+    let first =
+        save_png_with_stem(&sample_frame(), &directory, "IzarraVM_same", None, None).unwrap();
+    let second =
+        save_png_with_stem(&sample_frame(), &directory, "IzarraVM_same", None, None).unwrap();
     assert_eq!(first.file_name().unwrap(), "IzarraVM_same.png");
     assert_eq!(second.file_name().unwrap(), "IzarraVM_same_001.png");
     assert!(first.is_file());
@@ -86,9 +90,9 @@ fn a_same_timestamp_uses_a_collision_suffix() {
 #[test]
 fn an_invalid_frame_does_not_create_the_directory() {
     let directory = test_dir("invalid");
-    let frame = ScreenshotFrame::new(Arc::new(vec![0; 3]), 2, 2);
+    let frame = ScreenshotFrame::new(Arc::new(vec![0; 3]), 2, 2, false);
     assert!(matches!(
-        save_png_with_stem(&frame, &directory, "IzarraVM_bad", None),
+        save_png_with_stem(&frame, &directory, "IzarraVM_bad", None, None),
         Err(ScreenshotError::InvalidFrame { .. })
     ));
     assert!(!directory.exists());

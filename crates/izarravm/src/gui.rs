@@ -18,7 +18,7 @@ pub(crate) use session::load_cd_image_from_path;
 use crate::controller_names::ControllerNameResolver;
 use crate::controller_profiles::ControllerProfileStore;
 use crate::host_input::HostInputPolicy;
-use crate::prefs::{CrtStyle, GuiPrefs, KeyBinding, MAX_VOLUME};
+use crate::prefs::{CrtStyle, GlideGamma, GuiPrefs, KeyBinding, MAX_VOLUME};
 use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioPlayer, MidiEngine};
 use izarravm_core::{GswMode, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
@@ -29,7 +29,9 @@ use izarravm_input::{
     GuestKeyTransition, HostControlId, HostControlValue, HostControllerBatch, HostDigitalBinding,
     HostKeyboard, JoystickAxis, JoystickButton, keyboard_controls, resolve_control_value,
 };
-use izarravm_machine::{CdAudioState, GamePortButtonTransition, GamePortUpdate, JoystickState};
+use izarravm_machine::{
+    ActiveDisplay, CdAudioState, GamePortButtonTransition, GamePortUpdate, JoystickState,
+};
 use screenshot::ScreenshotFrame;
 use session::{
     AppliedState, CdSource, FloppySource, GuestInput, GuiSession, PreparedCd, PreparedFloppy,
@@ -711,6 +713,14 @@ pub struct GuiApp {
     // Assumed monitor gamma (None = Raw). Persisted; read by monitor_ui each
     // frame and mapped to the shader's monitor_gamma uniform.
     monitor_gamma: Option<f32>,
+    // Whether the Voodoo-era gamma lift is neutralised (Compatible, default)
+    // or presented as the period card did (Original). Persisted; applies to
+    // Distira's output only, so monitor_ui gates it on the frame's own owner.
+    glide_gamma: GlideGamma,
+    // The engine that produced the frame currently on the texture. The uniform
+    // is rewritten every paint but a frame arrives only on some of them, so
+    // this has to persist rather than be read off the frame in hand.
+    frame_owner: Option<ActiveDisplay>,
     // Live host hotkeys. The
     // event loop matches physical keys against these; the config dialog edits
     // staged copies and writes them back on Accept.
@@ -759,6 +769,7 @@ struct ConfigDialog {
     screenshot: KeyBinding,
     crt_style: CrtStyle,
     monitor_gamma: Option<f32>,
+    glide_gamma: GlideGamma,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
     soundfont: Option<PathBuf>,
@@ -1147,6 +1158,7 @@ impl GuiApp {
             remember_initial_media(&mut prefs, &initial_update.snapshot);
         let crt_style = prefs.crt_style;
         let monitor_gamma = prefs.monitor_gamma;
+        let glide_gamma = prefs.glide_gamma;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
         let screenshot_key = prefs.screenshot.clone();
@@ -1167,15 +1179,24 @@ impl GuiApp {
                 }
             });
         let panel_open = prefs.panel_open;
-        let screenshot_frame = initial_update
+        let frame_owner = initial_update
             .newest_frame
             .as_ref()
-            .map(|frame| ScreenshotFrame::new(frame.words.clone(), frame.width, frame.height));
+            .map(|frame| frame.owner);
+        let screenshot_frame = initial_update.newest_frame.as_ref().map(|frame| {
+            ScreenshotFrame::new(
+                frame.words.clone(),
+                frame.width,
+                frame.height,
+                frame.owner == ActiveDisplay::Distira,
+            )
+        });
         let app = Self {
             session,
             session_snapshot: initial_update.snapshot,
             session_frame: initial_update.newest_frame,
             screenshot_frame,
+            frame_owner,
             host_input,
             controllers,
             controller_names: ControllerNameResolver::default(),
@@ -1216,6 +1237,7 @@ impl GuiApp {
             gain,
             crt_style,
             monitor_gamma,
+            glide_gamma,
             input_release,
             fullscreen_key,
             screenshot_key,
@@ -1236,10 +1258,12 @@ impl GuiApp {
         let update = self.session.poll();
         self.session_snapshot = update.snapshot;
         if let Some(frame) = update.newest_frame {
+            self.frame_owner = Some(frame.owner);
             self.screenshot_frame = Some(ScreenshotFrame::new(
                 frame.words.clone(),
                 frame.width,
                 frame.height,
+                frame.owner == ActiveDisplay::Distira,
             ));
             // FOLD, do not overwrite. The frame already sitting here was polled
             // and never painted -- egui may have discarded the pass, or two
@@ -1353,7 +1377,13 @@ impl GuiApp {
             return;
         };
         let gamma = screenshot_gamma(self.crt_style, self.monitor_gamma);
-        match frame.save(&self.screenshots_dir, gamma) {
+        // Not style-gated, unlike the monitor gamma: the shader applies the
+        // Glide compensation under every CRT style.
+        let glide = frame
+            .from_distira
+            .then(|| self.glide_gamma.exponent())
+            .flatten();
+        match frame.save(&self.screenshots_dir, gamma, glide) {
             Ok(path) => info!(path = %path.display(), "saved guest screenshot"),
             Err(err) => {
                 warn!(%err, path = %self.screenshots_dir.display(), "could not save screenshot")
@@ -1421,6 +1451,22 @@ fn merge_row_runs(
 /// uncorrected. A saved screenshot must match what the window actually
 /// shows, not what the preference says in the abstract, so any style other
 /// than Off saves raw bytes regardless of `monitor_gamma`.
+/// The shader's `glide_gamma` uniform for one frame: the compensation
+/// exponent when the setting asks for it AND the frame came from Distira,
+/// and the identity sentinel 1.0 otherwise.
+///
+/// The owner has to come from the frame rather than from a live
+/// `Machine::active_display()` call: frames are published by the session's
+/// worker thread and painted later, so a separate query can name a different
+/// engine than the pixels in hand. Getting that wrong would recolour a DOS
+/// VGA frame during a mode switch.
+fn frame_glide_gamma(setting: GlideGamma, owner: Option<ActiveDisplay>) -> f32 {
+    if owner != Some(ActiveDisplay::Distira) {
+        return 1.0;
+    }
+    setting.exponent().unwrap_or(1.0)
+}
+
 fn screenshot_gamma(crt_style: CrtStyle, monitor_gamma: Option<f32>) -> Option<f32> {
     (crt_style == CrtStyle::Off)
         .then_some(monitor_gamma)
@@ -1470,6 +1516,10 @@ impl GuiApp {
         // spelling, mirrored so the WGSL side has an explicit branch rather
         // than relying on pow(c, 0.0), which is not the identity.
         let monitor_gamma = self.monitor_gamma.unwrap_or(0.0);
+        // 1.0 is the shader's "Original" sentinel, and it is also what every
+        // non-Distira frame gets: the toggle shapes Glide output only, so a
+        // DOS VGA or Margo frame must come out byte-identical either way.
+        let glide_gamma = frame_glide_gamma(self.glide_gamma, self.frame_owner);
         if self.crt_style == CrtStyle::YeOlde {
             ui.ctx().request_repaint();
         }
@@ -1480,6 +1530,7 @@ impl GuiApp {
                 style,
                 time,
                 monitor_gamma,
+                glide_gamma,
             },
         ));
         // Clicking the screen requests input capture (handled later by the event

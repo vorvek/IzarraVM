@@ -84,8 +84,8 @@ struct U {
   srgb: f32,
   time: f32,
   monitor_gamma: f32, // 0 = Raw (identity); otherwise the assumed CRT EOTF exponent
+  glide_gamma: f32, // 1 = Original (identity); otherwise the Glide compensation exponent
   pad1: f32,
-  pad2: f32,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -214,6 +214,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   }
 
   var col = sample_sharp(t, sharp);
+  // Glide gamma, "Compatible": neutralise the Voodoo era's authoring lift.
+  // This is a SIGNAL-domain edit -- it changes the code as if the guest had
+  // programmed a different gamma CLUT -- so it runs before the display model
+  // below, and it is deliberately NOT gated on the CRT style. The caller sets
+  // it to 1.0 for "Original" and for every frame that did not come from
+  // Distira; the explicit inequality keeps that case byte-exact, since
+  // pow(c, 1.0) is not guaranteed to be.
+  // See dev_docs/2026-09-01-glide-gamma-toggle-design.md section 4.3.
+  if (u.glide_gamma != 1.0) {
+    col = pow(col, vec3<f32>(u.glide_gamma));
+  }
   if (u.style > 0.5) {
     let fy = fract(t.y * u.src_size.y) - 0.5;
     let b = exp(-(fy * fy) / (2.0 * beam * beam));
@@ -289,6 +300,9 @@ pub struct CrtCallback {
     pub style: u32,
     pub time: f32,
     pub monitor_gamma: f32,
+    /// The Glide compensation exponent, or 1.0 for "Original" and for any
+    /// frame Distira did not produce. See `prefs::GlideGamma`.
+    pub glide_gamma: f32,
 }
 
 /// Persistent GPU resources, stored in the renderer's `callback_resources`.
@@ -321,10 +335,10 @@ pub(crate) fn pack_argb_rows(words: &[u32], width: usize, rows: Range<usize>, ou
 }
 
 /// Pack the shader's uniform block: 8 floats (32 bytes, std140-safe) --
-/// `src_size.xy, style, srgb, time, monitor_gamma, pad1, pad2` -- little-endian,
-/// matching WGSL struct `U` in `SHADER`. Pulled out of `prepare` so the byte
-/// layout (buffer size, and which offset `monitor_gamma` lands at) is a plain
-/// unit-testable function.
+/// `src_size.xy, style, srgb, time, monitor_gamma, glide_gamma, pad1` --
+/// little-endian, matching WGSL struct `U` in `SHADER`. Pulled out of
+/// `prepare` so the byte layout (buffer size, and which offsets the two gamma
+/// terms land at) is a plain unit-testable function.
 pub(crate) fn uniform_bytes(
     width: f32,
     height: f32,
@@ -332,6 +346,7 @@ pub(crate) fn uniform_bytes(
     srgb: bool,
     time: f32,
     monitor_gamma: f32,
+    glide_gamma: f32,
 ) -> [u8; 32] {
     let data: [f32; 8] = [
         width,
@@ -340,7 +355,7 @@ pub(crate) fn uniform_bytes(
         if srgb { 1.0 } else { 0.0 },
         time,
         monitor_gamma,
-        0.0,
+        glide_gamma,
         0.0,
     ];
     let mut bytes = [0u8; 32];
@@ -617,6 +632,7 @@ impl CallbackTrait for CrtCallback {
             res.srgb,
             self.time,
             self.monitor_gamma,
+            self.glide_gamma,
         );
         queue.write_buffer(&res.uniform, 0, &bytes);
         Vec::new()

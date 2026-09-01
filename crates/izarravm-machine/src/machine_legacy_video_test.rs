@@ -1750,3 +1750,49 @@ fn a_short_raster_presents_identically_through_both_frame_paths() {
         .expect("the short raster still presents");
     assert_eq!(again.words.as_slice(), words.as_slice());
 }
+
+/// The presented frame must carry the engine that produced it.
+///
+/// The GUI publishes frames from a worker thread and consumes them later, so
+/// asking `active_display()` separately at paint time can describe a different
+/// instant than the pixels do. The Glide gamma toggle
+/// (`dev_docs/2026-09-01-glide-gamma-toggle-design.md` section 4.2) applies to
+/// Distira's output only, so it needs the tag on the frame itself. Both fast
+/// branches must agree with the generic path.
+#[test]
+fn a_presented_frame_update_names_the_engine_that_produced_it() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x0d));
+    machine.advance_devices(600_000);
+    assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+    let vga = machine
+        .presented_frame_update()
+        .expect("a raster completed during the 600 000-clock advance");
+    assert_eq!(
+        vga.owner,
+        ActiveDisplay::VgaRaster,
+        "the VGA fast branch must tag its own frames"
+    );
+
+    machine.load_margo_test_pattern();
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    let margo = machine
+        .presented_frame_update()
+        .expect("a Margo frame is presentable");
+    assert_eq!(
+        margo.owner,
+        ActiveDisplay::MargoLfb,
+        "the Margo fast branch must tag its own frames"
+    );
+
+    set_distira_vga_pass(&mut machine, true);
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+    let distira = machine
+        .presented_frame_update()
+        .expect("a Distira frame is presentable");
+    assert_eq!(
+        distira.owner,
+        ActiveDisplay::Distira,
+        "the generic path must tag a Distira frame"
+    );
+}
