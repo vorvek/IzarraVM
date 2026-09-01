@@ -2218,6 +2218,7 @@ fn write_hdd_profile_json(
         "katea": machine.katea_storage_counters().as_ref().map(katea_counters_json),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
+        "shadow_l1": shadow_l1_json(machine.shadow_l1_diagnostics()),
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
         "sb_dsp": sb_dsp_json(machine.sb_dsp_diagnostics()),
         "mpu": mpu_json(machine.mpu_diagnostics(), machine.midi_trace()),
@@ -2321,6 +2322,31 @@ fn opl_diagnostics_json(
             "clk": e.core_clocks,
             "us": e.pending_micros,
         })).collect::<Vec<_>>(),
+    })
+}
+
+/// S1 (`dev_docs/2026-09-01-bus-clock-diag.md`) shadow-tag probe counters:
+/// hit/miss per access class against the real 486 L1 geometry (8 KiB, 4-way,
+/// 16-byte lines, 128 sets, pseudo-LRU), charging nothing. `enabled` is false
+/// unless `IZARRAVM_SHADOW_L1_PROBE=1`; every count is 0 when disabled, and
+/// `hit_ratio` reports 0.0 on an empty class rather than dividing by zero.
+/// Coverage is the interpreter / FastMap-direct access stream only -- see the
+/// `shadow_cache` module doc in `izarravm-machine` for what the JIT's bulk
+/// per-block charges leave uncovered.
+fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Value {
+    fn class_json(counts: izarravm_machine::ShadowClassCounts) -> serde_json::Value {
+        json!({
+            "hits": counts.hits,
+            "misses": counts.misses,
+            "accesses": counts.accesses(),
+            "hit_ratio": counts.hit_ratio(),
+        })
+    }
+    json!({
+        "enabled": diag.enabled,
+        "code_fetch": class_json(diag.code_fetch),
+        "data_read": class_json(diag.data_read),
+        "data_write": class_json(diag.data_write),
     })
 }
 

@@ -428,6 +428,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         isa_io_clocks: &mut machine.isa_io_batch_clocks,
         pit_observer_fine_until: &mut machine.pit_observer_fine_until,
         opl_probe: &mut machine.opl_probe,
+        shadow_l1: &mut machine.shadow_l1,
         device_wrote_memory: &mut machine.device_wrote_memory,
         pending_device_memory_write_range: &mut machine.pending_device_memory_write_range,
         direct_map_changed: &mut machine.direct_map_changed,

@@ -353,6 +353,7 @@ impl Machine {
             isa_io_clocks: &mut self.isa_io_batch_clocks,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
+            shadow_l1: &mut self.shadow_l1,
             device_wrote_memory: &mut self.device_wrote_memory,
             pending_device_memory_write_range: &mut self.pending_device_memory_write_range,
             direct_map_changed: &mut self.direct_map_changed,
@@ -1237,12 +1238,25 @@ impl MachineBus<'_> {
     #[inline]
     fn charge_ram_only(&mut self, address: u32, width: BusWidth, kind: BusAccessKind) {
         if self.flat_data_cost {
+            self.shadow_probe(kind, address);
             self.trace.record(kind, address, width, self.cache.cost.l1);
             return;
         }
         let address = self.apply_a20(address);
-        let ws = self.data_access_wait_states(address, width);
+        let ws = self.data_access_wait_states(address, width, kind);
         self.trace.record(kind, address, width, ws);
+    }
+
+    /// S1 shadow-tag probe call-out: folds a bus access kind to its shadow class
+    /// (`shadow_class_for`; port I/O and interrupt ack have none) and probes the
+    /// real 486 geometry alongside the flat charge above. A no-op call when the
+    /// probe is disabled (`ShadowL1Probe::probe` tests one bool first) or when
+    /// `kind` has no shadow class. See `shadow_cache` module doc for coverage.
+    #[inline]
+    fn shadow_probe(&mut self, kind: BusAccessKind, address: u32) {
+        if let Some(class) = crate::shadow_class_for(kind) {
+            self.shadow_l1.probe(class, address);
+        }
     }
 
     /// The classification tail of `charge_physical_instruction_fetch_run`: A20 folding, the
@@ -1290,6 +1304,9 @@ impl MachineBus<'_> {
                     .record_instruction_fetch_run(first, count, first_ws);
             } else {
                 // Single I-cache access for the whole instruction run.
+                if self.flat_data_cost {
+                    self.shadow_l1.probe(ShadowAccessClass::CodeFetch, first);
+                }
                 self.trace.record_instruction_fetch_run(first, 1, first_ws);
             }
         } else {
@@ -1339,7 +1356,7 @@ impl CpuBus for MachineBus<'_> {
         if let Some((address, start, end)) =
             self.direct_page_ram_bytes(address, width.bytes() as usize, width)
         {
-            let ws = self.data_access_wait_states(address, width);
+            let ws = self.data_access_wait_states(address, width, kind);
             self.trace.record(kind, address, width, ws);
             let data = &self.memory.as_slice()[start..end];
             let value = match width {
@@ -1442,7 +1459,7 @@ impl CpuBus for MachineBus<'_> {
         if let Some((address, start, _)) =
             self.direct_page_ram_bytes(address, width.bytes() as usize, width)
         {
-            let ws = self.data_access_wait_states(address, width);
+            let ws = self.data_access_wait_states(address, width, kind);
             self.trace.record(kind, address, width, ws);
             match width {
                 BusWidth::Byte => self.memory.write_u8(start, value as u8)?,
@@ -1849,6 +1866,14 @@ impl CpuBus for MachineBus<'_> {
             at < 0x000A_0000 || !self.is_device_window(at, BusWidth::Byte)
         }));
         if self.flat_data_cost {
+            // `record_memory_run`'s `count` here is `count` SEPARATE byte accesses
+            // (see its body: `elapsed_clocks += clocks_for(width, ws) * count`), the
+            // same convention the non-flat per-byte loop below uses and the same one
+            // `record_direct_ram_accesses` follows -- not one access with `count`
+            // byte-cycles. Probe each byte's own address to match.
+            for i in 0..count {
+                self.shadow_probe(kind, address.wrapping_add(i));
+            }
             self.trace
                 .record_memory_run(kind, address, count, BusWidth::Byte, self.cache.cost.l1);
             return Ok(());
@@ -1856,7 +1881,7 @@ impl CpuBus for MachineBus<'_> {
         let base = self.apply_a20(address);
         for i in 0..count {
             let at = base.wrapping_add(i);
-            let ws = self.data_access_wait_states(at, BusWidth::Byte);
+            let ws = self.data_access_wait_states(at, BusWidth::Byte, kind);
             self.trace.record(kind, at, BusWidth::Byte, ws);
         }
         Ok(())
@@ -2127,7 +2152,7 @@ impl CpuBus for MachineBus<'_> {
         let bytes = width.bytes() as usize;
 
         if let Some(value) = self.vega.read_wide_memory(address, width) {
-            let ws = self.data_access_wait_states(address, width);
+            let ws = self.data_access_wait_states(address, width, kind);
             self.trace.record(kind, address, width, ws);
             return Ok(value);
         }
@@ -2142,7 +2167,7 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if let Some((start, end)) = self.direct_ram_range(address, width) {
-            let ws = self.data_access_wait_states(address, width);
+            let ws = self.data_access_wait_states(address, width, kind);
             self.trace.record(kind, address, width, ws);
             let data = &self.memory.as_slice()[start..end];
             return Ok(match width {
@@ -2152,7 +2177,7 @@ impl CpuBus for MachineBus<'_> {
             });
         }
 
-        let ws = self.data_access_wait_states(address, width);
+        let ws = self.data_access_wait_states(address, width, kind);
         self.trace.record(kind, address, width, ws);
 
         let mut data = [0u8; 4];
@@ -2300,6 +2325,14 @@ impl CpuBus for MachineBus<'_> {
             // The whole charge is one add of a per-batch constant. The wait-state itself is only
             // needed to DESCRIBE the cycle, so it is read (chasing `cache`) exclusively on the
             // tracing arm, which the default build never takes.
+            //
+            // This is the dominant interpreter code-fetch path (the classified cold
+            // tail below is the rare byte-straddling/device case), so the shadow
+            // probe belongs here, not only in that tail.
+            if self.flat_data_cost {
+                self.shadow_l1
+                    .probe(ShadowAccessClass::CodeFetch, physical_start);
+            }
             if self.trace.tracing_mode() == TracingMode::Off {
                 self.trace.add_elapsed_clocks(self.icache_fetch_clocks);
             } else {
@@ -4020,13 +4053,20 @@ impl MachineBus<'_> {
     ) {
         if self.active_mode.uses_approximate_timing() {
             let count = bytes / width.bytes() as usize;
+            // A genuine RUN of `count` separate bus accesses (e.g. a bulk direct-RAM
+            // copy), unlike the single-access sites above: probe every one at its
+            // own address, not once for the whole run.
+            for i in 0..count {
+                let at = address.wrapping_add((i * width.bytes() as usize) as u32);
+                self.shadow_probe(kind, at);
+            }
             self.trace
                 .record_memory_run(kind, address, count as u32, width, self.cache.cost.l1);
             return;
         }
         for offset in (0..bytes).step_by(width.bytes() as usize) {
             let at = address + offset as u32;
-            let wait_states = self.data_access_wait_states(at, width);
+            let wait_states = self.data_access_wait_states(at, width, kind);
             self.trace.record(kind, at, width, wait_states);
         }
     }
@@ -4158,7 +4198,7 @@ impl MachineBus<'_> {
     ) -> Result<(), BusError> {
         let address = self.apply_a20(address);
         if self.vega.write_wide_memory(address, width, value) {
-            let ws = self.data_access_wait_states(address, width);
+            let ws = self.data_access_wait_states(address, width, kind);
             self.trace.record(kind, address, width, ws);
             return Ok(());
         }
@@ -4177,7 +4217,7 @@ impl MachineBus<'_> {
         }
 
         if let Some((start, _)) = self.direct_ram_range(address, width) {
-            let ws = self.data_access_wait_states(address, width);
+            let ws = self.data_access_wait_states(address, width, kind);
             self.trace.record(kind, address, width, ws);
             match width {
                 BusWidth::Byte => self.memory.write_u8(start, value as u8),
@@ -4188,7 +4228,7 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        let ws = self.data_access_wait_states(address, width);
+        let ws = self.data_access_wait_states(address, width, kind);
         self.trace.record(kind, address, width, ws);
 
         match width {
@@ -4291,7 +4331,12 @@ impl MachineBus<'_> {
     /// the model nor be re-timed by it). Cacheable RAM (conventional `< 0xA0000`
     /// and any extended RAM that is not a device window) is tiered, and the resolved
     /// tier's per-mode cost is charged.
-    fn data_access_wait_states(&mut self, address: u32, width: BusWidth) -> u8 {
+    fn data_access_wait_states(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> u8 {
         if address >= 0x000A_0000 && self.is_device_window(address, width) {
             // Device/ROM: untiered, unchanged timing (both classes).
             return self.memory_wait_states(address);
@@ -4301,6 +4346,7 @@ impl MachineBus<'_> {
             // the per-access tag-array tiering. The
             // benchmarks are L1-resident so cyc/iter stays near the accurate model;
             // the win is skipping ~3M tag lookups per run. Guest-invisible: only time.
+            self.shadow_probe(kind, address);
             return self.cache.cost.l1;
         }
         self.cache.data_wait_states(address, width)
