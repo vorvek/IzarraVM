@@ -999,10 +999,33 @@ Margo. They exist because nothing else on either board exercises a single
 triangle of hardware 3D: before them, Distira had register-level unit tests and
 no game had ever driven it.
 
-They ship the BYTE-IDENTICAL `glide2x.ovl`, md5 `341b8f5d82daa46fd1ce2363...`.
-That is the point of running both. Whatever the library asks of the device it
-asks identically in each, so a defect that moves one row and not the other is
-in the GAME's use of Glide, and one that moves both is in the device.
+**CORRECTED 2026-09-01** (`dev_docs/2026-09-01-tr-rush-investigation.md`,
+section 2): this used to claim both rows "ship the BYTE-IDENTICAL `glide2x.ovl`"
+and drew an attribution rule from that. False for the Tomb Raider row. The
+fixture's `AUTOEXEC.BAT` runs `TOMB.EXE`, which STATICALLY LINKS Glide 2.1.1
+and never opens an overlay at all -- the `glide2x.ovl` sitting in
+`.bench/tombraid3d_c/GAMES/TOMB3D/` is dead weight, nothing loads it. Descent
+II's `D2_3DFX.EXE` genuinely DYNAMICALLY LINKS and loads its `glide2x.ovl`
+(2.42, md5 `341b8f5d82daa46fd1ce2363...`). So the two rows exercise different
+Glide versions (2.1.1 vs 2.42) through different code paths, not a shared
+library -- the old "same library, so the game is the variable" rule is
+WITHDRAWN. A defect that moves one row and not the other no longer isolates
+anything by itself; check which linkage path each row actually takes before
+attributing.
+
+Two things fall out of that investigation, useful if either row ever needs a
+second data point:
+
+- `tomb_.exe`, in the same `TOMB3D` package, IS the dynamic-linkage variant --
+  it loads `glide2x.ovl` at runtime and exercises `grLfbLock`, a path
+  `TOMB.EXE` never takes. If a future defect needs "same game, different
+  library" separation, swapping `AUTOEXEC.BAT` to run `tomb_.exe` is the
+  cheapest way to get a second Glide row for Tomb Raider.
+- The SDK's `Vrush` (SST-96) overlay REFUSES Distira outright, with a legible
+  `_GlideInitEnvironment: glide2x.dll expected Voodoo Rush, none detected`
+  message -- a ready-made KNOWN-RED control for any test that needs to prove a
+  board-detection gate can actually fail. Refusal frame archived at
+  `.bench/tomb-raider-3dfx/rush-investigation/C_text.png`.
 
 **586 only.** Both are DOS/4GW protected-mode titles that need a Pentium and an
 FPU, exactly like the software `tombraid-586` row.
