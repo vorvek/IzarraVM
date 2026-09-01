@@ -1437,11 +1437,47 @@ fn ascii_to_set1_maps_a_letter_to_make_and_break() {
 
 #[test]
 fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::izarra_bios(),
-    )
-    .expect("build machine");
+    // The mux is FBIINIT0 bit 0 alone (86Box vid_voodoo.c:744-761, DOSBox-X
+    // voodoo_emu.cpp:1764-1775), and that register is write-protected by
+    // initEnable (PCI config offset 0x40) until a guest unlocks it -- both
+    // reachable only through port I/O, so a tiny real-mode program runs
+    // first (mirrors distira_display_enabled_machine in
+    // crates/izarravm-machine/tests/distira.rs) before the rest of this
+    // test's direct MMIO pokes.
+    let mut unlock = Vec::new();
+    let out_dx_eax = |code: &mut Vec<u8>, port: u16, value: u32| {
+        code.push(0xba);
+        code.extend_from_slice(&port.to_le_bytes());
+        code.extend_from_slice(&[0x66, 0xb8]);
+        code.extend_from_slice(&value.to_le_bytes());
+        code.extend_from_slice(&[0x66, 0xef]);
+    };
+    // PCI configuration mechanism 1: 0x0CF8 (address)/0x0CFC (data), and the
+    // Distira PCI slot's device number (0x10, `DISTIRA_PCI_SLOT` in
+    // crates/izarravm-machine/src/video_params.rs, not re-exported past
+    // that crate's own modules).
+    const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
+    const PCI_CONFIG_DATA_PORT: u16 = 0x0cfc;
+    const DISTIRA_PCI_SLOT: u32 = 0x10;
+    let init_enable_address = 0x8000_0000 | (DISTIRA_PCI_SLOT << 11) | 0x40;
+    out_dx_eax(&mut unlock, PCI_CONFIG_ADDRESS_PORT, init_enable_address);
+    out_dx_eax(
+        &mut unlock,
+        PCI_CONFIG_DATA_PORT,
+        izarravm_video::INIT_ENABLE_WRITE,
+    );
+    unlock.extend_from_slice(&[0xcd, 0x20]);
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &unlock)
+            .expect("build machine");
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    machine.write_physical_u32(
+        izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::SST_FBI_INIT0 as u32,
+        izarravm_video::FBIINIT0_VGA_PASS,
+    );
     machine.write_physical_u32(
         izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_CLEAR_COLOR as u32,
         0x0010_2030,

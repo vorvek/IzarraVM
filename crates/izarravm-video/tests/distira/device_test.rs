@@ -618,6 +618,10 @@ fn fbi_init_layout_and_reset_select_physical_buffers() {
     );
     write_reg(&mut distira, SST_VIDEO_DIMENSIONS, (480 << 16) | 639);
 
+    // VIDEO_RESET is video timing reset, not the mux (86Box: only `line`,
+    // `swap_count`, `retrace_count`; DOSBox-X names the bit
+    // `FBIINIT1_VIDEO_TIMING_RESET`) -- it must leave `display_enabled`
+    // alone. Only FBIINIT0 bit 0 does, and nothing has set it here.
     assert!(!distira.display_enabled());
     assert_eq!(distira.display().width, 640);
     assert_eq!(distira.display().height, 480);
@@ -626,8 +630,17 @@ fn fbi_init_layout_and_reset_select_physical_buffers() {
     assert_eq!(distira.display().back_base, 150 * 4096);
 
     write_reg(&mut distira, SST_FBI_INIT1, 10 << FBIINIT1_TILES_IN_X_SHIFT);
-    assert!(distira.display_enabled());
+    assert!(
+        !distira.display_enabled(),
+        "the VIDEO_RESET falling edge must not enable the display either"
+    );
+    write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
+    assert!(distira.display_enabled(), "bit 0 set enables the display");
     distira.swap_buffers();
+    assert!(
+        distira.display_enabled(),
+        "SWAPBUFFER must not touch the mux"
+    );
     assert_eq!(distira.display().front_base, 150 * 4096);
 
     write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_GRAPHICS_RESET);
@@ -648,14 +661,28 @@ fn voodoo_texture_detail_register_round_trips() {
 
 #[test]
 fn clear_back_buffer_and_swap_presents_rgb565_words() {
+    // The mux is FBIINIT0 bit 0, read continuously -- not a latch that a
+    // swap or a rasterised triangle can arm. Reference: 86Box
+    // `vid_voodoo.c:744-761` and DOSBox-X `voodoo_emu.cpp:1764-1775` both
+    // drive the override purely from that bit.
     let mut distira = Distira::new();
     distira.set_frame_size(4, 2);
     distira.clear_back_rgb(0x34, 0x56, 0x78);
 
-    assert!(!distira.display_enabled());
+    assert!(!distira.display_enabled(), "power-on: bit 0 clear");
     distira.swap_buffers();
+    assert!(
+        !distira.display_enabled(),
+        "SWAPBUFFER must not touch the mux on real hardware"
+    );
 
-    assert!(distira.display_enabled());
+    distira.set_init_enable(INIT_ENABLE_WRITE);
+    write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
+    assert!(
+        distira.display_enabled(),
+        "bit 0 set alone must enable the display, no swap required"
+    );
+
     let frame = distira.scanout_argb();
     assert_eq!(frame.len(), 8);
     assert!(frame.iter().all(|&pixel| pixel == 0x0031_557b));
@@ -1442,73 +1469,67 @@ fn the_census_records_the_video_dimensions_register_a_real_driver_writes() {
 }
 
 #[test]
-fn a_zero_pixel_triangle_does_not_arm_a_yielded_display() {
-    // A degenerate (zero-area) or fully clipped-away triangle rasterises
-    // nothing. "A triangle was submitted" is not "real content landed in the
-    // framebuffer" -- a guest that submits a culled triangle during a yielded
-    // VBE session (Tomb Raider's Glide FMV window does this for out-of-frustum
-    // geometry) must not have its next SWAPBUFFER steal the mux back.
+fn fbiinit0_bit0_alone_selects_the_display_mux() {
+    // PRIOR ART (described, not copied): 86Box `src/video/vid_voodoo.c:744-761`
+    // calls `svga_set_override(voodoo->svga, val & 1)` on every FBIINIT0
+    // write and gates the Voodoo's own scanline draw on the same bit
+    // (`vid_voodoo_display.c:515,635`); DOSBox-X `voodoo_emu.cpp:1764-1775`
+    // calls `Voodoo_Output_Enable(FBIINIT0_VGA_PASSTHRU(data))`, the only
+    // switch that flips its render override. Both derive the mux purely and
+    // continuously from bit 0, with bit 0 SET routing the Voodoo onto the
+    // cable. Against the pre-fix inverted decode this test failed both
+    // assertions below.
     let mut distira = Distira::new();
-    distira.set_frame_size(4, 4);
-    distira.disable_display();
-    assert!(!distira.display_enabled());
-
-    // All three vertices coincide: area is exactly zero.
-    let written = distira.draw_triangle([
-        DistiraVertex::rgb(1.0, 1.0, 255, 0, 0),
-        DistiraVertex::rgb(1.0, 1.0, 255, 0, 0),
-        DistiraVertex::rgb(1.0, 1.0, 255, 0, 0),
-    ]);
-    assert_eq!(written, 0);
-
-    distira.swap_buffers();
+    distira.set_init_enable(INIT_ENABLE_WRITE);
     assert!(
         !distira.display_enabled(),
-        "a zero-pixel triangle must not arm a yielded display"
+        "power-on: bit 0 clear, VGA/Margo on the cable"
+    );
+
+    write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
+    assert!(
+        distira.display_enabled(),
+        "bit 0 set must route Distira to the cable"
+    );
+
+    write_reg(&mut distira, SST_FBI_INIT0, 0);
+    assert!(
+        !distira.display_enabled(),
+        "bit 0 clear must route back to VGA/Margo"
     );
 }
 
 #[test]
-fn content_submitted_after_a_retrace_swap_is_issued_does_not_arm_that_swap() {
-    // present_swap for a SYNC_TO_RETRACE command used to read
-    // content_drawn_since_yield when the swap RETIRED, at the retrace edge,
-    // not when it was ISSUED. A triangle landing in the gap between issue and
-    // retrace then licensed a swap that was genuinely idle at the moment the
-    // guest asked for it -- content belonging to frame N+1 armed frame N's
-    // swap. The flag must be snapshotted at issue time.
+fn swapbuffer_and_triangles_never_move_the_mux() {
+    // SWAPBUFFER is pure buffer-index rotation on real hardware (86Box
+    // `vid_voodoo_reg.c:139-159` and its retrace consumer touch only
+    // `front_offset`/counters; DOSBox-X `swapbuffer()` rotates indices) and a
+    // rasterised triangle is a framebuffer write, not a register write.
+    // Neither can move the mux -- that is FBIINIT0 bit 0 alone. This
+    // replaces #802's `content_drawn_since_yield` activity latch, deleted
+    // along with the yield machinery it hung off.
     let mut distira = Distira::new();
-    distira.set_frame_size(1, 1);
-    distira.disable_display();
+    distira.set_frame_size(4, 4);
     assert!(!distira.display_enabled());
 
-    // Issue a retrace-synced swap (bit 0) with interval 0 while genuinely
-    // idle: no content since the yield.
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
-
-    // New real content lands AFTER the swap was issued but BEFORE its
-    // retrace fires.
     let written = distira.draw_triangle([
         DistiraVertex::rgb(0.0, 0.0, 0, 255, 0),
-        DistiraVertex::rgb(1.0, 0.0, 0, 255, 0),
-        DistiraVertex::rgb(0.0, 1.0, 0, 255, 0),
+        DistiraVertex::rgb(3.0, 0.0, 0, 255, 0),
+        DistiraVertex::rgb(0.0, 3.0, 0, 255, 0),
     ]);
     assert!(written > 0, "the probe triangle must draw real pixels");
-
-    // Retire the pending swap (480 lines to the first vertical retrace edge,
-    // per the interval-0 fixtures above).
-    distira.advance_frame_phase(480);
-
+    distira.swap_buffers();
     assert!(
         !distira.display_enabled(),
-        "content submitted after the swap was issued must not retroactively arm it"
+        "a triangle and a swap must not enable the display without a register write"
     );
 
-    // The content is real and still pending a swap of its own: the NEXT
-    // SWAPBUFFER (issued now that content_drawn_since_yield is true) must
-    // retake the display.
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+    distira.set_init_enable(INIT_ENABLE_WRITE);
+    write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
+    assert!(distira.display_enabled());
+    distira.swap_buffers();
     assert!(
         distira.display_enabled(),
-        "a swap issued after real content must arm the display"
+        "SWAPBUFFER must not clear the mux either"
     );
 }

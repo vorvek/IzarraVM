@@ -267,8 +267,11 @@ impl Vega {
     }
 
     pub(crate) fn select_legacy(&mut self) {
+        // The display mux is FBIINIT0 bit 0 alone (real hardware: 86Box
+        // `vid_voodoo.c:744-761`, DOSBox-X `voodoo_emu.cpp:1764-1775`); a
+        // 2D-side mode select does not touch it, so this no longer forces
+        // Distira off.
         self.margo_active = false;
-        self.distira.disable_display();
     }
 
     #[cfg(test)]
@@ -291,10 +294,9 @@ impl Vega {
         self.margo_active = true;
         self.margo_linear = request & 0x4000 != 0;
         self.margo_bank = 0;
-        // Same yield as INT 10h AH=00 (`select_legacy`) and the test helper
-        // `set_margo_mode_640x480x8`. Guest 4F02 must not leave Distira latched
-        // over a live Margo session.
-        self.distira.disable_display();
+        // No forced Distira yield here: the mux is FBIINIT0 bit 0 alone, and
+        // a VBE mode set does not touch it on real hardware (see
+        // `select_legacy`).
         if self.margo_linear {
             self.vbe_mode_sets_linear = self.vbe_mode_sets_linear.saturating_add(1);
         } else {
@@ -404,7 +406,6 @@ impl Vega {
         self.margo_active = true;
         self.margo_linear = true;
         self.margo_bank = 0;
-        self.distira.disable_display();
     }
 
     pub(crate) fn load_margo_test_pattern(&mut self) {

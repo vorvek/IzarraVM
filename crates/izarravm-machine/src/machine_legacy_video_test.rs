@@ -3,8 +3,7 @@
 
 use super::*;
 use izarravm_video::{
-    DISTIRA_REG_FB_WIDTH, FBIINIT1_VIDEO_RESET, INIT_ENABLE_WRITE, SST_FBI_INIT1,
-    SST_SWAPBUFFER_CMD,
+    DISTIRA_REG_FB_WIDTH, FBIINIT0_VGA_PASS, INIT_ENABLE_WRITE, SST_FBI_INIT0, SST_SWAPBUFFER_CMD,
 };
 
 #[test]
@@ -122,8 +121,8 @@ fn graphics_mode_reporting_follows_the_active_vega_engine() {
     assert_eq!(
         machine.active_display(),
         ActiveDisplay::MargoLfb,
-        "an idle SWAPBUFFER with no new Distira content must not steal scanout \
-         from a live VBE session"
+        "SWAPBUFFER is buffer-index rotation, not a register write, so it must \
+         not steal scanout from a live VBE session"
     );
     assert!(machine.is_graphics_mode());
 
@@ -146,7 +145,7 @@ fn margo_store_dump_ignores_the_active_mux() {
         "test pattern must be visible in the Margo dump"
     );
 
-    enable_distira_via_video_reset(&mut machine);
+    set_distira_vga_pass(&mut machine, true);
     assert_eq!(machine.active_display(), ActiveDisplay::Distira);
 
     let (after, width, height) = machine
@@ -164,26 +163,47 @@ fn margo_store_dump_ignores_the_active_mux() {
 }
 
 #[test]
-fn vbe_4f02_yields_distira_and_publishes_margo() {
+fn vbe_mode_set_alone_does_not_move_the_register_derived_mux() {
+    // On real hardware a VBE mode set is a 2D-side (Margo) affair and never
+    // touches FBIINIT0 -- see `set_distira_vga_pass`. The display stays with
+    // Distira until the GUEST writes the bit back to 0, which is what Tomb
+    // Raider Gold's Glide driver does before handing off to WVIDEO for an
+    // FMV (`guest_clearing_fbiinit0_yields_distira_and_publishes_margo`
+    // below covers that half).
     let mut machine = test_machine();
-    enable_distira_via_video_reset(&mut machine);
+    set_distira_vga_pass(&mut machine, true);
     assert_eq!(machine.active_display(), ActiveDisplay::Distira);
 
     assert!(machine.vega.set_vbe_mode(0x0101));
+    assert_eq!(
+        machine.active_display(),
+        ActiveDisplay::Distira,
+        "a VBE mode set must not move a register-derived mux"
+    );
+}
+
+#[test]
+fn guest_clearing_fbiinit0_yields_distira_and_publishes_margo() {
+    let mut machine = test_machine();
+    set_distira_vga_pass(&mut machine, true);
+    assert!(machine.vega.set_vbe_mode(0x0101));
+
+    set_distira_vga_pass(&mut machine, false);
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
     assert!(!machine.vega.distira_mut().display_enabled());
 }
 
 #[test]
-fn swapbuffer_does_not_steal_mux_from_vbe() {
-    // An idle SWAPBUFFER (no triangle, no LFB write since the yield) is the
-    // Glide vsync heartbeat WVIDEO keeps issuing while it blits an FMV frame
-    // into Margo. It must not retake the cable: see
-    // `swapbuffer_after_new_content_restores_distira_over_a_yielded_vbe_session`
-    // for the companion case where a swap DOES follow real content.
+fn swapbuffer_does_not_move_the_mux_during_a_vbe_session() {
+    // An idle SWAPBUFFER (the Glide vsync heartbeat WVIDEO keeps issuing
+    // while it blits an FMV frame into Margo) is pure buffer-index rotation
+    // on real hardware (86Box `vid_voodoo_reg.c:139-159` and its retrace
+    // consumer touch only `front_offset`/counters; DOSBox-X `swapbuffer()`
+    // rotates indices) and must not touch FBIINIT0's mux bit.
     let mut machine = test_machine();
-    enable_distira_via_video_reset(&mut machine);
+    set_distira_vga_pass(&mut machine, true);
     assert!(machine.vega.set_vbe_mode(0x0101));
+    set_distira_vga_pass(&mut machine, false);
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
 
     for byte in 0..4 {
@@ -194,21 +214,23 @@ fn swapbuffer_does_not_steal_mux_from_vbe() {
 }
 
 #[test]
-fn swapbuffer_after_new_content_restores_distira_over_a_yielded_vbe_session() {
-    // The regression this pins: Tomb Raider Gold sets a VBE mode (yield) for
-    // each FMV, then resumes Glide gameplay with real triangles and swaps,
-    // but never pulses VIDEO_RESET again. A latch that only re-arms on
-    // VIDEO_RESET leaves the Voodoo off the cable for the rest of the run
-    // (`dev_docs/2026-09-01-distira-fidelity-diag.md`). The mux must instead
-    // track who is actually producing pixels: a swap that follows real new
-    // content (a rasterised triangle) must retake the cable even without a
-    // VIDEO_RESET pulse.
+fn guest_resetting_fbiinit0_restores_distira_over_a_yielded_vbe_session() {
+    // The regression #802 patched around with a `content_drawn_since_yield`
+    // activity latch: Tomb Raider Gold sets a VBE mode for each FMV, then
+    // resumes Glide gameplay. That latch is deleted here in favour of the
+    // register truth (`dev_docs/2026-09-01-mux-fix-review.md`): on real
+    // hardware neither a VBE mode set, nor SWAPBUFFER, nor a rasterised
+    // triangle can move the mux -- only the guest's own FBIINIT0 write can,
+    // and the fixture evidence (portlog + presented-frame captures) is that
+    // Tomb Raider Gold's Glide driver does write it on both edges.
     let mut machine = test_machine();
-    enable_distira_via_video_reset(&mut machine);
+    set_distira_vga_pass(&mut machine, true);
     assert!(machine.vega.set_vbe_mode(0x0101));
+    set_distira_vga_pass(&mut machine, false);
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
-    assert!(!machine.vega.distira_mut().display_enabled());
 
+    // A stray triangle and swap during the yielded session must not retake
+    // the cable -- the mux does not track "who is producing pixels".
     machine.vega.distira_mut().set_frame_size(4, 4);
     machine.vega.distira_mut().draw_triangle([
         izarravm_video::DistiraVertex::rgb(0.0, 0.0, 255, 0, 0),
@@ -216,11 +238,17 @@ fn swapbuffer_after_new_content_restores_distira_over_a_yielded_vbe_session() {
         izarravm_video::DistiraVertex::rgb(0.0, 3.0, 255, 0, 0),
     ]);
     machine.vega.distira_mut().swap_buffers();
+    assert_eq!(
+        machine.active_display(),
+        ActiveDisplay::MargoLfb,
+        "content and a swap alone must not move a register-derived mux"
+    );
 
+    set_distira_vga_pass(&mut machine, true);
     assert_eq!(
         machine.active_display(),
         ActiveDisplay::Distira,
-        "a swap that follows new Distira content must retake the cable from a stale VBE session"
+        "only the guest's FBIINIT0 write retakes the cable"
     );
     assert!(machine.vega.distira_mut().display_enabled());
 }
@@ -231,13 +259,20 @@ fn write_distira_u32(machine: &mut Machine, offset: usize, value: u32) {
     }
 }
 
-fn enable_distira_via_video_reset(machine: &mut Machine) {
+/// Write FBIINIT0 bit 0 through the bus -- the guest's only lever for the
+/// display mux (86Box `vid_voodoo.c:744-761`, DOSBox-X
+/// `voodoo_emu.cpp:1764-1775`: both derive it purely from that bit, bit 0
+/// SET routing the Voodoo onto the cable). Nothing else in this file --
+/// not a VBE mode set, not SWAPBUFFER, not a rasterised triangle -- may
+/// move the mux; only a guest write of this register does, which is
+/// exactly what Tomb Raider Gold's Glide driver does around its FMVs.
+fn set_distira_vga_pass(machine: &mut Machine, enabled: bool) {
     machine
         .vega
         .distira_mut()
         .set_init_enable(INIT_ENABLE_WRITE);
-    write_distira_u32(machine, SST_FBI_INIT1, FBIINIT1_VIDEO_RESET);
-    write_distira_u32(machine, SST_FBI_INIT1, 0);
+    let value = if enabled { FBIINIT0_VGA_PASS } else { 0 };
+    write_distira_u32(machine, SST_FBI_INIT0, value);
 }
 
 #[test]
