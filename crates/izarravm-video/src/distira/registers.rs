@@ -3,7 +3,30 @@
 
 pub const DISTIRA_FB_SIZE: usize = 2 * 1024 * 1024;
 pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
-pub const DISTIRA_TEX_SIZE: usize = 2 * 1024 * 1024;
+/// Bytes of texture RAM per TMU. `DISTIRA_TMU_CONFIG` (`distira.rs`)
+/// advertises a dual-TMU board (both TMU-count bits set, matching DOSBox-X's
+/// `VOODOO_1_DTMU`), and a real dual-TMU Voodoo 1 board carries 4 MB of
+/// texture RAM per TMU (DOSBox-X pairs `VOODOO_1_DTMU` with `tmumem0 =
+/// tmumem1 = 4`; a plain single-TMU Voodoo 1 gets 2). This must match the
+/// advertised board: every texture-aperture write and every texture fetch
+/// masks its address with `DISTIRA_TEX_SIZE - 1`, so a value narrower than
+/// what the guest was told it has lets legitimate high uploads wrap and
+/// silently overwrite unrelated low texels. See
+/// `dev_docs/2026-09-01-tr-mipmap-diag.md` section 5.
+///
+/// 4 MB is also the size at which the mask stops disagreeing with the
+/// hardware it is masking: `SST_TEX_BASE_ADDR` (`raster_view.rs`,
+/// `tex_base_addr_for_tmu`/`_lod`) is itself only 19 bits wide --
+/// `(val & 0x0007_ffff) << 3`, the same field 86Box's non-Banshee
+/// `SST_texBaseAddr` handler masks (`vid_voodoo_reg.c`,
+/// `params.texBaseAddr[0] = (val & 0x7ffff) << 3`) -- so the register can
+/// name addresses only up to `0x3FFFF8`, one qword short of 4 MB. At the old
+/// 2 MB size that top register bit was being silently folded away by the
+/// (narrower) texture mask before the register's own width ever mattered;
+/// at 4 MB the two finally agree, and only `base + mip_offset + row_offset`
+/// can still cross the top, exactly as it does in 86Box and DOSBox-X. See
+/// `dev_docs/2026-09-01-tex4mb-review.md` section 1.
+pub const DISTIRA_TEX_SIZE: usize = 4 * 1024 * 1024;
 pub const DISTIRA_FIFO_CAPACITY: usize = 65_536;
 pub const DISTIRA_ID_VALUE: u32 = 0x4454_0100; // 'D''T', version 1.00
 pub const DISTIRA_MODEL_VALUE: u32 = 1;

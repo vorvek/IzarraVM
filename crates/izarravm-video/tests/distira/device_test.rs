@@ -86,10 +86,17 @@ fn glide_tmu_memory_probe_reads_the_selected_texture_base() {
     const SENSE2: u32 = 0x92f5_6eb0;
     const SENSE1: u32 = 0xf2a9_16b5;
     const SENSE0: u32 = 0xbadb_eef1;
+    const SENSE_HIGH: u32 = 0x1357_9bdf;
     const TREX0: usize = 2 << 10;
     const TMU1_APERTURE: usize = 1 << 21;
     const TC_REPLACE: u32 = (1 << 12) | (1 << 18);
     const TCA_REPLACE: u32 = (1 << 21) | (1 << 27);
+    // The largest byte address `SST_TEX_BASE_ADDR` can name on its own: the
+    // register's field is 19 bits (`(val & 0x0007_ffff) << 3`,
+    // `raster_view.rs::tex_base_addr_for_tmu`), matching 86Box's
+    // non-Banshee `SST_texBaseAddr` handler. One qword short of 4 MB.
+    // (`dev_docs/2026-09-01-tex4mb-review.md` section 1.)
+    const TEX_BASE_ADDR_MAX: u32 = 0x7_ffff << 3;
 
     fn sense(distira: &mut Distira, tmu: usize, memory_offset: u32) -> u32 {
         for (offset, value) in [(0x20_0000, SENSE2), (0x10_0000, SENSE1), (0, SENSE0)] {
@@ -97,6 +104,25 @@ fn glide_tmu_memory_probe_reads_the_selected_texture_base() {
             distira.write_texture_u32(tmu * TMU1_APERTURE, value);
         }
         write_reg(distira, SST_TEX_BASE_ADDR, memory_offset >> 3);
+        write_reg(distira, SST_TRIANGLE_CMD, 0);
+        distira.read_lfb_u32(0)
+    }
+
+    /// Pins the wrap boundary at the NEW 4 MB budget. `memory_offset` here
+    /// is `0x40_0000`, which `SST_TEX_BASE_ADDR` cannot name directly (see
+    /// `TEX_BASE_ADDR_MAX`), so this proves the alias by write ORDER
+    /// instead of by reading at the candidate address: write a victim to
+    /// offset 0, then write the candidate at `TEX_BASE_ADDR_MAX` plus the
+    /// remaining 8 bytes crossed through the aperture's own row offset --
+    /// the same `base + mip_offset + row_offset` sum `texture_write_offset`
+    /// computes for a real triangle's upload -- then sample offset 0. If
+    /// the candidate aliases, its value wins.
+    fn sense_at_four_megabytes(distira: &mut Distira, tmu: usize) -> u32 {
+        write_reg(distira, SST_TEX_BASE_ADDR, 0);
+        distira.write_texture_u32(tmu * TMU1_APERTURE, SENSE0);
+        write_reg(distira, SST_TEX_BASE_ADDR, TEX_BASE_ADDR_MAX >> 3);
+        distira.write_texture_u32(tmu * TMU1_APERTURE + 8, SENSE_HIGH);
+        write_reg(distira, SST_TEX_BASE_ADDR, 0);
         write_reg(distira, SST_TRIANGLE_CMD, 0);
         distira.read_lfb_u32(0)
     }
@@ -132,14 +158,21 @@ fn glide_tmu_memory_probe_reads_the_selected_texture_base() {
     write_reg(&mut distira, SST_DT_DY, 1 << 18);
     write_reg(&mut distira, SST_DW_DY, 0);
 
-    assert_eq!(sense(&mut distira, 0, 0x20_0000), SENSE0);
+    // At the new 4 MB-per-TMU budget, 2 MB no longer aliases offset 0: it is
+    // a real, distinct location now, and reads back what was written there
+    // rather than what offset 0 holds.
+    assert_eq!(sense(&mut distira, 0, 0x20_0000), SENSE2);
     assert_eq!(sense(&mut distira, 0, 0x10_0000), SENSE1);
     assert_eq!(sense(&mut distira, 0, 0), SENSE0);
+    // ...but a write 4 MB above offset 0 still wraps, pinning the boundary
+    // at the NEW size rather than just moving the old assertion up.
+    assert_eq!(sense_at_four_megabytes(&mut distira, 0), SENSE_HIGH);
 
     write_reg(&mut distira, TREX0 | SST_TEXTURE_MODE, 0);
-    assert_eq!(sense(&mut distira, 1, 0x20_0000), SENSE0);
+    assert_eq!(sense(&mut distira, 1, 0x20_0000), SENSE2);
     assert_eq!(sense(&mut distira, 1, 0x10_0000), SENSE1);
     assert_eq!(sense(&mut distira, 1, 0), SENSE0);
+    assert_eq!(sense_at_four_megabytes(&mut distira, 1), SENSE_HIGH);
 }
 
 #[test]
