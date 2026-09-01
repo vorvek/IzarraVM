@@ -110,7 +110,7 @@ impl RasterView<'_> {
     }
 
     fn sample_tmu_rgba(&self, tmu: usize, sample: TextureSample) -> TextureRgba {
-        if self.texture_mode_for_tmu(tmu) & 0x6 != 0 {
+        if !self.force_point_sampling && self.texture_mode_for_tmu(tmu) & 0x6 != 0 {
             return self.sample_tmu_bilinear_rgba(tmu, sample);
         }
         self.sample_tmu_nearest_rgba(tmu, sample)

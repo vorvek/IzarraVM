@@ -18,7 +18,7 @@ pub(crate) use session::load_cd_image_from_path;
 use crate::controller_names::ControllerNameResolver;
 use crate::controller_profiles::ControllerProfileStore;
 use crate::host_input::HostInputPolicy;
-use crate::prefs::{CrtStyle, GlideGamma, GuiPrefs, KeyBinding, MAX_VOLUME};
+use crate::prefs::{CrtStyle, GlideGamma, GlideTextureFilter, GuiPrefs, KeyBinding, MAX_VOLUME};
 use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioPlayer, MidiEngine};
 use izarravm_core::{GswMode, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
@@ -717,6 +717,11 @@ pub struct GuiApp {
     // or presented as the period card did (Original). Persisted; applies to
     // Distira's output only, so monitor_ui gates it on the frame's own owner.
     glide_gamma: GlideGamma,
+    // Whether Distira samples Glide textures as the guest programmed
+    // (Original, default) or forces nearest/point sampling regardless
+    // (Disabled). Persisted; takes effect on the next power-on. See
+    // `gui_session::SessionSpec::glide_force_point_sampling`.
+    glide_texture_filter: GlideTextureFilter,
     // The engine that produced the frame currently on the texture. The uniform
     // is rewritten every paint but a frame arrives only on some of them, so
     // this has to persist rather than be read off the frame in hand.
@@ -756,6 +761,7 @@ enum ConfigPage {
     Settings,
     Hotkeys,
     Midi,
+    Graphics,
 }
 
 /// Staged settings edited by the configuration modal. Seeded from the live
@@ -770,6 +776,7 @@ struct ConfigDialog {
     crt_style: CrtStyle,
     monitor_gamma: Option<f32>,
     glide_gamma: GlideGamma,
+    glide_texture_filter: GlideTextureFilter,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
     soundfont: Option<PathBuf>,
@@ -1146,6 +1153,10 @@ impl GuiApp {
             midi_config,
             glide_ovl,
             test_pattern,
+            glide_force_point_sampling: matches!(
+                prefs.glide_texture_filter,
+                GlideTextureFilter::Disabled
+            ),
             sink: Some(audio.sink()),
             rtc_setup,
             gain: gain.clone(),
@@ -1159,6 +1170,7 @@ impl GuiApp {
         let crt_style = prefs.crt_style;
         let monitor_gamma = prefs.monitor_gamma;
         let glide_gamma = prefs.glide_gamma;
+        let glide_texture_filter = prefs.glide_texture_filter;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
         let screenshot_key = prefs.screenshot.clone();
@@ -1238,6 +1250,7 @@ impl GuiApp {
             crt_style,
             monitor_gamma,
             glide_gamma,
+            glide_texture_filter,
             input_release,
             fullscreen_key,
             screenshot_key,

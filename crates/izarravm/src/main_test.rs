@@ -1644,6 +1644,109 @@ fn presented_ppm_is_unaffected_by_display_settings() {
     }
 }
 
+/// The "Glide texture filtering: Disabled" GUI setting is host-only in the
+/// same sense as `monitor_gamma`/`glide_gamma` above: headless capture never
+/// loads `GuiPrefs`, so the pref cannot reach `--presented-ppm` through the
+/// GUI at all -- the default (untouched) case below must render the same as
+/// it always has. Unlike gamma, though, filtering is a RASTER-side effect,
+/// not a presentation-time one, so a caller who reaches past the GUI (a bench
+/// harness measuring filtering's cost, say) and calls
+/// `Machine::set_glide_force_point_sampling` directly gets a genuinely
+/// different frame. This test proves both halves of that policy: the knob is
+/// inert unless something calls the setter, and when something does, it
+/// actually changes the pixels.
+#[test]
+fn presented_ppm_reflects_glide_texture_filtering_only_when_explicitly_set() {
+    // 3dfx-style BAR layout: `DISTIRA_PCI_TEX_OFFSET` in
+    // crates/izarravm-machine/src/video_params.rs, not re-exported past that
+    // crate's own modules (same reasoning as `DISTIRA_PCI_SLOT` above).
+    const DISTIRA_PCI_TEX_OFFSET: u32 = 0x0080_0000;
+    const TEXTUREMODE_BILINEAR_FILTER: u32 = 0x2;
+    const TEX_COORD_ONE: u32 = 1 << 18;
+    const BLENDED: [u8; 3] = [0x7b, 0x7d, 0x7b];
+
+    fn draw_gradient_triangle(machine: &mut Machine) {
+        let reg = |offset: usize| izarravm_machine::DISTIRA_MMIO_BASE + offset as u32;
+        let tex =
+            |offset: u32| izarravm_machine::DISTIRA_MMIO_BASE + DISTIRA_PCI_TEX_OFFSET + offset;
+        machine.write_physical_u32(
+            reg(izarravm_video::SST_TEXTURE_MODE),
+            (izarravm_video::TEX_R5G6B5 << 8)
+                | izarravm_video::TEXTUREMODE_LOCAL
+                | TEXTUREMODE_BILINEAR_FILTER,
+        );
+        machine.write_physical_u32(tex(0), 0x07e0_f800);
+        machine.write_physical_u32(tex(256 * 2), 0xffff_001f);
+        machine.write_physical_u32(
+            reg(izarravm_video::SST_FBZ_MODE),
+            izarravm_video::FBZ_RGB_WMASK | izarravm_video::FBZ_DRAW_BACK,
+        );
+        machine.write_physical_u32(
+            reg(izarravm_video::SST_FBZ_COLOR_PATH),
+            izarravm_video::FBZCP_TEXTURE_ENABLED | izarravm_video::RGB_SELECT_TEXTURE,
+        );
+        machine.write_physical_u32(reg(izarravm_video::SST_START_S), TEX_COORD_ONE);
+        machine.write_physical_u32(reg(izarravm_video::SST_START_T), TEX_COORD_ONE);
+        machine.write_physical_u32(reg(izarravm_video::SST_VERTEX_AX), 0);
+        machine.write_physical_u32(reg(izarravm_video::SST_VERTEX_AY), 0);
+        machine.write_physical_u32(reg(izarravm_video::SST_VERTEX_BX), 4 << 4);
+        machine.write_physical_u32(reg(izarravm_video::SST_VERTEX_BY), 0);
+        machine.write_physical_u32(reg(izarravm_video::SST_VERTEX_CX), 0);
+        machine.write_physical_u32(reg(izarravm_video::SST_VERTEX_CY), 4 << 4);
+        machine.write_physical_u32(reg(izarravm_video::SST_TRIANGLE_CMD), 0);
+        machine.write_physical_u32(
+            izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_COMMAND as u32,
+            izarravm_video::DISTIRA_CMD_SWAP,
+        );
+    }
+
+    fn capture_first_pixel(machine: &mut Machine) -> [u8; 3] {
+        let dir = std::env::temp_dir().join(format!(
+            "izarravm_presented_ppm_filter_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("frame.ppm");
+        let wrote = write_presented_ppm(machine, &path).expect("write ppm");
+        assert!(wrote, "a swapped frame must be reported as written");
+        let bytes = std::fs::read(&path).expect("read ppm back");
+        let _ = std::fs::remove_dir_all(&dir);
+        let header_end = bytes
+            .windows(4)
+            .position(|w| w == b"255\n")
+            .expect("PPM header must have a maxval line")
+            + 4;
+        [
+            bytes[header_end],
+            bytes[header_end + 1],
+            bytes[header_end + 2],
+        ]
+    }
+
+    let mut default_machine = distira_display_enabled_bios_machine();
+    draw_gradient_triangle(&mut default_machine);
+    let default_pixel = capture_first_pixel(&mut default_machine);
+    assert_eq!(
+        default_pixel, BLENDED,
+        "fixture must render the bilinear blend by default, or this guard proves nothing \
+         about whether filtering engaged"
+    );
+
+    let mut forced_machine = distira_display_enabled_bios_machine();
+    forced_machine.set_glide_force_point_sampling(true);
+    draw_gradient_triangle(&mut forced_machine);
+    let forced_pixel = capture_first_pixel(&mut forced_machine);
+    assert_ne!(
+        forced_pixel, default_pixel,
+        "set_glide_force_point_sampling(true) must change the presented frame: forcing \
+         point sampling is a raster-side effect, unlike monitor_gamma/glide_gamma"
+    );
+}
+
 #[test]
 fn langid_maps_to_guest_layout_index() {
     assert_eq!(layout_index_from_langid(0x0409), 0); // en-US

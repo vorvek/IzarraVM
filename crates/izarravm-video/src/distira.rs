@@ -408,6 +408,11 @@ pub struct Distira {
     /// clear and VIDEO_RESET was already clear. Level-triggered, not an edge.
     fbi_init0_byte0_enables: u64,
     dither_enabled: bool,
+    /// Host override: sample the nearest texel regardless of the guest's own
+    /// `texture_mode` bilinear bit. Off leaves every triangle exactly as the
+    /// guest programmed it -- this is the "Glide texture filtering: Disabled"
+    /// GUI setting, and it is the only thing that ever sets this true.
+    force_point_sampling: bool,
     /// How many threads rasterise a batch of triangles, caller included.
     /// Chosen from the host core count at construction; see
     /// [`Distira::raster_lanes_for_cores`].
@@ -574,6 +579,7 @@ impl Distira {
             video_reset_falling_edges: 0,
             fbi_init0_byte0_enables: 0,
             dither_enabled: false,
+            force_point_sampling: false,
             raster_lanes: raster_pool::host_lanes(),
             raster_queue: RasterQueue::default(),
             raster_queue_enabled: true,
@@ -1026,6 +1032,21 @@ impl Distira {
         self.dither_enabled = enabled;
     }
 
+    /// Host override for the Glide texture filtering setting: forces nearest
+    /// (point) sampling for every TMU regardless of the guest's own
+    /// `texture_mode` bilinear bit. Queued triangles were snapshotted with the
+    /// old value in their `RasterParams`, so this drains them first, same as
+    /// [`Self::set_dither_enabled`].
+    pub fn set_force_point_sampling(&mut self, enabled: bool) {
+        self.drain_raster_queue();
+        self.force_point_sampling = enabled;
+    }
+
+    /// See [`Self::set_force_point_sampling`].
+    pub fn force_point_sampling(&self) -> bool {
+        self.force_point_sampling
+    }
+
     /// The raster thread count for a host with `cores` logical CPUs: two,
     /// or four when six or more cores leave room for the main emulation
     /// thread.
@@ -1139,6 +1160,7 @@ impl Distira {
             tex_base_addr2: self.tex_base_addr2,
             tex_base_addr38: self.tex_base_addr38,
             trex_init1: self.trex_init1,
+            force_point_sampling: self.force_point_sampling,
         }
     }
 

@@ -225,6 +225,28 @@ impl GlideGamma {
     }
 }
 
+/// Glide texture filtering: whether Distira samples a texture the way the
+/// guest's `texture_mode` register asks, or forces nearest (point) sampling
+/// regardless.
+///
+/// "Improved" texture filtering -- something better than the SST-1's own
+/// bilinear filter -- was considered for a third option here and left out.
+/// A feasibility measurement against the in-progress renderer work is still
+/// pending, and this codebase's convention is to leave a feature off the
+/// board until it exists rather than show a disabled option for it (there is
+/// no disabled-radio-button precedent anywhere in this GUI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GlideTextureFilter {
+    /// Sample exactly as the guest's `texture_mode` register asks. The
+    /// default, and the only behavior this emulator has ever had.
+    #[default]
+    Original,
+    /// Force nearest (point) sampling for every TMU, regardless of the
+    /// guest's own bilinear bit.
+    Disabled,
+}
+
 /// Default assumed CRT gamma: the midpoint of the 2.2-2.5 desktop-SVGA band,
 /// and the analytically special value at which the correction collapses to a
 /// pure black-level offset above the sRGB knee (see
@@ -288,6 +310,10 @@ pub struct GuiPrefs {
     /// (`Original`). Applies to Distira's output only; DOS VGA and Margo are
     /// unaffected, as is the guest's `clutData` register.
     pub glide_gamma: GlideGamma,
+    /// Whether Distira samples Glide textures as the guest programmed
+    /// (`Original`, the default) or forces nearest/point sampling regardless
+    /// (`Disabled`). Applies to Distira's output only.
+    pub glide_texture_filter: GlideTextureFilter,
     /// Whether a new GUI window starts in borderless full screen.
     pub start_fullscreen: bool,
     /// Mouse sensitivity in percent, the DOSBox-X `sensitivity` scale (default
@@ -328,6 +354,7 @@ impl Default for GuiPrefs {
             crt_style: CrtStyle::Subtle,
             monitor_gamma: Some(DEFAULT_MONITOR_GAMMA),
             glide_gamma: GlideGamma::default(),
+            glide_texture_filter: GlideTextureFilter::default(),
             start_fullscreen: false,
             mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
             input_release: default_input_release(),
@@ -354,6 +381,8 @@ struct GuiPrefsWire {
     // (crt.rs's monitor_gamma uniform, CrtCallback).
     monitor_gamma: f32,
     glide_gamma: GlideGamma,
+    #[serde(default)]
+    glide_texture_filter: GlideTextureFilter,
     start_fullscreen: bool,
     mouse_sensitivity: u16,
     input_release: KeyBinding,
@@ -377,6 +406,7 @@ impl Default for GuiPrefsWire {
             crt_style: prefs.crt_style,
             monitor_gamma: prefs.monitor_gamma.unwrap_or(0.0),
             glide_gamma: prefs.glide_gamma,
+            glide_texture_filter: prefs.glide_texture_filter,
             start_fullscreen: prefs.start_fullscreen,
             mouse_sensitivity: prefs.mouse_sensitivity,
             input_release: prefs.input_release,
@@ -408,6 +438,7 @@ impl<'de> Deserialize<'de> for GuiPrefs {
                     .clamp(MIN_MONITOR_GAMMA, MAX_MONITOR_GAMMA),
             ),
             glide_gamma: wire.glide_gamma,
+            glide_texture_filter: wire.glide_texture_filter,
             start_fullscreen: wire.start_fullscreen,
             mouse_sensitivity: wire
                 .mouse_sensitivity
