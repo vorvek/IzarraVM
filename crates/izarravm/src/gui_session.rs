@@ -52,6 +52,13 @@ pub(super) struct SessionSpec {
     pub(super) midi_config: MidiConfig,
     pub(super) glide_ovl: Option<Vec<u8>>,
     pub(super) test_pattern: bool,
+    /// The "Glide texture filtering: Disabled" GUI setting, resolved to the
+    /// bool Distira's own setter takes. Applied once, when
+    /// `MachineGeneration::build` constructs the machine -- like `profile`,
+    /// this is a boot-time setting: changing it in the configuration dialog
+    /// takes effect on the next power-on, the same as a CPU, memory, or video
+    /// card change.
+    pub(super) glide_force_point_sampling: bool,
     pub(super) sink: Option<AudioSink>,
     pub(super) rtc_setup: crate::cmos::RtcSetup,
     /// The host playback level (the volume knob). Applied to the finished mix
@@ -499,6 +506,14 @@ impl GuiSession {
         }
     }
 
+    /// Stage the Glide texture filtering setting for the NEXT power-on. Like
+    /// `profile`, this is a boot-time-only field: it takes effect the next
+    /// time `MachineGeneration::build` runs, not on the machine that is
+    /// (possibly) already running.
+    pub(super) fn set_glide_force_point_sampling(&mut self, enabled: bool) {
+        self.spec.glide_force_point_sampling = enabled;
+    }
+
     pub(super) fn reset(&mut self) -> Result<ResetReport, SessionFailure> {
         let exit = self.stop_generation().ok_or_else(|| {
             SessionFailure::new("cannot reset a GUI session while it is powered off")
@@ -886,8 +901,9 @@ struct MachineGeneration {
 
 impl MachineGeneration {
     fn build(spec: SessionSpec, id: u64) -> Result<Self, SessionFailure> {
-        let machine = Machine::new(spec.profile.clone(), &spec.rom)
+        let mut machine = Machine::new(spec.profile.clone(), &spec.rom)
             .map_err(|err| SessionFailure::new(format!("failed to start machine: {err}")))?;
+        machine.set_glide_force_point_sampling(spec.glide_force_point_sampling);
         #[cfg(test)]
         let finalization_probe = spec.finalization_probe.clone();
         Ok(Self {

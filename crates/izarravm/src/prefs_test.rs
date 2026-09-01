@@ -13,6 +13,7 @@ fn round_trips_through_toml() {
         crt_style: CrtStyle::YeOlde,
         monitor_gamma: Some(2.2),
         glide_gamma: GlideGamma::Original,
+        glide_texture_filter: GlideTextureFilter::Disabled,
         start_fullscreen: true,
         mouse_sensitivity: 150,
         input_release: KeyBinding::new(true, true, false, true, "F4"),
@@ -486,4 +487,33 @@ fn glide_gamma_original_is_no_compensation() {
         GlideGamma::Compatible.exponent(),
         Some(crate::display_transform::GLIDE_COMPAT_EXPONENT)
     );
+}
+
+/// Same shape as `glide_gamma_round_trips_and_defaults_to_compatible`: the
+/// default must be `Original` (today's only behaviour, unchanged), an older
+/// preferences file without the key must default to it too, and every
+/// setting must round-trip through TOML.
+#[test]
+fn glide_texture_filter_round_trips_and_defaults_to_original() {
+    assert_eq!(
+        GuiPrefs::default().glide_texture_filter,
+        GlideTextureFilter::Original
+    );
+
+    let absent: GuiPrefs = toml::from_str("master_volume = 1.0").expect("deserialize");
+    assert_eq!(
+        absent.glide_texture_filter,
+        GlideTextureFilter::Original,
+        "an older preferences file without the key must default to Original"
+    );
+
+    for setting in [GlideTextureFilter::Original, GlideTextureFilter::Disabled] {
+        let prefs = GuiPrefs {
+            glide_texture_filter: setting,
+            ..GuiPrefs::default()
+        };
+        let text = toml::to_string(&prefs).expect("serialize");
+        let parsed: GuiPrefs = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed.glide_texture_filter, setting);
+    }
 }

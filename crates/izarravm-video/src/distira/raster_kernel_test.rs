@@ -98,6 +98,7 @@ fn scene(
         tex_base_addr2: [0, 0],
         tex_base_addr38: [0, 0],
         trex_init1: [0, 0],
+        force_point_sampling: false,
     };
 
     let a = DistiraVertex {

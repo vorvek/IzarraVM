@@ -309,6 +309,7 @@ impl GuiApp {
             crt_style: self.crt_style,
             monitor_gamma: self.monitor_gamma,
             glide_gamma: self.glide_gamma,
+            glide_texture_filter: self.glide_texture_filter,
             midi_backend: midi_config.backend,
             external_midi_port: midi_config.external_port,
             soundfont: midi_config.soundfont,
@@ -438,6 +439,7 @@ impl GuiApp {
                             ConfigPage::Settings => "SETTINGS",
                             ConfigPage::Hotkeys => "APPLICATION HOTKEYS",
                             ConfigPage::Midi => "MIDI EMULATION",
+                            ConfigPage::Graphics => "GRAPHICS EMULATION",
                         };
                         ui.label(header_text(title, 18.0));
                     });
@@ -452,6 +454,71 @@ impl GuiApp {
                             );
                             beige_group(ui, |ui| {
                                 ui.checkbox(&mut dialog.start_fullscreen, "Start in Full Screen");
+                                ui.horizontal(|ui| {
+                                    ui.label("Mouse sensitivity");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut dialog.mouse_sensitivity,
+                                                    crate::prefs::MIN_MOUSE_SENSITIVITY
+                                                        ..=crate::prefs::MAX_MOUSE_SENSITIVITY,
+                                                )
+                                                .suffix("%")
+                                                .logarithmic(true),
+                                            );
+                                        },
+                                    );
+                                });
+                            });
+
+                            ui.add_space(8.0);
+                            let width = ui.available_width();
+                            if ui
+                                .add_sized(
+                                    [width, 30.0],
+                                    egui::Button::new("Application Hotkeys..."),
+                                )
+                                .clicked()
+                            {
+                                dialog.page = ConfigPage::Hotkeys;
+                            }
+                            if ui
+                                .add_sized(
+                                    [width, 30.0],
+                                    egui::Button::new("Graphics emulation..."),
+                                )
+                                .clicked()
+                            {
+                                dialog.page = ConfigPage::Graphics;
+                            }
+                            if ui
+                                .add_sized(
+                                    [width, 30.0],
+                                    egui::Button::new("Controller emulation..."),
+                                )
+                                .clicked()
+                            {
+                                open_controller_setup = true;
+                            }
+                            if let Some(profile) = &self.controller_profile {
+                                ui.small(format!("Selected controller profile: {profile}"));
+                            }
+                            if !self.host_input.joystick_enabled() {
+                                ui.small("Joystick input is disabled in izarravm.toml.");
+                            } else if self.controllers.is_none() {
+                                ui.small("Host controller input is unavailable.");
+                            }
+                            if ui
+                                .add_sized([width, 30.0], egui::Button::new("MIDI emulation..."))
+                                .clicked()
+                            {
+                                dialog.page = ConfigPage::Midi;
+                            }
+                        }
+                        ConfigPage::Graphics => {
+                            beige_group(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("CRT emulation");
                                     ui.with_layout(
@@ -551,58 +618,36 @@ impl GuiApp {
                                     );
                                 });
                                 ui.horizontal(|ui| {
-                                    ui.label("Mouse sensitivity");
+                                    ui.label("Glide texture filtering");
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            ui.add(
-                                                egui::Slider::new(
-                                                    &mut dialog.mouse_sensitivity,
-                                                    crate::prefs::MIN_MOUSE_SENSITIVITY
-                                                        ..=crate::prefs::MAX_MOUSE_SENSITIVITY,
-                                                )
-                                                .suffix("%")
-                                                .logarithmic(true),
+                                            // "On (original)" samples exactly as
+                                            // the guest's texture_mode register
+                                            // asks -- today's only behaviour.
+                                            // "Disabled" forces nearest (point)
+                                            // sampling for every TMU regardless.
+                                            // Takes effect on the next power-on,
+                                            // like a CPU, memory, or video card
+                                            // change.
+                                            ui.selectable_value(
+                                                &mut dialog.glide_texture_filter,
+                                                crate::prefs::GlideTextureFilter::Disabled,
+                                                "Disabled",
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.glide_texture_filter,
+                                                crate::prefs::GlideTextureFilter::Original,
+                                                "On (original)",
                                             );
                                         },
                                     );
                                 });
                             });
-
-                            ui.add_space(8.0);
-                            let width = ui.available_width();
-                            if ui
-                                .add_sized(
-                                    [width, 30.0],
-                                    egui::Button::new("Application Hotkeys..."),
-                                )
-                                .clicked()
-                            {
-                                dialog.page = ConfigPage::Hotkeys;
-                            }
-                            if ui
-                                .add_sized(
-                                    [width, 30.0],
-                                    egui::Button::new("Controller emulation..."),
-                                )
-                                .clicked()
-                            {
-                                open_controller_setup = true;
-                            }
-                            if let Some(profile) = &self.controller_profile {
-                                ui.small(format!("Selected controller profile: {profile}"));
-                            }
-                            if !self.host_input.joystick_enabled() {
-                                ui.small("Joystick input is disabled in izarravm.toml.");
-                            } else if self.controllers.is_none() {
-                                ui.small("Host controller input is unavailable.");
-                            }
-                            if ui
-                                .add_sized([width, 30.0], egui::Button::new("MIDI emulation..."))
-                                .clicked()
-                            {
-                                dialog.page = ConfigPage::Midi;
-                            }
+                            ui.small(
+                                "Graphics settings take effect the next time the machine \
+                                 powers on.",
+                            );
                         }
                         ConfigPage::Hotkeys => {
                             beige_group(ui, |ui| {
@@ -786,6 +831,11 @@ impl GuiApp {
         self.crt_style = dialog.crt_style;
         self.monitor_gamma = dialog.monitor_gamma;
         self.glide_gamma = dialog.glide_gamma;
+        self.glide_texture_filter = dialog.glide_texture_filter;
+        self.session.set_glide_force_point_sampling(matches!(
+            dialog.glide_texture_filter,
+            crate::prefs::GlideTextureFilter::Disabled
+        ));
         self.prefs.start_fullscreen = dialog.start_fullscreen;
         self.prefs.mouse_sensitivity = dialog.mouse_sensitivity;
         self.mouse_scale = crate::host_input::mouse_sensitivity_scale(dialog.mouse_sensitivity);
@@ -795,6 +845,7 @@ impl GuiApp {
         self.prefs.crt_style = dialog.crt_style;
         self.prefs.monitor_gamma = dialog.monitor_gamma;
         self.prefs.glide_gamma = dialog.glide_gamma;
+        self.prefs.glide_texture_filter = dialog.glide_texture_filter;
         let midi_config = MidiConfig {
             backend: dialog.midi_backend,
             external_port: dialog.external_midi_port.clone(),

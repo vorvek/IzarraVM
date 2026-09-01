@@ -44,6 +44,7 @@ fn test_spec(scratch: &TestScratch) -> SessionSpec {
         midi_config: MidiConfig::default(),
         glide_ovl: None,
         test_pattern: false,
+        glide_force_point_sampling: false,
         sink: None,
         rtc_setup: crate::cmos::RtcSetup::from_c_root(scratch.path()),
         gain: SharedGain::new(1.0),

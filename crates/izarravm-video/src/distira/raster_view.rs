@@ -54,6 +54,8 @@ pub(super) struct RasterParams {
     pub(super) tex_base_addr2: [u32; 2],
     pub(super) tex_base_addr38: [u32; 2],
     pub(super) trex_init1: [u32; 2],
+    /// See `Distira::set_force_point_sampling`.
+    pub(super) force_point_sampling: bool,
 }
 
 /// One triangle's snapshot, plus the memories the pipeline reads live.

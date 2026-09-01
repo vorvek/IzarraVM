@@ -2575,6 +2575,14 @@ impl Machine {
         self.vega.host_metrics()
     }
 
+    /// Host override for the Glide texture filtering setting: forces nearest
+    /// (point) sampling on Distira for every TMU, regardless of the guest's
+    /// own `texture_mode` bilinear bit. Off (the default) leaves every
+    /// triangle exactly as the guest programmed it.
+    pub fn set_glide_force_point_sampling(&mut self, enabled: bool) {
+        self.vega.set_glide_force_point_sampling(enabled);
+    }
+
     /// Render the current display state immediately for a headless capture.
     /// Legacy VGA output is cropped to its visible rows; accelerated scanouts
     /// use their current front buffers.

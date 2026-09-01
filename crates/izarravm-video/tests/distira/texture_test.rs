@@ -402,6 +402,59 @@ fn triangle_cmd_bilinear_blends_four_rgb565_neighbors_at_integer_coordinates() {
     assert_eq!(distira.scanout_argb()[0], 0x007b_7d7b);
 }
 
+/// The "Glide texture filtering: Disabled" GUI setting forces nearest
+/// sampling for every TMU, regardless of the guest's own `texture_mode`
+/// bilinear bit. This is the same gradient-texture setup as
+/// `triangle_cmd_bilinear_blends_four_rgb565_neighbors_at_integer_coordinates`
+/// (bilinear requested, four distinct neighbor texels at an integer
+/// coordinate that blends them), except `set_force_point_sampling(true)` is
+/// on: the store must land on exactly one texel, never their blend.
+#[test]
+fn force_point_sampling_overrides_the_guest_bilinear_mode() {
+    const TEXTUREMODE_BILINEAR_FILTER: u32 = 0x2;
+    const TEX_COORD_ONE: u32 = 1 << 18;
+    const BLENDED: u32 = 0x007b_7d7b;
+    const CORNER_TEXELS: [u32; 4] = [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0x00ff_ffff];
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.set_force_point_sampling(true);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        (TEX_R5G6B5 << 8) | TEXTUREMODE_LOCAL | TEXTUREMODE_BILINEAR_FILTER,
+    );
+    assert!(distira.queue_texture_write_u32(0, 0x07e0_f800));
+    assert!(distira.queue_texture_write_u32(256 * 2, 0xffff_001f));
+    distira.drain_fifo();
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        (1 << 27) | RGB_SELECT_TEXTURE,
+    );
+    write_reg(&mut distira, SST_START_S, TEX_COORD_ONE);
+    write_reg(&mut distira, SST_START_T, TEX_COORD_ONE);
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+    let pixel = distira.scanout_argb()[0];
+    assert_ne!(
+        pixel, BLENDED,
+        "forced point sampling must not blend the four neighbor texels"
+    );
+    assert!(
+        CORNER_TEXELS.contains(&pixel),
+        "forced point sampling must select exactly one texel, got {pixel:#010x}"
+    );
+}
+
 #[test]
 fn bilinear_filter_blends_decoded_rgb_for_every_sst_texture_format() {
     for case in BILINEAR_FORMATS {

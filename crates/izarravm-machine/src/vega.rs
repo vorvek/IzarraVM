@@ -266,6 +266,12 @@ impl Vega {
         &mut self.distira
     }
 
+    /// Host override for the Glide texture filtering setting. See
+    /// `Distira::set_force_point_sampling`.
+    pub(crate) fn set_glide_force_point_sampling(&mut self, enabled: bool) {
+        self.distira.set_force_point_sampling(enabled);
+    }
+
     pub(crate) fn select_legacy(&mut self) {
         // The display mux is FBIINIT0 bit 0 alone (real hardware: 86Box
         // `vid_voodoo.c:744-761`, DOSBox-X `voodoo_emu.cpp:1764-1775`); a
