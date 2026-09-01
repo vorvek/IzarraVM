@@ -10,17 +10,17 @@ use izarravm_machine::{
 use izarravm_video::{
     ALPHA_BLEND_ENABLE, ALPHA_DST_FUNC_SHIFT, ALPHA_SRC_FUNC_SHIFT, BLEND_AONE, BLEND_AZERO,
     DACDATA_ADDR_SHIFT, DACDATA_RD, DISTIRA_CAPS_VALUE, DISTIRA_ID_VALUE, DISTIRA_REG_CAPS,
-    DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, DISTIRA_REG_ID, FBIINIT1_TILES_IN_X_SHIFT,
-    FBIINIT2_BUFFER_OFFSET_SHIFT, FBZ_DEPTH_WMASK, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
-    FBZCP_TEXTURE_ENABLED, INIT_ENABLE_REMAP, INIT_ENABLE_WRITE, LFB_ENABLE_PIXEL_PIPELINE,
-    LFB_FORMAT_ARGB8888, LFB_FORMAT_DEPTH, LFB_FORMAT_RGB565, LFB_READ_AUX, LFB_READ_BACK,
-    LFB_WRITE_BACK, LFB_WRITE_FRONT, RGB_SELECT_TEXTURE, SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT,
-    SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_FASTFILL_CMD, SST_FBI_INIT0,
-    SST_FBI_INIT1, SST_FBI_INIT2, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE, SST_START_A,
-    SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR,
-    SST_TEXTURE_MODE, SST_TLOD, SST_TREX_INIT0, SST_TREX_INIT1, SST_TRIANGLE_CMD, SST_VERTEX_AX,
-    SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY,
-    SST_VIDEO_DIMENSIONS, TEX_R5G6B5, TEXTUREMODE_LOCAL,
+    DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, DISTIRA_REG_ID, FBIINIT0_VGA_PASS,
+    FBIINIT1_TILES_IN_X_SHIFT, FBIINIT1_VIDEO_RESET, FBIINIT2_BUFFER_OFFSET_SHIFT, FBZ_DEPTH_WMASK,
+    FBZ_DRAW_BACK, FBZ_RGB_WMASK, FBZCP_TEXTURE_ENABLED, INIT_ENABLE_REMAP, INIT_ENABLE_WRITE,
+    LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_DEPTH, LFB_FORMAT_RGB565,
+    LFB_READ_AUX, LFB_READ_BACK, LFB_WRITE_BACK, LFB_WRITE_FRONT, RGB_SELECT_TEXTURE,
+    SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA,
+    SST_FASTFILL_CMD, SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2, SST_FBZ_COLOR_PATH,
+    SST_FBZ_MODE, SST_LFB_MODE, SST_START_A, SST_START_B, SST_START_G, SST_START_R, SST_STATUS,
+    SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR, SST_TEXTURE_MODE, SST_TLOD, SST_TREX_INIT0,
+    SST_TREX_INIT1, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY,
+    SST_VERTEX_CX, SST_VERTEX_CY, SST_VIDEO_DIMENSIONS, TEX_R5G6B5, TEXTUREMODE_LOCAL,
 };
 
 const TREX0: usize = 0x2 << 10;
@@ -39,6 +39,41 @@ fn write_reg_at(machine: &mut Machine, base: u32, reg: usize, value: u32) {
 
 fn write_reg(machine: &mut Machine, reg: usize, value: u32) {
     write_reg_at(machine, DISTIRA_MMIO_BASE, reg, value);
+}
+
+/// A machine for tests that poke Distira's registers directly through
+/// `write_reg`/`write_physical_u*`, taken through the same two-step
+/// handshake a real Glide driver's startup does before touching anything
+/// else: unlock initEnable (PCI config offset 0x40, real hardware and this
+/// codebase's PCI function both keep it there rather than the MMIO window --
+/// see `distira_guest_dac_detect_ics_probe_reaches_fbi_init2_through_pci_init_enable`),
+/// then set FBIINIT0 bit 0, the display mux itself (86Box
+/// `vid_voodoo.c:744-761`, DOSBox-X `voodoo_emu.cpp:1764-1775`: both derive
+/// it purely from that bit, bit 0 SET routing the Voodoo onto the cable).
+/// initEnable is reachable only through port I/O, so this runs a tiny
+/// real-mode program (mirrors
+/// `glide_destructive_framebuffer_probe_reports_two_megabytes`) before
+/// handing the machine back for the rest of a test's direct MMIO pokes.
+fn distira_display_enabled_machine(profile: MachineProfile) -> Machine {
+    let mut code = Vec::new();
+    push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8040);
+    push_real_out_dx_eax(&mut code, 0x0cfc, INIT_ENABLE_WRITE);
+    code.extend_from_slice(&[0xcd, 0x20]);
+    let mut machine = Machine::new_raw_program(profile, &code).unwrap();
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    write_reg(&mut machine, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
+    // The unlock program above ran real CPU cycles, which advanced the
+    // frame-phase/retrace timeline along with them. Pulse VIDEO_RESET (a
+    // timing reset only -- see `write_fbi_init1` -- it does not touch the
+    // FBIINIT0-derived mux this helper just set) to bring the timeline back
+    // to a clean, deterministic baseline for tests that measure exact
+    // retrace deadlines from machine construction.
+    write_reg(&mut machine, SST_FBI_INIT1, FBIINIT1_VIDEO_RESET);
+    write_reg(&mut machine, SST_FBI_INIT1, 0);
+    machine
 }
 
 fn read_reg_at(machine: &mut Machine, base: u32, reg: usize) -> u32 {
@@ -78,7 +113,7 @@ fn configure_glide_resolution(
 }
 
 fn run_glide_fbi_memory_probe(machine: &mut Machine) -> u32 {
-    write_reg(machine, SST_FBI_INIT0, 0);
+    write_reg(machine, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
     write_reg(machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DEPTH_WMASK);
 
     configure_glide_resolution(machine, 800, 600, 13, 247);
@@ -310,11 +345,7 @@ fn protected_flat_rom(body: &[u8]) -> Vec<u8> {
 
 #[test]
 fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
 
     assert_eq!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
     assert_eq!(machine.read_physical_u8(DISTIRA_LFB_BASE), 0xff);
@@ -338,11 +369,7 @@ fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
 
 #[test]
 fn distira_lfb_dword_writes_follow_voodoo_lfb_format() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
 
     write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 2);
     write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
@@ -361,11 +388,7 @@ fn distira_lfb_dword_writes_follow_voodoo_lfb_format() {
 
 #[test]
 fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
 
     write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 1);
     write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
@@ -411,11 +434,7 @@ fn glide_destructive_framebuffer_probe_reports_two_megabytes() {
 
 #[test]
 fn distira_odd_aligned_lfb_word_dword_accesses_use_voodoo_callbacks() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
 
     write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 4);
     write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
@@ -449,6 +468,13 @@ fn distira_guest_lfb_bar_odd_reads_and_writes_use_voodoo_callbacks() {
     push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
     push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
     push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8040);
+    push_out_dx_eax(&mut code, 0x0cfc, INIT_ENABLE_WRITE);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_FBI_INIT0 as u32,
+        FBIINIT0_VGA_PASS,
+    );
     push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_WIDTH as u32, 4);
     push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_HEIGHT as u32, 1);
     push_mov_moffs_u32_imm32(
@@ -495,6 +521,13 @@ fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
     push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
     push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
     push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8040);
+    push_out_dx_eax(&mut code, 0x0cfc, INIT_ENABLE_WRITE);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_FBI_INIT0 as u32,
+        FBIINIT0_VGA_PASS,
+    );
     push_mov_moffs_u32_imm32(
         &mut code,
         ASSIGNED_BAR + SST_TEXTURE_MODE as u32,
@@ -521,11 +554,7 @@ fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
 
 #[test]
 fn distira_texture_aperture_keeps_tmu_stores_independent() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
     write_reg(&mut machine, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
     write_reg(&mut machine, TREX1 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
     write_texture_texel(&mut machine, 0, 0, 0xf800);
@@ -537,11 +566,7 @@ fn distira_texture_aperture_keeps_tmu_stores_independent() {
 
 #[test]
 fn distira_glide_probe_detects_two_megabytes_on_each_tmu() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
 
     for tmu in 0..2 {
         let chip = if tmu == 0 { TREX0 } else { TREX1 };
@@ -574,11 +599,7 @@ fn distira_glide_probe_detects_two_megabytes_on_each_tmu() {
 
 #[test]
 fn distira_trex_config_send_reports_two_tmus() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
     const SEND_CONFIG: u32 = 1 << 18;
 
     write_reg(&mut machine, TREX0 | SST_TREX_INIT1, SEND_CONFIG);
@@ -593,11 +614,7 @@ fn distira_trex_config_send_reports_two_tmus() {
 
 #[test]
 fn distira_texture_aperture_aligns_dwords_and_ignores_narrow_writes() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
     let aperture = DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET;
 
     write_reg(&mut machine, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
@@ -611,11 +628,7 @@ fn distira_texture_aperture_aligns_dwords_and_ignores_narrow_writes() {
 
 #[test]
 fn distira_texture_aperture_ignores_unsupported_tmu_space_at_the_boundary() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
     let aperture = DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET;
 
     write_reg(&mut machine, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
@@ -673,17 +686,26 @@ fn vega_always_exposes_the_distira_pci_function() {
 fn distira_pci_bar_maps_voodoo_mmio_and_lfb_windows() {
     const ASSIGNED_BAR: u32 = 0xE200_0000;
     const ASSIGNED_LFB: u32 = ASSIGNED_BAR + 0x0040_0000;
-    const PROG: [u8; 46] = [
-        0xBA, 0xF8, 0x0C, 0x66, 0xB8, 0x10, 0x80, 0x00, 0x80, 0x66, 0xEF, 0xBA, 0xFC, 0x0C, 0x66,
-        0xB8, 0x00, 0x00, 0x00, 0xE2, 0x66, 0xEF, 0xBA, 0xF8, 0x0C, 0x66, 0xB8, 0x04, 0x80, 0x00,
-        0x80, 0x66, 0xEF, 0xBA, 0xFC, 0x0C, 0x66, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x66, 0xEF, 0xCD,
-        0x20,
-    ];
+    // BAR0, then memory-space-enable, then initEnable (real hardware and
+    // this codebase's PCI function keep initEnable in config space rather
+    // than the MMIO window).
+    let mut code = Vec::new();
+    push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
+    push_real_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
+    push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
+    push_real_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8040);
+    push_real_out_dx_eax(&mut code, 0x0cfc, INIT_ENABLE_WRITE);
+    code.extend_from_slice(&[0xcd, 0x20]);
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &code).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
+    // FBIINIT0 bit 0 is the display mux itself (86Box vid_voodoo.c:744-761,
+    // DOSBox-X voodoo_emu.cpp:1764-1775); this is a plain MMIO register, so
+    // it does not need to be set from guest code like the PCI writes above.
+    write_reg_at(&mut machine, ASSIGNED_BAR, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
 
     assert_eq!(
         read_reg_at(&mut machine, ASSIGNED_BAR, DISTIRA_REG_ID),
@@ -837,11 +859,7 @@ fn distira_v_retrace_poll_loop_terminates_as_device_clocks_advance() {
 }
 
 fn machine_with_pending_retrace_swap(mode: GswMode) -> Machine {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
+    let mut machine = distira_display_enabled_machine(MachineProfile::gsw_386(16, VideoCard::Vega));
     machine.set_mode(mode);
     write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 1);
     write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
@@ -859,9 +877,69 @@ fn distira_retrace_start_ticks() -> u64 {
     (MASTER_CLOCK_HZ * 480).div_ceil(525 * 60)
 }
 
+/// The textbook `distira_retrace_start_ticks()` assumes a machine whose
+/// master-tick clock starts at zero. `machine_with_pending_retrace_swap` no
+/// longer does: unlocking initEnable through PCI config space (required
+/// under the corrected FBIINIT0 mux model -- initEnable is reachable only
+/// through port I/O, so a few real CPU cycles run before any test gets its
+/// machine) nudges the machine's absolute master-tick position, and the
+/// master-tick-to-scanline rounding is sensitive to that absolute position,
+/// not just the ticks requested from it. The nudge is identical every time
+/// this exact setup runs (same profile, same unlock code, same cycle
+/// budget), so this calibrates the true retrace-edge tick empirically once,
+/// by binary search on the observable status bit, rather than trusting a
+/// formula that assumed a cold start. Every mode iteration below still runs
+/// the identical setup, so this preserves the "identical in every mode"
+/// contract the test exists to check.
+///
+/// CAVEAT: the predicate this bisects (`SST_STATUS` bit 0x40, the vertical
+/// retrace flag) is PERIODIC -- it reasserts every frame -- so bisection is
+/// only guaranteed to land on the first edge because `hi` starts at (and
+/// then only doubles past) `distira_retrace_start_ticks()`, which is close
+/// to the true edge. A search that drifted onto a later period would still
+/// return a self-consistent low/high split and this function would not
+/// notice on its own; the caller checks the result against the formula for
+/// exactly that reason.
+fn calibrate_retrace_edge_tick() -> u64 {
+    let mut hi = distira_retrace_start_ticks().max(1);
+    loop {
+        let mut probe = machine_with_pending_retrace_swap(GswMode::Gsw586);
+        probe.advance_devices_ticks(hi);
+        if read_reg(&mut probe, SST_STATUS) & 0x40 == 0 {
+            break;
+        }
+        hi *= 2;
+    }
+    let mut lo = 1u64;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mut probe = machine_with_pending_retrace_swap(GswMode::Gsw586);
+        probe.advance_devices_ticks(mid);
+        if read_reg(&mut probe, SST_STATUS) & 0x40 == 0 {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
 #[test]
 fn distira_retrace_swap_deadline_is_identical_in_every_cpu_mode() {
-    let deadline = distira_retrace_start_ticks();
+    let deadline = calibrate_retrace_edge_tick();
+    // Independent oracle: the calibrated edge must still sit close to the
+    // textbook formula, not just be self-consistent across modes. This is
+    // what catches the calibration silently locking onto a later period (or
+    // the device's retrace timing model moving) -- either would blow well
+    // past this bound, while the small, fixed nudge the initEnable-unlock
+    // program leaves in the master-tick position stays comfortably inside
+    // it (measured: tens of thousands of ticks against an ~83-million-tick
+    // deadline).
+    let formula = distira_retrace_start_ticks();
+    assert!(
+        deadline.abs_diff(formula) < 100_000,
+        "calibrated retrace edge {deadline} drifted too far from the textbook formula {formula}"
+    );
     let mut expected = None;
 
     for mode in [

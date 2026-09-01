@@ -3,7 +3,8 @@
 
 use super::*;
 use izarravm_video::{
-    FBIINIT3_REMAP, FBZ_DRAW_BACK, FBZ_RGB_WMASK, SST_FBI_INIT3, SST_FBZ_MODE, SST_SWAPBUFFER_CMD,
+    FBIINIT0_VGA_PASS, FBIINIT3_REMAP, FBZ_DRAW_BACK, FBZ_RGB_WMASK, SST_FBI_INIT0, SST_FBI_INIT3,
+    SST_FBZ_MODE, SST_SWAPBUFFER_CMD,
 };
 
 #[test]
@@ -551,13 +552,15 @@ fn distira_handover_machine() -> Machine {
     machine
 }
 
-/// Clear FBIINIT0's VGA_PASS bit through the bus, which is what hands the
-/// display from whatever owns it to Distira.
+/// Set FBIINIT0's VGA_PASS bit through the bus, which is what hands the
+/// display from whatever owns it to Distira. Reference polarity (86Box
+/// `vid_voodoo.c:744-761`, DOSBox-X `voodoo_emu.cpp:1764-1775`): bit 0 SET
+/// means the Voodoo drives the monitor.
 fn enable_distira_display(bus: &mut MachineBus<'_>) {
     bus.write_memory(
         DISTIRA_MMIO_BASE + izarravm_video::SST_FBI_INIT0 as u32,
         BusWidth::Dword,
-        0,
+        1,
         BusAccessKind::DataWrite,
     )
     .unwrap();
@@ -2111,6 +2114,10 @@ fn distira_alt_register_aperture_reaches_glide_setup() {
         }
     });
 
+    // The mux is FBIINIT0 bit 0 alone (86Box `vid_voodoo.c:744-761`,
+    // DOSBox-X `voodoo_emu.cpp:1764-1775`); a triangle and a swap no longer
+    // arm it, so the aperture probe must set it explicitly.
+    machine.write_physical_u32(RAM_BAR + SST_FBI_INIT0 as u32, FBIINIT0_VGA_PASS);
     machine.write_physical_u32(RAM_BAR + SST_FBI_INIT3 as u32, FBIINIT3_REMAP);
     machine.write_physical_u32(RAM_BAR + SST_FBZ_MODE as u32, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     for (register, value) in [

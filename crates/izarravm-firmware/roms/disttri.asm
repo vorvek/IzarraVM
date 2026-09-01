@@ -70,6 +70,17 @@ org 0
 %define SST_CLIP_LOW_Y_HIGH_Y 0x11c
 %define SST_SWAPBUFFER_CMD 0x128
 %define SST_COLOR1      0x148
+%define SST_FBI_INIT0   0x210
+
+; ---- initEnable (PCI config offset 0x40) and FBIINIT0 bit 0 ----
+; initEnable write-protects the FBIINIT registers on real hardware; a guest
+; must unlock it before FBIINIT0 takes effect. FBIINIT0 bit 0 is the display
+; mux itself: reference hardware (86Box src/video/vid_voodoo.c:744-761,
+; DOSBox-X voodoo_emu.cpp:1764-1775) both derive it purely from that bit,
+; bit 0 SET routing the Voodoo onto the cable. A real Glide driver's startup
+; handshake does both before drawing anything.
+%define INIT_ENABLE_WRITE 1
+%define FBIINIT0_VGA_PASS 1
 
 ; ---- Distira-native front-door registers ----
 %define DISTIRA_REG_FB_WIDTH  0xf020
@@ -170,6 +181,18 @@ protected_entry:
     mov eax, 0x0000_0002               ; bit1 = memory space enable
     mov dx, PCI_DATA_PORT
     out dx, eax
+
+    ; ---- Unlock initEnable (config offset 0x40) ----
+    mov eax, 0x8000_0040
+    or eax, edi
+    mov dx, PCI_ADDR_PORT
+    out dx, eax
+    mov eax, INIT_ENABLE_WRITE
+    mov dx, PCI_DATA_PORT
+    out dx, eax
+
+    ; ---- Set FBIINIT0 bit 0: take the display from VGA/Margo ----
+    mov dword [ASSIGNED_BAR + SST_FBI_INIT0], FBIINIT0_VGA_PASS
 
     ; ---- Set the Distira-native framebuffer size (4x4, tiny + deterministic) ----
     mov dword [ASSIGNED_BAR + DISTIRA_REG_FB_WIDTH], 4
