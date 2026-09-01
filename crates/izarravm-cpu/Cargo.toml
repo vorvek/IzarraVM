@@ -64,6 +64,21 @@ poll-head-probe = ["jit"]
 # refusal design and the guarded-edge design. Compiled out unless selected, so the default entry
 # path pays nothing.
 seg-head-diagnostic = ["jit"]
+# Stage 0 of the segwrite-continue design's own edge design
+# (dev_docs/2026-09-01-segwrite-continue-design.md, section 8, row "S0 -- Stage 0, the
+# conversion"). THROWAWAY. It extends L9's `written_segments_of` residue to answer the question
+# `SEGWRITE-V86-EDGE` needs before it can be built: at each runtime exit from a segment-write
+# block, tally per source site whether a block is compiled at the fallthrough linear, whether
+# that block's chain requirement claims the written segment, whether the LIVE post-write selector
+# equals the target's frozen requirement (the guard's true conversion rate -- the headline number
+# section 6.2 of the design calls out as unmeasured), whether the source's own PRE-write
+# entry-snapshot selector already matched it, `dirty_multi`, and the source block's terminal kind.
+# It decides D1 (a plain refusal) vs D2 (the guarded edge) and does not ship. Compiled out unless
+# selected, so the default entry path pays nothing. Like `seg-head-diagnostic` above, it carries
+# no separate runtime arm: an armed build counts unconditionally, there is no IZARRAVM_* knob to
+# flip, because `note_seg_head_diagnostic`'s only gate is the `#[cfg(feature = ...)]` on its call
+# site and this diagnostic mirrors that exactly for consistency.
+seg-edge-diagnostic = ["jit"]
 # Diagnostic guest-store watchpoint (IZARRAVM_WATCH_WRITE). OFF by default: the check sits
 # on the store hot path, and leaving it compiled in measured ~10% on a 586 16-bit workload
 # even while disarmed. Build with `--features watch-write` when hunting a corruption.

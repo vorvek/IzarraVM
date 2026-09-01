@@ -938,6 +938,12 @@ pub(crate) struct BlockCache {
     /// keeps the history the question is about. Only ever read by `note_seg_head_diagnostic`.
     #[cfg(feature = "seg-head-diagnostic")]
     seg_head_last_selector: HashMap<u32, u16, U32BuildHasher>,
+    /// Segwrite-continue design stage 0, THROWAWAY (dev_docs/2026-09-01-segwrite-continue-design.md
+    /// section 8, S0). Parallel to `blocks`: `Compilation::seg_edge_terminal_kind`. A SEPARATE
+    /// diagnostic's state from every `seg_head_*` field above -- built so this feature and
+    /// `seg-head-diagnostic` never interact even if both are compiled in at once.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    seg_edge_terminal_kind: Vec<SegEdgeTerminalKind>,
     /// `IZARRAVM_CHAIN_ENTRY_CHECK`, read ONCE here rather than on the entry path. See
     /// `chain_entry_check_armed` for the arm table and the nulling semantics,
     /// and `BlockCache::entry_layout` for what it selects.
@@ -1359,6 +1365,8 @@ impl BlockCache {
             seg_head_guard_eligible: Vec::new(),
             #[cfg(feature = "seg-head-diagnostic")]
             seg_head_last_selector: HashMap::default(),
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_terminal_kind: Vec::new(),
             chain_entry_check_armed: chain_entry_check_armed(),
             #[cfg(test)]
             entry_layout_fetches: std::sync::atomic::AtomicU32::new(0),
@@ -1641,6 +1649,9 @@ impl BlockCache {
             #[cfg(feature = "seg-head-diagnostic")]
             self.seg_head_guard_eligible
                 .push(compilation.seg_head_guard_eligible);
+            #[cfg(feature = "seg-edge-diagnostic")]
+            self.seg_edge_terminal_kind
+                .push(compilation.seg_edge_terminal_kind);
             self.block_imm_lanes.push(compilation.imm_lanes);
             self.block_imm_lane_widths.push(compilation.imm_lane_widths);
             if index == self.block_portals.len() {
@@ -1677,6 +1688,10 @@ impl BlockCache {
             #[cfg(feature = "seg-head-diagnostic")]
             {
                 self.seg_head_guard_eligible[index] = compilation.seg_head_guard_eligible;
+            }
+            #[cfg(feature = "seg-edge-diagnostic")]
+            {
+                self.seg_edge_terminal_kind[index] = compilation.seg_edge_terminal_kind;
             }
             self.block_imm_lanes[index] = compilation.imm_lanes;
             self.block_imm_lane_widths[index] = compilation.imm_lane_widths;
@@ -3722,6 +3737,8 @@ impl BlockCache {
         self.written_segments.clear();
         #[cfg(feature = "seg-head-diagnostic")]
         self.seg_head_guard_eligible.clear();
+        #[cfg(feature = "seg-edge-diagnostic")]
+        self.seg_edge_terminal_kind.clear();
         self.block_imm_lanes.clear();
         self.block_imm_lane_widths.clear();
         self.lane_trial_epochs.clear();
@@ -3921,6 +3938,57 @@ impl CompileOutcome {
     }
 }
 
+/// Segwrite-continue design stage 0, THROWAWAY (dev_docs/2026-09-01-segwrite-continue-design.md
+/// section 8, S0, tally item (f)). The source block's own terminal kind, bucketed to the small
+/// fixed set `is_segment_write_block`'s neighbouring predicates already enumerate by name
+/// (`seg_head_guard_eligible`'s exclusion list) rather than kept as an unbounded key, because the
+/// set really is small and enum-like -- a Space-Saving table (the SMC census's shape) would be
+/// the wrong tool here. `Fallthrough` is the plain-fallthrough catch-all `seg_head_guard_eligible`
+/// admits; every other variant is one of that predicate's exclusions, grouped by the family that
+/// shares an edge mechanism (`Loop`/`LoopCc` share the loop-counter decrement, `Ret`/`Ret16` share
+/// the near-return pop, `RetFar16`/`CallFar16` share the far PIC, and the four register/memory
+/// indirects share having no static target at all).
+#[cfg(feature = "seg-edge-diagnostic")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SegEdgeTerminalKind {
+    Fallthrough,
+    Jcc,
+    Loop,
+    Call,
+    Jmp,
+    Ret,
+    Far,
+    RegIndirect,
+}
+
+#[cfg(feature = "seg-edge-diagnostic")]
+impl SegEdgeTerminalKind {
+    pub(crate) const COUNT: usize = 8;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Fallthrough,
+        Self::Jcc,
+        Self::Loop,
+        Self::Call,
+        Self::Jmp,
+        Self::Ret,
+        Self::Far,
+        Self::RegIndirect,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Fallthrough => "fallthrough",
+            Self::Jcc => "jcc",
+            Self::Loop => "loop",
+            Self::Call => "call",
+            Self::Jmp => "jmp",
+            Self::Ret => "ret",
+            Self::Far => "far",
+            Self::RegIndirect => "reg_indirect",
+        }
+    }
+}
+
 pub(crate) struct Compilation {
     pub span: BlockSpan,
     pub fetch_lens: [u8; MAX_BLOCK_INSTRUCTIONS],
@@ -3981,6 +4049,12 @@ pub(crate) struct Compilation {
     /// the resulting miss as "no successor compiled".
     #[cfg(feature = "seg-head-diagnostic")]
     pub(crate) seg_head_guard_eligible: bool,
+    /// Segwrite-continue design stage 0, THROWAWAY (dev_docs/2026-09-01-segwrite-continue-design.md
+    /// section 8, S0). The source block's own terminal kind, bucketed for the (f) tally --
+    /// `note_seg_edge_diagnostic` counts by this rather than re-deriving it from `slots` at
+    /// runtime, because by the runtime call site the decode-time slot list no longer exists.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub(crate) seg_edge_terminal_kind: SegEdgeTerminalKind,
     #[cfg(feature = "direct-link-refusal-census")]
     pub(crate) emitted_static_targets: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
@@ -9039,6 +9113,30 @@ fn compile_with_budget(
                     | DirectKind::CallMem { .. }
             )
         );
+    // Segwrite-continue design stage 0, THROWAWAY (dev_docs/2026-09-01-segwrite-continue-design.md
+    // section 8, S0, tally item (f)). The same terminal read `seg_head_guard_eligible` just took,
+    // bucketed instead of collapsed to a bool, so a runtime reader can tell WHICH excluded shape a
+    // non-eligible segment-write block actually ended on. Computed for every segment-write block,
+    // not only the eligible ones -- (f) is meant to size the excluded population, and a diagnostic
+    // that only counted the population S1 would admit could not do that.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    let seg_edge_terminal_kind = match slots.last().map(|slot| slot.kind) {
+        Some(DirectKind::Jcc { .. }) => SegEdgeTerminalKind::Jcc,
+        Some(DirectKind::Loop { .. } | DirectKind::LoopCc { .. }) => SegEdgeTerminalKind::Loop,
+        Some(DirectKind::Call { .. } | DirectKind::Call16 { .. }) => SegEdgeTerminalKind::Call,
+        Some(DirectKind::Jmp { .. }) => SegEdgeTerminalKind::Jmp,
+        Some(DirectKind::Ret { .. } | DirectKind::Ret16 { .. }) => SegEdgeTerminalKind::Ret,
+        Some(DirectKind::RetFar16 { .. } | DirectKind::CallFar16 { .. }) => {
+            SegEdgeTerminalKind::Far
+        }
+        Some(
+            DirectKind::JmpMem { .. }
+                | DirectKind::JmpReg { .. }
+                | DirectKind::CallReg { .. }
+                | DirectKind::CallMem { .. },
+        ) => SegEdgeTerminalKind::RegIndirect,
+        _ => SegEdgeTerminalKind::Fallthrough,
+    };
     // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
     // segment-write block -- it writes CS, which is the whole point -- so the `!segment_write_block`
     // term above would make the far cell unreachable and the slice inert.
@@ -9281,6 +9379,8 @@ fn compile_with_budget(
         written_segments: dirty_segments,
         #[cfg(feature = "seg-head-diagnostic")]
         seg_head_guard_eligible,
+        #[cfg(feature = "seg-edge-diagnostic")]
+        seg_edge_terminal_kind,
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets,
         link_cells,
@@ -10010,9 +10110,9 @@ const fn segment_bit(segment: SegmentIndex) -> u8 {
 pub(crate) const LIVE_DATA_BITS: u8 = segment_bit(SegmentIndex::Ds) | segment_bit(SegmentIndex::Es);
 
 /// The inverse of `segment_bit` for a mask holding exactly one bit, `None` for anything else.
-/// L9 stage 0 only, which is why it is gated: nothing on the default path turns a mask back into a
-/// segment.
-#[cfg(feature = "seg-head-diagnostic")]
+/// The two stage-0 diagnostics only, which is why it is gated: nothing on the default path turns
+/// a mask back into a segment.
+#[cfg(any(feature = "seg-head-diagnostic", feature = "seg-edge-diagnostic"))]
 pub(crate) const fn segment_of_bit(bit: u8) -> Option<SegmentIndex> {
     match bit {
         1 => Some(SegmentIndex::Es),
@@ -33019,6 +33119,52 @@ pub(crate) struct DirectStallTally {
     pub seg_head_eligible_successor_absent: u64,
     #[cfg(feature = "seg-head-diagnostic")]
     pub seg_head_eligible_selector_repeat: u64,
+    /// Segwrite-continue design stage 0, THROWAWAY (dev_docs/2026-09-01-segwrite-continue-design.md
+    /// section 8, S0). Counted at every runtime exit from a block whose LOWERINGS wrote a segment
+    /// (the same narrowing `seg_head_diagnostic_entries` uses, so the `InterpretOne` call-out
+    /// producer is excluded here too), by `note_seg_edge_diagnostic`. A SEPARATE state from every
+    /// `seg_head_*` field above and sharing none of its bookkeeping, so an `--all-features` build
+    /// carrying both diagnostics never has one corrupt the other's numbers.
+    ///
+    /// * `seg_edge_diagnostic_entries` -- the denominator every ratio below is against.
+    /// * `seg_edge_successor_compiled` / `seg_edge_successor_absent` -- (a): is a block compiled at
+    ///   the head's fallthrough linear.
+    /// * `seg_edge_successor_claims_written` -- (b): of the compiled successors, how many have a
+    ///   chain requirement (`chain_layouts[..].used`) that claims the segment the head just wrote.
+    /// * `seg_edge_live_matches_target` -- (c), **the headline number**: of the entries where (b)
+    ///   holds, how many have the LIVE selector (the one the write just installed, read AFTER the
+    ///   block ran) equal to `chain_layouts[target].selector(segment)` -- the target's FROZEN
+    ///   requirement. This is the guard's true conversion rate the design's section 6.2 says no
+    ///   existing counter measures: it compares the POST-write value against what a bound edge
+    ///   would actually check, not "did this entry repeat the last one" the way
+    ///   `seg_head_selector_repeat` does. Gated on (b) because `SegmentLayout::selector` asserts
+    ///   the segment is in `used` -- it is meaningless to ask a target's expected selector for a
+    ///   segment it never claims.
+    /// * `seg_edge_entry_matches_target` -- (d): the same comparison as (c), but against the
+    ///   selector the SOURCE block itself had for that segment at entry, i.e. BEFORE its own write
+    ///   ran (captured in `run_direct_block` before the native call). A head where (d) already
+    ///   holds is one whose write was architecturally a no-op for guard purposes; the gap between
+    ///   (c) and (d) is what the write itself is responsible for changing.
+    /// * `seg_edge_dirty_multi` -- (e): heads writing more than one segment.
+    /// * `seg_edge_terminal_kind_hits` -- (f): the source block's own terminal kind, one counter
+    ///   per `SegEdgeTerminalKind` in `SegEdgeTerminalKind::ALL` order. Counted for EVERY entry,
+    ///   not only the eligible shape, so the excluded population is sized rather than assumed.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_diagnostic_entries: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_successor_compiled: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_successor_absent: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_successor_claims_written: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_live_matches_target: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_entry_matches_target: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_dirty_multi: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_terminal_kind_hits: [u64; SegEdgeTerminalKind::COUNT],
     /// The x87 TOP-mismatch retire cap (`retire_key_for_top_mismatch`). `suppressed` counts every
     /// retire the cap refused -- one per mismatch on an already-capped key, so on a churning guest
     /// it approaches `jit_direct_reject_x87_top`. The identity
@@ -34823,6 +34969,25 @@ impl crate::jit::JitState {
             seg_head_eligible_successor_absent: self.stalls.seg_head_eligible_successor_absent,
             #[cfg(feature = "seg-head-diagnostic")]
             seg_head_eligible_selector_repeat: self.stalls.seg_head_eligible_selector_repeat,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_diagnostic_entries: self.stalls.seg_edge_diagnostic_entries,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_successor_compiled: self.stalls.seg_edge_successor_compiled,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_successor_absent: self.stalls.seg_edge_successor_absent,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_successor_claims_written: self.stalls.seg_edge_successor_claims_written,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_live_matches_target: self.stalls.seg_edge_live_matches_target,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_entry_matches_target: self.stalls.seg_edge_entry_matches_target,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_dirty_multi: self.stalls.seg_edge_dirty_multi,
+            #[cfg(feature = "seg-edge-diagnostic")]
+            seg_edge_terminal_kind_hits: SegEdgeTerminalKind::ALL
+                .iter()
+                .map(|k| (k.label(), self.stalls.seg_edge_terminal_kind_hits[*k as usize]))
+                .collect(),
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
             lane_trial_first_grants: self.stalls.lane_trial_first_grants,
@@ -35142,9 +35307,10 @@ impl crate::jit::JitState {
     }
 
     /// The written mask of an installed block, `0` for a stale id and for the call-out producer.
-    /// Gated for now because the stage-0 tally is its only reader; the guarded-edge slice this
-    /// diagnostic decides is what makes it default-path code.
-    #[cfg(feature = "seg-head-diagnostic")]
+    /// Gated for now because the two stage-0 tallies (L9's and the segwrite-continue design's) are
+    /// its only readers; the guarded-edge slice either one decides is what makes it default-path
+    /// code (segwrite-continue-design.md section 4.4 item 2).
+    #[cfg(any(feature = "seg-head-diagnostic", feature = "seg-edge-diagnostic"))]
     pub(crate) fn written_segments_of(&self, id: BlockId) -> u8 {
         self.active_index(id)
             .map_or(0, |index| self.written_segments[index])
@@ -35200,6 +35366,85 @@ impl crate::jit::JitState {
         let repeat = u64::from(previous == Some(selector));
         self.stalls.seg_head_selector_repeat += repeat;
         self.stalls.seg_head_eligible_selector_repeat += repeat * u64::from(eligible);
+    }
+
+    /// Segwrite-continue design stage 0, THROWAWAY
+    /// (dev_docs/2026-09-01-segwrite-continue-design.md section 8, S0). Called once per dispatcher
+    /// entry whose head wrote a segment through one of the four real-mode lowerings, AFTER the
+    /// block ran -- `live_selector` is the value the write installed, exactly what a bound edge's
+    /// emitted guard would compare. `entry_selector` is the value the same segment held when this
+    /// block was ENTERED, i.e. before its own write ran; the caller captures it in
+    /// `run_direct_block` immediately before the native call because by this call site the block
+    /// has already run and the pre-write value is gone.
+    ///
+    /// A SEPARATE state from `note_seg_head_diagnostic`: own map, own tally fields, no read or
+    /// write of any `seg_head_*` state, so the two diagnostics cannot corrupt each other's numbers
+    /// on a build that selects both features.
+    ///
+    /// `#[inline(never)]` for the same reason as `note_seg_head_diagnostic`: the feature gate's
+    /// whole point is that the default build carries none of this, and an armed build is a
+    /// diagnostic build that is expected to pay for the call.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    #[inline(never)]
+    pub(crate) fn note_seg_edge_diagnostic(
+        &mut self,
+        id: BlockId,
+        span: BlockSpan,
+        mask: u8,
+        entry_selector: u16,
+        live_selector: u16,
+    ) {
+        if mask == 0 {
+            return;
+        }
+        if let Some(index) = self.active_index(id) {
+            let kind = self.seg_edge_terminal_kind[index];
+            self.stalls.seg_edge_terminal_kind_hits[kind as usize] += 1;
+        }
+        self.stalls.seg_edge_diagnostic_entries += 1;
+        self.stalls.seg_edge_dirty_multi += u64::from(mask.count_ones() > 1);
+        // The lowest set bit, matching `run.rs`'s own read of `selector` for this call: a
+        // two-segment head is tallied against its first written segment, and separately visible
+        // whole in `seg_edge_dirty_multi`.
+        let Some(segment) = segment_of_bit(1u8 << mask.trailing_zeros()) else {
+            return;
+        };
+        let fallthrough = LinkTarget {
+            linear: span.key.linear.wrapping_add(u32::from(span.guest_len)),
+            mode_key: span.key.mode_key,
+        };
+        match self
+            .linear_blocks
+            .get(&fallthrough)
+            .copied()
+            .and_then(|id| self.active_index(id))
+        {
+            Some(target_index) => {
+                self.stalls.seg_edge_successor_compiled += 1;
+                let target_layout = self.chain_layouts[target_index];
+                // (b): does the target's chain requirement claim the written segment. Gates (c)
+                // and (d) below because `SegmentLayout::selector` asserts the segment is in
+                // `used` -- a target that never claims the segment has no "expected selector" to
+                // compare against.
+                if target_layout.used & mask != 0 {
+                    self.stalls.seg_edge_successor_claims_written += 1;
+                    let expected = target_layout.selector(segment);
+                    // (c), THE HEADLINE NUMBER: the POST-write live selector against the target's
+                    // frozen requirement -- the comparison a bound edge's emitted guard would
+                    // actually run.
+                    self.stalls.seg_edge_live_matches_target +=
+                        u64::from(live_selector == expected);
+                    // (d): the PRE-write entry selector against the same target requirement. Below
+                    // (c)'s number, this head's write is changing something the guard needs, not
+                    // just repeating what was already true.
+                    self.stalls.seg_edge_entry_matches_target +=
+                        u64::from(entry_selector == expected);
+                }
+            }
+            None => {
+                self.stalls.seg_edge_successor_absent += 1;
+            }
+        }
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {

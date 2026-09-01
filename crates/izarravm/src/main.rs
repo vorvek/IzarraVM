@@ -2269,6 +2269,28 @@ fn write_hdd_profile_json(
             "segment_write_block_head_entries": stalls.segment_write_block_head_entries,
         });
     }
+    // Segwrite-continue design stage 0, THROWAWAY (dev_docs/2026-09-01-segwrite-continue-design.md
+    // section 8, S0). A SIBLING top-level object, for the same `perf_counters_json` ordered-key
+    // reason as the block above -- and deliberately its own object rather than folded into
+    // `seg_head_diagnostic`, because the two diagnostics keep separate state.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    {
+        let stalls = machine.cpu().direct_stall_snapshot();
+        report["seg_edge_diagnostic"] = serde_json::json!({
+            "entries": stalls.seg_edge_diagnostic_entries,
+            "successor_compiled": stalls.seg_edge_successor_compiled,
+            "successor_absent": stalls.seg_edge_successor_absent,
+            "successor_claims_written": stalls.seg_edge_successor_claims_written,
+            "live_matches_target": stalls.seg_edge_live_matches_target,
+            "entry_matches_target": stalls.seg_edge_entry_matches_target,
+            "dirty_multi": stalls.seg_edge_dirty_multi,
+            "terminal_kind_hits": stalls
+                .seg_edge_terminal_kind_hits
+                .iter()
+                .map(|(kind, count)| serde_json::json!({ "kind": kind, "count": count }))
+                .collect::<Vec<_>>(),
+        });
+    }
     #[cfg(feature = "retf-arity-census")]
     if let Some((histogram, sites)) = machine.cpu().retf_arity_snapshot() {
         report["retf_arity_census"] = serde_json::json!({

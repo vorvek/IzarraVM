@@ -79,6 +79,8 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         written_segments: 0,
         #[cfg(feature = "seg-head-diagnostic")]
         seg_head_guard_eligible: false,
+        #[cfg(feature = "seg-edge-diagnostic")]
+        seg_edge_terminal_kind: super::SegEdgeTerminalKind::Fallthrough,
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets: [None, None],
         link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],

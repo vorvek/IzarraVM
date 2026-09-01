@@ -3179,6 +3179,22 @@ impl CpuGsw {
         // H9's pin, taken at the P8 mark: `run_direct_block` has no `d`, so the block's own
         // mode-key bit 0 is the term available here.
         ea_pin_lane_bit0!(span.key.mode_key & 1);
+        // Segwrite-continue design stage 0, THROWAWAY, compiled out of every normal build
+        // (dev_docs/2026-09-01-segwrite-continue-design.md section 8, S0, tally item (d)). Read
+        // BEFORE the block runs, because by `note_seg_edge_diagnostic`'s call site below the block
+        // has already executed and the value its own write is about to replace is gone. `mask` is
+        // compile-time-known (`Compilation::written_segments`), so this needs no run-dependent
+        // state and reads the same segment `note_seg_edge_diagnostic` will read after the run.
+        #[cfg(feature = "seg-edge-diagnostic")]
+        let seg_edge_entry_selector: u16 = {
+            let mask = self.jit_direct.written_segments_of(block.id());
+            if mask == 0 {
+                0
+            } else {
+                crate::jit::direct::segment_of_bit(1u8 << mask.trailing_zeros())
+                    .map_or(0, |segment| self.registers.segment(segment).selector)
+            }
+        };
         ea_mark_coarse!(Phase::NativePreamble);
         unsafe {
             entry(
@@ -3553,6 +3569,29 @@ impl CpuGsw {
                 let selector = self.registers.segment(segment).selector;
                 self.jit_direct
                     .note_seg_head_diagnostic(block.id(), block.span(), mask, selector);
+            }
+        }
+        // Segwrite-continue design stage 0, THROWAWAY, compiled out of every normal build
+        // (dev_docs/2026-09-01-segwrite-continue-design.md section 8, S0). A SEPARATE call from
+        // the `seg-head-diagnostic` block above: own feature gate, own state, so the two
+        // diagnostics never interact even when both are compiled in. Read AFTER the block ran,
+        // same as L9's, so `seg_edge_live_selector` is the value the write installed;
+        // `seg_edge_entry_selector` was captured before the native call, above.
+        #[cfg(feature = "seg-edge-diagnostic")]
+        {
+            let mask = self.jit_direct.written_segments_of(block.id());
+            if mask != 0
+                && let Some(segment) =
+                    crate::jit::direct::segment_of_bit(1u8 << mask.trailing_zeros())
+            {
+                let seg_edge_live_selector = self.registers.segment(segment).selector;
+                self.jit_direct.note_seg_edge_diagnostic(
+                    block.id(),
+                    block.span(),
+                    mask,
+                    seg_edge_entry_selector,
+                    seg_edge_live_selector,
+                );
             }
         }
         // v2 IPE-trace observer, DISARMED in every normal build. A disarmed entry pays one null

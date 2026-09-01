@@ -2253,6 +2253,27 @@ pub struct DirectStallSnapshot {
     pub seg_head_eligible_successor_absent: u64,
     #[cfg(feature = "seg-head-diagnostic")]
     pub seg_head_eligible_selector_repeat: u64,
+    /// Segwrite-continue design stage 0, THROWAWAY
+    /// (dev_docs/2026-09-01-segwrite-continue-design.md section 8, S0). See `DirectStallTally` for
+    /// what each field counts; a SEPARATE diagnostic from `seg_head_*` above, sharing no state.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_diagnostic_entries: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_successor_compiled: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_successor_absent: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_successor_claims_written: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_live_matches_target: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_entry_matches_target: u64,
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_dirty_multi: u64,
+    /// One entry per `SegEdgeTerminalKind` label, in `SegEdgeTerminalKind::ALL` order:
+    /// `["fallthrough", "jcc", "loop", "call", "jmp", "ret", "far", "reg_indirect"]`.
+    #[cfg(feature = "seg-edge-diagnostic")]
+    pub seg_edge_terminal_kind_hits: Vec<(&'static str, u64)>,
     /// G1 lane trials granted and the subset that installed a lane-carrying block under a hot
     /// span. See `DirectStallTally`.
     pub lane_trials: u64,
