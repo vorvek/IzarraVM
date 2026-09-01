@@ -1970,6 +1970,35 @@ fn pending_flags_offset() {
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4624);
 }
 
+/// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and
+/// `CallOutTable` beside it -- see `FarCallLedger`'s own doc. `PartialEq` must return `true`
+/// regardless of the two values compared, or a differential test's whole-`CpuGsw` equality
+/// would start failing on a field no guest instruction can observe.
+#[cfg(feature = "jit")]
+#[test]
+fn far_call_ledger_partial_eq_is_always_equal() {
+    assert_eq!(FarCallLedger(0), FarCallLedger(0));
+    assert_eq!(FarCallLedger(0), FarCallLedger(u64::MAX));
+    assert_eq!(FarCallLedger(7), FarCallLedger(3));
+
+    let mut native = CpuGsw::default();
+    let mut interp = CpuGsw::default();
+    assert_eq!(
+        native, interp,
+        "two fresh CpuGsw values must be equal before this test says anything about the ledger"
+    );
+    native.far_call_ledger = FarCallLedger(1);
+    assert_eq!(
+        native, interp,
+        "a far call retiring on one role and not the other must not fail whole-CPU equality"
+    );
+    interp.far_call_ledger = FarCallLedger(9999);
+    assert_eq!(
+        native, interp,
+        "any two ledger values must compare equal, not just zero against nonzero"
+    );
+}
+
 /// Measure fully register-allocated native code against the interpreter. Runs a
 /// 32-bit flat drawcolumn-shaped loop
 /// (15 instructions, 7 memory ops) through the REAL interpreter (`run_straight_line`) and through

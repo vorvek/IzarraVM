@@ -5135,13 +5135,12 @@ pub(crate) enum DirectKind {
     /// `far_ret_native` would silently break its pre-registered identity
     /// (`decode_inval_cs_load(armed) + far_ret_native(armed) == decode_inval_cs_load(base)`),
     /// since a CALL and a RETF are two different `decode_inval_cs_load` gaps that must stay
-    /// separately attributable. So this kind deposits into a NEW, DEDICATED lane instead --
-    /// `STACK_FAR_CALL_NATIVE`, a whole extra 8-byte stack slot (with 8 bytes of padding beside
-    /// it to keep the frame's 16-byte alignment invariant intact) rather than a shared half --
-    /// unpacked in `run.rs` into `direct_stalls.far_call_native` and exposed as
-    /// `far_call_native_for_test`/the `far_call_native` JSON field, with its own identity
-    /// extension: `decode_inval_cs_load(armed) + far_ret_native(armed) + far_call_native(armed)
-    /// == decode_inval_cs_load(base)`.
+    /// separately attributable. So this kind deposits into a NEW, DEDICATED counter instead of a
+    /// shared half -- the `CpuGsw::far_call_ledger` cell (`far_call_ledger_offset`), written
+    /// through R15 by leg (e) below since the 2026-09-01 reprice moved it out of the frame -- read
+    /// by `direct_stall_snapshot` and exposed as the `far_call_native` JSON field, with its own
+    /// identity extension: `decode_inval_cs_load(armed) + far_ret_native(armed) +
+    /// far_call_native(armed) == decode_inval_cs_load(base)`.
     CallFar16 {
         selector: u16,
         offset: u16,
@@ -10213,23 +10212,11 @@ const STACK_SHIFT_COUNT: i32 = 152;
 /// calls `invalidate_code_caches_for_cs_load` any more than a RETF does, but the two are different
 /// instructions with different census rows and, on the corpus, wildly different execution counts.
 ///
-/// So this is a WHOLE dedicated 8-byte lane rather than a shared half, which is why the frame grew
-/// (`BASE_STACK_LEN` 160 -> 176: this slot at 160, then 8 bytes of padding at 168 to preserve the
-/// 16-byte alignment `native_stack_len_keeps_the_call_16_byte_aligned`-style asserts pin) instead
-/// of being threaded through the existing dynamic-counter machinery. Two consequences of that
-/// follow directly and are NOT bugs:
-///
-/// - 160 is outside `i8`'s range and outside `STACK_ZERO_FILL_LEN` (128), so this slot uses the
-///   disp32 load/store forms throughout (`dynamic_counter_fields`'s `(i8, usize)` pairs cannot
-///   name it) and is zeroed with its own explicit store in the prologue, exactly the pattern
-///   `STACK_EXIT`/`STACK_QUOTA` already use for the same reason: cheaper than widening the
-///   vector-fill window over the ALU scratch cluster (128..160), which is deliberately NOT zeroed
-///   (see `STACK_ZERO_FILL_LEN`'s own doc) and must stay that way.
-/// - The deposit itself cannot reuse `emit_dynamic_word_increment` (which always adds `1 << 32`,
-///   i.e. increments a shared HIGH half): a fresh full-width, low-half counter needs a plain
-///   64-bit `+= 1`, done here as an explicit disp32 load/add/store rather than the single
-///   `add_r64_to_mem_disp8` instruction the shared-half deposit uses, because that instruction has
-///   no disp32 form and this slot is out of disp8 range.
+/// So this needs a WHOLE dedicated counter rather than a shared half, not threaded through the
+/// existing dynamic-counter machinery. It was first built as a frame slot (`STACK_FAR_CALL_NATIVE`
+/// at offset 160, which grew `BASE_STACK_LEN` 160 -> 176), and the 2026-09-01 reprice moved it to
+/// the `CpuGsw` cell below -- see this function's own doc for why the frame slot was the wrong
+/// shape for a counter this rare.
 ///
 /// Byte offset from the `CpuGsw` pointer in R15 to the far-CALL ledger cell.
 ///
@@ -10366,6 +10353,12 @@ const _: () = {
 /// Links form at runtime between any two blocks sharing a mode key, so no compile-time union
 /// bounds either set. Both failures are guest-visible bus accounting. The prologue cost was
 /// recovered instead by making the zeroing WIDER, not narrower — see `STACK_ZERO_FILL_LEN`.
+///
+/// The identical argument later killed a conditional-growth design for L8's far-CALL ledger
+/// (`far_call_ledger_offset`): a per-`CallFar16` frame mask hits the same two failures above,
+/// just for one lane instead of seven. That lane's escape hatch was to leave the frame alone
+/// and put the counter in `CpuGsw` instead, written through R15 by the one lowering that needs
+/// it — see `dev_docs/2026-09-01-duke-l8-reprice.md` for the worked example.
 fn dynamic_counter_fields() -> [(i8, usize); 7] {
     [
         (
@@ -32893,8 +32886,9 @@ pub(crate) struct DirectStallTally {
     /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
     pub far_ret_native: u64,
     /// L8's sibling of `far_ret_native`: CALL FARs served natively by `DirectKind::CallFar16`,
-    /// read out of the DEDICATED `STACK_FAR_CALL_NATIVE` frame lane (not a shared high half --
-    /// see that constant's own doc for why no shared half was available).
+    /// read out of the DEDICATED `CpuGsw::far_call_ledger` cell (not a shared high half -- see
+    /// `far_call_ledger_offset`'s own doc for why no shared half was available and why the cell
+    /// lives in `CpuGsw` rather than the frame since the 2026-09-01 reprice).
     ///
     /// A LEDGER rather than a rate, for the identical reason `far_ret_native` is one: a native
     /// far CALL does not call `invalidate_code_caches_for_cs_load` either, so `decode_inval_cs_load`
