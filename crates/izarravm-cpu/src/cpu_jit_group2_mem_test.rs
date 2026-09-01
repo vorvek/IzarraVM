@@ -36,6 +36,23 @@
 //! and NO live descriptor. The no-descriptor half is load-bearing: a seed of `(0x8d5, pending)`
 //! never delivers a seeded CF, because the live descriptor swallows it, so a CF assertion made
 //! under that seed passes whatever the emitter does with CF.
+//!
+//! ## Mutation ledger
+//!
+//! Each mutant was applied to `emit_rotate_shift_mem` and reverted, against this whole module.
+//!
+//! | # | mutation | outcome |
+//! |---|---|---|
+//! | M1 | drop `emit_capture_flags(e, defined)` | RED, 4 rows |
+//! | M2 | drop the memory write-back `store_r{8,16,32}_disp8` | RED, 5 rows |
+//! | M3 | deposit the split charge ONCE instead of twice | RED, 1 row (`a_misaligned_group_two_memory_form_runs_natively`) |
+//! | M4 | rotate-above-1 tail publishes RBP wholesale instead of `emit_set_cf_only` | **SURVIVES, on both flag arms** |
+//!
+//! M4's survival is explained where the row that chases it lives, in
+//! `a_memory_rotate_above_count_one_routes_cf_through_a_live_descriptor`: the eager arm makes the
+//! two spellings the same instruction, and on the lazy arm `run.rs`'s entry clear means a native
+//! slot never meets a live descriptor. It is a blind spot the register lanes share, not a hole
+//! this kind opened.
 
 use super::*;
 
@@ -997,6 +1014,66 @@ fn group_two_memory_imm8_forms_match_the_interpreter_for_every_count() {
                             &context,
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Restores the ambient `IZARRAVM_DIRECT_EAGER_FLAGS` reading on the way out of a fixture --
+/// normally OR by panic. The override is thread-local and the harness reuses threads.
+struct EagerOverride;
+
+impl Drop for EagerOverride {
+    fn drop(&mut self) {
+        jit::direct::set_direct_eager_flags_for_test(None);
+    }
+}
+
+/// The whole matrix on the LAZY-DESCRIPTOR arm (`IZARRAVM_DIRECT_EAGER_FLAGS=0`), which emits a
+/// different tail: `emit_set_cf_only`'s two-branch descriptor sequence and `emit_clear_pending`'s
+/// four stores, in place of one publish each.
+///
+/// **A recorded SURVIVOR sits here, and it is recorded rather than papered over.** Replacing the
+/// rotate-above-1 tail's `emit_set_cf_only(e)` with a wholesale `store eflags, RBP` -- the publish
+/// a rotate must NOT do, since it architecturally preserves SF, ZF, PF and AF -- leaves this file
+/// green on BOTH arms. Two reasons stack:
+///
+/// * on the shipped eager arm `emit_set_cf_only` IS that store, so the two spellings are the same
+///   instruction and nothing can separate them;
+/// * on the lazy arm the descriptor branch is unreachable from inside a native block anyway.
+///   `run.rs`'s entry clear (E1) materialises and clears any live descriptor before the block is
+///   entered, and it is deliberately NOT under the knob, so a native slot never sees one. Only an
+///   `InterpretOne` call-out can install one mid-block, and this kind emits none.
+///
+/// The call therefore stays because it is the shared idiom for a CF-only write and because the
+/// descriptor branch is the correct answer if a future mid-block producer ever creates one -- not
+/// because a fixture can currently tell. The register lanes carry the identical blind spot. What
+/// this row DOES buy is that the lazy arm's emitted tail is executed and differentially compared
+/// at every cell, rather than being shipped untested behind a default-on knob.
+///
+/// The arm is read at EMISSION time, so the override is set BEFORE `build` compiles anything.
+#[test]
+fn a_memory_rotate_above_count_one_routes_cf_through_a_live_descriptor() {
+    let _arm = force_rows(true);
+    jit::direct::set_direct_eager_flags_for_test(Some(false));
+    let _eager = EagerOverride;
+    for seg in SEGMENTS {
+        for width in WIDTHS {
+            for (label, op) in SUB_OPS {
+                for count in [1u8, 2, 5, 31] {
+                    let context = format!(
+                        "{} {label} {} count={count} lazy descriptor",
+                        seg.label(),
+                        width.label()
+                    );
+                    lowered(
+                        seg,
+                        &with_consumers(seg, &imm8_mem(seg, width, op, count)),
+                        CONSUMED_SLOTS,
+                        Seed::new(0xaaaa_aaaa).flags(SEEDED_EFLAGS).pending(),
+                        &context,
+                    );
                 }
             }
         }
