@@ -3,7 +3,17 @@
 
 pub const DISTIRA_FB_SIZE: usize = 2 * 1024 * 1024;
 pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
-pub const DISTIRA_TEX_SIZE: usize = 2 * 1024 * 1024;
+/// Bytes of texture RAM per TMU. `DISTIRA_TMU_CONFIG` (`distira.rs`)
+/// advertises a dual-TMU board (both TMU-count bits set, matching DOSBox-X's
+/// `VOODOO_1_DTMU`), and a real dual-TMU Voodoo 1 board carries 4 MB of
+/// texture RAM per TMU (DOSBox-X pairs `VOODOO_1_DTMU` with `tmumem0 =
+/// tmumem1 = 4`; a plain single-TMU Voodoo 1 gets 2). This must match the
+/// advertised board: every texture-aperture write and every texture fetch
+/// masks its address with `DISTIRA_TEX_SIZE - 1`, so a value narrower than
+/// what the guest was told it has lets legitimate high uploads wrap and
+/// silently overwrite unrelated low texels. See
+/// `dev_docs/2026-09-01-tr-mipmap-diag.md` section 5.
+pub const DISTIRA_TEX_SIZE: usize = 4 * 1024 * 1024;
 pub const DISTIRA_FIFO_CAPACITY: usize = 65_536;
 pub const DISTIRA_ID_VALUE: u32 = 0x4454_0100; // 'D''T', version 1.00
 pub const DISTIRA_MODEL_VALUE: u32 = 1;
