@@ -1110,6 +1110,7 @@ pub(super) fn perf_counters_json(
         "jit_direct_chain_quota_entries": perf.jit_direct_chain_quota_entries,
         "jit_direct_chain_quota_cache_misses": perf.jit_direct_chain_quota_cache_misses,
         "jit_direct_x87_pad_bails": perf.jit_direct_x87_pad_bails,
+        "jit_direct_seg_guard_mismatch_exits": perf.jit_direct_seg_guard_mismatch_exits,
         "jit_direct_cache_resets": perf.jit_direct_cache_resets,
         "jit_direct_arena_compactions": perf.jit_direct_arena_compactions,
         "jit_direct_arena_compaction_live_blocks": perf.jit_direct_arena_compaction_live_blocks,

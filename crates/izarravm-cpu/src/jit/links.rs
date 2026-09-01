@@ -27,7 +27,7 @@
 
 use std::sync::{
     OnceLock,
-    atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -155,6 +155,18 @@ pub(crate) struct LinkCell {
     /// instructions later, plainly loads this byte, so if that assumption ever stopped holding,
     /// a genuinely concurrent relink could still pair a stale `portal` with a fresh flag.
     pub(crate) spilling: AtomicU8,
+    /// `SEGWRITE-V86-EDGE`: the selector this edge's TARGET froze for the segment the SOURCE
+    /// block writes, i.e. `chain_layouts[target].selector(written_segment)` at bind time. Only
+    /// meaningful for a slot whose source is a V86 segment-write block publishing a guarded
+    /// static fallthrough (`direct.rs`'s `emit_completed_path`, gated on `segment_guard`);
+    /// every other edge shape never reads this field. Written once, at bind time, by
+    /// `try_link_inner`; never updated in place -- a rebind goes through `clear` first, exactly
+    /// like `entry_top`/`spilling`.
+    ///
+    /// `AtomicU16` rather than a plain field for the same non-load-bearing-ordering reason as
+    /// `entry_top`/`spilling`: single-owner cache, no concurrent writer, the atomics exist so the
+    /// emitted reader's plain 16-bit load and the Rust-side plain 16-bit store share one type.
+    pub(crate) expected_selector: AtomicU16,
 }
 
 /// "This edge's target has no baked x87 entry TOP." Deliberately OUT of the legal 0..=7 range:
@@ -173,6 +185,7 @@ impl LinkCell {
             direct_link_refusal_census_id: AtomicU32::new(0),
             entry_top: AtomicU8::new(NO_ENTRY_TOP),
             spilling: AtomicU8::new(0),
+            expected_selector: AtomicU16::new(0),
         }
     }
 
@@ -201,6 +214,7 @@ impl LinkCell {
             .store(zero_portal().address(), Ordering::Release);
         self.entry_top.store(NO_ENTRY_TOP, Ordering::Release);
         self.spilling.store(0, Ordering::Release);
+        self.expected_selector.store(0, Ordering::Release);
     }
 
     /// Record the target's baked x87 entry TOP for the shared re-entry pad's runtime guard. Like
@@ -234,6 +248,13 @@ impl LinkCell {
 
     pub(crate) fn set(&self, portal: &BlockPortal) {
         self.portal.store(portal.address(), Ordering::Release);
+    }
+
+    /// `SEGWRITE-V86-EDGE`: bind the selector the emitted guard compares the live write against.
+    /// Called by `try_link_inner` on the admitted path only, after the merge that requires the
+    /// target to claim the written segment -- see `SegmentLayout::seg_write_merge`.
+    pub(crate) fn set_expected_selector(&self, selector: u16) {
+        self.expected_selector.store(selector, Ordering::Release);
     }
 
     pub(crate) fn set_dynamic(&self, target_eip: u32, portal: &BlockPortal) {

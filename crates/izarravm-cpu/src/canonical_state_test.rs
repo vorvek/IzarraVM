@@ -901,8 +901,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // (jit_direct_reject_data_segment_real / _v86 / _pm16 / _pm32; 32 bytes), moving the pin
     // 4592 -> 4624 -- measured, not derived. Reject counts are host bookkeeping, so both
     // canonical payloads are unchanged by it; see cpu_test.rs's twin comment.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4624);
+    // `SEGWRITE-V86-EDGE` adds one PerfCounters field (jit_direct_seg_guard_mismatch_exits;
+    // 8 bytes), moving the pin 4624 -> 4632 -- measured, not derived. Host-side conversion-rate
+    // bookkeeping, not architectural state, so both canonical payloads are unchanged by it; see
+    // cpu_test.rs's twin comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4632);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4624);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4632);
 }

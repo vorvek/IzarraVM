@@ -1967,7 +1967,11 @@ fn pending_flags_offset() {
     // (jit_direct_reject_data_segment_real / _v86 / _pm16 / _pm32; 32 bytes), moving this pin
     // 4592 -> 4624 -- measured off a failing-test readout, not derived. They belong in
     // PerfCounters so they ride phase_marks beside the existing strict/masked split.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4624);
+    // `SEGWRITE-V86-EDGE` adds one PerfCounters field (jit_direct_seg_guard_mismatch_exits;
+    // 8 bytes), moving this pin 4624 -> 4632 -- measured off a failing-test readout, not derived.
+    // Same shape as every other counter above: host-side bookkeeping the guard's true conversion
+    // rate rides, not guest state.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4632);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and
@@ -4240,6 +4244,14 @@ mod jit_poll_skip;
 ))]
 #[path = "cpu_jit_seg_load_mem_test.rs"]
 mod jit_seg_load_mem;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_segwrite_edge_test.rs"]
+mod jit_segwrite_edge;
 
 #[cfg(all(
     feature = "jit",
