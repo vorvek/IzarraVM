@@ -789,8 +789,12 @@ mod data_caches {
     }
 
     /// Anti-regression: a write that DOES move the map (PG set) must still wipe the physical-page
-    /// caches. Can-it-fail control: skip the new PG=0 gate check entirely (always keep) and this
-    /// row goes red.
+    /// caches. Can-it-fail control: this row and its clearing partner below route through the
+    /// CODE-side `flush_tlb_and_code_caches` arm (PG moving makes `cr0_write_moves_code_translation`
+    /// true), never through the gated `flush_tlb_keep_code_caches` function at all -- so mutation
+    /// M3 (the ungated arm stops wiping) is what these two catch, not the new PG=0 gate. See
+    /// `cr0_ts_change_under_paging_reaches_the_gate_and_still_wipes` below for the row that actually
+    /// exercises the gate's PG=1 arm.
     #[test]
     fn cr0_pg_set_still_wipes_the_data_read_page_cache() {
         let (mut cpu, mut bus) = data_fixture();
@@ -850,6 +854,35 @@ mod data_caches {
             "each CR0 write is one flush EVENT even when the data-side wipe is elided"
         );
     }
+
+    /// The gate's TRUE arm ("PG stays 1, wipe anyway") had zero coverage: both `cr0_pg_*_still_wipes_*`
+    /// rows above route through the CODE-side `flush_tlb_and_code_caches` predicate, never through
+    /// `flush_tlb_keep_code_caches`, because PG itself is moving. The only shape that reaches the
+    /// gated function with PG=1 is a write where PG (and WP) are unchanged -- e.g. TS. Can-it-fail
+    /// control: mutate the gate to `if false && ...` (always skip, "M2") and this is the sole row
+    /// that goes red.
+    #[test]
+    fn cr0_ts_change_under_paging_reaches_the_gate_and_still_wipes() {
+        let (mut cpu, mut bus) = data_fixture();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = PAGE_DIRECTORY;
+
+        assert_eq!(
+            cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, DATA, BusAccessKind::DataRead)
+                .expect("the byte reads"),
+            0x5a
+        );
+        assert!(cpu.data_read_pages.get(DATA).is_some());
+
+        // CR0.TS is bit 3: not PG, not WP, so the code-side predicate is false and this reaches
+        // the gated function with PG unchanged at 1.
+        write_cr0(&mut cpu, &mut bus, CR0_PE | CR0_PG | (1 << 3));
+
+        assert!(
+            cpu.data_read_pages.get(DATA).is_none(),
+            "the gated arm must still wipe while paging is on"
+        );
+    }
 }
 
 // MUTATION EVIDENCE for the CR0 flush predicate (2026-08-29, applied by hand, run, restored).
@@ -874,6 +907,15 @@ mod data_caches {
 // | decode-line hit test stops comparing `d` (whole-crate run) | `d_bit_change_at_the_same_linear_address_re_decodes`, `decode_cache_hits_only_on_matching_tag_and_generation` -- NOT by any row here, because every row in this file uses one `d` on both sides of the mode change |
 // | `flush_tlb_keep_code_caches` stops dropping the fetch frontend | `pe_toggle_still_drops_prefetch` |
 // | the gate applied to the MOV CR3 path too | `mov_cr3_still_flushes` |
+//
+// DATA-SIDE gate (`flush_tlb_keep_code_caches`'s `new_cr0 & CR0_PG != 0`, 2026-09-01, applied by
+// hand against `data_caches`, run, restored):
+//
+// | mutation | result | caught by |
+// |---|---|---|
+// | M1: `if new_cr0 & CR0_PG != 0` -> `if true \|\| ...` (restore the unconditional wipe) | 3 failed | the three `cr0_pe_toggle_keeps_*` survival rows |
+// | M2: `if new_cr0 & CR0_PG != 0` -> `if false && ...` (always skip the wipe) | 1 failed | `cr0_ts_change_under_paging_reaches_the_gate_and_still_wipes` -- the ONLY row that reaches the gate with PG=1; before this row was added M2 was a NON-GATE (18/18 green) |
+// | M3: `flush_tlb_and_direct_pages` stops calling `wipe_tlb_and_direct_pages` (ungated arm stops wiping) | 2 failed | `cr0_pg_set_still_wipes_the_data_read_page_cache`, `cr0_pg_clear_still_wipes_the_data_read_page_cache` |
 //
 // THE ARGUMENT SWAP IS INERT AT BOTH SITES, and this corrects the design's expectation that the
 // MOV CR0 swap would be caught by the PG rows. It is not, and it cannot be: `delta = old ^ new`
