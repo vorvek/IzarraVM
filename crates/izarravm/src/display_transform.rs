@@ -14,15 +14,32 @@
 //! `gamma == None` ("Raw") is the identity, byte for byte -- today's
 //! behaviour before this existed.
 
+/// The sRGB OETF's piecewise knee, in light (not code) units.
+pub(crate) const SRGB_LOW_THRESHOLD: f32 = 0.0031308;
+/// The OETF's linear-segment slope below the knee.
+pub(crate) const SRGB_LOW_SLOPE: f32 = 12.92;
+/// The OETF's power-segment scale above the knee.
+pub(crate) const SRGB_A: f32 = 1.055;
+/// The OETF's power-segment offset above the knee.
+pub(crate) const SRGB_B: f32 = 0.055;
+/// The OETF's power-segment exponent's reciprocal base -- also the sRGB
+/// curve's own gamma, and the special `monitor_gamma` value at which the
+/// whole correction collapses to an affine black-level offset (design
+/// section 4.3).
+pub(crate) const SRGB_GAMMA: f32 = 2.4;
+
 /// Exact sRGB OETF (IEC 61966-2-1), the inverse of the sRGB EOTF in the
 /// design's `L_srgb`. `l` is normalised light in [0, 1] (values outside that
 /// range are not expected here; the caller always feeds a `pow` result of a
 /// normalised byte).
+///
+/// The WGSL `srgb_oetf` helper in `crt.rs` mirrors this exactly; a
+/// `crt_test.rs` test checks the shader source uses these same constants.
 fn srgb_oetf(l: f32) -> f32 {
-    if l <= 0.0031308 {
-        12.92 * l
+    if l <= SRGB_LOW_THRESHOLD {
+        SRGB_LOW_SLOPE * l
     } else {
-        1.055 * l.powf(1.0 / 2.4) - 0.055
+        SRGB_A * l.powf(1.0 / SRGB_GAMMA) - SRGB_B
     }
 }
 

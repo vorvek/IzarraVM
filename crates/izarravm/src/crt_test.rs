@@ -20,6 +20,38 @@ fn shader_compiles_under_naga() {
         .unwrap_or_else(|e| panic!("WGSL validation error: {e}"));
 }
 
+/// The WGSL `srgb_oetf` helper (the display-gamma correction's re-encode
+/// half) must use the exact same constants as `display_transform.rs`'s
+/// `srgb_oetf`, not independently re-typed literals that could drift.
+#[test]
+fn shader_srgb_oetf_constants_mirror_display_transform() {
+    use crate::display_transform::{
+        SRGB_A, SRGB_B, SRGB_GAMMA, SRGB_LOW_SLOPE, SRGB_LOW_THRESHOLD,
+    };
+
+    let start = SHADER
+        .find("fn srgb_oetf")
+        .expect("the srgb_oetf WGSL helper must exist");
+    let end = SHADER[start..]
+        .find("@fragment")
+        .map(|offset| start + offset)
+        .unwrap_or(SHADER.len());
+    let body = &SHADER[start..end];
+
+    for literal in [
+        SRGB_LOW_THRESHOLD.to_string(),
+        SRGB_LOW_SLOPE.to_string(),
+        SRGB_A.to_string(),
+        SRGB_B.to_string(),
+        SRGB_GAMMA.to_string(),
+    ] {
+        assert!(
+            body.contains(&literal),
+            "shader's srgb_oetf must use the constant {literal}, matching display_transform.rs; got:\n{body}"
+        );
+    }
+}
+
 /// The uniform block must stay 32 bytes (std140-safe as 8 f32s) with
 /// `monitor_gamma` at the offset the WGSL struct `U` gives it: after
 /// `src_size.xy, style, srgb, time` (16 bytes), so byte offset 20.

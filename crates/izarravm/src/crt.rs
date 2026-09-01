@@ -154,11 +154,28 @@ fn hash13(p: vec3<f32>) -> f32 {
   return fract((q.x + q.y) * q.z);
 }
 
-// Exact sRGB -> linear, to cancel an sRGB render target's encode.
+// Exact sRGB -> linear, to cancel an sRGB render target's encode. Used by
+// styles Subtle and Ye Olde, and by Off when monitor_gamma is Raw (0.0).
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92;
   let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
   return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
+// CRT EOTF: decode a nonlinear DAC code into the linear light a period
+// monitor at this gamma would have emitted. The decode half of
+// display_transform's correction (crates/izarravm/src/display_transform.rs).
+fn to_light(c: vec3<f32>, gamma: f32) -> vec3<f32> {
+  return pow(c, vec3<f32>(gamma));
+}
+
+// Exact sRGB OETF (IEC 61966-2-1), the re-encode half of display_transform's
+// correction. Constants must match display_transform.rs's exactly; a
+// crt_test.rs test checks it.
+fn srgb_oetf(l: vec3<f32>) -> vec3<f32> {
+  let lo = l * 12.92;
+  let hi = 1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+  return select(hi, lo, l <= vec3<f32>(0.0031308));
 }
 
 @fragment
@@ -212,7 +229,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   }
   col = col * edge;
   col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
-  if (u.srgb > 0.5) { col = to_linear(col); }
+
+  // Display-gamma correction, style Off only (u.style < 0.5): decode with
+  // the assumed CRT EOTF, re-encode with the exact sRGB OETF, per
+  // dev_docs/2026-09-01-display-gamma-design.md section 4.2 step 8. Styles
+  // Subtle and Ye Olde, and Off at monitor_gamma == 0.0 ("Raw", an explicit
+  // branch -- pow(c, 0.0) is NOT the identity), keep today's exact
+  // to_linear cancellation.
+  if (u.style < 0.5 && u.monitor_gamma > 0.0) {
+    let light = to_light(col, u.monitor_gamma);
+    if (u.srgb > 0.5) {
+      // The sRGB render target's own hardware encode IS the re-encode step;
+      // handing it the linear value directly is exact, not an approximation.
+      col = light;
+    } else {
+      col = srgb_oetf(light);
+    }
+  } else if (u.srgb > 0.5) {
+    col = to_linear(col);
+  }
   return vec4<f32>(col, 1.0);
 }
 "#;
