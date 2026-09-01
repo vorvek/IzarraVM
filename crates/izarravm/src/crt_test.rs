@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use super::{SHADER, pack_argb_rows, upload_is_full};
+use super::{SHADER, pack_argb_rows, uniform_bytes, upload_is_full};
 
 /// Parse and validate the WGSL through naga so a shader error fails the test
 /// suite instead of panicking at pipeline creation when the GUI launches.
@@ -18,6 +18,60 @@ fn shader_compiles_under_naga() {
     validator
         .validate(&module)
         .unwrap_or_else(|e| panic!("WGSL validation error: {e}"));
+}
+
+/// The WGSL `srgb_oetf` helper (the display-gamma correction's re-encode
+/// half) must use `display_transform.rs`'s exact constants IN THE OPERAND
+/// POSITIONS its own `srgb_oetf` uses them, not merely contain the same five
+/// numbers somewhere in the function body.
+///
+/// A bare "does this text contain the number 2.4" check cannot catch the
+/// single most damaging drift this test exists to prevent: swapping the
+/// OETF's reciprocal exponent `pow(l, 1.0 / gamma)` for the EOTF's bare
+/// `pow(l, gamma)`, which silently turns the re-encode step into a second
+/// decode. `2.4` remains present in the text either way; the reciprocal
+/// `1.0 / 2.4` does not survive that mutation, so this test pins that exact
+/// substring rather than the number alone.
+#[test]
+fn shader_srgb_oetf_constants_mirror_display_transform() {
+    use crate::display_transform::{
+        SRGB_A, SRGB_B, SRGB_GAMMA, SRGB_LOW_SLOPE, SRGB_LOW_THRESHOLD,
+    };
+
+    let start = SHADER
+        .find("fn srgb_oetf")
+        .expect("the srgb_oetf WGSL helper must exist");
+    let end = SHADER[start..]
+        .find("@fragment")
+        .map(|offset| start + offset)
+        .unwrap_or(SHADER.len());
+    let body = &SHADER[start..end];
+
+    let checks = [
+        format!("l * {SRGB_LOW_SLOPE}"),
+        format!("1.0 / {SRGB_GAMMA}"),
+        format!("{SRGB_A} * pow"),
+        format!("vec3<f32>({SRGB_B})"),
+        format!("vec3<f32>({SRGB_LOW_THRESHOLD})"),
+    ];
+    for expected in checks {
+        assert!(
+            body.contains(&expected),
+            "srgb_oetf must contain `{expected}`, matching display_transform.rs's operand \
+             positions exactly; got:\n{body}"
+        );
+    }
+}
+
+/// The uniform block must stay 32 bytes (std140-safe as 8 f32s) with
+/// `monitor_gamma` at the offset the WGSL struct `U` gives it: after
+/// `src_size.xy, style, srgb, time` (16 bytes), so byte offset 20.
+#[test]
+fn uniform_block_is_32_bytes_with_monitor_gamma_at_offset_20() {
+    let bytes = uniform_bytes(320.0, 200.0, 1.0, true, 2.5, 2.4);
+    assert_eq!(bytes.len(), 32);
+    let gamma_bytes: [u8; 4] = bytes[20..24].try_into().unwrap();
+    assert_eq!(f32::from_le_bytes(gamma_bytes), 2.4);
 }
 
 /// Packing one run produces exactly that run's bytes, in upload order: the

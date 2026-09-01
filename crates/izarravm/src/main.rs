@@ -12,6 +12,7 @@ mod cmos;
 mod controller_names;
 mod controller_profiles;
 mod crt;
+mod display_transform;
 mod gui;
 mod host_input;
 mod ipe_trace;

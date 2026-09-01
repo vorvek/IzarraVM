@@ -11,7 +11,7 @@
 
 use izarravm_core::MidiConfig;
 use izarravm_input::{ControllerConfig, JoystickBinding};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -193,6 +193,29 @@ impl CrtStyle {
     }
 }
 
+/// Default assumed CRT gamma: the midpoint of the 2.2-2.5 desktop-SVGA band,
+/// and the analytically special value at which the correction collapses to a
+/// pure black-level offset above the sRGB knee (see
+/// `dev_docs/2026-09-01-display-gamma-design.md` section 4.3).
+pub const DEFAULT_MONITOR_GAMMA: f32 = 2.4;
+
+/// Accepted range for a free-entry monitor gamma, matching the design's band
+/// plus headroom on both sides for a user who wants to go outside the
+/// desktop-SVGA range on purpose.
+pub const MIN_MONITOR_GAMMA: f32 = 1.8;
+pub const MAX_MONITOR_GAMMA: f32 = 3.0;
+
+/// Write `None` ("Raw") as the explicit sentinel `0.0` rather than omitting
+/// the key, so it round-trips as itself instead of being indistinguishable
+/// from an absent key (whose default is `Some`, not `None`). See the doc
+/// comment on `GuiPrefs::monitor_gamma`.
+fn serialize_monitor_gamma<S: Serializer>(
+    value: &Option<f32>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_f32(value.unwrap_or(0.0))
+}
+
 /// Mouse sensitivity bounds and default, in percent. 100 is DOSBox-X's default
 /// and gives its cursor speed; the bounds are the ends of the slider.
 pub const DEFAULT_MOUSE_SENSITIVITY: u16 = 100;
@@ -211,6 +234,23 @@ pub struct GuiPrefs {
     pub master_volume: f32,
     /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
     pub crt_style: CrtStyle,
+    /// Assumed EOTF exponent of the monitor the guest content was authored
+    /// for. `None` is "Raw": the guest DAC byte reaches the host panel as an
+    /// sRGB code unchanged, which is what every path did before this existed.
+    /// `Some(gamma)` applies the present-time CRT-EOTF-to-sRGB-OETF
+    /// correction (`display_transform`) at that gamma. Default
+    /// `Some(DEFAULT_MONITOR_GAMMA)`.
+    ///
+    /// Unlike this struct's other `Option` fields, the default here is
+    /// `Some`, not `None` -- so an explicitly chosen `None` ("Raw") cannot be
+    /// told apart from an absent key by the usual "omit `None`, fill missing
+    /// keys from the default" TOML round trip: both would come back `Some`.
+    /// `serialize_monitor_gamma` writes the sentinel `0.0` for `None` instead
+    /// of omitting the key, so Raw is a real value on the wire and survives a
+    /// save/load cycle; see `GuiPrefsWire::monitor_gamma`, which is a plain
+    /// `f32` for the same reason.
+    #[serde(serialize_with = "serialize_monitor_gamma")]
+    pub monitor_gamma: Option<f32>,
     /// Whether a new GUI window starts in borderless full screen.
     pub start_fullscreen: bool,
     /// Mouse sensitivity in percent, the DOSBox-X `sensitivity` scale (default
@@ -249,6 +289,7 @@ impl Default for GuiPrefs {
         Self {
             master_volume: DEFAULT_VOLUME,
             crt_style: CrtStyle::Subtle,
+            monitor_gamma: Some(DEFAULT_MONITOR_GAMMA),
             start_fullscreen: false,
             mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
             input_release: default_input_release(),
@@ -270,6 +311,10 @@ impl Default for GuiPrefs {
 struct GuiPrefsWire {
     master_volume: f32,
     crt_style: CrtStyle,
+    // A plain f32, not Option<f32>: see GuiPrefs::monitor_gamma's doc comment.
+    // 0.0 is the "Raw" sentinel, matching the shader's own convention
+    // (crt.rs's monitor_gamma uniform, CrtCallback).
+    monitor_gamma: f32,
     start_fullscreen: bool,
     mouse_sensitivity: u16,
     input_release: KeyBinding,
@@ -291,6 +336,7 @@ impl Default for GuiPrefsWire {
         Self {
             master_volume: prefs.master_volume,
             crt_style: prefs.crt_style,
+            monitor_gamma: prefs.monitor_gamma.unwrap_or(0.0),
             start_fullscreen: prefs.start_fullscreen,
             mouse_sensitivity: prefs.mouse_sensitivity,
             input_release: prefs.input_release,
@@ -317,6 +363,10 @@ impl<'de> Deserialize<'de> for GuiPrefs {
         Ok(Self {
             master_volume: wire.master_volume,
             crt_style: wire.crt_style,
+            monitor_gamma: (wire.monitor_gamma > 0.0).then_some(
+                wire.monitor_gamma
+                    .clamp(MIN_MONITOR_GAMMA, MAX_MONITOR_GAMMA),
+            ),
             start_fullscreen: wire.start_fullscreen,
             mouse_sensitivity: wire
                 .mouse_sensitivity

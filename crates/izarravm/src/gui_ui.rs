@@ -307,6 +307,7 @@ impl GuiApp {
             fullscreen: self.fullscreen_key.clone(),
             screenshot: self.screenshot_key.clone(),
             crt_style: self.crt_style,
+            monitor_gamma: self.monitor_gamma,
             midi_backend: midi_config.backend,
             external_midi_port: midi_config.external_port,
             soundfont: midi_config.soundfont,
@@ -469,6 +470,56 @@ impl GuiApp {
                                                 &mut dialog.crt_style,
                                                 CrtStyle::Off,
                                                 "No",
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Monitor gamma");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let is_raw = dialog.monitor_gamma.is_none();
+                                            let mut custom = dialog
+                                                .monitor_gamma
+                                                .unwrap_or(crate::prefs::DEFAULT_MONITOR_GAMMA);
+                                            // Greyed out and inert while Raw is selected: a
+                                            // number here would otherwise claim an active
+                                            // gamma that Raw does not apply.
+                                            if ui
+                                                .add_enabled(
+                                                    !is_raw,
+                                                    egui::DragValue::new(&mut custom)
+                                                        .range(
+                                                            crate::prefs::MIN_MONITOR_GAMMA
+                                                                ..=crate::prefs::MAX_MONITOR_GAMMA,
+                                                        )
+                                                        .speed(0.01)
+                                                        .fixed_decimals(2),
+                                                )
+                                                .changed()
+                                            {
+                                                dialog.monitor_gamma = Some(custom);
+                                            }
+                                            ui.selectable_value(
+                                                &mut dialog.monitor_gamma,
+                                                Some(2.5),
+                                                "2.5",
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.monitor_gamma,
+                                                Some(crate::prefs::DEFAULT_MONITOR_GAMMA),
+                                                "2.4",
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.monitor_gamma,
+                                                Some(2.2),
+                                                "2.2",
+                                            );
+                                            ui.selectable_value(
+                                                &mut dialog.monitor_gamma,
+                                                None,
+                                                "Raw",
                                             );
                                         },
                                     );
@@ -707,6 +758,7 @@ impl GuiApp {
         self.fullscreen_key = dialog.fullscreen.clone();
         self.screenshot_key = dialog.screenshot.clone();
         self.crt_style = dialog.crt_style;
+        self.monitor_gamma = dialog.monitor_gamma;
         self.prefs.start_fullscreen = dialog.start_fullscreen;
         self.prefs.mouse_sensitivity = dialog.mouse_sensitivity;
         self.mouse_scale = crate::host_input::mouse_sensitivity_scale(dialog.mouse_sensitivity);
@@ -714,6 +766,7 @@ impl GuiApp {
         self.prefs.fullscreen = dialog.fullscreen.clone();
         self.prefs.screenshot = dialog.screenshot.clone();
         self.prefs.crt_style = dialog.crt_style;
+        self.prefs.monitor_gamma = dialog.monitor_gamma;
         let midi_config = MidiConfig {
             backend: dialog.midi_backend,
             external_port: dialog.external_midi_port.clone(),

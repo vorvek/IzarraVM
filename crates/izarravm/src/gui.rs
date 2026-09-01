@@ -708,6 +708,9 @@ pub struct GuiApp {
     // CRT presentation style (off / subtle / Ye Olde). Persisted; read by
     // monitor_ui each frame and mapped to the shader's style uniform.
     crt_style: CrtStyle,
+    // Assumed monitor gamma (None = Raw). Persisted; read by monitor_ui each
+    // frame and mapped to the shader's monitor_gamma uniform.
+    monitor_gamma: Option<f32>,
     // Live host hotkeys. The
     // event loop matches physical keys against these; the config dialog edits
     // staged copies and writes them back on Accept.
@@ -755,6 +758,7 @@ struct ConfigDialog {
     fullscreen: KeyBinding,
     screenshot: KeyBinding,
     crt_style: CrtStyle,
+    monitor_gamma: Option<f32>,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
     soundfont: Option<PathBuf>,
@@ -1142,6 +1146,7 @@ impl GuiApp {
         let mut initial_prefs_changed =
             remember_initial_media(&mut prefs, &initial_update.snapshot);
         let crt_style = prefs.crt_style;
+        let monitor_gamma = prefs.monitor_gamma;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
         let screenshot_key = prefs.screenshot.clone();
@@ -1210,6 +1215,7 @@ impl GuiApp {
             volume,
             gain,
             crt_style,
+            monitor_gamma,
             input_release,
             fullscreen_key,
             screenshot_key,
@@ -1346,7 +1352,8 @@ impl GuiApp {
             warn!("could not save screenshot because no guest frame is available");
             return;
         };
-        match frame.save(&self.screenshots_dir) {
+        let gamma = screenshot_gamma(self.crt_style, self.monitor_gamma);
+        match frame.save(&self.screenshots_dir, gamma) {
             Ok(path) => info!(path = %path.display(), "saved guest screenshot"),
             Err(err) => {
                 warn!(%err, path = %self.screenshots_dir.display(), "could not save screenshot")
@@ -1407,6 +1414,19 @@ fn merge_row_runs(
     merged
 }
 
+/// The gamma to bake into a saved screenshot. The shader applies the display
+/// gamma correction only on the `CrtStyle::Off` path (`crt.rs`'s
+/// `u.style < 0.5 && u.monitor_gamma > 0.0` branch) -- every other style
+/// keeps the pre-existing `to_linear` cancellation and shows the guest bytes
+/// uncorrected. A saved screenshot must match what the window actually
+/// shows, not what the preference says in the abstract, so any style other
+/// than Off saves raw bytes regardless of `monitor_gamma`.
+fn screenshot_gamma(crt_style: CrtStyle, monitor_gamma: Option<f32>) -> Option<f32> {
+    (crt_style == CrtStyle::Off)
+        .then_some(monitor_gamma)
+        .flatten()
+}
+
 /// The largest 4:3 rectangle that fits `area`, centred.
 fn fit_4_3(area: egui::Rect) -> egui::Rect {
     let (width, height) = if area.width() / area.height() > 4.0 / 3.0 {
@@ -1446,12 +1466,21 @@ impl GuiApp {
         // Olde grain animates, so keep repainting while it is active.
         let style = self.crt_style.as_u32();
         let time = ui.input(|i| i.time) as f32;
+        // 0.0 is the shader's "Raw" sentinel: display_transform's own None
+        // spelling, mirrored so the WGSL side has an explicit branch rather
+        // than relying on pow(c, 0.0), which is not the identity.
+        let monitor_gamma = self.monitor_gamma.unwrap_or(0.0);
         if self.crt_style == CrtStyle::YeOlde {
             ui.ctx().request_repaint();
         }
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
-            crate::crt::CrtCallback { frame, style, time },
+            crate::crt::CrtCallback {
+                frame,
+                style,
+                time,
+                monitor_gamma,
+            },
         ));
         // Clicking the screen requests input capture (handled later by the event
         // loop, which owns the winit Window).

@@ -1480,6 +1480,111 @@ fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
     assert_eq!((width, height), (640, 480));
 }
 
+/// The standing guard on
+/// `dev_docs/2026-09-01-display-gamma-design.md` section 5's claim that the
+/// re-pin set for the present-time shader placement is EMPTY: `--presented-ppm`
+/// captures the DAC signal, not the picture, and must stay raw no matter what
+/// `monitor_gamma` a GUI session has selected. Headless `main.rs` never even
+/// loads `GuiPrefs`, so today this holds by construction -- this test is what
+/// would catch a future change that threads the pref in anyway.
+///
+/// Not vacuous: the fixture's clear colour (0x00102030, channels 16/32/48) is
+/// deliberately in the design's golden-table anchors, where
+/// `display_transform` at the default gamma changes every channel. If
+/// `write_presented_ppm` is ever made to apply it, `body` stops matching
+/// `expected_raw` and this test goes red -- verified by hand: temporarily
+/// applying `display_transform` inside `write_presented_ppm`'s byte loop
+/// fails this test's first assertion, and reverting that change restores the
+/// pass.
+#[test]
+fn presented_ppm_is_unaffected_by_monitor_gamma() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .expect("build machine");
+    machine.write_physical_u32(
+        izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_CLEAR_COLOR as u32,
+        0x0010_2030,
+    );
+    machine.write_physical_u32(
+        izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_COMMAND as u32,
+        izarravm_video::DISTIRA_CMD_CLEAR,
+    );
+    machine.write_physical_u32(
+        izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_COMMAND as u32,
+        izarravm_video::DISTIRA_CMD_SWAP,
+    );
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+
+    let (pixels, _, _) = machine
+        .presented_frame_argb()
+        .expect("a swapped Distira frame is presented immediately");
+    let mut expected_raw = Vec::with_capacity(pixels.len() * 3);
+    for &color in &pixels {
+        expected_raw.extend_from_slice(&[(color >> 16) as u8, (color >> 8) as u8, color as u8]);
+    }
+
+    // Sanity: prove the fixture is not vacuous before trusting the guard.
+    let transformed: Vec<u8> = expected_raw
+        .iter()
+        .map(|&byte| display_transform::display_transform(byte, Some(prefs::DEFAULT_MONITOR_GAMMA)))
+        .collect();
+    assert_ne!(
+        expected_raw, transformed,
+        "fixture pixels must include codes display_transform actually changes, or this guard proves nothing"
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "izarravm_presented_ppm_gamma_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("frame.ppm");
+
+    let wrote = write_presented_ppm(&mut machine, &path).expect("write ppm");
+    let bytes = std::fs::read(&path).expect("read ppm back");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(wrote, "a swapped frame must be reported as written");
+    let header_end = bytes
+        .windows(4)
+        .position(|w| w == b"255\n")
+        .expect("PPM header must have a maxval line")
+        + 4;
+    let body = &bytes[header_end..];
+    // A plain assert_eq! here dumps two full-frame Vec<u8>s into the panic
+    // message on failure -- megabytes of noise for a fixture this size.
+    // Compare lengths and the first differing byte instead: enough to
+    // diagnose a regression, small enough to read.
+    assert_eq!(
+        body.len(),
+        expected_raw.len(),
+        "--presented-ppm body length must match the raw frame's"
+    );
+    if let Some((offset, (&got, &want))) = body
+        .iter()
+        .zip(expected_raw.iter())
+        .enumerate()
+        .find(|(_, (got, want))| got != want)
+    {
+        panic!(
+            "--presented-ppm must write the raw DAC bytes untouched, regardless of \
+             monitor_gamma: byte {offset} was {got}, expected {want} \
+             ({} of {} bytes differ)",
+            body.iter()
+                .zip(expected_raw.iter())
+                .filter(|(got, want)| got != want)
+                .count(),
+            body.len()
+        );
+    }
+}
+
 #[test]
 fn langid_maps_to_guest_layout_index() {
     assert_eq!(layout_index_from_langid(0x0409), 0); // en-US

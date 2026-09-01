@@ -15,6 +15,23 @@ fn controller_config(name: &str) -> ControllerConfig {
     })
 }
 
+/// A saved screenshot must match the window. The shader corrects for
+/// monitor_gamma only in CrtStyle::Off; every other style -- including the
+/// shipped default, Subtle -- must save raw bytes even when monitor_gamma is
+/// set, or the screenshot darkens while the window it is supposed to match
+/// does not.
+#[test]
+fn screenshot_gamma_applies_only_for_crt_style_off() {
+    assert_eq!(screenshot_gamma(CrtStyle::Off, Some(2.4)), Some(2.4));
+    assert_eq!(
+        screenshot_gamma(CrtStyle::Subtle, Some(2.4)),
+        None,
+        "Subtle is the shipped default; its window is uncorrected and the screenshot must match it"
+    );
+    assert_eq!(screenshot_gamma(CrtStyle::YeOlde, Some(2.4)), None);
+    assert_eq!(screenshot_gamma(CrtStyle::Off, None), None);
+}
+
 #[test]
 fn midi_rom_selection_is_visible_only_for_munt() {
     assert!(!midi_rom_selection_visible(MidiBackend::Off));
