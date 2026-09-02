@@ -44,7 +44,11 @@ fn record<'a>(records: &'a [SuiteRecord], name: &str) -> &'a SuiteRecord {
 }
 
 #[test]
-fn dsp_reset_probe_passes() {
+fn given_post_completes_when_the_result_block_is_parsed_then_the_audio_probes_pass() {
+    // Given: Izarra BIOS with an idle boot floppy, one POST.
+    // When: the audio probes (DSP reset / version, OPL rest-state) run.
+    // Then: DSP and OPL PASS, the version MEASURE is SB16 4.5, and each name
+    // appears once (neither probe clobbered the shared PROBE_SCRATCH buffer).
     let records = run_post();
     let dsp = record(&records, "component.audio_sbdsp");
     assert_eq!(
@@ -52,39 +56,19 @@ fn dsp_reset_probe_passes() {
         SuiteRecordStatus::Pass,
         "DSP reset handshake should see the 0xAA acknowledge"
     );
-}
-
-#[test]
-fn dsp_version_measure_reports_sb16_4_5() {
-    let records = run_post();
     let version = record(&records, "sound.dsp_version");
     assert_eq!(version.status, SuiteRecordStatus::Measure);
-    // The CT1747 model reports DSP version 4.5 (DSP_VERSION_HI/LO), the SB16
-    // identity games auto-detect; the probe formats it major.minor.
     assert_eq!(
         version.value.as_deref(),
         Some("4.5"),
         "command 0xE1 returns the SB16 4.5 version"
     );
-}
-
-#[test]
-fn opl_probe_passes() {
-    let records = run_post();
     let opl = record(&records, "component.audio_opl");
     assert_eq!(
         opl.status,
         SuiteRecordStatus::Pass,
         "OPL status should read the rest-state signature after a flag reset"
     );
-}
-
-#[test]
-fn audio_records_are_present_and_distinct() {
-    // All three audio records exist exactly once, so neither probe clobbered the
-    // other's name and the shared PROBE_SCRATCH version buffer did not corrupt a
-    // sibling record.
-    let records = run_post();
     for name in [
         "component.audio_sbdsp",
         "sound.dsp_version",

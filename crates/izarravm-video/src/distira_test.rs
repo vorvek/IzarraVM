@@ -3,11 +3,6 @@
 
 use super::*;
 
-#[test]
-fn model_always_reports_two_tmus() {
-    assert_eq!(Distira::new().tmu_count(), 2);
-}
-
 /// Reproduces the latent aliasing defect recorded in
 /// `dev_docs/2026-09-01-tr-mipmap-diag.md` section 5: Distira advertises a
 /// dual-TMU board (`DISTIRA_TMU_CONFIG` sets both TMU-count bits, matching

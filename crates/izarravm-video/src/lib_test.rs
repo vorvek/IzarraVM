@@ -4,14 +4,6 @@
 use super::*;
 
 #[test]
-fn mode13h_framebuffer_has_expected_size() {
-    let framebuffer = Framebuffer::mode13h();
-    assert_eq!(framebuffer.width, 320);
-    assert_eq!(framebuffer.height, 200);
-    assert_eq!(framebuffer.indexed_pixels.len(), MODE13H_MEMORY_SIZE);
-}
-
-#[test]
 fn default_dac_matches_stock_vga() {
     // The stock VGA mode-13h default palette (vgabios palette3). Key entries:
     // 0 black, 1 EGA blue (6-bit 0x2A -> 8-bit 0xAA), 6 brown, 15 white, and

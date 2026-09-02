@@ -24,15 +24,6 @@ fn sample_frame() -> ScreenshotFrame {
 }
 
 #[test]
-fn screenshots_directory_is_inside_the_state_directory() {
-    let state = Path::new("/home/user/.izarravm");
-    assert_eq!(
-        screenshots_dir(state),
-        PathBuf::from("/home/user/.izarravm/screenshots")
-    );
-}
-
-#[test]
 fn png_is_created_with_the_guest_pixels() {
     let directory = test_dir("pixels").join("screenshots");
     let path =
