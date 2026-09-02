@@ -1072,6 +1072,11 @@ impl CpuGsw {
                         } else {
                             self.far_jump(bus, selector, offset, operand_size)?;
                         }
+                        // `FF /3` and `FF /5`, the indirect far forms review N3 named:
+                        // a DPMI host's return through a saved far pointer is exactly
+                        // this shape, and the direct-form hooks at `0x9A`/`0xEA` miss it.
+                        #[cfg(feature = "reflected-call-diagnostic")]
+                        crate::reflected_call_diag::on_far_transfer(self);
                         Ok(clocks(11))
                     }
                     _extension => Err(undefined_opcode()),

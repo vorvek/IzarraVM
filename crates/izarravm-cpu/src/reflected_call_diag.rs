@@ -373,6 +373,10 @@ const ALL_CLASSES: [AddressClass; 9] = [
     AddressClass::Other,
 ];
 
+/// Review Appendix A R1.3's near-match histogram field names, in
+/// `Trip::note_near_match`'s bump order.
+const NEAR_MATCH_FIELDS: [&str; 5] = ["ss_selector", "sp_low16", "sp_high16", "cs_base", "other"];
+
 /// BDA: the fixed low-memory range `0000:0400`-`0000:04FF` (386 PRM /
 /// IBM PC AT technical reference). Address-range classification only, exactly
 /// as the design's own vocabulary calls for.
@@ -486,6 +490,12 @@ struct Trip {
     /// of them -- this confirms or refutes that reading directly rather than
     /// inferring it from `TR` churn alone.
     entered_via_task_gate: Option<bool>,
+    /// Review Appendix A R1.3: at every far return where `CS.selector` and
+    /// `EIP` already match the entry but the FULL match still fails, which
+    /// of `{ss_selector, sp_low16, sp_high16, cs_base, other}` differed.
+    /// Indexed by `NEAR_MATCH_FIELDS`. Diagnostic only -- this does not
+    /// change what counts as a match; it root-causes why it doesn't.
+    near_match_diffs: [u32; 5],
     nested_int_count: u32,
     far_transfer_count: u32,
     hw_interrupt_count: u32,
@@ -540,6 +550,7 @@ impl Trip {
             bda_head_at_entry: bda(0x041A),
             bda_tail_at_entry: bda(0x041C),
             entered_via_task_gate,
+            near_match_diffs: [0; 5],
             nested_int_count: 0,
             far_transfer_count: 0,
             hw_interrupt_count: 0,
@@ -594,6 +605,57 @@ impl Trip {
             && regs.eip == self.return_eip
             && ss.selector == self.entry_ss_selector
             && regs.esp() == self.entry_esp
+    }
+
+    /// Review Appendix A R1.3's near-match histogram. Called only when
+    /// `matches_return` just failed AND `CS.selector`/`EIP` already agree
+    /// with the entry (the trigger the design specifies): records which of
+    /// `{ss_selector, sp_low16, sp_high16, cs_base}` differ, both SP halves
+    /// unconditionally (not gated on the stack's architectural width), so a
+    /// run's aggregate tells C1 (SP_high16-dominated: a 16-bit stack, upper
+    /// `ESP` not restored) from C2 (`CS.base`-dominated: a stale cached base
+    /// across a `CR0.PE` toggle) from C3 (the histogram never fires at all --
+    /// the return isn't a far return this hook sees). Diagnostic only: this
+    /// changes no match decision.
+    fn note_near_match(&mut self, cpu: &CpuGsw) {
+        let regs = &cpu.registers;
+        let cs = regs.cs();
+        if cs.selector != self.return_cs_selector || regs.eip != self.return_eip {
+            return;
+        }
+        let ss = regs.segment(SegmentIndex::Ss);
+        let esp = regs.esp();
+        let mut any = false;
+        if ss.selector != self.entry_ss_selector {
+            self.near_match_diffs[0] += 1;
+            any = true;
+        }
+        if (esp as u16) != (self.entry_esp as u16) {
+            self.near_match_diffs[1] += 1;
+            any = true;
+        }
+        // The upper half is only architecturally meaningful on a 32-bit
+        // stack, but it is recorded regardless of the entry stack's own
+        // width: on a 16-bit stack a differing upper half is exactly
+        // candidate C1's signature (the excursion left it dirty and nothing
+        // on the return path restores what the architecture never reads).
+        if (esp >> 16) != (self.entry_esp >> 16) {
+            self.near_match_diffs[2] += 1;
+            any = true;
+        }
+        if cs.base != self.return_cs_base {
+            self.near_match_diffs[3] += 1;
+            any = true;
+        }
+        if !any {
+            // Should not happen: if none of the four differ, `matches_return`
+            // (which compares the same four plus the two that already
+            // triggered this call) would have been true. Recorded rather
+            // than asserted, because this is diagnostic code and a future
+            // field this method has not been taught about is a measurement
+            // gap, not a panic.
+            self.near_match_diffs[4] += 1;
+        }
     }
 }
 
@@ -652,6 +714,12 @@ struct KeyStats {
     bda_key_pending_trips: u64,
     bda_no_key_trips: u64,
     bda_unknown_trips: u64,
+    /// Review Appendix A R1.3. Summed across every near-miss far return this
+    /// key's trips saw, not one per trip -- an unmatched trip commonly spans
+    /// several nested far returns before it goes stale (R1.1: an "unmatched
+    /// trip" is an `MAX_TRIP_INSNS` window, not one round trip), and each is
+    /// a separate data point for which field diverges.
+    near_match_diffs: [u64; 5],
     // Journal-mode only.
     read_set_size: Samples,
     write_set_size: Samples,
@@ -786,6 +854,7 @@ fn on_far_return_on(state: &mut State, cpu: &mut CpuGsw) {
     // body returning from a call it made), so the trip stays open. Only the
     // staleness bound closes it here.
     if let Some(open) = state.open.as_mut() {
+        open.note_near_match(cpu);
         let over_budget = cpu
             .perf
             .instructions
@@ -1063,6 +1132,9 @@ fn finish_trip(cpu: &mut CpuGsw, guard: &mut State, unmatched: bool) {
         (Some(_), Some(_)) => stats.bda_no_key_trips += 1,
         _ => stats.bda_unknown_trips += 1,
     }
+    for (slot, count) in stats.near_match_diffs.iter_mut().zip(trip.near_match_diffs) {
+        *slot += u64::from(count);
+    }
 
     // Journal-mode-only aggregation. In shape mode `trip.reads`/`trip.writes`
     // are always empty (the hooks that would populate them early-return
@@ -1196,6 +1268,10 @@ pub struct KeyReport {
     pub bda_key_pending_trips: u64,
     pub bda_no_key_trips: u64,
     pub bda_unknown_trips: u64,
+    /// Review Appendix A R1.3's near-match histogram, name/count pairs in
+    /// `NEAR_MATCH_FIELDS` order. Instrument-only: does not change any
+    /// match decision, only explains a near-miss far return.
+    pub near_match_diffs: Vec<(&'static str, u64)>,
     pub read_set_size: StatSummary,
     pub write_set_size: StatSummary,
     pub reads_total: u64,
@@ -1262,6 +1338,11 @@ pub(crate) fn snapshot() -> Option<ReflectedCallDiagnosticSnapshot> {
                 bda_key_pending_trips: stats.bda_key_pending_trips,
                 bda_no_key_trips: stats.bda_no_key_trips,
                 bda_unknown_trips: stats.bda_unknown_trips,
+                near_match_diffs: NEAR_MATCH_FIELDS
+                    .iter()
+                    .zip(stats.near_match_diffs)
+                    .map(|(name, n)| (*name, n))
+                    .collect(),
                 read_set_size: (&stats.read_set_size).into(),
                 write_set_size: (&stats.write_set_size).into(),
                 reads_total: stats.reads_total,

@@ -1543,8 +1543,16 @@ impl CpuGsw {
         {
             self.census_note_read(linear);
         }
+        // Scoped OUT on a crossing access, mirroring the census gate immediately
+        // above: `read_paged_cross_page` splits a crossing access into
+        // page-local fragments that each reach `read_linear_fragment`, which
+        // notes its own address there. Noting here too would count a
+        // crossing access 1 + N times where it is N, inflating every
+        // read-set-size number this instrument reports (review N2).
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::note_read(self, linear);
+        if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
+            crate::reflected_call_diag::note_read(self, linear);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1626,8 +1634,14 @@ impl CpuGsw {
         {
             self.census_note_write(linear);
         }
+        // Scoped OUT on a crossing access, for the same reason as the read arm
+        // above (review N2): `write_paged_cross_page` splits it into
+        // page-local fragments that each note their own address at
+        // `write_linear_fragment`.
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
+        if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
+            crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",

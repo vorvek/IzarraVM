@@ -2921,6 +2921,10 @@ fn reflected_call_diagnostic_json(
             "bda_key_pending_trips": k.bda_key_pending_trips,
             "bda_no_key_trips": k.bda_no_key_trips,
             "bda_unknown_trips": k.bda_unknown_trips,
+            "near_match_diffs": k.near_match_diffs.iter().map(|(name, n)| json!({
+                "field": name,
+                "count": n,
+            })).collect::<Vec<_>>(),
             "read_set_size": stat_json(&k.read_set_size),
             "write_set_size": stat_json(&k.write_set_size),
             "reads_total": k.reads_total,
