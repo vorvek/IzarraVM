@@ -6311,6 +6311,92 @@ fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
     jit::direct::set_callout_segment_resume_for_test(None);
 }
 
+/// L9 slice 0 (B3, `dev_docs/2026-09-02-pmode-segwrite-edge-design.md` section 5, the
+/// `seg-head-diagnostic` diagnostic instrument). A two-write ring-0 pmode head -- `MOV DS,AX`
+/// then `MOV FS,AX`, ending on a `JMP` -- is the `0x5795` shape the design's headline is about.
+///
+/// `written_segments_of` must stay at 0: `dirty_segments` has exactly one producer, the native
+/// `LoadSegReal`/`PopSegReal` lowering arm, and neither write here goes through it (both are
+/// `MOV Sreg, r/m16` register forms, which `stack_width_kind` always routes to a call-out). The
+/// diagnostic's OWN lane, `callout_written_segments_of`, must instead carry BOTH the DS bit
+/// (`1 << 3`) and the FS bit (`1 << 4`) -- fed unconditionally by the walk, with
+/// `IZARRAVM_CALLOUT_SEGMENT_RESUME` left at its default (untouched by this fixture), which is
+/// OFF.
+///
+/// MUTATION: drop the `callout_dirty_segments |= barred_segment_write(&insn)` accumulator, or
+/// revert `Compilation::callout_written_segments` to always `0`. Either turns this red without
+/// moving `written_segments_of`, which is the point: the two lanes are provably independent.
+#[cfg(all(
+    feature = "jit",
+    feature = "seg-head-diagnostic",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_pmode_two_write_callout_head_reaches_the_callout_diagnostic_lane() {
+    const CODE: &[u8] = &[
+        0xB8,
+        SEL_DATA as u8,
+        (SEL_DATA >> 8) as u8,
+        0x00,
+        0x00, // mov eax,SEL_DATA    +0
+        0x8E,
+        0xD8, // mov ds,ax                                                        +5
+        0xB8,
+        SEL_OTHER as u8,
+        (SEL_OTHER >> 8) as u8,
+        0x00,
+        0x00, // mov eax,SEL_OTHER  +7
+        0x8E,
+        0xE0, // mov fs,ax                                                        +12
+        0xEB,
+        0x00, // jmp +0, the `0x5795` shape's terminal                            +14
+        0xF4, // hlt, the jmp target -- never reached, only decoded so the target        +16
+              // linear has a valid instruction behind it
+    ];
+    const STARTS: &[u32] = &[0, 5, 7, 12, 14, 16];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    let compilation =
+        jit::direct::compile(&mut cpu, ENTRY, true).expect("the two-write head compiles");
+    assert_eq!(
+        compilation.written_segments, 0,
+        "neither write here goes through the native lowering arm"
+    );
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+
+    assert_eq!(
+        cpu.jit_direct.written_segments_of(id),
+        0,
+        "the shipped lane must stay untouched by this diagnostic"
+    );
+    assert_eq!(
+        cpu.jit_direct.callout_written_segments_of(id),
+        0b0001_1000, // segment_bit(Ds) | segment_bit(Fs), direct.rs's private match
+        "the diagnostic lane must carry both call-out writes"
+    );
+}
+
 /// SS is in the mask ALWAYS, however empty the suffix is.
 ///
 /// `mov ss,dx` with a 16-bit stack descriptor moves `default_size_32`, which is `jit_mode_key`

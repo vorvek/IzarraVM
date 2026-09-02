@@ -2260,6 +2260,35 @@ pub struct DirectStallSnapshot {
     pub seg_head_eligible_successor_absent: u64,
     #[cfg(feature = "seg-head-diagnostic")]
     pub seg_head_eligible_selector_repeat: u64,
+    /// L9 slice 0 (B3), THROWAWAY. See `DirectStallTally` for what each of these counts.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_entries: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_entries_pmode: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_multi: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_arity_3plus: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_terminal_jmp: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_claims_all: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_claims_partial: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_claims_none: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_absent: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_stale_epoch: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_declined: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_seg_layout: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_block_shape: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_x87_pad: u64,
     /// G1 lane trials granted and the subset that installed a lane-carrying block under a hot
     /// span. See `DirectStallTally`.
     pub lane_trials: u64,

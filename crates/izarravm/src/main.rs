@@ -2269,6 +2269,20 @@ fn write_hdd_profile_json(
             "eligible_successor_absent": stalls.seg_head_eligible_successor_absent,
             "eligible_selector_repeat": stalls.seg_head_eligible_selector_repeat,
             "segment_write_block_head_entries": stalls.segment_write_block_head_entries,
+            "callout_head_entries": stalls.callout_head_entries,
+            "callout_head_entries_pmode": stalls.callout_head_entries_pmode,
+            "callout_head_multi": stalls.callout_head_multi,
+            "callout_head_arity_3plus": stalls.callout_head_arity_3plus,
+            "callout_head_terminal_jmp": stalls.callout_head_terminal_jmp,
+            "callout_successor_claims_all": stalls.callout_successor_claims_all,
+            "callout_successor_claims_partial": stalls.callout_successor_claims_partial,
+            "callout_successor_claims_none": stalls.callout_successor_claims_none,
+            "callout_successor_absent": stalls.callout_successor_absent,
+            "callout_probe_refusal_stale_epoch": stalls.callout_probe_refusal_stale_epoch,
+            "callout_probe_refusal_declined": stalls.callout_probe_refusal_declined,
+            "callout_probe_refusal_seg_layout": stalls.callout_probe_refusal_seg_layout,
+            "callout_probe_refusal_block_shape": stalls.callout_probe_refusal_block_shape,
+            "callout_probe_refusal_x87_pad": stalls.callout_probe_refusal_x87_pad,
         });
     }
     #[cfg(feature = "retf-arity-census")]

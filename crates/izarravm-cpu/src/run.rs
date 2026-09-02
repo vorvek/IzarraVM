@@ -3587,6 +3587,19 @@ impl CpuGsw {
                     .note_seg_head_diagnostic(block.id(), block.span(), mask, selector);
             }
         }
+        // L9 slice 0 (B3), THROWAWAY, compiled out of every normal build: the call-out lane's own
+        // copy, a SEPARATE mask from `written_segments_of` above (`dev_docs/2026-09-02-pmode-
+        // segwrite-edge-design.md` section 5.1). Read AFTER the block ran, for the same reason
+        // as the block above -- this diagnostic's counters do not depend on the value the write
+        // installed, but the site is shared for locality with its sibling.
+        #[cfg(feature = "seg-head-diagnostic")]
+        {
+            let callout_mask = self.jit_direct.callout_written_segments_of(block.id());
+            if callout_mask != 0 {
+                self.jit_direct
+                    .note_seg_callout_diagnostic(block.id(), block.span(), callout_mask);
+            }
+        }
         // v2 IPE-trace observer, DISARMED in every normal build. A disarmed entry pays one null
         // test and nothing else; the field is EXPECTED to share a cache line with the other
         // `Option<Box<..>>` diagnostics `JitState` already carries and that the line above

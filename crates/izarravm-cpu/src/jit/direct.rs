@@ -971,6 +971,12 @@ pub(crate) struct BlockCache {
     /// because that struct is pinned at 120 bytes and no reader of this mask is on the per-entry
     /// copy path; every one of them already holds an index.
     written_segments: Vec<u8>,
+    /// L9 slice 0 (B3), THROWAWAY. Parallel to `blocks`: `Compilation::callout_written_segments`.
+    #[cfg(feature = "seg-head-diagnostic")]
+    callout_written_segments: Vec<u8>,
+    /// L9 slice 0 (B3), THROWAWAY. Parallel to `blocks`: `Compilation::callout_head_terminal_jmp`.
+    #[cfg(feature = "seg-head-diagnostic")]
+    callout_head_terminal_jmp: Vec<bool>,
     /// L9 stage 0, THROWAWAY. Parallel to `blocks`: `Compilation::seg_head_guard_eligible`.
     #[cfg(feature = "seg-head-diagnostic")]
     seg_head_guard_eligible: Vec<bool>,
@@ -1397,6 +1403,10 @@ impl BlockCache {
             chain_layouts: Vec::new(),
             written_segments: Vec::new(),
             #[cfg(feature = "seg-head-diagnostic")]
+            callout_written_segments: Vec::new(),
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_head_terminal_jmp: Vec::new(),
+            #[cfg(feature = "seg-head-diagnostic")]
             seg_head_guard_eligible: Vec::new(),
             #[cfg(feature = "seg-head-diagnostic")]
             seg_head_last_selector: HashMap::default(),
@@ -1686,6 +1696,12 @@ impl BlockCache {
             self.chain_layouts.push(compilation.segment_layout);
             self.written_segments.push(compilation.written_segments);
             #[cfg(feature = "seg-head-diagnostic")]
+            self.callout_written_segments
+                .push(compilation.callout_written_segments);
+            #[cfg(feature = "seg-head-diagnostic")]
+            self.callout_head_terminal_jmp
+                .push(compilation.callout_head_terminal_jmp);
+            #[cfg(feature = "seg-head-diagnostic")]
             self.seg_head_guard_eligible
                 .push(compilation.seg_head_guard_eligible);
             self.block_imm_lanes.push(compilation.imm_lanes);
@@ -1723,6 +1739,8 @@ impl BlockCache {
             self.written_segments[index] = compilation.written_segments;
             #[cfg(feature = "seg-head-diagnostic")]
             {
+                self.callout_written_segments[index] = compilation.callout_written_segments;
+                self.callout_head_terminal_jmp[index] = compilation.callout_head_terminal_jmp;
                 self.seg_head_guard_eligible[index] = compilation.seg_head_guard_eligible;
             }
             self.block_imm_lanes[index] = compilation.imm_lanes;
@@ -4025,6 +4043,17 @@ pub(crate) struct Compilation {
     /// pinned at 120 bytes with a full budget. Every reader holds an index or a `Compilation`
     /// already, so the side lane costs nothing the packed byte would have saved.
     pub(crate) written_segments: u8,
+    /// L9 slice 0 (B3), THROWAWAY: the call-out lane's own copy of `written_segments`, fed by the
+    /// compile walk's `callout_dirty_segments` accumulator. Kept SEPARATE from `written_segments`
+    /// on purpose, so this diagnostic cannot change what `try_link_inner` merges or guards --
+    /// see `dev_docs/2026-09-02-pmode-segwrite-edge-design.md` section 5.1 point 1.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub(crate) callout_written_segments: u8,
+    /// L9 slice 0 (B3), THROWAWAY: whether this block's terminal is a `Jmp`. See the compile-walk
+    /// local of the same name for why it is captured here rather than re-derived from
+    /// `successors`.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub(crate) callout_head_terminal_jmp: bool,
     /// L9 stage 0, THROWAWAY: whether this block has the exact shape the guarded edge would admit.
     /// One real-mode lowering write, that segment neither CS nor SS, no call-out that could write a
     /// segment the compiler cannot name, and a plain fallthrough terminal. Without it the tally
@@ -7937,6 +7966,14 @@ fn compile_with_budget(
     // re-enter or leave the block without a segment check (see `self_loop` and `successors`).
     let mut dirty_segments = 0u8;
     let mut segment_writes = 0usize;
+    // L9 slice 0 (B3), THROWAWAY: the segment(s) a CALL-OUT slot in this block would overwrite,
+    // fed unconditionally -- not gated on `segment_resume` -- so the diagnostic below sees the
+    // mask even with `IZARRAVM_CALLOUT_SEGMENT_RESUME` off, which is the shipped default. A
+    // SEPARATE lane from `dirty_segments`: nothing outside `seg-head-diagnostic` ever reads it, so
+    // `written_segments`, `segment_write_block` and every merge/link decision downstream are
+    // untouched (`dev_docs/2026-09-02-pmode-segwrite-edge-design.md` section 5.1 point 1).
+    #[cfg(feature = "seg-head-diagnostic")]
+    let mut callout_dirty_segments = 0u8;
     let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
@@ -8606,6 +8643,12 @@ fn compile_with_budget(
                     .interpret_one_row()
                     .expect("an InterpretOne helper names its census row");
                 callout_segment_writes += usize::from(segment_resume && row.may_write_segment());
+                // L9 slice 0 (B3): fed unconditionally, unlike `callout_segment_writes` above --
+                // see the declaration of `callout_dirty_segments` for why.
+                #[cfg(feature = "seg-head-diagnostic")]
+                {
+                    callout_dirty_segments |= barred_segment_write(&insn);
+                }
                 // `slots.len()` IS the index this instruction is about to take: the push happens
                 // further down the same iteration and nothing between here and it can `break`.
                 // The assertion after the walk is what keeps that true.
@@ -9197,6 +9240,15 @@ fn compile_with_budget(
         && dirty_segments & (segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)) == 0
         && callout_segment_writes == 0
         && is_plain_fallthrough_terminal(slots.last().map(|slot| slot.kind));
+    // L9 slice 0 (B3): whether this block's terminal is a `Jmp`, the `0x5795` shape's terminal
+    // kind. Captured here, at compile time, rather than re-derived from `successors` at read
+    // time -- a fallthrough terminal also publishes `successors[0]`, so that array alone cannot
+    // tell the two apart.
+    #[cfg(feature = "seg-head-diagnostic")]
+    let callout_head_terminal_jmp = matches!(
+        slots.last().map(|slot| slot.kind),
+        Some(DirectKind::Jmp { .. })
+    );
     // `SEGWRITE-V86-EDGE` (dev_docs/2026-09-01-segwrite-continue-design.md §4.1). The bars a
     // segment-write block must clear to publish its plain static fallthrough anyway, on the
     // default path -- not gated behind a diagnostic feature, because this is what decides
@@ -9500,6 +9552,10 @@ fn compile_with_budget(
         far_dynamic,
         successors,
         written_segments: dirty_segments,
+        #[cfg(feature = "seg-head-diagnostic")]
+        callout_written_segments: callout_dirty_segments,
+        #[cfg(feature = "seg-head-diagnostic")]
+        callout_head_terminal_jmp,
         #[cfg(feature = "seg-head-diagnostic")]
         seg_head_guard_eligible,
         #[cfg(feature = "direct-link-refusal-census")]
@@ -9824,6 +9880,13 @@ pub(crate) struct BlockKey {
 /// take the relaxed path, and `BlockKey`/the entry check already refuse to enter a block admitted
 /// under one mode key from another.
 pub(crate) const JIT_MODE_KEY_V86_BIT: u32 = 1 << 2;
+
+/// Bit 1 of `jit_mode_key`: CR0.PE was set when the key was captured. Used, together with
+/// `JIT_MODE_KEY_V86_BIT`, by the `seg-head-diagnostic` call-out lane to tell the ring-0
+/// protected-mode population (`PE set, VM clear`) apart from V86 and from plain real mode
+/// (`dev_docs/2026-09-02-pmode-segwrite-edge-design.md` section 5.2, `callout_head_entries_pmode`).
+#[cfg(feature = "seg-head-diagnostic")]
+pub(crate) const JIT_MODE_KEY_PE_BIT: u32 = 1 << 1;
 
 impl BlockKey {
     pub(crate) const fn new(linear: u32, physical: u32, mode_key: u32) -> Self {
@@ -34195,6 +34258,58 @@ pub(crate) struct DirectStallTally {
     pub seg_head_eligible_successor_absent: u64,
     #[cfg(feature = "seg-head-diagnostic")]
     pub seg_head_eligible_selector_repeat: u64,
+    /// L9 slice 0 (B3), THROWAWAY (dev_docs/2026-09-02-pmode-segwrite-edge-design.md section 5).
+    /// The call-out lane's own diagnostic: entries whose head has `callout_dirty_segments != 0`,
+    /// the `0x5795` shape (constant-selector call-out `MOV DS,AX` / `MOV FS,AX`, ring-0 pmode,
+    /// `Jmp` terminal). Unlike the `seg_head_*` group above, whose denominator excludes the
+    /// call-out producer, this group counts NOTHING BUT it.
+    ///
+    /// * `callout_head_entries_pmode` -- of `callout_head_entries`, the ones with `PE` set and
+    ///   `VM` clear: the population this design widens to.
+    /// * `callout_head_multi` -- `count_ones() > 1`.
+    /// * `callout_head_arity_3plus` -- `count_ones() > 2`, the share that would need
+    ///   `SEG_GUARD_MAX` raised past 2 before it could be served.
+    /// * `callout_head_terminal_jmp` -- the head's terminal is a `Jmp`, the `0x5795` shape's
+    ///   terminal kind (captured at compile time, see `Compilation::callout_head_terminal_jmp`).
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_entries: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_entries_pmode: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_multi: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_arity_3plus: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_head_terminal_jmp: u64,
+    /// The B3 question: does the head's `Jmp` successor's `chain_layouts.used` claim the whole of
+    /// the head's dirty mask (`claims_all`, `used & mask == mask`), part of it (`claims_partial`,
+    /// `used & mask != 0` but not all), none of it (`claims_none`), or is there no compiled
+    /// successor at all (`claims_absent` below)?
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_claims_all: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_claims_partial: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_claims_none: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_successor_absent: u64,
+    /// A READ-ONLY replay of `try_link_inner`'s refusal chain against the head and its `Jmp`
+    /// successor, in the SAME short-circuit order the real bind uses (`StaleEpoch`, `Declined`,
+    /// `SegmentLayout` under the STRICT `used & mask == mask` bar, `BlockShape`, `MissingX87Pad`).
+    /// Binds nothing: no `outbound` write, no `link_cells` write, no `widen_chain_requirement`
+    /// call, no counter outside this group. Counted only when the head's dirty mask is non-zero
+    /// and a successor block is found, so each of the five is a subset of
+    /// `callout_head_entries - callout_successor_absent`.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_stale_epoch: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_declined: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_seg_layout: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_block_shape: u64,
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub callout_probe_refusal_x87_pad: u64,
     /// The x87 TOP-mismatch retire cap (`retire_key_for_top_mismatch`). `suppressed` counts every
     /// retire the cap refused -- one per mismatch on an already-capped key, so on a churning guest
     /// it approaches `jit_direct_reject_x87_top`. The identity
@@ -35994,6 +36109,34 @@ impl crate::jit::JitState {
             seg_head_eligible_successor_absent: self.stalls.seg_head_eligible_successor_absent,
             #[cfg(feature = "seg-head-diagnostic")]
             seg_head_eligible_selector_repeat: self.stalls.seg_head_eligible_selector_repeat,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_head_entries: self.stalls.callout_head_entries,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_head_entries_pmode: self.stalls.callout_head_entries_pmode,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_head_multi: self.stalls.callout_head_multi,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_head_arity_3plus: self.stalls.callout_head_arity_3plus,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_head_terminal_jmp: self.stalls.callout_head_terminal_jmp,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_successor_claims_all: self.stalls.callout_successor_claims_all,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_successor_claims_partial: self.stalls.callout_successor_claims_partial,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_successor_claims_none: self.stalls.callout_successor_claims_none,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_successor_absent: self.stalls.callout_successor_absent,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_probe_refusal_stale_epoch: self.stalls.callout_probe_refusal_stale_epoch,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_probe_refusal_declined: self.stalls.callout_probe_refusal_declined,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_probe_refusal_seg_layout: self.stalls.callout_probe_refusal_seg_layout,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_probe_refusal_block_shape: self.stalls.callout_probe_refusal_block_shape,
+            #[cfg(feature = "seg-head-diagnostic")]
+            callout_probe_refusal_x87_pad: self.stalls.callout_probe_refusal_x87_pad,
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
             lane_trial_first_grants: self.stalls.lane_trial_first_grants,
@@ -36338,6 +36481,14 @@ impl crate::jit::JitState {
             .map_or(0, |index| self.written_segments[index])
     }
 
+    /// The call-out lane's own copy: `0` for a stale id and for a block whose call-out slots
+    /// write no segment. See `Compilation::callout_written_segments`.
+    #[cfg(feature = "seg-head-diagnostic")]
+    pub(crate) fn callout_written_segments_of(&self, id: BlockId) -> u8 {
+        self.active_index(id)
+            .map_or(0, |index| self.callout_written_segments[index])
+    }
+
     /// L9 stage 0, THROWAWAY. Called once per dispatcher entry whose head wrote a segment through
     /// one of the four real-mode lowerings, AFTER the block ran, so `selector` is the value the
     /// write installed and is exactly what a selector-guarded edge would compare.
@@ -36388,6 +36539,89 @@ impl crate::jit::JitState {
         let repeat = u64::from(previous == Some(selector));
         self.stalls.seg_head_selector_repeat += repeat;
         self.stalls.seg_head_eligible_selector_repeat += repeat * u64::from(eligible);
+    }
+
+    /// L9 slice 0 (B3), THROWAWAY (`dev_docs/2026-09-02-pmode-segwrite-edge-design.md` section
+    /// 5.2). Called once per dispatcher entry whose head has `callout_dirty_segments != 0`, the
+    /// `0x5795` shape. Unlike `note_seg_head_diagnostic`, which probes the FALLTHROUGH linear,
+    /// this reads the head's own compiled `successors[0]` -- the block's terminal need not be a
+    /// plain fallthrough for this lane, and at `0x5795` it is a `Jmp`.
+    ///
+    /// The refusal replay binds nothing: it reads `block_link_epochs`, `data_segment_retires`,
+    /// `data_segment_link_declined`, `chain_layouts` and `has_x87`/`link_compatible`, and writes
+    /// only its own counters. No `outbound` write, no `link_cells` write, no
+    /// `widen_chain_requirement` call.
+    ///
+    /// `#[inline(never)]` for the same reason as its neighbour: the whole point of the feature
+    /// gate is that the default build carries none of this, and an armed build is a diagnostic
+    /// build that pays for the call.
+    #[cfg(feature = "seg-head-diagnostic")]
+    #[inline(never)]
+    pub(crate) fn note_seg_callout_diagnostic(&mut self, id: BlockId, span: BlockSpan, mask: u8) {
+        if mask == 0 {
+            return;
+        }
+        let Some(source_index) = self.active_index(id) else {
+            return;
+        };
+        self.stalls.callout_head_entries += 1;
+        let pmode = span.key.mode_key & JIT_MODE_KEY_PE_BIT != 0
+            && span.key.mode_key & JIT_MODE_KEY_V86_BIT == 0;
+        self.stalls.callout_head_entries_pmode += u64::from(pmode);
+        self.stalls.callout_head_multi += u64::from(mask.count_ones() > 1);
+        self.stalls.callout_head_arity_3plus += u64::from(mask.count_ones() > 2);
+        self.stalls.callout_head_terminal_jmp +=
+            u64::from(self.callout_head_terminal_jmp[source_index]);
+
+        let Some(target_index) = self.blocks[source_index].successors[0]
+            .and_then(|target| self.linear_blocks.get(&target).copied())
+            .and_then(|target_id| self.active_index(target_id))
+        else {
+            self.stalls.callout_successor_absent += 1;
+            return;
+        };
+
+        let used = self.chain_layouts[target_index].used;
+        if used & mask == mask {
+            self.stalls.callout_successor_claims_all += 1;
+        } else if used & mask != 0 {
+            self.stalls.callout_successor_claims_partial += 1;
+        } else {
+            self.stalls.callout_successor_claims_none += 1;
+        }
+
+        // A READ-ONLY replay of `try_link_inner`'s refusal chain, in the SAME short-circuit
+        // order: StaleEpoch, Declined, SegmentLayout (STRICT bar, `used & mask == mask`, which
+        // is the B2 merge bar this design adopts rather than today's `!= 0` one),
+        // BlockShape, MissingX87Pad.
+        let stale_epoch = self.block_link_epochs.get(source_index).copied()
+            != Some(self.link_epoch)
+            || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch);
+        if stale_epoch {
+            self.stalls.callout_probe_refusal_stale_epoch += 1;
+            return;
+        }
+        if self.link_source_declined(id) {
+            self.stalls.callout_probe_refusal_declined += 1;
+            return;
+        }
+        if used & mask != mask {
+            self.stalls.callout_probe_refusal_seg_layout += 1;
+            return;
+        }
+        if !self.blocks[source_index].link_compatible(&self.blocks[target_index]) {
+            self.stalls.callout_probe_refusal_block_shape += 1;
+            return;
+        }
+        // `x87_pad_address_if_built`, NOT `x87_pad_address`: the probe must bind nothing, and
+        // the latter lazily BUILDS the pad on first call, which is a real (if idempotent) side
+        // effect the real bind is entitled to but this read-only mirror is not.
+        if !self.blocks[source_index].has_x87()
+            && self.blocks[target_index].has_x87()
+            && self.x87_pad_address_if_built().is_none()
+        {
+            self.stalls.callout_probe_refusal_x87_pad += 1;
+        }
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {

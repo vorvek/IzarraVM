@@ -79,6 +79,10 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         successors: [None, None],
         written_segments: 0,
         #[cfg(feature = "seg-head-diagnostic")]
+        callout_written_segments: 0,
+        #[cfg(feature = "seg-head-diagnostic")]
+        callout_head_terminal_jmp: false,
+        #[cfg(feature = "seg-head-diagnostic")]
         seg_head_guard_eligible: false,
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets: [None, None],
