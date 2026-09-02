@@ -60,6 +60,12 @@ const CHUNK_SHIFT: u32 = 0;
 pub(crate) const NATIVE_CHUNK_SHIFT: u32 = CHUNK_SHIFT;
 const CHUNKS_PER_PAGE: usize = 1 << (PAGE_SHIFT - CHUNK_SHIFT);
 const MASK_WORDS: usize = CHUNKS_PER_PAGE / u64::BITS as usize;
+// `range_watched`'s masked fast arm reads a byte width as a chunk count. That equality is what
+// this pins: raise `CHUNK_SHIFT` and the arm has to convert the width first.
+const _: () = assert!(
+    CHUNK_SHIFT == 0,
+    "range_watched's masked arm assumes byte-granular chunks"
+);
 const MAX_RECYCLED_PAGES: usize = 64;
 const MAX_INACTIVE_PAGES: usize = 1024;
 const MAX_STICKY_PRECISE_PAGES: usize = 4096;
@@ -635,9 +641,28 @@ impl NativeCodeWatch {
         });
     }
 
+    /// Whether any chunk in `[physical, physical + len)` is watched. Asked of EVERY native and
+    /// interpreted guest store through `code_write_watched`.
+    ///
+    /// The overwhelmingly common shape is a 1/2/4-byte store whose chunks lie wholly inside one
+    /// 64-bit mask word, and that is answered here with one page lookup and one masked test rather
+    /// than `len` page shifts, `len` table loads and `len` mask loads. This is the same fast arm
+    /// its twin `DecodeCache::range_hits_code` already carries, ported over.
+    ///
+    /// `bit + len <= 64` is the non-crossing test: a range that straddles a mask word needs both
+    /// words, and it also settles the 4 GiB wrap the loop arm handles with `wrapping_add` -- a
+    /// range that cannot leave its 64-chunk word cannot leave its page or wrap the address space
+    /// either. Anything failing it, and any access wider than four bytes, takes the exact loop.
     pub(crate) fn range_watched(&self, physical: u32, len: u32) -> bool {
         if len == 0 || self.pages.is_empty() {
             return false;
+        }
+        // The masked arm counts `len` CHUNKS, which is the same as `len` bytes only at byte
+        // granularity; the const assert beside `MASK_WORDS` pins that.
+        let bit = ((physical & 0xfff) >> CHUNK_SHIFT) & (u64::BITS - 1);
+        if len <= 4 && bit + len <= u64::BITS {
+            let mask = ((1u64 << len) - 1) << bit;
+            return self.mask_word(physical) & mask != 0;
         }
         let mut chunk = physical & !((1 << CHUNK_SHIFT) - 1);
         let last = physical.wrapping_add(len - 1) & !((1 << CHUNK_SHIFT) - 1);
@@ -814,23 +839,30 @@ impl NativeCodeWatch {
     }
 
     fn chunk_watched(&self, physical: u32) -> bool {
-        let page = physical >> PAGE_SHIFT;
         let chunk = (physical & 0xfff) >> CHUNK_SHIFT;
-        let word = (chunk / 64) as usize;
         let bit = 1u64 << (chunk & 63);
+        self.mask_word(physical) & bit != 0
+    }
+
+    /// The one mask word covering `physical`'s chunk, or zero when the page carries no watch.
+    ///
+    /// Both the single-chunk test and `range_watched`'s masked fast arm read a page's mask through
+    /// here, so the published-table and owning-map arms exist once.
+    #[inline]
+    fn mask_word(&self, physical: u32) -> u64 {
+        let page = physical >> PAGE_SHIFT;
+        let word = (((physical & 0xfff) >> CHUNK_SHIFT) / u64::BITS) as usize;
         if let Some(table) = &self.table {
             let pointer = table[page as usize];
             if pointer == 0 {
-                return false;
+                return 0;
             }
             // `pages` owns boxed masks whose addresses stay fixed until their table entry is
             // cleared. Native execution and watch mutation never overlap.
             let page_watch = unsafe { &*std::ptr::with_exposed_provenance::<WatchPage>(pointer) };
-            return page_watch.mask[word] & bit != 0;
+            return page_watch.mask[word];
         }
-        self.pages
-            .get(&page)
-            .is_some_and(|watch| watch.mask[word] & bit != 0)
+        self.pages.get(&page).map_or(0, |watch| watch.mask[word])
     }
 }
 

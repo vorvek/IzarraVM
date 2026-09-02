@@ -667,7 +667,12 @@ impl CpuGsw {
                 self.registers.esi(),
             );
         }
-        let changed = Self::read_fast_map_ptr(ptr, width) != value;
+        // The read-back is GATED ON ITS CONSUMER. `changed` is only ever asked in conjunction
+        // with the condition below, and the read has to precede the store, so an ungated read-back
+        // put a load, a compare and a live register across the charge on every guest store served
+        // by the fast map -- for an answer the common unwatched store never looks at.
+        let consumer = watched || (width == BusWidth::Byte && self.unit_sim.0.is_some());
+        let changed = consumer && Self::read_fast_map_ptr(ptr, width) != value;
         Self::write_fast_map_ptr(ptr, width, value);
         // `note_code_write_hit` is a total no-op when `watched` is false and no unit sim is
         // attached: `code_write_watched` being false means both `range_hits_compiled_code` and
@@ -676,7 +681,7 @@ impl CpuGsw {
         // unwatched byte write, only to feed the diagnostic unit sim; narrowing that half to
         // "only when a unit sim is actually attached" keeps the diagnostic feed working while
         // dropping the call entirely on the default build's unwatched byte-write path.
-        if changed && (watched || (width == BusWidth::Byte && self.unit_sim.0.is_some())) {
+        if changed {
             self.note_code_write_hit(physical, width.bytes());
         }
         self.record_data_write(kind, true);
