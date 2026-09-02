@@ -225,36 +225,60 @@ unsafe fn xgetbv0() -> u64 {
 /// precompiled `std`/`kernel32`/`user32` code or a load of a precomputed
 /// `static`, never a copy this crate's own `-C target-cpu=x86-64-v3`
 /// codegen could lower to a VEX instruction.
+///
+/// The `stderr` write is deliberately infallible: `eprintln!` panics on a
+/// write error (a closed handle, a broken pipe on the other end of a
+/// redirect), which would unwind out of a `-> !` function and skip both
+/// the dialog and `process::exit(1)` -- the host would see nothing at all
+/// instead of at least the intended non-zero exit. `writeln!`'s `Result`
+/// is discarded on purpose: there is no better fallback for a stderr
+/// write that failed than to still show the dialog (if one is wanted) and
+/// still exit non-zero.
 #[inline(never)]
 fn report_and_exit() -> ! {
-    eprintln!("{AVX2_REQUIRED_MESSAGE}");
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{AVX2_REQUIRED_MESSAGE}");
     #[cfg(windows)]
-    if dialog_is_reachable_and_wanted() {
+    if dialog_wanted(no_dialog_env_is_set(), console_is_attached()) {
         show_message_box();
     }
     std::process::exit(1);
 }
 
-/// The binary is `IMAGE_SUBSYSTEM_WINDOWS_CUI`: it always has a console,
-/// either its own or one it inherited from the launching shell. A modal
-/// `MessageBoxW` is only the right move when nobody is positioned to read
-/// stderr -- launched from Explorer by double-click, where
-/// `GetConsoleWindow` returns `NULL`. With a console attached (an
-/// interactive shell, a CI runner, a scoreboard harness), stderr already
-/// reached someone; showing a dialog there would hang a headless run on a
-/// non-AVX2 CI box until the harness timeout instead of failing fast.
-/// `IZARRAVM_NO_DIALOG` is an explicit escape for the case where no
-/// console is attached at all (some CI launchers spawn with none) but a
-/// human still is not there to click OK.
+/// Pure decision: given whether `IZARRAVM_NO_DIALOG` is set and whether a
+/// console is attached, should the modal dialog be shown? Split out of the
+/// environment/`GetConsoleWindow` I/O so it is testable with plain `bool`s,
+/// the same reasoning as [`x86_64_v3_from_cpuid`] over raw CPUID/XCR0
+/// evidence: a mutation of the real condition (inverting it, or dropping
+/// one half) is otherwise invisible to the test suite. The binary is
+/// `IMAGE_SUBSYSTEM_WINDOWS_CUI`: it always has a console, either its own
+/// or one it inherited from the launching shell. A modal `MessageBoxW` is
+/// only the right move when nobody is positioned to read stderr --
+/// launched from Explorer by double-click, where no console is attached.
+/// With a console attached (an interactive shell, a CI runner, a
+/// scoreboard harness), stderr already reached someone; showing a dialog
+/// there would hang a headless run on a non-AVX2 CI box until the harness
+/// timeout instead of failing fast. `IZARRAVM_NO_DIALOG` is an explicit
+/// escape for the case where no console is attached at all (some CI
+/// launchers spawn with none) but a human still is not there to click OK.
 #[cfg(windows)]
-fn dialog_is_reachable_and_wanted() -> bool {
+fn dialog_wanted(no_dialog_env_set: bool, has_console: bool) -> bool {
+    !no_dialog_env_set && !has_console
+}
+
+#[cfg(windows)]
+fn no_dialog_env_is_set() -> bool {
+    std::env::var_os("IZARRAVM_NO_DIALOG").is_some_and(|v| !v.is_empty())
+}
+
+/// `GetConsoleWindow` returning non-null is the actual "console attached"
+/// evidence; wrapped here so [`dialog_wanted`] can stay pure.
+#[cfg(windows)]
+fn console_is_attached() -> bool {
     use windows_sys::Win32::System::Console::GetConsoleWindow;
 
-    if std::env::var_os("IZARRAVM_NO_DIALOG").is_some_and(|v| !v.is_empty()) {
-        return false;
-    }
     // SAFETY: `GetConsoleWindow` takes no arguments and has no precondition.
-    unsafe { GetConsoleWindow().is_null() }
+    !unsafe { GetConsoleWindow().is_null() }
 }
 
 #[cfg(windows)]

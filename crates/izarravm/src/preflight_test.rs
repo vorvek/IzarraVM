@@ -225,25 +225,32 @@ fn wide_strings_round_trip_the_ascii_source() {
     );
 }
 
-/// `IZARRAVM_NO_DIALOG` must suppress the dialog path regardless of
-/// console state -- this is the only piece of `dialog_is_reachable_and_wanted`
-/// that is safely testable without an attached/detached console fixture.
+/// Plain-value vectors for the pure [`dialog_wanted`] decision -- no
+/// `std::env::set_var`, no process-wide state, no fixture for an
+/// attached/detached console. Each of the four `(no_dialog_env_set,
+/// has_console)` combinations is checked; the one place the dialog is
+/// wanted is `IZARRAVM_NO_DIALOG` unset AND no console attached.
 #[cfg(windows)]
-#[test]
-fn no_dialog_env_var_suppresses_the_dialog() {
-    // SAFETY (test-only): no other test in this binary reads or writes
-    // IZARRAVM_NO_DIALOG, and `cargo test` for this crate runs each test
-    // in its own thread but shares the process environment; restoring the
-    // prior value below keeps this test from leaking state into others
-    // that happen to run around it.
-    let previous = std::env::var_os("IZARRAVM_NO_DIALOG");
-    unsafe {
-        std::env::set_var("IZARRAVM_NO_DIALOG", "1");
+mod dialog_wanted_vectors {
+    use super::*;
+
+    #[test]
+    fn no_dialog_env_set_suppresses_even_without_a_console() {
+        assert!(!dialog_wanted(true, false));
     }
-    let suppressed = !dialog_is_reachable_and_wanted();
-    match previous {
-        Some(value) => unsafe { std::env::set_var("IZARRAVM_NO_DIALOG", value) },
-        None => unsafe { std::env::remove_var("IZARRAVM_NO_DIALOG") },
+
+    #[test]
+    fn no_dialog_env_set_suppresses_with_a_console_too() {
+        assert!(!dialog_wanted(true, true));
     }
-    assert!(suppressed, "IZARRAVM_NO_DIALOG=1 must suppress the dialog");
+
+    #[test]
+    fn console_attached_suppresses_even_without_the_env_var() {
+        assert!(!dialog_wanted(false, true));
+    }
+
+    #[test]
+    fn no_env_var_and_no_console_wants_the_dialog() {
+        assert!(dialog_wanted(false, false));
+    }
 }
