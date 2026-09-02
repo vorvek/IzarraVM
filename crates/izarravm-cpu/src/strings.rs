@@ -503,13 +503,18 @@ impl CpuGsw {
                         .map(Some);
                 }
 
-                let mut buf = [0u8; 4096];
+                // Heap scratch on rep_execution, not a `[0u8; 4096]` local: see RepBulkScratch's
+                // doc. The mutable borrow below ends at its last use (the read call, or the
+                // copy if `bytes == access`), so the early-return bail and the later
+                // watch_bulk_write/write calls below -- both needing `self` again -- are fine
+                // under NLL without moving any statement.
+                let buf = &mut self.rep_execution.bulk.0[..bytes];
                 let first_bytes = first.to_le_bytes();
                 buf[..access].copy_from_slice(&first_bytes[..access]);
                 if bytes > access {
                     let got = bus.read_memory_bytes_direct(
                         src.wrapping_add(access as u32),
-                        &mut buf[access..bytes],
+                        &mut buf[access..],
                         width,
                         BusAccessKind::DataRead,
                     )?;
@@ -519,11 +524,13 @@ impl CpuGsw {
                             .map(Some);
                     }
                 }
+                // NOT hoisted above the short-read bail just above: that bail must not be
+                // attributed a write-watch hit for a write that never happened.
                 #[cfg(feature = "watch-write")]
                 self.watch_bulk_write("movs", dst, bytes as u32);
                 let put = bus.write_memory_bytes_direct(
                     dst,
-                    &buf[..bytes],
+                    &self.rep_execution.bulk.0[..bytes],
                     width,
                     BusAccessKind::DataWrite,
                 )?;
@@ -575,15 +582,20 @@ impl CpuGsw {
                     BusWidth::Word => pattern[..2].copy_from_slice(&(value as u16).to_le_bytes()),
                     BusWidth::Dword => pattern.copy_from_slice(&value.to_le_bytes()),
                 }
-                let mut buf = [0u8; 4096];
-                for chunk in buf[..bytes].chunks_mut(access) {
-                    chunk.copy_from_slice(&pattern[..access]);
+                // Heap scratch on rep_execution: see RepBulkScratch's doc. No bail sits between
+                // the fill and the write here, so the same shape as MOVS's is used only for
+                // consistency, not because it is load-bearing in this arm.
+                {
+                    let buf = &mut self.rep_execution.bulk.0[..bytes];
+                    for chunk in buf.chunks_mut(access) {
+                        chunk.copy_from_slice(&pattern[..access]);
+                    }
                 }
                 #[cfg(feature = "watch-write")]
                 self.watch_bulk_write("stos", dst, bytes as u32);
                 let put = bus.write_memory_bytes_direct(
                     dst,
-                    &buf[..bytes],
+                    &self.rep_execution.bulk.0[..bytes],
                     width,
                     BusAccessKind::DataWrite,
                 )?;
@@ -618,17 +630,13 @@ impl CpuGsw {
                     return Ok(None);
                 }
 
-                let mut buf = [0u8; 4096];
-                let got = bus.read_memory_bytes_direct(
-                    src,
-                    &mut buf[..bytes],
-                    width,
-                    BusAccessKind::DataRead,
-                )?;
+                // Heap scratch on rep_execution: see RepBulkScratch's doc.
+                let buf = &mut self.rep_execution.bulk.0[..bytes];
+                let got = bus.read_memory_bytes_direct(src, buf, width, BusAccessKind::DataRead)?;
                 if got != bytes {
                     return Ok(None);
                 }
-                let last = &buf[bytes - access..bytes];
+                let last = &self.rep_execution.bulk.0[bytes - access..bytes];
                 let value = match width {
                     BusWidth::Byte => u32::from(last[0]),
                     BusWidth::Word => u32::from(u16::from_le_bytes([last[0], last[1]])),

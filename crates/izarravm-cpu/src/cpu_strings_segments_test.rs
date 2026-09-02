@@ -891,6 +891,195 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 2);
 }
 
+/// T12 (code-smell batch 2, S4). The bulk scratch on `rep_execution.bulk` is REUSED across
+/// calls, so poison it by hand before each op and confirm the guest never observes it: neither
+/// the destination bytes (MOVS, STOS) nor the accumulator (LODS) may carry `0xCC`.
+#[test]
+fn bulk_scratch_residue_never_reaches_the_guest() {
+    let memory = vec![0; 2048];
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.load_segment_real(SegmentIndex::Es, 0);
+    let mut bus = TestBus::with_memory(memory);
+
+    // MOVS: CX=8 at byte width makes bytes=8 > access=1, so the multi-byte
+    // read_memory_bytes_direct fill runs, not just the single first-byte copy.
+    cpu.rep_execution.bulk.0.fill(0xcc);
+    bus.memory[0x100..0x108].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    cpu.registers.set_esi(0x100);
+    cpu.registers.set_edi(0x300);
+    cpu.registers.set_ecx(8);
+    cpu.run_string(
+        &mut bus,
+        StringOp::Movs,
+        BusWidth::Byte,
+        Prefixes {
+            rep: Some(RepKind::Repe),
+            ..Default::default()
+        },
+        AddressSize::Word,
+    )
+    .unwrap();
+    assert_eq!(
+        cpu.perf_counters().rep_string_fast_iterations,
+        8,
+        "must have taken the bulk path for this to test anything"
+    );
+    assert_eq!(&bus.memory[0x300..0x308], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert!(
+        !bus.memory[0x300..0x308].contains(&0xcc),
+        "MOVS must not leak poisoned scratch into the guest"
+    );
+
+    // STOS
+    cpu.reset_perf_counters();
+    cpu.rep_execution.bulk.0.fill(0xcc);
+    cpu.write_gpr8(0, 0x7e);
+    cpu.registers.set_edi(0x400);
+    cpu.registers.set_ecx(6);
+    cpu.run_string(
+        &mut bus,
+        StringOp::Stos,
+        BusWidth::Byte,
+        Prefixes {
+            rep: Some(RepKind::Repe),
+            ..Default::default()
+        },
+        AddressSize::Word,
+    )
+    .unwrap();
+    assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 6);
+    assert_eq!(&bus.memory[0x400..0x406], &[0x7e; 6]);
+
+    // LODS: the accumulator must be the real last byte read, never poison.
+    cpu.reset_perf_counters();
+    cpu.rep_execution.bulk.0.fill(0xcc);
+    bus.memory[0x500..0x505].copy_from_slice(&[9, 8, 7, 6, 5]);
+    cpu.registers.set_esi(0x500);
+    cpu.registers.set_ecx(5);
+    cpu.run_string(
+        &mut bus,
+        StringOp::Lods,
+        BusWidth::Byte,
+        Prefixes {
+            rep: Some(RepKind::Repe),
+            ..Default::default()
+        },
+        AddressSize::Word,
+    )
+    .unwrap();
+    assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 5);
+    assert_eq!(
+        cpu.read_gpr8(0),
+        5,
+        "LODS accumulator must be the real last byte, not poison"
+    );
+}
+
+/// T12b (code-smell batch 2, S4). Two CPUs identical except for a poisoned scratch buffer must
+/// still compare equal (the buffer is scratch, not guest state), and a `Clone` must come back
+/// zeroed rather than inheriting a previous call's bytes.
+#[test]
+fn bulk_scratch_does_not_affect_equality_and_clone_zeroes_it() {
+    let mut poisoned = CpuGsw::default();
+    poisoned.rep_execution.bulk.0.fill(0xcc);
+    let clean = CpuGsw::default();
+    assert_eq!(
+        poisoned, clean,
+        "a poisoned scratch buffer must not make two legally-equal CPUs compare unequal"
+    );
+
+    let cloned = poisoned.clone();
+    assert!(
+        cloned.rep_execution.bulk.0.iter().all(|&b| b == 0),
+        "a clone must come back zeroed, not inherit a previous call's scratch bytes"
+    );
+}
+
+/// Two of the three bails that keep the bulk scratch buffer's aliasing surface nil (code-smell
+/// batch 2, S4): DF=1 must never reach the bulk path at all, and an overlapping MOVS range must
+/// fall back to the single-step path instead of the bulk one. Both pin the OBSERVABLE consequence
+/// (`rep_string_fast_iterations` stays 0 while `rep_string_iterations` still makes progress on
+/// the slow path), because both bails sit ahead of every touch of the scratch buffer -- if either
+/// were ever weakened, this is what would move. The third bail, the one-page clamp on chunk size,
+/// needs no bus and is pinned directly in strings_test.rs.
+#[test]
+fn df_and_overlap_bails_never_reach_the_bulk_path() {
+    // DF=1.
+    {
+        let memory = vec![0u8; 2048];
+        let mut cpu = CpuGsw::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.set_flag(FLAG_DF, true);
+        cpu.write_gpr8(0, 0x11);
+        cpu.registers.set_edi(0x300);
+        cpu.registers.set_ecx(4);
+        cpu.run_string(
+            &mut bus,
+            StringOp::Stos,
+            BusWidth::Byte,
+            Prefixes {
+                rep: Some(RepKind::Repe),
+                ..Default::default()
+            },
+            AddressSize::Word,
+        )
+        .unwrap();
+        assert_eq!(
+            cpu.perf_counters().rep_string_fast_iterations,
+            0,
+            "DF=1 must never take the fast/bulk path"
+        );
+        assert_eq!(
+            cpu.perf_counters().rep_string_iterations,
+            4,
+            "the slow path must still make progress"
+        );
+    }
+
+    // Overlapping MOVS: a CORRECTNESS check, not a path-taken check, because the outer
+    // run_string loop re-invokes try_run_string_fast after every single-step fallback and the
+    // single-byte tail case converges with the bulk path's output anyway, so no perf counter
+    // distinguishes "took the bulk path" from "took the single-step fallback four times in a
+    // row". What DOES distinguish them is the RESULT: real x86 REP MOVSB with DI = SI + 1
+    // processes one byte at a time, so each write becomes the NEXT iteration's read and the
+    // first source byte "smears" forward. Reading the whole span first and writing it back in
+    // one shot (what the bulk path does, and exactly why it gates on `!ranges_overlap`) would
+    // instead copy the ORIGINAL bytes verbatim, one position over -- a different, wrong answer.
+    {
+        let memory = vec![0u8; 2048];
+        let mut cpu = CpuGsw::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x100..0x104].copy_from_slice(&[1, 2, 3, 4]);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x101); // dst = src + 1: forward overlap
+        cpu.registers.set_ecx(4);
+        cpu.run_string(
+            &mut bus,
+            StringOp::Movs,
+            BusWidth::Byte,
+            Prefixes {
+                rep: Some(RepKind::Repe),
+                ..Default::default()
+            },
+            AddressSize::Word,
+        )
+        .unwrap();
+        assert_eq!(
+            &bus.memory[0x101..0x105],
+            &[1, 1, 1, 1],
+            "an overlapping forward MOVS must smear byte-by-byte like real hardware, not copy \
+             the original bytes verbatim like a memmove-style bulk copy would"
+        );
+    }
+}
+
 #[test]
 fn repe_cmpsb_stops_on_first_mismatch() {
     // repe cmpsb (0xf3 0xa6), cx=4. Source "AABB" vs dest "AACC": the third byte

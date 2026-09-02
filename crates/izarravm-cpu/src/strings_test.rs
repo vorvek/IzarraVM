@@ -85,3 +85,39 @@ fn rep_core_upper_collapses_to_zero_exactly_when_resuming() {
         }
     }
 }
+
+/// The third of the three bails that keep the bulk scratch buffer's aliasing surface nil
+/// (code-smell batch 2, S4; the other two, DF=1 and overlap, are pinned in
+/// cpu_strings_segments_test.rs, which has the bus access this one does not need).
+/// `string_forward_chunk_iterations` clamps `max_bytes` to `0x1000 - (linear & 0x0fff)`, so its
+/// result can never exceed one page (4096 bytes) regardless of how large CX is -- exactly the
+/// bound RepBulkScratch's fixed 4 KiB size assumes. Swept across every byte offset within a page
+/// and every width, with CX large enough that the clamp, not CX, is always what binds.
+#[test]
+fn string_forward_chunk_iterations_never_exceeds_one_page() {
+    let mut cpu = CpuGsw::default();
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+
+    for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+        let huge_count = u32::MAX / width.bytes();
+        for page_offset in [0u32, 1, 2, 4, 0x0ff0, 0x0ffc, 0x0ffd, 0x0ffe, 0x0fff] {
+            for base in [0u32, 0x1000, 0x2000, 0x1_0000] {
+                let offset = base.wrapping_add(page_offset);
+                let iterations = cpu.string_forward_chunk_iterations(
+                    SegmentIndex::Ds,
+                    offset,
+                    AddressSize::Dword,
+                    width,
+                    huge_count,
+                );
+                let bytes = iterations as usize * width.bytes() as usize;
+                assert!(
+                    bytes <= 4096,
+                    "{width:?} at offset {offset:#x}: {bytes} bytes exceeds the one-page clamp \
+                     RepBulkScratch's fixed size assumes"
+                );
+            }
+        }
+    }
+}
