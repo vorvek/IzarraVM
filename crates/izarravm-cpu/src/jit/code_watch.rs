@@ -362,6 +362,13 @@ impl StickyDecodeCodeWatch {
         self.pending_edges.extend(edges.0);
     }
 
+    /// Whether the strict edge list has anything for the sweep to drain. See
+    /// `JitState::has_pending_watch_edges` for why the sweep asks before it takes.
+    #[inline]
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending_edges.is_empty()
+    }
+
     pub(crate) fn take_pending(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.pending_edges)
     }

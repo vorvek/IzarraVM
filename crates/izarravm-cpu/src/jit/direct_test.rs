@@ -5030,7 +5030,7 @@ fn entry_layout_selects_one_array_and_fetches_it_once() {
         );
 
         cache.entry_layout_fetches.store(0, Ordering::Relaxed);
-        let fetched = cache.entry_layout(root_id).expect("the block is live");
+        let fetched = cache.entry_layout(root_id);
         assert_eq!(
             cache.entry_layout_fetches.load(Ordering::Relaxed),
             1,

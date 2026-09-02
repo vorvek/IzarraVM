@@ -32493,7 +32493,7 @@ impl BlockCache {
     /// `cs_matches` shares this fetch and is unaffected: `chain.cs == own.cs` always, because
     /// every merge constructs `cs: self.cs` and `link_merge` refuses a near edge whose ends
     /// disagree on `cs` before the merge runs.
-    pub(crate) fn entry_layout(&self, id: BlockId) -> Option<SegmentLayout> {
+    pub(crate) fn entry_layout(&self, id: BlockId) -> SegmentLayout {
         let index = id.index();
         if self.chain_entry_check_armed {
             self.fetch_entry_layout(&self.chain_layouts, index)
@@ -32503,12 +32503,19 @@ impl BlockCache {
     }
 
     /// The single counted read behind `entry_layout`. See its doc comment for what the counter is
-    /// for; in a non-test build this is `Vec::get(..).copied()` and nothing else.
-    fn fetch_entry_layout(&self, from: &[SegmentLayout], index: usize) -> Option<SegmentLayout> {
+    /// for; in a non-test build this is one indexed copy and nothing else.
+    ///
+    /// INDEXED, not `get(..).copied()`. The caller holds a `CompiledBlock` the admission chain
+    /// just produced, so its `BlockId` names a live slot by construction; both layout vectors are
+    /// pushed, written and cleared in lockstep and `refresh_chain_layouts` copies one onto the
+    /// other, so they are always the same length. The `Option` the bounds test produced had no
+    /// reachable `None` arm, and the refusal it fed cost a bounds compare, a branch and a
+    /// discriminant test on a 116-byte value at every native entry.
+    fn fetch_entry_layout(&self, from: &[SegmentLayout], index: usize) -> SegmentLayout {
         #[cfg(test)]
         self.entry_layout_fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        from.get(index).copied()
+        from[index]
     }
 
     /// Whether the entry check reads the chain requirement. Read once per cache, in
@@ -37846,7 +37853,7 @@ pub const N_FALLBACK_TAGS: usize = 3;
 pub const FALLBACK_TAG_NAMES: [&str; N_FALLBACK_TAGS] = ["neither", "declined", "skipped"];
 
 #[cfg(feature = "direct-entry-attribution")]
-pub const N_REFUSAL_SITES: usize = 30;
+pub const N_REFUSAL_SITES: usize = 28;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// Every early return in the measured path, as `(label, run.rs line)`. The index constants in
@@ -37874,18 +37881,16 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("interrupt_shadow", 2663),
     ("aggregate_accounting", 2670),
     ("native_fetch_trace", 2684),
-    ("mode_key", 2692),
-    ("x87_top", 2706),
-    ("segment_layout_none", 2721),
-    ("cs_layout", 2729),
-    ("cpl", 2737),
-    ("callout_privileged", 2818),
-    ("data_segment", 2949),
-    ("alignment", 2958),
-    ("fetch_limit", 2973),
-    ("entry_deferred_short", 2987),
-    ("zero_budget", 3095),
-    ("block_regenerated_none", 3131),
+    ("x87_top", 2712),
+    ("cs_layout", 2730),
+    ("cpl", 2738),
+    ("callout_privileged", 2819),
+    ("data_segment", 2950),
+    ("alignment", 2959),
+    ("fetch_limit", 2974),
+    ("entry_deferred_short", 2988),
+    ("zero_budget", 3096),
+    ("block_regenerated_none", 3132),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -37909,18 +37914,16 @@ pub(crate) mod site {
     pub(crate) const INTERRUPT_SHADOW: usize = 15;
     pub(crate) const AGGREGATE_ACCOUNTING: usize = 16;
     pub(crate) const NATIVE_FETCH_TRACE: usize = 17;
-    pub(crate) const MODE_KEY: usize = 18;
-    pub(crate) const X87_TOP: usize = 19;
-    pub(crate) const SEGMENT_LAYOUT_NONE: usize = 20;
-    pub(crate) const CS_LAYOUT: usize = 21;
-    pub(crate) const CPL: usize = 22;
-    pub(crate) const CALLOUT_PRIVILEGED: usize = 23;
-    pub(crate) const DATA_SEGMENT: usize = 24;
-    pub(crate) const ALIGNMENT: usize = 25;
-    pub(crate) const FETCH_LIMIT: usize = 26;
-    pub(crate) const ENTRY_DEFERRED_SHORT: usize = 27;
-    pub(crate) const ZERO_BUDGET: usize = 28;
-    pub(crate) const BLOCK_REGENERATED_NONE: usize = 29;
+    pub(crate) const X87_TOP: usize = 18;
+    pub(crate) const CS_LAYOUT: usize = 19;
+    pub(crate) const CPL: usize = 20;
+    pub(crate) const CALLOUT_PRIVILEGED: usize = 21;
+    pub(crate) const DATA_SEGMENT: usize = 22;
+    pub(crate) const ALIGNMENT: usize = 23;
+    pub(crate) const FETCH_LIMIT: usize = 24;
+    pub(crate) const ENTRY_DEFERRED_SHORT: usize = 25;
+    pub(crate) const ZERO_BUDGET: usize = 26;
+    pub(crate) const BLOCK_REGENERATED_NONE: usize = 27;
 }
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -38417,9 +38420,9 @@ pub(crate) fn note_native(insns: u64, hops: u32, self_loop: bool) {
 
 #[cfg(feature = "direct-entry-attribution")]
 /// H9's pin. `run_direct_block` has no `d` parameter, so the block's own `mode_key` bit 0 is the
-/// only term available there; the mode-key refusal (`site::MODE_KEY`) already enforces the equality
-/// against the live CPU for free, so a mismatch here means the LANE latched at `begin()`
-/// disagrees — which is the failure H9 is about.
+/// only term available there; the block's key was matched against the live CPU by the probe that
+/// produced it (see the mode-key note in `run_direct_block`), so a mismatch here means the LANE
+/// latched at `begin()` disagrees — which is the failure H9 is about.
 #[inline(always)]
 pub(crate) fn pin_lane_bit0(bit: u32) {
     if arm() == Arm::Off {

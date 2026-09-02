@@ -75,9 +75,8 @@ macro_rules! ea_end {
 /// Bump the `refusal_site` histogram. Every early return in the measured path carries one, which
 /// is what makes refusals no `perf` key counts countable without adding a production counter.
 ///
-/// In `run_direct_block` exactly four refusals have no `self.perf` bump at all:
-/// `site::NATIVE_FETCH_TRACE`, `site::SEGMENT_LAYOUT_NONE`, `site::DATA_SEGMENT` and
-/// `site::BLOCK_REGENERATED_NONE`. Two more are counted but not DISTINGUISHED:
+/// In `run_direct_block` exactly three refusals have no `self.perf` bump at all:
+/// `site::NATIVE_FETCH_TRACE`, `site::DATA_SEGMENT` and `site::BLOCK_REGENERATED_NONE`. Two more are counted but not DISTINGUISHED:
 /// `jit_direct_deferred_short` is bumped from two different sites, which the histogram separates as
 /// `site::DISPATCH_DEFERRED_SHORT` vs `site::ENTRY_DEFERRED_SHORT`, and
 /// `note_reject_callout_privileged` lands in `DirectStallTally`, not in `perf`, so it is absent

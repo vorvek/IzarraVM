@@ -2684,13 +2684,19 @@ impl CpuGsw {
             return Ok(DirectBlockOutcome::NotRun);
         }
         let span = block.span();
-        if span.key.mode_key != self.jit_mode_key() {
-            self.perf.jit_direct_reject_mode_key += 1;
-            ea_mark!(Phase::Refused);
-            ea_refusal!(site::MODE_KEY);
-            ea_end!(Population::Refused);
-            return Ok(DirectBlockOutcome::NotRun);
-        }
+        // NO SECOND MODE-KEY COMPARE. The probe that produced this block matched the full
+        // `BlockKey`, mode key included, and nothing between that probe and here moves CS.D,
+        // SS.B, CR0, EFLAGS.VM or the GSW mode -- every instruction that can is non-continuable
+        // and ends the run before a dispatch. Re-deriving `jit_mode_key()` (about six loads and
+        // five branches) per entry therefore asked a question the probe had already answered.
+        // `perf.jit_direct_reject_mode_key` read identically zero on duke3d-586-short,
+        // wolf3d-486 and tyrian-586 before this came out; the counter stays in `PerfCounters`,
+        // permanently zero, so the report's field set does not move.
+        debug_assert_eq!(
+            span.key.mode_key,
+            self.jit_mode_key(),
+            "a compiled block was entered under a mode key it was not compiled for"
+        );
         if block
             .x87_entry_top()
             .is_some_and(|expected| self.fpu.top() != expected)
@@ -2714,12 +2720,7 @@ impl CpuGsw {
         // than adding a second, which the 2026-08-18 plan pinned as a requirement. `cs_matches`
         // below shares it and is unaffected, because `chain.cs == own.cs` always.
         ea_mark!(Phase::EntryGuards);
-        let Some(segments) = self.jit_direct.entry_layout(block.id()) else {
-            ea_mark!(Phase::Refused);
-            ea_refusal!(site::SEGMENT_LAYOUT_NONE);
-            ea_end!(Population::Refused);
-            return Ok(DirectBlockOutcome::NotRun);
-        };
+        let segments = self.jit_direct.entry_layout(block.id());
         if !segments.cs_matches(self) {
             self.perf.jit_direct_reject_cs_layout += 1;
             self.jit_direct.retire_key_for_recompile(span.key);

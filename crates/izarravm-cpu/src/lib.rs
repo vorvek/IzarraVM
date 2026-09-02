@@ -4399,6 +4399,17 @@ impl DecodeCache {
         self.native_code_watch.take_pending()
     }
 
+    /// See `StickyDecodeCodeWatch::has_pending`.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn has_pending_watch_edges(&self) -> bool {
+        self.native_code_watch.has_pending()
+    }
+
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",

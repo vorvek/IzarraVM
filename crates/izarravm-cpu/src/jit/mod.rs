@@ -479,6 +479,17 @@ impl JitState {
         self.code_watch.page_is_watched(page)
     }
 
+    /// Whether the block-watch edge list has anything for the sweep to drain.
+    ///
+    /// Asked before `take_watch_edge_pages` because the sweep runs at every native entry and is
+    /// a no-op read on the production path: `mem::take` writes three words into the live `Vec`
+    /// whether or not there was anything in it, and the `for` that consumes the taken `IntoIter`
+    /// then frees the buffer the next install would refill.
+    #[inline]
+    pub(crate) fn has_pending_watch_edges(&self) -> bool {
+        !self.pending_watch_edges.is_empty()
+    }
+
     pub(crate) fn take_watch_edge_pages(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.pending_watch_edges)
     }

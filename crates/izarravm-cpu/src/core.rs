@@ -1371,10 +1371,12 @@ impl CpuGsw {
         any(target_os = "windows", target_os = "linux")
     ))]
     pub(crate) fn sweep_sticky_watch_edges(&mut self) {
-        let pages = self.decode_cache.take_watch_edge_pages();
-        if pages.is_empty() {
+        // Asked BEFORE the take. This runs at every native entry and is a no-op read there, and
+        // `mem::take` writes three words into the live `Vec` whichever way the answer goes.
+        if !self.decode_cache.has_pending_watch_edges() {
             return;
         }
+        let pages = self.decode_cache.take_watch_edge_pages();
         let mut cleared = 0;
         for page in pages {
             cleared += self
@@ -1387,10 +1389,11 @@ impl CpuGsw {
     /// The block-watch twin (E2), drained after `JitState::install` / `reject`.
     #[cfg(feature = "jit")]
     pub(crate) fn sweep_block_watch_edges(&mut self) {
-        let pages = self.jit_direct.take_watch_edge_pages();
-        if pages.is_empty() {
+        // See `sweep_sticky_watch_edges`: the emptiness question is asked before the take.
+        if !self.jit_direct.has_pending_watch_edges() {
             return;
         }
+        let pages = self.jit_direct.take_watch_edge_pages();
         let mut cleared = 0;
         for page in pages {
             cleared += self
