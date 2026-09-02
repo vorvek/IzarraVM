@@ -1025,7 +1025,15 @@ impl CpuGsw {
     /// for one mode must never be reused in another at the same phys/d. Packs the CS operand-size
     /// default (D bit), protected mode (CR0.PE), V86, the SS stack big bit (B), and the GSW mode.
     /// A mode change already invalidates the decode cache (`set_mode`), but it is folded in here
-    /// too so the key is self-contained. Validated at every compiled-block entry.
+    /// too so the key is self-contained.
+    ///
+    /// Validated at the PROBE, not at the entry. `BlockKey` carries this value and
+    /// `BlockCache::probe` matches the whole key, so a block only ever reaches an entry that
+    /// already agreed on it. `run_direct_block` used to re-derive the key and compare a second
+    /// time; audit item 2.4 deleted that compare and left a `debug_assert_eq!` in its place,
+    /// because nothing between the probe and the entry executes a guest instruction and so none
+    /// of the bits above can move in between. `jit_direct_reject_mode_key` survives as a
+    /// permanently zero counter.
     #[cfg(feature = "jit")]
     pub(super) fn jit_mode_key(&self) -> u32 {
         let mut key = 0u32;

@@ -627,9 +627,16 @@ fn inline_chain_check_in_this_process() {
     // The claim the fixture exists to carry survives all of that: SOMEWHERE in `run_until_tick`
     // there is an address the old resolver reports as an izarravm-machine `run.rs` line while
     // the new one names the izarravm-cpu frame actually inlined there. That is what is asserted
-    // now, with every structural half kept -- the physical symbol is never its own inline frame,
-    // the two sides name different crates, and a resolver that produced no chain at all still
-    // fails here, which is the regression this watches for.
+    // now, with the structural halves kept that can still fail: the physical symbol is never its
+    // own inline frame, the revealed frame names an izarravm-cpu `run.rs` line, and a resolver
+    // that produced no chain at all still fails here, which is the regression this watches for.
+    //
+    // A fourth assertion used to sit at the end of this list, that the revealed frame does not
+    // itself collapse into the machine run loop. It was dropped rather than kept: the selection
+    // loop already requires the revealed site to start with `crates\izarravm-cpu` and the collapse
+    // predicate requires `crates\izarravm-machine`, so no string can satisfy both and no mutation
+    // of the resolver could ever have turned it red. A guard that cannot fail is worse than no
+    // guard, because it reads as coverage.
     fn collapses_into_the_machine_run_loop(site: &str) -> bool {
         site.starts_with("crates\\izarravm-machine") && site.contains("run.rs:")
     }
@@ -686,11 +693,6 @@ fn inline_chain_check_in_this_process() {
     assert!(
         innermost.site.starts_with("crates\\izarravm-cpu") && innermost.site.contains("run.rs"),
         "the revealed frame's site must be an izarravm-cpu run.rs line, got {:?}",
-        innermost.site
-    );
-    assert!(
-        !collapses_into_the_machine_run_loop(&innermost.site),
-        "the two sides must name different crates, got {:?} for the revealed frame",
         innermost.site
     );
 }

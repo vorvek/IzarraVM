@@ -428,6 +428,121 @@ fn packed_hit_condition_screens_tag_and_d_bit() {
     assert_eq!(packed.phys_start, view.phys_start);
 }
 
+/// `warmed`, for programs that are not a NOP. Each pair is a linear address and the bytes to
+/// decode there; the addresses must not share a decode slot or a page.
+fn warmed_bytes(programs: &[(u32, &[u8])]) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0u8; 0x5000];
+    for (lin, bytes) in programs {
+        let at = *lin as usize;
+        memory[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    let mut bus = TestBus::with_memory(memory);
+    for (lin, _) in programs {
+        cpu.registers.eip = *lin;
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, *lin).expect("decode");
+    }
+    (cpu, bus)
+}
+
+/// The two screen arms must answer `noncont_break_probe` identically for every line the cache can
+/// hold, and this is the only fixture that says so.
+///
+/// The two producers do NOT compute it the same way. `publish_line` stores the opcode predicate
+/// alone; `DecodeLineView::screen` ANDs it with `!continuable`, because the run loop reads the
+/// field in one place inside the `!continuable` break arm and the guard buys back the predicate on
+/// the nineteen-in-twenty continuable path (audit item 1.19). Those two definitions differ exactly
+/// on a line that is continuable AND carries a probe-set opcode.
+///
+/// No such line exists, and THAT is the property worth pinning, because it is a property of the
+/// opcode set rather than of either producer: every opcode
+/// `non_continuable_break_probe_candidate` names is a far transfer, and a far transfer always
+/// decodes non-continuable. Widen that set to anything continuable and this fixture goes red
+/// before the disagreement can reach a second consumer of the field.
+///
+/// The three quadrants that are reachable are all covered: non-continuable and in the set (the far
+/// family), non-continuable and out of it (`INT 21h`), continuable and out of it (`NOP`).
+#[test]
+fn two_arms_agree_on_the_break_probe_bit() {
+    const RETF: u32 = 0x1000;
+    const RETF_IMM: u32 = 0x1020;
+    const CALL_FAR: u32 = 0x1040;
+    const INT21: u32 = 0x1060;
+    const NOP: u32 = 0x1080;
+
+    let (cpu, _bus) = warmed_bytes(&[
+        (RETF, &[0xcb]),
+        (RETF_IMM, &[0xca, 0x00, 0x00]),
+        (CALL_FAR, &[0x9a, 0x00, 0x00, 0x00, 0x00]),
+        (INT21, &[0xcd, 0x21]),
+        (NOP, &[0x90]),
+    ]);
+
+    for (lin, name) in [
+        (RETF, "RETF"),
+        (RETF_IMM, "RETF imm16"),
+        (CALL_FAR, "CALL FAR"),
+        (INT21, "INT 21h"),
+        (NOP, "NOP"),
+    ] {
+        let packed = cpu.decode_cache.get_packed(lin, false).expect("warm");
+        let view = cpu.decode_cache.get_view(lin, false).expect("warm");
+        let unpacked = view.screen();
+        assert_eq!(
+            packed.continuable, unpacked.continuable,
+            "{name}: the arms disagree about continuable"
+        );
+        assert_eq!(
+            packed.noncont_break_probe, unpacked.noncont_break_probe,
+            "{name}: the arms disagree about the break-probe bit, so the guard in \
+             DecodeLineView::screen has become observable"
+        );
+    }
+
+    // The premise the agreement rests on: every opcode in the probe set decodes non-continuable,
+    // so `!continuable` is never the term that decides the unpacked arm's answer.
+    for (lin, opcode, name) in [
+        (RETF, 0xcbu16, "RETF"),
+        (RETF_IMM, 0xca, "RETF imm16"),
+        (CALL_FAR, 0x9a, "CALL FAR"),
+    ] {
+        assert!(
+            jit::direct::non_continuable_break_probe_candidate(opcode),
+            "{name} must be in the probe set for this fixture to test anything"
+        );
+        let view = cpu.decode_cache.get_view(lin, false).expect("warm");
+        assert!(
+            !view.insn.continuable,
+            "{name} is in the probe set and must decode non-continuable; a continuable member \
+             would split the two screen arms"
+        );
+        assert!(
+            view.screen().noncont_break_probe,
+            "{name} must reach the run loop's break gate"
+        );
+    }
+
+    // And the negative, so the assertions above cannot pass by the bit being universally set.
+    for (lin, name) in [(INT21, "INT 21h"), (NOP, "NOP")] {
+        let view = cpu.decode_cache.get_view(lin, false).expect("warm");
+        assert!(
+            !view.screen().noncont_break_probe,
+            "{name} is not in the probe set and must not reach the break gate"
+        );
+    }
+    assert!(
+        cpu.decode_cache
+            .get_view(NOP, false)
+            .expect("warm")
+            .insn
+            .continuable,
+        "NOP must decode continuable, which is the quadrant the guard actually screens"
+    );
+}
+
 /// The counter that says the deferred line fetch never misses is only worth reading if it CAN
 /// report a miss. Nothing in a passing run exercises the increment or its snapshot copy, so a
 /// mistyped field in `stall_snapshot` would make the counter report zero forever — which is

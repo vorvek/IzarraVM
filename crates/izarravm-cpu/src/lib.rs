@@ -4011,15 +4011,21 @@ impl DecodeLineView {
             phys_start: self.phys_start,
             #[cfg(feature = "jit")]
             slot: self.slot,
-            // The unpacked arm holds the instruction already, so it answers from the same
-            // definition the pack writer uses rather than from a stored bit. Both arms therefore
-            // reach the run loop's gate with the same value.
+            // DEFINED ONLY WHERE `continuable` IS FALSE, and that is the contract, not an
+            // accident. The run loop reads this field in ONE place, inside the `!continuable`
+            // break arm, and continuations are continuable about nineteen times in twenty, so
+            // the unpacked arm spends the opcode predicate only where the answer is read. The
+            // packed arm answers from a stored bit that `publish_line` sets from the opcode
+            // alone, so on a CONTINUABLE line the two arms are free to disagree, and this is
+            // the arm that reads false.
             //
-            // Guarded by `continuable` because the run loop reads this field in ONE place, inside
-            // the `!continuable` break arm, and continuations are continuable about nineteen
-            // times in twenty. The predicate is a handful of compares and a setcc; behind the
-            // bool the screen has already loaded it costs nothing on the common path. The packed
-            // arm answers from a stored bit and is unaffected either way.
+            // They cannot actually disagree on any line the cache can hold: every opcode the
+            // probe set names decodes non-continuable, so the guard is never the thing that
+            // changes the answer. That is a property of the opcode set, not of this function,
+            // so it is pinned by a fixture rather than left to be re-derived
+            // (`two_arms_agree_on_the_break_probe_bit` in cpu_decode_pack_test.rs). Do NOT
+            // hoist this read out of the break arm, and do not add a second consumer, without
+            // re-proving that property or guarding the packed writer the same way.
             #[cfg(feature = "jit")]
             noncont_break_probe: !self.insn.continuable
                 && jit::direct::non_continuable_break_probe_candidate(self.insn.opcode),
