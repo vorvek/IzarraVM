@@ -3053,6 +3053,204 @@ fn census_bucket(buckets: &[(&'static str, u64)], label: &str) -> u64 {
         .unwrap_or_else(|| panic!("census bucket {label} must exist"))
 }
 
+/// `SegmentLayout::guard_mask`, design section 4.3 slice 0
+/// (`dev_docs/2026-09-02-tyrian-s1b-refusals-design.md`): pure logic, no OS/arch gate needed,
+/// only the census feature that compiles the method in at all.
+///
+/// Feeds a known mask set -- ES and DS pinned by the target, source agrees on ES only, and CS is
+/// present on both sides but must never contribute a bit -- and asserts both the raw mask and its
+/// popcount.
+#[cfg(feature = "direct-link-refusal-census")]
+#[test]
+fn guard_mask_is_the_targets_unagreed_data_segments_with_cs_excluded() {
+    let cs = crate::SegmentRegister::real(0x1000);
+    let agreeing_es = crate::SegmentRegister::real(0x2000);
+    let ds_source = crate::SegmentRegister::real(0x4000);
+    let ds_target = crate::SegmentRegister::real(0x5000);
+
+    // Order matches `SEGMENT_ORDER`: Es, Cs, Ss, Ds, Fs, Gs.
+    let source = SegmentLayout {
+        cs,
+        data: [
+            agreeing_es, // Es: agrees with target
+            cs,          // Cs: irrelevant, excluded from the mask
+            SegmentRegister::real(0),
+            ds_source, // Ds: source pins a DIFFERENT descriptor than target
+            SegmentRegister::real(0),
+            SegmentRegister::real(0),
+        ],
+        used: segment_bit(SegmentIndex::Es) | segment_bit(SegmentIndex::Ds),
+    };
+    let target = SegmentLayout {
+        cs,
+        data: [
+            agreeing_es, // Es: target pins this, source agrees -> not in the mask
+            cs,
+            SegmentRegister::real(0),
+            ds_target, // Ds: target pins this, source disagrees -> in the mask
+            SegmentRegister::real(0),
+            SegmentRegister::real(0),
+        ],
+        used: segment_bit(SegmentIndex::Es)
+            | segment_bit(SegmentIndex::Cs)
+            | segment_bit(SegmentIndex::Ds)
+            | segment_bit(SegmentIndex::Fs), // Fs: target pins it, source does not pin it at all
+    };
+
+    let mask = source.guard_mask(target);
+    assert_eq!(
+        mask,
+        segment_bit(SegmentIndex::Ds) | segment_bit(SegmentIndex::Fs),
+        "Es agrees so it must be absent; Cs must never appear; Ds disagrees and Fs is unpinned \
+         by the source, both must be present"
+    );
+    assert_eq!(mask.count_ones(), 2);
+
+    // A source that pins nothing at all must produce the target's FULL data-segment `used`,
+    // CS still excluded -- the "every data segment" row of the design's section 4.3 table.
+    let empty_source = SegmentLayout {
+        cs,
+        data: [SegmentRegister::real(0); 6],
+        used: 0,
+    };
+    let full_target = SegmentLayout {
+        cs,
+        data: [SegmentRegister::real(0); 6],
+        used: SEGMENT_MASK_BITS, // every segment, CS included
+    };
+    let full_mask = empty_source.guard_mask(full_target);
+    assert_eq!(
+        full_mask,
+        SEGMENT_MASK_BITS & !segment_bit(SegmentIndex::Cs)
+    );
+    assert_eq!(full_mask.count_ones(), 5);
+}
+
+/// The census's `guard_mask_popcount_histogram`, design section 4.3 slice 0: feeds a known
+/// sequence of `SegmentLayout` refusals through the same `refused_segment_layout` path
+/// `try_link_inner` uses and asserts the resulting histogram, keyed by `popcount(guard_mask)`.
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn guard_mask_popcount_histogram_buckets_refusal_events_by_popcount() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+
+    let source = key(0x6000);
+    let fallthrough = LinkTarget {
+        linear: 0x6100,
+        mode_key: source.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    };
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut compilation = trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    compilation.successors = [Some(fallthrough), None];
+    compilation.emitted_static_targets = [Some(fallthrough), None];
+    cache.install(&compilation).expect("source install");
+
+    let initial_snapshot = cache.direct_link_refusal_census_snapshot();
+    assert!(initial_snapshot.is_some(), "row registered");
+
+    // Directly exercise the histogram accumulator with a known mask set, since driving three
+    // DISTINCT popcounts through full block installs would need three separately shaped
+    // targets: 1, 2 and 5 bits set, plus a repeat of the 1-bit case to prove counts accumulate
+    // rather than overwrite. `target_generation` (the second `u64` argument) is arbitrary here,
+    // 0..=4 chosen only to be visibly distinct from the masks -- it is not a popcount.
+    if let Some(census) = cache.direct_link_refusal_census.as_mut() {
+        census.refused(1, LinkRefusal::SegmentLayout, 0, Some(0b0000_1000)); // popcount 1
+        census.refused(1, LinkRefusal::SegmentLayout, 1, Some(0b0000_1001)); // popcount 2
+        census.refused(1, LinkRefusal::SegmentLayout, 2, Some(0b0001_1011)); // popcount 4
+        census.refused(1, LinkRefusal::SegmentLayout, 3, Some(0b0000_1000)); // popcount 1 again
+        census.refused(1, LinkRefusal::Declined, 4, None); // not a SegmentLayout refusal at all
+    }
+    let snapshot = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    assert_eq!(
+        snapshot.guard_mask_popcount_histogram,
+        [0, 2, 1, 0, 1, 0],
+        "index 0 not exercised by this test's masks (it CAN occur, see the histogram field's own \
+         doc comment); popcount 1 seen twice, popcount 2 once, popcount 4 once, popcount 5 \
+         never; the Declined refusal must not appear anywhere in this histogram"
+    );
+    // The row's LAST recorded state is the `Declined` call (target_generation 4), which carried
+    // no mask (`guard_mask: None`), so `last_guard_mask_popcount` is untouched by it and keeps
+    // its value from the fourth `refused()` call, the last one that DID carry a mask: popcount 1.
+    assert_eq!(snapshot.rows[0].last_guard_mask_popcount, Some(1));
+}
+
+/// N3 (review of `338fcf08`): the call site's
+/// `matches!(refusal, LinkRefusal::SegmentLayout)` gate (`direct.rs:32408`) is what keeps
+/// `guard_mask` un-computed, `None`, for every OTHER refusal reason. The two tests above call
+/// `census.refused` directly, so neither one exercises that gate -- a mutant threading
+/// `Some(mask)` for `Declined`/`BlockShape`/`StaleEpoch` would survive both. This one drives a
+/// REAL `BlockShape` refusal through `try_link_inner` (via `install`'s successor resolution) and
+/// asserts the histogram and the row's popcount are both untouched by it.
+#[cfg(all(
+    feature = "direct-link-refusal-census",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn a_non_segment_layout_refusal_does_not_thread_a_mask_into_the_histogram() {
+    let mut cache = BlockCache::default();
+    cache.set_direct_link_refusal_census_enabled(true);
+
+    let target = key(0x7000);
+    assert!(matches!(cache.probe(target), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(target), BlockProbe::Compile));
+    let mut target_compilation =
+        trivial_compilation(BlockSpan::new(target, 1, 1).expect("target span"));
+    // Both ends' segment layouts have `used == 0` (`trivial_compilation`'s default), so
+    // `merge_chain` admits the edge trivially regardless of `memory_cpl3`. The refusal this
+    // mismatch produces is `link_compatible`'s cpl3 check -- `LinkRefusal::BlockShape`, not
+    // `LinkRefusal::SegmentLayout` -- so the call site's gate must keep `guard_mask` at `None`.
+    target_compilation.memory_cpl3 = true;
+    cache.install(&target_compilation).expect("target install");
+
+    let source = key(0x7100);
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.successors = [
+        Some(LinkTarget {
+            linear: target.linear,
+            mode_key: target.mode_key,
+            context: LINK_CONTEXT_UNSTAMPED,
+        }),
+        None,
+    ];
+    source_compilation.emitted_static_targets = source_compilation.successors;
+    cache.install(&source_compilation).expect("source install");
+
+    let snapshot = cache
+        .direct_link_refusal_census_snapshot()
+        .expect("armed census");
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.source_linear == source.linear)
+        .expect("source row");
+    assert_eq!(row.state, "refused_block_shape");
+    assert_eq!(
+        row.last_guard_mask_popcount, None,
+        "a BlockShape refusal must not thread a guard_mask into the row"
+    );
+    assert_eq!(
+        snapshot.guard_mask_popcount_histogram, [0; 6],
+        "a BlockShape refusal must not increment the histogram at all"
+    );
+}
+
 #[cfg(all(
     feature = "direct-link-refusal-census",
     any(
@@ -3275,7 +3473,7 @@ fn direct_link_refusal_state_machine_maps_every_bucket() {
     // The two retired dynamic refusal variants and Reset's immediately closed state have no
     // stable guest route. Pin the same transition functions used by the live sites instead.
     for reason in LinkRefusal::ALL {
-        cache.note_direct_link_refused(source_index, 0, reason, target_id);
+        cache.note_direct_link_refused(source_index, 0, reason, target_id, None);
         cache.note_direct_link_refusal_exit(1);
     }
     for cause in LinkClearCause::ALL {

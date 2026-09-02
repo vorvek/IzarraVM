@@ -2848,6 +2848,7 @@ fn direct_link_refusal_census_json(
         "seen": snapshot.seen,
         "missing_id": snapshot.missing_id,
         "invalid_id": snapshot.invalid_id,
+        "guard_mask_popcount_histogram": snapshot.guard_mask_popcount_histogram,
         "rows": snapshot.rows.iter().map(|row| json!({
             "id": row.id,
             "source": {
@@ -2868,6 +2869,7 @@ fn direct_link_refusal_census_json(
                 "kind": kind,
                 "count": count,
             })).collect::<Vec<_>>(),
+            "last_guard_mask_popcount": row.last_guard_mask_popcount,
         })).collect::<Vec<_>>(),
     })
 }

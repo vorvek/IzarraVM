@@ -1976,6 +1976,11 @@ pub struct DirectLinkRefusalCensusRow {
     pub state: &'static str,
     pub unbound_exits: u64,
     pub buckets: Vec<(&'static str, u64)>,
+    /// `popcount(guard_mask)` from the row's most recent `refused_segment_layout` refusal, or
+    /// `None` if the row never took that refusal. Design section 4.3 slice 0
+    /// (`dev_docs/2026-09-02-tyrian-s1b-refusals-design.md`): diagnostic only, no shipped guard
+    /// reads this.
+    pub last_guard_mask_popcount: Option<u32>,
 }
 
 /// Deterministically ordered snapshot of the opt-in Direct link refusal census.
@@ -1986,6 +1991,9 @@ pub struct DirectLinkRefusalCensusSnapshot {
     pub missing_id: u64,
     pub invalid_id: u64,
     pub rows: Vec<DirectLinkRefusalCensusRow>,
+    /// Histogram of `popcount(guard_mask)` over every `refused_segment_layout` EVENT, indexed
+    /// 0..=5. Design section 4.3 slice 0.
+    pub guard_mask_popcount_histogram: [u64; 6],
 }
 
 #[cfg(feature = "direct-callout-attribution")]

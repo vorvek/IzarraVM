@@ -3531,10 +3531,11 @@ impl BlockCache {
         slot: usize,
         reason: LinkRefusal,
         target: BlockId,
+        guard_mask: Option<u8>,
     ) {
         let id = self.link_cells[source_index][slot].direct_link_refusal_census_id();
         if let Some(census) = self.direct_link_refusal_census.as_mut() {
-            census.refused(id, reason, target.generation());
+            census.refused(id, reason, target.generation(), guard_mask);
         }
     }
 
@@ -10344,6 +10345,44 @@ impl SegmentLayout {
             return None;
         }
         self.merge_chain(target)
+    }
+
+    /// Diagnostic only (`direct-link-refusal-census` scratch instrument, design section 4.3
+    /// slice 0, `dev_docs/2026-09-02-tyrian-s1b-refusals-design.md`): the mask a per-edge
+    /// runtime guard would need to bind THIS refused edge under the section 4.2 disposition --
+    /// the target's pinned DATA segments this source does not already pin with an agreeing
+    /// descriptor. `target.used & guard_mask == guard_mask` holds by construction, matching the
+    /// design's own invariant.
+    ///
+    /// CS is excluded on purpose: for the `link_merge` arm a CS disagreement is refused by
+    /// `link_merge`'s own equality test before `merge_chain` ever runs, and the design's guard is
+    /// a DATA-segment mechanism (section 4.3's table tops out at "5 (every data segment)"), not a
+    /// CS one. But the call site serves `far_merge` and `seg_write_merge` too, and both can refuse
+    /// for reasons this method neither sees nor names (INV-FAR-CS, the segwrite target not
+    /// claiming the written segment) -- so a popcount of 0 out of THIS method is not proof of a
+    /// CS-only conflict, only that no reason `guard_mask` itself can see applied. See the
+    /// histogram's own doc comment on `DirectLinkRefusalCensus::guard_mask_popcount_histogram`.
+    ///
+    /// Never read on the shipped path -- no guard exists yet -- only from the census call site
+    /// under the census feature, so it costs nothing on a plain build.
+    #[cfg(feature = "direct-link-refusal-census")]
+    pub(crate) fn guard_mask(self, target: Self) -> u8 {
+        let mut mask = 0u8;
+        for segment in SEGMENT_ORDER {
+            if segment == SegmentIndex::Cs {
+                continue;
+            }
+            let bit = segment_bit(segment);
+            if target.used & bit == 0 {
+                continue;
+            }
+            let index = segment_index(segment);
+            let agrees = self.used & bit != 0 && self.data[index] == target.data[index];
+            if !agrees {
+                mask |= bit;
+            }
+        }
+        mask
     }
 
     /// `link_merge` for a FAR edge, where the two ends disagree about CS by construction.
@@ -32234,7 +32273,13 @@ impl BlockCache {
         let Some(target_index) = self.active_index(target) else {
             self.stalls.link_refusals[LinkRefusal::Inactive as usize] += 1;
             #[cfg(feature = "direct-link-refusal-census")]
-            self.note_direct_link_refused(source_index, slot_index, LinkRefusal::Inactive, target);
+            self.note_direct_link_refused(
+                source_index,
+                slot_index,
+                LinkRefusal::Inactive,
+                target,
+                None,
+            );
             return false;
         };
         let source_block = self.blocks[source_index];
@@ -32355,7 +32400,22 @@ impl BlockCache {
                 self.stalls.far_link_refused_cs += 1;
             }
             #[cfg(feature = "direct-link-refusal-census")]
-            self.note_direct_link_refused(source_index, slot_index, refusal, target);
+            {
+                // Recomputed from `chain_layouts` rather than threaded out of the `chain_merge`
+                // closure above: `SegmentLayout` is `Copy`, the closure's locals do not escape
+                // it, and re-reading two `Vec` slots is cheaper than restructuring the refusal
+                // chain for a diagnostic gated out of every non-census build.
+                let guard_mask = matches!(refusal, LinkRefusal::SegmentLayout).then(|| {
+                    self.chain_layouts[source_index].guard_mask(self.chain_layouts[target_index])
+                });
+                self.note_direct_link_refused(
+                    source_index,
+                    slot_index,
+                    refusal,
+                    target,
+                    guard_mask,
+                );
+            }
             return false;
         }
         if self.outbound[source_index][slot_index] == Some(target) {
@@ -35216,6 +35276,11 @@ struct DirectLinkRefusalCell {
     last_target_generation: Option<u64>,
     unbound_exits: u64,
     buckets: [u64; DIRECT_LINK_REFUSAL_BUCKET_COUNT],
+    /// `popcount(SegmentLayout::guard_mask(source, target))` from the MOST RECENT
+    /// `SegmentLayout` refusal this row saw, design section 4.3 slice 0. `None` until the row's
+    /// first such refusal; a later `Declined` or `BlockShape` refusal on the same cell does not
+    /// clear it, so a row's last-known value is always its last `refused_segment_layout` one.
+    last_guard_mask_popcount: Option<u32>,
 }
 
 #[cfg(feature = "direct-link-refusal-census")]
@@ -35225,6 +35290,22 @@ pub(crate) struct DirectLinkRefusalCensus {
     missing_id: u64,
     invalid_id: u64,
     rows: Vec<DirectLinkRefusalCell>,
+    /// Histogram of `popcount(guard_mask)` over every `SegmentLayout`-refusal EVENT (not
+    /// weighted by later `unbound_exits`), indexed 0..=5 -- five data segments, CS excluded.
+    /// Design section 4.3 slice 0: "the diagnostic that gates this."
+    ///
+    /// Index 0 DOES occur, and the call site serves three different merges
+    /// (`link_merge`/`far_merge`/`seg_write_merge`), so it is not one cause: (1) `merge_chain`
+    /// refuses on the UNION mask -- a segment the SOURCE pins, the target does not, and the two
+    /// disagree on refuses the edge, and `guard_mask` skips it (`target.used & bit == 0`), which
+    /// is a genuine data-segment conflict `guard_mask` cannot see; (2) `far_merge` refuses on
+    /// INV-FAR-CS (the target pins CS or `BAKES_CS_BIT`) and `seg_write_merge` refuses when the
+    /// target does not claim the written segment, or on its own CS pre-test -- both reasons
+    /// `guard_mask` discards or was never built to see, since it only reads `merge_chain`'s
+    /// formula. A `SegmentLayout` refusal with CS agreeing and every pinned data segment agreeing
+    /// too (the `link_merge` case `guard_mask`'s own doc describes) is ALSO index 0, and this
+    /// histogram cannot distinguish it from either of the above without a second byte per row.
+    guard_mask_popcount_histogram: [u64; 6],
 }
 
 #[cfg(feature = "direct-link-refusal-census")]
@@ -35256,6 +35337,7 @@ impl DirectLinkRefusalCensus {
             last_target_generation: None,
             unbound_exits: 0,
             buckets: [0; DIRECT_LINK_REFUSAL_BUCKET_COUNT],
+            last_guard_mask_popcount: None,
         });
         id
     }
@@ -35265,10 +35347,28 @@ impl DirectLinkRefusalCensus {
         self.rows.get_mut(index)
     }
 
-    fn refused(&mut self, id: u32, reason: LinkRefusal, target_generation: u64) {
+    fn refused(
+        &mut self,
+        id: u32,
+        reason: LinkRefusal,
+        target_generation: u64,
+        guard_mask: Option<u8>,
+    ) {
+        if let Some(mask) = guard_mask {
+            let popcount = mask.count_ones();
+            if let Some(count) = self
+                .guard_mask_popcount_histogram
+                .get_mut(popcount as usize)
+            {
+                *count += 1;
+            }
+        }
         if let Some(row) = self.row_mut(id) {
             row.state = DirectLinkRefusalState::Refused { reason };
             row.last_target_generation = Some(target_generation);
+            if let Some(mask) = guard_mask {
+                row.last_guard_mask_popcount = Some(mask.count_ones());
+            }
         }
     }
 
@@ -35313,6 +35413,7 @@ impl DirectLinkRefusalCensus {
             seen: self.seen,
             missing_id: self.missing_id,
             invalid_id: self.invalid_id,
+            guard_mask_popcount_histogram: self.guard_mask_popcount_histogram,
             rows: self
                 .rows
                 .iter()
@@ -35334,6 +35435,7 @@ impl DirectLinkRefusalCensus {
                         .copied()
                         .zip(row.buckets.iter().copied())
                         .collect(),
+                    last_guard_mask_popcount: row.last_guard_mask_popcount,
                 })
                 .collect(),
         }
