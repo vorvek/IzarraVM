@@ -1,10 +1,11 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 0b of the reflected-call HLE design
+//! Slice 0b/0c of the reflected-call HLE design
 //! (`dev_docs/2026-09-03-reflected-call-hle-design.md`, `dev_docs/2026-09-03-
 //! reflected-call-hle-review.md`, `dev_docs/2026-09-04-reflected-call-slice0b-
-//! plan.md`): the CORRECTED trip-shape INSTRUMENT. Compiled in only under
+//! plan.md`, `dev_docs/2026-09-04-reflected-call-slice0b-review.md`): the
+//! CORRECTED trip-shape INSTRUMENT. Compiled in only under
 //! `--features reflected-call-diagnostic`; a plain build carries none of this
 //! code and is byte-identical to `main`. Armed by
 //! `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC=shape` or `=journal`; unset or `""`
@@ -15,6 +16,52 @@
 //! Both armed modes DO change host behaviour (timing, and `journal` mode
 //! forces the native backend off for the whole run): this is a diagnostic,
 //! never used in a graded run.
+//!
+//! # 0c's corrections over 0b (the slice0b review's D1-D7)
+//!
+//! * **D1**: a far RETURN (never a far transfer) that lands on the entry's
+//!   own CS:EIP:SS with SP at exactly the entry width minus 2 -- the shape of
+//!   a handler that returns by `RETF` and leaves the `INT`-pushed FLAGS word
+//!   on the caller's stack -- closes as a NEW `return_match_retf_flags`
+//!   bucket, reported separately from `return_match`. Rule 2/3 stay
+//!   classification-only.
+//! * **D2**: `peek_direct_ram` declines (returns `None`) on a misaligned
+//!   word/dword access even when every byte in the range is ordinary RAM
+//!   (`direct_page_ram_bytes`'s `should_split` term). The write/read path now
+//!   falls back to a byte-wise peek before concluding "not plain RAM".
+//! * **D3**: `TSS.ESP0` is read at the RIGHT offset for the TR descriptor's
+//!   actual type (16-bit TSS: `SP0` at `tr.base+2`; 32-bit TSS: `ESP0` at
+//!   `tr.base+4`), and the ESP0-anchored dead-stack window is applied ONLY to
+//!   the tracked segment whose selector equals the TSS's own `SS0` -- every
+//!   other non-client segment keeps using its own observed high-water mark,
+//!   as it always should have.
+//! * **D4**: the stack-segment cap is raised (`MAX_STACK_SEGMENTS`, plan §8)
+//!   to cover a reflected trip's observed seven concurrent segments, and
+//!   `classify` no longer resolves an address-range match against every
+//!   tracked segment (ambiguous when two segments share a base or one is
+//!   nested inside another's 64 KiB span) -- it classifies by the `SS`
+//!   selector actually in force at the access.
+//! * **D5**: `on_batch_boundary` now takes a `real_boundary: bool` (plan:
+//!   "the machine loop needs a one-line cfg-gated tag on the break reason"):
+//!   `izarravm-machine`'s batch loop tags whether the PREVIOUS batch ended on
+//!   the cap/a device deadline/a fault/HLT/an HLE post (real) or purely on
+//!   the "IF just became enabled" edge (`run.rs`, the `can_take_before`
+//!   check) that a reflected trip's own nested `IRET`s cause on every trip by
+//!   construction. Only real boundaries count toward `batch_straddle_trips`.
+//! * **D6**: the answer-cost report now prices TWO different things
+//!   separately: `probe_ns_per_read` (the diagnostic's own page-walking probe
+//!   cost, `probe_physical` + `peek_direct_ram`) and NEW `compare_ns_per_read`
+//!   (a pre-resolved physical dword compare -- one `peek_direct_ram` per
+//!   dword, no page walk -- which is what an HLE answer path would actually
+//!   pay, since CR3 never varies on the dominant keys).
+//! * **D7**: dead parameters/fields removed (`note_near_miss`'s unused
+//!   `boundary` argument, `WriteRecord::sp_at_first_write`, `Walk`'s
+//!   unreported `pde_value`/`pte_value`). `NotPlainRam` is no longer
+//!   described as a device-window proxy in its own doc comment (see below):
+//!   after D2, most of what used to be misclassified `NotPlainRam` was
+//!   ordinary misaligned RAM, so the class now means exactly what its peek
+//!   says -- "a byte-wise `peek_direct_ram` failed here" -- and nothing about
+//!   *why*.
 //!
 //! # 0b's corrections over slice 0 (see the plan doc, section headers below)
 //!
@@ -77,8 +124,13 @@ const TOP_IMAGES: usize = 16;
 const CLASS_N_ADDRESSES: usize = 32;
 
 /// How many distinct stack segments (by `SS.selector`) one trip tracks a
-/// low-water mark for.
-const MAX_STACK_SEGMENTS: usize = 4;
+/// low-water mark for. D4 (slice0b review): a traced `AH=0Bh` trip runs on
+/// SEVEN concurrent segments (client, ring-0 monitor, three V86/real-mode
+/// excursions, TOKAEMM's flat monitor stack, DOS's own kernel stack); 4 was
+/// slice 0b's cap and silently classified the overflow `Other`, where it
+/// could never be Class D. Raised with headroom; `stack_segments_over_cap`
+/// reports any trip that still overflows this.
+const MAX_STACK_SEGMENTS: usize = 12;
 
 /// The literal 8 KB `REFLECTED_CALL_DEAD_STACK_CAP` the design proposed.
 /// Reported (`write_dead_8kb`) as a cross-check only (plan §3: "Delete the
@@ -379,9 +431,14 @@ pub(crate) enum AddressClass {
     /// intermediate value written here is observable on screen -- never
     /// eligible for the Class R (restored) write disposition.
     FramebufferAperture,
-    /// NEW (plan §3.1): `bus.peek_direct_ram` returned `None` at this
-    /// physical address -- the instrument's proxy for "this is a device
-    /// window, not plain RAM". Also never eligible for Class R.
+    /// NEW (plan §3.1): a BYTE-WISE `peek_direct_ram` (D2: not merely the
+    /// width-native peek, which declines on a misaligned access even over
+    /// ordinary RAM) failed at this physical address. This means exactly
+    /// what it says -- the peek failed -- and NOT "this is a device window":
+    /// 0b's own instrument called this a device-window proxy and was wrong
+    /// (slice0b review, D2/D7): every top `not_plain_ram` address the review
+    /// traced was an odd (misaligned) address of ordinary RAM the width-only
+    /// peek merely declined to read. Also never eligible for Class R.
     NotPlainRam,
     Other,
 }
@@ -457,6 +514,7 @@ fn classify(
     linear: u32,
     physical: Option<u32>,
     plain_ram: bool,
+    ss_selector: u16,
     forced: Option<AddressClass>,
 ) -> AddressClass {
     if let Some(class) = forced {
@@ -486,7 +544,17 @@ fn classify(
     if (BDA_LO..BDA_HI).contains(&linear) {
         return AddressClass::Bda;
     }
+    // D4 (slice0b review §3): classify by the `SS` selector actually IN
+    // FORCE at this access, not by an address-range scan over every tracked
+    // segment. A range scan is ambiguous the moment two tracked segments
+    // share a base (a ring-0 flat SS aliasing the TSS's own base) or one's
+    // 64 KiB span nests inside another's (a V86 real-mode stack sitting
+    // inside a flat protected-mode segment) -- the review traced exactly
+    // that overlap misclassifying V86-stack writes under the wrong window.
     for seg in trip.stacks.iter().flatten() {
+        if seg.selector != ss_selector {
+            continue;
+        }
         if linear.wrapping_sub(seg.base) < seg.limit.max(1) {
             return if seg.selector == trip.entry_ss_selector {
                 AddressClass::ClientStack
@@ -507,18 +575,15 @@ fn classify(
 /// this closes slice 0's blind spots (the BDA peek, `entered_via_task_gate`,
 /// `TSS.ESP0`) WITHOUT teaching `probe_linear_read_physical` (`core.rs`) or
 /// any other production seam to walk -- the walker lives only here.
-/// `pde_value`/`pte_value` are captured (matching plan §3.2's "the physical
-/// PDE and PTE addresses AND values") but not currently read anywhere: the
-/// `translations` map's value type is pinned by the plan at `(u32, u32)`,
-/// which only fits the two ADDRESSES, so the values are not surfaced in 0b's
-/// own report. Kept on the struct for a future slice's use, `#[allow(dead_code)]`
-/// rather than dropped.
-#[allow(dead_code)]
+/// D7 (slice0b review): 0b captured `pde_value`/`pte_value` on this struct
+/// (matching plan §3.2's "the physical PDE and PTE addresses AND values") but
+/// never read either -- the `translations` map's value type is pinned by the
+/// plan at `(u32, u32)`, which only fits the two ADDRESSES. Dropped rather
+/// than carried dead; only the two addresses `record_translation` actually
+/// consumes remain.
 struct Walk {
     pde_phys: u32,
-    pde_value: u32,
     pte_phys: u32,
-    pte_value: u32,
 }
 
 /// TLB-independent linear-to-physical resolution for a DATA READ probe. Never
@@ -552,15 +617,30 @@ fn probe_physical<B: CpuBus>(cpu: &CpuGsw, bus: &B, linear: u32) -> Option<(u32,
         return None;
     }
     let phys = (pte_value & !0xFFF) | (linear & 0x0FFF);
-    Some((
-        phys,
-        Some(Walk {
-            pde_phys,
-            pde_value,
-            pte_phys,
-            pte_value,
-        }),
-    ))
+    Some((phys, Some(Walk { pde_phys, pte_phys })))
+}
+
+/// D2 (slice0b review §3): `CpuBus::peek_direct_ram(phys, width)` declines
+/// (returns `None`) on a misaligned word/dword access -- `direct_page_ram_bytes`'s
+/// `should_split` term, `bus.rs:4159`/`:4586` -- even when every byte in the
+/// range is ordinary RAM. 0b's classifier called every one of those `None`s
+/// `NotPlainRam`; the slice0b review traced every top `not_plain_ram` address
+/// in every leg to an ODD address of the DPMI host's own real-mode register
+/// block, which is plain RAM the width-native peek merely declined to read.
+/// Try the width-native peek first (the common, aligned case costs nothing
+/// extra); on a decline, fall back to a byte-wise peek and reassemble --
+/// `None` only when even THAT fails (a genuine device window or unmapped
+/// page).
+fn peek_ram_width_safe<B: CpuBus>(bus: &B, phys: u32, width: BusWidth) -> Option<u32> {
+    if let Some(v) = bus.peek_direct_ram(phys, width) {
+        return Some(v);
+    }
+    let n = width.bytes();
+    let mut bytes = [0u8; 4];
+    for i in 0..n {
+        bytes[i as usize] = bus.peek_direct_ram(phys.wrapping_add(i), BusWidth::Byte)? as u8;
+    }
+    Some(u32::from_le_bytes(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -582,13 +662,6 @@ struct WriteRecord {
     pre: Option<u32>,
     latest: u32,
     width_bytes: u32,
-    /// The trip's `ESP` at the first write to this address (plan §8). Not
-    /// consulted by 0b's own R/D/N decision, which classifies purely from
-    /// the write's ADDRESS against the trip's per-segment low-water tracking
-    /// (`is_dead_stack_derived`) -- kept on the record for a future slice's
-    /// higher-resolution audit of exactly when in the trip each write landed.
-    #[allow(dead_code)]
-    sp_at_first_write: u32,
 }
 
 struct ReadRecord {
@@ -633,6 +706,16 @@ impl GuestMode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CloseRule {
     ReturnMatch,
+    /// NEW (0c, D1): a far RETURN (never a far transfer) lands exactly on the
+    /// entry's CS:EIP:SS with SP at the entry width minus 2 -- the shape of a
+    /// handler that returns by `RETF`, popping only CS:IP and leaving the
+    /// `INT`-pushed FLAGS word on the caller's own stack (slice0b review §1:
+    /// RTM's protected-mode `INT 21h` hook does exactly this; the client's
+    /// own wrapper pops the FLAGS word 14 instructions later, which is what
+    /// slice 0b's rule 2 `frame_gone` close was actually seeing). Counts as a
+    /// match, reported in its own `closed_by` bucket, never folded into
+    /// `return_match`.
+    ReturnMatchRetfFlags,
     FrameGone,
     ReEntry,
     Stale,
@@ -642,14 +725,32 @@ impl CloseRule {
     fn index(self) -> usize {
         match self {
             CloseRule::ReturnMatch => 0,
-            CloseRule::FrameGone => 1,
-            CloseRule::ReEntry => 2,
-            CloseRule::Stale => 3,
+            CloseRule::ReturnMatchRetfFlags => 1,
+            CloseRule::FrameGone => 2,
+            CloseRule::ReEntry => 3,
+            CloseRule::Stale => 4,
         }
+    }
+
+    /// Whether this rule counts as a genuine matching return (plan §2.3: only
+    /// rule 1 counts as a match -- 0c extends "rule 1" to include the
+    /// RETF-with-flags arm, which is architecturally the SAME return, just
+    /// caught one `RETF` earlier).
+    fn is_match(self) -> bool {
+        matches!(
+            self,
+            CloseRule::ReturnMatch | CloseRule::ReturnMatchRetfFlags
+        )
     }
 }
 
-const CLOSED_BY_NAMES: [&str; 4] = ["return_match", "frame_gone", "re_entry", "stale"];
+const CLOSED_BY_NAMES: [&str; 5] = [
+    "return_match",
+    "return_match_retf_flags",
+    "frame_gone",
+    "re_entry",
+    "stale",
+];
 
 /// Which far-transfer form observed the near-miss (plan §2.4: "Both split by
 /// `boundary_kind`").
@@ -683,6 +784,11 @@ struct Trip {
     modes_seen: [bool; 3],
     mode_at_close: GuestMode,
     tss_esp0_at_entry: Option<u32>,
+    /// The TR descriptor's own SS0 field (D3, slice0b review): the ESP0
+    /// window in `is_dead_stack_derived` may only be applied to the tracked
+    /// stack SEGMENT this selector names -- not, as 0b did, to every
+    /// non-client segment indiscriminately.
+    tss_ss0_selector_at_entry: Option<u16>,
     start_instructions: u64,
     start_elapsed_clocks: u64,
     start_jit_entries: u64,
@@ -717,6 +823,9 @@ struct Trip {
     /// addresses; the report only needs the set's size.
     translations: HashMap<(u32, u32), (u32, u32)>,
     translation_set_over_cap: bool,
+    /// D4: this trip observed more than `MAX_STACK_SEGMENTS` distinct `SS`
+    /// selectors.
+    stack_segments_over_cap: bool,
 }
 
 impl Trip {
@@ -735,10 +844,27 @@ impl Trip {
             .map(|access| (access & 0x1f) == 0x05);
         // TSS.ESP0: no `CpuGsw` accessor exists for it (verified by source
         // search -- there is no `esp0`/`ESP0` field or method anywhere in
-        // this crate), so peek it directly at the 32-bit TSS's documented
-        // offset (386 PRM figure 7-2: ESP0 at offset 4).
-        let tss_esp0_at_entry = probe_physical(cpu, bus, cpu.tr.base.wrapping_add(4))
-            .and_then(|(phys, _)| bus.peek_direct_ram(phys, BusWidth::Dword));
+        // this crate), so peek it directly -- at the offset for the TR
+        // descriptor's ACTUAL type (D3, slice0b review): a 32-bit TSS has
+        // ESP0 at offset 4 and SS0 at offset 8 (386 PRM figure 7-2); a
+        // 16-bit (286-style) TSS has SP0 at offset 2 and SS0 at offset 4.
+        // Bit 3 of the TR descriptor's type nibble distinguishes them (32-bit
+        // avail/busy TSS = type 0x9/0xB, 16-bit avail/busy TSS = 0x1/0x3).
+        // 0b always read offset 4 as a dword, which on a 16-bit TSS reads
+        // SS0 (a word) as if it were ESP0 -- exactly the traced `Some(0x18)`
+        // on every trip, `0x18` being the ring-0 SS selector, not a stack
+        // pointer.
+        let tss_is_32bit = cpu.tr.access & 0x08 != 0;
+        let (esp0_off, ss0_off, esp0_width) = if tss_is_32bit {
+            (4u32, 8u32, BusWidth::Dword)
+        } else {
+            (2u32, 4u32, BusWidth::Word)
+        };
+        let tss_esp0_at_entry = probe_physical(cpu, bus, cpu.tr.base.wrapping_add(esp0_off))
+            .and_then(|(phys, _)| bus.peek_direct_ram(phys, esp0_width));
+        let tss_ss0_selector_at_entry = probe_physical(cpu, bus, cpu.tr.base.wrapping_add(ss0_off))
+            .and_then(|(phys, _)| bus.peek_direct_ram(phys, BusWidth::Word))
+            .map(|v| v as u16);
         let mode_at_entry = GuestMode::sample(cpu);
         let mut modes_seen = [false; 3];
         modes_seen[mode_index(mode_at_entry)] = true;
@@ -768,6 +894,7 @@ impl Trip {
             modes_seen,
             mode_at_close: mode_at_entry,
             tss_esp0_at_entry,
+            tss_ss0_selector_at_entry,
             start_instructions: cpu.perf.instructions,
             start_elapsed_clocks: cpu.elapsed_clocks,
             start_jit_entries: cpu.perf.jit_direct_entries,
@@ -795,6 +922,7 @@ impl Trip {
             read_phys_dwords: std::collections::HashSet::new(),
             translations: HashMap::new(),
             translation_set_over_cap: false,
+            stack_segments_over_cap: false,
         }
     }
 
@@ -819,6 +947,11 @@ impl Trip {
                 _ => {}
             }
         }
+        // Every tracked slot is occupied by a DIFFERENT selector: this trip
+        // has more concurrent stack segments than `MAX_STACK_SEGMENTS`
+        // tracks. Reported (`stack_segments_over_cap`), never silently
+        // dropped (D4).
+        self.stack_segments_over_cap = true;
     }
 
     fn observe_mode(&mut self, cpu: &CpuGsw) {
@@ -849,11 +982,11 @@ impl Trip {
         }
     }
 
-    /// Rule 1 (§2.1) and rule 2 (§2.3), evaluated at a candidate boundary
-    /// (far return or far transfer). Returns the first of the two that
-    /// fires, or `None` if neither does (a near-miss, or a nested
-    /// call/return that is not this trip's own boundary at all).
-    fn close_rule(&self, cpu: &CpuGsw) -> Option<CloseRule> {
+    /// Rule 1 (§2.1, plus 0c's D1 `RETF`-with-flags arm) and rule 2 (§2.3),
+    /// evaluated at a candidate boundary. Returns the first of these that
+    /// fires, or `None` if none does (a near-miss, or a nested call/return
+    /// that is not this trip's own boundary at all).
+    fn close_rule(&self, cpu: &CpuGsw, boundary: BoundaryKind) -> Option<CloseRule> {
         let regs = &cpu.registers;
         let cs = regs.cs();
         let ss = regs.segment(SegmentIndex::Ss);
@@ -861,17 +994,44 @@ impl Trip {
         let cs_matches = cs.selector == self.return_cs_selector;
         let eip_matches = regs.eip == self.return_eip;
         let ss_matches = ss.selector == self.entry_ss_selector;
-        let sp_matches = self.sp_at_entry_width(esp) == self.entry_sp_at_width();
-        if cs_matches && eip_matches && ss_matches && sp_matches {
+        let sp_here = self.sp_at_entry_width(esp);
+        let entry_sp = self.entry_sp_at_width();
+        if cs_matches && eip_matches && ss_matches && sp_here == entry_sp {
             return Some(CloseRule::ReturnMatch);
+        }
+        // D1 (slice0b review §1): a far RETURN -- never a far transfer, which
+        // has no FLAGS word of its own to leave behind -- that lands on the
+        // entry's own CS:EIP:SS with SP sitting exactly at entry-width minus
+        // 2 has already popped the return CS:IP the `INT` pushed and left
+        // only the FLAGS word un-popped. Architecturally this IS the trip's
+        // matching return; a caller-side epilogue may pop the FLAGS word many
+        // instructions later (that pop is not this trip's concern -- the
+        // trip already closed here).
+        if boundary == BoundaryKind::FarReturn
+            && cs_matches
+            && eip_matches
+            && ss_matches
+            && sp_here == entry_sp.wrapping_sub(2) & self.width_mask()
+        {
+            return Some(CloseRule::ReturnMatchRetfFlags);
         }
         // Rule 2, frame-gone: CS/SS match the entry but SP has moved PAST it
         // (at the entry width) -- the client's own frame is already gone,
         // so this cannot be its matching return, but the trip is over.
-        if cs_matches && ss_matches && self.sp_at_entry_width(esp) > self.entry_sp_at_width() {
+        if cs_matches && ss_matches && sp_here > entry_sp {
             return Some(CloseRule::FrameGone);
         }
         None
+    }
+
+    /// The entry stack segment's own architectural width, as a mask (plan
+    /// §2.1 / D1): `0xFFFF` on a 16-bit stack, `0xFFFF_FFFF` on a 32-bit one.
+    fn width_mask(&self) -> u32 {
+        if self.entry_ss_big {
+            0xFFFF_FFFF
+        } else {
+            0xFFFF
+        }
     }
 
     /// Rule 3 (§2.3), evaluated at `on_int_entry` against a FRESH `INT`
@@ -892,19 +1052,14 @@ impl Trip {
 
     /// Near-miss diagnostics (plan §2.4), called once per candidate boundary
     /// that did NOT close the trip. `cs_eip_matched` selects which of the two
-    /// histograms this boundary feeds.
-    fn note_near_miss(&mut self, cpu: &CpuGsw, boundary: BoundaryKind, cs_eip_matched: bool) {
+    /// histograms this boundary feeds. D7 (slice0b review): both kinds share
+    /// one set of per-trip counters; the split by `boundary_kind` happens in
+    /// the reported table via `record_near_miss_by_boundary`, whose CALLER
+    /// already knows which kind of boundary this is -- so this function no
+    /// longer takes a `boundary` parameter of its own to ignore.
+    fn note_near_miss(&mut self, cpu: &CpuGsw, cs_eip_matched: bool) {
         let regs = &cpu.registers;
         let cs = regs.cs();
-        let _ = boundary; // both kinds share one set of counters per key; the
-        // split by `boundary_kind` happens in the reported table (plan §2.4),
-        // by tracking two independent `Trip`-level near-miss accumulators is
-        // unnecessary complexity this instrument does not need: EVERY
-        // candidate boundary this module sees is either a far return or a far
-        // transfer, and the caller (on_far_return_on / on_far_transfer_boundary_on)
-        // already knows which; it bumps the per-key, per-boundary-kind
-        // counters directly rather than through this per-trip accumulator
-        // duplicating that split.
         if cs_eip_matched {
             let ss = regs.segment(SegmentIndex::Ss);
             let esp = regs.esp();
@@ -1001,7 +1156,7 @@ impl NearMissByBoundary {
 struct KeyStats {
     trips: u64,
     unmatched: u64,
-    closed_by: [u64; 4],
+    closed_by: [u64; 5],
     instructions: Samples,
     core_clocks: Samples,
     dispatcher_entries: Samples,
@@ -1047,6 +1202,7 @@ struct KeyStats {
     translation_set_size_windowed: Samples,
     trips_in_window: u64,
     translation_set_over_cap: u64,
+    stack_segments_over_cap_trips: u64,
     reads_under_other_cr3: u64,
     reads_total: u64,
     write_class_counts: [u64; 11],
@@ -1097,8 +1253,18 @@ struct State {
     trips_unmatched: u64,
     /// One-shot `IZARRAVM_REFLECTED_CALL_PROBE_BENCH` result (plan §6, Q4):
     /// `probe_ns_per_read`, filled in at the first trip close with a
-    /// non-empty read set.
+    /// non-empty read set. This is the diagnostic's OWN page-walking PROBE
+    /// cost (`probe_physical` + `peek_direct_ram`), not an answer-path cost
+    /// (D6, slice0b review §4).
     probe_ns_per_read: Option<f64>,
+    /// NEW (0c, D6): the pre-resolved physical COMPARE cost -- one
+    /// `peek_direct_ram(phys, Dword)` per distinct physical dword, no page
+    /// walk at all -- filled in alongside `probe_ns_per_read` from the same
+    /// trip's read set. This is what an HLE answer path would actually pay:
+    /// the design's dominant keys never vary CR3, so physical addresses can
+    /// be pre-resolved once at learn time and the answer path never walks
+    /// page tables again.
+    compare_ns_per_read: Option<f64>,
 }
 
 fn state() -> &'static Mutex<State> {
@@ -1175,7 +1341,7 @@ fn on_far_return_on<B: CpuBus>(state: &mut State, cpu: &mut CpuGsw, bus: &B) {
     let Some(open) = state.open.as_ref() else {
         return;
     };
-    match open.close_rule(cpu) {
+    match open.close_rule(cpu, BoundaryKind::FarReturn) {
         Some(rule) => finish_trip(cpu, bus, state, rule),
         None => {
             let cs_eip_matched = {
@@ -1185,7 +1351,7 @@ fn on_far_return_on<B: CpuBus>(state: &mut State, cpu: &mut CpuGsw, bus: &B) {
             };
             let mut over_budget = false;
             if let Some(open) = state.open.as_mut() {
-                open.note_near_miss(cpu, BoundaryKind::FarReturn, cs_eip_matched);
+                open.note_near_miss(cpu, cs_eip_matched);
                 open.observe_mode(cpu);
                 over_budget = cpu
                     .perf
@@ -1220,7 +1386,7 @@ fn on_far_transfer_boundary_on<B: CpuBus>(state: &mut State, cpu: &mut CpuGsw, b
     };
     open.far_transfer_count = open.far_transfer_count.saturating_add(1);
     let open_ref = state.open.as_ref().expect("just wrote Some above");
-    match open_ref.close_rule(cpu) {
+    match open_ref.close_rule(cpu, BoundaryKind::FarTransfer) {
         Some(rule) => finish_trip(cpu, bus, state, rule),
         None => {
             let cs_eip_matched = {
@@ -1229,7 +1395,7 @@ fn on_far_transfer_boundary_on<B: CpuBus>(state: &mut State, cpu: &mut CpuGsw, b
                 cs.selector == open_ref.return_cs_selector && regs.eip == open_ref.return_eip
             };
             if let Some(open) = state.open.as_mut() {
-                open.note_near_miss(cpu, BoundaryKind::FarTransfer, cs_eip_matched);
+                open.note_near_miss(cpu, cs_eip_matched);
                 open.observe_mode(cpu);
             }
             record_near_miss_by_boundary(state, BoundaryKind::FarTransfer);
@@ -1344,12 +1510,32 @@ pub(crate) fn on_x87() {
 /// (plan §14 Q2, orchestrator decision). No `CpuGsw` reference: the machine
 /// crate does not hand one to this seam (matches `on_hardware_interrupt`'s
 /// shape).
-pub fn on_batch_boundary() {
+///
+/// `real_boundary` is D5 (slice0b review §2): 0b counted EVERY batch entry
+/// while a trip was open, including the ones caused by the trip's OWN nested
+/// `IRET`s re-enabling IF (`run.rs`'s `can_take_before` check at the top of
+/// its inner run loop) -- a reflected trip is BY CONSTRUCTION a chain of gate
+/// entries and `IRET`s, so that counter was 100% tautological (a trip cannot
+/// help but contain the very edges it is being blamed for straddling). The
+/// caller now tags whether the PREVIOUS batch ended for a reason independent
+/// of this trip's own instructions (the cap, a cached device deadline, a
+/// fault, HLT, an HLE INT post) -- `true` -- or purely on that IF-enable edge
+/// -- `false`. Only `true` calls advance `batch_boundaries_seen`, so
+/// `batch_straddle_trips` now means "this trip's execution spanned more than
+/// one REAL batch", not "this trip contains an `IRET`".
+pub fn on_batch_boundary(real_boundary: bool) {
     if !armed() {
         return;
     }
     let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(open) = guard.open.as_mut() {
+    on_batch_boundary_on(&mut guard, real_boundary);
+}
+
+fn on_batch_boundary_on(state: &mut State, real_boundary: bool) {
+    if !real_boundary {
+        return;
+    }
+    if let Some(open) = state.open.as_mut() {
         open.batch_boundaries_seen = open.batch_boundaries_seen.saturating_add(1);
     }
 }
@@ -1392,10 +1578,13 @@ fn note_read_on<B: CpuBus>(state: &mut State, cpu: &mut CpuGsw, bus: &B, linear:
         return; // excluded: this is the trip's own earlier write
     }
     let (physical, walk) = resolved.map_or((None, None), |(p, w)| (Some(p), w));
+    // Byte width is never misaligned, so this read-side check was already
+    // width-safe pre-D2; kept as Byte rather than switched to the access's
+    // own (unknown here) width.
     let plain_ram = physical
         .map(|p| bus.peek_direct_ram(p, BusWidth::Byte).is_some())
         .unwrap_or(true);
-    let class = classify(cpu, open, linear, physical, plain_ram, None);
+    let class = classify(cpu, open, linear, physical, plain_ram, ss.selector, None);
     let under_entry_cr3 = cr3_now == open.entry_cr3;
     open.reads.entry(linear).or_insert(ReadRecord {
         class,
@@ -1478,17 +1667,28 @@ fn note_write_on<B: CpuBus>(
     };
     let already_written = open.writes.contains_key(&linear);
     let (physical, walk) = resolved.map_or((None, None), |(p, w)| (Some(p), w));
+    // D2: `peek_ram_width_safe` (not the width-native `peek_direct_ram`
+    // alone) so a misaligned word/dword write to ordinary RAM still resolves
+    // a `pre` value and is still recognised as plain RAM.
     let pre = if already_written {
         None
     } else {
-        physical.and_then(|phys| bus.peek_direct_ram(phys, width))
+        physical.and_then(|phys| peek_ram_width_safe(bus, phys, width))
     };
     open.touch_stack(ss, esp);
     open.observe_mode(cpu);
     let plain_ram = physical
-        .map(|p| bus.peek_direct_ram(p, width).is_some())
+        .map(|p| peek_ram_width_safe(bus, p, width).is_some())
         .unwrap_or(true);
-    let class = classify(cpu, open, linear, physical, plain_ram, forced_class);
+    let class = classify(
+        cpu,
+        open,
+        linear,
+        physical,
+        plain_ram,
+        ss.selector,
+        forced_class,
+    );
     open.writes
         .entry(linear)
         .and_modify(|rec| rec.latest = value)
@@ -1498,7 +1698,6 @@ fn note_write_on<B: CpuBus>(
             pre,
             latest: value,
             width_bytes: width.bytes(),
-            sp_at_first_write: esp,
         });
     if !already_written {
         let cr3_now = cpu.control.cr3;
@@ -1515,7 +1714,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
         return;
     };
     trip.mode_at_close = GuestMode::sample(cpu);
-    let unmatched = rule != CloseRule::ReturnMatch;
+    let unmatched = !rule.is_match();
     guard.trips_total += 1;
     if unmatched {
         guard.trips_unmatched += 1;
@@ -1531,7 +1730,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
     if unmatched {
         stats.unmatched += 1;
     }
-    if rule == CloseRule::ReturnMatch && trip.cs_base_differed_on_match {
+    if rule.is_match() && trip.cs_base_differed_on_match {
         stats.cs_base_differed_on_match += 1;
     }
     stats
@@ -1600,7 +1799,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
             stats.modes_seen_any[idx] += 1;
         }
     }
-    if rule == CloseRule::ReturnMatch && trip.mode_at_entry != trip.mode_at_close {
+    if rule.is_match() && trip.mode_at_entry != trip.mode_at_close {
         stats.mode_defect_trips += 1;
     }
     if trip.batch_boundaries_seen > 0 {
@@ -1608,7 +1807,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
     }
     stats.soft_int_posts += u64::from(trip.soft_int_posts);
 
-    if rule == CloseRule::ReturnMatch && mode_is_shape_relevant(&trip) {
+    if rule.is_match() && mode_is_shape_relevant(&trip) {
         push_bounded(
             &mut stats.warm_clocks,
             cpu.elapsed_clocks.saturating_sub(trip.start_elapsed_clocks),
@@ -1625,6 +1824,11 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
     {
         let ns = run_probe_bench(cpu, bus, &trip.read_phys_dwords);
         guard.probe_ns_per_read = Some(ns);
+        // D6: the SAME read set, priced as a pre-resolved physical compare
+        // instead of a page-walking probe -- the answer-cost estimate, kept
+        // separate from the probe cost above.
+        let compare_ns = run_compare_bench(bus, &trip.read_phys_dwords);
+        guard.compare_ns_per_read = Some(compare_ns);
     }
 
     // Journal-mode-only aggregation. In shape mode `trip.reads`/`trip.writes`
@@ -1662,6 +1866,9 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
     }
     if trip.translation_set_over_cap {
         stats.translation_set_over_cap += 1;
+    }
+    if trip.stack_segments_over_cap {
+        stats.stack_segments_over_cap_trips += 1;
     }
     let mut trip_has_class_n = false;
     for (&addr, write) in trip.writes.iter() {
@@ -1758,8 +1965,14 @@ fn is_dead_stack_derived(trip: &Trip, addr: u32) -> bool {
         if addr.wrapping_sub(seg.base) >= seg.limit.max(1) {
             continue;
         }
-        let is_client_stack = seg.selector == trip.entry_ss_selector;
-        let upper_esp = if !is_client_stack {
+        // D3 (slice0b review §3): the ESP0-anchored window only applies to
+        // the ONE tracked segment whose selector is the TSS's own SS0 -- not,
+        // as 0b did, to every non-client segment. Every other non-client
+        // stack (a V86 real-mode excursion, a DOS-kernel stack, TOKAEMM's
+        // flat monitor stack) keeps using its OWN observed high-water mark,
+        // exactly like the client stack does.
+        let is_ss0_segment = trip.tss_ss0_selector_at_entry == Some(seg.selector);
+        let upper_esp = if is_ss0_segment {
             trip.tss_esp0_at_entry.unwrap_or(seg.last_esp)
         } else {
             seg.last_esp
@@ -1830,6 +2043,28 @@ fn run_probe_bench<B: CpuBus>(
         if let Some((phys, _)) = probe_physical(cpu, bus, addr)
             && let Some(v) = bus.peek_direct_ram(phys, BusWidth::Dword)
         {
+            sink ^= v;
+        }
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(sink);
+    elapsed.as_secs_f64() * 1e9 / f64::from(ITERATIONS)
+}
+
+/// D6 (slice0b review §4): the ANSWER-cost estimate, as opposed to
+/// `run_probe_bench`'s diagnostic-probe cost. `addrs_set` already holds
+/// PHYSICAL dwords (`Trip::read_phys_dwords`), pre-resolved once when the
+/// read happened -- exactly what an HLE answer path would have cached at
+/// learn time, since the design's dominant keys never vary CR3. Prices ONE
+/// `peek_direct_ram(phys, Dword)` per iteration, no page walk at all.
+fn run_compare_bench<B: CpuBus>(bus: &B, addrs_set: &std::collections::HashSet<u32>) -> f64 {
+    let addrs: Vec<u32> = addrs_set.iter().copied().collect();
+    const ITERATIONS: u32 = 1_000_000;
+    let start = std::time::Instant::now();
+    let mut sink: u32 = 0;
+    for i in 0..ITERATIONS {
+        let addr = addrs[(i as usize) % addrs.len()];
+        if let Some(v) = bus.peek_direct_ram(addr, BusWidth::Dword) {
             sink ^= v;
         }
     }
@@ -1913,6 +2148,7 @@ pub struct KeyReport {
     pub translation_set_size: StatSummary,
     pub translation_set_size_windowed: StatSummary,
     pub translation_set_over_cap: u64,
+    pub stack_segments_over_cap_trips: u64,
     pub reads_total: u64,
     pub reads_under_other_cr3: u64,
     pub read_class_counts: Vec<(&'static str, u64)>,
@@ -1936,6 +2172,8 @@ pub struct ReflectedCallDiagnosticSnapshot {
     pub trips_total: u64,
     pub trips_unmatched: u64,
     pub probe_ns_per_read: Option<f64>,
+    /// D6: the pre-resolved physical compare cost, separate from the probe cost above.
+    pub compare_ns_per_read: Option<f64>,
     /// `IZARRAVM_REFLECTED_CALL_DIAG_WINDOW`'s bounds (retired guest
     /// instructions), when configured -- `None` means every key's
     /// `_windowed` field is empty (not armed), not a silent duplicate of the
@@ -2069,6 +2307,7 @@ pub(crate) fn snapshot() -> Option<ReflectedCallDiagnosticSnapshot> {
                 translation_set_size: (&stats.translation_set_size).into(),
                 translation_set_size_windowed: (&stats.translation_set_size_windowed).into(),
                 translation_set_over_cap: stats.translation_set_over_cap,
+                stack_segments_over_cap_trips: stats.stack_segments_over_cap_trips,
                 reads_total: stats.reads_total,
                 reads_under_other_cr3: stats.reads_under_other_cr3,
                 read_class_counts: ALL_CLASSES
@@ -2102,6 +2341,7 @@ pub(crate) fn snapshot() -> Option<ReflectedCallDiagnosticSnapshot> {
         trips_total: guard.trips_total,
         trips_unmatched: guard.trips_unmatched,
         probe_ns_per_read: guard.probe_ns_per_read,
+        compare_ns_per_read: guard.compare_ns_per_read,
         window_start_insns: window().map(|w| w.start_insns),
         window_end_insns: window().map(|w| w.end_insns),
         keys,

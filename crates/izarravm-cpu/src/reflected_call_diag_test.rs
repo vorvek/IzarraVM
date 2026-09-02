@@ -738,3 +738,180 @@ fn one_production_write_seam_reaches_the_instrument() {
     );
     assert_eq!(trip.writes[&OFFSET].latest, u32::from(VALUE));
 }
+
+// ---------------------------------------------------------------------------
+// Slice 0c tests (dev_docs/2026-09-04-reflected-call-slice0b-review.md, D1-D6)
+// ---------------------------------------------------------------------------
+
+/// D1: a far RETURN that lands exactly on the entry's own CS:EIP:SS, but with
+/// SP sitting at the entry width MINUS TWO -- the shape of a handler that
+/// returns by `RETF`, popping only CS:IP and leaving the `INT`-pushed FLAGS
+/// word behind on the caller's own stack -- must close as the NEW
+/// `return_match_retf_flags` bucket, and must count as a MATCH (not go
+/// through rule 2's `frame_gone`, which needs SP > entry, not SP < entry).
+///
+/// **Mutation bite**: delete the RETF-with-flags arm from `Trip::close_rule`
+/// and this test goes red: with SP below the entry value, neither rule 1 nor
+/// rule 2 fires, the boundary is a near-miss, and the trip never closes.
+#[test]
+fn a_retf_landing_at_entry_minus_two_closes_as_return_match_retf_flags() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    let mut state = State::default();
+    on_int_entry_on(&mut state, &mut cpu, &bus, VECTOR);
+    let entry_esp = cpu.registers.esp();
+
+    // CS/EIP/SS already sit at the entry's own return site (the fixture
+    // never actually executed the INT). Only SP moves: exactly 2 below the
+    // entry value, as a `RETF` that popped CS:IP but left FLAGS behind would
+    // leave it.
+    cpu.registers.set_esp(entry_esp - 2);
+
+    on_far_return_on(&mut state, &mut cpu, &bus);
+
+    assert_eq!(state.trips_total, 1);
+    assert_eq!(
+        state.trips_unmatched, 0,
+        "the RETF-with-flags landing must count as a match"
+    );
+    let key = state.keys.get(&(VECTOR, 0)).unwrap();
+    assert_eq!(
+        key.closed_by[CloseRule::ReturnMatchRetfFlags.index()],
+        1,
+        "must close via the NEW bucket, not the plain return_match one"
+    );
+    assert_eq!(key.closed_by[CloseRule::ReturnMatch.index()], 0);
+    assert_eq!(key.closed_by[CloseRule::FrameGone.index()], 0);
+}
+
+/// D1: the RETF-with-flags arm is defined only for a far RETURN boundary
+/// (`BoundaryKind::FarReturn`) -- a far `JMP`/`CALL` has no FLAGS word of its
+/// own to leave behind, so the SAME "SP = entry - 2" shape at a far
+/// TRANSFER must NOT match.
+#[test]
+fn the_retf_with_flags_arm_never_fires_on_a_far_transfer() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    let mut state = State::default();
+    on_int_entry_on(&mut state, &mut cpu, &bus, VECTOR);
+    let entry_esp = cpu.registers.esp();
+    cpu.registers.set_esp(entry_esp - 2);
+
+    on_far_transfer_boundary_on(&mut state, &mut cpu, &bus);
+
+    assert_eq!(
+        state.trips_total, 0,
+        "a far transfer at SP = entry - 2 must NOT close the trip"
+    );
+    assert!(state.open.is_some());
+}
+
+/// D2: `peek_direct_ram(phys, width)` declines on a misaligned word/dword
+/// access even over ordinary RAM (`should_split`). A misaligned RAM write
+/// must still classify plain RAM -- never `not_plain_ram` -- once the
+/// byte-wise fallback is in place.
+///
+/// **Mutation bite**: in `note_write_on`, replace `peek_ram_width_safe(bus,
+/// p, width)` with `bus.peek_direct_ram(p, width)` (0b's original call) and
+/// this test goes red: the odd-address word peek declines, `plain_ram`
+/// becomes `false`, and the write classifies `NotPlainRam`.
+#[test]
+fn a_misaligned_ram_write_is_not_classified_not_plain_ram() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    let mut state = State::default();
+    on_int_entry_on(&mut state, &mut cpu, &bus, VECTOR);
+
+    // An ODD word address, ordinary RAM, well clear of the fixture's GDT
+    // (0x1000), IDT (0x2000), BDA (0x400..0x500) and stack (around 0x4000).
+    const ODD_ADDR: u32 = 0x0141;
+    bus.write_raw(ODD_ADDR, BusWidth::Word, 0x1234);
+    note_write_on(
+        &mut state,
+        &mut cpu,
+        &bus,
+        ODD_ADDR,
+        BusWidth::Word,
+        0x5678,
+        false,
+        None,
+    );
+
+    on_far_return_on(&mut state, &mut cpu, &bus);
+    assert_eq!(state.trips_total, 1);
+    let key = state.keys.get(&(VECTOR, 0)).unwrap();
+    assert_eq!(
+        key.write_not_plain_ram, 0,
+        "a misaligned write to ordinary RAM must not classify not_plain_ram"
+    );
+    assert_eq!(
+        key.write_unknown_pre, 0,
+        "the byte-wise fallback must also resolve a `pre` value"
+    );
+}
+
+/// D3: `TSS.ESP0`/`SS0` must be read at the offset for the TR descriptor's
+/// ACTUAL type -- a 16-bit (286-style) TSS has SP0 at offset 2 and SS0 at
+/// offset 4, NOT ESP0 at offset 4 as a 32-bit TSS does.
+///
+/// **Mutation bite**: hardcode `esp0_off`/`ss0_off`/`esp0_width` to the
+/// 32-bit TSS's `(4, 8, Dword)` regardless of `cpu.tr.access` (0b's original
+/// behaviour) and this test goes red: the dword read at offset 4 combines
+/// this fixture's SS0 word with the two (zero) bytes after it, not `ESP0`.
+#[test]
+fn tss_esp0_is_read_from_the_right_offset_for_a_sixteen_bit_tss() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    const TSS_BASE: u32 = 0x0500;
+    const SP0: u16 = 0x1234;
+    const SS0: u16 = 0x0018;
+    bus.write_raw(TSS_BASE + 2, BusWidth::Word, u32::from(SP0));
+    bus.write_raw(TSS_BASE + 4, BusWidth::Word, u32::from(SS0));
+    cpu.tr.base = TSS_BASE;
+    cpu.tr.limit = 0x2c;
+    // P=1, DPL=00, S=0, TYPE=0001 (16-bit available TSS) -- bit 3 of the
+    // type nibble (0x08) is the 32-bit/16-bit discriminator this fixture
+    // means to exercise.
+    cpu.tr.access = 0x81;
+
+    let trip = Trip::start(&mut cpu, &bus, VECTOR, 0);
+    assert_eq!(
+        trip.tss_esp0_at_entry,
+        Some(u32::from(SP0)),
+        "SP0 must come from offset 2 on a 16-bit TSS"
+    );
+    assert_eq!(
+        trip.tss_ss0_selector_at_entry,
+        Some(SS0),
+        "SS0 must come from offset 4 on a 16-bit TSS"
+    );
+}
+
+/// D5: `on_batch_boundary` must only advance `batch_boundaries_seen` when
+/// the caller tags the boundary `real_boundary: true` -- a `false` tag (the
+/// trip's own IF-enable edge) must be a no-op, so `batch_straddle_trips`
+/// stops being tautological over a reflected trip's own nested `IRET`s.
+/// Drives the private `on_batch_boundary_on` against a LOCALLY constructed
+/// `State`, same as every other test in this file except
+/// `one_production_write_seam_reaches_the_instrument` (see this file's own
+/// header comment for why).
+///
+/// **Mutation bite**: delete the `if !real_boundary { return; }` guard from
+/// `on_batch_boundary_on` and this test goes red: all three calls count.
+#[test]
+fn on_batch_boundary_only_counts_real_boundaries() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    let mut state = State {
+        open: Some(Trip::start(&mut cpu, &bus, VECTOR, 0)),
+        ..State::default()
+    };
+
+    on_batch_boundary_on(&mut state, false);
+    on_batch_boundary_on(&mut state, false);
+    on_batch_boundary_on(&mut state, true);
+
+    let trip = state
+        .open
+        .as_ref()
+        .expect("this test never closes the trip");
+    assert_eq!(
+        trip.batch_boundaries_seen, 1,
+        "only the one real_boundary=true call may count"
+    );
+}
