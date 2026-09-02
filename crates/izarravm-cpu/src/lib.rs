@@ -794,6 +794,14 @@ pub struct PerfCounters {
     /// rt sag. NOT cumulative: it can fall as well as rise (a retire-all that clears the bitmap
     /// drops it to 0).
     pub translation_pages_marked: u64,
+    /// CR3 data-side gate (design `2026-09-02-cr3-data-side-design.md` T2, review D5): bumped once
+    /// per completed two-level page-table walk in `translate_linear_checked`, i.e. every time the
+    /// TLB fast path does NOT serve the access. T2's win gate: a retained TLB entry across an R1
+    /// reselect costs no walk, so this counter should fall on the Tyrian dwell once the ring keeps
+    /// entries live across the VCPI round trip. Also the direct, non-proxy assertion for a "the
+    /// entry is live again" test row, where a counter that only moves INSIDE a store guard
+    /// (`translation_a_stores`/`_d_stores`) cannot tell a retained hit from an unrelated miss.
+    pub tlb_walks: u64,
     /// Code-cache invalidation events, including narrow self-modifying-code kills. This is the
     /// aggregate rate; the `decode_inval_*` and `smc_narrow_kills` counters retain the cause and
     /// affected-line detail EXCEPT the translation-page write watch (review finding N2): that
@@ -4270,6 +4278,18 @@ pub(crate) fn poll_neg_cache_default() -> bool {
     poll_neg_cache_policy(value.as_deref())
 }
 
+/// Marker `retire_ring` returns (design `2026-09-02-cr3-data-side-design.md` T2, review D2).
+/// `retire_ring` RENUMBERS ring slots (`contexts = [None, None]`), which invalidates every
+/// per-slot cache keyed by the SAME slot indices -- today only `Tlb::generations` -- independent
+/// of what caused the retire. `#[must_use]` plus this crate's `-D warnings` clippy gate turns
+/// "retire both `Tlb` generations at every `retire_ring` call site" from a discipline an
+/// implementer can forget into a build failure: `Tlb::retire_all_slots` is the only function that
+/// consumes this token, so a call site that drops it instead of forwarding it to that method
+/// fails the gate.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RingRetired;
+
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
 /// (`cs.base + eip`). It lets a hot loop skip re-decoding the same bytes every iteration. The `gen`
 /// counter is advanced whenever a decode could change meaning: CS base / paging / mode changes (via
@@ -5098,15 +5118,17 @@ impl DecodeCache {
     /// slots. `clear_translation_marks` is `translation_pages`' clear gate (R7, amended by F11):
     /// pass `true` only when the caller flushed the TLB in this same operation, or a subsequent
     /// TLB-hit translation could insert a line with no mark behind it.
-    fn invalidate_and_clear_code_marks(&mut self, clear_translation_marks: bool) {
+    fn invalidate_and_clear_code_marks(&mut self, clear_translation_marks: bool) -> RingRetired {
         self.generation = self.allocate_generation();
-        self.retire_ring(clear_translation_marks);
+        self.retire_ring(clear_translation_marks)
     }
 
     /// The ring/marks half of a wholesale invalidation, split out so `select_context`'s R3 arm can
     /// retire the ring and THEN allocate the new context's generation separately, without a second
-    /// generation bump landing on top of it.
-    fn retire_ring(&mut self, clear_translation_marks: bool) {
+    /// generation bump landing on top of it. Returns `RingRetired` (design T2, review D2): every
+    /// call renumbers `self.contexts`, which invalidates any per-slot cache keyed by the same slot
+    /// indices, so every caller must forward the token to `Tlb::retire_all_slots`.
+    fn retire_ring(&mut self, clear_translation_marks: bool) -> RingRetired {
         // Zero only the words marked since the last clear (the dirty lists), not the whole
         // 384 KB: with millions of SMC flushes per timedemo the full memset was a measured
         // wall regression. Every set bit lives in a dirty-listed word by construction
@@ -5133,6 +5155,7 @@ impl DecodeCache {
             self.translation_pages.fill(0);
             self.translation_pages_marked = 0;
         }
+        RingRetired
     }
 
     /// How many ring slots are currently occupied: 0, 1 or 2. R4 reads this to decide whether the
@@ -5175,13 +5198,15 @@ impl DecodeCache {
             return ContextSelect::Skipped(slot as u8);
         }
         // R3: a third distinct value with both slots occupied retires everything -- today's
-        // behaviour -- then occupies slot 0 with the new value. The caller has already flushed
-        // the TLB in this same operation (it is the only caller), so `translation_pages` clears.
-        self.retire_ring(true);
+        // behaviour -- then occupies slot 0 with the new value. `translation_pages` clears: this
+        // arm's caller retires the TLB in the same operation (T2), by forwarding the `RingRetired`
+        // token below to `Tlb::retire_all_slots`, so no live TLB entry can survive with no marks
+        // behind it either.
+        let token = self.retire_ring(true);
         let slot_gen = self.allocate_generation();
         self.generation = slot_gen;
         self.contexts[0] = Some((new_cr3_masked, slot_gen));
-        ContextSelect::Taken(0)
+        ContextSelect::Taken(0, token)
     }
 
     /// Whether physical page `physical >> 12` was read as page-directory or page-table structure
@@ -5228,10 +5253,15 @@ impl DecodeCache {
 /// carry the ring slot the write resolved to (0 or 1), which the JIT half's link-context gate
 /// (`select_link_context` / `allocate_link_context`, `jit/direct.rs`) needs and which
 /// `DecodeCache::select_context` already computes for its own `self.contexts` indexing.
+///
+/// `Taken` also carries the `RingRetired` token from the `retire_ring` call inside R3 (design T2):
+/// the data-side ring (`Tlb`) must be retired in the same operation, and carrying the token on the
+/// variant that alone needs it means the `Skipped` arm cannot even try to consume one that was
+/// never minted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextSelect {
     Skipped(u8),
-    Taken(u8),
+    Taken(u8, RingRetired),
 }
 
 impl Default for DecodeCache {

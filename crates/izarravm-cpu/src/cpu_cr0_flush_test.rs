@@ -633,10 +633,10 @@ mod links {
 // no longer wiped by ANY control-register write -- not only the PG-stays-0 case this section
 // originally pinned. The rows below that used to assert those caches WIPE under a PG-moving or
 // PG=1-but-unrelated write now assert they SURVIVE, for the SAME reason T1 gives at its own
-// deletion site (`core.rs::wipe_tlb_and_direct_pages`): a physical-keyed entry with no
-// permission bits cannot be staled by a write that changes only CR0, CR3 or CPL. Only the three
-// bus causes (`note_a20_changed`, `note_direct_map_changed`, `note_direct_data_map_changed`)
-// still invalidate them; none is exercised by this file.
+// deletion site (`core.rs`'s `flush_tlb_and_code_caches` and `flush_tlb_keep_code_caches`): a
+// physical-keyed entry with no permission bits cannot be staled by a write that changes only
+// CR0, CR3 or CPL. Only the three bus causes (`note_a20_changed`, `note_direct_map_changed`,
+// `note_direct_data_map_changed`) still invalidate them; none is exercised by this file.
 //
 // The gate this section pins is narrower than the code-side one above: it fires ONLY when PG is 0
 // on both sides of the write, which `cr0_write_moves_code_translation` already forces whenever the
@@ -646,8 +646,8 @@ mod links {
 //
 // - `self.tlb`: consulted only from `translate_linear_checked`'s PAGED branch
 //   (`memory.rs::is_paging_enabled`); with PG clear that branch never runs, so the table holds
-//   nothing a PE toggle could stale. `tlb.flush()` is free here, not skipped, because there is
-//   nothing to charge for either way; it stays unconditional as the cheap default.
+//   nothing a PE toggle could stale. `Tlb::flush_live_slot()` is free here, not skipped, because
+//   there is nothing to charge for either way; it stays unconditional as the cheap default.
 // - `data_read_pages` / `data_write_pages`: keyed by PHYSICAL address alone
 //   (`memory.rs::read_direct_page_cached` et al. -- see `DirectPageCacheEntry`), with no
 //   permission or CPL bit stored in the entry, and (since T1) never touched by this path at all.
@@ -663,8 +663,8 @@ mod links {
 //   the one artifact whose emitted shape can bake in a CPL assumption -- the FastMap DATA entry it
 //   reads carries none.
 //
-// RED before the slice: `wipe_tlb_and_direct_pages` cleared `data_read_pages`/`data_write_pages`
-// unconditionally, so every survival row below failed before this slice landed.
+// RED before the slice: `flush_tlb_and_direct_pages` (now deleted) ran unconditionally from
+// `flush_tlb_keep_code_caches`, so every survival row below failed before this slice landed.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -808,7 +808,8 @@ mod data_caches {
     /// `data_read_pages`/`data_write_pages` at all -- they have no CR0/CR3/CPL-dependent bit to
     /// stale, PG-moving write or not. Can-it-fail control: this row and its clearing partner
     /// below share the fixture the OLD "still wipes" rows used, so a reader can see exactly what
-    /// changed.
+    /// changed. See `cr0_ts_change_under_paging_still_flushes_the_tlb` below for the row that
+    /// exercises the gate's PG=1 arm and still finds something that wipes.
     #[test]
     fn cr0_pg_set_no_longer_wipes_the_data_read_page_cache() {
         let (mut cpu, mut bus) = data_fixture();
@@ -876,14 +877,12 @@ mod data_caches {
     /// which route through the CODE-side `flush_tlb_and_code_caches` predicate, never through
     /// `flush_tlb_keep_code_caches` (PG itself is moving there). The only shape that reaches the
     /// gated function with PG=1 is a write where PG (and WP) are unchanged -- e.g. TS. Since T1,
-    /// `data_read_pages`/`data_write_pages` survive this arm too (no CR0-dependent bit to
-    /// stale); `wipes_tlb_flush_still_counts_elided_events` above is what still proves the gate's
-    /// arm is reached (the TLB and the FastMap still wipe there, unconditionally -- T2 changes
-    /// that gate too, in the follow-on slice). Can-it-fail control for THIS row now: mutate the
-    /// deleted `data_read_pages.invalidate()` back into `wipe_tlb_and_direct_pages` and this row
-    /// reddens.
+    /// what that arm still wipes is the TLB (`Tlb::flush_live_slot`) and the FastMap, NOT
+    /// `data_read_pages`/`data_write_pages` -- so this row now asserts the split directly: the
+    /// physical-page cache survives, the TLB entry does not. Can-it-fail control: mutate the gate
+    /// to `if false && ...` (always skip, "M2") and the TLB assertion is the one that goes red.
     #[test]
-    fn cr0_ts_change_under_paging_no_longer_wipes_the_data_read_page_cache() {
+    fn cr0_ts_change_under_paging_still_flushes_the_tlb() {
         let (mut cpu, mut bus) = data_fixture();
         cpu.control.cr0 |= CR0_PE | CR0_PG;
         cpu.control.cr3 = PAGE_DIRECTORY;
@@ -894,6 +893,10 @@ mod data_caches {
             0x5a
         );
         assert!(cpu.data_read_pages.get(DATA).is_some());
+        assert!(
+            cpu.tlb.lookup(DATA >> 12).is_some(),
+            "the fixture must warm the TLB too, or this row proves nothing"
+        );
 
         // CR0.TS is bit 3: not PG, not WP, so the code-side predicate is false and this reaches
         // the gated function with PG unchanged at 1.
@@ -902,6 +905,10 @@ mod data_caches {
         assert!(
             cpu.data_read_pages.get(DATA).is_some(),
             "T1: the physical-page cache has no CR0-dependent bit to stale, so it survives"
+        );
+        assert!(
+            cpu.tlb.lookup(DATA >> 12).is_none(),
+            "the gated arm must still flush the live TLB slot while paging is on"
         );
     }
 }
@@ -935,8 +942,8 @@ mod data_caches {
 // | mutation | result | caught by |
 // |---|---|---|
 // | M1: `if new_cr0 & CR0_PG != 0` -> `if true \|\| ...` (restore the unconditional wipe) | 3 failed | the three `cr0_pe_toggle_keeps_*` survival rows |
-// | M2: `if new_cr0 & CR0_PG != 0` -> `if false && ...` (always skip the wipe) | 1 failed (pre-T1) | `cr0_ts_change_under_paging_reaches_the_gate_and_still_wipes` -- the ONLY row that reached the gate with PG=1; before this row was added M2 was a NON-GATE (18/18 green). T1 (`2026-09-02-cr3-data-side-design.md`) renamed and inverted this row (`cr0_ts_change_under_paging_no_longer_wipes_the_data_read_page_cache`); M2 is still caught, now by `wipes_tlb_flush_still_counts_elided_events`'s counter (the gate still wipes the TLB/FastMap on this arm, unconditionally). |
-// | M3: `flush_tlb_and_direct_pages` stops calling `wipe_tlb_and_direct_pages` (ungated arm stops wiping) | HISTORICAL, pre-T1: caught by the two `cr0_pg_*_still_wipes_the_data_read_page_cache` rows this slice renamed to `cr0_pg_*_no_longer_wipes_the_data_read_page_cache`. T1 deleted the code this mutation targeted (`data_read_pages`/`data_write_pages` are no longer touched by any control-register flush), so the mutation no longer applies; kept for the historical record. |
+// | M2: `if new_cr0 & CR0_PG != 0` -> `if false && ...` (always skip the wipe) | 1 failed | `cr0_ts_change_under_paging_still_flushes_the_tlb` -- the ONLY row that reaches the gate with PG=1; before this row was added M2 was a NON-GATE (18/18 green) |
+// | M3: `flush_tlb_and_direct_pages` stops calling `wipe_tlb_and_direct_pages` (ungated arm stops wiping) | HISTORICAL, pre-T1: caught by the two `cr0_pg_*_still_wipes_the_data_read_page_cache` rows this slice renamed to `cr0_pg_*_no_longer_wipes_the_data_read_page_cache`. T1 (`2026-09-02-cr3-data-side-design.md`) deleted the code this mutation targeted (`data_read_pages`/`data_write_pages` are no longer touched by any control-register flush), so the mutation no longer applies; kept for the historical record. |
 //
 // THE ARGUMENT SWAP IS INERT AT BOTH SITES, and this corrects the design's expectation that the
 // MOV CR0 swap would be caught by the PG rows. It is not, and it cannot be: `delta = old ^ new`

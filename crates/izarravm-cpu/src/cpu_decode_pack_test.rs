@@ -384,7 +384,7 @@ fn eviction_republishes_the_packed_entry() {
 #[test]
 fn wholesale_invalidation_retires_every_packed_entry() {
     let (mut cpu, _bus) = warmed(&[0x1000, 0x1020]);
-    cpu.decode_cache.invalidate_and_clear_code_marks(true);
+    let _ = cpu.decode_cache.invalidate_and_clear_code_marks(true);
     assert!(cpu.decode_cache.get_packed(0x1000, false).is_none());
     assert!(cpu.decode_cache.get_packed(0x1020, false).is_none());
     cpu.decode_cache.assert_packs_consistent();
@@ -398,7 +398,7 @@ fn wholesale_invalidation_retires_every_packed_entry() {
     let slot = (0x1000 & cpu.decode_cache.mask) as usize;
     cpu.decode_cache.lines[slot].generation = u32::MAX;
     cpu.decode_cache.packs[slot].generation = u32::MAX;
-    cpu.decode_cache.invalidate_and_clear_code_marks(true);
+    let _ = cpu.decode_cache.invalidate_and_clear_code_marks(true);
     assert_eq!(cpu.decode_cache.generation, 1);
     assert!(
         cpu.decode_cache

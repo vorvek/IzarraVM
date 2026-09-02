@@ -463,6 +463,16 @@ impl CpuGsw {
                                 let linear =
                                     self.segment_linear_byte(memory.segment, memory.offset, false)?;
                                 self.tlb.invalidate(linear >> 12);
+                                // T2's second obligation (design `2026-09-02-cr3-data-side-design.md`
+                                // section (d)): `invalidate` above clears the entry only under the
+                                // LIVE generation. A dormant ring slot's entry for this same linear
+                                // page survives untouched, so retire the whole dormant generation --
+                                // one store, the conservative direction. This is INVLPG's OWN,
+                                // NARROWER fix, and it is load-bearing precisely because the call
+                                // below must NOT also retire the live slot: a real INVLPG invalidates
+                                // exactly one page, and `invlpg_invalidates_only_the_addressed_page_at_cpl0`
+                                // pins that an unrelated page's TLB entry survives.
+                                self.tlb.retire_dormant_slot();
                                 self.data_read_pages.invalidate();
                                 self.data_write_pages.invalidate();
                                 #[cfg(all(
@@ -475,7 +485,16 @@ impl CpuGsw {
                                 // TLB, so `translation_pages` must not clear here (F11) -- another
                                 // linear address's TLB entry can still serve a code translation
                                 // with no walk to re-mark it.
-                                self.invalidate_translation_code_caches(false);
+                                //
+                                // The decode/link teardown below still retires the WHOLE decode
+                                // ring and link graph unconditionally (pre-existing coarseness,
+                                // unrelated to T2) and returns a `RingRetired` token for it (design
+                                // review D2). Discarded here, deliberately: retiring the whole `Tlb`
+                                // too would defeat the narrower fix two lines above it -- the live
+                                // slot's OTHER entries must survive an INVLPG that did not touch
+                                // them, which `retire_all_slots` cannot do (it always retires both).
+                                let retired = self.invalidate_translation_code_caches(false);
+                                let _ = retired;
                                 Ok(clocks(12))
                             }
                             _ => Err(undefined_opcode()),

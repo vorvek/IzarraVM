@@ -2791,7 +2791,7 @@ fn invalidated_compiled_code_reused_as_data_stays_on_the_native_store_path() {
         cpu.decode_cache.range_hits_code(target, 1),
         "the interpreter watch has independent lifetime"
     );
-    cpu.decode_cache.invalidate_and_clear_code_marks(true);
+    let _ = cpu.decode_cache.invalidate_and_clear_code_marks(true);
 
     bus.memory[WATCHED_TARGET..WATCHED_TARGET + old_code.len()].fill(0);
     prime_direct_store_block(&mut cpu, &mut bus);
