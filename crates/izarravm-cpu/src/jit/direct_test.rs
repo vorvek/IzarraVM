@@ -304,12 +304,12 @@ fn both_successor_cells_resolve_unlink_recompile_and_reset() {
         Some(LinkTarget {
             linear: fallthrough.linear,
             mode_key: source.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         Some(LinkTarget {
             linear: taken.linear,
             mode_key: source.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
     ];
     let source_id = cache.install(&source_compilation).expect("source install");
@@ -813,7 +813,7 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     install_trivial(&mut cache, target, 1);
@@ -945,12 +945,12 @@ fn repeated_source_revalidation_does_not_rebuild_its_link_graph() {
         Some(LinkTarget {
             linear: unresolved_target.linear,
             mode_key: unresolved_target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         Some(LinkTarget {
             linear: hidden_target.linear,
             mode_key: hidden_target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
     ];
     let source_id = cache.install(&source_compilation).expect("source install");
@@ -1053,7 +1053,7 @@ fn invalidated_metadata_slot_reuse_rejects_its_stale_generation() {
     compilation.successors[0] = Some(LinkTarget {
         linear: missing.linear,
         mode_key: missing.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let stale_id = cache.install(&compilation).expect("source install");
     let stale_block = cache.block(stale_id).expect("source block");
@@ -1105,7 +1105,7 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_cell_address = source_compilation.link_cells[0].address();
     source_compilation.code = vec![0x48, 0xb8];
@@ -1177,12 +1177,19 @@ fn unresolved_waiting_edge_survives_arena_compaction() {
     assert!(matches!(cache.probe(source), BlockProbe::Compile));
     let mut source_compilation =
         trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    // Published successor: always the sentinel (S1a). The live-slot lookup/park key below is a
+    // SEPARATE value -- they only happen to share every field but `context` because this test
+    // never switches slots, so the live slot at resolve time is 0 either way.
+    source_compilation.successors[0] = Some(LinkTarget {
+        linear: target.linear,
+        mode_key: target.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    });
     let target_key = LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
         context: 0,
     };
-    source_compilation.successors[0] = Some(target_key);
     let source_id = cache.install(&source_compilation).expect("source install");
     let waiting = cache
         .waiting
@@ -1216,7 +1223,7 @@ fn translation_invalid_blocks_stay_invisible_through_compaction() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     let target_id = install_trivial(&mut cache, target, 1);
@@ -1867,7 +1874,7 @@ fn ranged_device_write_preserves_unrelated_blocks_and_unlinks_overlap() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: overlap.linear,
         mode_key: overlap.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     assert!(matches!(
         cpu.jit_direct.probe(source),
@@ -3020,12 +3027,12 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
     let fallthrough = LinkTarget {
         linear: 0x1100,
         mode_key: source.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     };
     let taken = LinkTarget {
         linear: 0x1200,
         mode_key: source.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     };
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
     assert!(matches!(cache.probe(source), BlockProbe::Compile));
@@ -3134,7 +3141,7 @@ fn direct_link_refusal_census_registers_before_the_first_link_attempt() {
         Some(LinkTarget {
             linear: target.linear,
             mode_key: target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         None,
     ];
@@ -3210,7 +3217,7 @@ fn direct_link_refusal_state_machine_maps_every_bucket() {
         Some(LinkTarget {
             linear: target.linear,
             mode_key: target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         None,
     ];
@@ -3268,7 +3275,7 @@ fn segment_write_static_cell_is_registered_as_suppressed_fallthrough() {
         Some(LinkTarget {
             linear: source.linear + 3,
             mode_key: source.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         None,
     ];
@@ -3307,7 +3314,7 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
     let target_link = LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     };
 
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
@@ -4145,7 +4152,7 @@ fn a_parked_source_keeps_its_own_slots_waiting_entry() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: successor_linear,
         mode_key: source.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     assert_eq!(cache.waiting.values().map(Vec::len).sum::<usize>(), 1);
@@ -4663,10 +4670,14 @@ fn chain_mask_compilation(
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 fn link_target_of(key: BlockKey) -> LinkTarget {
+    // Always the sentinel: this stands in for what `compile_with_budget` would have baked into
+    // a successor, and that is never a real ring slot (S1a, `LINK_CONTEXT_UNSTAMPED`'s doc
+    // comment). `resolve_successors` debug-asserts this now, so a helper that returned a real
+    // slot would panic the first time any caller's install reached it.
     LinkTarget {
         linear: key.linear,
         mode_key: key.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     }
 }
 

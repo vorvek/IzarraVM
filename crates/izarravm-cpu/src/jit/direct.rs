@@ -3944,6 +3944,14 @@ impl BlockCache {
             // a resolve must use the same live-at-THIS-instant value or the two ends of the
             // rendezvous silently stop agreeing the first time this block is re-stamped under the
             // other slot (the defect this slice fixes).
+            //
+            // Enforced, not just documented (review finding N3): a real ring slot leaking into a
+            // successor at compile time is exactly the defect class this slice fixes, so a future
+            // site that re-bakes one here should fail loudly rather than silently reopen it.
+            debug_assert_eq!(
+                successor.context, LINK_CONTEXT_UNSTAMPED,
+                "a compiled successor's context must always be the unstamped sentinel; a real                  ring slot leaking in here is the S1a defect reopening"
+            );
             let key = LinkTarget {
                 context: self.link_slot,
                 ..successor
@@ -32432,7 +32440,18 @@ impl BlockCache {
                         if link.block == id {
                             census_reparked += 1;
                         }
-                        self.waiting.entry(successor).or_default().push(link);
+                        // S1a (sixth site, found while landing that slice): `successor`'s stored
+                        // `context` is the compile-time sentinel, never a real slot -- same rule
+                        // as `resolve_successors`. This park must be findable by the FUTURE
+                        // `resolve_waiting` call that reinstalls something at `successor`'s
+                        // linear, and that call always builds its key from the LIVE slot at that
+                        // instant, so the key parked here must be built the identical way, not
+                        // from the raw stored value.
+                        let key = LinkTarget {
+                            context: self.link_slot,
+                            ..successor
+                        };
+                        self.waiting.entry(key).or_default().push(link);
                     }
                     self.stats.unlinks += 1;
                     self.stalls.links_cleared[LinkClearCause::Retired as usize] += 1;
