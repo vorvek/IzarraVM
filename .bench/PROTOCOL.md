@@ -1263,6 +1263,48 @@ stayed green — no other fixture drives the timer that way.
   table) and catch a music-only collapse. rt is the performance measurement,
   never asserted.
 
+### Tyrian 2000 Ship Specs dwell (586 only, added 2026-09-02)
+
+A FOURTH Tyrian fixture, `.bench/tyrian_specs_c`, and a fourth row,
+`tyrian-specs-586`. It exists because `tyrian-586` above polls 62x less than
+the Ship Specs screen and cannot show the lever the 09-02/03 CR3-gate and
+reflected-call campaigns work on
+(`dev_docs/2026-09-02-tyrian-586-specs-diag.md`,
+`dev_docs/2026-09-02-tyrian-586-reprofile.md`). This is a DIFFERENT tree from
+`tyrian_c`: the owner's install, TOKAEMM loaded, with save slot 1 preloaded,
+not the plain launcher.
+
+- Location: `.bench/tyrian_specs_c`. `GAMES\TYRIAN2K\TYRIAN.SAV` (4,722
+  bytes, save slot 1 = MicroCorp Stalker-B) and `GAMES\TYRIAN2K\TYRIAN.CFG`
+  must be COPIED from the fixture tree, never regenerated -- the graded frame
+  hash is a picture OF that save, and nothing reconstructs it from a fresh
+  install. The three top-level files: `CONFIG.SYS` (`DEVICE=C:\DOS\TOKAEMM.SYS
+  RAM /T` + `DOS=HIGH,UMB`, so DOS loads high the way the owner's box does),
+  `AUTOEXEC.BAT` (sets `BLASTER`, `LH TOKAMOUS /T`, `SNDCTRL /B /T`, then
+  loops `tyrian.exe` from `\GAMES\TYRIAN2K`), and `EXITVM.COM`. The tree
+  carries no `C:\DOS`, which the emulator supplies, exactly as `tyrian_c`
+  does. Provenance: copied verbatim from the throwaway harness at
+  `D:\ctd	yr586\src`.
+- Row and exact invocation: `tyrian-specs-586` in
+  `scripts/run-fixture-scoreboard.ps1`, 5.15e9 cycles (~31.02 guest s) at
+  `--cpu 586 --memory-mib 64 --video vega`. Schedule (guest cycles = guest
+  seconds x 166e6): title menu stable by t=12s; {down}+{enter} at 14.0/14.5
+  opens Load Game; {enter} at 16.5 loads save 1; {down}+{enter} at 19.0/19.5
+  opens Ship Specs. The picture is static from t=20.5s onward, so the
+  5.15e9-cycle budget end (t=31.024s) lands inside the dwell the diagnostic
+  docs grade (t=21.0-31.0).
+- Oracle: an exact `--presented-ppm` frame hash (`frame_sha256_allowed`),
+  confirmed by eye against the Stalker-B ship-data page before it was
+  recorded, plus `expected_display`/`expected_video_mode`/`expected_width`/
+  `expected_height` and the `cycle_budget`/`elapsed_budget_clocks` pair (not
+  `stop.requested`, which an injection schedule slices -- see the trap this
+  row hit in `Invoke-Fixture`, same fix as the frame-contract block's own).
+  No rt anchor: recorded on a box that was not quiet, so `realticsMinimum`/
+  `Maximum` are `$null` and nothing wall-clock is asserted. Reference rates
+  from the campaign's own re-profile -- 159.7 M guest instructions/gs, 17.7 M
+  dispatcher entries/gs during the dwell -- are in the row's own comment, not
+  asserted by this row.
+
 ## Traps (these bit prior rounds)
 
 0. COUNT-ONLY FRAMEBUFFER INVARIANTS DO NOT DISCRIMINATE. Grand Prix 2 under

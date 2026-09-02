@@ -1396,6 +1396,83 @@ function Get-FixtureTable {
             )
         }
         [pscustomobject]@{
+            # The Tyrian 2000 Ship Specs dwell, the recipe the 09-02/03 CR3-gate
+            # and reflected-call campaigns are graded on
+            # (dev_docs/2026-09-02-tyrian-586-specs-diag.md,
+            # dev_docs/2026-09-02-tyrian-586-reprofile.md,
+            # dev_docs/2026-09-03-morning-handoff.md). `tyrian-586` above polls
+            # 62x less than this screen and cannot show the lever the campaign
+            # works on -- this row exists to be graded on instead.
+            #
+            # The owner's install tree, not the plain `tyrian_c` fixture: the
+            # owner's CONFIG.SYS (`DEVICE=C:\DOS\TOKAEMM.SYS RAM /T`,
+            # `DOS=HIGH,UMB`), the owner's AUTOEXEC (`SET BLASTER=A220 I7 D1 H5
+            # P300 T6`, `LH TOKAMOUS /T`, `SNDCTRL /B /T`), and the owner's
+            # TYRIAN.CFG / TYRIAN.SAV (save slot 1 = MicroCorp Stalker-B).
+            # Fixture tree at `.bench/tyrian_specs_c`, copied verbatim from the
+            # throwaway harness at `D:\ctd\tyr586\src`.
+            #
+            # Schedule (guest cycles at 166 MHz = guest seconds x 166e6): title
+            # menu is stable by t=12s; {down}+{enter} at 14.0/14.5 opens Load
+            # Game; {enter} at 16.5 loads save 1; {down}+{enter} at 19.0/19.5
+            # opens Ship Specs. The picture is static from t=20.5s onward (the
+            # screen draws nothing; the guest busy-polls for a keypress) and the
+            # graded window in the diagnostic docs is t=21.0-31.0, ten guest
+            # seconds of dwell. The 5.15e9 cycle budget ends the run at
+            # t=31.024s, inside that static window, so the end frame IS the
+            # dwell picture.
+            #
+            # Reference rates from the campaign's own re-profile
+            # (2026-09-02-tyrian-586-reprofile.md, dwell t=21-31s on the PR #820
+            # binary): 159.7 M guest instructions per guest second, and the
+            # 2026-09-03 morning handoff reports 17.7 M dispatcher entries per
+            # guest second after the #825/#826 CR3 gate. Measured on this row
+            # at main 29a7b6dd (this branch's parent): 160.6 M instructions/gs
+            # and 18.48 M entries/gs over the same t=21-31s window (phase marks,
+            # IZARRAVM_PHASE_INTERVAL_MS=500) -- the same ballpark, moved by the
+            # commits between #825 and 29a7b6dd. These are NOT asserted by this
+            # row (no periodic phase sampling runs on a board leg); they are the
+            # reason the row exists and are recorded here so a future slice can
+            # compare its own dwell rate against this baseline.
+            #
+            # PROVISIONAL: no rt anchor. `realticsMinimum`/`Maximum` are $null
+            # below and nothing wall-clock is asserted, on purpose -- the box
+            # was not quiet while this row was built (background load 61-66%
+            # on two of the three legs that measured it), and a wall-clock
+            # anchor recorded under load is not a final pin. Re-anchor rt once
+            # the box is quiet, if an rt anchor for this row is wanted at all;
+            # the frame hash and the counters above are the real invariant.
+            name = "tyrian-specs-586"; folder = "tyrian_specs_c"
+            arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
+            cycles = [uint64]5150000000
+            realticsMinimum = $null; realticsMaximum = $null; gametics = $null
+            qconsole = $false; resultPpm = $true; dukemark = $null
+            injection = @("--inject-keys", ("2324000000:{down};2407000000:{enter};" +
+                "2739000000:{enter};3154000000:{down};3237000000:{enter}"))
+            # The Ship Specs screen is READ, not assumed: the picture behind
+            # this hash is MicroCorp Stalker-B's data page -- wireframe ship,
+            # the "MicroSol continues the Stalker line..." body text, the stat
+            # block, and the "Press a key" prompt the screen always shows while
+            # it dwells -- confirmed by eye against `--presented-ppm` before the
+            # hash was recorded. Two fresh runs from the fixture tree are
+            # frame-identical (this hash, twice) and read the identical pixel
+            # stats printed to stdout: 29,000 non-zero pixels (22.7%), 19
+            # distinct colours, top colours #000000/#104110/#04280C/#04A60C/
+            # #18DB3C.
+            #
+            # `gradePresentedFrame`, not a re-render: this screen is exactly the
+            # shape PROTOCOL.md warns about (a defect could fill video memory
+            # and never publish it), so the row grades what the scanout
+            # actually presented.
+            gradePresentedFrame = $true
+            frame_sha256_allowed = @(
+                "87e8f37c171de793c62bc4a1604e15a576cf467c2df2c95cd00f4c18fee3aee0"
+            )
+            stdout_contains = "video mode: mode 13h (320x200x256)"
+            expected_display = "VgaRaster"; expected_video_mode = "Mode13h"
+            expected_width = 320; expected_height = 400
+        }
+        [pscustomobject]@{
             name = "tombraid-loader-586"; folder = "tombraid_loader_c"
             arguments = @("--cpu", "586", "--memory-mib", "64")
             cycles = [uint64]500000000
@@ -3054,11 +3131,41 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
                 $failures += ("the final video mode is '$($profile.legacy_video_mode)', " +
                     "expected '$($Fixture.expected_video_mode)'")
             }
-            # See the frame-contract block below for why `stop.requested` is the
-            # wrong field for a row with an INPUT SCHEDULE. No row grading this
-            # way carries one today; give this the same treatment before adding
-            # the first that does.
-            if ($profile.stop.kind -ne "cycle_limit" -or
+            # `stop.requested` is the wrong field for a row with an INPUT
+            # SCHEDULE: an injection schedule slices the run into one
+            # `run_until_halt_or_cycles` call per scancode/mouse packet plus
+            # one final call for the remainder, so `stop.requested` holds only
+            # the LAST slice's budget rather than the fixture's total
+            # `--cycles` (see the frame-contract block's own comment above
+            # `Invoke-AnchorRun` for the tombraid3d-586 case that first found
+            # this). `tyrian-specs-586` is the first row on THIS grading path
+            # to carry a schedule, and it gets the frame-contract block's own
+            # fix, not a weaker one: that block does not skip the check, it
+            # SUBSTITUTES `cycle_budget` / `elapsed_budget_clocks` for
+            # `stop.requested`, and the pair is strictly stronger -- it
+            # catches a wrong budget AND a run that ended early. Skipping the
+            # check outright would have been unsafe on exactly this row: the
+            # Ship Specs picture is static for the whole 10.5-guest-second
+            # tail of the budget, so a truncated `cycles` would still hash
+            # correctly and grade green while under-reporting the dwell's
+            # instruction and entry rates, which is the only thing this row
+            # exists to carry.
+            $probedInjection = $Fixture.PSObject.Properties['injection']
+            $hasSchedule = ($null -ne $probedInjection -and
+                @($probedInjection.Value).Count -gt 0)
+            if ($hasSchedule) {
+                if ($profile.stop.kind -ne "cycle_limit") {
+                    $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
+                        "'cycle_limit' -- the guest did not run the whole budget")
+                } elseif ([uint64]$profile.cycle_budget -ne $Fixture.cycles) {
+                    $failures += ("the run was given a budget of $($profile.cycle_budget) " +
+                        "cycles, expected the fixture's $($Fixture.cycles)")
+                } elseif ([uint64]$profile.elapsed_budget_clocks -lt
+                    [uint64]$profile.cycle_budget) {
+                    $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
+                        "$($profile.cycle_budget) cycle budget -- it ended early")
+                }
+            } elseif ($profile.stop.kind -ne "cycle_limit" -or
                 [uint64]$profile.stop.requested -ne $Fixture.cycles) {
                 $failures += ("the run stopped as '$($profile.stop.kind)' at " +
                     "$($profile.stop.requested), expected cycle_limit at $($Fixture.cycles)")

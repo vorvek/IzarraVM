@@ -31,6 +31,7 @@ the exception and runs DUKEMARK exactly once, then ends the VM itself with
 | `duke3d_short_c` | 586 | the same DUKEMARK run, demo cut to 1560 records | the CHEAP duke ladder row: 143 s a leg against 342 s |
 | `tyrian_setup_c` | 486 | Tyrian 2000 SETUP.EXE, settings menu + jukebox | the guest 70 Hz audio clock (PIT rewrite per frame + MPU-401 MIDI + DSP 0x14 chain); see PROTOCOL.md |
 | `tyrian_c` | 486, 586 | Tyrian 2000 gameplay, scripted to level 1 with fire held | same audio clock under play; the 586 row is the perf row |
+| `tyrian_specs_c` | **586** | Tyrian 2000, TOKAEMM loaded, save slot 1 preloaded (MicroCorp Stalker-B), scripted to the Ship Specs screen | the frame-graded dwell recipe the CR3-gate and reflected-call campaigns are measured on; `tyrian_c` polls 62x less and cannot show the lever, see `2026-09-02-tyrian-586-specs-diag.md` |
 | `psycho_c` | **486** | Psycho Pinball, DOS/4GW, a table in play | the only row that replays its CRTC register table EVERY FRAME; grades the PUBLISHED frame, not a re-render |
 | `tombraid3d_c` | **586** | Tomb Raider Gold, 3dfx build, CD REQUIRED | the same game as `tombraid_c` with every pixel through GLIDE, so the two rows split a regression between engine and rasteriser |
 | `descent2_c` | **586** | Descent II, 3dfx patch, recorded demo, CD REQUIRED | the HEAVIER Glide row: rt 0.32 against Tomb Raider's 0.87, and it ships the byte-identical `glide2x.ovl` |
@@ -375,6 +376,7 @@ persona's rate: 486 is 66 MHz, 586 is 166 MHz.
 | Tyrian setup | 486 | 4.7e9 | 71 s | menu to 25 s, jukebox 27-59 s, menu tail |
 | Tyrian | 486 | 3.2e9 | 48 s | gameplay from ~31 s; the ship dies at ~53 s, the budget stops before it |
 | Tyrian | 586 | 8.05e9 | 48 s | the same guest-second schedule at 166 MHz |
+| Tyrian specs | 586 | 5.15e9 | 31 s | title -> Load Game -> save 1 -> Ship Specs; static from ~20.5 s, so the budget end lands mid-dwell |
 
 **The Duke3D budget no longer sets the length of the run.** The guest exits
 itself through `EXITVM.COM` when DUKEMARK is done, so the budget is only there
