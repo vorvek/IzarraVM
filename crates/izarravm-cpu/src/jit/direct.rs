@@ -35356,7 +35356,10 @@ impl DirectLinkRefusalCensus {
     ) {
         if let Some(mask) = guard_mask {
             let popcount = mask.count_ones();
-            if let Some(count) = self.guard_mask_popcount_histogram.get_mut(popcount as usize) {
+            if let Some(count) = self
+                .guard_mask_popcount_histogram
+                .get_mut(popcount as usize)
+            {
                 *count += 1;
             }
         }

@@ -3119,7 +3119,10 @@ fn guard_mask_is_the_targets_unagreed_data_segments_with_cs_excluded() {
         used: SEGMENT_MASK_BITS, // every segment, CS included
     };
     let full_mask = empty_source.guard_mask(full_target);
-    assert_eq!(full_mask, SEGMENT_MASK_BITS & !segment_bit(SegmentIndex::Cs));
+    assert_eq!(
+        full_mask,
+        SEGMENT_MASK_BITS & !segment_bit(SegmentIndex::Cs)
+    );
     assert_eq!(full_mask.count_ones(), 5);
 }
 
@@ -3211,9 +3214,7 @@ fn a_non_segment_layout_refusal_does_not_thread_a_mask_into_the_histogram() {
     // mismatch produces is `link_compatible`'s cpl3 check -- `LinkRefusal::BlockShape`, not
     // `LinkRefusal::SegmentLayout` -- so the call site's gate must keep `guard_mask` at `None`.
     target_compilation.memory_cpl3 = true;
-    cache
-        .install(&target_compilation)
-        .expect("target install");
+    cache.install(&target_compilation).expect("target install");
 
     let source = key(0x7100);
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
@@ -3229,9 +3230,7 @@ fn a_non_segment_layout_refusal_does_not_thread_a_mask_into_the_histogram() {
         None,
     ];
     source_compilation.emitted_static_targets = source_compilation.successors;
-    cache
-        .install(&source_compilation)
-        .expect("source install");
+    cache.install(&source_compilation).expect("source install");
 
     let snapshot = cache
         .direct_link_refusal_census_snapshot()
@@ -3247,8 +3246,7 @@ fn a_non_segment_layout_refusal_does_not_thread_a_mask_into_the_histogram() {
         "a BlockShape refusal must not thread a guard_mask into the row"
     );
     assert_eq!(
-        snapshot.guard_mask_popcount_histogram,
-        [0; 6],
+        snapshot.guard_mask_popcount_histogram, [0; 6],
         "a BlockShape refusal must not increment the histogram at all"
     );
 }
