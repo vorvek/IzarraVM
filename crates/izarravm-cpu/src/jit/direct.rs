@@ -15477,10 +15477,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // `emit_carry_alu_preloaded` now carries a Word arm that loads host CF from the RBP shadow
     // BEFORE the masked `alu_r16_r16`, the same ordering its Dword arm has always used, so the two
     // opcodes reach the SAME arm as their five siblings and need no allowlist entry of their own.
-    // Form 1's MEMORY shape is admitted at Word for every op, including the writing ones
-    // (`860698e5` opened it for `op != 7` only; the S-B ALU-rows slice deleted that residual
-    // guard -- see the arm's own comment for the argument). Form 3's memory shape is admitted
-    // for every op including ADC/SBB, because `emit_alu_mem_
+    // Form 1's MEMORY shape stays refused at Word regardless of op (see that arm) -- that boundary
+    // is untouched by this slice, it is the read-modify-write economics guard 3 left standing.
+    // Form 3's memory shape is admitted for every op including ADC/SBB, because `emit_alu_mem_
     // source`'s Word arm stages RAX/RCX exactly as the register callers do before reaching
     // `emit_alu_preloaded` -- see that arm and `cpu_jit_word_memory_test.rs`.
     //
@@ -16202,26 +16201,30 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                             src: m.reg,
                             width: operand_width,
                         }),
-                        // Word memory destination for all eight form-1 ops, including the
-                        // WRITING ones (AND, OR, ADC, SBB, ...), not just CMP. `860698e5`
-                        // ("Admit the word ALU register forms to 16-bit blocks") drew this
-                        // boundary on economics, not correctness: "`emit_wide_page_guard`
-                        // refuses every odd word address and 16-bit DOS code has no alignment
-                        // discipline". That guard is unconditional at Word
-                        // (`MemoryWidth::needs_alignment_guard`), so a misaligned operand still
-                        // side-exits at the slot rather than miscompiling; it does not stay
-                        // inside a compiled block on every execution the way the old comment
-                        // here claimed. The identical kind at the identical width already ships
-                        // from the `0x81`/`0x83` immediate-source arm (`AluMemDest { source:
-                        // StoreSource::Imm(..), width: operand_width, .. }`), certified by
-                        // `cpu_jit_word_memory_test.rs` and in production traffic
-                        // (`0x83 word mem /2` on pyramid-586). The only difference from that
-                        // shipping shape is `StoreSource::Reg(m.reg)` in place of
-                        // `StoreSource::Imm(imm)`, and `emit_read_store_value`'s `Reg` arm
-                        // already has the Word branch every other Word register source uses.
-                        // `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` and `MAX_MEMORY_ALU_SLOTS` still
-                        // bound how many of these a single block can carry, unchanged by this
-                        // arm's removal.
+                        // Word memory is refused for the WRITING ops and admitted for CMP, which
+                        // is the shape that already ships: `0x39` has been compiling word memory
+                        // in quake's renderer since before this slice, so `op != 7` here rather
+                        // than a blanket refusal, or that regresses.
+                        //
+                        // A missed lowering rather than a hazard, and the reason is economics.
+                        // 16-bit DOS code has no alignment discipline, and an `AluMemDest` slot
+                        // lowers through `emit_alu_mem_dest` -- one of the ELEVEN memory sites
+                        // that still refuse a misaligned access outright. Guard 3 relaxed only the
+                        // two lean one-lookup sites (the plain load and the plain store), so
+                        // naming the guard here would now be wrong: the refusal is the SITE's, not
+                        // the guard's. Admitted today, an odd operand would sit INSIDE the block
+                        // and side-exit at that slot on every execution, so nothing after it
+                        // retires natively.
+                        //
+                        // This is the hook for the read-modify-write follow-on. An RMW slot needs
+                        // a read deposit AND a write deposit inside one slot -- guard 3's stubs
+                        // each carry one -- which is what has to be built before this arm can be
+                        // opened, not a census row.
+                        DecodedOperand::Mem(_)
+                            if insn.operand_size == OperandSize::Word && op != 7 =>
+                        {
+                            None
+                        }
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
                             op,
                             source: StoreSource::Reg(m.reg),

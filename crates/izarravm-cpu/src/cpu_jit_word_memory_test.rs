@@ -828,124 +828,26 @@ fn a_watched_word_store_exits_before_writing() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Form 1 memory word -- the sixteen-bit memory-DESTINATION ALU (the S-B ALU-rows slice)
+// The `MAX_MEMORY_ALU_SLOTS` / `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` cap
 // ---------------------------------------------------------------------------------------------
 
-/// Every admitted opcode of the form-1 family at Word operand size, memory destination: all
-/// eight ops, not just CMP. `860698e5` admitted the register form and CMP's memory form; this
-/// slice deletes the residual `op != 7` guard on the classify arm and lets the writing ops
-/// (`AND`, `OR`, `ADC`, `SBB`, `ADD`, `SUB`, `XOR`) reach the same `AluMemDest` kind CMP already
-/// used, through `StoreSource::Reg` in place of `0x81`/`0x83`'s `StoreSource::Imm`.
-///
-/// The seed poisons the source register's high half with `0xdead_8000`, so a write-back into the
-/// wrong width or the wrong operand is a distinguishable register failure. `0x11` ADC and `0x19`
-/// SBB additionally run with CF=1 (no live descriptor -- see the form-3 fixture's own note on
-/// why `pending: true` cannot deliver a genuine carry-in here).
-#[test]
-fn the_word_memory_dest_alu_matches_the_interpreter_for_every_admitted_op() {
-    for (opcode, name) in [
-        (0x01u8, "add"),
-        (0x09, "or"),
-        (0x11, "adc"),
-        (0x19, "sbb"),
-        (0x21, "and"),
-        (0x29, "sub"),
-        (0x31, "xor"),
-        (0x39, "cmp"),
-    ] {
-        for src in [0u8, 3, 4, 7] {
-            for operand in [0x1234u16, 0xffff, 0x8000, 0x7fff, 0x0000] {
-                // `[ebp+0x10]` (SS default segment) and `es:[disp32]` (explicit override), the
-                // same two addressing shapes the form-3 fixture runs, for the same reason: they
-                // are expected green and what they close is "only one addressing mode was ever
-                // exercised".
-                let base_disp = vec![0x66u8, opcode, 0x40 | (src << 3) | 0b101, 0x10];
-                let mut es_override = vec![0x26u8, 0x66];
-                es_override.extend_from_slice(&disp32(&[opcode], src, OPERAND));
-
-                let addressing_eflags: &[(u32, bool)] = if matches!(opcode, 0x11 | 0x19) {
-                    &[(0x202, false), (0x8d7, false)]
-                } else {
-                    &[(0x202, false)]
-                };
-                for &(eflags, pending) in addressing_eflags {
-                    for (body, shape) in [
-                        (base_disp.clone(), "[ebp+0x10] (SS default)"),
-                        (es_override.clone(), "es:[disp32]"),
-                    ] {
-                        let mut seed = Seed::new()
-                            .gpr(usize::from(src), 0xdead_8000)
-                            .gpr(5, OPERAND - 0x10)
-                            .operand(operand)
-                            .flags(eflags);
-                        if pending {
-                            seed = seed.pending();
-                        }
-                        lowered(
-                            &body,
-                            seed,
-                            &format!(
-                                "{name} word {shape}, r16 src={src} operand={operand:#06x} \
-                                 eflags={eflags:#x} pending={pending}"
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// A misaligned word ALU memory-DEST operand side-exits rather than miscompiling. Same guard as
-/// the form-3 / `0x83` rows (`emit_wide_page_guard`, unconditional at Word), certified here for
-/// the writing form: what makes this row distinct is that the guard must fire BEFORE the write,
-/// so the operand and the two adjacent bytes are untouched at the guard and the interpreter's
-/// re-execution then matches byte for byte.
-#[test]
-fn a_misaligned_word_alu_memory_dest_side_exits_rather_than_miscompiling() {
-    for (opcode, name) in [(0x21u8, "and"), (0x09, "or")] {
-        let mut body = vec![0x66u8];
-        body.extend_from_slice(&disp32(&[opcode], 0, MISALIGNED_OPERAND));
-        guarded(
-            &body,
-            Seed::new().gpr(0, 0xdead_8000),
-            alignment_exits,
-            &format!("{name} word [odd], ax"),
-        );
-    }
-}
-
-/// `26 21 07` -- `and [es:bx], ax`, ES based away from DS. The fixture's ES is flat at base 0
-/// (like the form-3 row), so what this pins is that the SEGMENT the address resolves against is
-/// the override rather than the default DS: `direct_addr` carries `addr.segment` verbatim and
-/// `prefixes_supported_for` admits `segment_override` while refusing LOCK, REP and an
-/// address-size override.
-#[test]
-fn a_word_alu_memory_dest_honours_a_segment_override() {
-    let mut body = vec![0x26u8, 0x66, 0x21];
-    body.push(0x40 | 0b101); // and [ebp+0x10], ax, ES override (reg field 0)
-    body.push(0x10);
-    let seed = Seed::new()
-        .gpr(0, 0xdead_8000)
-        .gpr(5, OPERAND - 0x10)
-        .operand(0x4321);
-    lowered(&body, seed, "and word es:[ebp+0x10], ax");
-}
-
-/// The `MAX_MEMORY_ALU_SLOTS` / `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` cap. Four consecutive
-/// `and [OPERAND], ax` slots must not all join one block: the walk stops offering memory-ALU
-/// slots once `memory_alu_slots == MAX_MEMORY_ALU_SLOTS` (3), the same way the call-out slot cap
-/// ends a block early (`cpu_jit_out_imm8_callout_test.rs`'s `MAX_BLOCK_CALLOUT_SLOTS` fixture):
-/// the cap always fires with three or more slots already admitted, so the post-walk min-length
-/// rule never turns it into a `CompileOutcome::Retry` -- the walk lands on a Boundary and the
-/// block installs SHORT, at the filler plus the three admitted ALU slots, with the fourth
-/// `and [OPERAND], ax` becoming the next block's entry. This is the block-shape cap the design's
-/// review (finding 3) says the entry-count prediction has to account for.
+/// Four consecutive `and word [OPERAND], imm8` (`0x83 /4`, already-shipping memory-dest
+/// immediate-source form) slots must not all join one block: the walk stops offering
+/// memory-ALU slots once `memory_alu_slots == MAX_MEMORY_ALU_SLOTS` (3), the same way the
+/// call-out slot cap ends a block early (`cpu_jit_out_imm8_callout_test.rs`'s
+/// `MAX_BLOCK_CALLOUT_SLOTS` fixture): the cap always fires with three or more slots already
+/// admitted, so the post-walk min-length rule never turns it into a `CompileOutcome::Retry` --
+/// the walk lands on a Boundary and the block installs SHORT, at the filler plus the three
+/// admitted ALU slots, with the fourth `and` becoming the next block's entry. This is the
+/// block-shape cap the design's review (finding 3) says the entry-count prediction has to
+/// account for, expressed against `0x83`'s memory-destination form rather than form 1's
+/// register-source form, which stays refused at Word.
 #[test]
 fn four_consecutive_word_memory_alu_slots_break_the_walk_on_the_cap() {
     let one = {
         let mut v = vec![0x66u8];
-        v.extend_from_slice(&disp32(&[0x21], 0, OPERAND));
+        v.extend_from_slice(&disp32(&[0x83], 4, OPERAND));
+        v.push(0x03);
         v
     };
     let mut code = MOV_ESI_ESI.to_vec();
@@ -977,7 +879,7 @@ fn four_consecutive_word_memory_alu_slots_break_the_walk_on_the_cap() {
         jit::direct::CompileOutcome::Compiled(compilation) => {
             assert_eq!(
                 compilation.span.instructions, 4,
-                "the walk must stop at the filler plus three memory-ALU slots, the cap short of                  the fourth `and [OPERAND], ax` -- a longer span means the cap did not bite"
+                "the walk must stop at the filler plus three memory-ALU slots, the cap short of                  the fourth `and word [OPERAND], imm8` -- a longer span means the cap did not bite"
             );
         }
         jit::direct::CompileOutcome::Retry(cause) => {
@@ -989,57 +891,4 @@ fn four_consecutive_word_memory_alu_slots_break_the_walk_on_the_cap() {
             panic!("expected a short Compiled block, the walk structurally rejected instead")
         }
     }
-}
-
-/// The barrier census control and this row's mutation bite: with the pre-slice guard restored
-/// (the `DecodedOperand::Mem(_) if operand_size == Word && op != 7` arm), the memory-destination
-/// form of every writing op is a `hard_boundary` census row; with it removed, no `(0x21, ..,
-/// memory, word, ..)` row survives at all. Keyed on `operand_form == "memory"` (finding 12 gap 1)
-/// so an unrelated register-form refusal cannot make this flaky -- the register form has been
-/// admitted since `860698e5` and carries no row of its own.
-#[test]
-fn the_word_alu_memory_dest_row_is_no_longer_a_barrier() {
-    let mut body = vec![0x66u8];
-    body.extend_from_slice(&disp32(&[0x21], 0, OPERAND));
-
-    let mut code = MOV_ESI_ESI.to_vec();
-    code.extend_from_slice(&body);
-    code.extend_from_slice(&MOV_EDI_EDI);
-    code.push(0xf4);
-
-    let mut memory = memory_fill();
-    memory[(ENTRY - 1) as usize] = 0x90;
-    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
-    memory[OPERAND as usize..OPERAND as usize + 2].copy_from_slice(&0x1234u16.to_le_bytes());
-
-    let mut cpu = flat_cpu();
-    let mut bus = TestBus::with_memory(memory);
-    bus.direct_pages_enabled = true;
-    cpu.registers.set_esp(STACK_TOP);
-    cpu.enable_direct_barrier_census(true);
-    for offset in 0..code.len() as u32 {
-        let linear = ENTRY + offset;
-        cpu.set_eip(linear);
-        let _ = cpu.fetch_decoded(&mut bus, linear);
-    }
-    map_page(&mut cpu, &mut bus, OPERAND & !0xfff);
-    map_page(&mut cpu, &mut bus, (STACK_TOP - 4) & !0xfff);
-
-    assert!(
-        matches!(
-            jit::direct::compile(&mut cpu, ENTRY, true),
-            jit::direct::CompileOutcome::Compiled(_)
-        ),
-        "the memory-destination form must compile, not barrier"
-    );
-    let snapshot = cpu
-        .direct_barrier_census_snapshot()
-        .expect("the census was enabled");
-    assert!(
-        snapshot
-            .rows
-            .iter()
-            .all(|row| !(row.opcode == 0x21 && row.operand_form == "memory")),
-        "the memory-dest form compiled and must not also have recorded a barrier row"
-    );
 }
