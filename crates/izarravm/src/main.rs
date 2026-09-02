@@ -17,6 +17,7 @@ mod gui;
 mod host_input;
 mod ipe_trace;
 mod mode_census_json;
+mod preflight;
 mod prefs;
 #[cfg(windows)]
 mod riprofile;
@@ -304,13 +305,20 @@ fn requested_execution_backend(
     if native_backend_available {
         Ok(ExecutionBackend::Automatic)
     } else {
-        Err(
-            "this IzarraVM build requires an AVX2-capable x86-64 CPU; use --interpreter to run the portable CPU core",
-        )
+        // Owner ruling, 2026-09-04: AVX2 is a hard requirement for this build
+        // (`.cargo/config.toml` targets x86-64-v3), so `preflight::require_avx2`
+        // already exited the process before `main` reached this point on a host
+        // that would land here. This branch stays as defense in depth for a
+        // native-compiled, non-x86_64/Windows/Linux target where the compiled-in
+        // check differs from the runtime one -- it is not a reachable path on the
+        // hosts this build ships for, and there is no `--interpreter` escape left
+        // to point at.
+        Err("this IzarraVM build requires an AVX2-capable x86-64 CPU")
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    preflight::require_avx2();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
