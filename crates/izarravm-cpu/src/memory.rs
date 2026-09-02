@@ -1267,7 +1267,7 @@ impl CpuGsw {
             self.census_note_read(linear);
         }
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::note_read(self, linear);
+        crate::reflected_call_diag::note_read(self, bus, linear);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1551,7 +1551,7 @@ impl CpuGsw {
         // read-set-size number this instrument reports (review N2).
         #[cfg(feature = "reflected-call-diagnostic")]
         if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
-            crate::reflected_call_diag::note_read(self, linear);
+            crate::reflected_call_diag::note_read(self, bus, linear);
         }
         #[cfg(all(
             feature = "jit",
@@ -1744,7 +1744,7 @@ impl CpuGsw {
             self.census_note_read(linear);
         }
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::note_read(self, linear);
+        crate::reflected_call_diag::note_read(self, bus, linear);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",

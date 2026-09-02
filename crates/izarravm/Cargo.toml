@@ -44,7 +44,7 @@ watch-write = ["izarravm-cpu/watch-write"]
 int-trace = ["izarravm-cpu/int-trace"]
 # Passthrough for the reflected-call HLE design's slice-0 trip-shape
 # instrument; see izarravm-cpu.
-reflected-call-diagnostic = ["jit", "izarravm-cpu/reflected-call-diagnostic"]
+reflected-call-diagnostic = ["jit", "izarravm-cpu/reflected-call-diagnostic", "izarravm-machine/reflected-call-diagnostic"]
 
 [dependencies]
 clap.workspace = true

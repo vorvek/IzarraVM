@@ -2874,9 +2874,12 @@ fn direct_link_refusal_census_json(
     })
 }
 
-/// Slice 0 of the reflected-call HLE design's trip-shape instrument
+/// Slice 0b of the reflected-call HLE design's trip-shape instrument
 /// (`dev_docs/2026-09-03-reflected-call-hle-design.md`,
-/// `dev_docs/2026-09-03-reflected-call-hle-review.md`).
+/// `dev_docs/2026-09-03-reflected-call-hle-review.md`,
+/// `dev_docs/2026-09-04-reflected-call-slice0b-plan.md` §9's key list).
+/// Additive over slice 0's schema: no `izarravm-hdd-profile-v2` bump, no
+/// `KATEA_COUNTER_KEYS` change (plan §8's file-list note).
 #[cfg(feature = "reflected-call-diagnostic")]
 fn reflected_call_diagnostic_json(
     snapshot: Option<izarravm_cpu::ReflectedCallDiagnosticSnapshot>,
@@ -2897,11 +2900,19 @@ fn reflected_call_diagnostic_json(
         "mode": snapshot.mode,
         "trips_total": snapshot.trips_total,
         "trips_unmatched": snapshot.trips_unmatched,
+        "probe_ns_per_read": snapshot.probe_ns_per_read,
+        "compare_ns_per_read": snapshot.compare_ns_per_read,
+        "window_start_insns": snapshot.window_start_insns,
+        "window_end_insns": snapshot.window_end_insns,
         "keys": snapshot.keys.iter().map(|k| json!({
             "vector": format!("0x{:02x}", k.vector),
             "ah": format!("0x{:02x}", k.ah),
             "trips": k.trips,
             "unmatched": k.unmatched,
+            "closed_by": k.closed_by.iter().map(|(name, n)| json!({
+                "rule": name,
+                "count": n,
+            })).collect::<Vec<_>>(),
             "instructions": stat_json(&k.instructions),
             "core_clocks": stat_json(&k.core_clocks),
             "dispatcher_entries": stat_json(&k.dispatcher_entries),
@@ -2909,6 +2920,11 @@ fn reflected_call_diagnostic_json(
             "distinct_entry_images": k.distinct_entry_images,
             "distinct_cs_eip": k.distinct_cs_eip,
             "varying_fields": k.varying_fields,
+            "entry_image_top16": k.entry_image_top16_trips,
+            "entry_image_cum_share_1": k.entry_image_cum_share_1,
+            "entry_image_cum_share_4": k.entry_image_cum_share_4,
+            "entry_image_cum_share_8": k.entry_image_cum_share_8,
+            "entry_image_cum_share_16": k.entry_image_cum_share_16,
             "nested_int_trips": k.nested_int_trips,
             "far_transfer_trips": k.far_transfer_trips,
             "hw_edge_trips": k.hw_edge_trips,
@@ -2923,12 +2939,41 @@ fn reflected_call_diagnostic_json(
             "bda_key_pending_trips": k.bda_key_pending_trips,
             "bda_no_key_trips": k.bda_no_key_trips,
             "bda_unknown_trips": k.bda_unknown_trips,
-            "near_match_diffs": k.near_match_diffs.iter().map(|(name, n)| json!({
+            "near_match_diffs": k.near_match_diffs.iter().map(|(name, far_return, far_transfer)| json!({
                 "field": name,
-                "count": n,
+                "far_return": far_return,
+                "far_transfer": far_transfer,
             })).collect::<Vec<_>>(),
+            "near_match_cs_eip": k.near_match_cs_eip.iter().map(|(name, far_return, far_transfer)| json!({
+                "field": name,
+                "far_return": far_return,
+                "far_transfer": far_transfer,
+            })).collect::<Vec<_>>(),
+            "cs_base_differed_on_match": k.cs_base_differed_on_match,
+            "modes_seen": k.modes_seen_any.iter().map(|(name, n)| json!({
+                "mode": name,
+                "trips": n,
+            })).collect::<Vec<_>>(),
+            "mode_defect_trips": k.mode_defect_trips,
+            "batch_straddle_trips": k.batch_straddle_trips,
+            "soft_int_posts": k.soft_int_posts,
+            "clock_charge_events": stat_json(&k.clock_charge_events),
+            "trips_in_window": k.trips_in_window,
             "read_set_size": stat_json(&k.read_set_size),
+            "read_set_size_windowed": stat_json(&k.read_set_size_windowed),
+            "read_set_size_physical": stat_json(&k.read_set_size_physical),
+            "read_set_size_physical_windowed": stat_json(&k.read_set_size_physical_windowed),
             "write_set_size": stat_json(&k.write_set_size),
+            "write_set_size_windowed": stat_json(&k.write_set_size_windowed),
+            "translation_set_size": stat_json(&k.translation_set_size),
+            "translation_set_size_windowed": stat_json(&k.translation_set_size_windowed),
+            "translation_set_over_cap": k.translation_set_over_cap,
+            "stack_segments_over_cap_trips": k.stack_segments_over_cap_trips,
+            "entry_images_over_cap": k.entry_images_over_cap,
+            "write_addresses_over_cap": k.write_addresses_over_cap,
+            "class_n_addresses_over_cap": k.class_n_addresses_over_cap,
+            "trips_reads_over_cap": k.trips_reads_over_cap,
+            "trips_writes_over_cap": k.trips_writes_over_cap,
             "reads_total": k.reads_total,
             "reads_under_other_cr3": k.reads_under_other_cr3,
             "read_class_counts": k.read_class_counts.iter().map(|(name, n)| json!({
@@ -2939,16 +2984,25 @@ fn reflected_call_diagnostic_json(
                 "class": name,
                 "count": n,
             })).collect::<Vec<_>>(),
-            "write_restored": k.write_restored,
-            "write_net_change": k.write_net_change,
+            "write_class_r": k.write_class_r,
+            "write_class_d": k.write_class_d,
+            "write_class_n": k.write_class_n,
+            "write_class_n_trips": k.write_class_n_trips,
             "write_unknown_pre": k.write_unknown_pre,
             "write_dead_8kb": k.write_dead_8kb,
-            "write_dead_derived": k.write_dead_derived,
-            "write_live": k.write_live,
+            "write_not_plain_ram": k.write_not_plain_ram,
             "top_write_addresses": k.top_write_addresses.iter().map(|(addr, count)| json!({
                 "address": format!("0x{addr:08x}"),
                 "count": count,
             })).collect::<Vec<_>>(),
+            "class_n_addresses": k.class_n_addresses.iter().map(|(addr, class, count)| json!({
+                "address": format!("0x{addr:08x}"),
+                "class": class,
+                "count": count,
+            })).collect::<Vec<_>>(),
+            "warm_clock_samples": k.warm_clock_samples,
+            "warm_clock_distinct": k.warm_clock_distinct,
+            "warm_clock_longest_run": k.warm_clock_longest_run,
         })).collect::<Vec<_>>(),
     })
 }

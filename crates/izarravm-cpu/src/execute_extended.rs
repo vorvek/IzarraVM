@@ -905,7 +905,7 @@ impl CpuGsw {
                 let selector = insn.imm2 as u16;
                 self.far_call(bus, selector, offset, operand_size)?;
                 #[cfg(feature = "reflected-call-diagnostic")]
-                crate::reflected_call_diag::on_far_transfer(self);
+                crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 Ok(clocks(17))
             }
             0xea => {
@@ -914,7 +914,7 @@ impl CpuGsw {
                 let selector = insn.imm2 as u16;
                 self.far_jump(bus, selector, offset, operand_size)?;
                 #[cfg(feature = "reflected-call-diagnostic")]
-                crate::reflected_call_diag::on_far_transfer(self);
+                crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 Ok(clocks(17))
             }
             0xc2 => {
@@ -1076,7 +1076,7 @@ impl CpuGsw {
                         // a DPMI host's return through a saved far pointer is exactly
                         // this shape, and the direct-form hooks at `0x9A`/`0xEA` miss it.
                         #[cfg(feature = "reflected-call-diagnostic")]
-                        crate::reflected_call_diag::on_far_transfer(self);
+                        crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                         Ok(clocks(11))
                     }
                     _extension => Err(undefined_opcode()),
