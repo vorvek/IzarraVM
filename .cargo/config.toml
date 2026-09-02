@@ -1,2 +1,15 @@
 # This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 # SPDX-License-Identifier: GPL-3.0-only
+
+# OWNER DECISION 2026-09-02 (dev_docs/2026-09-02-cpu-code-smell-audit.md, Tier 5.1):
+# target the AVX2 floor, not the build host's exact CPU. `x86-64-v3` gives
+# AVX2, BMI1, BMI2, FMA, LZCNT, MOVBE -- the same floor the emitted x87 code
+# (jit/direct.rs x87_avx2_emit.rs) already assumes. `-C target-cpu=native`
+# would pin the produced binary to one box's exact CPU model and give a
+# different (and non-portable) binary on every build machine; `x86-64-v3` is
+# a fixed, portable target every AVX2-class host can run. Test builds get the
+# flag too: the gates should run on the shipped codegen. Guest state must not
+# move under this flag -- verified on the bit-identity fixtures before any
+# re-pin (see the audit's "Decisions and sequence for Tier 5").
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
