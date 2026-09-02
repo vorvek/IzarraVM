@@ -1325,6 +1325,12 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
+        // Falsification F1 (design section 9): any IN/OUT inside a reflected
+        // trip means no read-set can certify it. Counted regardless of
+        // outcome (a faulted permission check still means the trip touched a
+        // port).
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::on_port_io();
         let operand_size = insn.operand_size;
         match insn.opcode as u8 {
             0xe4 => {

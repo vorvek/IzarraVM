@@ -42,6 +42,9 @@ seg-head-diagnostic = ["jit", "izarravm-cpu/seg-head-diagnostic"]
 watch-write = ["izarravm-cpu/watch-write"]
 # Passthrough for the guest INT n tracer; see izarravm-cpu.
 int-trace = ["izarravm-cpu/int-trace"]
+# Passthrough for the reflected-call HLE design's slice-0 trip-shape
+# instrument; see izarravm-cpu.
+reflected-call-diagnostic = ["jit", "izarravm-cpu/reflected-call-diagnostic"]
 
 [dependencies]
 clap.workspace = true

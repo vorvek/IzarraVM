@@ -20,6 +20,13 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
+        // Design refusal `x87` (section 3.4): any x87 escape inside a
+        // reflected trip. Counted here, the interpreter's one entry point for
+        // the whole `DecodeGroup::Fpu` family, including WAIT/FWAIT -- slightly
+        // over-inclusive of the design's own rule (WAIT does not touch FPU
+        // state) but conservative in the direction that matters for a census.
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::on_x87();
         let opcode = insn.opcode as u8;
         if opcode == 0x9b {
             // WAIT checks task switching only when CR0.MP requests that behavior.

@@ -73,6 +73,15 @@ watch-write = []
 # conversation with a driver (this is how the TOKAEMM shared-pool defect was
 # found). Armed by IZARRAVM_INT_TRACE=<hex vectors, comma separated>.
 int-trace = []
+# Slice 0 of the reflected-call HLE design (dev_docs/2026-09-03-reflected-
+# call-hle-design.md, dev_docs/2026-09-03-reflected-call-hle-review.md): the
+# trip-shape INSTRUMENT. NO BEHAVIOUR CHANGE on the OFF arm or on a plain
+# build -- compiled out entirely unless this feature is selected. Armed by
+# IZARRAVM_REFLECTED_CALL_DIAGNOSTIC=shape or =journal; see
+# reflected_call_diag.rs for what each mode measures. Requires `jit`: the
+# `journal` mode forces the native backend off for the run, on the design's
+# own precondition for guest-memory-access journaling.
+reflected-call-diagnostic = ["jit"]
 
 [dependencies]
 thiserror.workspace = true

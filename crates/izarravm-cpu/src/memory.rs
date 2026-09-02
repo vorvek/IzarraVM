@@ -1266,6 +1266,8 @@ impl CpuGsw {
         if self.rmw_census_enabled {
             self.census_note_read(linear);
         }
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_read(self, linear);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1319,6 +1321,16 @@ impl CpuGsw {
         if self.rmw_census_enabled {
             self.census_note_write(linear);
         }
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_write(
+            self,
+            bus,
+            linear,
+            BusWidth::Byte,
+            u32::from(value),
+            false,
+            None,
+        );
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1531,6 +1543,8 @@ impl CpuGsw {
         {
             self.census_note_read(linear);
         }
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_read(self, linear);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1612,6 +1626,8 @@ impl CpuGsw {
         {
             self.census_note_write(linear);
         }
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1713,6 +1729,8 @@ impl CpuGsw {
         if self.rmw_census_enabled {
             self.census_note_read(linear);
         }
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_read(self, linear);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1769,6 +1787,8 @@ impl CpuGsw {
         if self.rmw_census_enabled {
             self.census_note_write(linear);
         }
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1954,6 +1974,21 @@ impl CpuGsw {
         physical: u32,
         value: u32,
     ) -> ExecResult<()> {
+        // Hooked BEFORE the bus write below, unlike every other write seam:
+        // this function's own comment says the old PTE bytes are gone by the
+        // time it returns, so a pre-value peek must happen here or not at
+        // all. `physical` is already a physical address (page-table entries
+        // have none other), hence `is_page_walk: true`.
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_write(
+            self,
+            bus,
+            physical,
+            BusWidth::Dword,
+            value,
+            true,
+            Some(crate::reflected_call_diag::AddressClass::PageTable),
+        );
         bus.write_memory(
             physical,
             BusWidth::Dword,

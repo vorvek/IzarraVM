@@ -2094,6 +2094,18 @@ impl CpuGsw {
         self.jit_direct.smc_census_snapshot()
     }
 
+    /// Slice 0 of the reflected-call HLE design's trip-shape instrument
+    /// (dev_docs/2026-09-03-reflected-call-hle-design.md /
+    /// dev_docs/2026-09-03-reflected-call-hle-review.md). `None` when the
+    /// feature is not built in or the run never armed
+    /// `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC`.
+    #[cfg(feature = "reflected-call-diagnostic")]
+    pub fn reflected_call_diagnostic_snapshot(
+        &self,
+    ) -> Option<crate::ReflectedCallDiagnosticSnapshot> {
+        crate::reflected_call_diag::snapshot()
+    }
+
     /// `(execution-weighted arity histogram, distinct sites)` from the THROWAWAY stage-0 RETF
     /// census, or `None` when it is disarmed. See `jit::direct::retf_census`.
     #[cfg(feature = "retf-arity-census")]

@@ -51,6 +51,10 @@ pub use jit::direct::{
 pub use jit::unit_sim::SimReport;
 mod memory;
 mod paging;
+#[cfg(feature = "reflected-call-diagnostic")]
+mod reflected_call_diag;
+#[cfg(feature = "reflected-call-diagnostic")]
+pub use reflected_call_diag::{KeyReport, ReflectedCallDiagnosticSnapshot, StatSummary};
 mod run;
 mod smc_trace;
 mod strings;
