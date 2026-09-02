@@ -94,6 +94,7 @@ pub const CDAUDIO_COM: &[u8] = include_bytes!("../roms/dos/cdaudio.com");
 pub const CDAUDIO_COM_SOURCE: &str = include_str!("../roms/dos/cdaudio.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
 pub const TOKAMOUS_COM: &[u8] = include_bytes!("../roms/dos/tokamous.com");
+pub const TOKADESK_EXE: &[u8] = include_bytes!("../roms/dos/tokadesk.exe");
 pub const MOUSEGFX_COM: &[u8] = include_bytes!("../roms/dos/mousegfx.com");
 pub const MOUSEGFX_COM_SOURCE: &str = include_str!("../roms/dos/mousegfx.asm");
 pub const UNHALT_COM: &[u8] = include_bytes!("../roms/dos/unhalt.com");
@@ -535,6 +536,15 @@ pub fn cdtest_com() -> &'static [u8] {
 /// binary on both of its paths) and is mounted directly by the driver tests.
 pub fn tokamous_com() -> &'static [u8] {
     TOKAMOUS_COM
+}
+
+/// TOKADESK.EXE: the Toka-DOS visual workbench, built from
+/// `toka-dos/tools-src/tokadesk` by `toka-dos/build-freedos.ps1`. Ships on the
+/// Toka-DOS image at `C:\DOS\TOKADESK.EXE` (see build-freedos-hdd-image.py,
+/// which takes this committed binary on both of its paths, like
+/// TOKAMOUS.COM above) and is mounted directly by the workbench fixture.
+pub fn tokadesk_exe() -> &'static [u8] {
+    TOKADESK_EXE
 }
 
 /// Guest fixture for TOKAMOUS's mode 13h graphics cursor: draw, hide, move,

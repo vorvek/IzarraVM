@@ -583,6 +583,28 @@ the sign-on line:
 
 It is off by default.
 
+## TOKADESK
+
+TOKADESK is the Toka-DOS visual workbench. It is a 32-bit protected-mode
+program that requires [TOKAEMM](../tokaemm/manual.md)'s VCPI server, and it
+runs the Vega card in its 1024x768, 65536-colour graphics mode.
+
+```
+TOKADESK
+```
+
+This is a first preview. The program opens with a menu bar, a left-hand tab
+rail, and a Directory tab showing two panes. Each pane holds a drive letter,
+a path, and a listing; the mouse or the arrow keys move the cursor, and
+buttons in the pane make a directory, copy, move, paste, and delete. Opening
+a file switches to a second tab, a visual version of TokaEDIT, for reading
+and writing plain text.
+
+TOKADESK does not yet start a program from its Directory tab; there is no
+way to run an EXE or COM file from inside it. The menu bar is not yet
+active, and there is no command that returns to the `C:\>` prompt. Reset the
+machine to leave TOKADESK.
+
 ## Next
 
 - [How to use Toka-DOS](using-toka-dos.md): the shell, the disk layout, and

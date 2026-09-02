@@ -19,4 +19,8 @@ documented command-line behavior only.
   buffer core (`buffer.c`) is self-checked at build time by a native
   `test_buffer.c` harness.
 - `tokadesk/` `TOKADESK.EXE`, the 32-bit visual workbench (Open Watcom `wcc386`
-  payload plus a NASM VCPI stub). Authoring build: `tokadesk/build.ps1`.
+  payload plus a NASM VCPI stub). Authoring build: `tokadesk/build.ps1`. Ships
+  on the Toka-DOS image at `C:\DOS\TOKADESK.EXE`; the committed binary lives
+  at `crates/izarravm-firmware/roms/dos/tokadesk.exe`, like TOKAMOUS.COM. This
+  is a first preview: it has a Directory tab and a TokaEDIT tab, and it cannot
+  yet start a program.
