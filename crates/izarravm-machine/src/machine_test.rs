@@ -366,6 +366,8 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         BusWidth::Byte,
         machine.cache_model.code_fetch_wait_states(),
     ));
+    let a20_open = machine.keyboard.a20_enabled();
+    let device_free_extended_floor = machine.vega.device_free_extended_floor();
     let mut bus = MachineBus {
         memory: &mut machine.memory,
         ram_lookup: &mut machine.ram_lookup,
@@ -415,6 +417,8 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         cache: &mut machine.cache_model,
         icache_fetch_clocks,
         flat_data_cost: machine.active_mode.uses_approximate_timing(),
+        a20_open,
+        device_free_extended_floor,
         extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
         isa_io_wait: crate::bus::isa_io_wait_armed(),

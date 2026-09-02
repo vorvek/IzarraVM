@@ -585,7 +585,7 @@ impl CpuGsw {
                 lin,
             );
         }
-        if diff_trace_enabled() {
+        if self.retire_gates.diff_trace {
             self.emit_diff_trace_line(start_cs, start_eip);
         }
         Ok(CycleOutcome {
@@ -847,11 +847,13 @@ impl CpuGsw {
                             }
                             break;
                         }
-                        if (lin & 0xfff) + u32::from(screen.len) > 0x1000 {
-                            self.perf.brk_decode_or_branch += 1;
-                            self.perf.brk_cont_page_cross += 1;
-                            break;
-                        }
+                        // NO PAGE-CROSS SCREEN. `DecodeCache::put` rejects any line whose
+                        // instruction straddles a 4 KiB boundary, under the identical predicate,
+                        // so a cached line can never answer this one yes and `brk_cont_page_cross`
+                        // is identically zero. The counter stays in `PerfCounters`, permanently
+                        // zero, so the report's field set does not move; what came out is an add,
+                        // a compare and a branch per continuation, plus `screen.len`'s live range
+                        // across them.
                         if !Self::fetch_within_limit(self.registers.eip, screen.len, cs.limit) {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_not_continuable += 1;
@@ -2648,7 +2650,7 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.sweep_sticky_watch_edges();
-        if self.profile.enabled || diff_trace_enabled() {
+        if self.profile.enabled || self.retire_gates.diff_trace {
             self.perf.jit_direct_reject_observer += 1;
             ea_mark!(Phase::Refused);
             ea_refusal!(site::OBSERVER_OR_DIFF_TRACE);
@@ -2684,13 +2686,19 @@ impl CpuGsw {
             return Ok(DirectBlockOutcome::NotRun);
         }
         let span = block.span();
-        if span.key.mode_key != self.jit_mode_key() {
-            self.perf.jit_direct_reject_mode_key += 1;
-            ea_mark!(Phase::Refused);
-            ea_refusal!(site::MODE_KEY);
-            ea_end!(Population::Refused);
-            return Ok(DirectBlockOutcome::NotRun);
-        }
+        // NO SECOND MODE-KEY COMPARE. The probe that produced this block matched the full
+        // `BlockKey`, mode key included, and nothing between that probe and here moves CS.D,
+        // SS.B, CR0, EFLAGS.VM or the GSW mode -- every instruction that can is non-continuable
+        // and ends the run before a dispatch. Re-deriving `jit_mode_key()` (about six loads and
+        // five branches) per entry therefore asked a question the probe had already answered.
+        // `perf.jit_direct_reject_mode_key` read identically zero on duke3d-586-short,
+        // wolf3d-486 and tyrian-586 before this came out; the counter stays in `PerfCounters`,
+        // permanently zero, so the report's field set does not move.
+        debug_assert_eq!(
+            span.key.mode_key,
+            self.jit_mode_key(),
+            "a compiled block was entered under a mode key it was not compiled for"
+        );
         if block
             .x87_entry_top()
             .is_some_and(|expected| self.fpu.top() != expected)
@@ -2714,12 +2722,7 @@ impl CpuGsw {
         // than adding a second, which the 2026-08-18 plan pinned as a requirement. `cs_matches`
         // below shares it and is unaffected, because `chain.cs == own.cs` always.
         ea_mark!(Phase::EntryGuards);
-        let Some(segments) = self.jit_direct.entry_layout(block.id()) else {
-            ea_mark!(Phase::Refused);
-            ea_refusal!(site::SEGMENT_LAYOUT_NONE);
-            ea_end!(Population::Refused);
-            return Ok(DirectBlockOutcome::NotRun);
-        };
+        let segments = self.jit_direct.entry_layout(block.id());
         if !segments.cs_matches(self) {
             self.perf.jit_direct_reject_cs_layout += 1;
             self.jit_direct.retire_key_for_recompile(span.key);
@@ -3924,7 +3927,7 @@ impl CpuGsw {
                     // interpreted-retire tail (506.85M instructions in a Quake/586 run) and the
                     // census, off by default, never consumes it otherwise.
                     #[cfg(feature = "jit")]
-                    if self.jit_direct.barrier_census_active() {
+                    if self.retire_gates.barrier_census {
                         self.jit_direct.note_barrier_census_interpreted(insn);
                     }
                     // This non-profiling fast tail is the COMMON continuation retire path; observe
@@ -3939,7 +3942,7 @@ impl CpuGsw {
                     if self.is_ring0_protected() {
                         self.perf.monitor_resident_core_clocks += charged;
                     }
-                    if diff_trace_enabled() {
+                    if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
                     Ok(CycleOutcome {
@@ -3960,7 +3963,7 @@ impl CpuGsw {
         // the same Ok retirements here so the count stays exact when profiling is enabled.
         #[cfg(feature = "jit")]
         if result.is_ok() {
-            if self.jit_direct.barrier_census_active() {
+            if self.retire_gates.barrier_census {
                 self.jit_direct.note_barrier_census_interpreted(insn);
             }
             self.unit_sim_observe(
@@ -4034,7 +4037,7 @@ impl CpuGsw {
                     // tail bypasses finish_instruction, so the diff-trace hook
                     // must be duplicated here or every cached-path instruction
                     // (the common case) goes untraced.
-                    if diff_trace_enabled() {
+                    if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
                     Ok(CycleOutcome {

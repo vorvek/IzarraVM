@@ -387,16 +387,31 @@ impl JitState {
         self.direct.fill_demoted_callout_sites_for_test();
     }
 
+    /// `#[cold]` + `#[inline(never)]` here too, so the hot entry function's call site is a call
+    /// and not an inlined forwarding shim into a body that is itself cold. See
+    /// `BlockCache::retire_key_for_recompile`.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_recompile(&mut self, key: direct::BlockKey) -> bool {
         self.direct
             .retire_key_for_recompile(&mut self.code_watch, key)
     }
 
+    /// `#[cold]` + `#[inline(never)]` here too, so the hot entry function's call site is a call
+    /// and not an inlined forwarding shim into a body that is itself cold. See
+    /// `BlockCache::retire_key_for_recompile`.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_top_mismatch(&mut self, key: direct::BlockKey) -> bool {
         self.direct
             .retire_key_for_top_mismatch(&mut self.code_watch, key)
     }
 
+    /// `#[cold]` + `#[inline(never)]` here too, so the hot entry function's call site is a call
+    /// and not an inlined forwarding shim into a body that is itself cold. See
+    /// `BlockCache::retire_key_for_recompile`.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_data_segment(
         &mut self,
         key: direct::BlockKey,
@@ -477,6 +492,17 @@ impl JitState {
 
     pub(crate) fn code_watch_page_is_watched(&self, page: u32) -> bool {
         self.code_watch.page_is_watched(page)
+    }
+
+    /// Whether the block-watch edge list has anything for the sweep to drain.
+    ///
+    /// Asked before `take_watch_edge_pages` because the sweep runs at every native entry and is
+    /// a no-op read on the production path: `mem::take` writes three words into the live `Vec`
+    /// whether or not there was anything in it, and the `for` that consumes the taken `IntoIter`
+    /// then frees the buffer the next install would refill.
+    #[inline]
+    pub(crate) fn has_pending_watch_edges(&self) -> bool {
+        !self.pending_watch_edges.is_empty()
     }
 
     pub(crate) fn take_watch_edge_pages(&mut self) -> Vec<u32> {

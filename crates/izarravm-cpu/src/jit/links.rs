@@ -25,10 +25,7 @@
 //! the resolution algorithms that operate on them stay OWNED separately by each backend's own
 //! cache type; only this shared vocabulary is common.
 
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct LinkTarget {
@@ -61,7 +58,7 @@ pub(crate) struct BlockPortal {
 }
 
 impl BlockPortal {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             body: AtomicUsize::new(0),
             integer_entry: AtomicUsize::new(0),
@@ -128,9 +125,14 @@ impl BlockPortal {
 /// instead of calling this function. Kept in the shared module because it is, structurally, just
 /// a static `BlockPortal` instance holding a permanent value; only its zero-body INTERPRETATION is
 /// Direct-specific.
+///
+/// A plain `static`, not a `OnceLock`: the constructor is `const`, so there is nothing to
+/// initialise lazily, and `LinkCell::linked()` reads this once per entry (twice per
+/// `has_linked_successor`). The `OnceLock` form cost an Acquire load, a branch and a
+/// non-inlinable `get_or_init` call on every one of those.
 pub(crate) fn zero_portal() -> &'static BlockPortal {
-    static ZERO_PORTAL: OnceLock<BlockPortal> = OnceLock::new();
-    ZERO_PORTAL.get_or_init(BlockPortal::new)
+    static ZERO_PORTAL: BlockPortal = BlockPortal::new();
+    &ZERO_PORTAL
 }
 
 #[repr(C)]

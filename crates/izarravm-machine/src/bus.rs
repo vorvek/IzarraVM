@@ -291,6 +291,10 @@ impl Machine {
             BusWidth::Byte,
             self.cache_model.code_fetch_wait_states(),
         ));
+        // Captured before the literal for the reason the four above it are: `keyboard` and `vega`
+        // are moved into it as mutable borrows, so they cannot be read from inside it.
+        let a20_open = self.keyboard.a20_enabled();
+        let device_free_extended_floor = self.vega.device_free_extended_floor();
         MachineBus {
             memory: &mut self.memory,
             ram_lookup: &mut self.ram_lookup,
@@ -340,6 +344,8 @@ impl Machine {
             cache: &mut self.cache_model,
             icache_fetch_clocks,
             flat_data_cost: self.active_mode.uses_approximate_timing(),
+            a20_open,
+            device_free_extended_floor,
             extended_ram_screen: extended_ram_screen_enabled(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             isa_io_wait: isa_io_wait_armed(),
@@ -1116,6 +1122,8 @@ impl MachineBus<'_> {
     fn set_a20_gate(&mut self, enabled: bool) {
         if self.keyboard.a20_enabled() != enabled {
             self.keyboard.set_a20(enabled);
+            // One of the two writers of the `a20_open` snapshot `apply_a20` reads.
+            self.a20_open = enabled;
             self.advance_direct_mapping_epoch();
         }
     }
@@ -2322,7 +2330,7 @@ impl CpuBus for MachineBus<'_> {
         // and the floor comparison sit behind the `||`.
         if let Some(end) = physical_start.checked_add(count - 1)
             && (end < 0x000A_0000
-                || (self.keyboard.a20_enabled()
+                || (self.a20_open
                     && self.is_device_free_extended_ram(physical_start, count as usize)))
         {
             debug_assert_eq!(
@@ -2993,6 +3001,12 @@ impl CpuBus for MachineBus<'_> {
         // which mirrors this post-write block for the HLE path.
         let pci_decode = self.vega.memory_decode_key();
         if self.pci.write_io(port, width, value, self.vega) {
+            // The only bus-side door onto Distira's PCI command register and BAR, so the only
+            // place the extended-RAM floor snapshot can go stale while this view is live. The
+            // HLE PCI BIOS arm (`bios.rs handle_pci_bios`) writes through `Machine`, which
+            // cannot run while a `MachineBus` is borrowed and gets a fresh snapshot at the next
+            // `make_bus`.
+            self.device_free_extended_floor = self.vega.device_free_extended_floor();
             if self.vega.memory_decode_key() != pci_decode {
                 self.ram_lookup.rebuild(self.memory.len(), self.vega);
                 self.mark_direct_map_changed();
@@ -3328,6 +3342,8 @@ impl CpuBus for MachineBus<'_> {
         let a20_before = self.keyboard.a20_enabled();
         if self.keyboard.write_port(port, value as u8) {
             if self.keyboard.a20_enabled() != a20_before {
+                // The other writer of the `a20_open` snapshot: an 8042 output-port command.
+                self.a20_open = !a20_before;
                 self.advance_direct_mapping_epoch();
             }
             return Ok(());
@@ -3962,8 +3978,11 @@ impl MachineBus<'_> {
     /// it: they address exact physical cells, not the guest's gated bus.
     /// pub(super) so the memory-poll executor's spin read gates the certified
     /// physical exactly like the certificate and the interpreter do.
+    ///
+    /// Reads the `a20_open` snapshot, not `keyboard.a20_enabled()`; see that field for the two
+    /// writers that keep it live.
     pub(super) fn apply_a20(&self, address: u32) -> u32 {
-        if self.keyboard.a20_enabled() {
+        if self.a20_open {
             address
         } else {
             address & A20_MASK
@@ -4098,6 +4117,18 @@ impl MachineBus<'_> {
         self.ram_lookup.direct_bytes(address, bytes)
     }
 
+    /// `direct_ram_bytes` for a caller that has already proved the range is non-empty and
+    /// page-local; see `RamPageLookup::direct_bytes_page_local` for what that buys.
+    #[inline]
+    fn direct_ram_bytes_page_local(&self, address: u32, bytes: usize) -> Option<(usize, usize)> {
+        let start = address as usize;
+        let end = start + bytes;
+        if end <= 0x000A_0000 && end <= self.memory.len() {
+            return Some((start, end));
+        }
+        self.ram_lookup.direct_bytes_page_local(address, bytes)
+    }
+
     #[inline]
     fn direct_page_ram_bytes(
         &self,
@@ -4114,7 +4145,9 @@ impl MachineBus<'_> {
         {
             return None;
         }
-        self.direct_ram_bytes(gated, bytes)
+        // The two tests above are exactly `direct_bytes_page_local`'s precondition, so the
+        // page-local form is what this calls: the general one would re-prove both.
+        self.direct_ram_bytes_page_local(gated, bytes)
             .map(|(start, end)| (gated, start, end))
     }
 
@@ -4143,7 +4176,8 @@ impl MachineBus<'_> {
         if (gated as usize & RAM_LOOKUP_PAGE_MASK) + bytes > RAM_LOOKUP_PAGE_SIZE {
             return None;
         }
-        self.direct_ram_bytes(gated, bytes)
+        // See `direct_page_ram_bytes`: the precondition is proved, so the page-local form serves.
+        self.direct_ram_bytes_page_local(gated, bytes)
             .map(|(start, end)| (gated, start, end))
     }
 
@@ -4469,7 +4503,7 @@ impl MachineBus<'_> {
         );
         self.extended_ram_screen
             && address >= 0x0010_0000
-            && address.saturating_add(bytes as u32) <= self.vega.device_free_extended_floor()
+            && address.saturating_add(bytes as u32) <= self.device_free_extended_floor
     }
 
     #[inline]

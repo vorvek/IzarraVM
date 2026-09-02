@@ -3714,6 +3714,23 @@ struct MachineBus<'a> {
     /// 386 class and forced false by the bandwidth diagnostic so its tier
     /// curve stays on the accurate model.
     flat_data_cost: bool,
+    /// The A20 gate, snapshotted at construction and REWRITTEN by the two writes that can move
+    /// it while this view is live: `set_a20_gate` (port 0x92 and the BIOS route) and the 8042
+    /// command port's own handler. `apply_a20` is on every bus access and the gate lives behind
+    /// `&mut Keyboard`, so reading it there cost two dependent loads through a reference for an
+    /// answer that changes a handful of times per boot.
+    ///
+    /// Both writers already do a second thing on the same edge (`advance_direct_mapping_epoch`),
+    /// so the refresh sits beside a step that was already the invalidation contract for this
+    /// state; nothing else in the machine can move A20 while a `MachineBus` is borrowed, because
+    /// the borrow is exclusive.
+    a20_open: bool,
+    /// `vega.device_free_extended_floor()`, snapshotted at construction and rewritten wherever a
+    /// Distira PCI config write can move it. `is_device_free_extended_ram` asks it on every access
+    /// at or above 1 MB -- where every 32-bit game's data lives -- and answering it re-derived
+    /// `distira_memory_enabled() && distira_mem_base < MARGO_LFB_BASE` through a reference each
+    /// time.
+    device_free_extended_floor: u32,
     /// Whether `is_device_free_extended_ram` may screen a classification, i.e.
     /// `IZARRAVM_EXTENDED_RAM_SCREEN` (default ON). Resolved once per process
     /// and carried here so the hot path reads a field, not the environment.

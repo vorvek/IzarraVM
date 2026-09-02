@@ -614,23 +614,31 @@ fn inline_chain_check_in_this_process() {
     // function (`next_timer_wake` down to `div_ceil`) that establishes
     // dbghelp's context order is INNERMOST-first, not outermost-first as the
     // design assumed -- a real correctness fix this test's existence found.
-    // The OLD resolver's collapse target, as a SPAN rather than one line. The exact line is
-    // dbghelp- and codegen-environment-dependent: this box attributes the collapsed address to
-    // machine/src/run.rs:1715 (the `let run_budget = remaining;` statement), while the
-    // 2026-08-30 CI runner attributed the same collapse to a neighbouring line of the same
-    // budgeted-run statement group and failed the exact-line pin (#776's first CI run). The
-    // defect being demonstrated is "OLD collapses into machine run.rs, NEW reveals the
-    // izarravm-cpu chain"; the specific line inside the statement group is incidental, so the
-    // pin covers the group. Widen deliberately, never past the enclosing function.
-    const OLD_COLLAPSE_SPAN: std::ops::RangeInclusive<u32> = 1700..=1730;
-    fn old_collapse_in_span(site: &str) -> bool {
-        let Some(idx) = site.rfind("run.rs:") else {
-            return false;
-        };
-        site[idx + "run.rs:".len()..]
-            .trim_end()
-            .parse::<u32>()
-            .is_ok_and(|line| OLD_COLLAPSE_SPAN.contains(&line))
+    // WHICH inlined callee carries the example is NOT pinned any more, and neither is the line it
+    // collapses onto. Both were, twice: first as an exact line, then (after the 2026-08-30 CI
+    // runner attributed the same collapse to a neighbouring line, #776's first CI run) as the
+    // 1700..=1730 budgeted-run statement group with `run_budgeted` named as its owner. Both pins
+    // are hostage to an inlining size heuristic in a function nobody is editing. The 2026-09-02
+    // CPU micro-cost batch moved `run_budgeted_inner`'s size, LLVM stopped inlining the
+    // `run_budgeted` wrapper into `run_until_tick` at all, and this fixture went red with
+    // nothing wrong with the resolver. `#[inline]` on the wrapper did not bring the frame back
+    // either, so it is not a decision this repository can hold still.
+    //
+    // The claim the fixture exists to carry survives all of that: SOMEWHERE in `run_until_tick`
+    // there is an address the old resolver reports as an izarravm-machine `run.rs` line while
+    // the new one names the izarravm-cpu frame actually inlined there. That is what is asserted
+    // now, with the structural halves kept that can still fail: the physical symbol is never its
+    // own inline frame, the revealed frame names an izarravm-cpu `run.rs` line, and a resolver
+    // that produced no chain at all still fails here, which is the regression this watches for.
+    //
+    // A fourth assertion used to sit at the end of this list, that the revealed frame does not
+    // itself collapse into the machine run loop. It was dropped rather than kept: the selection
+    // loop already requires the revealed site to start with `crates\izarravm-cpu` and the collapse
+    // predicate requires `crates\izarravm-machine`, so no string can satisfy both and no mutation
+    // of the resolver could ever have turned it red. A guard that cannot fail is worse than no
+    // guard, because it reads as coverage.
+    fn collapses_into_the_machine_run_loop(site: &str) -> bool {
+        site.starts_with("crates\\izarravm-machine") && site.contains("run.rs:")
     }
     const STRIDE: u64 = 8;
     let mut best: Option<(u64, Frame, String)> = None;
@@ -641,7 +649,7 @@ fn inline_chain_check_in_this_process() {
         let Some(old_line) = super::resolve_line(process, addr) else {
             continue;
         };
-        if !old_collapse_in_span(&old_line) {
+        if !collapses_into_the_machine_run_loop(&old_line) {
             continue;
         }
         let chain = resolve_inline_chain(process, addr);
@@ -649,9 +657,8 @@ fn inline_chain_check_in_this_process() {
             continue;
         };
         if !innermost.name.contains("run_until_tick")
-            && innermost.site.contains("izarravm-cpu")
+            && innermost.site.starts_with("crates\\izarravm-cpu")
             && innermost.site.contains("run.rs")
-            && !old_collapse_in_span(&innermost.site)
         {
             best = Some((addr, innermost.clone(), old_line));
             break;
@@ -665,17 +672,17 @@ fn inline_chain_check_in_this_process() {
     let (addr, innermost, old_line) = best.unwrap_or_else(|| {
         panic!(
             "no address in run_until_tick's {size:#x}-byte extent reproduced the \
-             defect example: OLD resolver collapsing into machine/src/run.rs's \
-             budgeted-run span ({OLD_COLLAPSE_SPAN:?}) while NEW resolver names a \
-             different izarravm-cpu run.rs line. Either the OLD resolver no longer \
-             collapses there (recheck the claim in the module doc) or the NEW \
+             defect example: OLD resolver collapsing into an izarravm-machine \
+             run.rs line while NEW resolver names the izarravm-cpu run.rs frame \
+             inlined there. Either nothing from izarravm-cpu is inlined into this \
+             function any more (recheck the claim in the module doc) or the NEW \
              resolver regressed."
         )
     });
 
     assert!(
-        old_collapse_in_span(&old_line) && old_line.contains("izarravm-machine"),
-        "the defect's OLD side must sit in the documented collapse span, got {old_line:?}"
+        collapses_into_the_machine_run_loop(&old_line),
+        "the defect's OLD side must be an izarravm-machine run.rs line, got {old_line:?}"
     );
     // The physical symbol itself is NEVER a member of the inline chain (a
     // reviewer rejected a guard that assumed otherwise).
@@ -684,13 +691,8 @@ fn inline_chain_check_in_this_process() {
         "run_until_tick must not appear inside its own inline chain at {addr:#x}"
     );
     assert!(
-        innermost.name.contains("run_budgeted"),
-        "expected the run_budgeted wrapper to own this defect example, got {:?}",
-        innermost.name
-    );
-    assert!(
         innermost.site.starts_with("crates\\izarravm-cpu") && innermost.site.contains("run.rs"),
-        "run_budgeted's site must be an izarravm-cpu run.rs line, got {:?}",
+        "the revealed frame's site must be an izarravm-cpu run.rs line, got {:?}",
         innermost.site
     );
 }

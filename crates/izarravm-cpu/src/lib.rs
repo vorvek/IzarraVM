@@ -2752,6 +2752,51 @@ impl PartialEq for FarCallLedger {
 
 impl Eq for FarCallLedger {}
 
+/// The two run-invariant diagnostic gates the interpreted-retire tail used to ask per
+/// instruction, mirrored into `CpuGsw` so the tail reads a byte instead of a synchronising load.
+///
+/// `diff_trace` mirrors `run::diff_trace_enabled()`, whose backing `OnceLock` costs an Acquire
+/// load that LLVM may not hoist out of `run_budgeted_inner`. `barrier_census` mirrors
+/// `JitState::barrier_census_active()`, which loads the boxed `JitState` pointer and then a field
+/// in a large struct the tail has no other reason to touch. Both answers are constant for the
+/// life of a run, and `decode_pack_enabled` already sets the precedent of resolving a
+/// process-constant knob once instead of per instruction.
+///
+/// Wrapper struct rather than two loose bools for `FastMapServeGate`'s reason: it must stay out of
+/// `CpuGsw` equality (whole-CPU `==` is load-bearing in the differential tests and this is a pair
+/// of diagnostic gates, not guest state), and its `Clone` has to match what the state it mirrors
+/// clones to.
+#[derive(Debug)]
+pub(crate) struct RetireGates {
+    /// `run::diff_trace_enabled()`, resolved at construction. Process-constant.
+    pub(crate) diff_trace: bool,
+    /// `jit_direct.barrier_census_active()`, resynced by `enable_direct_barrier_census`.
+    #[cfg(feature = "jit")]
+    pub(crate) barrier_census: bool,
+}
+
+impl Clone for RetireGates {
+    fn clone(&self) -> Self {
+        Self {
+            // The clone runs in the same process, so the env answer is the same answer.
+            diff_trace: self.diff_trace,
+            // `JitState`'s own `Clone` hands the clone a fresh state with no census attached, so
+            // the mirror clears rather than copies: this is the value the clone's `jit_direct`
+            // will actually report.
+            #[cfg(feature = "jit")]
+            barrier_census: false,
+        }
+    }
+}
+
+impl PartialEq for RetireGates {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RetireGates {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuGsw {
     pub registers: Registers,
@@ -2994,6 +3039,10 @@ pub struct CpuGsw {
     /// duke3d-486, and this instrument's disarm was gated on an interleaved A/B/B/A before the
     /// behavioural steps that consume it were allowed to land.
     slot_census_enabled: bool,
+    /// The hoisted per-retire diagnostic gates; see `RetireGates`. At the `CpuGsw` tail for the
+    /// layout reason every field around it carries: it must not move `pending_flags` off its
+    /// pinned offset.
+    pub(crate) retire_gates: RetireGates,
     /// Where the last fatal `CpuError` was raised, for the machine's stop
     /// report. Written by all three sites that turn an `InternalFault` into a
     /// fatal `CpuError`, so it can never name the wrong fault; read ONLY on the
@@ -3026,6 +3075,10 @@ impl Default for CpuGsw {
         let jit_direct = Box::new(jit::JitState::new(jit::direct::BlockCache::new(
             decode_cache.line_count(),
         )));
+        // Read before the literal below moves `jit_direct`: the mirror is seeded from the state
+        // it mirrors, never from `barrier_census_default()` a second time.
+        #[cfg(feature = "jit")]
+        let barrier_census_armed = jit_direct.barrier_census_active();
         #[allow(unused_mut)]
         let mut cpu = Self {
             registers: Registers::default(),
@@ -3099,6 +3152,13 @@ impl Default for CpuGsw {
             last_written_page: NO_LAST_WRITTEN_PAGE,
             rmw_census_enabled: rmw_census_default(),
             slot_census_enabled: slot_census_default(),
+            retire_gates: RetireGates {
+                diff_trace: crate::run::diff_trace_enabled(),
+                // Seeded from the state it mirrors rather than from `barrier_census_default()`
+                // directly, so the two can never disagree at construction.
+                #[cfg(feature = "jit")]
+                barrier_census: barrier_census_armed,
+            },
             fault_site: FaultSite::default(),
         };
         // The literal above is the only place a `CpuGsw` picks a mode without going through
@@ -4039,13 +4099,24 @@ impl DecodeLineView {
             phys_start: self.phys_start,
             #[cfg(feature = "jit")]
             slot: self.slot,
-            // The unpacked arm holds the instruction already, so it answers from the same
-            // definition the pack writer uses rather than from a stored bit. Both arms therefore
-            // reach the run loop's gate with the same value.
+            // DEFINED ONLY WHERE `continuable` IS FALSE, and that is the contract, not an
+            // accident. The run loop reads this field in ONE place, inside the `!continuable`
+            // break arm, and continuations are continuable about nineteen times in twenty, so
+            // the unpacked arm spends the opcode predicate only where the answer is read. The
+            // packed arm answers from a stored bit that `publish_line` sets from the opcode
+            // alone, so on a CONTINUABLE line the two arms are free to disagree, and this is
+            // the arm that reads false.
+            //
+            // They cannot actually disagree on any line the cache can hold: every opcode the
+            // probe set names decodes non-continuable, so the guard is never the thing that
+            // changes the answer. That is a property of the opcode set, not of this function,
+            // so it is pinned by a fixture rather than left to be re-derived
+            // (`two_arms_agree_on_the_break_probe_bit` in cpu_decode_pack_test.rs). Do NOT
+            // hoist this read out of the break arm, and do not add a second consumer, without
+            // re-proving that property or guarding the packed writer the same way.
             #[cfg(feature = "jit")]
-            noncont_break_probe: jit::direct::non_continuable_break_probe_candidate(
-                self.insn.opcode,
-            ),
+            noncont_break_probe: !self.insn.continuable
+                && jit::direct::non_continuable_break_probe_candidate(self.insn.opcode),
         }
     }
 }
@@ -4466,6 +4537,17 @@ impl DecodeCache {
         self.native_code_watch.take_pending()
     }
 
+    /// See `StickyDecodeCodeWatch::has_pending`.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn has_pending_watch_edges(&self) -> bool {
+        self.native_code_watch.has_pending()
+    }
+
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -4529,20 +4611,22 @@ impl DecodeCache {
     ///
     /// The three conditions on the fast arm are all load-bearing. `bit + width <= 64` is the
     /// non-crossing test: a range that straddles a word boundary needs both words, and shifting
-    /// a mask by more than the word width is not even defined. `physical + width <=
-    /// SMC_BYTE_COVERAGE` (checked without wrapping) keeps the whole range inside the window
-    /// `is_code_byte` treats as byte-granular -- one byte past it and the answer for that byte
-    /// comes from the page bitmap instead. Anything failing either test falls back to the exact
-    /// per-byte loop, which is also what a wide (>4-byte) access takes.
+    /// a mask by more than the word width is not even defined. `physical <= SMC_BYTE_COVERAGE -
+    /// width` keeps the whole range inside the window `is_code_byte` treats as byte-granular --
+    /// one byte past it and the answer for that byte comes from the page bitmap instead.
+    /// Anything failing either test falls back to the exact per-byte loop, which is also what a
+    /// wide (>4-byte) access takes.
+    ///
+    /// The bound is written as a subtraction from the constant rather than as
+    /// `physical.checked_add(width)`, and the two are the SAME SET. `width <= 4 <=
+    /// SMC_BYTE_COVERAGE`, so the subtraction cannot underflow; where the addition does not
+    /// overflow the two forms are the same inequality, and where it does, `physical` is within
+    /// four bytes of the 4 GiB wrap and both forms are false. What comes out is a carry test and
+    /// a never-taken branch on every store.
     #[inline]
     fn range_hits_code(&self, physical: u32, width: u32) -> bool {
         let bit = physical & 63;
-        if width <= 4
-            && bit + width <= 64
-            && physical
-                .checked_add(width)
-                .is_some_and(|end| end <= SMC_BYTE_COVERAGE)
-        {
+        if width <= 4 && bit + width <= 64 && physical <= SMC_BYTE_COVERAGE - width {
             let mask = ((1u64 << width) - 1) << bit;
             return self.code_bytes[(physical >> 6) as usize] & mask != 0;
         }

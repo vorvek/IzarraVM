@@ -736,17 +736,16 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
     assert_eq!(cpu.pending_flags, pending);
 
     cpu.interrupt_shadow = false;
-    let flat_ss = cpu.registers.segment(SegmentIndex::Ss);
-    let mut changed_ss = flat_ss;
-    changed_ss.default_size_32 = !changed_ss.default_size_32;
-    cpu.registers.set_segment(SegmentIndex::Ss, changed_ss);
-    let mode_rejects = cpu.perf_counters().jit_direct_reject_mode_key;
-    assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
-    assert_eq!(
-        cpu.perf_counters().jit_direct_reject_mode_key - mode_rejects,
-        1
-    );
-    cpu.registers.set_segment(SegmentIndex::Ss, flat_ss);
+    // NO MODE-KEY ROW HERE ANY MORE. `run_direct_block` used to re-derive `jit_mode_key()` and
+    // refuse on a mismatch; this stanza flipped SS.B under the block and asserted the refusal.
+    // The compare is gone (audit 2.4): the probe that produces a block matches the full
+    // `BlockKey`, mode key included, and nothing between that probe and the entry can move a
+    // mode-key input. Only this seam, which enters a block the probe never handed it, could
+    // reach the refusal, and `jit_direct_reject_mode_key` read identically zero across
+    // duke3d-586-short, wolf3d-486 and tyrian-586. What still enforces the property is the
+    // KEYING: `retained_real_mode_chain_is_unreachable_under_pe` and its neighbours in
+    // `cpu_cr0_flush_test` prove a mode change cannot reach a block keyed for another mode, and
+    // a `debug_assert_eq!` at the entry catches a seam that tries.
 
     let flat_cs = cpu.registers.cs();
     cpu.cpl = 3;
