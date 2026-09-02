@@ -334,9 +334,13 @@ impl CpuGsw {
     /// CR3, so no arm here touches them any more -- only their three bus causes do. The FastMap
     /// wipe stays unconditional on BOTH arms below, exactly as before (T3, retaining it across an
     /// R1 reselect, is a later slice). The TLB is now GATED, the same shape as the decode and JIT
-    /// halves (T2): `Skipped` restores the reselected slot's generation with `select_generation`,
-    /// no walk, no entry lost; `Taken` retires both generations with `retire_all_slots` (consuming
-    /// the `RingRetired` token `select_context`'s R3 hands back) and then mints slot 0's fresh one.
+    /// halves (T2): `Reselected` restores the reselected slot's generation with `select_generation`,
+    /// no walk, no entry lost; `Allocated` mints a fresh generation for the newly occupied slot
+    /// with `allocate_generation`, trusting nothing about who held the slot before (review finding
+    /// P1, PR #826: merging this with `Reselected` let a directory that had just vacated a slot
+    /// via INVLPG's narrower retire be silently restored for a completely different directory);
+    /// `Taken` retires both generations with `retire_all_slots` (consuming the `RingRetired` token
+    /// `select_context`'s R3 hands back) and then mints slot 0's fresh one.
     /// The eip-window fetch frontend stays unconditional on every write, both arms, unchanged. The
     /// JIT half is gated TOO, by slice S-B (design doc `2026-09-02-cr3-jit-half-design.md`): a link
     /// graph built under one directory is retained across an R1 reselect back to it, keyed apart
@@ -351,18 +355,15 @@ impl CpuGsw {
     /// | L4, root dispatch is the base case | entry always builds its `BlockKey` from the LIVE physical, so no cell can ever be armed FROM a block that was never entered under this context, and `try_link_inner`'s `stale_epoch` refusal (compared against the live slot's epoch alone) is a second, independent barrier behind the key partition |
     /// | L5, every wholesale cause retires both `link_epochs` | `invalidate_translation` (this function's `Taken` arm, the translation-page store arm, the SMC wholesale arm) keeps tearing the WHOLE graph down exactly as before this slice; only the R1 reselect path is new |
     ///
-    /// `ContextSelect::Skipped(slot)` is R1 or R2 (`DecodeCache::select_context` cannot tell them
-    /// apart in its return type, and the JIT half does not need to): EITHER WAY this arm calls
-    /// only `select_link_context`, never `allocate_link_context`. That is safe, but it is NOT
-    /// "safe either way" on its own -- it is safe only because `BlockCache::new` seeds every ring
-    /// slot's `link_epochs` entry with a value that can never equal the unstamped-block sentinel
-    /// (0) or any other slot's value (review finding N1, `jit/direct.rs`'s `link_epochs` doc
-    /// comment). A virgin slot 1 selected for the first time by an R2 allocate is simply given
-    /// that SEEDED epoch, exactly as an R1 reselect of an already-warm slot is given its own
-    /// existing one; both rely on the seed invariant, and only the seed invariant, to be
-    /// distinguishable from "unstamped". `ContextSelect::Taken(slot)` is R3, and only that arm
-    /// calls `invalidate_translation()` (and, after it, `allocate_link_context`, which mints a
-    /// FRESH epoch rather than trusting a seed).
+    /// `ContextSelect::Reselected(slot)` is R1 and `ContextSelect::Allocated(slot)` is R2
+    /// (review finding P1, PR #826, split them: `DecodeCache::select_context` used to return one
+    /// `Skipped(slot)` for both, and a caller that could not tell them apart could only stay safe
+    /// by leaning on an invariant a narrower retire elsewhere could break). `Reselected` calls
+    /// `select_link_context`, restoring that slot's saved epoch; `Allocated` calls
+    /// `allocate_link_context`, minting a fresh one, exactly mirroring what the `Tlb` arm above
+    /// does for the same two cases and for the same reason. `ContextSelect::Taken(slot)` is R3,
+    /// and only that arm calls `invalidate_translation()` (and, after it, `allocate_link_context`,
+    /// which mints a FRESH epoch for slot 0 after the wholesale retire).
     pub(super) fn flush_tlb_and_code_caches_for_cr3_write(&mut self, new_cr3: u32) {
         self.perf.decode_inval_cr3 += 1;
         // `wipes_tlb_flush` stays first and unconditional (design section (d) point 1): it counts
@@ -390,14 +391,35 @@ impl CpuGsw {
             .decode_cache
             .select_context(old_cr3_masked, new_cr3_masked)
         {
-            ContextSelect::Skipped(slot) => {
+            ContextSelect::Reselected(slot) => {
                 self.perf.cr3_code_flush_skipped += 1;
-                // R1/R2: restore (or, for a fresh slot, adopt) that slot's own generation. No
-                // entry is lost; the generation compare in `lookup`/`insert` IS the restore.
+                // R1: the requested directory already owns this slot. RESTORE its saved
+                // generation and epoch; no entry is lost, and the generation/epoch compare in
+                // `lookup`/`insert`/`is_link_visible` IS the restore. Never mint here: see the
+                // `ContextSelect` doc comment (review finding P1, PR #826).
                 self.tlb.select_generation(slot);
                 #[cfg(feature = "jit")]
                 {
                     self.jit_direct.select_link_context(slot);
+                    self.perf.cr3_link_context_selects += 1;
+                }
+            }
+            ContextSelect::Allocated(slot) => {
+                self.perf.cr3_code_flush_skipped += 1;
+                // R2: a miss took a free slot. MINT a fresh generation and epoch for it; nothing
+                // about that slot's previous occupant, if any, may be trusted. This is the P1
+                // fix (review, PR #826): before this split, this arm called `select_generation`,
+                // which could restore a directory that had just vacated the slot via a narrow
+                // retire (INVLPG's `retire_dormant_slot`) that never re-minted THIS slot's
+                // generation, silently serving one directory's cached translations to another.
+                // Minting costs nothing here -- the slot is, by construction, either virgin
+                // (seeded distinct at `Tlb::default`/`BlockCache::new`) or was already fully
+                // retired -- so this is not a narrower fix, it removes the dependency on every
+                // OTHER caller keeping its own retire paired correctly.
+                self.tlb.allocate_generation(slot);
+                #[cfg(feature = "jit")]
+                {
+                    self.jit_direct.allocate_link_context(slot);
                     self.perf.cr3_link_context_selects += 1;
                 }
             }

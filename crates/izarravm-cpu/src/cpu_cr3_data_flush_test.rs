@@ -3,7 +3,20 @@
 
 //! The CR3 DATA-side gate, T1+T2 (`dev_docs/2026-09-02-cr3-data-side-design.md`, amended by
 //! `dev_docs/2026-09-02-cr3-code-cache-gate-review.md`'s "Review of the data-side design"
-//! section, findings D1 through D5).
+//! section, findings D1 through D5, and by that same document's "Review of PR #826", finding P1).
+//!
+//! P1 (PR #826, BLOCKING, fixed in the same PR): `ContextSelect::Skipped(slot)` used to cover
+//! both R1 (reselect: an occupied slot's saved generation/epoch must be RESTORED) and R2
+//! (allocate: a freshly (re)occupied slot's state must be MINTED). INVLPG's own narrow TLB fix
+//! (`retire_dormant_slot`) re-mints only the dormant generation while its wholesale decode/link
+//! teardown empties the whole ring, so a `MOV CR3` to a brand-new directory right after an
+//! INVLPG could take R2 into the reoccupied (formerly live) slot and RESTORE its untouched
+//! generation instead of minting -- silently serving one directory's TLB entries to another.
+//! `ContextSelect` now distinguishes `Reselected` (R1, restore) from `Allocated` (R2, mint); see
+//! `core.rs`'s `ContextSelect` doc comment and `flush_tlb_and_code_caches_for_cr3_write`'s match
+//! arms for the fix, and
+//! `a_reoccupied_slot_after_invlpg_never_serves_the_vacating_directorys_entries` below for the
+//! red-first row.
 //!
 //! T1: `data_read_pages`/`data_write_pages` are physical-page-and-bus-epoch keyed with no CR3
 //! dependence at all, so they are removed from the `MOV CR3` wipe unconditionally -- and, as a
@@ -406,6 +419,61 @@ fn frame_remap_shaped_row_uses_the_new_mapping_after_a_same_value_reload() {
     );
 }
 
+/// P1 (review, PR #826, BLOCKING). INVLPG's own narrow fix (`retire_dormant_slot`) re-mints only
+/// the DORMANT generation; the LIVE slot's generation is untouched even though INVLPG's own
+/// wholesale decode/link teardown (`invalidate_translation_code_caches`, mirrored here by calling
+/// `decode_cache.invalidate_and_clear_code_marks(false)` directly and discarding the token,
+/// exactly as `execute_extended.rs`'s INVLPG handler does) EMPTIES the decode ring. Before P1's
+/// fix, `select_context`'s R1 (reselect: restore) and R2 (allocate: mint) both returned one
+/// `Skipped(slot)`, so a `MOV CR3` to a brand-new directory right after an INVLPG took R2 into
+/// the now-empty ring and "restored" (`select_generation`, not `allocate_generation`) slot 0's
+/// UNTOUCHED generation -- silently serving directory A's surviving TLB entries to a directory
+/// the ring had never seen. It bites on exactly the entry states an INVLPG's own `invalidate`
+/// did NOT touch, which is why this row invalidates an UNRELATED page (`WRITER`'s) and checks
+/// `TLB_DATA`'s survives the INVLPG only to be required gone after the reoccupation.
+///
+/// Constructed at the mechanism level, exactly like `invlpg_retires_the_dormant_generation_too`
+/// above and for the same reason: an end-to-end row through the real INVLPG opcode exercises
+/// this too, but the mechanism level isolates it from everything else INVLPG's handler does.
+/// Mutation-verified by hand: reverting the `Allocated` arm in
+/// `core.rs::flush_tlb_and_code_caches_for_cr3_write` to call `select_generation` instead of
+/// `allocate_generation` (the pre-P1-fix shape) reddens this row; the fixed code leaves it green.
+#[test]
+fn a_reoccupied_slot_after_invlpg_never_serves_the_vacating_directorys_entries() {
+    let (mut cpu, mut bus) = cr3_fixture();
+    warm_writer_and_tlb_data(&mut cpu, &mut bus);
+
+    // A same-value reload seeds the ring (R8) and puts directory A properly in slot 0 via a real
+    // R1 reselect, exactly as any first `MOV CR3` would. This is load-bearing for reproducing
+    // the review's exact sequence: without it, the FIRST `write_cr3` below would be the one that
+    // seeds the ring, and the R8 seed always lands in slot 0, which would (coincidentally) mask
+    // this bug by never letting the exploit land in the slot whose generation INVLPG left
+    // untouched. A guest that has been running for more than one `MOV CR3` always has a seeded
+    // ring by the time it issues an INVLPG, which is the case this row must cover.
+    write_cr3(&mut cpu, &mut bus, PAGE_DIRECTORY);
+    assert!(
+        cpu.tlb.lookup(TLB_DATA >> 12).is_some(),
+        "the same-value reload above must not have disturbed TLB_DATA's warmed entry"
+    );
+
+    // Directory A is live in slot 0. INVLPG targets WRITER's page (0), not TLB_DATA's (3), so
+    // TLB_DATA's entry survives the `invalidate` call, still stamped with A's generation. The
+    // decode/link teardown that follows every real INVLPG then empties the ring regardless of
+    // which page was addressed; `ring_seeded` (set above) stays true, so the ring's next
+    // `select_context` call does NOT re-seed slot 0 -- it lands the next directory in whichever
+    // slot is free first, which is slot 0, the one INVLPG's narrow fix did not touch.
+    cpu.tlb.invalidate(WRITER >> 12);
+    cpu.tlb.retire_dormant_slot();
+    let _ = cpu.decode_cache.invalidate_and_clear_code_marks(false);
+
+    write_cr3(&mut cpu, &mut bus, DIR_C); // a directory the ring has never seen occupy the slot.
+
+    assert!(
+        cpu.tlb.lookup(TLB_DATA >> 12).is_none(),
+        "P1: a reoccupied ring slot must MINT a fresh TLB generation, never RESTORE one --          directory A's surviving entry must not answer for directory C, which has never walked          this page"
+    );
+}
+
 /// Section (f)'s "anyone reading `wipe_pages_cleared` as this slice's gate is reading T3's gate"
 /// warning, made a check: T1+T2 do not touch the FastMap, so its wipe extent is UNCHANGED by a
 /// plain ring-served `MOV CR3` versus one that also warms and drops a direct-page cache entry.
@@ -426,10 +494,12 @@ fn wipe_pages_cleared_is_not_this_slices_gate() {
     );
 }
 
-// MUTATION LEDGER, CR3 data-side gate T1+T2 (2026-09-02):
+// MUTATION LEDGER, CR3 data-side gate T1+T2 (2026-09-02), amended for P1 (PR #826 review, fixed
+// in the same PR):
 //
 // | mutation | row that reddens | verified |
 // |---|---|---|
+// | P1: revert `core.rs`'s `ContextSelect::Allocated` arm from `self.tlb.allocate_generation(slot)` back to `self.tlb.select_generation(slot)` (the pre-fix shape, indistinguishable from the `Reselected` arm) | `a_reoccupied_slot_after_invlpg_never_serves_the_vacating_directorys_entries` | by hand |
 // | M6: re-add `data_read_pages.invalidate()`/`data_write_pages.invalidate()` to the CR3 path | `r_d1_direct_page_cache_survives_a_same_directory_reselect`, `r_d1_direct_page_cache_survives_the_taken_arm_too` | by hand |
 // | M1: retire only the live TLB generation at the translation-page arm in `note_code_write_inner` (`self.tlb.retire_all_slots(retired)` -> `self.tlb.flush_live_slot()`) | `r_d3_a_pte_edit_between_the_two_writes_still_kills_the_entry` | by hand |
 // | M1, the SMC-wholesale arm's twin: same substitution at the second `note_code_write_inner` call site | `cross_context_smc_store_kills_the_other_context` (parent file) continues to pass at the DECODE layer regardless, since it never reads `cpu.tlb`; the TLB-specific catch for this exact site is `invlpg_retires_the_dormant_generation_too`'s sibling shape is not built here, because the parent file's `cross_context_smc_store_kills_the_other_context` fixture does not warm a TLB entry -- recorded as an untested site rather than claimed. See "Open items" below. |

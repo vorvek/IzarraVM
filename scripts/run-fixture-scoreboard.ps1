@@ -1142,17 +1142,36 @@ function Get-FixtureTable {
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; dukemark = $null
             # 2026-09-02 re-pin, e312f8f3 -> 6cc0d354 (the SAME hash this row pinned before the
-            # 2026-08-27 entry below, moved back to it). The CR3 data-side gate's T2 slice
-            # (`dev_docs/2026-09-02-cr3-data-side-design.md`) retains the TLB across a
-            # same-directory `MOV CR3` reselect instead of re-walking every time, so emulated
-            # clocks-per-instruction move and the fixed 4e9-cycle budget lands one torch-flame
-            # frame earlier -- the same class of drift as every re-pin in this row's history.
-            # Isolated by hand: reverting T2's `Tlb::insert` eviction-report change alone did not
-            # move the hash, and forcing every `MOV CR3` to fully re-flush the TLB (defeating the
-            # slice's own retention) ALSO reproduced the identical new hash, so the shift is from
-            # T2's timing change itself, not from a soundness gap in which entries survive.
-            # T1 alone (`dev_docs/2026-09-02-cr3-data-side-design.md` T1) reproduces the prior
-            # `e312f8f3` hash unchanged, matching its hard instruction-count-identity bar.
+            # 2026-08-27 entry below, `90c5e41d` "Re-pin prince-486 and tombraid-loader-586 to
+            # the PR 736 kernel", moved back to it). The CR3 data-side gate's PR #826 (T1+T2,
+            # `dev_docs/2026-09-02-cr3-data-side-design.md`) shifts the fixed 4e9-cycle budget one
+            # torch-flame frame earlier -- the same class of drift `90c5e41d` describes for the
+            # opposite direction (156 of 128000 pixels, all inside the two torch sprites). Content
+            # is verified by hash identity to that already-inspected frame, not by a fresh read.
+            #
+            # CAUSE, HONESTLY: T1 alone (`dev_docs/2026-09-02-cr3-data-side-design.md` T1)
+            # reproduces the prior `e312f8f3` hash and the prior instruction count UNCHANGED, so
+            # T1 is cleared. T1+T2 together move both. Inside T2, three internal mechanisms were
+            # tested as the specific cause, individually and in combination -- reverting
+            # `Tlb::insert`'s eviction-report predicate to its pre-T2 form, forcing every `MOV
+            # CR3` to fully re-flush the TLB instead of retaining it (`ContextSelect::Reselected`
+            # forced through `retire_all_slots`), and forcing `flush_tlb_keep_code_caches`'s PG=1
+            # arm to fully flush instead of `flush_live_slot` -- and NONE of them, alone or
+            # together, moved the hash or the instruction count off `6cc0d354` /
+            # `2079676716`. The earlier claim in this row ("T2's retention behavior itself") is
+            # RETRACTED as unsupported: the experiment that should have refuted it (forcing full
+            # re-flush on the CR3-write gate) left the shifted hash exactly in place, which
+            # contradicts that claim rather than confirming it. The specific mechanism inside T2
+            # responsible for the shift was not isolated. This does not change the merge decision
+            # -- the content question is settled independently by hash identity to a previously
+            # shipped, hand-verified frame -- but the causal sentence itself is not asserted.
+            #
+            # irq0_edges (independent confirmation the shift is a phase shift, not a different
+            # execution path): main and T1-only both read 4064 (pit_writes 23); T1+T2 reads 4069
+            # (pit_writes 28), +5 edges (+0.12%) against instructions -0.0104%, proportionate and
+            # in the direction a slightly earlier-landing budget predicts (a few more timer edges
+            # land inside the same fixed cycle budget). Read from `--profile-json`'s `timer` block
+            # on both binaries, prince-486's own schedule.
             #
             # 2026-08-30 re-pin, 04fd8558 -> 802e9d4f. The ISA I/O wait-state
             # flip: prince issues only 43 PIT writes all run, so the charge

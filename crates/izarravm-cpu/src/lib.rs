@@ -5179,7 +5179,9 @@ impl DecodeCache {
             self.contexts[0] = Some((old_cr3_masked, self.generation));
         }
         // R1: select. A hit means the requested directory already owns a slot; adopt its
-        // generation and clear nothing.
+        // generation and clear nothing. `Reselected`, never `Allocated`: the caller's per-slot
+        // state (the `Tlb` generation, the JIT link epoch) must be RESTORED, not re-minted --
+        // review finding P1 (PR #826) is exactly a caller that could not tell the difference.
         if let Some(slot) = self
             .contexts
             .iter()
@@ -5187,15 +5189,18 @@ impl DecodeCache {
         {
             let (_, slot_gen) = self.contexts[slot].expect("position found Some");
             self.generation = slot_gen;
-            return ContextSelect::Skipped(slot as u8);
+            return ContextSelect::Reselected(slot as u8);
         }
         // R2: allocate. A miss with a free slot mints a fresh generation nothing can match yet;
-        // nothing already live is invalidated.
+        // nothing already live is invalidated. `Allocated`, never `Reselected`: this slot's
+        // PREVIOUS occupant, if any, may have left per-slot state elsewhere (the `Tlb`
+        // generation, the JIT link epoch) that this call site knows nothing about restoring
+        // correctly -- see the `ContextSelect` doc comment and review finding P1 (PR #826).
         if let Some(slot) = self.contexts.iter().position(Option::is_none) {
             let slot_gen = self.allocate_generation();
             self.contexts[slot] = Some((new_cr3_masked, slot_gen));
             self.generation = slot_gen;
-            return ContextSelect::Skipped(slot as u8);
+            return ContextSelect::Allocated(slot as u8);
         }
         // R3: a third distinct value with both slots occupied retires everything -- today's
         // behaviour -- then occupies slot 0 with the new value. `translation_pages` clears: this
@@ -5247,20 +5252,44 @@ impl DecodeCache {
 }
 
 /// The outcome of `DecodeCache::select_context`: whether a `MOV CR3` write's code half was served
-/// by the ring (`Skipped`, no teardown) or forced today's full teardown (`Taken`, a third distinct
-/// value with both slots already occupied). Named so the two new counters
-/// (`cr3_code_flush_taken` / `cr3_code_flush_skipped`) read directly off the match. Both variants
-/// carry the ring slot the write resolved to (0 or 1), which the JIT half's link-context gate
-/// (`select_link_context` / `allocate_link_context`, `jit/direct.rs`) needs and which
-/// `DecodeCache::select_context` already computes for its own `self.contexts` indexing.
+/// by the ring (`Reselected` or `Allocated`, no teardown) or forced today's full teardown
+/// (`Taken`, a third distinct value with both slots already occupied). Both `Reselected` and
+/// `Allocated` count as "skipped" for the `cr3_code_flush_taken` / `_skipped` counters (read them
+/// off `matches!(outcome, ContextSelect::Taken(..))`, not off the variant name); the split exists
+/// for the per-slot state a CR3 writer restores alongside the decode ring, not for those counters.
+///
+/// **`Reselected` and `Allocated` are not interchangeable, and merging them into one `Skipped`
+/// variant was review finding P1 (PR #826).** `DecodeCache::select_context`'s own ring
+/// (`self.contexts`) is the only thing that renumbers atomically with every other per-slot cache
+/// this ring gates -- the `Tlb`'s `generations` and the JIT link graph's `link_epochs`. A caller
+/// that cannot tell R1 (`Reselected`: the requested directory already owns a slot, so its saved
+/// state must be RESTORED) from R2 (`Allocated`: a miss took a free slot, so nothing about that
+/// slot's PREVIOUS occupant may be assumed, and its state must be MINTED fresh) can only stay safe
+/// by leaning on an invariant that every OTHER retire of this ring also re-mints every per-slot
+/// cache's state for both slots in the same operation. That invariant held for the JIT link side
+/// (every `retire_ring` call this file makes is paired, at its own call site, with a
+/// `jit_direct.invalidate_translation()` that re-mints both `link_epochs` together) but not for
+/// the `Tlb`: INVLPG empties the ring via `invalidate_translation_code_caches` while its OWN,
+/// narrower fix (`retire_dormant_slot`) re-mints only the DORMANT generation, leaving the LIVE
+/// slot's generation untouched. A subsequent R2 allocate into the now-empty ring that RESTORED
+/// that untouched generation, instead of minting a fresh one, served one directory's TLB entries
+/// to a completely different directory that had never been seen before -- silently, no fault, no
+/// counter. Distinguishing the two arms and always minting on `Allocated` closes that without
+/// depending on any caller keeping its own retire paired correctly; see `execute_extended.rs`'s
+/// INVLPG handler and `paging.rs`'s `Tlb::allocate_generation` for the two ends of the fix.
+///
+/// Both variants carry the ring slot the write resolved to (0 or 1), which the JIT half's
+/// link-context gate (`select_link_context` / `allocate_link_context`, `jit/direct.rs`) needs and
+/// which `DecodeCache::select_context` already computes for its own `self.contexts` indexing.
 ///
 /// `Taken` also carries the `RingRetired` token from the `retire_ring` call inside R3 (design T2):
 /// the data-side ring (`Tlb`) must be retired in the same operation, and carrying the token on the
-/// variant that alone needs it means the `Skipped` arm cannot even try to consume one that was
-/// never minted.
+/// variant that alone needs it means neither `Reselected` nor `Allocated` can even try to consume
+/// one that was never minted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextSelect {
-    Skipped(u8),
+    Reselected(u8),
+    Allocated(u8),
     Taken(u8, RingRetired),
 }
 
