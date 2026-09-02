@@ -3,6 +3,25 @@
 
 # Troubleshooting and FAQ
 
+## IzarraVM will not start, or closes right away with an AVX2 message
+
+IzarraVM needs a host PC (not the emulated machine -- the real one that runs
+IzarraVM) with a CPU that supports AVX2. This has been true of practically
+every PC sold since around 2013, but some older machines, some low-power
+netbook and thin-client chips, and some virtual machines with a narrowed CPU
+model do not have it.
+
+If the host CPU lacks AVX2, IzarraVM shows a message that says so and closes.
+The `--interpreter` switch does not help here: it picks the portable CPU core
+over the native one, but only on a PC that already has AVX2. It was once also
+a way around the AVX2 requirement itself; it no longer is, because the
+program is now built to use these instructions throughout, starting before
+`--interpreter` or any other switch is even read.
+
+To check what your PC's CPU supports, see its manufacturer's specification
+page, or a system information tool. There is no fix from inside IzarraVM: the
+CPU has to support AVX2, or a different PC is needed.
+
 ## The machine is slow, or a game is slow
 
 Most games run at full speed, also in the top GSW-586 mode. Before you report

@@ -82,6 +82,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_Input",
     "Win32_UI_WindowsAndMessaging",
+    # GetConsoleWindow: the AVX2 preflight uses it to decide whether a modal
+    # message box is reachable (no console) or would hang a headless run
+    # (console attached, so stderr already reaches someone).
+    "Win32_System_Console",
     # Temporary riprofile sampler (suspend/GetThreadContext + dbghelp).
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",

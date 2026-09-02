@@ -317,8 +317,25 @@ fn requested_execution_backend(
     }
 }
 
+/// Locals-free shim. `require_avx2` must be the first thing this process
+/// does, and it must run before `main`'s own prologue can execute a single
+/// instruction that assumes the feature set it is about to check for --
+/// see `preflight`'s module comment. That is a source-order property
+/// ONLY if `main` has no locals of its own: a `main` with any local that
+/// forces callee-save xmm spills gets a prologue of VEX `vmovapd` moves
+/// before the first statement runs on a build compiled `-C
+/// target-cpu=x86-64-v3`, which faults on exactly the non-AVX host this
+/// check exists to catch. Keeping the real body in a separate
+/// `#[inline(never)]` function is what keeps `main` itself empty of
+/// locals; verified by disassembly (`dev_docs/2026-09-04-avx2-preflight-review.md`
+/// F1), not assumed.
 fn main() -> Result<(), Box<dyn Error>> {
     preflight::require_avx2();
+    real_main()
+}
+
+#[inline(never)]
+fn real_main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
