@@ -913,3 +913,132 @@ fn regen_movzx_movsx_goldens() {
         );
     }
 }
+
+/// Plant a known CF through a PENDING descriptor rather than through live `eflags`.
+///
+/// That distinction is the whole point of these three rows: `flag(FLAG_CF)` is a cheap bit test
+/// when nothing is pending and a full materialisation through `arith_flag` when something is, and
+/// the audit's 1.4/1.6 sink exists to keep the five ops that never read the carry from paying for
+/// the second shape. A fixture that seeded `eflags` directly would be green under a mutation that
+/// read CF in the wrong arm.
+fn seed_pending_carry(cpu: &mut CpuGsw, carry: bool) {
+    // SUB (op 5) leaves a Sub descriptor whose CF is `a < b`.
+    if carry {
+        cpu.alu(5, 0, 1, BusWidth::Dword);
+    } else {
+        cpu.alu(5, 1, 0, BusWidth::Dword);
+    }
+    assert!(
+        !cpu.pending_flags.is_none(),
+        "the seed must leave a pending descriptor"
+    );
+    assert_eq!(cpu.flag(FLAG_CF), carry, "the seeded carry");
+}
+
+/// Audit 1.4: `alu` reads CF inside the ADC and SBB arms, not once above the match.
+///
+/// The mutation this kills is "read CF in the wrong arm", in both directions: an ADD, SUB, CMP,
+/// AND, OR or XOR that consumes the carry in, and an ADC or SBB that does not.
+#[test]
+fn only_adc_and_sbb_consume_the_carry_in() {
+    for carry in [false, true] {
+        let delta = u32::from(carry);
+        // (op, a, b, expected result)
+        let rows: &[(u8, u32, u32, u32)] = &[
+            (0, 0x0000_0010, 0x0000_0020, 0x0000_0030), // ADD: never
+            (2, 0x0000_0010, 0x0000_0020, 0x0000_0030 + delta), // ADC: always
+            (3, 0x0000_0030, 0x0000_0010, 0x0000_0020 - delta), // SBB: always
+            (5, 0x0000_0030, 0x0000_0010, 0x0000_0020), // SUB: never
+            (7, 0x0000_0030, 0x0000_0010, 0x0000_0020), // CMP: never
+            (1, 0x0000_0010, 0x0000_0020, 0x0000_0030), // OR:  never
+            (4, 0x0000_0030, 0x0000_0010, 0x0000_0010), // AND: never
+            (6, 0x0000_0030, 0x0000_0010, 0x0000_0020), // XOR: never
+        ];
+        for &(op, a, b, expected) in rows {
+            let mut cpu = CpuGsw::default();
+            seed_pending_carry(&mut cpu, carry);
+            assert_eq!(
+                cpu.alu(op, a, b, BusWidth::Dword),
+                expected,
+                "alu op {op} with carry in {carry}"
+            );
+        }
+    }
+}
+
+/// Audit 1.6: `shift_rotate` seeds its carry only for RCL and RCR.
+///
+/// Same mutation, same two directions. The six ops that write `cf` on their first iteration must
+/// produce the same result and the same carry out whatever the carry in was, and the two that
+/// rotate through it must not.
+#[test]
+fn only_rcl_and_rcr_consume_the_shift_carry_in() {
+    for carry in [false, true] {
+        let bit = u32::from(carry);
+
+        let mut cpu = CpuGsw::default();
+        seed_pending_carry(&mut cpu, carry);
+        assert_eq!(
+            cpu.shift_rotate(2, 0, 1, BusWidth::Dword),
+            bit,
+            "RCL of zero by one must shift the carry in into bit 0"
+        );
+
+        let mut cpu = CpuGsw::default();
+        seed_pending_carry(&mut cpu, carry);
+        assert_eq!(
+            cpu.shift_rotate(3, 0, 1, BusWidth::Dword),
+            bit << 31,
+            "RCR of zero by one must shift the carry in into bit 31"
+        );
+
+        // ROL, ROR, SHL, SHR, /6 (SHL alias) and SAR of zero: zero out, carry out clear, whatever
+        // the carry in was.
+        for op in [0u8, 1, 4, 5, 6, 7] {
+            let mut cpu = CpuGsw::default();
+            seed_pending_carry(&mut cpu, carry);
+            assert_eq!(
+                cpu.shift_rotate(op, 0, 1, BusWidth::Dword),
+                0,
+                "shift/rotate op {op} of zero with carry in {carry}"
+            );
+            assert!(
+                !cpu.flag(FLAG_CF),
+                "shift/rotate op {op} must clear the carry out of a zero operand"
+            );
+        }
+    }
+}
+
+/// Audit 1.5: `alu_logic` materialises AF out of an OUTGOING arithmetic descriptor only.
+///
+/// AF rides live `eflags` under a Logic descriptor, so the bit an ADD or SUB descriptor holds has
+/// to be written there before the Logic descriptor replaces it. The gate that skips the write when
+/// there is no pending descriptor, or when the pending one is already Logic, is exact precisely
+/// because AF already lives in `eflags` in both of those states. This row fails under the gate
+/// written the other way round, and under dropping the write altogether.
+#[test]
+fn a_logic_op_carries_af_out_of_the_outgoing_arithmetic_descriptor() {
+    for (a, b, af) in [(0x0f_u32, 0x01_u32, true), (0x01_u32, 0x01_u32, false)] {
+        let mut cpu = CpuGsw::default();
+        // The default eflags carry AF clear, so the `true` row also proves the bit is really
+        // coming out of the descriptor and not out of stale live flags.
+        cpu.alu(0, a, b, BusWidth::Dword);
+        assert_eq!(cpu.flag(FLAG_AF), af, "the ADD's own AF");
+        cpu.alu(4, 0xffff_ffff, 0xffff_ffff, BusWidth::Dword);
+        assert_eq!(cpu.flag(FLAG_AF), af, "AND must carry the ADD's AF forward");
+        // Logic on top of Logic: the skipped write is a no-op here, so the bit must survive.
+        cpu.alu(1, 0, 0, BusWidth::Dword);
+        assert_eq!(
+            cpu.flag(FLAG_AF),
+            af,
+            "OR after AND must carry it forward again"
+        );
+        cpu.alu(6, 0x1234, 0x1234, BusWidth::Dword);
+        assert_eq!(
+            cpu.flag(FLAG_AF),
+            af,
+            "XOR after OR must carry it forward again"
+        );
+    }
+}

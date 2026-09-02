@@ -2064,24 +2064,39 @@ impl CpuGsw {
         self.set_flag_live(flag, enabled);
     }
 
+    /// CF and the width mask are read INSIDE the arms that use them, not once at the top.
+    ///
+    /// Only ADC (2) and SBB (3) consume the carry in, and `flag(FLAG_CF)` is not a bit test: with
+    /// a pending descriptor live it materialises CF through `arith_flag`, which loads the
+    /// descriptor, decodes its op and does a 64-bit compare. Hoisting that above the match made
+    /// every ADD, SUB, CMP, AND, OR and XOR pay for it and throw the answer away. The mask is the
+    /// same story one order of magnitude down: only the three logic arms mask here (the add and
+    /// sub helpers mask for themselves).
+    ///
+    /// Nothing between the old read point and an arm can move CF, so the sunk read sees exactly
+    /// the value the hoisted one did.
     pub(super) fn alu(&mut self, op: u8, a: u32, b: u32, width: BusWidth) -> u32 {
-        let mask = width_mask(width);
-        let cf_in = u32::from(self.flag(FLAG_CF));
         match op {
             0 => self.alu_add(a, b, 0, width),
-            2 => self.alu_add(a, b, cf_in, width),
-            3 => self.alu_sub(a, b, cf_in, width),
+            2 => {
+                let cf_in = u32::from(self.flag(FLAG_CF));
+                self.alu_add(a, b, cf_in, width)
+            }
+            3 => {
+                let cf_in = u32::from(self.flag(FLAG_CF));
+                self.alu_sub(a, b, cf_in, width)
+            }
             5 | 7 => self.alu_sub(a, b, 0, width),
             1 => {
-                let result = (a | b) & mask;
+                let result = (a | b) & width_mask(width);
                 self.alu_logic(result, width)
             }
             4 => {
-                let result = (a & b) & mask;
+                let result = (a & b) & width_mask(width);
                 self.alu_logic(result, width)
             }
             6 => {
-                let result = (a ^ b) & mask;
+                let result = (a ^ b) & width_mask(width);
                 self.alu_logic(result, width)
             }
             _ => unreachable!("alu op {op}"),
@@ -2168,7 +2183,12 @@ impl CpuGsw {
         let msb = width_sign(width);
         let bits = width.bytes() * 8;
         let mut v = value & mask;
-        let mut cf = self.flag(FLAG_CF); // seed for RCL/RCR
+        // Seeded ONLY for RCL/RCR, the two ops that read the carry IN. Every other arm assigns
+        // `cf` on its first iteration and `count` is at least 1 here, so the seed those ops see is
+        // dead -- and `flag(FLAG_CF)` is a full materialisation through the pending descriptor,
+        // not a bit test, which is what made paying for it on every SHL/SHR/SAR/ROL/ROR worth
+        // removing.
+        let mut cf = matches!(op, 2 | 3) && self.flag(FLAG_CF);
         for _ in 0..count {
             match op {
                 0 => {
@@ -2339,11 +2359,18 @@ impl CpuGsw {
 
     pub(super) fn alu_logic(&mut self, result: u32, width: BusWidth) -> u32 {
         let result = result & width_mask(width);
-        let af = self.flag(FLAG_AF);
-        if af {
-            self.registers.eflags |= FLAG_AF;
-        } else {
-            self.registers.eflags &= !FLAG_AF;
+        // AF rides live `eflags` under a Logic descriptor (see `arith_flag`'s Logic arm), so the
+        // OUTGOING descriptor's AF has to be materialised into `eflags` before the Logic
+        // descriptor below replaces it. That is only true of an ADD or SUB descriptor: with no
+        // pending descriptor, or a Logic one already, `flag(FLAG_AF)` reads `eflags & FLAG_AF`
+        // and this writes the same bit straight back, so the read-back and the read-modify-write
+        // were a no-op on every logic op that followed a logic op.
+        if !self.pending_flags.is_none() && self.pending_flags.op() != LazyFlagOp::Logic {
+            if self.arith_flag(FLAG_AF) {
+                self.registers.eflags |= FLAG_AF;
+            } else {
+                self.registers.eflags &= !FLAG_AF;
+            }
         }
         self.registers.eflags |= 0x2;
         let lf = LazyFlags {
