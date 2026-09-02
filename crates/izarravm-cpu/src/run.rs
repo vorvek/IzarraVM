@@ -585,7 +585,7 @@ impl CpuGsw {
                 lin,
             );
         }
-        if diff_trace_enabled() {
+        if self.retire_gates.diff_trace {
             self.emit_diff_trace_line(start_cs, start_eip);
         }
         Ok(CycleOutcome {
@@ -2648,7 +2648,7 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.sweep_sticky_watch_edges();
-        if self.profile.enabled || diff_trace_enabled() {
+        if self.profile.enabled || self.retire_gates.diff_trace {
             self.perf.jit_direct_reject_observer += 1;
             ea_mark!(Phase::Refused);
             ea_refusal!(site::OBSERVER_OR_DIFF_TRACE);
@@ -3924,7 +3924,7 @@ impl CpuGsw {
                     // interpreted-retire tail (506.85M instructions in a Quake/586 run) and the
                     // census, off by default, never consumes it otherwise.
                     #[cfg(feature = "jit")]
-                    if self.jit_direct.barrier_census_active() {
+                    if self.retire_gates.barrier_census {
                         self.jit_direct.note_barrier_census_interpreted(insn);
                     }
                     // This non-profiling fast tail is the COMMON continuation retire path; observe
@@ -3939,7 +3939,7 @@ impl CpuGsw {
                     if self.is_ring0_protected() {
                         self.perf.monitor_resident_core_clocks += charged;
                     }
-                    if diff_trace_enabled() {
+                    if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
                     Ok(CycleOutcome {
@@ -3960,7 +3960,7 @@ impl CpuGsw {
         // the same Ok retirements here so the count stays exact when profiling is enabled.
         #[cfg(feature = "jit")]
         if result.is_ok() {
-            if self.jit_direct.barrier_census_active() {
+            if self.retire_gates.barrier_census {
                 self.jit_direct.note_barrier_census_interpreted(insn);
             }
             self.unit_sim_observe(
@@ -4034,7 +4034,7 @@ impl CpuGsw {
                     // tail bypasses finish_instruction, so the diff-trace hook
                     // must be duplicated here or every cached-path instruction
                     // (the common case) goes untraced.
-                    if diff_trace_enabled() {
+                    if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
                     Ok(CycleOutcome {

@@ -436,7 +436,7 @@ fn the_census_arm_is_byte_identical_with_and_without_the_memo() {
     fn run(memo: bool) -> (u64, u64, u64) {
         let mut cpu = fresh();
         cpu.jit_direct.decline_memo_disabled_for_test = !memo;
-        cpu.jit_direct.set_barrier_census_enabled(true);
+        cpu.enable_direct_barrier_census(true);
         let mut bus = TestBus::with_memory(loop_program());
         drive(&mut cpu, &mut bus);
         let census = cpu

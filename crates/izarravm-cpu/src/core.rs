@@ -1014,6 +1014,7 @@ impl CpuGsw {
     /// and branch. `finish_instruction` asks this on every retired instruction (V86-monitor
     /// residency attribution), so the redundancy is per-instruction. Identical by boolean
     /// algebra: `PE && (!PE || !VM) == PE && !VM`.
+    #[inline]
     pub fn is_ring0_protected(&self) -> bool {
         self.is_protected_mode()
             && self.registers.eflags & FLAG_VM == 0
@@ -1579,7 +1580,13 @@ impl CpuGsw {
     /// Enable or disable the host-only Direct structural-stop census.
     pub fn enable_direct_barrier_census(&mut self, enabled: bool) {
         #[cfg(feature = "jit")]
-        self.jit_direct.set_barrier_census_enabled(enabled);
+        {
+            self.jit_direct.set_barrier_census_enabled(enabled);
+            // The retire tail reads the mirror, not the boxed state, so this is the invalidation
+            // half of `RetireGates`. Re-read rather than assign `enabled`, so the mirror is
+            // whatever the state actually reports.
+            self.retire_gates.barrier_census = self.jit_direct.barrier_census_active();
+        }
         #[cfg(not(feature = "jit"))]
         let _ = enabled;
     }

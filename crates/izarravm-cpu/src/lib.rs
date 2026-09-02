@@ -2664,6 +2664,51 @@ impl PartialEq for FarCallLedger {
 
 impl Eq for FarCallLedger {}
 
+/// The two run-invariant diagnostic gates the interpreted-retire tail used to ask per
+/// instruction, mirrored into `CpuGsw` so the tail reads a byte instead of a synchronising load.
+///
+/// `diff_trace` mirrors `run::diff_trace_enabled()`, whose backing `OnceLock` costs an Acquire
+/// load that LLVM may not hoist out of `run_budgeted_inner`. `barrier_census` mirrors
+/// `JitState::barrier_census_active()`, which loads the boxed `JitState` pointer and then a field
+/// in a large struct the tail has no other reason to touch. Both answers are constant for the
+/// life of a run, and `decode_pack_enabled` already sets the precedent of resolving a
+/// process-constant knob once instead of per instruction.
+///
+/// Wrapper struct rather than two loose bools for `FastMapServeGate`'s reason: it must stay out of
+/// `CpuGsw` equality (whole-CPU `==` is load-bearing in the differential tests and this is a pair
+/// of diagnostic gates, not guest state), and its `Clone` has to match what the state it mirrors
+/// clones to.
+#[derive(Debug)]
+pub(crate) struct RetireGates {
+    /// `run::diff_trace_enabled()`, resolved at construction. Process-constant.
+    pub(crate) diff_trace: bool,
+    /// `jit_direct.barrier_census_active()`, resynced by `enable_direct_barrier_census`.
+    #[cfg(feature = "jit")]
+    pub(crate) barrier_census: bool,
+}
+
+impl Clone for RetireGates {
+    fn clone(&self) -> Self {
+        Self {
+            // The clone runs in the same process, so the env answer is the same answer.
+            diff_trace: self.diff_trace,
+            // `JitState`'s own `Clone` hands the clone a fresh state with no census attached, so
+            // the mirror clears rather than copies: this is the value the clone's `jit_direct`
+            // will actually report.
+            #[cfg(feature = "jit")]
+            barrier_census: false,
+        }
+    }
+}
+
+impl PartialEq for RetireGates {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RetireGates {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuGsw {
     pub registers: Registers,
@@ -2906,6 +2951,10 @@ pub struct CpuGsw {
     /// duke3d-486, and this instrument's disarm was gated on an interleaved A/B/B/A before the
     /// behavioural steps that consume it were allowed to land.
     slot_census_enabled: bool,
+    /// The hoisted per-retire diagnostic gates; see `RetireGates`. At the `CpuGsw` tail for the
+    /// layout reason every field around it carries: it must not move `pending_flags` off its
+    /// pinned offset.
+    pub(crate) retire_gates: RetireGates,
     /// Where the last fatal `CpuError` was raised, for the machine's stop
     /// report. Written by all three sites that turn an `InternalFault` into a
     /// fatal `CpuError`, so it can never name the wrong fault; read ONLY on the
@@ -2938,6 +2987,10 @@ impl Default for CpuGsw {
         let jit_direct = Box::new(jit::JitState::new(jit::direct::BlockCache::new(
             decode_cache.line_count(),
         )));
+        // Read before the literal below moves `jit_direct`: the mirror is seeded from the state
+        // it mirrors, never from `barrier_census_default()` a second time.
+        #[cfg(feature = "jit")]
+        let barrier_census_armed = jit_direct.barrier_census_active();
         #[allow(unused_mut)]
         let mut cpu = Self {
             registers: Registers::default(),
@@ -3011,6 +3064,13 @@ impl Default for CpuGsw {
             last_written_page: NO_LAST_WRITTEN_PAGE,
             rmw_census_enabled: rmw_census_default(),
             slot_census_enabled: slot_census_default(),
+            retire_gates: RetireGates {
+                diff_trace: crate::run::diff_trace_enabled(),
+                // Seeded from the state it mirrors rather than from `barrier_census_default()`
+                // directly, so the two can never disagree at construction.
+                #[cfg(feature = "jit")]
+                barrier_census: barrier_census_armed,
+            },
             fault_site: FaultSite::default(),
         };
         // The literal above is the only place a `CpuGsw` picks a mode without going through
