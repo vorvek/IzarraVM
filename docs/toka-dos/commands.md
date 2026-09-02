@@ -597,7 +597,7 @@ This is a first preview. The program opens with a menu bar, a left-hand tab
 rail, and a Directory tab showing two panes. Each pane holds a drive letter,
 a path, and a listing; the mouse or the arrow keys move the cursor, and
 buttons in the pane make a directory, copy, move, paste, and delete. Opening
-a file switches to a second tab, a visual version of TokaEDIT, for reading
+a file switches to a second tab, a visual version of TokaEdit, for reading
 and writing plain text.
 
 TOKADESK does not yet start a program from its Directory tab; there is no

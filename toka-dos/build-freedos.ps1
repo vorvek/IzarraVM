@@ -307,7 +307,7 @@ Write-Host "EDIT.COM: $((Get-Item $editExe).Length) bytes"
 # --- TOKADESK.EXE (32-bit visual workbench; original tools-src, GPL-3). Like
 # TOKAMOUS.COM below, the shipped copy is a committed binary in the firmware
 # crate: the image builder takes it from there on both of its paths, so a
-# TokaDESK change always needs a rebuild here before it reaches the image. ---
+# TokaDesk change always needs a rebuild here before it reaches the image. ---
 $tokadeskDir = Join-Path $root 'tools-src\tokadesk'
 & (Join-Path $tokadeskDir 'build.ps1')
 if ($LASTEXITCODE) { throw "TOKADESK build failed" }

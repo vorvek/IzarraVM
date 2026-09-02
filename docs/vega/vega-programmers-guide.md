@@ -404,8 +404,8 @@ It expands the text into the title bars and icons. It then draws the frames,
 as lines or as thin filled rectangles. The CPU writes a small number of
 registers for each object, and the engine moves the pixels.
 
-TokaDESK, the first preview of the Toka-DOS visual workbench, draws this way
+TokaDesk, the first preview of the Toka-DOS visual workbench, draws this way
 today: every keypress and mouse click redraws the whole screen with FILL and
 EXPAND commands, with no damage tracking and no offscreen cache. The MG_CMD_COPY
 command exists on the engine for a future cached redraw, but nothing in
-TokaDESK uses it yet.
+TokaDesk uses it yet.

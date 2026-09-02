@@ -443,7 +443,7 @@ def main(check: bool = False) -> int:
         # full-screen editor. A large-model MZ exe shipped as EDIT.COM --
         # faithful to real MS-DOS, whose EDIT.COM is itself an MZ executable.
         ("EDIT.COM", edit, ATTR_ARCHIVE),
-        # TokaDESK, the visual workbench (GPL-3, original tools-src). A
+        # TokaDesk, the visual workbench (GPL-3, original tools-src). A
         # committed binary in the firmware crate, like TOKAMOUS.COM above;
         # see toka-dos/tools-src/tokadesk and dev_docs/2026-09-02-tokadesk-ship.md.
         ("TOKADESK.EXE", tokadesk, ATTR_ARCHIVE),
