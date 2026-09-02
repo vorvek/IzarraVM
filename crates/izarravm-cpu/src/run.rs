@@ -847,11 +847,13 @@ impl CpuGsw {
                             }
                             break;
                         }
-                        if (lin & 0xfff) + u32::from(screen.len) > 0x1000 {
-                            self.perf.brk_decode_or_branch += 1;
-                            self.perf.brk_cont_page_cross += 1;
-                            break;
-                        }
+                        // NO PAGE-CROSS SCREEN. `DecodeCache::put` rejects any line whose
+                        // instruction straddles a 4 KiB boundary, under the identical predicate,
+                        // so a cached line can never answer this one yes and `brk_cont_page_cross`
+                        // is identically zero. The counter stays in `PerfCounters`, permanently
+                        // zero, so the report's field set does not move; what came out is an add,
+                        // a compare and a branch per continuation, plus `screen.len`'s live range
+                        // across them.
                         if !Self::fetch_within_limit(self.registers.eip, screen.len, cs.limit) {
                             self.perf.brk_decode_or_branch += 1;
                             self.perf.brk_cont_not_continuable += 1;

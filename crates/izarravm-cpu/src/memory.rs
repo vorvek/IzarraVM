@@ -956,8 +956,10 @@ impl CpuGsw {
             self.perf.direct_page_misses += 1;
             return Ok(None);
         };
-        let offset = (physical & 0x0fff) as usize;
-        if page.len < 0x1000 || offset + width.bytes() as usize > page.len {
+        // `offset + width > page.len` is NOT tested. `direct_access_page_local` at the top of this
+        // function already proved `offset + width <= 0x1000`, and the disjunct before this one
+        // proved `page.len >= 0x1000`, so the range is inside the page by transitivity.
+        if page.len < 0x1000 {
             self.perf.direct_page_misses += 1;
             return Ok(None);
         }
@@ -986,18 +988,7 @@ impl CpuGsw {
     pub(super) fn read_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        linear: u32,
-        physical: u32,
-        kind: BusAccessKind,
-    ) -> ExecResult<Option<u8>> {
-        self.read_direct_byte_page_cached_inner(bus, Some(linear), physical, kind)
-    }
-
-    #[inline]
-    fn read_direct_byte_page_cached_inner<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        _linear: Option<u32>,
+        _linear: u32,
         physical: u32,
         kind: BusAccessKind,
     ) -> ExecResult<Option<u8>> {
@@ -1007,15 +998,13 @@ impl CpuGsw {
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
             ))]
-            if let Some(linear) = _linear {
-                self.populate_fast_map_from_cached(
-                    linear,
-                    physical,
-                    entry,
-                    self.data_read_pages.mapping_epoch(),
-                    false,
-                );
-            }
+            self.populate_fast_map_from_cached(
+                _linear,
+                physical,
+                entry,
+                self.data_read_pages.mapping_epoch(),
+                false,
+            );
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             self.record_data_read(kind, true);
             self.perf.direct_data_pointer_reads += 1;
@@ -1038,9 +1027,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear {
-            self.populate_fast_map(linear, physical, page, false);
-        }
+        self.populate_fast_map(_linear, physical, page, false);
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, true);
         self.perf.direct_data_pointer_reads += 1;
@@ -1093,8 +1080,9 @@ impl CpuGsw {
             self.perf.direct_page_misses += 1;
             return Ok(None);
         };
-        let offset = (physical & 0x0fff) as usize;
-        if !page.writable || page.len < 0x1000 || offset + width.bytes() as usize > page.len {
+        // See `read_direct_page_cached`: the range-inside-the-page disjunct is implied by
+        // `direct_access_page_local` above plus `page.len >= 0x1000` here.
+        if !page.writable || page.len < 0x1000 {
             self.perf.direct_page_misses += 1;
             return Ok(None);
         }
@@ -1123,19 +1111,7 @@ impl CpuGsw {
     pub(super) fn write_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        linear: u32,
-        physical: u32,
-        value: u8,
-        kind: BusAccessKind,
-    ) -> ExecResult<Option<bool>> {
-        self.write_direct_byte_page_cached_inner(bus, Some(linear), physical, value, kind)
-    }
-
-    #[inline]
-    fn write_direct_byte_page_cached_inner<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        _linear: Option<u32>,
+        _linear: u32,
         physical: u32,
         value: u8,
         kind: BusAccessKind,
@@ -1146,15 +1122,13 @@ impl CpuGsw {
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
             ))]
-            if let Some(linear) = _linear {
-                self.populate_fast_map_from_cached(
-                    linear,
-                    physical,
-                    entry,
-                    self.data_write_pages.mapping_epoch(),
-                    true,
-                );
-            }
+            self.populate_fast_map_from_cached(
+                _linear,
+                physical,
+                entry,
+                self.data_write_pages.mapping_epoch(),
+                true,
+            );
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             let offset = (physical & 0x0fff) as usize;
             let changed = unsafe { *entry.ptr.add(offset) != value };
@@ -1181,9 +1155,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear {
-            self.populate_fast_map(linear, physical, page, true);
-        }
+        self.populate_fast_map(_linear, physical, page, true);
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         let changed = unsafe { *page.ptr.add(offset) != value };
         unsafe {
@@ -1422,6 +1394,7 @@ impl CpuGsw {
     /// Instruction fetch never routes through here (it uses `code_linear_for_offset`),
     /// so CS's own readability never needs checking on this path -- only the case of a
     /// *data* segment register (DS/ES/FS/GS/SS) that happens to hold a code descriptor.
+    #[inline]
     pub(super) fn check_segment_access_kind(
         &self,
         segment: SegmentIndex,
@@ -1905,6 +1878,9 @@ impl CpuGsw {
         Ok((linear, physical))
     }
 
+    /// `#[inline]` because it sits on every segmented data access and is two loads and a
+    /// comparison on the flat-descriptor arm every 32-bit game takes.
+    #[inline]
     fn segment_linear_range(
         &self,
         segment: SegmentIndex,
@@ -1912,12 +1888,16 @@ impl CpuGsw {
         width: u32,
         write: bool,
     ) -> ExecResult<u32> {
+        // Every caller passes `width.bytes()` (1, 2 or 4), a `bytes` product of a non-zero
+        // iteration count and a non-zero access width, or the literal 4. A zero would make the
+        // limit check ask about a range with no bytes in it, which is not a shape this core has.
+        debug_assert!(width >= 1, "a segmented access has at least one byte");
         let descriptor = self.registers.segment(segment);
         self.check_segment_access_kind(segment, descriptor.access, write)?;
         let linear = if descriptor.base == 0 && descriptor.limit == u32::MAX {
             offset
         } else {
-            let last = offset.saturating_add(width.saturating_sub(1));
+            let last = offset.saturating_add(width - 1);
             let expand_down = self.is_protected_mode()
                 && !self.is_v86_mode()
                 && descriptor.access & 0x18 == 0x10

@@ -387,16 +387,31 @@ impl JitState {
         self.direct.fill_demoted_callout_sites_for_test();
     }
 
+    /// `#[cold]` + `#[inline(never)]` here too, so the hot entry function's call site is a call
+    /// and not an inlined forwarding shim into a body that is itself cold. See
+    /// `BlockCache::retire_key_for_recompile`.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_recompile(&mut self, key: direct::BlockKey) -> bool {
         self.direct
             .retire_key_for_recompile(&mut self.code_watch, key)
     }
 
+    /// `#[cold]` + `#[inline(never)]` here too, so the hot entry function's call site is a call
+    /// and not an inlined forwarding shim into a body that is itself cold. See
+    /// `BlockCache::retire_key_for_recompile`.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_top_mismatch(&mut self, key: direct::BlockKey) -> bool {
         self.direct
             .retire_key_for_top_mismatch(&mut self.code_watch, key)
     }
 
+    /// `#[cold]` + `#[inline(never)]` here too, so the hot entry function's call site is a call
+    /// and not an inlined forwarding shim into a body that is itself cold. See
+    /// `BlockCache::retire_key_for_recompile`.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_data_segment(
         &mut self,
         key: direct::BlockKey,

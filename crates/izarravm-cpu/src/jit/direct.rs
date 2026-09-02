@@ -2659,6 +2659,12 @@ impl BlockCache {
     /// Retire one descriptor-specialized block while keeping its key in the observed state. The
     /// current encounter falls back to the interpreter; the next encounter recompiles directly
     /// for the then-current segment layout instead of paying another first-seen pass.
+    /// `#[cold]` + `#[inline(never)]`: a refusal arm inside `run_direct_block`. Inlining a
+    /// multi-lookup body into the hot entry function costs I-cache and register pressure on every
+    /// entry that does NOT refuse. `classify_unbound_exit` and `FastMap::classify_reject` carry
+    /// the same pair for the same reason.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_recompile(
         &mut self,
         watch: &mut NativeCodeWatch,
@@ -2704,6 +2710,12 @@ impl BlockCache {
     /// that has already spent its budget keeps its block and keeps refusing, so the worst case is
     /// permanent interpretation of that block: slow, never wrong. On a guest that cycles TOPs
     /// through one key the uncapped form recompiles forever and enters natively never.
+    /// `#[cold]` + `#[inline(never)]`: a refusal arm inside `run_direct_block`. Inlining a
+    /// multi-lookup body into the hot entry function costs I-cache and register pressure on every
+    /// entry that does NOT refuse. `classify_unbound_exit` and `FastMap::classify_reject` carry
+    /// the same pair for the same reason.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_top_mismatch(
         &mut self,
         watch: &mut NativeCodeWatch,
@@ -12017,6 +12029,29 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 ///   `=count`, `=true`) that fell through would run exactly what an unset environment runs and be
 ///   read as "the arm I asked for changed nothing", which is the one wrong conclusion an arm ladder
 ///   exists to avoid.
+/// `imm8_lanes_enabled() || count_lanes_enabled()`, resolved ONCE.
+///
+/// `note_code_byte_write_hit` asks this per changed byte store, and both knobs are process
+/// constants behind their own `OnceLock`, so the un-hoisted form cost two Acquire loads and two
+/// branches on a per-store path. Both default ON, so the common answer is `true` and the first
+/// load alone would usually settle it; the second is what a `0`/`off` arm pays for. The composed
+/// answer is cached here instead.
+///
+/// NOT cached under `cfg(test)`: both knobs have thread-local overrides there, and an A/B test
+/// that flips one has to see the flip.
+#[cfg(feature = "jit")]
+pub(crate) fn value_aware_byte_door_enabled() -> bool {
+    #[cfg(test)]
+    {
+        imm8_lanes_enabled() || count_lanes_enabled()
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| imm8_lanes_enabled() || count_lanes_enabled())
+    }
+}
+
 pub(crate) fn count_lanes_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = COUNT_LANES_OVERRIDE.with(std::cell::Cell::get) {
@@ -30557,13 +30592,16 @@ unsafe extern "C" fn push_all_dword<B: CpuBus>(
         );
         return STATUS_ABNORMAL;
     }
-    let registers = cpu.registers.clone();
+    // NO REGISTER SNAPSHOT. This used to clone the whole 136-byte `Registers` so the error arm
+    // could restore it, and the restore was redundant twice over: `push_all_gpr` performs its own
+    // ESP rewind on a fault, and a push touches no other register, so the wholesale assignment
+    // put back values nothing had changed. The residency proof above says the arm is unreachable
+    // anyway; the `debug_assert` stays, so a build that can reach it says so.
     if cpu.push_all_gpr(bus, OperandSize::Dword).is_err() {
         debug_assert!(
             false,
             "a resident PUSHAD frame faulted inside a call-out slot"
         );
-        cpu.registers = registers;
         #[cfg(feature = "direct-callout-attribution")]
         cpu.jit_direct.note_callout_attribution(
             CallOutHelper::PushAllDword,
@@ -30633,13 +30671,18 @@ unsafe extern "C" fn pop_all_dword<B: CpuBus>(
         );
         return STATUS_ABNORMAL;
     }
-    let registers = cpu.registers.clone();
+    // The GPRs alone, not the whole 136-byte `Registers`. `pop_all_gpr` writes through
+    // `write_gpr_sized` and `set_esp` and touches nothing else, so restoring the eight-word block
+    // is exactly what the wholesale assignment used to achieve, at 32 bytes instead of 136. The
+    // restore is kept rather than dropped because, unlike PUSHAD's, `pop_all_gpr` has no rewind
+    // of its own: a fault part way through leaves registers half loaded.
+    let gpr = cpu.registers.gpr;
     if cpu.pop_all_gpr(bus, OperandSize::Dword).is_err() {
         debug_assert!(
             false,
             "a resident POPAD frame faulted inside a call-out slot"
         );
-        cpu.registers = registers;
+        cpu.registers.gpr = gpr;
         #[cfg(feature = "direct-callout-attribution")]
         cpu.jit_direct.note_callout_attribution(
             CallOutHelper::PopAllDword,
@@ -33002,6 +33045,12 @@ impl BlockCache {
     /// `retire_key_for_top_mismatch`, so a key that is not `Compiled` never gets a row written for
     /// it and the map's key set stays contained in `entries`; and stage 2 needs the `BlockId`
     /// that lookup produces.
+    /// `#[cold]` + `#[inline(never)]`: a refusal arm inside `run_direct_block`. Inlining a
+    /// multi-lookup body into the hot entry function costs I-cache and register pressure on every
+    /// entry that does NOT refuse. `classify_unbound_exit` and `FastMap::classify_reject` carry
+    /// the same pair for the same reason.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn retire_key_for_data_segment(
         &mut self,
         watch: &mut NativeCodeWatch,
@@ -37860,37 +37909,37 @@ pub const N_REFUSAL_SITES: usize = 28;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1350),
-    ("skip_backend_or_skip_once", 1358),
-    ("skip_approximate_timing", 1364),
-    ("jit16_level_zero", 1506),
-    ("approximate_timing", 1512),
-    ("auto_admit", 1523),
-    ("direct_hot_at", 1537),
-    ("decline_memo_hit", 1563),
-    ("key_for_phys_none", 1575),
-    ("probe_interpret", 1588),
+    ("skip_native_continuations_inactive", 1352),
+    ("skip_backend_or_skip_once", 1360),
+    ("skip_approximate_timing", 1366),
+    ("jit16_level_zero", 1508),
+    ("approximate_timing", 1514),
+    ("auto_admit", 1525),
+    ("direct_hot_at", 1539),
+    ("decline_memo_hit", 1565),
+    ("key_for_phys_none", 1577),
+    ("probe_interpret", 1590),
     // Two returns carry this site since the break-site caller learned to tell a settled
     // `Rejected` from a `Dormant`; the first is cited, which is the one nearly every refusal
     // takes. Both satisfy the fixture below: each has the macro immediately above it.
-    ("probe_rejected", 1621),
-    ("link_line_not_live", 1914),
-    ("revalidate_none", 1920),
-    ("dispatch_deferred_short", 1958),
-    ("observer_or_diff_trace", 2656),
-    ("interrupt_shadow", 2663),
-    ("aggregate_accounting", 2670),
-    ("native_fetch_trace", 2684),
-    ("x87_top", 2712),
-    ("cs_layout", 2730),
-    ("cpl", 2738),
-    ("callout_privileged", 2819),
-    ("data_segment", 2950),
-    ("alignment", 2959),
-    ("fetch_limit", 2974),
-    ("entry_deferred_short", 2988),
-    ("zero_budget", 3096),
-    ("block_regenerated_none", 3132),
+    ("probe_rejected", 1623),
+    ("link_line_not_live", 1916),
+    ("revalidate_none", 1922),
+    ("dispatch_deferred_short", 1960),
+    ("observer_or_diff_trace", 2658),
+    ("interrupt_shadow", 2665),
+    ("aggregate_accounting", 2672),
+    ("native_fetch_trace", 2686),
+    ("x87_top", 2714),
+    ("cs_layout", 2732),
+    ("cpl", 2740),
+    ("callout_privileged", 2821),
+    ("data_segment", 2952),
+    ("alignment", 2961),
+    ("fetch_limit", 2976),
+    ("entry_deferred_short", 2990),
+    ("zero_budget", 3098),
+    ("block_regenerated_none", 3134),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -37929,7 +37978,7 @@ pub(crate) mod site {
 #[cfg(feature = "direct-entry-attribution")]
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1565;
+pub const P0_MARK_LINE: u32 = 1567;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
@@ -37956,13 +38005,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1717),
-    ("structural_reject", 1736),
-    ("compile_retry", 1747),
-    ("page_cover_failed", 1771),
-    ("lane_install_demote", 1807),
-    ("install_failed", 1817),
-    ("installed_fall_through", 1899),
+    ("heat_demote", 1719),
+    ("structural_reject", 1738),
+    ("compile_retry", 1749),
+    ("page_cover_failed", 1773),
+    ("lane_install_demote", 1809),
+    ("install_failed", 1819),
+    ("installed_fall_through", 1901),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {

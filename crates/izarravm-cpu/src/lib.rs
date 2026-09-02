@@ -4014,10 +4014,15 @@ impl DecodeLineView {
             // The unpacked arm holds the instruction already, so it answers from the same
             // definition the pack writer uses rather than from a stored bit. Both arms therefore
             // reach the run loop's gate with the same value.
+            //
+            // Guarded by `continuable` because the run loop reads this field in ONE place, inside
+            // the `!continuable` break arm, and continuations are continuable about nineteen
+            // times in twenty. The predicate is a handful of compares and a setcc; behind the
+            // bool the screen has already loaded it costs nothing on the common path. The packed
+            // arm answers from a stored bit and is unaffected either way.
             #[cfg(feature = "jit")]
-            noncont_break_probe: jit::direct::non_continuable_break_probe_candidate(
-                self.insn.opcode,
-            ),
+            noncont_break_probe: !self.insn.continuable
+                && jit::direct::non_continuable_break_probe_candidate(self.insn.opcode),
         }
     }
 }
@@ -4473,20 +4478,22 @@ impl DecodeCache {
     ///
     /// The three conditions on the fast arm are all load-bearing. `bit + width <= 64` is the
     /// non-crossing test: a range that straddles a word boundary needs both words, and shifting
-    /// a mask by more than the word width is not even defined. `physical + width <=
-    /// SMC_BYTE_COVERAGE` (checked without wrapping) keeps the whole range inside the window
-    /// `is_code_byte` treats as byte-granular -- one byte past it and the answer for that byte
-    /// comes from the page bitmap instead. Anything failing either test falls back to the exact
-    /// per-byte loop, which is also what a wide (>4-byte) access takes.
+    /// a mask by more than the word width is not even defined. `physical <= SMC_BYTE_COVERAGE -
+    /// width` keeps the whole range inside the window `is_code_byte` treats as byte-granular --
+    /// one byte past it and the answer for that byte comes from the page bitmap instead.
+    /// Anything failing either test falls back to the exact per-byte loop, which is also what a
+    /// wide (>4-byte) access takes.
+    ///
+    /// The bound is written as a subtraction from the constant rather than as
+    /// `physical.checked_add(width)`, and the two are the SAME SET. `width <= 4 <=
+    /// SMC_BYTE_COVERAGE`, so the subtraction cannot underflow; where the addition does not
+    /// overflow the two forms are the same inequality, and where it does, `physical` is within
+    /// four bytes of the 4 GiB wrap and both forms are false. What comes out is a carry test and
+    /// a never-taken branch on every store.
     #[inline]
     fn range_hits_code(&self, physical: u32, width: u32) -> bool {
         let bit = physical & 63;
-        if width <= 4
-            && bit + width <= 64
-            && physical
-                .checked_add(width)
-                .is_some_and(|end| end <= SMC_BYTE_COVERAGE)
-        {
+        if width <= 4 && bit + width <= 64 && physical <= SMC_BYTE_COVERAGE - width {
             let mask = ((1u64 << width) - 1) << bit;
             return self.code_bytes[(physical >> 6) as usize] & mask != 0;
         }

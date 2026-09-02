@@ -211,16 +211,17 @@ fn arms_agree_on_a_rep_string_move() {
     assert_arms_agree("rep movsb", &code, 0, 0x4000);
 }
 
-/// `len` rides the packed entry, and the page-cross screen is the one consumer of it that ends a
-/// run on its own. Driving that screen takes a hand-published line, and the reason is worth
-/// stating: `DecodeCache::put` REFUSES a page-straddling insert, so no guest program can ever
-/// warm the line the screen is looking for. The screen is defence in depth against a line that
-/// arrives some other way, and this fixture is the only thing that makes it a line of tested code
-/// rather than a line of hope.
+/// The run loop's page-cross screen is GONE (audit 1.17), and this is the fixture that pins the
+/// premise it was deleted on: `DecodeCache::put` refuses a page-straddling insert outright, under
+/// the identical predicate the screen used, so no continuation can ever be handed such a line and
+/// `brk_cont_page_cross` is identically zero.
 ///
-/// The published line is the same `DecodedInsn` the decoder produced for the identical bytes at a
-/// non-straddling address, and it goes in through `publish_line` — the sole writer — so the pack
-/// it produces is the one production would produce.
+/// It used to hand-publish a straddling line through `publish_line` to drive the screen. That
+/// proved the screen ran, not that anything could reach it; `publish_line` has exactly one
+/// production caller and it sits BELOW `put`'s straddle rejection. So the fixture now asks the
+/// question that matters: let the decoder meet a page-straddling instruction the way a guest
+/// would, and check the cache refuses to hold it, on both arms, with the run reaching HLT and the
+/// right answer in AX either way.
 fn page_cross_arm(pack: bool) -> (CpuGsw, PerfCounters) {
     select_arm(pack);
     let mut memory = vec![0u8; 0x4000];
@@ -236,22 +237,22 @@ fn page_cross_arm(pack: bool) -> (CpuGsw, PerfCounters) {
     arm_the_packed_path(&mut cpu);
     let mut bus = TestBus::with_memory(memory);
 
+    // The identical bytes at a page-INTERIOR address warm a line, which is the control: the
+    // decoder produces a three-byte MOV for them and `put` keeps it.
     cpu.registers.eip = 0x2000;
     cpu.begin_instruction();
     cpu.fetch_decoded(&mut bus, 0x2000).expect("decode MOV");
     let insn = cpu.decode_cache.get(0x2000, false).expect("warm MOV line");
     assert_eq!(insn.len, 3);
-    let slot = (0x0ffe & cpu.decode_cache.mask) as usize;
-    let generation = cpu.decode_cache.generation;
-    cpu.decode_cache.publish_line(
-        slot,
-        DecodeLine {
-            tag: 0x0ffe,
-            generation,
-            insn: Some(insn),
-            d: false,
-            phys_start: 0x0ffe,
-        },
+
+    // The same instruction at 0x0ffe straddles the 4 KiB boundary. Decoding it works; CACHING it
+    // does not, and that refusal is what makes the run loop's deleted page-cross screen dead.
+    cpu.registers.eip = 0x0ffe;
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 0x0ffe).expect("decode MOV");
+    assert!(
+        cpu.decode_cache.get(0x0ffe, false).is_none(),
+        "put must refuse a page-straddling line"
     );
 
     cpu.registers.eip = 0x0ffd;
@@ -274,16 +275,20 @@ fn arms_agree_when_the_next_instruction_crosses_a_page() {
     let (packed_cpu, packed_perf) = page_cross_arm(true);
     let (plain_cpu, plain_perf) = page_cross_arm(false);
     assert_eq!(
-        packed_perf.brk_cont_page_cross, 1,
-        "the fixture must actually reach the page-cross screen"
+        packed_perf.brk_cont_page_cross, 0,
+        "the page-cross counter is dead: put refuses the line the screen looked for"
     );
     assert_eq!(
-        packed_perf.brk_cont_page_cross, plain_perf.brk_cont_page_cross,
-        "both arms must break on the page-cross screen"
+        plain_perf.brk_cont_page_cross, 0,
+        "and it is dead on the unpacked arm too"
+    );
+    assert!(
+        packed_perf.brk_cont_decode_miss > 0,
+        "the straddling continuation must end the run as a decode miss"
     );
     assert_eq!(
         packed_perf.brk_cont_decode_miss, plain_perf.brk_cont_decode_miss,
-        "and neither may substitute a decode miss for it"
+        "and both arms must count the same number of them"
     );
     assert_eq!(packed_cpu, plain_cpu);
     assert_eq!(packed_cpu.read_reg16(Reg16::Ax), 0x1234);

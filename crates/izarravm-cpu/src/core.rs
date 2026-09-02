@@ -610,7 +610,7 @@ impl CpuGsw {
     #[inline]
     pub(super) fn note_code_byte_write_hit(&mut self, physical: u32) -> bool {
         #[cfg(feature = "jit")]
-        if crate::jit::direct::imm8_lanes_enabled() || crate::jit::direct::count_lanes_enabled() {
+        if crate::jit::direct::value_aware_byte_door_enabled() {
             return self.note_code_write_hit(physical, 1);
         }
         self.note_code_write(physical, 1)
