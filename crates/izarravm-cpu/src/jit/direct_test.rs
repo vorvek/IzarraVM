@@ -2923,10 +2923,12 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
     assert_eq!(&masked[unmasked.len()..], &mask[..], "then the 64K mask");
 }
 
-/// `CompiledBlock` is copied out of `BlockCache::block()` several times per Direct entry
-/// (probe, the `run_direct_block` argument, and the pre-entry re-resolve), so its size is
-/// memcpy traffic multiplied by ~47M entries in a Quake/586 run. Fields that are not read
-/// on a uniform-fetch entry belong in a parallel `BlockCache` lane, not in the copy.
+/// `CompiledBlock` is copied out of `BlockCache::block()` twice per Direct entry (the probe and
+/// the `run_direct_block` argument), so its size is memcpy traffic multiplied by ~47M entries in
+/// a Quake/586 run. Fields that are not read on a uniform-fetch entry belong in a parallel
+/// `BlockCache` lane, not in the copy. The pre-entry re-resolve used to be a third copy; it now
+/// goes through `entry_ptr_for`, which reads the one field that resolve needs (see
+/// `entry_ptr_for_matches_block_and_misses_after_retirement` below).
 ///
 /// The CR3 JIT-half gate (`2026-09-02-cr3-jit-half-design.md`, L2) adds a `context: u8` field to
 /// `LinkTarget`, and `successors: [Option<LinkTarget>; 2]` is a `CompiledBlock` field, so the
@@ -2941,6 +2943,50 @@ fn compiled_block_stays_small_enough_to_copy_per_entry() {
         128,
         "CompiledBlock size changed; if a field was added, check it is actually read on the \
          uniform-fetch entry path before letting it ride every per-entry copy"
+    );
+}
+
+/// T9 (code-smell batch 2, S1). `entry_ptr_for` must agree with `block(id).entry_ptr()` for a
+/// live id and must miss exactly when `block()` misses, through the same generational check --
+/// not a weaker one that would keep serving a retired slot's stale pointer.
+///
+/// Mutation bite performed by hand: dropping the generational check (returning
+/// `self.blocks.get(id.index()).map(CompiledBlock::entry_ptr)` instead of routing through
+/// `active_index`) makes the final `assert!` below fail, because the retired slot is reused by
+/// `install_trivial` but at a stale id whose generation `active_index` would reject and the
+/// unchecked form would not.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn entry_ptr_for_matches_block_and_misses_after_retirement() {
+    let mut cache = BlockCache::default();
+    let source = key(0x1900);
+    let id = install_trivial(&mut cache, source, 1);
+
+    assert_eq!(
+        cache.entry_ptr_for(id),
+        Some(cache.block(id).expect("live block").entry_ptr()),
+        "live id: entry_ptr_for must agree with block().entry_ptr()"
+    );
+
+    assert_eq!(cache.retire_physical_range_for_test(source.physical, 1), 1);
+    assert!(cache.block(id).is_none(), "retirement must clear block()");
+    assert!(
+        cache.entry_ptr_for(id).is_none(),
+        "entry_ptr_for must miss on the same retired id block() misses on"
+    );
+
+    // Reuse the freed slot at a fresh id and confirm the OLD id still misses through the new
+    // occupant -- the generational check, not merely "is this index installed".
+    let replacement = install_trivial(&mut cache, key(0x1a00), 1);
+    assert_eq!(replacement.index(), id.index());
+    assert_ne!(replacement, id);
+    assert!(cache.entry_ptr_for(id).is_none());
+    assert_eq!(
+        cache.entry_ptr_for(replacement),
+        Some(cache.block(replacement).expect("replacement").entry_ptr())
     );
 }
 

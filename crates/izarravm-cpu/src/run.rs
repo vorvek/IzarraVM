@@ -3126,8 +3126,11 @@ impl CpuGsw {
             ..jit::direct::NativeExit::default()
         };
         // Arena compaction can relocate code while callers still hold a copied block descriptor.
-        // Resolve its generational ID at the last safe point before entering native code.
-        let Some(current_block) = self.jit_direct.block(block.id()) else {
+        // Resolve the entry pointer at the last safe point before entering native code, through
+        // the same generational lookup `block()` uses. `entry_ptr_for` reads the one field this
+        // resolve needs rather than copying the whole 120-byte `CompiledBlock` a third time per
+        // entry (`jit_direct::block()` already copies it twice, at admission and at continuation).
+        let Some(current_block_entry_ptr) = self.jit_direct.entry_ptr_for(block.id()) else {
             ea_mark!(Phase::Refused);
             ea_refusal!(site::BLOCK_REGENERATED_NONE);
             ea_end!(Population::Refused);
@@ -3176,7 +3179,7 @@ impl CpuGsw {
         // SAFETY: direct::emit produced this page using the exact four-argument ABI, the arena
         // sealed it executable, and the current generational lookup keeps that arena entry live.
         let entry: jit::direct::DirectEntryFn =
-            unsafe { std::mem::transmute(current_block.entry_ptr()) };
+            unsafe { std::mem::transmute(current_block_entry_ptr) };
         // The call-out window: two stores in, two out, so the erased `*mut B` is never reachable
         // outside the call that owns the borrow. `publish::<B>` also picks the helper
         // instantiations for THIS bus type, which is what makes the erasure sound; see

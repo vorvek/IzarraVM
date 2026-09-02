@@ -1900,6 +1900,32 @@ impl CpuBus for MachineBus<'_> {
         Ok(())
     }
 
+    /// `charge_ram_only` IS `read_memory_direct`'s aligned direct-RAM arm's charge with the load
+    /// deleted: same `data_access_wait_states` call, same `trace.record` call, same argument
+    /// order, same skip of `apply_a20`'s mutation in the Approximate class under the same
+    /// precondition. See `charge_direct_ram_read`'s trait doc for why this reuses `charge_ram_only`
+    /// rather than `charge_direct_ram_memory`, whose `TestBus` override is not charge-identical.
+    #[inline]
+    fn charge_direct_ram_read(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        debug_assert!(
+            self.direct_page_ram_bytes(address, width.bytes() as usize, width)
+                .is_some(),
+            "charge_direct_ram_read's precondition: address must take read_memory_direct's \
+             aligned direct-RAM arm, exactly as peek_direct_ram's Some result promises"
+        );
+        // UNFOLDED: charge_ram_only applies apply_a20 itself, and does so idempotently under
+        // the precondition above. Pre-folding here would risk substituting a different value if
+        // the precondition were ever violated, which is exactly the silent-divergence failure
+        // mode the assert above exists to catch instead.
+        self.charge_ram_only(address, width, kind);
+        Ok(())
+    }
+
     /// Per-CYCLE, not per-access: `BusCycle::clocks_for` ignores width, so this returns the same
     /// value for all three widths and a MISALIGNED access costs `width.bytes()` times it. See the
     /// trait's declaration for the full caveat and for why the multiplier is the caller's.

@@ -3807,11 +3807,60 @@ struct RepResume {
     precharged_core: u64,
 }
 
+const REP_BULK_BYTES: usize = 4096;
+
+/// Bulk-REP scratch, valid only inside one `try_run_string_fast` call.
+///
+/// It lives here rather than as a `[0u8; 4096]` local because `bytes` is runtime and only the
+/// prefix up to `bytes` is ever written, so the compiler cannot elide the full 4 KiB zero-init a
+/// stack array pays on every call: a `REP MOVSW` with CX=5 memset 4 KiB to move ten bytes. It
+/// lives on `RepExecution` rather than directly on `CpuGsw` because that box already exists
+/// (`rep_execution: Box<RepExecution>`), so adding this field costs zero bytes on `CpuGsw` and
+/// moves no emitted native-code offset.
+///
+/// `Default`, `Debug`, `Clone`, `PartialEq` and `Eq` are all hand-written. `Box<[u8; 4096]>`
+/// has no `Default` at all (std's array `Default` stops at 32 elements), and the other four
+/// would be wrong if derived: this is scratch, not guest state, so equality must not distinguish
+/// two otherwise-identical CPUs holding different leftover bytes here (`FarCallLedger`'s reason,
+/// above); a debug dump must not print 4 KiB of stale bytes; and `Clone` -- taken by the
+/// differential and lockstep harnesses on every `CpuGsw` clone -- must ZERO rather than copy, so
+/// a fresh clone never inherits a previous call's residue.
+struct RepBulkScratch(Box<[u8; REP_BULK_BYTES]>);
+
+impl Default for RepBulkScratch {
+    fn default() -> Self {
+        Self(Box::new([0u8; REP_BULK_BYTES]))
+    }
+}
+
+impl std::fmt::Debug for RepBulkScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RepBulkScratch")
+            .field(&format_args!("<{REP_BULK_BYTES} bytes scratch>"))
+            .finish()
+    }
+}
+
+impl Clone for RepBulkScratch {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for RepBulkScratch {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RepBulkScratch {}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RepExecution {
     budget: Option<RepBudget>,
     resume: Option<RepResume>,
     yielded: bool,
+    bulk: RepBulkScratch,
 }
 
 /// Direct-mapped decode-cache lines (power of two so the index is a mask). A break-attribution

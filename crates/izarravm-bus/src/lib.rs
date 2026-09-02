@@ -994,7 +994,7 @@ pub trait CpuBus {
     /// `trace.record`, no counter, no device. It exists for one caller shape -- a native call-out
     /// helper that must decide whether it may proceed BEFORE it is allowed to commit any effect,
     /// and that then re-reads the same bytes through the charged path so the charge order matches
-    /// the interpreter's exactly (`jit/direct/callout.rs`, phase P).
+    /// the interpreter's exactly (`jit/direct.rs`'s port call-out helpers, phase P).
     ///
     /// ANY OTHER CALLER IS A BUG. A read that the guest can observe the timing of must go through
     /// `read_memory_direct` or `read_memory`; using this instead silently deletes the access from
@@ -1142,6 +1142,35 @@ pub trait CpuBus {
         Ok(())
     }
 
+    /// Charge exactly what `read_memory_direct` would charge for its ALIGNED direct-RAM arm, and
+    /// read nothing.
+    ///
+    /// THE PAIR TO `peek_direct_ram`: that primitive reads without charging so a call-out helper
+    /// can decide whether it may proceed; this one charges without reading so the helper can pay
+    /// the interpreter's exact price for a value it already holds from a paired `peek_direct_ram`
+    /// call. A `Some` from `peek_direct_ram` promises the aligned direct-RAM arm, and this is
+    /// that arm's charge with the load removed. Any other caller is a bug, for
+    /// `peek_direct_ram`'s reason.
+    ///
+    /// NOT `charge_direct_ram_memory`, on purpose, even though that method's `MachineBus`
+    /// override is charge-identical to this one's. Two reasons: `charge_direct_ram_memory`'s doc
+    /// scopes it to the interpreter's FastMap serve path, a different caller with a different
+    /// precondition (`PageKind::Ram` classified at population time, not `peek_direct_ram`'s
+    /// aligned-arm promise); and on `TestBus` the two are NOT interchangeable -- `TestBus`'s
+    /// override of `charge_direct_ram_memory` charges nothing at all unless its
+    /// `direct_page_clocks` test knob is armed, which would silently zero this method's charge on
+    /// every existing fixture that never had a reason to set that knob. The default below reads
+    /// and discards through the general charged path instead, so a bus without an override is
+    /// bit-identical to the code this method exists to replace.
+    fn charge_direct_ram_read(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        self.read_memory_direct(address, width, kind).map(|_| ())
+    }
+
     /// Return an upper bound on the raw clocks added by one cached direct-memory charge. `Some`
     /// remains valid until the bus reports a step break. A JIT uses it only after its CPU-side
     /// direct-page cache hit; `None` keeps the ordinary instruction path.
@@ -1265,6 +1294,12 @@ pub trait CpuBus {
     /// Conservative guest-clock cost for one byte of string data. Budgeted REP uses this before a
     /// chunk; buses with tiered or scaled timing override it so a cold cache or device window cannot
     /// cross an event.
+    ///
+    /// MUST NOT CHANGE WITHIN ONE INSTRUCTION: `run_string`'s `RepLimitPlan` prices the whole REP
+    /// loop from a single call made before the loop starts, on the strength of this. An override
+    /// that varies its answer per access silently moves the yield boundary the loop-invariant hoist
+    /// computed, and does so only in release builds, where the hoist's `debug_assert_eq!` staleness
+    /// check is compiled out.
     fn rep_data_byte_cost_upper(&self) -> u64 {
         self.jit_data_cost_clocks(BusWidth::Byte)
             .max(self.jit_mode13_data_cost_clocks(BusWidth::Byte))
@@ -1273,6 +1308,8 @@ pub trait CpuBus {
     /// Return a scaled-clock upper bound for one successful cold page translation, including
     /// PDE and PTE reads plus their possible accessed/dirty writes. `None` makes a budgeted paged
     /// REP yield before initial progress; a resumed instruction may still advance one iteration.
+    ///
+    /// MUST NOT CHANGE WITHIN ONE INSTRUCTION, for the same reason as `rep_data_byte_cost_upper`.
     fn rep_page_walk_cost_upper(&self) -> Option<u64> {
         None
     }
