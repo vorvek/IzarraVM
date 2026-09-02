@@ -12029,6 +12029,15 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 ///   `=count`, `=true`) that fell through would run exactly what an unset environment runs and be
 ///   read as "the arm I asked for changed nothing", which is the one wrong conclusion an arm ladder
 ///   exists to avoid.
+pub(crate) fn count_lanes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = COUNT_LANES_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_count_lanes_arm(std::env::var("IZARRAVM_COUNT_LANES")))
+}
+
 /// `imm8_lanes_enabled() || count_lanes_enabled()`, resolved ONCE.
 ///
 /// `note_code_byte_write_hit` asks this per changed byte store, and both knobs are process
@@ -12050,15 +12059,6 @@ pub(crate) fn value_aware_byte_door_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| imm8_lanes_enabled() || count_lanes_enabled())
     }
-}
-
-pub(crate) fn count_lanes_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(forced) = COUNT_LANES_OVERRIDE.with(std::cell::Cell::get) {
-        return forced;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| parse_count_lanes_arm(std::env::var("IZARRAVM_COUNT_LANES")))
 }
 
 /// The `IZARRAVM_COUNT_LANES` spelling table, lifted out of the `OnceLock` closure so it can be
