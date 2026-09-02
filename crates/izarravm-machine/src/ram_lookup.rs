@@ -60,6 +60,43 @@ impl RamPageLookup {
             })
     }
 
+    /// `direct_bytes` for a caller that has ALREADY proved the range is non-empty and lies inside
+    /// one lookup page.
+    ///
+    /// `direct_page_ram_bytes` and its unaligned sibling both prove exactly that before they get
+    /// here, and the general form then re-proved it: a second `bytes == 0` test, a `checked_add`
+    /// for an overflow that page-locality rules out, a `last_page` derivation and a multi-page
+    /// loop that this caller can never enter. What is left is the one thing that has to be asked,
+    /// which is whether the page is direct at all.
+    #[inline]
+    pub(crate) fn direct_bytes_page_local(
+        &self,
+        address: u32,
+        bytes: usize,
+    ) -> Option<(usize, usize)> {
+        debug_assert!(bytes != 0, "a page-local range has at least one byte");
+        debug_assert!(
+            (address as usize & RAM_LOOKUP_PAGE_MASK) + bytes <= RAM_LOOKUP_PAGE_SIZE,
+            "a page-local range does not leave its lookup page"
+        );
+        let start = address as usize;
+        // `start` is a 32-bit address widened to `usize` and `bytes` is at most one page, so this
+        // cannot overflow on any host this builds for.
+        let end = start + bytes;
+        if end > self.memory_len {
+            return None;
+        }
+        let base = self
+            .page_bases
+            .get(start >> RAM_LOOKUP_PAGE_BITS)
+            .copied()?;
+        if base == RAM_LOOKUP_SLOW {
+            return None;
+        }
+        let mapped_start = base + (start & RAM_LOOKUP_PAGE_MASK);
+        Some((mapped_start, mapped_start + bytes))
+    }
+
     #[inline]
     pub(crate) fn direct_bytes(&self, address: u32, bytes: usize) -> Option<(usize, usize)> {
         let start = address as usize;

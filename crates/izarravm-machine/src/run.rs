@@ -1419,6 +1419,11 @@ impl Machine {
             // is: a `Copy` policy bool, resolved once per machine.
             let ata_poll_skip_enabled = self.ata_poll_skip_enabled;
             let ata_poll_skip_slice_too_short = self.ata_poll_skip_slice_too_short;
+            // Read before the destructure for the same reason, and because both sources are
+            // moved into the bus below as mutable borrows. See `MachineBus::a20_open` and
+            // `MachineBus::device_free_extended_floor` for what keeps them live.
+            let a20_open = self.keyboard.a20_enabled();
+            let device_free_extended_floor = self.vega.device_free_extended_floor();
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
@@ -1540,6 +1545,8 @@ impl Machine {
                     )),
                     cache: cache_model,
                     flat_data_cost: active_mode.uses_approximate_timing(),
+                    a20_open,
+                    device_free_extended_floor,
                     extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
                     lazy_port_reads: active_mode.uses_approximate_timing(),
                     isa_io_wait: crate::bus::isa_io_wait_armed(),
