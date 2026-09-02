@@ -1248,6 +1248,20 @@ impl Encoder {
         self.modrm(0b11, op, dst.low3());
     }
 
+    /// A 16-bit shift/rotate by CL (`66 [REX] D3 /op`), the CL-count twin of `shift_r16_imm8` and
+    /// modelled on it exactly as `shift_r32_cl` is modelled on `shift_r32_imm8`: the `0x66` prefix
+    /// goes ahead of the optional REX. The host computes every flag against the 16-bit operand --
+    /// CF from bit 15 for a left shift and bit 0 for a right one, SF from bit 15, ZF and PF from
+    /// the 16-bit result -- and preserves bits 31 to 16, exactly as `shift_r16_imm8`'s doc records.
+    /// The host applies the architectural five-bit count mask to CL itself.
+    pub(crate) fn shift_r16_cl(&mut self, op: u8, dst: Reg) {
+        assert!(op < 8, "shift group must fit three bits");
+        self.bytes.push(0x66);
+        self.optional_rex(false, false, false, dst.ext());
+        self.bytes.push(0xD3);
+        self.modrm(0b11, op, dst.low3());
+    }
+
     /// `movzx dst32, byte [base + index]` (0F B6 /r, mod=00, rm=100 SIB, scale=1, no REX.W) -- load a
     /// byte from `[base + index]` and zero-extend it to 32 bits (clearing the host register's upper 64
     /// bits). The native byte-load probe uses this for the final deref off the host page pointer plus

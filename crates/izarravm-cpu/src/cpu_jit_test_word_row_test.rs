@@ -239,10 +239,19 @@ fn test_mem16() -> Vec<u8> {
     [vec![0x85, 0x06], OPERAND.to_le_bytes().to_vec()].concat()
 }
 
-/// `TEST AX, imm16` (0xA9) -- the family member this slice deliberately does NOT admit, because
-/// the duke census measures zero rows for it at any width.
+/// `TEST AX, imm16` (0xA9). Word admission joined `IZARRAVM_TEST_WORD_ROWS` on the S-B ALU-rows
+/// slice: the tyrian-586 no-EMM census measured 1,246,187 unbound exits for it, the measurement
+/// the earlier version of this fixture's comment said was missing.
 fn test_ax_imm16() -> Vec<u8> {
     vec![0xa9, 0x34, 0x12]
+}
+
+/// The mirror case finding 9 of the review names as load-bearing rather than decorative: `66 A9
+/// imm16` in a 32-BIT segment. `operand_size` there is `Word` (the prefix overrides CS.D), so
+/// this reaches the SAME gated arm `test_ax_imm16` reaches in a 16-bit segment -- refused with
+/// the gate off, admitted with it on, in EITHER segment default.
+fn test_ax_imm16_66() -> Vec<u8> {
+    vec![0x66, 0xa9, 0x34, 0x12]
 }
 
 /// `mov ax,cx` / `mov eax,ecx`: the control row, which must compile on BOTH arms. Without it a
@@ -413,13 +422,13 @@ fn the_word_test_row_flips_with_the_gate() {
 /// * The **memory form** of `0x85`. It has no kind at either width, no emitter and no census row on
 ///   duke3d-586 (zero memory rows against 53.6M register hits). The classify arm refuses it by
 ///   binding `DecodedOperand::Reg`, and a relaxed bind would reach an emitter expecting a register.
-/// * **`0xA9` TEST AX, imm16.** Its kind already carries a width and `emit_test_imm_reg` is already
-///   width-parameterised, so it is ONE allowlist entry from being admitted -- and it stays out
-///   because the census measures zero `0xA9` rows at any width, and an unmeasured admission is the
-///   campaign's standing refusal. This assertion is what keeps a later reader from adding it for
-///   symmetry instead of for a row.
 /// * **`0xF7 /0` TEST r/m16, imm16** is NOT here: it was already admitted before this slice, by
 ///   sub-opcode, and asserting it as a refusal would be wrong.
+///
+/// `0xA9` used to be a third refusal clause here and is now the inverted admission clause below:
+/// it moved from "deliberately not swept in" to "admitted under the same knob as `0x85`" on the
+/// S-B ALU-rows slice, and deleting the clause instead of inverting it would have lost the
+/// coverage that keeps `0xA9`'s Dword behaviour pinned on both arms.
 #[test]
 fn the_gate_does_not_sweep_in_its_neighbours() {
     for arm in [false, true] {
@@ -434,12 +443,59 @@ fn the_gate_does_not_sweep_in_its_neighbours() {
             None,
             "85 /r MEMORY form must stay a barrier at Dword on the {arm} arm"
         );
-        assert_eq!(
-            compile16(&test_ax_imm16()),
-            None,
-            "0xA9 TEST AX,imm16 must stay a barrier at Word on the {arm} arm"
-        );
     }
+    jit::direct::set_test_word_rows_for_test(None);
+}
+
+/// `0xA9` TEST AX, imm16: refused at Word with the gate off (the pre-slice tree, byte-identical
+/// by inspection), admitted with it on. The Dword form (`0xA9` with no `0x66` prefix in a 32-bit
+/// segment) is UNGATED and must compile identically on both arms -- it never reached the Word
+/// allowlist question at all, so the gate cannot move it.
+#[test]
+fn the_word_test_immediate_row_flips_with_the_gate() {
+    select_test_word_rows(false);
+    assert_eq!(
+        compile16(&test_ax_imm16()),
+        None,
+        "0xA9 at Word must stay a barrier with the gate off"
+    );
+    assert_eq!(
+        compile32(&test_eax_imm(0x1234)),
+        Some(3),
+        "0xA9 at Dword must compile with the gate off; it was never gated"
+    );
+
+    select_test_word_rows(true);
+    assert_eq!(
+        compile16(&test_ax_imm16()),
+        Some(3),
+        "0xA9 at Word must compile with the gate on"
+    );
+    assert_eq!(
+        compile32(&test_eax_imm(0x1234)),
+        Some(3),
+        "0xA9 at Dword must still compile with the gate on; the Dword arm is unaffected by the \
+         knob"
+    );
+    jit::direct::set_test_word_rows_for_test(None);
+}
+
+/// The 32-bit-segment twin (review finding 9): `66 A9 imm16` in a 32-bit segment reaches the same
+/// gated Word arm as the 16-bit-segment row, not the ungated Dword one.
+#[test]
+fn a_prefixed_word_test_immediate_in_a_32bit_segment_also_flips_with_the_gate() {
+    select_test_word_rows(false);
+    assert_eq!(
+        compile32(&test_ax_imm16_66()),
+        None,
+        "66 A9 in a 32-bit segment must stay a barrier with the gate off"
+    );
+    select_test_word_rows(true);
+    assert_eq!(
+        compile32(&test_ax_imm16_66()),
+        Some(3),
+        "66 A9 in a 32-bit segment must compile with the gate on"
+    );
     jit::direct::set_test_word_rows_for_test(None);
 }
 
@@ -770,6 +826,117 @@ fn test_dword_register_form_is_unchanged_on_both_arms() {
                     );
                 }
             }
+        }
+    }
+    jit::direct::set_test_word_rows_for_test(None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0xA9 TEST AX, imm16 -- the S-B ALU-rows slice
+// ---------------------------------------------------------------------------------------------
+
+/// `TEST AX, imm16` (`0xA9`) with a given immediate.
+fn test_ax_imm(imm: u16) -> Vec<u8> {
+    let mut body = vec![0xa9u8];
+    body.extend_from_slice(&imm.to_le_bytes());
+    body
+}
+
+/// `TEST EAX, imm32` -- the Dword-immediate encoding. NOT `test_ax_imm` with a widened type: the
+/// Dword form of `0xA9` fetches a four-byte immediate, and reusing the two-byte encoder against a
+/// 32-bit segment mis-lengths the decode (the walk reads two of the trailing filler's bytes as
+/// the top of the immediate), which reads back as a spurious refusal rather than the intended
+/// admission.
+fn test_eax_imm(imm: u32) -> Vec<u8> {
+    let mut body = vec![0xa9u8];
+    body.extend_from_slice(&imm.to_le_bytes());
+    body
+}
+
+/// The 16-bit-segment row itself: unprefixed `A9 imm16`, `emit_test_imm_reg` calling into the
+/// Word `emit_test_preloaded` lane in place of the pre-slice Dword one.
+///
+/// Catches: `width` reverted to `MemoryWidth::Dword` in the classify arm (AX's high half leaks
+/// into the flags computation, so ZF and SF diverge on the poisoned seed).
+#[test]
+fn test_ax_imm16_matches_the_interpreter_in_a_sixteen_bit_segment() {
+    select_test_word_rows(true);
+    for ax in OPERANDS {
+        for imm in OPERANDS {
+            for live_pending in [false, true] {
+                let mut seed = Seed::new().gpr(0, 0xdead_0000 | ax);
+                if live_pending {
+                    seed = seed.pending();
+                }
+                lowered_on(
+                    sixteen_bit_cpu,
+                    false,
+                    &test_ax_imm(imm as u16),
+                    seed,
+                    &format!(
+                        "test ax,{imm:#06x} ax={ax:#06x} pending={live_pending}",
+                        imm = imm as u16
+                    ),
+                );
+            }
+        }
+    }
+    jit::direct::set_test_word_rows_for_test(None);
+}
+
+/// The 32-bit-segment twin: `66 A9 imm16` in a 32-bit segment, the case review finding 9 calls
+/// load-bearing rather than decorative -- it reaches the same gated Word arm from the OTHER
+/// segment default, which `test_ax_imm16_66` sweeps for the compile-only question and this row
+/// sweeps for state.
+#[test]
+fn test_ax_imm16_matches_the_interpreter_in_a_thirty_two_bit_segment() {
+    select_test_word_rows(true);
+    for ax in OPERANDS {
+        for imm in OPERANDS {
+            let seed = Seed::new().gpr(0, 0xdead_0000 | ax);
+            let mut body = vec![0x66u8];
+            body.extend_from_slice(&test_ax_imm(imm as u16));
+            lowered_on(
+                flat_protected_cpu,
+                true,
+                &body,
+                seed,
+                &format!(
+                    "66 test ax,{imm:#06x} ax={ax:#06x} (32-bit segment)",
+                    imm = imm as u16
+                ),
+            );
+        }
+    }
+    jit::direct::set_test_word_rows_for_test(None);
+}
+
+/// THE DWORD REGRESSION for `0xA9`, on both arms: unprefixed `A9 imm32` in a 32-bit segment is
+/// ungated and must be byte-identical to the interpreter whichever way `IZARRAVM_TEST_WORD_ROWS`
+/// is set, exactly as `test_dword_register_form_is_unchanged_on_both_arms` pins for `0x85`.
+#[test]
+fn test_eax_imm32_is_unchanged_on_both_arms() {
+    for arm in [false, true] {
+        select_test_word_rows(arm);
+        for eax in [
+            0x0000_0000u32,
+            0x8000_0000,
+            0x0000_8000,
+            0xffff_ffff,
+            0x1234_5678,
+        ] {
+            let seed = Seed::new().gpr(0, eax);
+            lowered_on(
+                flat_protected_cpu,
+                true,
+                &{
+                    let mut body = vec![0xa9u8];
+                    body.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+                    body
+                },
+                seed,
+                &format!("dword test eax,imm32 eax={eax:#010x} arm={arm}"),
+            );
         }
     }
     jit::direct::set_test_word_rows_for_test(None);

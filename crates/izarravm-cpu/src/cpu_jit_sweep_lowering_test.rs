@@ -288,6 +288,12 @@ mod string_callout;
 #[path = "cpu_jit_group2_mem_test.rs"]
 mod group2_mem;
 
+/// The S-B ALU-rows slice, item 3: `0xD3 /4../7` Word shift-by-CL. Nested here for the reason the
+/// modules above are: it wants this module's `ENTRY`, `STACK_TOP` and `flat_cpu` rather than an
+/// eleventh copy of them.
+#[path = "cpu_jit_word_shift_cl_test.rs"]
+mod word_shift_cl;
+
 #[test]
 fn direction_flag_matches_the_interpreter_from_both_polarities() {
     // 0x202 has DF clear, 0x602 has DF (bit 10) set, so each opcode is exercised both as a

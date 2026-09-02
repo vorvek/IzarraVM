@@ -487,6 +487,26 @@ fn sixteen_bit_immediate_shift_has_known_bytes() {
     );
 }
 
+/// `shift_r16_cl` against its Dword sibling and its Word imm8 sibling, byte for byte. Same
+/// ordering requirement as `shift_r16_imm8`: 0x66 before the optional REX.
+#[test]
+fn shift_r16_cl_known_bytes() {
+    let mut e = Encoder::new();
+    e.shift_r16_cl(4, Reg::RCX); // shl cx, cl
+    e.shift_r16_cl(4, Reg::R9); // shl r9w, cl
+    e.shift_r16_cl(5, Reg::RDX); // shr dx, cl
+    e.shift_r16_cl(7, Reg::R12); // sar r12w, cl
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x66, 0xD3, 0xE1, //
+            0x66, 0x41, 0xD3, 0xE1, //
+            0x66, 0xD3, 0xEA, //
+            0x66, 0x41, 0xD3, 0xFC,
+        ]
+    );
+}
+
 #[test]
 fn double_shift_forms_have_known_bytes() {
     let mut e = Encoder::new();
