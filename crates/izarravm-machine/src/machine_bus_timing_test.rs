@@ -4544,6 +4544,145 @@ fn a_direct_system_read_charges_exactly_what_the_general_read_charges() {
     }
 }
 
+/// T16 (code-smell batch 2, S3, rung A). `CpuBus::charge_direct_ram_read`'s whole purpose is to
+/// be the charge half of `read_memory_direct`'s aligned direct-RAM arm with the load deleted --
+/// on `TestBus`, the port call-out fixtures' default bus, the trait's DEFAULT implementation
+/// (`read_memory_direct(..).map(|_| ())`) covers this and the code being replaced is
+/// indistinguishable from the code replacing it, so a test built on `TestBus` cannot fail no
+/// matter what `MachineBus`'s override does -- exactly the vacuity already named in-tree at
+/// `machine_direct_poll_skip_test.rs:6-11` about a sibling defaulted method. This lives on a real
+/// `Machine` instead, and follows `a_direct_system_read_charges_exactly_what_the_general_read_charges`'s
+/// warm-then-A/B/A/B discipline for the same reason that test states: `data_access_wait_states`
+/// consults the stateful data-cache tag array, so a cold first touch reads as a path difference
+/// rather than a real one. Run in both Accurate (Gsw386) and flat (Gsw486) class, because
+/// `charge_ram_only` is two different code arms.
+#[test]
+fn charge_direct_ram_read_charges_exactly_what_the_direct_read_charges() {
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        const BASE: u32 = 0x2000;
+        for i in 0..8u32 {
+            machine.write_physical_u8(BASE + i, 0x10 + i as u8);
+        }
+
+        with_bus(&mut machine, |bus| {
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                // Both offsets are aligned for every width tested (BASE and BASE+4 are both
+                // divisible by 4). `charge_direct_ram_read`'s precondition, like
+                // `peek_direct_ram`'s, is the ALIGNED direct-RAM arm only -- a misaligned access
+                // never reaches phase C at all, because `port_permission_resident`'s phase-P
+                // peek already returns `None` for it (`direct_page_ram_bytes`'s `should_split`
+                // term), so the interpreter's ordinary `check_io_permission` path runs instead.
+                for offset in [0, 4] {
+                    let address = BASE + offset;
+
+                    // Warm the line so the tag-array miss is not attributed to whichever path
+                    // runs first.
+                    bus.read_memory(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+
+                    assert!(
+                        bus.peek_direct_ram(address, width).is_some(),
+                        "{mode:?} {width:?} at {address:#x} must take the aligned direct-RAM \
+                         arm for this test to compare anything"
+                    );
+
+                    let clocks = bus.trace.elapsed_clocks();
+                    let accesses = bus.trace.access_count();
+                    bus.charge_direct_ram_read(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+                    let charge_only = (
+                        bus.trace.elapsed_clocks() - clocks,
+                        bus.trace.access_count() - accesses,
+                    );
+
+                    let clocks = bus.trace.elapsed_clocks();
+                    let accesses = bus.trace.access_count();
+                    bus.read_memory_direct(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+                    let full_read = (
+                        bus.trace.elapsed_clocks() - clocks,
+                        bus.trace.access_count() - accesses,
+                    );
+
+                    assert_eq!(
+                        charge_only, full_read,
+                        "{mode:?} {width:?} at {address:#x}: charge_direct_ram_read charged a \
+                         different (clocks, accesses) pair than read_memory_direct's aligned arm"
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// Review finding 17 (code-smell batch 2, S3, rung A). Phase C used to assert, per served
+/// call-out, that its charged re-read returned the SAME VALUE `peek_direct_ram` had already
+/// seen -- the only in-tree evidence that `peek_direct_ram`'s doc promise ("a `Some` result
+/// promises `read_memory_direct` will take its ALIGNED direct-RAM arm and return the same
+/// value") held on `MachineBus`. `charge_direct_ram_read` has no value left to compare, so that
+/// promise is pinned here instead, once, over the matrix it actually depends on: aligned RAM in
+/// both timing classes, a misaligned address (peek must decline), and a device-window address
+/// (peek must decline, since `direct_page_ram_bytes` only ever covers RAM).
+#[test]
+fn peek_direct_ram_agrees_with_read_memory_direct_on_every_aligned_ram_address() {
+    for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        const BASE: u32 = 0x3000;
+        for i in 0..8u32 {
+            machine.write_physical_u8(BASE + i, 0x20 + i as u8);
+        }
+
+        with_bus(&mut machine, |bus| {
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                for offset in [0, 4] {
+                    let address = BASE + offset;
+                    bus.read_memory(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+                    let peeked = bus.peek_direct_ram(address, width);
+                    assert!(
+                        peeked.is_some(),
+                        "{mode:?} {width:?} at {address:#x} must peek RAM"
+                    );
+                    let read = bus
+                        .read_memory_direct(address, width, BusAccessKind::DataRead)
+                        .unwrap();
+                    assert!(
+                        read.direct,
+                        "{mode:?} {width:?} at {address:#x} must take a direct arm"
+                    );
+                    assert_eq!(
+                        peeked,
+                        Some(read.value),
+                        "{mode:?} {width:?} at {address:#x}: peek_direct_ram disagreed with \
+                         read_memory_direct's aligned arm"
+                    );
+                }
+
+                // Misaligned (word/dword only): peek must decline outright, matching
+                // port_permission_resident's fallback to `None` permission (the interpreter's
+                // ordinary check_io_permission path) rather than serving a wrong value.
+                if width != BusWidth::Byte {
+                    let misaligned = BASE + 1;
+                    assert!(
+                        bus.peek_direct_ram(misaligned, width).is_none(),
+                        "{mode:?} {width:?} at {misaligned:#x} must decline a misaligned peek"
+                    );
+                }
+            }
+
+            // A device-window address: peek must decline, since direct_page_ram_bytes only ever
+            // covers RAM below the aperture.
+            assert!(
+                bus.peek_direct_ram(0x000A_0000, BusWidth::Byte).is_none(),
+                "peek_direct_ram must decline the Mode13h aperture"
+            );
+        });
+    }
+}
+
 /// THE FOUR TESTS BELOW PIN THE DEFAULT (`IZARRAVM_EXTENDED_RAM_SCREEN` unset,
 /// i.e. ON). Run the suite with the knob at `0` and exactly these four fail and
 /// nothing else does -- verified 2026-08-29, 1693 passed / 4 failed. That is not

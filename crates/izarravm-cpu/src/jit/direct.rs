@@ -30011,12 +30011,18 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
             }
         }
         Some(probe) => {
-            let Ok(io_base) = bus.read_memory_direct(
-                probe.io_base_physical,
-                BusWidth::Word,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked io_base word failed");
+            // Charges exactly what phase P's peek would have cost if it had charged: same
+            // aligned direct-RAM arm, same wait states, same trace record, no second RAM lookup.
+            // See charge_direct_ram_read's trait doc.
+            if bus
+                .charge_direct_ram_read(
+                    probe.io_base_physical,
+                    BusWidth::Word,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked io_base word failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortReadAlDx,
@@ -30024,17 +30030,27 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
+            // Charge-free re-peek: nothing between phase P and here writes guest memory (this
+            // whole match runs before the read_io that does the real work), so a second peek
+            // must still agree. The STRUCTURAL promise that a charged read returns the SAME
+            // VALUE the peek saw is a property of the bus, not of this call, and is pinned once
+            // as a standing fixture instead (machine_bus_timing_test.rs) now that
+            // charge_direct_ram_read has no value left to compare per call.
             debug_assert_eq!(
-                io_base.value, probe.io_base,
-                "the charged io_base re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.io_base_physical, BusWidth::Word),
+                Some(probe.io_base),
+                "the peeked io_base changed between phase P and phase C"
             );
-            let Ok(bits) = bus.read_memory_direct(
-                probe.bitmap_physical,
-                BusWidth::Byte,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked bitmap byte failed");
+            if bus
+                .charge_direct_ram_read(
+                    probe.bitmap_physical,
+                    BusWidth::Byte,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked bitmap byte failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortReadAlDx,
@@ -30042,10 +30058,11 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
             debug_assert_eq!(
-                bits.value, probe.bits,
-                "the charged bitmap re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.bitmap_physical, BusWidth::Byte),
+                Some(probe.bits),
+                "the peeked bitmap byte changed between phase P and phase C"
             );
         }
     }
@@ -30198,12 +30215,17 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
             }
         }
         Some(probe) => {
-            let Ok(io_base) = bus.read_memory_direct(
-                probe.io_base_physical,
-                BusWidth::Word,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked io_base word failed");
+            // PHASE C, verbatim from `port_read_al_dx`: see its comment for the charge and the
+            // charge-free re-peek both.
+            if bus
+                .charge_direct_ram_read(
+                    probe.io_base_physical,
+                    BusWidth::Word,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked io_base word failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortReadAlImm8 { port: port as u8 },
@@ -30211,17 +30233,21 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
             debug_assert_eq!(
-                io_base.value, probe.io_base,
-                "the charged io_base re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.io_base_physical, BusWidth::Word),
+                Some(probe.io_base),
+                "the peeked io_base changed between phase P and phase C"
             );
-            let Ok(bits) = bus.read_memory_direct(
-                probe.bitmap_physical,
-                BusWidth::Byte,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked bitmap byte failed");
+            if bus
+                .charge_direct_ram_read(
+                    probe.bitmap_physical,
+                    BusWidth::Byte,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked bitmap byte failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortReadAlImm8 { port: port as u8 },
@@ -30229,10 +30255,11 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
             debug_assert_eq!(
-                bits.value, probe.bits,
-                "the charged bitmap re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.bitmap_physical, BusWidth::Byte),
+                Some(probe.bits),
+                "the peeked bitmap byte changed between phase P and phase C"
             );
         }
     }
@@ -30430,12 +30457,17 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
             }
         }
         Some(probe) => {
-            let Ok(io_base) = bus.read_memory_direct(
-                probe.io_base_physical,
-                BusWidth::Word,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked io_base word failed");
+            // PHASE C, verbatim from `port_read_al_dx`: see its comment for the charge and the
+            // charge-free re-peek both.
+            if bus
+                .charge_direct_ram_read(
+                    probe.io_base_physical,
+                    BusWidth::Word,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked io_base word failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortWriteAlImm8 { port: port as u8 },
@@ -30443,17 +30475,21 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
             debug_assert_eq!(
-                io_base.value, probe.io_base,
-                "the charged io_base re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.io_base_physical, BusWidth::Word),
+                Some(probe.io_base),
+                "the peeked io_base changed between phase P and phase C"
             );
-            let Ok(bits) = bus.read_memory_direct(
-                probe.bitmap_physical,
-                BusWidth::Byte,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked bitmap byte failed");
+            if bus
+                .charge_direct_ram_read(
+                    probe.bitmap_physical,
+                    BusWidth::Byte,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked bitmap byte failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortWriteAlImm8 { port: port as u8 },
@@ -30461,10 +30497,11 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
             debug_assert_eq!(
-                bits.value, probe.bits,
-                "the charged bitmap re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.bitmap_physical, BusWidth::Byte),
+                Some(probe.bits),
+                "the peeked bitmap byte changed between phase P and phase C"
             );
         }
     }
@@ -30644,12 +30681,17 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
             }
         }
         Some(probe) => {
-            let Ok(io_base) = bus.read_memory_direct(
-                probe.io_base_physical,
-                BusWidth::Word,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked io_base word failed");
+            // PHASE C, verbatim from `port_read_al_dx`: see its comment for the charge and the
+            // charge-free re-peek both.
+            if bus
+                .charge_direct_ram_read(
+                    probe.io_base_physical,
+                    BusWidth::Word,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked io_base word failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortWriteAlDx,
@@ -30657,17 +30699,21 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
             debug_assert_eq!(
-                io_base.value, probe.io_base,
-                "the charged io_base re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.io_base_physical, BusWidth::Word),
+                Some(probe.io_base),
+                "the peeked io_base changed between phase P and phase C"
             );
-            let Ok(bits) = bus.read_memory_direct(
-                probe.bitmap_physical,
-                BusWidth::Byte,
-                BusAccessKind::DataRead,
-            ) else {
-                debug_assert!(false, "phase C re-read of a peeked bitmap byte failed");
+            if bus
+                .charge_direct_ram_read(
+                    probe.bitmap_physical,
+                    BusWidth::Byte,
+                    BusAccessKind::DataRead,
+                )
+                .is_err()
+            {
+                debug_assert!(false, "phase C charge of a peeked bitmap byte failed");
                 #[cfg(feature = "direct-callout-attribution")]
                 cpu.jit_direct.note_callout_attribution(
                     CallOutHelper::PortWriteAlDx,
@@ -30675,10 +30721,11 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
                     CallOutOutcome::Abnormal,
                 );
                 return STATUS_ABNORMAL;
-            };
+            }
             debug_assert_eq!(
-                bits.value, probe.bits,
-                "the charged bitmap re-read disagreed with the pure peek"
+                bus.peek_direct_ram(probe.bitmap_physical, BusWidth::Byte),
+                Some(probe.bits),
+                "the peeked bitmap byte changed between phase P and phase C"
             );
         }
     }
