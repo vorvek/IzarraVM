@@ -4920,6 +4920,7 @@ pub(crate) enum DirectKind {
     ShiftCl {
         op: u8,
         dst: u8,
+        width: MemoryWidth,
     },
     DoubleShiftReg {
         left: bool,
@@ -12776,6 +12777,85 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
     parse_test_word_rows_arm(value)
 }
 
+/// Whether `classify` admits **`0xD3 /4../7` (SHL/SHR/SAR by CL), REGISTER destination, at Word
+/// operand size** (`IZARRAVM_WORD_SHIFT_CL_ROWS`).
+///
+/// **DEFAULT ON.** An unset knob admits the Word shift-by-CL rows. `0` or `off` is the escape
+/// back to the pre-slice refusal (`0xd3` absent from the Word allowlist), which still ships whole
+/// because it is the base any A/B on this row is read against.
+///
+/// # The rows, from the tyrian-586 no-EMM census (`cenB.json`, cited in
+/// `dev_docs/2026-09-02-tyrian-sb-entry-cut-review.md` finding 4)
+///
+/// `0xD3 /4` (SHL) register word: 1,247,451 unbound exits, 1,247,714 runtime hits. `/5` (SHR) and
+/// `/7` (SAR) register word land with the same admission because `classify`'s own arm narrows
+/// `matches!(m.reg, 4..=7)` before this knob is reached, so admitting `0xd3` cannot sweep in `/0`
+/// ROL, `/1` ROR, `/2` RCL or `/3` RCR — those stay refused by the arm's narrowing, not by this
+/// gate.
+///
+/// # What is deliberately NOT in this gate
+///
+/// RCL (`/2`) and RCR (`/3`) at any width: they consume the incoming CF as a rotate input, which
+/// the emitted shift-by-CL form never loads. ROL/ROR (`/0`,`/1`) are a different arm
+/// (`DoubleShiftReg`-adjacent territory, not `ShiftCl`) with different flag rules.
+///
+/// # The spelling table
+///
+/// * unset, `` (empty), `1` or `on` -> ON.
+/// * `0` or `off` -> OFF, the pre-slice refusal.
+/// * anything else PANICS, for `parse_test_word_rows_arm`'s reason: a mistyped ladder leg that
+///   fell through to the default would run the ON arm and be misread as "the row did nothing".
+pub(crate) fn word_shift_cl_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = WORD_SHIFT_CL_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| parse_word_shift_cl_rows_arm(std::env::var("IZARRAVM_WORD_SHIFT_CL_ROWS")))
+}
+
+/// The `IZARRAVM_WORD_SHIFT_CL_ROWS` spelling table, lifted out of the `OnceLock` closure so it
+/// can be unit-tested without a process-global env write. See `word_shift_cl_rows_enabled` for
+/// the contract.
+fn parse_word_shift_cl_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_WORD_SHIFT_CL_ROWS is set to a value that is not valid UTF-8; accepted \
+             spellings are unset (the shipped default: ON), `0` or `off` (the pre-slice \
+             refusal, under which `0xd3` at Word stays a barrier), and `1` or `on` (the Word \
+             shift-by-CL admission)"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_WORD_SHIFT_CL_ROWS={other:?} names no arm; accepted spellings are unset \
+             (the shipped default, ON), `0` or `off` (the pre-slice refusal) and `1` or `on` \
+             (the `0xd3 /4../7` Word register-destination admission). Refusing to guess: a \
+             mistyped ladder leg that silently ran the default would be read as the arm it did \
+             not run"
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORD_SHIFT_CL_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the Word shift-by-CL arm on this thread for the length of a fixture; `None` restores
+/// the ambient `IZARRAVM_WORD_SHIFT_CL_ROWS` reading.
+#[cfg(test)]
+pub(crate) fn set_word_shift_cl_rows_for_test(forced: Option<bool>) {
+    WORD_SHIFT_CL_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
 /// Whether `classify` admits the **BYTE shift/rotate register rows `0xD0 /4..=7` and
 /// `0xC0 /5,/6,/7`**, and whether `0xC0`/`0xD0` reach the `OperandSize::Word` decode path at all
 /// (`IZARRAVM_BYTE_SHIFT_ROWS`).
@@ -15365,12 +15445,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // 66-prefixed and unprefixed encodings have identical semantics and `MovSegToReg` carries no
     // width to get wrong. Its Dword-sibling hazard does not exist because it has no Dword sibling.
     //
-    // Deliberately NOT here, and each would be a miscompile rather than a missed lowering:
-    // `0xf7` and `0xa9`. Both are the Dword sibling of an admitted byte form and their kinds
-    // hard-code Dword with no width field. (`0xc7` and `0x81` left this list when they grew width
-    // fields of their own; `0xa3` left it with the V86 loop-A slice, for the reason the paragraph
-    // above now gives; `0x85` left it with the Word TEST row; `0x8d` left it with the S1 width
-    // lift, which gave `Lea` a `width` and narrowed its destination write with
+    // Deliberately NOT here, and would be a miscompile rather than a missed lowering:
+    // `0xf7`. It is the Dword sibling of an admitted byte form and its kind hard-codes Dword
+    // with no width field. (`0xc7` and `0x81` left this list when they grew width fields of
+    // their own; `0xa3` left it with the V86 loop-A slice, for the reason the paragraph above
+    // now gives; `0x85` and `0xa9` left it with the Word TEST row; `0x8d` left it with the S1
+    // width lift, which gave `Lea` a `width` and narrowed its destination write with
     // `emit_write_gpr16`.)
     //
     // `0xb8..=0xbf` WAS on that list and is the 16-bit campaign's fourth slice. It left the same
@@ -15739,12 +15819,19 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // 53,583,389 runtime hits, 42.2% of the whole rejected table) and for the suffix
         // measurement that prices its extension exposure at ONE instruction.
         //
-        // ONLY `0x85`, and only the REGISTER form, which the arm enforces. `0xA9` (TEST eAX, imm)
-        // is the other Word-shaped member of the family and its emitter is already fully
-        // width-parameterised, so it is one entry away -- it stays out because the census measures
-        // ZERO `0xA9` rows at any width, and an unmeasured admission is the campaign's standing
-        // refusal rather than a free ride. `0x84`/`0xA8` are byte forms and were never at issue.
-        && !(test_word_rows_enabled() && insn.opcode == 0x85)
+        // `0x85`, register form only, which the arm enforces. `0xA9` (TEST ax, imm16) joined
+        // on the S-B ALU-rows slice: its emitter (`emit_test_imm_reg` / `emit_test_preloaded`)
+        // was already fully width-parameterised, and the tyrian-586 no-EMM census gave it the
+        // measurement the earlier version of this comment said it was missing (1,246,187
+        // unbound exits, 1,246,376 runtime hits, `cenB.json`). `0x84`/`0xA8` are byte forms and
+        // were never at issue.
+        && !(test_word_rows_enabled() && matches!(insn.opcode, 0x85 | 0xa9))
+        // THE WORD SHIFT-BY-CL ROW (`IZARRAVM_WORD_SHIFT_CL_ROWS`, default ON), a FOURTH
+        // allowlist term, its own for the same reason the two above are: the gate-off arm stays
+        // byte-identical to the pre-slice tree by inspection. `0xd3` reaches this list; the
+        // `/4..=7` narrowing that keeps ROL/ROR/RCL/RCR out lives in the classifier arm below,
+        // not here -- admitting the opcode does not sweep the rotates in.
+        && !(word_shift_cl_rows_enabled() && insn.opcode == 0xd3)
         // Group 3, admitted by SUB-OPCODE rather than by adding `0xf7` to the list above, because
         // the group's members do not get the same answer and the list cannot say so.
         //
@@ -17069,11 +17156,21 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     width: MemoryWidth::Byte,
                 });
             }
+            // TEST ax, imm16 / TEST eax, imm32. `width` is `operand_width` as of the S-B
+            // ALU-rows slice; it was a hard-coded Dword, which is why the header's "deliberately
+            // NOT here" list named this opcode. The Word arm is reached only when
+            // `test_word_rows_enabled()` opened the gate above, so the Dword behaviour is
+            // unchanged in both arms and the Word one exists only under the knob.
+            // `emit_test_imm_reg` needs no change of its own: it calls
+            // `emit_read_store_value(Reg(0), width, RAX)`, whose Word arm already masks to
+            // sixteen bits, then `emit_test_preloaded`'s Word `alu_r16_r16` lane. `0xa8`
+            // (byte form) keeps its literal `MemoryWidth::Byte`, because its width is a
+            // property of the form rather than of `operand_size`.
             0xa9 => {
                 return Some(DirectKind::TestImmReg {
                     dst: 0,
                     imm: insn.imm,
-                    width: MemoryWidth::Dword,
+                    width: operand_width,
                 });
             }
             0x88 => {
@@ -17822,7 +17919,11 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 let DecodedOperand::Reg(dst) = insn.operand? else {
                     return None;
                 };
-                return Some(DirectKind::ShiftCl { op: m.reg, dst });
+                return Some(DirectKind::ShiftCl {
+                    op: m.reg,
+                    dst,
+                    width: operand_width,
+                });
             }
             0xf6 | 0xf7 => {
                 let m = insn.modrm?;
@@ -19176,7 +19277,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 }
                 emit_set_cf_only(&mut e);
             }
-            DirectKind::ShiftCl { op, dst } => emit_shift_cl(&mut e, op, dst),
+            DirectKind::ShiftCl { op, dst, width } => emit_shift_cl(&mut e, op, dst, width),
             DirectKind::Bt { rm, index } => {
                 emit_bt_reg(&mut e, rm, index);
             }
@@ -25059,7 +25160,14 @@ fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, la
 /// `shl ax, 3` at Word, and the arm below was reached and PANICKED THE COMPILER on ordinary DOS
 /// code. The width bar is now explicit at the admission site, and
 /// `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
-/// fixture. That is what makes `shift_r16_cl` a helper this tree does not owe.
+/// fixture. That sentence used to end "that is what makes `shift_r16_cl` a helper this "
+/// "tree does not owe" -- true when this comment was about the COUNT-LANE arm alone, which
+/// takes an immediate byte and can never reach a CL-sourced shift. The S-B ALU-rows slice is
+/// what makes `shift_r16_cl` owed: `emit_shift_cl` (the SEPARATE, unrelated shift-by-CL
+/// emitter below) now has a Word arm that calls it, admitted under
+/// `IZARRAVM_WORD_SHIFT_CL_ROWS`. This function and its Word-bar argument are untouched by
+/// that slice; the two emitters share no code and this one still takes no lane at Word for
+/// the reason stated above.
 fn emit_shift_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, lane: ImmLane) {
     debug_assert!(
         matches!(op, 4..=7),
@@ -25199,7 +25307,14 @@ fn emit_merge_double_shift_flags(e: &mut Encoder, defined: u32) {
 /// site, grew generated code 51% and arena compactions 47.6%, and the slice was reverted for it.
 /// Here the two arms are two instructions each and everything after them, the OR, the EFLAGS
 /// publish and the single `emit_clear_pending`, is shared.
-fn emit_shift_cl(e: &mut Encoder, op: u8, dst: u8) {
+///
+/// `width` selects `shift_r32_cl` or `shift_r16_cl`; nothing else here is width-dependent. The
+/// count mask, the count-0 and count-1 tests, the `DEFINED`/`WITH_OF` masks and the eflags
+/// publish are all width-invariant, because the host's 66-prefixed shift computes CF, SF, ZF and
+/// PF from the 16-bit operand directly (`shift_r16_cl`'s own doc). The shift itself is emitted
+/// UNCONDITIONALLY before the count test below and is a no-op at count 0 only because the host
+/// applies its own five-bit CL mask -- there is no count-0 branch to add at either width.
+fn emit_shift_cl(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
     const DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
     const WITH_OF: u32 = DEFINED | crate::FLAG_OF;
     let one = e.label();
@@ -25210,7 +25325,10 @@ fn emit_shift_cl(e: &mut Encoder, op: u8, dst: u8) {
     // plus RBX, so this can never clobber `home(dst)` -- not even when `dst` is ECX itself.
     e.mov_r32_r32(Reg::RCX, home(1));
     e.and_r32_imm32(Reg::RCX, 0x1f);
-    e.shift_r32_cl(op, home(dst));
+    match width {
+        MemoryWidth::Word => e.shift_r16_cl(op, home(dst)),
+        _ => e.shift_r32_cl(op, home(dst)),
+    }
     e.pushfq();
     e.pop(Reg::RAX);
 

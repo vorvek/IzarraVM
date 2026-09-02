@@ -903,9 +903,9 @@ fn word_size_alu_carry_forms_are_lowered() {
 ///   16-bit DOS code has no alignment discipline, so admitted, an odd operand would sit inside the
 ///   block and side-exit at that slot on every execution, and nothing after it would retire
 ///   natively. Refused, it ends the block instead. Its Dword row must keep compiling, which is the
-///   second half of what this asserts. (An earlier version of this comment said "these forms lower
-///   through the read-modify-write memory site" of forms 1 AND 3; that was form-1-only and was
-///   already wrong for form 3, which never writes memory.)
+///   second half of what this asserts. (An earlier version of this comment called it "these forms
+///   lower through the read-modify-write memory site" of forms 1 AND 3; that was form-1-only and
+///   was already wrong for form 3, which never writes memory.)
 /// * Form 3 (`0x03 add r,m`, `0x33 xor r,m`) is `AluMemSource`, a pure READ through the relaxed
 ///   lean one-lookup read site, so the alignment economics that hold form 1 out do not apply. The
 ///   B2 peachdrm census ranked `0x2B` word memory at 99.0% of barrier runtime_hits and the slice
@@ -1237,20 +1237,25 @@ fn word_size_shift_forms_are_lowered() {
 fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
     // NO KNOB FORCE, and that absence is deliberate rather than an oversight. Every row left in
     // this table refuses UNCONDITIONALLY, on both arms of `IZARRAVM_ROTATE_ROWS`: RCL/RCR have
-    // never had a classify arm at any width at EITHER operand form, and `0xD3` has no arm at all
-    // (`emit_shift_cl` is Dword-only). A force here would be a gate that cannot fail -- it would pass
-    // identically with the knob on or off, certifying nothing about the knob and hiding that fact
-    // from a reader. (The one row that DID depend on the knob, `0xC1`/`0xD1 /0` ROL, moved OUT of
-    // this table as of `vorvek/direct-word-rot1`: `RotateReg` now carries a `width` field and is
-    // admitted at Word, so its positive coverage -- knob on and off -- lives in
-    // `cpu_jit_word_rotate_test.rs` and `group2_word_rotate_register_form_is_lowered` instead.)
+    // never had a classify arm at any width at EITHER operand form. A force here would be a gate
+    // that cannot fail -- it would pass identically with the knob on or off, certifying nothing
+    // about the knob and hiding that fact from a reader. (The one row that DID depend on the
+    // knob, `0xC1`/`0xD1 /0` ROL, moved OUT of this table as of `vorvek/direct-word-rot1`:
+    // `RotateReg` now carries a `width` field and is admitted at Word, so its positive coverage
+    // -- knob on and off -- lives in `cpu_jit_word_rotate_test.rs` and
+    // `group2_word_rotate_register_form_is_lowered` instead. `0xD3 /4` and `/7`, shift-by-CL,
+    // moved out the same way on the S-B ALU-rows slice: `ShiftCl` now carries a `width` field
+    // and is admitted at Word behind `IZARRAVM_WORD_SHIFT_CL_ROWS`, and its positive coverage
+    // lives in `cpu_jit_word_shift_cl_test.rs`. `/2` RCL and `/3` RCR are what is left here for
+    // `0xD3`: `classify`'s arm narrows to `matches!(m.reg, 4..=7)`, so the rotate sub-opcodes
+    // never reach the admission at all.)
     let cases: &[(&str, &[u8])] = &[
         ("0xc1 /2 rcl cx,imm8", &[0x66, 0xc1, 0xd1, 0x03]),
         ("0xc1 /3 rcr cx,imm8", &[0x66, 0xc1, 0xd9, 0x03]),
         ("0xd1 /2 rcl cx,1", &[0x66, 0xd1, 0xd1]),
         ("0xd1 /3 rcr cx,1", &[0x66, 0xd1, 0xd9]),
-        ("0xd3 /4 shl cx,cl", &[0x66, 0xd3, 0xe1]),
-        ("0xd3 /7 sar cx,cl", &[0x66, 0xd3, 0xf9]),
+        ("0xd3 /2 rcl cx,cl", &[0x66, 0xd3, 0xd1]),
+        ("0xd3 /3 rcr cx,cl", &[0x66, 0xd3, 0xd9]),
         // The MEMORY forms of RCL and RCR, at both operand sizes. These replace the two `/4`
         // memory rows the group-2 memory lane admitted: what has to be pinned now is that the
         // lane's `matches!(reg, 0 | 1 | 4..=7)` whitelist did not sweep `/2` and `/3` in with the

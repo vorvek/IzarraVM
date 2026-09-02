@@ -1487,9 +1487,10 @@ fn the_byte_shift_rows_flip_with_the_gate() {
 /// With the knob ON, the adjacent group-2 opcodes are exactly where they were, and the memory
 /// forms of the two claimed opcodes stay boundaries.
 ///
-/// `0xD3` is the shift-by-CL group and `emit_shift_cl` is Dword-only, so it compiles at Dword and
-/// stays a boundary at Word -- if this slice had put `0xd3` on the allowlist by proximity, the
-/// Word row would compile into a Dword shift. `0xD2` is its byte twin and has no arm at any width.
+/// `0xD3` is the shift-by-CL group. It compiles at Dword unconditionally and, as of the S-B
+/// ALU-rows slice, also at Word under its own `IZARRAVM_WORD_SHIFT_CL_ROWS` knob (default ON,
+/// unaffected by `IZARRAVM_BYTE_SHIFT_ROWS`) -- this row now pins that the byte-shift knob does
+/// not gate it either way. `0xD2` is its byte twin and has no arm at any width.
 #[test]
 fn the_gate_does_not_sweep_in_its_neighbours() {
     for on in [false, true] {
@@ -1573,7 +1574,9 @@ fn the_gate_does_not_sweep_in_its_neighbours() {
                 );
             }
         }
-        // `0xD3 /5` is Dword-only in the emitter and Word-refused by the allowlist's silence.
+        // `0xD3 /5` is admitted at Dword unconditionally and, since the S-B ALU-rows slice, at
+        // Word too under `IZARRAVM_WORD_SHIFT_CL_ROWS` (default ON) -- independent of
+        // `IZARRAVM_BYTE_SHIFT_ROWS`, so both arms of THIS knob admit it.
         assert_eq!(
             compile_span(Seg::ThirtyTwo, &[0xd3, 0xe8]),
             ADMITTED,
@@ -1581,8 +1584,8 @@ fn the_gate_does_not_sweep_in_its_neighbours() {
         );
         assert_eq!(
             compile_span(Seg::Sixteen, &[0xd3, 0xe8]),
-            REFUSED,
-            "0xd3 /5 at Word must stay a barrier on the {on} arm: emit_shift_cl is Dword-only"
+            ADMITTED,
+            "0xd3 /5 at Word must compile on the {on} arm: IZARRAVM_WORD_SHIFT_CL_ROWS is its own knob"
         );
     }
 }

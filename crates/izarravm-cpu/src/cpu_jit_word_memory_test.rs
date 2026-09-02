@@ -826,3 +826,69 @@ fn a_watched_word_store_exits_before_writing() {
         guarded(&body, Seed::new().watch(OPERAND), watch_exits, name);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The `MAX_MEMORY_ALU_SLOTS` / `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` cap
+// ---------------------------------------------------------------------------------------------
+
+/// Four consecutive `and word [OPERAND], imm8` (`0x83 /4`, already-shipping memory-dest
+/// immediate-source form) slots must not all join one block: the walk stops offering
+/// memory-ALU slots once `memory_alu_slots == MAX_MEMORY_ALU_SLOTS` (3), the same way the
+/// call-out slot cap ends a block early (`cpu_jit_out_imm8_callout_test.rs`'s
+/// `MAX_BLOCK_CALLOUT_SLOTS` fixture): the cap always fires with three or more slots already
+/// admitted, so the post-walk min-length rule never turns it into a `CompileOutcome::Retry` --
+/// the walk lands on a Boundary and the block installs SHORT, at the filler plus the three
+/// admitted ALU slots, with the fourth `and` becoming the next block's entry. This is the
+/// block-shape cap the design's review (finding 3) says the entry-count prediction has to
+/// account for, expressed against `0x83`'s memory-destination form rather than form 1's
+/// register-source form, which stays refused at Word.
+#[test]
+fn four_consecutive_word_memory_alu_slots_break_the_walk_on_the_cap() {
+    let one = {
+        let mut v = vec![0x66u8];
+        v.extend_from_slice(&disp32(&[0x83], 4, OPERAND));
+        v.push(0x03);
+        v
+    };
+    let mut code = MOV_ESI_ESI.to_vec();
+    for _ in 0..4 {
+        code.extend_from_slice(&one);
+    }
+    code.extend_from_slice(&MOV_EDI_EDI);
+    code.push(0xf4);
+
+    let mut memory = memory_fill();
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[OPERAND as usize..OPERAND as usize + 2].copy_from_slice(&0x1234u16.to_le_bytes());
+
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.registers.set_esp(STACK_TOP);
+    for offset in 0..code.len() as u32 {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        let _ = cpu.fetch_decoded(&mut bus, linear);
+    }
+    map_page(&mut cpu, &mut bus, OPERAND & !0xfff);
+    map_page(&mut cpu, &mut bus, (STACK_TOP - 4) & !0xfff);
+
+    match jit::direct::compile(&mut cpu, ENTRY, true) {
+        jit::direct::CompileOutcome::Compiled(compilation) => {
+            assert_eq!(
+                compilation.span.instructions, 4,
+                "the walk must stop at the filler plus three memory-ALU slots, the cap short of                  the fourth `and word [OPERAND], imm8` -- a longer span means the cap did not bite"
+            );
+        }
+        jit::direct::CompileOutcome::Retry(cause) => {
+            panic!(
+                "expected a short Compiled block, got Retry({cause:?}) instead -- the cap                  always fires past the post-walk min-length floor, so a Retry here means                  something else stopped the walk first"
+            );
+        }
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("expected a short Compiled block, the walk structurally rejected instead")
+        }
+    }
+}
