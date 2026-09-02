@@ -1268,6 +1268,9 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_read(self, bus, linear);
+        if self.reflected_call_journal {
+            crate::reflected_call_memo::note_read(self, bus, linear);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1331,6 +1334,17 @@ impl CpuGsw {
             false,
             None,
         );
+        if self.reflected_call_journal {
+            crate::reflected_call_memo::note_write(
+                self,
+                bus,
+                linear,
+                BusWidth::Byte,
+                u32::from(value),
+                false,
+                None,
+            );
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1553,6 +1567,11 @@ impl CpuGsw {
         if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
             crate::reflected_call_diag::note_read(self, bus, linear);
         }
+        if self.reflected_call_journal
+            && !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()))
+        {
+            crate::reflected_call_memo::note_read(self, bus, linear);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1641,6 +1660,11 @@ impl CpuGsw {
         #[cfg(feature = "reflected-call-diagnostic")]
         if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
             crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
+        }
+        if self.reflected_call_journal
+            && !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()))
+        {
+            crate::reflected_call_memo::note_write(self, bus, linear, width, value, false, None);
         }
         #[cfg(all(
             feature = "jit",
@@ -1745,6 +1769,9 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_read(self, bus, linear);
+        if self.reflected_call_journal {
+            crate::reflected_call_memo::note_read(self, bus, linear);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -1803,6 +1830,9 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
+        if self.reflected_call_journal {
+            crate::reflected_call_memo::note_write(self, bus, linear, width, value, false, None);
+        }
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -2001,8 +2031,19 @@ impl CpuGsw {
             BusWidth::Dword,
             value,
             true,
-            Some(crate::reflected_call_diag::AddressClass::PageTable),
+            Some(crate::reflected_call::AddressClass::PageTable),
         );
+        if self.reflected_call_journal {
+            crate::reflected_call_memo::note_write(
+                self,
+                bus,
+                physical,
+                BusWidth::Dword,
+                value,
+                true,
+                Some(crate::reflected_call::AddressClass::PageTable),
+            );
+        }
         bus.write_memory(
             physical,
             BusWidth::Dword,

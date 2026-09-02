@@ -1331,6 +1331,7 @@ impl CpuGsw {
         // port).
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::on_port_io();
+        crate::reflected_call_memo::note_port_io(self);
         let operand_size = insn.operand_size;
         match insn.opcode as u8 {
             0xe4 => {

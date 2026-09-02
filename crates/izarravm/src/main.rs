@@ -336,6 +336,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[inline(never)]
 fn real_main() -> Result<(), Box<dyn Error>> {
+    // R2.20(c)'s compare-loop microbenchmark: off unless
+    // `IZARRAVM_REFLECTED_CALL_MEMO_BENCH` is set, in which case it prints to
+    // stderr and does not otherwise affect this run.
+    izarravm_cpu::reflected_call_memo::maybe_run_compare_bench();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -2270,6 +2274,14 @@ fn write_hdd_profile_json(
     {
         report["reflected_call_diagnostic"] =
             reflected_call_diagnostic_json(machine.cpu().reflected_call_diagnostic_snapshot());
+    }
+    // Slice 1 (record-and-measure): additive, unconditional on both arms (plan section 7.4) --
+    // all-zero / `{"armed":false}` when `IZARRAVM_REFLECTED_CALL_MEMO` is unset, exactly as the
+    // OFF-arm counter surface must be for a ladder leg to trust it named the arm it meant to.
+    {
+        let raw = izarravm_cpu::reflected_call_memo_json(machine.cpu());
+        report["reflected_call_memo"] =
+            serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
     }
     #[cfg(feature = "direct-callout-attribution")]
     {

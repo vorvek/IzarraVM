@@ -906,6 +906,7 @@ impl CpuGsw {
                 self.far_call(bus, selector, offset, operand_size)?;
                 #[cfg(feature = "reflected-call-diagnostic")]
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
+                crate::reflected_call_memo::on_far_transfer(self, bus);
                 Ok(clocks(17))
             }
             0xea => {
@@ -915,6 +916,7 @@ impl CpuGsw {
                 self.far_jump(bus, selector, offset, operand_size)?;
                 #[cfg(feature = "reflected-call-diagnostic")]
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
+                crate::reflected_call_memo::on_far_transfer(self, bus);
                 Ok(clocks(17))
             }
             0xc2 => {
@@ -1077,6 +1079,7 @@ impl CpuGsw {
                         // this shape, and the direct-form hooks at `0x9A`/`0xEA` miss it.
                         #[cfg(feature = "reflected-call-diagnostic")]
                         crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
+                        crate::reflected_call_memo::on_far_transfer(self, bus);
                         Ok(clocks(11))
                     }
                     _extension => Err(undefined_opcode()),
@@ -1148,6 +1151,7 @@ impl CpuGsw {
                 self.set_edx_eax(tsc);
                 #[cfg(feature = "reflected-call-diagnostic")]
                 crate::reflected_call_diag::on_rdtsc_or_rdmsr_tsc();
+                crate::reflected_call_memo::note_rdtsc_or_rdmsr(self);
                 Ok(clocks(11))
             }
             0x32 => {
@@ -1157,6 +1161,9 @@ impl CpuGsw {
                 #[cfg(feature = "reflected-call-diagnostic")]
                 if self.read_gpr32(1) == MSR_TSC {
                     crate::reflected_call_diag::on_rdtsc_or_rdmsr_tsc();
+                }
+                if self.read_gpr32(1) == MSR_TSC {
+                    crate::reflected_call_memo::note_rdtsc_or_rdmsr(self);
                 }
                 let value = match self.read_gpr32(1) {
                     MSR_MCAR => self.msr.mcar,

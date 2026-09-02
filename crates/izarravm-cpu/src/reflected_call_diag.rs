@@ -98,6 +98,10 @@
 //! (re-entry) or the open trip has gone stale (rule 4).
 
 use super::*;
+use crate::reflected_call::{
+    AddressClass, EntryImage, FRAMEBUFFER_APERTURE_HI, FRAMEBUFFER_APERTURE_LO, GuestMode,
+    StackTrack, Walk, mask_to_width, probe_physical,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -167,13 +171,12 @@ const REFLECTED_CALL_MAX_ENTRY_IMAGES: usize = 4_096;
 const REFLECTED_CALL_MAX_WRITE_ADDRESSES: usize = 4_096;
 const REFLECTED_CALL_MAX_CLASS_N_ADDRESSES_TRACKED: usize = 4_096;
 
-/// The fixed legacy VGA aperture (`memory.rs`, `jit/direct.rs`), physical.
-/// Plan §3.1: no linear-framebuffer base is resolvable from this crate alone
-/// (UNVERIFIED base for any LFB aperture vega may expose), so only the
-/// legacy aperture is classified; that limitation is reported (see the
-/// result document, T4).
-const FRAMEBUFFER_APERTURE_LO: u32 = 0x000A_0000;
-const FRAMEBUFFER_APERTURE_HI: u32 = 0x000B_FFFF;
+// The fixed legacy VGA aperture (`memory.rs`, `jit/direct.rs`), physical --
+// `FRAMEBUFFER_APERTURE_LO`/`_HI`, moved to `crate::reflected_call` (slice1).
+// Plan §3.1: no linear-framebuffer base is resolvable from this crate alone
+// (UNVERIFIED base for any LFB aperture vega may expose), so only the
+// legacy aperture is classified; that limitation is reported (see the
+// result document, T4).
 
 /// Optional dwell-window gate on RETIRED GUEST INSTRUCTIONS
 /// (`IZARRAVM_REFLECTED_CALL_DIAG_WINDOW=<start_insns>:<end_insns>`, orchestrator
@@ -293,68 +296,6 @@ static FORCED_INTERPRETER: AtomicBool = AtomicBool::new(false);
 // Entry image
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct EntryImage {
-    eax: u32,
-    ebx: u32,
-    ecx: u32,
-    edx: u32,
-    esp: u32,
-    ebp: u32,
-    esi: u32,
-    edi: u32,
-    eflags_masked: u32,
-    cs_selector: u16,
-    cs_base: u32,
-    cs_limit: u32,
-    cs_access: u8,
-    ss_selector: u16,
-    ss_base: u32,
-    ss_limit: u32,
-    ss_access: u8,
-    cr0: u32,
-    cr3: u32,
-    cpl: u8,
-    vm: bool,
-    idtr_base: u32,
-    idtr_limit: u16,
-}
-
-const EFLAGS_ARCH_MASK: u32 = 0x0003_7fd5;
-
-impl EntryImage {
-    fn capture(cpu: &CpuGsw) -> Self {
-        let regs = &cpu.registers;
-        let cs = regs.cs();
-        let ss = regs.segment(SegmentIndex::Ss);
-        EntryImage {
-            eax: regs.eax(),
-            ebx: regs.ebx(),
-            ecx: regs.ecx(),
-            edx: regs.edx(),
-            esp: regs.esp(),
-            ebp: regs.ebp(),
-            esi: regs.esi(),
-            edi: regs.edi(),
-            eflags_masked: regs.eflags & EFLAGS_ARCH_MASK,
-            cs_selector: cs.selector,
-            cs_base: cs.base,
-            cs_limit: cs.limit,
-            cs_access: cs.access,
-            ss_selector: ss.selector,
-            ss_base: ss.base,
-            ss_limit: ss.limit,
-            ss_access: ss.access,
-            cr0: cpu.control.cr0,
-            cr3: cpu.control.cr3,
-            cpl: cpu.current_privilege_level(),
-            vm: cpu.is_v86_mode(),
-            idtr_base: cpu.idtr.base,
-            idtr_limit: cpu.idtr.limit,
-        }
-    }
-}
-
 #[derive(Default)]
 struct FieldVariance {
     first: Option<EntryImage>,
@@ -406,14 +347,14 @@ impl FieldVariance {
             image.esi != first.esi,
             image.edi != first.edi,
             image.eflags_masked != first.eflags_masked,
-            image.cs_selector != first.cs_selector,
-            image.cs_base != first.cs_base,
-            image.cs_limit != first.cs_limit,
-            image.cs_access != first.cs_access,
-            image.ss_selector != first.ss_selector,
-            image.ss_base != first.ss_base,
-            image.ss_limit != first.ss_limit,
-            image.ss_access != first.ss_access,
+            image.cs.selector != first.cs.selector,
+            image.cs.base != first.cs.base,
+            image.cs.limit != first.cs.limit,
+            image.cs.access != first.cs.access,
+            image.ss.selector != first.ss.selector,
+            image.ss.base != first.ss.base,
+            image.ss.limit != first.ss.limit,
+            image.ss.access != first.ss.access,
             image.cr0 != first.cr0,
             image.cr3 != first.cr3,
             image.cpl != first.cpl,
@@ -438,57 +379,6 @@ impl FieldVariance {
 // ---------------------------------------------------------------------------
 // Address classification (journal mode)
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum AddressClass {
-    ClientStack,
-    HostStack,
-    Bda,
-    Gdt,
-    Ldt,
-    Idt,
-    Tss,
-    PageTable,
-    /// NEW (plan §3.1): the legacy VGA aperture, physical `0xA0000..=0xBFFFF`.
-    /// The CRTC reads guest memory every scanline with no arming step, so an
-    /// intermediate value written here is observable on screen -- never
-    /// eligible for the Class R (restored) write disposition.
-    FramebufferAperture,
-    /// NEW (plan §3.1): a BYTE-WISE `peek_direct_ram` (D2: not merely the
-    /// width-native peek, which declines on a misaligned access even over
-    /// ordinary RAM) failed at this physical address. This means exactly
-    /// what it says -- the peek failed -- and NOT "this is a device window":
-    /// 0b's own instrument called this a device-window proxy and was wrong
-    /// (slice0b review, D2/D7): every top `not_plain_ram` address the review
-    /// traced was an odd (misaligned) address of ordinary RAM the width-only
-    /// peek merely declined to read. Also never eligible for Class R.
-    NotPlainRam,
-    Other,
-}
-
-impl AddressClass {
-    fn name(self) -> &'static str {
-        match self {
-            Self::ClientStack => "client_stack",
-            Self::HostStack => "host_stack",
-            Self::Bda => "bda",
-            Self::Gdt => "gdt",
-            Self::Ldt => "ldt",
-            Self::Idt => "idt",
-            Self::Tss => "tss",
-            Self::PageTable => "page_table",
-            Self::FramebufferAperture => "framebuffer_aperture",
-            Self::NotPlainRam => "not_plain_ram",
-            Self::Other => "other",
-        }
-    }
-
-    /// Plan §3: "Exception: device windows and the framebuffer aperture are
-    /// never Class R."
-    fn never_restored(self) -> bool {
-        matches!(self, Self::FramebufferAperture | Self::NotPlainRam)
-    }
-}
 
 /// N6/A.4: length 11 (was 9 in slice 0 -- two new device-window classes).
 /// Every `[u64; 11]` and every JSON zip over `ALL_CLASSES` below must stay in
@@ -593,58 +483,9 @@ fn classify(
 // The non-charging page walker (plan §4)
 // ---------------------------------------------------------------------------
 
-/// The two page-walk entries resolved for one linear address, TLB-independent
-/// (a pure function of guest CR3 + guest page-table memory). Module-private:
-/// this closes slice 0's blind spots (the BDA peek, `entered_via_task_gate`,
-/// `TSS.ESP0`) WITHOUT teaching `probe_linear_read_physical` (`core.rs`) or
-/// any other production seam to walk -- the walker lives only here.
-/// D7 (slice0b review): 0b captured `pde_value`/`pte_value` on this struct
-/// (matching plan §3.2's "the physical PDE and PTE addresses AND values") but
-/// never read either -- the `translations` map's value type is pinned by the
-/// plan at `(u32, u32)`, which only fits the two ADDRESSES. Dropped rather
-/// than carried dead; only the two addresses `record_translation` actually
-/// consumes remain.
-struct Walk {
-    pde_phys: u32,
-    pte_phys: u32,
-}
-
-/// TLB-independent linear-to-physical resolution for a DATA READ probe. Never
-/// fills the TLB, never charges a bus access, never sets an accessed/dirty
-/// bit -- it uses only `CpuBus::peek_direct_ram`, which by contract does
-/// none of those things.
-///
-/// 1. Paging off: identity map, no walk.
-/// 2. Paging on: ALWAYS walks by hand, never consulting the cached TLB
-///    (`probe_linear_read_physical`, `core.rs:1845`) at all -- merge-review
-///    nit 8 corrected this comment, which used to claim a TLB fast path the
-///    code has never taken (`the_walker_resolves_a_physical_address_on_a_tlb_miss`'s
-///    own mutation bite, reverting to `probe_linear_read_physical` alone,
-///    confirms the hand walk is the intended path, not a fallback from it).
-///    PDE at `(cr3 & !0xFFF) + (linear >> 22) * 4`, PTE at
-///    `(pde & !0xFFF) + ((linear >> 12) & 0x3FF) * 4`. `None` if either
-///    present bit is clear or either peek misses. 4 MiB (PSE) pages are not
-///    modelled: the design's guest population (DOS extenders under a DPMI
-///    host) runs exclusively 4 KiB paging, so this is an accepted scope
-///    limitation, not silently wrong for the guests this instrument targets.
-fn probe_physical<B: CpuBus>(cpu: &CpuGsw, bus: &B, linear: u32) -> Option<(u32, Option<Walk>)> {
-    if !cpu.is_paging_enabled() {
-        return Some((linear, None));
-    }
-    let cr3 = cpu.control.cr3;
-    let pde_phys = (cr3 & !0xFFF).wrapping_add((linear >> 22) * 4);
-    let pde_value = bus.peek_direct_ram(pde_phys, BusWidth::Dword)?;
-    if pde_value & 1 == 0 {
-        return None;
-    }
-    let pte_phys = (pde_value & !0xFFF).wrapping_add(((linear >> 12) & 0x3FF) * 4);
-    let pte_value = bus.peek_direct_ram(pte_phys, BusWidth::Dword)?;
-    if pte_value & 1 == 0 {
-        return None;
-    }
-    let phys = (pte_value & !0xFFF) | (linear & 0x0FFF);
-    Some((phys, Some(Walk { pde_phys, pte_phys })))
-}
+// `Walk`/`probe_physical` moved to `crate::reflected_call` (slice1); merge-
+// review nit 8's doc-comment correction (the walk always resolves by hand,
+// never consulting the cached TLB) was ported to that copy.
 
 /// D2 (slice0b review §3): `CpuBus::peek_direct_ram(phys, width)` declines
 /// (returns `None`) on a misaligned word/dword access -- `direct_page_ram_bytes`'s
@@ -673,15 +514,6 @@ fn peek_ram_width_safe<B: CpuBus>(bus: &B, phys: u32, width: BusWidth) -> Option
 // Per-trip state
 // ---------------------------------------------------------------------------
 
-#[derive(Default, Clone, Copy)]
-struct StackTrack {
-    selector: u16,
-    base: u32,
-    limit: u32,
-    low_water_esp: u32,
-    last_esp: u32,
-}
-
 struct WriteRecord {
     class: AddressClass,
     physical: Option<u32>,
@@ -695,36 +527,10 @@ struct ReadRecord {
     under_entry_cr3: bool,
 }
 
-/// Guest execution mode, sampled at trip entry/close and on every hook this
-/// module reaches, for the "mode transitions inside a trip" check (plan
-/// §2.1): a trip entering protected mode and closing in V86 is a defect, not
-/// a match.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum GuestMode {
-    Protected,
-    V86,
-    Real,
-}
-
-impl GuestMode {
-    fn sample(cpu: &CpuGsw) -> Self {
-        if cpu.is_v86_mode() {
-            GuestMode::V86
-        } else if cpu.is_protected_mode() {
-            GuestMode::Protected
-        } else {
-            GuestMode::Real
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            GuestMode::Protected => "pm",
-            GuestMode::V86 => "v86",
-            GuestMode::Real => "real",
-        }
-    }
-}
+// Guest execution mode, sampled at trip entry/close and on every hook this
+// module reaches, for the "mode transitions inside a trip" check (plan
+// §2.1): a trip entering protected mode and closing in V86 is a defect, not
+// a match. Type moved to `crate::reflected_call::GuestMode`.
 
 /// The four ways a trip can close (plan §2.1/§2.3). Only `ReturnMatch` counts
 /// as a match; the other three close the trip and are recorded, but never
@@ -1832,7 +1638,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
     }
     stats
         .distinct_cs_eip
-        .insert((trip.entry_image.cs_selector, trip.return_eip));
+        .insert((trip.entry_image.cs.selector, trip.return_eip));
     if trip.nested_int_count > 0 {
         stats.nested_int_trips += 1;
     }
@@ -2093,14 +1899,6 @@ fn is_dead_stack_8kb(trip: &Trip, addr: u32) -> bool {
         return below <= DEAD_STACK_CAP_BYTES;
     }
     false
-}
-
-fn mask_to_width(v: u32, width_bytes: u32) -> u32 {
-    match width_bytes {
-        1 => v & 0xff,
-        2 => v & 0xffff,
-        _ => v,
-    }
 }
 
 fn read_class_bump(stats: &mut KeyStats, class: AddressClass) {

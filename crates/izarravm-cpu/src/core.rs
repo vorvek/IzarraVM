@@ -1800,6 +1800,15 @@ impl CpuGsw {
         self.timing_rem
     }
 
+    /// `timing_rem`, ungated by `feature = "jit"` (unlike
+    /// `poll_skip_timing_remainder` above): the reflected-call memo's raw-clock
+    /// recovery (slice1 plan Revision 2, R2.2/R2.15) is production code behind a
+    /// runtime knob, not a diagnostic feature, and needs this carry sampled at a
+    /// trip's open and close regardless of which cargo features are compiled in.
+    pub(crate) fn reflected_call_timing_rem(&self) -> u64 {
+        self.timing_rem
+    }
+
     /// `core_clocks_so_far`, exposed for the GP2 poll-skip seam's `izarravm-machine` fixtures,
     /// which build the same `CalloutPollSkipRequest` the Direct call-out builds and need this
     /// exact term (`core_clocks_at_block_entry`) to reproduce `now_at(0)`.
