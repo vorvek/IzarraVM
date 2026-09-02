@@ -3461,6 +3461,8 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "decode_inval_task_switch": mark.perf.decode_inval_task_switch,
                 "cr3_code_flush_taken": mark.perf.cr3_code_flush_taken,
                 "cr3_code_flush_skipped": mark.perf.cr3_code_flush_skipped,
+                "cr3_link_context_selects": mark.perf.cr3_link_context_selects,
+                "cr3_link_graph_retires": mark.perf.cr3_link_graph_retires,
                 "translation_page_writes": mark.perf.translation_page_writes,
                 "translation_a_stores": mark.perf.translation_a_stores,
                 "translation_d_stores": mark.perf.translation_d_stores,
@@ -3760,6 +3762,9 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "jit_direct_poll_skip_raw_bus_clocks": snapshot.poll_skip_raw_bus_clocks,
         "jit_direct_poll_skip_max_span": snapshot.poll_skip_max_span,
         "jit_direct_poll_skip_last_head": snapshot.poll_skip_last_head,
+        "jit_direct_link_context_rebinds": snapshot.link_context_rebinds,
+        "jit_direct_link_waiting_entries": snapshot.link_waiting_entries,
+        "jit_direct_link_linear_blocks_entries": snapshot.link_linear_blocks_entries,
     });
     // Task 0's census-gated half. The park pair is read as a mean WITH its censoring rate
     // `(smc_heat_demotions - park_lifts) / smc_heat_demotions`: never-lifted and reset-ended parks

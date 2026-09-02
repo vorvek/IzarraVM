@@ -914,8 +914,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // measured, not derived. Host-side diagnostics and a transparent accelerator, not
     // architectural state, so both canonical payloads are unchanged by it; see cpu_test.rs's
     // twin comment.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4760);
+    // The CR3 JIT-half gate adds two PerfCounters fields (16 bytes), moving the pin 4760 -> 4776
+    // -- measured, not derived. Documentation counters (design review J8), not architectural
+    // state; see cpu_test.rs's twin comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4776);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4760);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4776);
 }

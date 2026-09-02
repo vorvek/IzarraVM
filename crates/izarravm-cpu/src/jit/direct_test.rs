@@ -304,10 +304,12 @@ fn both_successor_cells_resolve_unlink_recompile_and_reset() {
         Some(LinkTarget {
             linear: fallthrough.linear,
             mode_key: source.mode_key,
+            context: 0,
         }),
         Some(LinkTarget {
             linear: taken.linear,
             mode_key: source.mode_key,
+            context: 0,
         }),
     ];
     let source_id = cache.install(&source_compilation).expect("source install");
@@ -811,6 +813,7 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
+        context: 0,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     install_trivial(&mut cache, target, 1);
@@ -942,10 +945,12 @@ fn repeated_source_revalidation_does_not_rebuild_its_link_graph() {
         Some(LinkTarget {
             linear: unresolved_target.linear,
             mode_key: unresolved_target.mode_key,
+            context: 0,
         }),
         Some(LinkTarget {
             linear: hidden_target.linear,
             mode_key: hidden_target.mode_key,
+            context: 0,
         }),
     ];
     let source_id = cache.install(&source_compilation).expect("source install");
@@ -1048,6 +1053,7 @@ fn invalidated_metadata_slot_reuse_rejects_its_stale_generation() {
     compilation.successors[0] = Some(LinkTarget {
         linear: missing.linear,
         mode_key: missing.mode_key,
+        context: 0,
     });
     let stale_id = cache.install(&compilation).expect("source install");
     let stale_block = cache.block(stale_id).expect("source block");
@@ -1099,6 +1105,7 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
+        context: 0,
     });
     let source_cell_address = source_compilation.link_cells[0].address();
     source_compilation.code = vec![0x48, 0xb8];
@@ -1173,6 +1180,7 @@ fn unresolved_waiting_edge_survives_arena_compaction() {
     let target_key = LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
+        context: 0,
     };
     source_compilation.successors[0] = Some(target_key);
     let source_id = cache.install(&source_compilation).expect("source install");
@@ -1208,6 +1216,7 @@ fn translation_invalid_blocks_stay_invisible_through_compaction() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
+        context: 0,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     let target_id = install_trivial(&mut cache, target, 1);
@@ -1858,6 +1867,7 @@ fn ranged_device_write_preserves_unrelated_blocks_and_unlinks_overlap() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: overlap.linear,
         mode_key: overlap.mode_key,
+        context: 0,
     });
     assert!(matches!(
         cpu.jit_direct.probe(source),
@@ -2917,11 +2927,18 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
 /// (probe, the `run_direct_block` argument, and the pre-entry re-resolve), so its size is
 /// memcpy traffic multiplied by ~47M entries in a Quake/586 run. Fields that are not read
 /// on a uniform-fetch entry belong in a parallel `BlockCache` lane, not in the copy.
+///
+/// The CR3 JIT-half gate (`2026-09-02-cr3-jit-half-design.md`, L2) adds a `context: u8` field to
+/// `LinkTarget`, and `successors: [Option<LinkTarget>; 2]` is a `CompiledBlock` field, so the
+/// struct grows with it -- 120 -> 128, measured off a failing-test readout, not derived. The
+/// added byte is read only at link-resolution time (`resolve_successors`,
+/// `make_link_visible`), never on the uniform-fetch entry path itself, so the per-entry copy
+/// cost this test guards is unaffected in kind, only in the fixed size of the copy.
 #[test]
 fn compiled_block_stays_small_enough_to_copy_per_entry() {
     assert_eq!(
         core::mem::size_of::<CompiledBlock>(),
-        120,
+        128,
         "CompiledBlock size changed; if a field was added, check it is actually read on the \
          uniform-fetch entry path before letting it ride every per-entry copy"
     );
@@ -3003,10 +3020,12 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
     let fallthrough = LinkTarget {
         linear: 0x1100,
         mode_key: source.mode_key,
+        context: 0,
     };
     let taken = LinkTarget {
         linear: 0x1200,
         mode_key: source.mode_key,
+        context: 0,
     };
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
     assert!(matches!(cache.probe(source), BlockProbe::Compile));
@@ -3054,6 +3073,7 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
             "cleared_reset",
             "cleared_chain_widen",
             "cleared_data_segment_decline",
+            "cleared_context_rebind",
             "unexpected_linked",
             "closed",
         ]
@@ -3114,6 +3134,7 @@ fn direct_link_refusal_census_registers_before_the_first_link_attempt() {
         Some(LinkTarget {
             linear: target.linear,
             mode_key: target.mode_key,
+            context: 0,
         }),
         None,
     ];
@@ -3189,6 +3210,7 @@ fn direct_link_refusal_state_machine_maps_every_bucket() {
         Some(LinkTarget {
             linear: target.linear,
             mode_key: target.mode_key,
+            context: 0,
         }),
         None,
     ];
@@ -3246,6 +3268,7 @@ fn segment_write_static_cell_is_registered_as_suppressed_fallthrough() {
         Some(LinkTarget {
             linear: source.linear + 3,
             mode_key: source.mode_key,
+            context: 0,
         }),
         None,
     ];
@@ -3284,6 +3307,7 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
     let target_link = LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
+        context: 0,
     };
 
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
@@ -3679,7 +3703,26 @@ fn link_clear_causes_close_on_the_aggregate() {
         "the decline cuts exactly the one live outbound cell, under its own cause"
     );
 
-    // All SIX sites: deleting any single increment above must break the sum.
+    // ContextRebind: `make_link_visible`'s L3 arm (design doc
+    // `2026-09-02-cr3-jit-half-design.md` (b)), a block made link-visible under one CR3 ring
+    // slot re-touched under the other. Fresh blocks for the same reason the reset/chain-widen
+    // sections above need them.
+    let rebind_source = key(0x1b00);
+    let rebind_target = key(0x1c00);
+    let rebind_source_id = install_trivial(&mut cache, rebind_source, 1);
+    let rebind_target_id = install_trivial(&mut cache, rebind_target, 1);
+    assert!(cache.try_link(rebind_source_id, 0, rebind_target_id));
+    cache.allocate_link_context(1);
+    cache.make_link_visible(rebind_source_id);
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::ContextRebind as usize],
+        1,
+        "L3 clears the block's one live outbound cell before the cross-context rebind; the \
+         other cell is already empty and `unlink_outbound` does not count a no-op clear"
+    );
+    cache.select_link_context(0);
+
+    // All SEVEN sites: deleting any single increment above must break the sum.
     let causes = cache.stalls.links_cleared;
     assert!(
         causes.iter().all(|&n| n > 0),
@@ -3692,6 +3735,437 @@ fn link_clear_causes_close_on_the_aggregate() {
         "the cause split must sum to the aggregate it attributes"
     );
 }
+
+// =================================================================================================
+// CR3 JIT-half gate (design doc `2026-09-02-cr3-jit-half-design.md`): the link graph's own
+// two-slot ring. `link_epochs`, `link_slot`, `select_link_context`, `allocate_link_context` and
+// `LinkTarget.context` are exercised directly at the `BlockCache` level here (rather than through
+// a full guest `MOV CR3` write, `DecodeCache`'s ring, as `cpu_cr3_flush_test.rs` does for the
+// decode half) because the mechanism under test is entirely internal to `BlockCache`: driving it
+// through native JIT compilation and execution would exercise the SAME code paths through an
+// extra, expensive layer with no additional coverage of the property in question.
+// =================================================================================================
+
+/// R-1. RED before L1-L5 existed: `invalidate_translation` ran on every CR3 write, so a
+/// same-directory reselect always tore the link down and rebuilt it from nothing.
+#[test]
+fn returning_to_a_directory_restores_its_links() {
+    let mut cache = BlockCache::default();
+    let source = key(0x2000);
+    let target = key(0x2100);
+    let source_id = install_trivial(&mut cache, source, 1);
+    let target_id = install_trivial(&mut cache, target, 1);
+    assert!(cache.try_link(source_id, 0, target_id));
+    assert!(cache.has_linked_successor(source_id));
+    assert!(cache.is_link_visible(target_id));
+
+    let unlinks_before = cache.stats.unlinks;
+    let flushed_before = cache.stalls.links_cleared[LinkClearCause::Flushed as usize];
+
+    // R2 allocate: CR3 = B.
+    cache.allocate_link_context(1);
+    assert!(
+        !cache.is_link_visible(target_id),
+        "B must not see A's link live merely by switching the ring slot"
+    );
+
+    // R1 reselect: CR3 = A.
+    cache.select_link_context(0);
+    assert!(
+        cache.has_linked_successor(source_id),
+        "the cell was never touched by either write -- a select is a pointer swap"
+    );
+    assert!(
+        cache.is_link_visible(target_id),
+        "returning to A must restore the link with no work"
+    );
+    assert_eq!(
+        cache.stats.unlinks, unlinks_before,
+        "neither write may tear down any edge"
+    );
+    assert_eq!(
+        cache.stalls.links_cleared[LinkClearCause::Flushed as usize],
+        flushed_before
+    );
+}
+
+/// R-2. Under B, a DIFFERENT physical at the SAME linear as A's target must not become the
+/// target of A's already-bound source cell. RED against "one link epoch shared by both slots"
+/// (design review J4): a shared epoch would make A's own stamp stale against the post-allocate
+/// live epoch, so `is_link_visible(target_a_id)` would read false even after returning to A.
+#[test]
+fn a_second_directory_gets_its_own_link_graph() {
+    let mut cache = BlockCache::default();
+    let source = key(0x2200);
+    let target_a = key(0x2300);
+    let source_id = install_trivial(&mut cache, source, 1);
+    let target_a_id = install_trivial(&mut cache, target_a, 1);
+    assert!(cache.try_link(source_id, 0, target_a_id));
+    let source_index = cache.active_index(source_id).expect("source active");
+    let portal_before = cache.link_cells[source_index][0]
+        .portal
+        .load(Ordering::Acquire);
+    assert_ne!(portal_before, 0);
+
+    // Under B (R2 allocate), a DIFFERENT physical block at the SAME linear as target_a.
+    cache.allocate_link_context(1);
+    let target_c = BlockKey::new(
+        target_a.linear,
+        target_a.physical + 0x1000,
+        target_a.mode_key,
+    );
+    let target_c_id = install_trivial(&mut cache, target_c, 1);
+    assert!(
+        cache.is_link_visible(target_c_id),
+        "B's own install must succeed under B's own context"
+    );
+
+    // Return to A.
+    cache.select_link_context(0);
+    let portal_after = cache.link_cells[source_index][0]
+        .portal
+        .load(Ordering::Acquire);
+    assert_eq!(
+        portal_before, portal_after,
+        "A's source cell must still point at A's own target, untouched by B's install"
+    );
+    assert!(cache.is_link_visible(target_a_id));
+}
+
+/// G-1. Both slots occupied, a third distinct directory retires the WHOLE graph (R3): the
+/// `Taken` arm calls `invalidate_translation()` then `allocate_link_context`.
+#[test]
+fn a_third_directory_retires_the_link_graph() {
+    let mut cache = BlockCache::default();
+    let a = key(0x2400);
+    let a_target = key(0x2450);
+    let b = key(0x2500);
+    let a_id = install_trivial(&mut cache, a, 1);
+    let a_target_id = install_trivial(&mut cache, a_target, 1);
+    // A genuine edge under slot 0, so the wholesale retire below has something to unlink.
+    // Cross-slot edges cannot form at all (`try_link_inner`'s `stale_epoch` refuses them), so
+    // this is the only shape available for the assertion below.
+    assert!(cache.try_link(a_id, 0, a_target_id));
+    cache.allocate_link_context(1);
+    let b_id = install_trivial(&mut cache, b, 1);
+    assert!(cache.is_link_visible(b_id));
+
+    let epochs_before = cache.link_epochs;
+    let unlinks_before = cache.stats.unlinks;
+    cache.invalidate_translation();
+    cache.allocate_link_context(0);
+
+    assert!(
+        cache.linear_blocks.is_empty(),
+        "a wholesale retire must drain the WHOLE rendezvous map, both slots"
+    );
+    assert!(!cache.is_link_visible(a_id));
+    assert!(!cache.is_link_visible(b_id));
+    assert!(cache.stats.unlinks > unlinks_before);
+    assert_ne!(
+        cache.link_epochs[0], epochs_before[0],
+        "both epochs must be freshly minted, never recycled (design review J2)"
+    );
+    assert_ne!(cache.link_epochs[1], epochs_before[1]);
+    assert_ne!(
+        cache.link_epochs[0], cache.link_epochs[1],
+        "the two fresh epochs must not collide with EACH OTHER either"
+    );
+}
+
+/// G-2. The (e) row's JIT-side twin: a translation-page store retires the link graph.
+/// `invalidate_translation()` is the mechanism the translation-page arm calls
+/// (`core.rs`'s `note_code_write_inner`); the CPU-level wiring to that call is unchanged by
+/// this slice and is covered by `cpu_cr3_flush_test.rs`'s own (e) row.
+#[test]
+fn a_translation_page_store_retires_the_link_graph() {
+    let mut cache = BlockCache::default();
+    let source = key(0x2600);
+    let target = key(0x2700);
+    let source_id = install_trivial(&mut cache, source, 1);
+    let target_id = install_trivial(&mut cache, target, 1);
+    assert!(cache.try_link(source_id, 0, target_id));
+    assert!(cache.has_linked_successor(source_id));
+
+    cache.invalidate_translation();
+
+    assert!(!cache.has_linked_successor(source_id));
+    assert!(cache.linear_blocks.is_empty());
+}
+
+/// G-3. The SMC wholesale arm's twin: same mechanism, exercised with BOTH slots occupied so it
+/// is visibly distinct from G-2's single-slot case.
+#[test]
+fn an_smc_wholesale_store_retires_the_link_graph() {
+    let mut cache = BlockCache::default();
+    let a = key(0x2800);
+    let b = key(0x2900);
+    let a_id = install_trivial(&mut cache, a, 1);
+    cache.allocate_link_context(1);
+    let b_id = install_trivial(&mut cache, b, 1);
+
+    cache.invalidate_translation();
+
+    assert!(!cache.is_link_visible(a_id));
+    assert!(!cache.is_link_visible(b_id));
+    assert!(cache.linear_blocks.is_empty());
+    assert!(cache.waiting.is_empty());
+}
+
+/// G-4. The inert control: nothing that is not one of the wholesale sites above may touch the
+/// link graph. Proves G-1 through G-3 are not passing because everything retires everything.
+#[test]
+fn an_inert_operation_does_not_retire_the_link_graph() {
+    let mut cache = BlockCache::default();
+    let source = key(0x2a10);
+    let target = key(0x2b10);
+    let source_id = install_trivial(&mut cache, source, 1);
+    let target_id = install_trivial(&mut cache, target, 1);
+    assert!(cache.try_link(source_id, 0, target_id));
+
+    // Nothing: no `invalidate_translation`, no context switch. The link graph must be exactly
+    // as it was.
+    assert!(cache.has_linked_successor(source_id));
+    assert!(cache.is_link_visible(target_id));
+}
+
+/// G-5. Section (c): the pre-existing `mode_key` partition and the NEW `context` (ring slot)
+/// partition are independent, and neither substitutes for the other. Two blocks at the same
+/// linear, the same slot, differing only in the V86 mode-key bit, occupy separate
+/// `linear_blocks` entries -- the same property `core.rs:359` already asserts for the CR0 arm
+/// (`retained_real_mode_chain_is_unreachable_under_pe`), restated here for the slice's own key.
+#[test]
+fn the_same_slot_keeps_two_mode_key_graphs_separately() {
+    let mut cache = BlockCache::default();
+    let linear = 0x2c10;
+    let physical = 0x20_000 + (linear & 0xfff);
+    // Base mode_key of 1 (CS.D only, no V86 bit set), so OR-ing in `JIT_MODE_KEY_V86_BIT` below
+    // actually changes the key rather than being a no-op against a base that already carries it.
+    let base_mode_key = 1u32;
+    let real_key = BlockKey::new(linear, physical, base_mode_key);
+    // A distinct physical: two BlockKeys sharing (linear, physical) but different `mode_key`
+    // collide in the compile walk's physical-span bookkeeping, which is a REAL admission rule
+    // and orthogonal to what this row tests (the `linear_blocks` partition), so it is sidestepped
+    // rather than driven through.
+    let v86_key = BlockKey::new(
+        linear,
+        physical + 0x1000,
+        base_mode_key | JIT_MODE_KEY_V86_BIT,
+    );
+    let real_id = install_trivial(&mut cache, real_key, 1);
+    let v86_id = install_trivial(&mut cache, v86_key, 1);
+
+    let real_target = LinkTarget {
+        linear,
+        mode_key: base_mode_key,
+        context: 0,
+    };
+    let v86_target = LinkTarget {
+        linear,
+        mode_key: base_mode_key | JIT_MODE_KEY_V86_BIT,
+        context: 0,
+    };
+    assert_eq!(cache.linear_blocks.len(), 2);
+    assert_eq!(
+        cache.linear_blocks.get(&real_target).copied(),
+        Some(real_id)
+    );
+    assert_eq!(cache.linear_blocks.get(&v86_target).copied(), Some(v86_id));
+}
+
+/// A-1. Section (c): the same CR3 reselected under a different mode keeps ONE ring slot but TWO
+/// separate link graphs, needing no new mechanism beyond what `mode_key` already carries on
+/// every lookup table.
+#[test]
+fn the_same_cr3_under_a_different_mode_keeps_one_slot_and_two_graphs() {
+    let mut cache = BlockCache::default();
+    let linear = 0x2d10;
+    let physical = 0x20_000 + (linear & 0xfff);
+    // Base mode_key of 1 (CS.D only, PE bit clear), so OR-ing in PE (bit 1, value 2) below
+    // actually changes the key.
+    let base_mode_key = 1u32;
+    let real_key = BlockKey::new(linear, physical, base_mode_key);
+    // A distinct physical, for the same reason as this file's `the_same_slot_keeps_two_mode_key_
+    // graphs_separately`: two BlockKeys sharing (linear, physical) but different `mode_key` trip
+    // the compile walk's physical-span bookkeeping, a real but orthogonal admission rule.
+    let pe_key = BlockKey::new(linear, physical + 0x1000, base_mode_key | 2);
+    let real_id = install_trivial(&mut cache, real_key, 1);
+    // `select_link_context(0)` here is the R1 no-op a same-directory, different-mode reselect
+    // takes at the DecodeCache/CpuGsw level; at this level it is simply "still slot 0".
+    cache.select_link_context(0);
+    let pe_id = install_trivial(&mut cache, pe_key, 1);
+
+    assert!(cache.is_link_visible(real_id));
+    assert!(cache.is_link_visible(pe_id));
+    assert_eq!(
+        cache
+            .linear_blocks
+            .get(&LinkTarget {
+                linear,
+                mode_key: base_mode_key,
+                context: 0
+            })
+            .copied(),
+        Some(real_id)
+    );
+    assert_eq!(
+        cache
+            .linear_blocks
+            .get(&LinkTarget {
+                linear,
+                mode_key: base_mode_key | 2,
+                context: 0
+            })
+            .copied(),
+        Some(pe_id)
+    );
+}
+
+/// A-2 (FS1's row). L3's own row: a block visible under one slot, re-touched under the other,
+/// is REBOUND, not shared. Catches the omission of `unlink_outbound` in L3, which nothing else
+/// catches: without it, a stale cell would chain into the wrong context's target with no fault,
+/// no counter, wrong answers (design doc FS1).
+#[test]
+fn a_block_visible_under_two_slots_is_rebound_not_shared() {
+    let mut cache = BlockCache::default();
+    let source = key(0x2e10);
+    let target_a = key(0x2f10);
+    let source_id = install_trivial(&mut cache, source, 1);
+    let target_a_id = install_trivial(&mut cache, target_a, 1);
+    assert!(cache.try_link(source_id, 0, target_a_id));
+    let source_index = cache.active_index(source_id).expect("source active");
+    assert!(cache.link_cells[source_index][0].linked());
+
+    cache.allocate_link_context(1);
+    let rebinds_before = cache.stalls.link_context_rebinds;
+    // Re-touch source under B, exactly as `revalidate_translation` does on the first entry that
+    // is not already link-visible: source has no successor under B (trivial compilation), so
+    // nothing new binds, but L3 must still clear the stale cross-context cell first.
+    cache.make_link_visible(source_id);
+    assert_eq!(cache.stalls.link_context_rebinds, rebinds_before + 1);
+    assert!(
+        cache.link_cells[source_index][0].is_cleared(),
+        "L3 must clear the stale cross-context cell rather than leave it pointing at A's target"
+    );
+}
+
+/// A-3. L4's base case: root dispatch always builds its key from the LIVE physical, so a probe
+/// under a different physical never returns A's block. Pre-existing, physical-keyed behaviour
+/// this slice does not touch (design review: "the induction in L4 closes").
+#[test]
+fn a_retained_link_is_never_entered_from_the_other_context() {
+    let mut cache = BlockCache::default();
+    let a_key = key(0x3010);
+    let a_id = install_trivial(&mut cache, a_key, 1);
+    let b_key = BlockKey::new(a_key.linear, a_key.physical + 0x1000, a_key.mode_key);
+    assert!(matches!(cache.probe(b_key), BlockProbe::Interpret));
+    assert!(
+        cache.active_index(a_id).is_some(),
+        "a probe under a different physical key must not touch A's block at all"
+    );
+}
+
+/// A-5 (FS2's row, rewritten per design review J3). `try_link_inner`'s `stale_epoch` refusal
+/// already blocks any cross-context bind on its own, so "the bind is refused" cannot fail even
+/// with `LinkTarget.context` dropped -- J3. What the field actually buys is MAP CARDINALITY:
+/// `waiting` keeps A's parked source and B's install in separate entries instead of one
+/// colliding key silently displacing the other.
+#[test]
+fn a_parked_source_keeps_its_own_slots_waiting_entry() {
+    let mut cache = BlockCache::default();
+    let source = key(0x3110);
+    let successor_linear = 0x3210;
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.successors[0] = Some(LinkTarget {
+        linear: successor_linear,
+        mode_key: source.mode_key,
+        context: 0,
+    });
+    let source_id = cache.install(&source_compilation).expect("source install");
+    assert_eq!(cache.waiting.values().map(Vec::len).sum::<usize>(), 1);
+
+    // Under B, a DIFFERENT-physical block at the successor's linear.
+    cache.allocate_link_context(1);
+    let b_key = BlockKey::new(successor_linear, 0x40_000, source.mode_key);
+    let source_index = cache.active_index(source_id).expect("source active");
+    let _b_id = install_trivial(&mut cache, b_key, 1);
+    assert!(
+        !cache.link_cells[source_index][0].linked(),
+        "B's install must not resolve A's parked source: the keys differ by context"
+    );
+    assert_eq!(
+        cache.waiting.values().map(Vec::len).sum::<usize>(),
+        1,
+        "A's parked source is untouched; B's install resolved nothing of its own to park"
+    );
+
+    // Return to A and install the successor under A's OWN context: NOW it must resolve.
+    cache.select_link_context(0);
+    let a_id = install_trivial(&mut cache, key(successor_linear), 1);
+    assert!(
+        cache.waiting.is_empty(),
+        "A's own install must drain A's parked source"
+    );
+    assert_eq!(cache.outbound[source_index][0], Some(a_id));
+}
+
+/// A-6 (FS3's row, rewritten per design review J3). `bind_dynamic_successor` returns
+/// `try_link_inner`'s verdict either way, so "the bind is refused" is true regardless of
+/// whether `LinkTarget` carries `context` -- the row that actually gates the field is
+/// cardinality: A's own `linear_blocks` entry must survive B's install at the SAME linear
+/// untouched, which is exactly what `bind_dynamic_successor`'s lookup reads.
+#[test]
+fn linear_blocks_holds_separate_entries_per_slot_for_the_same_linear() {
+    let mut cache = BlockCache::default();
+    let linear = 0x3310;
+    let a_key = key(linear);
+    let a_id = install_trivial(&mut cache, a_key, 1);
+    let a_target = LinkTarget {
+        linear,
+        mode_key: a_key.mode_key,
+        context: 0,
+    };
+    assert_eq!(cache.linear_blocks.get(&a_target).copied(), Some(a_id));
+
+    cache.allocate_link_context(1);
+    let b_key = BlockKey::new(linear, a_key.physical + 0x1000, a_key.mode_key);
+    let b_id = install_trivial(&mut cache, b_key, 1);
+    let b_target = LinkTarget {
+        linear,
+        mode_key: a_key.mode_key,
+        context: 1,
+    };
+    assert_eq!(
+        cache.linear_blocks.len(),
+        2,
+        "one entry per slot for the same linear, not a collision"
+    );
+    assert_eq!(cache.linear_blocks.get(&a_target).copied(), Some(a_id));
+    assert_eq!(cache.linear_blocks.get(&b_target).copied(), Some(b_id));
+
+    cache.select_link_context(0);
+    assert_eq!(
+        cache.linear_blocks.get(&a_target).copied(),
+        Some(a_id),
+        "A's entry must survive B's install at the same linear, untouched"
+    );
+}
+
+// CR3 JIT-half mutation ledger (2026-09-02):
+//
+// | mutation | must go red | verified |
+// |---|---|---|
+// | bump the link epoch on every select (revert L1, restore the old scalar `link_epoch`) | `returning_to_a_directory_restores_its_links` | by hand |
+// | one link epoch shared by both slots | `a_second_directory_gets_its_own_link_graph` | by hand |
+// | drop the `context` field from `LinkTarget` | `a_parked_source_keeps_its_own_slots_waiting_entry`, `linear_blocks_holds_separate_entries_per_slot_for_the_same_linear` (map-cardinality rows per design review J3; the bind-outcome framing FS2/FS3 originally proposed cannot fail on its own, because `try_link_inner`'s `stale_epoch` refusal already blocks the cross-context bind independent of the key) | by hand |
+// | `make_link_visible` does not `unlink_outbound` on a context change (delete L3's arm) | `a_block_visible_under_two_slots_is_rebound_not_shared` | by hand |
+// | R3 does not retire the link graph (`allocate_link_context` without a prior `invalidate_translation`) | `a_third_directory_retires_the_link_graph` | by hand |
+// | the translation-page arm no longer calls `invalidate_translation` | `a_translation_page_store_retires_the_link_graph`, and `cpu_cr3_flush_test.rs`'s `pte_edit_with_a_tlb_warm_target_still_retires` | by hand |
+// | `allocate_link_context`/`invalidate_translation` mint colliding epochs (revert J2: bump both slots' scalar independently instead of drawing from `next_link_epoch`) | `a_third_directory_retires_the_link_graph`'s epoch-collision assertion | by hand |
+// | put the slot into `BlockKey.mode_key` as well | **NON-GATE for soundness**, exactly as the design doc's own ledger records: strictly stricter, no row here can fail. Caught only by the counter bar (`jit_direct_blocks_installed` roughly halves on a workload where slot and mode_key genuinely align), not by a test. |
 
 #[test]
 fn table_slots_are_host_state_not_guest_state() {
@@ -3882,6 +4356,7 @@ fn link_target_of(key: BlockKey) -> LinkTarget {
     LinkTarget {
         linear: key.linear,
         mode_key: key.mode_key,
+        context: 0,
     }
 }
 

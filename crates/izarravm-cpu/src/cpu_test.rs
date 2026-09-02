@@ -1986,7 +1986,11 @@ fn pending_flags_offset() {
     // measured off a failing-test readout, not derived. None of it is guest state: the counters
     // are diagnostics like their CR3/CR0/task-switch siblings, and the ring/bitmap are the same
     // kind of transparent accelerator `DecodeCache` already was.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4760);
+    // The CR3 JIT-half gate (`2026-09-02-cr3-jit-half-design.md`) adds two PerfCounters fields
+    // (cr3_link_context_selects, cr3_link_graph_retires; 16 bytes), moving this pin
+    // 4760 -> 4776 -- measured off a failing-test readout, not derived. Both are documentation
+    // counters (design review J8): host-side diagnostics, not guest state.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4776);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and

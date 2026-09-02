@@ -202,26 +202,43 @@ fn pte_edit_under_a_live_cr3_forces_a_redecode() {
     );
 }
 
-/// As `pte_edit_under_a_live_cr3_forces_a_redecode`, but with the write's OWN translation made
-/// TLB-warm first (a throwaway same-page write, so the PTE's dirty bit is already set): the
-/// edit's own `translate_linear` call takes the TLB fast path with no walk (confirmed by hand:
-/// instrumenting `translate_linear_checked`'s walk arm shows it not reached for the second
-/// write), which was an attempt to isolate the `code_write_watched` disjunct from the SEPARATE,
-/// unconditional `write_page_walk_entry` enforcement path a fresh walk would also exercise. It
-/// still retires with `code_write_watched`'s translation-page arm forced off by hand, so
-/// something else in the FastMap/watched-page write path (`physical_page_watched`'s own
-/// disjunct, untouched by that mutation, gates a REFUSAL to cache the write at all) independently
-/// catches it; the exact mechanism was not fully traced in the time available. Recorded as a
-/// useful anti-regression row on its own merits (a TLB-warm PTE edit does still retire), not as
-/// the isolating mutation row it was meant to be -- see the ledger's honest non-gate entry.
+/// The #820 non-gate, diagnosed and fixed (design doc `2026-09-02-cr3-jit-half-design.md` (e)).
+///
+/// The original row ran the warm-up BEFORE the witness was decoded. That put the fixture's own
+/// order backwards: the warm-up's walk (translating linear page 9 to store page 14's throwaway
+/// PTE at `0x9038`) sets A on the directory's PDE and A+D on page 9's OWN PTE (`0x9024`), each
+/// store landing before F11's mark, so nothing retires there -- but the walk THEN marks `0x8000`
+/// and `0x9000` as translation structure. `warm_witness` ran next and its OWN code walk touched
+/// page 0's PTE at `0x9000`, which the warm-up had JUST marked, so the ring retired right there,
+/// before the witness line was ever inserted. The final assertion under test was then satisfied
+/// by the WARM-UP's incidental retire, not by the store under test: the mutation this row exists
+/// to catch (dropping `code_write_watched`'s `range_hits_translation_page` disjunct) could never
+/// make it fail, because the row never observed the mutated predicate. Verified by hand: with
+/// that disjunct forced off, this row was still green before the fix below.
+///
+/// Fixed by ORDER: run the throwaway store FIRST, before any decode has run, so its walk's marks
+/// land with nothing live to retire. Decode the witness next (its own walk DOES retire against
+/// the now-marked table page -- F11's placement correction doing its job, not a bug; the line is
+/// inserted afterward and `warm_witness`'s own assertion is the proof it survived). Only THEN
+/// take the store under test, on an ALREADY-WARM translation for linear page 9 (the throwaway
+/// store's own walk set the page's TLB/FastMap entry dirty), so `translation_a_stores` /
+/// `translation_d_stores` not moving across it is this row's own proof that it took no walk and
+/// that `code_write_watched`'s `range_hits_translation_page` disjunct is the only door left open
+/// to it.
 #[test]
 fn pte_edit_with_a_tlb_warm_target_still_retires() {
     let (mut cpu, mut bus) = cr3_fixture();
-    warm_witness(&mut cpu, &mut bus);
     let d = cpu.registers.cs().default_size_32;
 
-    // Throwaway: page 14's PTE slot, same table page as the witness's. Its own walk marks the
-    // table and sets the page's dirty bit, warming the TLB entry the real edit below reuses.
+    // Throwaway: page 14's PTE slot, same table page as the witness's PTE but an entry the
+    // witness never reads. No decode has happened yet, so this walk's own A/D stores land on an
+    // UNMARKED table page and do not retire anything on their OWN account. The CONTENT write
+    // that follows the walk lands in the table page the walk just marked, so it is itself a
+    // `code_write_watched`-caught translation-page write (measured, not assumed: this table is
+    // one of the identity-mapped low pages, so "write into the page holding your own PTE" is a
+    // self-referential shape and cannot avoid marking itself first) -- which is fine; nothing
+    // downstream depends on this store staying silent, only on the STORE UNDER TEST below doing
+    // so.
     let throwaway_pte = 0x9000 + 14 * 4;
     let throwaway_value = (14u32 << 12) | 3;
     cpu.write_memory_sized(
@@ -234,6 +251,18 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
     )
     .expect("the warm-up store must retire");
 
+    // NOW decode the witness -- AFTER the warm-up, so its walk touches an ALREADY-marked table
+    // page and retires there, and the line inserted afterward is the one the store under test
+    // must kill.
+    warm_witness(&mut cpu, &mut bus);
+
+    // The store under test: page 0's PTE at 0x9000, rewritten to ALT_FRAME | 3. Its own
+    // translation (linear page 9) reuses the warm-up's already-dirty TLB/FastMap entry for that
+    // page, so it takes no walk of its own -- proved by `translation_a_stores` /
+    // `translation_d_stores` not moving across it, below.
+    let a_stores_before = cpu.perf_counters().translation_a_stores;
+    let d_stores_before = cpu.perf_counters().translation_d_stores;
+    let writes_before = cpu.perf_counters().translation_page_writes;
     let witness_pte = 0x9000 + (WITNESS >> 12) * 4;
     let new_pte = ALT_FRAME | 3;
     cpu.write_memory_sized(
@@ -244,10 +273,27 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
         new_pte,
         BusAccessKind::DataWrite,
     )
-    .expect("the TLB-warm PTE store must still retire");
+    .expect("the store under test must retire");
+    assert_eq!(
+        cpu.perf_counters().translation_a_stores,
+        a_stores_before,
+        "the store under test must take no walk of its own: code_write_watched, not \
+         write_page_walk_entry, is what must catch it"
+    );
+    assert_eq!(
+        cpu.perf_counters().translation_d_stores,
+        d_stores_before,
+        "same proof, the dirty-bit half"
+    );
+
     assert!(
         !cpu.decode_cache.line_live(WITNESS, d),
         "code_write_watched's translation_pages disjunct, alone, must catch this store"
+    );
+    assert_eq!(
+        cpu.perf_counters().translation_page_writes,
+        writes_before + 1,
+        "exactly one translation-page WRITE happened: the store under test"
     );
 }
 
@@ -424,21 +470,19 @@ fn wipes_tlb_flush_counts_every_cr3_write_ring_hit_or_not() {
 // | mutation | must go red | verified |
 // |---|---|---|
 // | force the fast arm unconditionally (never retire on R3) | `a_third_directory_retires_everything` | by hand |
-// | drop `translation_pages` from `code_write_watched` | **NON-GATE against every row in this
-//   file, including `pte_edit_with_a_tlb_warm_target_still_retires`, which was built specifically
-//   to try to isolate it.** Verified by hand, twice: forcing `code_write_watched`'s
-//   translation-page arm to `false` leaves all eleven rows green. For the un-warmed rows this is
-//   explained -- resolving the store's own linear address walks the same table and retires
-//   through `write_page_walk_entry`'s UNCONDITIONAL `note_code_write` call, a second enforcement
-//   path independent of `code_write_watched` -- but the TLB-warm row was built to remove exactly
-//   that confound (confirmed by hand that its second write takes no walk) and STILL does not
-//   redden, so something else in the watched-page write path independently catches it too
-//   (`physical_page_watched`'s own disjunct is the leading suspect; not traced to a conclusion in
-//   the time available). Recorded honestly as an open question rather than a claimed isolation:
-//   `code_write_watched`'s translation-page arm may be fully redundant with
-//   `physical_page_watched`'s for every guest-write shape this design targets, in which case F1's
-//   placement is still correct (advisory 15's deferred-window argument depends on it) but the
-//   mutation that would prove it independently load-bearing was not found here. |
+// | drop `range_hits_translation_page` from `code_write_watched` | **FIXED, no longer a
+//   non-gate** (design doc `2026-09-02-cr3-jit-half-design.md` (e)). The original
+//   `pte_edit_with_a_tlb_warm_target_still_retires` ran its warm-up BEFORE the witness decode,
+//   so `warm_witness`'s own walk (not the store under test) did the only retire the row ever
+//   observed -- the row's final assertion was satisfied by an ORDERING accident, not by the
+//   mechanism it was built to isolate. Reordered so the warm-up runs FIRST (marking the table
+//   page with nothing live to retire) and the witness decodes SECOND (retiring there, against
+//   the now-marked page -- F11's placement doing its job), leaving the STORE UNDER TEST as the
+//   only remaining door: `translation_a_stores`/`translation_d_stores` asserted unchanged across
+//   it proves it takes no walk of its own. Verified by hand: forcing `code_write_watched`'s
+//   `range_hits_translation_page` disjunct to `false` now reddens this row (and only this row;
+//   the other ten still pass through `write_page_walk_entry`'s independent unconditional path,
+//   exactly as the original ledger entry for the un-warmed rows described), reverted after. |
 // | `narrow_invalidate` does not refuse with two contexts occupied | `cross_context_smc_store_kills_the_other_context` | by hand |
 // | mark only on a CODE-producing walk, not every walk | `a_tlb_hit_code_translation_is_still_protected` | by hand |
 // | `translation_pages` cleared on a select (R7) | `pte_edit_under_a_live_cr3_forces_a_redecode` after a prior A/B/A cycle | by hand |

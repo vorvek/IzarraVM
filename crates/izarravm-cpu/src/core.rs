@@ -313,8 +313,26 @@ impl CpuGsw {
     ///
     /// The data half (TLB, `data_read_pages`/`data_write_pages`, the FastMap) and the eip-window
     /// fetch frontend stay unconditional on EVERY `MOV CR3`, exactly as before this slice (design
-    /// part 2(d)): only the DECODE half is gated. The JIT link graph is untouched by this slice on
-    /// purpose (part 2(e)) and keeps tearing down on every write, ring hit or not.
+    /// part 2(d)): only the DECODE half is gated. The JIT half is gated TOO, by slice S-B (design
+    /// doc `2026-09-02-cr3-jit-half-design.md`): a link graph built under one directory is
+    /// retained across an R1 reselect back to it, keyed apart from a second directory's graph by
+    /// a per-slot epoch and a `slot`-tagged rendezvous key rather than being torn down on every
+    /// write.
+    ///
+    /// | mechanism | what it buys, and why it is safe |
+    /// |---|---|
+    /// | L1, `link_epochs: [u64; 2]` plus a live `link_slot` | an R1 reselect restores that slot's own epoch instead of minting a new one, so every block made link-visible under it is visible again with no work; R2 allocate mints a fresh epoch for the newly occupied slot, invalidating nothing because nothing carries it yet |
+    /// | L2, `LinkTarget` carries a `context: u8` | partitions `linear_blocks` AND `waiting` by ring slot at zero new comparison sites, so an install under slot B cannot resolve a source parked under slot A |
+    /// | L3, `make_link_visible`'s cross-context arm | a block re-touched under the OTHER slot's live epoch has its outbound cells cleared before this context's admission can rebind them -- **a retained link is a direct jump inside the arena that bypasses every key check**, so without this a stale cell would chain into the wrong context's target with no fault, no counter, wrong answers |
+    /// | L4, root dispatch is the base case | entry always builds its `BlockKey` from the LIVE physical, so no cell can ever be armed FROM a block that was never entered under this context, and `try_link_inner`'s `stale_epoch` refusal (compared against the live slot's epoch alone) is a second, independent barrier behind the key partition |
+    /// | L5, every wholesale cause retires both `link_epochs` | `invalidate_translation` (this function's `Taken` arm, the translation-page store arm, the SMC wholesale arm) keeps tearing the WHOLE graph down exactly as before this slice; only the R1 reselect path is new |
+    ///
+    /// `ContextSelect::Skipped(slot)` is R1 or R2 (`DecodeCache::select_context` cannot tell them
+    /// apart in its return type, and the JIT half does not need to: a reselect restores an epoch
+    /// that already exists, and an allocate mints one that does not, and `select_link_context` /
+    /// `allocate_link_context` are both safe to call idempotently either way -- see their own
+    /// doc comments). `ContextSelect::Taken(slot)` is R3, and only that arm calls
+    /// `invalidate_translation()`.
     pub(super) fn flush_tlb_and_code_caches_for_cr3_write(&mut self, new_cr3: u32) {
         self.perf.decode_inval_cr3 += 1;
         let old_cr3_masked = self.control.cr3 & 0xffff_f000;
@@ -326,19 +344,28 @@ impl CpuGsw {
             .decode_cache
             .select_context(old_cr3_masked, new_cr3_masked)
         {
-            ContextSelect::Skipped => {
+            ContextSelect::Skipped(slot) => {
                 self.perf.cr3_code_flush_skipped += 1;
+                #[cfg(feature = "jit")]
+                {
+                    self.jit_direct.select_link_context(slot);
+                    self.perf.cr3_link_context_selects += 1;
+                }
             }
-            ContextSelect::Taken => {
+            ContextSelect::Taken(slot) => {
                 self.perf.cr3_code_flush_taken += 1;
                 self.perf.decode_inval_other += 1;
                 self.perf.code_invalidations += 1;
                 self.has_aperture_code.0 = false;
                 self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
+                #[cfg(feature = "jit")]
+                {
+                    self.jit_direct.invalidate_translation();
+                    self.jit_direct.allocate_link_context(slot);
+                    self.perf.cr3_link_graph_retires += 1;
+                }
             }
         }
-        #[cfg(feature = "jit")]
-        self.jit_direct.invalidate_translation();
     }
 
     /// `flush_tlb_and_code_caches` without the code-translation teardown: the decode lines, their

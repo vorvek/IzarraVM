@@ -752,6 +752,18 @@ pub struct PerfCounters {
     /// CR3 code-cache gate: `MOV CR3` writes served by the ring (a same-directory reselect, R1,
     /// or a fresh allocation into a free slot, R2) with no decode-cache teardown at all.
     pub cr3_code_flush_skipped: u64,
+    /// CR3 JIT-half gate (design doc `2026-09-02-cr3-jit-half-design.md`): `MOV CR3` writes whose
+    /// LINK graph was served by `select_link_context` -- the `Skipped` arm, R1 or R2. Incremented
+    /// beside `cr3_code_flush_skipped` in the same match arm, so
+    /// `cr3_link_context_selects == cr3_code_flush_skipped` is true by construction and is kept
+    /// as documentation rather than a check (design review J8); the identity with teeth is
+    /// `stalls.links_cleared[Flushed]` moving only on the `Taken` arm.
+    pub cr3_link_context_selects: u64,
+    /// CR3 JIT-half gate: `MOV CR3` writes whose LINK graph was wholesale-retired via
+    /// `allocate_link_context` -- the `Taken` arm, R3. Same construction note as
+    /// `cr3_link_context_selects`: `cr3_link_graph_retires == cr3_code_flush_taken` by
+    /// construction.
+    pub cr3_link_graph_retires: u64,
     /// CR3 code-cache gate: guest or native stores that retired the ring because they hit
     /// `translation_pages` (a page-directory or page-table page a walk had read), as opposed to a
     /// hit on `code_bytes`/a compiled block's span. Counted at `code_write_watched`'s new
@@ -2462,6 +2474,15 @@ pub struct DirectStallSnapshot {
     pub poll_skip_raw_bus_clocks: u64,
     pub poll_skip_max_span: u64,
     pub poll_skip_last_head: u32,
+    /// `make_link_visible`'s L3 arm firing: a block visible under one CR3 ring slot re-touched
+    /// under the other. See `DirectStallTally::link_context_rebinds`.
+    pub link_context_rebinds: u64,
+    /// Residency of `BlockCache::waiting`, summed across both ring slots. See
+    /// `DirectStallTally::link_waiting_entries`.
+    pub link_waiting_entries: u64,
+    /// Residency of `BlockCache::linear_blocks`, summed across both ring slots. See
+    /// `DirectStallTally::link_linear_blocks_entries`.
+    pub link_linear_blocks_entries: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -4995,7 +5016,7 @@ impl DecodeCache {
         {
             let (_, slot_gen) = self.contexts[slot].expect("position found Some");
             self.generation = slot_gen;
-            return ContextSelect::Skipped;
+            return ContextSelect::Skipped(slot as u8);
         }
         // R2: allocate. A miss with a free slot mints a fresh generation nothing can match yet;
         // nothing already live is invalidated.
@@ -5003,7 +5024,7 @@ impl DecodeCache {
             let slot_gen = self.allocate_generation();
             self.contexts[slot] = Some((new_cr3_masked, slot_gen));
             self.generation = slot_gen;
-            return ContextSelect::Skipped;
+            return ContextSelect::Skipped(slot as u8);
         }
         // R3: a third distinct value with both slots occupied retires everything -- today's
         // behaviour -- then occupies slot 0 with the new value. The caller has already flushed
@@ -5012,7 +5033,7 @@ impl DecodeCache {
         let slot_gen = self.allocate_generation();
         self.generation = slot_gen;
         self.contexts[0] = Some((new_cr3_masked, slot_gen));
-        ContextSelect::Taken
+        ContextSelect::Taken(0)
     }
 
     /// Whether physical page `physical >> 12` was read as page-directory or page-table structure
@@ -5055,11 +5076,14 @@ impl DecodeCache {
 /// The outcome of `DecodeCache::select_context`: whether a `MOV CR3` write's code half was served
 /// by the ring (`Skipped`, no teardown) or forced today's full teardown (`Taken`, a third distinct
 /// value with both slots already occupied). Named so the two new counters
-/// (`cr3_code_flush_taken` / `cr3_code_flush_skipped`) read directly off the match.
+/// (`cr3_code_flush_taken` / `cr3_code_flush_skipped`) read directly off the match. Both variants
+/// carry the ring slot the write resolved to (0 or 1), which the JIT half's link-context gate
+/// (`select_link_context` / `allocate_link_context`, `jit/direct.rs`) needs and which
+/// `DecodeCache::select_context` already computes for its own `self.contexts` indexing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextSelect {
-    Skipped,
-    Taken,
+    Skipped(u8),
+    Taken(u8),
 }
 
 impl Default for DecodeCache {
