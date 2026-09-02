@@ -1141,6 +1141,19 @@ function Get-FixtureTable {
             cycles = [uint64]4000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; dukemark = $null
+            # 2026-09-02 re-pin, e312f8f3 -> 6cc0d354 (the SAME hash this row pinned before the
+            # 2026-08-27 entry below, moved back to it). The CR3 data-side gate's T2 slice
+            # (`dev_docs/2026-09-02-cr3-data-side-design.md`) retains the TLB across a
+            # same-directory `MOV CR3` reselect instead of re-walking every time, so emulated
+            # clocks-per-instruction move and the fixed 4e9-cycle budget lands one torch-flame
+            # frame earlier -- the same class of drift as every re-pin in this row's history.
+            # Isolated by hand: reverting T2's `Tlb::insert` eviction-report change alone did not
+            # move the hash, and forcing every `MOV CR3` to fully re-flush the TLB (defeating the
+            # slice's own retention) ALSO reproduced the identical new hash, so the shift is from
+            # T2's timing change itself, not from a soundness gap in which entries survive.
+            # T1 alone (`dev_docs/2026-09-02-cr3-data-side-design.md` T1) reproduces the prior
+            # `e312f8f3` hash unchanged, matching its hard instruction-count-identity bar.
+            #
             # 2026-08-30 re-pin, 04fd8558 -> 802e9d4f. The ISA I/O wait-state
             # flip: prince issues only 43 PIT writes all run, so the charge
             # moves it by ppm and the 4e9 budget lands one torch-flame frame
