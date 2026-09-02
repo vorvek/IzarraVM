@@ -146,6 +146,35 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
     assert_eq!(compilation.span.guest_len, 3);
 }
 
+/// Design test 4 (`2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1): the compile
+/// side of S1a, exercised through the REAL `compile_with_budget` (via `jit::direct::compile`)
+/// rather than a hand-built `direct_test.rs` fixture -- this is the only level that can drive the
+/// five successor-baking sites the defect actually lived in. `compile_with_budget` must never
+/// publish a real ring slot into a successor's `context`; every reader of that field is now at
+/// RESOLVE time (`resolve_successors`), against the LIVE slot at that instant. Selecting slot 1
+/// before compiling is not load-bearing for the assertion below -- it demonstrates that the
+/// published value is independent of which slot happens to be live, rather than causing it.
+#[test]
+fn compile_time_successors_carry_the_unstamped_link_context() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, DIRECT_BARRIER]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    cpu.jit_direct.select_link_context(1);
+
+    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+    let successor = compilation.successors[0].expect("plain fallthrough must publish a successor");
+    assert_eq!(
+        successor.context,
+        jit::direct::LINK_CONTEXT_UNSTAMPED,
+        "a successor's stored context must be the sentinel, never a real ring slot baked at \
+         compile time"
+    );
+    assert_eq!(compilation.successors[1], None);
+}
+
 /// gp2 in-imm8 callout design rev 3 §8.1's `StructuralReject` gate, THE THREE-CASE FORM: a hard
 /// boundary reached at 1, 2 and 5 slots into the walk. `direct.rs:7215-7216`'s min-length guard
 /// (`slots.len() < 3`) is read ONLY below 3 slots -- `stop` is consulted there and there alone --
