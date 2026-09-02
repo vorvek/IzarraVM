@@ -1030,11 +1030,22 @@ struct KeyStats {
     batch_straddle_trips: u64,
     soft_int_posts: u64,
     clock_charge_events: Samples,
-    // Journal-mode only.
+    // Journal-mode only. Each of these four is reported TWICE (plan §14 Q1,
+    // orchestrator decision): the unsuffixed field is WHOLE-RUN (every
+    // trip), the `_windowed` field only counts trips whose instruction range
+    // falls entirely inside `IZARRAVM_REFLECTED_CALL_DIAG_WINDOW`. When no
+    // window is configured the `_windowed` fields stay empty (`sample_count:
+    // 0`), which is the honest "not armed" signal rather than a silent
+    // duplicate of the whole-run numbers.
     read_set_size: Samples,
+    read_set_size_windowed: Samples,
     read_set_size_physical: Samples,
+    read_set_size_physical_windowed: Samples,
     write_set_size: Samples,
+    write_set_size_windowed: Samples,
     translation_set_size: Samples,
+    translation_set_size_windowed: Samples,
+    trips_in_window: u64,
     translation_set_over_cap: u64,
     reads_under_other_cr3: u64,
     reads_total: u64,
@@ -1617,12 +1628,20 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
     }
 
     // Journal-mode-only aggregation. In shape mode `trip.reads`/`trip.writes`
-    // are always empty.
-    stats.reads_total += trip.reads.len() as u64;
+    // are always empty. WHOLE-RUN totals are unconditional; `_windowed`
+    // counterparts additionally require `in_window` (plan §14 Q1).
     if in_window {
-        stats.read_set_size.push(trip.reads.len() as u64);
+        stats.trips_in_window += 1;
+    }
+    stats.reads_total += trip.reads.len() as u64;
+    stats.read_set_size.push(trip.reads.len() as u64);
+    stats
+        .read_set_size_physical
+        .push(trip.read_phys_dwords.len() as u64);
+    if in_window {
+        stats.read_set_size_windowed.push(trip.reads.len() as u64);
         stats
-            .read_set_size_physical
+            .read_set_size_physical_windowed
             .push(trip.read_phys_dwords.len() as u64);
     }
     for read in trip.reads.values() {
@@ -1631,10 +1650,14 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
             stats.reads_under_other_cr3 += 1;
         }
     }
+    stats.write_set_size.push(trip.writes.len() as u64);
+    stats
+        .translation_set_size
+        .push(trip.translations.len() as u64);
     if in_window {
-        stats.write_set_size.push(trip.writes.len() as u64);
+        stats.write_set_size_windowed.push(trip.writes.len() as u64);
         stats
-            .translation_set_size
+            .translation_set_size_windowed
             .push(trip.translations.len() as u64);
     }
     if trip.translation_set_over_cap {
@@ -1880,10 +1903,15 @@ pub struct KeyReport {
     pub batch_straddle_trips: u64,
     pub soft_int_posts: u64,
     pub clock_charge_events: StatSummary,
+    pub trips_in_window: u64,
     pub read_set_size: StatSummary,
+    pub read_set_size_windowed: StatSummary,
     pub read_set_size_physical: StatSummary,
+    pub read_set_size_physical_windowed: StatSummary,
     pub write_set_size: StatSummary,
+    pub write_set_size_windowed: StatSummary,
     pub translation_set_size: StatSummary,
+    pub translation_set_size_windowed: StatSummary,
     pub translation_set_over_cap: u64,
     pub reads_total: u64,
     pub reads_under_other_cr3: u64,
@@ -1908,6 +1936,12 @@ pub struct ReflectedCallDiagnosticSnapshot {
     pub trips_total: u64,
     pub trips_unmatched: u64,
     pub probe_ns_per_read: Option<f64>,
+    /// `IZARRAVM_REFLECTED_CALL_DIAG_WINDOW`'s bounds (retired guest
+    /// instructions), when configured -- `None` means every key's
+    /// `_windowed` field is empty (not armed), not a silent duplicate of the
+    /// whole-run numbers (plan §14 Q1).
+    pub window_start_insns: Option<u64>,
+    pub window_end_insns: Option<u64>,
     pub keys: Vec<KeyReport>,
 }
 
@@ -2025,10 +2059,15 @@ pub(crate) fn snapshot() -> Option<ReflectedCallDiagnosticSnapshot> {
                 batch_straddle_trips: stats.batch_straddle_trips,
                 soft_int_posts: stats.soft_int_posts,
                 clock_charge_events: (&stats.clock_charge_events).into(),
+                trips_in_window: stats.trips_in_window,
                 read_set_size: (&stats.read_set_size).into(),
+                read_set_size_windowed: (&stats.read_set_size_windowed).into(),
                 read_set_size_physical: (&stats.read_set_size_physical).into(),
+                read_set_size_physical_windowed: (&stats.read_set_size_physical_windowed).into(),
                 write_set_size: (&stats.write_set_size).into(),
+                write_set_size_windowed: (&stats.write_set_size_windowed).into(),
                 translation_set_size: (&stats.translation_set_size).into(),
+                translation_set_size_windowed: (&stats.translation_set_size_windowed).into(),
                 translation_set_over_cap: stats.translation_set_over_cap,
                 reads_total: stats.reads_total,
                 reads_under_other_cr3: stats.reads_under_other_cr3,
@@ -2063,6 +2102,8 @@ pub(crate) fn snapshot() -> Option<ReflectedCallDiagnosticSnapshot> {
         trips_total: guard.trips_total,
         trips_unmatched: guard.trips_unmatched,
         probe_ns_per_read: guard.probe_ns_per_read,
+        window_start_insns: window().map(|w| w.start_insns),
+        window_end_insns: window().map(|w| w.end_insns),
         keys,
     })
 }
