@@ -61,12 +61,16 @@ impl CpuGsw {
         vector: u8,
     ) -> ExecResult<()> {
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
-        // Slice 0 of the reflected-call HLE design's trip-shape instrument
-        // (dev_docs/2026-09-03-reflected-call-hle-design.md section 3.1): the
-        // design's own hook point, immediately after `interrupt_acknowledge`
-        // and before `deliver_interrupt`. A no-op call (one relaxed atomic
-        // load) unless built with `--features reflected-call-diagnostic` AND
-        // armed via `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC`.
+        // Slice 0b of the reflected-call HLE design's trip-shape instrument
+        // (dev_docs/2026-09-04-reflected-call-slice0b-plan.md): the design's
+        // own hook point, immediately after `interrupt_acknowledge` and
+        // before `deliver_interrupt`. Unless built with `--features
+        // reflected-call-diagnostic` AND armed via
+        // `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC`, this compiles to a check of a
+        // couple of cheap relaxed atomic loads and returns (N6: an earlier
+        // revision of this comment said "one relaxed atomic load", which
+        // undercounted -- `armed()` touches both the `ARMED_INIT` OnceLock's
+        // own state check and the `ARMED` flag itself).
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::on_int_entry(self, bus, vector);
         if self.is_protected_mode() {
@@ -100,8 +104,8 @@ impl CpuGsw {
         // makes.
         #[cfg(feature = "reflected-call-diagnostic")]
         {
-            crate::reflected_call_diag::note_read(self, vector_address);
-            crate::reflected_call_diag::note_read(self, vector_address + 2);
+            crate::reflected_call_diag::note_read(self, bus, vector_address);
+            crate::reflected_call_diag::note_read(self, bus, vector_address + 2);
         }
         self.load_segment_real(SegmentIndex::Cs, cs);
         self.set_eip(u32::from(ip));
@@ -930,7 +934,7 @@ impl CpuGsw {
             .value;
         // GDT/LDT/IDT/TSS reads (design section 3.3's seam table).
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::note_read(self, linear);
+        crate::reflected_call_diag::note_read(self, bus, linear);
         Ok(value)
     }
 
@@ -1058,7 +1062,7 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-diagnostic")]
         if result.is_ok() {
-            crate::reflected_call_diag::on_far_return(self);
+            crate::reflected_call_diag::on_far_return(self, bus);
         }
         result
     }
@@ -1388,7 +1392,7 @@ impl CpuGsw {
         // here regardless; IRET is where the design's trips close.
         #[cfg(feature = "reflected-call-diagnostic")]
         if result.is_ok() {
-            crate::reflected_call_diag::on_far_return(self);
+            crate::reflected_call_diag::on_far_return(self, bus);
         }
         result
     }

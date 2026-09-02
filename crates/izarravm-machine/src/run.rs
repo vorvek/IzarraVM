@@ -1413,6 +1413,12 @@ impl Machine {
                 .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
                 .max(1);
             let cap = self.event_batch_cap_cached(remaining);
+            // Slice 0b's batch-straddle counter (plan §5, Q6/B6; §14 Q2): one
+            // cfg-gated call marking a batch boundary on the reflected-call
+            // diagnostic's currently open trip, if any and if armed. The
+            // ONLY reason this diagnostic feature reaches the machine crate.
+            #[cfg(feature = "reflected-call-diagnostic")]
+            izarravm_cpu::on_batch_boundary();
             #[cfg(feature = "jit")]
             let poll_skip_enabled = self.poll_skip_enabled;
             // Read before the destructure below, the same way `poll_skip_enabled`

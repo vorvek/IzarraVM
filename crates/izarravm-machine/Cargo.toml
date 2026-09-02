@@ -15,6 +15,12 @@ authors.workspace = true
 default = ["jit"]
 jit = ["izarravm-cpu/jit"]
 poll-head-probe = ["jit", "izarravm-cpu/poll-head-probe"]
+# Slice 0b of the reflected-call HLE design's trip-shape instrument (plan
+# `dev_docs/2026-09-04-reflected-call-slice0b-plan.md` §14 Q2): the ONLY
+# reason this diagnostic-only feature is allowed to propagate past the CPU
+# crate is the batch-straddle counter (`on_batch_boundary`, called from
+# `run.rs`'s `event_batch_cap_cached` site). NOT in `default`.
+reflected-call-diagnostic = ["izarravm-cpu/reflected-call-diagnostic"]
 
 [dependencies]
 thiserror.workspace = true
