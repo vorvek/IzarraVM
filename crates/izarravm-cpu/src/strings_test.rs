@@ -3,6 +3,10 @@
 
 use super::*;
 
+// The three `level_timing` literal tripwires used to live here, #[cfg(test)]-only. Moved to
+// strings.rs beside rep_core_upper (review N2) so a release build breaks too, not only a test
+// build.
+
 const ALL_STRING_OPS: [StringOp; 7] = [
     StringOp::Movs,
     StringOp::Cmps,
@@ -18,14 +22,6 @@ const ALL_PERSONAS: [(GswMode, CpuPersona); 3] = [
     (GswMode::Gsw486, CpuPersona::I486),
     (GswMode::Gsw586, CpuPersona::I586),
 ];
-
-/// `level_timing`'s literals, pinned. `rep_core_upper`'s match carries these two pairs verbatim
-/// rather than reading `level_timing` at a runtime cost; if a future change to `level_timing`
-/// moves either pair without the match following, this fails at COMPILE time rather than after
-/// the match has silently stopped agreeing with it.
-const _: () = assert!(matches!(level_timing(CpuPersona::I386), (2, 5)));
-const _: () = assert!(matches!(level_timing(CpuPersona::I486), (1, 12)));
-const _: () = assert!(matches!(level_timing(CpuPersona::I586), (1, 12)));
 
 /// T11 (code-smell batch 2, S2), corrected per the adversarial review's finding 9: the oracle
 /// calls `level_timing_for_test`, never a hardcoded copy of its literals, so this is blind to

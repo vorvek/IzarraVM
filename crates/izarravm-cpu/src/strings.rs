@@ -121,10 +121,12 @@ impl CpuGsw {
     /// form with a runtime `den` emitted a hardware `div` on every call, where a `match` over the
     /// persona gives the compiler a compile-time divisor and strength-reduces it to a
     /// magic-multiplier multiply-shift. The arms carry `level_timing`'s literals verbatim,
-    /// `(2, 5)` and `(1, 12)`, and `rep_core_clocks_test_identity` below pins that substitution
-    /// exact for every op, persona and `rep_resume_active` state `rep_chunk_limit` and
-    /// `rep_budget_exhausted` can reach. `rep_resume_active` collapses this to 0 regardless of
-    /// persona, checked BEFORE the match so neither arm has to encode it.
+    /// `(2, 5)` and `(1, 12)`, and
+    /// `rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input`
+    /// (`strings_test.rs`) pins that substitution exact for every op, persona and
+    /// `rep_resume_active` state `rep_chunk_limit` and `rep_budget_exhausted` can reach.
+    /// `rep_resume_active` collapses this to 0 regardless of persona, checked BEFORE the match so
+    /// neither arm has to encode it.
     fn rep_core_upper(&self, op: StringOp) -> u64 {
         if self.rep_resume_active {
             return 0;
@@ -136,6 +138,20 @@ impl CpuGsw {
         }
     }
 
+    /// `level_timing`'s literals, pinned beside the match that carries them verbatim (review
+    /// N2: these used to live in `strings_test.rs` as `#[cfg(test)]`-only tripwires, which meant
+    /// only a test build would break if `level_timing` ever moved without `rep_core_upper`
+    /// following; a plain `const _` assert has no runtime cost, so there is no reason not to make
+    /// a release build catch it too). If a future change to `level_timing` moves either pair
+    /// without the match following, this fails at COMPILE time rather than after the match has
+    /// silently stopped agreeing with it.
+    const _REP_CORE_UPPER_I386_LITERAL: () =
+        assert!(matches!(level_timing(CpuPersona::I386), (2, 5)));
+    const _REP_CORE_UPPER_I486_LITERAL: () =
+        assert!(matches!(level_timing(CpuPersona::I486), (1, 12)));
+    const _REP_CORE_UPPER_I586_LITERAL: () =
+        assert!(matches!(level_timing(CpuPersona::I586), (1, 12)));
+
     fn rep_chunk_limit<B: CpuBus>(
         &self,
         plan: RepLimitPlan,
@@ -144,6 +160,14 @@ impl CpuGsw {
         width: BusWidth,
     ) -> Option<u32> {
         let budget = self.rep_execution.budget?;
+        // Recomputes the whole plan from scratch on every call (once per fast chunk, once
+        // per slow REP iteration) in debug builds only -- the same idiom run.rs:3040 uses
+        // for global_block_upper's memo, so this is house style, not an oversight. Kept
+        // rather than demoted to a separate test-only check because the hazard it catches
+        // (a bus cost dial or the paging mode moving mid-REP) can only be exercised through
+        // a real run_string loop, not a unit test in isolation. Cost: it will make a
+        // debug-build REP-heavy test measurably slower than the release path; that is
+        // expected, not a regression to bisect.
         debug_assert_eq!(
             plan,
             RepLimitPlan::compute(self, bus, op, width),
