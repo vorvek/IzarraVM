@@ -4282,6 +4282,91 @@ fn a_downstream_slot_addressing_through_ds_refuses_the_resume_without_the_knob()
     );
 }
 
+/// A slot AFTER the write that STORES THROUGH the written segment refuses the resume (the third
+/// `pinned_segments` channel, `write_segment`, closing the set the two fixtures above cover
+/// jointly but neither pins alone).
+///
+/// `mov [eax],al` after `mov ds,ax` writes through DS by the ordinary default-segment rule, which
+/// is `DirectKind::write_segment`. It is deliberately the STORE form rather than the load fixture
+/// above with a different opcode: a mutation that narrows `pinned_segments` to
+/// `read_segment | selector_segment` (drops `write_segment` alone, leaving the read channel this
+/// file already pins untouched) would pass every existing fixture and only this one catches it.
+///
+/// MUTATION: narrow `pinned_segments` to `read_segment | selector_segment` (drop `write_segment`)
+/// and this resumes instead of resyncing, because DS would no longer be in the cell's
+/// `used_by_others` even though the very next slot stores through it.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_downstream_store_through_ds_refuses_the_resume_without_the_knob() {
+    const CODE: &[u8] = &[
+        0xB8,
+        imm32(SEL_UNDEMOTE_DS)[0],
+        imm32(SEL_UNDEMOTE_DS)[1],
+        imm32(SEL_UNDEMOTE_DS)[2],
+        imm32(SEL_UNDEMOTE_DS)[3], // mov eax, SEL_OTHER   +0
+        0x8E,
+        0xD8, // mov ds, ax            +5
+        0x88,
+        0x00, // mov [eax], al         +7 -- stores through DS
+        0xF4, // hlt                   +9
+    ];
+    const STARTS: &[u32] = &[0, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+    let compilation =
+        jit::direct::compile(&mut cpu, ENTRY, true).expect("the fixture must compile as a block");
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("the block must run and reach its own side exit"),
+        "the block must run and reach its own side exit"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - insns_before,
+        2,
+        "the prefix plus the retired DS write"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "the downstream store addresses through DS, so the write must RESYNC"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        SEL_UNDEMOTE_DS,
+        "the load itself must have happened: a RESYNC is not an undo"
+    );
+}
+
 /// A slot AFTER the write that BAKES the written segment's SELECTOR, without addressing memory
 /// through it at all, also refuses the resume (review4 H9).
 ///
