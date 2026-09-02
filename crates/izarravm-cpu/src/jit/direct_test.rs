@@ -304,12 +304,12 @@ fn both_successor_cells_resolve_unlink_recompile_and_reset() {
         Some(LinkTarget {
             linear: fallthrough.linear,
             mode_key: source.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         Some(LinkTarget {
             linear: taken.linear,
             mode_key: source.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
     ];
     let source_id = cache.install(&source_compilation).expect("source install");
@@ -813,7 +813,7 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     install_trivial(&mut cache, target, 1);
@@ -945,12 +945,12 @@ fn repeated_source_revalidation_does_not_rebuild_its_link_graph() {
         Some(LinkTarget {
             linear: unresolved_target.linear,
             mode_key: unresolved_target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         Some(LinkTarget {
             linear: hidden_target.linear,
             mode_key: hidden_target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
     ];
     let source_id = cache.install(&source_compilation).expect("source install");
@@ -1053,7 +1053,7 @@ fn invalidated_metadata_slot_reuse_rejects_its_stale_generation() {
     compilation.successors[0] = Some(LinkTarget {
         linear: missing.linear,
         mode_key: missing.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let stale_id = cache.install(&compilation).expect("source install");
     let stale_block = cache.block(stale_id).expect("source block");
@@ -1105,7 +1105,7 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_cell_address = source_compilation.link_cells[0].address();
     source_compilation.code = vec![0x48, 0xb8];
@@ -1177,12 +1177,19 @@ fn unresolved_waiting_edge_survives_arena_compaction() {
     assert!(matches!(cache.probe(source), BlockProbe::Compile));
     let mut source_compilation =
         trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    // Published successor: always the sentinel (S1a). The live-slot lookup/park key below is a
+    // SEPARATE value -- they only happen to share every field but `context` because this test
+    // never switches slots, so the live slot at resolve time is 0 either way.
+    source_compilation.successors[0] = Some(LinkTarget {
+        linear: target.linear,
+        mode_key: target.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    });
     let target_key = LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
         context: 0,
     };
-    source_compilation.successors[0] = Some(target_key);
     let source_id = cache.install(&source_compilation).expect("source install");
     let waiting = cache
         .waiting
@@ -1216,7 +1223,7 @@ fn translation_invalid_blocks_stay_invisible_through_compaction() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     let target_id = install_trivial(&mut cache, target, 1);
@@ -1867,7 +1874,7 @@ fn ranged_device_write_preserves_unrelated_blocks_and_unlinks_overlap() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: overlap.linear,
         mode_key: overlap.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     assert!(matches!(
         cpu.jit_direct.probe(source),
@@ -3066,12 +3073,12 @@ fn direct_link_refusal_census_registers_static_cells_and_closes_exactly() {
     let fallthrough = LinkTarget {
         linear: 0x1100,
         mode_key: source.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     };
     let taken = LinkTarget {
         linear: 0x1200,
         mode_key: source.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     };
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
     assert!(matches!(cache.probe(source), BlockProbe::Compile));
@@ -3180,7 +3187,7 @@ fn direct_link_refusal_census_registers_before_the_first_link_attempt() {
         Some(LinkTarget {
             linear: target.linear,
             mode_key: target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         None,
     ];
@@ -3256,7 +3263,7 @@ fn direct_link_refusal_state_machine_maps_every_bucket() {
         Some(LinkTarget {
             linear: target.linear,
             mode_key: target.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         None,
     ];
@@ -3314,7 +3321,7 @@ fn segment_write_static_cell_is_registered_as_suppressed_fallthrough() {
         Some(LinkTarget {
             linear: source.linear + 3,
             mode_key: source.mode_key,
-            context: 0,
+            context: LINK_CONTEXT_UNSTAMPED,
         }),
         None,
     ];
@@ -3353,7 +3360,7 @@ fn link_refusal_census_preserves_generation_history_through_retry_and_source_ret
     let target_link = LinkTarget {
         linear: target.linear,
         mode_key: target.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     };
 
     assert!(matches!(cache.probe(source), BlockProbe::Interpret));
@@ -4191,7 +4198,7 @@ fn a_parked_source_keeps_its_own_slots_waiting_entry() {
     source_compilation.successors[0] = Some(LinkTarget {
         linear: successor_linear,
         mode_key: source.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     });
     let source_id = cache.install(&source_compilation).expect("source install");
     assert_eq!(cache.waiting.values().map(Vec::len).sum::<usize>(), 1);
@@ -4262,6 +4269,253 @@ fn linear_blocks_holds_separate_entries_per_slot_for_the_same_linear() {
         "A's entry must survive B's install at the same linear, untouched"
     );
 }
+
+// =================================================================================================
+// S1a, the live rendezvous key (design doc `2026-09-02-tyrian-unbound-to-compiled-design.md`
+// section 4.1, review `2026-09-02-cr3-code-cache-gate-review.md` "Review of S1a"). The JIT-half
+// battery above pins that the RESOLVE side already reads the LIVE slot (`make_link_visible`,
+// `bind_dynamic_successor`). What it never covered was the COMPILE side: `compile_with_budget`
+// baked the ring slot live AT COMPILE TIME into every published successor, and `resolve_successors`
+// used that baked value unchanged for both the `linear_blocks` lookup and the `waiting` park. The
+// two halves of one rendezvous agreed only until a block was re-stamped under the other slot, and
+// then the edge was unreachable for the block's whole life -- `cleared_flushed`, 5.19 M unbound
+// exits per guest second on the Tyrian dwell, 54.53% of the compiled subset. The fix deletes the
+// bake (`LINK_CONTEXT_UNSTAMPED` is published instead, a value no live slot can equal) and builds
+// the resolve-time key from `self.link_slot` once, at the top of `resolve_successors`, for both
+// halves of the lookup.
+// =================================================================================================
+
+/// S1a headline (design review S1-1, red on `eaac2e8b`). Before the fix, `resolve_successors`
+/// read the successor's own COMPILE-TIME `context` for both the `linear_blocks` lookup and the
+/// `waiting` park; `make_link_visible` inserts and drains against the LIVE slot at re-admission
+/// time. A block compiled while one slot was live, torn down, and re-admitted under the OTHER
+/// slot therefore named two different contexts at the two ends of its own rendezvous, and the
+/// edge could never re-form. This exercises exactly that lifecycle: install under slot 0, tear
+/// the graph down and switch to slot 1 (as a third distinct CR3 directory does), then re-admit
+/// both blocks and confirm the edge re-forms.
+#[test]
+fn a_source_restamped_under_the_other_ring_slot_resolves_its_successor() {
+    let mut cache = BlockCache::default();
+    let source = key(0x3800);
+    let target = key(0x3900);
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.successors[0] = Some(LinkTarget {
+        linear: target.linear,
+        mode_key: source.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    });
+    let source_id = cache.install(&source_compilation).expect("source install");
+    let target_id = install_trivial(&mut cache, target, 1);
+    assert!(
+        cache.has_linked_successor(source_id),
+        "premise: the edge must form the first time, under one live slot"
+    );
+
+    // Tear the whole graph down and switch the live ring slot, exactly as a CR3 write to a THIRD
+    // distinct directory does (R3): `invalidate_translation` clears every cell plus both
+    // `linear_blocks`/`waiting`, and the dispatcher then re-touches every block it re-enters
+    // through `make_link_visible`.
+    cache.invalidate_translation();
+    cache.select_link_context(1);
+
+    // Re-admit S first: nothing is yet visible for T under slot 1, so S's successor parks.
+    cache.make_link_visible(source_id);
+    assert!(
+        !cache.has_linked_successor(source_id),
+        "T is not yet visible under the new slot; the park has to wait for T"
+    );
+    // Re-admit T: this must drain S's park and re-form the edge under slot 1.
+    cache.make_link_visible(target_id);
+    assert!(
+        cache.has_linked_successor(source_id),
+        "S's park, built from the LIVE slot at resolve time, must be drained by T's own \
+         re-admission under that same slot. The defect baked the COMPILE-TIME slot into this key \
+         instead, which never agreed with T's re-admission under a different slot again"
+    );
+}
+
+/// Design test 2, corrected by design review S1-6: the ORIGINAL bind-outcome framing ("not
+/// linked, and still parked") cannot fail even with `context` deleted from `LinkTarget` entirely,
+/// because `try_link_inner`'s `stale_epoch` arm refuses a cross-context bind on its own and
+/// `resolve_waiting` re-parks any refused-but-still-active source -- so both "not linked" and
+/// "still parked" hold either way. The row instead asserts MAP STATE (which key `waiting` holds
+/// the park under) and whether `try_link_inner` was even REACHED
+/// (`link_refusals[stale_epoch]`): with the field, an install under the WRONG slot never looks
+/// the park up at all, so the counter must not move.
+#[test]
+fn a_park_is_drained_only_by_an_install_under_the_slot_it_parked_in() {
+    let mut cache = BlockCache::default();
+    cache.select_link_context(1);
+
+    // First half: park under slot 1, install T under slot 1, the park must drain.
+    let source_a = key(0x3a00);
+    let target_a = key(0x3b00);
+    assert!(matches!(cache.probe(source_a), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source_a), BlockProbe::Compile));
+    let mut source_a_compilation =
+        trivial_compilation(BlockSpan::new(source_a, 1, 1).expect("source_a span"));
+    source_a_compilation.successors[0] = Some(LinkTarget {
+        linear: target_a.linear,
+        mode_key: source_a.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    });
+    let source_a_id = cache
+        .install(&source_a_compilation)
+        .expect("source_a install");
+    assert_eq!(cache.waiting.values().map(Vec::len).sum::<usize>(), 1);
+    install_trivial(&mut cache, target_a, 1);
+    assert!(
+        cache.waiting.is_empty(),
+        "install under the SAME slot must drain the park"
+    );
+    assert!(cache.has_linked_successor(source_a_id));
+
+    // Second half: park a FRESH source under slot 1, then install its target under slot 0.
+    let source_b = key(0x3c00);
+    let target_b = key(0x3d00);
+    assert!(matches!(cache.probe(source_b), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source_b), BlockProbe::Compile));
+    let mut source_b_compilation =
+        trivial_compilation(BlockSpan::new(source_b, 1, 1).expect("source_b span"));
+    source_b_compilation.successors[0] = Some(LinkTarget {
+        linear: target_b.linear,
+        mode_key: source_b.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    });
+    let source_b_id = cache
+        .install(&source_b_compilation)
+        .expect("source_b install");
+    assert_eq!(
+        cache
+            .waiting
+            .keys()
+            .filter(|target| target.context == 1)
+            .count(),
+        1,
+        "source_b's park must sit under slot 1's key"
+    );
+
+    cache.select_link_context(0);
+    let refusals_before = cache.stalls.link_refusals[LinkRefusal::StaleEpoch as usize];
+    install_trivial(&mut cache, target_b, 1);
+
+    assert!(
+        !cache.has_linked_successor(source_b_id),
+        "an install under the WRONG slot must not resolve the park"
+    );
+    assert_eq!(
+        cache
+            .waiting
+            .keys()
+            .filter(|target| target.context == 1)
+            .count(),
+        1,
+        "source_b's park must survive untouched, still keyed under slot 1"
+    );
+    assert!(
+        cache.waiting.keys().all(|target| target.context != 0),
+        "no key under slot 0 may exist for source_b: T's own install under slot 0 published \
+         itself under a context-0 key that source_b was never parked under"
+    );
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::StaleEpoch as usize],
+        refusals_before,
+        "the key partition must stop T's install from even LOOKING UP source_b's park -- \
+         `try_link_inner` must never be reached, so this counter must not move. Without the \
+         `context` field in `LinkTarget`, T's install would collapse onto the SAME key source_b \
+         parked under, `try_link_inner` would run and refuse on the epoch instead -- which still \
+         reads \"not linked\", the exact trap this row exists to close"
+    );
+}
+
+/// Design test 3, the load-bearing row, corrected by design review S1-7 (prove the premise
+/// first) and S1-8 (name the test-only reachable state). What actually stands between a bound
+/// cross-context edge and a wrong-context jump is NOT the key partition `LinkTarget.context`
+/// adds -- it is `try_link_inner`'s pre-existing `stale_epoch` arm, compared against the LIVE
+/// slot's epoch alone (design doc `2026-09-02-cr3-jit-half-design.md` L4). S1a enlarges the
+/// population that reaches this barrier; it does not weaken it.
+#[test]
+fn an_edge_whose_ends_are_stamped_under_different_slots_refuses_stale_epoch() {
+    let mut cache = BlockCache::default();
+
+    // S1-7: prove the premise. Under ONE live slot, an ordinary edge forms -- ruling out that
+    // the refusal below is a fixture artefact (a layout mismatch, a missing target) rather than
+    // the epoch barrier actually firing.
+    let premise_source = key(0x3e00);
+    let premise_target = key(0x3f00);
+    assert!(matches!(cache.probe(premise_source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(premise_source), BlockProbe::Compile));
+    let mut premise_compilation =
+        trivial_compilation(BlockSpan::new(premise_source, 1, 1).expect("premise span"));
+    premise_compilation.successors[0] = Some(LinkTarget {
+        linear: premise_target.linear,
+        mode_key: premise_source.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    });
+    let premise_source_id = cache
+        .install(&premise_compilation)
+        .expect("premise source install");
+    install_trivial(&mut cache, premise_target, 1);
+    assert!(
+        cache.has_linked_successor(premise_source_id),
+        "premise: an edge under one live slot must form before this row can mean anything"
+    );
+
+    // The row itself. S is made link-visible while slot 0 is live, so its OWN stamp is
+    // `link_epochs[0]`, and it is never touched again. In production `resolve_successors` is
+    // reached only from `make_link_visible`, which re-stamps the SOURCE's own epoch on the line
+    // immediately before calling it -- so a source can never be stale at that call on any guest
+    // path. Calling `resolve_successors_for_test` directly below, skipping that re-stamp, is a
+    // deliberate TEST-ONLY pin of the epoch barrier (design review S1-8), not a shape any guest
+    // instruction sequence reaches.
+    let source = key(0x4000);
+    let target = key(0x4100);
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.successors[0] = Some(LinkTarget {
+        linear: target.linear,
+        mode_key: source.mode_key,
+        context: LINK_CONTEXT_UNSTAMPED,
+    });
+    let source_id = cache.install(&source_compilation).expect("source install");
+    // Drop S's own park from its install above (parked under slot 0's key, since T does not
+    // exist yet): the row below is about a FRESH resolve attempt, not this leftover.
+    cache.waiting.clear();
+
+    // T installs under slot 1: T's OWN stamp is `link_epochs[1]`, the then-current live epoch,
+    // so T itself is perfectly valid. It is S's stamp, not T's, that is stale below.
+    cache.allocate_link_context(1);
+    let target_id = install_trivial(&mut cache, target, 1);
+    assert!(cache.is_link_visible(target_id));
+
+    let refusals_before = cache.stalls.link_refusals[LinkRefusal::StaleEpoch as usize];
+    cache.resolve_successors_for_test(source_id);
+
+    assert_eq!(
+        cache.stalls.link_refusals[LinkRefusal::StaleEpoch as usize],
+        refusals_before + 1,
+        "the epoch barrier, not the key partition, is what refuses an edge whose source is \
+         stamped under a slot other than the live one"
+    );
+    assert!(
+        !cache.has_linked_successor(source_id),
+        "no cell may be armed for a refused edge"
+    );
+}
+
+// S1a mutation ledger (2026-09-02):
+//
+// | mutation | must go red | verified |
+// |---|---|---|
+// | restore the compile-time bake (`context: cpu.jit_direct.direct.link_slot` at the five `compile_with_budget` successor sites, instead of `LINK_CONTEXT_UNSTAMPED`) and revert `resolve_successors` to use the successor's own stored context unchanged | `a_source_restamped_under_the_other_ring_slot_resolves_its_successor` | by hand |
+// | drop the `context` field from `LinkTarget` (S1-6's corrected reading) | `a_park_is_drained_only_by_an_install_under_the_slot_it_parked_in`'s `link_refusals[stale_epoch]` assertion, which moves under the mutation and must not | by hand |
+// | delete `try_link_inner`'s `stale_epoch` arm | `an_edge_whose_ends_are_stamped_under_different_slots_refuses_stale_epoch` | by hand |
+// | reintroduce `context: link_slot` (a real ring slot) at any of the five `compile_with_budget` successor sites | `compile_time_successors_carry_the_unstamped_link_context` (`cpu_jit_compile_outcome_test.rs`) | by hand |
 
 // CR3 JIT-half mutation ledger (2026-09-02):
 //
@@ -4462,10 +4716,14 @@ fn chain_mask_compilation(
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 fn link_target_of(key: BlockKey) -> LinkTarget {
+    // Always the sentinel: this stands in for what `compile_with_budget` would have baked into
+    // a successor, and that is never a real ring slot (S1a, `LINK_CONTEXT_UNSTAMPED`'s doc
+    // comment). `resolve_successors` debug-asserts this now, so a helper that returned a real
+    // slot would panic the first time any caller's install reached it.
     LinkTarget {
         linear: key.linear,
         mode_key: key.mode_key,
-        context: 0,
+        context: LINK_CONTEXT_UNSTAMPED,
     }
 }
 

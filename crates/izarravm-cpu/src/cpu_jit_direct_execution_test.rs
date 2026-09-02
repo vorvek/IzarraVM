@@ -2308,12 +2308,14 @@ fn link_refusal_census_routes_both_segment_write_jcc_arms() {
             Some(jit::links::LinkTarget {
                 linear: FALLTHROUGH,
                 mode_key: compilation.span.key.mode_key,
-                context: 0,
+                // S1a: a compiled successor's `context` is never a real ring slot, only the
+                // sentinel -- `resolve_successors` reads the LIVE slot at resolve time instead.
+                context: jit::direct::LINK_CONTEXT_UNSTAMPED,
             }),
             Some(jit::links::LinkTarget {
                 linear: TAKEN,
                 mode_key: compilation.span.key.mode_key,
-                context: 0,
+                context: jit::direct::LINK_CONTEXT_UNSTAMPED,
             }),
         ]
     );

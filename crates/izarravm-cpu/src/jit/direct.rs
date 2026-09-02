@@ -126,6 +126,13 @@ pub(super) const EMITTED_MEMORY_SLOT_BYTES: u32 = 352;
 pub(super) const EMITTED_CALL_OUT_SLOT_BYTES: u32 = 592;
 pub(super) const EMITTED_TERMINAL_SLOT_EXTRA_BYTES: u32 = 208;
 pub(crate) const HOT_LOOKUP_LEN: usize = 65_536;
+/// `LinkTarget::context` for a successor published by `compile_with_budget`, before it has ever
+/// been through a rendezvous. The field is meaningless at compile time (S1a, design doc
+/// `2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1): `resolve_successors` overwrites
+/// it with the LIVE ring slot before either the `linear_blocks` lookup or the `waiting` park, so
+/// no reader may ever branch on a successor's stored `context`. `u8::MAX` rather than `0` so the
+/// value can never be mistaken for a real ring slot (review finding S1-11).
+pub(crate) const LINK_CONTEXT_UNSTAMPED: u8 = u8::MAX;
 pub(crate) const MAX_CHAIN_BLOCKS: usize = 256;
 pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
 const MAX_BLOCK_STACK_ACCESSES: u8 = 4;
@@ -3945,7 +3952,28 @@ impl BlockCache {
             let Some(successor) = successor else {
                 continue;
             };
-            if let Some(target) = self.linear_blocks.get(&successor).copied()
+            // S1a: the successor's stored `context` is whatever was published when this block was
+            // compiled (`LINK_CONTEXT_UNSTAMPED` from `compile_with_budget`, never a real slot --
+            // see that constant's doc comment). It must never be read. The rendezvous key is built
+            // HERE instead, from the LIVE ring slot, for both halves of the lookup below:
+            // `linear_blocks` and `waiting` are both partitioned by the slot that was live when a
+            // block was last made link-visible (`make_link_visible`, `bind_dynamic_successor`), so
+            // a resolve must use the same live-at-THIS-instant value or the two ends of the
+            // rendezvous silently stop agreeing the first time this block is re-stamped under the
+            // other slot (the defect this slice fixes).
+            //
+            // Enforced, not just documented (review finding N3): a real ring slot leaking into a
+            // successor at compile time is exactly the defect class this slice fixes, so a future
+            // site that re-bakes one here should fail loudly rather than silently reopen it.
+            debug_assert_eq!(
+                successor.context, LINK_CONTEXT_UNSTAMPED,
+                "a compiled successor's context must always be the unstamped sentinel; a real                  ring slot leaking in here is the S1a defect reopening"
+            );
+            let key = LinkTarget {
+                context: self.link_slot,
+                ..successor
+            };
+            if let Some(target) = self.linear_blocks.get(&key).copied()
                 && self.try_link(source, slot as u8, target)
             {
                 continue;
@@ -3959,7 +3987,7 @@ impl BlockCache {
             if self.link_source_declined(source) {
                 continue;
             }
-            self.waiting.entry(successor).or_default().push(LinkSource {
+            self.waiting.entry(key).or_default().push(LinkSource {
                 block: source,
                 slot: slot as u8,
             });
@@ -8024,12 +8052,19 @@ fn compile_with_budget(
     let Some(key) = key_for(cpu, entry_lin, d) else {
         return CompileOutcome::Retry(RetryCause::NoKey);
     };
-    // The ring slot live AT COMPILE TIME, baked into every successor `LinkTarget` below. A
-    // successor is resolved later, at `make_link_visible` time, against `linear_blocks` /
-    // `waiting`, which are partitioned by this same field (design doc
-    // `2026-09-02-cr3-jit-half-design.md` (b) L2); stamping the compile-time slot here is what
-    // keeps that partition correct without a second read at resolve time.
-    let link_slot = cpu.jit_direct.direct.link_slot;
+    // The compile-time ring slot is NOT baked into any successor `LinkTarget` below (S1a, design
+    // doc `2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1, correcting
+    // `2026-09-02-cr3-jit-half-design.md` (b) L2's original instruction). Every successor
+    // published here carries `LINK_CONTEXT_UNSTAMPED` instead: a rendezvous is resolved later, at
+    // `resolve_successors` time, against `linear_blocks` / `waiting`, and both of those are
+    // partitioned by the LIVE ring slot at THAT instant, which `resolve_successors` reads itself.
+    // Baking the compile-time value here was the defect this slice fixes -- a block re-stamped
+    // under the other slot after compiling made the two ends of the rendezvous disagree forever.
+    // What actually keeps a cross-context edge from being armed is `try_link_inner`'s
+    // `stale_epoch` arm, which compares both ends' `block_link_epochs` against the LIVE slot's
+    // epoch alone; the key's `context` field only tells `resolve_successors` which map partition
+    // to consult, and it should always be read at resolve time.
+    let unstamped_context = LINK_CONTEXT_UNSTAMPED;
     // B.3: "a compile walk started here", recorded before anything can refuse the block, so a walk
     // that stops on its first slot still counts as tried. `key.linear()` and not `entry_lin` on
     // purpose -- `classify_unbound_exit` reports the same canonicalized value, and the whole point
@@ -9335,7 +9370,7 @@ fn compile_with_budget(
     let fallthrough = LinkTarget {
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
-        context: link_slot,
+        context: unstamped_context,
     };
     // A block that overwrites a segment register publishes NO successors, static or dynamic.
     //
@@ -9488,7 +9523,7 @@ fn compile_with_budget(
                 Some(LinkTarget {
                     linear: entry_lin.wrapping_add(taken_delta),
                     mode_key: key.mode_key,
-                    context: link_slot,
+                    context: unstamped_context,
                 }),
             ],
             successor_mask: [true, !self_loop],
@@ -9503,7 +9538,7 @@ fn compile_with_budget(
                 Some(LinkTarget {
                     linear: entry_lin.wrapping_add(target_delta),
                     mode_key: key.mode_key,
-                    context: link_slot,
+                    context: unstamped_context,
                 }),
                 None,
             ],
@@ -9570,7 +9605,7 @@ fn compile_with_budget(
             (!self_loop).then_some(LinkTarget {
                 linear: entry_lin.wrapping_add(taken_delta),
                 mode_key: key.mode_key,
-                context: link_slot,
+                context: unstamped_context,
             }),
         ],
         Some(
@@ -9581,7 +9616,7 @@ fn compile_with_budget(
             Some(LinkTarget {
                 linear: entry_lin.wrapping_add(target_delta),
                 mode_key: key.mode_key,
-                context: link_slot,
+                context: unstamped_context,
             }),
             None,
         ],
@@ -32469,7 +32504,18 @@ impl BlockCache {
                         if link.block == id {
                             census_reparked += 1;
                         }
-                        self.waiting.entry(successor).or_default().push(link);
+                        // S1a (sixth site, found while landing that slice): `successor`'s stored
+                        // `context` is the compile-time sentinel, never a real slot -- same rule
+                        // as `resolve_successors`. This park must be findable by the FUTURE
+                        // `resolve_waiting` call that reinstalls something at `successor`'s
+                        // linear, and that call always builds its key from the LIVE slot at that
+                        // instant, so the key parked here must be built the identical way, not
+                        // from the raw stored value.
+                        let key = LinkTarget {
+                            context: self.link_slot,
+                            ..successor
+                        };
+                        self.waiting.entry(key).or_default().push(link);
                     }
                     self.stats.unlinks += 1;
                     self.stalls.links_cleared[LinkClearCause::Retired as usize] += 1;
