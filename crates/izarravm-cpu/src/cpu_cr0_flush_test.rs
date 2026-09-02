@@ -263,20 +263,25 @@ fn cr0_wp_change_without_paging_keeps_the_decode_cache() {
 /// This slice does NOT touch the CR3 path. Mutation row "gate applied to the CR3 path too".
 #[test]
 fn mov_cr3_still_flushes() {
+    // **Updated for the CR3 code-cache gate**: `MOV CR3` no longer always tears the decode cache
+    // down (that is the whole point of the gate, see `dev_docs/2026-09-02-cr3-code-cache-gate-
+    // design.md`). What survives from this row's original claim is that the OBSERVER-visible
+    // result is unchanged: the witness line, decoded before the write, is never live afterward,
+    // whether the ring serves the write (R1/R2, no teardown) or forces one (R3). This fixture's
+    // write is the CPU's first-ever `MOV CR3` with an empty ring, so it takes R2; the exhaustive
+    // ring-outcome coverage (R1 select, R2 allocate, R3 retire-all) lives in
+    // `cpu_cr3_flush_test.rs`.
     let (mut cpu, mut bus) = cr0_fixture(&mov_to_cr(3));
     warm_witness(&mut cpu, &mut bus);
     let d = cpu.registers.cs().default_size_32;
-    let invalidations = cpu.perf_counters().decode_inval_other;
 
     write_cr0(&mut cpu, &mut bus, PAGE_DIRECTORY);
 
     assert_eq!(cpu.control.cr3, PAGE_DIRECTORY);
-    assert_eq!(
-        cpu.perf_counters().decode_inval_other,
-        invalidations + 1,
-        "MOV CR3 is untouched by this slice and must still flush"
+    assert!(
+        !cpu.decode_cache.line_live(WITNESS, d),
+        "a witness decoded under the OLD directory must never read live under the new one"
     );
-    assert!(!cpu.decode_cache.line_live(WITNESS, d));
 }
 
 // ---- 5. LMSW, for every operand ----------------------------------------------------------------
@@ -953,6 +958,16 @@ mod flush_attribution {
     use super::*;
 
     /// RED when the `TranslationFlushReason::Cr3` arm's increment is deleted.
+    ///
+    /// **Updated for the CR3 code-cache gate**
+    /// (`dev_docs/2026-09-02-cr3-code-cache-gate-design.md`): `decode_inval_cr3` still counts
+    /// every `MOV CR3` WRITE unconditionally (it is bumped at the top of
+    /// `flush_tlb_and_code_caches_for_cr3_write`, above the ring decision), but it no longer
+    /// implies a teardown. This fixture's `MOV CR3` is the FIRST one this `CpuGsw` executes, with
+    /// an empty ring and a free slot, so the ring serves it with R2 (allocate) rather than R3
+    /// (retire-all): `decode_inval_other` does NOT move, and `cr3_code_flush_skipped` does. The
+    /// witness line still dies from the OBSERVER's side (a fresh generation matches no stored
+    /// line), which is `mov_cr3_still_flushes`'s row, just above.
     #[test]
     fn mov_cr3_attributes_its_flush_to_cr3() {
         let (mut cpu, mut bus) = cr0_fixture(&mov_to_cr(3));
@@ -968,12 +983,22 @@ mod flush_attribution {
         assert_eq!(
             cpu.perf_counters().decode_inval_cr3,
             before.decode_inval_cr3 + 1,
-            "MOV CR3's teardown must be attributed to CR3"
+            "MOV CR3's write must be attributed to CR3"
+        );
+        assert_eq!(
+            cpu.perf_counters().cr3_code_flush_skipped,
+            before.cr3_code_flush_skipped + 1,
+            "an empty ring's first write is an R2 allocate, served by the ring"
+        );
+        assert_eq!(
+            cpu.perf_counters().cr3_code_flush_taken,
+            before.cr3_code_flush_taken,
+            "R2 must not also count as a forced teardown"
         );
         assert_eq!(
             cpu.perf_counters().decode_inval_other,
-            before.decode_inval_other + 1,
-            "and it must still land in the aggregate the split partitions"
+            before.decode_inval_other,
+            "a ring-served write does not land in the wholesale-teardown aggregate"
         );
         assert_eq!(
             cpu.perf_counters().decode_inval_cr0,
@@ -1095,3 +1120,6 @@ mod flush_attribution {
 // | the CR3 call site passes `Cr0`, or the CR0 site passes `Cr3` | both instruction-driven rows |
 // | the split stops bumping `decode_inval_other`, i.e. a second total instead of a partition | all five rows |
 // | the CR0 arm fires on the kept-caches path too | `a_pe_only_cr0_write_attributes_nothing` |
+
+#[path = "cpu_cr3_flush_test.rs"]
+mod cr3_flush;

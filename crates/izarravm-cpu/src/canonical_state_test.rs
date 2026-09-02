@@ -909,8 +909,13 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // (decode_inval_cr3 / _cr0 / _task_switch; 24 bytes), moving the pin 4632 -> 4656 --
     // measured, not derived. An attribution of `decode_inval_other`, host bookkeeping, so both
     // canonical payloads are unchanged by it; see cpu_test.rs's twin comment.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4656);
+    // The CR3 code-cache gate adds six PerfCounters fields (48 bytes) and grows `DecodeCache`
+    // with the two-slot ring and the `translation_pages` bitmap, moving the pin 4656 -> 4760 --
+    // measured, not derived. Host-side diagnostics and a transparent accelerator, not
+    // architectural state, so both canonical payloads are unchanged by it; see cpu_test.rs's
+    // twin comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4760);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4656);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4760);
 }

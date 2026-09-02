@@ -379,17 +379,21 @@ fn eviction_republishes_the_packed_entry() {
 #[test]
 fn wholesale_invalidation_retires_every_packed_entry() {
     let (mut cpu, _bus) = warmed(&[0x1000, 0x1020]);
-    cpu.decode_cache.invalidate_and_clear_code_marks();
+    cpu.decode_cache.invalidate_and_clear_code_marks(true);
     assert!(cpu.decode_cache.get_packed(0x1000, false).is_none());
     assert!(cpu.decode_cache.get_packed(0x1020, false).is_none());
     cpu.decode_cache.assert_packs_consistent();
 
     let (mut cpu, _bus) = warmed(&[0x1000]);
+    // The wrap trigger moved to `next_generation` (the ring's shared allocator, R6): `generation`
+    // alone no longer drives it, since a ring select can set `generation` to an OLDER stored
+    // value without ever approaching the wrap.
     cpu.decode_cache.generation = u32::MAX;
+    cpu.decode_cache.next_generation = u32::MAX;
     let slot = (0x1000 & cpu.decode_cache.mask) as usize;
     cpu.decode_cache.lines[slot].generation = u32::MAX;
     cpu.decode_cache.packs[slot].generation = u32::MAX;
-    cpu.decode_cache.invalidate_and_clear_code_marks();
+    cpu.decode_cache.invalidate_and_clear_code_marks(true);
     assert_eq!(cpu.decode_cache.generation, 1);
     assert!(
         cpu.decode_cache

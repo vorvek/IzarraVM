@@ -866,7 +866,7 @@ fn decode_cache_hits_only_on_matching_tag_and_generation() {
         cache.get(lin + 4, false).is_none(),
         "a different tag in the same slot misses (no false hit)"
     );
-    cache.invalidate_and_clear_code_marks();
+    cache.invalidate_and_clear_code_marks(true);
     assert!(
         cache.get(lin, false).is_none(),
         "a generation bump invalidates every stamped line"
@@ -897,7 +897,7 @@ fn decode_cache_put_reports_accepted_and_rejected_lines() {
     assert!(different_decode_key.inserted);
     assert_eq!(different_decode_key.evicted_slot, Some(0));
 
-    cache.invalidate_and_clear_code_marks();
+    cache.invalidate_and_clear_code_marks(true);
     let dead_collision = cache.put(0x104, insn, false, 0x104);
     assert!(dead_collision.inserted);
     assert_eq!(dead_collision.evicted_slot, None);
@@ -940,7 +940,8 @@ fn decode_cache_generation_wrap_clears_lines_and_watches() {
     assert!(cache.native_code_watch.is_watched(0x100));
 
     cache.generation = u32::MAX;
-    cache.invalidate_and_clear_code_marks();
+    cache.next_generation = u32::MAX;
+    cache.invalidate_and_clear_code_marks(true);
     assert_eq!(cache.generation, 1, "wrap skips 0");
     assert!(cache.get(0x100, false).is_none());
     assert!(!cache.native_code_watch.is_watched(0x100));
@@ -1013,7 +1014,7 @@ fn decode_cache_narrow_kills_retain_sticky_native_chunks_until_global_clear() {
     cache.assert_native_watch_consistent();
     cache.assert_packs_consistent();
 
-    cache.invalidate_and_clear_code_marks();
+    cache.invalidate_and_clear_code_marks(true);
     assert!(!cache.native_code_watch.is_watched(0x100));
 }
 
@@ -1031,7 +1032,7 @@ fn decode_cache_global_clear_drops_marks_but_narrow_kill_does_not() {
     assert!(cache.put(0x100, insn, false, 0x100).inserted);
     assert!(cache.native_code_watch.is_watched(0x100));
 
-    cache.invalidate_and_clear_code_marks();
+    cache.invalidate_and_clear_code_marks(true);
     assert!(!cache.native_code_watch.is_watched(0x100));
     cache.assert_native_watch_consistent();
     cache.assert_packs_consistent();
@@ -1042,7 +1043,7 @@ fn decode_cache_global_clear_drops_marks_but_narrow_kill_does_not() {
     cache.assert_native_watch_consistent();
     cache.assert_packs_consistent();
 
-    cache.invalidate_and_clear_code_marks();
+    cache.invalidate_and_clear_code_marks(true);
     assert!(!cache.native_code_watch.is_watched(0x100));
 }
 

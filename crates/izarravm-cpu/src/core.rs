@@ -8,7 +8,14 @@ use crate::paging::{VGA_APERTURE_END, VGA_APERTURE_START};
 /// select a counter and nothing else. See `CpuGsw::flush_tlb_and_code_caches`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranslationFlushReason {
-    /// `MOV CR3, r32` -- the page-directory base was reloaded.
+    /// `MOV CR3, r32` -- the page-directory base was reloaded. No PRODUCTION caller constructs
+    /// this any more: a real reload executes through
+    /// `CpuGsw::flush_tlb_and_code_caches_for_cr3_write`, the ring-gated entry point that needs
+    /// the register's old value and so cannot go through this generic, reason-only function. The
+    /// variant stays live for test scaffolding that wants the pre-gate always-full-flush behavior
+    /// without simulating a real reload's old/new pair (`allow(dead_code)` outside `cfg(test)`,
+    /// where nothing in the lib-only compilation unit constructs it).
+    #[cfg_attr(not(test), allow(dead_code))]
     Cr3,
     /// `MOV CR0, r32` or `LMSW`, on the arm where `cr0_write_moves_code_translation` is true.
     Cr0,
@@ -149,7 +156,12 @@ impl CpuGsw {
     }
 
     fn invalidate_code_caches_uncounted(&mut self) {
-        self.invalidate_decode_frontend();
+        // None of this function's callers (A20 toggle, direct-map change, device DMA, aperture
+        // remap) flush the whole TLB in the same operation, so `translation_pages` must not clear
+        // here (F11): a stale TLB entry could still serve a code translation with no fresh walk
+        // to re-mark it. Keeping the marks is the conservative direction -- more retires, never
+        // fewer -- exactly like retaining `code_bytes`.
+        self.invalidate_decode_frontend(false);
         #[cfg(feature = "jit")]
         self.jit_direct.clear();
     }
@@ -167,21 +179,29 @@ impl CpuGsw {
         self.fetch_page.invalidate();
     }
 
-    fn invalidate_decode_frontend(&mut self) {
+    /// `clear_translation_marks` is threaded straight through to
+    /// `DecodeCache::invalidate_and_clear_code_marks`: `true` only when the caller flushed the
+    /// whole TLB in this same operation (F11).
+    fn invalidate_decode_frontend(&mut self, clear_translation_marks: bool) {
         self.invalidate_fetch_frontend();
         // Paging, mode, A20, and physical-map changes route through here. Any can make the same
         // linear address decode from different bytes, so invalidate the lines and their SMC marks.
-        self.decode_cache.invalidate_and_clear_code_marks();
+        self.decode_cache
+            .invalidate_and_clear_code_marks(clear_translation_marks);
+        self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
         // No line survives the bump, so no aperture line does either. Clearing here is what
         // makes the aperture-remap flush self-limiting: the flush it triggers lands in this
         // function and disarms it until aperture code is genuinely decoded again.
         self.has_aperture_code.0 = false;
     }
 
-    pub(super) fn invalidate_translation_code_caches(&mut self) {
+    /// `clear_translation_marks`: see `invalidate_decode_frontend`. The two production callers
+    /// disagree: `flush_tlb_and_code_caches`'s CR0/task-switch arms flush the whole TLB first
+    /// (`true`); `INVLPG` invalidates a single TLB entry (`false`).
+    pub(super) fn invalidate_translation_code_caches(&mut self, clear_translation_marks: bool) {
         self.perf.decode_inval_other += 1;
         self.perf.code_invalidations += 1;
-        self.invalidate_decode_frontend();
+        self.invalidate_decode_frontend(clear_translation_marks);
         #[cfg(feature = "jit")]
         self.jit_direct.invalidate_translation();
     }
@@ -264,6 +284,15 @@ impl CpuGsw {
     /// here gates anything. `dev_docs/2026-09-02-tyrian-586-specs-diag.md` section 4.1 reached
     /// "it is CR3" by eliminating the other two from unrelated counters; this makes the same
     /// claim measurable, which is the precondition the diagnosis set for writing any gate.
+    ///
+    /// **`Cr3` here is the pre-gate, always-full-flush entry point**, kept for callers that are
+    /// not simulating a real `MOV CR3` reload and so have no old/new register pair to give the
+    /// ring (test scaffolding, mainly). A real `MOV CR3` executes through
+    /// `flush_tlb_and_code_caches_for_cr3_write` below, which is the only caller that can seed and
+    /// consult the two-slot ring. Both bump `decode_inval_cr3`, so the ring's own identity
+    /// (`cr3_code_flush_taken + cr3_code_flush_skipped == decode_inval_cr3`) holds for every ring
+    /// write; this generic arm is simply outside that count's denominator on the taken/skipped
+    /// side, exactly as an "under-attributed" `Unattributed` reason would be.
     pub(super) fn flush_tlb_and_code_caches(&mut self, reason: TranslationFlushReason) {
         match reason {
             TranslationFlushReason::Cr3 => self.perf.decode_inval_cr3 += 1,
@@ -271,7 +300,45 @@ impl CpuGsw {
             TranslationFlushReason::TaskSwitch => self.perf.decode_inval_task_switch += 1,
         }
         self.flush_tlb_and_direct_pages();
-        self.invalidate_translation_code_caches();
+        // The whole TLB was just flushed above, so translation_pages may clear (F11).
+        self.invalidate_translation_code_caches(true);
+    }
+
+    /// `MOV CR3, r32`, the ring-gated code half (design `2026-09-02-cr3-code-cache-gate-design.md`
+    /// part 2). Unlike `flush_tlb_and_code_caches(Cr3)` above, this is what a REAL reload executes:
+    /// it needs the register's OLD value to seed the ring (R8) and to tell a same-directory
+    /// reselect (R1) from a genuine third value (R3), so it owns the assignment to
+    /// `self.control.cr3` itself. Callers must pass the value about to be written and must NOT
+    /// assign the register first.
+    ///
+    /// The data half (TLB, `data_read_pages`/`data_write_pages`, the FastMap) and the eip-window
+    /// fetch frontend stay unconditional on EVERY `MOV CR3`, exactly as before this slice (design
+    /// part 2(d)): only the DECODE half is gated. The JIT link graph is untouched by this slice on
+    /// purpose (part 2(e)) and keeps tearing down on every write, ring hit or not.
+    pub(super) fn flush_tlb_and_code_caches_for_cr3_write(&mut self, new_cr3: u32) {
+        self.perf.decode_inval_cr3 += 1;
+        let old_cr3_masked = self.control.cr3 & 0xffff_f000;
+        self.control.cr3 = new_cr3;
+        let new_cr3_masked = new_cr3 & 0xffff_f000;
+        self.flush_tlb_and_direct_pages();
+        self.invalidate_fetch_frontend();
+        match self
+            .decode_cache
+            .select_context(old_cr3_masked, new_cr3_masked)
+        {
+            ContextSelect::Skipped => {
+                self.perf.cr3_code_flush_skipped += 1;
+            }
+            ContextSelect::Taken => {
+                self.perf.cr3_code_flush_taken += 1;
+                self.perf.decode_inval_other += 1;
+                self.perf.code_invalidations += 1;
+                self.has_aperture_code.0 = false;
+                self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
+            }
+        }
+        #[cfg(feature = "jit")]
+        self.jit_direct.invalidate_translation();
     }
 
     /// `flush_tlb_and_code_caches` without the code-translation teardown: the decode lines, their
@@ -592,16 +659,29 @@ impl CpuGsw {
     }
 
     /// Cheap, side-effect-free probe hoisted out of `note_code_write_hit`: does the store range
-    /// touch any watched code (a compiled block's physical span or a decoded instruction line)?
-    /// Value-aware callers (the sized-store path) gate the read-old-bytes comparison that drives
-    /// G2 same-value elision on this, paying nothing extra when the store misses all code.
+    /// touch any watched code (a compiled block's physical span or a decoded instruction line) OR
+    /// a page the CR3 code-cache gate's ring depends on (a page-directory or page-table page a
+    /// walk has read, `translation_pages`)? Value-aware callers (the sized-store path) gate the
+    /// read-old-bytes comparison that drives G2 same-value elision on this, paying nothing extra
+    /// when the store misses all code.
+    ///
+    /// `translation_pages` belongs HERE and not in `note_code_write_inner` (finding F1): this is
+    /// the predicate BOTH FastMap store gates already compute unconditionally
+    /// (`memory.rs`'s `finish_fast_map_write` and `write_linear_fragment_after_probe`), so a page
+    /// table's writes reach the invalidation door at all only because this test sees them. Placed
+    /// below those gates, a `MOV [pte], eax` would never open the door and the watch would be dead
+    /// on the hot path.
     #[inline]
     pub(super) fn code_write_watched(&self, physical: u32, width: u32) -> bool {
         #[cfg(feature = "jit")]
         if self.jit_direct.range_hits_compiled_code(physical, width) {
             return true;
         }
-        self.decode_cache.range_hits_code(physical, width)
+        if self.decode_cache.range_hits_code(physical, width) {
+            return true;
+        }
+        self.decode_cache
+            .range_hits_translation_page(physical, width)
     }
 
     /// The invalidation body of a code write, entered from the guest's own COMMITTED data stores.
@@ -777,6 +857,29 @@ impl CpuGsw {
         }
         #[cfg(not(feature = "jit"))]
         let _ = lanes;
+        // The CR3 code-cache gate's write watch (finding F1): a store into a page-directory or
+        // page-table page a walk has read forces the same wholesale retire an SMC store into
+        // unmarked code never gets, because the ring's soundness rests on the invariant that NO
+        // live decode line survives an edit to the structures its translation depended on. A page
+        // table holds no code, so this can never overlap the `range_hits_code` branch below on a
+        // real guest. `clear_translation_marks: false` -- this write did not flush the TLB, so
+        // clearing the bitmap here would leave a future TLB-hit translation's line unprotected
+        // (F11); the marks stay set, which only costs a future retire that would have fired
+        // anyway.
+        if self
+            .decode_cache
+            .range_hits_translation_page(physical, width)
+        {
+            invalidated = true;
+            action.wholesale = true;
+            self.perf.translation_page_writes += 1;
+            self.perf.code_invalidations += 1;
+            self.decode_cache.invalidate_and_clear_code_marks(false);
+            self.has_aperture_code.0 = false;
+            #[cfg(feature = "jit")]
+            self.jit_direct.invalidate_translation();
+            self.fetch_page.invalidate();
+        }
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
             // The demoted-call-out map, at the second of the two doors. It has to be BOTH because
@@ -833,7 +936,10 @@ impl CpuGsw {
                     action.wholesale = true;
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
-                    self.decode_cache.invalidate_and_clear_code_marks();
+                    // `false`: an SMC store does not flush the TLB, so `translation_pages` must
+                    // stay set (F11) -- the ring's slots are still retired below via this same
+                    // call, only the bitmap survives.
+                    self.decode_cache.invalidate_and_clear_code_marks(false);
                     // The second of the two generation-bump call sites; same clearing rule as
                     // invalidate_decode_frontend, or an SMC wholesale flush would leave the
                     // aperture flag armed with no line behind it.
@@ -1388,7 +1494,32 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         let watched = watched || self.decode_cache.code_watch_page_is_watched(page);
-        watched
+        // Finding F2: without this, a native emitted store bypasses the invalidation door
+        // entirely (it goes straight to the host pointer unless the FastMap entry's PAGE_WATCHED
+        // bit, stamped from this function, says otherwise), so a page that just became a page
+        // table would keep taking native stores unobserved.
+        watched || self.decode_cache.translation_page_is_watched(page)
+    }
+
+    /// Mark `physical`'s page as page-directory/page-table structure a walk just read (design
+    /// part 2(b)/finding F11), called unconditionally from `translate_linear_checked` on EVERY
+    /// walk. When this is the page's unwatched -> watched edge, sweep it through the FastMap
+    /// synchronously, in the shape of `sweep_sticky_watch_edges` (finding F2): a native block's
+    /// interpreter call-out can decode mid-block, so a bit-clear FastMap entry for a page that
+    /// just became watched must not survive to the next native store.
+    #[inline]
+    pub(super) fn mark_translation_page(&mut self, physical: u32) {
+        if !self.decode_cache.mark_translation_page(physical) {
+            return;
+        }
+        self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_fast_map
+            .clear_unwatched_entries_of_physical_page(physical & 0xffff_f000);
     }
 
     /// Drain and apply the sticky watch's strict E1 edges (watched-page-bit design D4): every

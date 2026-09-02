@@ -106,8 +106,11 @@ fn cpu_registers_field_offset_is_stable() {
     // `u32` and a `bool`, plus a count and an overflow bit) and the window flag to `CpuGsw`,
     // moving this pin from 480 to 520 -- measured, not derived. The list is sized for one
     // instruction's stores plus a whole exception delivery's; see `MAX_DEFERRED_CODE_WRITES`.
+    // The CR3 code-cache gate grows `DecodeCache` (which sits ahead of `registers`) with the
+    // two-slot ring and the `translation_pages` bitmap, moving this pin from 520 to 576 --
+    // measured, not derived.
     assert_eq!(
-        off, 520,
+        off, 576,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -1975,7 +1978,15 @@ fn pending_flags_offset() {
     // (decode_inval_cr3 / _cr0 / _task_switch; 24 bytes), moving this pin 4632 -> 4656 --
     // measured off a failing-test readout, not derived. They are an attribution of
     // `decode_inval_other`, host-side diagnostics, not guest state.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4656);
+    // The CR3 code-cache gate (`2026-09-02-cr3-code-cache-gate-design.md`) adds six PerfCounters
+    // fields (cr3_code_flush_taken / _skipped, translation_page_writes, translation_a_stores /
+    // _d_stores, translation_pages_marked; 48 bytes) and grows `DecodeCache` (mid-struct, a
+    // by-value field) with the two-slot ring (`contexts`, `next_generation`, `ring_seeded`) and
+    // the `translation_pages` bitmap plus its residency counter, moving this pin 4656 -> 4760 --
+    // measured off a failing-test readout, not derived. None of it is guest state: the counters
+    // are diagnostics like their CR3/CR0/task-switch siblings, and the ring/bitmap are the same
+    // kind of transparent accelerator `DecodeCache` already was.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4760);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and

@@ -1826,7 +1826,7 @@ fn cpu_code_write_uses_selective_direct_invalidation() {
     install_trivial(&mut cpu.jit_direct, adjacent, 16);
     cpu.mark_decode_code_for_test(overlap.physical, 1);
     cpu.mark_block_code_for_test(overlap.physical, 1);
-    cpu.decode_cache.invalidate_and_clear_code_marks();
+    cpu.decode_cache.invalidate_and_clear_code_marks(true);
     assert!(!cpu.decode_cache.range_hits_code(overlap.physical, 1));
 
     cpu.note_code_write(overlap.physical, 1);

@@ -778,7 +778,7 @@ fn interpret_one_abnormal_when_decode_view_missing() {
     // Kill the decode LINES only. `invalidate_code_caches` would be wrong here for a reason that
     // is the point of the test: it also drops the compiled block, so the entry would be refused
     // before the helper ever ran and the fixture would pass while proving nothing.
-    native.decode_cache.invalidate_and_clear_code_marks();
+    native.decode_cache.invalidate_and_clear_code_marks(true);
     let before = native.perf_counters().jit_direct_insns;
     assert!(
         native
@@ -3034,6 +3034,25 @@ fn pushf_then_popf_round_trip_natively_in_v86_at_iopl_3() {
         0x3000,
         "the fixture needs IOPL 3"
     );
+
+    // Pre-warm the V86 stack page's PTE accessed/dirty bits through the guest write path, before
+    // installing and running the block natively. `v86_world` pages the whole low 0x20000 range
+    // identity, so PUSHF's stack write is otherwise the FIRST write to a still-clean page
+    // (`SS:SP` = 0x0900:0x1000), which forces a fresh walk that stores the PTE's D bit -- and
+    // that PTE lives inside the same low-memory table page (0x2000) the CR3 code-cache gate's
+    // write watch already marked as translation structure while decoding V86_BASE. Without the
+    // warm-up, PUSHF's D-bit store legitimately retires the ring from inside the call-out (design
+    // `2026-09-02-cr3-code-cache-gate-design.md`, advisory 12), which the deferred-write window
+    // then reports as non-empty and `allows_resume`'s R5 correctly refuses -- a real, accepted
+    // side exit, just not the one this fixture exists to isolate.
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ss,
+        0x0ffe,
+        0,
+        BusAccessKind::DataWrite,
+    )
+    .expect("stack warm-up write");
 
     for offset in [0u32, 3, 4, 5, 6] {
         let linear = V86_BASE + offset;
@@ -6387,7 +6406,7 @@ fn interpret_one_closes_the_callout_attribution_ledger() {
         cpu.registers.set_ebx(0xffff);
     }
     fn drop_the_decode_lines(cpu: &mut CpuGsw, _: &mut TestBus) {
-        cpu.decode_cache.invalidate_and_clear_code_marks();
+        cpu.decode_cache.invalidate_and_clear_code_marks(true);
     }
 
     /// The three legs differ only in how the fixture is perturbed, and every one must close.

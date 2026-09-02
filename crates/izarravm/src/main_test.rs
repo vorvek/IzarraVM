@@ -94,6 +94,8 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "code_watch_block_page_releases",
     "code_watch_sticky_page_edges",
     "code_watch_sweep_cleared",
+    "cr3_code_flush_skipped",
+    "cr3_code_flush_taken",
     "data_direct_reads",
     "data_direct_writes",
     "data_slow_reads",
@@ -225,6 +227,10 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "smc_scan_calls",
     "smc_scan_keys",
     "straight_line_runs",
+    "translation_a_stores",
+    "translation_d_stores",
+    "translation_page_writes",
+    "translation_pages_marked",
 ];
 
 #[test]
@@ -1233,6 +1239,12 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         decode_inval_cr3: _,
         decode_inval_cr0: _,
         decode_inval_task_switch: _,
+        cr3_code_flush_taken: _,
+        cr3_code_flush_skipped: _,
+        translation_page_writes: _,
+        translation_a_stores: _,
+        translation_d_stores: _,
+        translation_pages_marked: _,
         code_invalidations: _,
         smc_narrow_kills: _,
         smc_lane_registrations: _,
