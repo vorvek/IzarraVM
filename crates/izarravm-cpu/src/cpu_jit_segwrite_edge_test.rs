@@ -58,6 +58,11 @@ fn filler() -> Vec<u8> {
 /// `mov ds, ax` -- `0x8E /3`, register form.
 const MOV_DS_AX: [u8; 2] = [0x8e, 0xd8];
 
+/// `mov fs, cx` -- `0x8E /4`, register form. `MovSreg` in every mode, unlike `mov ds,ax` above,
+/// which is native (`LoadSegReal`) outside protected mode: this is what the block-keyed
+/// un-demotion's V86 exclusion (2026-09-02 review N1) is about.
+const MOV_FS_CX: [u8; 2] = [0x8e, 0xe1];
+
 /// Block B's body: `mov al,[bx]` (a byte read through DS, the segment A just wrote), followed by
 /// two filler slots so B also clears the three-instruction floor. `[bx]`'s default segment is DS
 /// with no override, which is what makes B's `SegmentLayout` PIN DS -- `seg_write_merge`'s own
@@ -652,4 +657,132 @@ fn a_write_only_segment_never_gates_reentry_into_its_own_source_block() {
         TARGET_SELECTOR,
         "A's write must have taken, overwriting the unrelated entry-time DS"
     );
+}
+
+// =================================================================================================
+// N1 (2026-09-02, PR #824 review): the block-keyed MOV Sreg un-demotion must not touch this V86
+// population. A V86 block mixing this fixture file's native DS write with an FS `MovSreg`
+// call-out must still get the guarded edge above, exactly as if the call-out were not there.
+// =================================================================================================
+
+/// `mov fs,cx` beside `mov ds,ax` in the SAME V86 block, CX held at FS's own already-current
+/// selector so the call-out is a plain same-record reload -- resumable under R2's `u8::MAX`
+/// default regardless of the mask, which isolates this fixture to the property under test
+/// (`callout_segment_writes` / `seg_write_edge_eligible`) rather than conflating it with R2's mask
+/// width.
+///
+/// Before the block-keyed un-demotion's V86 exclusion, `MovSreg` fed `callout_segment_writes`
+/// unconditionally in every mode, so this FS call-out would have failed `seg_write_edge_eligible`'s
+/// `callout_segment_writes == 0` term and cost block A the guarded edge it has without the call-out
+/// (the fixture above). That is exactly the regression review finding N1 measured on `duke3d-486`:
+/// `jit_direct_linked_transfers` falling and `jit_direct_unresolved_static_unbound` rising by a
+/// real, if small, amount. This fixture is the unit-level red proof for the fix.
+///
+/// MUTATION: drop the `movsreg_block_keyed_eligible` term from the accumulator in `direct.rs` (let
+/// `MovSreg` feed `callout_segment_writes` unconditionally again, in every mode) and
+/// `is_segment_write_block()` goes back to `true`: the edge is lost, and the entries/linked-transfer
+/// assertions below fail (2 entries instead of 1, 0 linked transfers instead of 1).
+#[test]
+fn a_v86_block_mixing_a_native_write_with_an_fs_callout_still_gets_the_guarded_edge() {
+    let mut code = filler();
+    let mut starts = vec![ENTRY, ENTRY + 2, ENTRY + 4];
+    code.extend_from_slice(&MOV_FS_CX);
+    starts.push(ENTRY + 6);
+    code.extend_from_slice(&MOV_DS_AX);
+    let b_linear = ENTRY + code.len() as u32;
+    starts.push(b_linear);
+    let body_b = block_b_body();
+    for i in 0..(body_b.len() / 2) {
+        starts.push(b_linear + 2 * i as u32);
+    }
+    code.extend_from_slice(&body_b);
+    code.push(0xf4); // HLT: a chain that runs off the end of B halts rather than decoding junk.
+    starts.push(b_linear + body_b.len() as u32);
+
+    let mut memory = memory_fill();
+    memory[(ENTRY - 1) as usize] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[0x0400] = 0xa5;
+
+    let mut cpu = v86_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    cpu.set_fast_map_enabled_for_test(true);
+    cpu.registers.set_ebx(0);
+    for &linear in &starts {
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    for page in (0..MEMORY_LEN).step_by(0x1000) {
+        map_direct_page(&mut cpu, &mut bus, page);
+    }
+    cpu.set_eip(ENTRY);
+
+    let block_a = install_at(&mut cpu, ENTRY);
+    assert!(
+        !block_a.is_segment_write_block(),
+        "a V86 block mixing a native write with an FS MovSreg call-out must still publish its \
+         guarded successor -- the block-keyed un-demotion must not touch this population"
+    );
+
+    // Compile B with DS = TARGET_SELECTOR live, exactly as the win fixture does.
+    cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+    let block_b = install_at(&mut cpu, b_linear);
+
+    // FS's own current selector, so `mov fs,cx` reloads the SAME record: resumable regardless of
+    // R2's mask width, which is deliberate (see the fixture's own doc comment above).
+    let fs_selector = cpu.registers.segment(SegmentIndex::Fs).selector;
+    cpu.registers.set_ecx(u32::from(fs_selector));
+    cpu.registers.set_eax(u32::from(TARGET_SELECTOR));
+    cpu.load_segment_real(SegmentIndex::Ds, 0); // whatever DS held before the write is irrelevant
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+
+    let entries_before = cpu.perf_counters().jit_direct_entries;
+    let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+    let mismatches_before = cpu.perf_counters().jit_direct_seg_guard_mismatch_exits;
+
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap()
+    );
+
+    assert_eq!(
+        cpu.perf_counters().jit_direct_entries - entries_before,
+        1,
+        "A and B must still run in ONE run_direct_block entry, FS call-out notwithstanding"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+        1,
+        "the chain hop from A into B must still be counted as a linked transfer"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_seg_guard_mismatch_exits,
+        mismatches_before,
+        "a passing guard must not be counted as a mismatch"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(
+        stalls.callout_interpret_one_resync, 0,
+        "the FS call-out reloads its own record and must resume, not resync"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        TARGET_SELECTOR,
+        "A's DS write must have taken"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Fs).selector,
+        fs_selector,
+        "A's FS call-out must have run and resumed"
+    );
+    assert_eq!(
+        cpu.registers.eax() & 0xff,
+        0xa5,
+        "B must have run and read the byte at the NEW DS:[BX]"
+    );
+    let _ = block_b;
 }

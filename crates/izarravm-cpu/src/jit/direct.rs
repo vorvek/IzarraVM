@@ -8069,12 +8069,34 @@ fn compile_with_budget(
     // OTHER slot in the block depends on, so nothing in the block ever runs against a record the
     // step moved.
     //
-    // Zero when the knob is off, which is the whole of the off arm's successor behaviour: the
-    // block publishes its successors exactly as it did before S4f.
+    // NO LONGER zero on the shipped default for a `MovSreg` row OUTSIDE V86 (block-keyed
+    // un-demotion, 2026-09-02, narrowed 2026-09-02 review N1). `MovSreg` -- `0x8E` `/0`, `/3`, `/4`,
+    // `/5` -- opts into R2's mask whether or not the knob is set, keyed on the block's OWN
+    // prefix-plus-suffix `used` mask rather than on `IZARRAVM_CALLOUT_SEGMENT_RESUME`, but ONLY when
+    // `movsreg_block_keyed_eligible` (the block's `mode_key` has the V86 bit clear); see the
+    // accumulator below and the mask-gate note at the R2 pass. A V86 `MovSreg` cell -- an FS/GS load
+    // beside a native DS/ES write, the shape the V86 guarded successor edge exists for -- still
+    // needs the knob, exactly as before this slice. `MovSsReg` and `PopSs` stay exactly as they
+    // were in every mode: zero, and therefore R2-strict at `u8::MAX`, unless the knob is explicitly
+    // on. That split is why this counter can be nonzero on the default build now, and why it must be
+    // read alongside `may_write_segment()` rather than assumed to name every segment-writing row.
     let mut callout_segment_writes = 0usize;
     // Read ONCE per walk and baked into the cells below, never at run time. A block keeps the arm
     // it was compiled under for its whole life, which is what makes an interleaved A/B readable.
     let segment_resume = callout_segment_resume_enabled();
+    // N1 (PR #824 review): the block-keyed `MovSreg` relaxation below is confined to blocks the
+    // V86 guarded successor edge (`seg_write_edge_eligible`, below) could never claim in the first
+    // place. Keyed on the V86 BIT rather than on `seg_write_edge_eligible` itself, which is the
+    // simpler and TIGHTER-BY-CONSTRUCTION of the two: `seg_write_edge_eligible` is computed once,
+    // after this walk, from aggregates (`dirty_segments`, `segment_writes`, the terminal kind) this
+    // per-slot accumulator does not have yet, while `key.mode_key` is known from block entry and
+    // never changes mid-walk. Gating on the bit is also the READING the task asked for: "V86 blocks
+    // keep today's behaviour exactly", not "V86 blocks that would have qualified for the edge
+    // anyway". A V86 block that would never have been edge-eligible (two dirty segments, a non-
+    // fallthrough terminal) still keeps the pre-PR knob-gated behaviour under this predicate, which
+    // is a strictly SAFER bar than `seg_write_edge_eligible` would give: it never approves a
+    // `MovSreg` relaxation `seg_write_edge_eligible` would also have to refuse the edge for.
+    let movsreg_block_keyed_eligible = key.mode_key & JIT_MODE_KEY_V86_BIT == 0;
     let x87_entry_top = cpu.fpu.top();
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
@@ -8712,7 +8734,15 @@ fn compile_with_budget(
                 let row = helper
                     .interpret_one_row()
                     .expect("an InterpretOne helper names its census row");
-                callout_segment_writes += usize::from(segment_resume && row.may_write_segment());
+                // `MovSreg` opts into the count unconditionally OUTSIDE V86 (block-keyed
+                // un-demotion, narrowed by N1 to exclude the population the V86 guarded edge could
+                // claim); every other segment-writing row (`MovSsReg`, `PopSs`), and a `MovSreg` row
+                // inside a V86 block, still needs the knob. See the field's doc comment above.
+                callout_segment_writes += usize::from(
+                    row.may_write_segment()
+                        && (segment_resume
+                            || (row == InterpretOneRow::MovSreg && movsreg_block_keyed_eligible)),
+                );
                 // `slots.len()` IS the index this instruction is about to take: the push happens
                 // further down the same iteration and nothing between here and it can `break`.
                 // The assertion after the walk is what keeps that true.
@@ -8990,9 +9020,17 @@ fn compile_with_budget(
     // all -- and it is written this way because the rule is about the OTHER slots, not because the
     // arithmetic needs it.
     //
-    // Skipped entirely when the knob is off: the cells keep their `u8::MAX` defaults, R2 compares
-    // all six records, and the block published its successors above.
-    if segment_resume {
+    // Runs whenever the knob forces it OR the block holds a block-keyed-eligible `MovSreg` cell
+    // (block-keyed un-demotion, 2026-09-02, narrowed by N1): the pass itself does not know which row
+    // a cell belongs to, so it is gated on the WIDER of the two questions and the per-cell loop below
+    // narrows it back down. `MovSsReg` and `PopSs` cells, and any `MovSreg` cell inside a V86 block,
+    // keep their `u8::MAX` defaults -- R2 compares all six records for them -- unless the knob is
+    // ALSO on, exactly as before this slice.
+    let callout_mov_sreg_present = movsreg_block_keyed_eligible
+        && interpret_one_cells
+            .iter()
+            .any(|(_, cell)| cell.row() == InterpretOneRow::MovSreg);
+    if segment_resume || callout_mov_sreg_present {
         debug_assert_eq!(
             interpret_one_cells.len(),
             slots
@@ -9041,7 +9079,17 @@ fn compile_with_budget(
             suffix |= slots[index].kind.pinned_segments();
         }
         debug_assert_eq!(back, 0, "a cell named a slot index below the block");
+        // The row filter is what keeps `MovSsReg` and `PopSs` at the `u8::MAX` default when the
+        // knob is off: the two passes above compute a mask for every cell regardless of row (they
+        // are a fact about slot POSITIONS, not about which row occupies one), and this loop is the
+        // one place that decides which cells actually RECEIVE theirs. A cell this loop skips is
+        // left exactly as `InterpretOneCell::new` built it.
         for (position, (_, cell)) in interpret_one_cells.iter_mut().enumerate() {
+            let movsreg_block_keyed_cell =
+                movsreg_block_keyed_eligible && cell.row() == InterpretOneRow::MovSreg;
+            if !segment_resume && !movsreg_block_keyed_cell {
+                continue;
+            }
             let cell = Arc::get_mut(cell)
                 .expect("the compile walk owns its cells until install clones them");
             cell.set_segment_masks(
@@ -9056,9 +9104,17 @@ fn compile_with_budget(
         // the `pinned_segments()` mutation this slice forbids. Asserted because the entry check
         // leans on the subset: a mask reaching outside the pinned set would compare a record the
         // block never pinned.
+        //
+        // Filtered by the same row test as the loop above: a cell the loop left at `u8::MAX` would
+        // otherwise fail this assert on any block that does not pin every one of the six segments,
+        // which is every ordinary block.
         debug_assert_eq!(
             interpret_one_cells
                 .iter()
+                .filter(|(_, cell)| {
+                    segment_resume
+                        || (movsreg_block_keyed_eligible && cell.row() == InterpretOneRow::MovSreg)
+                })
                 .fold(0u8, |mask, (_, cell)| mask | cell.used_by_others())
                 & !pinned_segments,
             0,
@@ -9320,20 +9376,24 @@ fn compile_with_budget(
     // requires `segment_writes != 0`. The two are mutually exclusive by construction, not by an
     // extra check here.
     //
-    // `callout_segment_writes == 0` IS VACUOUS ON THE SHIPPED DEFAULT (review finding N6), and
-    // this is recorded rather than left to be rediscovered. `callout_segment_writes` is fed by
-    // `segment_resume && row.may_write_segment()`, and `segment_resume` reads
-    // `IZARRAVM_CALLOUT_SEGMENT_RESUME`, default OFF since 2026-08-22. So on every shipped build
-    // `callout_segment_writes` is always 0 and this term never refuses anything. What actually
-    // keeps an `InterpretOne` row that writes a segment out of this population, on the shipped
-    // arm, is a DIFFERENT invariant: with the knob off, R2 resyncs against all six segment
-    // records for these rows, so a call-out slot that really moves one leaves the block via a
-    // side exit (a resync) at that slot and never reaches this catch-all at all -- there is no
-    // eligible block for the term to have refused. The term stays here as a real bar rather than
-    // a redundant one for exactly one reason: it is the only thing that keeps this population
-    // disjoint from lever 1's the day `IZARRAVM_CALLOUT_SEGMENT_RESUME` is ever flipped on, at
-    // which point R2's resync stops running and this term becomes load-bearing for the first
-    // time.
+    // `callout_segment_writes == 0` IS VACUOUS ON THE SHIPPED DEFAULT, AGAIN, and by design this
+    // time (2026-09-02, review N1). The block-keyed un-demotion originally made `MovSreg` feed
+    // `callout_segment_writes` unconditionally in every mode, which for one day made this term
+    // load-bearing: a V86 block mixing a native DS/ES write with an FS/GS `MovSreg` call-out would
+    // fail it and lose the guarded edge it had before that slice. Measured on `duke3d-486` (the
+    // most V86-loader-heavy row on the board) and found to move `jit_direct_linked_transfers` and
+    // `jit_direct_unresolved_static_unbound` by a real, if small, amount -- so the un-demotion was
+    // narrowed to `movsreg_block_keyed_eligible` (`key.mode_key` V86 bit CLEAR), and this predicate
+    // requires the OPPOSITE, `key.mode_key & JIT_MODE_KEY_V86_BIT != 0` two lines below. The two
+    // conditions are mutually exclusive by construction: a `MovSreg` cell inside a V86 block never
+    // contributes to `callout_segment_writes` unconditionally any more, so within the population
+    // this predicate is asking about, `callout_segment_writes` is back to needing the knob for
+    // EVERY row, exactly as it was before the block-keyed un-demotion existed. `MovSsReg` and
+    // `PopSs` were never in this population either way (`stack_width_kind` never rewrites them, and
+    // their SS write is unrelated to the V86 edge's single dirty-segment bit). The term stays here
+    // as a real bar rather than a redundant one for the reason it always was: nothing guarantees
+    // `IZARRAVM_CALLOUT_SEGMENT_RESUME` stays off forever, and the day it is flipped on this term is
+    // what keeps the V86 edge and the call-out relaxation's populations disjoint.
     let seg_write_edge_eligible = segment_writes != 0
         && dirty_segments.count_ones() == 1
         && dirty_segments & (segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)) == 0
@@ -14022,10 +14082,35 @@ pub(crate) fn parse_retry_lift_arm_for_test(value: Result<String, std::env::VarE
 /// Whether a segment-loading `InterpretOne` call-out may RESUME its block when the record it moved
 /// is one no other slot in the block uses (design section 11, S4f).
 ///
-/// **DEFAULT OFF SINCE 2026-08-22: REFUTED ON THE LOADER.** Unset, `0` or `off` all keep the
-/// pre-S4f behaviour, which is what ships: R2 compares all six records for these rows, so any
-/// change resyncs, and the block publishes its successors because nothing feeds
-/// `callout_segment_writes`. `1` or `on` admits the relaxation.
+/// **NARROWED TO `MovSsReg`, `PopSs`, AND `MovSreg` INSIDE V86 BY THE BLOCK-KEYED UN-DEMOTION
+/// (2026-09-02, narrowed again 2026-09-02 review N1).** A `MovSreg` cell -- `0x8E` `/0`, `/3`, `/4`,
+/// `/5` -- OUTSIDE V86 (`key.mode_key`'s V86 bit clear: real mode and protected non-V86) no longer
+/// reads this knob at all: it gets the S4f relaxation unconditionally, keyed on the block's own
+/// prefix-plus-suffix `used` mask rather than on this process-wide switch
+/// (`dev_docs/2026-09-02-sreg-undemotion-design.md`, option (i)). A `MovSreg` cell INSIDE V86 still
+/// needs the knob, deliberately: that is the population the V86 guarded successor edge
+/// (`seg_write_edge_eligible`) claims, and un-demoting it unconditionally was found in review to move
+/// `jit_direct_linked_transfers` and `jit_direct_unresolved_static_unbound` on `duke3d-486`, the
+/// most V86-loader-heavy row on the board. What follows, including the loader measurement, describes
+/// the knob's remaining scope: `MovSsReg`, `PopSs`, and `MovSreg` inside V86 all still take the
+/// pre-S4f rule (R2 compares all six records) unless this is explicitly on. Read it as "for the rows
+/// still gated here" rather than "for every segment-writing row", which it no longer is outside V86.
+///
+/// **DEFAULT OFF SINCE 2026-08-22: REFUTED ON THE LOADER, FOR THE POPULATION THIS KNOB STILL
+/// GATES.** Unset, `0` or `off` all keep the pre-S4f behaviour for `MovSsReg`/`PopSs`/V86 `MovSreg`:
+/// R2 compares all six records for these rows, so any change resyncs, and a block whose only
+/// segment-writing call-outs are these keeps its successors because nothing feeds
+/// `callout_segment_writes` for them. `1` or `on` admits the relaxation for these rows as well.
+///
+/// The measurement below predates the split and was run before `MovSreg` was carved out, so it
+/// prices the relaxation across every segment-writing row, `MovSreg` included -- read it as the
+/// upper bound of what `MovSreg` alone now costs unconditionally on a loader-shaped guest, not as a
+/// statement about what this knob prices today. The block-keyed slice's own evidence
+/// (`dev_docs/2026-09-02-sreg-undemotion-design.md` section 6, and the design doc's "Implementation
+/// result" section) is what to read for `MovSreg` specifically; it measured a 486 monitor-prologue
+/// workload (`100-000-pyramid`) and a fixture with no monitor trips at all (`wolf3d-486`), not a
+/// loader-shaped one, and a loader-shaped regression of roughly this size remains a live risk this
+/// slice did not retire.
 ///
 /// THE MEASUREMENT, in full, because a refuted slice that ships whole is only worth its evidence.
 /// Loader phase, ONE binary (`9138d554`), knob OFF against knob ON, A/A 1.0117 and every pin
@@ -30860,9 +30945,17 @@ pub(crate) struct InterpretOneCell {
     /// write can no longer fail its own entry check.
     ///
     /// Filled AFTER the walk, by slot index, because it is a fact about the rest of the block that
-    /// the walk does not know while it is still growing. `u8::MAX` when
-    /// `callout_segment_resume_enabled` is off, which makes R2 compare everything and is exactly
-    /// the pre-S4f rule.
+    /// the walk does not know while it is still growing.
+    ///
+    /// `u8::MAX` -- R2 compares all six records, the pre-S4f rule -- for a `MovSsReg` or `PopSs`
+    /// cell whenever `callout_segment_resume_enabled` is off, and for a `MovSreg` cell inside a V86
+    /// block regardless of the knob (2026-09-02 review N1: that population is what the V86 guarded
+    /// successor edge claims, and this slice must not touch it). A `MovSreg` cell OUTSIDE V86 gets
+    /// the real mask UNCONDITIONALLY since the block-keyed un-demotion (2026-09-02): the mask is a
+    /// fact about what the rest of THIS block bakes, so keying it on a process-wide env var rather
+    /// than on the block was never more than a rollout switch, and R2's own compare is what makes it
+    /// sound (see its note). `IZARRAVM_CALLOUT_SEGMENT_RESUME` no longer has anything to say about a
+    /// `MovSreg` cell outside V86; it still governs `MovSsReg`, `PopSs`, and `MovSreg` inside V86.
     used_by_others: u8,
     /// The SUFFIX half on its own, kept for one purpose: pricing what the prefix half costs.
     ///

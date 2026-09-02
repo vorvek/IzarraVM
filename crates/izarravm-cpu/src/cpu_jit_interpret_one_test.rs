@@ -3470,67 +3470,59 @@ fn interpret_one_mov_sreg_resyncs_when_an_earlier_slot_uses_the_segment() {
     assert_legs_agree(&mut legs);
 }
 
-/// The knob's OFF arm is the pre-S4f behaviour, both halves of it, and it is the SHIPPED arm since
-/// the loader refuted the slice on 2026-08-22.
+/// The knob's REMAINING scope, after the block-keyed un-demotion (2026-09-02): `MovSreg` no longer
+/// reads `IZARRAVM_CALLOUT_SEGMENT_RESUME` at all (section 6a above), and this row is where the
+/// knob's OWN behaviour used to be pinned before that slice. `MovSsReg` still needs it, so this
+/// test now proves the knob restores the pre-S4f successor rule for the row that is still gated,
+/// not for `MovSreg`.
 ///
-/// The same fixture that resumes on the ON arm resyncs here, and the block that publishes no
-/// successors on the ON arm publishes its fallthrough again. Those are the two things S4f changed,
-/// and an escape that restored one without the other would be an arm nobody measured.
+/// Why the RESUME/RESYNC half of the old test does not carry over: R2 compares `segment_bit(Ss)`
+/// UNCONDITIONALLY for any row that can write a segment (`direct.rs`'s R2 note), so a `MovSsReg`
+/// slot's own write is compared whether or not the knob's mask ever reaches it. Reloading the SAME
+/// selector resumes and a DIFFERENT one resyncs on EITHER arm; the section-11 SS-row tests already
+/// pin both. What the knob still decides, and the only thing left for it to decide on this row, is
+/// whether the block PUBLISHES its successors -- `is_segment_write_block`, fed by
+/// `callout_segment_writes`, which still requires `segment_resume` for every row but `MovSreg`.
 ///
 /// The arm is read ONCE PER COMPILE, so the override has to be set before `build_native` runs, not
 /// before the entry.
 ///
-/// MUTATION: read the knob at resume time instead of baking it into the cell and the first
-/// assertion still passes while the successor one does not, which is the split this test exists to
-/// catch.
+/// MUTATION: widen the `row == InterpretOneRow::MovSreg` exclusion in `callout_segment_writes`'s
+/// accumulator to also admit `MovSsReg`, and the OFF arm's assertion goes red: the block would then
+/// bar its successors unconditionally, which is the migration this slice must confine to `MovSreg`
+/// alone.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn the_segment_resume_knob_restores_the_strict_rule_and_the_successors() {
-    let (code, starts) = row_program(&[0x8E, 0xE0]);
+fn the_segment_resume_knob_still_governs_the_ss_rows_successors() {
+    let (code, starts) = row_program(MOV_SS_SAME);
 
     jit::direct::set_callout_segment_resume_for_test(Some(false));
     let (cpu, _, block) = build_native(&code, &starts);
     assert!(
         !block.is_segment_write_block(),
-        "off arm: the block must publish its successors again"
+        "off arm: MovSsReg still needs the knob to bar its successors"
     );
     assert_eq!(
         cpu.jit_direct.waiting_len_for_test(),
         1,
         "off arm: and queue its fallthrough"
     );
-    let mut legs = run_both(&code, &starts, no_perturb);
     jit::direct::set_callout_segment_resume_for_test(None);
 
-    assert_eq!(
-        legs.exit_reason,
-        Some(jit::direct::SideExitReason::CallOutResync as u32),
-        "off arm: any changed record must RESYNC"
-    );
-    assert_eq!(legs.native_insns, 2, "off arm");
-    assert_eq!(
-        legs.native
-            .direct_stall_snapshot()
-            .callout_interpret_one_resume_refused_prefix_use,
-        0,
-        "off arm: the prefix counter is about the ON arm's mask and must stay silent"
-    );
-    assert_legs_agree(&mut legs);
-
-    // Control: the SAME program on the ON arm resumes and bars the successors. Stated rather than
-    // inherited, and since 2026-08-22 the ON arm is the one that has to be asked for.
+    // Control: the SAME program on the ON arm bars the successors, exactly as it did before this
+    // slice -- `MovSsReg` is untouched by the block-keyed relaxation.
     jit::direct::set_callout_segment_resume_for_test(Some(true));
     let (cpu, _, block) = build_native(&code, &starts);
-    assert!(block.is_segment_write_block());
+    assert!(
+        block.is_segment_write_block(),
+        "on arm: unchanged from before this slice"
+    );
     assert_eq!(cpu.jit_direct.waiting_len_for_test(), 0);
-    let legs = run_both(&code, &starts, no_perturb);
     jit::direct::set_callout_segment_resume_for_test(None);
-    assert_eq!(legs.exit_reason, None);
-    assert_eq!(legs.native_insns, u64::from(BLOCK_INSTRUCTIONS));
 }
 
 /// The knob's spelling table, unset included. DEFAULT OFF since the 2026-08-22 refutation, so
@@ -4064,6 +4056,397 @@ fn interpret_one_protected_mode_segment_change_resyncs() {
         legs.native.registers.segment(SegmentIndex::Fs).limit,
         0xffff,
         "the load itself must have happened, and taken the unscaled limit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6a. The block-keyed un-demotion (2026-09-02 slice): `MovSreg`'s R2 mask relaxation is keyed on
+// the block's own prefix-plus-suffix `used` mask, not on `IZARRAVM_CALLOUT_SEGMENT_RESUME`, so
+// none of these three touch the knob at all. `MovSsReg` and `PopSs` are untouched by this slice --
+// they still need the knob -- and that is what the SS-row section and
+// `the_segment_resume_knob_restores_the_strict_rule_and_the_successors` (below) still pin.
+// ---------------------------------------------------------------------------
+
+/// Selector for the DS load: differs from `SEL_DATA`, which is what `protected_cpu` seeds every
+/// segment with, so loading it is a genuine record move and not a reload.
+const SEL_UNDEMOTE_DS: u16 = SEL_OTHER;
+/// Selector for the FS load, the same shape one slot later with a DIFFERENT descriptor, so the
+/// fixture proves the mask independently for both writes rather than once and assuming it
+/// generalises.
+const SEL_UNDEMOTE_FS: u16 = SEL_UNACCESSED;
+
+const fn imm32(value: u16) -> [u8; 4] {
+    let value = value as u32;
+    [
+        (value & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 24) & 0xff) as u8,
+    ]
+}
+
+/// The pyramid site itself, byte for byte against `dev_docs/2026-09-02-sreg-undemotion-design.md`
+/// section 1.1: `mov eax,0x10 / mov ds,ax / mov eax,0x20 / mov fs,ax`, here loading `SEL_OTHER` and
+/// `SEL_UNACCESSED` so both writes actually move the record `protected_cpu` seeded. Neither
+/// selector is read back by a later slot, in either channel `pinned_segments` unions: no memory
+/// slot addresses through DS or FS, and no slot bakes either selector. That is the shape the design
+/// document's option (i) exists for, and the knob is never touched.
+///
+/// MUTATION: revert the accumulator at `callout_segment_writes += ...` and the mask gate `if
+/// segment_resume || callout_mov_sreg_present` to `if segment_resume` alone, and this fixture's
+/// resume assertions go red: with the knob at its ambient default (unset, OFF), both cells keep
+/// their `u8::MAX` default, R2 compares all six records for each, and the DS write -- which just
+/// moved DS's own record -- resyncs instead of resuming.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_pmode_two_write_prologue_resumes_and_is_never_demoted_without_the_knob() {
+    const CODE: &[u8] = &[
+        0xB8,
+        imm32(SEL_UNDEMOTE_DS)[0],
+        imm32(SEL_UNDEMOTE_DS)[1],
+        imm32(SEL_UNDEMOTE_DS)[2],
+        imm32(SEL_UNDEMOTE_DS)[3], // mov eax, SEL_OTHER          +0
+        0x8E,
+        0xD8, // mov ds, ax                   +5
+        0xB8,
+        imm32(SEL_UNDEMOTE_FS)[0],
+        imm32(SEL_UNDEMOTE_FS)[1],
+        imm32(SEL_UNDEMOTE_FS)[2],
+        imm32(SEL_UNDEMOTE_FS)[3], // mov eax, SEL_UNACCESSED     +7
+        0x8E,
+        0xE0, // mov fs, ax                   +12
+        0xF4, // hlt                          +14
+    ];
+    const STARTS: &[u32] = &[0, 5, 7, 12];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("both segment writes must resume, not stop the walk");
+    assert_eq!(
+        compilation.span.instructions, 4,
+        "the walk must not stop at either demoted-site test: both writes resume"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 2,
+        "both segment loads must be InterpretOne slots"
+    );
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+    assert!(
+        block.is_segment_write_block(),
+        "a block whose only segment writes are MovSreg call-outs still bars its successors"
+    );
+
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the installed block must actually run"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - insns_before,
+        4,
+        "all four slots must have retired natively: neither call-out ended the run"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        None,
+        "the block must have completed rather than side-exited"
+    );
+
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_executed, 2);
+    assert_eq!(
+        stalls.callout_interpret_one_resync, 0,
+        "neither write is used by another slot, so neither may resync"
+    );
+    assert_eq!(stalls.callout_interpret_one_demoted, 0);
+    assert_eq!(
+        cpu.jit_direct.demoted_callout_site_count_for_test(),
+        0,
+        "a resumed slot must never reach the demotion path at all"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        SEL_UNDEMOTE_DS
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Fs).selector,
+        SEL_UNDEMOTE_FS
+    );
+}
+
+/// A slot AFTER the write that ADDRESSES MEMORY through the written segment refuses the resume.
+///
+/// `mov al,[eax]` after `mov ds,ax` reads through DS by the ordinary default-segment rule, which is
+/// `DirectKind::read_segment`, one of the three accessors `pinned_segments` unions. EAX still holds
+/// the just-loaded selector value (`mov eax,SEL_OTHER` only feeds AX into the segment load), so the
+/// read lands inside page 0, which `seed_protected_tables` leaves zero-filled there.
+///
+/// MUTATION: narrow `pinned_segments` to `selector_segment` alone (drop the
+/// `read_segment`/`write_segment` union) and this resumes instead of resyncing, because DS would no
+/// longer be in the cell's `used_by_others` even though the very next slot addresses through it.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_downstream_slot_addressing_through_ds_refuses_the_resume_without_the_knob() {
+    const CODE: &[u8] = &[
+        0xB8,
+        imm32(SEL_UNDEMOTE_DS)[0],
+        imm32(SEL_UNDEMOTE_DS)[1],
+        imm32(SEL_UNDEMOTE_DS)[2],
+        imm32(SEL_UNDEMOTE_DS)[3], // mov eax, SEL_OTHER   +0
+        0x8E,
+        0xD8, // mov ds, ax            +5
+        0x8A,
+        0x00, // mov al, [eax]         +7 -- reads through DS
+        0xF4, // hlt                   +9
+    ];
+    const STARTS: &[u32] = &[0, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+    let compilation =
+        jit::direct::compile(&mut cpu, ENTRY, true).expect("the fixture must compile as a block");
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the block must run and reach its own side exit"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - insns_before,
+        2,
+        "the prefix plus the retired DS write"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "the downstream memory read addresses through DS, so the write must RESYNC"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        SEL_UNDEMOTE_DS,
+        "the load itself must have happened: a RESYNC is not an undo"
+    );
+}
+
+/// A slot AFTER the write that STORES THROUGH the written segment refuses the resume (the third
+/// `pinned_segments` channel, `write_segment`, closing the set the two fixtures above cover
+/// jointly but neither pins alone).
+///
+/// `mov [eax],al` after `mov ds,ax` writes through DS by the ordinary default-segment rule, which
+/// is `DirectKind::write_segment`. It is deliberately the STORE form rather than the load fixture
+/// above with a different opcode: a mutation that narrows `pinned_segments` to
+/// `read_segment | selector_segment` (drops `write_segment` alone, leaving the read channel this
+/// file already pins untouched) would pass every existing fixture and only this one catches it.
+///
+/// MUTATION: narrow `pinned_segments` to `read_segment | selector_segment` (drop `write_segment`)
+/// and this resumes instead of resyncing, because DS would no longer be in the cell's
+/// `used_by_others` even though the very next slot stores through it.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_downstream_store_through_ds_refuses_the_resume_without_the_knob() {
+    const CODE: &[u8] = &[
+        0xB8,
+        imm32(SEL_UNDEMOTE_DS)[0],
+        imm32(SEL_UNDEMOTE_DS)[1],
+        imm32(SEL_UNDEMOTE_DS)[2],
+        imm32(SEL_UNDEMOTE_DS)[3], // mov eax, SEL_OTHER   +0
+        0x8E,
+        0xD8, // mov ds, ax            +5
+        0x88,
+        0x00, // mov [eax], al         +7 -- stores through DS
+        0xF4, // hlt                   +9
+    ];
+    const STARTS: &[u32] = &[0, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+    let compilation =
+        jit::direct::compile(&mut cpu, ENTRY, true).expect("the fixture must compile as a block");
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("the block must run and reach its own side exit"),
+        "the block must run and reach its own side exit"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - insns_before,
+        2,
+        "the prefix plus the retired DS write"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "the downstream store addresses through DS, so the write must RESYNC"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        SEL_UNDEMOTE_DS,
+        "the load itself must have happened: a RESYNC is not an undo"
+    );
+}
+
+/// A slot AFTER the write that BAKES the written segment's SELECTOR, without addressing memory
+/// through it at all, also refuses the resume (review4 H9).
+///
+/// `mov bx,ds` neither reads nor writes through DS -- it is `MovSegToReg`, which reports only
+/// through `selector_segment` -- so this is a different channel of `pinned_segments` than the
+/// fixture above, and it needs its own proof: `mov bx, ds` after a resumed `mov ds, ax` must
+/// deliver the SELECTOR JUST LOADED, not the one DS held at compile time.
+///
+/// MUTATION: narrow `pinned_segments` to `read_segment | write_segment` (drop `selector_segment`)
+/// and this resumes instead of resyncing, because DS would no longer be in the cell's
+/// `used_by_others` even though the very next slot bakes its selector.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn a_downstream_selector_bake_of_ds_refuses_the_resume_without_the_knob() {
+    const CODE: &[u8] = &[
+        0xB8,
+        imm32(SEL_UNDEMOTE_DS)[0],
+        imm32(SEL_UNDEMOTE_DS)[1],
+        imm32(SEL_UNDEMOTE_DS)[2],
+        imm32(SEL_UNDEMOTE_DS)[3], // mov eax, SEL_OTHER   +0
+        0x8E,
+        0xD8, // mov ds, ax            +5
+        0x8C,
+        0xDB, // mov bx, ds            +7 -- bakes DS's selector, addresses nothing
+        0xF4, // hlt                   +9
+    ];
+    const STARTS: &[u32] = &[0, 5, 7];
+
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + CODE.len()].copy_from_slice(CODE);
+    seed_protected_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    for &offset in STARTS {
+        let linear = ENTRY + offset;
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+    let compilation =
+        jit::direct::compile(&mut cpu, ENTRY, true).expect("the fixture must compile as a block");
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the block must run and reach its own side exit"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - insns_before,
+        2,
+        "the prefix plus the retired DS write"
+    );
+    assert_eq!(
+        cpu.jit_direct.last_side_exit_reason_for_test(),
+        Some(jit::direct::SideExitReason::CallOutResync as u32),
+        "the downstream selector bake depends on DS, so the write must RESYNC"
+    );
+    let stalls = cpu.direct_stall_snapshot();
+    assert_eq!(stalls.callout_interpret_one_resync, 1);
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        SEL_UNDEMOTE_DS,
+        "the load itself must have happened: a RESYNC is not an undo"
     );
 }
 
