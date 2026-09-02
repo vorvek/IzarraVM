@@ -10354,9 +10354,14 @@ impl SegmentLayout {
     /// descriptor. `target.used & guard_mask == guard_mask` holds by construction, matching the
     /// design's own invariant.
     ///
-    /// CS is excluded on purpose: a CS disagreement is refused by `link_merge`'s own equality
-    /// test before `merge_chain` ever runs, and the design's guard is a DATA-segment mechanism
-    /// (section 4.3's table tops out at "5 (every data segment)"), not a CS one.
+    /// CS is excluded on purpose: for the `link_merge` arm a CS disagreement is refused by
+    /// `link_merge`'s own equality test before `merge_chain` ever runs, and the design's guard is
+    /// a DATA-segment mechanism (section 4.3's table tops out at "5 (every data segment)"), not a
+    /// CS one. But the call site serves `far_merge` and `seg_write_merge` too, and both can refuse
+    /// for reasons this method neither sees nor names (INV-FAR-CS, the segwrite target not
+    /// claiming the written segment) -- so a popcount of 0 out of THIS method is not proof of a
+    /// CS-only conflict, only that no reason `guard_mask` itself can see applied. See the
+    /// histogram's own doc comment on `DirectLinkRefusalCensus::guard_mask_popcount_histogram`.
     ///
     /// Never read on the shipped path -- no guard exists yet -- only from the census call site
     /// under the census feature, so it costs nothing on a plain build.
@@ -35287,8 +35292,19 @@ pub(crate) struct DirectLinkRefusalCensus {
     rows: Vec<DirectLinkRefusalCell>,
     /// Histogram of `popcount(guard_mask)` over every `SegmentLayout`-refusal EVENT (not
     /// weighted by later `unbound_exits`), indexed 0..=5 -- five data segments, CS excluded.
-    /// Design section 4.3 slice 0: "the diagnostic that gates this." Index 0 cannot occur (a
-    /// zero-bit disagreement would not have refused) and is kept only so the array is dense.
+    /// Design section 4.3 slice 0: "the diagnostic that gates this."
+    ///
+    /// Index 0 DOES occur, and the call site serves three different merges
+    /// (`link_merge`/`far_merge`/`seg_write_merge`), so it is not one cause: (1) `merge_chain`
+    /// refuses on the UNION mask -- a segment the SOURCE pins, the target does not, and the two
+    /// disagree on refuses the edge, and `guard_mask` skips it (`target.used & bit == 0`), which
+    /// is a genuine data-segment conflict `guard_mask` cannot see; (2) `far_merge` refuses on
+    /// INV-FAR-CS (the target pins CS or `BAKES_CS_BIT`) and `seg_write_merge` refuses when the
+    /// target does not claim the written segment, or on its own CS pre-test -- both reasons
+    /// `guard_mask` discards or was never built to see, since it only reads `merge_chain`'s
+    /// formula. A `SegmentLayout` refusal with CS agreeing and every pinned data segment agreeing
+    /// too (the `link_merge` case `guard_mask`'s own doc describes) is ALSO index 0, and this
+    /// histogram cannot distinguish it from either of the above without a second byte per row.
     guard_mask_popcount_histogram: [u64; 6],
 }
 
