@@ -275,9 +275,10 @@ def main(check: bool = False) -> int:
         print("sourcing binaries from the committed image (build artifacts absent)")
     assert len(mbr) == 512, "MBR must be 512 bytes"
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
-    # The small Toka-DOS drivers and GSWMODE.COM are committed binaries (built
-    # straight from NASM source by toka-dos/build-freedos.ps1 into the firmware
-    # crate), never extracted from the previous image.
+    # The small Toka-DOS drivers, GSWMODE.COM and TOKADESK.EXE are committed
+    # binaries (built by toka-dos/build-freedos.ps1 into the firmware crate --
+    # NASM alone for the drivers, NASM + Open Watcom + pack.py for TOKADESK),
+    # never extracted from the previous image.
     tokamous = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokamous.com"), "rb").read()
     tokaemm = open(os.path.join(
@@ -290,6 +291,8 @@ def main(check: bool = False) -> int:
         repo, "crates", "izarravm-firmware", "roms", "dos", "sndctrl.com"), "rb").read()
     sndmixer = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "sndmixer.com"), "rb").read()
+    tokadesk = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "tokadesk.exe"), "rb").read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). TOKAEMM
     # loads as the memory manager, drawing EMS pages on demand from the same
@@ -440,6 +443,10 @@ def main(check: bool = False) -> int:
         # full-screen editor. A large-model MZ exe shipped as EDIT.COM --
         # faithful to real MS-DOS, whose EDIT.COM is itself an MZ executable.
         ("EDIT.COM", edit, ATTR_ARCHIVE),
+        # TokaDesk, the visual workbench (GPL-3, original tools-src). A
+        # committed binary in the firmware crate, like TOKAMOUS.COM above;
+        # see toka-dos/tools-src/tokadesk and dev_docs/2026-09-02-tokadesk-ship.md.
+        ("TOKADESK.EXE", tokadesk, ATTR_ARCHIVE),
         ("HELLO.TXT", hello_txt, ATTR_ARCHIVE),
     ]
 

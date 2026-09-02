@@ -570,6 +570,7 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
     "DELTREE.COM",
     "XCOPY.EXE",
     "EDIT.COM",
+    "TOKADESK.EXE",
     "GLIDE2X.OVL",
 ];
 

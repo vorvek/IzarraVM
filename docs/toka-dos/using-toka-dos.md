@@ -34,7 +34,7 @@ C:\DOS\
     TOKAMOUS.COM    SNDCTRL.COM     SORT.EXE        FIND.EXE
     TOKAEMM.SYS     SNDMIXER.COM    MEM.EXE         LABEL.EXE
     UNHALT.COM      CHOICE.EXE      ATTRIB.EXE      DELTREE.COM
-                    EDIT.COM        XCOPY.EXE       HELLO.TXT
+    EDIT.COM        XCOPY.EXE       TOKADESK.EXE    HELLO.TXT
 ```
 
 The CD-ROM needs no driver files. The Izarra3000's CD-ROM drive uses a
@@ -165,8 +165,17 @@ This arrangement controls the order of the lines on the screen. Each driver
 prints its own line, at its own time, in the tree style of the boot screen.
 Without the arrangement, all of the lines print together after the loop. The
 three `ECHO` lines after the loop draw the closed box at the bottom of the
-boot screen. The workbench in that box is not part of this release. In text
-mode, the line is information only.
+boot screen. `TOKADESK.EXE` is on the disk. Run `TOKADESK` from the `C:\>`
+prompt to start it.
+
+TokaDesk is a first preview of the visual workbench. It opens in graphics
+mode with a menu bar, a Directory tab, and a place for a second tab that
+opens when you edit a file. The Directory tab lists a drive and lets you
+move around it with the mouse or the keyboard. From there you can make a
+directory, copy, move, delete, and open a file for editing with a visual
+TokaEdit. It does not yet start programs; there is no way to run an EXE or
+COM file from inside TokaDesk, and there is no command to leave it and
+return to the `C:\>` prompt. Reset the machine to get back to DOS.
 
 The individual lines:
 

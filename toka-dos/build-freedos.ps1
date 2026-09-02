@@ -304,12 +304,18 @@ $editExe = Join-Path $editDir 'edit.exe'
 if (-not (Test-Path $editExe)) { throw "edit.exe not produced" }
 Write-Host "EDIT.COM: $((Get-Item $editExe).Length) bytes"
 
-# --- TOKADESK.EXE (32-bit visual workbench; original tools-src, GPL-3) ---
+# --- TOKADESK.EXE (32-bit visual workbench; original tools-src, GPL-3). Like
+# TOKAMOUS.COM below, the shipped copy is a committed binary in the firmware
+# crate: the image builder takes it from there on both of its paths, so a
+# TokaDesk change always needs a rebuild here before it reaches the image. ---
 $tokadeskDir = Join-Path $root 'tools-src\tokadesk'
 & (Join-Path $tokadeskDir 'build.ps1')
 if ($LASTEXITCODE) { throw "TOKADESK build failed" }
 $tokadeskExe = Join-Path $tokadeskDir 'tokadesk.exe'
 if (-not (Test-Path $tokadeskExe)) { throw "TOKADESK.EXE not produced" }
+$tokadeskOut = Join-Path $root '..\crates\izarravm-firmware\roms\dos\tokadesk.exe'
+Copy-Item $tokadeskExe $tokadeskOut -Force
+Write-Host "TOKADESK.EXE: $((Get-Item $tokadeskOut).Length) bytes"
 
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 # A committed binary in the firmware crate, like TOKAEMM.SYS below: the image
