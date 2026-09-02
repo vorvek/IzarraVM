@@ -2967,6 +2967,11 @@ fn reflected_call_diagnostic_json(
             "translation_set_size_windowed": stat_json(&k.translation_set_size_windowed),
             "translation_set_over_cap": k.translation_set_over_cap,
             "stack_segments_over_cap_trips": k.stack_segments_over_cap_trips,
+            "entry_images_over_cap": k.entry_images_over_cap,
+            "write_addresses_over_cap": k.write_addresses_over_cap,
+            "class_n_addresses_over_cap": k.class_n_addresses_over_cap,
+            "trips_reads_over_cap": k.trips_reads_over_cap,
+            "trips_writes_over_cap": k.trips_writes_over_cap,
             "reads_total": k.reads_total,
             "reads_under_other_cr3": k.reads_under_other_cr3,
             "read_class_counts": k.read_class_counts.iter().map(|(name, n)| json!({

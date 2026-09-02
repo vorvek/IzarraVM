@@ -2787,6 +2787,17 @@ pub(crate) struct RetireGates {
     /// `jit_direct.barrier_census_active()`, resynced by `enable_direct_barrier_census`.
     #[cfg(feature = "jit")]
     pub(crate) barrier_census: bool,
+    /// `reflected_call_diag::armed()`, resolved at construction. Process-constant,
+    /// same shape as `diff_trace` above. Merge-review nit 3: `on_clock_charge`'s
+    /// seven (now six) call sites in `run.rs`'s interpreted-retire tails were
+    /// each paying `armed()`'s `OnceLock` init check plus a relaxed atomic load
+    /// on EVERY retired instruction under the feature -- two atomic loads and
+    /// two branches, not the one predictable branch `barrier_census` two lines
+    /// below already gets. Checking this cached field at the call site instead
+    /// costs one predictable branch and, when clear, no cross-module call at
+    /// all.
+    #[cfg(feature = "reflected-call-diagnostic")]
+    pub(crate) reflected_call_diag_armed: bool,
 }
 
 impl Clone for RetireGates {
@@ -2799,6 +2810,10 @@ impl Clone for RetireGates {
             // will actually report.
             #[cfg(feature = "jit")]
             barrier_census: false,
+            // Same reasoning as `diff_trace`: the clone runs in the same process, so the
+            // armed/unarmed answer is the same answer.
+            #[cfg(feature = "reflected-call-diagnostic")]
+            reflected_call_diag_armed: self.reflected_call_diag_armed,
         }
     }
 }
@@ -3172,6 +3187,8 @@ impl Default for CpuGsw {
                 // directly, so the two can never disagree at construction.
                 #[cfg(feature = "jit")]
                 barrier_census: barrier_census_armed,
+                #[cfg(feature = "reflected-call-diagnostic")]
+                reflected_call_diag_armed: crate::reflected_call_diag::armed(),
             },
             fault_site: FaultSite::default(),
         };

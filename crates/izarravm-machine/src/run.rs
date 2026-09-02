@@ -1300,9 +1300,13 @@ impl Machine {
         // open trip's own instructions (`true`) or purely because that
         // trip's own nested `IRET` just re-enabled IF (`false`, the
         // `can_take_before` check below). `true` at the very first iteration
-        // is correct: there is no prior batch to blame here.
+        // is correct: there is no prior batch to blame here. The
+        // default-true/mark-false-only-on-the-IF-edge bookkeeping is pulled
+        // out into `BatchBoundaryRealTag` (bottom of this file) so it has its
+        // own plain unit test (merge-review nit 7) independent of the
+        // surrounding CPU/bus machinery this loop needs.
         #[cfg(feature = "reflected-call-diagnostic")]
-        let mut reflected_call_batch_was_real_boundary = true;
+        let mut reflected_call_batch_tag = BatchBoundaryRealTag::new();
         while self.timeline.now_ticks() < deadline_ticks {
             // Periodic sampling, gated on a sentinel that is `u64::MAX` when disarmed so this
             // costs one compare against an already-live value. See `fire_periodic_phase_mark`.
@@ -1427,15 +1431,13 @@ impl Machine {
             // cfg-gated call marking a batch boundary on the reflected-call
             // diagnostic's currently open trip, if any and if armed. The
             // ONLY reason this diagnostic feature reaches the machine crate.
+            // `take_and_reset` reads whether the PREVIOUS batch ended for a
+            // real (cap/deadline/fault/HLT/HLE-post) reason, then immediately
+            // resets the tag to "real" as the default for the batch about to
+            // run; only the `can_take_before` IF-edge break below can mark it
+            // `false` again before the NEXT iteration's call here reads it.
             #[cfg(feature = "reflected-call-diagnostic")]
-            izarravm_cpu::on_batch_boundary(reflected_call_batch_was_real_boundary);
-            // Default the NEXT report to "real"; only the `can_take_before`
-            // IF-edge break below (this batch's own trip re-enabling IF) sets
-            // it false again before the next iteration's call above reads it.
-            #[cfg(feature = "reflected-call-diagnostic")]
-            {
-                reflected_call_batch_was_real_boundary = true;
-            }
+            izarravm_cpu::on_batch_boundary(reflected_call_batch_tag.take_and_reset());
             #[cfg(feature = "jit")]
             let poll_skip_enabled = self.poll_skip_enabled;
             // Read before the destructure below, the same way `poll_skip_enabled`
@@ -1765,9 +1767,7 @@ impl Machine {
                                     // `on_batch_boundary` call must NOT count
                                     // toward `batch_straddle_trips`.
                                     #[cfg(feature = "reflected-call-diagnostic")]
-                                    {
-                                        reflected_call_batch_was_real_boundary = false;
-                                    }
+                                    reflected_call_batch_tag.mark_if_edge();
                                     break;
                                 }
                                 // A core-only fast exit avoids another loop when
@@ -2050,3 +2050,46 @@ impl Machine {
         Ok(StopReason::CycleLimit { requested })
     }
 }
+
+/// D5's real/IF-edge bookkeeping (slice0b review §2), pulled out of
+/// `run_until_tick`'s batch loop so it has its own plain unit test
+/// (merge-review nit 7) independent of the surrounding CPU/bus machinery: the
+/// interesting half of D5 is that this tag defaults to "real" every
+/// iteration and is marked "not real" ONLY by the trip's own IF-enable edge
+/// (`can_take_before` false, then true) -- a wrong default, or a mark that
+/// leaks across iterations, would silently restore the 100%-tautological
+/// `batch_straddle_trips` 0c exists to fix, and `cargo check` alone (the only
+/// gate this file gets under `-p izarravm-machine` in CI's quartet) cannot
+/// catch that.
+#[cfg(feature = "reflected-call-diagnostic")]
+#[derive(Debug, Default)]
+struct BatchBoundaryRealTag(bool);
+
+#[cfg(feature = "reflected-call-diagnostic")]
+impl BatchBoundaryRealTag {
+    /// `true`: there is no prior batch to blame at the very first iteration,
+    /// so the first `on_batch_boundary` call correctly reports "real".
+    fn new() -> Self {
+        Self(true)
+    }
+
+    /// Read the tag left by the batch that just ended, then reset it to
+    /// `true` -- the default for the batch about to run, overridden only if
+    /// THAT batch's own `can_take_before` edge calls `mark_if_edge` before
+    /// the next `take_and_reset`.
+    fn take_and_reset(&mut self) -> bool {
+        let real = self.0;
+        self.0 = true;
+        real
+    }
+
+    /// The trip's own IF-enable edge, not a cap/deadline/fault/HLT/HLE-post
+    /// reason: the NEXT `take_and_reset` must report `false`.
+    fn mark_if_edge(&mut self) {
+        self.0 = false;
+    }
+}
+
+#[cfg(all(test, feature = "reflected-call-diagnostic"))]
+#[path = "run_batch_boundary_tag_test.rs"]
+mod batch_boundary_real_tag_tests;

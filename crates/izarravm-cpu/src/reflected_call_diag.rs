@@ -144,6 +144,29 @@ const WARM_CLOCK_SAMPLES: usize = 32;
 /// §3.2/§8).
 const REFLECTED_CALL_MAX_TRANSLATIONS: usize = 64;
 
+/// Merge-review nit 6: per-trip `reads`/`writes` had no cap of their own --
+/// `MAX_TRIP_INSNS` bounds INSTRUCTIONS, not memory accesses, so a single
+/// budgeted `REP` string op inside a trip could add a very large read or
+/// write set. Give both the same `_over_cap` treatment `translations` already
+/// has, at roughly `MAX_TRIP_INSNS`'s own order of magnitude (a REP moving
+/// one byte per instruction cannot touch more distinct addresses than the
+/// trip has instructions to spend).
+const REFLECTED_CALL_MAX_TRIP_READS: usize = 8_192;
+const REFLECTED_CALL_MAX_TRIP_WRITES: usize = 8_192;
+
+/// Merge-review nit 6: per-key `entry_images`/`write_addresses`/
+/// `class_n_addresses` grew for the life of the process with no cap of their
+/// own -- `MAX_SAMPLES_PER_KEY`/`TOP_IMAGES`/`CLASS_N_ADDRESSES` bound only
+/// what is SAMPLED or REPORTED, not the underlying accumulator. Capped with
+/// generous headroom over `TOP_IMAGES`/`TOP_ADDRESSES`/`CLASS_N_ADDRESSES`
+/// (16-32) so the cap is never reached by a workload with a genuinely small
+/// distinct population, only by a pathological one; an `_over_cap` counter
+/// reports it rather than silently corrupting `distinct_entry_images`, which
+/// IS a reported metric (Q2).
+const REFLECTED_CALL_MAX_ENTRY_IMAGES: usize = 4_096;
+const REFLECTED_CALL_MAX_WRITE_ADDRESSES: usize = 4_096;
+const REFLECTED_CALL_MAX_CLASS_N_ADDRESSES_TRACKED: usize = 4_096;
+
 /// The fixed legacy VGA aperture (`memory.rs`, `jit/direct.rs`), physical.
 /// Plan §3.1: no linear-framebuffer base is resolvable from this crate alone
 /// (UNVERIFIED base for any LFB aperture vega may expose), so only the
@@ -245,7 +268,7 @@ pub(crate) fn test_clear_armed() {
 }
 
 #[inline]
-fn armed() -> bool {
+pub(crate) fn armed() -> bool {
     #[cfg(test)]
     if TEST_OVERRIDE.with(|c| c.get()).is_some() {
         return true;
@@ -592,15 +615,18 @@ struct Walk {
 /// none of those things.
 ///
 /// 1. Paging off: identity map, no walk.
-/// 2. Paging on: try the cached TLB first (`probe_linear_read_physical`,
-///    `core.rs:1845`) for the common case; on a miss (or to populate the
-///    translation-set data even on a hit) resolve the walk by hand: PDE at
-///    `(cr3 & !0xFFF) + (linear >> 22) * 4`, PTE at `(pde & !0xFFF) +
-///    ((linear >> 12) & 0x3FF) * 4`. `None` if either present bit is clear or
-///    either peek misses. 4 MiB (PSE) pages are not modelled: the design's
-///    guest population (DOS extenders under a DPMI host) runs exclusively
-///    4 KiB paging, so this is an accepted scope limitation, not silently
-///    wrong for the guests this instrument targets.
+/// 2. Paging on: ALWAYS walks by hand, never consulting the cached TLB
+///    (`probe_linear_read_physical`, `core.rs:1845`) at all -- merge-review
+///    nit 8 corrected this comment, which used to claim a TLB fast path the
+///    code has never taken (`the_walker_resolves_a_physical_address_on_a_tlb_miss`'s
+///    own mutation bite, reverting to `probe_linear_read_physical` alone,
+///    confirms the hand walk is the intended path, not a fallback from it).
+///    PDE at `(cr3 & !0xFFF) + (linear >> 22) * 4`, PTE at
+///    `(pde & !0xFFF) + ((linear >> 12) & 0x3FF) * 4`. `None` if either
+///    present bit is clear or either peek misses. 4 MiB (PSE) pages are not
+///    modelled: the design's guest population (DOS extenders under a DPMI
+///    host) runs exclusively 4 KiB paging, so this is an accepted scope
+///    limitation, not silently wrong for the guests this instrument targets.
 fn probe_physical<B: CpuBus>(cpu: &CpuGsw, bus: &B, linear: u32) -> Option<(u32, Option<Walk>)> {
     if !cpu.is_paging_enabled() {
         return Some((linear, None));
@@ -826,6 +852,13 @@ struct Trip {
     /// D4: this trip observed more than `MAX_STACK_SEGMENTS` distinct `SS`
     /// selectors.
     stack_segments_over_cap: bool,
+    /// Merge-review nit 6: this trip's `reads`/`read_phys_dwords` hit
+    /// `REFLECTED_CALL_MAX_TRIP_READS` (a budgeted `REP` can blow up a read
+    /// set); further distinct reads this trip stop being tracked, and this is
+    /// reported rather than silently under-counting `read_set_size`.
+    reads_over_cap: bool,
+    /// As `reads_over_cap`, for `writes` against `REFLECTED_CALL_MAX_TRIP_WRITES`.
+    writes_over_cap: bool,
 }
 
 impl Trip {
@@ -923,6 +956,8 @@ impl Trip {
             translations: HashMap::new(),
             translation_set_over_cap: false,
             stack_segments_over_cap: false,
+            reads_over_cap: false,
+            writes_over_cap: false,
         }
     }
 
@@ -1203,6 +1238,18 @@ struct KeyStats {
     trips_in_window: u64,
     translation_set_over_cap: u64,
     stack_segments_over_cap_trips: u64,
+    /// Merge-review nit 6: counts a distinct entry image / write address /
+    /// Class N address that arrived AFTER its accumulator was already at its
+    /// cap (`REFLECTED_CALL_MAX_ENTRY_IMAGES`/`_WRITE_ADDRESSES`/
+    /// `_CLASS_N_ADDRESSES_TRACKED`) and was therefore dropped rather than
+    /// tracked.
+    entry_images_over_cap: u64,
+    write_addresses_over_cap: u64,
+    class_n_addresses_over_cap: u64,
+    /// Trips whose per-trip `reads`/`writes` hit
+    /// `REFLECTED_CALL_MAX_TRIP_READS`/`_WRITES`.
+    trips_reads_over_cap: u64,
+    trips_writes_over_cap: u64,
     reads_under_other_cr3: u64,
     reads_total: u64,
     write_class_counts: [u64; 11],
@@ -1586,12 +1633,26 @@ fn note_read_on<B: CpuBus>(state: &mut State, cpu: &mut CpuGsw, bus: &B, linear:
         .unwrap_or(true);
     let class = classify(cpu, open, linear, physical, plain_ram, ss.selector, None);
     let under_entry_cr3 = cr3_now == open.entry_cr3;
-    open.reads.entry(linear).or_insert(ReadRecord {
-        class,
-        under_entry_cr3,
-    });
-    if let Some(phys) = physical {
-        open.read_phys_dwords.insert(phys & !0x3);
+    // Merge-review nit 6: cap the per-trip read side. An already-recorded
+    // address is always updated for free (a HashMap lookup either way); a
+    // NEW address past the cap is dropped and flagged rather than growing
+    // `reads`/`read_phys_dwords` without bound (a budgeted `REP` can revisit
+    // many distinct addresses in one trip).
+    if open.reads.contains_key(&linear) {
+        // Already tracked; nothing to add.
+    } else if open.reads.len() >= REFLECTED_CALL_MAX_TRIP_READS {
+        open.reads_over_cap = true;
+    } else {
+        open.reads.insert(
+            linear,
+            ReadRecord {
+                class,
+                under_entry_cr3,
+            },
+        );
+        if let Some(phys) = physical {
+            open.read_phys_dwords.insert(phys & !0x3);
+        }
     }
     record_translation(open, cr3_now, linear, walk);
 }
@@ -1689,17 +1750,26 @@ fn note_write_on<B: CpuBus>(
         ss.selector,
         forced_class,
     );
-    open.writes
-        .entry(linear)
-        .and_modify(|rec| rec.latest = value)
-        .or_insert(WriteRecord {
-            class,
-            physical,
-            pre,
-            latest: value,
-            width_bytes: width.bytes(),
-        });
-    if !already_written {
+    // Merge-review nit 6: cap the per-trip write side, same shape as the read
+    // side above. An already-recorded address is always updated for free; a
+    // NEW address past the cap is dropped and flagged.
+    if already_written {
+        if let Some(rec) = open.writes.get_mut(&linear) {
+            rec.latest = value;
+        }
+    } else if open.writes.len() >= REFLECTED_CALL_MAX_TRIP_WRITES {
+        open.writes_over_cap = true;
+    } else {
+        open.writes.insert(
+            linear,
+            WriteRecord {
+                class,
+                physical,
+                pre,
+                latest: value,
+                width_bytes: width.bytes(),
+            },
+        );
         let cr3_now = cpu.control.cr3;
         record_translation(open, cr3_now, linear, walk);
     }
@@ -1753,7 +1823,13 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
         .clock_charge_events
         .push(u64::from(trip.clock_charge_events));
     stats.field_variance.observe(&trip.entry_image);
-    *stats.entry_images.entry(trip.entry_image).or_insert(0) += 1;
+    if stats.entry_images.contains_key(&trip.entry_image)
+        || stats.entry_images.len() < REFLECTED_CALL_MAX_ENTRY_IMAGES
+    {
+        *stats.entry_images.entry(trip.entry_image).or_insert(0) += 1;
+    } else {
+        stats.entry_images_over_cap += 1;
+    }
     stats
         .distinct_cs_eip
         .insert((trip.entry_image.cs_selector, trip.return_eip));
@@ -1806,6 +1882,12 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
         stats.batch_straddle_trips += 1;
     }
     stats.soft_int_posts += u64::from(trip.soft_int_posts);
+    if trip.reads_over_cap {
+        stats.trips_reads_over_cap += 1;
+    }
+    if trip.writes_over_cap {
+        stats.trips_writes_over_cap += 1;
+    }
 
     if rule.is_match() && mode_is_shape_relevant(&trip) {
         push_bounded(
@@ -1873,7 +1955,13 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
     let mut trip_has_class_n = false;
     for (&addr, write) in trip.writes.iter() {
         write_class_bump(stats, write.class);
-        *stats.write_addresses.entry(addr).or_insert(0) += 1;
+        if stats.write_addresses.contains_key(&addr)
+            || stats.write_addresses.len() < REFLECTED_CALL_MAX_WRITE_ADDRESSES
+        {
+            *stats.write_addresses.entry(addr).or_insert(0) += 1;
+        } else {
+            stats.write_addresses_over_cap += 1;
+        }
         if write.class == AddressClass::NotPlainRam {
             stats.write_not_plain_ram += 1;
         }
@@ -1895,11 +1983,17 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
                 // to look the address up against the guest's real memory
                 // map, which is physical.
                 let key = write.physical.unwrap_or(addr);
-                let entry = stats
-                    .class_n_addresses
-                    .entry(key)
-                    .or_insert((write.class, 0));
-                entry.1 += 1;
+                if stats.class_n_addresses.contains_key(&key)
+                    || stats.class_n_addresses.len() < REFLECTED_CALL_MAX_CLASS_N_ADDRESSES_TRACKED
+                {
+                    let entry = stats
+                        .class_n_addresses
+                        .entry(key)
+                        .or_insert((write.class, 0));
+                    entry.1 += 1;
+                } else {
+                    stats.class_n_addresses_over_cap += 1;
+                }
             }
         }
         if is_dead_stack_8kb(&trip, addr) {
@@ -2149,6 +2243,11 @@ pub struct KeyReport {
     pub translation_set_size_windowed: StatSummary,
     pub translation_set_over_cap: u64,
     pub stack_segments_over_cap_trips: u64,
+    pub entry_images_over_cap: u64,
+    pub write_addresses_over_cap: u64,
+    pub class_n_addresses_over_cap: u64,
+    pub trips_reads_over_cap: u64,
+    pub trips_writes_over_cap: u64,
     pub reads_total: u64,
     pub reads_under_other_cr3: u64,
     pub read_class_counts: Vec<(&'static str, u64)>,
@@ -2308,6 +2407,11 @@ pub(crate) fn snapshot() -> Option<ReflectedCallDiagnosticSnapshot> {
                 translation_set_size_windowed: (&stats.translation_set_size_windowed).into(),
                 translation_set_over_cap: stats.translation_set_over_cap,
                 stack_segments_over_cap_trips: stats.stack_segments_over_cap_trips,
+                entry_images_over_cap: stats.entry_images_over_cap,
+                write_addresses_over_cap: stats.write_addresses_over_cap,
+                class_n_addresses_over_cap: stats.class_n_addresses_over_cap,
+                trips_reads_over_cap: stats.trips_reads_over_cap,
+                trips_writes_over_cap: stats.trips_writes_over_cap,
                 reads_total: stats.reads_total,
                 reads_under_other_cr3: stats.reads_under_other_cr3,
                 read_class_counts: ALL_CLASSES

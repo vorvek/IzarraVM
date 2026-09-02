@@ -193,7 +193,9 @@ impl CpuGsw {
             let charged = self.scale_clocks(61);
             self.elapsed_clocks += charged;
             #[cfg(feature = "reflected-call-diagnostic")]
-            crate::reflected_call_diag::on_clock_charge();
+            if self.retire_gates.reflected_call_diag_armed {
+                crate::reflected_call_diag::on_clock_charge();
+            }
             return Ok(Some(CycleOutcome {
                 core_clocks: charged.min(u64::from(u32::MAX)) as u32,
                 halted: false,
@@ -314,7 +316,9 @@ impl CpuGsw {
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::on_clock_charge();
+        if self.retire_gates.reflected_call_diag_armed {
+            crate::reflected_call_diag::on_clock_charge();
+        }
         if self.is_ring0_protected() {
             self.perf.monitor_resident_core_clocks += charged;
         }
@@ -570,7 +574,9 @@ impl CpuGsw {
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::on_clock_charge();
+        if self.retire_gates.reflected_call_diag_armed {
+            crate::reflected_call_diag::on_clock_charge();
+        }
         self.perf.instructions += 1;
         // V86 trap tax residency: see PerfCounters::monitor_resident_core_clocks.
         if self.is_ring0_protected() {
@@ -3552,7 +3558,9 @@ impl CpuGsw {
         let charged = self.scale_clocks_batch(raw_clocks);
         self.elapsed_clocks += charged;
         #[cfg(feature = "reflected-call-diagnostic")]
-        crate::reflected_call_diag::on_clock_charge();
+        if self.retire_gates.reflected_call_diag_armed {
+            crate::reflected_call_diag::on_clock_charge();
+        }
         let reads = byte_reads + word_reads + dword_reads;
         let writes = ram_byte_writes
             + ram_word_writes
@@ -3934,7 +3942,9 @@ impl CpuGsw {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     #[cfg(feature = "reflected-call-diagnostic")]
-                    crate::reflected_call_diag::on_clock_charge();
+                    if self.retire_gates.reflected_call_diag_armed {
+                        crate::reflected_call_diag::on_clock_charge();
+                    }
                     self.perf.instructions += 1;
                     // Gated at the CALL SITE, not inside the hook: this is the common
                     // interpreted-retire tail (506.85M instructions in a Quake/586 run) and the
@@ -4030,7 +4040,9 @@ impl CpuGsw {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     #[cfg(feature = "reflected-call-diagnostic")]
-                    crate::reflected_call_diag::on_clock_charge();
+                    if self.retire_gates.reflected_call_diag_armed {
+                        crate::reflected_call_diag::on_clock_charge();
+                    }
                     self.perf.instructions += 1;
                     // A budgeted REP retires (does not yield) here; observe it once. The yielding
                     // arm above returns without retiring, so it is deliberately not observed.
