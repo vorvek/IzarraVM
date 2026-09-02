@@ -79,13 +79,16 @@ fn setup_skipped_without_hotkey_boots_and_idles() {
 }
 
 #[test]
-fn setup_save_applies_chosen_gsw_mode() {
+fn given_setup_saves_586_when_post_finishes_then_the_mode_and_vga_restore_stick() {
+    // Given: setup, CPU-mode row, two Rights (386 -> 486 -> 586).
+    // When: Save (F10) commits and cold-resets. POST uses the Margo LFB, then
+    // the boot planner restores legacy VGA before the signed idle sector.
+    // Then: live Lotura mode is 586 and the display is VGA again. One Right
+    // would land on 486; this path is the two-step navigation plus the VGA
+    // restore the old 486-only Save test asserted.
     let mut machine = boot_machine();
     assert_eq!(machine.active_mode(), GswMode::Gsw386, "boot mode is 386");
 
-    // Hotkey to enter setup, move down to the CPU-mode row, advance the mode from
-    // 386 to 586 with two Right presses, then Save with F10. The save writes the
-    // chosen code to the live Lotura register; the switch lands at once.
     enter_setup(&mut machine);
     let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
     let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
@@ -100,6 +103,11 @@ fn setup_save_applies_chosen_gsw_mode() {
         machine.active_mode(),
         GswMode::Gsw586,
         "Save wrote the chosen mode to the live Lotura register"
+    );
+    assert_eq!(
+        machine.active_display(),
+        ActiveDisplay::VgaRaster,
+        "the boot planner restored legacy VGA after the POST LFB"
     );
 }
 
@@ -152,26 +160,6 @@ fn setup_save_enables_debug_on_com1() {
         "the saved CMOS checksum is valid"
     );
     assert_eq!(reloaded.cmos_byte(0x14), 1);
-}
-
-#[test]
-fn setup_save_reboots_and_keeps_the_chosen_speed() {
-    // Save commits and cold-resets. POST uses the Margo LFB, then the unified
-    // boot planner restores legacy VGA before entering the signed idle sector.
-    // The persisted speed must survive both transitions.
-    let mut machine = boot_machine();
-    enter_setup(&mut machine);
-    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
-    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
-    let _ = press(&mut machine, RIGHT_MAKE, RIGHT_BREAK, 3_000_000);
-    let _ = press(&mut machine, F10_MAKE, F10_BREAK, 30_000_000);
-
-    assert_eq!(
-        machine.active_display(),
-        ActiveDisplay::VgaRaster,
-        "the boot planner restored legacy VGA after the POST LFB"
-    );
-    assert_eq!(machine.active_mode(), GswMode::Gsw486);
 }
 
 #[test]

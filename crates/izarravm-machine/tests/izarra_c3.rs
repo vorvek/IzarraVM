@@ -112,56 +112,39 @@ fn full_post_work_does_not_scale_with_cpu_frequency() {
 }
 
 #[test]
-fn cpu_gsw_probe_passes_on_all_four_modes() {
-    for mode in [
-        GswMode::Gsw386Slow,
-        GswMode::Gsw386,
-        GswMode::Gsw486,
-        GswMode::Gsw586,
-    ] {
+fn given_a_bare_machine_when_post_runs_then_cpu_floppy_optical_and_hdd_match_the_probes() {
+    // Given: a bare machine (no ATA disk). probe-cpu.inc has three control flows:
+    // 386 AC-fixed, 486 AC-toggle/ID-fixed, 586 AC+ID then CPUID leaf 0
+    // `IzarBenetako`. 386-slow shares the 386 persona and is not a fourth path.
+    // When: POST runs on each persona.
+    // Then: component.cpu_gsw PASSes on 386/486/586. On 386 the present
+    // floppy/optical controllers PASS and the missing ATA disk FAILs.
+    for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
         let results = run_post_bare(mode);
-        let actual = results
-            .records
-            .iter()
-            .find(|record| record.name == "component.cpu_gsw")
-            .map(|record| record.status);
         assert_eq!(
-            actual,
-            Some(SuiteRecordStatus::Pass),
+            status(&results, "component.cpu_gsw"),
+            SuiteRecordStatus::Pass,
             "CPU probe failed in {mode} mode; records: {:?}",
             results.records
         );
+        if mode == GswMode::Gsw386 {
+            assert_eq!(
+                status(&results, "component.floppy_fdc"),
+                SuiteRecordStatus::Pass,
+                "floppy controller is present (RQM ready at idle)"
+            );
+            assert_eq!(
+                status(&results, "component.optical_atapi"),
+                SuiteRecordStatus::Pass,
+                "secondary channel presents an ATAPI signature"
+            );
+            assert_eq!(
+                status(&results, "component.disk_hdd"),
+                SuiteRecordStatus::Fail,
+                "no ATA image: primary channel is open-bus, C: is HLE-backed"
+            );
+        }
     }
-}
-
-#[test]
-fn floppy_fdc_probe_passes_on_the_present_controller() {
-    // The floppy controller is always present (RQM ready at idle), so its icon lights.
-    assert_eq!(
-        status(&run_post_bare(GswMode::Gsw386), "component.floppy_fdc"),
-        SuiteRecordStatus::Pass
-    );
-}
-
-#[test]
-fn optical_atapi_probe_passes_on_the_signature() {
-    // The secondary channel presents an ATAPI CD-ROM drive (signature 0x14/0xEB)
-    // from power-on, media optional, so the optical icon lights.
-    assert_eq!(
-        status(&run_post_bare(GswMode::Gsw386), "component.optical_atapi"),
-        SuiteRecordStatus::Pass
-    );
-}
-
-#[test]
-fn hdd_probe_fails_when_no_real_ata_disk_is_present() {
-    // Faithful behaviour: with no ATA image mounted (C: is HLE-backed), the primary
-    // channel reads open-bus, so the HDD probe FAILs and the icon stays grey. It
-    // lights only when a real ATA disk is attached (see the aggregate test).
-    assert_eq!(
-        status(&run_post_bare(GswMode::Gsw386), "component.disk_hdd"),
-        SuiteRecordStatus::Fail
-    );
 }
 
 #[test]

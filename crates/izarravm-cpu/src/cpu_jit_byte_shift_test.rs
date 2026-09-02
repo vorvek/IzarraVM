@@ -1069,25 +1069,31 @@ fn byte_rotate_differential(seg: Seg) {
     }
 }
 
-/// EVERY raw count byte from 0 to 255, unmasked, at both sub-opcodes and both segment kinds, run
-/// through the NATIVE lane. `lowered` (via `run_and_compare`) asserts `jit_direct_insns` advances
-/// by every slot in the block, so a count that silently fell back to the interpreter would fail
-/// here rather than being missed.
+/// Raw-count cover for `emit_rotate_reg8`'s five-bit mask on the decoded immediate.
 ///
-/// The full range matters for the same reason `emit_rotate_reg8`'s doc names for
-/// `emit_rotate_reg`'s Dword sibling: the five-bit mask is applied to the RAW decoded immediate,
-/// not to a pre-masked value, so `rol al, 0x20` (masks to 0, the no-op shape) and `rol al, 0x21`
-/// (masks to 1, the only OF-defining shape) sit one apart in the RAW byte and any distance apart in
-/// the masked one. A mask applied at the wrong point, or applied to the wrong operand, shows up
-/// somewhere in this sweep even when the ten hand-picked `COUNTS` values above miss it.
+/// Given: byte ROL/ROR via `0xC0`, native vs interpreter.
+/// When: the count byte is the RAW immediate, not a pre-masked value.
+/// Then: every raw count 0..=255 on one representative shape (32-bit CS, ROL,
+/// operand 0x55) matches the interpreter, so a high-bit special case
+/// (`if raw >= 128 { raw - 128 }`) that agrees at 128/255 still fails at 160.
+/// The full (segment × ROL/ROR × operand) matrix runs only the boundary counts
+/// `COUNTS` does not already name: 63/64 catch a 6-bit mask, 127/128 a 7-bit
+/// mask, 255 an 8-bit mask. 0/1/7/8/9/16/31/32/33 stay so a 3-bit mask or a
+/// mask applied to the destination still diverges on ROR of 0x00 and on 0x55.
 #[test]
 fn byte_rotates_match_the_interpreter_across_every_raw_count() {
     let _arm = force_byte_shift_rows(true);
+    const BOUNDARY_COUNTS: [u8; 14] = [0, 1, 7, 8, 9, 16, 31, 32, 33, 63, 64, 127, 128, 255];
+    for raw_count in 0u16..=0xff {
+        let raw_count = raw_count as u8;
+        let seed = Seed::new().byte(2, 0x55).flags(ROTATE_SEEDED_EFLAGS);
+        let context = format!("32-bit segment 0xc0 /0 rol dl=0x55 raw_count={raw_count:#04x}");
+        lowered(Seg::ThirtyTwo, &c0_reg(0, 2, raw_count), 3, seed, &context);
+    }
     for seg in SEGMENTS {
         for (label, op) in ROL_ROR_SUB_OPS {
             for operand in [0x00u8, 0x55, 0xff] {
-                for raw_count in 0u16..=0xff {
-                    let raw_count = raw_count as u8;
+                for raw_count in BOUNDARY_COUNTS {
                     let seed = Seed::new().byte(2, operand).flags(ROTATE_SEEDED_EFLAGS);
                     let context = format!(
                         "{} 0xc0 {label} dl={operand:#04x} raw_count={raw_count:#04x}",

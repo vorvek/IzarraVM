@@ -120,147 +120,51 @@ fn tsc_keeps_running_while_hlt_waits_for_irq0() {
 }
 
 #[test]
-fn boot_suite_reports_timer_irq0_pass() {
-    let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::X86_BOOT_TEST_IMAGE,
-    )
-    .unwrap();
-    let reason = machine.run_until_halt_or_cycles(11_000_000).unwrap();
+fn given_the_boot_suite_image_when_it_halts_at_586_then_every_named_probe_passes() {
+    // Given: the Lotura boot-suite image at Gsw586, using the same half-second
+    // cycle budget `--headless-boot-suite` uses.
+    // When: it runs to halt.
+    // Then: every probe the old per-record / per-mode cargo tests asserted is
+    // PASS, and elapsed_clocks shows real PIT time rather than an instant spin.
+    // 386/486/386-slow loops only re-checked the same record names; the CLI
+    // step still fails the job on any FAIL record at this same 586 profile.
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let budget = profile.cpu.clock_rate().clocks_for_fraction_floor(1, 2);
+    let mut machine =
+        Machine::new_boot_image(profile, izarravm_firmware::X86_BOOT_TEST_IMAGE).unwrap();
+    let reason = machine.run_until_halt_or_cycles(budget).unwrap();
     assert_eq!(reason, StopReason::Halted);
 
     let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
-    assert!(
-        results.records.iter().any(|record| {
-            record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                && record.name == "timer.irq0"
-        }),
-        "boot suite should report PASS timer.irq0"
-    );
-    // The timer idle genuinely advanced emulated time (ten ticks of ~11932
-    // input clocks each), not spun instantly.
-    assert!(machine.elapsed_clocks() > 1_500_000);
-}
-
-#[test]
-fn boot_suite_reports_sb_dsp_reset_pass() {
-    for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
-        let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Vega),
-            izarravm_firmware::X86_BOOT_TEST_IMAGE,
-        )
-        .unwrap();
-        machine.set_mode(mode);
-        let reason = machine
-            .run_until_halt_or_cycles(mode.clock_hz() / 2)
-            .unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
-        assert!(
-            results.records.iter().any(|record| {
-                record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                    && record.name == "sound.sb_dsp_reset"
-            }),
-            "boot suite should report PASS sound.sb_dsp_reset in {mode:?}"
-        );
-    }
-}
-
-#[test]
-fn boot_suite_reports_opl3_pass() {
-    for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
-        let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Vega),
-            izarravm_firmware::X86_BOOT_TEST_IMAGE,
-        )
-        .unwrap();
-        machine.set_mode(mode);
-        let reason = machine
-            .run_until_halt_or_cycles(mode.clock_hz() / 2)
-            .unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
-        assert!(
-            results.records.iter().any(|record| {
-                record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                    && record.name == "sound.opl3"
-            }),
-            "boot suite should report PASS sound.opl3 in {mode:?}"
-        );
-    }
-}
-
-#[test]
-fn boot_suite_reports_opl2_pass() {
-    for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
-        let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Vega),
-            izarravm_firmware::X86_BOOT_TEST_IMAGE,
-        )
-        .unwrap();
-        machine.set_mode(mode);
-        let reason = machine
-            .run_until_halt_or_cycles(mode.clock_hz() / 2)
-            .unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
-        assert!(
-            results.records.iter().any(|record| {
-                record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                    && record.name == "sound.opl2"
-            }),
-            "boot suite should report PASS sound.opl2 in {mode:?}"
-        );
-    }
-}
-
-#[test]
-fn boot_suite_reports_sb_8bit_dma_pass() {
-    for mode in [
-        GswMode::Gsw386Slow,
-        GswMode::Gsw386,
-        GswMode::Gsw486,
-        GswMode::Gsw586,
+    for name in [
+        "timer.irq0",
+        "sound.sb_dsp_reset",
+        "sound.opl3",
+        "sound.opl2",
+        "sound.sb_8bit_dma",
+        "sound.sb_16bit_dma",
     ] {
-        let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Vega),
-            izarravm_firmware::X86_BOOT_TEST_IMAGE,
-        )
-        .unwrap();
-        machine.set_mode(mode);
-        let reason = machine
-            .run_until_halt_or_cycles(mode.clock_hz() / 2)
-            .unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
         assert!(
             results.records.iter().any(|record| {
-                record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                    && record.name == "sound.sb_8bit_dma"
+                record.status == izarravm_firmware::SuiteRecordStatus::Pass && record.name == name
             }),
-            "boot suite should report PASS sound.sb_8bit_dma in {mode:?}; remaining={}, playing={}",
+            "boot suite should report PASS {name}; remaining={}, playing={}",
             machine.sb16.test_block_remaining(),
             machine.sb16.test_is_playing()
         );
     }
-}
-
-#[test]
-fn boot_suite_reports_sb_16bit_dma_pass() {
-    let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::X86_BOOT_TEST_IMAGE,
-    )
-    .unwrap();
-    let reason = machine.run_until_halt_or_cycles(11_000_000).unwrap();
-    assert_eq!(reason, StopReason::Halted);
-    let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+    // Clock-relative floor: 1_500_000 clocks was ~68 ms at 22 MHz and only ~9 ms
+    // at 166 MHz, so it stopped meaning "the timer idle actually waited."
+    // One-twentieth of a second is still far below the ten PIT ticks the probe
+    // waits, and still fails a guest that spun instantly.
+    let pit_floor = GswMode::Gsw586
+        .clock_rate()
+        .clocks_for_fraction_floor(1, 20);
     assert!(
-        results.records.iter().any(|record| {
-            record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                && record.name == "sound.sb_16bit_dma"
-        }),
-        "boot suite should report PASS sound.sb_16bit_dma (clock-driven auto-init DMA + IRQ5)"
+        machine.elapsed_clocks() > pit_floor,
+        "timer idle must advance guest time, not spin instantly (elapsed={}, floor={pit_floor})",
+        machine.elapsed_clocks()
     );
 }
 

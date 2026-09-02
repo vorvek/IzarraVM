@@ -40,17 +40,6 @@ fn frame_past_the_decoded_region_is_absent() {
 }
 
 #[test]
-fn a_red_book_frame_is_2352_bytes() {
-    // Pinned against cdimage::RAW_SECTOR by a compile-time assert in cdimage.rs.
-    // Written as the arithmetic the constant's own doc claims -- 588 stereo
-    // samples of 16-bit PCM -- so the framing is pinned alongside the number.
-    // The mixer reaches 588 from the other direction, dividing its frame size by
-    // those same 4 bytes per sample; nothing here can see that constant, but
-    // holding the framing honest on this side keeps the number it divides right.
-    assert_eq!(AUDIO_FRAME_BYTES, 588 * 2 * 2);
-}
-
-#[test]
 fn a_source_survives_the_move_to_a_worker_thread() {
     // This is what pins `Send + Sync`. `Arc<dyn AudioTrackSource>` builds with or
     // without those supertraits, so the test above it would keep passing if they

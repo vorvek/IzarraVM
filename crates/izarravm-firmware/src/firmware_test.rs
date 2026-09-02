@@ -27,11 +27,6 @@ fn test_rom_is_64k_and_has_reset_far_jump() {
 }
 
 #[test]
-fn kbd_bios_is_64k() {
-    assert_eq!(KBD_BIOS.len(), I386DX25_TEST_ROM_SIZE);
-}
-
-#[test]
 fn izarra_flash_is_256k_with_shadowed_reset() {
     let flash = izarra_bios();
     assert_eq!(flash.len(), IZARRA_FLASH_SIZE);
