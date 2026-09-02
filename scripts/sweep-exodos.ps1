@@ -50,7 +50,7 @@ param(
     [string]$Executable = "D:\dev\IzarraVM\target\release\izarravm.exe",
     [string]$Translator = "D:\dev\IzarraVM\target\release\izarravm-exodos.exe",
     # Scratch lives on D:, which has the free space; C: does not.
-    [string]$ScratchRoot = "D:\exo-scratch",
+    [string]$ScratchRoot = "D:\dev\exo-sweeps\exo-scratch",
     # Per-game key schedules, `<short>.json`. Missing files fall back to the
     # translator's generic sequence.
     [string]$RecipeDir,
