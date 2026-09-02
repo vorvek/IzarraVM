@@ -1729,19 +1729,32 @@ function Get-FixtureTable {
             # is the rare case; see dos-3d-title-waiting-looks-hung for the rule
             # it is the exception to.
             # MOJO.TXT is pinned raw -- every line of it is a board-identity
-            # fact and none of them may drift benignly. MOJOV.TXT needs ONE
-            # line masked, and the mask was earned rather than assumed: Distira
-            # synthesises `vRetrace` from the live beam position, so it reports
-            # whatever scanline the raster was on when the program asked.
-            # Rebuilding this very fixture tree with two unused binaries removed
-            # moved it 0x29 -> 0x14 and moved NOTHING else in the file. Left
-            # unmasked it would be a phase-sensitive hash of exactly the kind
-            # Duke3D, Tomb Raider and NASCAR each had to give up; masked, the
-            # rest of the SST-1 register file stays under an exact pin.
+            # fact and none of them may drift benignly. MOJOV.TXT needs the
+            # beam-phase lines masked, and the mask was earned rather than
+            # assumed: Distira synthesises `vRetrace` from the live beam
+            # position, so it reports whatever scanline the raster was on
+            # when the program asked. Rebuilding this very fixture tree with
+            # two unused binaries removed moved it 0x29 -> 0x14 and moved
+            # NOTHING else in the file.
+            #
+            # 2026-09-04 (dev_docs/2026-09-04-red-pins-bisect.md): the same
+            # beam phase also leaked through `status:` (distira.rs
+            # status_value() clears bit 0x40 while in_vretrace(), so
+            # 0ffff07f <-> 0ffff03f tracks vRetrace exactly) and through
+            # MOJO's own decode of that bit on the line beneath it. All
+            # three lines carry the identical fact, so all three are masked
+            # together now. Left unmasked it would be a phase-sensitive hash
+            # of exactly the kind Duke3D, Tomb Raider and NASCAR each had to
+            # give up; masked, the remaining ~37 lines of the SST-1 register
+            # file stay under an exact pin.
             textResults = @{
                 exitCode = 0x51
                 files    = @("MOJO.TXT", "MOJOV.TXT")
-                masks    = @{ "MOJOV.TXT" = @('^\s*vRetrace:') }
+                masks    = @{ "MOJOV.TXT" = @(
+                    '^\s*vRetrace:',
+                    '^\s*status:',
+                    ':\s*vertical retrace\s*$'
+                ) }
             }
         }
     )

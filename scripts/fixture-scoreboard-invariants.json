@@ -23,12 +23,12 @@
     "dukemark_samples_tolerance": 0.02
   },
   "gp2-586": {
-    "frame_sha256": "00d7611afc5d47684e33f8a6484ce847a9decaef0f5b63ca8c48a7561854aeee"
+    "frame_sha256": "8b6e1e450e5d25262bb901a74ba9fc467d05906b5b205542707bf0524cbc98f6"
   },
   "mojo-586": {
     "text_result_sha256": {
       "MOJO.TXT": "aeaa75522e2f472b36d1459333d2196ebd9bda2a239283a648ff1d95c5cb37ff",
-      "MOJOV.TXT": "ae016d72c21aba3bfad5a2e780152267361b106ffa3c55839624a79b87b3e394"
+      "MOJOV.TXT": "64c5a0fe167b4f3690c7e8c37503811bec3f5fdd0d6c8f793a3e1cf03c8bf8b9"
     }
   },
   "nascar-586": {
