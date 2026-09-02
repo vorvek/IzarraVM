@@ -1434,6 +1434,14 @@ function Get-FixtureTable {
             # row (no periodic phase sampling runs on a board leg); they are the
             # reason the row exists and are recorded here so a future slice can
             # compare its own dwell rate against this baseline.
+            #
+            # PROVISIONAL: no rt anchor. `realticsMinimum`/`Maximum` are $null
+            # below and nothing wall-clock is asserted, on purpose -- the box
+            # was not quiet while this row was built (background load 61-66%
+            # on two of the three legs that measured it), and a wall-clock
+            # anchor recorded under load is not a final pin. Re-anchor rt once
+            # the box is quiet, if an rt anchor for this row is wanted at all;
+            # the frame hash and the counters above are the real invariant.
             name = "tyrian-specs-586"; folder = "tyrian_specs_c"
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
             cycles = [uint64]5150000000
@@ -3123,19 +3131,39 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
                 $failures += ("the final video mode is '$($profile.legacy_video_mode)', " +
                     "expected '$($Fixture.expected_video_mode)'")
             }
-            # See the frame-contract block below for why `stop.requested` is the
-            # wrong field for a row with an INPUT SCHEDULE: an injection
-            # schedule slices the run into one `run_until_halt_or_cycles` call
-            # per scancode/mouse packet plus one final call for the remainder,
-            # so `stop.requested` holds only the LAST slice's budget rather
-            # than the fixture's total `--cycles`. `tyrian-specs-586` is the
-            # first row on this grading path to carry a schedule, so it gets
-            # the same treatment the frame-contract block already uses: check
-            # only that the run ended as a cycle limit, not which one.
-            if ($Fixture.injection.Count -gt 0) {
+            # `stop.requested` is the wrong field for a row with an INPUT
+            # SCHEDULE: an injection schedule slices the run into one
+            # `run_until_halt_or_cycles` call per scancode/mouse packet plus
+            # one final call for the remainder, so `stop.requested` holds only
+            # the LAST slice's budget rather than the fixture's total
+            # `--cycles` (see the frame-contract block's own comment above
+            # `Invoke-AnchorRun` for the tombraid3d-586 case that first found
+            # this). `tyrian-specs-586` is the first row on THIS grading path
+            # to carry a schedule, and it gets the frame-contract block's own
+            # fix, not a weaker one: that block does not skip the check, it
+            # SUBSTITUTES `cycle_budget` / `elapsed_budget_clocks` for
+            # `stop.requested`, and the pair is strictly stronger -- it
+            # catches a wrong budget AND a run that ended early. Skipping the
+            # check outright would have been unsafe on exactly this row: the
+            # Ship Specs picture is static for the whole 10.5-guest-second
+            # tail of the budget, so a truncated `cycles` would still hash
+            # correctly and grade green while under-reporting the dwell's
+            # instruction and entry rates, which is the only thing this row
+            # exists to carry.
+            $probedInjection = $Fixture.PSObject.Properties['injection']
+            $hasSchedule = ($null -ne $probedInjection -and
+                @($probedInjection.Value).Count -gt 0)
+            if ($hasSchedule) {
                 if ($profile.stop.kind -ne "cycle_limit") {
                     $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
-                        "cycle_limit")
+                        "'cycle_limit' -- the guest did not run the whole budget")
+                } elseif ([uint64]$profile.cycle_budget -ne $Fixture.cycles) {
+                    $failures += ("the run was given a budget of $($profile.cycle_budget) " +
+                        "cycles, expected the fixture's $($Fixture.cycles)")
+                } elseif ([uint64]$profile.elapsed_budget_clocks -lt
+                    [uint64]$profile.cycle_budget) {
+                    $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
+                        "$($profile.cycle_budget) cycle budget -- it ended early")
                 }
             } elseif ($profile.stop.kind -ne "cycle_limit" -or
                 [uint64]$profile.stop.requested -ne $Fixture.cycles) {

@@ -376,6 +376,7 @@ persona's rate: 486 is 66 MHz, 586 is 166 MHz.
 | Tyrian setup | 486 | 4.7e9 | 71 s | menu to 25 s, jukebox 27-59 s, menu tail |
 | Tyrian | 486 | 3.2e9 | 48 s | gameplay from ~31 s; the ship dies at ~53 s, the budget stops before it |
 | Tyrian | 586 | 8.05e9 | 48 s | the same guest-second schedule at 166 MHz |
+| Tyrian specs | 586 | 5.15e9 | 31 s | title -> Load Game -> save 1 -> Ship Specs; static from ~20.5 s, so the budget end lands mid-dwell |
 
 **The Duke3D budget no longer sets the length of the run.** The guest exits
 itself through `EXITVM.COM` when DUKEMARK is done, so the budget is only there
