@@ -257,10 +257,22 @@ impl CpuGsw {
     /// still paying `bump_wipes_tlb_flush_counter` every time (see that function).
     fn wipe_tlb_and_direct_pages(&mut self) {
         self.tlb.flush();
-        // Clear the physical caches with the linear FastMap so alias-verification tags and
-        // mappings are rebuilt from the current translation and permissions.
-        self.data_read_pages.invalidate();
-        self.data_write_pages.invalidate();
+        // T1 (design `2026-09-02-cr3-data-side-design.md`): `data_read_pages`/`data_write_pages`
+        // used to be cleared here too. They are physical-page-and-bus-mapping-epoch keyed, with
+        // no linear address, CR3, CPL or WP bit anywhere in the entry
+        // (`DirectPageCacheEntry { physical_page, ptr }`), so no control-register write of any
+        // kind -- not this one, not a CR3 R3 third value, not a task switch -- can make an entry
+        // stale. Only the three bus causes that actually move the physical map still invalidate
+        // them: `note_a20_changed`, `note_direct_map_changed`, `note_direct_data_map_changed`.
+        //
+        // Do not re-add the two `invalidate()` calls this comment replaces to "restore" belt and
+        // braces. `DirectPageCache::invalidate` also zeroes `mapping_epoch`, and
+        // `fast_map_data_slot` compares a FastMap entry's stored epoch against that value
+        // (`memory.rs`), so every wipe here used to be a SECOND, implicit kill of every FastMap
+        // entry on top of `record_fast_map_wipe_extent` below -- coincidentally, since a CR3
+        // write's own FastMap wipe already covers it. Retaining the physical caches removes that
+        // producer; `record_fast_map_wipe_extent` is now the FastMap's only invalidation source
+        // from this function.
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
