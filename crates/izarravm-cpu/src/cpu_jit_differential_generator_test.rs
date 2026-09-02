@@ -713,6 +713,18 @@ fn assert_measured_pair_ignoring_translation_watch_split(
     interpreter_settled.materialize_flags();
     assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
     assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
+    // Review finding N3: a DROPPED equality is a lost gate, not a neutral one. The exact split
+    // is legitimately case-dependent (a cold decode's fetch charge varies with instruction
+    // length and alignment), so this cannot be `SPLIT_BUS_CLOCKS`'s exact-pin shape, but a
+    // regression that changed the split's ORDER OF MAGNITUDE -- a second retire slipping in, a
+    // fetch-charge constant moving by 10x -- must still redden here rather than sail through
+    // silently forever.
+    let split =
+        direct_bus.trace.elapsed_clocks() as i64 - interpreter_bus.trace.elapsed_clocks() as i64;
+    assert!(
+        (-256..=0).contains(&split),
+        "translation-watch split {split} out of the expected bound: native must not charge MORE          bus clocks than the interpreted role's extra cold-decode fetch, and the extra fetch          itself must stay within a bounded number of bus clocks -- {case:#?}"
+    );
     direct
         .perf_counters()
         .jit_direct_insns

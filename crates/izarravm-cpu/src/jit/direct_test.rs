@@ -3832,6 +3832,45 @@ fn a_second_directory_gets_its_own_link_graph() {
     assert!(cache.is_link_visible(target_a_id));
 }
 
+/// N1 (review finding). RED against the pre-fix seed `link_epochs: [1, 0]`: 0 is the
+/// unstamped-block sentinel (`block_link_epochs.push(0)` on install), so a VIRGIN cache's
+/// first `MOV CR3` to a second directory -- which, in production, ALWAYS reaches
+/// `select_link_context`, never `allocate_link_context` (`core.rs`'s `Skipped` arm covers
+/// both R1 and R2) -- made the live epoch under slot 1 read 0, and `make_link_visible` took
+/// its same-epoch fast path for every block compiled there: republish the portal, never
+/// insert into `linear_blocks`, never `resolve_successors`/`resolve_waiting`. A silent loss
+/// of the whole JIT-half win for that context, with no cross-context corruption for any
+/// other row to notice. Drives the REAL R2 path (`select_link_context`, not
+/// `allocate_link_context`, unlike `a_second_directory_gets_its_own_link_graph` above, which
+/// is why that row did not catch this).
+#[test]
+fn a_virgin_second_context_still_forms_links() {
+    let mut cache = BlockCache::default();
+    // A fresh cache's slot 0 is already "selected" (R8's seed), so this is the first-ever
+    // reselect to slot 1 -- exactly the shape `core.rs`'s R2 arm produces on the very first
+    // `MOV CR3` to a second directory.
+    cache.select_link_context(1);
+    let source = key(0x2350);
+    let target = key(0x2450);
+    let source_id = install_trivial(&mut cache, source, 1);
+    let target_id = install_trivial(&mut cache, target, 1);
+    assert!(
+        cache.try_link(source_id, 0, target_id),
+        "a link must be formable under a virgin ring slot's seeded epoch"
+    );
+    assert!(cache.is_link_visible(target_id));
+    let target_key = LinkTarget {
+        linear: target.linear,
+        mode_key: target.mode_key,
+        context: 1,
+    };
+    assert_eq!(
+        cache.linear_blocks.get(&target_key).copied(),
+        Some(target_id),
+        "the target must be a real linear_blocks entry, not merely a republished portal          from make_link_visible's same-epoch fast path"
+    );
+}
+
 /// G-1. Both slots occupied, a third distinct directory retires the WHOLE graph (R3): the
 /// `Taken` arm calls `invalidate_translation()` then `allocate_link_context`.
 #[test]
@@ -4062,6 +4101,30 @@ fn a_retained_link_is_never_entered_from_the_other_context() {
     assert!(
         cache.active_index(a_id).is_some(),
         "a probe under a different physical key must not touch A's block at all"
+    );
+}
+
+/// N6 (review finding), the complement of A-3: `BlockKey` does NOT carry the ring context, and
+/// this pins that on purpose rather than leaving it an implicit property a future refactor could
+/// silently change. A block admitted under one ring slot is still ENTERED (`probe` returns
+/// `Ready`, a genuine cache hit) under the OTHER slot when the physical matches -- entry is
+/// physical-keyed, full stop, and the link-graph partition (L2's `context` field) is the ONLY
+/// thing slot-scoped. Putting `context` into `BlockKey` as well is the design's own documented
+/// non-gate for soundness (it is strictly stricter, no correctness row can fail it) but it WOULD
+/// halve native coverage on a workload where the two ring slots share code, by forcing a second
+/// compile under the second slot for bytes already compiled under the first -- and this is the
+/// row that would catch a silent regression to that shape, because it fails the moment `probe`
+/// stops hitting.
+#[test]
+fn entry_is_still_a_probe_hit_under_the_other_ring_slot() {
+    let mut cache = BlockCache::default();
+    let source = key(0x3110);
+    let source_id = install_trivial(&mut cache, source, 1);
+
+    cache.select_link_context(1);
+    assert!(
+        matches!(cache.probe(source), BlockProbe::Ready(id) if id == source_id),
+        "the SAME physical key must still be a cache hit under the other ring slot: BlockKey          carries no context field, by design"
     );
 }
 

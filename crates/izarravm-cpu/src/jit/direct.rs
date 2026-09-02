@@ -1469,9 +1469,19 @@ impl BlockCache {
             block_decode_slots: Vec::new(),
             decode_slot_mask: decode_slot_count - 1,
             block_link_epochs: Vec::new(),
-            link_epochs: [1, 0],
+            // [1, 2], NOT [1, 0] (review finding N1): 0 is the unstamped-block sentinel
+            // (`block_link_epochs.push(0)` on install, the reset on retire, the wrap fill),
+            // and slot 1's epoch must never equal it. A virgin cache's first `MOV CR3` to a
+            // second directory takes R2 (`select_link_context`, no `allocate_link_context`
+            // call -- see its own doc comment), so slot 1's epoch is whatever this seed left
+            // it at; `[1, 0]` would make `link_epoch()` read 0 under that context, and
+            // `make_link_visible` would take its same-epoch fast path for every UNSTAMPED
+            // block, republishing without ever inserting into `linear_blocks` -- a silent
+            // loss of the whole JIT-half win for that context, with no cross-context
+            // corruption to make a test notice.
+            link_epochs: [1, 2],
             link_slot: 0,
-            next_link_epoch: 2,
+            next_link_epoch: 3,
             block_active: Vec::new(),
             free_block_slots: Vec::new(),
             next_block_generation: 1,

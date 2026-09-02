@@ -3045,6 +3045,7 @@ fn pushf_then_popf_round_trip_natively_in_v86_at_iopl_3() {
     // `2026-09-02-cr3-code-cache-gate-design.md`, advisory 12), which the deferred-write window
     // then reports as non-empty and `allows_resume`'s R5 correctly refuses -- a real, accepted
     // side exit, just not the one this fixture exists to isolate.
+    let translation_page_writes_before = cpu.perf_counters().translation_page_writes;
     cpu.write_memory_u8(
         &mut bus,
         SegmentIndex::Ss,
@@ -3053,6 +3054,17 @@ fn pushf_then_popf_round_trip_natively_in_v86_at_iopl_3() {
         BusAccessKind::DataWrite,
     )
     .expect("stack warm-up write");
+    // Review finding N4: the same discipline the fixed `(e)` row
+    // (`pte_edit_with_a_tlb_warm_target_still_retires`) now carries, applied here. This
+    // warm-up exists specifically so PUSHF's LATER stack write does not retire the ring; if the
+    // warm-up itself silently opened `code_write_watched`'s translation-page door (an ordering
+    // mistake, not a guest one), this fixture would stop testing what it claims to and no row
+    // would notice.
+    assert_eq!(
+        cpu.perf_counters().translation_page_writes,
+        translation_page_writes_before,
+        "the warm-up write itself must not retire the ring -- if it does, this fixture is no          longer isolating PUSHF's own D-bit store"
+    );
 
     for offset in [0u32, 3, 4, 5, 6] {
         let linear = V86_BASE + offset;

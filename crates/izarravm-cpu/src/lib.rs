@@ -713,10 +713,21 @@ pub struct PerfCounters {
     /// Decode-cache invalidation diagnostics. `decode_inval_cs_load` counts CS LOADS (which no
     /// longer flush the decode cache: the D bit is in the hit condition and the fetch limit is
     /// re-checked per hit); `decode_inval_smc` counts SMC whole-cache flushes
-    /// (`note_code_write`); `decode_inval_other` counts everything else (paging/TLB flushes,
-    /// A20, device DMA writes, ISA-level changes, direct-map changes). Diagnoses an
+    /// (`note_code_write`); `decode_inval_other` counts the CONTROL-REGISTER/TLB-flush causes
+    /// (paging/TLB flushes, A20, device DMA writes, ISA-level changes, direct-map changes) --
+    /// specifically, every wholesale teardown reached through
+    /// `flush_tlb_and_code_caches`/`invalidate_translation_code_caches`. Diagnoses an
     /// invalidation storm: the Doom 586 census measured decode_hit pinned at 21% regardless of
     /// cache size by 326M per-CS-load whole-cache flushes.
+    ///
+    /// **NOT counted here** (review finding N2): the CR3 code-cache gate's translation-page
+    /// write watch (`core.rs`'s `range_hits_translation_page` arm) is a THIRD class of
+    /// wholesale decode teardown, reached from an ordinary guest or native STORE with no CR3
+    /// write, no TLB flush, and no `flush_tlb_and_code_caches` call anywhere on its path -- it
+    /// bumps `translation_page_writes` and `code_invalidations` only. A census that sums
+    /// `decode_inval_cs_load + decode_inval_smc + decode_inval_other` and expects the total to
+    /// equal every wholesale retire will silently under-count on any workload with page-table
+    /// writes. Use `translation_page_writes` for that population.
     pub decode_inval_cs_load: u64,
     pub decode_inval_smc: u64,
     pub decode_inval_other: u64,
@@ -785,7 +796,11 @@ pub struct PerfCounters {
     pub translation_pages_marked: u64,
     /// Code-cache invalidation events, including narrow self-modifying-code kills. This is the
     /// aggregate rate; the `decode_inval_*` and `smc_narrow_kills` counters retain the cause and
-    /// affected-line detail.
+    /// affected-line detail EXCEPT the translation-page write watch (review finding N2): that
+    /// arm bumps this counter and `translation_page_writes`, but no `decode_inval_*` field,
+    /// because it is reached directly from `code_write_watched`'s store path, not from
+    /// `flush_tlb_and_code_caches`. A `decode_inval_*` sum will therefore under-count this
+    /// aggregate whenever `translation_page_writes` is nonzero.
     pub code_invalidations: u64,
     /// Lines killed by the NARROW SMC path (a self-patch whose covering lines were
     /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
