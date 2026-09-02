@@ -2899,6 +2899,7 @@ fn reflected_call_diagnostic_json(
         "trips_total": snapshot.trips_total,
         "trips_unmatched": snapshot.trips_unmatched,
         "probe_ns_per_read": snapshot.probe_ns_per_read,
+        "compare_ns_per_read": snapshot.compare_ns_per_read,
         "window_start_insns": snapshot.window_start_insns,
         "window_end_insns": snapshot.window_end_insns,
         "keys": snapshot.keys.iter().map(|k| json!({
@@ -2965,6 +2966,7 @@ fn reflected_call_diagnostic_json(
             "translation_set_size": stat_json(&k.translation_set_size),
             "translation_set_size_windowed": stat_json(&k.translation_set_size_windowed),
             "translation_set_over_cap": k.translation_set_over_cap,
+            "stack_segments_over_cap_trips": k.stack_segments_over_cap_trips,
             "reads_total": k.reads_total,
             "reads_under_other_cr3": k.reads_under_other_cr3,
             "read_class_counts": k.read_class_counts.iter().map(|(name, n)| json!({

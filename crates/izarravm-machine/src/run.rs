@@ -1293,6 +1293,16 @@ impl Machine {
         // thread, so dropping it once here covers all of them
         // at the cost of one pull-scan per run call (~1 ms of guest time).
         self.invalidate_device_edge_cache();
+        // D5 (slice0b review §2, the reflected-call diagnostic's
+        // `on_batch_boundary` tag): persists ACROSS iterations of the loop
+        // below, so the batch-entry call each iteration can tell whether the
+        // PREVIOUS batch ended for a reason independent of the currently
+        // open trip's own instructions (`true`) or purely because that
+        // trip's own nested `IRET` just re-enabled IF (`false`, the
+        // `can_take_before` check below). `true` at the very first iteration
+        // is correct: there is no prior batch to blame here.
+        #[cfg(feature = "reflected-call-diagnostic")]
+        let mut reflected_call_batch_was_real_boundary = true;
         while self.timeline.now_ticks() < deadline_ticks {
             // Periodic sampling, gated on a sentinel that is `u64::MAX` when disarmed so this
             // costs one compare against an already-live value. See `fire_periodic_phase_mark`.
@@ -1418,7 +1428,14 @@ impl Machine {
             // diagnostic's currently open trip, if any and if armed. The
             // ONLY reason this diagnostic feature reaches the machine crate.
             #[cfg(feature = "reflected-call-diagnostic")]
-            izarravm_cpu::on_batch_boundary();
+            izarravm_cpu::on_batch_boundary(reflected_call_batch_was_real_boundary);
+            // Default the NEXT report to "real"; only the `can_take_before`
+            // IF-edge break below (this batch's own trip re-enabling IF) sets
+            // it false again before the next iteration's call above reads it.
+            #[cfg(feature = "reflected-call-diagnostic")]
+            {
+                reflected_call_batch_was_real_boundary = true;
+            }
             #[cfg(feature = "jit")]
             let poll_skip_enabled = self.poll_skip_enabled;
             // Read before the destructure below, the same way `poll_skip_enabled`
@@ -1742,6 +1759,15 @@ impl Machine {
                                     break;
                                 }
                                 if !can_take_before && cpu.can_take_interrupt() {
+                                    // D5: this break is the trip's OWN
+                                    // instructions re-enabling IF, not a
+                                    // cap/deadline/device reason -- the next
+                                    // `on_batch_boundary` call must NOT count
+                                    // toward `batch_straddle_trips`.
+                                    #[cfg(feature = "reflected-call-diagnostic")]
+                                    {
+                                        reflected_call_batch_was_real_boundary = false;
+                                    }
                                     break;
                                 }
                                 // A core-only fast exit avoids another loop when
