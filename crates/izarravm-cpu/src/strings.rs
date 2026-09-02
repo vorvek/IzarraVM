@@ -3,6 +3,73 @@
 
 use super::*;
 
+/// The loop-invariant half of `rep_chunk_limit`'s admission math, priced once before a REP's
+/// loop starts instead of on every fast chunk and every slow iteration. `per_iteration` and the
+/// paging setup cost are pure functions of the active mode's bus cost dials and of whether
+/// paging is on, and neither can change inside one REP: `bus.rs:1950-1956` documents that every
+/// JIT cost dial on `MachineBus` is a function of the active mode alone, a mode change is staged
+/// in `pending_mode` and applied only after the current batch, and paging cannot be toggled by
+/// the instruction that is currently repeating itself. `CpuBus::rep_data_byte_cost_upper` and
+/// `rep_page_walk_cost_upper` both carry that same "must not change within one instruction"
+/// promise in their own doc comments, so this holds for every implementor, not only the one it
+/// was checked against.
+///
+/// `self.rep_resume_active` is deliberately NOT folded in here: it is a `CpuGsw` field the
+/// resume machinery writes, and there is no equivalent proof that it is invariant across the
+/// loop, so `rep_chunk_limit` and `rep_budget_exhausted` keep reading it per call through
+/// `rep_core_upper`.
+///
+/// Two outcomes are NOT loop-invariant and must reach `rep_chunk_limit`'s caller exactly as they
+/// did before this hoist, so they are variants of the plan rather than fields inside it:
+/// - No REP budget active means UNLIMITED. `compute` checks this FIRST and returns `Unbounded`
+///   without touching the paging accessor at all, so a budget-less REP never pays for, or is
+///   gated by, a page-walk cost it does not need.
+/// - Paging enabled with `bus.rep_page_walk_cost_upper() == None` means YIELD (limit 0), and
+///   must reach the caller as `Some(0)`, not sit inside a plan field the budget-less path could
+///   observe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepLimitPlan {
+    /// No REP budget is active; `rep_chunk_limit` returns `None` (unlimited) before this is ever
+    /// inspected.
+    Unbounded,
+    /// Paging is on and the bus could not price a page walk; `rep_chunk_limit` returns
+    /// `Some(0)`, a yield, without reaching the divide.
+    Yield,
+    /// The two terms `rep_chunk_limit`'s divide needs, priced once for the whole REP.
+    Bounded {
+        per_iteration: u64,
+        paging_setup: u64,
+    },
+}
+
+impl RepLimitPlan {
+    fn compute<B: CpuBus>(cpu: &CpuGsw, bus: &B, op: StringOp, width: BusWidth) -> Self {
+        if cpu.rep_execution.budget.is_none() {
+            return Self::Unbounded;
+        }
+        let byte_cost = bus.rep_data_byte_cost_upper();
+        // A misaligned wide access may split into byte cycles. Use that larger cost as the
+        // admission bound even though the aligned bulk path normally charges one wide cycle.
+        let access_upper = byte_cost.saturating_mul(u64::from(width.bytes()));
+        let per_iteration = access_upper.saturating_mul(CpuGsw::rep_memory_accesses(op));
+        let paging_setup = if cpu.is_paging_enabled() {
+            let Some(walk_cost) = bus.rep_page_walk_cost_upper() else {
+                return Self::Yield;
+            };
+            let translations_per_operand = if width == BusWidth::Byte { 1 } else { 2 };
+            walk_cost
+                .saturating_mul(CpuGsw::rep_memory_accesses(op))
+                .saturating_mul(translations_per_operand)
+        } else {
+            0
+        };
+        Self::Bounded {
+            per_iteration,
+            paging_setup,
+        }
+    }
+}
+
 impl CpuGsw {
     const MAX_BUDGETED_REP_ITERATIONS: u32 = 4_096;
 
@@ -49,37 +116,62 @@ impl CpuGsw {
         }
     }
 
-    fn rep_chunk_limit<B: CpuBus>(&self, bus: &B, op: StringOp, width: BusWidth) -> Option<u32> {
+    /// `rep_core_clocks(op)` scaled by `level_timing(persona)`'s `(num, den)` and rounded up,
+    /// same expression `scale_clocks` (`core.rs:1122`) already measured and fixed: the generic
+    /// form with a runtime `den` emitted a hardware `div` on every call, where a `match` over the
+    /// persona gives the compiler a compile-time divisor and strength-reduces it to a
+    /// magic-multiplier multiply-shift. The arms carry `level_timing`'s literals verbatim,
+    /// `(2, 5)` and `(1, 12)`, and `rep_core_clocks_test_identity` below pins that substitution
+    /// exact for every op, persona and `rep_resume_active` state `rep_chunk_limit` and
+    /// `rep_budget_exhausted` can reach. `rep_resume_active` collapses this to 0 regardless of
+    /// persona, checked BEFORE the match so neither arm has to encode it.
+    fn rep_core_upper(&self, op: StringOp) -> u64 {
+        if self.rep_resume_active {
+            return 0;
+        }
+        let raw = u64::from(Self::rep_core_clocks(op));
+        match self.persona() {
+            CpuPersona::I386 => raw.saturating_mul(2).saturating_add(4) / 5,
+            CpuPersona::I486 | CpuPersona::I586 => raw.saturating_add(11) / 12,
+        }
+    }
+
+    fn rep_chunk_limit<B: CpuBus>(
+        &self,
+        plan: RepLimitPlan,
+        bus: &B,
+        op: StringOp,
+        width: BusWidth,
+    ) -> Option<u32> {
         let budget = self.rep_execution.budget?;
+        debug_assert_eq!(
+            plan,
+            RepLimitPlan::compute(self, bus, op, width),
+            "REP limit plan went stale mid-loop: a bus cost dial or the paging mode moved \
+             inside one REP, which rep_data_byte_cost_upper's and rep_page_walk_cost_upper's \
+             doc comments both say must not happen"
+        );
+        let (per_iteration, paging_setup) = match plan {
+            RepLimitPlan::Unbounded => {
+                // budget is Some here (the `?` above would have returned), so a plan computed
+                // as Unbounded (which only happens when budget is None) cannot reach this arm
+                // unless budget flipped mid-loop, which run_string's single pre-loop compute
+                // and CpuGsw's own write sites (run.rs:408, :410 -- set before, cleared after,
+                // never inside) both rule out. Fail closed rather than divide by a bound that
+                // was never priced.
+                return Some(0);
+            }
+            RepLimitPlan::Yield => return Some(0),
+            RepLimitPlan::Bounded {
+                per_iteration,
+                paging_setup,
+            } => (per_iteration, paging_setup),
+        };
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
         let used = self.core_clocks_so_far.saturating_add(bus_growth);
-        let (num, den) = level_timing(self.persona());
-        let core_upper = if self.rep_resume_active {
-            0
-        } else {
-            u64::from(Self::rep_core_clocks(op))
-                .saturating_mul(u64::from(num))
-                .saturating_add(u64::from(den) - 1)
-                / u64::from(den)
-        };
-        let byte_cost = bus.rep_data_byte_cost_upper();
-        // A misaligned wide access may split into byte cycles. Use that larger cost as the
-        // admission bound even though the aligned bulk path normally charges one wide cycle.
-        let access_upper = byte_cost.saturating_mul(u64::from(width.bytes()));
-        let per_iteration = access_upper.saturating_mul(Self::rep_memory_accesses(op));
-        let paging_setup = if self.is_paging_enabled() {
-            let Some(walk_cost) = bus.rep_page_walk_cost_upper() else {
-                return Some(0);
-            };
-            let translations_per_operand = if width == BusWidth::Byte { 1 } else { 2 };
-            walk_cost
-                .saturating_mul(Self::rep_memory_accesses(op))
-                .saturating_mul(translations_per_operand)
-        } else {
-            0
-        };
+        let core_upper = self.rep_core_upper(op);
         let available = budget
             .cap
             .saturating_sub(used)
@@ -99,15 +191,7 @@ impl CpuGsw {
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
-        let (num, den) = level_timing(self.persona());
-        let core_upper = if self.rep_resume_active {
-            0
-        } else {
-            u64::from(Self::rep_core_clocks(op))
-                .saturating_mul(u64::from(num))
-                .saturating_add(u64::from(den) - 1)
-                / u64::from(den)
-        };
+        let core_upper = self.rep_core_upper(op);
         self.core_clocks_so_far
             .saturating_add(bus_growth)
             .saturating_add(core_upper)
@@ -661,7 +745,10 @@ impl CpuGsw {
             None => self.string_step(bus, op, width, prefixes, address_size)?,
             Some(kind) => {
                 let mut chunk_iterations = 0u32;
-                let mut allowance = self.rep_chunk_limit(bus, op, width);
+                // Priced once for the whole REP: see RepLimitPlan's doc for why per_iteration
+                // and the paging setup cost cannot change across this loop's iterations.
+                let plan = RepLimitPlan::compute(self, bus, op, width);
+                let mut allowance = self.rep_chunk_limit(plan, bus, op, width);
                 loop {
                     if self.string_count(address_size) == 0 {
                         break;
@@ -701,7 +788,7 @@ impl CpuGsw {
                         if fast.stop {
                             break;
                         }
-                        if let Some(refreshed) = self.rep_chunk_limit(bus, op, width) {
+                        if let Some(refreshed) = self.rep_chunk_limit(plan, bus, op, width) {
                             allowance = Some(
                                 allowance.map_or(refreshed, |available| available.min(refreshed)),
                             );
@@ -737,7 +824,7 @@ impl CpuGsw {
                             break;
                         }
                     }
-                    if let Some(refreshed) = self.rep_chunk_limit(bus, op, width) {
+                    if let Some(refreshed) = self.rep_chunk_limit(plan, bus, op, width) {
                         allowance =
                             Some(allowance.map_or(refreshed, |available| available.min(refreshed)));
                     }
@@ -776,3 +863,7 @@ impl CpuGsw {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "strings_test.rs"]
+mod tests;

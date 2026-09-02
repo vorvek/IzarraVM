@@ -477,6 +477,26 @@ fn paged_rep_without_a_walk_bound_advances_once_per_resumed_batch() {
     }
 }
 
+/// Code-smell batch 2, S2's `RepLimitPlan` hoist must keep "the bus could not price a page walk"
+/// a YIELD outcome, distinct from "the page walk is known to cost zero". The test above pins
+/// that with a cap of 1, which is tight enough that `available` saturates to 0 whether or not
+/// the paging term is folded in, so it cannot by itself tell the two outcomes apart -- a hoist
+/// that silently substituted a zero-cost walk for the unpriced one would still pass it. This
+/// gives the yield a budget generous enough to complete the whole REP in one call if the unpriced
+/// walk were ever treated as free, so the two outcomes diverge observably.
+#[test]
+fn paged_rep_without_a_walk_bound_yields_even_with_budget_to_spare() {
+    let (mut cpu, mut bus) = budgeted_paged_rep_fixture();
+    bus.page_walk_bound_available = false;
+
+    cpu.run_budgeted(&mut bus, 1_000_000).unwrap();
+    assert_eq!(
+        cpu.registers.ecx(),
+        BUDGETED_PAGED_REP_COUNT,
+        "an unpriced page walk must force a yield before any progress, not be treated as free"
+    );
+}
+
 #[test]
 fn paged_rep_movsb_bulk_translates_each_page_once_and_keeps_noncontiguous_frames() {
     const PAGE_DIRECTORY: usize = 0x1000;

@@ -1265,6 +1265,12 @@ pub trait CpuBus {
     /// Conservative guest-clock cost for one byte of string data. Budgeted REP uses this before a
     /// chunk; buses with tiered or scaled timing override it so a cold cache or device window cannot
     /// cross an event.
+    ///
+    /// MUST NOT CHANGE WITHIN ONE INSTRUCTION: `run_string`'s `RepLimitPlan` prices the whole REP
+    /// loop from a single call made before the loop starts, on the strength of this. An override
+    /// that varies its answer per access silently moves the yield boundary the loop-invariant hoist
+    /// computed, and does so only in release builds, where the hoist's `debug_assert_eq!` staleness
+    /// check is compiled out.
     fn rep_data_byte_cost_upper(&self) -> u64 {
         self.jit_data_cost_clocks(BusWidth::Byte)
             .max(self.jit_mode13_data_cost_clocks(BusWidth::Byte))
@@ -1273,6 +1279,8 @@ pub trait CpuBus {
     /// Return a scaled-clock upper bound for one successful cold page translation, including
     /// PDE and PTE reads plus their possible accessed/dirty writes. `None` makes a budgeted paged
     /// REP yield before initial progress; a resumed instruction may still advance one iteration.
+    ///
+    /// MUST NOT CHANGE WITHIN ONE INSTRUCTION, for the same reason as `rep_data_byte_cost_upper`.
     fn rep_page_walk_cost_upper(&self) -> Option<u64> {
         None
     }
