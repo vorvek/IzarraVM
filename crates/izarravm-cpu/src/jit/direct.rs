@@ -3395,6 +3395,23 @@ impl BlockCache {
             .and_then(|index| self.blocks.get(index).copied())
     }
 
+    /// The entry pointer for a block id, re-resolved through the same generational lookup
+    /// `block()` uses. Arena compaction can relocate code while a caller holds a copied
+    /// descriptor, so this resolve sits below every refusal and before the transmute into a
+    /// callable entry -- it is not the LAST safe point (a `&mut jit_direct` counter bump runs
+    /// after it at the caller), only the last one that reads block identity. It returns the ONE
+    /// field that resolve exists for rather than another 120-byte copy of a struct whose other
+    /// 112 bytes go unused at the call site.
+    ///
+    /// Returns `*const u8`, not `usize`: the caller transmutes this straight into a function
+    /// pointer, and losing provenance through an integer round trip would make that transmute
+    /// strictly worse than the pointer-to-pointer one it replaces.
+    pub(crate) fn entry_ptr_for(&self, id: BlockId) -> Option<*const u8> {
+        self.active_index(id)
+            .and_then(|index| self.blocks.get(index))
+            .map(CompiledBlock::entry_ptr)
+    }
+
     /// Why a static successor cell is still unbound, asked at the exit that hit it.
     ///
     /// Diagnostic only, and gated at the call site on the barrier census. Two successive audit
@@ -38188,7 +38205,7 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("fetch_limit", 2976),
     ("entry_deferred_short", 2990),
     ("zero_budget", 3098),
-    ("block_regenerated_none", 3134),
+    ("block_regenerated_none", 3137),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
