@@ -383,16 +383,6 @@ fn execution_backend_requires_avx2_only_for_native_builds() {
     );
 }
 
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-#[test]
-#[allow(clippy::assertions_on_constants)]
-fn windows_build_keeps_avx2_runtime_detectable() {
-    assert!(
-        !cfg!(target_feature = "avx2"),
-        "the portable host binary must not enable AVX2 at compile time"
-    );
-}
-
 #[test]
 fn cli_accepts_hdd_folder_profile_json_output() {
     let cli = Cli::try_parse_from([
