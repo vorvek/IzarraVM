@@ -34,6 +34,12 @@ use std::sync::{
 pub(crate) struct LinkTarget {
     pub(crate) linear: u32,
     pub(crate) mode_key: u32,
+    /// The CR3 ring slot (0 or 1, see `BlockCache::link_slot`) this rendezvous belongs to.
+    /// Named `context`, not `slot`, because `slot` already means the per-block link-CELL index
+    /// (0 or 1) everywhere else in this module (`LinkSource::slot`, `unlink_outbound`'s
+    /// `slot` parameter, `outbound[index][slot]`); reusing the name for a different partition
+    /// would collide the two meanings in the same file.
+    pub(crate) context: u8,
 }
 
 /// A published jump target: the address of whatever landing record a resolved link should

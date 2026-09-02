@@ -1904,7 +1904,7 @@ impl CpuGsw {
             self.control.cr3 = self.read_system_linear_u32(bus, base + 28)?;
             // The incoming task reloads CR3, so its page mappings replace the old
             // task's: drop the previous task's cached translations.
-            self.flush_tlb_and_code_caches();
+            self.flush_tlb_and_code_caches(TranslationFlushReason::TaskSwitch);
         }
         // The LDTR is loaded first so segment loads that reference the LDT resolve.
         let ldtr = self.read_system_linear(bus, base + 96, BusWidth::Word)? as u16;

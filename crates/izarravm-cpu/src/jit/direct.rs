@@ -1256,7 +1256,26 @@ pub(crate) struct BlockCache {
     block_decode_slots: Vec<Vec<u32>>,
     decode_slot_mask: usize,
     block_link_epochs: Vec<u64>,
-    link_epoch: u64,
+    /// One epoch series per CR3 ring slot (see `lib.rs`'s `select_context`/`ContextSelect`).
+    /// `block_link_epochs[i] == link_epochs[link_slot]` is the "visible under the LIVE context"
+    /// test `is_link_visible` reads; `block_link_epochs[i] == link_epochs[1 - link_slot]` is the
+    /// "visible under the OTHER, currently-parked context" case `make_link_visible`'s L3 arm
+    /// must catch and clear before rebinding (design doc `2026-09-02-cr3-jit-half-design.md`
+    /// (b), L1/L3).
+    link_epochs: [u64; 2],
+    /// The live index into `link_epochs`, 0 or 1. Seeded to 0 (design doc J7): `select_context`
+    /// already seeds ring slot 0 with the pre-existing context on its first call, so the graph
+    /// built before any `MOV CR3` belongs there, and `link_epochs[0]` inherits the pre-slice
+    /// initial epoch of 1 for the same reason.
+    link_slot: u8,
+    /// The SOLE source of fresh epoch values (design doc J2). Minting `link_epochs[0]` and
+    /// `link_epochs[1]` independently off two counters (or bumping both of one scalar) can
+    /// alias two DIFFERENT contexts onto the SAME epoch value, which `make_link_visible`'s
+    /// same-epoch fast path cannot tell apart from a genuine re-select. Every mint -- R2's
+    /// `allocate_link_context` and a wholesale `invalidate_translation` re-mint of both slots --
+    /// draws its next value from here and none is ever reused. Wraps to 1 with both epoch slots
+    /// zeroed, mirroring the pre-slice wrap arm.
+    next_link_epoch: u64,
     block_active: Vec<bool>,
     /// Memoised `global_block_upper`, the chain-quota divisor, indexed by `has_x87`. 0 is unset
     /// and cannot collide with a real value, which is at least 1 on every bus. Its inputs are the
@@ -1450,7 +1469,19 @@ impl BlockCache {
             block_decode_slots: Vec::new(),
             decode_slot_mask: decode_slot_count - 1,
             block_link_epochs: Vec::new(),
-            link_epoch: 1,
+            // [1, 2], NOT [1, 0] (review finding N1): 0 is the unstamped-block sentinel
+            // (`block_link_epochs.push(0)` on install, the reset on retire, the wrap fill),
+            // and slot 1's epoch must never equal it. A virgin cache's first `MOV CR3` to a
+            // second directory takes R2 (`select_link_context`, no `allocate_link_context`
+            // call -- see its own doc comment), so slot 1's epoch is whatever this seed left
+            // it at; `[1, 0]` would make `link_epoch()` read 0 under that context, and
+            // `make_link_visible` would take its same-epoch fast path for every UNSTAMPED
+            // block, republishing without ever inserting into `linear_blocks` -- a silent
+            // loss of the whole JIT-half win for that context, with no cross-context
+            // corruption to make a test notice.
+            link_epochs: [1, 2],
+            link_slot: 0,
+            next_link_epoch: 3,
             block_active: Vec::new(),
             free_block_slots: Vec::new(),
             next_block_generation: 1,
@@ -2837,11 +2868,55 @@ impl BlockCache {
         self.linear_blocks.clear();
         self.stats.unlinks += links;
         self.stalls.links_cleared[LinkClearCause::Flushed as usize] += links;
-        self.link_epoch = self.link_epoch.wrapping_add(1);
-        if self.link_epoch == 0 {
+        // Both slots re-mint from the SAME monotonic counter (design doc J2), never by bumping
+        // each slot's own scalar independently: two independent bumps can alias slot 0's new
+        // epoch onto slot 1's, and `make_link_visible`'s same-epoch fast path cannot tell that
+        // apart from a genuine re-select of the block's own context.
+        self.link_epochs[0] = self.mint_link_epoch();
+        self.link_epochs[1] = self.mint_link_epoch();
+    }
+
+    /// The sole source of fresh link-epoch values (design doc J2): every mint, whether a
+    /// wholesale `invalidate_translation` re-mint of both ring slots or R2's
+    /// `allocate_link_context` minting one, draws its next value from here, and no value is ever
+    /// reused. On a `u64` wrap, every block's stamp is invalidated together with the counter
+    /// restart, mirroring the pre-slice single-scalar wrap arm.
+    fn mint_link_epoch(&mut self) -> u64 {
+        if self.next_link_epoch == 0 {
             self.block_link_epochs.fill(0);
-            self.link_epoch = 1;
+            self.next_link_epoch = 1;
         }
+        let epoch = self.next_link_epoch;
+        self.next_link_epoch = self.next_link_epoch.wrapping_add(1);
+        epoch
+    }
+
+    /// The link epoch live under the CURRENT CR3 ring slot. Read through this accessor, never
+    /// `link_epochs[link_slot]` inline, so every call site keeps working unchanged if the slot
+    /// count ever needs to grow past two.
+    fn link_epoch(&self) -> u64 {
+        self.link_epochs[usize::from(self.link_slot)]
+    }
+
+    /// R1: reselect a ring slot the cache was already told is occupied. Restores that context's
+    /// epoch with no other work -- every block previously made link-visible under it is visible
+    /// again for free, because the epoch comparison IS the restore. Never re-checks a link at
+    /// this point; the whole argument for that is design doc (b) L1-L4.
+    pub(crate) fn select_link_context(&mut self, slot: u8) {
+        debug_assert!(
+            usize::from(slot) < self.link_epochs.len(),
+            "select_link_context given a slot this cache was not told is occupied"
+        );
+        self.link_slot = slot;
+    }
+
+    /// R2: a CR3 write allocated a fresh directory slot. Mint that slot's epoch anew, which
+    /// invalidates nothing on its own, because nothing is stamped with a value this call has not
+    /// yet minted.
+    pub(crate) fn allocate_link_context(&mut self, slot: u8) {
+        let epoch = self.mint_link_epoch();
+        self.link_epochs[usize::from(slot)] = epoch;
+        self.link_slot = slot;
     }
 
     /// Hide every block that depends on one displaced decode slot. Logical links stay intact and
@@ -2863,7 +2938,19 @@ impl BlockCache {
             if !self.block_portals[index].visible() {
                 continue;
             }
-            debug_assert_eq!(self.block_link_epochs[index], self.link_epoch);
+            // Under the pre-slice single epoch this held against `self.link_epoch` exactly,
+            // because a global bump on every CR3 write meant no visible portal could outlive its
+            // epoch. Under L1 a block made visible under ring slot A keeps its published portal
+            // while slot B is live, so the invariant this assert states is "the stamp equals ONE
+            // OF THE TWO live `link_epochs`", not "equals the live one" -- design doc J1. Hiding
+            // a portal stamped for the OTHER slot is still conservative and correct
+            // (`is_link_visible` requires both the epoch match against the LIVE slot AND the
+            // portal), so only the assert's statement changes, not the code path.
+            debug_assert!(
+                self.block_link_epochs[index] == self.link_epochs[0]
+                    || self.block_link_epochs[index] == self.link_epochs[1],
+                "visible portal's link epoch is neither of the two live ring contexts"
+            );
             self.block_portals[index].clear();
             hidden += 1;
         }
@@ -2873,7 +2960,8 @@ impl BlockCache {
 
     pub(crate) fn is_link_visible(&self, id: BlockId) -> bool {
         self.active_index(id).is_some_and(|index| {
-            self.block_link_epochs[index] == self.link_epoch && self.block_portals[index].visible()
+            self.block_link_epochs[index] == self.link_epoch()
+                && self.block_portals[index].visible()
         })
     }
 
@@ -7907,6 +7995,12 @@ fn compile_with_budget(
     let Some(key) = key_for(cpu, entry_lin, d) else {
         return CompileOutcome::Retry(RetryCause::NoKey);
     };
+    // The ring slot live AT COMPILE TIME, baked into every successor `LinkTarget` below. A
+    // successor is resolved later, at `make_link_visible` time, against `linear_blocks` /
+    // `waiting`, which are partitioned by this same field (design doc
+    // `2026-09-02-cr3-jit-half-design.md` (b) L2); stamping the compile-time slot here is what
+    // keeps that partition correct without a second read at resolve time.
+    let link_slot = cpu.jit_direct.direct.link_slot;
     // B.3: "a compile walk started here", recorded before anything can refuse the block, so a walk
     // that stops on its first slot still counts as tried. `key.linear()` and not `entry_lin` on
     // purpose -- `classify_unbound_exit` reports the same canonicalized value, and the whole point
@@ -9156,6 +9250,7 @@ fn compile_with_budget(
     let fallthrough = LinkTarget {
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
+        context: link_slot,
     };
     // A block that overwrites a segment register publishes NO successors, static or dynamic.
     //
@@ -9304,6 +9399,7 @@ fn compile_with_budget(
                 Some(LinkTarget {
                     linear: entry_lin.wrapping_add(taken_delta),
                     mode_key: key.mode_key,
+                    context: link_slot,
                 }),
             ],
             successor_mask: [true, !self_loop],
@@ -9318,6 +9414,7 @@ fn compile_with_budget(
                 Some(LinkTarget {
                     linear: entry_lin.wrapping_add(target_delta),
                     mode_key: key.mode_key,
+                    context: link_slot,
                 }),
                 None,
             ],
@@ -9384,6 +9481,7 @@ fn compile_with_budget(
             (!self_loop).then_some(LinkTarget {
                 linear: entry_lin.wrapping_add(taken_delta),
                 mode_key: key.mode_key,
+                context: link_slot,
             }),
         ],
         Some(
@@ -9394,6 +9492,7 @@ fn compile_with_budget(
             Some(LinkTarget {
                 linear: entry_lin.wrapping_add(target_delta),
                 mode_key: key.mode_key,
+                context: link_slot,
             }),
             None,
         ],
@@ -31919,9 +32018,15 @@ impl BlockCache {
         // if-chain preserves, and it is load-bearing twice over: a stale index's layout entry is
         // not meaningful, and the epoch arm is a high-frequency refusal that must not start paying
         // for a six-segment merge it never consults.
+        // The SECOND barrier the L2 key partition stands behind (design doc J3, and (b)'s L4
+        // induction should be read with this cite): compared against the LIVE slot's epoch only,
+        // via `link_epoch()`, so a source or target stamped under the OTHER context's series
+        // refuses here even if `LinkTarget`'s `context` field were somehow dropped from a map
+        // key. `bind_dynamic_successor`'s two tails both fall through to this same function, so
+        // the barrier is not specific to the static-successor or `waiting`-resolution paths.
         let stale_epoch = self.block_link_epochs.get(source_index).copied()
-            != Some(self.link_epoch)
-            || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch);
+            != Some(self.link_epoch())
+            || self.block_link_epochs.get(target_index).copied() != Some(self.link_epoch());
         // A FAR source merges through `far_merge` instead: its snapshot holds the PRE-RETF CS
         // and the target's holds the POST-RETF one, so `link_merge`'s plain `cs` compare refuses
         // every far edge. `far_merge` replaces that compare with INV-FAR-CS, which is a refusal on
@@ -32130,12 +32235,19 @@ impl BlockCache {
         #[cfg(feature = "smc-census")]
         let mut census_reparked = 0u64;
         self.remove_waiting_sources(id);
-        let target_key = LinkTarget {
-            linear: self.blocks[index].span.key.linear,
-            mode_key: self.blocks[index].span.key.mode_key,
-        };
-        if self.linear_blocks.get(&target_key) == Some(&id) {
-            self.linear_blocks.remove(&target_key);
+        // A retiring block does not know which ring context it was made link-visible under (no
+        // per-block record of it is kept, by design), so remove it from BOTH contexts' rendezvous
+        // maps. The `== Some(&id)` test already guards against removing a different block's live
+        // entry, so this is sound with no new bookkeeping.
+        for context in 0..2u8 {
+            let target_key = LinkTarget {
+                linear: self.blocks[index].span.key.linear,
+                mode_key: self.blocks[index].span.key.mode_key,
+                context,
+            };
+            if self.linear_blocks.get(&target_key) == Some(&id) {
+                self.linear_blocks.remove(&target_key);
+            }
         }
         if let Some(inbound) = self.inbound.remove(&id) {
             for link in inbound {
@@ -32363,18 +32475,34 @@ impl BlockCache {
         let Some(index) = self.active_index(id) else {
             return;
         };
-        if self.block_link_epochs.get(index).copied() == Some(self.link_epoch) {
+        if self.block_link_epochs.get(index).copied() == Some(self.link_epoch()) {
             if !self.block_portals[index].visible() {
                 self.publish_portal(index);
             }
             return;
         }
+        // L3 (design doc (b)): a block whose stamped epoch belongs to the OTHER slot's live
+        // series is still LINKED under that context -- no wholesale retire has happened, so its
+        // outbound cells were never torn down. Left alone, a cell armed under the other context
+        // is a direct jump inside the arena that bypasses every key check this partition relies
+        // on (FS1/FS2). Clear both of this block's outbound cells BEFORE this context's
+        // admission below can insert it into `linear_blocks` and resolve successors against it,
+        // so no stale cross-context edge survives the rebind.
+        let other_slot = 1 - self.link_slot;
+        if self.block_link_epochs.get(index).copied()
+            == Some(self.link_epochs[usize::from(other_slot)])
+        {
+            self.unlink_outbound(id, 0, LinkClearCause::ContextRebind);
+            self.unlink_outbound(id, 1, LinkClearCause::ContextRebind);
+            self.stalls.link_context_rebinds += 1;
+        }
         self.block_portals[index].clear();
-        self.block_link_epochs[index] = self.link_epoch;
+        self.block_link_epochs[index] = self.link_epoch();
         let span = self.blocks[index].span;
         let target = LinkTarget {
             linear: span.key.linear,
             mode_key: span.key.mode_key,
+            context: self.link_slot,
         };
         self.linear_blocks.insert(target, id);
         self.resolve_successors(id);
@@ -32416,6 +32544,7 @@ impl BlockCache {
         let target_key = LinkTarget {
             linear: target_linear,
             mode_key,
+            context: self.link_slot,
         };
         let Some(target) = self.linear_blocks.get(&target_key).copied() else {
             return false;
@@ -34432,6 +34561,16 @@ pub(crate) struct DirectStallTally {
     pub poll_skip_raw_bus_clocks: u64,
     pub poll_skip_max_span: u64,
     pub poll_skip_last_head: u32,
+    /// `make_link_visible`'s L3 arm firing (design doc `2026-09-02-cr3-jit-half-design.md` (b)):
+    /// a block visible under one ring slot is re-touched under the other and its outbound cells
+    /// are cleared before rebinding. Near zero on the Tyrian dwell says the slot and `mode_key`
+    /// partitions align on that workload; a large value is a decayed win, not a correctness bug.
+    pub link_context_rebinds: u64,
+    // `waiting` and `linear_blocks` residency (advisory J5) are GAUGES, not running totals -- the
+    // map's live size read at `stall_snapshot` time, not a tally incremented anywhere -- so they
+    // are computed directly there (`DirectStallSnapshot::link_waiting_entries` /
+    // `link_linear_blocks_entries`) and have no field here, the same shape `demoted_callout_sites`
+    // already uses for the identical reason.
 }
 
 /// The four terminal states a non-structural compile failure can land in. Threaded from the three
@@ -34782,6 +34921,7 @@ fn link_clear_bucket_label(cause: LinkClearCause) -> &'static str {
         LinkClearCause::Reset => "cleared_reset",
         LinkClearCause::ChainWiden => "cleared_chain_widen",
         LinkClearCause::DataSegmentDecline => "cleared_data_segment_decline",
+        LinkClearCause::ContextRebind => "cleared_context_rebind",
     }
 }
 
@@ -35058,10 +35198,17 @@ pub(crate) enum LinkClearCause {
     /// re-parked in `waiting`. Reads ZERO on every arm but
     /// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=on`.
     DataSegmentDecline,
+    /// `make_link_visible`'s L3 arm (design doc `2026-09-02-cr3-jit-half-design.md` (b)): a block
+    /// whose stamped link epoch belongs to the OTHER ring slot's live series is still linked
+    /// under that context, and its outbound cells are cleared before this context's admission can
+    /// rebind them. Deliberately split from `Flushed`, which Bar C's identity requires to move
+    /// ONLY on a wholesale retire (the `Taken` arm) -- a rebind is neither a CR3 flush nor a
+    /// retire, and folding it into `Flushed` would make that identity untestable.
+    ContextRebind,
 }
 
 impl LinkClearCause {
-    pub(crate) const COUNT: usize = 6;
+    pub(crate) const COUNT: usize = 7;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Replaced,
         Self::Retired,
@@ -35069,6 +35216,7 @@ impl LinkClearCause {
         Self::Reset,
         Self::ChainWiden,
         Self::DataSegmentDecline,
+        Self::ContextRebind,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -35079,6 +35227,7 @@ impl LinkClearCause {
             Self::Reset => "reset",
             Self::ChainWiden => "chain_widen",
             Self::DataSegmentDecline => "data_segment_decline",
+            Self::ContextRebind => "context_rebind",
         }
     }
 }
@@ -36186,6 +36335,12 @@ impl crate::jit::JitState {
             poll_skip_raw_bus_clocks: self.stalls.poll_skip_raw_bus_clocks,
             poll_skip_max_span: self.stalls.poll_skip_max_span,
             poll_skip_last_head: self.stalls.poll_skip_last_head,
+            link_context_rebinds: self.stalls.link_context_rebinds,
+            // GAUGEs, the same shape as `demoted_callout_sites` above: read the map's live size
+            // rather than a running total, because both maps lost their per-CR3-write reaper
+            // (design doc advisory J5) and are now bounded only by block death.
+            link_waiting_entries: self.waiting.values().map(|v| v.len() as u64).sum(),
+            link_linear_blocks_entries: self.linear_blocks.len() as u64,
         }
     }
 
@@ -36483,6 +36638,7 @@ impl crate::jit::JitState {
         let fallthrough = LinkTarget {
             linear: span.key.linear.wrapping_add(u32::from(span.guest_len)),
             mode_key: span.key.mode_key,
+            context: self.link_slot,
         };
         match self
             .linear_blocks

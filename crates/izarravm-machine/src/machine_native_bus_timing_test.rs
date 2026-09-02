@@ -2172,9 +2172,24 @@ fn paged_memory_poll_declines_on_a_not_present_page_without_perturbation() {
         cpu.poll_skip_backedge_housekeeping();
     });
     machine.cpu.reset_perf_counters();
-    // Not vacuous: the shape still classifies at the head; only the R2 probe
-    // (TLB miss for the cell's page) declines the executor.
-    assert!(machine.cpu.poll_loop().is_some());
+    // **Updated for the CR3 code-cache gate**
+    // (`dev_docs/2026-09-02-cr3-code-cache-gate-design.md`). This row used to prove the R2 probe
+    // (TLB miss) was the SOLE reason the executor declines, by first showing the head's structural
+    // classification was untouched by clearing `cell_pte`. That is no longer true, correctly: the
+    // gate's write watch now treats the `cell_pte` store as the live page-table edit it is (it
+    // shares `PAGED_PT`'s physical page with the head's own PTE, and `PAGED_PT` is exactly the
+    // structure `translate_linear_checked` marked while warming the poll loop), so it retires the
+    // whole ring -- `code_pages`/`code_bytes` included, which is what `poll_head_possible`'s
+    // prefilter reads. Re-decoding the head to restore the mark is not available cross-crate
+    // (`fetch_decoded` is crate-private) and re-EXECUTING it would read the now-not-present cell
+    // and triple-fault, so the row can no longer isolate the R2 probe this way. What still holds,
+    // and is asserted below exactly as before: the R2-declined `attempt_poll_skip` call touches
+    // NOTHING (CR2, elapsed clocks, trace clocks, the timing remainder and the PTE bytes), which
+    // is the row's actual "without perturbation" claim.
+    assert!(
+        machine.cpu.poll_loop().is_none(),
+        "the PTE clear is a genuine page-table edit and must retire the ring's structural marks"
+    );
 
     const CR2_SENTINEL: u32 = 0xdead_0000;
     machine.cpu.control.cr2 = CR2_SENTINEL;

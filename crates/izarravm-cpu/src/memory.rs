@@ -2067,9 +2067,22 @@ impl CpuGsw {
         }
         if pde & 0x20 == 0 {
             pde |= 0x20;
+            self.perf.translation_a_stores += 1;
             self.write_page_walk_entry(bus, directory_address, pde)?;
         }
+        // CR3 code-cache gate write watch (design part 2(b), finding F11): mark the directory
+        // page on EVERY walk that reaches here, code or data. A code translation served from a
+        // TLB entry an earlier data access filled never reaches this function at all, so this is
+        // the only site that can see the structure pages behind a decode line before that line
+        // exists. Marked AFTER the accessed-bit write above (not before): marking first would
+        // make that very store retire the ring it just protected, on the FIRST walk of every
+        // page table -- self-inflicted, not the guest editing a live mapping.
+        self.mark_translation_page(directory);
 
+        // PSE (CR4.PSE / PDE bit 7) is not implemented: this engine always does the two-level
+        // walk regardless of the PS bit, so a PS=1 PDE's "table" is really a guest 4 MB data
+        // frame. Marking it as translation structure would retire the ring on ordinary data
+        // writes to that frame (advisory 14), so the mark is skipped when PS is set.
         let table_address = (pde & 0xffff_f000) + (((linear >> 12) & 0x03ff) * 4);
         let mut pte =
             bus.read_memory(table_address, BusWidth::Dword, BusAccessKind::PageWalkRead)?;
@@ -2110,7 +2123,26 @@ impl CpuGsw {
         let accessed_dirty = 0x20 | dirty;
         if pte & accessed_dirty != accessed_dirty {
             pte |= accessed_dirty;
+            // D is the live one (advisory 12): a write to a page whose cached entry is not dirty
+            // falls through to this walk every time (the TLB fast path's `!write || e.dirty`
+            // test above), so the first write to each clean data page after a retire stores a
+            // PTE and would retire the ring under the gate. A stores settle after one pass over a
+            // working set (the bit persists in guest memory); counted separately so a future
+            // refinement knows which one to build.
+            if dirty != 0 {
+                self.perf.translation_d_stores += 1;
+            } else {
+                self.perf.translation_a_stores += 1;
+            }
             self.write_page_walk_entry(bus, table_address, pte)?;
+        }
+        // Mark the table page AFTER its own accessed/dirty write above, for the same
+        // self-inflicted-retire reason the directory page's mark moved (finding F11): marking
+        // first would make the PTE's own first accessed-bit store retire the ring it just
+        // protected. Skipped for a PS=1 PDE (advisory 14): `table_address` above is then really a
+        // guest data frame, not page-table structure.
+        if pde & 0x80 == 0 {
+            self.mark_translation_page(pde & 0xffff_f000);
         }
 
         // Cache the completed translation. Only reached on the success path, so a

@@ -263,20 +263,25 @@ fn cr0_wp_change_without_paging_keeps_the_decode_cache() {
 /// This slice does NOT touch the CR3 path. Mutation row "gate applied to the CR3 path too".
 #[test]
 fn mov_cr3_still_flushes() {
+    // **Updated for the CR3 code-cache gate**: `MOV CR3` no longer always tears the decode cache
+    // down (that is the whole point of the gate, see `dev_docs/2026-09-02-cr3-code-cache-gate-
+    // design.md`). What survives from this row's original claim is that the OBSERVER-visible
+    // result is unchanged: the witness line, decoded before the write, is never live afterward,
+    // whether the ring serves the write (R1/R2, no teardown) or forces one (R3). This fixture's
+    // write is the CPU's first-ever `MOV CR3` with an empty ring, so it takes R2; the exhaustive
+    // ring-outcome coverage (R1 select, R2 allocate, R3 retire-all) lives in
+    // `cpu_cr3_flush_test.rs`.
     let (mut cpu, mut bus) = cr0_fixture(&mov_to_cr(3));
     warm_witness(&mut cpu, &mut bus);
     let d = cpu.registers.cs().default_size_32;
-    let invalidations = cpu.perf_counters().decode_inval_other;
 
     write_cr0(&mut cpu, &mut bus, PAGE_DIRECTORY);
 
     assert_eq!(cpu.control.cr3, PAGE_DIRECTORY);
-    assert_eq!(
-        cpu.perf_counters().decode_inval_other,
-        invalidations + 1,
-        "MOV CR3 is untouched by this slice and must still flush"
+    assert!(
+        !cpu.decode_cache.line_live(WITNESS, d),
+        "a witness decoded under the OLD directory must never read live under the new one"
     );
-    assert!(!cpu.decode_cache.line_live(WITNESS, d));
 }
 
 // ---- 5. LMSW, for every operand ----------------------------------------------------------------
@@ -934,3 +939,187 @@ mod data_caches {
 // ran green. The fixture now gives every segment a 32-bit default and the row asserts the two keys
 // differ in EXACTLY `1 << 1` -- an assertion that is stronger than the design asked for, and that
 // is what turns this row into the only catcher the mutation has.
+
+// ---- 8. the control-register attribution split -------------------------------------------------
+
+/// Sub-task 0 of slice S-A (`dev_docs/2026-09-02-tyrian-586-specs-diag.md` sections 4.1 and 9).
+///
+/// `decode_inval_other` aggregates every whole-cache code-translation teardown, so it cannot say
+/// which control-register write caused one. The Tyrian 586 diagnosis reached "the 155,144 events
+/// per guest second are `MOV CR3`" by ELIMINATION -- counter equalities plus TOKAEMM's own source
+/// forcing PG on across every CR0 write it lets through -- and set measuring it as the
+/// precondition for designing any gate. These rows are that measurement.
+///
+/// The split is an attribution of `decode_inval_other`, not a second total. Every row asserts
+/// BOTH: the split counter moved by one AND `decode_inval_other` moved by one with it. A split
+/// that drifted away from the aggregate would be worse than no split at all, because the
+/// aggregate is what every previous census in the repo is denominated in.
+mod flush_attribution {
+    use super::*;
+
+    /// RED when the `TranslationFlushReason::Cr3` arm's increment is deleted.
+    ///
+    /// **Updated for the CR3 code-cache gate**
+    /// (`dev_docs/2026-09-02-cr3-code-cache-gate-design.md`): `decode_inval_cr3` still counts
+    /// every `MOV CR3` WRITE unconditionally (it is bumped at the top of
+    /// `flush_tlb_and_code_caches_for_cr3_write`, above the ring decision), but it no longer
+    /// implies a teardown. This fixture's `MOV CR3` is the FIRST one this `CpuGsw` executes, with
+    /// an empty ring and a free slot, so the ring serves it with R2 (allocate) rather than R3
+    /// (retire-all): `decode_inval_other` does NOT move, and `cr3_code_flush_skipped` does. The
+    /// witness line still dies from the OBSERVER's side (a fresh generation matches no stored
+    /// line), which is `mov_cr3_still_flushes`'s row, just above.
+    #[test]
+    fn mov_cr3_attributes_its_flush_to_cr3() {
+        let (mut cpu, mut bus) = cr0_fixture(&mov_to_cr(3));
+        warm_witness(&mut cpu, &mut bus);
+        let before = cpu.perf_counters().clone();
+
+        write_cr0(&mut cpu, &mut bus, PAGE_DIRECTORY);
+
+        assert_eq!(
+            cpu.control.cr3, PAGE_DIRECTORY,
+            "the write must have landed"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_cr3,
+            before.decode_inval_cr3 + 1,
+            "MOV CR3's write must be attributed to CR3"
+        );
+        assert_eq!(
+            cpu.perf_counters().cr3_code_flush_skipped,
+            before.cr3_code_flush_skipped + 1,
+            "an empty ring's first write is an R2 allocate, served by the ring"
+        );
+        assert_eq!(
+            cpu.perf_counters().cr3_code_flush_taken,
+            before.cr3_code_flush_taken,
+            "R2 must not also count as a forced teardown"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_other,
+            before.decode_inval_other,
+            "a ring-served write does not land in the wholesale-teardown aggregate"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_cr0,
+            before.decode_inval_cr0,
+            "a CR3 write is not a CR0 write"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_task_switch,
+            before.decode_inval_task_switch,
+            "a CR3 write is not a task switch"
+        );
+    }
+
+    /// RED when the `TranslationFlushReason::Cr0` arm's increment is deleted.
+    ///
+    /// PG has to MOVE for the write to reach the flushing arm at all: a CR0 write that leaves PG
+    /// alone takes `flush_tlb_keep_code_caches` (PR #799) and tears nothing down. That is exactly
+    /// why section 4.1 could rule CR0 out for TOKAEMM, whose V86 monitor forces PG on in every
+    /// client CR0 value it writes through.
+    #[test]
+    fn mov_cr0_that_moves_pg_attributes_its_flush_to_cr0() {
+        let (mut cpu, mut bus) = cr0_fixture(&mov_to_cr(0));
+        warm_witness(&mut cpu, &mut bus);
+        cpu.control.cr3 = PAGE_DIRECTORY;
+        let before = cpu.perf_counters().clone();
+
+        write_cr0(&mut cpu, &mut bus, CR0_PE | CR0_PG);
+
+        assert_eq!(cpu.control.cr0 & CR0_PG, CR0_PG, "PG must actually be set");
+        assert_eq!(
+            cpu.perf_counters().decode_inval_cr0,
+            before.decode_inval_cr0 + 1,
+            "a PG-moving CR0 write's teardown must be attributed to CR0"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_other,
+            before.decode_inval_other + 1,
+            "and it must still land in the aggregate the split partitions"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_cr3,
+            before.decode_inval_cr3,
+            "a CR0 write is not a CR3 write"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_task_switch,
+            before.decode_inval_task_switch,
+            "a CR0 write is not a task switch"
+        );
+    }
+
+    /// A CR0 write that does NOT move PG reaches the #799 gate, so it attributes NOTHING: no
+    /// split counter and no aggregate. Without this row the CR0 arm could be wired to fire on
+    /// every CR0 write and still pass the row above.
+    #[test]
+    fn a_pe_only_cr0_write_attributes_nothing() {
+        let (mut cpu, mut bus) = cr0_fixture(&mov_to_cr(0));
+        warm_witness(&mut cpu, &mut bus);
+        let before = cpu.perf_counters().clone();
+
+        write_cr0(&mut cpu, &mut bus, CR0_PE);
+
+        assert_eq!(cpu.control.cr0 & CR0_PE, CR0_PE, "PE must actually be set");
+        assert_eq!(
+            cpu.perf_counters().decode_inval_cr0,
+            before.decode_inval_cr0,
+            "the kept-caches arm tears nothing down, so it attributes nothing"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_other,
+            before.decode_inval_other,
+            "and it does not move the aggregate either"
+        );
+    }
+
+    /// RED when the `TranslationFlushReason::TaskSwitch` arm's increment is deleted.
+    ///
+    /// WEAKER THAN THE TWO ROWS ABOVE, deliberately and on the record: it drives the flush
+    /// entry point directly instead of executing a hardware task switch under paging, because
+    /// building a paged TSS fixture is a slice of its own and `monitor_trips_vec13` was 30 for
+    /// the entire Tyrian run -- the task-switch arm is not a candidate cause and this row exists
+    /// to keep the third bucket honest, not to price it. An implementer adding a CR3 gate should
+    /// upgrade this to a `jmp_to_tss` fixture with PG set before relying on the bucket.
+    #[test]
+    fn a_task_switch_flush_attributes_to_the_task_switch_bucket() {
+        let (mut cpu, mut bus) = cr0_fixture(&mov_to_cr(3));
+        warm_witness(&mut cpu, &mut bus);
+        let before = cpu.perf_counters().clone();
+
+        cpu.flush_tlb_and_code_caches(TranslationFlushReason::TaskSwitch);
+
+        assert_eq!(
+            cpu.perf_counters().decode_inval_task_switch,
+            before.decode_inval_task_switch + 1
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_other,
+            before.decode_inval_other + 1,
+            "and it must still land in the aggregate the split partitions"
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_cr3,
+            before.decode_inval_cr3
+        );
+        assert_eq!(
+            cpu.perf_counters().decode_inval_cr0,
+            before.decode_inval_cr0
+        );
+    }
+}
+
+// MUTATION LEDGER, attribution split (2026-09-02):
+//
+// | mutation | caught by |
+// |---|---|
+// | delete the `Cr3` arm's increment | `mov_cr3_attributes_its_flush_to_cr3` |
+// | delete the `Cr0` arm's increment | `mov_cr0_that_moves_pg_attributes_its_flush_to_cr0` |
+// | delete the `TaskSwitch` arm's increment | `a_task_switch_flush_attributes_to_the_task_switch_bucket` |
+// | the CR3 call site passes `Cr0`, or the CR0 site passes `Cr3` | both instruction-driven rows |
+// | the split stops bumping `decode_inval_other`, i.e. a second total instead of a partition | all five rows |
+// | the CR0 arm fires on the kept-caches path too | `a_pe_only_cr0_write_attributes_nothing` |
+
+#[path = "cpu_cr3_flush_test.rs"]
+mod cr3_flush;

@@ -648,7 +648,7 @@ fn remapping_the_code_page_re_keys_instead_of_reusing_the_stale_lane() {
 
     // Point linear page 0 at REMAP_FRAME, then flush the TLB the way a CR3 reload does.
     guest_store(&mut native, &mut native_bus, PAGE_TABLE, REMAP_FRAME | 7);
-    native.flush_tlb_and_code_caches();
+    native.flush_tlb_and_code_caches(TranslationFlushReason::Cr3);
     decode_starts(&mut native, &mut native_bus, ENTRY, &block_starts());
 
     // The property under test is that PHYSICAL KEYING is what makes the remap safe, so the block

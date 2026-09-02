@@ -12,6 +12,7 @@ pub use canonical_state::{CanonicalCpuExecution, CpuCanonicalCaptureError};
 mod control;
 #[path = "core.rs"]
 mod cpu_core;
+pub(crate) use cpu_core::TranslationFlushReason;
 mod decode;
 mod execute;
 mod execute_extended;
@@ -712,16 +713,94 @@ pub struct PerfCounters {
     /// Decode-cache invalidation diagnostics. `decode_inval_cs_load` counts CS LOADS (which no
     /// longer flush the decode cache: the D bit is in the hit condition and the fetch limit is
     /// re-checked per hit); `decode_inval_smc` counts SMC whole-cache flushes
-    /// (`note_code_write`); `decode_inval_other` counts everything else (paging/TLB flushes,
-    /// A20, device DMA writes, ISA-level changes, direct-map changes). Diagnoses an
+    /// (`note_code_write`); `decode_inval_other` counts the CONTROL-REGISTER/TLB-flush causes
+    /// (paging/TLB flushes, A20, device DMA writes, ISA-level changes, direct-map changes) --
+    /// specifically, every wholesale teardown reached through
+    /// `flush_tlb_and_code_caches`/`invalidate_translation_code_caches`. Diagnoses an
     /// invalidation storm: the Doom 586 census measured decode_hit pinned at 21% regardless of
     /// cache size by 326M per-CS-load whole-cache flushes.
+    ///
+    /// **NOT counted here** (review finding N2): the CR3 code-cache gate's translation-page
+    /// write watch (`core.rs`'s `range_hits_translation_page` arm) is a THIRD class of
+    /// wholesale decode teardown, reached from an ordinary guest or native STORE with no CR3
+    /// write, no TLB flush, and no `flush_tlb_and_code_caches` call anywhere on its path -- it
+    /// bumps `translation_page_writes` and `code_invalidations` only. A census that sums
+    /// `decode_inval_cs_load + decode_inval_smc + decode_inval_other` and expects the total to
+    /// equal every wholesale retire will silently under-count on any workload with page-table
+    /// writes. Use `translation_page_writes` for that population.
     pub decode_inval_cs_load: u64,
     pub decode_inval_smc: u64,
     pub decode_inval_other: u64,
+    /// Attribution SPLIT of the `flush_tlb_and_code_caches` share of `decode_inval_other`. Every
+    /// event counted here also bumps `decode_inval_other`, so the three are a partition of that
+    /// counter's control-register half and never a second total: `decode_inval_cr3 +
+    /// decode_inval_cr0 + decode_inval_task_switch <= decode_inval_other`, with the remainder
+    /// being A20, direct-map, device-DMA and `INVLPG` invalidations.
+    ///
+    /// They exist because `decode_inval_other` alone cannot say WHICH control-register write
+    /// tore the code caches down, and the Tyrian 586 diagnosis
+    /// (`dev_docs/2026-09-02-tyrian-586-specs-diag.md` section 4.1) had to reach `MOV CR3` by
+    /// elimination rather than by measurement. A gate on any one of these three paths must be
+    /// designed against the counter that names it.
+    ///
+    /// **After the CR3 code-cache gate** (`2026-09-02-cr3-code-cache-gate-design.md`),
+    /// `decode_inval_cr3` no longer implies a teardown: it is bumped by
+    /// `flush_tlb_and_code_caches_for_cr3_write` on EVERY `MOV CR3`, ring hit or miss, so it keeps
+    /// counting CR3 WRITES, not CR3 flushes. `cr3_code_flush_taken` and `cr3_code_flush_skipped`
+    /// below split it into "forced today's full teardown" and "served by the ring", so
+    /// `cr3_code_flush_taken + cr3_code_flush_skipped == decode_inval_cr3` is an exact identity
+    /// for every write that goes through the ring-gated path (the pre-gate
+    /// `flush_tlb_and_code_caches(Cr3)` entry point, kept for callers with no old/new register
+    /// pair to give the ring, bumps `decode_inval_cr3` without moving either split counter, so
+    /// production traffic -- which uses only the ring-gated path -- satisfies the identity exactly
+    /// while a mixed-caller run would only satisfy it as `<=`).
+    pub decode_inval_cr3: u64,
+    pub decode_inval_cr0: u64,
+    pub decode_inval_task_switch: u64,
+    /// CR3 code-cache gate: `MOV CR3` writes whose code half forced the full teardown (a third
+    /// distinct directory with both ring slots already occupied, R3).
+    pub cr3_code_flush_taken: u64,
+    /// CR3 code-cache gate: `MOV CR3` writes served by the ring (a same-directory reselect, R1,
+    /// or a fresh allocation into a free slot, R2) with no decode-cache teardown at all.
+    pub cr3_code_flush_skipped: u64,
+    /// CR3 JIT-half gate (design doc `2026-09-02-cr3-jit-half-design.md`): `MOV CR3` writes whose
+    /// LINK graph was served by `select_link_context` -- the `Skipped` arm, R1 or R2. Incremented
+    /// beside `cr3_code_flush_skipped` in the same match arm, so
+    /// `cr3_link_context_selects == cr3_code_flush_skipped` is true by construction and is kept
+    /// as documentation rather than a check (design review J8); the identity with teeth is
+    /// `stalls.links_cleared[Flushed]` moving only on the `Taken` arm.
+    pub cr3_link_context_selects: u64,
+    /// CR3 JIT-half gate: `MOV CR3` writes whose LINK graph was wholesale-retired via
+    /// `allocate_link_context` -- the `Taken` arm, R3. Same construction note as
+    /// `cr3_link_context_selects`: `cr3_link_graph_retires == cr3_code_flush_taken` by
+    /// construction.
+    pub cr3_link_graph_retires: u64,
+    /// CR3 code-cache gate: guest or native stores that retired the ring because they hit
+    /// `translation_pages` (a page-directory or page-table page a walk had read), as opposed to a
+    /// hit on `code_bytes`/a compiled block's span. Counted at `code_write_watched`'s new
+    /// disjunct; every event here forces a wholesale retire (R5).
+    pub translation_page_writes: u64,
+    /// CR3 code-cache gate: page-walk PDE/PTE accessed-bit stores through `write_page_walk_entry`
+    /// that hit `translation_pages` and so retired the ring, counted separately from D stores
+    /// (advisory 12) because A bits settle after one pass over a working set while D stores recur
+    /// on every clean-page-then-write transition.
+    pub translation_a_stores: u64,
+    /// CR3 code-cache gate: page-walk PTE dirty-bit stores through `write_page_walk_entry` that
+    /// hit `translation_pages` and so retired the ring. See `translation_a_stores`.
+    pub translation_d_stores: u64,
+    /// CR3 code-cache gate: `translation_pages`' current residency (pages marked right now), read
+    /// off `DecodeCache::translation_pages_marked` every time a mark or a clear changes it, so
+    /// R7's "growth is observable" requirement has a JSON-visible counter rather than an inferred
+    /// rt sag. NOT cumulative: it can fall as well as rise (a retire-all that clears the bitmap
+    /// drops it to 0).
+    pub translation_pages_marked: u64,
     /// Code-cache invalidation events, including narrow self-modifying-code kills. This is the
     /// aggregate rate; the `decode_inval_*` and `smc_narrow_kills` counters retain the cause and
-    /// affected-line detail.
+    /// affected-line detail EXCEPT the translation-page write watch (review finding N2): that
+    /// arm bumps this counter and `translation_page_writes`, but no `decode_inval_*` field,
+    /// because it is reached directly from `code_write_watched`'s store path, not from
+    /// `flush_tlb_and_code_caches`. A `decode_inval_*` sum will therefore under-count this
+    /// aggregate whenever `translation_page_writes` is nonzero.
     pub code_invalidations: u64,
     /// Lines killed by the NARROW SMC path (a self-patch whose covering lines were
     /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
@@ -2410,6 +2489,15 @@ pub struct DirectStallSnapshot {
     pub poll_skip_raw_bus_clocks: u64,
     pub poll_skip_max_span: u64,
     pub poll_skip_last_head: u32,
+    /// `make_link_visible`'s L3 arm firing: a block visible under one CR3 ring slot re-touched
+    /// under the other. See `DirectStallTally::link_context_rebinds`.
+    pub link_context_rebinds: u64,
+    /// Residency of `BlockCache::waiting`, summed across both ring slots. See
+    /// `DirectStallTally::link_waiting_entries`.
+    pub link_waiting_entries: u64,
+    /// Residency of `BlockCache::linear_blocks`, summed across both ring slots. See
+    /// `DirectStallTally::link_linear_blocks_entries`.
+    pub link_linear_blocks_entries: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -4091,6 +4179,38 @@ struct DecodeCache {
     /// Coarse interpreter companion for the whole 4 GB physical space: 1 bit per 4 KiB page.
     /// Low memory still uses `code_bytes` for exact invalidation decisions.
     code_pages: Box<[u64]>,
+    /// The CR3 code-cache gate's write watch (design `2026-09-02-cr3-code-cache-gate-design.md`
+    /// part 2(b)): 1 bit per 4 KiB physical page, set on every page-walk read of a page-directory
+    /// or page-table page (`CpuGsw::mark_translation_page`, called from `translate_linear_checked`
+    /// on EVERY walk, not only ones producing a code translation -- a TLB-hit code translation
+    /// never walks, so a code-only rule would miss the pages backing a decode line inserted after
+    /// a data access had already filled the TLB entry; see finding F11). Folded into
+    /// `CpuGsw::code_write_watched` and `CpuGsw::physical_page_watched` so a guest or native store
+    /// into a marked page retires the ring exactly like self-modifying code. Cleared ONLY in the
+    /// same operation that flushes the TLB (R7 as amended by F11): the CR3-ring-miss, CR0-that-
+    /// moves-PG and task-switch retires qualify; the SMC wholesale arm does not flush the TLB and
+    /// must retire the ring while KEEPING these marks, or a subsequent TLB-hit translation would
+    /// insert an unprotected line.
+    translation_pages: Box<[u64]>,
+    /// Residency counter for `translation_pages`: how many pages are currently marked. Reset to 0
+    /// whenever the bitmap itself is cleared, so unbounded growth (R7's failure mode) is
+    /// observable rather than inferred from a decaying hit rate.
+    translation_pages_marked: u64,
+    /// The CR3 code-cache gate's two-slot ring: `(cr3 & 0xffff_f000, generation)` per occupied
+    /// slot. VCPI alternates exactly two page directories, so two slots capture the whole
+    /// measured traffic (advisory 18). See `select_context` for R1 through R3 and R8.
+    contexts: [Option<(u32, u32)>; 2],
+    /// The ring's generation allocator. Shares its numbering with `generation` itself: every
+    /// wholesale bump (`invalidate_and_clear_code_marks`) and every ring allocation
+    /// (`select_context`'s R2/R3) draws from this ONE monotonic counter, so a value handed to a
+    /// ring slot can never collide with a later un-ringed flush's bump (R6). Never reused; a wrap
+    /// retires every live line and every ring slot before restarting at 1.
+    next_generation: u32,
+    /// Whether `select_context` has ever run. The very first call seeds slot 0 with the CR3 value
+    /// and generation already live (R8/finding F12), so lines decoded under the boot CR3 before
+    /// the first `MOV CR3` are not orphaned by the first reload. Never reset: after any retire-all
+    /// nothing is orphaned (every line is already dead), so later calls need no seed.
+    ring_seeded: bool,
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -4222,6 +4342,13 @@ impl DecodeCache {
             generation: 1,
             code_bytes: vec![0u64; SMC_BITMAP_WORDS].into_boxed_slice(),
             code_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
+            translation_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
+            translation_pages_marked: 0,
+            contexts: [None, None],
+            // Matches `generation`'s initial value: the first genuine full-flush bump (no ring
+            // in play) advances this to 2, exactly the old unringed `generation += 1` sequence.
+            next_generation: 1,
+            ring_seeded: false,
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
@@ -4640,6 +4767,14 @@ impl DecodeCache {
     /// stays set either way: a stale mark only costs a future narrow attempt, never correctness.
     #[inline]
     fn narrow_invalidate(&mut self, physical: u32) -> Option<u32> {
+        // R4: with two ring contexts live, `code_page_lin`'s one-linear-per-physical entry
+        // belongs to whichever context wrote it last and cannot name a candidate carrying the
+        // OTHER context's generation. Refusing here degrades to the wholesale fallback for
+        // exactly the multi-context case (see `flush_attribution`/`cpu_cr3_flush_test.rs`'s
+        // cross-context SMC row) and costs nothing when only one context is live.
+        if self.contexts_occupied() > 1 {
+            return None;
+        }
         let info = *self.code_page_lin.get(&(physical >> 12))?;
         if info.aliased {
             return None;
@@ -4806,16 +4941,39 @@ impl DecodeCache {
         }
     }
 
+    /// Mint the next ring/flush generation. ONE monotonic counter feeds both a plain wholesale
+    /// bump (no ring slot involved) and a ring allocation (R2/R3), so a value handed to a slot can
+    /// never collide with a later un-ringed bump (R6). Never reused: on wrap, every live line and
+    /// every ring slot is retired before the counter restarts at 1.
+    fn allocate_generation(&mut self) -> u32 {
+        if self.next_generation == u32::MAX {
+            // Clear old generation-1 lines before 1 can become live again, and retire the ring:
+            // resetting the allocator while a slot still held a small stored generation would let
+            // two slots read as equal (the trap R6 exists to name).
+            self.clear_lines();
+            self.contexts = [None, None];
+            self.next_generation = 1;
+        } else {
+            self.next_generation += 1;
+        }
+        self.next_generation
+    }
+
     /// Invalidate every cached line and drop every matching code watch. The generation advance and
     /// watch clear stay one operation so no dead decode line can leave an unowned native watch.
-    fn invalidate_and_clear_code_marks(&mut self) {
-        if self.generation == u32::MAX {
-            // Clear old generation-1 lines before 1 can become live again.
-            self.clear_lines();
-            self.generation = 1;
-        } else {
-            self.generation += 1;
-        }
+    /// Retires the whole ring (R5): every wholesale invalidation, ringed or not, empties both
+    /// slots. `clear_translation_marks` is `translation_pages`' clear gate (R7, amended by F11):
+    /// pass `true` only when the caller flushed the TLB in this same operation, or a subsequent
+    /// TLB-hit translation could insert a line with no mark behind it.
+    fn invalidate_and_clear_code_marks(&mut self, clear_translation_marks: bool) {
+        self.generation = self.allocate_generation();
+        self.retire_ring(clear_translation_marks);
+    }
+
+    /// The ring/marks half of a wholesale invalidation, split out so `select_context`'s R3 arm can
+    /// retire the ring and THEN allocate the new context's generation separately, without a second
+    /// generation bump landing on top of it.
+    fn retire_ring(&mut self, clear_translation_marks: bool) {
         // Zero only the words marked since the last clear (the dirty lists), not the whole
         // 384 KB: with millions of SMC flushes per timedemo the full memset was a measured
         // wall regression. Every set bit lives in a dirty-listed word by construction
@@ -4837,7 +4995,110 @@ impl DecodeCache {
         // The narrow-SMC page map describes exactly the markable lines; no line survives a
         // global flush, so it is rebuilt from scratch by the re-decodes.
         self.code_page_lin.clear();
+        self.contexts = [None, None];
+        if clear_translation_marks {
+            self.translation_pages.fill(0);
+            self.translation_pages_marked = 0;
+        }
     }
+
+    /// How many ring slots are currently occupied: 0, 1 or 2. R4 reads this to decide whether the
+    /// narrow SMC path may trust `code_page_lin`.
+    #[inline]
+    fn contexts_occupied(&self) -> usize {
+        self.contexts.iter().filter(|c| c.is_some()).count()
+    }
+
+    /// `MOV CR3`'s code-half decision, R1 through R3 plus the R8 seed. `old_cr3_masked` is the
+    /// value CR3 held BEFORE this write (used only to seed slot 0 on the very first call);
+    /// `new_cr3_masked` is the value being selected. Both already masked with `0xffff_f000`
+    /// (advisory 17): PCD/PWT toggles must not allocate spurious contexts.
+    fn select_context(&mut self, old_cr3_masked: u32, new_cr3_masked: u32) -> ContextSelect {
+        // R8: the FIRST call ever seeds slot 0 with the context already live -- the boot CR3 and
+        // whatever generation lines decoded under it carry -- so they are not orphaned by the
+        // first reload. `self.generation` is left untouched: the seed describes what is already
+        // true, it does not create it.
+        if !self.ring_seeded {
+            self.ring_seeded = true;
+            self.contexts[0] = Some((old_cr3_masked, self.generation));
+        }
+        // R1: select. A hit means the requested directory already owns a slot; adopt its
+        // generation and clear nothing.
+        if let Some(slot) = self
+            .contexts
+            .iter()
+            .position(|c| matches!(c, Some((cr3, _)) if *cr3 == new_cr3_masked))
+        {
+            let (_, slot_gen) = self.contexts[slot].expect("position found Some");
+            self.generation = slot_gen;
+            return ContextSelect::Skipped(slot as u8);
+        }
+        // R2: allocate. A miss with a free slot mints a fresh generation nothing can match yet;
+        // nothing already live is invalidated.
+        if let Some(slot) = self.contexts.iter().position(Option::is_none) {
+            let slot_gen = self.allocate_generation();
+            self.contexts[slot] = Some((new_cr3_masked, slot_gen));
+            self.generation = slot_gen;
+            return ContextSelect::Skipped(slot as u8);
+        }
+        // R3: a third distinct value with both slots occupied retires everything -- today's
+        // behaviour -- then occupies slot 0 with the new value. The caller has already flushed
+        // the TLB in this same operation (it is the only caller), so `translation_pages` clears.
+        self.retire_ring(true);
+        let slot_gen = self.allocate_generation();
+        self.generation = slot_gen;
+        self.contexts[0] = Some((new_cr3_masked, slot_gen));
+        ContextSelect::Taken(0)
+    }
+
+    /// Whether physical page `physical >> 12` was read as page-directory or page-table structure
+    /// by a walk (design part 2(b), `translation_pages`).
+    #[inline]
+    fn translation_page_is_watched(&self, page: u32) -> bool {
+        self.translation_pages[(page >> 6) as usize] & (1u64 << (page & 63)) != 0
+    }
+
+    /// Whether any page touched by `[physical, physical + width)` is watched translation
+    /// structure. Page-granular only: a PDE/PTE write is always DWORD-aligned within one page.
+    #[inline]
+    fn range_hits_translation_page(&self, physical: u32, width: u32) -> bool {
+        let first_page = physical >> 12;
+        let last_page = physical.wrapping_add(width.saturating_sub(1)) >> 12;
+        (first_page..=last_page).any(|page| self.translation_page_is_watched(page))
+    }
+
+    /// Mark `physical`'s page as page-directory/page-table structure a walk just read. Called
+    /// unconditionally from `translate_linear_checked` on EVERY walk (finding F11): a TLB hit
+    /// never walks, so a code-only marking rule would miss the pages behind a decode line whose
+    /// translation was served from a TLB entry an earlier DATA access filled. Returns whether this
+    /// is the page's unwatched -> watched edge, the signal the caller must sweep through the
+    /// FastMap before native code runs again (finding F2), mirroring `mark_code_range`'s
+    /// dirty-word-on-first-set pattern.
+    #[inline]
+    fn mark_translation_page(&mut self, physical: u32) -> bool {
+        let page = physical >> 12;
+        let word = (page >> 6) as usize;
+        let bit = 1u64 << (page & 63);
+        if self.translation_pages[word] & bit != 0 {
+            return false;
+        }
+        self.translation_pages[word] |= bit;
+        self.translation_pages_marked += 1;
+        true
+    }
+}
+
+/// The outcome of `DecodeCache::select_context`: whether a `MOV CR3` write's code half was served
+/// by the ring (`Skipped`, no teardown) or forced today's full teardown (`Taken`, a third distinct
+/// value with both slots already occupied). Named so the two new counters
+/// (`cr3_code_flush_taken` / `cr3_code_flush_skipped`) read directly off the match. Both variants
+/// carry the ring slot the write resolved to (0 or 1), which the JIT half's link-context gate
+/// (`select_link_context` / `allocate_link_context`, `jit/direct.rs`) needs and which
+/// `DecodeCache::select_context` already computes for its own `self.contexts` indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextSelect {
+    Skipped(u8),
+    Taken(u8),
 }
 
 impl Default for DecodeCache {

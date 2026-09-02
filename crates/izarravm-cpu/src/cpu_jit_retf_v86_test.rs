@@ -1540,9 +1540,14 @@ fn far_returns_match_the_interpreter_across_a_swept_grid() {
 /// stop meaning anything.
 #[test]
 fn far_dynamic_cannot_be_inherited_by_a_recycled_block_slot() {
+    // 120 -> 128: the CR3 JIT-half gate's `LinkTarget.context: u8` field
+    // (`2026-09-02-cr3-jit-half-design.md` L2) grows `successors: [Option<LinkTarget>; 2]`,
+    // measured off a failing-test readout, not derived; see `direct_test.rs`'s twin comment.
+    // Unrelated to `dynamic_flags`, which still keeps `far_dynamic` inside the whole-struct
+    // assignment this row tests.
     assert_eq!(
         core::mem::size_of::<jit::direct::CompiledBlock>(),
-        120,
+        128,
         "the far bit is packed into `dynamic_flags`, which is what keeps this struct at 120 bytes \
          and keeps `far_dynamic` inside the whole-struct assignment `install`'s recycle arm makes"
     );

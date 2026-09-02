@@ -471,7 +471,11 @@ impl CpuGsw {
                                     any(target_os = "windows", target_os = "linux")
                                 ))]
                                 self.jit_fast_map.invalidate_page(linear);
-                                self.invalidate_translation_code_caches();
+                                // `false`: INVLPG invalidates a single TLB entry, not the whole
+                                // TLB, so `translation_pages` must not clear here (F11) -- another
+                                // linear address's TLB entry can still serve a code translation
+                                // with no walk to re-mark it.
+                                self.invalidate_translation_code_caches(false);
                                 Ok(clocks(12))
                             }
                             _ => Err(undefined_opcode()),
@@ -616,8 +620,10 @@ impl CpuGsw {
                             CpuPersona::I386 => 0xffff_f000,
                             CpuPersona::I486 | CpuPersona::I586 => 0xffff_f018,
                         };
-                        self.control.cr3 = value & mask;
-                        self.flush_tlb_and_code_caches();
+                        // Ring-gated (design `2026-09-02-cr3-code-cache-gate-design.md`): the
+                        // function reads the OLD register value to seed/select the ring, so it
+                        // owns the assignment -- do not set `self.control.cr3` here.
+                        self.flush_tlb_and_code_caches_for_cr3_write(value & mask);
                     }
                     4 => {
                         // CR4 is present only on the P55C persona. TSD has a modeled effect;

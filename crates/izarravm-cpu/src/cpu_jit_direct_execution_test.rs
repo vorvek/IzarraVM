@@ -2309,10 +2309,12 @@ fn link_refusal_census_routes_both_segment_write_jcc_arms() {
             Some(jit::links::LinkTarget {
                 linear: FALLTHROUGH,
                 mode_key: compilation.span.key.mode_key,
+                context: 0,
             }),
             Some(jit::links::LinkTarget {
                 linear: TAKEN,
                 mode_key: compilation.span.key.mode_key,
+                context: 0,
             }),
         ]
     );
