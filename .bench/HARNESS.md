@@ -31,6 +31,7 @@ the exception and runs DUKEMARK exactly once, then ends the VM itself with
 | `duke3d_short_c` | 586 | the same DUKEMARK run, demo cut to 1560 records | the CHEAP duke ladder row: 143 s a leg against 342 s |
 | `tyrian_setup_c` | 486 | Tyrian 2000 SETUP.EXE, settings menu + jukebox | the guest 70 Hz audio clock (PIT rewrite per frame + MPU-401 MIDI + DSP 0x14 chain); see PROTOCOL.md |
 | `tyrian_c` | 486, 586 | Tyrian 2000 gameplay, scripted to level 1 with fire held | same audio clock under play; the 586 row is the perf row |
+| `tyrian_specs_c` | **586** | Tyrian 2000, TOKAEMM loaded, save slot 1 preloaded (MicroCorp Stalker-B), scripted to the Ship Specs screen | the frame-graded dwell recipe the CR3-gate and reflected-call campaigns are measured on; `tyrian_c` polls 62x less and cannot show the lever, see `2026-09-02-tyrian-586-specs-diag.md` |
 | `psycho_c` | **486** | Psycho Pinball, DOS/4GW, a table in play | the only row that replays its CRTC register table EVERY FRAME; grades the PUBLISHED frame, not a re-render |
 | `tombraid3d_c` | **586** | Tomb Raider Gold, 3dfx build, CD REQUIRED | the same game as `tombraid_c` with every pixel through GLIDE, so the two rows split a regression between engine and rasteriser |
 | `descent2_c` | **586** | Descent II, 3dfx patch, recorded demo, CD REQUIRED | the HEAVIER Glide row: rt 0.32 against Tomb Raider's 0.87, and it ships the byte-identical `glide2x.ovl` |
