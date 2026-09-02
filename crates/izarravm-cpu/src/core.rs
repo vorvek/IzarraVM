@@ -161,7 +161,16 @@ impl CpuGsw {
         // here (F11): a stale TLB entry could still serve a code translation with no fresh walk
         // to re-mark it. Keeping the marks is the conservative direction -- more retires, never
         // fewer -- exactly like retaining `code_bytes`.
-        self.invalidate_decode_frontend(false);
+        let retired = self.invalidate_decode_frontend(false);
+        // None of these causes moves a linear->physical PAGE TABLE mapping (T1's own A1
+        // analysis: A20/direct-map/aperture/device-DMA are bus-level), so no `Tlb` entry is made
+        // stale by one on its OWN account. But `retire_ring` (inside `invalidate_decode_frontend`
+        // above) still renumbers ring slots regardless of cause (design review D2), and unlike
+        // INVLPG this caller has no narrower, targeted fix for that -- so retire fully. These
+        // causes are all rare (A20 toggles once at boot; aperture/direct-map track video mode
+        // and PCI decode changes, not per-instruction traffic), so the cost is negligible, and it
+        // closes the same slot-reoccupation gap D2 names rather than leaving it open.
+        self.tlb.retire_all_slots(retired);
         #[cfg(feature = "jit")]
         self.jit_direct.clear();
     }
@@ -182,28 +191,50 @@ impl CpuGsw {
     /// `clear_translation_marks` is threaded straight through to
     /// `DecodeCache::invalidate_and_clear_code_marks`: `true` only when the caller flushed the
     /// whole TLB in this same operation (F11).
-    fn invalidate_decode_frontend(&mut self, clear_translation_marks: bool) {
+    ///
+    /// The SOLE choke point for `invalidate_code_caches_uncounted` (A20, direct-map, aperture)
+    /// and `invalidate_translation_code_caches` (CR0/task-switch full flush, INVLPG): the decode
+    /// ring is always fully retired here, which renumbers its slots (design review D2). Returns
+    /// the `RingRetired` token instead of consuming it, because what that renumbering means for
+    /// the `Tlb` is NOT the same at every caller -- INVLPG has its OWN narrower, targeted fix
+    /// (`retire_dormant_slot`, called in `execute_extended.rs` before this function even runs),
+    /// and retiring the whole `Tlb` here too would silently defeat it (a real INVLPG invalidates
+    /// exactly one page, not the whole TLB, and `invlpg_invalidates_only_the_addressed_page_at_cpl0`
+    /// pins that). Every caller must therefore decide, explicitly, at its own call site.
+    fn invalidate_decode_frontend(&mut self, clear_translation_marks: bool) -> RingRetired {
         self.invalidate_fetch_frontend();
         // Paging, mode, A20, and physical-map changes route through here. Any can make the same
         // linear address decode from different bytes, so invalidate the lines and their SMC marks.
-        self.decode_cache
+        let retired = self
+            .decode_cache
             .invalidate_and_clear_code_marks(clear_translation_marks);
         self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
         // No line survives the bump, so no aperture line does either. Clearing here is what
         // makes the aperture-remap flush self-limiting: the flush it triggers lands in this
         // function and disarms it until aperture code is genuinely decoded again.
         self.has_aperture_code.0 = false;
+        retired
     }
 
     /// `clear_translation_marks`: see `invalidate_decode_frontend`. The two production callers
     /// disagree: `flush_tlb_and_code_caches`'s CR0/task-switch arms flush the whole TLB first
     /// (`true`); `INVLPG` invalidates a single TLB entry (`false`).
-    pub(super) fn invalidate_translation_code_caches(&mut self, clear_translation_marks: bool) {
+    ///
+    /// Returns the `RingRetired` token `invalidate_decode_frontend` produced, for the SAME reason
+    /// that function does not consume it: `flush_tlb_and_code_caches` needs the whole `Tlb`
+    /// retired here (it has no narrower fix of its own), while the INVLPG handler in
+    /// `execute_extended.rs` does (`retire_dormant_slot`, already run) and must discard this one
+    /// explicitly rather than have it silently retire the live slot too.
+    pub(super) fn invalidate_translation_code_caches(
+        &mut self,
+        clear_translation_marks: bool,
+    ) -> RingRetired {
         self.perf.decode_inval_other += 1;
         self.perf.code_invalidations += 1;
-        self.invalidate_decode_frontend(clear_translation_marks);
+        let retired = self.invalidate_decode_frontend(clear_translation_marks);
         #[cfg(feature = "jit")]
         self.jit_direct.invalidate_translation();
+        retired
     }
 
     fn invalidate_direct_pages(&mut self) {
@@ -231,19 +262,6 @@ impl CpuGsw {
         self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
     }
 
-    /// The half every UNGATED control-register flush runs: the TLB, the physical data-page caches
-    /// and the FastMap. Used as-is by `flush_tlb_and_code_caches`, whose callers always have a
-    /// linear->physical map that moved (or a WP change under paging), so there is nothing to gate.
-    ///
-    /// `wipes_tlb_flush` is counted HERE, above the wipe, so it keeps counting flush EVENTS: it is
-    /// the divergence check that says the guest took the same path the same number of times. The
-    /// PE-only caller (`flush_tlb_keep_code_caches`) does NOT route through here -- see that
-    /// function for why the data-side wipe itself is conditional there while the count is not.
-    fn flush_tlb_and_direct_pages(&mut self) {
-        self.bump_wipes_tlb_flush_counter();
-        self.wipe_tlb_and_direct_pages();
-    }
-
     #[cfg(feature = "jit")]
     fn bump_wipes_tlb_flush_counter(&mut self) {
         self.jit_direct.fast_map_audit.wipes_tlb_flush += 1;
@@ -251,23 +269,6 @@ impl CpuGsw {
 
     #[cfg(not(feature = "jit"))]
     fn bump_wipes_tlb_flush_counter(&mut self) {}
-
-    /// The TLB, the physical data-page caches and the FastMap, unconditionally. Split out of
-    /// `flush_tlb_and_direct_pages` so `flush_tlb_keep_code_caches` can skip this half alone while
-    /// still paying `bump_wipes_tlb_flush_counter` every time (see that function).
-    fn wipe_tlb_and_direct_pages(&mut self) {
-        self.tlb.flush();
-        // Clear the physical caches with the linear FastMap so alias-verification tags and
-        // mappings are rebuilt from the current translation and permissions.
-        self.data_read_pages.invalidate();
-        self.data_write_pages.invalidate();
-        #[cfg(all(
-            feature = "jit",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        self.record_fast_map_wipe_extent();
-    }
 
     /// The whole-cache code-translation teardown, with the CAUSE named so the teardown that
     /// `decode_inval_other` aggregates can be attributed to the control-register write that
@@ -299,9 +300,25 @@ impl CpuGsw {
             TranslationFlushReason::Cr0 => self.perf.decode_inval_cr0 += 1,
             TranslationFlushReason::TaskSwitch => self.perf.decode_inval_task_switch += 1,
         }
-        self.flush_tlb_and_direct_pages();
-        // The whole TLB was just flushed above, so translation_pages may clear (F11).
-        self.invalidate_translation_code_caches(true);
+        self.bump_wipes_tlb_flush_counter();
+        // T1 (design `2026-09-02-cr3-data-side-design.md`): the physical data-page caches
+        // (`data_read_pages`/`data_write_pages`) are keyed by physical page and a bus mapping
+        // epoch, never by CR3, so they are no longer touched by any control-register flush --
+        // only their three bus causes (`note_a20_changed`, `note_direct_map_changed`,
+        // `note_direct_data_map_changed`) invalidate them.
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.record_fast_map_wipe_extent();
+        // The decode ring retires below, unconditionally, which renumbers ring slots (design
+        // review D2) -- this caller (unlike INVLPG) has no narrower `Tlb` fix of its own, so the
+        // whole `Tlb` retires too, consuming the token `invalidate_translation_code_caches`
+        // returns. `translation_pages` may clear here (F11): both the TLB and the decode lines it
+        // could back are gone by the time this returns.
+        let retired = self.invalidate_translation_code_caches(true);
+        self.tlb.retire_all_slots(retired);
     }
 
     /// `MOV CR3, r32`, the ring-gated code half (design `2026-09-02-cr3-code-cache-gate-design.md`
@@ -311,13 +328,24 @@ impl CpuGsw {
     /// `self.control.cr3` itself. Callers must pass the value about to be written and must NOT
     /// assign the register first.
     ///
-    /// The data half (TLB, `data_read_pages`/`data_write_pages`, the FastMap) and the eip-window
-    /// fetch frontend stay unconditional on EVERY `MOV CR3`, exactly as before this slice (design
-    /// part 2(d)): only the DECODE half is gated. The JIT half is gated TOO, by slice S-B (design
-    /// doc `2026-09-02-cr3-jit-half-design.md`): a link graph built under one directory is
-    /// retained across an R1 reselect back to it, keyed apart from a second directory's graph by
-    /// a per-slot epoch and a `slot`-tagged rendezvous key rather than being torn down on every
-    /// write.
+    /// The data side is now split three ways (design `2026-09-02-cr3-data-side-design.md`, T1+T2,
+    /// amending the paragraph this replaces). `data_read_pages`/`data_write_pages` are OUT of this
+    /// function entirely (T1): they are keyed by physical page and a bus mapping epoch, never by
+    /// CR3, so no arm here touches them any more -- only their three bus causes do. The FastMap
+    /// wipe stays unconditional on BOTH arms below, exactly as before (T3, retaining it across an
+    /// R1 reselect, is a later slice). The TLB is now GATED, the same shape as the decode and JIT
+    /// halves (T2): `Reselected` restores the reselected slot's generation with `select_generation`,
+    /// no walk, no entry lost; `Allocated` mints a fresh generation for the newly occupied slot
+    /// with `allocate_generation`, trusting nothing about who held the slot before (review finding
+    /// P1, PR #826: merging this with `Reselected` let a directory that had just vacated a slot
+    /// via INVLPG's narrower retire be silently restored for a completely different directory);
+    /// `Taken` retires both generations with `retire_all_slots` (consuming the `RingRetired` token
+    /// `select_context`'s R3 hands back) and then mints slot 0's fresh one.
+    /// The eip-window fetch frontend stays unconditional on every write, both arms, unchanged. The
+    /// JIT half is gated TOO, by slice S-B (design doc `2026-09-02-cr3-jit-half-design.md`): a link
+    /// graph built under one directory is retained across an R1 reselect back to it, keyed apart
+    /// from a second directory's graph by a per-slot epoch and a `slot`-tagged rendezvous key
+    /// rather than being torn down on every write.
     ///
     /// | mechanism | what it buys, and why it is safe |
     /// |---|---|
@@ -327,42 +355,86 @@ impl CpuGsw {
     /// | L4, root dispatch is the base case | entry always builds its `BlockKey` from the LIVE physical, so no cell can ever be armed FROM a block that was never entered under this context, and `try_link_inner`'s `stale_epoch` refusal (compared against the live slot's epoch alone) is a second, independent barrier behind the key partition |
     /// | L5, every wholesale cause retires both `link_epochs` | `invalidate_translation` (this function's `Taken` arm, the translation-page store arm, the SMC wholesale arm) keeps tearing the WHOLE graph down exactly as before this slice; only the R1 reselect path is new |
     ///
-    /// `ContextSelect::Skipped(slot)` is R1 or R2 (`DecodeCache::select_context` cannot tell them
-    /// apart in its return type, and the JIT half does not need to): EITHER WAY this arm calls
-    /// only `select_link_context`, never `allocate_link_context`. That is safe, but it is NOT
-    /// "safe either way" on its own -- it is safe only because `BlockCache::new` seeds every ring
-    /// slot's `link_epochs` entry with a value that can never equal the unstamped-block sentinel
-    /// (0) or any other slot's value (review finding N1, `jit/direct.rs`'s `link_epochs` doc
-    /// comment). A virgin slot 1 selected for the first time by an R2 allocate is simply given
-    /// that SEEDED epoch, exactly as an R1 reselect of an already-warm slot is given its own
-    /// existing one; both rely on the seed invariant, and only the seed invariant, to be
-    /// distinguishable from "unstamped". `ContextSelect::Taken(slot)` is R3, and only that arm
-    /// calls `invalidate_translation()` (and, after it, `allocate_link_context`, which mints a
-    /// FRESH epoch rather than trusting a seed).
+    /// `ContextSelect::Reselected(slot)` is R1 and `ContextSelect::Allocated(slot)` is R2
+    /// (review finding P1, PR #826, split them: `DecodeCache::select_context` used to return one
+    /// `Skipped(slot)` for both, and a caller that could not tell them apart could only stay safe
+    /// by leaning on an invariant a narrower retire elsewhere could break). `Reselected` calls
+    /// `select_link_context`, restoring that slot's saved epoch; `Allocated` calls
+    /// `allocate_link_context`, minting a fresh one, exactly mirroring what the `Tlb` arm above
+    /// does for the same two cases and for the same reason. `ContextSelect::Taken(slot)` is R3,
+    /// and only that arm calls `invalidate_translation()` (and, after it, `allocate_link_context`,
+    /// which mints a FRESH epoch for slot 0 after the wholesale retire).
     pub(super) fn flush_tlb_and_code_caches_for_cr3_write(&mut self, new_cr3: u32) {
         self.perf.decode_inval_cr3 += 1;
+        // `wipes_tlb_flush` stays first and unconditional (design section (d) point 1): it counts
+        // the EVENT, not the outcome, and is the divergence check against `cr3_code_flush_taken +
+        // _skipped`.
+        self.bump_wipes_tlb_flush_counter();
+        // T1: the FastMap wipe stays unconditional on both arms (design section (d) point 5); T3,
+        // retaining it too, is a later slice. `data_read_pages`/`data_write_pages` are not touched
+        // here at all any more.
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.record_fast_map_wipe_extent();
         let old_cr3_masked = self.control.cr3 & 0xffff_f000;
         self.control.cr3 = new_cr3;
         let new_cr3_masked = new_cr3 & 0xffff_f000;
-        self.flush_tlb_and_direct_pages();
         self.invalidate_fetch_frontend();
+        // T2: the TLB is now gated on the SAME ring decision as the decode and JIT halves, so it
+        // has to run AFTER `select_context`, not before -- the reverse of the pre-T2 ordering, in
+        // which the whole data side wiped unconditionally above this match. Write any future
+        // reordering's rule here; do not leave a stale comment standing next to it.
         match self
             .decode_cache
             .select_context(old_cr3_masked, new_cr3_masked)
         {
-            ContextSelect::Skipped(slot) => {
+            ContextSelect::Reselected(slot) => {
                 self.perf.cr3_code_flush_skipped += 1;
+                // R1: the requested directory already owns this slot. RESTORE its saved
+                // generation and epoch; no entry is lost, and the generation/epoch compare in
+                // `lookup`/`insert`/`is_link_visible` IS the restore. Never mint here: see the
+                // `ContextSelect` doc comment (review finding P1, PR #826).
+                self.tlb.select_generation(slot);
                 #[cfg(feature = "jit")]
                 {
                     self.jit_direct.select_link_context(slot);
                     self.perf.cr3_link_context_selects += 1;
                 }
             }
-            ContextSelect::Taken(slot) => {
+            ContextSelect::Allocated(slot) => {
+                self.perf.cr3_code_flush_skipped += 1;
+                // R2: a miss took a free slot. MINT a fresh generation and epoch for it; nothing
+                // about that slot's previous occupant, if any, may be trusted. This is the P1
+                // fix (review, PR #826): before this split, this arm called `select_generation`,
+                // which could restore a directory that had just vacated the slot via a narrow
+                // retire (INVLPG's `retire_dormant_slot`) that never re-minted THIS slot's
+                // generation, silently serving one directory's cached translations to another.
+                // Minting costs nothing here -- the slot is, by construction, either virgin
+                // (seeded distinct at `Tlb::default`/`BlockCache::new`) or was already fully
+                // retired -- so this is not a narrower fix, it removes the dependency on every
+                // OTHER caller keeping its own retire paired correctly.
+                self.tlb.allocate_generation(slot);
+                #[cfg(feature = "jit")]
+                {
+                    self.jit_direct.allocate_link_context(slot);
+                    self.perf.cr3_link_context_selects += 1;
+                }
+            }
+            ContextSelect::Taken(slot, token) => {
                 self.perf.cr3_code_flush_taken += 1;
                 self.perf.decode_inval_other += 1;
                 self.perf.code_invalidations += 1;
                 self.has_aperture_code.0 = false;
+                // R3: both TLB generations retire together with the decode ring (design review
+                // D2) -- `retire_ring` already renumbered the slots this token came from, so
+                // `slot`'s old occupant, if any, must not be served under the new one. Mint slot
+                // 0's fresh generation only after the retire, exactly as the decode and JIT
+                // halves mint their own fresh state only after their own retire.
+                self.tlb.retire_all_slots(token);
+                self.tlb.allocate_generation(slot);
                 self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
                 #[cfg(feature = "jit")]
                 {
@@ -396,29 +468,40 @@ impl CpuGsw {
     /// only make link ADMISSION stricter, never admit an edge that should be refused, so it is not
     /// a soundness question -- but it is why the ladder measures `link_refusals` alongside the win.
     ///
-    /// The DATA half (TLB, `data_read_pages`/`data_write_pages`, FastMap) is now ALSO gated, on a
-    /// narrower condition than the code half above: it wipes only when `new_cr0 & CR0_PG != 0`.
-    /// This branch is reached only when `cr0_write_moves_code_translation` is false, which forces
+    /// The DATA half (TLB, FastMap) is now ALSO gated, on a narrower condition than the code half
+    /// above: it wipes only when `new_cr0 & CR0_PG != 0`. This branch is reached only when
+    /// `cr0_write_moves_code_translation` is false, which forces
     /// `old_cr0 & CR0_PG == new_cr0 & CR0_PG` (the predicate's first disjunct is exactly
     /// `delta & CR0_PG != 0`) -- so PG is unchanged here, and checking `new_cr0` alone tells us
     /// whether it was already 0 or already 1 on both sides. Two cases:
     ///
     /// - PG stays 1 (paging was already on, e.g. only TS/MP/EM/NE/AM/CD/NW moved): still wipe.
-    ///   `data_read_pages`/`data_write_pages` and the FastMap ARE privilege-tagged once paging is
-    ///   live (`memory.rs::fast_map_permissions` reads the live TLB entry's `user`/`writable`
-    ///   bits), and the `memory.rs` WP invariant ("WP changes flush, so `wp` is consistent within a
-    ///   generation") stays exactly as conservative as before for this case -- unconditional.
+    ///   CORRECTING THE PRIOR TEXT HERE (design `2026-09-02-cr3-data-side-design.md` section (c)):
+    ///   `data_read_pages`/`data_write_pages` are NOT touched by this function at all any more
+    ///   (T1 -- they are physical-keyed with no permission bits, so no control-register write of
+    ///   any kind bears on them), and what the FastMap caches is never the filling access's
+    ///   privilege, only the PAGE's U/S and R/W bits, re-checked against the LIVE accessor at
+    ///   every probe (`memory.rs::lookup_access`). The FastMap still wipes here, but for the
+    ///   ordinary reason every unconditional flush wipes it, not because it is "privilege-tagged".
+    ///   The TLB (T2) is gated the SAME way the CR3 ring gates it: this path never renumbers ring
+    ///   slots (`select_context` is not called here), so only the LIVE slot's generation may
+    ///   retire -- `Tlb::flush_live_slot()`, not `retire_all_slots()`, because there is no
+    ///   `RingRetired` token to consume and the dormant slot's entries are still valid under their
+    ///   own directory. The `memory.rs` WP invariant ("WP changes flush, so `wp` is consistent
+    ///   within a generation") stays exactly as conservative as before for this case --
+    ///   unconditional.
     /// - PG stays 0 (paging was already off -- the ONLY way a bare PE toggle reaches this branch,
     ///   since PG=1 with PE=0 is `#GP(0)` at the MOV CR0 site): skip the wipe. With paging off,
     ///   `translate_linear_checked`'s early return makes the TLB dead weight (never populated,
     ///   never consulted); `data_read_pages`/`data_write_pages` are keyed by PHYSICAL address alone
-    ///   with no permission bits in the entry (`memory.rs::read_direct_page_cached`); and
-    ///   `memory.rs::fast_map_permissions` returns the fixed, fully-permissive
-    ///   `PagePermissions::UNPAGED` for every population made while paging is off, so no FastMap
-    ///   entry populated under this condition carries a CPL-dependent tag to begin with. A PE
-    ///   toggle "changes CPL", but there is no privilege-tagged data here for a changed CPL to
-    ///   stale. `tlb.flush()` is skipped along with the rest rather than kept alone: it is free
-    ///   either way (nothing is in it), so keeping it unconditional would buy nothing.
+    ///   with no permission bits in the entry (`memory.rs::read_direct_page_cached`) and, since T1,
+    ///   are not reached from this function regardless; and `memory.rs::fast_map_permissions`
+    ///   returns the fixed, fully-permissive `PagePermissions::UNPAGED` for every population made
+    ///   while paging is off, so no FastMap entry populated under this condition carries a
+    ///   CPL-dependent tag to begin with. A PE toggle "changes CPL", but there is no
+    ///   privilege-tagged data here for a changed CPL to stale. The TLB wipe is skipped along with
+    ///   the rest rather than kept alone: it is free either way (nothing is in it, paging being
+    ///   off), so keeping it unconditional would buy nothing.
     ///
     /// `wipes_tlb_flush` still counts the EVENT on the skipped arm (`bump_wipes_tlb_flush_counter`
     /// runs unconditionally, same as the ungated function above) -- only `wipe_pages_cleared` and
@@ -429,7 +512,13 @@ impl CpuGsw {
     fn flush_tlb_keep_code_caches(&mut self, new_cr0: u32) {
         self.bump_wipes_tlb_flush_counter();
         if new_cr0 & CR0_PG != 0 {
-            self.wipe_tlb_and_direct_pages();
+            self.tlb.flush_live_slot();
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            self.record_fast_map_wipe_extent();
         }
         self.invalidate_fetch_frontend();
     }
@@ -453,8 +542,9 @@ impl CpuGsw {
     /// current accessor (CPL can change without a flush); WP changes flush, so `wp` is consistent
     /// within a generation. That invariant still holds with the data-side gate in place: a write
     /// where `new & CR0_PG != 0 && delta & CR0_WP != 0` makes this predicate TRUE, so it takes the
-    /// `flush_tlb_and_code_caches` arm and its ungated `flush_tlb_and_direct_pages` -- not the gated
-    /// `flush_tlb_keep_code_caches` at all. A WP change can only reach the gated function when
+    /// `flush_tlb_and_code_caches` arm, which retires the TLB unconditionally via
+    /// `invalidate_translation_code_caches` -- not the gated `flush_tlb_keep_code_caches` at all.
+    /// A WP change can only reach the gated function when
     /// `new & CR0_PG == 0`, at which point the WP bit governs nothing (WP is a paging-only
     /// protection check) and the DATA-side gate's own `new_cr0 & CR0_PG != 0` test is already false,
     /// so it wipes only for the unrelated "PG stays 1" case, never skips it. Keeping the term costs
@@ -895,10 +985,13 @@ impl CpuGsw {
         // unmarked code never gets, because the ring's soundness rests on the invariant that NO
         // live decode line survives an edit to the structures its translation depended on. A page
         // table holds no code, so this can never overlap the `range_hits_code` branch below on a
-        // real guest. `clear_translation_marks: false` -- this write did not flush the TLB, so
-        // clearing the bitmap here would leave a future TLB-hit translation's line unprotected
-        // (F11); the marks stay set, which only costs a future retire that would have fired
-        // anyway.
+        // real guest. `clear_translation_marks: false` -- this write did not flush the TLB before
+        // T2, so clearing the bitmap here would leave a future TLB-hit translation's line
+        // unprotected (F11); the marks stay set, which only costs a future retire that would have
+        // fired anyway. `retire_ring`'s call inside DOES retire both `Tlb` generations now (design
+        // T2, review D2): this arm renumbers ring slots exactly like every other wholesale cause,
+        // and the TLB's per-slot generations must retire with it or a stale generation would
+        // survive under the wrong directory.
         if self
             .decode_cache
             .range_hits_translation_page(physical, width)
@@ -907,7 +1000,8 @@ impl CpuGsw {
             action.wholesale = true;
             self.perf.translation_page_writes += 1;
             self.perf.code_invalidations += 1;
-            self.decode_cache.invalidate_and_clear_code_marks(false);
+            let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
+            self.tlb.retire_all_slots(retired);
             self.has_aperture_code.0 = false;
             #[cfg(feature = "jit")]
             self.jit_direct.invalidate_translation();
@@ -971,8 +1065,13 @@ impl CpuGsw {
                     self.perf.code_invalidations += 1;
                     // `false`: an SMC store does not flush the TLB, so `translation_pages` must
                     // stay set (F11) -- the ring's slots are still retired below via this same
-                    // call, only the bitmap survives.
-                    self.decode_cache.invalidate_and_clear_code_marks(false);
+                    // call, only the bitmap survives. SMC has no bearing on any linear->physical
+                    // map, but `retire_ring` renumbers ring slots regardless of cause (design T2,
+                    // review D2), so the `Tlb`'s per-slot generations must retire here too or a
+                    // stale generation would survive under the wrong directory after the next
+                    // `MOV CR3` reoccupies this slot.
+                    let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
+                    self.tlb.retire_all_slots(retired);
                     // The second of the two generation-bump call sites; same clearing rule as
                     // invalidate_decode_frontend, or an SMC wholesale flush would leave the
                     // aperture flag armed with no line behind it.

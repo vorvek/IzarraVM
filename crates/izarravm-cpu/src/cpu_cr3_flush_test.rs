@@ -496,3 +496,6 @@ fn wipes_tlb_flush_counts_every_cr3_write_ring_hit_or_not() {
 //   `0xffff_f000` is inert on every row here, because none of these directories set PWT/PCD bits.
 //   It would need a dedicated PCD/PWT row to catch, which this file does not add (advisory 17 is
 //   satisfied by inspection: `select_context`'s callers mask with `0xffff_f000` explicitly).
+
+#[path = "cpu_cr3_data_flush_test.rs"]
+mod cr3_data_flush;

@@ -1012,6 +1012,7 @@ pub(super) fn perf_counters_json(
         "translation_a_stores": perf.translation_a_stores,
         "translation_d_stores": perf.translation_d_stores,
         "translation_pages_marked": perf.translation_pages_marked,
+        "tlb_walks": perf.tlb_walks,
         "poll_skip_spans": perf.poll_skip_spans,
         "poll_skip_iterations": perf.poll_skip_iterations,
         "poll_neg_cache_hits": perf.poll_neg_cache_hits,

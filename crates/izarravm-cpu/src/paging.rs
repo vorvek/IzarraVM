@@ -120,10 +120,31 @@ impl TlbEntry {
 /// direction (the guest relaxed a PTE and skipped its flush) costs a walk instead of a spurious
 /// #PF. The permissive direction -- the guest tightened a PTE and skipped its flush -- is still
 /// live, and is the one this capacity note is about.
+///
+/// Per-slot generation, mirroring `DecodeCache`'s two-slot ring (design
+/// `2026-09-02-cr3-data-side-design.md` T2). `generation` stays the HOT field every `lookup` and
+/// `insert` compares -- unchanged from the single-slot form -- and is kept in sync with
+/// `generations[live]` by every method below; nothing on the hot path reads `generations` or
+/// `live` directly. Capacity stays shared (1024 entries for both directories together); only
+/// LIVENESS is partitioned, exactly as design section (a) A4 argues.
 #[derive(Clone)]
 pub(crate) struct Tlb {
     pub(crate) entries: [TlbEntry; TLB_ENTRIES],
     pub(crate) generation: u32,
+    /// The generation each ring slot last held. Restored verbatim on an R1 reselect
+    /// (`select_generation`) and re-minted on an R2/R3 allocation (`allocate_generation`).
+    generations: [u32; 2],
+    /// Which slot `generation` currently mirrors, 0 or 1. Used only by `retire_dormant_slot`
+    /// (INVLPG's second obligation) to name the OTHER slot; every other method is told its
+    /// slot explicitly by the caller, which already knows it from `DecodeCache::select_context`.
+    live: u8,
+    /// The sole source of fresh generation values (mirrors `BlockCache::next_link_epoch`, design
+    /// review J2/D3): every mint, whether a single-slot flush, a ring allocation, or a wholesale
+    /// retire-all, draws from this ONE counter, so a value handed to one slot can never collide
+    /// with the other's. Starts at 3 because `generations` is seeded `[1, 2]`; NEVER mints 0,
+    /// which is `TlbEntry::EMPTY`'s sentinel (design review D3) -- a slot holding it would make
+    /// every empty entry read as live the moment that slot is selected.
+    next_generation: u32,
 }
 
 impl Default for Tlb {
@@ -131,6 +152,9 @@ impl Default for Tlb {
         Self {
             entries: [TlbEntry::EMPTY; TLB_ENTRIES],
             generation: 1,
+            generations: [1, 2],
+            live: 0,
+            next_generation: 3,
         }
     }
 }
@@ -147,6 +171,25 @@ impl Tlb {
         (e.generation == self.generation && e.tag == page).then_some(e)
     }
 
+    /// Returns the entry this insert displaced from its array slot, if that slot held one.
+    ///
+    /// Reports `previous` whenever `previous.generation != 0` (D3: 0 is `TlbEntry::EMPTY`'s own
+    /// sentinel and is never a live generation), NOT only when `previous.generation ==
+    /// self.generation`. The narrower, generation-matching check was sound before T2 (design
+    /// `2026-09-02-cr3-data-side-design.md`): every generation bump was ALSO a wholesale FastMap
+    /// wipe (`record_fast_map_wipe_extent`, tied to the same CR3/CR0 flush), so a displaced entry
+    /// from an OLDER generation was already covered by that wipe and reporting it again would
+    /// have been redundant work, not a correctness gap. T2 breaks that pairing: the translation-
+    /// page and SMC-wholesale retires now bump the generation WITHOUT touching the FastMap at
+    /// all, so a displaced entry from a generation this same walk just retired (a live entry one
+    /// statement ago) would silently stop being reported, and the caller's FastMap-invalidate-on-
+    /// eviction (`memory.rs`'s `same_residency` check) would never run for it -- measured on
+    /// `active_fast_map_tracks_tlb_collision_and_rewalks_canonically` (`cpu_test.rs`): a second
+    /// linear page colliding into the same array slot, walked immediately after a translation-
+    /// page retire fired on the SAME walk, stopped invalidating the evicted page's FastMap entry.
+    /// Reporting on any non-empty slot costs nothing extra on the common path (the caller's own
+    /// `same_residency` comparison already runs whenever `previous` is `Some`) and costs at most
+    /// one redundant, harmless invalidate on the pre-T2 already-wiped-FastMap path.
     #[inline]
     pub(crate) fn insert(
         &mut self,
@@ -166,7 +209,7 @@ impl Tlb {
             user,
             dirty,
         };
-        (previous.generation == self.generation).then_some(previous)
+        (previous.generation != 0).then_some(previous)
     }
 
     #[inline]
@@ -178,14 +221,104 @@ impl Tlb {
         }
     }
 
-    /// Drop every cached translation (CR0/CR3 write, task switch, INVLPG). The rare
-    /// generation wrap clears the table so stale gen-0 entries cannot alias.
-    pub(crate) fn flush(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
+    /// The sole minter (design review D3/J2): never returns 0, `TlbEntry::EMPTY`'s sentinel. On
+    /// wrap the whole table is cleared before the counter restarts at 1, so no entry carrying a
+    /// pre-wrap generation can alias a freshly-minted one.
+    fn mint_generation(&mut self) -> u32 {
+        if self.next_generation == 0 {
             self.entries = [TlbEntry::EMPTY; TLB_ENTRIES];
-            self.generation = 1;
+            self.next_generation = 1;
         }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        generation
+    }
+
+    /// R1: reselect a ring slot the caller already knows is occupied. Restores that slot's
+    /// stored generation with no other work -- every entry inserted while it was last live is
+    /// live again for free, because the generation comparison in `lookup`/`insert` IS the
+    /// restore. Never walks or re-checks an entry at this point; the whole soundness argument
+    /// for that is design section (d).
+    pub(crate) fn select_generation(&mut self, slot: u8) {
+        debug_assert!(
+            usize::from(slot) < self.generations.len(),
+            "select_generation given a slot the ring did not report as occupied"
+        );
+        self.live = slot;
+        self.generation = self.generations[usize::from(slot)];
+    }
+
+    /// R2 (a fresh directory took a free slot) or the post-retire mint in R3 (a third distinct
+    /// value re-occupies slot 0 after `retire_all_slots`). Mints a generation nothing has been
+    /// stamped with yet, so nothing already cached can match it: no entry is invalidated by this
+    /// call on its own.
+    pub(crate) fn allocate_generation(&mut self, slot: u8) {
+        let generation = self.mint_generation();
+        self.generations[usize::from(slot)] = generation;
+        self.live = slot;
+        self.generation = generation;
+    }
+
+    /// The `flush_tlb_keep_code_caches` PG-stays-1 CR0 path (design review D4): that caller does
+    /// NOT retire the decode ring (`DecodeCache::contexts` is untouched, so no slot renumbering
+    /// happens), so only the CURRENTLY LIVE slot's generation may be retired -- the dormant
+    /// slot's entries are still valid under their own directory and must survive. Mirrors the
+    /// pre-T2 single-slot `flush()` exactly, scoped to the live slot's bookkeeping entry too.
+    pub(crate) fn flush_live_slot(&mut self) {
+        let generation = self.mint_generation();
+        self.generations[usize::from(self.live)] = generation;
+        self.generation = generation;
+    }
+
+    /// Every site that retires `DecodeCache`'s ring (design review D2): `retire_ring` RENUMBERS
+    /// slots (`contexts = [None, None]`, so the next `select_context` allocates into slot 0
+    /// regardless of who held it before), and slot INDEX is the only thing tying a `Tlb`
+    /// generation to a directory. A retire therefore invalidates the correspondence, not merely
+    /// the contents, independent of what caused it -- A20, a direct-map change, an SMC wholesale
+    /// kill, a translation-page store, or a real ring retire (R3/R5) all renumber the same way.
+    /// Takes the `RingRetired` token `retire_ring` returns so an implementer who forgets to call
+    /// this where a ring retire happened gets an `unused_must_use` warning, promoted to a build
+    /// failure under this crate's `-D warnings` gate, instead of a silent stale-generation bug.
+    /// Unconditional at every call site: a translation-page write or an SMC kill can fire on a
+    /// ring that was never seeded at all (no `MOV CR3` has run yet), and the retire is still
+    /// needed there for CONTENT reasons -- the edited PTE makes an existing cached translation
+    /// wrong regardless of ring bookkeeping (`pte_edit_under_a_live_cr3_forces_a_redecode` and
+    /// its siblings exercise exactly that shape). See `Tlb::insert`'s doc comment for the OTHER
+    /// half of this: an eviction whose victim carries a generation this call already retired must
+    /// still be reported to the FastMap-invalidate caller, which is why `insert` no longer gates
+    /// on an exact generation match.
+    pub(crate) fn retire_all_slots(&mut self, _token: crate::RingRetired) {
+        self.generations[0] = self.mint_generation();
+        self.generations[1] = self.mint_generation();
+        self.live = 0;
+        self.generation = self.generations[0];
+    }
+
+    /// INVLPG's second obligation under two slots (design section (d)). `invalidate` above
+    /// clears only the LIVE generation's entry for this page; a dormant slot's entry for the
+    /// same linear page survives untouched. Retire the whole non-live generation rather than
+    /// reaching for one entry under it: one store, the conservative direction (more re-walks for
+    /// the other context, never a wrong answer), and INVLPG is rare enough on this workload that
+    /// the extra re-walks it costs never show up.
+    pub(crate) fn retire_dormant_slot(&mut self) {
+        let dormant = 1 - usize::from(self.live);
+        self.generations[dormant] = self.mint_generation();
+    }
+
+    /// Force the allocator to the wrap boundary without four billion inserts, so a wrap test can
+    /// run in microseconds. Mirrors `DecodeCache::next_generation`'s equivalent test-only path
+    /// (`cache.next_generation = u32::MAX` in `cpu_persona_system_test.rs`).
+    #[cfg(test)]
+    pub(crate) fn set_next_generation_for_test(&mut self, value: u32) {
+        self.next_generation = value;
+    }
+
+    /// The stored per-slot generations, for a test that wants to assert VALUES (e.g. that a wrap
+    /// never leaves two slots reading the same one) rather than inferring them through `lookup`,
+    /// which a wrap's own entries-clear would satisfy regardless of whether the values collided.
+    #[cfg(test)]
+    pub(crate) fn generations_for_test(&self) -> [u32; 2] {
+        self.generations
     }
 }
 

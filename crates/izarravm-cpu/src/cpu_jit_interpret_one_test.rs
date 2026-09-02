@@ -778,7 +778,7 @@ fn interpret_one_abnormal_when_decode_view_missing() {
     // Kill the decode LINES only. `invalidate_code_caches` would be wrong here for a reason that
     // is the point of the test: it also drops the compiled block, so the entry would be refused
     // before the helper ever ran and the fixture would pass while proving nothing.
-    native.decode_cache.invalidate_and_clear_code_marks(true);
+    let _ = native.decode_cache.invalidate_and_clear_code_marks(true);
     let before = native.perf_counters().jit_direct_insns;
     assert!(
         native
@@ -6801,7 +6801,7 @@ fn interpret_one_closes_the_callout_attribution_ledger() {
         cpu.registers.set_ebx(0xffff);
     }
     fn drop_the_decode_lines(cpu: &mut CpuGsw, _: &mut TestBus) {
-        cpu.decode_cache.invalidate_and_clear_code_marks(true);
+        let _ = cpu.decode_cache.invalidate_and_clear_code_marks(true);
     }
 
     /// The three legs differ only in how the fixture is perturbed, and every one must close.

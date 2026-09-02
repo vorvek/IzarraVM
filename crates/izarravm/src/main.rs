@@ -3467,6 +3467,7 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "translation_a_stores": mark.perf.translation_a_stores,
                 "translation_d_stores": mark.perf.translation_d_stores,
                 "translation_pages_marked": mark.perf.translation_pages_marked,
+                "tlb_walks": mark.perf.tlb_walks,
                 "code_invalidations": mark.perf.code_invalidations,
                 "smc_narrow_kills": mark.perf.smc_narrow_kills,
                 "smc_lane_accepts": mark.perf.smc_lane_accepts,

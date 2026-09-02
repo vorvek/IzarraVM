@@ -585,7 +585,7 @@ fn logical_tlb_projection_normalizes_generation_order_and_dead_residue() {
     first.tlb.insert(68, 0x44000, false, true, false);
 
     let mut second = CpuGsw::default();
-    second.tlb.flush();
+    second.tlb.flush_live_slot();
     second.tlb.insert(68, 0x44000, false, true, false);
     second.tlb.insert(3, 0x3000, true, false, true);
     let dead_slot = Tlb::slot(10);
@@ -917,8 +917,12 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // The CR3 JIT-half gate adds two PerfCounters fields (16 bytes), moving the pin 4760 -> 4776
     // -- measured, not derived. Documentation counters (design review J8), not architectural
     // state; see cpu_test.rs's twin comment.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4776);
+    // The CR3 data-side gate T2 adds one PerfCounters field (`tlb_walks`; 8 bytes), moving the
+    // pin 4776 -> 4784 -- measured, not derived. The win-gate diagnostic counter, not
+    // architectural state; `Tlb`'s own growth does not move this pin (see cpu_test.rs's twin
+    // comment).
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4776);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
 }

@@ -1990,7 +1990,13 @@ fn pending_flags_offset() {
     // (cr3_link_context_selects, cr3_link_graph_retires; 16 bytes), moving this pin
     // 4760 -> 4776 -- measured off a failing-test readout, not derived. Both are documentation
     // counters (design review J8): host-side diagnostics, not guest state.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4776);
+    // The CR3 data-side gate T2 (`2026-09-02-cr3-data-side-design.md`) adds one PerfCounters
+    // field (`tlb_walks`; 8 bytes), moving this pin 4776 -> 4784 -- measured off a failing-test
+    // readout, not derived. It is a diagnostic (the T2 win-gate counter), not guest state; the
+    // TLB's own growth (`Tlb::generations`/`live`/`next_generation`) does not move this pin at
+    // all, because `Tlb` sits ahead of `pending_flags` as part of the SAME by-value block that
+    // was already counted, and none of its three new fields change `CpuGsw`'s own field order.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and

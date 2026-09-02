@@ -666,15 +666,43 @@ const SPLIT_BITMAP_PAGE: u32 = 3;
 /// FILLS the two TLB entries phase P then requires, which is the design's self-healing claim --
 /// a miss costs one interpreted IN and the next one is served natively. Building the entries by
 /// hand would let the fixture pass against a phase P that read the wrong linear.
+///
+/// A THROWAWAY pass runs first (design `2026-09-02-cr3-data-side-design.md` T2, review D2, plus
+/// advisory 12's A/D settling argument). `entry`'s page, the io_base page and (for the split-TSS
+/// lanes) the bitmap page all share ONE page table. The FIRST of the three ever walked marks
+/// that table; each DIFFERENT page walked after it then stores ITS OWN accessed bit into an
+/// ALREADY-marked table, which retires the whole ring (both TLB generations) on EVERY one of
+/// them, not just the first. Without a throwaway pass, `entry`'s page (walked first, to fetch
+/// the `IN` opcode) is inserted before io_base's walk retires, and io_base's own entry is then
+/// inserted before bitmap's walk retires it AGAIN -- so entry, io_base and bitmap each end up
+/// under a DIFFERENT generation, and `port_read_al_dx_for_test`'s fast path, which needs
+/// io_base's and bitmap's entries live SIMULTANEOUSLY, cannot be served even by the unbroken
+/// fixture. The throwaway pass settles every accessed bit these three pages will ever need
+/// (advisory 12: "A bits persist in guest memory... after one pass over a working set no walk
+/// stores anything"), so the MEASURED pass below takes no walk-triggered store at all and every
+/// entry it inserts shares the ring's one unchanged generation.
 fn warm_the_tss_tlb(cpu: &mut CpuGsw, bus: &mut TestBus) {
     let entry = 0x4000u32;
     bus.memory[entry as usize] = 0xec;
     bus.memory[entry as usize + 1] = 0xf4;
+
+    cpu.set_eip(entry);
+    cpu.cycle(bus)
+        .expect("the throwaway warming IN must retire");
+    bus.trace = BusTrace::default();
+
     cpu.set_eip(entry);
     cpu.cycle(bus).expect("the warming IN must retire");
+    // The throwaway pass above already settled every accessed bit these three pages need, so
+    // THIS pass is expected to take no walk-triggered store at all -- and, since the throwaway
+    // pass also already inserted all three TLB entries under the ring's one unchanged
+    // generation, this pass is typically served entirely from the TLB, with no walk (not even a
+    // read) at all. A write here would mean the settling did not happen and the ring retired
+    // again mid-instruction, splitting entry/io_base/bitmap across generations the way the
+    // no-throwaway-pass version of this fixture used to.
     assert!(
-        !page_walk_writes(bus).is_empty(),
-        "the warming pass never walked, so the TLB is not warm for the reason claimed"
+        page_walk_writes(bus).is_empty(),
+        "the throwaway pass above should have settled every accessed bit already"
     );
 
     cpu.registers.set_eax(0xdead_beef);

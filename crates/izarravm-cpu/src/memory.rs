@@ -2036,6 +2036,12 @@ impl CpuGsw {
             }
         }
 
+        // CR3 data-side gate win counter (design T2, review D5): every walk that reaches here is
+        // one the TLB fast path above did NOT serve, whether from a cold entry, a permission
+        // mismatch, or a dirty-bit miss. A retained entry across an R1 reselect costs no walk, so
+        // this is the direct measure of T2's payoff -- and the direct, non-proxy assertion for a
+        // test that wants to know whether a walk ran.
+        self.perf.tlb_walks += 1;
         let directory = self.control.cr3 & 0xffff_f000;
         let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
         let mut pde = bus.read_memory(

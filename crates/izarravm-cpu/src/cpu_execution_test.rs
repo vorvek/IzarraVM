@@ -1208,7 +1208,7 @@ fn tlb_caches_translations_and_is_non_snooping_until_flushed() {
     );
 
     // After a flush the next access re-walks and sees the new mapping.
-    cpu.tlb.flush();
+    cpu.tlb.flush_live_slot();
     assert_eq!(
         cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
         0x6000

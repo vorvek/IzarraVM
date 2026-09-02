@@ -711,8 +711,55 @@ fn assert_measured_pair_ignoring_translation_watch_split(
     let mut interpreter_settled = interpreter.clone();
     direct_settled.materialize_flags();
     interpreter_settled.materialize_flags();
+    // T2 (design `2026-09-02-cr3-data-side-design.md`) makes a same-directory `MOV CR3` retain
+    // the TLB across an R1 reselect -- that is the whole slice. `direct` is pre-warmed by
+    // `prime_direct`, called by every caller of this function BEFORE the measured comparison, so
+    // its TLB already holds a live entry for the linear page this fixture's LAST instruction
+    // translates; `interpreter` has no such prior warmth and always walks fresh here. Both are
+    // correct (a TLB hit is DEFINED to skip the walk), but the walk's own accessed/dirty-bit
+    // store also calls `record_write_page` (`memory.rs::write_page_walk_entry`), so whichever
+    // role walks records one MORE entry in `written_pages` than the one that hit the TLB --
+    // `PerfCounters` is already excluded from `CpuGsw`'s `PartialEq` (`impl PartialEq for
+    // PerfCounters`, "diagnostic-only: never affects CpuGsw equality"), so that part needs no
+    // help, but `written_pages`/`written_count`/`written_pages_overflow` are real `CpuGsw`
+    // fields and are not. They are cleared per instruction (`core.rs:1136`) and read only through
+    // ONE derived boolean, `pending_prefetch_invalidation` (`canonical_state.rs:101-106`, "does
+    // any written page match the live prefetch window's physical page") -- and the walk's extra
+    // entry is a PAGE-TABLE page, never the code page the prefetch window holds, so that boolean
+    // comes out identical either way. Reset here, on both sides, to the value they would have had
+    // with no walk at all, before the strict equality below, so a real divergence in any OTHER
+    // field still reddens.
+    for cpu in [&mut direct_settled, &mut interpreter_settled] {
+        cpu.written_pages = [None; TRACKED_WRITE_PAGES];
+        cpu.written_count = 0;
+        cpu.written_pages_overflow = false;
+    }
     assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
-    assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
+    // T2 (design `2026-09-02-cr3-data-side-design.md`) makes a same-directory `MOV CR3` retain
+    // the TLB across an R1 reselect (that is the whole slice), so `direct` -- pre-warmed by
+    // `prime_direct` before this function's OWN `restore_bus` reset `direct_bus.memory` back to
+    // `pristine` -- now legitimately SERVES the low-memory page-directory/page-table bytes this
+    // fixture plants at `0x3000`/`0x4000` from that still-live TLB entry, taking no walk and so
+    // never re-storing the PTE accessed bit `restore_bus` just erased from memory. `interpreter`
+    // has no such prior warmth (nothing primes it) and always walks fresh here, so it DOES
+    // re-store the bit. Both are correct: a TLB hit is defined to skip the walk (paging.rs's own
+    // `Tlb` doc comment), so this is a HOST bookkeeping timing difference, not a guest-visible
+    // one -- no code in either role ever reads these bytes as anything but page-table structure.
+    // Masking bits 0x20 (accessed) and 0x40 (dirty) -- a write through the still-warm TLB entry
+    // takes the fast path too, so `direct` can skip the D-bit store the SAME way it skips the
+    // A-bit one -- in the KNOWN page-table byte ranges these differential fixtures plant
+    // (`0x3000..0x3004` the PDE, `0x4000..0x4080` the 32-entry PT) keeps the comparison exact
+    // everywhere else, so a real content divergence anywhere else still reddens here.
+    const PAGE_TABLE_RANGES: [std::ops::Range<usize>; 2] = [0x3000..0x3004, 0x4000..0x4080];
+    let mut direct_masked = direct_bus.memory.to_vec();
+    let mut interpreter_masked = interpreter_bus.memory.to_vec();
+    for range in PAGE_TABLE_RANGES {
+        for i in range {
+            direct_masked[i] &= !0x60;
+            interpreter_masked[i] &= !0x60;
+        }
+    }
+    assert_eq!(direct_masked, interpreter_masked, "{case:#?}");
     // Review finding N3: a DROPPED equality is a lost gate, not a neutral one. The exact split
     // is legitimately case-dependent (a cold decode's fetch charge varies with instruction
     // length and alignment), so this cannot be `SPLIT_BUS_CLOCKS`'s exact-pin shape, but a
@@ -1217,12 +1264,53 @@ fn generated_native_prefix_preserves_fault_outcome_and_charged_clocks() {
     let mut interpreter_settled = interpreter.clone();
     direct_settled.materialize_flags();
     interpreter_settled.materialize_flags();
+    // T2 (design `2026-09-02-cr3-data-side-design.md`) extends the SAME loosening
+    // `assert_measured_pair_ignoring_translation_watch_split` already needs to the data side: the
+    // priming loop's `restore_bus`-then-rerun pattern makes `direct`'s TLB end up warmer than
+    // `interpreter`'s by the time this comparison runs (T2 retains the TLB across a
+    // same-directory reselect, so repeated priming accumulates warmth there the way it always
+    // did for decode lines and links). Whichever role's LAST instruction still needs a walk
+    // records one extra `written_pages` entry (the walk's own accessed/dirty-bit store also calls
+    // `record_write_page`) that the already-warm role does not -- see that function's comment for
+    // why this is host bookkeeping (read only through `pending_prefetch_invalidation`, which a
+    // page-table-page entry can never move) and why `PerfCounters` itself needs no such reset
+    // (`impl PartialEq for PerfCounters` already excludes it from this comparison). Reset here on
+    // both sides for the same reason, so a real divergence in any OTHER field still reddens.
+    for cpu in [&mut direct_settled, &mut interpreter_settled] {
+        cpu.written_pages = [None; TRACKED_WRITE_PAGES];
+        cpu.written_count = 0;
+        cpu.written_pages_overflow = false;
+    }
     assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
-    assert_eq!(direct_bus.memory, interpreter_bus.memory, "{case:#?}");
-    assert_eq!(
-        direct_bus.trace.elapsed_clocks(),
-        interpreter_bus.trace.elapsed_clocks(),
-        "{case:#?}"
+    // Same reasoning, for the accessed/dirty bits (0x20/0x40) the asymmetric walk count leaves
+    // behind in the page-directory/page-table bytes this fixture plants at `0x3000`/`0x4000`: a
+    // TLB hit is defined to skip the walk, so the more-often-warm role skips the A/D-bit store
+    // too. Masked only in that known range; a real content divergence anywhere else still
+    // reddens.
+    const PAGE_TABLE_RANGES: [std::ops::Range<usize>; 2] = [0x3000..0x3004, 0x4000..0x4080];
+    let mut direct_masked = direct_bus.memory.to_vec();
+    let mut interpreter_masked = interpreter_bus.memory.to_vec();
+    for range in PAGE_TABLE_RANGES {
+        for i in range {
+            direct_masked[i] &= !0x60;
+            interpreter_masked[i] &= !0x60;
+        }
+    }
+    assert_eq!(direct_masked, interpreter_masked, "{case:#?}");
+    // T2's same walk-count asymmetry (see the two comments above) also means `direct` -- when its
+    // TLB is warm for the fixture's LAST instruction and `interpreter`'s is not -- charges fewer
+    // bus clocks than `interpreter` by exactly the skipped walk's cost (measured: a 6-clock gap,
+    // two dword `PageWalkRead`s plus the elided accessed-bit `PageWalkWrite`). Bounded the same
+    // way `assert_measured_pair_ignoring_translation_watch_split` bounds its own translation-watch
+    // split, in the OTHER direction: here it is `direct` that may be CHEAPER, never more
+    // expensive, and only by a walk's worth of clocks.
+    let split =
+        direct_bus.trace.elapsed_clocks() as i64 - interpreter_bus.trace.elapsed_clocks() as i64;
+    assert!(
+        (-256..=0).contains(&split),
+        "translation-watch split {split} out of the expected bound: direct must not charge MORE \
+         bus clocks than interpreter, and may charge fewer by at most one skipped walk -- \
+         {case:#?}"
     );
     // **Loosened for the CR3 code-cache gate** (`dev_docs/2026-09-02-cr3-code-cache-gate-
     // design.md`): the priming loop above calls `restore_bus` before every run, which resets the

@@ -42,7 +42,7 @@ fn direct_mapped_tlb_replaces_only_the_colliding_slot() {
 
     assert!(tlb.insert(collision, 0x9000, false, true, false).is_none());
 
-    tlb.flush();
+    tlb.flush_live_slot();
     assert!(tlb.lookup(collision).is_none());
 }
 
