@@ -759,6 +759,7 @@ fn direct_link_refusal_census_json_exposes_ordered_zero_snapshot() {
             "seen": 0,
             "missing_id": 0,
             "invalid_id": 0,
+            "guard_mask_popcount_histogram": [0, 0, 0, 0, 0, 0],
             "rows": [],
         })
     );
@@ -771,6 +772,7 @@ fn direct_link_refusal_census_json_preserves_nonzero_rows_and_closures() {
         seen: 3,
         missing_id: 1,
         invalid_id: 1,
+        guard_mask_popcount_histogram: [0, 0, 1, 0, 0, 0],
         rows: vec![izarravm_cpu::DirectLinkRefusalCensusRow {
             id: 7,
             source_linear: 0x1000,
@@ -788,6 +790,7 @@ fn direct_link_refusal_census_json_preserves_nonzero_rows_and_closures() {
                 ("not_attempted", 0),
                 ("refused_segment_layout", 1),
             ],
+            last_guard_mask_popcount: Some(2),
         }],
     };
     assert_eq!(
@@ -815,6 +818,8 @@ fn direct_link_refusal_census_json_preserves_nonzero_rows_and_closures() {
     assert_eq!(report["rows"][0]["source"]["generation"], 11);
     assert_eq!(report["rows"][0]["target"]["last_attempted_generation"], 12);
     assert_eq!(report["rows"][0]["buckets"][2]["count"], 1);
+    assert_eq!(report["guard_mask_popcount_histogram"][2], 1);
+    assert_eq!(report["rows"][0]["last_guard_mask_popcount"], 2);
 }
 
 #[cfg(feature = "direct-callout-attribution")]
