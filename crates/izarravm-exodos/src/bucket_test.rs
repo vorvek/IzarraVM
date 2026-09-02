@@ -2027,13 +2027,13 @@ fn the_real_fixture_board_still_matches_the_embedded_table() {
 }
 
 // ---------------------------------------------------------------------------
-// The archived stage-1 corpus, when it happens to be there. `D:\exo-stage1` is
+// The archived stage-1 corpus, when it happens to be there. `D:\dev\exo-sweeps\exo-stage1` is
 // not in the repo, so these cannot be gates either; they pin two claims that
 // only real data can settle.
 // ---------------------------------------------------------------------------
 
 fn stage1_archive() -> Option<PathBuf> {
-    let root = PathBuf::from(r"D:\exo-stage1\passB-20260816");
+    let root = PathBuf::from(r"D:\dev\exo-sweeps\exo-stage1\passB-20260816");
     root.is_dir().then_some(root)
 }
 

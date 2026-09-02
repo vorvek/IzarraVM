@@ -1404,6 +1404,6 @@ jit_direct_dispatch_declines and wall per PROTOCOL rules; rank 16-bit
 work by insns/entry, never coverage.
 
 Provenance: eXoDOS "Peach's Dream (1999)" (READ-ONLY corpus), stage-1
-archive D:\exo-stage1\passB-20260816\PeachDrm (translate.json carries
+archive D:\dev\exo-sweeps\exo-stage1\passB-20260816\PeachDrm (translate.json carries
 the recipe), screened against GameRobo and Redhook (also deterministic;
 PeachDrm won on insns/entry and decline density).
