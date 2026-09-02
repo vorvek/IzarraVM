@@ -61,6 +61,14 @@ impl CpuGsw {
         vector: u8,
     ) -> ExecResult<()> {
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
+        // Slice 0 of the reflected-call HLE design's trip-shape instrument
+        // (dev_docs/2026-09-03-reflected-call-hle-design.md section 3.1): the
+        // design's own hook point, immediately after `interrupt_acknowledge`
+        // and before `deliver_interrupt`. A no-op call (one relaxed atomic
+        // load) unless built with `--features reflected-call-diagnostic` AND
+        // armed via `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC`.
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::on_int_entry(self, bus, vector);
         if self.is_protected_mode() {
             // `SoftwareInterrupt`, not `External`: this is the one source the
             // gate-DPL check applies to. It used to pass the `is_external =
@@ -87,6 +95,14 @@ impl CpuGsw {
         let ip = bus.read_memory(vector_address, BusWidth::Word, BusAccessKind::DataRead)? as u16;
         let cs =
             bus.read_memory(vector_address + 2, BusWidth::Word, BusAccessKind::DataRead)? as u16;
+        // The design's IVT-read seams (section 3.3): journal these two reads
+        // the same as any other memory read a reflected trip's real-mode half
+        // makes.
+        #[cfg(feature = "reflected-call-diagnostic")]
+        {
+            crate::reflected_call_diag::note_read(self, vector_address);
+            crate::reflected_call_diag::note_read(self, vector_address + 2);
+        }
         self.load_segment_real(SegmentIndex::Cs, cs);
         self.set_eip(u32::from(ip));
         Ok(())
@@ -100,6 +116,10 @@ impl CpuGsw {
         bus: &mut B,
         vector: u8,
     ) -> ExecResult<()> {
+        // A device edge landed; if a reflected trip is open, count it (design
+        // section 8 item 5 / review B6).
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::on_hardware_interrupt(vector);
         if self.is_protected_mode() {
             self.deliver_interrupt(bus, vector, None, DeliverySource::External)
         } else {
@@ -466,6 +486,13 @@ impl CpuGsw {
         error_code: Option<u32>,
         source: DeliverySource,
     ) -> ExecResult<()> {
+        // #GP/#PF traps taken while a reflected trip is open (design's
+        // `task_switch`-adjacent refusal population; review section 3 item
+        // 3 asks for trap counts).
+        #[cfg(feature = "reflected-call-diagnostic")]
+        if source.pushes_error_code() {
+            crate::reflected_call_diag::on_exception_delivered(vector);
+        }
         if vector == 6 && source.pushes_error_code() {
             self.trace_ud_if_enabled(bus);
         }
@@ -898,9 +925,13 @@ impl CpuGsw {
         width: BusWidth,
     ) -> ExecResult<u32> {
         let physical = self.translate_linear_system(bus, linear, false)?;
-        Ok(bus
+        let value = bus
             .read_memory_direct(physical, width, BusAccessKind::DataRead)?
-            .value)
+            .value;
+        // GDT/LDT/IDT/TSS reads (design section 3.3's seam table).
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_read(self, linear);
+        Ok(value)
     }
 
     /// Write a value to a linear address through paging with implicit-supervisor
@@ -934,6 +965,12 @@ impl CpuGsw {
         value: u32,
     ) -> ExecResult<()> {
         let physical = self.translate_linear_system(bus, linear, true)?;
+        // Hooked BEFORE the write below, on `linear` (not `physical`): this is
+        // the TSS busy-bit / descriptor-Accessed-bit seam (design section 3.3,
+        // review B3), and `note_write` needs the pre-write value, which this
+        // function's own doc says is gone once the write below commits.
+        #[cfg(feature = "reflected-call-diagnostic")]
+        crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
         bus.write_memory(physical, width, value, BusAccessKind::DataWrite)?;
         self.record_write_page(physical);
         self.note_code_write(physical, width.bytes());
@@ -1018,6 +1055,10 @@ impl CpuGsw {
         let result = self.iret_body(bus, operand_size);
         if result.is_err() {
             self.registers.set_esp(esp_before);
+        }
+        #[cfg(feature = "reflected-call-diagnostic")]
+        if result.is_ok() {
+            crate::reflected_call_diag::on_far_return(self);
         }
         result
     }
@@ -1339,6 +1380,15 @@ impl CpuGsw {
         let result = self.return_far_body(bus, operand_size, release);
         if result.is_err() {
             self.registers.set_esp(esp_before);
+        }
+        // Checked here, before the `RETF imm16` form's separate
+        // `release_stack` call in the 0xCA executor arm: a RETF-based return
+        // is not the shape a reflected `INT`/`IRET` trip takes (RETF pops two
+        // frame words where IRET pops three), so it is not expected to match
+        // here regardless; IRET is where the design's trips close.
+        #[cfg(feature = "reflected-call-diagnostic")]
+        if result.is_ok() {
+            crate::reflected_call_diag::on_far_return(self);
         }
         result
     }

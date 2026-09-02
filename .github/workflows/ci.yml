@@ -100,6 +100,14 @@ jobs:
           cargo test -p izarravm-cpu --no-default-features --features smc-census smc_census
           cargo test -p izarravm --no-default-features --features smc-census hdd_profile_json_reports_fixed_time_and_native_metrics
           cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features smc-census -- -D warnings
+          # Slice 0 of the reflected-call HLE design's trip-shape instrument. Off by
+          # default, so the workspace test/clippy steps below build neither the module
+          # nor its two tests; this trio proves the feature still wires through izarravm,
+          # both tests in reflected_call_diag_test.rs still pass, and the armed arm is
+          # warning-clean.
+          cargo check -p izarravm --no-default-features --features reflected-call-diagnostic
+          cargo test -p izarravm-cpu --no-default-features --features reflected-call-diagnostic reflected_call_diag
+          cargo clippy -p izarravm-cpu -p izarravm --all-targets --no-default-features --features reflected-call-diagnostic -- -D warnings
 
       - name: Format
         run: cargo fmt --check

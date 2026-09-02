@@ -904,6 +904,8 @@ impl CpuGsw {
                 let offset = insn.imm;
                 let selector = insn.imm2 as u16;
                 self.far_call(bus, selector, offset, operand_size)?;
+                #[cfg(feature = "reflected-call-diagnostic")]
+                crate::reflected_call_diag::on_far_transfer(self);
                 Ok(clocks(17))
             }
             0xea => {
@@ -911,6 +913,8 @@ impl CpuGsw {
                 let offset = insn.imm;
                 let selector = insn.imm2 as u16;
                 self.far_jump(bus, selector, offset, operand_size)?;
+                #[cfg(feature = "reflected-call-diagnostic")]
+                crate::reflected_call_diag::on_far_transfer(self);
                 Ok(clocks(17))
             }
             0xc2 => {
@@ -1068,6 +1072,11 @@ impl CpuGsw {
                         } else {
                             self.far_jump(bus, selector, offset, operand_size)?;
                         }
+                        // `FF /3` and `FF /5`, the indirect far forms review N3 named:
+                        // a DPMI host's return through a saved far pointer is exactly
+                        // this shape, and the direct-form hooks at `0x9A`/`0xEA` miss it.
+                        #[cfg(feature = "reflected-call-diagnostic")]
+                        crate::reflected_call_diag::on_far_transfer(self);
                         Ok(clocks(11))
                     }
                     _extension => Err(undefined_opcode()),
@@ -1137,12 +1146,18 @@ impl CpuGsw {
                 }
                 let tsc = self.time_stamp_counter();
                 self.set_edx_eax(tsc);
+                #[cfg(feature = "reflected-call-diagnostic")]
+                crate::reflected_call_diag::on_rdtsc_or_rdmsr_tsc();
                 Ok(clocks(11))
             }
             0x32 => {
                 // RDMSR: read the model-specific register selected by ECX into EDX:EAX.
                 // Privileged; an undefined selector #GP(0)s.
                 self.require_cpl0()?;
+                #[cfg(feature = "reflected-call-diagnostic")]
+                if self.read_gpr32(1) == MSR_TSC {
+                    crate::reflected_call_diag::on_rdtsc_or_rdmsr_tsc();
+                }
                 let value = match self.read_gpr32(1) {
                     MSR_MCAR => self.msr.mcar,
                     MSR_MCTR => self.msr.mctr,

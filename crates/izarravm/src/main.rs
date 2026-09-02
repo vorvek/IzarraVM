@@ -2240,6 +2240,11 @@ fn write_hdd_profile_json(
         report["direct_link_refusal_census"] =
             direct_link_refusal_census_json(machine.cpu().direct_link_refusal_census_snapshot());
     }
+    #[cfg(feature = "reflected-call-diagnostic")]
+    {
+        report["reflected_call_diagnostic"] =
+            reflected_call_diagnostic_json(machine.cpu().reflected_call_diagnostic_snapshot());
+    }
     #[cfg(feature = "direct-callout-attribution")]
     {
         report["direct_callout_attribution"] =
@@ -2861,6 +2866,85 @@ fn direct_link_refusal_census_json(
             "unbound_exits": row.unbound_exits,
             "buckets": row.buckets.iter().map(|(kind, count)| json!({
                 "kind": kind,
+                "count": count,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Slice 0 of the reflected-call HLE design's trip-shape instrument
+/// (`dev_docs/2026-09-03-reflected-call-hle-design.md`,
+/// `dev_docs/2026-09-03-reflected-call-hle-review.md`).
+#[cfg(feature = "reflected-call-diagnostic")]
+fn reflected_call_diagnostic_json(
+    snapshot: Option<izarravm_cpu::ReflectedCallDiagnosticSnapshot>,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    fn stat_json(s: &izarravm_cpu::StatSummary) -> serde_json::Value {
+        json!({
+            "min": s.min,
+            "median": s.median,
+            "max": s.max,
+            "mean": s.mean,
+            "sample_count": s.sample_count,
+        })
+    }
+    json!({
+        "mode": snapshot.mode,
+        "trips_total": snapshot.trips_total,
+        "trips_unmatched": snapshot.trips_unmatched,
+        "keys": snapshot.keys.iter().map(|k| json!({
+            "vector": format!("0x{:02x}", k.vector),
+            "ah": format!("0x{:02x}", k.ah),
+            "trips": k.trips,
+            "unmatched": k.unmatched,
+            "instructions": stat_json(&k.instructions),
+            "core_clocks": stat_json(&k.core_clocks),
+            "dispatcher_entries": stat_json(&k.dispatcher_entries),
+            "cr3_writes_per_trip": stat_json(&k.cr3_writes),
+            "distinct_entry_images": k.distinct_entry_images,
+            "distinct_cs_eip": k.distinct_cs_eip,
+            "varying_fields": k.varying_fields,
+            "nested_int_trips": k.nested_int_trips,
+            "far_transfer_trips": k.far_transfer_trips,
+            "hw_edge_trips": k.hw_edge_trips,
+            "gp_trap_trips": k.gp_trap_trips,
+            "pf_trap_trips": k.pf_trap_trips,
+            "rdtsc_trips": k.rdtsc_trips,
+            "port_io_trips": k.port_io_trips,
+            "x87_trips": k.x87_trips,
+            "task_switch_trips": k.task_switch_trips,
+            "task_gate_trips": k.task_gate_trips,
+            "task_gate_unknown_trips": k.task_gate_unknown_trips,
+            "bda_key_pending_trips": k.bda_key_pending_trips,
+            "bda_no_key_trips": k.bda_no_key_trips,
+            "bda_unknown_trips": k.bda_unknown_trips,
+            "near_match_diffs": k.near_match_diffs.iter().map(|(name, n)| json!({
+                "field": name,
+                "count": n,
+            })).collect::<Vec<_>>(),
+            "read_set_size": stat_json(&k.read_set_size),
+            "write_set_size": stat_json(&k.write_set_size),
+            "reads_total": k.reads_total,
+            "reads_under_other_cr3": k.reads_under_other_cr3,
+            "read_class_counts": k.read_class_counts.iter().map(|(name, n)| json!({
+                "class": name,
+                "count": n,
+            })).collect::<Vec<_>>(),
+            "write_class_counts": k.write_class_counts.iter().map(|(name, n)| json!({
+                "class": name,
+                "count": n,
+            })).collect::<Vec<_>>(),
+            "write_restored": k.write_restored,
+            "write_net_change": k.write_net_change,
+            "write_unknown_pre": k.write_unknown_pre,
+            "write_dead_8kb": k.write_dead_8kb,
+            "write_dead_derived": k.write_dead_derived,
+            "write_live": k.write_live,
+            "top_write_addresses": k.top_write_addresses.iter().map(|(addr, count)| json!({
+                "address": format!("0x{addr:08x}"),
                 "count": count,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
