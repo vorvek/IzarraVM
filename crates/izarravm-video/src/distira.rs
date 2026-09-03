@@ -351,6 +351,19 @@ pub struct DistiraScanoutState {
     pub lfb_mode: u32,
     pub aux_base: u32,
     pub frame_store_bytes: usize,
+    /// This instance's configured raster lane cap (`self.raster_lanes`;
+    /// see [`Distira::set_raster_lanes`] and the `IZARRAVM_DISTIRA_LANES`
+    /// default). Not necessarily how many lanes any given triangle
+    /// actually forked across -- `lanes_for_rows` can return fewer for a
+    /// small batch -- this is the ceiling, not a per-draw count.
+    pub raster_lane_count: usize,
+    /// The dedicated raster pool's REALIZED OS thread count
+    /// (`raster_pool::pool_size`). Exposed so `--mode-census` can answer
+    /// "did the knob actually grow the pool?" directly instead of only by
+    /// inference from wall-clock deltas
+    /// (`dev_docs/2026-09-05-lane-cap-ladder.md`'s "Pool sizing" section
+    /// found no field for this).
+    pub raster_pool_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1135,6 +1148,8 @@ impl Distira {
                 counts
             },
             frame_store_bytes: self.fb.len(),
+            raster_lane_count: self.raster_lanes,
+            raster_pool_size: raster_pool::pool_size(),
         }
     }
 

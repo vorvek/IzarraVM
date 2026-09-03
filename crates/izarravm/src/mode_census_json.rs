@@ -147,6 +147,25 @@ pub fn mode_census_json(
             "frame_store_bytes": state.frame_store_bytes,
         })
     });
+    // The lane-cap ladder's own finding: nothing in the census announced
+    // the realized pool size, so "did the knob actually grow the pool?"
+    // could only be inferred from wall-clock deltas
+    // (`dev_docs/2026-09-05-lane-cap-ladder.md`, "Pool sizing" section).
+    // `lane_count` is this Distira instance's configured cap
+    // (`IZARRAVM_DISTIRA_LANES`, or the >=8-core default of 8); `pool_size`
+    // is the dedicated raster pool's actual OS thread count, which the
+    // pool never disagrees with the default lane count on (both read the
+    // same cached `IZARRAVM_DISTIRA_LANES`/host-core value), but a lower
+    // `set_raster_lanes` override CAN sit below the pool's size. Host-side
+    // only: identical across arms for otherwise-identical guest state, so
+    // it never affects the frame or instruction identity the rest of this
+    // census guards.
+    let distira_raster_lanes = distira_state.map(|state| {
+        json!({
+            "lane_count": state.raster_lane_count,
+            "pool_size": state.raster_pool_size,
+        })
+    });
     json!({
         "schema": "izarravm-mode-census-v1",
         "vga": vga,
@@ -176,6 +195,7 @@ pub fn mode_census_json(
             "texture_narrow_writes": aperture.texture_narrow_writes,
         },
         "distira_offset_bits_or": offset_bits_or,
+        "distira_raster_lanes": distira_raster_lanes,
     })
 }
 
