@@ -495,6 +495,10 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(report["schema"], "izarravm-hdd-profile-v2");
     assert_eq!(report["mode"], "486");
+    assert_eq!(
+        report["timing_model_epoch"],
+        izarravm_cpu::TIMING_MODEL_EPOCH
+    );
     assert_eq!(report["stop"]["kind"], "dos_exit");
     assert_eq!(report["stop"]["code"], 0);
     assert_eq!(report["timedemo"]["gametics"], 35);

@@ -2161,6 +2161,10 @@ fn write_hdd_profile_json(
         "schema": "izarravm-hdd-profile-v2",
         "workload": workload.display().to_string(),
         "mode": mode.canonical_name(),
+        // Guest-clock model version (see `izarravm_cpu::TIMING_MODEL_EPOCH`). Bumped whenever
+        // a change alters guest clocks charged per instruction for any persona; rt numbers
+        // recorded under different epochs are not comparable as performance.
+        "timing_model_epoch": izarravm_cpu::TIMING_MODEL_EPOCH,
         "cycle_budget": budget,
         "stop": stop_reason_json(stop_reason),
         "wall_seconds": wall_seconds,

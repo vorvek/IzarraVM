@@ -547,6 +547,23 @@ function Invoke-ScoreboardSelfTest {
         @{ path = "mpu.wavetable"; min = 1; max = 2 })
     Assert-ScoreboardSelfTestEqual $bandObject.failures.Count 1 "a non-numeric target goes RED"
 
+    # The stored final-instruction pin must refuse a comparison across a timing-model epoch
+    # bump: the same cycle_budget legitimately retires a different instruction count once
+    # izarravm_cpu::TIMING_MODEL_EPOCH changes, so a silent drift grade would be meaningless.
+    $epochMatch = Test-InstructionPinTimingEpoch @{ timing_model_epoch = 1 } ([uint32]1)
+    Assert-ScoreboardSelfTestEqual $epochMatch.refused $false "same epoch is not refused"
+    $epochMissingRecorded = Test-InstructionPinTimingEpoch @{} ([uint32]1)
+    Assert-ScoreboardSelfTestEqual $epochMissingRecorded.refused $false `
+        "a missing recorded epoch is treated as epoch 1"
+    $epochMismatch = Test-InstructionPinTimingEpoch @{ timing_model_epoch = 1 } ([uint32]2)
+    Assert-ScoreboardSelfTestEqual $epochMismatch.refused $true `
+        "a mismatched epoch is refused"
+    Assert-ScoreboardSelfTestEqual $epochMismatch.recorded_epoch ([uint32]1) `
+        "the refusal reports the recorded epoch"
+    if ($epochMismatch.note -notmatch "not comparable across timing-model epochs") {
+        throw "epoch mismatch note did not explain the refusal: $($epochMismatch.note)"
+    }
+
     $noJit = Get-CoverageMetrics (New-CoverageSelfTestProfile 100 0 0 0 0)
     Assert-ScoreboardSelfTestEqual $noJit.interpreted_insns 100 "no-JIT instructions"
     Assert-ScoreboardSelfTestEqual $noJit.emitted_coverage 0.0 "no-JIT emitted coverage"
@@ -2194,6 +2211,33 @@ function Write-TextLf([string]$Path, [string]$Text) {
     [IO.File]::WriteAllText($Path, $normalised, (New-Object Text.UTF8Encoding $false))
 }
 
+# A fixed cycle_budget retires a different instruction count under a different guest-clock
+# model (izarravm_cpu::TIMING_MODEL_EPOCH), so a recorded `final_instructions` pin is only
+# valid within the epoch it was recorded under. Pulled out as its own function so the
+# self-test can exercise the refusal without driving the whole per-fixture grading loop. A
+# sidecar entry with no `timing_model_epoch` predates the marker and is epoch 1.
+function Test-InstructionPinTimingEpoch($Recorded, [uint32]$RowEpoch) {
+    $recordedEpoch = if ($null -ne $Recorded -and $Recorded.Contains("timing_model_epoch")) {
+        [uint32]$Recorded.timing_model_epoch
+    } else {
+        [uint32]1
+    }
+    if ($recordedEpoch -ne $RowEpoch) {
+        return [pscustomobject][ordered]@{
+            refused        = $true
+            recorded_epoch = $recordedEpoch
+            note           = ("final instruction pin was recorded under timing_model_epoch " +
+                "$recordedEpoch but this run is epoch $RowEpoch -- rt and instruction counts " +
+                "are not comparable across timing-model epochs; refusing the comparison")
+        }
+    }
+    return [pscustomobject][ordered]@{
+        refused        = $false
+        recorded_epoch = $recordedEpoch
+        note           = $null
+    }
+}
+
 function Write-Invariants($Table) {
     $json = $Table.GetEnumerator() |
         Sort-Object Key |
@@ -3045,6 +3089,15 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     $result.real_time_factor = [math]::Round($profile.real_time_factor, 4)
     $result.guest_seconds = [math]::Round($profile.guest_seconds, 3)
     $result.wall_seconds = [math]::Round($profile.wall_seconds, 3)
+    # The guest-clock model epoch this row's rt/instruction counts were measured under (see
+    # izarravm_cpu::TIMING_MODEL_EPOCH). A profile JSON with no field predates the marker and
+    # is epoch 1. rt and final-instruction numbers are not comparable across epochs.
+    $epochProperty = $profile.PSObject.Properties["timing_model_epoch"]
+    $result.timing_model_epoch = if ($null -ne $epochProperty) {
+        [uint32]$epochProperty.Value
+    } else {
+        [uint32]1
+    }
     $coverageFailure = $null
     try {
         $null = Add-CoverageMetrics $result $profile
@@ -3712,6 +3765,11 @@ try {
                         $invariants[$fixture.name].final_instructions_tolerance =
                             $frameInstructionTolerance
                     }
+                    # A fixed cycle_budget retires a different instruction count under a
+                    # different guest-clock model, so the pin is only valid within one
+                    # timing_model_epoch. Stamped alongside the pin so a later comparison
+                    # can refuse rather than silently grading across epochs.
+                    $invariants[$fixture.name].timing_model_epoch = $row.timing_model_epoch
                     $row.notes += "final instruction pin recorded ($($row.instructions))"
                 }
                 # @() around the PIPELINE, not just its source: under StrictMode a
@@ -3765,9 +3823,18 @@ try {
                     $recorded.Contains("final_instructions")) {
                     [double]$recorded.final_instructions
                 } else { $null }
+                $epochCheck = Test-InstructionPinTimingEpoch $recorded ([uint32]$row.timing_model_epoch)
                 if ($row.Contains("instructions") -and $null -eq $instructionPin) {
                     $row.notes += "no recorded final instruction pin to compare against"
                     if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
+                } elseif ($row.Contains("instructions") -and $epochCheck.refused) {
+                    # REFUSE the comparison outright rather than grading a drift that has no
+                    # meaning: the recorded pin and this run's instruction count were charged
+                    # under different guest-clock models, so a fixed cycle_budget legitimately
+                    # retires a different number of instructions. Re-record with -RecordInvariants
+                    # -Force once the new epoch's pin has been established.
+                    $row.invariant = "FAIL"
+                    $row.notes += $epochCheck.note
                 } elseif ($row.Contains("instructions")) {
                     $tolerance = if ($recorded.Contains("final_instructions_tolerance")) {
                         [double]$recorded.final_instructions_tolerance

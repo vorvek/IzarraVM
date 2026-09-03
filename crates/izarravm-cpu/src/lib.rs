@@ -5947,6 +5947,21 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
     }
 }
 
+/// Version marker for the guest clock model: bump this whenever a change alters
+/// the number of guest clocks charged per instruction for ANY persona, whether
+/// the change lives in the core per-mode table (`izarravm_core::GSW_MODE_SPECS`),
+/// `level_timing`, `bus_timing`, or an absorber that scales clocks on top of them
+/// (e.g. the x87 `IntConvert32` multiplier, the mode-13h wait state). Consumers
+/// (the profile-json report, the fixture scoreboard, the realtime gate) stamp
+/// this value alongside recorded runtimes.
+///
+/// Runtime (`rt`) numbers recorded under different epochs are NOT comparable as
+/// performance: an rt change across an epoch bump can mean the guest is doing a
+/// different amount of work per guest second, not that the emulator got faster
+/// or slower. Compare rt only within one epoch; treat a cross-epoch rt delta as
+/// uninterpreted until the underlying instruction/bus counts are checked too.
+pub const TIMING_MODEL_EPOCH: u32 = 1;
+
 /// Per-level instruction-clock scaling as (numerator, denominator), CALIBRATED
 /// (B-T10) against the Neurketa compute benchmarks. A retired op's base clocks are
 /// scaled by num/den (with a fractional remainder carry in `scale_clocks`), so

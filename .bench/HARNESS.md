@@ -467,7 +467,13 @@ measurement rather than guessed — `-Arm off`, the largest lever here, moves th
 it covers JIT-mix changes but deliberately not timing-model changes, is in
 `PROTOCOL.md`'s Duke3D section. A fixture with no recorded hash (or
 no recorded sample pin) reports `unpinned` rather than `pass`, so "never checked"
-and "checked and fine" are different words.
+and "checked and fine" are different words. The retired-instruction pin also
+carries the guest-clock model epoch it was recorded under (`timing_model_epoch`,
+see `izarravm_cpu::TIMING_MODEL_EPOCH`; a sidecar entry with none predates the
+marker and is epoch 1), and a row measured under a different epoch than its pin
+goes RED with a refusal note rather than being graded against a drift tolerance
+that has no meaning once the guest does a different amount of work per guest
+second.
 
 **`-RecordInvariants` REFUSES to write the frame-contract bands, by design.** It
 records what a single run can honestly establish — the anchor frame hash and the
