@@ -8,9 +8,14 @@
 //! went there". The compatibility board grades on that difference, so the
 //! shape must not collapse.
 
-use izarravm_video::{DistiraCensus, DistiraScanoutState, ModeCensus};
+use izarravm_video::{DistiraCensus, DistiraScanoutState, ModeCensus, SwapToNextDrainStats};
 use serde_json::{Value, json};
 
+// One parameter per independent census source, mirroring the JSON's own flat
+// section list -- a struct wrapper would just move the eight fields one level
+// out without changing what a caller has to gather. `distira_swap_to_next_drain`
+// is the eighth (slice 0 of the async-overlap review).
+#[allow(clippy::too_many_arguments)]
 pub fn mode_census_json(
     vga: &ModeCensus,
     distira: &DistiraCensus,
@@ -19,6 +24,7 @@ pub fn mode_census_json(
     register_reads: &[(usize, u64)],
     aperture: izarravm_video::DistiraApertureTraffic,
     offset_bits_or: usize,
+    swap_to_next_drain: SwapToNextDrainStats,
 ) -> Value {
     let vga: Vec<Value> = vga
         .entries()
@@ -196,6 +202,18 @@ pub fn mode_census_json(
         },
         "distira_offset_bits_or": offset_bits_or,
         "distira_raster_lanes": distira_raster_lanes,
+        // Slice 0 of the async-overlap review
+        // (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2):
+        // the swap -> next-drain-call wall-clock window, whole run. Answers
+        // whether the fastfill that follows a swap lands microseconds later
+        // (a real overlap window an async lever could fill) or effectively
+        // at once (the window is already spent before any lever can act).
+        "distira_swap_to_next_drain_ns": {
+            "count": swap_to_next_drain.count,
+            "min": swap_to_next_drain.min_ns,
+            "median": swap_to_next_drain.median_ns,
+            "max": swap_to_next_drain.max_ns,
+        },
     })
 }
 

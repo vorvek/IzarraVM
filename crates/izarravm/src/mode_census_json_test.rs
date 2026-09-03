@@ -31,6 +31,7 @@ fn an_empty_census_renders_two_empty_lists_rather_than_nothing() {
         &[],
         Default::default(),
         0,
+        Default::default(),
     );
     assert_eq!(json["schema"], "izarravm-mode-census-v1");
     assert_eq!(json["vga"].as_array().expect("vga is a list").len(), 0);
@@ -54,6 +55,7 @@ fn a_vga_row_carries_every_key_field_and_its_count() {
         &[],
         Default::default(),
         0,
+        Default::default(),
     );
     let row = &json["vga"][0];
     assert_eq!(row["mode"], "ModeX");
@@ -94,6 +96,7 @@ fn two_line_counts_at_one_pixel_height_render_as_two_rows() {
         &[],
         Default::default(),
         0,
+        Default::default(),
     );
     let rows = json["vga"].as_array().expect("vga is a list");
     assert_eq!(rows.len(), 2);
@@ -140,6 +143,7 @@ fn source_lines_halves_a_double_scanned_mode() {
         &[],
         Default::default(),
         0,
+        Default::default(),
     );
     assert_eq!(json["vga"][0]["vdisp_end"], 400);
     assert_eq!(json["vga"][0]["source_lines"], 200);
@@ -161,6 +165,7 @@ fn a_distira_row_carries_its_size_and_count() {
         &[],
         Default::default(),
         0,
+        Default::default(),
     );
     let row = &json["distira"][0];
     assert_eq!(row["width"], 640);

@@ -12,8 +12,8 @@ use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, MASTER_CLOCK_HZ};
 use izarravm_video::{
     CGA_FB_SIZE, DAC_ENTRIES, Distira, DistiraApertureTraffic, DistiraCensus, DistiraScanoutState,
     HGC_FB_SIZE, MARGO_FRAME_HZ, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, Margo, MargoDisplay,
-    MargoScanTiming, ModeCensus, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
-    VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode,
+    MargoScanTiming, ModeCensus, SwapToNextDrainStats, TextFrame, VGA_MODE13H_BASE,
+    VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode,
 };
 
 use crate::video_params::{
@@ -567,6 +567,10 @@ impl Vega {
 
     pub(crate) fn distira_offset_bits_or(&self) -> usize {
         self.distira.mmio_offset_bits_or()
+    }
+
+    pub(crate) fn distira_swap_to_next_drain_stats(&self) -> SwapToNextDrainStats {
+        self.distira.swap_to_next_drain_stats()
     }
 
     pub(crate) fn mode13_direct_page_available(&self) -> bool {

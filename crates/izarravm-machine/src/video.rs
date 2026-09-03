@@ -2458,6 +2458,13 @@ impl Machine {
         self.vega.distira_offset_bits_or()
     }
 
+    /// See `izarravm_video::SwapToNextDrainStats`: the fastfill-after-swap
+    /// census from `dev_docs/2026-09-05-distira-async-overlap-review.md`
+    /// section 2.
+    pub fn distira_swap_to_next_drain_stats(&self) -> izarravm_video::SwapToNextDrainStats {
+        self.vega.distira_swap_to_next_drain_stats()
+    }
+
     pub fn margo_display(&self) -> Option<crate::MargoDisplay> {
         self.vega.margo_active().then(|| self.vega.margo_display())
     }

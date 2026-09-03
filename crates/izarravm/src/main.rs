@@ -2020,6 +2020,7 @@ fn run_boot_hdd_folder(
             &machine.distira_register_reads(),
             machine.distira_aperture_traffic(),
             machine.distira_offset_bits_or(),
+            machine.distira_swap_to_next_drain_stats(),
         );
         let (vbe_linear, vbe_banked) = machine.vbe_mode_set_window_counts();
         census["margo"] = json!({

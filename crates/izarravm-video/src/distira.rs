@@ -216,6 +216,17 @@ pub struct DistiraTriangleCensus {
     /// which caller forced each of the `queue_drains` above. Named at the
     /// call site (`DrainCause`, passed to `Distira::drain_raster_queue`), not
     /// inferred after the fact, so it never drifts from the real trigger.
+    ///
+    /// **Widened in slice 0 of the async-overlap review**
+    /// (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2):
+    /// this now counts every CALL to `drain_raster_queue`, including one that
+    /// finds the queue already empty and returns without drawing anything.
+    /// Before this it undercounted by exactly the empty-queue calls, which
+    /// hid the fastfill-after-swap question the review asks: a swap that
+    /// flushes and a fastfill that immediately follows it, finding nothing
+    /// left to draw, used to be invisible here. `queue_drains` above is
+    /// unchanged -- it still counts only the calls that found a non-empty
+    /// queue and actually rasterised.
     pub queue_drain_causes: DistiraDrainCauses,
 }
 
@@ -295,6 +306,27 @@ impl DistiraDrainCauses {
             DrainCause::Config => self.config += 1,
         }
     }
+}
+
+/// The swap -> next-drain-call wall-clock window, summarised. Answers
+/// the fastfill-after-swap question from
+/// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 2: does the
+/// call that follows a `swapbufferCMD` land microseconds later (the window
+/// an async lever would have to overlap the guest's frame with) or is it
+/// effectively simultaneous (the fastfill finding an already-drained queue,
+/// eating the whole window before any lever can act)? Wall-clock, not guest
+/// cycles -- on the synchronous model the two are the same elapsed interval
+/// on the one thread that runs both, so this is measured directly rather
+/// than derived from a cycle counter Distira does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SwapToNextDrainStats {
+    /// How many swap -> next-call windows were closed (i.e. a swap was
+    /// followed by at least one more `drain_raster_queue` call before the
+    /// run ended).
+    pub count: usize,
+    pub min_ns: u64,
+    pub median_ns: u64,
+    pub max_ns: u64,
 }
 
 /// Traffic through the three non-register apertures. A guest can look idle in
@@ -677,6 +709,21 @@ pub struct Distira {
     trex_init0: [u32; 2],
     trex_init1: [u32; 2],
     ncc: NccState,
+    /// The instant of the most recent guest `swapbufferCMD` write
+    /// (`SST_SWAPBUFFER_CMD`, byte 3, see `write_mmio_u8`) that has not yet
+    /// been closed off by a following `drain_raster_queue` call. `None` once
+    /// that following call lands -- see `swap_to_next_drain_ns` and slice 0
+    /// of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 2: this
+    /// is the fastfill-after-swap question, measured on the SYNCHRONOUS
+    /// model as a lower bound (the async lever cannot widen a window this
+    /// narrow, only fail to shrink it further).
+    last_swap_instant: Option<std::time::Instant>,
+    /// Every measured swap -> next-call window, in nanoseconds. Read out
+    /// through `swap_to_next_drain_stats`, never compared field-by-field --
+    /// it is wall-clock, so it is in the census "may move" whitelist, not
+    /// graded for identity.
+    swap_to_next_drain_ns: Vec<u64>,
 }
 
 impl Default for Distira {
@@ -809,6 +856,8 @@ impl Distira {
             trex_init0: [0; 2],
             trex_init1: [0; 2],
             ncc: NccState::default(),
+            last_swap_instant: None,
+            swap_to_next_drain_ns: Vec::new(),
         };
         distira.clear_aux_depth();
         distira
@@ -1107,6 +1156,23 @@ impl Distira {
 
     pub fn mmio_offset_bits_or(&self) -> usize {
         self.offset_bits_or
+    }
+
+    /// See [`SwapToNextDrainStats`]. Sorts a clone of the sample vector, so
+    /// it is O(n log n) per call -- fine for an end-of-run census read, not
+    /// meant for a hot loop.
+    pub fn swap_to_next_drain_stats(&self) -> SwapToNextDrainStats {
+        if self.swap_to_next_drain_ns.is_empty() {
+            return SwapToNextDrainStats::default();
+        }
+        let mut samples = self.swap_to_next_drain_ns.clone();
+        samples.sort_unstable();
+        SwapToNextDrainStats {
+            count: samples.len(),
+            min_ns: samples[0],
+            median_ns: samples[samples.len() / 2],
+            max_ns: samples[samples.len() - 1],
+        }
     }
 
     pub fn scanout_state(&mut self) -> DistiraScanoutState {
@@ -1436,12 +1502,34 @@ impl Distira {
     /// fork/join through [`Self::render_triangle_segment`], and the write is
     /// applied serially, on this thread, between the two runs it separates.
     fn drain_raster_queue(&mut self, cause: DrainCause) -> u64 {
+        // Slice 0 of the async-overlap review
+        // (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2):
+        // record the CALL, not just a non-empty drain. Before this, an
+        // empty-queue call returned above without ever reaching
+        // `queue_drain_causes.record`, so a fastfill that landed after the
+        // queue was already empty (the exact hazard the review names) was
+        // invisible to the census. Every call is now counted, and the
+        // swap -> next-call wall-clock window is measured here too: a
+        // guest `swapbufferCMD` write (`issue_swapbuffer_command`) sets
+        // `last_swap_instant`, and the very next `drain_raster_queue` call
+        // of ANY cause closes the window. That next call is almost always
+        // the following register write's own pre-write drain (see
+        // `write_mmio_u8`), which is where `fastfillCMD` lives -- so this is
+        // measuring exactly the interval the review's finding 2 asks about,
+        // not the rare direct `DrainCause::SwapOrScanout` accessor call
+        // (`scanout_state`/`scanout_argb`/`swap_buffers`), which on these two
+        // rows fires only a handful of times a whole run (diagnostic reads,
+        // not the guest's own per-frame swap).
+        self.triangle_census.queue_drain_causes.record(cause);
+        if let Some(start) = self.last_swap_instant.take() {
+            self.swap_to_next_drain_ns
+                .push(start.elapsed().as_nanos() as u64);
+        }
         if self.raster_queue.is_empty() {
             return 0;
         }
         let commands = self.raster_queue.take();
         self.triangle_census.queue_drains += 1;
-        self.triangle_census.queue_drain_causes.record(cause);
         let mut written = 0u64;
         let mut any_parallel = false;
         // A run of triangles between two `TextureWrite`s (or the batch's
@@ -2275,6 +2363,11 @@ impl Distira {
                 merge_byte(&mut self.swapbuffer_command, byte, value);
                 if byte == 3 {
                     self.issue_swapbuffer_command(self.swapbuffer_command);
+                    // Opens the swap -> next-drain-call window `drain_raster_queue`
+                    // closes. See its doc comment and
+                    // `dev_docs/2026-09-05-distira-async-overlap-review.md`
+                    // section 2.
+                    self.last_swap_instant = Some(std::time::Instant::now());
                 }
             }
             SST_FOG_COLOR => merge_byte(&mut self.fog_color, byte, value),
