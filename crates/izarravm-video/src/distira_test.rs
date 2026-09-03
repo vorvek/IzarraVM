@@ -63,7 +63,7 @@ fn high_texture_upload_does_not_alias_a_low_texel_within_tmu_budget() {
     // Read the low texel back both ways: raw storage, and through the real
     // fetch path at the coordinates the low write targeted.
     distira.tex_base_addr = 0;
-    let raw_low = distira.texture[0][0];
+    let raw_low = distira.raster_owned.as_ref().unwrap().texture[0][0];
     let sampled_low = distira.raster_view().sample_tmu_u8(
         0,
         TextureSample {
@@ -168,4 +168,73 @@ fn lane_split_is_graduated_by_row_span_not_forced_to_the_cap() {
              count, not the cap alone"
         );
     }
+}
+
+/// Slice 0b of `dev_docs/2026-09-05-distira-async-overlap-review.md`
+/// section 3: `raster_owned` is `None` only inside `drain_raster_queue`'s own
+/// batch, and nothing outside that method ever re-enters while the box is
+/// out -- there is no async yet to make that observable directly, so this
+/// pins the invariant at every accessor's boundary instead: after ANY call
+/// that could plausibly take the box (a queued texture write, a drain, the
+/// `&mut self` census accessors this slice added the door to), the box is
+/// back. If a future edit ever left it out (forgot to hand it back, or
+/// panicked mid-batch and unwound past the restore), every one of these
+/// would start panicking on the very next call via `raster_owned_mut`'s
+/// `expect`, which is the point: the invariant is enforced at the door, not
+/// asserted once and hoped for.
+#[test]
+fn raster_owned_is_present_after_every_call_that_could_take_it() {
+    let mut distira = Distira::new();
+    assert!(
+        distira.raster_owned.is_some(),
+        "a fresh Distira starts with the box in place"
+    );
+
+    // A queued texture write: `write_texture_u32` pushes a `TextureWrite`
+    // command and may itself force a drain if the queue is full -- both
+    // paths touch `raster_owned` (the queue-off store goes through
+    // `raster_owned_mut` directly; a forced drain takes the box out for the
+    // batch and hands it back before returning).
+    distira.write_texture_u32(0, 0x1234_5678);
+    assert!(
+        distira.raster_owned.is_some(),
+        "a queued texture write leaves the box in place"
+    );
+
+    // An explicit drain with no triangles queued: the empty-queue early
+    // return (slice 0) never touches `raster_owned` at all.
+    distira.drain_raster_queue(DrainCause::Config);
+    assert!(
+        distira.raster_owned.is_some(),
+        "an empty-queue drain leaves the box in place"
+    );
+
+    // The queue-off synchronous store path in `write_texture_u32`, which
+    // writes through `raster_owned_mut` directly with no queue involved.
+    distira.set_raster_queue_enabled(false);
+    distira.write_texture_u32(0, 0x9abc_def0);
+    assert!(
+        distira.raster_owned.is_some(),
+        "the queue-off texture store leaves the box in place"
+    );
+    distira.set_raster_queue_enabled(true);
+
+    // The four `&mut self` census accessors slice 0b routed through the
+    // joining door (`Self::join_raster`).
+    let _ = distira.census();
+    let _ = distira.register_write_histogram();
+    let _ = distira.register_read_histogram();
+    let _ = distira.aperture_traffic();
+    assert!(
+        distira.raster_owned.is_some(),
+        "the census accessors leave the box in place"
+    );
+
+    // A register write that goes through the NCC table, which now lives
+    // inside `RasterOwned` too.
+    distira.write_mmio_u8(SST_TEXTURE_MODE, 0);
+    assert!(
+        distira.raster_owned.is_some(),
+        "an NCC-routed register write leaves the box in place"
+    );
 }

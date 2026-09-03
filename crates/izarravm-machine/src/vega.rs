@@ -541,7 +541,7 @@ impl Vega {
         self.vga.text_rows_rendered()
     }
 
-    pub(crate) fn distira_census(&self) -> &DistiraCensus {
+    pub(crate) fn distira_census(&mut self) -> DistiraCensus {
         self.distira.census()
     }
 
@@ -549,15 +549,15 @@ impl Vega {
         self.distira.scanout_state()
     }
 
-    pub(crate) fn distira_register_writes(&self) -> Vec<(usize, u64)> {
+    pub(crate) fn distira_register_writes(&mut self) -> Vec<(usize, u64)> {
         self.distira.register_write_histogram()
     }
 
-    pub(crate) fn distira_register_reads(&self) -> Vec<(usize, u64)> {
+    pub(crate) fn distira_register_reads(&mut self) -> Vec<(usize, u64)> {
         self.distira.register_read_histogram()
     }
 
-    pub(crate) fn distira_aperture_traffic(&self) -> DistiraApertureTraffic {
+    pub(crate) fn distira_aperture_traffic(&mut self) -> DistiraApertureTraffic {
         DistiraApertureTraffic {
             texture_reads: self.distira_texture_reads,
             texture_narrow_writes: self.distira_texture_narrow_writes,

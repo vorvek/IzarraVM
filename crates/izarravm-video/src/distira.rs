@@ -6,6 +6,7 @@
 //! swaps, ordered dither, triangle setup, texture sampling, and host-color decode.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 mod ncc;
 mod raster_kernel;
@@ -532,8 +533,14 @@ pub struct Distira {
     /// ever driven it, so this is the first instrument that says whether a
     /// real title reached the 3D unit at all.
     census: DistiraCensus,
-    fb: FrameStore,
-    texture: [Vec<u8>; 2],
+    /// `Arc`, not a plain `FrameStore`: slice 0b of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 3.
+    /// `FrameStore` is ALREADY `Vec<AtomicU8>` (`raster_pool.rs`) -- every
+    /// method takes `&self` and stores through relaxed atomics -- so the
+    /// interior mutability this needs is already there, and `Arc` adds one
+    /// indirection to an access that is already a load, never a `Mutex` or
+    /// `RefCell`. Nothing here is unsafe: `#![forbid(unsafe_code)]` holds.
+    fb: Arc<FrameStore>,
     fifo: VecDeque<DistiraFifoEntry>,
     command_fifo: VecDeque<u32>,
     display: DistiraDisplay,
@@ -708,7 +715,25 @@ pub struct Distira {
     tex_base_addr38: [u32; 2],
     trex_init0: [u32; 2],
     trex_init1: [u32; 2],
-    ncc: NccState,
+    /// The texture stores and NCC/CLUT tables a raster batch touches, moved
+    /// out for the duration of a batch rather than shared. Slice 0b of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 3: NO
+    /// atomics here, unlike `fb` -- `self.texture` has exactly two `&mut
+    /// self` writers (the drain's serial application of a queued texture
+    /// write, and the queue-off store in `write_texture_u32`) and no `&self`
+    /// reader outside the lane-side view (#840 established that a
+    /// texture-aperture READ never reaches the device), so ownership can
+    /// just move to the batch and back instead of sharing through atomics
+    /// the way `fb` does.
+    ///
+    /// `None` only for the duration of `drain_raster_queue`'s own batch --
+    /// every other access goes through `raster_owned_mut`, which joins
+    /// first (a no-op today; slice 1 makes it wait on an in-flight batch).
+    /// `drain_raster_queue` is the ONLY method that ever observes `None`
+    /// here, and even there only between its own `take()` and putting the
+    /// box back before it returns -- no other method runs in between on the
+    /// fully synchronous model this slice keeps.
+    raster_owned: Option<Box<RasterOwned>>,
     /// The instant of the most recent guest `swapbufferCMD` write
     /// (`SST_SWAPBUFFER_CMD`, byte 3, see `write_mmio_u8`) that has not yet
     /// been closed off by a following `drain_raster_queue` call. `None` once
@@ -726,6 +751,16 @@ pub struct Distira {
     swap_to_next_drain_ns: Vec<u64>,
 }
 
+/// The two per-batch memories a raster batch reads and (for `texture`)
+/// writes: moved out of `Distira` for a batch's duration instead of shared.
+/// See `Distira::raster_owned`'s doc comment and slice 0b of
+/// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RasterOwned {
+    texture: [Vec<u8>; 2],
+    ncc: NccState,
+}
+
 impl Default for Distira {
     fn default() -> Self {
         Self::new()
@@ -738,8 +773,7 @@ impl Distira {
         let buffer_stride = display.pitch * display.height;
         let mut distira = Self {
             census: DistiraCensus::default(),
-            fb: FrameStore::new(DISTIRA_FB_SIZE),
-            texture: std::array::from_fn(|_| vec![0; DISTIRA_TEX_SIZE]),
+            fb: Arc::new(FrameStore::new(DISTIRA_FB_SIZE)),
             fifo: VecDeque::new(),
             command_fifo: VecDeque::new(),
             display,
@@ -855,7 +889,10 @@ impl Distira {
             tex_base_addr38: [0; 2],
             trex_init0: [0; 2],
             trex_init1: [0; 2],
-            ncc: NccState::default(),
+            raster_owned: Some(Box::new(RasterOwned {
+                texture: std::array::from_fn(|_| vec![0; DISTIRA_TEX_SIZE]),
+                ncc: NccState::default(),
+            })),
             last_swap_instant: None,
             swap_to_next_drain_ns: Vec::new(),
         };
@@ -1106,8 +1143,19 @@ impl Distira {
     }
 
     /// Every frame size this guest programmed, against its count.
-    pub fn census(&self) -> &DistiraCensus {
-        &self.census
+    ///
+    /// `&mut self` and an owned return, not `&self` and `&DistiraCensus`:
+    /// slice 0b of `dev_docs/2026-09-05-distira-async-overlap-review.md`
+    /// section 1 closes the `&self`-accessor hole by routing this through
+    /// `join_raster` first. An owned `DistiraCensus` (it derives `Clone`)
+    /// keeps the borrow from `self` from outliving the call, which matters
+    /// once a caller (see `main.rs`'s `--mode-census` dump) reads several of
+    /// these accessors back to back on the same `&mut Machine` -- a borrowed
+    /// return would force them to interleave in a fixed order again, which
+    /// is exactly the "ordering is luck" hazard this slice removes.
+    pub fn census(&mut self) -> DistiraCensus {
+        self.join_raster();
+        self.census.clone()
     }
 
     pub fn display(&self) -> DistiraDisplay {
@@ -1129,7 +1177,11 @@ impl Distira {
     /// A run that reports painted_bytes 0 never rendered; one that reports a
     /// large count with a black picture rendered somewhere nobody is looking.
     /// Diagnostic: `(register index, byte writes)`, busiest first.
-    pub fn register_write_histogram(&self) -> Vec<(usize, u64)> {
+    ///
+    /// `&mut self`: see [`Self::census`]'s doc comment -- same hole, same
+    /// fix.
+    pub fn register_write_histogram(&mut self) -> Vec<(usize, u64)> {
+        self.join_raster();
         let mut rows: Vec<(usize, u64)> = self
             .register_writes
             .iter()
@@ -1142,7 +1194,11 @@ impl Distira {
     }
 
     /// Diagnostic: `(register index, byte reads)`, busiest first.
-    pub fn register_read_histogram(&self) -> Vec<(usize, u64)> {
+    ///
+    /// `&mut self`: see [`Self::census`]'s doc comment -- same hole, same
+    /// fix.
+    pub fn register_read_histogram(&mut self) -> Vec<(usize, u64)> {
+        self.join_raster();
         let mut rows: Vec<(usize, u64)> = self
             .register_reads
             .iter()
@@ -1360,16 +1416,27 @@ impl Distira {
     /// The pipeline's view of the device THIS INSTANT. The LFB write path and
     /// the texture-aperture decode use it; a triangle uses the params it was
     /// submitted with instead.
-    fn raster_view(&self) -> RasterView<'_> {
-        self.view_memory().view(self.raster_params())
-    }
-
-    fn view_memory(&self) -> ViewMemory<'_> {
+    ///
+    /// `&mut self`: joins first (see [`Self::join_raster`]), then borrows
+    /// `self.fb`/`self.raster_owned` directly rather than through
+    /// [`Self::raster_owned_mut`] -- that method's `&mut self` receiver would
+    /// keep the whole of `self` borrowed for as long as the returned
+    /// [`RasterView`] lives, which is longer than `self.raster_params()`
+    /// (also `&self`) can tolerate. Reading the fields straight keeps the two
+    /// borrows disjoint.
+    fn raster_view(&mut self) -> RasterView<'_> {
+        self.join_raster();
+        let params = self.raster_params();
+        let owned = self.raster_owned.as_ref().expect(
+            "raster_owned is only None inside drain_raster_queue's own batch, \
+             which never calls back into this accessor",
+        );
         ViewMemory {
-            fb: &self.fb,
-            texture: &self.texture,
-            ncc: &self.ncc,
+            fb: self.fb.as_ref(),
+            texture: &owned.texture,
+            ncc: &owned.ncc,
         }
+        .view(params)
     }
 
     /// Set a triangle up and either queue it or draw it.
@@ -1480,6 +1547,33 @@ impl Distira {
         self.drain_raster_queue(DrainCause::ImmediateTriangle)
     }
 
+    /// Wait for an in-flight raster batch, if there is one, before any
+    /// caller observes state a batch could have produced. Slice 0b of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 1 (the
+    /// `&self`-accessor hole): today this is a no-op -- `drain_raster_queue`
+    /// is still fully synchronous, so nothing is ever in flight when this
+    /// runs. It exists so every reader already goes through the door slice 1
+    /// needs, rather than adding the join call at four separate call sites
+    /// later. `raster_owned_mut` and the census accessors
+    /// (`Self::census`, `Self::aperture_traffic`, the two register
+    /// histograms) all call this first.
+    fn join_raster(&mut self) {}
+
+    /// The door onto [`RasterOwned`]: every reader of `self.texture`/
+    /// `self.ncc` outside a batch goes through this, never the fields
+    /// directly. Joins first (see [`Self::join_raster`]), then unwraps --
+    /// the `None` case is `drain_raster_queue`'s own batch window, and
+    /// nothing else runs while that window is open on the fully synchronous
+    /// model this slice keeps, so the `expect` cannot fire today. Slice 1
+    /// makes that a real invariant instead of an accident of scheduling.
+    fn raster_owned_mut(&mut self) -> &mut RasterOwned {
+        self.join_raster();
+        self.raster_owned.as_mut().expect(
+            "raster_owned is only None inside drain_raster_queue's own batch, \
+             which never calls back into this accessor",
+        )
+    }
+
     /// Draw every triangle waiting on the queue -- and apply every queued
     /// texture-aperture write, in submission order -- and return how many
     /// pixels the triangles stored.
@@ -1496,7 +1590,7 @@ impl Distira {
     /// Internally the batch still has to respect the write's ordering: a
     /// triangle queued before a `TextureWrite` must sample the OLD texel,
     /// one queued after must sample the NEW one, and a lane's borrow of
-    /// `self.texture` can never overlap the write's `&mut` (see
+    /// the batch's texture store can never overlap the write's `&mut` (see
     /// `distira/raster_queue.rs`'s module doc). So the batch is split into
     /// runs of triangles at every `TextureWrite`, each run gets its own
     /// fork/join through [`Self::render_triangle_segment`], and the write is
@@ -1530,6 +1624,17 @@ impl Distira {
         }
         let commands = self.raster_queue.take();
         self.triangle_census.queue_drains += 1;
+        // Slice 0b: take the batch's memories OUT of `self` for the
+        // duration of the drain, instead of borrowing them from `self` (the
+        // old model, which relied on the lanes' shared borrow ending before
+        // the texture write's `&mut` ran). `owned` is a local now, so it
+        // aliases nothing in `self`, and handing it back at the end is what
+        // slice 1's `join_raster` will instead do after a real cross-thread
+        // join.
+        let mut owned = self.raster_owned.take().expect(
+            "raster_owned is only None inside this method's own batch, which \
+             cannot re-enter drain_raster_queue",
+        );
         let mut written = 0u64;
         let mut any_parallel = false;
         // A run of triangles between two `TextureWrite`s (or the batch's
@@ -1537,8 +1642,6 @@ impl Distira {
         // tracks it by index instead of copying triangles into a side `Vec`,
         // which used to memcpy every queued triangle (~600 B each) on every
         // drain, even the common case with no write in the batch at all.
-        // `commands` is a local, not a borrow of `self`, so slicing it and
-        // then mutating `self.texture` below never conflicts.
         let mut run_start = 0usize;
         for (index, command) in commands.iter().enumerate() {
             let QueuedCommand::TextureWrite(write) = *command else {
@@ -1546,18 +1649,19 @@ impl Distira {
             };
             if index > run_start {
                 let (segment_written, parallel) =
-                    self.render_triangle_segment(&commands[run_start..index]);
+                    self.render_triangle_segment(&commands[run_start..index], &owned);
                 written += segment_written;
                 any_parallel |= parallel;
             }
             let mask = DISTIRA_TEX_SIZE - 1;
             for (byte_index, byte) in write.bytes.into_iter().enumerate() {
-                self.texture[write.tmu][(write.offset + byte_index) & mask] = byte;
+                owned.texture[write.tmu][(write.offset + byte_index) & mask] = byte;
             }
             run_start = index + 1;
         }
         if run_start < commands.len() {
-            let (segment_written, parallel) = self.render_triangle_segment(&commands[run_start..]);
+            let (segment_written, parallel) =
+                self.render_triangle_segment(&commands[run_start..], &owned);
             written += segment_written;
             any_parallel |= parallel;
         }
@@ -1565,6 +1669,7 @@ impl Distira {
             self.triangle_census.queue_drains_parallel += 1;
         }
         self.raster_queue.recycle(commands);
+        self.raster_owned = Some(owned);
         written
     }
 
@@ -1576,13 +1681,24 @@ impl Distira {
     /// row is the one that has to partition and not the triangle's own row.
     /// Returns the pixels stored and whether the run reached the parallel
     /// lanes.
-    fn render_triangle_segment(&mut self, jobs: &[QueuedCommand]) -> (u64, bool) {
+    ///
+    /// `owned` is the caller's local [`RasterOwned`] (taken out of `self` for
+    /// the batch), not `self.raster_owned` -- see `drain_raster_queue`.
+    fn render_triangle_segment(
+        &mut self,
+        jobs: &[QueuedCommand],
+        owned: &RasterOwned,
+    ) -> (u64, bool) {
         let lanes = self.batch_lanes(jobs);
         let mut lane_stats: Vec<PixelStats> = (0..lanes).map(|_| PixelStats::new(0)).collect();
+        let memory = ViewMemory {
+            fb: self.fb.as_ref(),
+            texture: &owned.texture,
+            ncc: &owned.ncc,
+        };
         if lanes == 1 {
-            render_band(jobs, self.view_memory(), 0, 1, &mut lane_stats[0]);
+            render_band(jobs, memory, 0, 1, &mut lane_stats[0]);
         } else {
-            let memory = self.view_memory();
             let lane_count = lanes as u32;
             // A lane accumulates into a stack-local `PixelStats` and stores
             // it once at the end: the `lane_stats` elements share cache
@@ -1799,7 +1915,11 @@ impl Distira {
     }
 
     /// Diagnostic: the aperture counters. See [`DistiraApertureTraffic`].
-    pub fn aperture_traffic(&self) -> DistiraApertureTraffic {
+    ///
+    /// `&mut self`: see [`Self::census`]'s doc comment -- same hole, same
+    /// fix.
+    pub fn aperture_traffic(&mut self) -> DistiraApertureTraffic {
+        self.join_raster();
         DistiraApertureTraffic {
             lfb_reads: self.lfb_reads.get(),
             ..self.aperture_traffic
@@ -2172,7 +2292,11 @@ impl Distira {
             self.drain_raster_queue(DrainCause::RegisterWriteUncovered);
         }
         let chip = tmu_chip_mask(offset);
-        if self.ncc.write_register(chip, register, byte, value) {
+        if self
+            .raster_owned_mut()
+            .ncc
+            .write_register(chip, register, byte, value)
+        {
             return;
         }
         if register < DISTIRA_REG_ID
@@ -2605,8 +2729,9 @@ impl Distira {
             // off there is no ordering to build, only the same store there
             // always was.
             let mask = DISTIRA_TEX_SIZE - 1;
+            let owned = self.raster_owned_mut();
             for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-                self.texture[tmu][(offset + index) & mask] = byte;
+                owned.texture[tmu][(offset + index) & mask] = byte;
             }
             return;
         }
@@ -3027,7 +3152,7 @@ impl Distira {
         }
     }
 
-    fn lfb_pipeline_depth_test_passes(&self, position: (u32, u32), depth: u16) -> bool {
+    fn lfb_pipeline_depth_test_passes(&mut self, position: (u32, u32), depth: u16) -> bool {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
             return true;
         }
