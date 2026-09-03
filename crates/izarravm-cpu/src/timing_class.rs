@@ -289,6 +289,11 @@ timing_classes! {
     JmpFar = (17, 204, 204, "UNSOURCED x12"),
     /// `RETF` (`0xca`/`0xcb`), both operand sizes.
     RetFar = (17, 204, 204, "UNSOURCED x12"),
+    /// Far `CALL` (`0xff /3`) and far `JMP` (`0xff /5`) THROUGH MEMORY, which
+    /// charge 11 where the direct `0x9a`/`0xea` forms charge 17. A separate
+    /// class rather than a shared one because the two literals differ today, and
+    /// a class may hold only one epoch-1 value.
+    CallJmpFarMem = (11, 132, 132, "UNSOURCED x12"),
     /// `LOOP` (`0xe2`) -- charged taken or not, one arm past both branches.
     Loop = (11, 84, 66, "486 §5 (7 clk taken) / design §3.2 (5.5 clk)"),
     /// `LOOPE`/`LOOPNE` (`0xe0`/`0xe1`).
@@ -384,14 +389,14 @@ timing_classes! {
     SldtStr = (2, 24, 24, "UNSOURCED x12"),
     /// `LLDT`/`LTR` (`0x0f00 /2`, `/3`).
     LldtLtr = (11, 132, 132, "UNSOURCED x12"),
-    /// `SGDT`/`SIDT` (`0x0f01 /0`, `/1`).
-    SgdtSidt = (2, 24, 24, "UNSOURCED x12"),
+    /// `SGDT`/`SIDT` (`0x0f01 /0`, `/1`), memory form only.
+    SgdtSidt = (11, 132, 132, "UNSOURCED x12"),
     /// `LGDT`/`LIDT` (`0x0f01 /2`, `/3`).
     LgdtLidt = (11, 132, 132, "UNSOURCED x12"),
     /// `SMSW` (`0x0f01 /4`).
-    Smsw = (3, 36, 36, "UNSOURCED x12"),
+    Smsw = (2, 24, 24, "UNSOURCED x12"),
     /// `LMSW` (`0x0f01 /6`).
-    Lmsw = (11, 132, 132, "UNSOURCED x12"),
+    Lmsw = (3, 36, 36, "UNSOURCED x12"),
     /// `INVLPG` (`0x0f01 /7`).
     Invlpg = (12, 144, 144, "UNSOURCED x12"),
     /// `CLTS` (`0x0f06`).
@@ -504,16 +509,20 @@ timing_classes! {
     /// sub-opcode at the charge site and is a later sub-slice. This entry takes
     /// `FADD`'s 3-clock latency, an under-charge for `FDIV` recorded here.
     X87RegArith = (20, 240, 36, "cmp §3 row 19 (FADD 3 clk); FDIV/FSQRT split deferred"),
-    /// `FCOM`/`FCOMP`/`FUCOM` and the `FCOMPP`/`FUCOMPP` pair forms.
-    X87RegCompare = (5, 60, 60, "UNSOURCED x12"),
+    /// `FUCOM`/`FUCOMP` (`0xdd /4`, `/5`).
+    X87RegCompare = (4, 48, 48, "UNSOURCED x12"),
     /// `FLD ST(i)` and `FXCH` (`0xd9 c0..cf`, `0xd9 d0`).
     X87RegExchange = (4, 48, 12, "design §3.2 (FXCH raw 12)"),
-    /// `FCHS`/`FABS`/`FTST`/`FXAM` (`0xd9 e0..e5`).
+    /// `FCHS` (`0xd9 e0`) and `FABS` (`0xd9 e1`).
     X87RegSign = (6, 72, 72, "UNSOURCED x12"),
-    /// The constant loads `FLD1`/`FLDL2T`/.../`FLDZ` (`0xd9 e8..ee`).
+    /// `FXAM` (`0xd9 e5`) and the four-and-a-half-digit constant loads
+    /// `FLDL2T`/`FLDL2E`/`FLDPI`/`FLDLG2`/`FLDLN2` (`0xd9 e9..ed`), which all
+    /// charge 8 today. `FXAM` is not a constant load and shares the class only
+    /// because it shares the literal; splitting it needs an epoch-2 source it
+    /// does not have yet.
     X87RegConst = (8, 96, 96, "UNSOURCED x12"),
-    /// `FLDZ` and the two cheap constant loads that charge 4 rather than 8
-    /// (`0xd9 e8`, `0xd9 ee`, `0xd9 e4`).
+    /// `FTST` (`0xd9 e4`), `FLD1` (`0xd9 e8`) and `FLDZ` (`0xd9 ee`), the three
+    /// register-form ops that charge 4 rather than 8 today.
     X87RegConstCheap = (4, 48, 48, "UNSOURCED x12"),
     /// `F2XM1` (`0xd9 f0`).
     X87Exp = (200, 2400, 2400, "UNSOURCED x12"),
@@ -533,14 +542,18 @@ timing_classes! {
     X87Scale = (30, 360, 360, "UNSOURCED x12"),
     /// `FDECSTP`/`FINCSTP` (`0xd9 f6`/`0xd9 f7`).
     X87StackPointer = (4, 48, 48, "UNSOURCED x12"),
-    /// `FNCLEX`/`FNINIT`/`FSETPM` and `FFREE` (`0xdb e0..e4`, `0xdd c0..c7`).
+    /// `FNENI`/`FNDISI`/`FNSETPM` (`0xdb e0`/`e1`/`e4`, 387 no-ops) and `FNCLEX`
+    /// (`0xdb e2`).
     X87Control = (2, 24, 24, "UNSOURCED x12"),
-    /// `FNSTSW AX` (`0xdf e0`) and the `0xdb e3`/`0xdd` register forms that
-    /// charge 3.
+    /// `FNINIT` (`0xdb e3`).
+    X87Init = (3, 36, 36, "UNSOURCED x12"),
+    /// `FFREE ST(i)` (`0xdd /0`).
+    X87Free = (3, 36, 36, "UNSOURCED x12"),
+    /// `FNSTSW AX` (`0xdf e0`).
     X87StatusReg = (3, 36, 36, "UNSOURCED x12"),
-    /// `FFREE`/`FST ST(i)`/`FSTP ST(i)` register forms that charge 4 (`0xdd`).
-    X87RegStore = (4, 48, 48, "UNSOURCED x12"),
-    /// `FUCOMPP`/`FCOMPP` (`0xda e9`, `0xde d9`) -- the compare-and-pop-twice pair.
+    /// `FST ST(i)` / `FSTP ST(i)` register forms (`0xdd /2`, `/3`).
+    X87RegStore = (3, 36, 36, "UNSOURCED x12"),
+    /// `FCOMPP` (`0xde d9`) and `FUCOMPP` (`0xda e9`) -- compare and pop twice.
     X87ComparePop = (5, 60, 60, "UNSOURCED x12"),
 }
 

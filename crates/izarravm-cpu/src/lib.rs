@@ -6193,12 +6193,26 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     }
 };
 
+/// The last free clock constructor, and it no longer takes a LITERAL from
+/// anybody.
+///
+/// Slice 1a/1b routed every one of the 273 interpreter charge sites through
+/// `CpuGsw::charge(TimingClass)`, and this function was deleted with them. It
+/// comes back for the twelve port and string-port arms the port slices (P1-P3)
+/// own: those compute their charge at RUN TIME from
+/// `port_core_clocks(epoch, is_out, priv_mode)`, which is keyed on a privilege
+/// column the class table has no row for, so they cannot go through a class.
+///
+/// **Every argument here is a computed value.** A bare integer at a call site is
+/// the thing slice 1 removed; if a new site needs one, it needs a class, or
+/// `TimingClass::Legacy(n)` to say out loud that it has none yet.
 fn clocks(core_clocks: u32) -> CycleOutcome {
     CycleOutcome {
         core_clocks,
         halted: false,
     }
 }
+
 
 /// Version marker for the guest clock model: bump this whenever a change alters
 /// the number of guest clocks charged per instruction for ANY persona, whether

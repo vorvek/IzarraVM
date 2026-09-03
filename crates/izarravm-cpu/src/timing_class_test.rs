@@ -73,6 +73,7 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::CallFar, 17),
     (TimingClass::JmpFar, 17),
     (TimingClass::RetFar, 17),
+    (TimingClass::CallJmpFarMem, 11),
     (TimingClass::Loop, 11),
     (TimingClass::LoopCc, 11),
     (TimingClass::Jcxz, 9),
@@ -105,10 +106,10 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::VerRw, 10),
     (TimingClass::SldtStr, 2),
     (TimingClass::LldtLtr, 11),
-    (TimingClass::SgdtSidt, 2),
+    (TimingClass::SgdtSidt, 11),
     (TimingClass::LgdtLidt, 11),
-    (TimingClass::Smsw, 3),
-    (TimingClass::Lmsw, 11),
+    (TimingClass::Smsw, 2),
+    (TimingClass::Lmsw, 3),
     (TimingClass::Invlpg, 12),
     (TimingClass::Clts, 2),
     (TimingClass::MovCrDr, 6),
@@ -151,7 +152,7 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::X87LoadBcd, 75),
     (TimingClass::X87StoreBcd, 160),
     (TimingClass::X87RegArith, 20),
-    (TimingClass::X87RegCompare, 5),
+    (TimingClass::X87RegCompare, 4),
     (TimingClass::X87RegExchange, 4),
     (TimingClass::X87RegSign, 6),
     (TimingClass::X87RegConst, 8),
@@ -164,8 +165,10 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::X87Scale, 30),
     (TimingClass::X87StackPointer, 4),
     (TimingClass::X87Control, 2),
+    (TimingClass::X87Init, 3),
+    (TimingClass::X87Free, 3),
     (TimingClass::X87StatusReg, 3),
-    (TimingClass::X87RegStore, 4),
+    (TimingClass::X87RegStore, 3),
     (TimingClass::X87ComparePop, 5),
 ];
 
@@ -312,7 +315,7 @@ fn the_unsourced_and_placeholder_census_is_pinned() {
         .count();
     assert_eq!(
         (unsourced, placeholder),
-        (78, 2),
+        (81, 2),
         "the unsourced/placeholder census moved; update the pin and say why"
     );
     for class in TimingClass::ALL {
@@ -415,4 +418,47 @@ fn the_cpu_charges_the_epoch_and_persona_column() {
             EPOCH2_I586.raw(TimingClass::Reg)
         );
     }
+}
+
+/// The classifier sites, pinned.
+///
+/// Sixteen charge sites do not name a class outright: they call `alu_class`,
+/// `group1_class`, `group2_class` or `test_rm_class`, which pick from several
+/// classes using the decoded operand or the opcode. Every one of those sites
+/// carried the literal `2` before the routing, so epoch-1 identity holds only if
+/// EVERY class those four functions can return is pinned at 2. A later
+/// sub-slice that re-solves one of these epoch-2 entries and touches its epoch-1
+/// entry by accident would silently move a charge on the hottest arms in the
+/// interpreter; this catches it.
+#[test]
+fn every_class_a_classifier_can_return_is_pinned_at_the_sites_literal() {
+    for class in [
+        TimingClass::Reg,
+        TimingClass::AluRegMem,
+        TimingClass::AluMemReg,
+        TimingClass::ShiftImm,
+        TimingClass::ShiftOne,
+        TimingClass::ShiftCl,
+    ] {
+        assert_eq!(
+            EPOCH1.raw(class),
+            2,
+            "{} is reachable from a classifier site whose literal was 2",
+            class.name()
+        );
+    }
+}
+
+/// The four classifiers agree with the shapes their doc comments claim, checked
+/// against the enum rather than against prose.
+#[test]
+fn the_classifiers_pick_the_documented_shapes() {
+    use crate::execute::group2_class;
+
+    assert_eq!(group2_class(0xc0), TimingClass::ShiftImm);
+    assert_eq!(group2_class(0xc1), TimingClass::ShiftImm);
+    assert_eq!(group2_class(0xd0), TimingClass::ShiftOne);
+    assert_eq!(group2_class(0xd1), TimingClass::ShiftOne);
+    assert_eq!(group2_class(0xd2), TimingClass::ShiftCl);
+    assert_eq!(group2_class(0xd3), TimingClass::ShiftCl);
 }
