@@ -1636,22 +1636,6 @@ pub struct Machine {
     // Set only when a bus-side DMA block copy writes guest RAM without exposing
     // its destination range. Range-aware HLE and device paths notify the CPU directly.
     device_wrote_memory: bool,
-    /// The native-backend setting this machine was CONFIGURED with. The batch loop may
-    /// force the interpreter for one batch on the reflected-call memo's behalf (a
-    /// journaled learn trip must retire every instruction through the interpreter's own
-    /// seam), and this is what it restores to afterwards -- so the forcing can never
-    /// silently promote an `ExecutionBackend::Interpreter` machine to the JIT.
-    #[cfg_attr(
-        not(all(feature = "jit", feature = "reflected-call-memo")),
-        allow(dead_code)
-    )]
-    native_backend_configured: bool,
-    /// Whether the batch loop currently has the interpreter forced for that reason.
-    #[cfg_attr(
-        not(all(feature = "jit", feature = "reflected-call-memo")),
-        allow(dead_code)
-    )]
-    reflected_call_interpreter_forced: bool,
     // An exact RAM write performed while MachineBus owns the memory borrow. The CPU cannot be
     // notified until that borrow ends, so the run loop consumes this before another CPU entry.
     pending_device_memory_write_range: Option<(u32, u32)>,
@@ -2210,8 +2194,6 @@ impl Machine {
             #[cfg(not(feature = "shadow-cache-probe"))]
             shadow_l1: ShadowL1Probe::from_env(),
             device_wrote_memory: false,
-            native_backend_configured: false,
-            reflected_call_interpreter_forced: false,
             pending_device_memory_write_range: None,
             direct_map_changed: false,
             direct_data_map_changed: false,
@@ -2327,13 +2309,9 @@ impl Machine {
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
         #[cfg(feature = "jit")]
-        {
-            machine.native_backend_configured =
-                matches!(execution_backend, ExecutionBackend::Automatic);
-            machine
-                .cpu
-                .set_native_backend_enabled(machine.native_backend_configured);
-        }
+        machine
+            .cpu
+            .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
         machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
         // Both sweep knobs are read ONCE, here, and pushed onto the channel --
         // never per access. See `ata_poll_run_default`.

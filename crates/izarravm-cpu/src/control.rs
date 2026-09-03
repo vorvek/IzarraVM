@@ -122,8 +122,8 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
-            crate::reflected_call_memo::note_read(self, bus, vector_address);
-            crate::reflected_call_memo::note_read(self, bus, vector_address + 2);
+            crate::reflected_call_memo::note_read(self, bus, vector_address, BusWidth::Word);
+            crate::reflected_call_memo::note_read(self, bus, vector_address + 2, BusWidth::Word);
         }
         self.load_segment_real(SegmentIndex::Cs, cs);
         self.set_eip(u32::from(ip));
@@ -959,7 +959,7 @@ impl CpuGsw {
         crate::reflected_call_diag::note_read(self, bus, linear);
         #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
-            crate::reflected_call_memo::note_read(self, bus, linear);
+            crate::reflected_call_memo::note_read(self, bus, linear, width);
         }
         Ok(value)
     }

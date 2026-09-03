@@ -621,13 +621,6 @@ impl CpuGsw {
         profile_key: Option<(DecodeGroup, u16, CpuProfileOperandForm)>,
         profile_start: Option<std::time::Instant>,
     ) -> Result<CycleOutcome, CpuError> {
-        // The CS base as it stands on ENTRY to this seam. A far transfer inside the
-        // instruction has already moved it, which is the same caveat the profile
-        // histogram below carries; for the reflected-call memo's code-page set that is
-        // the conservative direction (a mis-attributed page adds a watch, never removes
-        // one), and the completeness check is on the COUNT, not on the addresses.
-        #[cfg(feature = "reflected-call-memo")]
-        let start_cs_base = self.registers.cs().base;
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
@@ -728,16 +721,6 @@ impl CpuGsw {
             crate::reflected_call_diag::on_clock_charge();
         }
         self.perf.instructions += 1;
-        // The reflected-call memo's CODE-PAGE seam (slice1 plan R2.4). Gated on the same
-        // `reflected_call_journal` bool the memory seams use -- one predictable,
-        // never-taken branch off an already-warm line -- so it fires only for the two
-        // journaled trips of a learn cycle, which the batch loop has forced onto the
-        // interpreter precisely so that every instruction passes here.
-        #[cfg(feature = "reflected-call-memo")]
-        if self.reflected_call_journal {
-            let linear = start_cs_base.wrapping_add(start_eip);
-            crate::reflected_call_memo::note_retired_instruction(self, bus, linear);
-        }
         // V86 trap tax residency: see PerfCounters::monitor_resident_core_clocks.
         if self.is_ring0_protected() {
             self.perf.monitor_resident_core_clocks += charged;
@@ -1142,6 +1125,13 @@ impl CpuGsw {
                 can_take_before = false;
             }
             total += u64::from(outcome.core_clocks);
+            // An answered reflected call charged `elapsed_clocks` from inside this
+            // instruction; the BATCH's core total has to see it too, or the devices never
+            // do. See `CpuGsw::reflected_call_pending_core`.
+            #[cfg(feature = "reflected-call-memo")]
+            {
+                total += self.take_reflected_call_pending_core();
+            }
             // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
             // machine can service an event or interrupt before any further iteration.
             if self.rep_resume_active {

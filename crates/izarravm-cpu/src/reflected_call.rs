@@ -46,6 +46,10 @@ pub(crate) const EFLAGS_ARCH_MASK: u32 = 0x0003_7fd5 | (1 << 18);
 /// byte write as "not restored" merely because the untouched high bytes of
 /// the two 32-bit reads/writes happened to differ (they didn't move; they
 /// were simply never part of this access).
+// Consumed today only by `reflected_call_diag` (feature-gated): the memo module moved to
+// a per-dword byte MASK for both reads and writes (answer-path amendment 3's follow-up),
+// which subsumes width-masking a low-order-justified value.
+#[allow(dead_code)]
 pub(crate) fn mask_to_width(v: u32, width_bytes: u32) -> u32 {
     match width_bytes {
         1 => v & 0xFF,

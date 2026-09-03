@@ -147,7 +147,6 @@ pub(crate) const MEMO_AUDIT_BUS_BAND: u64 = 64;
 /// Physical code pages a memo may carry (plan section 4.5's `code_pages_too_many`).
 /// The dominant key's trip spans the client, the DPMI host and the DOS kernel; 16 is
 /// the plan's own figure.
-pub(crate) const MEMO_MAX_CODE_PAGES: usize = 16;
 /// Nested `interrupt_acknowledge` calls a memo may carry (plan R2.6). Over the cap ->
 /// `nested_acks_too_many`. The dominant key nests two `INT 16h`, an `INT 28h` and the
 /// reflected `INT 21h`; 16 is 4x that.
@@ -284,11 +283,10 @@ pub(crate) enum LearnRefused {
     ControlEffectsTooMany,
     ControlEffectUnreplayable,
     Mmx,
-    CodePagesTooMany,
-    CodePagesIncomplete,
+    ReadSetUnstable,
 }
 
-pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 25] = [
+pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 24] = [
     LearnRefused::PortIo,
     LearnRefused::NondeterministicRead,
     LearnRefused::PendingSoftInt,
@@ -312,8 +310,7 @@ pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 25] = [
     LearnRefused::ControlEffectsTooMany,
     LearnRefused::ControlEffectUnreplayable,
     LearnRefused::Mmx,
-    LearnRefused::CodePagesTooMany,
-    LearnRefused::CodePagesIncomplete,
+    LearnRefused::ReadSetUnstable,
 ];
 
 impl LearnRefused {
@@ -349,8 +346,7 @@ impl LearnRefused {
             Self::ControlEffectsTooMany => "control_effects_too_many",
             Self::ControlEffectUnreplayable => "control_effect_unreplayable",
             Self::Mmx => "mmx",
-            Self::CodePagesTooMany => "code_pages_too_many",
-            Self::CodePagesIncomplete => "code_pages_incomplete",
+            Self::ReadSetUnstable => "read_set_unstable",
         }
     }
 }
@@ -459,24 +455,47 @@ struct WriteObs {
     /// write actually fell in.
     ss_selector: u16,
     /// The value of the WHOLE aligned dword immediately before this trip's FIRST write to
-    /// it, peeked directly rather than inferred from the read set. Used only by the audit
-    /// (plan R2.18's formula needs "the value the address held at trip entry" for EVERY
-    /// written address, including the ones the trip never read -- which `pinned_pre`, by
-    /// construction, cannot supply). `None` when the peek declined.
+    /// it, peeked directly. Two consumers: the audit's formula (plan R2.18 needs "the value
+    /// the address held at trip entry" for EVERY written address, including ones the trip
+    /// never read), and the Class R test, which is a compare of pre against post over the
+    /// bytes actually written.
     pre_dword: Option<u32>,
-    /// The pre-value, if pinned: `Some` only when this trip's own read set
-    /// (or translation set, for a page-table entry) already covers this
-    /// dword before the first write to it.
-    pinned_pre: Option<u32>,
-    latest: u32,
+    /// The dword as this trip has left it so far, and the MASK of the bytes it wrote.
+    ///
+    /// **Accumulated, not overwritten.** A trip that writes two different fields of the
+    /// same aligned dword -- a byte here, a word there -- produces two journal entries at
+    /// one key, and keeping only the LAST loses the first: the memo then replays half the
+    /// dword and leaves the other half holding whatever the previous trip put there. That
+    /// is silent guest-memory corruption, and it is what the fixture-scale AUDIT caught on
+    /// `tyrian-specs-586` (2026-09-03): `audit_mismatch[write_value]` fired on 13,768 of
+    /// 13,768 audited trips while the epilogue, the core clocks and the instruction count
+    /// all agreed exactly.
+    latest_dword: u32,
+    mask: u32,
     class: AddressClass,
-    /// The EXACT physical write address (not dword-aligned) and its width (answer-path
-    /// amendment 2): a Class W replay must reproduce the write at the SAME granularity the
-    /// original trip used, through `bus.write_memory(phys_addr, width, ..)`, rather than
-    /// smearing `latest`'s low-order-justified bits across a whole aligned dword and
-    /// clobbering neighbouring bytes the trip never touched.
-    phys_addr: u32,
-    width_bytes: u8,
+}
+
+impl WriteObs {
+    /// Splice one write's bytes into the accumulated dword.
+    fn apply(&mut self, offset: u32, width_bytes: u32, value: u32) {
+        let (byte_mask, shifted) = splice(offset, width_bytes, value);
+        self.latest_dword = (self.latest_dword & !byte_mask) | shifted;
+        self.mask |= byte_mask;
+    }
+}
+
+/// The byte mask this access covers inside its aligned dword, and its value shifted into
+/// place. An access running off the end of the dword is CLIPPED here; the seam that split
+/// it hands the tail in as its own fragment.
+fn splice(offset: u32, width_bytes: u32, value: u32) -> (u32, u32) {
+    let bytes = width_bytes.min(4 - offset);
+    let sub = if bytes >= 4 {
+        u32::MAX
+    } else {
+        (1u32 << (bytes * 8)) - 1
+    };
+    let byte_mask = sub << (offset * 8);
+    (byte_mask, (value & sub) << (offset * 8))
 }
 
 /// One TLB / decode-cache invalidation effect the trip caused, captured in TRIP ORDER
@@ -557,9 +576,10 @@ struct OpenTrip {
     stack_segments_over_cap: bool,
     // Journal-only (Slot::JournalA/JournalB); unused for Warm/Natural.
     journaling: bool,
-    reads: HashMap<u32, u32>,       // aligned phys dword -> first-seen value
+    /// Aligned phys dword -> (first-seen dword value, MASK of the bytes actually read).
+    reads: HashMap<u32, (u32, u32)>,
     writes: HashMap<u32, WriteObs>, // aligned phys dword -> observation
-    translations: HashMap<u32, u32>, // pde/pte aligned phys dword -> value
+    translations: HashMap<u32, (u32, u32)>, // pde/pte aligned phys dword -> (value, mask)
     read_set_over_cap: bool,
     translation_set_over_cap: bool,
     hazard: Option<LearnRefused>,
@@ -577,14 +597,6 @@ struct OpenTrip {
     /// The trip's TLB/decode invalidations, in trip order (plan R2.5).
     control_effects: Vec<ControlEffect>,
     control_effects_over_cap: bool,
-    /// Physical PAGES this trip fetched code from, collected at the interpreter's retire
-    /// seam (plan R2.4). Sorted-unique, capped at `MEMO_MAX_CODE_PAGES`.
-    code_pages: Vec<u32>,
-    code_pages_over_cap: bool,
-    /// How many instructions the retire seam SAW. Compared at close against the trip's
-    /// own instruction count: if they disagree the trip ran partly on the native
-    /// backend, so `code_pages` is INCOMPLETE and no memo may be built from it.
-    retired_insns: u64,
     /// The memo this trip is auditing (`Slot::Audit` only).
     audit: Option<Arc<Memo>>,
     hw_interrupt_seen: bool,
@@ -688,9 +700,6 @@ impl OpenTrip {
             nested_acks_over_cap: false,
             control_effects: Vec::new(),
             control_effects_over_cap: false,
-            code_pages: Vec::new(),
-            code_pages_over_cap: false,
-            retired_insns: 0,
             audit: None,
             hw_interrupt_seen: false,
             entry_tail,
@@ -900,8 +909,8 @@ struct JournalSnapshot {
     /// happened not to expose the difference; this is the same closure-rule concern
     /// BLOCKING finding 1 fixed for the image fields, applied to the A-vs-B compare itself.
     entry_image: EntryImage,
-    reads: HashMap<u32, u32>,
-    translations: HashMap<u32, u32>,
+    reads: HashMap<u32, (u32, u32)>,
+    translations: HashMap<u32, (u32, u32)>,
     writes: HashMap<u32, WriteObs>,
     insns: u64,
     exit_image: EntryImage,
@@ -935,12 +944,20 @@ pub(crate) struct KeyState {
     pub rearms: u64,
     pub learn_attempts: u64,
     pub learned: u64,
-    pub learn_refused: [u64; 25],
+    pub learn_refused: [u64; 24],
     /// Answers this key has applied since its last audit, and the signed bus-clock drift
     /// the memo has accumulated against what the audits actually observed (amendment 6).
     answers_since_audit: u64,
     bus_drift_acc: i64,
     pub audits: u64,
+    /// The distinct read-set cells that have made this key's memo fall through, with the
+    /// value the memo pinned, the value found live, and how often. Capped: a handful of
+    /// addresses is what a real "this input is not actually an input" looks like, and an
+    /// unbounded map would be a leak on a key whose whole read set is unstable.
+    read_set_offenders: Vec<(u32, u32, u32, u64)>,
+    /// The same dump for the AUDIT's write formula: the cell whose predicted final value
+    /// disagreed with the observed one, what was predicted, what was found.
+    audit_offenders: Vec<(u32, u32, u32, u64)>,
     pub write_class_r_pinned: u64,
     pub write_class_r_unpinned: u64,
     pub write_class_d: u64,
@@ -950,7 +967,34 @@ pub(crate) struct KeyState {
     pub read_set_size: SizeStats,
 }
 
+/// How many distinct read-set offenders one key reports (see `read_set_offenders`).
+const MEMO_READ_SET_OFFENDERS_TRACKED: usize = 8;
+
 impl KeyState {
+    fn note_audit_offender(&mut self, (phys, predicted, observed): (u32, u32, u32)) {
+        if let Some(entry) = self.audit_offenders.iter_mut().find(|e| e.0 == phys) {
+            entry.1 = predicted;
+            entry.2 = observed;
+            entry.3 += 1;
+            return;
+        }
+        if self.audit_offenders.len() < MEMO_READ_SET_OFFENDERS_TRACKED {
+            self.audit_offenders.push((phys, predicted, observed, 1));
+        }
+    }
+
+    fn note_read_set_offender(&mut self, (phys, expected, live): (u32, u32, u32)) {
+        if let Some(entry) = self.read_set_offenders.iter_mut().find(|e| e.0 == phys) {
+            entry.1 = expected;
+            entry.2 = live;
+            entry.3 += 1;
+            return;
+        }
+        if self.read_set_offenders.len() < MEMO_READ_SET_OFFENDERS_TRACKED {
+            self.read_set_offenders.push((phys, expected, live, 1));
+        }
+    }
+
     /// Plan section 4.2 point 2, restored by the Fable review (2026-09-03): "`journal_mismatch`
     /// is NOT structurally cached (it can become learnable)" -- only `ClocksUnstable` counts
     /// toward `MEMO_LEARN_BUDGET`'s CONSECUTIVE-failure disarm. Every other refusal reason
@@ -1056,13 +1100,6 @@ pub(crate) struct ReflectedCallMemoState {
     /// is only ever populated under ONE epoch: the first build after a bump retires the
     /// rest, so this single field stands for every memo in the map.
     pub(crate) code_mark_epoch: u64,
-    /// Batches the machine ran on the interpreter for this module's sake (R2.10 item 12:
-    /// a LEARNING fall-through is not bit-identical to `main`, and the cost is bounded
-    /// and counted rather than argued away).
-    pub(crate) learn_batches: u64,
-    /// Keys currently sitting in a journal slot; the batch loop forces the interpreter
-    /// while this is non-zero.
-    journal_keys: u32,
     /// `IZARRAVM_REFLECTED_CALL_MEMO_AUDIT`, read ONCE when this state is created.
     pub(crate) audit_period: u64,
     /// Trips refused on purpose so the memo's prediction could be compared against the
@@ -1103,8 +1140,6 @@ impl Default for ReflectedCallMemoState {
             code_watch_retires: 0,
             code_mark_epoch_retires: 0,
             code_mark_epoch: 0,
-            learn_batches: 0,
-            journal_keys: 0,
             // Read ONCE, here, exactly as the arm knob is: the answer path afterwards only
             // ever reads this field.
             audit_period: knob_audit_period(),
@@ -1141,19 +1176,31 @@ pub(crate) enum FellThrough {
 /// passed; the caller applies nothing here (screens 1/2/4/5/7/8 -- knob, bucket, pending
 /// interrupt, clamp, observer test, apply order -- are amendment 3's, once a pass means
 /// something).
-pub(crate) fn screen_memo<B: CpuBus>(
+/// `screen_memo` with the offending CELL reported. The plan asks for exactly this dump
+/// ("naming the address is still worth one per-address dump before the answer path
+/// lands"): a read-set miss is the mechanism's dominant fall-through, and a bare counter
+/// says only that some input moved, never WHICH -- which is the difference between a
+/// screen that is doing its job and a memo pinning a cell that was never an input.
+pub(crate) fn screen_memo_detailed<B: CpuBus>(
     cpu: &CpuGsw,
     bus: &B,
     memo: &Memo,
+    offender: &mut Option<(u32, u32, u32)>,
 ) -> Result<(), FellThrough> {
     let live_image = EntryImage::capture(cpu);
     if live_image != memo.image {
         return Err(FellThrough::EntryStateMismatch);
     }
-    for &(phys, expected) in memo.reads.iter().chain(memo.translations.iter()) {
+    for &(phys, expected, mask) in memo.reads.iter().chain(memo.translations.iter()) {
         match bus.peek_direct_ram(phys, BusWidth::Dword) {
-            None => return Err(FellThrough::ReadSetUnreadable),
-            Some(live) if live != expected => return Err(FellThrough::ReadSetMismatch),
+            None => {
+                *offender = Some((phys, expected, 0));
+                return Err(FellThrough::ReadSetUnreadable);
+            }
+            Some(live) if (live ^ expected) & mask != 0 => {
+                *offender = Some((phys, expected & mask, live & mask));
+                return Err(FellThrough::ReadSetMismatch);
+            }
             Some(_) => {}
         }
     }
@@ -1165,17 +1212,18 @@ pub(crate) fn screen_memo<B: CpuBus>(
 /// `FellThrough::NotMemoised`; `None` with candidates present but none matching is the LAST
 /// candidate's own reason (arbitrary among misses, since none of them will answer either
 /// way -- only used for a counter bucket, never for control flow in this commit).
-pub(crate) fn screen_key<'a, B: CpuBus>(
+pub(crate) fn screen_key_detailed<'a, B: CpuBus>(
     cpu: &CpuGsw,
     bus: &B,
     memos: &'a [Arc<Memo>],
+    offender: &mut Option<(u32, u32, u32)>,
 ) -> Result<&'a Arc<Memo>, FellThrough> {
     if memos.is_empty() {
         return Err(FellThrough::NotMemoised);
     }
     let mut last_reason = FellThrough::NotMemoised;
     for memo in memos.iter().rev() {
-        match screen_memo(cpu, bus, memo) {
+        match screen_memo_detailed(cpu, bus, memo, offender) {
             Ok(()) => return Ok(memo),
             Err(reason) => last_reason = reason,
         }
@@ -1193,11 +1241,6 @@ impl ReflectedCallMemoState {
     /// the gate changes. Called from `CpuGsw::note_a20_changed`, the single production seam
     /// (`izarravm-machine/src/run.rs:2023`); a coarse whole-cache flush is fine, exactly like
     /// the code-cache/decode-cache invalidation A20 already triggers there.
-    /// See `CpuGsw::reflected_call_wants_interpreter`.
-    pub(crate) fn wants_interpreter(&self) -> bool {
-        self.journal_keys > 0
-    }
-
     pub(crate) fn retire_all_memos(&mut self) {
         let retired = self.clear_all_memos();
         self.a20_retires += retired;
@@ -1225,28 +1268,28 @@ impl ReflectedCallMemoState {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Memo {
     pub(crate) image: EntryImage,
-    /// Pre-resolved aligned physical dword -> value, the inputs (plan section 3/5.6).
-    pub(crate) reads: Box<[(u32, u32)]>,
-    /// Pre-resolved aligned physical PDE/PTE dword -> value (plan section 5.6).
-    pub(crate) translations: Box<[(u32, u32)]>,
+    /// Pre-resolved aligned physical dword -> (expected value, MASK of the bytes the trip
+    /// actually read), the inputs (plan section 3/5.6). The mask is what keeps the screen
+    /// from pinning bytes the trip never looked at -- see `note_read`.
+    pub(crate) reads: Box<[(u32, u32, u32)]>,
+    /// Pre-resolved aligned physical PDE/PTE dword -> (value, mask) (plan section 5.6).
+    pub(crate) translations: Box<[(u32, u32, u32)]>,
     /// The EXIT architectural state, reused for the epilogue (see the struct doc above).
     pub(crate) epilogue: EntryImage,
     /// `EIP` the epilogue sets: `int_eip + insn_len`, constant for a given key (plan 5.8d).
     pub(crate) return_eip: u32,
-    /// Class W: deterministic net writes plus the live stack tail (plan 4.3/4.4), applied at
-    /// answer time through `CpuGsw::write_physical_replay`. EXACT (not dword-aligned)
-    /// physical address, width in bytes, value -- the same granularity the original write
-    /// used, so replay never clobbers neighbouring bytes the trip did not touch.
-    pub(crate) replay: Box<[(u32, u8, u32)]>,
+    /// Class W: deterministic net writes plus the live stack tail (plan 4.3/4.4), applied
+    /// at answer time through `CpuGsw::write_physical_replay`. Aligned physical dword, the
+    /// MASK of the bytes the trip wrote, and the dword's post-trip value -- so a replay
+    /// reproduces exactly the bytes the trip touched, however many separate writes made
+    /// them, and never clobbers a neighbour it did not.
+    pub(crate) replay: Box<[(u32, u32, u32)]>,
     /// Class R ranges, coalesced, for the answer-time observer test (plan 5.7 / review A.4):
     /// (physical_lo, physical_hi_inclusive).
     pub(crate) class_r_ranges: Box<[(u32, u32)]>,
     pub(crate) raw_core_clocks: u64,
     pub(crate) raw_bus_clocks: u64,
     pub(crate) insns: u64,
-    /// Physical pages the trip fetched code from (slice 2's code-watch retire; plan section
-    /// 4 module layout, `code_pages: Box<[u32]>`).
-    pub(crate) code_pages: Box<[u32]>,
     /// Nested `interrupt_acknowledge` pairs, in TRIP ORDER, re-issued as the answer's
     /// FIRST mutation (plan R2.6).
     pub(crate) nested_acks: Box<[(u8, u16)]>,
@@ -1254,19 +1297,6 @@ pub(crate) struct Memo {
     /// BEFORE the epilogue (plan R2.16 item 2: control effects LAST, so a replayed write
     /// into a page-table entry cannot leave a TLB that predates it).
     pub(crate) control_effects: Box<[ControlEffect]>,
-}
-
-impl Memo {
-    /// Does this memo's trip fetch code from any byte of `[physical, physical + width)`?
-    /// Page granularity, which is the granularity `code_pages` records, and the
-    /// conservative direction: a write anywhere on a fetched page retires the memo.
-    fn code_overlaps(&self, physical: u32, width: u32) -> bool {
-        let first = physical >> 12;
-        let last = physical.wrapping_add(width.saturating_sub(1)) >> 12;
-        self.code_pages
-            .iter()
-            .any(|&page| page >= first && page <= last)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,12 +1426,82 @@ pub(crate) fn on_int<B: CpuBus>(
         return Ok(IntOutcome::NotAnswered);
     }
     let slot: Slot = key_state.slot.into();
-    let journaling = matches!(slot, Slot::JournalA | Slot::JournalB);
+    let journaling = slot.journals();
     cpu.reflected_call_journal = journaling;
     let open = OpenTrip::start(cpu, &*bus, key, slot);
     let state = cpu.reflected_call.as_mut().expect("checked above");
     state.open = Some(open);
+    // The candidate memo's read set is pinned from LIVE memory at the natural trips'
+    // opens, which is the state an answer would screen against. See the function.
+    if matches!(slot, Slot::Natural(_)) {
+        sample_read_set_at_open(cpu, &*bus, key);
+    }
     Ok(IntOutcome::NotAnswered)
+}
+
+/// Pin the candidate memo's read set to what its cells hold at the START of an
+/// occurrence -- which is what the answer's screen compares against, and which is NOT
+/// what the journal trip's own reads observed.
+///
+/// Called at each of the 8 natural trips' opens. The first sample OVERWRITES the recorded
+/// values; the remaining seven must agree with it (under each cell's own byte mask) or the
+/// candidate is refused as `read_set_unstable` -- a cell whose pre-trip value is not stable
+/// across eight consecutive occurrences is not an input a memo can screen on, and pinning
+/// it anyway costs a fall-through on every trip forever.
+///
+/// **Why this is measured and not derived.** Three derivations were tried against
+/// `tyrian-specs-586` on 2026-09-03, and the per-key offender dump refuted each in turn:
+/// the journal trip's own READ value fails on physical `0x17b0` (DOS data, 726,123 of
+/// 726,134 answer attempts); the POST-trip value fixes `0x17b0` (down to 6) and breaks
+/// `0x17cc` instead (726,117), because this title's two dominant keys INTERLEAVE and what
+/// `0x17cc` holds before an `AH=0Bh` trip is what the `INT 33h` trip in between wrote; and
+/// no rule over one trip's own journal can see that at all. Eight samples of the actual
+/// pre-trip state can, and they cost ~150 peeks per learn cycle.
+fn sample_read_set_at_open<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoKey) {
+    let live: Vec<Option<u32>> = {
+        let Some(state) = cpu.reflected_call.as_ref() else {
+            return;
+        };
+        let Some(confirmed) = state.keys.get(&key).and_then(|ks| ks.confirmed.as_ref()) else {
+            return;
+        };
+        confirmed
+            .reads
+            .iter()
+            .map(|&(addr, _, _)| bus.peek_direct_ram(addr, BusWidth::Dword))
+            .collect()
+    };
+    let Some(confirmed) = cpu
+        .reflected_call
+        .as_mut()
+        .and_then(|state| state.keys.get_mut(&key))
+        .and_then(|ks| ks.confirmed.as_mut())
+    else {
+        return;
+    };
+    if !confirmed.read_set_pinned {
+        confirmed.read_set_pinned = true;
+        for (cell, sampled) in confirmed.reads.iter_mut().zip(live) {
+            match sampled {
+                Some(value) => cell.1 = value,
+                // A cell that is not plain RAM at open would fail the answer's own screen
+                // anyway (`read_set_unreadable`); marking it unstable refuses the memo now
+                // rather than building one that can never answer.
+                None => confirmed.read_set_unstable = true,
+            }
+        }
+        return;
+    }
+    for (cell, sampled) in confirmed.reads.iter().zip(live) {
+        let disagrees = match sampled {
+            Some(value) => (value ^ cell.1) & cell.2 != 0,
+            None => true,
+        };
+        if disagrees {
+            confirmed.read_set_unstable = true;
+            return;
+        }
+    }
 }
 
 /// Screen and, if every screen passes, APPLY one memo (plan section 5, steps 2-8).
@@ -1414,10 +1514,11 @@ fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecRes
     sync_code_mark_epoch(cpu);
     // Screen 2/3/6: bucket lookup, the 43-field entry-image compare, then the
     // pre-resolved physical read and translation sets against LIVE memory. Read-only.
+    let mut offender: Option<(u32, u32, u32)> = None;
     let screened = {
         let state = cpu.reflected_call.as_ref().expect("caller checked");
         match state.memos.get(&key) {
-            Some(memos) => screen_key(cpu, &*bus, memos).map(Arc::clone),
+            Some(memos) => screen_key_detailed(cpu, &*bus, memos, &mut offender).map(Arc::clone),
             None => Err(FellThrough::NotMemoised),
         }
     };
@@ -1425,6 +1526,14 @@ fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecRes
         Ok(memo) => memo,
         Err(reason) => {
             note_fell_through(cpu, reason);
+            if let Some(cell) = offender
+                && let Some(key_state) = cpu
+                    .reflected_call
+                    .as_mut()
+                    .and_then(|state| state.keys.get_mut(&key))
+            {
+                key_state.note_read_set_offender(cell);
+            }
             return Ok(None);
         }
     };
@@ -1631,13 +1740,26 @@ fn apply_answer<B: CpuBus>(
         bus.interrupt_acknowledge(vector, ax)?;
     }
 
-    for &(phys, width_bytes, value) in memo.replay.iter() {
-        let width = match width_bytes {
-            1 => BusWidth::Byte,
-            2 => BusWidth::Word,
-            _ => BusWidth::Dword,
-        };
-        cpu.write_physical_replay(bus, phys, width, value)?;
+    for &(dword, mask, value) in memo.replay.iter() {
+        if mask == u32::MAX {
+            cpu.write_physical_replay(bus, dword, BusWidth::Dword, value)?;
+            continue;
+        }
+        // Byte at a time for a partial dword: at most four writes, and it is the only
+        // shape that touches the trip's own bytes and no others. A wider write would
+        // clobber a neighbour the trip never wrote -- which is the whole reason the mask
+        // exists.
+        for byte in 0..4u32 {
+            if mask & (0xFF << (byte * 8)) == 0 {
+                continue;
+            }
+            cpu.write_physical_replay(
+                bus,
+                dword + byte,
+                BusWidth::Byte,
+                (value >> (byte * 8)) & 0xFF,
+            )?;
+        }
     }
 
     for effect in memo.control_effects.iter() {
@@ -1761,55 +1883,24 @@ pub(crate) fn on_far_transfer<B: CpuBus>(cpu: &mut CpuGsw, bus: &B) {
     }
 }
 
-/// Production seam: the interpreter's retire seam (`run.rs`'s `finish_instruction`),
-/// called for every instruction of a JOURNALED trip. Records the physical PAGE the
-/// instruction was fetched from and counts the retire, so `finish_trip` can prove the
-/// page set is complete (plan R2.4).
-pub(crate) fn note_retired_instruction<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, linear: u32) {
-    let resolved = probe_physical(cpu, &*bus, linear);
-    let Some(open) = cpu
-        .reflected_call
-        .as_mut()
-        .and_then(|state| state.open.as_mut())
-    else {
-        return;
-    };
-    open.retired_insns = open.retired_insns.saturating_add(1);
-    let Some((physical, _walk)) = resolved else {
-        // The page walk declined (a device window, an unmapped page). Mark the set
-        // incomplete rather than silently narrow: a memo whose code pages cannot all be
-        // named is a memo whose code watch has a hole in it.
-        open.code_pages_over_cap = true;
-        return;
-    };
-    let page = physical >> 12;
-    if open.code_pages.contains(&page) {
-        return;
-    }
-    if open.code_pages.len() >= MEMO_MAX_CODE_PAGES {
-        open.code_pages_over_cap = true;
-        return;
-    }
-    open.code_pages.push(page);
-}
-
-/// Production seam: `CpuGsw::note_code_write_inner` (`core.rs`). Retires every memo whose
-/// trip fetched code from the written range (plan R2.4 / BLOCKING finding 4: a slice that
-/// answers with no code-write retirement answers from stale code forever -- a TSR
-/// chaining `INT 21h`, a DPMI host rewriting its own hook, ordinary self-modifying code).
-pub(crate) fn note_code_write_range(cpu: &mut CpuGsw, physical: u32, width: u32) {
+/// Production seam: `CpuGsw::note_code_write_inner` (`core.rs`), on the tail where
+/// `invalidated` is known -- i.e. exactly when a guest write hit a compiled block, a
+/// cached decode line or a marked translation page. Retires the WHOLE memo cache (plan
+/// R2.4 / BLOCKING finding 4: a slice that answers with no code-write retirement answers
+/// from stale code forever -- a TSR chaining `INT 21h`, a DPMI host rewriting its own
+/// hook, ordinary self-modifying code -- and no screen can see it, because the read set
+/// covers DATA and never instruction fetch).
+///
+/// Coarser than the plan's per-memo range overlap, and deliberately so; the call site
+/// carries the measurement that decided it.
+pub(crate) fn note_code_hit(cpu: &mut CpuGsw) {
     let Some(state) = cpu.reflected_call.as_mut() else {
         return;
     };
     if state.memos.is_empty() {
         return;
     }
-    let mut retired = 0u64;
-    for memos in state.memos.values_mut() {
-        let before = memos.len();
-        memos.retain(|memo| !memo.code_overlaps(physical, width));
-        retired += (before - memos.len()) as u64;
-    }
+    let retired = state.clear_all_memos();
     state.code_watch_retires += retired;
     state.retired[RetireCause::CodeWatch.index()] += retired;
 }
@@ -1921,7 +2012,14 @@ fn refuse_open(cpu: &mut CpuGsw, reason: LearnRefused) {
     }
 }
 
-pub(crate) fn note_read<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, linear: u32) {
+/// One journaled READ. `width` is load-bearing (2026-09-03 measurement): the read set is
+/// keyed by aligned physical DWORD, so recording a byte read as a whole dword pins three
+/// bytes the trip never looked at. On `tyrian-specs-586` that over-pinning was fatal --
+/// physical `0x17cc` mismatched on 726,117 of 726,134 answer attempts on the dominant key
+/// because ONE byte of its dword is a DOS counter the trip does not read, and the memo
+/// pinned the whole word. A MASK of the bytes actually read is what makes the screen say
+/// what it means.
+pub(crate) fn note_read<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, linear: u32, width: BusWidth) {
     if cpu.reflected_call.is_none() {
         return;
     }
@@ -1936,15 +2034,48 @@ pub(crate) fn note_read<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, linear: u32) {
         cpu.reflected_call.as_mut().expect("checked above").open = Some(open);
         return;
     }
-    if !open.writes.contains_key(&aligned_dword(linear)) {
+    {
         let resolved = probe_physical(cpu, bus, linear);
         if let Some((physical, walk)) = resolved {
             let dword = aligned_dword(physical);
-            if !open.reads.contains_key(&dword) {
-                if open.reads.len() >= MEMO_MAX_READ_SET {
-                    open.read_set_over_cap = true;
-                } else if let Some(v) = bus.peek_direct_ram(dword, BusWidth::Dword) {
-                    open.reads.insert(dword, v);
+            // A cell this trip has ALREADY WRITTEN is not an input: what a later read of
+            // it sees is the trip's own store, not guest state the answer's screens can
+            // compare. Putting it in the read set makes the memo compare its own output
+            // against whatever the PREVIOUS trip left there, which mismatches on almost
+            // every occurrence.
+            //
+            // The screen was here before this fix, but it tested `open.writes` -- a map
+            // keyed by aligned PHYSICAL dword -- with the LINEAR address. Under paging
+            // the two differ, so it essentially never fired: measured on
+            // `tyrian-specs-586` (2026-09-03), 1,387,638 of 1,459,463 answer attempts
+            // fell through as `read_set_mismatch` and NOTHING was ever answered, while
+            // Journal A and B agreed 65,633 times -- because two consecutive trips write
+            // and read the same slots identically, and only the compare against LIVE
+            // pre-trip memory can see the difference.
+            if open.writes.contains_key(&dword) {
+                cpu.reflected_call.as_mut().expect("checked above").open = Some(open);
+                return;
+            }
+            let offset = physical - dword;
+            // The bytes of THIS dword the access actually touches. An access that runs off
+            // the end of the dword (a misaligned word or dword) has its tail recorded by
+            // its own fragment or, where the seam does not split it, left unpinned -- the
+            // conservative direction for a SCREEN is to pin less, never to pin bytes the
+            // trip did not read, which is what produces a fall-through on every occurrence.
+            let bytes = width.bytes().min(4 - offset);
+            let mask = if bytes >= 4 {
+                u32::MAX
+            } else {
+                ((1u32 << (bytes * 8)) - 1) << (offset * 8)
+            };
+            match open.reads.get_mut(&dword) {
+                Some(entry) => entry.1 |= mask,
+                None => {
+                    if open.reads.len() >= MEMO_MAX_READ_SET {
+                        open.read_set_over_cap = true;
+                    } else if let Some(v) = bus.peek_direct_ram(dword, BusWidth::Dword) {
+                        open.reads.insert(dword, (v, mask));
+                    }
                 }
             }
             if let Some(walk) = walk {
@@ -1954,7 +2085,8 @@ pub(crate) fn note_read<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, linear: u32) {
                         if open.translations.len() >= MEMO_MAX_TRANSLATION_SET {
                             open.translation_set_over_cap = true;
                         } else if let Some(v) = bus.peek_direct_ram(wdword, BusWidth::Dword) {
-                            open.translations.insert(wdword, v);
+                            // A PDE/PTE is read as a whole dword, always.
+                            open.translations.insert(wdword, (v, u32::MAX));
                         }
                     }
                 }
@@ -2005,36 +2137,23 @@ pub(crate) fn note_write<B: CpuBus>(
                 open.entry_ss_selector,
             )
         });
-        let masked = mask_to_width(value, width.bytes());
-        let pinned_pre = open
-            .reads
-            .get(&dword)
-            .copied()
-            .or_else(|| open.translations.get(&dword).copied());
+        let offset = physical - dword;
         if let Some(rec) = open.writes.get_mut(&dword) {
-            rec.latest = masked;
-            rec.phys_addr = physical;
-            rec.width_bytes = width.bytes() as u8;
-            if rec.pinned_pre.is_none() {
-                rec.pinned_pre = pinned_pre;
-            }
+            rec.apply(offset, width.bytes(), value);
         } else if open.writes.len() >= MEMO_MAX_REPLAY_WRITES {
             open.hazard.get_or_insert(LearnRefused::ReplaySetTooLarge);
         } else {
             let pre_dword = bus.peek_direct_ram(dword, BusWidth::Dword);
-            open.writes.insert(
-                dword,
-                WriteObs {
-                    linear,
-                    ss_selector: ss.selector,
-                    pre_dword,
-                    pinned_pre,
-                    latest: masked,
-                    class,
-                    phys_addr: physical,
-                    width_bytes: width.bytes() as u8,
-                },
-            );
+            let mut rec = WriteObs {
+                linear,
+                ss_selector: ss.selector,
+                pre_dword,
+                latest_dword: pre_dword.unwrap_or(0),
+                mask: 0,
+                class,
+            };
+            rec.apply(offset, width.bytes(), value);
+            open.writes.insert(dword, rec);
         }
     }
     cpu.reflected_call.as_mut().expect("checked above").open = Some(open);
@@ -2100,31 +2219,6 @@ fn classify_write<B: CpuBus>(
 /// delta around ONE key rather than a scan of the map: `finish_trip` is per tracked trip,
 /// not per answer, but the map holds every key the run has ever seen.
 fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: bool) {
-    let key = open.key;
-    let before = key_is_journaling(cpu, key);
-    finish_trip_inner(cpu, bus, open, is_match);
-    let after = key_is_journaling(cpu, key);
-    if before != after
-        && let Some(state) = cpu.reflected_call.as_mut()
-    {
-        if after {
-            state.journal_keys = state.journal_keys.saturating_add(1);
-        } else {
-            state.journal_keys = state.journal_keys.saturating_sub(1);
-        }
-    }
-}
-
-fn key_is_journaling(cpu: &CpuGsw, key: MemoKey) -> bool {
-    cpu.reflected_call.as_ref().is_some_and(|state| {
-        state
-            .keys
-            .get(&key)
-            .is_some_and(|ks| matches!(ks.slot, SlotState::JournalA | SlotState::JournalB))
-    })
-}
-
-fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: bool) {
     cpu.reflected_call_journal = false;
     let close_bus_raw = bus.cumulative_raw_bus_clocks();
     let close_elapsed = cpu.elapsed_clocks;
@@ -2185,10 +2279,6 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
             key_state.slot = SlotState::JournalA;
         }
         Slot::JournalA => {
-            if let Some(reason) = code_page_refusal(&open, close_instructions) {
-                key_state.record_failure(reason);
-                return;
-            }
             if open.read_set_over_cap {
                 key_state.record_failure(LearnRefused::ReadSetTooLarge);
                 return;
@@ -2210,10 +2300,6 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
             key_state.slot = SlotState::JournalB;
         }
         Slot::JournalB => {
-            if let Some(reason) = code_page_refusal(&open, close_instructions) {
-                key_state.record_failure(reason);
-                return;
-            }
             if open.read_set_over_cap {
                 key_state.record_failure(LearnRefused::ReadSetTooLarge);
                 return;
@@ -2298,7 +2384,14 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
             if usize::from(i) + 1 >= MEMO_CLOCK_SAMPLES {
                 let all_equal = key_state.natural_samples.windows(2).all(|w| w[0] == w[1]);
                 key_state.stability.finish_attempt(all_equal);
-                if all_equal {
+                if all_equal
+                    && key_state
+                        .confirmed
+                        .as_ref()
+                        .is_some_and(|c| c.read_set_unstable)
+                {
+                    key_state.record_failure(LearnRefused::ReadSetUnstable);
+                } else if all_equal {
                     key_state.learned += 1;
                     let confirmed = key_state.confirmed.take();
                     key_state.record_success_and_reset();
@@ -2314,7 +2407,6 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
                             raw_core_clocks: raw_core,
                             raw_bus_clocks: raw_bus,
                             insns,
-                            code_pages: c.code_pages.into_boxed_slice(),
                             nested_acks: c.nested_acks.into_boxed_slice(),
                             control_effects: c.control_effects.into_boxed_slice(),
                         });
@@ -2341,28 +2433,6 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
             }
         }
     }
-}
-
-/// Is this journaled trip's CODE-PAGE set usable (plan R2.4)? Two ways it is not, and
-/// both are refusals rather than a narrowed watch:
-///
-/// * **Over the cap, or a page whose walk declined.** The set would name fewer pages than
-///   the trip fetched from, so a patch to an unnamed page would never retire the memo.
-/// * **Incomplete.** The retire seam saw fewer instructions than the trip retired, which
-///   means part of it ran on the native backend and never passed that seam. The batch
-///   loop forces the interpreter for a journaling batch precisely to prevent this; the
-///   check is what makes that forcing's correctness a PROOF rather than an assumption,
-///   and what stops a mistimed toggle (the flag is read at batch entry, and a trip can
-///   open mid-batch) from producing an unsound memo instead of a lost learn attempt.
-fn code_page_refusal(open: &OpenTrip, close_instructions: u64) -> Option<LearnRefused> {
-    if open.code_pages_over_cap {
-        return Some(LearnRefused::CodePagesTooMany);
-    }
-    let insns = close_instructions.saturating_sub(open.open_instructions);
-    if open.retired_insns != insns {
-        return Some(LearnRefused::CodePagesIncomplete);
-    }
-    None
 }
 
 /// What an audited trip actually did, gathered at its close.
@@ -2418,8 +2488,17 @@ fn finish_audit<B: CpuBus>(
     if bus_delta.unsigned_abs() > MEMO_AUDIT_BUS_BAND {
         mismatches.push(AuditMismatch::BusClocks);
     }
-    if audit_write_values_disagree(bus, memo, open) {
+    let mut write_offender: Option<(u32, u32, u32)> = None;
+    if audit_write_values_disagree(bus, memo, open, &mut write_offender) {
         mismatches.push(AuditMismatch::WriteValue);
+    }
+    if let Some(cell) = write_offender
+        && let Some(key_state) = cpu
+            .reflected_call
+            .as_mut()
+            .and_then(|state| state.keys.get_mut(&key))
+    {
+        key_state.note_audit_offender(cell);
     }
     record_audit(cpu, key, &mismatches, bus_delta);
 }
@@ -2427,14 +2506,36 @@ fn finish_audit<B: CpuBus>(
 /// The write half of the audit formula. Walks the UNION of the observed write set and the
 /// memo's replay set, at aligned-dword granularity, comparing the memo's prediction with
 /// the live post-trip value.
-fn audit_write_values_disagree<B: CpuBus>(bus: &B, memo: &Memo, open: &OpenTrip) -> bool {
+fn audit_write_values_disagree<B: CpuBus>(
+    bus: &B,
+    memo: &Memo,
+    open: &OpenTrip,
+    offender: &mut Option<(u32, u32, u32)>,
+) -> bool {
     let mut dwords: Vec<u32> = open.writes.keys().copied().collect();
     for &(addr, _, _) in memo.replay.iter() {
-        dwords.push(aligned_dword(addr));
+        dwords.push(addr);
     }
     dwords.sort_unstable();
     dwords.dedup();
     for dword in dwords {
+        // Class D is excluded, and that is the formula's meaning rather than a hole in it.
+        // A dead-stack write lies below this trip's OWN observed low-water mark for the
+        // segment it fell in: nothing reads it again, which is exactly why the memo skips
+        // it. Grading the memo on it asks the answer to reproduce bytes no guest can
+        // observe, and on this title's dominant key that is 128 stack dwords per trip --
+        // measured 2026-09-03, `audit_mismatch[write_value]` fired on 14,510 of 14,510
+        // audited trips while the epilogue, the core clocks and the instruction count all
+        // agreed exactly, and every one of them was this.
+        if let Some(obs) = open.writes.get(&dword)
+            && matches!(
+                obs.class,
+                AddressClass::ClientStack | AddressClass::HostStack
+            )
+            && open.is_dead_stack(obs.ss_selector, obs.linear)
+        {
+            continue;
+        }
         let Some(observed_now) = bus.peek_direct_ram(dword, BusWidth::Dword) else {
             // The cell is not plain RAM any more. A memo may not carry such an address at
             // all (`build_confirmed` refuses `never_restored` classes), so this is a
@@ -2450,19 +2551,14 @@ fn audit_write_values_disagree<B: CpuBus>(bus: &B, memo: &Memo, open: &OpenTrip)
             .and_then(|obs| obs.pre_dword)
             .unwrap_or(observed_now);
         let mut predicted = entry;
-        for &(addr, width_bytes, value) in memo.replay.iter() {
-            if aligned_dword(addr) != dword {
+        for &(addr, mask, value) in memo.replay.iter() {
+            if addr != dword {
                 continue;
             }
-            let shift = (addr - dword) * 8;
-            let mask = match width_bytes {
-                1 => 0xFFu32,
-                2 => 0xFFFFu32,
-                _ => 0xFFFF_FFFFu32,
-            };
-            predicted = (predicted & !(mask << shift)) | ((value & mask) << shift);
+            predicted = (predicted & !mask) | (value & mask);
         }
         if predicted != observed_now {
+            *offender = Some((dword, predicted, observed_now));
             return true;
         }
     }
@@ -2524,8 +2620,8 @@ fn compare_journal(
     baseline: &JournalSnapshot,
     entry_image: &EntryImage,
     writes: &HashMap<u32, WriteObs>,
-    reads: &HashMap<u32, u32>,
-    translations: &HashMap<u32, u32>,
+    reads: &HashMap<u32, (u32, u32)>,
+    translations: &HashMap<u32, (u32, u32)>,
     insns_b: u64,
     exit_image: &EntryImage,
 ) -> Result<(), LearnRefused> {
@@ -2538,8 +2634,14 @@ fn compare_journal(
     if baseline.reads.len() != reads.len() || baseline.translations.len() != translations.len() {
         return Err(LearnRefused::JournalMismatch);
     }
-    for (addr, v) in &baseline.reads {
-        if reads.get(addr) != Some(v) {
+    // Values compared under the INTERSECTION of the two masks: a byte neither trip read is
+    // not evidence about either. The masks themselves must agree, or the two trips read
+    // different bytes of the same dword and are not the same shape.
+    for (addr, &(a_value, a_mask)) in &baseline.reads {
+        let Some(&(b_value, b_mask)) = reads.get(addr) else {
+            return Err(LearnRefused::JournalMismatch);
+        };
+        if a_mask != b_mask || (a_value ^ b_value) & a_mask != 0 {
             return Err(LearnRefused::JournalMismatch);
         }
     }
@@ -2555,7 +2657,10 @@ fn compare_journal(
         let Some(b) = writes.get(addr) else {
             return Err(LearnRefused::JournalMismatch);
         };
-        if a.latest != b.latest {
+        // The bytes each trip wrote must be the same bytes, and must have been left holding
+        // the same values. A post-value that varies between two consecutive trips is a
+        // memo that would freeze a per-trip counter (design 4.9's hole).
+        if a.mask != b.mask || (a.latest_dword ^ b.latest_dword) & a.mask != 0 {
             return Err(LearnRefused::WriteClassN);
         }
     }
@@ -2567,15 +2672,18 @@ fn compare_journal(
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ConfirmedTrip {
     entry_image: EntryImage,
-    reads: Vec<(u32, u32)>,
-    translations: Vec<(u32, u32)>,
+    reads: Vec<(u32, u32, u32)>,
+    translations: Vec<(u32, u32, u32)>,
     epilogue: EntryImage,
     return_eip: u32,
-    replay: Vec<(u32, u8, u32)>,
+    replay: Vec<(u32, u32, u32)>,
     class_r_ranges: Vec<(u32, u32)>,
     nested_acks: Vec<(u8, u16)>,
     control_effects: Vec<ControlEffect>,
-    code_pages: Vec<u32>,
+    /// Has `sample_read_set_at_open` taken its first live sample yet, and did any later
+    /// sample disagree with it? See that function.
+    read_set_pinned: bool,
+    read_set_unstable: bool,
 }
 
 /// Amendment 2: classify JournalB's write set into Class R (restored, admitted classes only --
@@ -2643,7 +2751,7 @@ fn build_confirmed<B: CpuBus>(
     if replayed_cr3 != exit_image.cr3 {
         return Err(LearnRefused::ControlEffectUnreplayable);
     }
-    let mut replay: HashMap<u32, (u8, u32)> = HashMap::new();
+    let mut replay: HashMap<u32, (u32, u32)> = HashMap::new();
     let mut class_r_dwords: Vec<u32> = Vec::new();
     for (&dword, obs) in &open.writes {
         if obs.class.never_restored() {
@@ -2656,22 +2764,22 @@ fn build_confirmed<B: CpuBus>(
         {
             continue; // Class D: skip, recorded nowhere.
         }
-        // `pinned_pre` is the value of the WHOLE aligned dword the trip's own read set (or
-        // translation set) saw before the first write; a sub-dword write's `latest` is
-        // low-order-justified to its own width (`note_write`'s `mask_to_width`), so the
-        // pre-value must be shifted down by the write's byte offset within that dword and
-        // masked the same way before the two are commensurable.
-        let byte_offset = obs.phys_addr.wrapping_sub(dword);
-        let pre_here = obs
-            .pinned_pre
-            .map(|pre| mask_to_width(pre >> (byte_offset * 8), u32::from(obs.width_bytes)));
-        match pre_here {
-            Some(pre) if pre == obs.latest => {
-                class_r_dwords.push(dword); // Class R: restored, admitted, skip.
-            }
-            _ => {
-                replay.insert(obs.phys_addr, (obs.width_bytes, obs.latest)); // Class W.
-            }
+        // Class R (restored), with R2.3's PINNED requirement: the trip's own read set must
+        // cover this dword -- i.e. the trip READ it before writing it -- and the bytes it
+        // wrote must hold what they held before. `note_read` already excludes a cell the
+        // trip wrote FIRST, so membership in `reads` IS "read before written".
+        //
+        // A coincidental restoration the trip never read is NOT Class R (finding 3): at
+        // answer time the address may hold something else, the real trip would overwrite
+        // it, and skipping the write diverges with nothing in the read set to catch it.
+        let pinned = open.reads.contains_key(&dword) || open.translations.contains_key(&dword);
+        let restored = obs
+            .pre_dword
+            .is_some_and(|pre| (pre ^ obs.latest_dword) & obs.mask == 0);
+        if pinned && restored {
+            class_r_dwords.push(dword); // Class R: restored, admitted, skip.
+        } else {
+            replay.insert(dword, (obs.mask, obs.latest_dword)); // Class W.
         }
     }
 
@@ -2685,16 +2793,27 @@ fn build_confirmed<B: CpuBus>(
         && let Some(close_value) = bus.peek_direct_ram(phys, BusWidth::Word)
         && close_value != entry_value
     {
-        replay.insert(phys, (2, close_value));
+        let dword = aligned_dword(phys);
+        let (byte_mask, shifted) = splice(phys - dword, 2, close_value);
+        let entry = replay
+            .get(&dword)
+            .map(|&(_, v)| v)
+            .or_else(|| bus.peek_direct_ram(dword, BusWidth::Dword))
+            .unwrap_or(0);
+        let existing_mask = replay.get(&dword).map(|&(m, _)| m).unwrap_or(0);
+        replay.insert(
+            dword,
+            (existing_mask | byte_mask, (entry & !byte_mask) | shifted),
+        );
     }
 
     if replay.len() > MEMO_MAX_REPLAY_WRITES {
         return Err(LearnRefused::ReplaySetTooLarge);
     }
 
-    let mut replay: Vec<(u32, u8, u32)> = replay
+    let mut replay: Vec<(u32, u32, u32)> = replay
         .into_iter()
-        .map(|(addr, (w, v))| (addr, w, v))
+        .map(|(addr, (m, v))| (addr, m, v))
         .collect();
     replay.sort_unstable_by_key(|&(addr, _, _)| addr);
 
@@ -2711,11 +2830,29 @@ fn build_confirmed<B: CpuBus>(
         class_r_ranges.push((dword, dword + 3));
     }
 
-    let mut reads: Vec<(u32, u32)> = open.reads.iter().map(|(&a, &v)| (a, v)).collect();
-    reads.sort_unstable_by_key(|&(a, _)| a);
-    let mut translations: Vec<(u32, u32)> =
-        open.translations.iter().map(|(&a, &v)| (a, v)).collect();
-    translations.sort_unstable_by_key(|&(a, _)| a);
+    // The values recorded here are the ones the READ observed, which is NOT what the
+    // answer's screen needs: the screen runs BEFORE a trip, so what it must pin is the
+    // value each cell holds at the START of an occurrence. The two differ for every cell
+    // the trip itself writes, and neither the read value nor the post-trip value is right
+    // in general -- on this title the two dominant keys INTERLEAVE, so what a cell holds
+    // before an `AH=0Bh` trip is what the `INT 33h` trip in between left there.
+    //
+    // So the pin is MEASURED rather than derived: `sample_read_set_at_open` overwrites
+    // these values from live memory at the first of the 8 natural trips' opens and
+    // requires the remaining 7 to agree. See its own comment for the measurement that
+    // decided it.
+    let mut reads: Vec<(u32, u32, u32)> = open
+        .reads
+        .iter()
+        .map(|(&addr, &(value, mask))| (addr, value, mask))
+        .collect();
+    reads.sort_unstable_by_key(|&(a, _, _)| a);
+    let mut translations: Vec<(u32, u32, u32)> = open
+        .translations
+        .iter()
+        .map(|(&a, &(v, m))| (a, v, m))
+        .collect();
+    translations.sort_unstable_by_key(|&(a, _, _)| a);
 
     Ok(ConfirmedTrip {
         entry_image: open.entry_image,
@@ -2727,12 +2864,13 @@ fn build_confirmed<B: CpuBus>(
         class_r_ranges,
         nested_acks: open.nested_acks.clone(),
         control_effects: open.control_effects.clone(),
-        code_pages: open.code_pages.clone(),
+        read_set_pinned: false,
+        read_set_unstable: false,
     })
 }
 
 fn tally_write_classes(key_state: &mut KeyState, open: &OpenTrip, writes: &HashMap<u32, WriteObs>) {
-    for obs in writes.values() {
+    for (dword, obs) in writes {
         if obs.class.never_restored() {
             key_state.write_class_w_other += 1;
             continue;
@@ -2749,13 +2887,14 @@ fn tally_write_classes(key_state: &mut KeyState, open: &OpenTrip, writes: &HashM
             key_state.write_class_d += 1;
             continue;
         }
-        match obs.pinned_pre {
-            Some(pre) if pre == obs.latest => {
-                key_state.write_class_r_pinned += 1;
-            }
-            _ => {
-                key_state.write_class_r_unpinned += 1;
-            }
+        let pinned = open.reads.contains_key(dword) || open.translations.contains_key(dword);
+        let restored = obs
+            .pre_dword
+            .is_some_and(|pre| (pre ^ obs.latest_dword) & obs.mask == 0);
+        if pinned && restored {
+            key_state.write_class_r_pinned += 1;
+        } else {
+            key_state.write_class_r_unpinned += 1;
         }
     }
 }
@@ -2861,7 +3000,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         return "{\"armed\":false}".to_string();
     };
     let mut out = format!(
-        "{{\"armed\":true,\"audit_period\":{},\"answered\":{},\"would_answer\":{},         \"insns_elided\":{},\"core_clocks_charged\":{},\"bus_clocks_charged\":{},         \"audited\":{},\"relearned\":{},\"drift_forced_audits\":{},\"learn_batches\":{},         \"a20_retires\":{},\"code_watch_retires\":{},\"code_mark_epoch_retires\":{},         \"fell_through\":{{\"not_memoised\":{},\"entry_state_mismatch\":{},         \"read_set_mismatch\":{},\"read_set_unreadable\":{},\"pending_interrupt\":{},         \"cap\":{},\"device_edge\":{},\"dma_visible\":{},\"not_armed\":{},         \"clock_projection\":{},\"soft_int_posted\":{}}},",
+        "{{\"armed\":true,\"audit_period\":{},\"answered\":{},\"would_answer\":{},         \"insns_elided\":{},\"core_clocks_charged\":{},\"bus_clocks_charged\":{},         \"audited\":{},\"relearned\":{},\"drift_forced_audits\":{},         \"a20_retires\":{},\"code_watch_retires\":{},\"code_mark_epoch_retires\":{},         \"fell_through\":{{\"not_memoised\":{},\"entry_state_mismatch\":{},         \"read_set_mismatch\":{},\"read_set_unreadable\":{},\"pending_interrupt\":{},         \"cap\":{},\"device_edge\":{},\"dma_visible\":{},\"not_armed\":{},         \"clock_projection\":{},\"soft_int_posted\":{}}},",
         state.audit_period,
         state.answered,
         state.would_answer,
@@ -2871,7 +3010,6 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         state.audited,
         state.relearned,
         state.drift_forced_audits,
-        state.learn_batches,
         state.a20_retires,
         state.code_watch_retires,
         state.code_mark_epoch_retires,
@@ -2977,7 +3115,29 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
                 ks.learn_refused[reason.index()]
             ));
         }
-        out.push_str("}}");
+        out.push_str("},\"read_set_offenders\":[");
+        let mut ofirst = true;
+        for (phys, expected, live, hits) in &ks.read_set_offenders {
+            if !ofirst {
+                out.push(',');
+            }
+            ofirst = false;
+            out.push_str(&format!(
+                "{{\"phys\":{phys},\"expected\":{expected},\"live\":{live},\"hits\":{hits}}}"
+            ));
+        }
+        out.push_str("],\"audit_offenders\":[");
+        let mut afirst2 = true;
+        for (phys, predicted, observed, hits) in &ks.audit_offenders {
+            if !afirst2 {
+                out.push(',');
+            }
+            afirst2 = false;
+            out.push_str(&format!(
+                "{{\"phys\":{phys},\"predicted\":{predicted},\"observed\":{observed},\"hits\":{hits}}}"
+            ));
+        }
+        out.push_str("]}");
     }
     out.push_str("]}");
     out

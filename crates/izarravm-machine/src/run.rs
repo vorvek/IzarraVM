@@ -1435,25 +1435,6 @@ impl Machine {
                 .timeline
                 .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
                 .max(1);
-            // The reflected-call memo's interpreter forcing (slice1 plan section 4.2's
-            // last paragraph: the batch loop owns this toggle, never the call-out).
-            // A learn cycle's two JOURNALED trips must retire every instruction through
-            // `finish_instruction`, which is the seam the memo's code-page set is built
-            // from and which a compiled block bypasses. Read once per batch, and only
-            // acted on when the answer CHANGES, so a run with the knob off pays one bool
-            // compare per batch and nothing else.
-            #[cfg(all(feature = "jit", feature = "reflected-call-memo"))]
-            {
-                let want = self.cpu.reflected_call_wants_interpreter();
-                if want != self.reflected_call_interpreter_forced {
-                    self.cpu
-                        .set_native_backend_enabled(!want && self.native_backend_configured);
-                    self.reflected_call_interpreter_forced = want;
-                    if want {
-                        self.cpu.reflected_call_note_learn_batch();
-                    }
-                }
-            }
             let cap = self.event_batch_cap_cached(remaining);
             // Published to `MachineBus` below so the reflected-call memo's answer gate
             // bounds a lump by THIS cap rather than a second, drift-prone derivation;

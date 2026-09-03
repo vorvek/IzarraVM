@@ -375,9 +375,6 @@ fn a_retf_return_leaving_the_flags_word_closes_as_a_return_match() {
         nested_acks_over_cap: false,
         control_effects: Vec::new(),
         control_effects_over_cap: false,
-        code_pages: Vec::new(),
-        code_pages_over_cap: false,
-        retired_insns: 0,
         audit: None,
         hw_interrupt_seen: false,
         entry_tail: None,
@@ -451,9 +448,6 @@ fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
         nested_acks_over_cap: false,
         control_effects: Vec::new(),
         control_effects_over_cap: false,
-        code_pages: Vec::new(),
-        code_pages_over_cap: false,
-        retired_insns: 0,
         audit: None,
         hw_interrupt_seen: false,
         entry_tail: None,
@@ -537,11 +531,9 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
                 pre_dword: None,
                 linear: addr,
                 ss_selector: DATA_SELECTOR,
-                pinned_pre: None,
-                latest: 1,
+                latest_dword: 1,
+                mask: u32::MAX,
                 class: AddressClass::Other,
-                phys_addr: addr,
-                width_bytes: 4,
             },
         )]),
         insns: 10,
@@ -554,11 +546,9 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
             pre_dword: None,
             linear: addr,
             ss_selector: DATA_SELECTOR,
-            pinned_pre: None,
-            latest: 2, // differs from trip A's 1
+            latest_dword: 2, // differs from trip A's 1
+            mask: u32::MAX,
             class: AddressClass::Other,
-            phys_addr: addr,
-            width_bytes: 4,
         },
     );
     let result = compare_journal(
@@ -591,14 +581,14 @@ fn a_write_of_a_constant_the_trip_never_read_is_class_w_not_class_r() {
     writes.insert(
         0x9000u32,
         WriteObs {
-            pre_dword: None,
+            pre_dword: Some(0),
             linear: 0x9000,
             ss_selector: DATA_SELECTOR,
-            pinned_pre: None, // never read before the write: NOT pinned
-            latest: 0x1234,
+            // A perfect restoration -- but the trip never READ the address, and
+            // `open.reads` is empty, so it is not pinned and must not count as R.
+            latest_dword: 0,
+            mask: u32::MAX,
             class: AddressClass::Other,
-            phys_addr: 0x9000,
-            width_bytes: 4,
         },
     );
     tally_write_classes(&mut key_state, &open, &writes);
@@ -923,11 +913,9 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
             pre_dword: None,
             linear: 0x9080,
             ss_selector: HOST_SS_SELECTOR,
-            pinned_pre: None,
-            latest: 0xdead_beef,
+            latest_dword: 0xdead_beef,
+            mask: u32::MAX,
             class: AddressClass::HostStack,
-            phys_addr: 0x9080,
-            width_bytes: 4,
         },
     );
     tally_write_classes(&mut key_state, &open, &writes);
@@ -959,11 +947,9 @@ fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
             pre_dword: None,
             linear: 0x9150,
             ss_selector: HOST_SS_SELECTOR,
-            pinned_pre: None,
-            latest: 0x1234,
+            latest_dword: 0x1234,
+            mask: u32::MAX,
             class: AddressClass::HostStack,
-            phys_addr: 0x9150,
-            width_bytes: 4,
         },
     );
     tally_write_classes(&mut key_state, &open, &writes);
@@ -1190,7 +1176,6 @@ fn fake_memo() -> Arc<Memo> {
         raw_core_clocks: 1,
         raw_bus_clocks: 1,
         insns: 1,
-        code_pages: Box::new([]),
         nested_acks: Box::new([]),
         control_effects: Box::new([]),
     })
@@ -1314,13 +1299,6 @@ fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u
     // applied HERE, between open and close, is what the raw-clock recovery (an
     // open/close DELTA) actually measures.
     cpu.elapsed_clocks += 100;
-    // Seven instructions, each announced at the retire seam the way the interpreter
-    // announces them -- which is what builds the memo's CODE-PAGE set and what
-    // `code_page_refusal` checks the count of. Driving `perf.instructions` without
-    // driving this seam is exactly the "the trip ran natively" shape the check refuses.
-    for i in 0..7u32 {
-        note_retired_instruction(cpu, bus, HANDLER_EIP + i * 4);
-    }
     cpu.perf.instructions += 7;
     bus.bus_clock += 50;
     cpu.registers.set_esp(STACK_TOP - 2); // RETF-with-flags: leaves the FLAGS word behind.
@@ -1366,7 +1344,9 @@ fn a_full_learn_cycle_produces_an_armed_memo_for_the_key() {
     assert!(
         memo.replay
             .iter()
-            .any(|&(addr, width, value)| addr == CLASS_W_ADDR && width == 4 && value == 0xCAFEBABE),
+            .any(|&(addr, mask, value)| addr == CLASS_W_ADDR
+                && mask == u32::MAX
+                && value == 0xCAFEBABE),
         "the never-read write must be classified Class W and replayed verbatim: {:?}",
         memo.replay
     );
@@ -1386,7 +1366,7 @@ fn a_poisoned_read_cell_falls_through_with_zero_state_change() {
     bus.write_raw(addr, BusWidth::Dword, 0x1111_1111);
     let memo = Memo {
         image: EntryImage::capture(&cpu),
-        reads: Box::new([(addr, 0x1111_1111)]),
+        reads: Box::new([(addr, 0x1111_1111, u32::MAX)]),
         translations: Box::new([]),
         epilogue: EntryImage::capture(&cpu),
         return_eip: CLIENT_RETURN_EIP,
@@ -1395,19 +1375,18 @@ fn a_poisoned_read_cell_falls_through_with_zero_state_change() {
         raw_core_clocks: 42,
         raw_bus_clocks: 7,
         insns: 3,
-        code_pages: Box::new([]),
         nested_acks: Box::new([]),
         control_effects: Box::new([]),
     };
     // Sanity: an UNPOISONED read set matches, so the screen would pass.
-    assert_eq!(screen_memo(&cpu, &bus, &memo), Ok(()));
+    assert_eq!(screen_memo_detailed(&cpu, &bus, &memo, &mut None), Ok(()));
 
     // Poison the one read cell the memo depends on.
     bus.write_raw(addr, BusWidth::Dword, 0x2222_2222);
     let cpu_before = cpu.clone();
     let mem_before = bus.mem.clone();
 
-    let result = screen_memo(&cpu, &bus, &memo);
+    let result = screen_memo_detailed(&cpu, &bus, &memo, &mut None);
 
     assert_eq!(result, Err(FellThrough::ReadSetMismatch));
     assert_eq!(cpu, cpu_before, "screening must never mutate CPU state");
@@ -1427,7 +1406,7 @@ fn on_int_screening_never_mutates_state_on_a_poisoned_cell() {
     bus.write_raw(addr, BusWidth::Dword, 0x1111_1111);
     let memo = Memo {
         image: EntryImage::capture(&cpu),
-        reads: Box::new([(addr, 0x1111_1111)]),
+        reads: Box::new([(addr, 0x1111_1111, u32::MAX)]),
         translations: Box::new([]),
         epilogue: EntryImage::capture(&cpu),
         return_eip: CLIENT_RETURN_EIP,
@@ -1436,7 +1415,6 @@ fn on_int_screening_never_mutates_state_on_a_poisoned_cell() {
         raw_core_clocks: 1,
         raw_bus_clocks: 1,
         insns: 1,
-        code_pages: Box::new([]),
         nested_acks: Box::new([]),
         control_effects: Box::new([]),
     };
@@ -1504,7 +1482,7 @@ fn distinguishable_memo(cpu: &CpuGsw, replay_addr: u32, cr3_after: u32) -> Memo 
         // holds, or a mutation deleting the `set_eip` would pass unnoticed and the
         // real guest would re-execute the `INT`.
         return_eip: CLIENT_RETURN_EIP + 2,
-        replay: Box::new([(replay_addr, 2, 0xBEEF)]),
+        replay: Box::new([(replay_addr, 0x0000_FFFF, 0xBEEF)]),
         class_r_ranges: Box::new([(0x7000, 0x7003)]),
         // 1,000 is NOT a multiple of `den` (12) on this persona, so a committer that
         // fed a PRE-SCALED delta back through the scaler would leave a different
@@ -1512,7 +1490,6 @@ fn distinguishable_memo(cpu: &CpuGsw, replay_addr: u32, cr3_after: u32) -> Memo 
         raw_core_clocks: 1_000,
         raw_bus_clocks: 500,
         insns: 1_579,
-        code_pages: Box::new([]),
         nested_acks: Box::new([(0x16, 0x0100), (0x28, 0x0000)]),
         control_effects: Box::new([ControlEffect::Cr3Write(cr3_after)]),
     }
@@ -1812,7 +1789,7 @@ fn a_poisoned_read_cell_leaves_every_register_memory_clock_and_counter_untouched
     bus.write_raw(addr, BusWidth::Dword, 0x1111_1111);
     let key = key_for(&cpu, VECTOR, 0);
     let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
-    memo.reads = Box::new([(addr, 0x1111_1111)]);
+    memo.reads = Box::new([(addr, 0x1111_1111, u32::MAX)]);
     install_memo(&mut cpu, key, memo);
     bus.write_raw(addr, BusWidth::Dword, 0x2222_2222); // poison, after caching
 
@@ -1910,56 +1887,64 @@ fn a_nested_int_outside_the_opening_window_is_still_recorded_as_an_ack() {
 // Amendment 4: the code-watch retire (plan R2.4 / BLOCKING finding 4).
 // ---------------------------------------------------------------------------
 
-/// **Mutation bite**: delete the `note_code_write_range` call at the top of
+/// **Mutation bite**: delete the `note_code_hit` call from the tail of
 /// `CpuGsw::note_code_write_inner`. A TSR chaining `INT 21h`, a DPMI host rewriting its
 /// own hook, or ordinary self-modifying code then patches the handler and the memo goes
 /// on answering from the code that USED to be there, for the rest of the run -- and
 /// nothing in any screen can see it, because the read set covers DATA and never
 /// instruction fetch.
+///
+/// A second bite: hook the retire on the write ITSELF rather than on `invalidated`. Every
+/// replayed Class W write goes through `note_code_write`, so the answer path would retire
+/// the memo it had just used, on every single answer.
 #[test]
-fn a_code_write_into_a_memos_fetched_range_retires_it() {
+fn a_write_that_hits_cached_code_retires_every_memo() {
     let (mut cpu, mut bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key = key_for(&cpu, VECTOR, 0);
-    let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
-    // The trip fetched code from physical page 6 (0x6000..0x6fff).
-    memo.code_pages = Box::new([0x6]);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
     install_memo(&mut cpu, key, memo);
     assert_eq!(cpu.reflected_call.as_ref().unwrap().memos[&key].len(), 1);
 
-    // A write on a page the trip never fetched from leaves it alone.
-    cpu.note_code_write(0x9000, 4);
+    // A write onto a page holding NO cached code invalidates nothing, so the memo stands.
+    // This is the case the answer path's own replay writes fall into, and getting it wrong
+    // makes the mechanism retire its memo on every answer.
+    assert!(!cpu.note_code_write(0x9000, 4));
     assert_eq!(
         cpu.reflected_call.as_ref().unwrap().memos[&key].len(),
         1,
-        "a write off the trip's code pages must not retire anything"
+        "a write that hits no cached code must not retire anything"
     );
     assert_eq!(cpu.reflected_call.as_ref().unwrap().code_watch_retires, 0);
 
-    // A write INSIDE it retires the memo.
-    cpu.note_code_write(0x6abc, 1);
+    // Now make the write hit code: decode an instruction at 0x6000 so the decode cache
+    // marks it, then store onto it. That is a real self-patch, and it retires the cache.
+    bus.write_raw(0x6000, BusWidth::Dword, 0x9090_9090);
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(CODE_SELECTOR, 0x9b));
+    cpu.set_eip(0x6000);
+    let _ = cpu.cycle(&mut bus);
+    assert!(
+        cpu.note_code_write(0x6000, 1),
+        "the store must land on code the CPU has cached, or this fixture proves nothing"
+    );
     assert!(
         cpu.reflected_call.as_ref().unwrap().memos[&key].is_empty(),
-        "a write onto a fetched code page must retire the memo"
+        "a write onto cached code must retire the memo cache"
     );
     assert_eq!(cpu.reflected_call.as_ref().unwrap().code_watch_retires, 1);
-
-    // And with no memo left, the same INT falls through instead of answering.
-    bus.gate_allowance = Some(1_000_000);
-    let regs_before = cpu.registers.clone();
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
-        IntOutcome::NotAnswered
+        cpu.reflected_call.as_ref().unwrap().retired[RetireCause::CodeWatch.index()],
+        1
     );
-    assert_eq!(cpu.registers, regs_before);
 }
 
-/// **Mutation bite**: stop bumping `DecodeCache::code_mark_epoch` in `retire_ring`, or
-/// drop the `sync_code_mark_epoch` call from `try_answer`. The overlap retire above rests
-/// on the memo's code pages still being MARKED -- marks are what route a write into
+/// **Mutation bite**: freeze `reflected_call_code_mark_epoch`, or drop the
+/// `sync_code_mark_epoch` call from `try_answer`. The write-hit retire above rests on the
+/// memo's code pages still being MARKED -- marks are what route a write into
 /// `note_code_write_inner` at all -- and a wholesale mark clear silently removes that
-/// routing while the memo lives on. This is the half of the code watch that no
-/// range-overlap test can cover.
+/// routing while the memo lives on. This is the half of the code watch that no write-hit
+/// test can cover.
 #[test]
 fn a_wholesale_decode_mark_clear_retires_every_memo() {
     let (mut cpu, mut bus) = synthetic_reflected_client();
@@ -1968,11 +1953,6 @@ fn a_wholesale_decode_mark_clear_retires_every_memo() {
     let key = key_for(&cpu, VECTOR, 0);
     let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
     install_memo(&mut cpu, key, memo);
-    // Populate the cache's epoch field the way the answer path does.
-    {
-        let live = cpu.reflected_call_code_mark_epoch();
-        cpu.reflected_call.as_mut().unwrap().code_mark_epoch = live;
-    }
 
     // A wholesale invalidation: every SMC mark the decode cache held is gone.
     let _ = cpu.invalidate_translation_code_caches(true);
@@ -1986,76 +1966,8 @@ fn a_wholesale_decode_mark_clear_retires_every_memo() {
     assert_eq!(cpu.registers, regs_before);
     let state = cpu.reflected_call.as_ref().unwrap();
     assert_eq!(state.code_mark_epoch_retires, 1);
+    assert_eq!(state.retired[RetireCause::CodeMarkEpoch.index()], 1);
     assert!(state.memos[&key].is_empty());
-}
-
-/// **Mutation bite**: drop the `retired_insns != insns` arm of `code_page_refusal`. A
-/// journaled trip that ran partly on the native backend -- which is exactly what happens
-/// if the batch loop's interpreter forcing is mistimed, and a trip CAN open mid-batch --
-/// then produces a memo whose code-page set names fewer pages than the trip fetched from,
-/// so a patch to an unnamed page never retires it.
-#[test]
-fn a_journal_trip_the_retire_seam_did_not_see_in_full_refuses() {
-    let (mut cpu, _bus) = synthetic_reflected_client();
-    arm(&mut cpu);
-    let mut open = test_open_trip(&cpu);
-    open.open_instructions = 0;
-    open.retired_insns = 3; // the seam saw three...
-    assert_eq!(
-        code_page_refusal(&open, 10), // ...but the trip retired ten.
-        Some(LearnRefused::CodePagesIncomplete)
-    );
-    open.retired_insns = 10;
-    assert_eq!(code_page_refusal(&open, 10), None);
-    open.code_pages_over_cap = true;
-    assert_eq!(
-        code_page_refusal(&open, 10),
-        Some(LearnRefused::CodePagesTooMany)
-    );
-}
-
-/// **Mutation bite**: make `reflected_call_wants_interpreter` always answer `false` (or
-/// never maintain `journal_keys`). The batch loop then never forces the interpreter, every
-/// journaled trip runs natively, and `code_page_refusal`'s completeness arm refuses every
-/// learn attempt -- the mechanism goes quietly inert rather than becoming unsound, which
-/// is the direction this pairing is built to fail in.
-#[test]
-fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
-    let (mut cpu, bus) = synthetic_reflected_client();
-    arm(&mut cpu);
-    assert!(!cpu.reflected_call_wants_interpreter(), "idle: no forcing");
-
-    // Close a WARM trip as a return match: the key advances to JournalA.
-    let key = key_for(&cpu, VECTOR, 0);
-    let open = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
-    cpu.reflected_call.as_mut().unwrap().open = Some(open);
-    on_far_return(&mut cpu, &bus);
-    assert_eq!(
-        cpu.reflected_call.as_ref().unwrap().keys[&key].slot,
-        SlotState::JournalA
-    );
-    assert!(
-        cpu.reflected_call_wants_interpreter(),
-        "a key in a journal slot forces the interpreter for the next batch"
-    );
-
-    // A refusal drops it back to Warm, and the forcing lifts with it.
-    cpu.reflected_call
-        .as_mut()
-        .unwrap()
-        .keys
-        .get_mut(&key)
-        .unwrap()
-        .slot = SlotState::JournalB;
-    let mut open2 = OpenTrip::start(&cpu, &bus, key, Slot::JournalB);
-    open2.hazard = Some(LearnRefused::PortIo);
-    cpu.reflected_call.as_mut().unwrap().open = Some(open2);
-    on_far_return(&mut cpu, &bus);
-    assert_eq!(
-        cpu.reflected_call.as_ref().unwrap().keys[&key].slot,
-        SlotState::Warm
-    );
-    assert!(!cpu.reflected_call_wants_interpreter());
 }
 
 // ---------------------------------------------------------------------------
@@ -2103,12 +2015,11 @@ fn matching_memo(cpu: &CpuGsw, bus: &FlatMemBus, write_value: u32) -> Memo {
         translations: Box::new([]),
         epilogue,
         return_eip: CLIENT_RETURN_EIP,
-        replay: Box::new([(CLASS_W_ADDR, 4, write_value)]),
+        replay: Box::new([(CLASS_W_ADDR, u32::MAX, write_value)]),
         class_r_ranges: Box::new([]),
         raw_core_clocks: 100 * u64::from(den) / u64::from(num),
         raw_bus_clocks: 50,
         insns: 7,
-        code_pages: Box::new([]),
         nested_acks: Box::new([]),
         control_effects: Box::new([]),
     }
@@ -2494,4 +2405,271 @@ fn the_mmx_refusal_is_the_isa_gate_not_a_memo_lane() {
             );
         }
     }
+}
+
+/// A cell the trip WRITES and then READS is the trip's own output, not an input, and it
+/// must never enter the read set: the answer's screen compares the read set against LIVE
+/// PRE-TRIP memory, so such a cell would be compared against whatever the PREVIOUS trip
+/// left there and mismatch on almost every occurrence.
+///
+/// **Mutation bite**: screen `open.writes` with the LINEAR address instead of the
+/// resolved physical dword. `writes` is keyed by aligned PHYSICAL dword, so UNDER PAGING
+/// the two differ and the screen never fires -- which is the shipped defect this test was
+/// written for, and why this fixture pays for a real page table instead of running
+/// unpaged like every other one in this file. Measured on `tyrian-specs-586`
+/// (2026-09-03) the defect cost the mechanism EVERYTHING: 1,387,638 of 1,459,463 answer
+/// attempts fell through as `read_set_mismatch`, `answered` was 0, and nothing in the
+/// learn cycle could see it, because Journal A and Journal B write and read the same
+/// slots identically and only a compare against live PRE-TRIP memory can tell.
+#[test]
+fn a_cell_the_trip_wrote_before_reading_is_not_in_the_read_set() {
+    const PD: u32 = 0x1_0000;
+    const PT: u32 = 0x1_1000;
+    // One page is deliberately NOT identity-mapped, so linear and physical differ for the
+    // addresses under test and the two screens are distinguishable.
+    const REMAPPED_LINEAR_PAGE: u32 = 0x7;
+    const REMAPPED_PHYSICAL_PAGE: u32 = 0x5;
+    const SLOT_LINEAR: u32 = 0x7300;
+    const SLOT_PHYSICAL: u32 = 0x5300;
+    const INPUT_LINEAR: u32 = 0x8400;
+
+    let (mut cpu, mut bus) = synthetic_reflected_client_with(0x2_0000, STACK_TOP, true);
+    bus.write_raw(PD, BusWidth::Dword, PT | 3);
+    for page in 0..32u32 {
+        let mapped = if page == REMAPPED_LINEAR_PAGE {
+            REMAPPED_PHYSICAL_PAGE
+        } else {
+            page
+        };
+        bus.write_raw(PT + page * 4, BusWidth::Dword, (mapped << 12) | 3);
+    }
+    cpu.control.cr3 = PD;
+    cpu.control.cr0 |= CR0_PG;
+    assert!(cpu.is_paging_enabled());
+    assert_eq!(
+        probe_physical(&cpu, &bus, SLOT_LINEAR).map(|(phys, _)| phys),
+        Some(SLOT_PHYSICAL),
+        "the fixture must actually separate linear from physical, or the bite is invisible"
+    );
+
+    arm(&mut cpu);
+    let mut open = test_open_trip(&cpu);
+    open.journaling = true;
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+
+    // Write, then read the same address -- the shape a stack slot takes inside a trip.
+    note_write(
+        &mut cpu,
+        &bus,
+        SLOT_LINEAR,
+        BusWidth::Dword,
+        0xFEED_FACE,
+        false,
+        None,
+    );
+    bus.write_raw(SLOT_PHYSICAL, BusWidth::Dword, 0xFEED_FACE);
+    note_read(&mut cpu, &bus, SLOT_LINEAR, BusWidth::Dword);
+
+    // And an ordinary INPUT the trip only reads (identity-mapped, so linear == physical).
+    bus.write_raw(INPUT_LINEAR, BusWidth::Dword, 0x0BAD_C0DE);
+    note_read(&mut cpu, &bus, INPUT_LINEAR, BusWidth::Dword);
+
+    let open = cpu.reflected_call.as_ref().unwrap().open.as_ref().unwrap();
+    assert!(
+        !open.reads.contains_key(&SLOT_PHYSICAL),
+        "a cell the trip wrote first is its own output, not an input"
+    );
+    assert!(
+        !open.reads.contains_key(&SLOT_LINEAR),
+        "and it must not sneak in under its linear address either"
+    );
+    assert_eq!(
+        open.reads.get(&INPUT_LINEAR),
+        Some(&(0x0BAD_C0DEu32, u32::MAX)),
+        "a cell the trip only reads IS an input and must be pinned"
+    );
+}
+
+/// The read set is keyed by aligned physical DWORD, but reads are byte- and word-wide.
+/// A byte read must pin ONE byte, not four.
+///
+/// **Mutation bite**: record `u32::MAX` as the mask regardless of the access width. The
+/// screen then pins three bytes the trip never looked at, and any neighbour that moves --
+/// a DOS counter sharing the dword -- fails the screen on every occurrence. Measured on
+/// `tyrian-specs-586` (2026-09-03), that was worth the entire mechanism: physical
+/// `0x17cc` mismatched on 726,117 of 726,134 answer attempts on the dominant key, on a
+/// single differing byte, and `answered` was 0.
+#[test]
+fn a_byte_read_pins_one_byte_not_the_whole_dword() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let mut open = test_open_trip(&cpu);
+    open.journaling = true;
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+
+    const CELL: u32 = 0x7500;
+    bus.write_raw(CELL, BusWidth::Dword, 0xAABB_CCDD);
+    // The trip reads only byte 1 of this dword.
+    note_read(&mut cpu, &bus, CELL + 1, BusWidth::Byte);
+    let recorded = *cpu
+        .reflected_call
+        .as_ref()
+        .unwrap()
+        .open
+        .as_ref()
+        .unwrap()
+        .reads
+        .get(&CELL)
+        .expect("the dword is in the read set");
+    assert_eq!(recorded, (0xAABB_CCDDu32, 0x0000_FF00u32));
+
+    // A second read of byte 3 ORs its own byte into the same mask; the two other bytes
+    // stay unpinned.
+    note_read(&mut cpu, &bus, CELL + 3, BusWidth::Byte);
+    let recorded = *cpu
+        .reflected_call
+        .as_ref()
+        .unwrap()
+        .open
+        .as_ref()
+        .unwrap()
+        .reads
+        .get(&CELL)
+        .expect("still one entry");
+    assert_eq!(recorded.1, 0xFF00_FF00u32);
+
+    // And the screen compares only the pinned bytes.
+    let entry = EntryImage::capture(&cpu);
+    let memo = Memo {
+        image: entry,
+        reads: Box::new([(CELL, 0xAABB_CCDD, 0xFF00_FF00)]),
+        translations: Box::new([]),
+        epilogue: entry,
+        return_eip: CLIENT_RETURN_EIP,
+        replay: Box::new([]),
+        class_r_ranges: Box::new([]),
+        raw_core_clocks: 1,
+        raw_bus_clocks: 1,
+        insns: 1,
+        nested_acks: Box::new([]),
+        control_effects: Box::new([]),
+    };
+    // Move an UNPINNED byte: the screen must still pass.
+    bus.write_raw(CELL, BusWidth::Dword, 0xAA11_CC22);
+    assert_eq!(
+        screen_memo_detailed(&cpu, &bus, &memo, &mut None),
+        Ok(()),
+        "a byte the trip never read must not fail the screen"
+    );
+    // Move a PINNED byte: it must fail.
+    bus.write_raw(CELL, BusWidth::Dword, 0xAA11_9922);
+    assert_eq!(
+        screen_memo_detailed(&cpu, &bus, &memo, &mut None),
+        Err(FellThrough::ReadSetMismatch)
+    );
+}
+
+/// A cell the trip READS AND THEN WRITES is a real input, but the value to pin is its
+/// POST-trip value: the answer's screen runs BEFORE the trip, and in steady state the cell
+/// holds what the previous occurrence of this trip left there.
+///
+/// **This is a HIT-RATE decision, not a soundness one, and it has no unit bite** -- said
+/// plainly rather than dressed up as a mutation the fixture cannot actually distinguish.
+/// Whichever value is pinned, the screen still runs and a cell that does not match still
+/// falls through to the guest; the only thing at stake is how often. What decided it is
+/// the FIXTURE measurement: with the read value pinned, `tyrian-specs-586`'s per-key
+/// offender dump named physical `0x17b0` in DOS data on `AH=0Bh` and 726,123 of 726,134
+/// answer attempts fell through on that one cell; with the post-trip value pinned the
+/// same cell accounts for 6. A unit fixture cannot tell the two apart, because in steady
+/// state the value a trip reads IS what the previous occurrence wrote -- which is the
+/// whole point.
+///
+/// What this test does pin: the cell stays IN the read set (dropping it would weaken the
+/// screen) and carries the value the next occurrence will find.
+#[test]
+fn a_cell_read_then_written_is_pinned_at_its_post_trip_value() {
+    const CELL: u32 = 0x7600;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+
+    // Run one full learn cycle whose trip READS `CELL` (value 0x1111) and then WRITES it
+    // (value 0x2222) -- the DOS-data shape the measurement named.
+    for _ in 0..11 {
+        cpu.registers.set_esp(STACK_TOP);
+        cpu.set_eip(CLIENT_RETURN_EIP);
+        let _ = on_int(&mut cpu, &mut bus, VECTOR);
+        note_read(&mut cpu, &bus, CELL, BusWidth::Dword);
+        note_write(&mut cpu, &bus, CELL, BusWidth::Dword, 0x2222, false, None);
+        bus.write_raw(CELL, BusWidth::Dword, 0x2222);
+        cpu.elapsed_clocks += 100;
+        cpu.perf.instructions += 7;
+        bus.bus_clock += 50;
+        cpu.registers.set_esp(STACK_TOP - 2);
+        cpu.set_eip(CLIENT_RETURN_EIP);
+        on_far_return(&mut cpu, &bus);
+        // The next occurrence starts from what this one left, and the trip restores its
+        // own read value before reading again -- exactly the steady state the memo has to
+        // screen against.
+        bus.write_raw(CELL, BusWidth::Dword, 0x2222);
+    }
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    let memo = &state.memos[&key][0];
+    let pinned = memo
+        .reads
+        .iter()
+        .find(|(addr, _, _)| *addr == CELL)
+        .expect("the cell is an input and must stay in the read set");
+    assert_eq!(
+        pinned.1, 0x2222,
+        "pinned at the POST-trip value, which is what the next occurrence will find"
+    );
+}
+
+/// A trip that writes TWO different fields of the same aligned dword -- a byte here, a
+/// word there -- must have BOTH replayed. The write journal is keyed by dword, so a model
+/// that keeps only the LAST write at each key replays half the dword and leaves the other
+/// half holding whatever the previous occurrence put there.
+///
+/// **Mutation bite**: overwrite `latest_dword`/`mask` on a repeat write instead of
+/// splicing and OR-ing. This is not hypothetical: it is the shipped shape, and the
+/// fixture-scale AUDIT is what caught it -- `tyrian-specs-586` (2026-09-03) reported
+/// `audit_mismatch[write_value]` on 13,768 of 13,768 audited trips while the epilogue, the
+/// core clocks and the instruction count all agreed exactly.
+#[test]
+fn two_writes_to_one_dword_are_both_replayed() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let mut open = test_open_trip(&cpu);
+    open.journaling = true;
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+
+    const CELL: u32 = 0x7700;
+    bus.write_raw(CELL, BusWidth::Dword, 0x0000_0000);
+    // Byte 0, then a word at bytes 2-3: two journal entries at one dword key.
+    note_write(&mut cpu, &bus, CELL, BusWidth::Byte, 0xAB, false, None);
+    bus.write_raw(CELL, BusWidth::Byte, 0xAB);
+    note_write(
+        &mut cpu,
+        &bus,
+        CELL + 2,
+        BusWidth::Word,
+        0xCDEF,
+        false,
+        None,
+    );
+    bus.write_raw(CELL + 2, BusWidth::Word, 0xCDEF);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    let open = state.open.as_ref().unwrap();
+    let obs = open.writes.get(&CELL).expect("one entry, at the dword key");
+    assert_eq!(
+        (obs.latest_dword, obs.mask),
+        (0xCDEF_00AB, 0xFFFF_00FF),
+        "both writes must be spliced into the dword, and both byte ranges masked in"
+    );
+    // Byte 1 is untouched by the trip and must stay out of the mask, so a replay can never
+    // clobber it.
+    assert_eq!(obs.mask & 0x0000_FF00, 0);
 }
