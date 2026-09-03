@@ -38370,37 +38370,37 @@ pub const N_REFUSAL_SITES: usize = 28;
 /// `site` below are positions in THIS table; they are written out rather than generated so a
 /// reader can check one against the other by eye.
 pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
-    ("skip_native_continuations_inactive", 1352),
-    ("skip_backend_or_skip_once", 1360),
-    ("skip_approximate_timing", 1366),
-    ("jit16_level_zero", 1508),
-    ("approximate_timing", 1514),
-    ("auto_admit", 1525),
-    ("direct_hot_at", 1539),
-    ("decline_memo_hit", 1565),
-    ("key_for_phys_none", 1577),
-    ("probe_interpret", 1590),
+    ("skip_native_continuations_inactive", 1364),
+    ("skip_backend_or_skip_once", 1372),
+    ("skip_approximate_timing", 1378),
+    ("jit16_level_zero", 1520),
+    ("approximate_timing", 1526),
+    ("auto_admit", 1537),
+    ("direct_hot_at", 1551),
+    ("decline_memo_hit", 1577),
+    ("key_for_phys_none", 1589),
+    ("probe_interpret", 1602),
     // Two returns carry this site since the break-site caller learned to tell a settled
     // `Rejected` from a `Dormant`; the first is cited, which is the one nearly every refusal
     // takes. Both satisfy the fixture below: each has the macro immediately above it.
-    ("probe_rejected", 1623),
-    ("link_line_not_live", 1916),
-    ("revalidate_none", 1922),
-    ("dispatch_deferred_short", 1960),
-    ("observer_or_diff_trace", 2658),
-    ("interrupt_shadow", 2665),
-    ("aggregate_accounting", 2672),
-    ("native_fetch_trace", 2686),
-    ("x87_top", 2714),
-    ("cs_layout", 2732),
-    ("cpl", 2740),
-    ("callout_privileged", 2821),
-    ("data_segment", 2952),
-    ("alignment", 2961),
-    ("fetch_limit", 2976),
-    ("entry_deferred_short", 2990),
-    ("zero_budget", 3098),
-    ("block_regenerated_none", 3137),
+    ("probe_rejected", 1635),
+    ("link_line_not_live", 1928),
+    ("revalidate_none", 1934),
+    ("dispatch_deferred_short", 1972),
+    ("observer_or_diff_trace", 2670),
+    ("interrupt_shadow", 2677),
+    ("aggregate_accounting", 2684),
+    ("native_fetch_trace", 2698),
+    ("x87_top", 2726),
+    ("cs_layout", 2744),
+    ("cpl", 2752),
+    ("callout_privileged", 2833),
+    ("data_segment", 2964),
+    ("alignment", 2973),
+    ("fetch_limit", 2988),
+    ("entry_deferred_short", 3002),
+    ("zero_budget", 3110),
+    ("block_regenerated_none", 3149),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]
@@ -38439,7 +38439,7 @@ pub(crate) mod site {
 #[cfg(feature = "direct-entry-attribution")]
 /// The `run.rs` line the `mark(P0)` sits on, and the sole authority for which refusal sites are
 /// "above" it. Kept beside the tables it partitions so all three move together.
-pub const P0_MARK_LINE: u32 = 1567;
+pub const P0_MARK_LINE: u32 = 1579;
 
 #[cfg(feature = "direct-entry-attribution")]
 /// The refusal sites that return BEFORE `mark(P0)`. A3 states `marks(P0) = decode_probes`; that
@@ -38466,13 +38466,13 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 pub const N_COMPILE_SITES: usize = 7;
 #[cfg(feature = "direct-entry-attribution")]
 pub const COMPILE_SITES: [(&str, u32); N_COMPILE_SITES] = [
-    ("heat_demote", 1719),
-    ("structural_reject", 1738),
-    ("compile_retry", 1749),
-    ("page_cover_failed", 1773),
-    ("lane_install_demote", 1809),
-    ("install_failed", 1819),
-    ("installed_fall_through", 1901),
+    ("heat_demote", 1731),
+    ("structural_reject", 1750),
+    ("compile_retry", 1761),
+    ("page_cover_failed", 1785),
+    ("lane_install_demote", 1821),
+    ("install_failed", 1831),
+    ("installed_fall_through", 1912),
 ];
 #[cfg(feature = "direct-entry-attribution")]
 pub(crate) mod compile_site {
