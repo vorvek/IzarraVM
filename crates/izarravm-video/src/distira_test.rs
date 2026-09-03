@@ -53,6 +53,13 @@ fn high_texture_upload_does_not_alias_a_low_texel_within_tmu_budget() {
     distira.tex_base_addr = SINGLE_TMU_BUDGET >> 3;
     distira.write_texture_u32(0, 0x22_22_22_22);
 
+    // Both writes ride the raster queue now (slice 1 of the texture-queue
+    // lever, `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section
+    // 6): the STORE into texture memory is deferred to `drain_raster_queue`,
+    // so a direct read of `distira.texture` must drain first, the same as
+    // any real consumer (an LFB access, a scanout, a statistics read) would.
+    distira.drain_raster_queue(DrainCause::Config);
+
     // Read the low texel back both ways: raw storage, and through the real
     // fetch path at the coordinates the low write targeted.
     distira.tex_base_addr = 0;

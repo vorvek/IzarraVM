@@ -119,6 +119,24 @@ pub fn mode_census_json(
                 // parallel lanes. See DistiraTriangleCensus::queue_drains.
                 "queue_drains": state.triangles.queue_drains,
                 "queue_drains_parallel": state.triangles.queue_drains_parallel,
+                // Slice 0 of the texture-queue lever: which caller forced
+                // each drain. See DistiraDrainCauses.
+                "queue_drain_causes": {
+                    "texture_write": state.triangles.queue_drain_causes.texture_write,
+                    "lfb_read": state.triangles.queue_drain_causes.lfb_read,
+                    "lfb_write": state.triangles.queue_drain_causes.lfb_write,
+                    "register_read_stats":
+                        state.triangles.queue_drain_causes.register_read_stats,
+                    "register_write_uncovered":
+                        state.triangles.queue_drain_causes.register_write_uncovered,
+                    "nop_cmd_reset_stats":
+                        state.triangles.queue_drain_causes.nop_cmd_reset_stats,
+                    "swap_or_scanout": state.triangles.queue_drain_causes.swap_or_scanout,
+                    "queue_full": state.triangles.queue_drain_causes.queue_full,
+                    "immediate_triangle":
+                        state.triangles.queue_drain_causes.immediate_triangle,
+                    "config": state.triangles.queue_drain_causes.config,
+                },
             },
             "retrace_count": state.retrace_count,
             "painted_bytes": state.painted_bytes,
