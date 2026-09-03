@@ -719,4 +719,27 @@ fn the_histogram_attributes_a_block_exactly_and_never_guesses() {
     hist.record_unattributed(500);
     assert_eq!(hist.unattributed(), 501);
     assert_eq!(hist.attributed(), 33);
+
+    // AND the divisor is the SLOT count, not the classed-slot count. A block
+    // with an x87 or call-out slot carries `UNCLASSED_SLOT` in its place, so its
+    // retires land in `unattributed` and its neighbours do not absorb them --
+    // the bias that made an x87-heavy row's class term read high before this was
+    // fixed.
+    let mut mixed = TimingHistogram::default();
+    let with_gap = [
+        TimingClass::Reg.index() as u8,
+        crate::timing_class::UNCLASSED_SLOT,
+        TimingClass::Jcc.index() as u8,
+    ];
+    mixed.record_block(&with_gap, 4, 0);
+    assert_eq!(mixed.attributed(), 8, "two classed slots, four passes");
+    assert_eq!(
+        mixed.unattributed(),
+        4,
+        "the x87 slot retired four times too"
+    );
+    let rows: std::collections::HashMap<_, _> = mixed.rows().into_iter().collect();
+    assert_eq!(rows["Reg"], 4);
+    assert_eq!(rows["Jcc"], 4);
+    assert_eq!(rows.len(), 2);
 }

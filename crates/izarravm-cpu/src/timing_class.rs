@@ -875,6 +875,17 @@ const _: () = {
 /// Slots whose charge arrives at run time -- x87 (through `weighted_fp_clocks`)
 /// and call-outs (through the helper's return value) -- carry no class and are
 /// absent from a block's vector, so they are unattributed too.
+/// The marker a block's class vector carries for a slot with no class -- an x87
+/// or call-out slot, whose charge arrives at run time. `N_CLASSES` is 157, so
+/// `u8::MAX` can never collide with a real index; a static assertion below says
+/// so rather than leaving it to arithmetic.
+pub(crate) const UNCLASSED_SLOT: u8 = u8::MAX;
+
+const _: () = assert!(
+    N_CLASSES < UNCLASSED_SLOT as usize,
+    "a class index would collide with UNCLASSED_SLOT; the vector needs a wider element"
+);
+
 #[derive(Clone)]
 pub(crate) struct TimingHistogram {
     counts: [u64; N_CLASSES],
@@ -933,14 +944,21 @@ impl TimingHistogram {
     /// One compiled-block entry: `passes` complete traversals of `vector` plus a
     /// `remainder`-long prefix of it, which is exactly how a block's slots
     /// retire on a completed run, a self-loop and a mid-block side exit alike.
+    ///
+    /// `vector` carries ONE ENTRY PER SLOT, with [`UNCLASSED_SLOT`] for the x87
+    /// and call-out slots whose charge arrives at run time. Those retires go to
+    /// `unattributed`: they did happen, and they have no class to hold them.
     pub(crate) fn record_block(&mut self, vector: &[u8], passes: u64, remainder: usize) {
-        if passes > 0 {
-            for index in vector {
-                self.counts[usize::from(*index)] += passes;
+        for (position, index) in vector.iter().enumerate() {
+            let times = passes + u64::from(position < remainder);
+            if times == 0 {
+                continue;
             }
-        }
-        for index in vector.iter().take(remainder) {
-            self.counts[usize::from(*index)] += 1;
+            if *index == UNCLASSED_SLOT {
+                self.unattributed += times;
+            } else {
+                self.counts[usize::from(*index)] += times;
+            }
         }
     }
 

@@ -5980,18 +5980,24 @@ pub(crate) struct DirectAddr {
     pub(crate) disp_lane: Option<ImmLane>,
 }
 
-/// One block's slot classes as dense indices, in slot order.
+/// One block's slot classes as dense indices, in slot order, ONE ENTRY PER SLOT.
 ///
-/// Slots whose charge arrives at run time (`X87`, `CallOut`) have no class and
-/// are absent: an x87 slot's cost comes through `weighted_fp_clocks` and a
-/// call-out's through the helper's return value, so attributing either to a
-/// class here would double-count it in the histogram's own terms.
+/// Slots whose charge arrives at run time (`X87`, `CallOut`) have no class --
+/// an x87 slot's cost comes through `weighted_fp_clocks` and a call-out's
+/// through the helper's return value, so attributing either to a class would
+/// double-count it in the histogram's own terms. They are marked with
+/// `UNCLASSED_SLOT` rather than dropped, because the vector's LENGTH is the
+/// divisor `record_block` uses to turn a retire count into passes: dropping a
+/// slot would shorten the block and smear that slot's retires across its
+/// classed neighbours.
 #[cfg(feature = "timing-class-histogram")]
 fn class_vector(slots: &[DirectInsn]) -> Box<[u8]> {
     slots
         .iter()
-        .filter_map(|slot| slot.kind.timing_class())
-        .map(|class| class.index() as u8)
+        .map(|slot| match slot.kind.timing_class() {
+            Some(class) => class.index() as u8,
+            None => crate::timing_class::UNCLASSED_SLOT,
+        })
         .collect()
 }
 
