@@ -120,6 +120,9 @@ pub(crate) const MEMO_MAX_TRANSLATION_SET: usize = 64;
 /// Replay-write cap, raised from 32 to 192 by R2.3/R2.17 (the pinned-pre-
 /// value fix moves most same-address writes from R to W).
 pub(crate) const MEMO_MAX_REPLAY_WRITES: usize = 192;
+/// Per-key image cache depth, LRU (plan section 3): 0b measured top-8 images cover 99.99% of
+/// trips on both dominant keys.
+pub(crate) const MEMO_IMAGES_PER_KEY: usize = 8;
 
 // ---------------------------------------------------------------------------
 // The knob
@@ -299,6 +302,13 @@ struct WriteObs {
     pinned_pre: Option<u32>,
     latest: u32,
     class: AddressClass,
+    /// The EXACT physical write address (not dword-aligned) and its width (answer-path
+    /// amendment 2): a Class W replay must reproduce the write at the SAME granularity the
+    /// original trip used, through `bus.write_memory(phys_addr, width, ..)`, rather than
+    /// smearing `latest`'s low-order-justified bits across a whole aligned dword and
+    /// clobbering neighbouring bytes the trip never touched.
+    phys_addr: u32,
+    width_bytes: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +367,13 @@ struct OpenTrip {
     hazard: Option<LearnRefused>,
     nested_int_count: u32,
     hw_interrupt_seen: bool,
+    /// Plan 4.4, the live stack tail: the physical address and WORD value at
+    /// `[entry_esp - 2, entry_esp)` sampled at trip OPEN, before the `INT`'s own push --
+    /// generic scratch content, unrelated to this trip. Compared at close against the same
+    /// address's live value to decide whether the `RETF`-with-flags shape's `INT`-pushed
+    /// FLAGS word needs to be in `memo.replay` (it always does in practice, but the compare
+    /// is the generic rule the plan states, not a hardcoded "always emit").
+    entry_tail: Option<(u32, u32)>,
 }
 
 // `OpenTrip` participates in `CpuGsw`'s derived `PartialEq`/`Eq`/`Clone` only
@@ -419,6 +436,9 @@ impl OpenTrip {
             last_esp: entry_esp,
         });
         let hazard = entry_hazard(&entry_image);
+        let tail_linear = ss.base.wrapping_add(entry_esp.wrapping_sub(2));
+        let entry_tail = probe_physical(cpu, bus, tail_linear)
+            .and_then(|(phys, _walk)| bus.peek_direct_ram(phys, BusWidth::Word).map(|v| (phys, v)));
         OpenTrip {
             key,
             slot,
@@ -444,6 +464,7 @@ impl OpenTrip {
             hazard,
             nested_int_count: 0,
             hw_interrupt_seen: false,
+            entry_tail,
         }
     }
 
@@ -644,6 +665,12 @@ enum SlotState {
 /// set (address -> observation), instruction count, exit image.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct JournalSnapshot {
+    /// Amendment 2: JournalA's own entry image. `compare_journal` checks this against
+    /// JournalB's entry image -- two occurrences of the same `MemoKey` whose entry states
+    /// genuinely differ (say, DS) must never silently agree just because the read set
+    /// happened not to expose the difference; this is the same closure-rule concern
+    /// BLOCKING finding 1 fixed for the image fields, applied to the A-vs-B compare itself.
+    entry_image: EntryImage,
     reads: HashMap<u32, u32>,
     translations: HashMap<u32, u32>,
     writes: HashMap<u32, WriteObs>,
@@ -657,6 +684,11 @@ pub(crate) struct KeyState {
     consecutive_failures: u32,
     pub disarmed: bool,
     pending_journal: Option<JournalSnapshot>,
+    /// JournalB's classified write set, carried across the 8 Natural samples (which run with
+    /// journaling OFF and so cannot re-observe writes) so a `Memo` can be assembled once the
+    /// clocks are confirmed stable, without re-deriving classification from data the Natural
+    /// trips never collected.
+    confirmed: Option<ConfirmedTrip>,
     natural_samples: Vec<(u64, u64, u64)>,
     /// Every `INT` occurrence `on_int` identified as this key, whether it opened a trip or was
     /// dropped because the key is disarmed (Fable review 2026-09-03, finding 6(iii): without
@@ -705,6 +737,7 @@ impl KeyState {
         }
         self.slot = SlotState::Warm;
         self.pending_journal = None;
+        self.confirmed = None;
         self.natural_samples.clear();
     }
 
@@ -720,6 +753,7 @@ impl KeyState {
             self.consecutive_failures = 0;
             self.slot = SlotState::Warm;
             self.pending_journal = None;
+            self.confirmed = None;
             self.natural_samples.clear();
             self.rearms += 1;
         }
@@ -730,6 +764,8 @@ impl KeyState {
         self.slot = SlotState::Warm;
         self.pending_journal = None;
         self.natural_samples.clear();
+        // `confirmed` is deliberately NOT cleared here: the `Slot::Natural` success arm reads
+        // it via `take()` before calling this, so by the time this runs it is already `None`.
     }
 }
 
@@ -748,6 +784,78 @@ pub(crate) struct ReflectedCallMemoState {
     /// `reflected_call_a20_retires` (plan Revision 2 amendments, item A): incremented by the
     /// COUNT of memos discarded, every time `retire_all_memos` runs.
     pub(crate) a20_retires: u64,
+    /// Amendment 2 screening counters (a partial slice of plan section 7.4's full
+    /// `fell_through[]` surface -- `not_memoised`, `entry_state_mismatch`,
+    /// `read_set_mismatch` and `read_set_unreadable` only; the remaining lanes
+    /// (`pending_interrupt`, `edge_or_cap`, `dma_visible`, `device_window`, ...) are wired as
+    /// their own screens land). `would_answer` counts a full screen PASS: in this commit
+    /// nothing is actually applied yet (that is amendment 3), so a pass still falls through
+    /// to native execution exactly like a miss -- this counter is purely observational,
+    /// proving the screen would have fired once the apply path exists.
+    pub(crate) not_memoised: u64,
+    pub(crate) entry_state_mismatch: u64,
+    pub(crate) read_set_mismatch: u64,
+    pub(crate) read_set_unreadable: u64,
+    pub(crate) would_answer: u64,
+}
+
+/// Why a candidate memo did not answer (plan section 5, screens 2/3/6): the entry-image and
+/// physical read/translation-set compare, screened BEFORE any mutation (the fall-through
+/// invariant -- "any mismatch = fall through to the guest with zero state changed").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FellThrough {
+    NotMemoised,
+    EntryStateMismatch,
+    ReadSetMismatch,
+    ReadSetUnreadable,
+}
+
+/// Screen ONE candidate memo (plan section 5, steps 3 and 6): compare all 43 entry-image
+/// fields, then the pre-resolved physical read set, then the translation set, against LIVE
+/// memory -- read-only, no mutation anywhere in this function. `Ok(())` means every screen
+/// passed; the caller applies nothing here (screens 1/2/4/5/7/8 -- knob, bucket, pending
+/// interrupt, clamp, observer test, apply order -- are amendment 3's, once a pass means
+/// something).
+pub(crate) fn screen_memo<B: CpuBus>(
+    cpu: &CpuGsw,
+    bus: &B,
+    memo: &Memo,
+) -> Result<(), FellThrough> {
+    let live_image = EntryImage::capture(cpu);
+    if live_image != memo.image {
+        return Err(FellThrough::EntryStateMismatch);
+    }
+    for &(phys, expected) in memo.reads.iter().chain(memo.translations.iter()) {
+        match bus.peek_direct_ram(phys, BusWidth::Dword) {
+            None => return Err(FellThrough::ReadSetUnreadable),
+            Some(live) if live != expected => return Err(FellThrough::ReadSetMismatch),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Screen every cached memo for `key`, most-recently-inserted first (plan section 3's LRU),
+/// returning the first that passes. `None` with no memo cached at all is
+/// `FellThrough::NotMemoised`; `None` with candidates present but none matching is the LAST
+/// candidate's own reason (arbitrary among misses, since none of them will answer either
+/// way -- only used for a counter bucket, never for control flow in this commit).
+pub(crate) fn screen_key<'a, B: CpuBus>(
+    cpu: &CpuGsw,
+    bus: &B,
+    memos: &'a [Memo],
+) -> Result<&'a Memo, FellThrough> {
+    if memos.is_empty() {
+        return Err(FellThrough::NotMemoised);
+    }
+    let mut last_reason = FellThrough::NotMemoised;
+    for memo in memos.iter().rev() {
+        match screen_memo(cpu, bus, memo) {
+            Ok(()) => return Ok(memo),
+            Err(reason) => last_reason = reason,
+        }
+    }
+    Err(last_reason)
 }
 
 impl ReflectedCallMemoState {
@@ -790,9 +898,10 @@ pub(crate) struct Memo {
     /// `EIP` the epilogue sets: `int_eip + insn_len`, constant for a given key (plan 5.8d).
     pub(crate) return_eip: u32,
     /// Class W: deterministic net writes plus the live stack tail (plan 4.3/4.4), applied at
-    /// answer time through `CpuGsw::write_physical_replay`. Pre-resolved aligned physical
-    /// dword -> value.
-    pub(crate) replay: Box<[(u32, u32)]>,
+    /// answer time through `CpuGsw::write_physical_replay`. EXACT (not dword-aligned)
+    /// physical address, width in bytes, value -- the same granularity the original write
+    /// used, so replay never clobbers neighbouring bytes the trip did not touch.
+    pub(crate) replay: Box<[(u32, u8, u32)]>,
     /// Class R ranges, coalesced, for the answer-time observer test (plan 5.7 / review A.4):
     /// (physical_lo, physical_hi_inclusive).
     pub(crate) class_r_ranges: Box<[(u32, u32)]>,
@@ -868,6 +977,33 @@ pub(crate) fn on_int<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, vector: u8) {
     let key_state = state.keys.entry(key).or_default();
     key_state.trips_seen += 1;
     key_state.maybe_rearm();
+    // Amendment 2, observational only: screen any cached memo for this key against the LIVE
+    // entry state and physical read set, BEFORE any mutation happens anywhere below. Nothing
+    // is applied on a pass yet (amendment 3) -- production control flow is unchanged by this
+    // block's outcome either way, so the plain/feature-off and even the feature-on arm's
+    // GUEST-VISIBLE behaviour cannot move from adding this counter.
+    {
+        let state = cpu.reflected_call.as_ref().expect("checked above");
+        let outcome: Result<(), FellThrough> = match state.memos.get(&key) {
+            Some(memos) => screen_key(cpu, bus, memos).map(|_memo| ()),
+            None => Err(FellThrough::NotMemoised),
+        };
+        let state = cpu.reflected_call.as_mut().expect("checked above");
+        match outcome {
+            Ok(_) => state.would_answer += 1,
+            Err(FellThrough::NotMemoised) => state.not_memoised += 1,
+            Err(FellThrough::EntryStateMismatch) => state.entry_state_mismatch += 1,
+            Err(FellThrough::ReadSetMismatch) => state.read_set_mismatch += 1,
+            Err(FellThrough::ReadSetUnreadable) => state.read_set_unreadable += 1,
+        }
+    }
+    let key_state = cpu
+        .reflected_call
+        .as_mut()
+        .expect("checked above")
+        .keys
+        .get_mut(&key)
+        .expect("just touched above");
     if key_state.disarmed {
         key_state.disarmed_returns += 1;
         return;
@@ -1073,6 +1209,8 @@ pub(crate) fn note_write<B: CpuBus>(
             .or_else(|| open.translations.get(&dword).copied());
         if let Some(rec) = open.writes.get_mut(&dword) {
             rec.latest = masked;
+            rec.phys_addr = physical;
+            rec.width_bytes = width.bytes() as u8;
             if rec.pinned_pre.is_none() {
                 rec.pinned_pre = pinned_pre;
             }
@@ -1087,6 +1225,8 @@ pub(crate) fn note_write<B: CpuBus>(
                     pinned_pre,
                     latest: masked,
                     class,
+                    phys_addr: physical,
+                    width_bytes: width.bytes() as u8,
                 },
             );
         }
@@ -1156,6 +1296,10 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
     let close_persona = cpu.persona();
     let close_instructions = cpu.perf.instructions;
     let exit_image = EntryImage::capture(cpu);
+    // Plan 4.4: which return arm actually matched, so a JournalB success knows whether the
+    // live stack tail (the `RETF`-with-flags shape's `INT`-pushed FLAGS word) applies. Cheap,
+    // pure, and safe to compute even when `is_match` is false (then unused).
+    let is_flags_arm = is_match && open.is_return_match(cpu) == Some(true);
 
     let key = open.key;
     let state = cpu.reflected_call.as_mut().expect("checked by callers");
@@ -1206,6 +1350,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
             key_state.write_set_size.observe(open.writes.len() as u32);
             key_state.read_set_size.observe(open.reads.len() as u32);
             key_state.pending_journal = Some(JournalSnapshot {
+                entry_image: open.entry_image,
                 reads: open.reads,
                 translations: open.translations,
                 writes: open.writes,
@@ -1231,6 +1376,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
             key_state.learn_attempts += 1;
             match compare_journal(
                 &baseline,
+                &open.entry_image,
                 &open.writes,
                 &open.reads,
                 &open.translations,
@@ -1239,7 +1385,15 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
             ) {
                 Ok(()) => {
                     tally_write_classes(key_state, &open, &open.writes);
-                    key_state.slot = SlotState::Natural(0);
+                    match build_confirmed(&open, bus, is_flags_arm, &exit_image) {
+                        Ok(confirmed) => {
+                            key_state.confirmed = Some(confirmed);
+                            key_state.slot = SlotState::Natural(0);
+                        }
+                        Err(reason) => {
+                            key_state.record_failure(reason);
+                        }
+                    }
                 }
                 Err(reason) => {
                     key_state.record_failure(reason);
@@ -1272,7 +1426,32 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
                 key_state.stability.finish_attempt(all_equal);
                 if all_equal {
                     key_state.learned += 1;
+                    let confirmed = key_state.confirmed.take();
                     key_state.record_success_and_reset();
+                    if let Some(c) = confirmed {
+                        let memo = Memo {
+                            image: c.entry_image,
+                            reads: c.reads.into_boxed_slice(),
+                            translations: c.translations.into_boxed_slice(),
+                            epilogue: c.epilogue,
+                            return_eip: c.return_eip,
+                            replay: c.replay.into_boxed_slice(),
+                            class_r_ranges: c.class_r_ranges.into_boxed_slice(),
+                            raw_core_clocks: raw_core,
+                            raw_bus_clocks: raw_bus,
+                            insns,
+                            code_pages: Box::new([]),
+                        };
+                        let state = cpu.reflected_call.as_mut().expect("checked above");
+                        let slot_vec = state.memos.entry(key).or_default();
+                        // Same entry image relearned (e.g. after an A20 retire): replace
+                        // rather than duplicate.
+                        slot_vec.retain(|m| m.image != memo.image);
+                        if slot_vec.len() >= MEMO_IMAGES_PER_KEY {
+                            slot_vec.remove(0); // FIFO eviction of the oldest image.
+                        }
+                        slot_vec.push(memo);
+                    }
                 } else {
                     key_state.record_failure(LearnRefused::ClocksUnstable);
                 }
@@ -1285,12 +1464,16 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
 
 fn compare_journal(
     baseline: &JournalSnapshot,
+    entry_image: &EntryImage,
     writes: &HashMap<u32, WriteObs>,
     reads: &HashMap<u32, u32>,
     translations: &HashMap<u32, u32>,
     insns_b: u64,
     exit_image: &EntryImage,
 ) -> Result<(), LearnRefused> {
+    if baseline.entry_image != *entry_image {
+        return Err(LearnRefused::JournalMismatch);
+    }
     if baseline.insns != insns_b || baseline.exit_image != *exit_image {
         return Err(LearnRefused::JournalMismatch);
     }
@@ -1319,6 +1502,119 @@ fn compare_journal(
         }
     }
     Ok(())
+}
+
+/// JournalB's classification, carried forward to Natural-sample completion so a `Memo` can be
+/// built (plan section 3) once the raw-clock samples confirm the trip is worth memoising.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ConfirmedTrip {
+    entry_image: EntryImage,
+    reads: Vec<(u32, u32)>,
+    translations: Vec<(u32, u32)>,
+    epilogue: EntryImage,
+    return_eip: u32,
+    replay: Vec<(u32, u8, u32)>,
+    class_r_ranges: Vec<(u32, u32)>,
+}
+
+/// Amendment 2: classify JournalB's write set into Class R (restored, admitted classes only --
+/// recorded into `class_r_ranges` for the answer-time observer test, review A.4, and SKIPPED
+/// at answer time) and Class W (deterministic net write -- REPLAYED at answer time), and
+/// assemble the rest of what the answer path needs. A write to an address
+/// `AddressClass::never_restored` (the framebuffer aperture or a device window/unmapped page)
+/// refuses the WHOLE trip (`write_class_n`): plan 4.3's Class W rule requires "plain RAM
+/// outside every device window and outside the framebuffer aperture", so such a write is
+/// eligible for neither R (skipping a hardware-visible write is wrong) nor W -- it can never
+/// be memoised. Class D (dead stack) is skipped and recorded nowhere.
+fn build_confirmed<B: CpuBus>(
+    open: &OpenTrip,
+    bus: &B,
+    is_flags_arm: bool,
+    exit_image: &EntryImage,
+) -> Result<ConfirmedTrip, LearnRefused> {
+    let mut replay: HashMap<u32, (u8, u32)> = HashMap::new();
+    let mut class_r_dwords: Vec<u32> = Vec::new();
+    for (&dword, obs) in &open.writes {
+        if obs.class.never_restored() {
+            return Err(LearnRefused::WriteClassN);
+        }
+        if matches!(
+            obs.class,
+            AddressClass::ClientStack | AddressClass::HostStack
+        ) && open.is_dead_stack(obs.ss_selector, obs.linear)
+        {
+            continue; // Class D: skip, recorded nowhere.
+        }
+        // `pinned_pre` is the value of the WHOLE aligned dword the trip's own read set (or
+        // translation set) saw before the first write; a sub-dword write's `latest` is
+        // low-order-justified to its own width (`note_write`'s `mask_to_width`), so the
+        // pre-value must be shifted down by the write's byte offset within that dword and
+        // masked the same way before the two are commensurable.
+        let byte_offset = obs.phys_addr.wrapping_sub(dword);
+        let pre_here = obs
+            .pinned_pre
+            .map(|pre| mask_to_width(pre >> (byte_offset * 8), u32::from(obs.width_bytes)));
+        match pre_here {
+            Some(pre) if pre == obs.latest => {
+                class_r_dwords.push(dword); // Class R: restored, admitted, skip.
+            }
+            _ => {
+                replay.insert(obs.phys_addr, (obs.width_bytes, obs.latest)); // Class W.
+            }
+        }
+    }
+
+    // Plan 4.4, the live stack tail: the `RETF`-with-flags shape leaves the `INT`-pushed
+    // FLAGS word at `[entry_esp - 2, entry_esp)` guest-visible above the final SP. Generic
+    // rule: whenever that word differs from what was there at entry (ordinary pre-trip stack
+    // scratch, unrelated to this trip), it must be replayed -- omitting it silently corrupts
+    // the guest stack (this is what test 7 catches).
+    if is_flags_arm
+        && let Some((phys, entry_value)) = open.entry_tail
+        && let Some(close_value) = bus.peek_direct_ram(phys, BusWidth::Word)
+        && close_value != entry_value
+    {
+        replay.insert(phys, (2, close_value));
+    }
+
+    if replay.len() > MEMO_MAX_REPLAY_WRITES {
+        return Err(LearnRefused::ReplaySetTooLarge);
+    }
+
+    let mut replay: Vec<(u32, u8, u32)> = replay
+        .into_iter()
+        .map(|(addr, (w, v))| (addr, w, v))
+        .collect();
+    replay.sort_unstable_by_key(|&(addr, _, _)| addr);
+
+    class_r_dwords.sort_unstable();
+    class_r_dwords.dedup();
+    let mut class_r_ranges: Vec<(u32, u32)> = Vec::new();
+    for dword in class_r_dwords {
+        if let Some((_, hi)) = class_r_ranges.last_mut()
+            && dword <= hi.wrapping_add(1)
+        {
+            *hi = dword + 3;
+            continue;
+        }
+        class_r_ranges.push((dword, dword + 3));
+    }
+
+    let mut reads: Vec<(u32, u32)> = open.reads.iter().map(|(&a, &v)| (a, v)).collect();
+    reads.sort_unstable_by_key(|&(a, _)| a);
+    let mut translations: Vec<(u32, u32)> =
+        open.translations.iter().map(|(&a, &v)| (a, v)).collect();
+    translations.sort_unstable_by_key(|&(a, _)| a);
+
+    Ok(ConfirmedTrip {
+        entry_image: open.entry_image,
+        reads,
+        translations,
+        epilogue: *exit_image,
+        return_eip: open.return_eip,
+        replay,
+        class_r_ranges,
+    })
 }
 
 fn tally_write_classes(key_state: &mut KeyState, open: &OpenTrip, writes: &HashMap<u32, WriteObs>) {
