@@ -58,12 +58,18 @@ fn write_interrupt_gate(mem: &mut [u8], vector: u8, offset: u32) {
 
 struct FlatMemBus {
     mem: Vec<u8>,
+    /// Test-controllable cumulative raw bus clock counter (Fable review 2026-09-03, finding
+    /// 1's regression test): unlike `in_batch_raw_bus_clocks`, this must NEVER reset, even
+    /// across a simulated machine-batch re-entry -- the test drives it directly to prove the
+    /// memo samples `cumulative_raw_bus_clocks`, not the batch-relative figure.
+    bus_clock: u64,
 }
 
 impl FlatMemBus {
     fn new(size: usize) -> Self {
         Self {
             mem: vec![0u8; size],
+            bus_clock: 0,
         }
     }
 
@@ -167,6 +173,10 @@ impl CpuBus for FlatMemBus {
         _ax: u16,
     ) -> Result<(), izarravm_bus::BusError> {
         Ok(())
+    }
+
+    fn cumulative_raw_bus_clocks(&self) -> u64 {
+        self.bus_clock
     }
 }
 
@@ -451,6 +461,7 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
             addr,
             WriteObs {
                 linear: addr,
+                ss_selector: DATA_SELECTOR,
                 pinned_pre: None,
                 latest: 1,
                 class: AddressClass::Other,
@@ -464,6 +475,7 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
         addr,
         WriteObs {
             linear: addr,
+            ss_selector: DATA_SELECTOR,
             pinned_pre: None,
             latest: 2, // differs from trip A's 1
             class: AddressClass::Other,
@@ -499,6 +511,7 @@ fn a_write_of_a_constant_the_trip_never_read_is_class_w_not_class_r() {
         0x9000u32,
         WriteObs {
             linear: 0x9000,
+            ss_selector: DATA_SELECTOR,
             pinned_pre: None, // never read before the write: NOT pinned
             latest: 0x1234,
             class: AddressClass::Other,
@@ -700,4 +713,225 @@ fn maybe_compare_bench_is_off_by_default_and_does_not_panic() {
     let (ns_per_read, ns_total) = run_compare_bench(155);
     assert!(ns_per_read >= 0.0);
     assert!(ns_total >= 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Fable review 2026-09-03, finding 1: raw bus clocks must be recovered from
+// a cumulative (whole-run) counter, never a per-batch one that resets at
+// every IF-edge machine-batch re-entry.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn raw_bus_clocks_recover_correctly_across_a_simulated_batch_restart() {
+    let open_bus_raw = 1_000_000u64;
+    let close_bus_raw = 1_000_150u64;
+    assert_eq!(
+        recover_raw_bus_clocks(open_bus_raw, close_bus_raw),
+        Some(150)
+    );
+
+    let open_bus_raw_2 = 500u64;
+    let close_bus_raw_2 = 500u64;
+    assert_eq!(
+        recover_raw_bus_clocks(open_bus_raw_2, close_bus_raw_2),
+        Some(0)
+    );
+}
+
+#[test]
+fn open_trip_samples_the_cumulative_bus_accessor() {
+    let (cpu, mut bus) = synthetic_reflected_client();
+    bus.bus_clock = 42;
+    let key = MemoKey {
+        vector: VECTOR,
+        ax: 0,
+        cs_selector: CODE_SELECTOR,
+        int_eip: CLIENT_RETURN_EIP,
+        ss_selector: DATA_SELECTOR,
+        ss_big: true,
+        cpl: 0,
+        vm: false,
+    };
+    let open = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
+    assert_eq!(open.open_bus_raw, 42);
+    bus.bus_clock = 42 + 12 + 8 + 108;
+    assert_eq!(
+        recover_raw_bus_clocks(open.open_bus_raw, bus.cumulative_raw_bus_clocks()),
+        Some(128)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fable review 2026-09-03, finding 2 (plan section 4.2 point 2): only
+// `clocks_unstable` counts toward the consecutive-failure disarm budget.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journal_mismatch_and_boundary_refusals_do_not_disarm_only_clocks_unstable_does() {
+    let mut ks = KeyState::default();
+    for _ in 0..10 {
+        ks.record_failure(LearnRefused::JournalMismatch);
+    }
+    assert!(!ks.disarmed, "journal_mismatch must never disarm the key");
+    assert_eq!(ks.learn_refused[LearnRefused::JournalMismatch.index()], 10);
+
+    let mut ks2 = KeyState::default();
+    for _ in 0..10 {
+        ks2.record_failure(LearnRefused::ClosedWithoutReturn);
+    }
+    assert!(
+        !ks2.disarmed,
+        "a boundary refusal must never disarm the key"
+    );
+
+    let mut ks3 = KeyState::default();
+    for _ in 0..(MEMO_LEARN_BUDGET - 1) {
+        ks3.record_failure(LearnRefused::ClocksUnstable);
+    }
+    assert!(
+        !ks3.disarmed,
+        "must not disarm before the budget is reached"
+    );
+    ks3.record_failure(LearnRefused::ClocksUnstable);
+    assert!(
+        ks3.disarmed,
+        "MEMO_LEARN_BUDGET consecutive clocks_unstable refusals must disarm"
+    );
+
+    let mut ks4 = KeyState::default();
+    ks4.record_failure(LearnRefused::ClocksUnstable);
+    ks4.record_failure(LearnRefused::JournalMismatch);
+    ks4.record_success_and_reset();
+    ks4.record_failure(LearnRefused::ClocksUnstable);
+    ks4.record_failure(LearnRefused::ClocksUnstable);
+    ks4.record_failure(LearnRefused::ClocksUnstable);
+    assert!(
+        !ks4.disarmed,
+        "the reset-by-success streak must not carry across an intervening success"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fable review 2026-09-03, finding 5: Class D must be tested against the SS
+// selector actually in force at the write, and HostStack writes are
+// eligible for Class D exactly like ClientStack ones.
+// ---------------------------------------------------------------------------
+
+const HOST_SS_SELECTOR: u16 = 0x30;
+
+#[test]
+fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
+    let (cpu, _bus) = synthetic_reflected_client();
+    let mut open = test_open_trip(&cpu);
+    open.stacks[1] = Some(StackTrack {
+        selector: HOST_SS_SELECTOR,
+        base: 0x9000,
+        limit: 0xffff,
+        low_water_esp: 0x9100,
+        last_esp: 0x9200,
+    });
+    let mut key_state = KeyState::default();
+    let mut writes = HashMap::new();
+    writes.insert(
+        0x9080u32, // below low_water_esp (0x9100): a deeper push than ever reached again
+        WriteObs {
+            linear: 0x9080,
+            ss_selector: HOST_SS_SELECTOR,
+            pinned_pre: None,
+            latest: 0xdead_beef,
+            class: AddressClass::HostStack,
+        },
+    );
+    tally_write_classes(&mut key_state, &open, &writes);
+    assert_eq!(
+        key_state.write_class_d, 1,
+        "a HostStack write below its OWN segment's low-water mark must classify Dead"
+    );
+    assert_eq!(key_state.write_class_r_pinned, 0);
+    assert_eq!(key_state.write_class_r_unpinned, 0);
+    let _ = &mut open;
+}
+
+#[test]
+fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
+    let (cpu, _bus) = synthetic_reflected_client();
+    let mut open = test_open_trip(&cpu);
+    open.stacks[1] = Some(StackTrack {
+        selector: HOST_SS_SELECTOR,
+        base: 0x9000,
+        limit: 0xffff,
+        low_water_esp: 0x9100,
+        last_esp: 0x9200,
+    });
+    let mut key_state = KeyState::default();
+    let mut writes = HashMap::new();
+    writes.insert(
+        0x9150u32,
+        WriteObs {
+            linear: 0x9150,
+            ss_selector: HOST_SS_SELECTOR,
+            pinned_pre: None,
+            latest: 0x1234,
+            class: AddressClass::HostStack,
+        },
+    );
+    tally_write_classes(&mut key_state, &open, &writes);
+    assert_eq!(key_state.write_class_d, 0);
+    assert_eq!(key_state.write_class_r_unpinned, 1);
+    let _ = &mut open;
+}
+
+// ---------------------------------------------------------------------------
+// Fable review 2026-09-03, finding 5 (the aperture/device-window classes):
+// classify_write must actually return them.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn classify_write_returns_the_two_never_restored_device_classes() {
+    let (cpu, bus) = synthetic_reflected_client();
+    let fb_physical = crate::reflected_call::FRAMEBUFFER_APERTURE_LO + 0x100;
+    let class = classify_write(
+        &cpu,
+        &bus,
+        fb_physical,
+        fb_physical,
+        DATA_SELECTOR,
+        DATA_SELECTOR,
+    );
+    assert_eq!(class, AddressClass::FramebufferAperture);
+    assert!(class.never_restored());
+
+    let unmapped_physical = (MEM_SIZE as u32) + 0x1000;
+    let class2 = classify_write(
+        &cpu,
+        &bus,
+        unmapped_physical,
+        unmapped_physical,
+        DATA_SELECTOR,
+        DATA_SELECTOR,
+    );
+    assert_eq!(class2, AddressClass::NotPlainRam);
+    assert!(class2.never_restored());
+}
+
+// ---------------------------------------------------------------------------
+// Fable review 2026-09-03, finding 6(iii): trips_seen/disarmed_returns must
+// be visible per key.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disarmed_key_still_counts_trips_seen_and_disarmed_returns() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    {
+        let state = cpu.reflected_call.as_mut().unwrap();
+        state.keys.entry(key).or_default().disarmed = true;
+    }
+    on_int(&mut cpu, &bus, VECTOR);
+    let state = cpu.reflected_call.as_ref().unwrap();
+    let ks = state.keys.get(&key).expect("recorded");
+    assert_eq!(ks.trips_seen, 1);
+    assert_eq!(ks.disarmed_returns, 1);
+    assert!(state.open.is_none());
 }

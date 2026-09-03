@@ -45,9 +45,13 @@
 //!    clocks and instruction count are recovered EXACTLY from
 //!    `elapsed_clocks`/`timing_rem` sampled at open and close (R2.2/R2.15's
 //!    telescoping-carry identity -- **no per-instruction accumulator on any
-//!    hot path**) and from `CpuBus::in_batch_raw_bus_clocks` (already raw and
-//!    monotone within a batch). If all 8 triples agree, the key's `learned`
-//!    counter increments; otherwise `learn_refused[clocks_unstable]`.
+//!    hot path**) and from `CpuBus::cumulative_raw_bus_clocks` (whole-run cumulative, NEVER
+//!    reset at a machine-batch boundary -- unlike `CpuBus::in_batch_raw_bus_clocks`, which
+//!    resets at every batch re-entry INCLUDING the plain IF-edge break a trip's own nested
+//!    `IRET`s cause 6-8 times per trip; a Fable review on 2026-09-03 caught this module using
+//!    the wrong one, producing a `raw_bus` delta that went negative on `INT 33h`). If all 8
+//!    triples agree, the key's `learned` counter increments; otherwise
+//!    `learn_refused[clocks_unstable]`.
 //!
 //! Any refusal, at any slot, restarts the key at Warm and counts one
 //! CONSECUTIVE failure (`MEMO_LEARN_BUDGET`); any success at the Natural
@@ -265,6 +269,12 @@ impl LearnRefused {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct WriteObs {
     linear: u32,
+    /// The `SS` selector IN FORCE at the moment of this write (Fable review 2026-09-03,
+    /// finding 5): needed at tally time to pick the RIGHT stack tracker (the trip may carry
+    /// several concurrent stack segments -- client, host, V86 excursion) rather than always
+    /// comparing against the entry segment's own tracker regardless of which segment the
+    /// write actually fell in.
+    ss_selector: u16,
     /// The pre-value, if pinned: `Some` only when this trip's own read set
     /// (or translation set, for a page-table entry) already covers this
     /// dword before the first write to it.
@@ -404,7 +414,7 @@ impl OpenTrip {
             open_elapsed_clocks: cpu.elapsed_clocks,
             open_timing_rem: cpu.reflected_call_timing_rem(),
             open_instructions: cpu.perf.instructions,
-            open_bus_raw: bus.in_batch_raw_bus_clocks(),
+            open_bus_raw: bus.cumulative_raw_bus_clocks(),
             stacks,
             stack_segments_over_cap: false,
             journaling: matches!(slot, Slot::JournalA | Slot::JournalB),
@@ -630,6 +640,13 @@ pub(crate) struct KeyState {
     pub disarmed: bool,
     pending_journal: Option<JournalSnapshot>,
     natural_samples: Vec<(u64, u64, u64)>,
+    /// Every `INT` occurrence `on_int` identified as this key, whether it opened a trip or was
+    /// dropped because the key is disarmed (Fable review 2026-09-03, finding 6(iii): without
+    /// this the JSON cannot show that a key was seen 727,000 times while only 44 of them ever
+    /// became a tracked trip).
+    pub trips_seen: u64,
+    /// Of `trips_seen`, how many were dropped specifically because `disarmed` was already true.
+    pub disarmed_returns: u64,
     pub learn_attempts: u64,
     pub learned: u64,
     pub learn_refused: [u64; 19],
@@ -643,11 +660,22 @@ pub(crate) struct KeyState {
 }
 
 impl KeyState {
+    /// Plan section 4.2 point 2, restored by the Fable review (2026-09-03): "`journal_mismatch`
+    /// is NOT structurally cached (it can become learnable)" -- only `ClocksUnstable` counts
+    /// toward `MEMO_LEARN_BUDGET`'s CONSECUTIVE-failure disarm. Every other refusal reason
+    /// (a structural journal mismatch, a boundary/cap refusal, a hazard) resets the key to
+    /// `Warm` and re-learns on the next matching trip, exactly like a success, without ever
+    /// touching the budget. This is the fix for the defect the review's traced counters
+    /// found: the dwell's own dominant keys were disarming after 4 attempts on
+    /// `journal_mismatch`/`clocks_unstable` mixed reasons and then dropping ~1.46 M returns
+    /// for the rest of the run.
     fn record_failure(&mut self, reason: LearnRefused) {
         self.learn_refused[reason.index()] += 1;
-        self.consecutive_failures += 1;
-        if self.consecutive_failures >= MEMO_LEARN_BUDGET {
-            self.disarmed = true;
+        if reason == LearnRefused::ClocksUnstable {
+            self.consecutive_failures += 1;
+            if self.consecutive_failures >= MEMO_LEARN_BUDGET {
+                self.disarmed = true;
+            }
         }
         self.slot = SlotState::Warm;
         self.pending_journal = None;
@@ -730,7 +758,9 @@ pub(crate) fn on_int<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, vector: u8) {
     let key = key_for(cpu, vector, ax);
     let state = cpu.reflected_call.as_mut().expect("checked above");
     let key_state = state.keys.entry(key).or_default();
+    key_state.trips_seen += 1;
     if key_state.disarmed {
+        key_state.disarmed_returns += 1;
         return;
     }
     let slot: Slot = key_state.slot.into();
@@ -916,7 +946,16 @@ pub(crate) fn note_write<B: CpuBus>(
     };
     if let Some((physical, _walk)) = resolved {
         let dword = aligned_dword(physical);
-        let class = forced_class.unwrap_or_else(|| classify_write(cpu, linear, ss.selector));
+        let class = forced_class.unwrap_or_else(|| {
+            classify_write(
+                cpu,
+                bus,
+                physical,
+                linear,
+                ss.selector,
+                open.entry_ss_selector,
+            )
+        });
         let masked = mask_to_width(value, width.bytes());
         let pinned_pre = open
             .reads
@@ -935,6 +974,7 @@ pub(crate) fn note_write<B: CpuBus>(
                 dword,
                 WriteObs {
                     linear,
+                    ss_selector: ss.selector,
                     pinned_pre,
                     latest: masked,
                     class,
@@ -945,7 +985,29 @@ pub(crate) fn note_write<B: CpuBus>(
     cpu.reflected_call.as_mut().expect("checked above").open = Some(open);
 }
 
-fn classify_write(cpu: &CpuGsw, linear: u32, ss_selector: u16) -> AddressClass {
+#[allow(clippy::too_many_arguments)]
+fn classify_write<B: CpuBus>(
+    cpu: &CpuGsw,
+    bus: &B,
+    physical: u32,
+    linear: u32,
+    ss_selector: u16,
+    entry_ss_selector: u16,
+) -> AddressClass {
+    // Fable review 2026-09-03, finding 5: the classifier already resolves `physical` (its
+    // caller just walked it) and already has a bus handle, so the two never-restored device
+    // classes cost the four lines below rather than staying permanently unreachable
+    // (`write_class_w_other` silently vacuous, a framebuffer write wrongly eligible as
+    // replayable W).
+    if (FRAMEBUFFER_APERTURE_LO..=FRAMEBUFFER_APERTURE_HI).contains(&physical) {
+        return AddressClass::FramebufferAperture;
+    }
+    if bus
+        .peek_direct_ram(aligned_dword(physical), BusWidth::Dword)
+        .is_none()
+    {
+        return AddressClass::NotPlainRam;
+    }
     let idtr = cpu.idtr;
     if idtr.limit > 0 && linear.wrapping_sub(idtr.base) <= u32::from(idtr.limit) {
         return AddressClass::Idt;
@@ -964,7 +1026,11 @@ fn classify_write(cpu: &CpuGsw, linear: u32, ss_selector: u16) -> AddressClass {
     }
     let ss = cpu.registers.segment(SegmentIndex::Ss);
     if ss.selector == ss_selector && linear.wrapping_sub(ss.base) < ss.limit.max(1) {
-        return AddressClass::ClientStack; // refined to Host/Client at close by the caller
+        return if ss_selector == entry_ss_selector {
+            AddressClass::ClientStack
+        } else {
+            AddressClass::HostStack
+        };
     }
     AddressClass::Other
 }
@@ -975,7 +1041,7 @@ fn classify_write(cpu: &CpuGsw, linear: u32, ss_selector: u16) -> AddressClass {
 
 fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: bool) {
     cpu.reflected_call_journal = false;
-    let close_bus_raw = bus.in_batch_raw_bus_clocks();
+    let close_bus_raw = bus.cumulative_raw_bus_clocks();
     let close_elapsed = cpu.elapsed_clocks;
     let close_rem = cpu.reflected_call_timing_rem();
     let close_persona = cpu.persona();
@@ -1079,7 +1145,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
                 key_state.record_failure(LearnRefused::LevelChanged);
                 return;
             };
-            let Some(raw_bus) = close_bus_raw.checked_sub(open.open_bus_raw) else {
+            let Some(raw_bus) = recover_raw_bus_clocks(open.open_bus_raw, close_bus_raw) else {
                 key_state.record_failure(LearnRefused::ClocksUnstable);
                 return;
             };
@@ -1147,13 +1213,14 @@ fn tally_write_classes(key_state: &mut KeyState, open: &OpenTrip, writes: &HashM
             key_state.write_class_w_other += 1;
             continue;
         }
-        let seg_selector = if obs.class == AddressClass::ClientStack {
-            open.entry_ss_selector
-        } else {
-            0
-        };
-        if matches!(obs.class, AddressClass::ClientStack)
-            && open.is_dead_stack(seg_selector, obs.linear)
+        // Fable review 2026-09-03, finding 5: pick the tracker by the SS selector IN FORCE at
+        // the write (recorded on `WriteObs`), not unconditionally the entry segment's own --
+        // a trip can carry several concurrent stack segments (client, host, a V86 excursion),
+        // and the design's Class D rule is per SEGMENT, no constant cap.
+        if matches!(
+            obs.class,
+            AddressClass::ClientStack | AddressClass::HostStack
+        ) && open.is_dead_stack(obs.ss_selector, obs.linear)
         {
             key_state.write_class_d += 1;
             continue;
@@ -1199,6 +1266,18 @@ fn recover_raw_core_clocks(
         "raw-clock recovery numerator must be exactly divisible by the scaler's `num`"
     );
     Some((numerator / i64::from(num)) as u64)
+}
+
+/// Raw bus clock recovery: a plain delta over `CpuBus::cumulative_raw_bus_clocks`, which is
+/// monotone for the WHOLE run (never reset at a machine-batch boundary). Fable review
+/// 2026-09-03, finding 1: the previous version sampled `CpuBus::in_batch_raw_bus_clocks`,
+/// which resets at every batch re-entry (a trip's own nested `IRET`s cause 6-8 of these), so
+/// `open_bus_raw` could be larger than `close_bus_raw` even on a perfectly healthy trip --
+/// `checked_sub` then returned `None` and the trip was refused as `clocks_unstable` for a
+/// reason that had nothing to do with clock jitter. No carry is needed here (unlike the core
+/// recovery above): `cumulative_raw_bus_clocks` is already the RAW, unscaled total.
+fn recover_raw_bus_clocks(open_bus_raw: u64, close_bus_raw: u64) -> Option<u64> {
+    close_bus_raw.checked_sub(open_bus_raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,8 +1339,8 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         }
         first = false;
         out.push_str(&format!(
-            "{{\"vector\":{},\"ax\":{},\"int_eip\":{},\"cpl\":{},\"vm\":{},\
-             \"disarmed\":{},\"learn_attempts\":{},\"learned\":{},\
+            "{{\"vector\":{},\"ax\":{},\"int_eip\":{},\"cs_selector\":{},\"ss_selector\":{},\"cpl\":{},\"vm\":{},\
+             \"disarmed\":{},\"trips_seen\":{},\"disarmed_returns\":{},\"learn_attempts\":{},\"learned\":{},\
              \"write_class_r_pinned\":{},\"write_class_r_unpinned\":{},\
              \"write_class_d\":{},\"write_class_w_other\":{},\
              \"stability_total_attempts\":{},\"stability_stable_attempts\":{},\
@@ -1273,9 +1352,13 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
             key.vector,
             key.ax,
             key.int_eip,
+            key.cs_selector,
+            key.ss_selector,
             key.cpl,
             key.vm,
             ks.disarmed,
+            ks.trips_seen,
+            ks.disarmed_returns,
             ks.learn_attempts,
             ks.learned,
             ks.write_class_r_pinned,
