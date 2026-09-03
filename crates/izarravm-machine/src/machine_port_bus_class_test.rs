@@ -328,3 +328,200 @@ fn epoch_2_refuses_the_poll_skip_certificate_structurally() {
         "the structural refusal must be counted"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// F2: the port lane counts against the batch cap.
+//
+// `run.rs`'s own overshoot note stated the hole outright -- "`port_bus_batch_clocks` joins the
+// batch-end `step` without ever having been counted against the cap". With seven charged ports
+// that was hundreds of clocks. Under epoch 2 every port is charged, so a mode-set burst of 768
+// `OUT 0x3C9` would accrue ~40,000 clocks (a quarter of a PIT tick) that no cap test could see,
+// and the batch would run past a device deadline by that much with interrupt edge placement
+// downstream.
+//
+// The fix has two halves and BOTH are load-bearing, which is why they are pinned separately:
+// `in_batch_scaled_bus_clocks()` (what `spent` is built from, run.rs) now carries the lane, and
+// `in_batch_scaled_bus_clocks_screen_scale()` returns 0 so the CPU's per-instruction screen stops
+// answering "certainly below the cap" from a bound that no longer holds.
+// ---------------------------------------------------------------------------------------------
+
+/// A hundred `OUT 0x3C9, AL` -- a VGA palette load, the mode-set burst the review names -- driven
+/// through the bus in the RING-0 PROTECTED-MODE regime, where `skip_io_touched` is live and the
+/// batch loop's `io_touched` break does NOT end the batch after each access. That regime is the
+/// only one in which the overshoot is interesting: a real-mode guest's `OUT` sets `io_touched`,
+/// which breaks the batch on its own, so a fixture built there would pass whatever this
+/// accounting did.
+fn burst_of_palette_writes(machine: &mut Machine, count: u32) {
+    with_bus(machine, |bus| {
+        for i in 0..count {
+            bus.write_io(0x03C9, BusWidth::Byte, i & 0x3f, true)
+                .expect("the palette port must accept a write");
+        }
+    });
+}
+
+#[test]
+fn epoch_2_counts_the_port_lane_against_the_batch_cap() {
+    // `run.rs:1666` is literally `let spent = u64::from(batch_core) + bus.in_batch_scaled_bus_clocks();`
+    // so this accessor IS the cap accounting. Under epoch 1 the lane is invisible to it (the
+    // pre-slice behaviour, byte-identical); under epoch 2 it must be there in full.
+    const BURST: u32 = 100;
+    // PciLegacyVga (0x3C9 is in the 0x3C0-0x3CF VGA register block) = 56 clocks a byte cycle,
+    // less the generic 4-raw cycle scaled by I586's (16, 105), which floors to 0.
+    const PER_ACCESS: u64 = 56;
+
+    for epoch in [1u32, 2] {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        machine.timing_epoch = epoch;
+        machine.port_bus_batch_clocks = 0;
+        let before = with_bus(&mut machine, |bus| bus.in_batch_scaled_bus_clocks());
+        burst_of_palette_writes(&mut machine, BURST);
+        let lane = machine.port_bus_batch_clocks;
+        let after = with_bus(&mut machine, |bus| bus.in_batch_scaled_bus_clocks());
+
+        if epoch == 1 {
+            assert_eq!(
+                lane, 0,
+                "epoch 1 must not charge the VGA palette port at all (86Box parity)"
+            );
+            assert_eq!(
+                after, before,
+                "epoch 1's cap accounting must be byte-identical to the pre-slice figure"
+            );
+        } else {
+            assert_eq!(
+                lane,
+                u64::from(BURST) * PER_ACCESS,
+                "epoch 2 must charge every write in the burst"
+            );
+            assert_eq!(
+                after - before,
+                lane,
+                "the whole port lane must be visible to the cap accounting; the burst is the \
+                 review's own example and the difference here is exactly the overshoot F2 names"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_division_free_cap_test_agrees_with_the_value_form_under_both_epochs() {
+    // The run loop asks `in_batch_scaled_bus_clocks_at_least(target)` once per retired
+    // instruction and takes its answer as EXACTLY `in_batch_scaled_bus_clocks() >= target`. Epoch
+    // 2 adds an unscaled additive term to the value form that does not survive the u128
+    // multiply-through, so the two forms had to stop sharing an implementation -- and a
+    // divergence between them would move run boundaries with nothing to notice.
+    for epoch in [1u32, 2] {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        machine.timing_epoch = epoch;
+        machine.port_bus_batch_clocks = 0;
+        burst_of_palette_writes(&mut machine, 7);
+        with_bus(&mut machine, |bus| {
+            let value = bus.in_batch_scaled_bus_clocks();
+            assert!(
+                epoch == 1 || value > 0,
+                "epoch 2's burst must have moved the figure, or the sweep below proves nothing"
+            );
+            for target in 0..=value + 8 {
+                assert_eq!(
+                    bus.in_batch_scaled_bus_clocks_at_least(target),
+                    value >= target,
+                    "epoch {epoch}: the two cap-test forms disagreed at target {target} \
+                     (value {value})"
+                );
+            }
+            assert!(
+                !bus.in_batch_scaled_bus_clocks_at_least(u64::MAX),
+                "epoch {epoch}: an unreachable target must answer 'not at the cap'"
+            );
+        });
+    }
+}
+
+#[test]
+fn epoch_2_turns_the_per_instruction_cap_screen_off() {
+    // The screen's contract (`CpuBus::in_batch_scaled_bus_clocks_screen_scale`) is a per-batch
+    // constant F with `S(raw2) - S(raw1) <= (raw2 - raw1) * F`. Epoch 2's figure carries a term
+    // that is not a function of raw bus clocks, so the bus ratio is NOT such an F -- and the
+    // screen only ever skips the exact test, so an invalid F silently removes cap breaks. The
+    // trait spells `0` as "no bound offered", which sends every ask to the exact test.
+    //
+    // Non-vacuity: the burst below is measured against the epoch-1 F on the same machine, and the
+    // arithmetic showing why that F fails is asserted rather than described.
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+
+    machine.timing_epoch = 1;
+    let epoch_1_screen = with_bus(&mut machine, |bus| {
+        bus.in_batch_scaled_bus_clocks_screen_scale()
+    });
+    assert_eq!(
+        epoch_1_screen, 1,
+        "I586's (16, 105) bus ratio gives ceil(num/den).max(1) = 1; if this moved, the \
+         arithmetic below is stale"
+    );
+
+    machine.timing_epoch = 2;
+    assert_eq!(
+        with_bus(&mut machine, |bus| bus
+            .in_batch_scaled_bus_clocks_screen_scale()),
+        0,
+        "epoch 2 must offer no screen bound at all"
+    );
+
+    // WHY 1 would have been wrong, in the same units the screen uses. One palette write records
+    // one 4-raw-clock generic I/O cycle and accrues 56 unscaled clocks on the port lane, so the
+    // scaled figure grows by 56 for 4 raw clocks -- fourteen times the bound the epoch-1 F claims.
+    machine.port_bus_batch_clocks = 0;
+    let (raw_growth, scaled_growth) = with_bus(&mut machine, |bus| {
+        let raw_before = bus.in_batch_raw_bus_clocks();
+        let scaled_before = bus.in_batch_scaled_bus_clocks();
+        bus.write_io(0x03C9, BusWidth::Byte, 0, true).unwrap();
+        (
+            bus.in_batch_raw_bus_clocks() - raw_before,
+            bus.in_batch_scaled_bus_clocks() - scaled_before,
+        )
+    });
+    assert!(
+        scaled_growth > raw_growth * epoch_1_screen,
+        "one epoch-2 port access grew the scaled figure by {scaled_growth} over {raw_growth} raw \
+         clocks, which the epoch-1 screen bound of {epoch_1_screen} per raw clock does NOT cover \
+         -- this is the arithmetic that makes the screen unsound under epoch 2, and if it ever \
+         stops holding the screen could be re-armed with a widened bound instead of turned off"
+    );
+}
+
+/// T7's machine half: the charge follows the EXECUTED access. The CPU-side fixture
+/// (`izarravm-cpu`'s `a_bitmap_denied_port_charges_no_column_and_the_epoch_cannot_change_that`)
+/// pins that the FAULTING V86 instruction pays no column; this one pins that the monitor's own
+/// 0x92 access -- the ring-0 instruction the `#GP` handler eventually runs -- pays the `IsaXBus`
+/// class charge exactly once, on both the read and the write side.
+#[test]
+fn the_monitors_own_0x92_access_pays_the_isa_class_charge_once() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    machine.timing_epoch = 2;
+
+    machine.port_bus_batch_clocks = 0;
+    with_bus(&mut machine, |bus| {
+        // `cpu_is_ring0_pm = true`: the monitor, not the trapped V86 task.
+        bus.read_io(0x0092, BusWidth::Byte, 0, true).unwrap();
+    });
+    assert_eq!(
+        machine.port_bus_batch_clocks, 160,
+        "the monitor's 0x92 read must pay IsaXBus (160) exactly once"
+    );
+
+    machine.port_bus_batch_clocks = 0;
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0092, BusWidth::Byte, 0x02, true).unwrap();
+    });
+    assert_eq!(
+        machine.port_bus_batch_clocks, 160,
+        "the monitor's 0x92 write must pay IsaXBus (160) exactly once -- 0x92 is one of the four \
+         ports the ring-0 io_touched exemption does NOT cover, so this arm has side effects (A20) \
+         the charge must not be folded into or duplicated by"
+    );
+}

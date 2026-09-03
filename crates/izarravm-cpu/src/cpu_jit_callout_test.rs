@@ -4633,3 +4633,96 @@ fn the_cross_mode_maximum_dominates_every_column_of_both_epochs() {
         "a maximal port charge on top of a maximal skipped span overflows the 32-bit clock lane"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// T7 (design §5): a bitmap-TRAPPED access, and the two families P1 deliberately does not move.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_bitmap_denied_port_charges_no_column_and_the_epoch_cannot_change_that() {
+    // Under TOKAEMM exactly one port has its bit set (0x92, `tokaemm.asm:819`), so on that port
+    // the V86 guest's `IN`/`OUT` FAULTS instead of executing. The design's rule for that case
+    // (§1.2, §5 T7) is that the charge follows the EXECUTED access: the faulting instruction pays
+    // no port column and no class bus cost, and the monitor's own 0x92 access -- a different
+    // instruction, in ring 0 -- pays the `IsaXBus` charge when it runs. No trap constant is added
+    // either: Intel's 88-100 for the `#GP` is already covered by the `INT n` and `IRET` charges we
+    // make on the delivery path.
+    //
+    // The claim is pinned as an INVARIANCE rather than a number: whatever the faulting instruction
+    // costs, it must cost the SAME under both epochs, because none of what it charges is a port
+    // charge. A build that reached the column before the permission check -- the natural way to
+    // get this wrong, since the charge sits at the bottom of every arm -- would move.
+    for is_out in [false, true] {
+        let mut charges = Vec::new();
+        for epoch_two in [false, true] {
+            // PERMITTED while warming, DENIED for the access under test: `warm_the_tss_tlb` runs
+            // two real `IN`s to settle the accessed bits, which a denied bitmap would fault, so
+            // the bit has to go up after the warming and not before it.
+            let (mut cpu, mut bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+            let bitmap = TSS_BASE as usize + usize::from(TSS_IO_MAP_OFFSET) + usize::from(PORT / 8);
+            bus.memory[bitmap] = 1 << (PORT % 8);
+            cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+            assert!(cpu.is_v86_mode());
+            bus.timing_epoch_two = epoch_two;
+            bus.lazy_io_reads = true;
+            bus.lazy_io_writes = true;
+            bus.io_reads.clear();
+            bus.io_writes.clear();
+            cpu.registers.set_edx(u32::from(PORT));
+            cpu.set_eip(PORT_COLUMN_ENTRY);
+            bus.memory[PORT_COLUMN_ENTRY as usize] = if is_out { 0xee } else { 0xec };
+            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+
+            // NOT unwrapped: the fixture's IVT is zeroed and the `#GP` nests. The subject -- the
+            // permission decision and the charge that did or did not precede it -- has already
+            // happened by then.
+            let _ = cpu.cycle(&mut bus);
+
+            assert!(
+                bus.io_reads.is_empty() && bus.io_writes.is_empty(),
+                "epoch2={epoch_two}/out={is_out}: a denied port must never reach the device"
+            );
+            charges.push(charged_raw_core_clocks(&cpu));
+        }
+        assert_eq!(
+            charges[0], charges[1],
+            "out={is_out}: a bitmap-denied access charged a different amount under epoch 2, so \
+             something on the fault path is reaching the port column"
+        );
+    }
+}
+
+#[test]
+fn the_string_port_forms_are_untouched_by_p1() {
+    // `INS`/`OUTS` (0x6C-0x6F) are slice P3's, not P1's, and for a stated reason: their bus side
+    // already runs `read_io`/`write_io` once per ELEMENT, so a class charge lands on every ATA
+    // data word and the design's blocker (b) prices that at 160 clocks -- 2.0 MB/s, slower than
+    // PIO mode 0. P3 fixes it with the ATA cycle-time rate (20 clocks, ATA-3 X3.298-1997 Table
+    // 21) and the amortized `REP` per-element counts. Until then the CORE side must not move at
+    // all, or P3 would be repricing something P1 had already half-repriced.
+    for opcode in [0x6cu8, 0x6d, 0x6e, 0x6f] {
+        let mut charges = Vec::new();
+        for epoch_two in [false, true] {
+            let (mut cpu, mut bus) =
+                port_column_fixture(crate::PortIoPrivMode::ProtectedPrivileged, epoch_two);
+            // ES:DI / DS:SI on a data page the code is not on, so the element access is plain RAM.
+            cpu.registers.set_edi(0x6000);
+            cpu.registers.set_esi(0x6000);
+            bus.memory[PORT_COLUMN_ENTRY as usize] = opcode;
+            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
+            cpu.set_eip(PORT_COLUMN_ENTRY);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.cycle(&mut bus)
+                .expect("the privileged string port form must retire");
+            charges.push(charged_raw_core_clocks(&cpu));
+        }
+        assert_eq!(
+            charges[0], charges[1],
+            "{opcode:#04x}: a string port form's CORE charge moved under epoch 2; P1 must leave \
+             INS/OUTS to P3"
+        );
+    }
+}

@@ -1945,10 +1945,20 @@ impl Machine {
                                 //       budget;
                                 //   (b) the batch-entry `service_pending_interrupt`
                                 //       is charged before any cap test runs;
-                                //   (c) `port_bus_batch_clocks` joins the batch-end
-                                //       `step` without ever having been counted
-                                //       against the cap (`spent` is core plus
-                                //       in-batch bus only);
+                                //   (c) under EPOCH 1 `port_bus_batch_clocks` joins
+                                //       the batch-end `step` without ever having
+                                //       been counted against the cap (`spent` is
+                                //       core plus in-batch bus only). Under epoch 2
+                                //       it IS counted: review finding F2 folded the
+                                //       lane into `in_batch_scaled_bus_clocks()`,
+                                //       which is what `spent` is built from, and
+                                //       turned the CPU's per-instruction cap screen
+                                //       off so the exact test runs after every
+                                //       retired instruction. That route's
+                                //       contribution to the overshoot is then one
+                                //       access, not a whole batch's worth -- which
+                                //       matters because epoch 2 charges every port,
+                                //       not seven of them;
                                 //   (d) the grant itself rounds UP --
                                 //       `cpu_clocks_for_master_ticks_ceil(..).max(1)`
                                 //       -- so even a batch that spends exactly what
@@ -1964,7 +1974,9 @@ impl Machine {
                                 // the batch's uncounted ISA charge -- `isa_io_clocks`
                                 // is `clock_hz / 1_000_000`, i.e. 166 clocks per ISA
                                 // access at the 586 persona, so an Approximate-class
-                                // batch can overshoot by hundreds.
+                                // EPOCH-1 batch can overshoot by hundreds. Under
+                                // epoch 2 route (c) contributes one access's class
+                                // charge and no more.
                                 // `next_timer_wake` already clamps the same quantity
                                 // the same way, and it is exactly what returned None
                                 // here.

@@ -2408,8 +2408,19 @@ impl CpuBus for MachineBus<'_> {
 
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
-        (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
-            / u64::from(self.bus_den_at_batch_start)
+        let scaled = (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
+            / u64::from(self.bus_den_at_batch_start);
+        // F2 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2 the port lane joins
+        // the figure the run loop's `spent` is built from, so the charge is counted AGAINST the cap
+        // instead of only joining the batch-end `step`. See `in_batch_scaled_bus_clocks_screen_scale`
+        // for the other half of the fix -- without it the CPU's per-instruction screen would let a
+        // burst run past the cap unasked. Epoch 1 is byte-identical: the pre-slice lane was
+        // OPL/DSP-poll-only and `run.rs`'s overshoot note (route (c)) still describes it exactly.
+        if self.timing_epoch >= 2 {
+            scaled.saturating_add(*self.isa_io_clocks)
+        } else {
+            scaled
+        }
     }
 
     /// The division-free form of the run-loop cap test. Exactly equivalent to
@@ -2420,6 +2431,17 @@ impl CpuBus for MachineBus<'_> {
     /// tens, and this runs once per retired instruction.
     #[inline]
     fn in_batch_scaled_bus_clocks_at_least(&self, target: u64) -> bool {
+        // Under epoch 2 the figure carries an ADDITIVE unscaled term (the port lane, F2), which
+        // does not survive the multiply-through: `floor(A/den) + p >= t` is not
+        // `A >= (t - p) * den` when `t < p`, and folding `p * den` back in would re-introduce the
+        // very divide this form exists to avoid only to lose exactness at the floor. Ask the value
+        // question instead. It costs one 64-bit divide per retired instruction, which is the 2.99%
+        // of wall this form was written to remove -- accepted, because epoch 2 is not the shipping
+        // configuration and an inexact cap test would be a guest-visible defect rather than a
+        // slow one.
+        if self.timing_epoch >= 2 {
+            return self.in_batch_scaled_bus_clocks() >= target;
+        }
         let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         let scaled = u128::from(raw) * u128::from(self.bus_num_at_batch_start)
             + u128::from(self.bus_rem_at_batch_start);
@@ -2449,6 +2471,20 @@ impl CpuBus for MachineBus<'_> {
     /// run loop to read once per run.
     #[inline]
     fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
+        // F2, second half. `ceil(num/den)` bounds the SCALED figure's growth per raw bus clock, and
+        // under epoch 2 the figure carries a term that is not a function of raw bus clocks at all:
+        // one port access adds up to 160 unscaled clocks for four raw ones. A screen sized to the
+        // bus ratio would then be an INVALID bound -- it would answer "certainly below the cap"
+        // for a burst that had already crossed it, and the run would keep retiring `OUT`s past the
+        // cap unasked. A bound of `40 + ceil(num/den)` would be sound (160 per 4 raw clocks), but
+        // it rests on every port access recording exactly four raw clocks alongside its lane
+        // charge, in that order, at every one of the two call sites -- a coupling no test states.
+        // `0` is the trait's own "this bus offers no bound", which turns the screen off and sends
+        // every ask to the exact test: the pre-screen behaviour, sound by construction, and what
+        // makes the batch's overshoot past the cap exactly one instruction under epoch 2.
+        if self.timing_epoch >= 2 {
+            return 0;
+        }
         let num = u64::from(self.bus_num_at_batch_start);
         let den = u64::from(self.bus_den_at_batch_start);
         num.div_ceil(den).max(1)
