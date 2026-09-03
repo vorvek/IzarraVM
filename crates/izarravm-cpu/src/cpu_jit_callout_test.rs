@@ -4695,34 +4695,133 @@ fn a_bitmap_denied_port_charges_no_column_and_the_epoch_cannot_change_that() {
 }
 
 #[test]
-fn the_string_port_forms_are_untouched_by_p1() {
-    // `INS`/`OUTS` (0x6C-0x6F) are slice P3's, not P1's, and for a stated reason: their bus side
-    // already runs `read_io`/`write_io` once per ELEMENT, so a class charge lands on every ATA
-    // data word and the design's blocker (b) prices that at 160 clocks -- 2.0 MB/s, slower than
-    // PIO mode 0. P3 fixes it with the ATA cycle-time rate (20 clocks, ATA-3 X3.298-1997 Table
-    // 21) and the amortized `REP` per-element counts. Until then the CORE side must not move at
-    // all, or P3 would be repricing something P1 had already half-repriced.
-    for opcode in [0x6cu8, 0x6d, 0x6e, 0x6f] {
-        let mut charges = Vec::new();
+fn the_string_port_singletons_charge_intels_four_columns() {
+    // P3. `INS`/`OUTS` singletons: Intel's 9 / 6 / 24 / 22 and 13 / 10 / 27 / 25, re-anchored on
+    // Chapter 25 (Appendix F's string-I/O rows are column-drifted). Written as literals here, not
+    // read back from the table under test. Epoch 1 must return the flat 15 / 14 in every column,
+    // which is the knob-unset merge bar.
+    let columns = [
+        (crate::PortIoPrivMode::Real, 9u64, 13u64),
+        (crate::PortIoPrivMode::ProtectedPrivileged, 6, 10),
+        (crate::PortIoPrivMode::ProtectedUnprivileged, 24, 27),
+        (crate::PortIoPrivMode::V86, 22, 25),
+    ];
+    for (mode, ins, outs) in columns {
+        for (opcode, expected) in [(0x6cu8, ins), (0x6d, ins), (0x6e, outs), (0x6f, outs)] {
+            for epoch_two in [false, true] {
+                let (mut cpu, mut bus) = port_column_fixture(mode, epoch_two);
+                // ES:DI / DS:SI on a data page the code is not on, so the element access is
+                // plain RAM.
+                cpu.registers.set_edi(0x6000);
+                cpu.registers.set_esi(0x6000);
+                bus.memory[PORT_COLUMN_ENTRY as usize] = opcode;
+                bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
+                cpu.set_eip(PORT_COLUMN_ENTRY);
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.cycle(&mut bus)
+                    .expect("the string port singleton must retire");
+                let want = if epoch_two {
+                    expected * 12
+                } else if opcode >= 0x6e {
+                    14
+                } else {
+                    15
+                };
+                assert_eq!(
+                    charged_raw_core_clocks(&cpu),
+                    want,
+                    "{opcode:#04x} epoch2={epoch_two} mode={mode:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_rep_string_port_form_charges_intels_setup_plus_three_or_four_per_element() {
+    // P3, the half the design's blocker (b) turns on. Intel's `REP INS` is `23 + 3c` in V86 and
+    // `REP OUTS` `25 + 4c` -- a SETUP charged once plus 3 or 4 clocks per ELEMENT, NOT the 22/25
+    // singleton per element, which would price a `REP INSW` at seven times its real cost. Both
+    // figures are literals here.
+    //
+    // The pre-slice model charged the flat 15 / 14 ONCE for the whole repeat regardless of the
+    // element count, which epoch 1 must still do exactly.
+    const ELEMENTS: u32 = 5;
+    for (opcode, is_out, setup, element, flat) in
+        [(0x6du8, false, 23u64, 3u64, 15u64), (0x6f, true, 25, 4, 14)]
+    {
         for epoch_two in [false, true] {
-            let (mut cpu, mut bus) =
-                port_column_fixture(crate::PortIoPrivMode::ProtectedPrivileged, epoch_two);
-            // ES:DI / DS:SI on a data page the code is not on, so the element access is plain RAM.
+            let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86, epoch_two);
             cpu.registers.set_edi(0x6000);
             cpu.registers.set_esi(0x6000);
-            bus.memory[PORT_COLUMN_ENTRY as usize] = opcode;
-            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
+            cpu.registers.set_ecx(ELEMENTS);
+            bus.memory[PORT_COLUMN_ENTRY as usize] = 0xf3; // REP
+            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = opcode;
+            bus.memory[PORT_COLUMN_ENTRY as usize + 2] = 0xf4;
             cpu.set_eip(PORT_COLUMN_ENTRY);
             cpu.elapsed_clocks = 0;
             cpu.timing_rem = 0;
             cpu.cycle(&mut bus)
-                .expect("the privileged string port form must retire");
-            charges.push(charged_raw_core_clocks(&cpu));
+                .expect("the REP string port form must retire");
+            let moved = if is_out {
+                bus.io_writes.len()
+            } else {
+                bus.io_reads.len()
+            };
+            assert_eq!(
+                moved, ELEMENTS as usize,
+                "{opcode:#04x} epoch2={epoch_two}: every element must reach the device"
+            );
+            let want = if epoch_two {
+                (setup + element * u64::from(ELEMENTS)) * 12
+            } else {
+                flat
+            };
+            assert_eq!(
+                charged_raw_core_clocks(&cpu),
+                want,
+                "{opcode:#04x} epoch2={epoch_two}: setup once plus per element"
+            );
         }
-        assert_eq!(
-            charges[0], charges[1],
-            "{opcode:#04x}: a string port form's CORE charge moved under epoch 2; P1 must leave \
-             INS/OUTS to P3"
-        );
+    }
+}
+
+#[test]
+fn a_v86_rep_string_port_form_traps_on_its_first_element() {
+    // P3, gap 3. `INS`/`OUTS` never consulted the TSS bitmap
+    // (`dev_docs/2026-09-05-v86-port-io-timing-research.md` section 5): `strings.rs` called
+    // `read_io`/`write_io` bare and `check_io_permission` appeared nowhere in the file, so string
+    // port I/O could not `#GP` under ANY monitor. Inert under TOKAEMM, which traps only 0x92 --
+    // and wrong under any monitor trapping a port a driver reaches with `REP INSW`.
+    //
+    // A zero TSS limit puts the bitmap byte for `PORT / 8` past the limit, which is the `#GP(0)`
+    // `check_io_permission` raises. The fault must land on the FIRST element: nothing reaches the
+    // device, and `CX` still counts every element, which is what makes the instruction
+    // restartable. The `Result` is not unwrapped -- with no IDT the `#GP` nests, exactly as
+    // `a_denied_port_is_abnormal_with_zero_partial_effects` records.
+    for (opcode, is_out) in [(0x6du8, false), (0x6f, true)] {
+        for epoch_two in [false, true] {
+            let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86, epoch_two);
+            cpu.tr.limit = 0;
+            cpu.registers.set_edi(0x6000);
+            cpu.registers.set_esi(0x6000);
+            cpu.registers.set_ecx(4);
+            bus.memory[PORT_COLUMN_ENTRY as usize] = 0xf3;
+            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = opcode;
+            bus.memory[PORT_COLUMN_ENTRY as usize + 2] = 0xf4;
+            cpu.set_eip(PORT_COLUMN_ENTRY);
+            let _ = cpu.cycle(&mut bus);
+            assert!(
+                bus.io_reads.is_empty() && bus.io_writes.is_empty(),
+                "{opcode:#04x} epoch2={epoch_two}/out={is_out}: a bitmap-denied string element \
+                 must never reach the device"
+            );
+            assert_eq!(
+                cpu.registers.ecx(),
+                4,
+                "{opcode:#04x} epoch2={epoch_two}: the trap must leave every element to count"
+            );
+        }
     }
 }

@@ -429,6 +429,28 @@ pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
     }
 }
 
+/// The ATA PIO mode-4 cycle time `t0`, in guest clocks at 166.667 MHz: **120 ns minimum**
+/// (`dev_docs/reference/ata/ATA-3_X3.298-1997_std.txt:6708`; `:6625` "shall not report a value
+/// less than 120 ns"). Per 16-BIT WORD, which is what an ATA data-register cycle moves.
+///
+/// The one bus constant in this whole repricing that is READ FROM A DOCUMENT rather than
+/// inferred: `IsaXBus` 160 and `PciLegacyVga` 56 are 86Box constants (bracketed and unverified
+/// respectively -- design section 8). It is used only for a STRING element on the IDE/ATAPI data
+/// register, never for a single access: status polling at 0x1F7 and the ATAPI poll skip's own
+/// port keep `PciTarget` 56, because those are single accesses and not a burst.
+///
+/// Resulting rate: 3 (`REP INS` per element) + 20 = 23 clocks per word = 138 ns -> **14.5 MB/s**,
+/// against a real P166's PIO mode 4 **16.6 MB/s** -- 87% of the spec rate, period-correct and
+/// erring slow.
+pub(super) const ATA_STRING_WORD_CLOCKS: u64 = 20;
+
+/// The IDE/ATAPI DATA registers, primary and secondary. The only ports whose string element rate
+/// is the ATA cycle time; every other register in those blocks (status 0x1F7, the control block)
+/// stays at its class latency.
+pub(super) const fn is_ata_data_port(port: u16) -> bool {
+    matches!(port, 0x01f0 | 0x0170)
+}
+
 /// The one port the io-family poll skip can ever certify. Both entry points into
 /// `poll_bus_certificate_from` reach it only after establishing the polled port
 /// is the active colour status-1 register: the interpreter checks
@@ -535,6 +557,7 @@ impl Machine {
             timing_epoch: self.timing_epoch,
             poll_skip_certificate: &self.poll_skip_certificate,
             retrace_poll: &mut self.retrace_poll,
+            string_port_element_bytes: 0,
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
@@ -1339,7 +1362,10 @@ impl MachineBus<'_> {
         // fewer accesses from one whose accesses merely cost more.
         self.port_accesses_by_class[class.index()] += 1;
         if self.timing_epoch >= 2 {
-            *self.isa_io_clocks += self.port_bus_lane_clocks(class);
+            *self.isa_io_clocks += match self.string_port_element_bytes {
+                0 => self.port_bus_lane_clocks(class),
+                bytes => self.string_element_lane_clocks(port, class, bytes),
+            };
         } else if self.isa_io_wait && self.lazy_port_reads && port_is_legacy_isa_io(port) {
             *self.isa_io_clocks += isa_io_clocks(self.active_mode);
         }
@@ -1352,6 +1378,32 @@ impl MachineBus<'_> {
     /// Factored out of `charge_port_bus` because P2's poll-skip certificate needs the SAME
     /// figure for an iteration it elides: one function, so an elided iteration and an executed
     /// one can never be priced differently.
+    /// P3. The epoch-2 port lane's per-BYTE-CYCLE figure for one byte cycle of a STRING element
+    /// `bytes` wide.
+    ///
+    /// Every port but the IDE/ATAPI DATA register keeps its class figure: an ISA card driven by
+    /// `REP OUTSB` (a floppy PIO stream) really does pay a full 8 MHz X-bus cycle per byte, and
+    /// Intel's pipelining note for string I/O is a CPU-side statement we claim no bus credit for.
+    ///
+    /// The data register is the exception the design's blocker (b) is about, and it is priced at
+    /// the ATA PIO **cycle time** rather than the `PciTarget` access latency:
+    /// `ATA_STRING_WORD_CLOCKS` per 16-bit word, divided across the byte cycles the element
+    /// decomposes into. A 1-byte element pays a whole word cycle (nothing narrower exists on the
+    /// wire); 2 and 4 pay 10 per byte cycle, i.e. 20 and 40 for the element. Exact for every
+    /// element width the ISA can encode, with no remainder to lose.
+    fn string_element_lane_clocks(&self, port: u16, class: PortBusClass, bytes: u8) -> u64 {
+        if !is_ata_data_port(port) {
+            return self.port_bus_lane_clocks(class);
+        }
+        let bytes = u64::from(bytes.max(1));
+        let words = bytes.div_ceil(2);
+        let element_clocks = words * ATA_STRING_WORD_CLOCKS;
+        let generic_raw = u64::from(BusCycle::clocks_for(BusWidth::Byte, self.wait_states.io));
+        let scaled_generic = (generic_raw * u64::from(self.bus_num_at_batch_start))
+            / u64::from(self.bus_den_at_batch_start);
+        (element_clocks / bytes).saturating_sub(scaled_generic)
+    }
+
     fn port_bus_lane_clocks(&self, class: PortBusClass) -> u64 {
         let generic_raw = u64::from(BusCycle::clocks_for(BusWidth::Byte, self.wait_states.io));
         let scaled_generic = (generic_raw * u64::from(self.bus_num_at_batch_start))
@@ -4087,6 +4139,46 @@ impl CpuBus for MachineBus<'_> {
             committed_raw_bus_clocks,
             now_after,
         })
+    }
+
+    /// P3. One string element's port read, with the element's WIDTH published to
+    /// `charge_port_bus` so an IDE data-register burst is priced at the ATA cycle time rather
+    /// than the register class's single-access latency. The flag is set for the duration of this
+    /// one access and cleared unconditionally afterwards, including on the error path: a leaked
+    /// `true` would misprice every subsequent single access in the batch.
+    fn read_io_string_element(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<u32, BusError> {
+        self.string_port_element_bytes = width.bytes() as u8;
+        let result =
+            <Self as CpuBus>::read_io(self, port, width, core_clocks_so_far, cpu_is_ring0_pm);
+        self.string_port_element_bytes = 0;
+        result
+    }
+
+    fn write_io_string_element(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        value: u32,
+        core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<(), BusError> {
+        self.string_port_element_bytes = width.bytes() as u8;
+        let result = <Self as CpuBus>::write_io(
+            self,
+            port,
+            width,
+            value,
+            core_clocks_so_far,
+            cpu_is_ring0_pm,
+        );
+        self.string_port_element_bytes = 0;
+        result
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {

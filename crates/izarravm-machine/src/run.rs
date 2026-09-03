@@ -1569,6 +1569,7 @@ impl Machine {
                     timing_epoch: *timing_epoch,
                     poll_skip_certificate: &*poll_skip_certificate,
                     retrace_poll,
+                    string_port_element_bytes: 0,
                     pending_mode,
                     fast_post: *fast_post,
                     booter_inert: *booter_inert,

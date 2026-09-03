@@ -2220,6 +2220,62 @@ impl CpuGsw {
         crate::port_core_clocks(bus.timing_epoch(), is_out, self.port_io_priv_mode())
     }
 
+    /// The whole-instruction core charge for one `INS`/`OUTS` (`is_rep` false) or the SETUP of a
+    /// `REP INS`/`REP OUTS` (`is_rep` true), in the CPU's live privilege column under the bus's
+    /// guest-clock model epoch. The string-I/O twin of `port_io_core_clocks`.
+    pub(crate) fn string_port_setup_core_clocks<B: izarravm_bus::CpuBus>(
+        &self,
+        bus: &B,
+        is_out: bool,
+        is_rep: bool,
+    ) -> u32 {
+        crate::string_port_setup_core_clocks(
+            bus.timing_epoch(),
+            is_out,
+            is_rep,
+            self.port_io_priv_mode(),
+        )
+    }
+
+    /// Charge one `REP INS`/`REP OUTS` ELEMENT's core clocks directly into the CPU's guest clock,
+    /// through the same remainder-carrying scaler ordinary execution uses.
+    ///
+    /// WHY DIRECTLY AND NOT THROUGH `CycleOutcome`. A `REP` string is chunked: it can yield mid
+    /// instruction and resume, and only the FIRST chunk's `CycleOutcome` is ever charged
+    /// (`pause_rep_instruction` charges it; `resume_rep_instruction` maps every later chunk to
+    /// `core_clocks: 0`). Returning `setup + 3 * elements_this_chunk` from the executor arm would
+    /// therefore lose every element after the first chunk. There is no per-element core charge
+    /// anywhere in the string executor today -- `REP MOVS` of a megabyte charges 4 clocks total
+    /// -- so this is the first, and it is deliberately scoped to the two port forms: the rest of
+    /// the string family is the recalibration's business, not the port reprice's.
+    ///
+    /// **Structurally zero under epoch 1** (`string_port_element_core_clocks` returns 0), so a
+    /// knob-unset build cannot move.
+    ///
+    /// `core_clocks_so_far` is deliberately NOT advanced: it is assigned (never incremented) at
+    /// batch-level sites, so a mid-`REP` increment would be overwritten. The budget limiter still
+    /// sees this `REP`'s cost, because its per-element PORT BUS charge -- three to eight times
+    /// larger -- is in `in_batch_scaled_bus_clocks()` under epoch 2 (review F2).
+    pub(crate) fn charge_string_port_element_core<B: izarravm_bus::CpuBus>(
+        &mut self,
+        bus: &B,
+        is_out: bool,
+    ) {
+        let raw = u64::from(crate::string_port_element_core_clocks(
+            bus.timing_epoch(),
+            is_out,
+        ));
+        if raw == 0 {
+            return;
+        }
+        let (num, den) = level_timing(self.persona());
+        let scaled = raw
+            .saturating_mul(u64::from(num))
+            .saturating_add(self.timing_rem);
+        self.elapsed_clocks = self.elapsed_clocks.saturating_add(scaled / u64::from(den));
+        self.timing_rem = scaled % u64::from(den);
+    }
+
     /// IOPL-sensitive instructions (CLI, STI, PUSHF/POPF, INT n) fault to the monitor
     /// inside a V86 task when IOPL is below 3.
     pub(super) fn check_v86_iopl(&self) -> ExecResult<()> {

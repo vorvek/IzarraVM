@@ -580,3 +580,118 @@ fn the_monitors_own_0x92_access_pays_the_isa_class_charge_once() {
          the charge must not be folded into or duplicated by"
     );
 }
+
+/// P3's throughput fixture: a 64 KiB `REP INSW` from `port`, run to the `HLT` that follows it,
+/// returning the megabytes per guest second the GUEST sees. Real mode, 16-bit operand and address
+/// size, `ES` pointed well above the program so the transfer cannot overwrite its own code.
+#[cfg(feature = "jit")]
+fn rep_insw_megabytes_per_guest_second(port: u16, epoch: u32) -> f64 {
+    const WORDS: u16 = 0x8000;
+    let program = [
+        0xba,
+        (port & 0xff) as u8,
+        (port >> 8) as u8, // mov dx, port
+        0xb9,
+        (WORDS & 0xff) as u8,
+        (WORDS >> 8) as u8, // mov cx, 0x8000
+        0xbf,
+        0x00,
+        0x00, // mov di, 0
+        0xf3,
+        0x6d, // rep insw
+        0xf4, // hlt
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &program).unwrap();
+    machine.set_mode(GswMode::Gsw586);
+    machine.timing_epoch = epoch;
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+    let before = machine.elapsed_clocks();
+    for _ in 0..2048 {
+        if machine.run_cycles(50_000_000).unwrap() == StopReason::Halted {
+            break;
+        }
+    }
+    assert!(
+        machine.cpu.halted,
+        "port {port:#06x}: the transfer must finish"
+    );
+    let clocks = (machine.elapsed_clocks() - before) as f64;
+    let seconds = clocks / 166_666_667.0;
+    f64::from(u32::from(WORDS)) * 2.0 / 1.0e6 / seconds
+}
+
+/// P3, design blocker (b). A `REP INSW` from the IDE DATA register must move at the ATA PIO
+/// **cycle time**, not at the `PciTarget` class's single-access latency.
+///
+/// The three candidate rates, all computed from the same 64 KiB transfer:
+///
+/// * ATA `t0` 20 clocks/word (this slice): 3 + 20 = 23 clocks/word -> **14.5 MB/s**, against a
+///   real P166's PIO mode 4 16.6 MB/s -- 87% of the spec rate, period-correct and erring slow.
+/// * `PciTarget` 56 per byte cycle: 6.7 MB/s, 2.5x slow.
+/// * `IsaXBus` 160 per byte cycle: 2.0 MB/s, **slower than PIO mode 0** -- which is what would
+///   have landed on every HDD and CD read on the board without this rate.
+///
+/// The band is wide because the figure also carries the element's memory write and the generic
+/// recorded bus cycle; it is far tighter than the 2.2x that separates it from the nearest wrong
+/// answer, which is what the assertion is for.
+#[test]
+#[cfg(feature = "jit")]
+fn a_rep_insw_from_the_ide_data_register_runs_at_the_ata_cycle_time() {
+    let rate = rep_insw_megabytes_per_guest_second(0x01f0, 2);
+    assert!(
+        (11.0..=16.6).contains(&rate),
+        "REP INSW from 0x1F0 must land near the ATA PIO mode-4 rate and under the spec's 16.6 \
+         MB/s, got {rate:.2} MB/s"
+    );
+    // The secondary channel is the same register file and takes the same treatment (review F11):
+    // ATAPI on 0x170 is where the CD rows live.
+    let atapi = rep_insw_megabytes_per_guest_second(0x0170, 2);
+    assert!(
+        (rate - atapi).abs() < 0.5,
+        "0x170 (ATAPI) must take the same element rate as 0x1F0: {rate:.2} vs {atapi:.2} MB/s"
+    );
+}
+
+/// The other half of the same rule: an ISA-class port keeps its 160 per byte cycle for a string
+/// element. A floppy PIO stream really does pay a full 8 MHz X-bus cycle per byte -- Intel's
+/// pipelining note for string I/O is a CPU-side statement and we claim no bus credit for it -- so
+/// this rate must stay an order below the ATA one, and the exception must be the DATA register
+/// alone rather than "string accesses are cheap".
+#[test]
+#[cfg(feature = "jit")]
+fn a_rep_insw_from_an_isa_port_keeps_the_class_rate() {
+    // 0x378 rather than the FDC's 0x3F5, deliberately: a WORD string element covers two
+    // consecutive ports and each byte cycle is charged its OWN class, so `INSW` from 0x3F5 reads
+    // 0x3F5 (`IsaXBus` 160) and 0x3F6 (the IDE control block, `PciTarget` 56) and lands at 1.53
+    // MB/s rather than the flat-ISA 1.03. That is correct -- the charge follows the port on the
+    // wire -- but it makes 0x3F5 a bad fixture for "the ISA rate". Both LPT bytes are `IsaXBus`.
+    let isa = rep_insw_megabytes_per_guest_second(0x0378, 2);
+    let ata = rep_insw_megabytes_per_guest_second(0x01f0, 2);
+    assert!(
+        isa < 1.2,
+        "an ISA-class string element must still pay 160 a byte cycle -- 2 x 160 + 3 = 323 clocks          a word, about 1.03 MB/s; got {isa:.2} MB/s"
+    );
+    assert!(
+        ata / isa > 8.0,
+        "the ATA data register must be the exception, not the rule: {ata:.2} vs {isa:.2} MB/s"
+    );
+}
+
+/// The knob-unset merge bar for P3's bus half: under epoch 1 the transfer rate must be exactly
+/// what it was before the slice, on both the ATA and the ISA port -- no class charge at all.
+#[test]
+#[cfg(feature = "jit")]
+fn epoch_1_string_port_throughput_is_untouched() {
+    for port in [0x01f0u16, 0x03f5] {
+        let rate = rep_insw_megabytes_per_guest_second(port, 1);
+        assert!(
+            rate > 30.0,
+            "port {port:#06x}: epoch 1 charges no class rate at all, so the transfer must stay \
+             far above any repriced figure; got {rate:.2} MB/s"
+        );
+    }
+}

@@ -3920,6 +3920,13 @@ struct MachineBus<'a> {
     timing_epoch: u32,
     /// Points at `Machine::retrace_poll` (F14's instrument).
     retrace_poll: &'a mut RetracePollCensus,
+    /// P3. Non-zero only for the duration of ONE `INS`/`OUTS` element's port access, carrying
+    /// that element's width in bytes; `charge_port_bus` reads it to price an IDE data-register
+    /// burst at the ATA cycle time instead of the register class's single-access latency. A
+    /// batch-scoped plain field rather than a borrow: it is set and cleared inside a single
+    /// `read_io_string_element` call and never outlives one, so nothing needs to see it across a
+    /// batch boundary.
+    string_port_element_bytes: u8,
     /// Points at `Machine::poll_skip_certificate`. `&`, not `&mut`: the certificate path this
     /// counts is `&self` (see the struct's own doc).
     poll_skip_certificate: &'a PollSkipCertificateCounters,

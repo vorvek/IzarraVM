@@ -1491,7 +1491,14 @@ impl CpuGsw {
                     insn.prefixes,
                     address_size,
                 )?;
-                Ok(clocks(15))
+                // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
+                // charged inside `string_step` (see `charge_string_port_element_core` for why it
+                // cannot ride this return value); epoch 1 returns the flat 15 unchanged.
+                Ok(clocks(self.string_port_setup_core_clocks(
+                    bus,
+                    false,
+                    insn.prefixes.rep.is_some(),
+                )))
             }
             0x6d => {
                 self.run_string(
@@ -1501,7 +1508,14 @@ impl CpuGsw {
                     insn.prefixes,
                     address_size,
                 )?;
-                Ok(clocks(15))
+                // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
+                // charged inside `string_step` (see `charge_string_port_element_core` for why it
+                // cannot ride this return value); epoch 1 returns the flat 15 unchanged.
+                Ok(clocks(self.string_port_setup_core_clocks(
+                    bus,
+                    false,
+                    insn.prefixes.rep.is_some(),
+                )))
             }
             0x6e => {
                 self.run_string(
@@ -1511,7 +1525,14 @@ impl CpuGsw {
                     insn.prefixes,
                     address_size,
                 )?;
-                Ok(clocks(14))
+                // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
+                // charged inside `string_step` (see `charge_string_port_element_core` for why it
+                // cannot ride this return value); epoch 1 returns the flat 14 unchanged.
+                Ok(clocks(self.string_port_setup_core_clocks(
+                    bus,
+                    true,
+                    insn.prefixes.rep.is_some(),
+                )))
             }
             0x6f => {
                 self.run_string(
@@ -1521,7 +1542,14 @@ impl CpuGsw {
                     insn.prefixes,
                     address_size,
                 )?;
-                Ok(clocks(14))
+                // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
+                // charged inside `string_step` (see `charge_string_port_element_core` for why it
+                // cannot ride this return value); epoch 1 returns the flat 14 unchanged.
+                Ok(clocks(self.string_port_setup_core_clocks(
+                    bus,
+                    true,
+                    insn.prefixes.rep.is_some(),
+                )))
             }
             0xa8 => {
                 // TEST AL, imm8: AND-for-flags, no write-back. `decode` fetched the imm8.

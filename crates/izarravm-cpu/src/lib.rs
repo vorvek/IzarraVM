@@ -5551,6 +5551,100 @@ pub(crate) const OUT_PORT_CORE_CLOCKS_EPOCH2: [u32; 4] = [
     24 * PORT_CORE_CLOCK_TWELFTHS,
 ];
 
+/// Epoch-2 `INS` core clocks for the NON-`REP` singleton, indexed by `PortIoPrivMode`: Intel's
+/// 9 / 6 / 24 / 22, in raw twelfths. Appendix F is column-drifted for the string-I/O rows and
+/// every one was re-anchored against the independent Chapter 25 pages (`INS` V3:33066-33070,
+/// `OUTS` :36058-36063, `REP` :36956-36988) --
+/// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 2.1.
+pub(crate) const INS_CORE_CLOCKS_EPOCH2: [u32; 4] = [
+    9 * PORT_CORE_CLOCK_TWELFTHS,
+    6 * PORT_CORE_CLOCK_TWELFTHS,
+    24 * PORT_CORE_CLOCK_TWELFTHS,
+    22 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `OUTS` singleton core clocks: Intel's 13 / 10 / 27 / 25, raw twelfths.
+pub(crate) const OUTS_CORE_CLOCKS_EPOCH2: [u32; 4] = [
+    13 * PORT_CORE_CLOCK_TWELFTHS,
+    10 * PORT_CORE_CLOCK_TWELFTHS,
+    27 * PORT_CORE_CLOCK_TWELFTHS,
+    25 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `REP INS` SETUP core clocks, charged ONCE for the whole repeat: Intel's `11 + 3c` /
+/// `8 + 3c` / `25 + 3c` / `23 + 3c`, raw twelfths, `c` being the element count.
+///
+/// **The setup is what the design's blocker (b) turns on.** Intel's 22/25 are the singleton
+/// forms; charging them per element -- which is what a naive reading of "`INS` costs 22" gives
+/// -- would price a `REP INSW` at seven times its real cost. The per-element figure is 3 (`INS`)
+/// and 4 (`OUTS`), below.
+pub(crate) const REP_INS_SETUP_CLOCKS_EPOCH2: [u32; 4] = [
+    11 * PORT_CORE_CLOCK_TWELFTHS,
+    8 * PORT_CORE_CLOCK_TWELFTHS,
+    25 * PORT_CORE_CLOCK_TWELFTHS,
+    23 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `REP OUTS` setup core clocks: Intel's 13 / 10 / 27 / 25, raw twelfths.
+pub(crate) const REP_OUTS_SETUP_CLOCKS_EPOCH2: [u32; 4] = [
+    13 * PORT_CORE_CLOCK_TWELFTHS,
+    10 * PORT_CORE_CLOCK_TWELFTHS,
+    27 * PORT_CORE_CLOCK_TWELFTHS,
+    25 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 per-ELEMENT core clocks for `REP INS` (3) and `REP OUTS` (4), raw twelfths. Mode
+/// independent: Intel's `c` coefficient is the same in all four privilege columns, because the
+/// bitmap consult that separates those columns happens once at setup, not per element.
+pub(crate) const REP_INS_ELEMENT_CLOCKS_EPOCH2: u32 = 3 * PORT_CORE_CLOCK_TWELFTHS;
+pub(crate) const REP_OUTS_ELEMENT_CLOCKS_EPOCH2: u32 = 4 * PORT_CORE_CLOCK_TWELFTHS;
+
+/// The whole-instruction core charge for `INS`/`OUTS`: the singleton's own cost, or a `REP`
+/// form's SETUP. Epoch 1 returns the flat pre-repricing 15 / 14 byte-identically, whatever the
+/// mode and whatever the `REP` prefix, which is exactly what the four `execute_extended` arms
+/// charged before this slice.
+pub(crate) const fn string_port_setup_core_clocks(
+    epoch: u32,
+    is_out: bool,
+    is_rep: bool,
+    mode: PortIoPrivMode,
+) -> u32 {
+    if epoch < 2 {
+        return if is_out {
+            OUTS_CORE_CLOCKS_EPOCH1
+        } else {
+            INS_CORE_CLOCKS_EPOCH1
+        };
+    }
+    let index = mode as usize;
+    match (is_out, is_rep) {
+        (false, false) => INS_CORE_CLOCKS_EPOCH2[index],
+        (true, false) => OUTS_CORE_CLOCKS_EPOCH2[index],
+        (false, true) => REP_INS_SETUP_CLOCKS_EPOCH2[index],
+        (true, true) => REP_OUTS_SETUP_CLOCKS_EPOCH2[index],
+    }
+}
+
+/// The per-ELEMENT core charge for a `REP INS`/`REP OUTS`. **Zero under epoch 1**, where the
+/// whole instruction's cost is the flat 15 / 14 charged once regardless of the element count --
+/// the pre-slice model, kept byte-identical.
+pub(crate) const fn string_port_element_core_clocks(epoch: u32, is_out: bool) -> u32 {
+    if epoch < 2 {
+        return 0;
+    }
+    if is_out {
+        REP_OUTS_ELEMENT_CLOCKS_EPOCH2
+    } else {
+        REP_INS_ELEMENT_CLOCKS_EPOCH2
+    }
+}
+
+/// The flat pre-repricing `INS` / `OUTS` whole-instruction charges (`execute_extended.rs`'s
+/// 0x6C-0x6F arms). Named so epoch 1's identity is a constant a reader can find rather than two
+/// literals in a `match`.
+pub(crate) const INS_CORE_CLOCKS_EPOCH1: u32 = 15;
+pub(crate) const OUTS_CORE_CLOCKS_EPOCH1: u32 = 14;
+
 /// The one function every `IN`/`OUT` charge in the tree goes through, both epochs and all four
 /// privilege columns. Epoch 1 returns the flat pre-repricing constants BYTE-IDENTICALLY, so the
 /// knob-unset build cannot move; epoch 2 indexes the tables above.

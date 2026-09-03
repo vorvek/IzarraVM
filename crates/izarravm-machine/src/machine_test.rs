@@ -425,6 +425,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         timing_epoch: machine.timing_epoch,
         poll_skip_certificate: &machine.poll_skip_certificate,
         retrace_poll: &mut machine.retrace_poll,
+        string_port_element_bytes: 0,
         lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),
         io_touched: &mut machine.io_touched,
         exempt_io_touched: &mut machine.exempt_io_touched,
