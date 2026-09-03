@@ -56,8 +56,15 @@ mod sb16_path;
 #[cfg(feature = "shadow-cache-probe")]
 #[path = "shadow_cache_probe.rs"]
 mod shadow_cache;
+// OFF-FEATURE: plain `mod shadow_cache;` (no `#[path]` override) resolves to
+// `shadow_cache.rs`, byte-for-byte the pre-S1a module -- including its
+// `file!()`-embedded panic/debug_assert! location strings. A `#[path]`
+// override to a differently-named file (tried first, reverted) changes those
+// embedded strings even when the file's CONTENT is identical, which showed up
+// as ~430 KiB of spurious whole-binary diff against a same-directory rebuild
+// of 64b379c9 -- the file's NAME, not just its content, is part of what must
+// stay identical for the plain build's byte-identity claim.
 #[cfg(not(feature = "shadow-cache-probe"))]
-#[path = "shadow_cache_plain.rs"]
 mod shadow_cache;
 mod timeline;
 mod timing;

@@ -1346,7 +1346,7 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         monitor_trips_vec13: _,
         monitor_resident_core_clocks: _,
         #[cfg(feature = "shadow-cache-probe")]
-        jit_direct_reject_shadow_sample: _,
+            jit_direct_reject_shadow_sample: _,
     } = PerfCounters::default();
     let izarravm_cpu::PollSkipMemoryCounters {
         spans: _,

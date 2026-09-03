@@ -330,5 +330,5 @@ impl ShadowL1Probe {
 }
 
 #[cfg(test)]
-#[path = "shadow_cache_plain_test.rs"]
+#[path = "shadow_cache_test.rs"]
 mod tests;
