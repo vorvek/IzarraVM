@@ -2169,7 +2169,7 @@ impl CpuGsw {
         // defaults), where the bus terms that normally swamp the core term vanish -- and the
         // chain-pricing `debug_assert` that `per_hop_estimate <= global_block_upper` would trip
         // on a bound that is supposed to dominate by construction.
-        // `MAX_CALL_OUT_CORE_CLOCKS`, not `IN_PORT_CORE_CLOCKS`: this bound cannot see which
+        // `MAX_CALL_OUT_CORE_CLOCKS`, not the IN column: this bound cannot see which
         // helper a slot carries, so it prices every slot at the largest charge any admitted helper
         // returns. That is 18 (PUSHAD/POPAD) rather than 12 (IN AL,DX) as of the memory class, and
         // the constant is derived from the three per-opcode constants so a fourth helper raises it
@@ -2355,9 +2355,20 @@ impl CpuGsw {
         // would not cover it.
         //
         // Priced BY CLASS rather than at the worst helper. The port class was an EXACT sum until
-        // `0xE6` joined it: the reads charge `IN_PORT_CORE_CLOCKS`, `PortWriteAlImm8` charges
-        // `OUT_PORT_CORE_CLOCKS` (10 against 12), so it is now a STATED two-member maximum rather
-        // than the IN constant left standing. A memory slot still charges `PUSH_ALL_CORE_CLOCKS` (=
+        // `0xE6` joined it: the reads charge the IN column, `PortWriteAlImm8` the OUT one (epoch 1:
+        // 10 against 12), so it became a STATED two-member maximum rather than the IN constant left
+        // standing. Review finding F5 (`dev_docs/2026-09-05-port-io-repricing-review.md`) widened
+        // it again: under epoch 2 the charge is a function of the live privilege column, which this
+        // COMPILE-TIME bound cannot see -- a protected block spans `CPL <= IOPL` (9) and
+        // `CPL > IOPL` (26) under one `jit_mode_key`, since that key carries CR0.PE and EFLAGS.VM
+        // but neither CPL nor IOPL. So the term is `MAX_PORT_CORE_CLOCKS`, the cross-mode
+        // cross-epoch maximum (312 raw). It is EPOCH-KEYED rather than unconditional -- unlike the
+        // other two F5 bounds, which are pure 32-bit-lane headroom the `cap - spent` term dominates
+        // anyway -- because this one really does throttle: it is `iteration_upper`'s port term and
+        // therefore the chain quota's divisor, so raising it under epoch 1 would move the ADMISSION
+        // of every doom-shaped port block on a knob-unset build and break the slice's byte-identity
+        // bar (T8). Under epoch 2 it over-budgets a `CPL <= IOPL` port block 3x, which is the price
+        // of a compile-time bound that cannot under-cover a runtime charge. A memory slot still charges `PUSH_ALL_CORE_CLOCKS` (=
         // `POP_ALL_CORE_CLOCKS`); both are the ONLY case for that class, so its sum stays exact.
         // Pricing both classes at the maximum
         // of the two would inflate every port-only block -- which is what doom's 20 M call-outs
@@ -2373,7 +2384,7 @@ impl CpuGsw {
         // own charge. Widening the allowlist means widening the constant, which is why the
         // constant is derived beside the per-opcode ones rather than written here.
         let callout_core_upper = u64::from(block.callout_port_slots())
-            .saturating_mul(u64::from(IN_PORT_CORE_CLOCKS.max(OUT_PORT_CORE_CLOCKS)))
+            .saturating_mul(u64::from(port_slot_core_upper(bus.timing_epoch())))
             .saturating_add(
                 u64::from(block.callout_memory_slots())
                     .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),

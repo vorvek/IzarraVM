@@ -1037,6 +1037,20 @@ pub trait CpuBus {
     /// overshoot the next timer edge - the batch cap's PIT terms are guest
     /// clocks, and a real PIT interrupts at every edge. Buses without batch
     /// bus accounting return 0 and use the core-only check.
+    /// Which guest-clock model epoch this machine was constructed under
+    /// (`IZARRAVM_TIMING_EPOCH`, read once at construction; see `izarravm-machine`'s
+    /// `Machine::timing_epoch`). `1` is the pre-repricing model and the default here, so a bus
+    /// with no notion of an epoch -- every test bus, every embedder -- keeps epoch-1 charges
+    /// byte-identically.
+    ///
+    /// The CPU reads this at every port access to pick the `IN`/`OUT` core-clock column
+    /// (`crate::CpuBus` is the only channel the CPU has to a machine-level dial). It MUST be
+    /// constant for the life of the bus: the JIT caches per-block raw clocks, so an epoch that
+    /// changed mid-run would leave already-compiled blocks charging the old model.
+    fn timing_epoch(&self) -> u32 {
+        1
+    }
+
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         0
     }

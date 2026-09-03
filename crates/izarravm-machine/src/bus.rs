@@ -1518,11 +1518,19 @@ impl MachineBus<'_> {
 /// bit, so nothing this may admit may let `raw_core_clocks * iterations` reach it -- whatever a
 /// misconfigured `IZARRAVM_DIRECT_POLL_MAX_RAW` claims. `max_skipped_raw` can still tune the
 /// bound DOWN (a smaller request always wins the `.min`); it can never tune it up past this
-/// ceiling. The 64-clock margin comfortably covers `IN_PORT_CORE_CLOCKS` (12, `izarravm-cpu`,
-/// not visible from this crate) plus any other small additive term the caller folds in on top of
-/// this function's own return.
+/// ceiling. The margin must cover the port charge the caller folds in on top of this function's
+/// own return (`direct.rs`'s `port_read_al_dx`, which adds `port_io_core_clocks` to the skip's
+/// `extra_raw_clocks`) plus any other small additive term.
+///
+/// Review finding F5 (`dev_docs/2026-09-05-port-io-repricing-review.md`): that margin used to be a
+/// literal 64, sized to the flat `IN_PORT_CORE_CLOCKS` of 12. Under `IZARRAVM_TIMING_EPOCH=2` the
+/// same charge reaches 312 raw (`OUT`, `CPL>IOPL`), so 64 was a latent 32-bit lane overflow. It is
+/// now `izarravm_cpu::MAX_PORT_CORE_CLOCKS` -- imported, not copied, so a widened column raises
+/// this bound by construction -- plus the same 64 clocks of slack the original carried for
+/// "any other small additive term".
 #[cfg(feature = "jit")]
-pub(crate) const LANE_SAFETY_CEILING: u64 = u32::MAX as u64 - 64;
+pub(crate) const LANE_SAFETY_CEILING: u64 =
+    u32::MAX as u64 - (izarravm_cpu::MAX_PORT_CORE_CLOCKS as u64 + 64);
 
 #[cfg(feature = "jit")]
 pub(crate) fn poll_skip_upper_bound(
@@ -2390,6 +2398,14 @@ impl CpuBus for MachineBus<'_> {
     /// to its core total against the guest-clock run cap. The same scaled-bus
     /// accounting applies in every CPU mode so a bus-heavy run cannot cross an
     /// earlier master-timeline deadline unnoticed.
+    /// `Machine::timing_epoch`, copied into this bus at construction. The CPU reads it at every
+    /// port access to pick the `IN`/`OUT` privilege column (`CpuGsw::port_io_core_clocks`); it is
+    /// a plain field, so it cannot change mid-run and the JIT's cached per-block raw clocks stay
+    /// valid.
+    fn timing_epoch(&self) -> u32 {
+        self.timing_epoch
+    }
+
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)

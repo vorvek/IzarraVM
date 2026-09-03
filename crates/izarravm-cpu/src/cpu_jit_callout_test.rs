@@ -4392,3 +4392,244 @@ fn out_dx_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_e
     assert_eq!(stalls.side_exit_callout_abnormal, 1);
     assert_eq!(stalls.side_exit_callout_step_break, 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The four privilege columns (`dev_docs/2026-09-05-port-io-repricing-design.md` §1.2, slice P1).
+//
+// The port charge stopped being a constant: `IN`/`OUT` now cost what Intel's Appendix F says for
+// the column the access executes in, and epoch 1's flat 12/10 survives only as that table's
+// epoch-1 row. Three things could go wrong and only a matrix catches all three -- a column read
+// off the wrong index, an epoch-1 build that moved, and the JIT call-out drifting from the
+// interpreter on exactly one column (the failure mode `IN_PORT_CORE_CLOCKS`'s doc comment was
+// written to prevent, now that the contract is a function of live CPU state rather than a
+// `const`).
+// ---------------------------------------------------------------------------------------------
+
+/// Where the port-column fixtures put their two code bytes. Inside every fixture's identity-mapped
+/// low memory, on a page none of the paged fixtures uses for a page table or the TSS -- and,
+/// load-bearing, NOT `warm_the_tss_tlb`'s own 0x4000. That helper runs two throwaway `IN AL,DX`
+/// instructions at 0x4000 to settle the accessed bits, which leaves a DECODE-CACHE line there for
+/// `0xEC`; a fixture that then poked `0xEE` straight into `bus.memory` (no code-watch write, so no
+/// invalidation) would re-execute the cached `IN` and read the read column's charge back as the
+/// write column's.
+const PORT_COLUMN_ENTRY: u32 = 0x5000;
+
+/// The RAW core clocks a leg charged, recovered from the two halves `scale_clocks` splits them
+/// into. `level_timing(I586)` is `(1, 12)`, so a raw charge `R` deposited from a zeroed state
+/// lands as `elapsed_clocks = R / 12` and `timing_rem = R % 12`. Reading only `elapsed_clocks`
+/// would see 0 for every epoch-1 charge (12 and 10 both floor to 1 and 0); reading only
+/// `timing_rem` would see 0 for every epoch-2 charge that is a multiple of 12 -- which is all
+/// eight of them.
+fn charged_raw_core_clocks(cpu: &CpuGsw) -> u64 {
+    cpu.elapsed_clocks * 12 + cpu.timing_rem
+}
+
+/// A CPU/bus pair sitting in exactly one of `port_io_priv_mode`'s four columns, with `PORT`
+/// permitted, the TSS pages TLB-resident where there are any, and `DX` already loaded.
+///
+/// The two bitmap columns are the SAME fixture with different EFLAGS: `warmed_tss_cpu` is CPL 3 /
+/// IOPL 0 (the `CPL > IOPL` column) as built, and adding VM with IOPL 3 moves it to the V86 column
+/// without touching the bitmap it consults. That is deliberate -- a fixture pair differing in more
+/// than the column would not isolate the column.
+fn port_column_fixture(mode: crate::PortIoPrivMode, epoch_two: bool) -> (CpuGsw, TestBus) {
+    use crate::PortIoPrivMode as Column;
+    let (mut cpu, mut bus) = match mode {
+        Column::Real => {
+            let mut cpu = CpuGsw::default();
+            cpu.set_mode(GswMode::Gsw586);
+            // `Registers::default` starts at the RESET vector, CS.base 0xFFFF_0000. Every other
+            // column's fixture already has a base-0 CS, so give this one the same, or the
+            // interpreted leg fetches out of a 4 GiB-high unmapped page instead of the entry.
+            cpu.registers
+                .set_segment(SegmentIndex::Cs, SegmentRegister::real(0));
+            (cpu, TestBus::with_memory(vec![0u8; 0x9000]))
+        }
+        Column::ProtectedPrivileged => (flat_cpu(), TestBus::with_memory(vec![0u8; 0x9000])),
+        Column::ProtectedUnprivileged => warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000),
+        Column::V86 => {
+            let (mut cpu, bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+            cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+            (cpu, bus)
+        }
+    };
+    bus.timing_epoch_two = epoch_two;
+    // The lazy status-port shape, so neither leg's charge carries a step break the other does not.
+    bus.lazy_io_reads = true;
+    bus.lazy_io_writes = true;
+    bus.io_read_value = Some(0x5a);
+    cpu.registers.set_edx(u32::from(PORT));
+    cpu.registers.set_eax(0xdead_beef);
+    assert_eq!(
+        cpu.port_io_priv_mode(),
+        mode,
+        "the fixture does not sit in the column it claims"
+    );
+    (cpu, bus)
+}
+
+#[test]
+fn the_port_charge_is_intels_privilege_column_under_epoch_two_and_flat_under_epoch_one() {
+    use crate::PortIoPrivMode as Column;
+    // Intel V3 `:32962-32979` (IN 7 / 4 / 21 / 19) and `:35991-35995` (OUT 12 / 9 / 26 / 24), in
+    // GUEST clocks; the tree's raw unit is twelfths, so every cell is multiplied by 12 below.
+    // Written out here rather than read from `port_core_clocks`, which is the thing under test.
+    const COLUMNS: [Column; 4] = [
+        Column::Real,
+        Column::ProtectedPrivileged,
+        Column::ProtectedUnprivileged,
+        Column::V86,
+    ];
+    const EPOCH2_IN: [u64; 4] = [7, 4, 21, 19];
+    const EPOCH2_OUT: [u64; 4] = [12, 9, 26, 24];
+
+    for (index, column) in COLUMNS.into_iter().enumerate() {
+        for epoch_two in [false, true] {
+            for is_out in [false, true] {
+                let expected: u64 = match (epoch_two, is_out) {
+                    // Epoch 1: the flat pre-repricing constants, mode-independent. A build with
+                    // the knob unset must not move by one clock on any column.
+                    (false, false) => 12,
+                    (false, true) => 10,
+                    (true, false) => EPOCH2_IN[index] * 12,
+                    (true, true) => EPOCH2_OUT[index] * 12,
+                };
+                let lane = format!("{column:?}/epoch2={epoch_two}/out={is_out}");
+
+                // Leg A: wholly interpreted, through `execute_port_io_decoded`.
+                let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
+                let entry = PORT_COLUMN_ENTRY as usize;
+                bus.memory[entry] = if is_out { 0xee } else { 0xec };
+                bus.memory[entry + 1] = 0xf4;
+                cpu.set_eip(PORT_COLUMN_ENTRY);
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.cycle(&mut bus)
+                    .unwrap_or_else(|_| panic!("{lane}: the permitted port must retire"));
+                assert_eq!(
+                    cpu.registers.eip,
+                    PORT_COLUMN_ENTRY + 1,
+                    "{lane}: the instruction must retire"
+                );
+                let interpreted = charged_raw_core_clocks(&cpu);
+
+                // Leg B: the JIT call-out slot, on a fresh fixture in the same column.
+                let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
+                let status = if is_out {
+                    jit::direct::port_write_al_dx_for_test(&mut cpu, &mut bus, 0, 0)
+                } else {
+                    jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0)
+                };
+                assert!(status >= 0, "{lane}: the call-out must serve");
+                let native = status & 0xffff_ffff;
+
+                assert_eq!(
+                    interpreted, expected,
+                    "{lane}: the interpreter charged the wrong column"
+                );
+                assert_eq!(
+                    native, expected as i64,
+                    "{lane}: the call-out charged the wrong column"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_imm8_port_call_outs_take_the_same_column_as_their_dx_siblings() {
+    // `PortReadAlImm8` (`0xE4`) and `PortWriteAlImm8` (`0xE6`) are separate helpers with their own
+    // return expressions, so the matrix above -- which exercises only the DX forms -- would pass
+    // with either of them left on the old constant.
+    use crate::PortIoPrivMode as Column;
+    for column in [
+        Column::Real,
+        Column::ProtectedPrivileged,
+        Column::ProtectedUnprivileged,
+        Column::V86,
+    ] {
+        for epoch_two in [false, true] {
+            let lane = format!("{column:?}/epoch2={epoch_two}");
+            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
+            let read = jit::direct::port_read_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT)
+                & 0xffff_ffff;
+            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
+            let write = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT)
+                & 0xffff_ffff;
+            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
+            let read_dx =
+                jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0) & 0xffff_ffff;
+            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
+            let write_dx =
+                jit::direct::port_write_al_dx_for_test(&mut cpu, &mut bus, 0, 0) & 0xffff_ffff;
+            assert_eq!(read, read_dx, "{lane}: 0xE4 and 0xEC disagreed");
+            assert_eq!(write, write_dx, "{lane}: 0xE6 and 0xEE disagreed");
+        }
+    }
+}
+
+#[test]
+fn the_word_port_forms_charge_the_same_column_as_the_byte_forms() {
+    // `0xE5` and `0xED` carried a BARE LITERAL 12 rather than `IN_PORT_CORE_CLOCKS`
+    // (`execute.rs`, design §1.1). Under epoch 2 that literal would have made a word `IN` the one
+    // form still priced at the pre-repricing rate, on every column at once.
+    use crate::PortIoPrivMode as Column;
+    for column in [Column::Real, Column::V86] {
+        for (byte_opcode, word_opcode) in [(0xecu8, 0xedu8), (0xee, 0xef)] {
+            let mut charges = Vec::new();
+            for opcode in [byte_opcode, word_opcode] {
+                let (mut cpu, mut bus) = port_column_fixture(column, true);
+                let entry = PORT_COLUMN_ENTRY as usize;
+                bus.memory[entry] = opcode;
+                bus.memory[entry + 1] = 0xf4;
+                cpu.set_eip(PORT_COLUMN_ENTRY);
+                cpu.elapsed_clocks = 0;
+                cpu.timing_rem = 0;
+                cpu.cycle(&mut bus).expect("the permitted port must retire");
+                charges.push(charged_raw_core_clocks(&cpu));
+            }
+            assert_eq!(
+                charges[0], charges[1],
+                "{column:?}: the word form ({word_opcode:#04x}) charged a different column from \
+                 the byte form ({byte_opcode:#04x})"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_cross_mode_maximum_dominates_every_column_of_both_epochs() {
+    // F5 (`dev_docs/2026-09-05-port-io-repricing-review.md`): three bounds that used to be sized
+    // to the flat 12 now take `MAX_PORT_CORE_CLOCKS` instead. What makes them sound is that this
+    // constant really is the maximum over the whole table, DERIVED rather than written -- so the
+    // property is asserted here against every cell, not against the literal 312.
+    use crate::PortIoPrivMode as Column;
+    for column in [
+        Column::Real,
+        Column::ProtectedPrivileged,
+        Column::ProtectedUnprivileged,
+        Column::V86,
+    ] {
+        for epoch in [1u32, 2] {
+            for is_out in [false, true] {
+                assert!(
+                    crate::port_core_clocks(epoch, is_out, column) <= crate::MAX_PORT_CORE_CLOCKS,
+                    "{column:?}/epoch={epoch}/out={is_out} exceeds MAX_PORT_CORE_CLOCKS"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        crate::MAX_PORT_CORE_CLOCKS,
+        26 * 12,
+        "the maximum is epoch 2's OUT / CPL>IOPL column"
+    );
+    // The 32-bit poll-skip lane bound, which the caller adds a port charge on top of
+    // (`direct.rs`'s `port_read_al_dx` folds `extra_raw_clocks` and the charge into ONE i64 whose
+    // low 32 bits are the clock lane, bit 32 the step-break flag). The margin must cover the
+    // widest charge; at the old literal 64 it did not.
+    let machine_lane_ceiling = u64::from(u32::MAX) - (u64::from(crate::MAX_PORT_CORE_CLOCKS) + 64);
+    assert!(
+        machine_lane_ceiling + u64::from(crate::MAX_PORT_CORE_CLOCKS) < u64::from(u32::MAX),
+        "a maximal port charge on top of a maximal skipped span overflows the 32-bit clock lane"
+    );
+}

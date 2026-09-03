@@ -2998,6 +2998,10 @@ struct TestBus {
     mode13_word_writes: u64,
     mode13_dword_writes: u64,
     direct_mapping_epoch: u64,
+    // `IZARRAVM_TIMING_EPOCH=2` without an env write: `CpuBus::timing_epoch` reports 2 when set.
+    // A bool rather than a `u32` so `#[derive(Default)]` still lands on epoch 1, which is what
+    // every fixture written before the port repricing expects.
+    timing_epoch_two: bool,
 }
 
 impl TestBus {
@@ -3005,6 +3009,7 @@ impl TestBus {
         Self {
             memory: memory.into(),
             trace: BusTrace::default(),
+            timing_epoch_two: false,
             pending_irq: None,
             io_touched: false,
             lazy_io_reads: false,
@@ -3351,6 +3356,10 @@ impl CpuBus for TestBus {
     /// (`generated_three_block_chain_aggregates_across_event_caps`). Fingerprint both, so the
     /// Direct backend's memo of the derived worst-case hop cost cannot go stale. Offset by one to
     /// stay clear of the trait default's 0.
+    fn timing_epoch(&self) -> u32 {
+        if self.timing_epoch_two { 2 } else { 1 }
+    }
+
     fn jit_cost_dial_epoch(&self) -> u64 {
         1 + u64::from(self.uniform_native_fetches) + 2 * u64::from(self.direct_page_clocks)
     }

@@ -39,10 +39,9 @@ use super::x87_avx2_emit::{
 };
 use crate::{
     AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, DirectBarrierCensusRow,
-    DirectBarrierCensusSnapshot, FLAG_IF, FLAG_TF, FLAG_VM, IN_PORT_CORE_CLOCKS,
-    OUT_PORT_CORE_CLOCKS, OperandSize, POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags,
-    PodKeyBuildHasher, PollFamily, Prefixes, Registers, SegmentIndex, SegmentRegister,
-    U32BuildHasher,
+    DirectBarrierCensusSnapshot, FLAG_IF, FLAG_TF, FLAG_VM, MAX_PORT_CORE_CLOCKS, OperandSize,
+    POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags, PodKeyBuildHasher, PollFamily,
+    Prefixes, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
 };
 
 use super::block::{PollScanOutcome, build_poll_loop_from};
@@ -6990,7 +6989,7 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
 ///
 /// `0xEE` is the WRITE twin of `0xEC` (`CallOutHelper::PortWriteAlDx`) exactly as `PortWriteAlImm8`
 /// is the write twin of `PortReadAlImm8`: same two-phase TSS-bitmap probe
-/// (`port_permission_resident`), same `OUT_PORT_CORE_CLOCKS` charge and unconditional step break as
+/// (`port_permission_resident`), same `port_io_core_clocks(bus, true)` charge and unconditional step break as
 /// `PortWriteAlImm8`, but with the port read out of DX at runtime instead of riding a compile-time
 /// immediate -- the same difference `PortReadAlDx` already carries against `PortReadAlImm8`. It
 /// ships unconditionally, with no knob, for the same reason `0xEC` does: the OUT audit's device-write
@@ -14796,13 +14795,15 @@ pub(crate) fn direct_poll_skip_min_iterations() -> u64 {
 }
 
 /// `IZARRAVM_DIRECT_POLL_MAX_RAW`: the 32-bit return-lane bound (GP2 poll-skip design obligation
-/// 4). Default `u32::MAX - IN_PORT_CORE_CLOCKS`, so `IN_PORT_CORE_CLOCKS + raw_core_clocks *
+/// 4). Default `u32::MAX - MAX_PORT_CORE_CLOCKS`, so `port_core_clocks(..) + raw_core_clocks *
 /// best` cannot reach bit 32 (`STATUS_STEP_BREAK_BIT`) on the default arm.
 pub(crate) fn direct_poll_skip_max_raw() -> u64 {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| match std::env::var("IZARRAVM_DIRECT_POLL_MAX_RAW") {
-        Err(std::env::VarError::NotPresent) => u64::from(u32::MAX) - u64::from(IN_PORT_CORE_CLOCKS),
-        Ok(raw) if raw.trim().is_empty() => u64::from(u32::MAX) - u64::from(IN_PORT_CORE_CLOCKS),
+        Err(std::env::VarError::NotPresent) => {
+            u64::from(u32::MAX) - u64::from(MAX_PORT_CORE_CLOCKS)
+        }
+        Ok(raw) if raw.trim().is_empty() => u64::from(u32::MAX) - u64::from(MAX_PORT_CORE_CLOCKS),
         Ok(raw) => raw
             .trim()
             .parse()
@@ -16957,7 +16958,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // `block_continuable`'s own OUT refusal); this arm is the emittability half.
             //
             // `CallOutHelper::PortWriteAlDx` mirrors `PortWriteAlImm8` (same `port_permission_resident`
-            // two-phase probe, same `OUT_PORT_CORE_CLOCKS` charge, same unconditional step break
+            // two-phase probe, same `port_io_core_clocks(bus, true)` charge, same unconditional step break
             // for the reason stated on `port_write_al_imm8`'s doc: a port write can make an
             // interrupt newly deliverable from inside `write_io`, and the guest class this row is
             // measured on -- 16-bit V86 -- never sets `io_touched` on a write either, the same gap
@@ -16981,7 +16982,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // IN AL, imm8 -- gp2's B2 residue, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
             // (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3). The lean sibling
             // of the arm above: same `port_permission_resident` two-phase probe, same shared
-            // `IN_PORT_CORE_CLOCKS` charge, no poll-skip scan (rev 3 §1.4).
+            // `port_io_core_clocks(bus, false)` charge, no poll-skip scan (rev 3 §1.4).
             //
             // `classify` admits ANY immediate port here, unconditionally (rev 3 §1.1, ROUND-2
             // item 5 correction): the per-port-class safety table the design carries is a PROOF
@@ -17025,7 +17026,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // TWO DIFFERENCES from `0xE4`, and both are the whole design:
             //
-            // 1. THE CHARGE is `OUT_PORT_CORE_CLOCKS` (10), not `IN_PORT_CORE_CLOCKS` (12). The
+            // 1. THE CHARGE is the OUT column, not the IN one (epoch 1: 10 against 12). The
             //    interpreter's `0xE6` arm charges 10, and the exact-clocks claim is what the
             //    census identity gate reads.
             // 2. THE STEP BREAK IS UNCONDITIONAL, not `bus.requires_step_break()`. A port WRITE can
@@ -29499,7 +29500,7 @@ pub(crate) enum CallOutHelper {
     /// (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3).
     ///
     /// The LEAN sibling of `PortReadAlDx`: same two-phase TSS-bitmap probe
-    /// (`port_permission_resident`), same shared `IN_PORT_CORE_CLOCKS` charge, same
+    /// (`port_permission_resident`), same shared `port_io_core_clocks(bus, false)` charge, same
     /// `preview_scale_clocks` remainder carry, but no poll-skip scan (rev 3 §1.4 -- the scan's own
     /// shape needs a one-byte IN fetch and this form is two bytes) and no `slot_delta` (nothing to
     /// scan backward from). The port is a compile-time IMMEDIATE rather than a live register, so
@@ -29514,7 +29515,7 @@ pub(crate) enum CallOutHelper {
     /// The WRITE twin of `PortReadAlImm8`: same two-phase TSS-bitmap probe, same compile-time port
     /// immediate on the fourth-argument channel, no poll-skip scan and no cell. It differs in
     /// exactly two places, and both are load-bearing rather than incidental -- it charges
-    /// `OUT_PORT_CORE_CLOCKS` (10, not the reads' 12), and it reports a step break
+    /// the OUT column (epoch 1: 10, not the reads' 12), and it reports a step break
     /// UNCONDITIONALLY, because a port write can raise an IRQ from inside `write_io` while the
     /// bus's own `requires_step_break()` stays false for the ring-0 protected-mode guests that
     /// carry this row.
@@ -29522,7 +29523,7 @@ pub(crate) enum CallOutHelper {
     /// `0xEE` OUT DX,AL, admitted unconditionally (no knob), mirroring `PortReadAlDx`.
     ///
     /// The WRITE twin of `PortReadAlDx` exactly as `PortWriteAlImm8` is the write twin of
-    /// `PortReadAlImm8`: same two-phase TSS-bitmap probe, same `OUT_PORT_CORE_CLOCKS` charge, same
+    /// `PortReadAlImm8`: same two-phase TSS-bitmap probe, same OUT-column charge, same
     /// unconditional step break `PortWriteAlImm8` reports. It differs from `PortWriteAlImm8` the
     /// same way `PortReadAlDx` differs from `PortReadAlImm8`: the port is a live DX read at
     /// runtime, not a compile-time immediate, so it carries no port value in the variant and no
@@ -30336,12 +30337,12 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                 CallOutOutcome::Continued
             },
         );
-        i64::from(IN_PORT_CORE_CLOCKS).saturating_add(extra_raw_clocks as i64)
+        i64::from(cpu.port_io_core_clocks(bus, false)).saturating_add(extra_raw_clocks as i64)
             | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
     }
     #[cfg(not(feature = "direct-callout-attribution"))]
     {
-        i64::from(IN_PORT_CORE_CLOCKS).saturating_add(extra_raw_clocks as i64)
+        i64::from(cpu.port_io_core_clocks(bus, false)).saturating_add(extra_raw_clocks as i64)
             | (i64::from(bus.requires_step_break() || forced_step_break) << STATUS_STEP_BREAK_BIT)
     }
 }
@@ -30350,7 +30351,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
 /// `IZARRAVM_DIRECT_IN_IMM8_CALLOUT` (gp2 in-imm8 callout design rev 3).
 ///
 /// The LEAN sibling of `port_read_al_dx`: same phase P (`port_permission_resident`), same phase C
-/// charged re-reads, same shared `IN_PORT_CORE_CLOCKS` charge and the same `preview_scale_clocks`
+/// charged re-reads, same shared `port_io_core_clocks(bus, false)` charge and the same `preview_scale_clocks`
 /// remainder carry -- but with the whole GP2 call-out-site poll-skip block deleted (rev 3 §1.4: the
 /// scan's own `debug_assert` requires a `len == 1` IN fetch, which this form's two-byte encoding
 /// cannot satisfy, and the shape it certifies is wrong for this routine besides), and with no
@@ -30529,11 +30530,12 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
                 CallOutOutcome::Continued
             },
         );
-        i64::from(IN_PORT_CORE_CLOCKS) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+        i64::from(cpu.port_io_core_clocks(bus, false))
+            | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
     }
     #[cfg(not(feature = "direct-callout-attribution"))]
     {
-        i64::from(IN_PORT_CORE_CLOCKS)
+        i64::from(cpu.port_io_core_clocks(bus, false))
             | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
     }
 }
@@ -30545,7 +30547,7 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
 /// re-reads, the `preview_scale_clocks` remainder carry and the fourth-argument PORT immediate are
 /// that helper's, verbatim, and are not re-derived here. Two things are its own.
 ///
-/// **THE CHARGE.** `OUT_PORT_CORE_CLOCKS` (10), not `IN_PORT_CORE_CLOCKS` (12). The interpreter's
+/// **THE CHARGE.** The OUT column of `port_core_clocks`, not the IN one (epoch 1: 10 against 12). The interpreter's
 /// `0xE6` arm charges 10; reaching for the sibling's constant because the code is otherwise
 /// identical would overcharge every admitted execution by two core clocks, and the only instrument
 /// that would ever see it is the census identity gate.
@@ -30773,7 +30775,7 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
         Some(original_port),
         CallOutOutcome::StepBreak,
     );
-    i64::from(OUT_PORT_CORE_CLOCKS) | (1 << STATUS_STEP_BREAK_BIT)
+    i64::from(cpu.port_io_core_clocks(bus, true)) | (1 << STATUS_STEP_BREAK_BIT)
 }
 
 /// `0xEE` OUT DX,AL through the interpreter's own port path, admitted unconditionally (no knob),
@@ -30781,7 +30783,7 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
 ///
 /// The WRITE twin of `port_read_al_dx`, exactly as `port_write_al_imm8` is the write twin of
 /// `port_read_al_imm8`: phase P (`port_permission_resident`), phase C's charged re-reads, the
-/// `preview_scale_clocks` remainder carry, the `OUT_PORT_CORE_CLOCKS` charge and the unconditional
+/// `preview_scale_clocks` remainder carry, the OUT-column charge and the unconditional
 /// step break are `port_write_al_imm8`'s, verbatim -- see that function's doc for what the
 /// unconditional bit buys and does not buy; nothing here restates it. The one thing this helper
 /// does that `port_write_al_imm8` does not is read the port out of DX, live, at the top -- the
@@ -30994,7 +30996,7 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
         Some(original_port),
         CallOutOutcome::StepBreak,
     );
-    i64::from(OUT_PORT_CORE_CLOCKS) | (1 << STATUS_STEP_BREAK_BIT)
+    i64::from(cpu.port_io_core_clocks(bus, true)) | (1 << STATUS_STEP_BREAK_BIT)
 }
 
 /// Resolve the published bus for a helper instantiation, or `None` if the window is not open.

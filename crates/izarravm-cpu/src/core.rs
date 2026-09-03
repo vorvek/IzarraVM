@@ -2142,6 +2142,42 @@ impl CpuGsw {
         ((self.registers.eflags >> 12) & 3) as u8
     }
 
+    /// Which of Intel's four I/O privilege columns the NEXT `IN`/`OUT` executes in
+    /// (`crate::PortIoPrivMode`). Derived live, once per port access, from exactly the three bits
+    /// `check_io_permission` derives its own early return from -- CR0.PE, EFLAGS.VM and
+    /// `cpl <= iopl` -- so the column that pays for a bitmap consult is by construction the
+    /// column that performs one.
+    ///
+    /// NOT resolvable at JIT compile time, which is why every port charge in the tree is applied
+    /// at the call-out and never baked into a block's `raw_clocks`: `jit_mode_key` carries CR0.PE
+    /// and EFLAGS.VM (bits 1 and 2), so it separates `Real` / `V86` / protected -- but it carries
+    /// neither CPL nor IOPL, so a protected block admitted under one mode key spans both
+    /// `ProtectedPrivileged` and `ProtectedUnprivileged` and the two differ by 17 clocks on `OUT`.
+    /// The call-out sites already return their charge as a runtime `i64`, so this costs nothing
+    /// beyond the three loads.
+    pub(crate) fn port_io_priv_mode(&self) -> crate::PortIoPrivMode {
+        if self.is_v86_mode() {
+            crate::PortIoPrivMode::V86
+        } else if !self.is_protected_mode() {
+            crate::PortIoPrivMode::Real
+        } else if self.cpl <= self.iopl() {
+            crate::PortIoPrivMode::ProtectedPrivileged
+        } else {
+            crate::PortIoPrivMode::ProtectedUnprivileged
+        }
+    }
+
+    /// The core-clock charge for one `IN` (`is_out` false) or `OUT` (true) in the CPU's current
+    /// privilege column, under the bus's own guest-clock model epoch. The single seam between
+    /// `crate::port_core_clocks`'s table and every charging site.
+    pub(crate) fn port_io_core_clocks<B: izarravm_bus::CpuBus>(
+        &self,
+        bus: &B,
+        is_out: bool,
+    ) -> u32 {
+        crate::port_core_clocks(bus.timing_epoch(), is_out, self.port_io_priv_mode())
+    }
+
     /// IOPL-sensitive instructions (CLI, STI, PUSHF/POPF, INT n) fault to the monitor
     /// inside a V86 task when IOPL is below 3.
     pub(super) fn check_v86_iopl(&self) -> ExecResult<()> {
