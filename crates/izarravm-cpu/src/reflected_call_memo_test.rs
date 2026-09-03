@@ -2673,3 +2673,43 @@ fn two_writes_to_one_dword_are_both_replayed() {
     // clobber it.
     assert_eq!(obs.mask & 0x0000_FF00, 0);
 }
+
+/// R2.3's PINNED requirement is per BYTE, not per dword: a trip that reads the HIGH half
+/// of a dword and writes the LOW half has not pinned what it wrote, so its write may not
+/// be classified Class R and skipped.
+///
+/// **Mutation bite**: test dword MEMBERSHIP (`reads.contains_key(&dword)`) instead of mask
+/// coverage. That is the shipped shape, and the fixture-scale AUDIT is what named it: on
+/// `tyrian-specs-586` (2026-09-03) it left exactly one divergent address per dominant key
+/// -- `0x1a3ea4` on `INT 33h`, 54,988 of 55,188 audits, and `0x127150` on `AH=0Bh`, 60,243
+/// of 60,243 -- while the epilogue, the core clocks, the instruction count and the bus
+/// total all agreed exactly.
+#[test]
+fn a_write_whose_bytes_the_trip_never_read_is_not_pinned() {
+    const CELL: u32 = 0x7800;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let mut open = test_open_trip(&cpu);
+    open.journaling = true;
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+
+    bus.write_raw(CELL, BusWidth::Dword, 0xAABB_CCDD);
+    // Read the HIGH word, write the LOW word -- and restore it, so `restored` is true and
+    // only the pinned test can keep this out of Class R.
+    note_read(&mut cpu, &bus, CELL + 2, BusWidth::Word);
+    note_write(&mut cpu, &bus, CELL, BusWidth::Word, 0xCCDD, false, None);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    let open = state.open.as_ref().unwrap();
+    let obs = open.writes.get(&CELL).expect("the write is journaled");
+    assert_eq!(obs.mask, 0x0000_FFFF, "the write covers the low word");
+    assert!(
+        !write_is_pinned(open, CELL, obs.mask),
+        "the read set covers the HIGH word only, so the written bytes are not pinned"
+    );
+
+    // Reading the low half too pins it.
+    let mut open2 = open.clone();
+    open2.reads.insert(CELL, (0xAABB_CCDD, u32::MAX));
+    assert!(write_is_pinned(&open2, CELL, obs.mask));
+}

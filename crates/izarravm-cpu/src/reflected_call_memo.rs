@@ -957,7 +957,7 @@ pub(crate) struct KeyState {
     read_set_offenders: Vec<(u32, u32, u32, u64)>,
     /// The same dump for the AUDIT's write formula: the cell whose predicted final value
     /// disagreed with the observed one, what was predicted, what was found.
-    audit_offenders: Vec<(u32, u32, u32, u64)>,
+    audit_offenders: Vec<(u32, u32, u32, u64, u32)>,
     pub write_class_r_pinned: u64,
     pub write_class_r_unpinned: u64,
     pub write_class_d: u64,
@@ -971,15 +971,27 @@ pub(crate) struct KeyState {
 const MEMO_READ_SET_OFFENDERS_TRACKED: usize = 8;
 
 impl KeyState {
-    fn note_audit_offender(&mut self, (phys, predicted, observed): (u32, u32, u32)) {
+    /// `provenance` says WHERE the offending dword came from, which is the one bit that
+    /// separates the two live hypotheses for a write-value divergence: bit 0, the memo
+    /// REPLAYS this dword (so a stale replay value is being written over live state); bit
+    /// 1, the audited trip's own journal saw a write to it (so the trip really does write
+    /// it and the memo's classification is what is wrong). Neither bit set means the dword
+    /// reached the comparison from the replay set alone with no live write behind it.
+    fn note_audit_offender(
+        &mut self,
+        (phys, predicted, observed): (u32, u32, u32),
+        provenance: u32,
+    ) {
         if let Some(entry) = self.audit_offenders.iter_mut().find(|e| e.0 == phys) {
             entry.1 = predicted;
             entry.2 = observed;
             entry.3 += 1;
+            entry.4 |= provenance;
             return;
         }
         if self.audit_offenders.len() < MEMO_READ_SET_OFFENDERS_TRACKED {
-            self.audit_offenders.push((phys, predicted, observed, 1));
+            self.audit_offenders
+                .push((phys, predicted, observed, 1, provenance));
         }
     }
 
@@ -2498,7 +2510,9 @@ fn finish_audit<B: CpuBus>(
             .as_mut()
             .and_then(|state| state.keys.get_mut(&key))
     {
-        key_state.note_audit_offender(cell);
+        let provenance = u32::from(memo.replay.iter().any(|&(a, _, _)| a == cell.0))
+            | (u32::from(open.writes.contains_key(&cell.0)) << 1);
+        key_state.note_audit_offender(cell, provenance);
     }
     record_audit(cpu, key, &mismatches, bus_delta);
 }
@@ -2667,6 +2681,32 @@ fn compare_journal(
     Ok(())
 }
 
+/// R2.3's PINNED requirement, at the granularity the write actually has.
+///
+/// A write may be Class R -- skipped, because the trip restored what was there -- only if
+/// the trip's own read set covers EVERY BYTE it wrote. The read set is what the answer's
+/// screen compares, so a byte the trip wrote but never read is a byte the screen cannot
+/// vouch for: at answer time it may hold something else, the real trip would overwrite it,
+/// and skipping the write diverges with nothing able to catch it (finding 3).
+///
+/// **Per byte, not per dword.** Both sets are keyed by aligned dword and both carry a byte
+/// MASK, and testing mere dword MEMBERSHIP admits exactly the case the fixture-scale audit
+/// caught on `tyrian-specs-586` (2026-09-03): a trip that reads the high half of a dword
+/// and writes the low half was called pinned, classified R and skipped, while the low half
+/// varied freely underneath the screen. It was the whole of the remaining divergence --
+/// one address per dominant key, `0x1a3ea4` on `INT 33h` (54,988 of 55,188 audits) and
+/// `0x127150` on `AH=0Bh` (60,243 of 60,243) -- with the epilogue, the core clocks, the
+/// instruction count and the bus total all agreeing exactly.
+fn write_is_pinned(open: &OpenTrip, dword: u32, write_mask: u32) -> bool {
+    let read_mask = open
+        .reads
+        .get(&dword)
+        .or_else(|| open.translations.get(&dword))
+        .map(|&(_, mask)| mask)
+        .unwrap_or(0);
+    read_mask & write_mask == write_mask
+}
+
 /// JournalB's classification, carried forward to Natural-sample completion so a `Memo` can be
 /// built (plan section 3) once the raw-clock samples confirm the trip is worth memoising.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2764,15 +2804,11 @@ fn build_confirmed<B: CpuBus>(
         {
             continue; // Class D: skip, recorded nowhere.
         }
-        // Class R (restored), with R2.3's PINNED requirement: the trip's own read set must
-        // cover this dword -- i.e. the trip READ it before writing it -- and the bytes it
-        // wrote must hold what they held before. `note_read` already excludes a cell the
-        // trip wrote FIRST, so membership in `reads` IS "read before written".
-        //
-        // A coincidental restoration the trip never read is NOT Class R (finding 3): at
-        // answer time the address may hold something else, the real trip would overwrite
-        // it, and skipping the write diverges with nothing in the read set to catch it.
-        let pinned = open.reads.contains_key(&dword) || open.translations.contains_key(&dword);
+        // Class R (restored): every byte written must be covered by the read set (see
+        // `write_is_pinned`) AND must hold what it held before. `note_read` already
+        // excludes a cell the trip wrote FIRST, so read-set coverage IS "read before
+        // written".
+        let pinned = write_is_pinned(open, dword, obs.mask);
         let restored = obs
             .pre_dword
             .is_some_and(|pre| (pre ^ obs.latest_dword) & obs.mask == 0);
@@ -2887,7 +2923,7 @@ fn tally_write_classes(key_state: &mut KeyState, open: &OpenTrip, writes: &HashM
             key_state.write_class_d += 1;
             continue;
         }
-        let pinned = open.reads.contains_key(dword) || open.translations.contains_key(dword);
+        let pinned = write_is_pinned(open, *dword, obs.mask);
         let restored = obs
             .pre_dword
             .is_some_and(|pre| (pre ^ obs.latest_dword) & obs.mask == 0);
@@ -3128,13 +3164,13 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         }
         out.push_str("],\"audit_offenders\":[");
         let mut afirst2 = true;
-        for (phys, predicted, observed, hits) in &ks.audit_offenders {
+        for (phys, predicted, observed, hits, provenance) in &ks.audit_offenders {
             if !afirst2 {
                 out.push(',');
             }
             afirst2 = false;
             out.push_str(&format!(
-                "{{\"phys\":{phys},\"predicted\":{predicted},\"observed\":{observed},\"hits\":{hits}}}"
+                "{{\"phys\":{phys},\"predicted\":{predicted},\"observed\":{observed},\"hits\":{hits},\"provenance\":{provenance}}}"
             ));
         }
         out.push_str("]}");
