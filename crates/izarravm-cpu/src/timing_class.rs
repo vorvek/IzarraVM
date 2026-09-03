@@ -206,7 +206,14 @@ macro_rules! timing_classes {
 
         /// The epoch-1 column: today's literal for every class, for every
         /// persona. This array IS the byte-identity proof -- see the module docs.
-        pub(crate) static EPOCH1: ClassTable = ClassTable(EPOCH1_ENTRIES);
+        pub(crate) static EPOCH1: ClassTable = EPOCH1_CONST;
+
+        /// A `const` twin of [`EPOCH1`], for compile-time tripwires.
+        ///
+        /// Callers that need a stable ADDRESS take `&EPOCH1`; callers that need
+        /// to evaluate at compile time take this, because a `const` may not read
+        /// a `static`. The two are the same array by construction.
+        pub(crate) const EPOCH1_CONST: ClassTable = ClassTable(EPOCH1_ENTRIES);
 
         /// `EPOCH1`'s array as a `const`, so the tripwire block below it can be
         /// evaluated at compile time: a `const` may not read a `static`, and

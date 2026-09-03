@@ -19288,7 +19288,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     } = input;
     let full_accounting = StaticAccounting {
         instructions: span.instructions,
-        raw_clocks: raw_clocks as u16,
+        raw_clocks,
         byte_reads,
         word_reads,
         dword_reads,
@@ -21590,7 +21590,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     emit_store_homes(&mut e);
     emit_return(&mut e);
     debug_assert_eq!(usize::from(completed.instructions), slots.len());
-    debug_assert_eq!(u32::from(completed.raw_clocks), raw_clocks);
+    debug_assert_eq!(completed.raw_clocks, raw_clocks);
     debug_assert_eq!(completed.weighted_fp_clocks, weighted_fp_clocks);
     debug_assert_eq!(completed.byte_reads, byte_reads);
     debug_assert_eq!(completed.word_reads, word_reads);
@@ -21656,7 +21656,7 @@ fn emit_accounting(
 fn accounting_fields(accounting: StaticAccounting) -> [(i8, u32); 7] {
     [
         (STACK_INSTRUCTIONS, u32::from(accounting.instructions)),
-        (STACK_RAW_CLOCKS, u32::from(accounting.raw_clocks)),
+        (STACK_RAW_CLOCKS, accounting.raw_clocks),
         (STACK_BYTE_READS, u32::from(accounting.byte_reads)),
         (STACK_DWORD_READS, u32::from(accounting.dword_reads)),
         (STACK_WEIGHTED_FP_CLOCKS, accounting.weighted_fp_clocks),
@@ -22152,7 +22152,21 @@ fn emit_completed_dynamic_path(
 #[derive(Clone, Copy, Default)]
 struct StaticAccounting {
     instructions: u8,
-    raw_clocks: u16,
+    /// `u32`, not `u16`, since slice 1d (review B4.2).
+    ///
+    /// This accumulator used to be a `u16` fed by `slot.kind.raw_clocks() as u16`
+    /// -- a TRUNCATING cast -- and an unchecked `+=` that panics in debug and
+    /// wraps in release. At epoch 1 the widest slot charge is 17 and 32 of them
+    /// cannot overflow a byte and a half; at epoch 2 a single class reaches
+    /// 24,000 (`WBINVD`), so the pair was a latent wrap. `u32` makes the sum
+    /// unreachable rather than merely checked: 32 slots at the table's widest
+    /// entry is under 800,000 against a `u32`'s four billion, and `emit` has no
+    /// refusal path to take if it were not.
+    ///
+    /// `accounting_fields` already hands these to the encoder as `u32`, and
+    /// `CompiledBlock::raw_clocks` keeps its own `u16` with the refusal at
+    /// `compile`'s install site, so nothing downstream widens with it.
+    raw_clocks: u32,
     byte_reads: u8,
     word_reads: u8,
     dword_reads: u8,
@@ -22165,7 +22179,14 @@ struct StaticAccounting {
 impl StaticAccounting {
     fn retire(&mut self, slot: &DirectInsn, table: &ClassTable) {
         self.instructions += 1;
-        self.raw_clocks += slot.kind.raw_clocks(table) as u16;
+        // `saturating_add` and not `+=`: the `u32` above makes saturation
+        // unreachable for any block the compile walk can build, and this is the
+        // shape that stays correct if a later slice raises either bound.
+        self.raw_clocks = self.raw_clocks.saturating_add(slot.kind.raw_clocks(table));
+        debug_assert!(
+            self.raw_clocks < u32::MAX,
+            "static accounting saturated: a block's raw clocks no longer fit u32"
+        );
         self.weighted_fp_clocks += slot.weighted_fp_clocks;
         self.byte_reads += slot.kind.byte_reads();
         self.word_reads += slot.kind.word_reads();
@@ -32330,7 +32351,10 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 fn emit_call_out(
     e: &mut Encoder,
     helper: CallOutHelper,
-    static_prefix_raw: u16,
+    // `u32` since slice 1d, with `StaticAccounting::raw_clocks` (review B4.2):
+    // this is that accumulator's value for the slots before the call-out, and the
+    // two must not disagree about width.
+    static_prefix_raw: u32,
     abnormal: Label,
     step_break: Label,
     exit_arg: Option<u64>,
@@ -32376,7 +32400,7 @@ fn emit_call_out(
     // two values across the frame adjust costs nothing.
     e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_RAW_CLOCKS);
     if static_prefix_raw != 0 {
-        e.add_r64_imm32(Reg::RAX, u32::from(static_prefix_raw));
+        e.add_r64_imm32(Reg::RAX, static_prefix_raw);
     }
     e.load_r64_disp8(Reg::RDX, Reg::RSP, STACK_WEIGHTED_FP_CLOCKS);
     e.sub_r64_imm32(Reg::RSP, CALLOUT_CALL_FRAME);

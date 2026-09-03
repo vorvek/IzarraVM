@@ -610,3 +610,59 @@ fn the_interpret_one_budget_term_covers_the_group_three_rows() {
     assert_eq!(max_at(&EPOCH2_I486), EPOCH2_I486.raw(TimingClass::Idiv32));
     assert_eq!(max_at(&EPOCH2_I486), 528);
 }
+
+/// The four width sites (review B4), checked at the values that would have
+/// truncated.
+///
+/// `DIV r/m32` is raw 492 on the 586 and 480 on the 486; `FSQRT` is raw 840.
+/// Both exceed a `u8`, and 840 exceeds it by more than three times. Before slice
+/// 1d, `jit/native_x87.rs`'s per-instruction `raw_clocks` was a `u8` and
+/// `StaticAccounting`'s accumulator was a `u16` fed by a truncating cast and an
+/// unchecked `+=`. This walks the values through every stage that used to
+/// narrow them.
+#[test]
+fn the_widest_epoch_two_charges_survive_every_stage() {
+    // Stage 1: the table itself. `u16`, so both fit with room.
+    assert_eq!(EPOCH2_I586.raw(TimingClass::Div32), 492);
+    assert_eq!(EPOCH2_I486.raw(TimingClass::Div32), 480);
+    assert_eq!(EPOCH2_I586.raw(TimingClass::X87Sqrt), 840);
+    assert_eq!(EPOCH2_I486.raw(TimingClass::X87Sqrt), 840);
+    for class in [TimingClass::Div32, TimingClass::X87Sqrt] {
+        for (name, table) in [("I486", &EPOCH2_I486), ("I586", &EPOCH2_I586)] {
+            assert!(
+                table.raw(class) > u32::from(u8::MAX),
+                "{name} {} would have fitted a u8, so this test proves nothing",
+                class.name()
+            );
+        }
+    }
+
+    // Stage 2: a full block of the widest class the JIT can lower natively.
+    // `CompiledBlock::raw_clocks` is still a `u16` and still refuses rather than
+    // truncating, so the worst native block has to fit it.
+    let worst_native = EPOCH2_I586.raw(TimingClass::Idiv32);
+    let worst_block = worst_native * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u32;
+    assert!(
+        worst_block <= u32::from(u16::MAX),
+        "a full block of the widest native class ({worst_native} raw x \
+         {} slots = {worst_block}) no longer fits the block sum's u16; either the sum widens \
+         or the install refusal becomes reachable on ordinary code",
+        crate::jit::direct::MAX_BLOCK_INSTRUCTIONS
+    );
+
+    // Stage 3: the static accounting accumulator, now u32. The widest entry in
+    // the table is `WBINVD`'s printed floor, which is not a native slot but is
+    // the number the accumulator has to be safe against if one ever is.
+    let widest = EPOCH2_I586.max_raw();
+    assert_eq!(widest, EPOCH2_I586.raw(TimingClass::Wbinvd));
+    let worst_accumulation = u64::from(widest) * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u64;
+    assert!(
+        worst_accumulation <= u64::from(u32::MAX),
+        "the static accounting accumulator would saturate at {worst_accumulation}"
+    );
+    assert!(
+        worst_accumulation > u64::from(u16::MAX),
+        "the u16 this accumulator used to be would have WRAPPED at {worst_accumulation}, which \
+         is the defect slice 1d fixed; if this stops being true the test is no longer a proof"
+    );
+}

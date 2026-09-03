@@ -330,7 +330,16 @@ pub(crate) struct NativeX87MemoryAccess {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeX87Metadata {
-    pub(crate) raw_clocks: u8,
+    /// The instruction's raw core clocks before `fp_timing_class`'s scaling.
+    ///
+    /// `u16`, not `u8`, since slice 1d (review B4.1). The widest epoch-1 literal
+    /// here is 70 (`FSQRT`), which fits a byte; every epoch-2 x87 charge is that
+    /// count times twelve -- `FSQRT` alone is raw 840 -- so the byte overflows
+    /// the moment this table is driven from the class table. Widening it ahead of
+    /// that is free: the field is read as `u64` one line below, and
+    /// `MAX_X87_BLOCK_CORE_CLOCKS`'s compile-time dominance check re-derives
+    /// itself from this table rather than from the field's width.
+    pub(crate) raw_clocks: u16,
     pub(crate) fp_class: FpOpClass,
     pub(crate) memory: Option<NativeX87MemoryAccess>,
     pub(crate) pops: bool,

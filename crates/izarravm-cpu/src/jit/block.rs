@@ -46,6 +46,65 @@ use super::step::Slot;
 /// (that path never reaches native codegen).
 const MEMORY_POLL_RAW_CORE_CLOCKS: u64 = 5;
 
+/// The four poll-shape per-iteration charges, RE-DERIVED from the running
+/// persona-and-epoch class table instead of hand-summed (review B4.4).
+///
+/// A skipped poll iteration must charge what a really-run one charges, or the
+/// projection lane and the interpreter disagree about how much guest time an
+/// elided span consumed. The four literals these replace -- 17, 21, 28 and 5 --
+/// were correct sums of the epoch-1 charges and could not follow the table, so
+/// under epoch 2 a skipped `IN AL,DX` poll would have cost 17 raw where a run
+/// one costs 168.
+///
+/// Each function names the exact instruction sequence its shape matches; the
+/// structural predicates above are what guarantee the sequence.
+mod poll_clocks {
+    use crate::timing_class::{ClassTable, TimingClass};
+
+    /// `IN AL, DX` + `TEST AL, imm8` + `Jcc rel8`. Epoch 1: 12 + 2 + 3 = 17.
+    pub(super) const fn io_three_slot(table: &ClassTable) -> u64 {
+        table.raw(TimingClass::InPort) as u64
+            + table.raw(TimingClass::TestImmReg) as u64
+            + table.raw(TimingClass::Jcc) as u64
+    }
+
+    /// `MOV r/m32, r32` + `SUB r32, r32` + `IN AL, DX` + `TEST` + `Jcc`.
+    /// Epoch 1: 2 + 2 + 12 + 2 + 3 = 21.
+    pub(super) const fn io_five_slot(table: &ClassTable) -> u64 {
+        table.raw(TimingClass::MovMemReg) as u64
+            + table.raw(TimingClass::Reg) as u64
+            + io_three_slot(table)
+    }
+
+    /// The five-slot shape plus the paired `JMP rel`. Epoch 1: 21 + 7 = 28.
+    pub(super) const fn io_six_slot(table: &ClassTable) -> u64 {
+        io_five_slot(table) + table.raw(TimingClass::CallJmpRel) as u64
+    }
+
+    /// `CMP m, imm` + `Jcc rel8`. Epoch 1: 2 + 3 = 5, which is
+    /// `MEMORY_POLL_RAW_CORE_CLOCKS`. The memory-operand `CMP` writes nothing
+    /// back, so it is Intel's load form and not a read/modify/write -- the same
+    /// split `alu_class` and `DirectKind::timing_class` make.
+    pub(super) const fn memory(table: &ClassTable) -> u64 {
+        table.raw(TimingClass::AluRegMem) as u64 + table.raw(TimingClass::Jcc) as u64
+    }
+}
+
+/// The four hand-summed poll literals, kept as COMPILE-TIME tripwires.
+///
+/// 17, 21, 28 and `MEMORY_POLL_RAW_CORE_CLOCKS` were the shipped values, pinned
+/// by the machine-side state-and-timing identity tests. The derivations above
+/// have to reproduce them exactly at epoch 1 or the poll-skip projection stops
+/// matching a really-run span, so the equality is asserted at build time rather
+/// than left to a test that a `#[cfg]` could skip.
+const _: () = {
+    use crate::timing_class::EPOCH1_CONST;
+    assert!(poll_clocks::io_three_slot(&EPOCH1_CONST) == 17);
+    assert!(poll_clocks::io_five_slot(&EPOCH1_CONST) == 21);
+    assert!(poll_clocks::io_six_slot(&EPOCH1_CONST) == 28);
+    assert!(poll_clocks::memory(&EPOCH1_CONST) == MEMORY_POLL_RAW_CORE_CLOCKS);
+};
+
 /// Cap on a built block's slot count, to bound the scan. A block that reaches the cap ends
 /// linearly (its tail is interpreted); the poll shapes the scanner looks for are far smaller.
 const MAX_BLOCK_SLOTS: usize = 128;
@@ -487,7 +546,7 @@ fn build_poll_loop_at(
             status_mask: mask,
             mask_source,
             branch_when_zero,
-            raw_core_clocks: 17,
+            raw_core_clocks: poll_clocks::io_three_slot(cpu.class_table()),
             at_head: current == entry,
             memory: None,
         });
@@ -541,7 +600,7 @@ fn build_poll_loop_at(
             status_mask: 0,
             mask_source: PollMaskSource::Immediate(0),
             branch_when_zero: false,
-            raw_core_clocks: MEMORY_POLL_RAW_CORE_CLOCKS,
+            raw_core_clocks: poll_clocks::memory(cpu.class_table()),
             at_head: current == entry,
             memory: Some(PollMemoryFields {
                 linear,
@@ -604,7 +663,7 @@ fn build_poll_loop_at(
             status_mask: mask,
             mask_source: PollMaskSource::Immediate(mask),
             branch_when_zero,
-            raw_core_clocks: 21,
+            raw_core_clocks: poll_clocks::io_five_slot(cpu.class_table()),
             at_head: current == entry,
             memory: None,
         });
@@ -653,7 +712,7 @@ fn build_poll_loop_at(
         status_mask: mask,
         mask_source: PollMaskSource::Immediate(mask),
         branch_when_zero,
-        raw_core_clocks: 28,
+        raw_core_clocks: poll_clocks::io_six_slot(cpu.class_table()),
         at_head: current == entry,
         memory: None,
     })
