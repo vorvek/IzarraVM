@@ -2424,6 +2424,13 @@ impl Machine {
         self.vega.mode_census()
     }
 
+    /// Text rows the legacy VGA path has actually rendered, whole run. Flat
+    /// while a Voodoo-style device owns the monitor cable -- see
+    /// `Vga::text_rows_rendered`.
+    pub fn vga_text_rows_rendered(&self) -> u64 {
+        self.vega.vga_text_rows_rendered()
+    }
+
     /// Every frame size the guest gave Distira, against its count. An empty
     /// census means the guest never reached the 3D unit.
     pub fn distira_census(&self) -> &DistiraCensus {

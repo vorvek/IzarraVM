@@ -124,6 +124,16 @@ pub struct Vga {
     pub(crate) beam: u64,
     pub(crate) last_line: u32,
     pub(crate) frames: u64,
+    /// True while a Voodoo-style device owns the monitor cable this tick, set
+    /// each call by `advance_cable_aware`. Gates the per-pixel render work in
+    /// `finalize_frame`/`catch_up` only -- it never touches beam timing, the
+    /// frame counter above, or any guest-visible register.
+    pub(crate) skip_render: bool,
+    /// Text rows actually rendered by `render_scanline`'s `VideoMode::Text`
+    /// arm. A diagnostic counter, not gameplay state: it is what makes "zero
+    /// rows rendered while the cable is elsewhere" a checkable fact instead of
+    /// an assertion about wall time.
+    pub(crate) text_rows_rendered: u64,
     pub(crate) work: Vec<u8>,
     pub(crate) presented: Option<VgaRaster>,
     pub(crate) pending_start: Option<u32>,
@@ -203,6 +213,8 @@ impl Default for Vga {
             beam: 0,
             last_line: 0,
             frames: 0,
+            skip_render: false,
+            text_rows_rendered: 0,
             work: Vec::new(),
             presented: None,
             pending_start: None,
@@ -2692,6 +2704,14 @@ impl Vga {
     /// Every geometry this guest programmed, against its count.
     pub fn mode_census(&self) -> &ModeCensus {
         &self.mode_census
+    }
+
+    /// Text rows rendered so far by `render_scanline`'s text-mode arm. Stays
+    /// flat while a Voodoo-style device owns the monitor cable
+    /// (`advance_cable_aware(_, true)`), because that raster is elided --
+    /// nobody will ever scan it out.
+    pub fn text_rows_rendered(&self) -> u64 {
+        self.text_rows_rendered
     }
 
     /// True only in a text mode. Text adds time-based cursor/attribute blink with

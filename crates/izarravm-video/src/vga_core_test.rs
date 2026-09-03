@@ -858,3 +858,96 @@ fn both_vga_direct_page_backings_are_page_aligned() {
         "mode13_linear (chained 13h path)"
     );
 }
+
+/// Slice 0 of the "skip the VGA's per-frame render while a Voodoo owns the
+/// cable" lever (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md`, lever
+/// C): `advance_cable_aware(_, true)` must render zero rows, and it must do
+/// so without touching beam timing at all -- the frame counter blink derives
+/// from and the retrace bits the guest polls are pure beam-position geometry,
+/// computed independently of whether `finalize_frame` painted anything.
+#[test]
+fn cable_ownership_elides_render_without_touching_beam_timing() {
+    let mut shown = Vga::default();
+    let mut hidden = Vga::default();
+    let dots_per_frame = shown.frame_dots();
+    assert_eq!(dots_per_frame, hidden.frame_dots());
+
+    for _ in 0..3 {
+        shown.advance(dots_per_frame);
+        hidden.advance_cable_aware(dots_per_frame, true);
+    }
+
+    assert_eq!(
+        shown.frames, hidden.frames,
+        "the frame counter (blink phase) advances identically either way"
+    );
+    assert_eq!(
+        shown.beam, hidden.beam,
+        "the beam position advances identically either way"
+    );
+    assert!(
+        shown.text_rows_rendered() > 0,
+        "sanity: the non-skipping VGA actually rendered rows over three frames"
+    );
+    assert_eq!(
+        hidden.text_rows_rendered(),
+        0,
+        "the cable-elsewhere VGA renders zero rows over the same three frames"
+    );
+    // status1_bits (the CRTC vertical-retrace status the guest polls at 0x3DA)
+    // is a pure function of the CRTC timing and a beam position -- never of
+    // `work` or `presented` -- so it must read identically at every phase of
+    // the frame regardless of whether the cable is elsewhere.
+    for beam in [
+        0u64,
+        dots_per_frame / 4,
+        dots_per_frame / 2,
+        dots_per_frame - 1,
+    ] {
+        assert_eq!(
+            shown.status1_bits(beam),
+            hidden.status1_bits(beam),
+            "retrace status bits must not depend on cable ownership (beam {beam})"
+        );
+    }
+}
+
+/// Slice 0, second half: switching the cable back to the VGA must present
+/// exactly the frame a VGA that was never skipped would have presented. The
+/// mechanism this pins is `finalize_frame`'s "`last_line` always resets to 0"
+/// invariant -- the first non-skipped frame after any number of skipped ones
+/// always renders every line from scratch against current register state, so
+/// nothing is ever presented stale.
+#[test]
+fn switch_back_frame_matches_a_non_skipping_vga_exactly() {
+    let mut control = Vga::default();
+    let mut test = Vga::default();
+    let dots_per_frame = control.frame_dots();
+
+    // Baseline: three ordinary frames, cable on the VGA throughout.
+    for _ in 0..3 {
+        control.advance(dots_per_frame);
+    }
+    let baseline = control
+        .last_presented()
+        .cloned()
+        .expect("control published");
+
+    // Same three frames, but the Voodoo owns the cable for the first two --
+    // nothing is published while it does.
+    test.advance_cable_aware(dots_per_frame, true);
+    test.advance_cable_aware(dots_per_frame, true);
+    assert!(
+        test.last_presented().is_none(),
+        "no raster is published while the cable is elsewhere"
+    );
+    // Cable switches back for the third frame.
+    test.advance_cable_aware(dots_per_frame, false);
+    let switch_back = test.last_presented().cloned().expect("test published");
+
+    assert_eq!(
+        switch_back, baseline,
+        "the first presented frame after switch-back equals what a \
+         non-skipping VGA would have presented"
+    );
+}
