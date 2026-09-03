@@ -88,6 +88,12 @@ reflected-call-diagnostic = ["jit"]
 # `shadow_probe_should_sample_entry` CpuBus method it needs from izarravm-bus.
 # NOT in `default`.
 shadow-cache-probe = ["jit", "izarravm-bus/shadow-cache-probe"]
+# Slice 1 of the reflected-call HLE design (`dev_docs/2026-09-04-reflected-call-slice1-plan.md`):
+# the record-and-measure memo. Fable review 2026-09-03: gate the whole module under this
+# feature (not merely the runtime knob) so a plain build carries none of it -- byte-identical
+# `CpuGsw` layout and binary to a plain `main` build. `IZARRAVM_REFLECTED_CALL_MEMO` arms it
+# only when this feature is compiled in.
+reflected-call-memo = ["jit"]
 
 [dependencies]
 thiserror.workspace = true

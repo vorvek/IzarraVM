@@ -27,6 +27,8 @@ impl CpuGsw {
         // state) but conservative in the direction that matters for a census.
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::on_x87();
+        #[cfg(feature = "reflected-call-memo")]
+        crate::reflected_call_memo::note_x87(self);
         let opcode = insn.opcode as u8;
         if opcode == 0x9b {
             // WAIT checks task switching only when CR0.MP requests that behavior.

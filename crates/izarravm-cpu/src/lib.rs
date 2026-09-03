@@ -51,12 +51,18 @@ pub use jit::direct::{
 pub use jit::unit_sim::SimReport;
 mod memory;
 mod paging;
+#[cfg(any(feature = "reflected-call-diagnostic", feature = "reflected-call-memo"))]
+mod reflected_call;
 #[cfg(feature = "reflected-call-diagnostic")]
 mod reflected_call_diag;
 #[cfg(feature = "reflected-call-diagnostic")]
 pub use reflected_call_diag::{
     KeyReport, ReflectedCallDiagnosticSnapshot, StatSummary, on_batch_boundary,
 };
+#[cfg(feature = "reflected-call-memo")]
+pub mod reflected_call_memo;
+#[cfg(feature = "reflected-call-memo")]
+pub use reflected_call_memo::reflected_call_memo_json;
 mod run;
 mod smc_trace;
 mod strings;
@@ -3081,6 +3087,23 @@ pub struct CpuGsw {
     /// duke3d-486, and this instrument's disarm was gated on an interleaved A/B/B/A before the
     /// behavioural steps that consume it were allowed to land.
     slot_census_enabled: bool,
+    /// Slice1's reflected-call memo journal gate (`dev_docs/2026-09-04-reflected-call-
+    /// slice1-plan.md` Revision 2, section 7.1 / decision 13.3 reversed): a SEPARATE bool from
+    /// `rmw_census_enabled` above, on purpose -- folding it into that gate's recompute would be a
+    /// correctness trap (Revision 2's re-review item 14: a missed recompute on a fold drops
+    /// journal entries silently, which makes a learned memo unsound rather than merely inert).
+    /// One never-taken branch per journal seam when the knob is off, same shape as
+    /// `rmw_census_enabled`. Gated under `feature = "reflected-call-memo"` (Fable review,
+    /// 2026-09-03: the module must be `cfg`-gated like `reflected_call_diag`, not merely
+    /// knob-gated, so the plain build's `CpuGsw` layout and binary are byte-identical to a
+    /// plain `main` build with neither field present at all).
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) reflected_call_journal: bool,
+    /// The reflected-call memo's own state, lazily boxed on the first armed `INT` and `None` for
+    /// the whole run when `IZARRAVM_REFLECTED_CALL_MEMO` is unset/off (plan section 2: "one
+    /// pointer of growth"). `cfg`-gated as of the Fable review above.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) reflected_call: Option<Box<crate::reflected_call_memo::ReflectedCallMemoState>>,
     /// The hoisted per-retire diagnostic gates; see `RetireGates`. At the `CpuGsw` tail for the
     /// layout reason every field around it carries: it must not move `pending_flags` off its
     /// pinned offset.
@@ -3194,6 +3217,11 @@ impl Default for CpuGsw {
             last_written_page: NO_LAST_WRITTEN_PAGE,
             rmw_census_enabled: rmw_census_default(),
             slot_census_enabled: slot_census_default(),
+            #[cfg(feature = "reflected-call-memo")]
+            reflected_call_journal: false,
+            #[cfg(feature = "reflected-call-memo")]
+            reflected_call: crate::reflected_call_memo::armed_at_construction()
+                .then(|| Box::new(crate::reflected_call_memo::ReflectedCallMemoState::default())),
             retire_gates: RetireGates {
                 diff_trace: crate::run::diff_trace_enabled(),
                 // Seeded from the state it mirrors rather than from `barrier_census_default()`

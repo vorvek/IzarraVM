@@ -29,6 +29,9 @@ reflected-call-diagnostic = ["izarravm-cpu/reflected-call-diagnostic"]
 # see shadow_cache.rs (the off-feature module, verbatim pre-S1a) vs
 # shadow_cache_probe.rs (the on-feature module) in lib.rs's cfg'd `mod` pair.
 shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-bus/shadow-cache-probe"]
+# Passthrough only (izarravm-machine has no hook of its own for slice 1, unlike
+# reflected-call-diagnostic's batch-straddle counter); kept for CI symmetry.
+reflected-call-memo = ["izarravm-cpu/reflected-call-memo"]
 
 [dependencies]
 thiserror.workspace = true
