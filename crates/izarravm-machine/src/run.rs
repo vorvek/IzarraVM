@@ -895,6 +895,79 @@ impl Machine {
         }
     }
 
+    /// Slice 9C-pre: the primary-channel (fixed-disk) analogue of
+    /// `actuate_ata_poll_skip`, above -- same shape, same seam, a SEPARATE
+    /// armed flag and counter set so this stays entirely independent of the
+    /// shipped ATAPI mechanism (no shared mutable state, no risk of
+    /// interference either way).
+    ///
+    /// Reuses `next_device_edge_ticks()` unmodified: it already chains
+    /// `next_ata_deadline()` ungated, which folds `self.ata`, `bmide` and
+    /// `self.ide` together (see that function's doc comment), so a skip armed
+    /// by the primary channel cannot outrun the secondary's boundary or a DMA
+    /// transfer's, exactly as the ATAPI skip cannot outrun the primary's.
+    /// Reuses `stall_for_master_ticks` to commit: the same whole-machine
+    /// advance `stall_for_hdd_sectors_cached` uses for the INT 13h path, so
+    /// every device -- including `self.ata` itself -- advances in lockstep
+    /// with the master clock the skip moves.
+    ///
+    /// A reduced mechanism relative to the ATAPI one BY DESIGN, not by
+    /// oversight: no interactive "slice too short" pre-arm mitigation (§12 of
+    /// the ATAPI test file) and no `monitor_exempt` counter, because this
+    /// whole path is dark unless `DeviceTimingProfile::ata` is armed, and
+    /// nothing yet arms it in production. Reopen both if 9C ships a real
+    /// non-zero `ata::COMMAND_LATENCY_TICKS` and the interactive path shows
+    /// the same waste the ATAPI confirmation run found.
+    pub(crate) fn actuate_ata_hdd_poll_skip(&mut self, deadline_ticks: u64, halted: bool) {
+        let armed = std::mem::take(&mut self.ata_hdd_poll_skip_armed);
+        if !armed || halted {
+            return;
+        }
+        let Some(ata_ticks) = self
+            .ata
+            .as_ref()
+            .and_then(ata::AtaDisk::ticks_until_completion)
+        else {
+            // THE MANDATORY ATA PRECONDITION, same rationale as the ATAPI
+            // actuation: with no command pending, `next_device_edge_ticks`'s
+            // `min` falls through to an unrelated edge and stalling there
+            // would grant the guest that whole span with the drive READY.
+            return;
+        };
+        // THE `min` IS DEFENCE IN DEPTH, same as the ATAPI actuation: it is
+        // provably redundant today because `next_device_edge_ticks` already
+        // chains this exact `ticks_until_completion()` call, but keeping it
+        // makes the precondition and the bound the SAME fact.
+        let device_target = self
+            .next_device_edge_ticks()
+            .map_or(ata_ticks, |edge| ata_ticks.min(edge));
+        if device_target < ata::ATA_POLL_FLOOR_TICKS {
+            // A device edge truncated it: bound to one wasted break per
+            // pending command.
+            if let Some(disk) = self.ata.as_mut() {
+                disk.block_poll_skip();
+            }
+            return;
+        }
+        let remaining = deadline_ticks.saturating_sub(self.timeline.now_ticks());
+        let ticks = device_target.min(remaining);
+        if ticks < ata::ATA_POLL_FLOOR_TICKS {
+            // The CALLER's slice ran out, not a device edge: decline and do
+            // NOT block, so the next slice re-arms after another run of reads.
+            return;
+        }
+        self.stall_for_master_ticks(ticks);
+        self.ata_hdd_poll_skip_counters.skips =
+            self.ata_hdd_poll_skip_counters.skips.saturating_add(1);
+        self.ata_hdd_poll_skip_counters.skipped_ticks = self
+            .ata_hdd_poll_skip_counters
+            .skipped_ticks
+            .saturating_add(ticks);
+        if let Some(disk) = self.ata.as_mut() {
+            disk.clear_poll_skip_block();
+        }
+    }
+
     /// Enable or disable the trace-driven unit-growth simulator on the CPU (feature `jit`,
     /// diagnostic). A no-op without feature `jit`. See `CpuGsw::set_unit_sim_enabled`.
     pub fn set_unit_sim_enabled(&mut self, on: bool) {
@@ -1362,6 +1435,13 @@ impl Machine {
             // than the much weaker "N reads eventually".
             self.ata_poll_skip_armed = false;
             self.ide.reset_alt_status_run();
+            // Slice 9C-pre: the primary-channel analogue, cleared at the same
+            // batch-entry point and for the same reason -- see the ATAPI
+            // comment above.
+            self.ata_hdd_poll_skip_armed = false;
+            if let Some(disk) = self.ata.as_mut() {
+                disk.reset_alt_status_run();
+            }
             // DO NOT ARM INTO A SLICE THAT CANNOT PAY FOR A SKIP.
             //
             // Measured on the interactive confirmation run, not modelled: the
@@ -1521,6 +1601,7 @@ impl Machine {
                     ata_poll_skip,
                     port_bus_batch_clocks,
                     port_accesses_by_class,
+                    ata_hdd_poll_skip_armed,
                     pit_observer_fine_until,
                     opl_probe,
                     shadow_l1,
@@ -1607,6 +1688,7 @@ impl Machine {
                     ata_poll_skip,
                     isa_io_clocks: port_bus_batch_clocks,
                     port_accesses_by_class,
+                    ata_hdd_poll_skip_armed,
                     pit_observer_fine_until,
                     opl_probe,
                     shadow_l1,
@@ -2031,6 +2113,7 @@ impl Machine {
                             .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
                     }
                     self.actuate_ata_poll_skip(deadline_ticks, outcome.halted);
+                    self.actuate_ata_hdd_poll_skip(deadline_ticks, outcome.halted);
                     // Keep the cached device edge across this batch only if the batch
                     // was provably quiet. Anything else could have rearmed a device:
                     // a guest port access (io_touched -- NOT a Margo blit arm, which

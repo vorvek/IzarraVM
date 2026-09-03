@@ -60,6 +60,17 @@ const COMMAND_LATENCY_TICKS: u64 = 0;
 const PIO_BYTES_PER_SECOND: u64 = 16_700_000;
 const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 
+/// Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6): the
+/// primary-channel analogue of `ide::ATA_POLL_RUN`, reusing the same value --
+/// this is a PORT, not an independent tuning. See `ide.rs`'s doc comment for
+/// the full derivation; it is not repeated here because the rationale is a
+/// property of the shared poll-skip shape, not of either channel.
+pub(crate) const ATA_POLL_RUN: u32 = 16;
+
+/// The primary-channel analogue of `ide::ATA_POLL_FLOOR_TICKS`, same value
+/// (20 us of guest time) for the same reason: see `ide.rs`.
+pub(crate) const ATA_POLL_FLOOR_TICKS: u64 = MASTER_CLOCK_HZ / 50_000;
+
 fn pio_sector_ticks() -> u64 {
     (SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(PIO_BYTES_PER_SECOND as u128) as u64
 }
@@ -246,6 +257,27 @@ pub struct AtaDisk {
     /// lookup mutates LRU order on a `&self` read path. Host-side state, and
     /// deliberately outside canonical capture — see `sector_cache`.
     cache: std::cell::RefCell<crate::sector_cache::SectorCache>,
+
+    // ------------------------------------------------------------------
+    // Slice 9C-pre: device-armed poll skip, device half. HOST BOOKKEEPING,
+    // never canonical. The shape is `ide.rs`'s `note_alt_status_read` /
+    // `poll_skip_blocked` mechanism ported to the primary channel; see that
+    // file's "Device-armed poll skip, device half" comment for the reasoning
+    // this only summarizes. The bus half (the timing-class gate, the
+    // `DeviceTimingProfile::ata` family check, and the batch-end actuation)
+    // lives in `bus.rs` / `run.rs`, gated OFF by default so this whole
+    // mechanism is dark while `IZARRAVM_DEVICE_TIMING` leaves `ata` unarmed.
+    // ------------------------------------------------------------------
+    /// Consecutive alt-status reads seen inside the current CPU batch.
+    alt_status_run: u32,
+    /// Suppresses further arming until the next `schedule` or a committed
+    /// skip. Set by a batch-end decline whose DEVICE-bounded target fell
+    /// under the floor, and by `write_port` / `soft_reset`.
+    poll_skip_blocked: bool,
+    /// The arming threshold and the minimum skip, in master ticks. Read here
+    /// rather than from the environment per access.
+    poll_run_threshold: u32,
+    poll_floor_ticks: u64,
 }
 
 /// Whether new disks get a live sector cache. Read once per disk from
@@ -311,6 +343,10 @@ impl AtaDisk {
             cache: std::cell::RefCell::new(crate::sector_cache::SectorCache::new(
                 sector_cache_enabled(),
             )),
+            alt_status_run: 0,
+            poll_skip_blocked: false,
+            poll_run_threshold: ATA_POLL_RUN,
+            poll_floor_ticks: ATA_POLL_FLOOR_TICKS,
         }
     }
 
@@ -610,6 +646,92 @@ impl AtaDisk {
         (PRIMARY_CMD_BASE..=PRIMARY_CMD_BASE + 7).contains(&port) || port == PRIMARY_CTRL
     }
 
+    // ------------------------------------------------------------------
+    // Slice 9C-pre: device-armed poll skip, device half. See the struct
+    // field doc comments above and `ide.rs`'s "Device-armed poll skip,
+    // device half" block for the mechanism this ports.
+    // ------------------------------------------------------------------
+
+    /// Count one alt-status read and answer "arm the skip on this read".
+    ///
+    /// Called ONLY from the bus's primary-channel arm, and only when
+    /// `DeviceTimingProfile::ata` is armed on this machine -- unlike the
+    /// ATAPI mechanism, this whole path is DARK by default (the design's
+    /// slice-9 knob-unset identity bar), not merely gated by a separate
+    /// enable flag.
+    pub(crate) fn note_alt_status_read(&mut self) -> bool {
+        // Nothing pending: a read outside any wait must not carry a run
+        // across a completion boundary.
+        if self.pending_command.is_none() {
+            self.alt_status_run = 0;
+            return false;
+        }
+        if self.poll_skip_blocked {
+            self.alt_status_run = 0;
+            return false;
+        }
+        self.alt_status_run = self.alt_status_run.saturating_add(1);
+        if self.alt_status_run < self.poll_run_threshold {
+            return false;
+        }
+        // The arm-time floor is evaluated against the channel's OWN
+        // deadline, the only one the bus half can see cheaply, so a wait
+        // that is intrinsically not worth a batch break never costs one.
+        let armed = self
+            .ticks_until_completion()
+            .is_some_and(|ticks| ticks >= self.poll_floor_ticks);
+        if armed {
+            self.alt_status_run = 0;
+        }
+        armed
+    }
+
+    /// Clear the run counter at a CPU batch boundary, or on any read that is
+    /// not an alt-status poll.
+    pub(crate) fn reset_alt_status_run(&mut self) {
+        self.alt_status_run = 0;
+    }
+
+    /// Bound the device-edge pathology: at most ONE wasted batch break per
+    /// pending command. Cleared by `schedule` and by a committed skip.
+    pub(crate) fn block_poll_skip(&mut self) {
+        self.poll_skip_blocked = true;
+    }
+
+    pub(crate) fn clear_poll_skip_block(&mut self) {
+        self.poll_skip_blocked = false;
+    }
+
+    /// Test seam: the latch state.
+    #[cfg(test)]
+    pub(crate) fn poll_skip_blocked(&self) -> bool {
+        self.poll_skip_blocked
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alt_status_run_for_test(&self) -> u32 {
+        self.alt_status_run
+    }
+
+    /// Test seam: schedule an arbitrary pending completion without going
+    /// through a real ATA command, so a fixture can inject a latency
+    /// `COMMAND_LATENCY_TICKS` does not carry today. Reuses the same
+    /// `CompleteOk` boundary RECALIBRATE/SEEK already schedule through, so the
+    /// completion behaviour (DRDY|DSC, IRQ) is the real one, not a stub.
+    #[cfg(test)]
+    pub(crate) fn schedule_test_pending(&mut self, ticks: u64) {
+        self.schedule(PendingAction::CompleteOk, ticks);
+    }
+
+    /// Test seam: pin the arming threshold and the minimum skip so a fixture
+    /// can isolate the batch-end floor check from the arm-time one, the same
+    /// way `ide::IdeChannel::configure_poll_skip` does for the ATAPI channel.
+    #[cfg(test)]
+    pub(crate) fn configure_poll_skip_for_test(&mut self, run: u32, floor_ticks: u64) {
+        self.poll_run_threshold = run.max(1);
+        self.poll_floor_ticks = floor_ticks;
+    }
+
     /// Whether the master device is selected (drive bit 4 == 0).
     fn master_selected(&self) -> bool {
         self.drive_head & 0x10 == 0
@@ -630,6 +752,13 @@ impl AtaDisk {
         if !(PRIMARY_CMD_BASE..=PRIMARY_CMD_BASE + 7).contains(&port) {
             return None;
         }
+        // Any OTHER read on the channel breaks the alt-status run, mirroring
+        // `ide::IdeChannel::read_port`: the arm means "N alt-status reads
+        // with no other I/O to the channel", so a status, error or data
+        // register read is not part of a poll wait. The PRIMARY_CTRL arm
+        // above returns before this; its counting is the bus half's
+        // `note_alt_status_read` call.
+        self.reset_alt_status_run();
         let reg = port - PRIMARY_CMD_BASE;
         let value = match reg {
             0 => self.read_data_byte(),
@@ -653,6 +782,14 @@ impl AtaDisk {
     /// Write one byte to a channel port. Word writes to the data register split
     /// into two byte writes at the bus layer, so the PIO buffer is byte-fed.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
+        // A write is not a poll, and a control-port write can trigger SRST,
+        // which clears `pending_command` mid-batch -- mirroring
+        // `ide::IdeChannel::write_port`'s two guards. Ordering is
+        // load-bearing: `schedule` clears the latch, and `write_command`
+        // below reaches `schedule`, so writing a new command re-enables
+        // skipping for that command.
+        self.reset_alt_status_run();
+        self.poll_skip_blocked = true;
         if port == PRIMARY_CTRL {
             // Device control: bit 1 = nIEN, bit 2 = SRST (soft reset).
             self.interrupts_disabled = value & 0x02 != 0;
@@ -683,6 +820,10 @@ impl AtaDisk {
     }
 
     fn soft_reset(&mut self) {
+        // Same disposition as `write_port`'s guard: nothing armed before a
+        // reset may be honoured after it.
+        self.reset_alt_status_run();
+        self.poll_skip_blocked = true;
         self.phase = Phase::Idle;
         self.dma_request = None;
         self.pending_command = None;
@@ -783,6 +924,10 @@ impl AtaDisk {
     }
 
     fn schedule(&mut self, action: PendingAction, ticks: u64) {
+        // A NEW pending command gets a fresh chance at the skip: the latch
+        // bounds ONE wasted batch break per command, mirroring
+        // `ide::IdeChannel::schedule`.
+        self.poll_skip_blocked = false;
         self.phase = Phase::Idle;
         self.status = status::BSY;
         self.error = 0;
@@ -821,6 +966,9 @@ impl AtaDisk {
     }
 
     fn finish_pending(&mut self, action: PendingAction) {
+        // A completion boundary ends the wait the run was counting. Arms
+        // that follow belong to the NEXT command, not this one.
+        self.reset_alt_status_run();
         match action {
             PendingAction::PrepareIdentify => self.prepare_identify(),
             PendingAction::PrepareRead => self.prepare_read_sector(),

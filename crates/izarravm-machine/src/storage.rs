@@ -483,6 +483,23 @@ impl Machine {
         self.device_timing
     }
 
+    /// Force the `ata` family arm for one machine, in either direction, the
+    /// same shape as `set_ata_poll_skip_enabled` but for the whole-family
+    /// flag rather than a dedicated enable bool -- there is no
+    /// `IZARRAVM_ATA_HDD_POLL_SKIP` knob, by design.
+    #[doc(hidden)]
+    pub fn set_device_timing_ata_for_test(&mut self, enabled: bool) {
+        self.device_timing.ata = enabled;
+    }
+
+    /// Slice 9C-pre: mechanism counters for the primary-channel (fixed-disk)
+    /// poll skip. All zero on a fixture that never armed the `ata` family,
+    /// and all zero while `ata::COMMAND_LATENCY_TICKS` stays 0 and no
+    /// test-injected latency is scheduled.
+    pub fn ata_hdd_poll_skip_counters(&self) -> crate::AtaHddPollSkipCounters {
+        self.ata_hdd_poll_skip_counters
+    }
+
     /// Slice 9A: total 8259A acknowledge (INTA) cycles serviced. Always-on,
     /// never gated by `IZARRAVM_DEVICE_TIMING`.
     pub fn inta_acknowledge_count(&self) -> u64 {

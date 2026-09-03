@@ -567,6 +567,7 @@ impl Machine {
             ata_poll_skip_armed: &mut self.ata_poll_skip_armed,
             ata_poll_skip_slice_too_short: self.ata_poll_skip_slice_too_short,
             ata_poll_skip: &mut self.ata_poll_skip,
+            ata_hdd_poll_skip_armed: &mut self.ata_hdd_poll_skip_armed,
             isa_io_clocks: &mut self.port_bus_batch_clocks,
             port_accesses_by_class: &mut self.port_accesses_by_class,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
@@ -3390,11 +3391,37 @@ impl CpuBus for MachineBus<'_> {
         if ata::AtaDisk::owns_port(port) {
             // The primary channel: a mounted disk drives the task file; an empty
             // channel reads open-bus (0xFF), so a probe sees no device.
+            //
+            // Slice 9C-pre: THE ARM SITE for the primary-channel poll skip, the
+            // fixed-disk analogue of the ATAPI arm just above. It is dark unless
+            // `DeviceTimingProfile::ata` is armed on this machine -- there is no
+            // separate `IZARRAVM_ATA_HDD_POLL_SKIP` enable bool the way the ATAPI
+            // mechanism has one, by design, so the knob-unset identity bar (the
+            // whole point of 9C-pre being "pure plumbing") holds without a second
+            // gate to keep in sync.
+            let lazy_alt_status = self.device_timing.ata
+                && self.lazy_port_reads
+                && port == ata::PRIMARY_CTRL
+                && !io_touched_before_read;
+            let arm = lazy_alt_status
+                && !skip_io_touched
+                && self
+                    .ata
+                    .as_mut()
+                    .is_some_and(ata::AtaDisk::note_alt_status_read);
             let value = self
                 .ata
                 .as_mut()
                 .and_then(|d| d.read_port(port))
                 .unwrap_or(0xff);
+            // SUPPRESS THE CLEAR, never force the set -- same contract as the
+            // ATAPI arm above.
+            if lazy_alt_status && !arm {
+                *self.io_touched = false;
+            }
+            if arm {
+                *self.ata_hdd_poll_skip_armed = true;
+            }
             return Ok(u32::from(value));
         }
         if fdc::Fdc::owns_port(port) {

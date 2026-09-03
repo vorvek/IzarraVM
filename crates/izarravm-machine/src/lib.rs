@@ -958,6 +958,21 @@ impl Drop for AtaPollSkipDiagnostics {
     }
 }
 
+/// Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6):
+/// mechanism counters for the primary-channel (fixed-disk) analogue of the
+/// ATAPI poll skip. All zero unless `IZARRAVM_DEVICE_TIMING` armed the `ata`
+/// family AND the mechanism actually committed a skip -- there is no separate
+/// enable flag the way `ata_poll_skip_enabled` is one, by design: the family
+/// flag IS the gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AtaHddPollSkipCounters {
+    /// Committed skips: a run of alt-status reads while a primary-channel
+    /// command was pending, elided straight to its completion deadline.
+    pub skips: u64,
+    /// Master ticks actually skipped across every committed span.
+    pub skipped_ticks: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MachineProfilePhaseKind {
     CpuBatch,
@@ -1664,6 +1679,14 @@ pub struct Machine {
     // The minimum skip, in master ticks. A copy of the channel's own floor so
     // the batch-end check does not have to reach through the device for it.
     ata_poll_floor_ticks: u64,
+    // Slice 9C-pre: the primary-channel (fixed-disk) analogue of
+    // `ata_poll_skip_armed`, above. Gated by `DeviceTimingProfile::ata`
+    // ONLY -- there is no separate `IZARRAVM_ATA_HDD_POLL_SKIP` knob, by
+    // design: this whole mechanism stays dark until the family is armed.
+    // Reset at batch ENTRY next to `ata_poll_skip_armed`; taken at batch end
+    // by `actuate_ata_hdd_poll_skip`.
+    ata_hdd_poll_skip_armed: bool,
+    ata_hdd_poll_skip_counters: AtaHddPollSkipCounters,
     // Fixed ISA-bus time (in CPU clocks) accrued this batch by the OPL status poll,
     // added to the batch's device advance in the fast modes so a fast CPU
     // poll cannot outrun the 80 us OPL timer. See the batch-end use in
@@ -2257,6 +2280,8 @@ impl Machine {
             ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
             port_bus_batch_clocks: 0,
             port_accesses_by_class: [0; crate::bus::PORT_BUS_CLASS_COUNT],
+            ata_hdd_poll_skip_armed: false,
+            ata_hdd_poll_skip_counters: AtaHddPollSkipCounters::default(),
             pit_observer_fine_until: 0,
             device_edge_cache: timing::DeviceEdgeCache::Stale,
             device_edge_batches: 0,
@@ -4097,6 +4122,10 @@ struct MachineBus<'a> {
     // Points at `Machine::ata_poll_skip`. The bus half owns `arms` and
     // `monitor_exempt`; every other field is written by the batch-end actuation.
     ata_poll_skip: &'a mut AtaPollSkipDiagnostics,
+    // Slice 9C-pre: the primary-channel arm site's own armed flag, mirroring
+    // `ata_poll_skip_armed` above but gated by `device_timing.ata` alone (see
+    // that field, also in this struct) rather than a separate enable bool.
+    ata_hdd_poll_skip_armed: &'a mut bool,
     // Accrues fixed ISA-bus time (CPU clocks) for the OPL status poll in the
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::port_bus_batch_clocks`.
