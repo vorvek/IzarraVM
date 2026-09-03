@@ -2239,6 +2239,14 @@ impl CpuBus for MachineBus<'_> {
         self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start
     }
 
+    /// The whole-run cumulative counter `in_batch_raw_bus_clocks` derives from, exposed
+    /// directly (never reset): `self.trace.elapsed_clocks()` on its own, with no batch-start
+    /// subtrahend.
+    #[inline]
+    fn cumulative_raw_bus_clocks(&self) -> u64 {
+        self.trace.elapsed_clocks()
+    }
+
     /// `F = ceil(num / den)` over this batch's snapshotted scale. See the trait doc for why that
     /// is a valid bound on the scaled figure's growth per raw clock. `num` and `den` are `u32`
     /// and `den > 0` (every `bus_timing` pair is), so the ceiling cannot overflow and is never 0.

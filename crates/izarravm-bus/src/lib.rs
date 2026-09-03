@@ -1057,7 +1057,25 @@ pub trait CpuBus {
     /// RAW (unscaled) bus clocks this batch has accumulated so far — the `raw` that
     /// `in_batch_scaled_bus_clocks` divides down. Must be monotone non-decreasing within a batch.
     /// Only meaningful together with a non-zero `in_batch_scaled_bus_clocks_screen_scale`.
+    ///
+    /// **Trap, named for whoever reaches for this across a trip that spans more than one
+    /// machine batch**: it resets at every batch re-entry (`izarravm-machine`'s `run.rs`
+    /// re-snapshots the subtrahend at the top of each batch, including the plain IF-edge
+    /// break — not just a cap/deadline/fault boundary), so subtracting two samples taken on
+    /// either side of ANY batch re-entry can go negative or under-count. Use
+    /// `cumulative_raw_bus_clocks` below for a span that must survive a batch boundary.
     fn in_batch_raw_bus_clocks(&self) -> u64 {
+        0
+    }
+
+    /// RAW (unscaled) bus clocks since the bus was constructed — monotone non-decreasing for
+    /// the whole run, NEVER reset at a batch boundary (unlike `in_batch_raw_bus_clocks` above).
+    /// A caller that needs a raw bus-clock delta across a span that might cross one or more
+    /// machine batches (a reflected-call trip, which crosses 6-8 IF-edge batch re-entries per
+    /// the 0b review) must sample this, not the in-batch figure, at both ends and subtract.
+    /// `0` on a bus that does not track it (the same "unsupported = 0" convention as
+    /// `in_batch_raw_bus_clocks`).
+    fn cumulative_raw_bus_clocks(&self) -> u64 {
         0
     }
 
