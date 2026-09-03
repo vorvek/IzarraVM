@@ -29,17 +29,42 @@
 //! # Provenance
 //!
 //! Every class carries a `provenance` string naming the document and row it
-//! came from. Three spellings appear, and the difference is load-bearing:
+//! came from, and **every class is sourced** -- the `UNSOURCED x12` default the
+//! table shipped with is gone, by the count asserted in
+//! `the_unsourced_and_placeholder_census_is_pinned`. The spellings:
 //!
+//! * `F2 p.N` / `F3` / `F5` -- Intel's Pentium Tables F-2 (integer), F-3 (I/O)
+//!   and F-5 (floating point), Appendix F of 241430-004. `INT` is the interrupt
+//!   clock-count table.
+//! * `T10.1` / `T10.2` / `T10.3` -- the i486 DX2 Data Book's Tables 10.1
+//!   (integer), 10.2 (I/O) and 10.3 (floating point). The persona is a
+//!   **DX2-66**, so the DX2 book is the primary 486 column wherever it differs
+//!   from the base-i486 datasheet; each such row says so.
+//! * `A1` / `3.6.2.1` -- the Optimization Manual's pairing table and rules.
+//!   Table F-2's own `Pairing` column is column-drifted in the extraction and
+//!   is never read positionally.
 //! * `cmp §3 row N` -- `dev_docs/2026-09-05-86box-pentium-timing-comparison.md`
-//!   §3's per-instruction table (Intel App. F of 241430-004, re-read there).
+//!   §3, which is Appendix F read for the same rows.
 //! * `486 §5` -- `dev_docs/2026-09-05-486-timing-audit.md` §5's I486 column.
-//! * `UNSOURCED x12` -- **no reference count was read for this class.** The
-//!   epoch-2 entry is the epoch-1 literal times 12, which preserves today's
-//!   relative cost and lands on the SLOW side (the owner's 12:15 ruling:
-//!   "a miss on the slow side is a soft finding; a miss on the fast side is a
-//!   hard failure"). These are the rows slice 4 must source or re-solve; the
-//!   count is asserted in the tests so it cannot grow silently.
+//!
+//! Conventions, all from `dev_docs/2026-09-05-class-table-sources.md`: a true
+//! min/max range takes the SLOW end (the owner's 12:15 ruling -- "a miss on the
+//! slow side is a soft finding; a miss on the fast side is a hard failure"); a
+//! DATA-dependent MN/MX range takes a typical and records the range, following
+//! `RclRcrCl`'s precedent; a mode split takes the real-mode row, as `IntN` and
+//! `MovSregReg` already did; and an x87 latency/throughput pair takes the
+//! LATENCY, which is what a non-overlapped retire actually costs and is the slow
+//! side.
+//!
+//! **The I486 x87 column is the shipped literal times twelve, deliberately.**
+//! `dev_docs/2026-09-05-k6-fpu-provenance.md` found that our x87 literals ARE
+//! i486 DX2 Table 10.3 counts (FBLD 75, FLDENV 44, FSTENV 56, FCHS 6, FXCH 4,
+//! FFREE 3, FADD 20 at the high end, FSAVE 150, with F2XM1 200 and the
+//! transcendentals 300 as round stand-ins inside the 486's ranges), so the 486
+//! arm was accidentally right all along and only the I586 column moved onto the
+//! Pentium counts. The three classes SPLIT out during the sourcing
+//! (`X87MemArithIntDiv32`/`16`, `X87Xam`) have no shipped literal of their own
+//! and take Table 10.3 directly.
 //!
 //! # EPOCH 2 IS NOT YET COHERENT. Do not measure it.
 //!
@@ -224,34 +249,34 @@ timing_classes! {
     Lea = (2, 12, 12, "cmp §3 row 1 (LEA, 1 clk)"),
     /// `XCHG` in every form (`0x86`, `0x87`, `0x91..=0x97`), today's
     /// `XCHG_CORE_CLOCKS`.
-    Xchg = (3, 36, 36, "UNSOURCED x12"),
+    Xchg = (3, 60, 36, "F2 p.F-22 (3, mem form) / T10.1 (5, mem form), slow end"),
     /// `MOVZX`/`MOVSX` (`0x0fb6`..`0x0fbf`), both widths, both operand forms.
-    MovExtend = (3, 36, 36, "UNSOURCED x12"),
+    MovExtend = (3, 36, 36, "F2 (MOVSX/MOVZX 3) / T10.1 (3)"),
 
     // --- flag and accumulator housekeeping -----------------------------------
     /// `CLC`/`STC`/`CMC`/`CLD`/`STD`/`SALC` -- the one-byte flag writes.
-    FlagOp = (2, 24, 24, "UNSOURCED x12"),
+    FlagOp = (2, 24, 24, "F2 (CLC/CLD/STC/STD/CMC 2) / T10.1 (2); SALC has no row on either part"),
     /// `CLI` (`0xfa`), today's `CLI_CORE_CLOCKS`.
-    Cli = (3, 36, 36, "UNSOURCED x12"),
+    Cli = (3, 60, 84, "F2 (CLI 7) / T10.1 (CLI 5); V86 is INT+9, a later mode-keyed sub-slice"),
     /// `STI` (`0xfb`), today's `STI_CORE_CLOCKS`. A separate class from `Cli`
     /// for the reason the two constants are separate: separate interpreter arms.
-    Sti = (3, 36, 36, "UNSOURCED x12"),
+    Sti = (3, 60, 84, "F2 (STI 7) / T10.1 (STI 5); V86 is INT+9, a later mode-keyed sub-slice"),
     /// `SAHF` (`0x9e`).
-    Sahf = (3, 36, 36, "UNSOURCED x12"),
+    Sahf = (3, 24, 24, "F2 (SAHF 2) / T10.1 (2)"),
     /// `LAHF` (`0x9f`).
-    Lahf = (2, 24, 24, "UNSOURCED x12"),
+    Lahf = (2, 36, 24, "F2 (LAHF 2) / T10.1 (3)"),
     /// `CBW`/`CWDE` (`0x98`).
-    Cbw = (3, 36, 36, "UNSOURCED x12"),
+    Cbw = (3, 36, 36, "F2 (CBW/CWDE 3) / T10.1 (3)"),
     /// `CWD`/`CDQ` (`0x99`).
-    Cwd = (2, 24, 24, "UNSOURCED x12"),
+    Cwd = (2, 36, 24, "F2 (CWD/CDQ 2) / T10.1 (3)"),
     /// `DAA`/`DAS`/`AAA`/`AAS` (`0x27`/`0x2f`/`0x37`/`0x3f`).
-    DecimalAdjust = (4, 48, 48, "UNSOURCED x12"),
+    DecimalAdjust = (4, 36, 36, "F2 (AAA/AAS/DAA/DAS 3) / T10.1 (AAA/AAS 3), slow end of the family"),
     /// `AAM` (`0xd4`).
-    Aam = (17, 204, 204, "UNSOURCED x12"),
+    Aam = (17, 180, 216, "F2 (AAM 18) / T10.1 (AAM 15)"),
     /// `AAD` (`0xd5`).
-    Aad = (19, 228, 228, "UNSOURCED x12"),
+    Aad = (19, 168, 120, "F2 (AAD 10) / T10.1 (AAD 14); the 486 is SLOWER than the P5 here"),
     /// `XLAT` (`0xd7`).
-    Xlat = (5, 60, 60, "UNSOURCED x12"),
+    Xlat = (5, 48, 48, "F2 (XLAT 4) / T10.1 (4)"),
 
     // --- stack ---------------------------------------------------------------
     /// `PUSH r` (`0x50..=0x57`).
@@ -276,13 +301,13 @@ timing_classes! {
     /// `POPA`/`POPAD` (`0x61`), today's `POP_ALL_CORE_CLOCKS`.
     PopAll = (18, 108, 60, "486 §5 (9 clk) / Intel App. F POPA 5 clk"),
     /// `PUSHF`/`PUSHFD` (`0x9c`), today's `PUSHF_CORE_CLOCKS`.
-    PushFlags = (3, 48, 36, "UNSOURCED x12 (486 4 clk assumed)"),
+    PushFlags = (3, 48, 36, "F2 (PUSHF 3 real) / T10.1 (PUSHF 4 real); V86 INT+9 deferred"),
     /// `POPF`/`POPFD` (`0x9d`), today's `POPF_CORE_CLOCKS`.
-    PopFlags = (4, 108, 72, "UNSOURCED x12 (486 9 / P5 6 clk assumed)"),
+    PopFlags = (4, 108, 48, "F2 (POPF 4 real) / T10.1 (POPF 9 real)"),
     /// `ENTER` (`0xc8`).
-    Enter = (10, 168, 132, "UNSOURCED x12 (486 14 / P5 11 clk assumed)"),
+    Enter = (10, 204, 180, "F2 (ENTER 15 at L>=1) / T10.1 (17); the +2L/+3L term wants a level-keyed site"),
     /// `LEAVE` (`0xc9`), both operand sizes and both stack widths.
-    Leave = (4, 60, 36, "UNSOURCED x12 (486 5 / P5 3 clk assumed)"),
+    Leave = (4, 60, 36, "F2 (LEAVE 3) / T10.1 (5)"),
 
     // --- control transfer ----------------------------------------------------
     /// `Jcc` short and near, taken or not.
@@ -303,16 +328,21 @@ timing_classes! {
     /// `RET` near with an immediate stack adjust (`0xc2`).
     RetNearImm = (10, 60, 36, "486 §5 (5 clk) / cmp §3 row 7 (3 clk, NP)"),
     /// `CALL` far (`0x9a`, and `0xff /3` through memory).
-    CallFar = (17, 204, 204, "UNSOURCED x12"),
+    CallFar = (17, 216, 60, "F2 (CALL far indirect 5 real) / T10.1 (18 real); protected 22-45+TS deferred"),
     /// `JMP` far (`0xea`, and `0xff /5` through memory).
-    JmpFar = (17, 204, 204, "UNSOURCED x12"),
+    JmpFar = (17, 204, 48, "F2 (JMP far indirect 4 real) / T10.1 (17 real)"),
     /// `RETF` (`0xca`/`0xcb`), both operand sizes.
-    RetFar = (17, 204, 204, "UNSOURCED x12"),
+    RetFar = (17, 168, 48, "F2 (RETF 4 real) / T10.1 (14 real, imm form)"),
     /// Far `CALL` (`0xff /3`) and far `JMP` (`0xff /5`) THROUGH MEMORY, which
     /// charge 11 where the direct `0x9a`/`0xea` forms charge 17. A separate
     /// class rather than a shared one because the two literals differ today, and
     /// a class may hold only one epoch-1 value.
-    CallJmpFarMem = (11, 132, 132, "UNSOURCED x12"),
+    /// Far `CALL`/`JMP` through memory take the same real-mode counts as their
+    /// direct forms (`CallFar`/`JmpFar`); they are a separate class only because
+    /// their epoch-1 literals differ (11 against 17), and a class holds one
+    /// epoch-1 value. The epoch-2 entries take the slower of the two families,
+    /// `CallFar`, per the 12:15 ruling.
+    CallJmpFarMem = (11, 216, 60, "F2 (CALL far indirect 5 real) / T10.1 (18 real)"),
     /// `LOOP` (`0xe2`) -- charged taken or not, one arm past both branches.
     Loop = (11, 84, 66, "486 §5 (7 clk taken) / design §3.2 (5.5 clk)"),
     /// `LOOPE`/`LOOPNE` (`0xe0`/`0xe1`).
@@ -332,7 +362,7 @@ timing_classes! {
     /// `INTO` (`0xce`) when the overflow flag is set.
     IntO = (35, 360, 204, "486 §5 IntN / cmp §3 row 17 (INT n family)"),
     /// `INTO` (`0xce`) when it falls through.
-    IntONotTaken = (3, 36, 36, "UNSOURCED x12"),
+    IntONotTaken = (3, 36, 48, "F2 (INTO not taken 4) / T10.1 (3)"),
     /// `IRET`/`IRETD` (`0xcf`).
     Iret = (22, 180, 84, "486 §5 (15 clk) / cmp §3 row 17 (7 clk real)"),
 
@@ -359,7 +389,7 @@ timing_classes! {
     /// the shared class takes the cheaper shift number, an under-charge.
     ShiftCl = (2, 36, 48, "486 §5 (3 clk) / cmp §3 row 11 (4 clk, NP)"),
     /// `SHLD`/`SHRD` (`0x0fa4`/`0x0fa5`/`0x0fac`/`0x0fad`).
-    DoubleShift = (3, 36, 48, "UNSOURCED x12 (486 3 / P5 4 clk assumed)"),
+    DoubleShift = (3, 48, 60, "F2 (SHLD/SHRD mem by CL 5) / T10.1 (4), slow end"),
     // --- group 3 (`0xf6`/`0xf7`), SPLIT -------------------------------------
     // Design §9.1's headline finding: one `clocks(2)` used to serve all seven
     // sub-opcodes at every width, giving `DIV EAX, ECX` the cost of
@@ -379,46 +409,50 @@ timing_classes! {
     /// `MUL`/`IMUL r/m8` -- group 3 `/4`, `/5` at byte width. One class for both
     /// sub-opcodes because both references price them together (comparison
     /// §3 row 13; audit §5 `Mul` 8/16/32).
-    Mul8 = (2, 186, 132, "486 §5 (13-18, midpoint 15.5) / cmp §3 row 13 (11 clk)"),
+    Mul8 = (2, 216, 132, "F2 p.F-13 (MUL/IMUL r/m8 11) / T10.1 note 3 (13-18, slow end)"),
     /// `MUL`/`IMUL r/m16`.
-    Mul16 = (2, 234, 132, "486 §5 (13-26, midpoint 19.5) / cmp §3 row 13 (11 clk)"),
+    Mul16 = (2, 312, 132, "F2 p.F-13 (11) / T10.1 note 3 (13-26, slow end)"),
     /// `MUL`/`IMUL r/m32`.
-    Mul32 = (2, 330, 120, "486 §5 (13-42, midpoint 27.5) / cmp §3 row 13 (10 clk)"),
+    Mul32 = (2, 504, 120, "F2 p.F-13 (10) / T10.1 note 3 (13-42, slow end)"),
     /// `DIV r/m8` -- group 3 `/6` at byte width.
-    Div8 = (2, 192, 204, "486 §5 (16 clk) / cmp §3 row 14 (17 clk)"),
+    Div8 = (2, 192, 204, "F2 p.F-13 (DIV r/m8 17) / T10.1 (16)"),
     /// `DIV r/m16`.
-    Div16 = (2, 288, 300, "486 §5 (24 clk) / cmp §3 row 14 (25 clk)"),
+    Div16 = (2, 288, 300, "F2 p.F-13 (25) / T10.1 (24)"),
     /// `DIV r/m32` -- the 246x row itself.
-    Div32 = (2, 480, 492, "486 §5 (40 clk) / cmp §3 row 14 (41 clk)"),
+    Div32 = (2, 480, 492, "F2 p.F-13 (41) / T10.1 (40) -- design section 9.1's 246x row, sourced digit for digit"),
     /// `IDIV r/m8` -- group 3 `/7` at byte width.
-    Idiv8 = (2, 228, 264, "486 §5 (19 clk) / cmp §3 row 14 (22 clk)"),
+    Idiv8 = (2, 240, 264, "F2 p.F-13 (IDIV r/m8 22) / T10.1 (19 reg, 20 mem, slow end)"),
     /// `IDIV r/m16`.
-    Idiv16 = (2, 324, 360, "486 §5 (27 clk) / cmp §3 row 14 (30 clk)"),
+    Idiv16 = (2, 336, 360, "F2 p.F-13 (30) / T10.1 (27 reg, 28 mem)"),
     /// `IDIV r/m32`.
-    Idiv32 = (2, 516, 552, "486 §5 (43 clk) / cmp §3 row 14 (46 clk)"),
+    Idiv32 = (2, 528, 552, "F2 p.F-13 (46) / T10.1 (43 reg, 44 mem)"),
     /// `INC`/`DEC r/m8` (`0xfe`), today's `INC_DEC_RM8_CORE_CLOCKS`. The memory
     /// form is a read/modify/write, so it takes `AluMemReg`'s shape.
     IncDecRm = (2, 36, 36, "cmp §3 row 4 (3 clk RMW)"),
     /// Two-operand `IMUL r, r/m` (`0x0faf`), both operand forms.
-    ImulRm = (9, 234, 120, "486 §5 Mul 16-bit midpoint / cmp §3 row 13 (10 clk r/m32)"),
+    ImulRm = (9, 504, 120, "F2 p.F-13 (IMUL r,r/m flat 10 at every width) / T10.1 note 3 (13-42 at Dword, slow end); the per-width 486 split wants a width field the JIT kinds do not carry"),
     /// Three-operand `IMUL r, r/m, imm` (`0x69`/`0x6b`).
-    ImulImm = (14, 234, 132, "486 §5 Mul midpoint / cmp §3 row 13 (11 clk)"),
+    ImulImm = (14, 504, 120, "F2 p.F-13 (IMUL r,r/m,imm flat 10) / T10.1 note 3 (13-42 at Dword, slow end); same per-width note"),
 
     // --- bit operations ------------------------------------------------------
     /// `BT`/`BTS`/`BTR`/`BTC` in both encodings, today's `BIT_STRING_CORE_CLOCKS`.
-    BitTest = (6, 72, 72, "UNSOURCED x12"),
+    BitTest = (6, 96, 108, "F2 (BT 4-9, slow end 9) / T10.1 (BT 3-8, slow end 8)"),
+    /// `BTS`/`BTR`/`BTC` in both encodings -- the read/modify/write bit ops,
+    /// which lock their memory form and cost 13 clocks on both parts where `BT`
+    /// costs 8-9.
+    BitTestModify = (6, 156, 156, "F2 (BTS/BTR/BTC mem,reg 13, locked) / T10.1 (13)"),
     /// `BSF`/`BSR` (`0x0fbc`/`0x0fbd`).
-    BitScan = (10, 120, 120, "UNSOURCED x12"),
+    BitScan = (10, 144, 144, "F2 (BSF 6-42, BSR 7-72 MN/MX) / T10.1; data-dependent, typical 12 per the RclRcrCl precedent -- slow end would be 864/1248, recorded not taken"),
     /// `BSWAP` (`0x0fc8..=0x0fcf`).
-    Bswap = (1, 12, 12, "UNSOURCED x12"),
+    Bswap = (1, 12, 12, "F2 (BSWAP 1) / T10.1 (1)"),
     /// `CMPXCHG` (`0x0fb0`/`0x0fb1`).
-    CmpXchg = (6, 72, 72, "UNSOURCED x12"),
+    CmpXchg = (6, 120, 72, "F2 (CMPXCHG mem 6) / T10.1 (mem 10 locked), slow end"),
     /// `CMPXCHG8B` (`0x0fc7`).
-    CmpXchg8b = (10, 120, 120, "UNSOURCED x12"),
+    CmpXchg8b = (10, 120, 120, "F2 (CMPXCHG8B 10); NOT implemented on a 486DX2 -- the I486 entry is unreachable (#UD) and keeps the literal"),
     /// `XADD` (`0x0fc0`/`0x0fc1`).
-    Xadd = (4, 48, 48, "UNSOURCED x12"),
+    Xadd = (4, 48, 48, "F2 (XADD mem 4) / T10.1 (4)"),
     /// `SETcc` (`0x0f90..=0x0f9f`), register and memory forms alike.
-    SetCc = (4, 48, 48, "UNSOURCED x12"),
+    SetCc = (4, 48, 24, "F2 (SETcc mem 2) / T10.1 (4); neither part's rows are condition-keyed"),
 
     // --- segment and system --------------------------------------------------
     /// `MOV r/m16, Sreg` (`0x8c`), today's `MOV_RM_SREG_CORE_CLOCKS`.
@@ -428,43 +462,51 @@ timing_classes! {
     /// needs the mode at the charge site and is a later sub-slice.
     MovSregReg = (7, 36, 24, "486 §5 (3 clk real) / cmp §3 row 15 (2 clk real)"),
     /// `LES`/`LDS` (`0xc4`/`0xc5`) and `LFS`/`LGS`/`LSS` (`0x0fb2`..`0x0fb5`).
-    LesLds = (7, 84, 84, "UNSOURCED x12"),
+    LesLds = (7, 72, 96, "F2 (LSS 8 real, slow end of the five) / T10.1 (6 real); protected 12-17 deferred"),
     /// `LAR` (`0x0f02`).
-    Lar = (11, 132, 132, "UNSOURCED x12"),
+    Lar = (11, 132, 96, "F2 (LAR 8) / T10.1 (11); +8 per unaccessed descriptor (F2 note 9) not modelled"),
     /// `LSL` (`0x0f03`).
-    Lsl = (11, 132, 132, "UNSOURCED x12"),
+    Lsl = (11, 120, 96, "F2 (LSL 8) / T10.1 (10)"),
     /// `VERR`/`VERW` (`0x0f00 /4`, `/5`).
-    VerRw = (10, 120, 120, "UNSOURCED x12"),
+    VerRw = (10, 132, 84, "F2 (VERR/VERW 7) / T10.1 (11)"),
     /// `SLDT`/`STR` (`0x0f00 /0`, `/1`).
-    SldtStr = (2, 24, 24, "UNSOURCED x12"),
+    SldtStr = (2, 36, 24, "F2 (SLDT/STR 2) / T10.1 (mem 3), slow end"),
     /// `LLDT`/`LTR` (`0x0f00 /2`, `/3`).
-    LldtLtr = (11, 132, 132, "UNSOURCED x12"),
+    LldtLtr = (11, 240, 120, "F2 (LTR 10, slow end of the pair) / T10.1 (LTR 20)"),
     /// `SGDT`/`SIDT` (`0x0f01 /0`, `/1`), memory form only.
-    SgdtSidt = (11, 132, 132, "UNSOURCED x12"),
+    SgdtSidt = (11, 120, 48, "F2 (SGDT/SIDT 4) / T10.1 (10)"),
     /// `LGDT`/`LIDT` (`0x0f01 /2`, `/3`).
-    LgdtLidt = (11, 132, 132, "UNSOURCED x12"),
+    LgdtLidt = (11, 144, 72, "F2 (LGDT/LIDT 6) / T10.1 (12)"),
     /// `SMSW` (`0x0f01 /4`).
-    Smsw = (2, 24, 24, "UNSOURCED x12"),
+    Smsw = (2, 36, 48, "F2 (SMSW 4) / T10.1 (mem 3), slow end"),
     /// `LMSW` (`0x0f01 /6`).
-    Lmsw = (3, 36, 36, "UNSOURCED x12"),
+    Lmsw = (3, 156, 96, "F2 (LMSW 8) / T10.1 (13)"),
     /// `INVLPG` (`0x0f01 /7`).
-    Invlpg = (12, 144, 144, "UNSOURCED x12"),
+    Invlpg = (12, 144, 348, "F2 (INVLPG 29; 25 is often republished -- 29 is the slow side, taken and flagged) / T10.1 (12)"),
     /// `CLTS` (`0x0f06`).
-    Clts = (2, 24, 24, "UNSOURCED x12"),
+    Clts = (2, 84, 120, "F2 (CLTS 10) / T10.1 (7)"),
     /// `MOV` to and from `CRn`/`DRn` (`0x0f20`..`0x0f23`).
-    MovCrDr = (6, 72, 72, "UNSOURCED x12"),
+    MovCrDr = (6, 204, 264, "F2 (MOV CR0,r 22, slow end; CR3 21, CR2 12, from CR 4) / T10.1 (CR0 17); a CR0-vs-rest split is worth having, CR3 reloads are the hot ones"),
     /// `BOUND` (`0x62`).
-    Bound = (10, 120, 120, "UNSOURCED x12"),
+    Bound = (10, 84, 96, "F2 (BOUND in range 8) / T10.1 (7); out of range is INT+32 / INT+24"),
     /// `WRMSR` (`0x0f30`).
-    Wrmsr = (30, 360, 360, "UNSOURCED x12"),
+    Wrmsr = (30, 360, 540, "F2 (WRMSR 30-45 MN/MX, slow end); no MSRs on a 486DX2 -- the I486 entry is unreachable and keeps the literal"),
     /// `RDTSC` (`0x0f31`).
-    Rdtsc = (11, 132, 132, "UNSOURCED x12"),
+    Rdtsc = (11, 132, 132, "F2 (RDTSC; PARTIAL -- the extraction cannot separate the clock count from note 11, so the slow reading 11 is kept); no RDTSC on a 486DX2"),
     /// `RDMSR` (`0x0f32`).
-    Rdmsr = (11, 132, 132, "UNSOURCED x12"),
-    /// `INVD`/`WBINVD` (`0x0f08`/`0x0f09`).
-    InvdWbinvd = (4, 48, 48, "UNSOURCED x12"),
+    Rdmsr = (11, 132, 288, "F2 (RDMSR 20-24 MN/MX, slow end); no MSRs on a 486DX2 -- I486 keeps the literal"),
+    /// `INVD` (`0x0f08`).
+    Invd = (4, 48, 180, "F2 (INVD 15) / T10.1 (4)"),
+    /// `WBINVD` (`0x0f09`) -- **2000+ clocks on a P5**, against `INVD`'s 15.
+    ///
+    /// The two shared one class until the manual sourcing found the spread: a
+    /// 133x difference on the Pentium and the single largest hole the pass
+    /// turned up. The 486's own spread is 4 vs 5 and would never have shown it.
+    /// Intel prints "2000+" rather than a count, so this is a floor, not a
+    /// measurement -- which is the slow side and the side the 12:15 ruling wants.
+    Wbinvd = (4, 60, 24000, "F2 (WBINVD 2000+, a printed floor) / T10.1 (5)"),
     /// `CPUID` (`0x0fa2`).
-    Cpuid = (14, 168, 168, "UNSOURCED x12"),
+    Cpuid = (14, 168, 144, "F2 (CPUID 12; 14 is often republished, 12 taken as read and flagged); no CPUID on the DX2 stepping -- I486 keeps the literal"),
 
     // --- strings and port I/O -----------------------------------------------
     /// One string instruction (`MOVS`/`STOS`/`LODS`/`CMPS`/`SCAS`), today's flat
@@ -475,36 +517,45 @@ timing_classes! {
     /// and is a later sub-slice, so this stays one flat class.
     StringElem = (4, 48, 48, "PLACEHOLDER x12 -- the per-element split is a later sub-slice"),
     /// `INS`/`INSB`/`INSW`/`INSD` (`0x6c`/`0x6d`).
-    InsString = (15, 180, 180, "UNSOURCED x12 -- owned by the port slice"),
+    InsString = (15, 240, 108, "F3 (INS 9 real) / T10.2 DX2 (20 real; the base i486 datasheet says 17 -- the persona is a DX2-66, so the DX2 column is taken). The bus term is P1's"),
     /// `OUTS`/`OUTSB`/`OUTSW`/`OUTSD` (`0x6e`/`0x6f`).
-    OutsString = (14, 168, 168, "UNSOURCED x12 -- owned by the port slice"),
+    OutsString = (14, 240, 156, "F3 (OUTS 13 real) / T10.2 DX2 (20 real; base i486 17). The bus term is P1's"),
     /// `IN AL/eAX, imm8` and `IN AL/eAX, DX`, today's `IN_PORT_CORE_CLOCKS`.
     ///
     /// P1 (`dev_docs/2026-09-05-port-io-repricing-design.md`) owns the epoch-2
     /// port charge and applies it on the BUS side, not here; this row keeps the
     /// core term so a port access does not lose its core cost when the bus term
     /// moves. 486 §5's 168/192 are recorded, not yet reconciled with P1.
-    InPort = (12, 168, 168, "486 §5 (14 clk) -- the bus term is P1's"),
+    InPort = (12, 204, 168, "T10.2 DX2 (IN 17 real; the base i486 datasheet says 14, and the persona is a DX2-66 so the DX2 column is taken -- recorded). The bus term is P1's"),
     /// `OUT imm8/DX, AL/eAX`, today's `OUT_PORT_CORE_CLOCKS`.
-    OutPort = (10, 192, 192, "486 §5 (16 clk) -- the bus term is P1's"),
+    OutPort = (10, 228, 192, "T10.2 DX2 (OUT 19 real; the base i486 datasheet says 16, and the persona is a DX2-66 so the DX2 column is taken -- recorded). The bus term is P1's"),
     /// `IN eAX, imm8`/`IN eAX, DX` at the dword width, which charge 12 from a
     /// literal rather than through `IN_PORT_CORE_CLOCKS`.
-    InPortDword = (12, 168, 168, "486 §5 (14 clk) -- the bus term is P1's"),
+    InPortDword = (12, 204, 168, "T10.2 DX2 (IN 17 real; base i486 14). The bus term is P1's"),
 
     // --- x87 -----------------------------------------------------------------
     // Every x87 charge is scaled a second time by `fp_timing_class`, which is a
     // SEPARATE dial and is untouched here (design §4 deletes its `IntConvert32`
     // absorber in slice 4, not now).
     /// `WAIT`/`FWAIT` (`0x9b`) with no pending unmasked exception.
-    X87Wait = (6, 72, 72, "UNSOURCED x12"),
+    X87Wait = (6, 72, 12, "F5 (FWAIT 1 latency) / T10.3 via the shipped literal (WAIT 1-3)"),
     /// `FADD`/`FSUB`/`FMUL`/`FDIV`/`FCOM` with an m32 real operand (`0xd8`).
-    X87MemArith32 = (20, 240, 36, "cmp §3 row 19 (FADD 3 clk latency)"),
+    X87MemArith32 = (20, 240, 36, "F5 (FADD m32 3 latency) / T10.3 via the shipped literal (FADD 20, high end)"),
     /// The same family with an m64 real operand (`0xdc`).
-    X87MemArith64 = (20, 240, 36, "cmp §3 row 19 (FADD 3 clk latency)"),
+    X87MemArith64 = (20, 240, 36, "F5 (FADD m64 3 latency) / T10.3 via the shipped literal"),
     /// `FIADD`/`FIMUL`/... with an m32 integer operand (`0xda`).
-    X87MemArithInt32 = (20, 240, 240, "UNSOURCED x12"),
+    X87MemArithInt32 = (20, 240, 96, "F5 (FIADD/FISUB/FIMUL 7, FICOM 8 latency -- FIDIV split out) / T10.3 via the shipped literal"),
     /// The same family with an m16 integer operand (`0xde`).
-    X87MemArithInt16 = (20, 240, 240, "UNSOURCED x12"),
+    X87MemArithInt16 = (20, 240, 96, "F5 (integer-operand arith 8 latency without FIDIV) / T10.3 via the shipped literal"),
+    /// `FIDIV`/`FIDIVR m32int` (`0xda /6`, `/7`) -- **42 P5 clocks against the
+    /// rest of the family's 7-8**, and 85.5 on the 486 against 20.
+    ///
+    /// Splitting it is worth more than any other x87 split the sourcing found:
+    /// without it the whole `0xda` family carries the divide's cost or the
+    /// divide carries the adds'.
+    X87MemArithIntDiv32 = (20, 1026, 504, "F5 (FIDIV m32 42) / T10.3 (FIDIV m32 Avg 84-86 = 85.5)"),
+    /// `FIDIV`/`FIDIVR m16int` (`0xde /6`, `/7`). See `X87MemArithIntDiv32`.
+    X87MemArithIntDiv16 = (20, 1044, 504, "F5 (FIDIV m16 42) / T10.3 (FIDIV m16 Avg 85-89 = 87)"),
     /// `FLD m32` (`0xd9 /0`).
     X87LoadReal32 = (14, 168, 12, "cmp §3 row 19 (FLD m32 1 clk)"),
     /// `FST`/`FSTP m32` (`0xd9 /2`, `/3`).
@@ -514,9 +565,9 @@ timing_classes! {
     /// `FST`/`FSTP m64` (`0xdd /2`, `/3`).
     X87StoreReal64 = (14, 168, 24, "cmp §3 row 19 (FST 2 clk)"),
     /// `FLD m80` (`0xdb /5`).
-    X87LoadExtended80 = (14, 168, 168, "UNSOURCED x12"),
+    X87LoadExtended80 = (14, 168, 36, "F5 (FLD m80 3) / T10.3 via the shipped literal"),
     /// `FSTP m80` (`0xdb /7`).
-    X87StoreExtended80 = (14, 168, 168, "UNSOURCED x12"),
+    X87StoreExtended80 = (14, 168, 36, "F5 (FSTP m80 3) / T10.3 via the shipped literal"),
     /// `FILD m32` (`0xdb /0`). Intel's row is `3/1` (latency/throughput); the
     /// 12:15 ruling takes the slow side.
     X87LoadInt32 = (14, 168, 36, "cmp §3 row 20 (FILD m32 3 clk latency, slow side)"),
@@ -533,23 +584,23 @@ timing_classes! {
     /// `FISTP m64` (`0xdf /7`).
     X87StoreInt64 = (14, 168, 72, "cmp §3 row 20 (FISTP family)"),
     /// `FLDCW` (`0xd9 /5`).
-    X87LoadControl = (4, 48, 48, "UNSOURCED x12"),
+    X87LoadControl = (4, 48, 84, "F5 (FLDCW 7; named unpairable in Optimization Manual 3.6.2.1) / T10.3 (FLDCW 4)"),
     /// `FNSTCW` (`0xd9 /7`).
-    X87StoreControl = (14, 168, 168, "UNSOURCED x12"),
+    X87StoreControl = (14, 168, 24, "F5 (FSTCW 2) / T10.3 via the shipped literal"),
     /// `FNSTSW m16` (`0xdd /7`).
-    X87StoreStatus = (14, 168, 168, "UNSOURCED x12"),
+    X87StoreStatus = (14, 168, 60, "F5 (FSTSW m16 5 latency) / T10.3 via the shipped literal"),
     /// `FLDENV` (`0xd9 /4`).
-    X87LoadEnv = (44, 528, 528, "UNSOURCED x12"),
+    X87LoadEnv = (44, 528, 444, "F5 (FLDENV 37 real) / T10.3 (FLDENV 44)"),
     /// `FNSTENV` (`0xd9 /6`).
-    X87StoreEnv = (56, 672, 672, "UNSOURCED x12"),
+    X87StoreEnv = (56, 672, 600, "F5 (FSTENV 50 real) / T10.3 (FSTENV 56)"),
     /// `FRSTOR` (`0xdd /4`).
-    X87Restore = (75, 900, 900, "UNSOURCED x12"),
+    X87Restore = (75, 900, 1140, "F5 (FRSTOR 95 real, 32-bit address form) / T10.3 via the shipped literal (FRSTOR 75)"),
     /// `FNSAVE` (`0xdd /6`).
-    X87Save = (150, 1800, 1800, "UNSOURCED x12"),
+    X87Save = (150, 1800, 1812, "F5 (FSAVE 151 real, 32-bit address form) / T10.3 (FSAVE 150)"),
     /// `FBLD` (`0xdf /4`).
-    X87LoadBcd = (75, 900, 900, "UNSOURCED x12"),
+    X87LoadBcd = (75, 900, 696, "F5 (FBLD 48-58, slow end) / T10.3 (FBLD 75, Intel's own average)"),
     /// `FBSTP` (`0xdf /6`).
-    X87StoreBcd = (160, 1920, 1920, "UNSOURCED x12"),
+    X87StoreBcd = (160, 1920, 1848, "F5 (FBSTP 148-154, slow end) / T10.3 via the shipped literal"),
     /// Register-form `FADD`/`FSUB`/`FMUL`/`FDIV` and their `P`/`R` variants.
     ///
     /// One class for the whole arithmetic family, which is what the interpreter
@@ -560,51 +611,55 @@ timing_classes! {
     /// `FADD`'s 3-clock latency, an under-charge for `FDIV` recorded here.
     X87RegArith = (20, 240, 36, "cmp §3 row 19 (FADD 3 clk); FDIV/FSQRT split deferred"),
     /// `FUCOM`/`FUCOMP` (`0xdd /4`, `/5`).
-    X87RegCompare = (4, 48, 48, "UNSOURCED x12"),
+    X87RegCompare = (4, 48, 48, "F5 (FUCOM ST(i) 4 latency) / T10.3 via the shipped literal"),
     /// `FLD ST(i)` and `FXCH` (`0xd9 c0..cf`, `0xd9 d0`).
     X87RegExchange = (4, 48, 12, "design §3.2 (FXCH raw 12)"),
     /// `FCHS` (`0xd9 e0`) and `FABS` (`0xd9 e1`).
-    X87RegSign = (6, 72, 72, "UNSOURCED x12"),
+    X87RegSign = (6, 72, 12, "F5 (FCHS/FABS 1 latency) / T10.3 (FCHS 6)"),
     /// `FXAM` (`0xd9 e5`) and the four-and-a-half-digit constant loads
     /// `FLDL2T`/`FLDL2E`/`FLDPI`/`FLDLG2`/`FLDLN2` (`0xd9 e9..ed`), which all
     /// charge 8 today. `FXAM` is not a constant load and shares the class only
     /// because it shares the literal; splitting it needs an epoch-2 source it
     /// does not have yet.
-    X87RegConst = (8, 96, 96, "UNSOURCED x12"),
+    X87RegConst = (8, 96, 60, "F5 (FLDL2T/L2E/PI/LG2/LN2 5 latency) / T10.3 via the shipped literal (8)"),
+    /// `FXAM` (`0xd9 e5`) -- **21 P5 clocks**, where the five constant loads it
+    /// used to share a literal with are 5. It is not a constant load and never
+    /// was; only the shipped `clocks(8)` put them together.
+    X87Xam = (8, 96, 252, "F5 (FXAM 21 latency) / T10.3 (FXAM 8)"),
     /// `FTST` (`0xd9 e4`), `FLD1` (`0xd9 e8`) and `FLDZ` (`0xd9 ee`), the three
     /// register-form ops that charge 4 rather than 8 today.
-    X87RegConstCheap = (4, 48, 48, "UNSOURCED x12"),
+    X87RegConstCheap = (4, 48, 24, "F5 (FLD1/FLDZ 2 latency) / T10.3 via the shipped literal (4)"),
     /// `F2XM1` (`0xd9 f0`).
-    X87Exp = (200, 2400, 2400, "UNSOURCED x12"),
+    X87Exp = (200, 2400, 684, "F5 (F2XM1 13-57, slow end 57) / T10.3 via the shipped literal (200, a round stand-in inside the 486's 140-279 range)"),
     /// The transcendentals that charge 300: `FYL2X`, `FPTAN`, `FPATAN`,
     /// `FSIN`, `FCOS`, `FSINCOS`, `FYL2XP1` (`0xd9 f1..f3`, `f9`, `fb`, `fe`, `ff`).
-    X87Transcendental = (300, 3600, 3600, "UNSOURCED x12"),
+    X87Transcendental = (300, 3600, 2076, "F5 (FPTAN 17-173, slow end across the family) / T10.3 via the shipped literal (300, a round stand-in inside the 486 ranges)"),
     /// `FXTRACT` (`0xd9 f4`) and `FSQRT` (`0xd9 fa`).
     ///
     /// Design §3.2 puts `FSQRT` at raw 840 on the 586; that number arrives with
     /// the slice-4 ladder that R7 requires, not here.
     X87Sqrt = (70, 840, 840, "design §3.2 (FSQRT 70 clk = raw 840)"),
     /// `FPREM` (`0xd9 f8`) and `FPREM1` (`0xd9 f5`).
-    X87Rem = (100, 1200, 1200, "UNSOURCED x12"),
+    X87Rem = (100, 1200, 840, "F5 (FPREM1 20-70, slow end) / T10.3 via the shipped literal"),
     /// `FRNDINT` (`0xd9 fc`).
-    X87RoundInt = (20, 240, 240, "UNSOURCED x12"),
+    X87RoundInt = (20, 240, 240, "F5 (FRNDINT 9-20, slow end 20) / T10.3 via the shipped literal"),
     /// `FSCALE` (`0xd9 fd`).
-    X87Scale = (30, 360, 360, "UNSOURCED x12"),
+    X87Scale = (30, 360, 372, "F5 (FSCALE 20-31, slow end; named unpairable in 3.6.2.1) / T10.3 via the shipped literal"),
     /// `FDECSTP`/`FINCSTP` (`0xd9 f6`/`0xd9 f7`).
-    X87StackPointer = (4, 48, 48, "UNSOURCED x12"),
+    X87StackPointer = (4, 48, 12, "F5 (FINCSTP/FDECSTP 1) / T10.3 via the shipped literal (3)"),
     /// `FNENI`/`FNDISI`/`FNSETPM` (`0xdb e0`/`e1`/`e4`, 387 no-ops) and `FNCLEX`
     /// (`0xdb e2`).
-    X87Control = (2, 24, 24, "UNSOURCED x12"),
+    X87Control = (2, 24, 108, "F5 (FCLEX 9 latency, slow end of the arm) / T10.3 via the shipped literal"),
     /// `FNINIT` (`0xdb e3`).
-    X87Init = (3, 36, 36, "UNSOURCED x12"),
+    X87Init = (3, 36, 192, "F5 (FINIT 16 latency) / T10.3 via the shipped literal (17)"),
     /// `FFREE ST(i)` (`0xdd /0`).
-    X87Free = (3, 36, 36, "UNSOURCED x12"),
+    X87Free = (3, 36, 12, "F5 (FFREE 1) / T10.3 (FFREE 3)"),
     /// `FNSTSW AX` (`0xdf e0`).
-    X87StatusReg = (3, 36, 36, "UNSOURCED x12"),
+    X87StatusReg = (3, 36, 72, "F5 (FSTSW AX 6 latency) / T10.3 via the shipped literal"),
     /// `FST ST(i)` / `FSTP ST(i)` register forms (`0xdd /2`, `/3`).
-    X87RegStore = (3, 36, 36, "UNSOURCED x12"),
+    X87RegStore = (3, 36, 12, "F5 (FST/FSTP ST(i) 1) / T10.3 via the shipped literal"),
     /// `FCOMPP` (`0xde d9`) and `FUCOMPP` (`0xda e9`) -- compare and pop twice.
-    X87ComparePop = (5, 60, 60, "UNSOURCED x12"),
+    X87ComparePop = (5, 60, 48, "F5 (FCOMPP/FUCOMPP 4 latency) / T10.3 via the shipped literal"),
 }
 
 /// One persona's charges, indexed by [`TimingClass::index`].

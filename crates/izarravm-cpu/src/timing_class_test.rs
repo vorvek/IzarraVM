@@ -103,6 +103,7 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::ImulRm, 9),
     (TimingClass::ImulImm, 14),
     (TimingClass::BitTest, 6),
+    (TimingClass::BitTestModify, 6),
     (TimingClass::BitScan, 10),
     (TimingClass::Bswap, 1),
     (TimingClass::CmpXchg, 6),
@@ -128,7 +129,8 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::Wrmsr, 30),
     (TimingClass::Rdtsc, 11),
     (TimingClass::Rdmsr, 11),
-    (TimingClass::InvdWbinvd, 4),
+    (TimingClass::Invd, 4),
+    (TimingClass::Wbinvd, 4),
     (TimingClass::Cpuid, 14),
     (TimingClass::StringElem, 4),
     (TimingClass::InsString, 15),
@@ -141,6 +143,8 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::X87MemArith64, 20),
     (TimingClass::X87MemArithInt32, 20),
     (TimingClass::X87MemArithInt16, 20),
+    (TimingClass::X87MemArithIntDiv32, 20),
+    (TimingClass::X87MemArithIntDiv16, 20),
     (TimingClass::X87LoadReal32, 14),
     (TimingClass::X87StoreReal32, 14),
     (TimingClass::X87LoadReal64, 14),
@@ -167,6 +171,7 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::X87RegExchange, 4),
     (TimingClass::X87RegSign, 6),
     (TimingClass::X87RegConst, 8),
+    (TimingClass::X87Xam, 8),
     (TimingClass::X87RegConstCheap, 4),
     (TimingClass::X87Exp, 200),
     (TimingClass::X87Transcendental, 300),
@@ -302,18 +307,21 @@ fn class_names_are_unique() {
     assert_eq!(names.len(), count, "two classes share a name");
 }
 
-/// The unsourced census, pinned.
+/// The unsourced census, pinned -- and it is now ZERO.
 ///
 /// A class whose provenance says `UNSOURCED x12` has NO reference count behind
-/// its epoch-2 entry: it is the epoch-1 literal times twelve, which preserves
-/// today's relative cost and errs slow. That is a legitimate default under the
-/// owner's 12:15 ruling and an illegitimate place to stop, so the count is
-/// pinned: a later sub-slice that sources a row lowers this number, and one that
-/// adds an unsourced row has to say so in the diff.
+/// its epoch-2 entry: it is the epoch-1 literal times twelve, a default that
+/// preserves today's relative cost and errs slow. Slice 1a shipped 78 of them.
+/// `dev_docs/2026-09-05-class-table-sources.md` sourced every one against
+/// Intel's Pentium Table F-2/F-3/F-5, the Optimization Manual's Table A-1 for
+/// the pairing letters, and the i486 DX2 Data Book's Tables 10.1-10.3, so the
+/// count is now 0 and a row that reappears has to say why in the diff.
 ///
 /// `PLACEHOLDER` is the stronger admission: the row is not merely unsourced, its
-/// SHAPE is wrong (`Group3Unsplit` fuses `TEST` with `DIV`; `StringElem` fuses a
-/// per-element cost with a setup cost) and a later sub-slice must split it.
+/// SHAPE is wrong. One remains -- `StringElem`, which still fuses a per-element
+/// cost with a setup cost. The sources doc supplies both terms for all seven
+/// string families; spending them is slice 1's REP item
+/// (`RepLimitPlan::compute`), not this commit's.
 #[test]
 fn the_unsourced_and_placeholder_census_is_pinned() {
     let unsourced = TimingClass::ALL
@@ -326,7 +334,7 @@ fn the_unsourced_and_placeholder_census_is_pinned() {
         .count();
     assert_eq!(
         (unsourced, placeholder),
-        (81, 1),
+        (0, 1),
         "the unsourced/placeholder census moved; update the pin and say why"
     );
     for class in TimingClass::ALL {
@@ -345,22 +353,23 @@ fn the_unsourced_and_placeholder_census_is_pinned() {
 /// a declared blend, and the blend list is pinned exactly so a fabricated value
 /// cannot hide behind the word.
 ///
-/// The declared blends, all of them half- or third-clock:
-/// * I586 `Jcc` raw 16 (1.33 clk, a third of a clock) -- design section 3.4: Intel's 1-clock
-///   predicted cost plus an amortized mispredict, not any single count.
+/// The declared blends, and there are now only two families of them:
+/// * I586 `Jcc` raw 16 (1.33 clk, a third of a clock) -- design section 3.4:
+///   Intel's 1-clock predicted cost plus an amortized mispredict, not any single
+///   count.
 /// * I586 `Loop` / `LoopCc` / `Jcxz` raw 66 / 90 / 66 (5.5 / 7.5 / 5.5) --
 ///   section 3.2's midpoints of Intel's taken/not-taken ranges (5-6, 7-8, 6-5),
 ///   which the interpreter's one-arm charge cannot separate.
-/// * I486 `ImulRm` / `ImulImm` raw 234 (19.5 clk) and `Mul8` / `Mul16` / `Mul32`
-///   raw 186 / 234 / 330 (15.5 / 19.5 / 27.5 clk) -- the audit's own midpoints of
-///   the i486's 13-18, 13-26 and 13-42 multiply ranges, which it prints as `~186
-///   / 234 / 330` and tells us to record as ranges.
+/// * I486 `X87MemArithIntDiv32` raw 1026 (85.5 clk) -- Intel's OWN printed
+///   average of the DX2's 84-86 range for `FIDIV m32` (Table 10.3's "Cache Hit"
+///   column is an average), not a midpoint we chose.
+///
+/// The multiply midpoints that used to be here are gone: the manual sourcing
+/// replaced `Mul8`/`Mul16`/`Mul32` and `ImulRm`/`ImulImm`'s invented 486
+/// "midpoints" with the slow end of Intel's own MN/MX ranges, which are whole
+/// clocks.
 const DECLARED_BLENDS: &[(&str, &str)] = &[
-    ("I486", "ImulRm"),
-    ("I486", "ImulImm"),
-    ("I486", "Mul8"),
-    ("I486", "Mul16"),
-    ("I486", "Mul32"),
+    ("I486", "X87MemArithIntDiv32"),
     ("I586", "Jcc"),
     ("I586", "Loop"),
     ("I586", "LoopCc"),

@@ -256,13 +256,25 @@ impl CpuGsw {
                 // FIADD/FIMUL/FICOM/FICOMP/FISUB/FISUBR/FIDIV/FIDIVR m32int.
                 let operand = self.read_int32(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(self.charge(TimingClass::X87MemArithInt32))
+                // `/6` FIDIV and `/7` FIDIVR are 42 P5 clocks against the rest of
+                // the family's 7-8, and 85.5 against 20 on the 486. They shared
+                // one `clocks(20)` until the manual sourcing separated them.
+                Ok(self.charge(if reg >= 6 {
+                    TimingClass::X87MemArithIntDiv32
+                } else {
+                    TimingClass::X87MemArithInt32
+                }))
             }
             0xde => {
                 // Integer-operand arithmetic with an m16 source.
                 let operand = self.read_int16(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(self.charge(TimingClass::X87MemArithInt16))
+                // See the `0xda` arm: FIDIV/FIDIVR are the family's outlier.
+                Ok(self.charge(if reg >= 6 {
+                    TimingClass::X87MemArithIntDiv16
+                } else {
+                    TimingClass::X87MemArithInt16
+                }))
             }
             0xdf => match reg {
                 0 => {
@@ -458,9 +470,11 @@ impl CpuGsw {
                 self.fpu_compare(a, 0.0);
                 Ok(self.charge(TimingClass::X87RegConstCheap))
             }
+            // FXAM: 21 P5 clocks, where the five constant loads it shared a
+            // `clocks(8)` with are 5. It is not a constant load.
             0xe5 => {
                 self.fpu_examine();
-                Ok(self.charge(TimingClass::X87RegConst))
+                Ok(self.charge(TimingClass::X87Xam))
             }
             0xe8 => {
                 self.fpu.push(1.0);

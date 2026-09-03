@@ -138,7 +138,7 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let index = self.read_gpr_sized(modrm.reg, operand_size);
                 self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
-                Ok(self.charge(TimingClass::BitTest))
+                Ok(self.charge(bit_string_class(op)))
             }
             0x0fba => {
                 // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 was fetched by
@@ -162,7 +162,7 @@ impl CpuGsw {
                     address_size,
                     false,
                 )?;
-                Ok(self.charge(TimingClass::BitTest))
+                Ok(self.charge(bit_string_class(op)))
             }
             0x0fa4 | 0x0fac => {
                 // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 count was fetched by `decode` into
@@ -1226,7 +1226,15 @@ impl CpuGsw {
                     });
                 }
                 bus.note_cache_flush();
-                Ok(self.charge(TimingClass::InvdWbinvd))
+                // Sourced apart, not together: `INVD` is 15 P5 clocks and
+                // `WBINVD` is Intel's printed "2000+" (a floor, not a count) --
+                // a 133x spread that shared one `clocks(4)` until the manual
+                // pass. The 486's own 4-vs-5 could never have shown it.
+                Ok(self.charge(if opcode & 1 == 0 {
+                    TimingClass::Invd
+                } else {
+                    TimingClass::Wbinvd
+                }))
             }
             // CMPXCHG (0xb0/0xb1) and XADD (0xc0/0xc1) are converted to the decode/execute split
             // (task A10): `route_group` classifies them as `DecodeGroup::BitManip` and
@@ -1676,5 +1684,20 @@ impl CpuGsw {
             | 0x0fc8..=0x0fcf => self.execute_two_byte(bus, insn.opcode as u8, insn.operand_size),
             opcode => unreachable!("misc opcode {opcode:#x}"),
         }
+    }
+}
+
+/// `BT` against `BTS`/`BTR`/`BTC`, by the sub-operation both encodings decode to
+/// (`0` = `BT`).
+///
+/// `BT` reads and writes nothing, so it costs 8-9 clocks on both parts; the other
+/// three are read/modify/writes that lock their memory form and cost 13. They
+/// shared one `clocks(BIT_STRING_CORE_CLOCKS)` until the manual sourcing
+/// separated them.
+pub(crate) fn bit_string_class(op: u8) -> TimingClass {
+    if op == 0 {
+        TimingClass::BitTest
+    } else {
+        TimingClass::BitTestModify
     }
 }
