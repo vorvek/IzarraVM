@@ -1006,10 +1006,14 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 match modrm.reg {
                     0 | 1 => {
+                        // INC/DEC r/m (group 5). Register form is the SIMPLE_FORM_RAW row; the
+                        // memory (RMW) form stays at the flat 2, matching INC_DEC_RM8_CORE_CLOCKS'
+                        // exclusion of the same family's byte-group-4 memory form.
+                        let is_register_form = matches!(operand, RmOperand::Register(_));
                         let value = self.read_operand_sized(bus, operand, operand_size)?;
                         let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
                         self.write_operand_sized(bus, operand, operand_size, result)?;
-                        Ok(clocks(2))
+                        Ok(clocks(self.simple_form_clocks(is_register_form)))
                     }
                     2 => {
                         let target = self.read_operand_sized(bus, operand, operand_size)?;
@@ -1512,16 +1516,18 @@ impl CpuGsw {
                 Ok(clocks(14))
             }
             0xa8 => {
-                // TEST AL, imm8: AND-for-flags, no write-back. `decode` fetched the imm8.
+                // TEST AL, imm8: AND-for-flags, no write-back. `decode` fetched the imm8. Always
+                // a register form -- accumulator + immediate, no ModRM.
                 let al = self.read_gpr8(0);
                 self.alu(4, u32::from(al), insn.imm, BusWidth::Byte);
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(true)))
             }
             0xa9 => {
                 // TEST AX/EAX, imm: AND-for-flags, no write-back. `decode` fetched the immediate.
+                // Always a register form.
                 let acc = self.read_gpr_sized(0, operand_size);
                 self.alu(4, acc, insn.imm, operand_size.bus_width());
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(true)))
             }
             0xd4 => {
                 // AAM: AH = AL / imm8, AL = AL % imm8. OF/AF/CF undefined; SF/ZF/PF from AL.

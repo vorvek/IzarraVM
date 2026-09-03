@@ -5904,7 +5904,14 @@ pub(crate) struct DirectAddr {
 }
 
 impl DirectKind {
-    pub(crate) fn raw_clocks(self) -> u32 {
+    /// `simple_form_raw` is `CpuGsw::simple_form_raw` (2026-09-05 revision 2, IZARRAVM_SIMPLE_FORM_RAW
+    /// prototype): the knob-gated charge for the 586 core-clock table's modal 2-raw-clock REGISTER
+    /// forms. Passing the field's value through rather than reading it from a `&CpuGsw` keeps this
+    /// a pure function of the slot's own shape, callable from the compile walk (which has `cpu`)
+    /// and from `StaticAccounting::retire` (which does not, and is threaded the value through
+    /// `EmitInput` instead). With the knob unset `simple_form_raw == 2`, so every arm added for
+    /// this prototype returns exactly what the `_ => 2` default already returned -- bit-identical.
+    pub(crate) fn raw_clocks(self, simple_form_raw: u32) -> u32 {
         match self {
             // NOP joins Jcc at 3. Both interpreter arms charge `clocks(3)` and neither consults
             // `operand_size`. Without this arm it rides the `_ => 2` default and undercharges
@@ -6030,6 +6037,48 @@ impl DirectKind {
             // the emitter's own `completed_raw` assertion: that assertion sums this same
             // accessor, so it agrees with itself whatever the arm returns.
             Self::ImulImm { .. } => 14,
+            // 2026-09-05 SIMPLE_FORM_RAW prototype: the modal register forms the research note's
+            // Fix 1 names -- register/simple ALU (both operand orders and the immediate forms,
+            // full-width and byte-lane), MOV register-to-register and register-immediate (both
+            // widths), LEA, INC/DEC register, TEST register form (both the ModRM and the
+            // accumulator-immediate encodings), shift/rotate by 1, imm8 or CL in the register
+            // form, and PUSH of a register source. Every one of these already returned the flat
+            // `2` through the `_ => 2` default below; this is the same charge with a knob.
+            //
+            // Deliberately NOT here (all fall through to the flat `2` default, unmoved): every
+            // memory-operand instance of the kinds above (`AluMemSource`/`AluMemDest`,
+            // `RmwIncDec`, `TestImmMem`, `RotateShiftMem`, `PushMem`, `Load`/`LoadExtend`/`Store`
+            // carry their own `raw_clocks` field and never reach this default at all); the Group 3
+            // MUL/IMUL/DIV/IDIV/NOT/NEG family (`MulReg`, `ImulRegAcc`, `DivReg`, `NegReg`,
+            // `MulMemAcc`, `ImulMemAcc`, `DivMem`) -- the knob must not touch them, matching the
+            // interpreter side's Group 3 exclusion; `MovSegToReg` (MOV r,Sreg), which the
+            // interpreter charges through the separate `MOV_RM_SREG_CORE_CLOCKS` constant, never
+            // raised on the interpreter side either; and PUSH of anything but a register source
+            // (`Imm`, `Selector`, `EipDelta`, the SETcc-byte source), matching the interpreter's
+            // segment-push and PUSH-imm exclusions.
+            Self::MovReg { .. }
+            | Self::MovRegByte { .. }
+            | Self::MovImm { .. }
+            | Self::MovImmByte { .. }
+            | Self::Lea { .. }
+            | Self::IncDecReg { .. }
+            | Self::AluReg { .. }
+            | Self::AluImm { .. }
+            | Self::AluByteImm { .. }
+            | Self::AluRegByte { .. }
+            | Self::Test { .. }
+            | Self::TestByte { .. }
+            | Self::TestImmReg { .. }
+            | Self::RotateReg { .. }
+            | Self::RotateRegByte { .. }
+            | Self::Shift { .. }
+            | Self::ShiftCl { .. } => simple_form_raw,
+            Self::Push {
+                source: StoreSource::Reg(_),
+            }
+            | Self::Push16 {
+                source: StoreSource::Reg(_),
+            } => simple_form_raw,
             _ => 2,
         }
     }
@@ -8736,7 +8785,8 @@ fn compile_with_budget(
         }
         let slot_weighted_fp_clocks =
             kind.weighted_fp_clocks(cpu.persona(), cpu.x87_intconvert32_num);
-        let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks()) else {
+        let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks(cpu.simple_form_raw))
+        else {
             stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
@@ -9659,6 +9709,7 @@ fn compile_with_budget(
         slots: &slots,
         span,
         raw_clocks,
+        simple_form_raw: cpu.simple_form_raw,
         weighted_fp_clocks,
         byte_reads,
         word_reads,
@@ -18890,6 +18941,11 @@ struct EmitInput<'a> {
     slots: &'a [DirectInsn],
     span: BlockSpan,
     raw_clocks: u32,
+    /// `CpuGsw::simple_form_raw` (2026-09-05 revision 2, IZARRAVM_SIMPLE_FORM_RAW prototype),
+    /// threaded through because `emit`'s own per-slot `StaticAccounting::retire` walk recomputes
+    /// each slot's `raw_clocks()` independently (for the side-exit prefix stubs) and has no
+    /// `&CpuGsw` of its own to read the knob from.
+    simple_form_raw: u32,
     weighted_fp_clocks: u32,
     byte_reads: u8,
     word_reads: u8,
@@ -19113,6 +19169,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         slots,
         span,
         raw_clocks,
+        simple_form_raw,
         weighted_fp_clocks,
         byte_reads,
         word_reads,
@@ -20235,7 +20292,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.alu_r16_imm16(0, home(4), release.wrapping_add(2));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20345,7 +20402,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_RET_FAR_OFFSET);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20461,7 +20518,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // costs nothing extra anyway, since `segment_write_block` already forces
                 // `successors = [None, None]` regardless of which completion path is chosen.
                 e.mov_r32_imm32(Reg::RDX, u32::from(offset));
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20783,7 +20840,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r32_imm32(5, home(4), 4);
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -20830,7 +20887,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r16_imm16(5, home(4), 2);
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -20847,7 +20904,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 break;
             }
             DirectKind::Jmp { target_delta } => {
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -20894,7 +20951,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.add_r32_imm32(home(4), 4 + u32::from(release));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20940,7 +20997,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20983,7 +21040,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // Reading `home(dst)` is safe for EVERY dst including ESP: nothing in this arm has
                 // written a guest home, so the value is the architectural pre-instruction one.
                 e.mov_r32_r32(Reg::RDX, home(dst));
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21036,7 +21093,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // AFTER the side exit is published, the same faulting-push invariant `Call` keeps:
                 // a faulting push must leave ESP at its pre-instruction value.
                 e.alu_r32_imm32(5, home(4), 4);
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21100,7 +21157,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // target is live in RDX across this and stays live: `home(4)` is a GUEST_HOMES
                 // register, never a scratch one.
                 e.alu_r32_imm32(5, home(4), 4);
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21143,7 +21200,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 wanted_zf,
                 taken_delta,
             } => {
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 let taken = e.label();
                 let counter_dead = e.label();
                 e.alu_r32_imm32(5, home(1), 1);
@@ -21205,7 +21262,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 taken_delta,
                 counter_word,
             } => {
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 let taken = e.label();
                 // The width swap the `counter_word` field exists for. `alu_r16_imm16` writes
                 // only CX and preserves ECX's bits 31..16, exactly as `alu_r32_imm32` writes all
@@ -21269,7 +21326,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 condition,
                 taken_delta,
             } => {
-                completed.retire(slot);
+                completed.retire(slot, simple_form_raw);
                 let taken = e.label();
                 // The one arm switch of the `IZARRAVM_JCC_SHADOW` slice, read at the emission
                 // site so both arms live in ONE binary and a ladder needs no rebuild. The OFF
@@ -21326,7 +21383,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 break;
             }
         }
-        completed.retire(slot);
+        completed.retire(slot, simple_form_raw);
     }
     if !terminal {
         emit_completed_path(
@@ -22005,9 +22062,9 @@ struct StaticAccounting {
 }
 
 impl StaticAccounting {
-    fn retire(&mut self, slot: &DirectInsn) {
+    fn retire(&mut self, slot: &DirectInsn, simple_form_raw: u32) {
         self.instructions += 1;
-        self.raw_clocks += slot.kind.raw_clocks() as u16;
+        self.raw_clocks += slot.kind.raw_clocks(simple_form_raw) as u16;
         self.weighted_fp_clocks += slot.weighted_fp_clocks;
         self.byte_reads += slot.kind.byte_reads();
         self.word_reads += slot.kind.word_reads();

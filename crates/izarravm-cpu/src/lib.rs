@@ -2930,6 +2930,17 @@ pub struct CpuGsw {
     /// x1-x3 against the fitted x34 in fp_timing_class. None (env unset or empty)
     /// keeps today's 272/8. Read ONCE at construction.
     x87_intconvert32_num: Option<u32>,
+    /// IZARRAVM_SIMPLE_FORM_RAW knob-gated prototype (2026-09-05 revision 2, coordinator
+    /// directive): raw clocks charged for the 586 core-clock table's MODAL 2-raw-clock register
+    /// forms -- register/simple ALU, MOV register-to-register, shift/rotate by 1 or CL in the
+    /// register form, LEA, INC/DEC register, TEST register form, PUSH r/m register form -- as
+    /// distinct from `IZARRAVM_ISSUE_RAW`'s flat per-instruction add. Deliberately does NOT touch
+    /// MUL/DIV/IMUL/IDIV/NOT/NEG (Group 3, `GROUP3_CORE_CLOCKS`, a defect the research note's Fix
+    /// 2 covers separately) or any memory-operand instance of the forms above (raising those too
+    /// would move the RMW rows the research note's per-class table prices very differently from
+    /// the register rows). Read ONCE at construction; unset or empty keeps today's flat 2,
+    /// bit-identical. Never read per instruction.
+    simple_form_raw: u32,
     /// The call-out window: whether an `InterpretOne` slot is running one interpreter instruction
     /// with a native block live on the host stack, and the code writes that window has deferred.
     ///
@@ -3165,6 +3176,7 @@ impl Default for CpuGsw {
             written_pages_overflow: false,
             issue_raw: issue_raw_default(),
             x87_intconvert32_num: x87_intconvert32_override_default(),
+            simple_form_raw: simple_form_raw_default(),
             #[cfg(feature = "jit")]
             deferred_code_writes: DeferredCodeWrites::default(),
             decode_cache,
@@ -4349,6 +4361,23 @@ pub(crate) fn x87_intconvert32_override_policy(value: Option<&str>) -> Option<u3
 /// (2026-09-05 issue-charge prototype).
 pub(crate) fn x87_intconvert32_override_default() -> Option<u32> {
     x87_intconvert32_override_policy(std::env::var("IZARRAVM_X87_INTCONVERT_MUL").ok().as_deref())
+}
+
+/// The whole `IZARRAVM_SIMPLE_FORM_RAW` spelling table, split out for the same reason
+/// `issue_raw_policy` is. Unset or empty keeps the flat `2` raw clocks the 586 core-clock table
+/// charges today for its modal register forms -- today's model, bit-identical. A malformed value
+/// also falls back to `2` rather than panicking.
+pub(crate) fn simple_form_raw_policy(value: Option<&str>) -> u32 {
+    value
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2)
+}
+
+/// IZARRAVM_SIMPLE_FORM_RAW ambient default, read fresh at CPU construction (2026-09-05 revision
+/// 2 prototype).
+pub(crate) fn simple_form_raw_default() -> u32 {
+    simple_form_raw_policy(std::env::var("IZARRAVM_SIMPLE_FORM_RAW").ok().as_deref())
 }
 
 /// Ambient default for the poll negative cache, read fresh at CPU construction.

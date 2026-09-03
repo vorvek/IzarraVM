@@ -4,6 +4,22 @@
 use super::*;
 
 impl CpuGsw {
+    /// `IZARRAVM_SIMPLE_FORM_RAW`'s knob-gated charge for one instance of a modal-2-raw-clock
+    /// register form (2026-09-05 revision 2 prototype). `is_register_form` is decided at each
+    /// call site from the resolved operand (or is a compile-time-known `true`/`false` for an arm
+    /// that can only ever be one or the other, e.g. LEA or a memory-only RMW). Register instances
+    /// get `self.simple_form_raw`; every non-register instance keeps the flat `2` this whole
+    /// table charged before the knob existed, exactly like `IZARRAVM_ISSUE_RAW` unset reproduces
+    /// `scale_clocks` unchanged.
+    #[inline]
+    pub(crate) fn simple_form_clocks(&self, is_register_form: bool) -> u32 {
+        if is_register_form {
+            self.simple_form_raw
+        } else {
+            2
+        }
+    }
+
     /// Stage A executor. For the opcodes converted to the split (the whole ALU block), execute from
     /// the pre-decoded `operand`/`modrm`/`imm` (resolving the addressing-mode descriptor against the
     /// live registers). Every other opcode continues into the shared fused dispatch (which re-reads
@@ -129,9 +145,17 @@ impl CpuGsw {
         let write_back = op != 7; // CMP computes flags only
         let operand_size = insn.operand_size;
 
+        // 2026-09-05 SIMPLE_FORM_RAW prototype: forms 0-3 mix a register-register instance with
+        // a register-memory (RMW or read-only) instance behind the SAME ModRM byte, so which one
+        // this call is can only be known here, from the resolved `RmOperand`. Forms 4/5 (AL/eAX +
+        // imm) are always register. `is_register_form` is the per-call answer the raise applies
+        // to; the memory instances of forms 0-3 are deliberately left at the flat `clocks(2)` --
+        // "NOT the memory forms" per the knob's own scope.
+        let is_register_form;
         match form {
             0 => {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                is_register_form = matches!(operand, RmOperand::Register(_));
                 let a = u32::from(self.read_operand_u8(bus, operand)?);
                 let b = u32::from(self.read_gpr8(modrm.reg));
                 let result = self.alu(op, a, b, BusWidth::Byte) as u8;
@@ -141,6 +165,7 @@ impl CpuGsw {
             }
             1 => {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                is_register_form = matches!(operand, RmOperand::Register(_));
                 let a = self.read_operand_sized(bus, operand, operand_size)?;
                 let b = self.read_gpr_sized(modrm.reg, operand_size);
                 let result = self.alu(op, a, b, operand_size.bus_width());
@@ -150,6 +175,7 @@ impl CpuGsw {
             }
             2 => {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                is_register_form = matches!(operand, RmOperand::Register(_));
                 let a = u32::from(self.read_gpr8(modrm.reg));
                 let b = u32::from(self.read_operand_u8(bus, operand)?);
                 let result = self.alu(op, a, b, BusWidth::Byte) as u8;
@@ -159,6 +185,7 @@ impl CpuGsw {
             }
             3 => {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                is_register_form = matches!(operand, RmOperand::Register(_));
                 let a = self.read_gpr_sized(modrm.reg, operand_size);
                 let b = self.read_operand_sized(bus, operand, operand_size)?;
                 let result = self.alu(op, a, b, operand_size.bus_width());
@@ -168,6 +195,7 @@ impl CpuGsw {
             }
             4 => {
                 // imm8 was fetched + charged by `decode`; consume it from the decoded instruction.
+                is_register_form = true;
                 let imm = insn.imm;
                 let a = u32::from(self.read_gpr8(0));
                 let result = self.alu(op, a, imm, BusWidth::Byte) as u8;
@@ -177,6 +205,7 @@ impl CpuGsw {
             }
             5 => {
                 // imm16/32 was fetched + charged by `decode`; consume it from the decoded form.
+                is_register_form = true;
                 let imm = insn.imm;
                 let a = self.read_gpr_sized(0, operand_size);
                 let result = self.alu(op, a, imm, operand_size.bus_width());
@@ -187,7 +216,7 @@ impl CpuGsw {
             _ => unreachable!("alu form {form}"),
         }
 
-        Ok(clocks(2))
+        Ok(clocks(self.simple_form_clocks(is_register_form)))
     }
 
     /// The data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms, plus the two-byte
@@ -267,7 +296,9 @@ impl CpuGsw {
                 // MOV r/m8, r8.
                 let modrm = insn.modrm.expect("MOV r/m8,r8 decoded with a ModRM");
                 let value = self.read_gpr8(modrm.reg);
-                match insn.operand.expect("MOV r/m8,r8 decoded with an operand") {
+                let operand = insn.operand.expect("MOV r/m8,r8 decoded with an operand");
+                let is_register_form = matches!(operand, DecodedOperand::Reg(_));
+                match operand {
                     DecodedOperand::Reg(index) => self.write_gpr8(index, value),
                     DecodedOperand::Mem(addr) => {
                         let memory = self.resolve_memory_addr_mode(&addr);
@@ -280,13 +311,15 @@ impl CpuGsw {
                         )?;
                     }
                 }
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0x89 => {
                 // MOV r/m16/32, r16/32.
                 let modrm = insn.modrm.expect("MOV r/m,r decoded with a ModRM");
                 let value = self.read_gpr_sized(modrm.reg, operand_size);
-                match insn.operand.expect("MOV r/m,r decoded with an operand") {
+                let operand = insn.operand.expect("MOV r/m,r decoded with an operand");
+                let is_register_form = matches!(operand, DecodedOperand::Reg(_));
+                match operand {
                     DecodedOperand::Reg(index) => {
                         self.write_gpr_sized(index, operand_size, value);
                     }
@@ -302,12 +335,14 @@ impl CpuGsw {
                         )?;
                     }
                 }
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0x8a => {
                 // MOV r8, r/m8.
                 let modrm = insn.modrm.expect("MOV r8,r/m8 decoded with a ModRM");
-                let value = match insn.operand.expect("MOV r8,r/m8 decoded with an operand") {
+                let operand = insn.operand.expect("MOV r8,r/m8 decoded with an operand");
+                let is_register_form = matches!(operand, DecodedOperand::Reg(_));
+                let value = match operand {
                     DecodedOperand::Reg(index) => self.read_gpr8(index),
                     DecodedOperand::Mem(addr) => {
                         let memory = self.resolve_memory_addr_mode(&addr);
@@ -320,12 +355,14 @@ impl CpuGsw {
                     }
                 };
                 self.write_gpr8(modrm.reg, value);
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0x8b => {
                 // MOV r16/32, r/m16/32.
                 let modrm = insn.modrm.expect("MOV r,r/m decoded with a ModRM");
-                let value = match insn.operand.expect("MOV r,r/m decoded with an operand") {
+                let operand = insn.operand.expect("MOV r,r/m decoded with an operand");
+                let is_register_form = matches!(operand, DecodedOperand::Reg(_));
+                let value = match operand {
                     DecodedOperand::Reg(index) => self.read_gpr_sized(index, operand_size),
                     DecodedOperand::Mem(addr) => {
                         let memory = self.resolve_memory_addr_mode(&addr);
@@ -339,7 +376,7 @@ impl CpuGsw {
                     }
                 };
                 self.write_gpr_sized(modrm.reg, operand_size, value);
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0x8c => {
                 // MOV r/m16, Sreg. Always a word store regardless of operand size.
@@ -358,7 +395,11 @@ impl CpuGsw {
                 match operand {
                     RmOperand::Memory(mem) => {
                         self.write_gpr_sized(modrm.reg, operand_size, mem.offset);
-                        Ok(clocks(2))
+                        // LEA computes an effective ADDRESS, never a data-memory access, so it is
+                        // a register form for SIMPLE_FORM_RAW purposes even though its operand is
+                        // structurally RmOperand::Memory -- P5 Appendix F prices it with MOV r,r
+                        // and ALU r,r, not with a memory read or write.
+                        Ok(clocks(self.simple_form_clocks(true)))
                     }
                     RmOperand::Register(_) => Err(InternalFault::Exception {
                         vector: 6,
@@ -466,14 +507,15 @@ impl CpuGsw {
                 Ok(clocks(4))
             }
             0xb0..=0xb7 => {
-                // MOV r8, imm8. The immediate was captured into `imm` by decode.
+                // MOV r8, imm8. The immediate was captured into `imm` by decode. Always a
+                // register form -- no ModRM, no memory operand possible.
                 self.write_gpr8(opcode - 0xb0, insn.imm as u8);
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(true)))
             }
             0xb8..=0xbf => {
-                // MOV r16/32, imm16/32.
+                // MOV r16/32, imm16/32. Always a register form.
                 self.write_gpr_sized(opcode - 0xb8, operand_size, insn.imm);
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(true)))
             }
             0xc6 => {
                 // MOV r/m8, imm8 (group 11). Only reg=000 is defined; decode left `operand`/`imm`
@@ -483,8 +525,9 @@ impl CpuGsw {
                     return Err(undefined_opcode());
                 }
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                let is_register_form = matches!(operand, RmOperand::Register(_));
                 self.write_operand_u8(bus, operand, insn.imm as u8)?;
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0xc7 => {
                 // MOV r/m16/32, imm16/32 (group 11). Same reg=000 gate as 0xc6.
@@ -493,8 +536,9 @@ impl CpuGsw {
                     return Err(undefined_opcode());
                 }
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                let is_register_form = matches!(operand, RmOperand::Register(_));
                 self.write_operand_sized(bus, operand, operand_size, insn.imm)?;
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             _ => unreachable!("data-move opcode {opcode:#x}"),
         }
@@ -588,10 +632,12 @@ impl CpuGsw {
                 Ok(clocks(7))
             }
             0x50..=0x57 => {
+                // PUSH r: the named "PUSH r" register form the SIMPLE_FORM_RAW knob raises. The
+                // stack write itself is priced through the bus dial, not this core-clocks term.
                 let index = opcode - 0x50;
                 let value = self.read_gpr_sized(index, operand_size);
                 self.push(bus, value, operand_size)?;
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(true)))
             }
             0x58..=0x5f => {
                 let index = opcode - 0x58;
@@ -834,6 +880,12 @@ impl CpuGsw {
         let opcode = insn.opcode as u8;
         let operand_size = insn.operand_size;
         let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+        // 2026-09-05 SIMPLE_FORM_RAW prototype: shared across every arm in this function that
+        // resolves the SAME `operand` above (Group 1 ALU imm forms and Group 2 shift/rotate).
+        // Group 3 (0xf6/0xf7, TEST/NOT/NEG/MUL/IMUL/DIV/IDIV) deliberately does NOT consult this
+        // -- it shares one charge site across all seven sub-ops and the knob must not touch
+        // MUL/IMUL/DIV/IDIV, so TEST via this encoding stays at the flat `2` too.
+        let is_register_form = matches!(operand, RmOperand::Register(_));
 
         match opcode {
             0x80 | 0x82 => {
@@ -845,7 +897,7 @@ impl CpuGsw {
                 if modrm.reg != 7 {
                     self.write_operand_u8(bus, operand, result)?;
                 }
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0x81 => {
                 // Group 1 ALU r/m16/32, imm16/32. Full-width immediate from `decode`.
@@ -855,7 +907,7 @@ impl CpuGsw {
                 if modrm.reg != 7 {
                     self.write_operand_sized(bus, operand, operand_size, result)?;
                 }
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0x83 => {
                 // Group 1 ALU r/m16/32, imm8 sign-extended to the operand width. `decode` already
@@ -866,7 +918,7 @@ impl CpuGsw {
                 if modrm.reg != 7 {
                     self.write_operand_sized(bus, operand, operand_size, result)?;
                 }
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3 => {
                 // Group 2 shift/rotate. `reg` selects ROL/ROR/RCL/RCR/SHL/SHR/SAL/SAR; the count
@@ -888,7 +940,7 @@ impl CpuGsw {
                     let result = self.shift_rotate(op, value, count, operand_size.bus_width());
                     self.write_operand_sized(bus, operand, operand_size, result)?;
                 }
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0xf6 => {
                 // Group 3 byte. /0 TEST (AND-for-flags, no write-back) takes the imm8 `decode`
@@ -1088,10 +1140,11 @@ impl CpuGsw {
             0x84 => {
                 // TEST r/m8, reg8. AND-for-flags only; no write-back (same as op=4, write_back=false).
                 let modrm = insn.modrm.expect("TEST r/m8,reg8 decoded with a ModRM");
-                let value = match insn
+                let operand = insn
                     .operand
-                    .expect("TEST r/m8,reg8 decoded with an operand")
-                {
+                    .expect("TEST r/m8,reg8 decoded with an operand");
+                let is_register_form = matches!(operand, DecodedOperand::Reg(_));
+                let value = match operand {
                     DecodedOperand::Reg(index) => self.read_gpr8(index),
                     DecodedOperand::Mem(addr) => {
                         let memory = self.resolve_memory_addr_mode(&addr);
@@ -1105,12 +1158,14 @@ impl CpuGsw {
                 };
                 let reg = self.read_gpr8(modrm.reg);
                 self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             0x85 => {
                 // TEST r/m16/32, reg16/32. AND-for-flags only; no write-back.
                 let modrm = insn.modrm.expect("TEST r/m,reg decoded with a ModRM");
-                let value = match insn.operand.expect("TEST r/m,reg decoded with an operand") {
+                let operand = insn.operand.expect("TEST r/m,reg decoded with an operand");
+                let is_register_form = matches!(operand, DecodedOperand::Reg(_));
+                let value = match operand {
                     DecodedOperand::Reg(index) => self.read_gpr_sized(index, operand_size),
                     DecodedOperand::Mem(addr) => {
                         let memory = self.resolve_memory_addr_mode(&addr);
@@ -1125,16 +1180,17 @@ impl CpuGsw {
                 };
                 let reg = self.read_gpr_sized(modrm.reg, operand_size);
                 self.alu(4, value, reg, operand_size.bus_width());
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(is_register_form)))
             }
             opcode @ 0x40..=0x4f => {
-                // INC (0x40-0x47) / DEC (0x48-0x4f) register. CF is preserved by `inc_dec`.
+                // INC (0x40-0x47) / DEC (0x48-0x4f) register. CF is preserved by `inc_dec`. Always
+                // a register form -- this 16-bit-opcode-space INC/DEC has no ModRM at all.
                 let index = opcode & 0x07;
                 let is_dec = opcode >= 0x48;
                 let value = self.read_gpr_sized(index, operand_size);
                 let result = self.inc_dec(value, is_dec, operand_size.bus_width());
                 self.write_gpr_sized(index, operand_size, result);
-                Ok(clocks(2))
+                Ok(clocks(self.simple_form_clocks(true)))
             }
             0x98 => {
                 // CBW / CWDE: sign-extend the accumulator into the next width.
